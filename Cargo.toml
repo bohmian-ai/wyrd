@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wyrd/*",
+    "crates/vala/*",
+    "crates/shared/*",
+    "crates/wyrd-spec",
+    "python/py-wyrd",
+]
+default-members = [
+    "crates/wyrd/wyrd-server",
+    "crates/wyrd/wyrd-cli",
+    "crates/wyrd/wyrd-mcp",
+    "crates/vala/wyrd-observability-server",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.87.0"
+repository = "https://github.com/wyrd-ai/wyrd"
+authors = ["Thorrester <sjforrester32@gmail.com>"]
+
+[workspace.dependencies]
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
+axum = "0.8"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+missing_errors_doc = "allow"

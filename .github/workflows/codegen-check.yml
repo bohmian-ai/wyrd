@@ -1,0 +1,24 @@
+name: codegen-check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  codegen:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+      - name: mise run codegen:check
+        run: mise run codegen:check

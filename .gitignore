@@ -1,0 +1,40 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node / SvelteKit
+node_modules/
+.svelte-kit/
+build/
+.vite/
+dist/
+
+# Python / uv / maturin
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Wyrd dev cache
+.cache/wyrd/
+postgres-data/
+
+# Logs / pid files
+/tmp/wyrd-*.log
+/tmp/wyrd-*.pid
+
+# Env files
+.env
+.env.local
+
+# dev files
+.dev/

@@ -1,0 +1,64 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PolicySpec",
+  "description": "Declarative policy rule set.",
+  "type": "object",
+  "properties": {
+    "description": {
+      "description": "Policy description.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "details": {
+      "description": "Free-form details.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "enforcement": {
+      "description": "Enforcement mode.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "rules": {
+      "description": "Policy rules.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/PolicyRule"
+      }
+    }
+  },
+  "definitions": {
+    "PolicyRule": {
+      "description": "One policy rule.",
+      "type": "object",
+      "required": [
+        "action",
+        "expression",
+        "name"
+      ],
+      "properties": {
+        "action": {
+          "description": "Action such as `allow`, `warn`, `block`, or `approval_required`.",
+          "type": "string"
+        },
+        "expression": {
+          "description": "Rule expression.",
+          "type": "string"
+        },
+        "metadata": {
+          "description": "Rule metadata.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "name": {
+          "description": "Rule name.",
+          "type": "string"
+        }
+      }
+    }
+  }
+}

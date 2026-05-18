@@ -1,0 +1,116 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RunKind",
+  "description": "Execution kind recorded as a Run.",
+  "oneOf": [
+    {
+      "description": "Training execution.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "training"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Inference execution.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "inference"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Offline or batch evaluation execution.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "offline_eval"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Drift check execution.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "drift_check"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Import execution.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "import"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Workflow execution.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "workflow"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Externally defined execution kind.",
+      "type": "object",
+      "required": [
+        "type",
+        "value"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "external"
+          ]
+        },
+        "value": {
+          "type": "string"
+        }
+      }
+    }
+  ]
+}

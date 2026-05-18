@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolSpec",
+  "description": "Declarative tool definition for agent harnesses.",
+  "type": "object",
+  "required": [
+    "tool_type"
+  ],
+  "properties": {
+    "allowed_tools": {
+      "description": "Allowed downstream tool names.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "api_config": {
+      "description": "API tool config.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "args_schema": {
+      "description": "Input argument schema."
+    },
+    "description": {
+      "description": "Tool description.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "details": {
+      "description": "Free-form details.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "hook_events": {
+      "description": "Hook event names.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "hook_matcher": {
+      "description": "Hook matcher metadata.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "mcp_server_name": {
+      "description": "MCP server name.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "output_schema": {
+      "description": "Output schema."
+    },
+    "requires_approval": {
+      "description": "Whether approval is required before use.",
+      "default": false,
+      "type": "boolean"
+    },
+    "script_config": {
+      "description": "Script tool config.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "tool_type": {
+      "description": "Tool type, such as `script`, `api`, `mcp`, or `builtin`.",
+      "type": "string"
+    }
+  }
+}

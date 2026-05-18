@@ -27,6 +27,50 @@ run = "cargo clippy --workspace --all-features --all-targets -- -D warnings"
 description = "Run all Rust unit tests"
 run = "cargo test --workspace --all-features --lib"
 
+[tasks."cardkind:check"]
+description = "Verify CardKind native count and External serde shape"
+run = "cargo test -p wyrd-spec --test cardkind_check --features server"
+
+[tasks."check:client-tier"]
+description = "Assert wyrd-spec keeps server/runtime deps out of no-default normal deps"
+run = """
+if cargo tree -p wyrd-spec --no-default-features -e normal | rg 'utoipa|pyo3|sqlx|axum|opentelemetry|reqwest|tokio'; then
+  echo 'client-tier dependency leak detected'
+  exit 1
+fi
+"""
+
+[tasks."check:pyo3-scope"]
+description = "Assert PyO3 stays out of foundation crates"
+run = """
+if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/wyrd-spec crates/shared; then
+  echo 'PyO3 scope violation detected'
+  exit 1
+fi
+"""
+
+[tasks."check:mocks-scope"]
+description = "Assert mock helpers stay out of production source"
+run = """
+if rg -n 'mockall|wiremock|mockito' crates --glob '!crates/shared/wyrd-testing/**'; then
+  echo 'mock dependency leaked outside wyrd-testing'
+  exit 1
+fi
+"""
+
+[tasks."check:unwrap-audit"]
+description = "Audit unwrap/expect calls outside tests and examples"
+run = """
+if rg -n '\\.(unwrap|expect)\\(' crates --glob '!**/tests/**' --glob '!**/examples/**'; then
+  echo 'unwrap/expect audit failed'
+  exit 1
+fi
+"""
+
+[tasks."check:wasm"]
+description = "Build wyrd-spec for wasm32"
+run = "cargo check --target wasm32-unknown-unknown -p wyrd-spec --features wasm"
+
 [tasks."py:setup"]
 description = "uv sync placeholder for the future Python package"
 dir = "python/py-wyrd"
@@ -86,8 +130,7 @@ cargo check --workspace --all-features
 [tasks."codegen:regen"]
 description = "Regenerate OpenAPI / JSON schemas / MCP tool list / pyi stubs from source"
 run = """
-mkdir -p crates/wyrd-spec/schemas
-touch crates/wyrd-spec/schemas/.gitkeep
+cargo run -p wyrd-spec --example gen_schemas --features server
 test -f openapi.yaml || { echo 'openapi.yaml missing'; exit 1; }
 """
 
@@ -101,7 +144,7 @@ git diff --exit-code -- openapi.yaml crates/wyrd-spec/schemas/ python/py-wyrd/ \
 
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check"
-depends = ["check", "codegen:check"]
+depends = ["check", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:wasm"]
 
 [tasks."dev:pg:nuke"]
 description = "Wipe embedded pg cache"

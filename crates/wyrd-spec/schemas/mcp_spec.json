@@ -1,0 +1,274 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "McpSpec",
+  "description": "MCP server or tool catalog metadata.",
+  "type": "object",
+  "required": [
+    "server_name"
+  ],
+  "properties": {
+    "description": {
+      "description": "MCP description.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "details": {
+      "description": "Free-form details.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "scopes": {
+      "description": "Required scopes.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "server_name": {
+      "description": "Server name.",
+      "type": "string"
+    },
+    "tool_refs": {
+      "description": "Tool references.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CardRef"
+      }
+    },
+    "transport": {
+      "description": "Transport descriptor.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "CardKind": {
+      "description": "Native Wyrd Card kind plus forward-compatible external catch-all.",
+      "oneOf": [
+        {
+          "description": "Data Card.",
+          "type": "string",
+          "enum": [
+            "Data"
+          ]
+        },
+        {
+          "description": "Model Card.",
+          "type": "string",
+          "enum": [
+            "Model"
+          ]
+        },
+        {
+          "description": "Experiment Card.",
+          "type": "string",
+          "enum": [
+            "Experiment"
+          ]
+        },
+        {
+          "description": "Prompt Card.",
+          "type": "string",
+          "enum": [
+            "Prompt"
+          ]
+        },
+        {
+          "description": "Tool Card.",
+          "type": "string",
+          "enum": [
+            "Tool"
+          ]
+        },
+        {
+          "description": "Agent Card.",
+          "type": "string",
+          "enum": [
+            "Agent"
+          ]
+        },
+        {
+          "description": "Workflow Card.",
+          "type": "string",
+          "enum": [
+            "Workflow"
+          ]
+        },
+        {
+          "description": "Evaluation Card.",
+          "type": "string",
+          "enum": [
+            "Eval"
+          ]
+        },
+        {
+          "description": "Drift Card.",
+          "type": "string",
+          "enum": [
+            "Drift"
+          ]
+        },
+        {
+          "description": "Service Card.",
+          "type": "string",
+          "enum": [
+            "Service"
+          ]
+        },
+        {
+          "description": "Policy Card.",
+          "type": "string",
+          "enum": [
+            "Policy"
+          ]
+        },
+        {
+          "description": "MCP Card.",
+          "type": "string",
+          "enum": [
+            "Mcp"
+          ]
+        },
+        {
+          "description": "Skill Card.",
+          "type": "string",
+          "enum": [
+            "Skill"
+          ]
+        },
+        {
+          "description": "Sub-agent Card.",
+          "type": "string",
+          "enum": [
+            "SubAgent"
+          ]
+        },
+        {
+          "description": "Audit Card.",
+          "type": "string",
+          "enum": [
+            "Audit"
+          ]
+        },
+        {
+          "description": "Artifact Card.",
+          "type": "string",
+          "enum": [
+            "Artifact"
+          ]
+        },
+        {
+          "description": "Unknown Card kind with schema hash.",
+          "type": "object",
+          "required": [
+            "External"
+          ],
+          "properties": {
+            "External": {
+              "type": "object",
+              "required": [
+                "name",
+                "schema_hash"
+              ],
+              "properties": {
+                "name": {
+                  "description": "External kind name.",
+                  "type": "string"
+                },
+                "schema_hash": {
+                  "description": "32-byte schema hash.",
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "uint8",
+                    "minimum": 0.0
+                  },
+                  "maxItems": 32,
+                  "minItems": 32
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardRef": {
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Referenced Card kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "Referenced Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "space": {
+          "description": "Optional space; omitted means current/default space.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Optional resolved UID.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Exact referenced Card version.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VersionBlock"
+            }
+          ]
+        }
+      }
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "VersionBlock": {
+      "description": "Semver-compatible version string.",
+      "type": "string"
+    }
+  }
+}

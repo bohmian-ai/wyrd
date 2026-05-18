@@ -1,0 +1,601 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ExperimentSpec",
+  "description": "Grouping and comparison context for related runs.",
+  "type": "object",
+  "properties": {
+    "artifact_refs": {
+      "description": "Artifact references.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CardRef"
+      }
+    },
+    "best_run_ref": {
+      "description": "Best run reference.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RunRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "default_parameters": {
+      "description": "Default parameters applied to runs.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/ParameterValue"
+      }
+    },
+    "description": {
+      "description": "Experiment description.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "details": {
+      "description": "Free-form details.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "experiment_type": {
+      "description": "Experiment type.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "run_refs": {
+      "description": "Associated runs.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/RunRef"
+      }
+    },
+    "summary_metrics": {
+      "description": "Summary metrics for comparison.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/MetricEntry"
+      }
+    },
+    "target_refs": {
+      "description": "Primary target Cards.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CardRef"
+      }
+    }
+  },
+  "definitions": {
+    "CardKind": {
+      "description": "Native Wyrd Card kind plus forward-compatible external catch-all.",
+      "oneOf": [
+        {
+          "description": "Data Card.",
+          "type": "string",
+          "enum": [
+            "Data"
+          ]
+        },
+        {
+          "description": "Model Card.",
+          "type": "string",
+          "enum": [
+            "Model"
+          ]
+        },
+        {
+          "description": "Experiment Card.",
+          "type": "string",
+          "enum": [
+            "Experiment"
+          ]
+        },
+        {
+          "description": "Prompt Card.",
+          "type": "string",
+          "enum": [
+            "Prompt"
+          ]
+        },
+        {
+          "description": "Tool Card.",
+          "type": "string",
+          "enum": [
+            "Tool"
+          ]
+        },
+        {
+          "description": "Agent Card.",
+          "type": "string",
+          "enum": [
+            "Agent"
+          ]
+        },
+        {
+          "description": "Workflow Card.",
+          "type": "string",
+          "enum": [
+            "Workflow"
+          ]
+        },
+        {
+          "description": "Evaluation Card.",
+          "type": "string",
+          "enum": [
+            "Eval"
+          ]
+        },
+        {
+          "description": "Drift Card.",
+          "type": "string",
+          "enum": [
+            "Drift"
+          ]
+        },
+        {
+          "description": "Service Card.",
+          "type": "string",
+          "enum": [
+            "Service"
+          ]
+        },
+        {
+          "description": "Policy Card.",
+          "type": "string",
+          "enum": [
+            "Policy"
+          ]
+        },
+        {
+          "description": "MCP Card.",
+          "type": "string",
+          "enum": [
+            "Mcp"
+          ]
+        },
+        {
+          "description": "Skill Card.",
+          "type": "string",
+          "enum": [
+            "Skill"
+          ]
+        },
+        {
+          "description": "Sub-agent Card.",
+          "type": "string",
+          "enum": [
+            "SubAgent"
+          ]
+        },
+        {
+          "description": "Audit Card.",
+          "type": "string",
+          "enum": [
+            "Audit"
+          ]
+        },
+        {
+          "description": "Artifact Card.",
+          "type": "string",
+          "enum": [
+            "Artifact"
+          ]
+        },
+        {
+          "description": "Unknown Card kind with schema hash.",
+          "type": "object",
+          "required": [
+            "External"
+          ],
+          "properties": {
+            "External": {
+              "type": "object",
+              "required": [
+                "name",
+                "schema_hash"
+              ],
+              "properties": {
+                "name": {
+                  "description": "External kind name.",
+                  "type": "string"
+                },
+                "schema_hash": {
+                  "description": "32-byte schema hash.",
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "uint8",
+                    "minimum": 0.0
+                  },
+                  "maxItems": 32,
+                  "minItems": 32
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardRef": {
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Referenced Card kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "Referenced Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "space": {
+          "description": "Optional space; omitted means current/default space.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Optional resolved UID.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Exact referenced Card version.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VersionBlock"
+            }
+          ]
+        }
+      }
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "MetricEntry": {
+      "description": "Metric summary entry.",
+      "type": "object",
+      "required": [
+        "name",
+        "value"
+      ],
+      "properties": {
+        "created_at": {
+          "description": "Metric creation timestamp.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "is_eval": {
+          "description": "Whether this metric came from evaluation.",
+          "default": false,
+          "type": "boolean"
+        },
+        "name": {
+          "description": "Metric name.",
+          "type": "string"
+        },
+        "step": {
+          "description": "Optional step.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "timestamp": {
+          "description": "Metric event timestamp.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "value": {
+          "description": "Numeric metric value.",
+          "type": "number",
+          "format": "double"
+        }
+      }
+    },
+    "ParameterValue": {
+      "description": "Typed parameter value for experiments, runs, workflows, and tools.",
+      "oneOf": [
+        {
+          "description": "Integer value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "int"
+              ]
+            },
+            "value": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        },
+        {
+          "description": "Floating-point value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "float"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "String value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "str"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Boolean value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "Structured JSON value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "json"
+              ]
+            },
+            "value": true
+          }
+        }
+      ]
+    },
+    "RunKind": {
+      "description": "Execution kind recorded as a Run.",
+      "oneOf": [
+        {
+          "description": "Training execution.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "training"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Inference execution.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "inference"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Offline or batch evaluation execution.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "offline_eval"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Drift check execution.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "drift_check"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Import execution.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "import"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Workflow execution.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "workflow"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Externally defined execution kind.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "external"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "RunRef": {
+      "description": "Reference to a Run.",
+      "type": "object",
+      "required": [
+        "kind",
+        "uid"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Run kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RunKind"
+            }
+          ]
+        },
+        "labels": {
+          "description": "Query/display labels.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "space": {
+          "description": "Optional space.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Run UID. Promoted to `RunUid` in the Runs phase.",
+          "type": "string"
+        }
+      }
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "VersionBlock": {
+      "description": "Semver-compatible version string.",
+      "type": "string"
+    }
+  }
+}

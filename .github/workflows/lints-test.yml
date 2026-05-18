@@ -5,49 +5,10 @@ on:
   push:
     branches: [main]
 
-permissions:
-  contents: read
-
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: "0"
-  CARGO_NET_RETRY: "10"
-  RUSTFLAGS: "-C debuginfo=0"
-
 jobs:
-  paths:
-    runs-on: ubuntu-24.04
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-      ui: ${{ steps.filter.outputs.ui }}
+  lints-test:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - id: filter
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            rust:
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain.toml'
-              - 'crates/**'
-              - 'python/py-wyrd/**'
-            ui:
-              - 'crates/wyrd/wyrd-server/wyrd-ui/**'
-              - 'crates/wyrd-spec/**'
-
-  check:
-    runs-on: ubuntu-24.04
-    needs: paths
-    if: needs.paths.outputs.rust == 'true'
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up mise
-        uses: jdx/mise-action@v3
-        with:
-          install: true
-          cache: true
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-      - name: mise run check
-        run: mise run check
+      - uses: jdx/mise-action@v2
+      - run: mise run pre-pr

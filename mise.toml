@@ -31,8 +31,24 @@ run = "cargo test --locked --workspace --all-features"
 [tasks."check:docs"]
 description = "Build public Rust docs and doctests"
 run = """
-RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links" cargo doc --locked -p wyrd-spec --no-deps --all-features
-cargo test --locked -p wyrd-spec --doc --all-features
+RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links" cargo doc --locked --no-deps --all-features \
+  -p wyrd-spec \
+  -p wyrd-runtime \
+  -p wyrd-telemetry \
+  -p wyrd-testing \
+  -p wyrd-auth \
+  -p wyrd-crypt \
+  -p wyrd-utils \
+  -p wyrd-error-derive
+cargo test --locked --doc --all-features \
+  -p wyrd-spec \
+  -p wyrd-runtime \
+  -p wyrd-telemetry \
+  -p wyrd-testing \
+  -p wyrd-auth \
+  -p wyrd-crypt \
+  -p wyrd-utils \
+  -p wyrd-error-derive
 """
 
 [tasks."cardkind:check"]
@@ -40,12 +56,27 @@ description = "Verify CardKind native count and External serde shape"
 run = "cargo test -p wyrd-spec --test cardkind_check --features server"
 
 [tasks."check:client-tier"]
-description = "Assert wyrd-spec keeps server/runtime deps out of no-default normal deps"
+description = "Foundation invariants: wyrd-spec server-tier-free; shared shells pyo3+sqlx-free"
 run = """
-if cargo tree -p wyrd-spec --no-default-features -e normal | rg 'utoipa|pyo3|sqlx|axum|opentelemetry|reqwest|tokio'; then
-  echo 'client-tier dependency leak detected'
+set -euo pipefail
+
+forbidden_spec=$(cargo tree -p wyrd-spec --no-default-features -e normal | \
+  rg '(^|[ ─└├])(utoipa|pyo3|sqlx|axum|opentelemetry|reqwest|tokio)' || true)
+if [ -n "$forbidden_spec" ]; then
+  echo "FAIL: wyrd-spec pulls forbidden deps at --no-default-features:"
+  echo "$forbidden_spec"
   exit 1
 fi
+
+for crate in wyrd-runtime wyrd-telemetry wyrd-auth; do
+  forbidden_shared=$(cargo tree -p "$crate" --all-features -e normal | \
+    rg '(^|[ ─└├])(pyo3|sqlx)' || true)
+  if [ -n "$forbidden_shared" ]; then
+    echo "FAIL: $crate pulls forbidden deps:"
+    echo "$forbidden_shared"
+    exit 1
+  fi
+done
 """
 
 [tasks."check:pyo3-scope"]

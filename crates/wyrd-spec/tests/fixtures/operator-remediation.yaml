@@ -1,0 +1,50 @@
+# OperatorCard - server-side, policy-gated agent.
+
+apiVersion: wyrd/v1
+kind: Operator
+metadata:
+  space: retention
+  name: churn-retrain-on-drift
+  version: 1.0.0
+
+spec:
+  type: Operator
+
+  adapter:
+    name: langgraph
+    version: "^0.2"
+    config:
+      graph_artifact_ref:
+        type: object
+        value:
+          kind:
+            type: str
+            value: Artifact
+          name:
+            type: str
+            value: churn-retrain-graph
+          version:
+            type: str
+            value: "^1"
+
+  inputs:
+    - name: drift_observation
+      schema_ref: "wyrd/v1/observations/drift"
+
+  pre_invoke:
+    - kind: Policy
+      name: retrain-cost-guard
+      version: "^1"
+    - kind: Policy
+      name: pii-redaction-check
+      version: "^1"
+
+  post_invoke:
+    - kind: Policy
+      name: outcome-audit-required
+      version: "^1"
+
+  budget:
+    max_wall_seconds: 600
+    max_memory_mb: 4096
+    max_tool_calls: 20

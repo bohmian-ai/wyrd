@@ -22,12 +22,14 @@ use crate::card::eval::EvalSpec;
 use crate::card::experiment::ExperimentSpec;
 use crate::card::mcp::McpSpec;
 use crate::card::model::ModelSpec;
+use crate::card::operator::OperatorSpec;
 use crate::card::policy::PolicySpec;
 use crate::card::prompt::PromptSpec;
 use crate::card::service::ServiceSpec;
 use crate::card::skill::SkillSpec;
 use crate::card::subagent::SubAgentSpec;
 use crate::card::tool::ToolSpec;
+use crate::card::trigger::TriggerSpec;
 use crate::card::workflow::WorkflowSpec;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::version::{ApiVersion, VersionBlock};
@@ -70,7 +72,13 @@ pub struct Metadata {
     /// Display labels.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
-    /// Free-form metadata.
+    /// Free-form annotations for automation, UI, and integration metadata.
+    ///
+    /// As of 2026-05-18, keys under `wyrd.io/*` MUST remain reserved for
+    /// Wyrd-owned runtime and registry metadata. User and vendor annotations
+    /// MUST use another DNS-style prefix, such as `acme.com/cost-center`, to
+    /// avoid collisions.
+    // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-6
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub annotations: BTreeMap<String, String>,
     /// Spec content hash.
@@ -119,6 +127,12 @@ pub enum Spec {
     Audit(AuditSpec),
     /// Artifact card spec.
     Artifact(ArtifactSpec),
+    /// Trigger card spec.
+    // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-1
+    Trigger(TriggerSpec),
+    /// Operator card spec.
+    // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-2
+    Operator(OperatorSpec),
 }
 
 /// Server-derived relationship summary for graph, UI, policy, imports, and diff.
@@ -183,6 +197,12 @@ pub enum CardKind {
     Audit,
     /// Artifact Card.
     Artifact,
+    /// Trigger Card.
+    // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-1
+    Trigger,
+    /// Operator Card.
+    // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-2
+    Operator,
     /// Unknown Card kind with schema hash.
     External {
         /// External kind name.
@@ -194,7 +214,7 @@ pub enum CardKind {
 
 impl CardKind {
     /// Native v1 Card kind count.
-    pub const NATIVE_COUNT: usize = 16;
+    pub const NATIVE_COUNT: usize = 18;
 
     /// Return every native kind.
     #[must_use]
@@ -216,6 +236,8 @@ impl CardKind {
             Self::SubAgent,
             Self::Audit,
             Self::Artifact,
+            Self::Trigger,
+            Self::Operator,
         ]
     }
 
@@ -239,6 +261,8 @@ impl CardKind {
             Self::SubAgent => "SubAgent",
             Self::Audit => "Audit",
             Self::Artifact => "Artifact",
+            Self::Trigger => "Trigger",
+            Self::Operator => "Operator",
             Self::External { .. } => return None,
         })
     }
@@ -264,6 +288,8 @@ impl CardKind {
             Self::SubAgent => "SubAgent",
             Self::Audit => "Audit",
             Self::Artifact => "Artifact",
+            Self::Trigger => "Trigger",
+            Self::Operator => "Operator",
         }
     }
 }
@@ -375,6 +401,8 @@ fn native_from_str(value: &str) -> Option<CardKind> {
         "SubAgent" => CardKind::SubAgent,
         "Audit" => CardKind::Audit,
         "Artifact" => CardKind::Artifact,
+        "Trigger" => CardKind::Trigger,
+        "Operator" => CardKind::Operator,
         _ => return None,
     })
 }

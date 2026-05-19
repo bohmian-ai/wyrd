@@ -36,3 +36,33 @@ fn card_yaml_round_trip() {
     let decoded = format::yaml::from_str(&yaml).unwrap();
     assert_eq!(decoded, card);
 }
+
+#[test]
+fn phase_1_addendum_fixtures_round_trip() {
+    for fixture in [
+        include_str!("fixtures/trigger-on-drift.yaml"),
+        include_str!("fixtures/operator-remediation.yaml"),
+        include_str!("fixtures/service-with-runtime-policy.yaml"),
+    ] {
+        let decoded: Card = format::yaml::from_str(fixture).unwrap();
+        let encoded = format::yaml::to_string(&decoded).unwrap();
+        let reparsed: Card = format::yaml::from_str(&encoded).unwrap();
+        assert_eq!(reparsed, decoded);
+    }
+}
+
+#[test]
+fn trigger_fixture_uses_native_trigger_kind() {
+    let decoded: Card =
+        format::yaml::from_str(include_str!("fixtures/trigger-on-drift.yaml")).unwrap();
+    assert_eq!(decoded.kind, CardKind::Trigger);
+    assert!(matches!(decoded.spec, Spec::Trigger(_)));
+}
+
+#[test]
+fn operator_fixture_uses_native_operator_kind() {
+    let decoded: Card =
+        format::yaml::from_str(include_str!("fixtures/operator-remediation.yaml")).unwrap();
+    assert_eq!(decoded.kind, CardKind::Operator);
+    assert!(matches!(decoded.spec, Spec::Operator(_)));
+}

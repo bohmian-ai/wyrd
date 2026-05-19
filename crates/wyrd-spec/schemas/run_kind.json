@@ -94,6 +94,21 @@
       }
     },
     {
+      "description": "Autonomous remediation execution.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "remediation"
+          ]
+        }
+      }
+    },
+    {
       "description": "Externally defined execution kind.",
       "type": "object",
       "required": [

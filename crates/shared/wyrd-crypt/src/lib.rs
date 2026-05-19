@@ -2,10 +2,10 @@
 
 #![deny(missing_docs)]
 
+use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::Argon2;
-use rand::RngCore;
 use zeroize::Zeroize;
 
 /// Secret key bytes with redacted debug output.

@@ -232,7 +232,9 @@
             "Skill",
             "SubAgent",
             "Audit",
-            "Artifact"
+            "Artifact",
+            "Trigger",
+            "Operator"
           ]
         },
         {
@@ -774,6 +776,31 @@
         }
       ]
     },
+    "FrameworkAdapterRef": {
+      "description": "Framework adapter reference for loading or invoking artifacts.",
+      "type": "object",
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "config": {
+          "description": "Non-secret adapter configuration.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "name": {
+          "description": "Adapter name.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Adapter version or version range.",
+          "type": "string"
+        }
+      }
+    },
     "Governance": {
       "description": "Declarative governance and audit hooks.",
       "type": "object",
@@ -848,7 +875,7 @@
       ],
       "properties": {
         "annotations": {
-          "description": "Free-form metadata.",
+          "description": "Free-form annotations for automation, UI, and integration metadata.\n\nAs of 2026-05-18, keys under `wyrd.io/*` MUST remain reserved for Wyrd-owned runtime and registry metadata. User and vendor annotations MUST use another DNS-style prefix, such as `acme.com/cost-center`, to avoid collisions.",
           "type": "object",
           "additionalProperties": {
             "type": "string"
@@ -1087,6 +1114,57 @@
           "items": {
             "$ref": "#/definitions/CardRef"
           }
+        }
+      }
+    },
+    "OperatorBudget": {
+      "description": "Operator execution budget.",
+      "type": "object",
+      "properties": {
+        "max_memory_mb": {
+          "description": "Maximum memory in MiB.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "max_tool_calls": {
+          "description": "Maximum tool calls allowed during invocation.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "max_wall_seconds": {
+          "description": "Maximum wall-clock runtime in seconds.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "OperatorInput": {
+      "description": "Operator input declaration.",
+      "type": "object",
+      "required": [
+        "name",
+        "schema_ref"
+      ],
+      "properties": {
+        "name": {
+          "description": "Input name.",
+          "type": "string"
+        },
+        "schema_ref": {
+          "description": "Schema reference URI or symbolic schema identifier.",
+          "type": "string"
         }
       }
     },
@@ -1539,6 +1617,21 @@
           }
         },
         {
+          "description": "Autonomous remediation execution.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "remediation"
+              ]
+            }
+          }
+        },
+        {
           "description": "Externally defined execution kind.",
           "type": "object",
           "required": [
@@ -1643,6 +1736,122 @@
               "type": "null"
             }
           ]
+        }
+      }
+    },
+    "ServiceRuntime": {
+      "description": "Server-side runtime declaration; tenancy is inherited from `Card.metadata.space`.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "config": {
+          "description": "Non-secret runtime configuration.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "framework": {
+          "description": "Framework or adapter hint.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "Runtime kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ServiceRuntimeKind"
+            }
+          ]
+        },
+        "mode": {
+          "description": "Runtime placement mode.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ServiceRuntimeMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "policy": {
+          "description": "Runtime policy settings.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ServiceRuntimePolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "strict": {
+          "description": "Whether the runtime should fail closed on unsupported features.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "ServiceRuntimeKind": {
+      "description": "Service runtime kind.",
+      "oneOf": [
+        {
+          "description": "API service runtime.",
+          "type": "string",
+          "enum": [
+            "api"
+          ]
+        },
+        {
+          "description": "MCP service runtime.",
+          "type": "string",
+          "enum": [
+            "mcp"
+          ]
+        },
+        {
+          "description": "Agent service runtime.",
+          "type": "string",
+          "enum": [
+            "agent"
+          ]
+        },
+        {
+          "description": "Workflow service runtime.",
+          "type": "string",
+          "enum": [
+            "workflow"
+          ]
+        }
+      ]
+    },
+    "ServiceRuntimeMode": {
+      "description": "Service runtime placement mode.",
+      "oneOf": [
+        {
+          "description": "Run inside Wyrd's server process.",
+          "type": "string",
+          "enum": [
+            "in_process"
+          ]
+        }
+      ]
+    },
+    "ServiceRuntimePolicy": {
+      "description": "Service runtime policy settings.",
+      "type": "object",
+      "properties": {
+        "runtime_hooks": {
+          "description": "Whether to invoke Policy Cards around server-side runtime calls.",
+          "default": false,
+          "type": "boolean"
         }
       }
     },
@@ -2691,6 +2900,17 @@
                 "$ref": "#/definitions/NonSecretValue"
               }
             },
+            "runtime": {
+              "description": "Optional server-side runtime declaration.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ServiceRuntime"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "service_config": {
               "description": "Service config.",
               "type": "object",
@@ -3100,6 +3320,17 @@
                 "null"
               ]
             },
+            "framework_adapter": {
+              "description": "Framework adapter metadata for runtime loaders.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/FrameworkAdapterRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "integrity": {
               "description": "Integrity digest.",
               "type": [
@@ -3141,6 +3372,111 @@
               ]
             }
           }
+        },
+        {
+          "description": "Trigger card spec.",
+          "type": "object",
+          "required": [
+            "source",
+            "target",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "description": "Non-secret trigger configuration.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "cooldown_seconds": {
+              "description": "Minimum cooldown between firings, in seconds.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "source": {
+              "description": "Trigger source.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TriggerSource"
+                }
+              ]
+            },
+            "target": {
+              "description": "Target Operator Card reference.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Trigger"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Operator card spec.",
+          "type": "object",
+          "required": [
+            "adapter",
+            "type"
+          ],
+          "properties": {
+            "adapter": {
+              "description": "Framework adapter used to execute this Operator.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/FrameworkAdapterRef"
+                }
+              ]
+            },
+            "budget": {
+              "description": "Optional runtime budget.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/OperatorBudget"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "inputs": {
+              "description": "Declared runtime inputs.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/OperatorInput"
+              }
+            },
+            "post_invoke": {
+              "description": "Policy Cards evaluated after invocation.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "pre_invoke": {
+              "description": "Policy Cards evaluated before invocation.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Operator"
+              ]
+            }
+          }
         }
       ]
     },
@@ -3171,6 +3507,79 @@
           "format": "date-time"
         }
       }
+    },
+    "TriggerSource": {
+      "description": "Trigger source declaration.",
+      "oneOf": [
+        {
+          "description": "Drift observation emitted by a Drift Card.",
+          "type": "object",
+          "required": [
+            "card",
+            "kind"
+          ],
+          "properties": {
+            "card": {
+              "description": "Source Drift Card reference.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "drift_observation"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Evaluation observation emitted by an Eval Card.",
+          "type": "object",
+          "required": [
+            "card",
+            "kind"
+          ],
+          "properties": {
+            "card": {
+              "description": "Source Eval Card reference.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "eval_observation"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Cron schedule.",
+          "type": "object",
+          "required": [
+            "cron",
+            "kind"
+          ],
+          "properties": {
+            "cron": {
+              "description": "Cron expression.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "schedule"
+              ]
+            }
+          }
+        }
+      ]
     },
     "VersionBlock": {
       "description": "Semver-compatible version string.",

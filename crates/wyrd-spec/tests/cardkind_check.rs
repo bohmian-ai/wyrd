@@ -5,7 +5,17 @@ use wyrd_spec::envelope::CardKind;
 #[test]
 fn native_card_kind_count_is_locked() {
     assert_eq!(CardKind::native().len(), CardKind::NATIVE_COUNT);
-    assert_eq!(CardKind::NATIVE_COUNT, 16);
+    assert_eq!(CardKind::NATIVE_COUNT, 18);
+    assert!(
+        CardKind::native()
+            .iter()
+            .any(|kind| matches!(kind, CardKind::Trigger))
+    );
+    assert!(
+        CardKind::native()
+            .iter()
+            .any(|kind| matches!(kind, CardKind::Operator))
+    );
 }
 
 #[test]
@@ -43,6 +53,18 @@ fn card_kind_schema_matches_wire_shape() {
     let value = serde_json::to_value(schema).unwrap();
     let one_of = value["oneOf"].as_array().expect("oneOf schema");
     assert_eq!(one_of[0]["enum"][0], json!("Data"));
+    assert!(
+        one_of[0]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("Trigger"))
+    );
+    assert!(
+        one_of[0]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("Operator"))
+    );
     assert_eq!(
         one_of[1]["properties"]["schema_hash"]["pattern"],
         json!("^[0-9a-f]{64}$")

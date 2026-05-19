@@ -9,6 +9,7 @@ use crate::ids::SpaceName;
 /// Execution kind recorded as a Run.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[non_exhaustive]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum RunKind {
     /// Training execution.
@@ -23,6 +24,8 @@ pub enum RunKind {
     Import,
     /// Workflow execution.
     Workflow,
+    /// Autonomous remediation execution.
+    Remediation,
     /// Externally defined execution kind.
     External(String),
 }

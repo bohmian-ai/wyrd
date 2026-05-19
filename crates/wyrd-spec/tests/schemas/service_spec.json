@@ -60,6 +60,17 @@
         "$ref": "#/definitions/NonSecretValue"
       }
     },
+    "runtime": {
+      "description": "Optional server-side runtime declaration.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ServiceRuntime"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "service_config": {
       "description": "Service config.",
       "type": "object",
@@ -100,7 +111,9 @@
             "Skill",
             "SubAgent",
             "Audit",
-            "Artifact"
+            "Artifact",
+            "Trigger",
+            "Operator"
           ]
         },
         {
@@ -380,6 +393,122 @@
               "type": "null"
             }
           ]
+        }
+      }
+    },
+    "ServiceRuntime": {
+      "description": "Server-side runtime declaration; tenancy is inherited from `Card.metadata.space`.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "config": {
+          "description": "Non-secret runtime configuration.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "framework": {
+          "description": "Framework or adapter hint.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "Runtime kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ServiceRuntimeKind"
+            }
+          ]
+        },
+        "mode": {
+          "description": "Runtime placement mode.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ServiceRuntimeMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "policy": {
+          "description": "Runtime policy settings.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ServiceRuntimePolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "strict": {
+          "description": "Whether the runtime should fail closed on unsupported features.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "ServiceRuntimeKind": {
+      "description": "Service runtime kind.",
+      "oneOf": [
+        {
+          "description": "API service runtime.",
+          "type": "string",
+          "enum": [
+            "api"
+          ]
+        },
+        {
+          "description": "MCP service runtime.",
+          "type": "string",
+          "enum": [
+            "mcp"
+          ]
+        },
+        {
+          "description": "Agent service runtime.",
+          "type": "string",
+          "enum": [
+            "agent"
+          ]
+        },
+        {
+          "description": "Workflow service runtime.",
+          "type": "string",
+          "enum": [
+            "workflow"
+          ]
+        }
+      ]
+    },
+    "ServiceRuntimeMode": {
+      "description": "Service runtime placement mode.",
+      "oneOf": [
+        {
+          "description": "Run inside Wyrd's server process.",
+          "type": "string",
+          "enum": [
+            "in_process"
+          ]
+        }
+      ]
+    },
+    "ServiceRuntimePolicy": {
+      "description": "Service runtime policy settings.",
+      "type": "object",
+      "properties": {
+        "runtime_hooks": {
+          "description": "Whether to invoke Policy Cards around server-side runtime calls.",
+          "default": false,
+          "type": "boolean"
         }
       }
     },

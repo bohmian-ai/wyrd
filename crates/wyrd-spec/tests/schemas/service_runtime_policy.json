@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ServiceRuntimePolicy",
+  "description": "Service runtime policy settings.",
+  "type": "object",
+  "properties": {
+    "runtime_hooks": {
+      "description": "Whether to invoke Policy Cards around server-side runtime calls.",
+      "default": false,
+      "type": "boolean"
+    }
+  }
+}

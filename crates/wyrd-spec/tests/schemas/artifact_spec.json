@@ -32,6 +32,17 @@
         "null"
       ]
     },
+    "framework_adapter": {
+      "description": "Framework adapter metadata for runtime loaders.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/FrameworkAdapterRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "integrity": {
       "description": "Integrity digest.",
       "type": [
@@ -92,7 +103,9 @@
             "Skill",
             "SubAgent",
             "Audit",
-            "Artifact"
+            "Artifact",
+            "Trigger",
+            "Operator"
           ]
         },
         {
@@ -184,6 +197,31 @@
     "CardUid": {
       "description": "Resolved immutable Card UID.",
       "type": "string"
+    },
+    "FrameworkAdapterRef": {
+      "description": "Framework adapter reference for loading or invoking artifacts.",
+      "type": "object",
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "config": {
+          "description": "Non-secret adapter configuration.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "name": {
+          "description": "Adapter name.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Adapter version or version range.",
+          "type": "string"
+        }
+      }
     },
     "NonSecretValue": {
       "description": "Non-secret JSON-like configuration value.",

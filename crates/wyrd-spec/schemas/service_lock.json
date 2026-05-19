@@ -1,5 +1,5 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ServiceLock",
   "description": "Installed service lock.",
   "type": "object",
@@ -22,7 +22,9 @@
     "metadata": {
       "description": "Lock metadata.",
       "type": "object",
-      "additionalProperties": true
+      "additionalProperties": {
+        "$ref": "#/definitions/NonSecretValue"
+      }
     },
     "ref": {
       "description": "Locked service reference.",
@@ -35,150 +37,51 @@
   },
   "definitions": {
     "CardKind": {
-      "description": "Native Wyrd Card kind plus forward-compatible external catch-all.",
+      "title": "CardKind",
+      "description": "Native Wyrd Card kind string or external kind object.",
       "oneOf": [
         {
-          "description": "Data Card.",
+          "title": "NativeCardKind",
+          "description": "Native Wyrd Card kind.",
           "type": "string",
           "enum": [
-            "Data"
-          ]
-        },
-        {
-          "description": "Model Card.",
-          "type": "string",
-          "enum": [
-            "Model"
-          ]
-        },
-        {
-          "description": "Experiment Card.",
-          "type": "string",
-          "enum": [
-            "Experiment"
-          ]
-        },
-        {
-          "description": "Prompt Card.",
-          "type": "string",
-          "enum": [
-            "Prompt"
-          ]
-        },
-        {
-          "description": "Tool Card.",
-          "type": "string",
-          "enum": [
-            "Tool"
-          ]
-        },
-        {
-          "description": "Agent Card.",
-          "type": "string",
-          "enum": [
-            "Agent"
-          ]
-        },
-        {
-          "description": "Workflow Card.",
-          "type": "string",
-          "enum": [
-            "Workflow"
-          ]
-        },
-        {
-          "description": "Evaluation Card.",
-          "type": "string",
-          "enum": [
-            "Eval"
-          ]
-        },
-        {
-          "description": "Drift Card.",
-          "type": "string",
-          "enum": [
-            "Drift"
-          ]
-        },
-        {
-          "description": "Service Card.",
-          "type": "string",
-          "enum": [
-            "Service"
-          ]
-        },
-        {
-          "description": "Policy Card.",
-          "type": "string",
-          "enum": [
-            "Policy"
-          ]
-        },
-        {
-          "description": "MCP Card.",
-          "type": "string",
-          "enum": [
-            "Mcp"
-          ]
-        },
-        {
-          "description": "Skill Card.",
-          "type": "string",
-          "enum": [
-            "Skill"
-          ]
-        },
-        {
-          "description": "Sub-agent Card.",
-          "type": "string",
-          "enum": [
-            "SubAgent"
-          ]
-        },
-        {
-          "description": "Audit Card.",
-          "type": "string",
-          "enum": [
-            "Audit"
-          ]
-        },
-        {
-          "description": "Artifact Card.",
-          "type": "string",
-          "enum": [
+            "Data",
+            "Model",
+            "Experiment",
+            "Prompt",
+            "Tool",
+            "Agent",
+            "Workflow",
+            "Eval",
+            "Drift",
+            "Service",
+            "Policy",
+            "Mcp",
+            "Skill",
+            "SubAgent",
+            "Audit",
             "Artifact"
           ]
         },
         {
-          "description": "Unknown Card kind with schema hash.",
+          "title": "ExternalCardKind",
+          "description": "External Card kind with schema hash.",
           "type": "object",
           "required": [
-            "External"
+            "kind",
+            "schema_hash"
           ],
           "properties": {
-            "External": {
-              "type": "object",
-              "required": [
-                "name",
-                "schema_hash"
-              ],
-              "properties": {
-                "name": {
-                  "description": "External kind name.",
-                  "type": "string"
-                },
-                "schema_hash": {
-                  "description": "32-byte schema hash.",
-                  "type": "array",
-                  "items": {
-                    "type": "integer",
-                    "format": "uint8",
-                    "minimum": 0.0
-                  },
-                  "maxItems": 32,
-                  "minItems": 32
-                }
-              }
+            "kind": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"
+            },
+            "schema_hash": {
+              "type": "string",
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$"
             }
           },
           "additionalProperties": false
@@ -279,7 +182,9 @@
         "metadata": {
           "description": "Component metadata.",
           "type": "object",
-          "additionalProperties": true
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
         },
         "ref": {
           "description": "Exact locked Card reference.",
@@ -290,6 +195,113 @@
           ]
         }
       }
+    },
+    "NonSecretValue": {
+      "description": "Non-secret JSON-like configuration value.",
+      "oneOf": [
+        {
+          "description": "String value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "str"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Numeric value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "number"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "Boolean value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "List of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "list"
+              ]
+            },
+            "value": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        },
+        {
+          "description": "Object of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "object"
+              ]
+            },
+            "value": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        }
+      ]
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",

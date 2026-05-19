@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::card::common::NonSecretValue;
 use crate::reference::CardRef;
 
 /// MCP server or tool catalog metadata.
@@ -26,5 +27,5 @@ pub struct McpSpec {
     pub scopes: Vec<String>,
     /// Free-form details.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub details: BTreeMap<String, serde_json::Value>,
+    pub details: BTreeMap<String, NonSecretValue>,
 }

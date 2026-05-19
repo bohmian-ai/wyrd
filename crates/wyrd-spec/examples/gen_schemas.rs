@@ -62,7 +62,8 @@ fn write<T: schemars::JsonSchema>(
     golden: &Path,
     name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = schema_for!(T);
+    let mut schema = schema_for!(T);
+    schema.meta_schema = Some("https://json-schema.org/draft/2020-12/schema".to_string());
     let json = serde_json::to_string_pretty(&schema)?;
     fs::write(out.join(format!("{name}.json")), format!("{json}\n"))?;
     fs::write(golden.join(format!("{name}.json")), format!("{json}\n"))?;

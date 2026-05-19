@@ -18,4 +18,7 @@ pub mod subagent;
 pub mod tool;
 pub mod workflow;
 
-pub use common::{AgentInterface, MetricEntry, ParameterValue, ProtocolProfile};
+pub use common::{
+    AgentInterface, CredentialRef, Governance, MetricEntry, NonSecretValue, ObservationHooks,
+    ParameterValue, PromptRole, ProtocolProfile, Provider,
+};

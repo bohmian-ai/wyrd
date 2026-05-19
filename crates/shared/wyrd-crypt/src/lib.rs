@@ -6,9 +6,9 @@ use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::Argon2;
 use rand::RngCore;
+use zeroize::Zeroize;
 
 /// Secret key bytes with redacted debug output.
-#[derive(Clone)]
 pub struct SecretKey([u8; 32]);
 
 impl SecretKey {
@@ -22,6 +22,12 @@ impl SecretKey {
 impl std::fmt::Debug for SecretKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SecretKey(***)")
+    }
+}
+
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -94,4 +100,27 @@ pub enum CryptError {
     /// Decryption failed.
     #[error("decryption failed")]
     Decrypt,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decrypt, derive_key, encrypt};
+
+    #[test]
+    fn encrypt_decrypt_round_trip() {
+        let key = match derive_key(b"correct horse battery staple", "workspace-salt") {
+            Ok(key) => key,
+            Err(error) => panic!("{error}"),
+        };
+        let payload = match encrypt(&key, b"payload") {
+            Ok(payload) => payload,
+            Err(error) => panic!("{error}"),
+        };
+        let plaintext = match decrypt(&key, &payload) {
+            Ok(plaintext) => plaintext,
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(plaintext, b"payload");
+        assert_eq!(format!("{key:?}"), "SecretKey(***)");
+    }
 }

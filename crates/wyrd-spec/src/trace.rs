@@ -24,16 +24,18 @@ impl TraceContext {
     pub fn parse_traceparent(header: &str, trace_state: String) -> Result<Self, TraceError> {
         let parts: Vec<&str> = header.split('-').collect();
         if parts.len() != 4 || parts[0] != "00" {
-            return Err(TraceError::BadHeader(header.to_string()));
+            return Err(TraceError::BadHeader);
         }
-        if parts[1].len() != 32 || hex::decode(parts[1]).is_err() {
-            return Err(TraceError::BadHeader(header.to_string()));
+        if !is_lower_hex(parts[1], 32) || is_all_zero(parts[1]) {
+            return Err(TraceError::BadHeader);
         }
-        if parts[2].len() != 16 || hex::decode(parts[2]).is_err() {
-            return Err(TraceError::BadHeader(header.to_string()));
+        if !is_lower_hex(parts[2], 16) || is_all_zero(parts[2]) {
+            return Err(TraceError::BadHeader);
         }
-        let trace_flags = u8::from_str_radix(parts[3], 16)
-            .map_err(|_| TraceError::BadHeader(header.to_string()))?;
+        if !is_lower_hex(parts[3], 2) {
+            return Err(TraceError::BadHeader);
+        }
+        let trace_flags = u8::from_str_radix(parts[3], 16).map_err(|_| TraceError::BadHeader)?;
         Ok(Self {
             trace_id: parts[1].to_string(),
             span_id: parts[2].to_string(),
@@ -56,6 +58,17 @@ impl TraceContext {
 #[derive(Debug, thiserror::Error)]
 pub enum TraceError {
     /// Header did not match W3C `traceparent` shape.
-    #[error("bad traceparent header: {0}")]
-    BadHeader(String),
+    #[error("bad traceparent header")]
+    BadHeader,
+}
+
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_all_zero(value: &str) -> bool {
+    value.bytes().all(|byte| byte == b'0')
 }

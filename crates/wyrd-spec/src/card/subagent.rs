@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::card::common::{Governance, NonSecretValue, ObservationHooks};
 use crate::reference::CardRef;
 
 /// Declarative sub-agent definition for harnesses.
@@ -36,7 +37,7 @@ pub struct SubAgentSpec {
     pub permission_mode: Option<String>,
     /// Memory descriptor.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub memory: BTreeMap<String, serde_json::Value>,
+    pub memory: BTreeMap<String, NonSecretValue>,
     /// Whether background execution is allowed by the harness.
     #[serde(default)]
     pub background: bool,
@@ -58,7 +59,13 @@ pub struct SubAgentSpec {
     /// Model temperature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Governance and audit controls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance: Option<Governance>,
+    /// Observation hooks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_hooks: Option<ObservationHooks>,
     /// Free-form details.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub details: BTreeMap<String, serde_json::Value>,
+    pub details: BTreeMap<String, NonSecretValue>,
 }

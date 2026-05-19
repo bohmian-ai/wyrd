@@ -6,6 +6,7 @@ rust = "stable"
 "npm:pnpm" = "latest"
 cmake = "3.26.4"
 protoc = "33.2"
+"cargo:cargo-deny" = "latest"
 
 [settings]
 env_shell_expand = false
@@ -21,11 +22,18 @@ run = "cargo fmt --all"
 
 [tasks.lints]
 description = "Workspace clippy with -D warnings (all features, all targets)"
-run = "cargo clippy --workspace --all-features --all-targets -- -D warnings"
+run = "cargo clippy --locked --workspace --all-features --all-targets -- -D warnings"
 
 [tasks."test:unit"]
 description = "Run all Rust unit tests"
-run = "cargo test --workspace --all-features --lib"
+run = "cargo test --locked --workspace --all-features"
+
+[tasks."check:docs"]
+description = "Build public Rust docs and doctests"
+run = """
+RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links" cargo doc --locked -p wyrd-spec --no-deps --all-features
+cargo test --locked -p wyrd-spec --doc --all-features
+"""
 
 [tasks."cardkind:check"]
 description = "Verify CardKind native count and External serde shape"
@@ -69,7 +77,11 @@ fi
 
 [tasks."check:wasm"]
 description = "Build wyrd-spec for wasm32"
-run = "cargo check --target wasm32-unknown-unknown -p wyrd-spec --features wasm"
+run = "cargo check --locked --target wasm32-unknown-unknown -p wyrd-spec --features wasm"
+
+[tasks."check:deny"]
+description = "cargo-deny check (licenses, advisories, sources, bans)"
+run = "cargo deny check"
 
 [tasks."py:setup"]
 description = "uv sync placeholder for the future Python package"
@@ -123,14 +135,14 @@ wait $SERVER_PID $OBS_PID $UI_PID
 description = "Phase 0 gate: fmt --check + clippy + cargo check (workspace, all features)"
 run = """
 cargo fmt --all -- --check
-cargo clippy --workspace --all-features --all-targets -- -D warnings
-cargo check --workspace --all-features
+cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
+cargo check --locked --workspace --all-features
 """
 
 [tasks."codegen:regen"]
 description = "Regenerate OpenAPI / JSON schemas / MCP tool list / pyi stubs from source"
 run = """
-cargo run -p wyrd-spec --example gen_schemas --features server
+cargo run --locked -p wyrd-spec --example gen_schemas --features server
 test -f openapi.yaml || { echo 'openapi.yaml missing'; exit 1; }
 """
 
@@ -138,13 +150,13 @@ test -f openapi.yaml || { echo 'openapi.yaml missing'; exit 1; }
 description = "Fail if generated openapi/schemas/MCP/pyi drift from source"
 run = """
 mise run codegen:regen
-git diff --exit-code -- openapi.yaml crates/wyrd-spec/schemas/ python/py-wyrd/ \
+git diff --exit-code -- openapi.yaml crates/wyrd-spec/schemas/ crates/wyrd-spec/tests/schemas/ python/py-wyrd/ \
   || { echo 'codegen drift detected - run mise run codegen:regen and commit'; exit 1; }
 """
 
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check"
-depends = ["check", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:wasm"]
+depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:wasm", "check:deny", "check:docs"]
 
 [tasks."dev:pg:nuke"]
 description = "Wipe embedded pg cache"

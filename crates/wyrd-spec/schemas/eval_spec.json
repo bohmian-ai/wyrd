@@ -1,5 +1,5 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "EvalSpec",
   "description": "Reusable evaluation logic and pass gates.",
   "type": "object",
@@ -21,6 +21,13 @@
         "$ref": "#/definitions/CardRef"
       }
     },
+    "default_parameters": {
+      "description": "Default non-secret parameters for eval orchestration.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/ParameterValue"
+      }
+    },
     "description": {
       "description": "Eval description.",
       "type": [
@@ -31,11 +38,28 @@
     "details": {
       "description": "Free-form details.",
       "type": "object",
-      "additionalProperties": true
+      "additionalProperties": {
+        "$ref": "#/definitions/NonSecretValue"
+      }
     },
     "eval_type": {
       "description": "Eval type, such as `judge`, `assertion`, or `benchmark`.",
-      "type": "string"
+      "allOf": [
+        {
+          "$ref": "#/definitions/EvalType"
+        }
+      ]
+    },
+    "governance": {
+      "description": "Governance and audit requirements.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Governance"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "judge_refs": {
       "description": "Judge Card references.",
@@ -44,12 +68,34 @@
         "$ref": "#/definitions/CardRef"
       }
     },
+    "observation_hooks": {
+      "description": "Observation routing for eval runs.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ObservationHooks"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "pass_gates": {
       "description": "Pass gate definitions.",
       "type": "array",
       "items": {
         "$ref": "#/definitions/EvalPassGate"
       }
+    },
+    "profile": {
+      "description": "Reusable evaluation profile.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/EvalProfile"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "target_refs": {
       "description": "Target Card references.",
@@ -60,151 +106,127 @@
     }
   },
   "definitions": {
+    "AgenticEvalProfile": {
+      "description": "Agentic eval profile.",
+      "type": "object",
+      "properties": {
+        "max_steps": {
+          "description": "Maximum step count for the evaluated behavior.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "required_tools": {
+          "description": "Required tool names or Card aliases.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "scenarios": {
+          "description": "Scenario definitions.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EvalScenario"
+          }
+        }
+      }
+    },
+    "AssertionEvalProfile": {
+      "description": "Assertion-based eval profile.",
+      "type": "object",
+      "properties": {
+        "input_schema": {
+          "description": "Optional input schema."
+        },
+        "output_schema": {
+          "description": "Optional output schema."
+        },
+        "rules": {
+          "description": "Assertion expressions or rule names.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "BenchmarkEvalProfile": {
+      "description": "Benchmark eval profile.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "dataset_refs": {
+          "description": "Dataset Card references.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRef"
+          }
+        },
+        "metrics": {
+          "description": "Expected metric names.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "description": "Benchmark name.",
+          "type": "string"
+        }
+      }
+    },
     "CardKind": {
-      "description": "Native Wyrd Card kind plus forward-compatible external catch-all.",
+      "title": "CardKind",
+      "description": "Native Wyrd Card kind string or external kind object.",
       "oneOf": [
         {
-          "description": "Data Card.",
+          "title": "NativeCardKind",
+          "description": "Native Wyrd Card kind.",
           "type": "string",
           "enum": [
-            "Data"
-          ]
-        },
-        {
-          "description": "Model Card.",
-          "type": "string",
-          "enum": [
-            "Model"
-          ]
-        },
-        {
-          "description": "Experiment Card.",
-          "type": "string",
-          "enum": [
-            "Experiment"
-          ]
-        },
-        {
-          "description": "Prompt Card.",
-          "type": "string",
-          "enum": [
-            "Prompt"
-          ]
-        },
-        {
-          "description": "Tool Card.",
-          "type": "string",
-          "enum": [
-            "Tool"
-          ]
-        },
-        {
-          "description": "Agent Card.",
-          "type": "string",
-          "enum": [
-            "Agent"
-          ]
-        },
-        {
-          "description": "Workflow Card.",
-          "type": "string",
-          "enum": [
-            "Workflow"
-          ]
-        },
-        {
-          "description": "Evaluation Card.",
-          "type": "string",
-          "enum": [
-            "Eval"
-          ]
-        },
-        {
-          "description": "Drift Card.",
-          "type": "string",
-          "enum": [
-            "Drift"
-          ]
-        },
-        {
-          "description": "Service Card.",
-          "type": "string",
-          "enum": [
-            "Service"
-          ]
-        },
-        {
-          "description": "Policy Card.",
-          "type": "string",
-          "enum": [
-            "Policy"
-          ]
-        },
-        {
-          "description": "MCP Card.",
-          "type": "string",
-          "enum": [
-            "Mcp"
-          ]
-        },
-        {
-          "description": "Skill Card.",
-          "type": "string",
-          "enum": [
-            "Skill"
-          ]
-        },
-        {
-          "description": "Sub-agent Card.",
-          "type": "string",
-          "enum": [
-            "SubAgent"
-          ]
-        },
-        {
-          "description": "Audit Card.",
-          "type": "string",
-          "enum": [
-            "Audit"
-          ]
-        },
-        {
-          "description": "Artifact Card.",
-          "type": "string",
-          "enum": [
+            "Data",
+            "Model",
+            "Experiment",
+            "Prompt",
+            "Tool",
+            "Agent",
+            "Workflow",
+            "Eval",
+            "Drift",
+            "Service",
+            "Policy",
+            "Mcp",
+            "Skill",
+            "SubAgent",
+            "Audit",
             "Artifact"
           ]
         },
         {
-          "description": "Unknown Card kind with schema hash.",
+          "title": "ExternalCardKind",
+          "description": "External Card kind with schema hash.",
           "type": "object",
           "required": [
-            "External"
+            "kind",
+            "schema_hash"
           ],
           "properties": {
-            "External": {
-              "type": "object",
-              "required": [
-                "name",
-                "schema_hash"
-              ],
-              "properties": {
-                "name": {
-                  "description": "External kind name.",
-                  "type": "string"
-                },
-                "schema_hash": {
-                  "description": "32-byte schema hash.",
-                  "type": "array",
-                  "items": {
-                    "type": "integer",
-                    "format": "uint8",
-                    "minimum": 0.0
-                  },
-                  "maxItems": 32,
-                  "minItems": 32
-                }
-              }
+            "kind": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"
+            },
+            "schema_hash": {
+              "type": "string",
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$"
             }
           },
           "additionalProperties": false
@@ -276,6 +298,26 @@
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
+    "CustomEvalProfile": {
+      "description": "Custom eval profile.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "config": {
+          "description": "Non-secret profile configuration.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "name": {
+          "description": "Custom profile name.",
+          "type": "string"
+        }
+      }
+    },
     "EvalAssertion": {
       "description": "Evaluation assertion.",
       "type": "object",
@@ -287,7 +329,9 @@
         "metadata": {
           "description": "Assertion metadata.",
           "type": "object",
-          "additionalProperties": true
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
         },
         "name": {
           "description": "Assertion name.",
@@ -322,6 +366,491 @@
           "format": "double"
         }
       }
+    },
+    "EvalProfile": {
+      "description": "Typed reusable evaluation profile.",
+      "oneOf": [
+        {
+          "description": "Assertion bundle profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/AssertionEvalProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "assertion"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Judge prompt/profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/JudgeEvalProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "judge"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Benchmark profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/BenchmarkEvalProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "benchmark"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Agentic evaluation profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/AgenticEvalProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "agentic"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Custom profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/CustomEvalProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "custom"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "EvalRubricItem": {
+      "description": "Judge rubric item.",
+      "type": "object",
+      "required": [
+        "description",
+        "name"
+      ],
+      "properties": {
+        "description": {
+          "description": "Criterion description.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Rubric criterion name.",
+          "type": "string"
+        },
+        "weight": {
+          "description": "Optional weight.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      }
+    },
+    "EvalScenario": {
+      "description": "Agentic eval scenario.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "expectations": {
+          "description": "Expected outcomes or checks.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "inputs": {
+          "description": "Scenario input values.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/ParameterValue"
+          }
+        },
+        "name": {
+          "description": "Scenario name.",
+          "type": "string"
+        }
+      }
+    },
+    "EvalType": {
+      "description": "Reusable evaluation category.",
+      "oneOf": [
+        {
+          "description": "Rule/assertion evaluation.",
+          "type": "string",
+          "enum": [
+            "assertion"
+          ]
+        },
+        {
+          "description": "LLM or model judge evaluation.",
+          "type": "string",
+          "enum": [
+            "judge"
+          ]
+        },
+        {
+          "description": "Dataset or benchmark evaluation.",
+          "type": "string",
+          "enum": [
+            "benchmark"
+          ]
+        },
+        {
+          "description": "Agentic evaluation of tool use or multi-step behavior.",
+          "type": "string",
+          "enum": [
+            "agentic"
+          ]
+        },
+        {
+          "description": "Custom evaluation profile.",
+          "type": "string",
+          "enum": [
+            "custom"
+          ]
+        }
+      ]
+    },
+    "Governance": {
+      "description": "Declarative governance and audit hooks.",
+      "type": "object",
+      "properties": {
+        "approval_requirements": {
+          "description": "Required approval labels or scopes.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "audit_ref": {
+          "description": "Audit Card reference.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "metadata": {
+          "description": "Governance metadata.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "policy_refs": {
+          "description": "Policy Card references.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRef"
+          }
+        }
+      }
+    },
+    "JudgeEvalProfile": {
+      "description": "Judge-based eval profile.",
+      "type": "object",
+      "properties": {
+        "config": {
+          "description": "Judge configuration without secret values.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "prompt_refs": {
+          "description": "Prompt Cards used by the judge.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRef"
+          }
+        },
+        "rubric": {
+          "description": "Judge rubric.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EvalRubricItem"
+          }
+        }
+      }
+    },
+    "NonSecretValue": {
+      "description": "Non-secret JSON-like configuration value.",
+      "oneOf": [
+        {
+          "description": "String value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "str"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Numeric value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "number"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "Boolean value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "List of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "list"
+              ]
+            },
+            "value": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        },
+        {
+          "description": "Object of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "object"
+              ]
+            },
+            "value": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ObservationHooks": {
+      "description": "Observation routing hooks for Cards that produce runs or events.",
+      "type": "object",
+      "properties": {
+        "events": {
+          "description": "Event names to observe.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "route_refs": {
+          "description": "Observation route Card references.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRef"
+          }
+        }
+      }
+    },
+    "ParameterValue": {
+      "description": "Typed parameter value for experiments, runs, workflows, and tools.",
+      "oneOf": [
+        {
+          "description": "Integer value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "int"
+              ]
+            },
+            "value": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        },
+        {
+          "description": "Floating-point value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "float"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "String value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "str"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Boolean value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "Structured JSON value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "json"
+              ]
+            },
+            "value": true
+          }
+        }
+      ]
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",

@@ -1,7 +1,12 @@
-//! Trigger Card spec.
+//! Status: Locked (2026-05-18)
+//! source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-1
+//! source: reference/spec/specs.rs (TriggerSpec / TriggerSource - canonical wire shape)
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::card::common::NonSecretValue;
 use crate::reference::CardRef;
 
 /// Declarative trigger that invokes an Operator when its source condition fires.
@@ -16,8 +21,8 @@ pub struct TriggerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown_seconds: Option<u32>,
     /// Non-secret trigger configuration.
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-    pub config: serde_json::Value,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, NonSecretValue>,
 }
 
 /// Trigger source declaration.

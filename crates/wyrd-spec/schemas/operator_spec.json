@@ -67,15 +67,15 @@
             "Workflow",
             "Eval",
             "Drift",
-            "Trigger",
-            "Operator",
             "Service",
             "Policy",
             "Mcp",
             "Skill",
             "SubAgent",
             "Audit",
-            "Artifact"
+            "Artifact",
+            "Trigger",
+            "Operator"
           ]
         },
         {
@@ -177,7 +177,11 @@
       ],
       "properties": {
         "config": {
-          "description": "Non-secret adapter configuration."
+          "description": "Non-secret adapter configuration.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
         },
         "name": {
           "description": "Adapter name.",
@@ -188,6 +192,113 @@
           "type": "string"
         }
       }
+    },
+    "NonSecretValue": {
+      "description": "Non-secret JSON-like configuration value.",
+      "oneOf": [
+        {
+          "description": "String value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "str"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Numeric value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "number"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "Boolean value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "List of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "list"
+              ]
+            },
+            "value": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        },
+        {
+          "description": "Object of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "object"
+              ]
+            },
+            "value": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        }
+      ]
     },
     "OperatorBudget": {
       "description": "Operator execution budget.",
@@ -226,7 +337,8 @@
       "description": "Operator input declaration.",
       "type": "object",
       "required": [
-        "name"
+        "name",
+        "schema_ref"
       ],
       "properties": {
         "name": {
@@ -235,10 +347,7 @@
         },
         "schema_ref": {
           "description": "Schema reference URI or symbolic schema identifier.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         }
       }
     },

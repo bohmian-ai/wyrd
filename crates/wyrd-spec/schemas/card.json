@@ -226,15 +226,15 @@
             "Workflow",
             "Eval",
             "Drift",
-            "Trigger",
-            "Operator",
             "Service",
             "Policy",
             "Mcp",
             "Skill",
             "SubAgent",
             "Audit",
-            "Artifact"
+            "Artifact",
+            "Trigger",
+            "Operator"
           ]
         },
         {
@@ -785,7 +785,11 @@
       ],
       "properties": {
         "config": {
-          "description": "Non-secret adapter configuration."
+          "description": "Non-secret adapter configuration.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
         },
         "name": {
           "description": "Adapter name.",
@@ -871,7 +875,7 @@
       ],
       "properties": {
         "annotations": {
-          "description": "Free-form annotations for automation, UI, and integration metadata.\n\nKeys under `wyrd.io/*` are reserved for Wyrd-owned runtime and registry metadata. User and vendor annotations should use another DNS-style prefix to avoid future collisions.",
+          "description": "Free-form annotations for automation, UI, and integration metadata.\n\nAs of 2026-05-18, keys under `wyrd.io/*` MUST remain reserved for Wyrd-owned runtime and registry metadata. User and vendor annotations MUST use another DNS-style prefix, such as `acme.com/cost-center`, to avoid collisions.",
           "type": "object",
           "additionalProperties": {
             "type": "string"
@@ -1150,7 +1154,8 @@
       "description": "Operator input declaration.",
       "type": "object",
       "required": [
-        "name"
+        "name",
+        "schema_ref"
       ],
       "properties": {
         "name": {
@@ -1159,10 +1164,7 @@
         },
         "schema_ref": {
           "description": "Schema reference URI or symbolic schema identifier.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         }
       }
     },
@@ -1738,14 +1740,18 @@
       }
     },
     "ServiceRuntime": {
-      "description": "Server-side runtime declaration for a Service Card.",
+      "description": "Server-side runtime declaration; tenancy is inherited from `Card.metadata.space`.",
       "type": "object",
       "required": [
         "kind"
       ],
       "properties": {
         "config": {
-          "description": "Non-secret runtime configuration."
+          "description": "Non-secret runtime configuration.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
         },
         "framework": {
           "description": "Framework or adapter hint.",
@@ -2832,107 +2838,6 @@
           }
         },
         {
-          "description": "Trigger card spec.",
-          "type": "object",
-          "required": [
-            "source",
-            "target",
-            "type"
-          ],
-          "properties": {
-            "config": {
-              "description": "Non-secret trigger configuration."
-            },
-            "cooldown_seconds": {
-              "description": "Minimum cooldown between firings, in seconds.",
-              "type": [
-                "integer",
-                "null"
-              ],
-              "format": "uint32",
-              "minimum": 0.0
-            },
-            "source": {
-              "description": "Trigger source.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/TriggerSource"
-                }
-              ]
-            },
-            "target": {
-              "description": "Target Operator Card reference.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/CardRef"
-                }
-              ]
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "Trigger"
-              ]
-            }
-          }
-        },
-        {
-          "description": "Operator card spec.",
-          "type": "object",
-          "required": [
-            "adapter",
-            "type"
-          ],
-          "properties": {
-            "adapter": {
-              "description": "Framework adapter used to execute this Operator.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/FrameworkAdapterRef"
-                }
-              ]
-            },
-            "budget": {
-              "description": "Optional runtime budget.",
-              "anyOf": [
-                {
-                  "$ref": "#/definitions/OperatorBudget"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "inputs": {
-              "description": "Declared runtime inputs.",
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/OperatorInput"
-              }
-            },
-            "post_invoke": {
-              "description": "Policy Cards evaluated after invocation.",
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/CardRef"
-              }
-            },
-            "pre_invoke": {
-              "description": "Policy Cards evaluated before invocation.",
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/CardRef"
-              }
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "Operator"
-              ]
-            }
-          }
-        },
-        {
           "description": "Service card spec.",
           "type": "object",
           "required": [
@@ -3464,6 +3369,111 @@
               "type": "string",
               "enum": [
                 "Artifact"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Trigger card spec.",
+          "type": "object",
+          "required": [
+            "source",
+            "target",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "description": "Non-secret trigger configuration.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "cooldown_seconds": {
+              "description": "Minimum cooldown between firings, in seconds.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "source": {
+              "description": "Trigger source.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TriggerSource"
+                }
+              ]
+            },
+            "target": {
+              "description": "Target Operator Card reference.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Trigger"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Operator card spec.",
+          "type": "object",
+          "required": [
+            "adapter",
+            "type"
+          ],
+          "properties": {
+            "adapter": {
+              "description": "Framework adapter used to execute this Operator.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/FrameworkAdapterRef"
+                }
+              ]
+            },
+            "budget": {
+              "description": "Optional runtime budget.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/OperatorBudget"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "inputs": {
+              "description": "Declared runtime inputs.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/OperatorInput"
+              }
+            },
+            "post_invoke": {
+              "description": "Policy Cards evaluated after invocation.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "pre_invoke": {
+              "description": "Policy Cards evaluated before invocation.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Operator"
               ]
             }
           }

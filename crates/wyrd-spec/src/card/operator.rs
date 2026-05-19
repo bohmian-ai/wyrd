@@ -1,4 +1,6 @@
-//! Operator Card spec.
+//! Status: Locked (2026-05-18)
+//! source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-2
+//! source: reference/spec/specs.rs (OperatorSpec - canonical wire shape)
 
 use serde::{Deserialize, Serialize};
 
@@ -32,12 +34,11 @@ pub struct OperatorInput {
     /// Input name.
     pub name: String,
     /// Schema reference URI or symbolic schema identifier.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schema_ref: Option<String>,
+    pub schema_ref: String,
 }
 
 /// Operator execution budget.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct OperatorBudget {
     /// Maximum wall-clock runtime in seconds.

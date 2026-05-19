@@ -15,9 +15,17 @@ spec:
     version: "^0.2"
     config:
       graph_artifact_ref:
-        kind: Artifact
-        name: churn-retrain-graph
-        version: "^1"
+        type: object
+        value:
+          kind:
+            type: str
+            value: Artifact
+          name:
+            type: str
+            value: churn-retrain-graph
+          version:
+            type: str
+            value: "^1"
 
   inputs:
     - name: drift_observation

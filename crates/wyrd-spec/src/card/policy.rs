@@ -46,6 +46,8 @@ pub struct PolicyRule {
 }
 
 /// Invocation context passed to runtime Policy Cards.
+// Status: Locked (2026-05-18)
+// source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-5
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct InvokeContext {
@@ -59,12 +61,14 @@ pub struct InvokeContext {
     pub request_id: RequestId,
     /// Trace context for the invocation.
     pub trace: TraceContext,
-    /// Schema-validated invocation inputs.
+    /// Runtime invocation inputs; runtime phases validate schemas and redact before audit.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub inputs: serde_json::Value,
 }
 
 /// Invocation outcome passed to post-invoke Policy Cards.
+// Status: Locked (2026-05-18)
+// source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-5
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct InvokeOutcome {
@@ -76,14 +80,17 @@ pub struct InvokeOutcome {
     /// Machine-readable error code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
-    /// Non-secret outcome summary.
+    /// Runtime outcome summary; runtime phases validate schemas and redact before audit.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub summary: serde_json::Value,
 }
 
 /// Policy evaluation decision.
+// Status: Locked (2026-05-18)
+// source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-5
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[non_exhaustive]
 #[serde(tag = "verdict", rename_all = "snake_case")]
 pub enum PolicyDecision {
     /// Permit the operation.
@@ -112,6 +119,8 @@ impl PolicyDecision {
 }
 
 /// Runtime evaluation surface for Policy Cards.
+// Status: Locked (2026-05-18)
+// source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-5
 pub trait PolicyCard {
     /// Evaluate a Card envelope and spec payload.
     fn evaluate(&self, card: &Card, spec: &Spec) -> PolicyDecision;

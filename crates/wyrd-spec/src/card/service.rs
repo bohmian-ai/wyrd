@@ -46,7 +46,11 @@ pub struct ServiceSpec {
     pub metadata: BTreeMap<String, NonSecretValue>,
 }
 
-/// Server-side runtime declaration for a Service Card.
+/// Server-side runtime declaration; tenancy is inherited from `Card.metadata.space`.
+// Status: Locked (2026-05-18)
+// source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-4
+// source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-5
+// source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-7
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ServiceRuntime {
@@ -61,12 +65,12 @@ pub struct ServiceRuntime {
     /// Whether the runtime should fail closed on unsupported features.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
+    /// Non-secret runtime configuration.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, NonSecretValue>,
     /// Runtime policy settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<ServiceRuntimePolicy>,
-    /// Non-secret runtime configuration.
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-    pub config: serde_json::Value,
 }
 
 /// Service runtime kind.

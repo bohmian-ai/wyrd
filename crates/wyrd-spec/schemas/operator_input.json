@@ -4,7 +4,8 @@
   "description": "Operator input declaration.",
   "type": "object",
   "required": [
-    "name"
+    "name",
+    "schema_ref"
   ],
   "properties": {
     "name": {
@@ -13,10 +14,7 @@
     },
     "schema_ref": {
       "description": "Schema reference URI or symbolic schema identifier.",
-      "type": [
-        "string",
-        "null"
-      ]
+      "type": "string"
     }
   }
 }

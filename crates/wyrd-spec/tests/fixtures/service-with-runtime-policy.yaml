@@ -24,7 +24,9 @@ spec:
     policy:
       runtime_hooks: true
     config:
-      max_concurrent_invocations: 4
+      max_concurrent_invocations:
+        type: number
+        value: 4.0
 
   components:
     - alias: trigger

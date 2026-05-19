@@ -40,6 +40,9 @@ pub struct ArtifactSpec {
 }
 
 /// Framework adapter reference for loading or invoking artifacts.
+// Status: Locked (2026-05-18)
+// source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-6
+// source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-7
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct FrameworkAdapterRef {
@@ -48,6 +51,6 @@ pub struct FrameworkAdapterRef {
     /// Adapter version or version range.
     pub version: String,
     /// Non-secret adapter configuration.
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-    pub config: serde_json::Value,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, NonSecretValue>,
 }

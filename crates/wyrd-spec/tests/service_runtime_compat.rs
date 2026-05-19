@@ -1,5 +1,6 @@
 use proptest::prelude::*;
-use serde_json::json;
+use std::collections::BTreeMap;
+use wyrd_spec::card::common::NonSecretValue;
 use wyrd_spec::card::service::{
     ServiceRuntime, ServiceRuntimeKind, ServiceRuntimeMode, ServiceRuntimePolicy, ServiceSpec,
 };
@@ -48,9 +49,15 @@ fn runtime_strategy() -> impl Strategy<Value = ServiceRuntime> {
         any::<bool>().prop_map(|runtime_hooks| ServiceRuntimePolicy { runtime_hooks }),
     );
     let config = prop_oneof![
-        Just(serde_json::Value::Null),
-        Just(json!({"max_concurrent_invocations": 4})),
-        Just(json!({"queue": "default"})),
+        Just(BTreeMap::new()),
+        Just(BTreeMap::from([(
+            "max_concurrent_invocations".to_string(),
+            NonSecretValue::Number(4.0),
+        )])),
+        Just(BTreeMap::from([(
+            "queue".to_string(),
+            NonSecretValue::Str("default".to_string()),
+        )])),
     ];
 
     (kind, framework, mode, strict, policy, config).prop_map(
@@ -59,8 +66,8 @@ fn runtime_strategy() -> impl Strategy<Value = ServiceRuntime> {
             framework,
             mode,
             strict,
-            policy,
             config,
+            policy,
         },
     )
 }

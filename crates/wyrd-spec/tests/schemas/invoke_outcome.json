@@ -30,7 +30,7 @@
       "type": "boolean"
     },
     "summary": {
-      "description": "Non-secret outcome summary."
+      "description": "Runtime outcome summary; runtime phases validate schemas and redact before audit."
     }
   },
   "definitions": {

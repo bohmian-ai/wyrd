@@ -28,7 +28,7 @@
       ]
     },
     "inputs": {
-      "description": "Schema-validated invocation inputs."
+      "description": "Runtime invocation inputs; runtime phases validate schemas and redact before audit."
     },
     "request_id": {
       "description": "Request correlation ID.",
@@ -163,15 +163,15 @@
             "Workflow",
             "Eval",
             "Drift",
-            "Trigger",
-            "Operator",
             "Service",
             "Policy",
             "Mcp",
             "Skill",
             "SubAgent",
             "Audit",
-            "Artifact"
+            "Artifact",
+            "Trigger",
+            "Operator"
           ]
         },
         {

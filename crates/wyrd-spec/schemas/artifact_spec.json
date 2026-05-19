@@ -97,15 +97,15 @@
             "Workflow",
             "Eval",
             "Drift",
-            "Trigger",
-            "Operator",
             "Service",
             "Policy",
             "Mcp",
             "Skill",
             "SubAgent",
             "Audit",
-            "Artifact"
+            "Artifact",
+            "Trigger",
+            "Operator"
           ]
         },
         {
@@ -207,7 +207,11 @@
       ],
       "properties": {
         "config": {
-          "description": "Non-secret adapter configuration."
+          "description": "Non-secret adapter configuration.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
         },
         "name": {
           "description": "Adapter name.",

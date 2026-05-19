@@ -25,4 +25,6 @@ spec:
   cooldown_seconds: 3600
 
   config:
-    severity_min: alert
+    severity_min:
+      type: str
+      value: alert

@@ -92,15 +92,15 @@
             "Workflow",
             "Eval",
             "Drift",
-            "Trigger",
-            "Operator",
             "Service",
             "Policy",
             "Mcp",
             "Skill",
             "SubAgent",
             "Audit",
-            "Artifact"
+            "Artifact",
+            "Trigger",
+            "Operator"
           ]
         },
         {

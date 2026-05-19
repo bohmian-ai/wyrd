@@ -6,6 +6,16 @@ use wyrd_spec::envelope::CardKind;
 fn native_card_kind_count_is_locked() {
     assert_eq!(CardKind::native().len(), CardKind::NATIVE_COUNT);
     assert_eq!(CardKind::NATIVE_COUNT, 18);
+    assert!(
+        CardKind::native()
+            .iter()
+            .any(|kind| matches!(kind, CardKind::Trigger))
+    );
+    assert!(
+        CardKind::native()
+            .iter()
+            .any(|kind| matches!(kind, CardKind::Operator))
+    );
 }
 
 #[test]

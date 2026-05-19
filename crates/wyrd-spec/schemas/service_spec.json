@@ -105,15 +105,15 @@
             "Workflow",
             "Eval",
             "Drift",
-            "Trigger",
-            "Operator",
             "Service",
             "Policy",
             "Mcp",
             "Skill",
             "SubAgent",
             "Audit",
-            "Artifact"
+            "Artifact",
+            "Trigger",
+            "Operator"
           ]
         },
         {
@@ -397,14 +397,18 @@
       }
     },
     "ServiceRuntime": {
-      "description": "Server-side runtime declaration for a Service Card.",
+      "description": "Server-side runtime declaration; tenancy is inherited from `Card.metadata.space`.",
       "type": "object",
       "required": [
         "kind"
       ],
       "properties": {
         "config": {
-          "description": "Non-secret runtime configuration."
+          "description": "Non-secret runtime configuration.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
         },
         "framework": {
           "description": "Framework or adapter hint.",

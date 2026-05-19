@@ -74,9 +74,11 @@ pub struct Metadata {
     pub labels: BTreeMap<String, String>,
     /// Free-form annotations for automation, UI, and integration metadata.
     ///
-    /// Keys under `wyrd.io/*` are reserved for Wyrd-owned runtime and registry
-    /// metadata. User and vendor annotations should use another DNS-style
-    /// prefix to avoid future collisions.
+    /// As of 2026-05-18, keys under `wyrd.io/*` MUST remain reserved for
+    /// Wyrd-owned runtime and registry metadata. User and vendor annotations
+    /// MUST use another DNS-style prefix, such as `acme.com/cost-center`, to
+    /// avoid collisions.
+    // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-6
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub annotations: BTreeMap<String, String>,
     /// Spec content hash.
@@ -111,10 +113,6 @@ pub enum Spec {
     Eval(EvalSpec),
     /// Drift card spec.
     Drift(DriftSpec),
-    /// Trigger card spec.
-    Trigger(TriggerSpec),
-    /// Operator card spec.
-    Operator(OperatorSpec),
     /// Service card spec.
     Service(ServiceSpec),
     /// Policy card spec.
@@ -129,6 +127,12 @@ pub enum Spec {
     Audit(AuditSpec),
     /// Artifact card spec.
     Artifact(ArtifactSpec),
+    /// Trigger card spec.
+    // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-1
+    Trigger(TriggerSpec),
+    /// Operator card spec.
+    // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-2
+    Operator(OperatorSpec),
 }
 
 /// Server-derived relationship summary for graph, UI, policy, imports, and diff.
@@ -179,10 +183,6 @@ pub enum CardKind {
     Eval,
     /// Drift Card.
     Drift,
-    /// Trigger Card.
-    Trigger,
-    /// Operator Card.
-    Operator,
     /// Service Card.
     Service,
     /// Policy Card.
@@ -197,6 +197,12 @@ pub enum CardKind {
     Audit,
     /// Artifact Card.
     Artifact,
+    /// Trigger Card.
+    // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-1
+    Trigger,
+    /// Operator Card.
+    // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-2
+    Operator,
     /// Unknown Card kind with schema hash.
     External {
         /// External kind name.
@@ -223,8 +229,6 @@ impl CardKind {
             Self::Workflow,
             Self::Eval,
             Self::Drift,
-            Self::Trigger,
-            Self::Operator,
             Self::Service,
             Self::Policy,
             Self::Mcp,
@@ -232,6 +236,8 @@ impl CardKind {
             Self::SubAgent,
             Self::Audit,
             Self::Artifact,
+            Self::Trigger,
+            Self::Operator,
         ]
     }
 
@@ -248,8 +254,6 @@ impl CardKind {
             Self::Workflow => "Workflow",
             Self::Eval => "Eval",
             Self::Drift => "Drift",
-            Self::Trigger => "Trigger",
-            Self::Operator => "Operator",
             Self::Service => "Service",
             Self::Policy => "Policy",
             Self::Mcp => "Mcp",
@@ -257,6 +261,8 @@ impl CardKind {
             Self::SubAgent => "SubAgent",
             Self::Audit => "Audit",
             Self::Artifact => "Artifact",
+            Self::Trigger => "Trigger",
+            Self::Operator => "Operator",
             Self::External { .. } => return None,
         })
     }
@@ -275,8 +281,6 @@ impl CardKind {
             Self::Workflow => "Workflow",
             Self::Eval => "Eval",
             Self::Drift => "Drift",
-            Self::Trigger => "Trigger",
-            Self::Operator => "Operator",
             Self::Service => "Service",
             Self::Policy => "Policy",
             Self::Mcp => "Mcp",
@@ -284,6 +288,8 @@ impl CardKind {
             Self::SubAgent => "SubAgent",
             Self::Audit => "Audit",
             Self::Artifact => "Artifact",
+            Self::Trigger => "Trigger",
+            Self::Operator => "Operator",
         }
     }
 }
@@ -388,8 +394,6 @@ fn native_from_str(value: &str) -> Option<CardKind> {
         "Workflow" => CardKind::Workflow,
         "Eval" => CardKind::Eval,
         "Drift" => CardKind::Drift,
-        "Trigger" => CardKind::Trigger,
-        "Operator" => CardKind::Operator,
         "Service" => CardKind::Service,
         "Policy" => CardKind::Policy,
         "Mcp" => CardKind::Mcp,
@@ -397,6 +401,8 @@ fn native_from_str(value: &str) -> Option<CardKind> {
         "SubAgent" => CardKind::SubAgent,
         "Audit" => CardKind::Audit,
         "Artifact" => CardKind::Artifact,
+        "Trigger" => CardKind::Trigger,
+        "Operator" => CardKind::Operator,
         _ => return None,
     })
 }

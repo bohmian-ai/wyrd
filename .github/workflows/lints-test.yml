@@ -13,5 +13,4 @@ jobs:
       - uses: jdx/mise-action@v2
       - run: sudo apt-get update && sudo apt-get install -y ripgrep
       - run: rustup target add wasm32-unknown-unknown
-      - run: cargo install cargo-deny --locked || true
       - run: mise run pre-pr

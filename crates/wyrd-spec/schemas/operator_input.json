@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OperatorInput",
+  "description": "Operator input declaration.",
+  "type": "object",
+  "required": [
+    "name"
+  ],
+  "properties": {
+    "name": {
+      "description": "Input name.",
+      "type": "string"
+    },
+    "schema_ref": {
+      "description": "Schema reference URI or symbolic schema identifier.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

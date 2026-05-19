@@ -22,12 +22,14 @@ use crate::card::eval::EvalSpec;
 use crate::card::experiment::ExperimentSpec;
 use crate::card::mcp::McpSpec;
 use crate::card::model::ModelSpec;
+use crate::card::operator::OperatorSpec;
 use crate::card::policy::PolicySpec;
 use crate::card::prompt::PromptSpec;
 use crate::card::service::ServiceSpec;
 use crate::card::skill::SkillSpec;
 use crate::card::subagent::SubAgentSpec;
 use crate::card::tool::ToolSpec;
+use crate::card::trigger::TriggerSpec;
 use crate::card::workflow::WorkflowSpec;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::version::{ApiVersion, VersionBlock};
@@ -70,7 +72,11 @@ pub struct Metadata {
     /// Display labels.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
-    /// Free-form metadata.
+    /// Free-form annotations for automation, UI, and integration metadata.
+    ///
+    /// Keys under `wyrd.io/*` are reserved for Wyrd-owned runtime and registry
+    /// metadata. User and vendor annotations should use another DNS-style
+    /// prefix to avoid future collisions.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub annotations: BTreeMap<String, String>,
     /// Spec content hash.
@@ -105,6 +111,10 @@ pub enum Spec {
     Eval(EvalSpec),
     /// Drift card spec.
     Drift(DriftSpec),
+    /// Trigger card spec.
+    Trigger(TriggerSpec),
+    /// Operator card spec.
+    Operator(OperatorSpec),
     /// Service card spec.
     Service(ServiceSpec),
     /// Policy card spec.
@@ -169,6 +179,10 @@ pub enum CardKind {
     Eval,
     /// Drift Card.
     Drift,
+    /// Trigger Card.
+    Trigger,
+    /// Operator Card.
+    Operator,
     /// Service Card.
     Service,
     /// Policy Card.
@@ -194,7 +208,7 @@ pub enum CardKind {
 
 impl CardKind {
     /// Native v1 Card kind count.
-    pub const NATIVE_COUNT: usize = 16;
+    pub const NATIVE_COUNT: usize = 18;
 
     /// Return every native kind.
     #[must_use]
@@ -209,6 +223,8 @@ impl CardKind {
             Self::Workflow,
             Self::Eval,
             Self::Drift,
+            Self::Trigger,
+            Self::Operator,
             Self::Service,
             Self::Policy,
             Self::Mcp,
@@ -232,6 +248,8 @@ impl CardKind {
             Self::Workflow => "Workflow",
             Self::Eval => "Eval",
             Self::Drift => "Drift",
+            Self::Trigger => "Trigger",
+            Self::Operator => "Operator",
             Self::Service => "Service",
             Self::Policy => "Policy",
             Self::Mcp => "Mcp",
@@ -257,6 +275,8 @@ impl CardKind {
             Self::Workflow => "Workflow",
             Self::Eval => "Eval",
             Self::Drift => "Drift",
+            Self::Trigger => "Trigger",
+            Self::Operator => "Operator",
             Self::Service => "Service",
             Self::Policy => "Policy",
             Self::Mcp => "Mcp",
@@ -368,6 +388,8 @@ fn native_from_str(value: &str) -> Option<CardKind> {
         "Workflow" => CardKind::Workflow,
         "Eval" => CardKind::Eval,
         "Drift" => CardKind::Drift,
+        "Trigger" => CardKind::Trigger,
+        "Operator" => CardKind::Operator,
         "Service" => CardKind::Service,
         "Policy" => CardKind::Policy,
         "Mcp" => CardKind::Mcp,

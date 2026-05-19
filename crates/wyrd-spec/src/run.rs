@@ -23,6 +23,8 @@ pub enum RunKind {
     Import,
     /// Workflow execution.
     Workflow,
+    /// Autonomous remediation execution.
+    Remediation,
     /// Externally defined execution kind.
     External(String),
 }

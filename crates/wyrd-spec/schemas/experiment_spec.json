@@ -91,6 +91,8 @@
             "Workflow",
             "Eval",
             "Drift",
+            "Trigger",
+            "Operator",
             "Service",
             "Policy",
             "Mcp",
@@ -534,6 +536,21 @@
               "type": "string",
               "enum": [
                 "workflow"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Autonomous remediation execution.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "remediation"
               ]
             }
           }

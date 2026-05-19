@@ -1,0 +1,39 @@
+# ServiceCard - autonomous remediation service with runtime policy hooks.
+
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  space: retention
+  name: churn-remediation-service
+  version: 1.0.0
+  annotations:
+    environment: production
+    team: retention
+
+spec:
+  type: Service
+
+  description: Autonomous churn remediation operator + drift trigger
+  service_type: agent
+
+  runtime:
+    kind: agent
+    framework: langgraph
+    mode: in_process
+    strict: true
+    policy:
+      runtime_hooks: true
+    config:
+      max_concurrent_invocations: 4
+
+  components:
+    - alias: trigger
+      ref:
+        kind: Trigger
+        name: churn-drift-trigger
+        version: "^1"
+    - alias: operator
+      ref:
+        kind: Operator
+        name: churn-retrain-on-drift
+        version: "^1"

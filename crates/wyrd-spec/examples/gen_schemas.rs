@@ -5,7 +5,7 @@ use std::path::Path;
 
 use schemars::schema_for;
 use wyrd_spec::card::agent::AgentSpec;
-use wyrd_spec::card::artifact::ArtifactSpec;
+use wyrd_spec::card::artifact::{ArtifactSpec, FrameworkAdapterRef};
 use wyrd_spec::card::audit::AuditSpec;
 use wyrd_spec::card::data::DataSpec;
 use wyrd_spec::card::drift::DriftSpec;
@@ -13,13 +13,17 @@ use wyrd_spec::card::eval::EvalSpec;
 use wyrd_spec::card::experiment::ExperimentSpec;
 use wyrd_spec::card::mcp::McpSpec;
 use wyrd_spec::card::model::ModelSpec;
-use wyrd_spec::card::policy::PolicySpec;
+use wyrd_spec::card::operator::{OperatorBudget, OperatorInput, OperatorSpec};
+use wyrd_spec::card::policy::{InvokeContext, InvokeOutcome, PolicyDecision, PolicySpec};
 use wyrd_spec::card::prompt::PromptSpec;
-use wyrd_spec::card::service::ServiceSpec;
 use wyrd_spec::card::service::{LockedComponent, ServiceLock};
+use wyrd_spec::card::service::{
+    ServiceRuntime, ServiceRuntimeKind, ServiceRuntimeMode, ServiceRuntimePolicy, ServiceSpec,
+};
 use wyrd_spec::card::skill::SkillSpec;
 use wyrd_spec::card::subagent::SubAgentSpec;
 use wyrd_spec::card::tool::ToolSpec;
+use wyrd_spec::card::trigger::{TriggerSource, TriggerSpec};
 use wyrd_spec::card::workflow::WorkflowSpec;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::reference::CardRef;
@@ -47,13 +51,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<WorkflowSpec>(out, golden, "workflow_spec")?;
     write::<EvalSpec>(out, golden, "eval_spec")?;
     write::<DriftSpec>(out, golden, "drift_spec")?;
+    write::<TriggerSpec>(out, golden, "trigger_spec")?;
+    write::<TriggerSource>(out, golden, "trigger_source")?;
+    write::<OperatorSpec>(out, golden, "operator_spec")?;
+    write::<OperatorInput>(out, golden, "operator_input")?;
+    write::<OperatorBudget>(out, golden, "operator_budget")?;
     write::<ServiceSpec>(out, golden, "service_spec")?;
+    write::<ServiceRuntime>(out, golden, "service_runtime")?;
+    write::<ServiceRuntimeKind>(out, golden, "service_runtime_kind")?;
+    write::<ServiceRuntimeMode>(out, golden, "service_runtime_mode")?;
+    write::<ServiceRuntimePolicy>(out, golden, "service_runtime_policy")?;
     write::<PolicySpec>(out, golden, "policy_spec")?;
+    write::<InvokeContext>(out, golden, "invoke_context")?;
+    write::<InvokeOutcome>(out, golden, "invoke_outcome")?;
+    write::<PolicyDecision>(out, golden, "policy_decision")?;
     write::<McpSpec>(out, golden, "mcp_spec")?;
     write::<SkillSpec>(out, golden, "skill_spec")?;
     write::<SubAgentSpec>(out, golden, "subagent_spec")?;
     write::<AuditSpec>(out, golden, "audit_spec")?;
     write::<ArtifactSpec>(out, golden, "artifact_spec")?;
+    write::<FrameworkAdapterRef>(out, golden, "framework_adapter_ref")?;
     Ok(())
 }
 

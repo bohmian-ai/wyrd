@@ -1,0 +1,28 @@
+# TriggerCard - fires when a DriftCard observation crosses thresholds.
+
+apiVersion: wyrd/v1
+kind: Trigger
+metadata:
+  space: retention
+  name: churn-drift-trigger
+  version: 1.0.0
+
+spec:
+  type: Trigger
+
+  source:
+    kind: drift_observation
+    card:
+      kind: Drift
+      name: churn-input-drift
+      version: "^1"
+
+  target:
+    kind: Operator
+    name: churn-retrain-on-drift
+    version: "^1"
+
+  cooldown_seconds: 3600
+
+  config:
+    severity_min: alert

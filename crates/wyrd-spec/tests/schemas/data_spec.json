@@ -92,6 +92,8 @@
             "Workflow",
             "Eval",
             "Drift",
+            "Trigger",
+            "Operator",
             "Service",
             "Policy",
             "Mcp",

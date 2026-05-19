@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FrameworkAdapterRef",
+  "description": "Framework adapter reference for loading or invoking artifacts.",
+  "type": "object",
+  "required": [
+    "name",
+    "version"
+  ],
+  "properties": {
+    "config": {
+      "description": "Non-secret adapter configuration."
+    },
+    "name": {
+      "description": "Adapter name.",
+      "type": "string"
+    },
+    "version": {
+      "description": "Adapter version or version range.",
+      "type": "string"
+    }
+  }
+}

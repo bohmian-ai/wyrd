@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ServiceRuntimeKind",
+  "description": "Service runtime kind.",
+  "oneOf": [
+    {
+      "description": "API service runtime.",
+      "type": "string",
+      "enum": [
+        "api"
+      ]
+    },
+    {
+      "description": "MCP service runtime.",
+      "type": "string",
+      "enum": [
+        "mcp"
+      ]
+    },
+    {
+      "description": "Agent service runtime.",
+      "type": "string",
+      "enum": [
+        "agent"
+      ]
+    },
+    {
+      "description": "Workflow service runtime.",
+      "type": "string",
+      "enum": [
+        "workflow"
+      ]
+    }
+  ]
+}

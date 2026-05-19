@@ -7,7 +7,6 @@ rust = "stable"
 cmake = "3.26.4"
 protoc = "33.2"
 "cargo:cargo-deny" = "latest"
-"cargo:ripgrep" = "latest"
 
 [settings]
 env_shell_expand = false

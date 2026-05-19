@@ -7,6 +7,7 @@ rust = "stable"
 cmake = "3.26.4"
 protoc = "33.2"
 "cargo:cargo-deny" = "latest"
+"cargo:ripgrep" = "latest"
 
 [settings]
 env_shell_expand = false
@@ -58,7 +59,7 @@ run = "cargo test -p wyrd-spec --test cardkind_check --features server"
 [tasks."check:client-tier"]
 description = "Foundation invariants: wyrd-spec server-tier-free; shared shells pyo3+sqlx-free"
 run = """
-set -euo pipefail
+set -eu
 
 forbidden_spec=$(cargo tree -p wyrd-spec --no-default-features -e normal | \
   rg '(^|[ ─└├])(utoipa|pyo3|sqlx|axum|opentelemetry|reqwest|tokio)' || true)

@@ -16,10 +16,10 @@ impl RequestId {
     /// # Errors
     /// Returns an error when the input is neither a valid ULID nor UUID.
     pub fn parse(value: &str) -> Result<Self, RequestIdError> {
-        if is_ulid(value) || uuid::Uuid::parse_str(value).is_ok() {
+        if is_ulid(value) || is_uuid7(value) {
             return Ok(Self(value.to_string()));
         }
-        Err(RequestIdError::Invalid(value.to_string()))
+        Err(RequestIdError::Invalid)
     }
 
     /// Borrow the inner identifier string.
@@ -34,6 +34,12 @@ fn is_ulid(value: &str) -> bool {
         && value
             .chars()
             .all(|ch| matches!(ch, '0'..='9' | 'A'..='H' | 'J'..='K' | 'M'..='N' | 'P'..='T' | 'V'..='Z'))
+}
+
+fn is_uuid7(value: &str) -> bool {
+    uuid::Uuid::parse_str(value)
+        .map(|uuid| uuid.get_version_num() == 7)
+        .unwrap_or(false)
 }
 
 impl fmt::Display for RequestId {
@@ -54,6 +60,6 @@ impl FromStr for RequestId {
 #[derive(Debug, thiserror::Error)]
 pub enum RequestIdError {
     /// Input did not parse as a ULID or UUID.
-    #[error("invalid request id: {0}")]
-    Invalid(String),
+    #[error("invalid request id")]
+    Invalid,
 }

@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::card::common::NonSecretValue;
+
 /// Declarative policy rule set.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -19,7 +21,7 @@ pub struct PolicySpec {
     pub enforcement: Option<String>,
     /// Free-form details.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub details: BTreeMap<String, serde_json::Value>,
+    pub details: BTreeMap<String, NonSecretValue>,
 }
 
 /// One policy rule.
@@ -34,5 +36,5 @@ pub struct PolicyRule {
     pub action: String,
     /// Rule metadata.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub metadata: BTreeMap<String, serde_json::Value>,
+    pub metadata: BTreeMap<String, NonSecretValue>,
 }

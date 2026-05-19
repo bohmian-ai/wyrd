@@ -3,8 +3,15 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use schemars::r#gen::SchemaGenerator;
+use schemars::schema::{
+    InstanceType, Metadata as SchemaMetadata, ObjectValidation, Schema, SchemaObject,
+    StringValidation, SubschemaValidation,
+};
+use schemars::{JsonSchema, Map as SchemaMap};
 use serde::de::{Error as DeError, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::json;
 
 use crate::card::agent::AgentSpec;
 use crate::card::artifact::ArtifactSpec;
@@ -30,6 +37,7 @@ use crate::version::{ApiVersion, VersionBlock};
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct Card {
     /// API version. Must be `wyrd/v1` for v1 Cards.
+    #[serde(rename = "apiVersion")]
     pub api_version: ApiVersion,
     /// Card kind discriminator.
     pub kind: CardKind,
@@ -76,7 +84,8 @@ pub struct Metadata {
 /// Kind-specific Card spec payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(tag = "kind", content = "spec", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
+#[serde(tag = "type", rename_all = "PascalCase")]
 pub enum Spec {
     /// Data card spec.
     Data(DataSpec),
@@ -139,7 +148,7 @@ pub struct Status {
 }
 
 /// Native Wyrd Card kind plus forward-compatible external catch-all.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub enum CardKind {
     /// Data Card.
@@ -214,24 +223,48 @@ impl CardKind {
     #[must_use]
     pub fn native_name(&self) -> Option<&'static str> {
         Some(match self {
-            Self::Data => "data",
-            Self::Model => "model",
-            Self::Experiment => "experiment",
-            Self::Prompt => "prompt",
-            Self::Tool => "tool",
-            Self::Agent => "agent",
-            Self::Workflow => "workflow",
-            Self::Eval => "eval",
-            Self::Drift => "drift",
-            Self::Service => "service",
-            Self::Policy => "policy",
-            Self::Mcp => "mcp",
-            Self::Skill => "skill",
-            Self::SubAgent => "sub_agent",
-            Self::Audit => "audit",
-            Self::Artifact => "artifact",
+            Self::Data => "Data",
+            Self::Model => "Model",
+            Self::Experiment => "Experiment",
+            Self::Prompt => "Prompt",
+            Self::Tool => "Tool",
+            Self::Agent => "Agent",
+            Self::Workflow => "Workflow",
+            Self::Eval => "Eval",
+            Self::Drift => "Drift",
+            Self::Service => "Service",
+            Self::Policy => "Policy",
+            Self::Mcp => "Mcp",
+            Self::Skill => "Skill",
+            Self::SubAgent => "SubAgent",
+            Self::Audit => "Audit",
+            Self::Artifact => "Artifact",
             Self::External { .. } => return None,
         })
+    }
+
+    /// Public wire name for this kind.
+    #[must_use]
+    pub fn wire_name(&self) -> &str {
+        match self {
+            Self::External { name, .. } => name,
+            Self::Data => "Data",
+            Self::Model => "Model",
+            Self::Experiment => "Experiment",
+            Self::Prompt => "Prompt",
+            Self::Tool => "Tool",
+            Self::Agent => "Agent",
+            Self::Workflow => "Workflow",
+            Self::Eval => "Eval",
+            Self::Drift => "Drift",
+            Self::Service => "Service",
+            Self::Policy => "Policy",
+            Self::Mcp => "Mcp",
+            Self::Skill => "Skill",
+            Self::SubAgent => "SubAgent",
+            Self::Audit => "Audit",
+            Self::Artifact => "Artifact",
+        }
     }
 }
 
@@ -270,8 +303,7 @@ impl<'de> Deserialize<'de> for CardKind {
             }
 
             fn visit_str<E: DeError>(self, value: &str) -> Result<Self::Value, E> {
-                native_from_str(value)
-                    .ok_or_else(|| E::custom(format!("unknown native card kind: {value}")))
+                native_from_str(value).ok_or_else(|| E::custom("unknown native card kind"))
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
@@ -291,6 +323,28 @@ impl<'de> Deserialize<'de> for CardKind {
                 if let Some(native) = native_from_str(&name) {
                     return Ok(native);
                 }
+                if name.is_empty()
+                    || !name.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+                    })
+                    || !name
+                        .bytes()
+                        .next()
+                        .is_some_and(|byte| byte.is_ascii_alphabetic())
+                {
+                    return Err(A::Error::custom(
+                        "external kind must match [A-Za-z][A-Za-z0-9_.-]*",
+                    ));
+                }
+                if hash.len() != 64
+                    || !hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(A::Error::custom(
+                        "schema_hash must be 64 lowercase hexadecimal characters",
+                    ));
+                }
                 let decoded = hex::decode(hash).map_err(A::Error::custom)?;
                 let schema_hash: [u8; 32] = decoded
                     .try_into()
@@ -305,22 +359,108 @@ impl<'de> Deserialize<'de> for CardKind {
 
 fn native_from_str(value: &str) -> Option<CardKind> {
     Some(match value {
-        "data" => CardKind::Data,
-        "model" => CardKind::Model,
-        "experiment" => CardKind::Experiment,
-        "prompt" => CardKind::Prompt,
-        "tool" => CardKind::Tool,
-        "agent" => CardKind::Agent,
-        "workflow" => CardKind::Workflow,
-        "eval" => CardKind::Eval,
-        "drift" => CardKind::Drift,
-        "service" => CardKind::Service,
-        "policy" => CardKind::Policy,
-        "mcp" => CardKind::Mcp,
-        "skill" => CardKind::Skill,
-        "sub_agent" => CardKind::SubAgent,
-        "audit" => CardKind::Audit,
-        "artifact" => CardKind::Artifact,
+        "Data" => CardKind::Data,
+        "Model" => CardKind::Model,
+        "Experiment" => CardKind::Experiment,
+        "Prompt" => CardKind::Prompt,
+        "Tool" => CardKind::Tool,
+        "Agent" => CardKind::Agent,
+        "Workflow" => CardKind::Workflow,
+        "Eval" => CardKind::Eval,
+        "Drift" => CardKind::Drift,
+        "Service" => CardKind::Service,
+        "Policy" => CardKind::Policy,
+        "Mcp" => CardKind::Mcp,
+        "Skill" => CardKind::Skill,
+        "SubAgent" => CardKind::SubAgent,
+        "Audit" => CardKind::Audit,
+        "Artifact" => CardKind::Artifact,
         _ => return None,
     })
+}
+
+impl JsonSchema for CardKind {
+    fn schema_name() -> String {
+        "CardKind".to_string()
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        let native_values = Self::native()
+            .iter()
+            .map(|kind| json!(kind.wire_name()))
+            .collect();
+
+        let native_schema = SchemaObject {
+            metadata: Some(Box::new(SchemaMetadata {
+                title: Some("NativeCardKind".to_string()),
+                description: Some("Native Wyrd Card kind.".to_string()),
+                ..SchemaMetadata::default()
+            })),
+            instance_type: Some(InstanceType::String.into()),
+            enum_values: Some(native_values),
+            ..SchemaObject::default()
+        };
+
+        let mut properties = SchemaMap::new();
+        properties.insert(
+            "kind".to_string(),
+            SchemaObject {
+                instance_type: Some(InstanceType::String.into()),
+                string: Some(Box::new(StringValidation {
+                    min_length: Some(1),
+                    pattern: Some(r"^[A-Za-z][A-Za-z0-9_.-]*$".to_string()),
+                    ..StringValidation::default()
+                })),
+                ..SchemaObject::default()
+            }
+            .into(),
+        );
+        properties.insert(
+            "schema_hash".to_string(),
+            SchemaObject {
+                instance_type: Some(InstanceType::String.into()),
+                string: Some(Box::new(StringValidation {
+                    min_length: Some(64),
+                    max_length: Some(64),
+                    pattern: Some(r"^[0-9a-f]{64}$".to_string()),
+                })),
+                ..SchemaObject::default()
+            }
+            .into(),
+        );
+
+        let external_schema = SchemaObject {
+            metadata: Some(Box::new(SchemaMetadata {
+                title: Some("ExternalCardKind".to_string()),
+                description: Some("External Card kind with schema hash.".to_string()),
+                ..SchemaMetadata::default()
+            })),
+            instance_type: Some(InstanceType::Object.into()),
+            object: Some(Box::new(ObjectValidation {
+                required: ["kind".to_string(), "schema_hash".to_string()]
+                    .into_iter()
+                    .collect(),
+                properties,
+                additional_properties: Some(Box::new(Schema::Bool(false))),
+                ..ObjectValidation::default()
+            })),
+            ..SchemaObject::default()
+        };
+
+        SchemaObject {
+            metadata: Some(Box::new(SchemaMetadata {
+                title: Some(Self::schema_name()),
+                description: Some(
+                    "Native Wyrd Card kind string or external kind object.".to_string(),
+                ),
+                ..SchemaMetadata::default()
+            })),
+            subschemas: Some(Box::new(SubschemaValidation {
+                one_of: Some(vec![native_schema.into(), external_schema.into()]),
+                ..SubschemaValidation::default()
+            })),
+            ..SchemaObject::default()
+        }
+        .into()
+    }
 }

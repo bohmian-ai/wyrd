@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::card::common::{AgentInterface, ProtocolProfile};
+use crate::card::common::{
+    AgentInterface, Governance, NonSecretValue, ObservationHooks, ProtocolProfile, Provider,
+};
 use crate::reference::CardRef;
 
 /// Protocol-neutral agent metadata and composition.
@@ -44,6 +46,12 @@ pub struct AgentSpec {
     /// Maximum loop iterations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_iterations: Option<u32>,
+    /// Preferred provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Provider>,
+    /// Preferred model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Supported interfaces.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interfaces: Vec<AgentInterface>,
@@ -56,9 +64,15 @@ pub struct AgentSpec {
     /// Security requirements.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub security_requirements: Vec<String>,
-    /// Provider metadata.
+    /// Provider metadata and hints.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub provider: BTreeMap<String, serde_json::Value>,
+    pub provider_metadata: BTreeMap<String, NonSecretValue>,
+    /// Governance and audit controls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance: Option<Governance>,
+    /// Observation hooks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_hooks: Option<ObservationHooks>,
     /// Documentation URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub documentation_url: Option<String>,
@@ -67,8 +81,8 @@ pub struct AgentSpec {
     pub icon_url: Option<String>,
     /// Signature metadata.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub signatures: BTreeMap<String, serde_json::Value>,
+    pub signatures: BTreeMap<String, NonSecretValue>,
     /// Free-form details.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub details: BTreeMap<String, serde_json::Value>,
+    pub details: BTreeMap<String, NonSecretValue>,
 }

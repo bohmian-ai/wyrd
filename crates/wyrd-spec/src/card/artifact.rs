@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::card::common::NonSecretValue;
 use crate::reference::CardRef;
 
 /// Versioned artifact descriptor.
@@ -32,5 +33,5 @@ pub struct ArtifactSpec {
     pub external_uri: Option<String>,
     /// Artifact metadata.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub metadata: BTreeMap<String, serde_json::Value>,
+    pub metadata: BTreeMap<String, NonSecretValue>,
 }

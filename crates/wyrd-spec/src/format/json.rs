@@ -9,8 +9,6 @@ use crate::error::WyrdError;
 /// Returns a Wyrd error when serialization fails.
 pub fn to_string_pretty(card: &Card) -> Result<String, WyrdError> {
     serde_json::to_string_pretty(card).map_err(|source| WyrdError::Internal {
-        code: "WYRD_SPEC_500_JSON_SERIALIZE".to_string(),
-        status: 500,
         message: "failed to serialize card to JSON".to_string(),
         details: serde_json::json!({ "source": source.to_string() }),
     })
@@ -22,8 +20,6 @@ pub fn to_string_pretty(card: &Card) -> Result<String, WyrdError> {
 /// Returns a Wyrd error when parsing fails.
 pub fn from_str(input: &str) -> Result<Card, WyrdError> {
     serde_json::from_str(input).map_err(|source| WyrdError::Validation {
-        code: "WYRD_SPEC_400_JSON_PARSE".to_string(),
-        status: 400,
         message: "failed to parse card JSON".to_string(),
         details: serde_json::json!({ "source": source.to_string() }),
     })

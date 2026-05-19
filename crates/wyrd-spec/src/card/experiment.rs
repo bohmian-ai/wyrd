@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::card::common::{MetricEntry, ParameterValue};
+use crate::card::common::{MetricEntry, NonSecretValue, ParameterValue};
 use crate::reference::CardRef;
 use crate::run::RunRef;
 
@@ -38,5 +38,5 @@ pub struct ExperimentSpec {
     pub artifact_refs: Vec<CardRef>,
     /// Free-form details.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub details: BTreeMap<String, serde_json::Value>,
+    pub details: BTreeMap<String, NonSecretValue>,
 }

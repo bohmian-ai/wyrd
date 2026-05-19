@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::card::common::NonSecretValue;
 use crate::reference::CardRef;
 
 /// Pure-data description of a dataset or data product.
@@ -33,5 +34,5 @@ pub struct DataSpec {
     pub artifact_refs: Vec<CardRef>,
     /// Free-form details.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub details: BTreeMap<String, serde_json::Value>,
+    pub details: BTreeMap<String, NonSecretValue>,
 }

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::card::common::NonSecretValue;
 use crate::reference::CardRef;
 
 /// Skill definition used by agent harnesses.
@@ -27,5 +28,5 @@ pub struct SkillSpec {
     pub output_schema: Option<serde_json::Value>,
     /// Free-form details.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub details: BTreeMap<String, serde_json::Value>,
+    pub details: BTreeMap<String, NonSecretValue>,
 }

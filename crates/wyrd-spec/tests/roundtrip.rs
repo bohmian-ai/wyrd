@@ -30,6 +30,9 @@ fn card_yaml_round_trip() {
     };
 
     let yaml = format::yaml::to_string(&card).unwrap();
+    assert!(yaml.contains("apiVersion: wyrd/v1"));
+    assert!(yaml.contains("type: Prompt"));
+    assert!(!yaml.contains("api_version:"));
     let decoded = format::yaml::from_str(&yaml).unwrap();
     assert_eq!(decoded, card);
 }

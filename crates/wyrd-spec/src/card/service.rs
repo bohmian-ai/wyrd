@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::card::common::{CredentialRef, NonSecretValue};
 use crate::reference::CardRef;
 
 /// Composition of cards used by an application or deployment.
@@ -24,10 +25,13 @@ pub struct ServiceSpec {
     pub entry_point: Option<String>,
     /// Deployment metadata.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub deployment: BTreeMap<String, serde_json::Value>,
+    pub deployment: BTreeMap<String, NonSecretValue>,
     /// Service config.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub service_config: BTreeMap<String, serde_json::Value>,
+    pub service_config: BTreeMap<String, NonSecretValue>,
+    /// Credential references required by this service.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_refs: Vec<CredentialRef>,
     /// Content hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
@@ -36,7 +40,7 @@ pub struct ServiceSpec {
     pub lock_hash: Option<String>,
     /// Free-form metadata.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub metadata: BTreeMap<String, serde_json::Value>,
+    pub metadata: BTreeMap<String, NonSecretValue>,
 }
 
 /// Alias-bound service component.
@@ -53,7 +57,10 @@ pub struct ServiceComponent {
     pub source: Option<ComponentSource>,
     /// Component config.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub config: BTreeMap<String, serde_json::Value>,
+    pub config: BTreeMap<String, NonSecretValue>,
+    /// Component credential references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_refs: Vec<CredentialRef>,
 }
 
 /// Development-time local source resolved by `lock` or `install`.
@@ -80,7 +87,7 @@ pub struct ServiceLock {
     pub lock_hash: String,
     /// Lock metadata.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub metadata: BTreeMap<String, serde_json::Value>,
+    pub metadata: BTreeMap<String, NonSecretValue>,
 }
 
 /// Locked resolved service component.
@@ -100,5 +107,5 @@ pub struct LockedComponent {
     pub content_hash: Option<String>,
     /// Component metadata.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub metadata: BTreeMap<String, serde_json::Value>,
+    pub metadata: BTreeMap<String, NonSecretValue>,
 }

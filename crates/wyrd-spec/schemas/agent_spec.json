@@ -1,0 +1,613 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentSpec",
+  "description": "Protocol-neutral agent metadata and composition.",
+  "type": "object",
+  "properties": {
+    "capabilities": {
+      "description": "Agent capabilities.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "default_input_modes": {
+      "description": "Default input modes.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "default_output_modes": {
+      "description": "Default output modes.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "description": {
+      "description": "Agent description.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "details": {
+      "description": "Free-form details.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/NonSecretValue"
+      }
+    },
+    "documentation_url": {
+      "description": "Documentation URL.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "governance": {
+      "description": "Governance and audit controls.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Governance"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "icon_url": {
+      "description": "Icon URL.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "interfaces": {
+      "description": "Supported interfaces.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/AgentInterface"
+      }
+    },
+    "max_iterations": {
+      "description": "Maximum loop iterations.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "memory_ref": {
+      "description": "Memory profile reference.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CardRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "model": {
+      "description": "Preferred model.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "observation_hooks": {
+      "description": "Observation hooks.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ObservationHooks"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "prompt_ref": {
+      "description": "Primary prompt reference.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CardRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "prompt_refs": {
+      "description": "Additional prompt references.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CardRef"
+      }
+    },
+    "protocol_profiles": {
+      "description": "Protocol profiles.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ProtocolProfile"
+      }
+    },
+    "provider": {
+      "description": "Preferred provider.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Provider"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "provider_metadata": {
+      "description": "Provider metadata and hints.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/NonSecretValue"
+      }
+    },
+    "security_requirements": {
+      "description": "Security requirements.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "security_schemes": {
+      "description": "Security scheme names or inline descriptors.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "signatures": {
+      "description": "Signature metadata.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/NonSecretValue"
+      }
+    },
+    "skill_refs": {
+      "description": "Skill references.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CardRef"
+      }
+    },
+    "subagent_refs": {
+      "description": "Sub-agent references.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CardRef"
+      }
+    },
+    "tool_refs": {
+      "description": "Tool references.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CardRef"
+      }
+    }
+  },
+  "definitions": {
+    "AgentInterface": {
+      "description": "Agent-facing interface declaration.",
+      "type": "object",
+      "required": [
+        "mode",
+        "name"
+      ],
+      "properties": {
+        "metadata": {
+          "description": "Interface metadata.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "mode": {
+          "description": "Interface mode, such as `text`, `json`, `audio`, or `tool`.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Interface name.",
+          "type": "string"
+        },
+        "schema_ref": {
+          "description": "Optional schema Card reference.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "CardKind": {
+      "title": "CardKind",
+      "description": "Native Wyrd Card kind string or external kind object.",
+      "oneOf": [
+        {
+          "title": "NativeCardKind",
+          "description": "Native Wyrd Card kind.",
+          "type": "string",
+          "enum": [
+            "Data",
+            "Model",
+            "Experiment",
+            "Prompt",
+            "Tool",
+            "Agent",
+            "Workflow",
+            "Eval",
+            "Drift",
+            "Service",
+            "Policy",
+            "Mcp",
+            "Skill",
+            "SubAgent",
+            "Audit",
+            "Artifact"
+          ]
+        },
+        {
+          "title": "ExternalCardKind",
+          "description": "External Card kind with schema hash.",
+          "type": "object",
+          "required": [
+            "kind",
+            "schema_hash"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"
+            },
+            "schema_hash": {
+              "type": "string",
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardRef": {
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Referenced Card kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "Referenced Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "space": {
+          "description": "Optional space; omitted means current/default space.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Optional resolved UID.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Exact referenced Card version.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VersionBlock"
+            }
+          ]
+        }
+      }
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "Governance": {
+      "description": "Declarative governance and audit hooks.",
+      "type": "object",
+      "properties": {
+        "approval_requirements": {
+          "description": "Required approval labels or scopes.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "audit_ref": {
+          "description": "Audit Card reference.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "metadata": {
+          "description": "Governance metadata.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "policy_refs": {
+          "description": "Policy Card references.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRef"
+          }
+        }
+      }
+    },
+    "NonSecretValue": {
+      "description": "Non-secret JSON-like configuration value.",
+      "oneOf": [
+        {
+          "description": "String value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "str"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Numeric value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "number"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "Boolean value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "List of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "list"
+              ]
+            },
+            "value": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        },
+        {
+          "description": "Object of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "object"
+              ]
+            },
+            "value": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ObservationHooks": {
+      "description": "Observation routing hooks for Cards that produce runs or events.",
+      "type": "object",
+      "properties": {
+        "events": {
+          "description": "Event names to observe.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "route_refs": {
+          "description": "Observation route Card references.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRef"
+          }
+        }
+      }
+    },
+    "ProtocolProfile": {
+      "description": "Protocol-specific public metadata for an agent or service interface.",
+      "type": "object",
+      "required": [
+        "protocol"
+      ],
+      "properties": {
+        "metadata": {
+          "description": "Protocol-specific declarative metadata.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "protocol": {
+          "description": "Protocol name, such as `a2a`, `ag_ui`, `a2ui`, `mcp`, or `http`.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Protocol version.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "Provider": {
+      "description": "Provider identity for LLM and agentic specs.",
+      "oneOf": [
+        {
+          "description": "OpenAI-compatible provider.",
+          "type": "string",
+          "enum": [
+            "OpenAi"
+          ]
+        },
+        {
+          "description": "Anthropic-compatible provider.",
+          "type": "string",
+          "enum": [
+            "Anthropic"
+          ]
+        },
+        {
+          "description": "Gemini-compatible provider.",
+          "type": "string",
+          "enum": [
+            "Gemini"
+          ]
+        },
+        {
+          "description": "Vertex-compatible provider.",
+          "type": "string",
+          "enum": [
+            "Vertex"
+          ]
+        },
+        {
+          "description": "Bedrock-compatible provider.",
+          "type": "string",
+          "enum": [
+            "Bedrock"
+          ]
+        },
+        {
+          "description": "Google ADK-compatible provider.",
+          "type": "string",
+          "enum": [
+            "GoogleAdk"
+          ]
+        },
+        {
+          "description": "Other named provider.",
+          "type": "object",
+          "required": [
+            "Other"
+          ],
+          "properties": {
+            "Other": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "VersionBlock": {
+      "description": "Semver-compatible version string.",
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,508 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PromptSpec",
+  "description": "Prompt template and metadata.",
+  "type": "object",
+  "required": [
+    "template"
+  ],
+  "properties": {
+    "audit_ref": {
+      "description": "Audit Card reference.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CardRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "content_hash": {
+      "description": "Content hash.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "description": {
+      "description": "Prompt description.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "details": {
+      "description": "Free-form details.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/NonSecretValue"
+      }
+    },
+    "experiment_ref": {
+      "description": "Related experiment.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CardRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "input_schema": {
+      "description": "Input schema."
+    },
+    "messages": {
+      "description": "Structured prompt messages.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/PromptMessage"
+      }
+    },
+    "model": {
+      "description": "Model identifier.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "output_schema": {
+      "description": "Output schema or structured-output contract."
+    },
+    "parameters": {
+      "description": "Provider parameters.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/NonSecretValue"
+      }
+    },
+    "provider": {
+      "description": "Provider identity.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Provider"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "template": {
+      "description": "Template body.",
+      "type": "string"
+    },
+    "template_format": {
+      "description": "Template format, such as `text`, `jinja`, or `chat`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_refs": {
+      "description": "Tool references made available to this prompt.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CardRef"
+      }
+    },
+    "variable_specs": {
+      "description": "Structured variable descriptors.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/PromptVariable"
+      }
+    },
+    "variables": {
+      "description": "Required variable names.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "definitions": {
+    "CardKind": {
+      "title": "CardKind",
+      "description": "Native Wyrd Card kind string or external kind object.",
+      "oneOf": [
+        {
+          "title": "NativeCardKind",
+          "description": "Native Wyrd Card kind.",
+          "type": "string",
+          "enum": [
+            "Data",
+            "Model",
+            "Experiment",
+            "Prompt",
+            "Tool",
+            "Agent",
+            "Workflow",
+            "Eval",
+            "Drift",
+            "Service",
+            "Policy",
+            "Mcp",
+            "Skill",
+            "SubAgent",
+            "Audit",
+            "Artifact"
+          ]
+        },
+        {
+          "title": "ExternalCardKind",
+          "description": "External Card kind with schema hash.",
+          "type": "object",
+          "required": [
+            "kind",
+            "schema_hash"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"
+            },
+            "schema_hash": {
+              "type": "string",
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardRef": {
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Referenced Card kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "Referenced Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "space": {
+          "description": "Optional space; omitted means current/default space.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Optional resolved UID.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Exact referenced Card version.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VersionBlock"
+            }
+          ]
+        }
+      }
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "NonSecretValue": {
+      "description": "Non-secret JSON-like configuration value.",
+      "oneOf": [
+        {
+          "description": "String value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "str"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Numeric value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "number"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "Boolean value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "List of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "list"
+              ]
+            },
+            "value": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        },
+        {
+          "description": "Object of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "object"
+              ]
+            },
+            "value": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "PromptMessage": {
+      "description": "One prompt message.",
+      "type": "object",
+      "required": [
+        "content",
+        "role"
+      ],
+      "properties": {
+        "content": {
+          "description": "Message content template.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Optional message name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "description": "Message role.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PromptRole"
+            }
+          ]
+        }
+      }
+    },
+    "PromptRole": {
+      "description": "Chat prompt role.",
+      "oneOf": [
+        {
+          "description": "System instruction.",
+          "type": "string",
+          "enum": [
+            "system"
+          ]
+        },
+        {
+          "description": "User message.",
+          "type": "string",
+          "enum": [
+            "user"
+          ]
+        },
+        {
+          "description": "Assistant message.",
+          "type": "string",
+          "enum": [
+            "assistant"
+          ]
+        },
+        {
+          "description": "Tool result message.",
+          "type": "string",
+          "enum": [
+            "tool"
+          ]
+        }
+      ]
+    },
+    "PromptVariable": {
+      "description": "Prompt variable descriptor.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "description": {
+          "description": "Variable description.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Variable name.",
+          "type": "string"
+        },
+        "required": {
+          "description": "Whether the variable is required.",
+          "default": false,
+          "type": "boolean"
+        },
+        "schema": {
+          "description": "Optional variable schema."
+        }
+      }
+    },
+    "Provider": {
+      "description": "Provider identity for LLM and agentic specs.",
+      "oneOf": [
+        {
+          "description": "OpenAI-compatible provider.",
+          "type": "string",
+          "enum": [
+            "OpenAi"
+          ]
+        },
+        {
+          "description": "Anthropic-compatible provider.",
+          "type": "string",
+          "enum": [
+            "Anthropic"
+          ]
+        },
+        {
+          "description": "Gemini-compatible provider.",
+          "type": "string",
+          "enum": [
+            "Gemini"
+          ]
+        },
+        {
+          "description": "Vertex-compatible provider.",
+          "type": "string",
+          "enum": [
+            "Vertex"
+          ]
+        },
+        {
+          "description": "Bedrock-compatible provider.",
+          "type": "string",
+          "enum": [
+            "Bedrock"
+          ]
+        },
+        {
+          "description": "Google ADK-compatible provider.",
+          "type": "string",
+          "enum": [
+            "GoogleAdk"
+          ]
+        },
+        {
+          "description": "Other named provider.",
+          "type": "object",
+          "required": [
+            "Other"
+          ],
+          "properties": {
+            "Other": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "VersionBlock": {
+      "description": "Semver-compatible version string.",
+      "type": "string"
+    }
+  }
+}

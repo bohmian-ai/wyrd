@@ -1,0 +1,649 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkflowSpec",
+  "description": "Declarative workflow definition.",
+  "type": "object",
+  "properties": {
+    "description": {
+      "description": "Workflow description.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "details": {
+      "description": "Free-form details.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/NonSecretValue"
+      }
+    },
+    "governance": {
+      "description": "Governance and audit controls.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Governance"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "inputs": {
+      "description": "Typed workflow inputs.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/ParameterValue"
+      }
+    },
+    "observation_hooks": {
+      "description": "Observation hooks.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ObservationHooks"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "outputs": {
+      "description": "Output descriptors.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "steps": {
+      "description": "Workflow steps.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/WorkflowStep"
+      }
+    }
+  },
+  "definitions": {
+    "CardKind": {
+      "title": "CardKind",
+      "description": "Native Wyrd Card kind string or external kind object.",
+      "oneOf": [
+        {
+          "title": "NativeCardKind",
+          "description": "Native Wyrd Card kind.",
+          "type": "string",
+          "enum": [
+            "Data",
+            "Model",
+            "Experiment",
+            "Prompt",
+            "Tool",
+            "Agent",
+            "Workflow",
+            "Eval",
+            "Drift",
+            "Service",
+            "Policy",
+            "Mcp",
+            "Skill",
+            "SubAgent",
+            "Audit",
+            "Artifact"
+          ]
+        },
+        {
+          "title": "ExternalCardKind",
+          "description": "External Card kind with schema hash.",
+          "type": "object",
+          "required": [
+            "kind",
+            "schema_hash"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"
+            },
+            "schema_hash": {
+              "type": "string",
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardRef": {
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Referenced Card kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "Referenced Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "space": {
+          "description": "Optional space; omitted means current/default space.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Optional resolved UID.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Exact referenced Card version.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VersionBlock"
+            }
+          ]
+        }
+      }
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "Governance": {
+      "description": "Declarative governance and audit hooks.",
+      "type": "object",
+      "properties": {
+        "approval_requirements": {
+          "description": "Required approval labels or scopes.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "audit_ref": {
+          "description": "Audit Card reference.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "metadata": {
+          "description": "Governance metadata.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "policy_refs": {
+          "description": "Policy Card references.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRef"
+          }
+        }
+      }
+    },
+    "NonSecretValue": {
+      "description": "Non-secret JSON-like configuration value.",
+      "oneOf": [
+        {
+          "description": "String value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "str"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Numeric value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "number"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "Boolean value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "List of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "list"
+              ]
+            },
+            "value": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        },
+        {
+          "description": "Object of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "object"
+              ]
+            },
+            "value": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ObservationHooks": {
+      "description": "Observation routing hooks for Cards that produce runs or events.",
+      "type": "object",
+      "properties": {
+        "events": {
+          "description": "Event names to observe.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "route_refs": {
+          "description": "Observation route Card references.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRef"
+          }
+        }
+      }
+    },
+    "ParameterValue": {
+      "description": "Typed parameter value for experiments, runs, workflows, and tools.",
+      "oneOf": [
+        {
+          "description": "Integer value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "int"
+              ]
+            },
+            "value": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        },
+        {
+          "description": "Floating-point value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "float"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "String value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "str"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Boolean value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "Structured JSON value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "json"
+              ]
+            },
+            "value": true
+          }
+        }
+      ]
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "VersionBlock": {
+      "description": "Semver-compatible version string.",
+      "type": "string"
+    },
+    "WorkflowAction": {
+      "description": "Workflow action target.",
+      "oneOf": [
+        {
+          "description": "Skill action.",
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/CardRef"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "skill"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Agent action.",
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/CardRef"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "agent"
+              ]
+            }
+          }
+        },
+        {
+          "description": "MCP server action.",
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/CardRef"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "mcp"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Tool action.",
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/CardRef"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tool"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Prompt action.",
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/CardRef"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "prompt"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "WorkflowRetryPolicy": {
+      "description": "Workflow retry policy.",
+      "type": "object",
+      "required": [
+        "max_retries"
+      ],
+      "properties": {
+        "initial_backoff_ms": {
+          "description": "Initial backoff in milliseconds.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_retries": {
+          "description": "Maximum retry attempts.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "WorkflowStep": {
+      "description": "One workflow step.",
+      "type": "object",
+      "required": [
+        "action",
+        "id"
+      ],
+      "properties": {
+        "action": {
+          "description": "Step action kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/WorkflowAction"
+            }
+          ]
+        },
+        "condition": {
+          "description": "Optional condition expression.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "depends_on": {
+          "description": "Dependency step IDs.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "display": {
+          "description": "Display metadata.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "id": {
+          "description": "Stable step ID.",
+          "type": "string"
+        },
+        "inputs": {
+          "description": "Step inputs.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/ParameterValue"
+          }
+        },
+        "retry": {
+          "description": "Retry policy.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WorkflowRetryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timeout_seconds": {
+          "description": "Timeout in seconds.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    }
+  }
+}

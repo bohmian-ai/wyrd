@@ -1,0 +1,549 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DriftSpec",
+  "description": "Reusable drift-monitor definition.",
+  "type": "object",
+  "required": [
+    "method"
+  ],
+  "properties": {
+    "baseline_ref": {
+      "description": "Baseline data reference.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CardRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "description": {
+      "description": "Drift description.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "details": {
+      "description": "Free-form details.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/NonSecretValue"
+      }
+    },
+    "features": {
+      "description": "Feature names.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "method": {
+      "description": "Drift method.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/DriftMethod"
+        }
+      ]
+    },
+    "profile": {
+      "description": "Method-specific profile.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DriftProfile"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "target_refs": {
+      "description": "Target data/model/service references.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CardRef"
+      }
+    },
+    "thresholds": {
+      "description": "Thresholds by metric.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "number",
+        "format": "double"
+      }
+    }
+  },
+  "definitions": {
+    "AgentEvalProfile": {
+      "description": "Agent evaluation drift profile fields.",
+      "type": "object",
+      "required": [
+        "task"
+      ],
+      "properties": {
+        "alert_threshold": {
+          "description": "Alert threshold.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "sample_ratio": {
+          "description": "Sample ratio.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "task": {
+          "description": "Evaluation task.",
+          "type": "string"
+        }
+      }
+    },
+    "CardKind": {
+      "title": "CardKind",
+      "description": "Native Wyrd Card kind string or external kind object.",
+      "oneOf": [
+        {
+          "title": "NativeCardKind",
+          "description": "Native Wyrd Card kind.",
+          "type": "string",
+          "enum": [
+            "Data",
+            "Model",
+            "Experiment",
+            "Prompt",
+            "Tool",
+            "Agent",
+            "Workflow",
+            "Eval",
+            "Drift",
+            "Service",
+            "Policy",
+            "Mcp",
+            "Skill",
+            "SubAgent",
+            "Audit",
+            "Artifact"
+          ]
+        },
+        {
+          "title": "ExternalCardKind",
+          "description": "External Card kind with schema hash.",
+          "type": "object",
+          "required": [
+            "kind",
+            "schema_hash"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"
+            },
+            "schema_hash": {
+              "type": "string",
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardRef": {
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Referenced Card kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "Referenced Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "space": {
+          "description": "Optional space; omitted means current/default space.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Optional resolved UID.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Exact referenced Card version.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VersionBlock"
+            }
+          ]
+        }
+      }
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "CustomProfile": {
+      "description": "Custom drift profile fields.",
+      "type": "object",
+      "required": [
+        "metric"
+      ],
+      "properties": {
+        "alert_threshold": {
+          "description": "Alert threshold.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "metric": {
+          "description": "Metric name.",
+          "type": "string"
+        },
+        "sample_size": {
+          "description": "Sample size.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "DriftMethod": {
+      "description": "Supported drift monitor method.",
+      "oneOf": [
+        {
+          "description": "Statistical process-control drift.",
+          "type": "string",
+          "enum": [
+            "Spc"
+          ]
+        },
+        {
+          "description": "Population stability index drift.",
+          "type": "string",
+          "enum": [
+            "Psi"
+          ]
+        },
+        {
+          "description": "Custom metric drift.",
+          "type": "string",
+          "enum": [
+            "Custom"
+          ]
+        },
+        {
+          "description": "Agent evaluation drift.",
+          "type": "string",
+          "enum": [
+            "Agent"
+          ]
+        },
+        {
+          "description": "External drift method.",
+          "type": "string",
+          "enum": [
+            "External"
+          ]
+        }
+      ]
+    },
+    "DriftProfile": {
+      "description": "Drift profile configuration.",
+      "oneOf": [
+        {
+          "description": "SPC profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/SpcProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Spc"
+              ]
+            }
+          }
+        },
+        {
+          "description": "PSI profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/PsiProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Psi"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Custom profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/CustomProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Custom"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Agent profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/AgentEvalProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Agent"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "NonSecretValue": {
+      "description": "Non-secret JSON-like configuration value.",
+      "oneOf": [
+        {
+          "description": "String value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "str"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Numeric value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "number"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "Boolean value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "List of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "list"
+              ]
+            },
+            "value": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        },
+        {
+          "description": "Object of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "object"
+              ]
+            },
+            "value": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "PsiProfile": {
+      "description": "PSI profile fields.",
+      "type": "object",
+      "properties": {
+        "alert_threshold": {
+          "description": "Alert threshold.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "binning_strategy": {
+          "description": "Numeric binning strategy.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "categorical_features": {
+          "description": "Categorical feature names.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "SpcProfile": {
+      "description": "SPC profile fields.",
+      "type": "object",
+      "properties": {
+        "alert_threshold": {
+          "description": "Alert threshold.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "feature_map": {
+          "description": "Feature map.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "sample_size": {
+          "description": "Sample size.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "VersionBlock": {
+      "description": "Semver-compatible version string.",
+      "type": "string"
+    }
+  }
+}

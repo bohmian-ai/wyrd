@@ -1,0 +1,3374 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Card",
+  "description": "Universal registered Card envelope.",
+  "type": "object",
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
+  "properties": {
+    "apiVersion": {
+      "description": "API version. Must be `wyrd/v1` for v1 Cards.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ApiVersion"
+        }
+      ]
+    },
+    "kind": {
+      "description": "Card kind discriminator.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardKind"
+        }
+      ]
+    },
+    "metadata": {
+      "description": "Card metadata.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Metadata"
+        }
+      ]
+    },
+    "relationships": {
+      "description": "Server-derived relationship summary.",
+      "default": {},
+      "allOf": [
+        {
+          "$ref": "#/definitions/Relationships"
+        }
+      ]
+    },
+    "spec": {
+      "description": "Kind-specific spec payload.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Spec"
+        }
+      ]
+    },
+    "status": {
+      "description": "Optional server-derived status.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Status"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "AgentEvalProfile": {
+      "description": "Agent evaluation drift profile fields.",
+      "type": "object",
+      "required": [
+        "task"
+      ],
+      "properties": {
+        "alert_threshold": {
+          "description": "Alert threshold.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "sample_ratio": {
+          "description": "Sample ratio.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "task": {
+          "description": "Evaluation task.",
+          "type": "string"
+        }
+      }
+    },
+    "AgentInterface": {
+      "description": "Agent-facing interface declaration.",
+      "type": "object",
+      "required": [
+        "mode",
+        "name"
+      ],
+      "properties": {
+        "metadata": {
+          "description": "Interface metadata.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "mode": {
+          "description": "Interface mode, such as `text`, `json`, `audio`, or `tool`.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Interface name.",
+          "type": "string"
+        },
+        "schema_ref": {
+          "description": "Optional schema Card reference.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "AgenticEvalProfile": {
+      "description": "Agentic eval profile.",
+      "type": "object",
+      "properties": {
+        "max_steps": {
+          "description": "Maximum step count for the evaluated behavior.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "required_tools": {
+          "description": "Required tool names or Card aliases.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "scenarios": {
+          "description": "Scenario definitions.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EvalScenario"
+          }
+        }
+      }
+    },
+    "ApiVersion": {
+      "description": "Canonical Wyrd API version.",
+      "type": "string"
+    },
+    "AssertionEvalProfile": {
+      "description": "Assertion-based eval profile.",
+      "type": "object",
+      "properties": {
+        "input_schema": {
+          "description": "Optional input schema."
+        },
+        "output_schema": {
+          "description": "Optional output schema."
+        },
+        "rules": {
+          "description": "Assertion expressions or rule names.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "BenchmarkEvalProfile": {
+      "description": "Benchmark eval profile.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "dataset_refs": {
+          "description": "Dataset Card references.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRef"
+          }
+        },
+        "metrics": {
+          "description": "Expected metric names.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "description": "Benchmark name.",
+          "type": "string"
+        }
+      }
+    },
+    "CardKind": {
+      "title": "CardKind",
+      "description": "Native Wyrd Card kind string or external kind object.",
+      "oneOf": [
+        {
+          "title": "NativeCardKind",
+          "description": "Native Wyrd Card kind.",
+          "type": "string",
+          "enum": [
+            "Data",
+            "Model",
+            "Experiment",
+            "Prompt",
+            "Tool",
+            "Agent",
+            "Workflow",
+            "Eval",
+            "Drift",
+            "Service",
+            "Policy",
+            "Mcp",
+            "Skill",
+            "SubAgent",
+            "Audit",
+            "Artifact"
+          ]
+        },
+        {
+          "title": "ExternalCardKind",
+          "description": "External Card kind with schema hash.",
+          "type": "object",
+          "required": [
+            "kind",
+            "schema_hash"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"
+            },
+            "schema_hash": {
+              "type": "string",
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardRef": {
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Referenced Card kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "Referenced Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "space": {
+          "description": "Optional space; omitted means current/default space.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Optional resolved UID.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Exact referenced Card version.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VersionBlock"
+            }
+          ]
+        }
+      }
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "ComponentSource": {
+      "description": "Development-time local source resolved by `lock` or `install`.",
+      "type": "object",
+      "required": [
+        "kind",
+        "path"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Source kind hint.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Local path.",
+          "type": "string"
+        }
+      }
+    },
+    "CredentialRef": {
+      "description": "Reference to a credential or secret managed outside public Card specs.",
+      "type": "object",
+      "required": [
+        "name",
+        "provider"
+      ],
+      "properties": {
+        "name": {
+          "description": "Key or logical name in that provider.",
+          "type": "string"
+        },
+        "provider": {
+          "description": "Credential provider or secret store name.",
+          "type": "string"
+        }
+      }
+    },
+    "CustomEvalProfile": {
+      "description": "Custom eval profile.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "config": {
+          "description": "Non-secret profile configuration.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "name": {
+          "description": "Custom profile name.",
+          "type": "string"
+        }
+      }
+    },
+    "CustomProfile": {
+      "description": "Custom drift profile fields.",
+      "type": "object",
+      "required": [
+        "metric"
+      ],
+      "properties": {
+        "alert_threshold": {
+          "description": "Alert threshold.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "metric": {
+          "description": "Metric name.",
+          "type": "string"
+        },
+        "sample_size": {
+          "description": "Sample size.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "DriftMethod": {
+      "description": "Supported drift monitor method.",
+      "oneOf": [
+        {
+          "description": "Statistical process-control drift.",
+          "type": "string",
+          "enum": [
+            "Spc"
+          ]
+        },
+        {
+          "description": "Population stability index drift.",
+          "type": "string",
+          "enum": [
+            "Psi"
+          ]
+        },
+        {
+          "description": "Custom metric drift.",
+          "type": "string",
+          "enum": [
+            "Custom"
+          ]
+        },
+        {
+          "description": "Agent evaluation drift.",
+          "type": "string",
+          "enum": [
+            "Agent"
+          ]
+        },
+        {
+          "description": "External drift method.",
+          "type": "string",
+          "enum": [
+            "External"
+          ]
+        }
+      ]
+    },
+    "DriftProfile": {
+      "description": "Drift profile configuration.",
+      "oneOf": [
+        {
+          "description": "SPC profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/SpcProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Spc"
+              ]
+            }
+          }
+        },
+        {
+          "description": "PSI profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/PsiProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Psi"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Custom profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/CustomProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Custom"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Agent profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/AgentEvalProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Agent"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "EvalAssertion": {
+      "description": "Evaluation assertion.",
+      "type": "object",
+      "required": [
+        "name",
+        "rule"
+      ],
+      "properties": {
+        "metadata": {
+          "description": "Assertion metadata.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "name": {
+          "description": "Assertion name.",
+          "type": "string"
+        },
+        "rule": {
+          "description": "Assertion expression or declarative rule.",
+          "type": "string"
+        }
+      }
+    },
+    "EvalPassGate": {
+      "description": "Evaluation pass gate.",
+      "type": "object",
+      "required": [
+        "name",
+        "operator",
+        "threshold"
+      ],
+      "properties": {
+        "name": {
+          "description": "Metric or assertion name.",
+          "type": "string"
+        },
+        "operator": {
+          "description": "Comparison operator.",
+          "type": "string"
+        },
+        "threshold": {
+          "description": "Threshold value.",
+          "type": "number",
+          "format": "double"
+        }
+      }
+    },
+    "EvalProfile": {
+      "description": "Typed reusable evaluation profile.",
+      "oneOf": [
+        {
+          "description": "Assertion bundle profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/AssertionEvalProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "assertion"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Judge prompt/profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/JudgeEvalProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "judge"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Benchmark profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/BenchmarkEvalProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "benchmark"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Agentic evaluation profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/AgenticEvalProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "agentic"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Custom profile.",
+          "type": "object",
+          "required": [
+            "config",
+            "type"
+          ],
+          "properties": {
+            "config": {
+              "$ref": "#/definitions/CustomEvalProfile"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "custom"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "EvalRubricItem": {
+      "description": "Judge rubric item.",
+      "type": "object",
+      "required": [
+        "description",
+        "name"
+      ],
+      "properties": {
+        "description": {
+          "description": "Criterion description.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Rubric criterion name.",
+          "type": "string"
+        },
+        "weight": {
+          "description": "Optional weight.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      }
+    },
+    "EvalScenario": {
+      "description": "Agentic eval scenario.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "expectations": {
+          "description": "Expected outcomes or checks.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "inputs": {
+          "description": "Scenario input values.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/ParameterValue"
+          }
+        },
+        "name": {
+          "description": "Scenario name.",
+          "type": "string"
+        }
+      }
+    },
+    "EvalType": {
+      "description": "Reusable evaluation category.",
+      "oneOf": [
+        {
+          "description": "Rule/assertion evaluation.",
+          "type": "string",
+          "enum": [
+            "assertion"
+          ]
+        },
+        {
+          "description": "LLM or model judge evaluation.",
+          "type": "string",
+          "enum": [
+            "judge"
+          ]
+        },
+        {
+          "description": "Dataset or benchmark evaluation.",
+          "type": "string",
+          "enum": [
+            "benchmark"
+          ]
+        },
+        {
+          "description": "Agentic evaluation of tool use or multi-step behavior.",
+          "type": "string",
+          "enum": [
+            "agentic"
+          ]
+        },
+        {
+          "description": "Custom evaluation profile.",
+          "type": "string",
+          "enum": [
+            "custom"
+          ]
+        }
+      ]
+    },
+    "Governance": {
+      "description": "Declarative governance and audit hooks.",
+      "type": "object",
+      "properties": {
+        "approval_requirements": {
+          "description": "Required approval labels or scopes.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "audit_ref": {
+          "description": "Audit Card reference.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "metadata": {
+          "description": "Governance metadata.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "policy_refs": {
+          "description": "Policy Card references.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRef"
+          }
+        }
+      }
+    },
+    "JudgeEvalProfile": {
+      "description": "Judge-based eval profile.",
+      "type": "object",
+      "properties": {
+        "config": {
+          "description": "Judge configuration without secret values.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "prompt_refs": {
+          "description": "Prompt Cards used by the judge.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRef"
+          }
+        },
+        "rubric": {
+          "description": "Judge rubric.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EvalRubricItem"
+          }
+        }
+      }
+    },
+    "Metadata": {
+      "description": "Card metadata common to every kind.",
+      "type": "object",
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "annotations": {
+          "description": "Free-form metadata.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "artifact_hash": {
+          "description": "Artifact content hash.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "labels": {
+          "description": "Display labels.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "description": "Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "space": {
+          "description": "Optional space.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "spec_hash": {
+          "description": "Spec content hash.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uid": {
+          "description": "Optional resolved UID.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Exact Card version.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VersionBlock"
+            }
+          ]
+        }
+      }
+    },
+    "MetricEntry": {
+      "description": "Metric summary entry.",
+      "type": "object",
+      "required": [
+        "name",
+        "value"
+      ],
+      "properties": {
+        "created_at": {
+          "description": "Metric creation timestamp.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "is_eval": {
+          "description": "Whether this metric came from evaluation.",
+          "default": false,
+          "type": "boolean"
+        },
+        "name": {
+          "description": "Metric name.",
+          "type": "string"
+        },
+        "step": {
+          "description": "Optional step.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "timestamp": {
+          "description": "Metric event timestamp.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "value": {
+          "description": "Numeric metric value.",
+          "type": "number",
+          "format": "double"
+        }
+      }
+    },
+    "NonSecretValue": {
+      "description": "Non-secret JSON-like configuration value.",
+      "oneOf": [
+        {
+          "description": "String value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "str"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Numeric value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "number"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "Boolean value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "List of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "list"
+              ]
+            },
+            "value": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        },
+        {
+          "description": "Object of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "object"
+              ]
+            },
+            "value": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ObservationHooks": {
+      "description": "Observation routing hooks for Cards that produce runs or events.",
+      "type": "object",
+      "properties": {
+        "events": {
+          "description": "Event names to observe.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "route_refs": {
+          "description": "Observation route Card references.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRef"
+          }
+        }
+      }
+    },
+    "ParameterValue": {
+      "description": "Typed parameter value for experiments, runs, workflows, and tools.",
+      "oneOf": [
+        {
+          "description": "Integer value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "int"
+              ]
+            },
+            "value": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        },
+        {
+          "description": "Floating-point value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "float"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "String value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "str"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Boolean value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "Structured JSON value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "json"
+              ]
+            },
+            "value": true
+          }
+        }
+      ]
+    },
+    "PolicyRule": {
+      "description": "One policy rule.",
+      "type": "object",
+      "required": [
+        "action",
+        "expression",
+        "name"
+      ],
+      "properties": {
+        "action": {
+          "description": "Action such as `allow`, `warn`, `block`, or `approval_required`.",
+          "type": "string"
+        },
+        "expression": {
+          "description": "Rule expression.",
+          "type": "string"
+        },
+        "metadata": {
+          "description": "Rule metadata.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "name": {
+          "description": "Rule name.",
+          "type": "string"
+        }
+      }
+    },
+    "PromptMessage": {
+      "description": "One prompt message.",
+      "type": "object",
+      "required": [
+        "content",
+        "role"
+      ],
+      "properties": {
+        "content": {
+          "description": "Message content template.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Optional message name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "description": "Message role.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PromptRole"
+            }
+          ]
+        }
+      }
+    },
+    "PromptRole": {
+      "description": "Chat prompt role.",
+      "oneOf": [
+        {
+          "description": "System instruction.",
+          "type": "string",
+          "enum": [
+            "system"
+          ]
+        },
+        {
+          "description": "User message.",
+          "type": "string",
+          "enum": [
+            "user"
+          ]
+        },
+        {
+          "description": "Assistant message.",
+          "type": "string",
+          "enum": [
+            "assistant"
+          ]
+        },
+        {
+          "description": "Tool result message.",
+          "type": "string",
+          "enum": [
+            "tool"
+          ]
+        }
+      ]
+    },
+    "PromptVariable": {
+      "description": "Prompt variable descriptor.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "description": {
+          "description": "Variable description.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Variable name.",
+          "type": "string"
+        },
+        "required": {
+          "description": "Whether the variable is required.",
+          "default": false,
+          "type": "boolean"
+        },
+        "schema": {
+          "description": "Optional variable schema."
+        }
+      }
+    },
+    "ProtocolProfile": {
+      "description": "Protocol-specific public metadata for an agent or service interface.",
+      "type": "object",
+      "required": [
+        "protocol"
+      ],
+      "properties": {
+        "metadata": {
+          "description": "Protocol-specific declarative metadata.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "protocol": {
+          "description": "Protocol name, such as `a2a`, `ag_ui`, `a2ui`, `mcp`, or `http`.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Protocol version.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "Provider": {
+      "description": "Provider identity for LLM and agentic specs.",
+      "oneOf": [
+        {
+          "description": "OpenAI-compatible provider.",
+          "type": "string",
+          "enum": [
+            "OpenAi"
+          ]
+        },
+        {
+          "description": "Anthropic-compatible provider.",
+          "type": "string",
+          "enum": [
+            "Anthropic"
+          ]
+        },
+        {
+          "description": "Gemini-compatible provider.",
+          "type": "string",
+          "enum": [
+            "Gemini"
+          ]
+        },
+        {
+          "description": "Vertex-compatible provider.",
+          "type": "string",
+          "enum": [
+            "Vertex"
+          ]
+        },
+        {
+          "description": "Bedrock-compatible provider.",
+          "type": "string",
+          "enum": [
+            "Bedrock"
+          ]
+        },
+        {
+          "description": "Google ADK-compatible provider.",
+          "type": "string",
+          "enum": [
+            "GoogleAdk"
+          ]
+        },
+        {
+          "description": "Other named provider.",
+          "type": "object",
+          "required": [
+            "Other"
+          ],
+          "properties": {
+            "Other": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "PsiProfile": {
+      "description": "PSI profile fields.",
+      "type": "object",
+      "properties": {
+        "alert_threshold": {
+          "description": "Alert threshold.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "binning_strategy": {
+          "description": "Numeric binning strategy.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "categorical_features": {
+          "description": "Categorical feature names.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "Relationships": {
+      "description": "Server-derived relationship summary for graph, UI, policy, imports, and diff.",
+      "type": "object",
+      "properties": {
+        "inbound": {
+          "description": "Inbound references as normalized display strings.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "outbound": {
+          "description": "Outbound references as normalized display strings.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "RunKind": {
+      "description": "Execution kind recorded as a Run.",
+      "oneOf": [
+        {
+          "description": "Training execution.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "training"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Inference execution.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "inference"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Offline or batch evaluation execution.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "offline_eval"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Drift check execution.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "drift_check"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Import execution.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "import"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Workflow execution.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "workflow"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Externally defined execution kind.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "external"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "RunRef": {
+      "description": "Reference to a Run.",
+      "type": "object",
+      "required": [
+        "kind",
+        "uid"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Run kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RunKind"
+            }
+          ]
+        },
+        "labels": {
+          "description": "Query/display labels.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "space": {
+          "description": "Optional space.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Run UID. Promoted to `RunUid` in the Runs phase.",
+          "type": "string"
+        }
+      }
+    },
+    "ServiceComponent": {
+      "description": "Alias-bound service component.",
+      "type": "object",
+      "required": [
+        "alias",
+        "ref"
+      ],
+      "properties": {
+        "alias": {
+          "description": "Local AppState handle.",
+          "type": "string"
+        },
+        "config": {
+          "description": "Component config.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "credential_refs": {
+          "description": "Component credential references.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CredentialRef"
+          }
+        },
+        "ref": {
+          "description": "Canonical Card reference.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        "source": {
+          "description": "Optional development-time source.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ComponentSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "SpcProfile": {
+      "description": "SPC profile fields.",
+      "type": "object",
+      "properties": {
+        "alert_threshold": {
+          "description": "Alert threshold.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "feature_map": {
+          "description": "Feature map.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "sample_size": {
+          "description": "Sample size.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Spec": {
+      "description": "Kind-specific Card spec payload.",
+      "oneOf": [
+        {
+          "description": "Data card spec.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "artifact_refs": {
+              "description": "Artifact references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "audit_ref": {
+              "description": "Audit Card reference.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "data_type": {
+              "description": "Logical data type.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "description": {
+              "description": "Dataset description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "details": {
+              "description": "Free-form details.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "experiment_ref": {
+              "description": "Producing or related experiment.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "schema_ref": {
+              "description": "Schema Card reference.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "source_uri": {
+              "description": "Dataset source URI.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Data"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Model card spec.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "artifact_refs": {
+              "description": "Model artifact references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "audit_ref": {
+              "description": "Audit Card reference.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "data_ref": {
+              "description": "Data Card reference.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "description": {
+              "description": "Model description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "details": {
+              "description": "Free-form details.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "experiment_ref": {
+              "description": "Experiment Card reference.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "framework": {
+              "description": "Framework name.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "task_type": {
+              "description": "Model task type.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Model"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Experiment card spec.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "artifact_refs": {
+              "description": "Artifact references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "best_run_ref": {
+              "description": "Best run reference.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RunRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "default_parameters": {
+              "description": "Default parameters applied to runs.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/ParameterValue"
+              }
+            },
+            "description": {
+              "description": "Experiment description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "details": {
+              "description": "Free-form details.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "experiment_type": {
+              "description": "Experiment type.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "run_refs": {
+              "description": "Associated runs.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/RunRef"
+              }
+            },
+            "summary_metrics": {
+              "description": "Summary metrics for comparison.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/MetricEntry"
+              }
+            },
+            "target_refs": {
+              "description": "Primary target Cards.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Experiment"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Prompt card spec.",
+          "type": "object",
+          "required": [
+            "template",
+            "type"
+          ],
+          "properties": {
+            "audit_ref": {
+              "description": "Audit Card reference.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "content_hash": {
+              "description": "Content hash.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "description": {
+              "description": "Prompt description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "details": {
+              "description": "Free-form details.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "experiment_ref": {
+              "description": "Related experiment.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "input_schema": {
+              "description": "Input schema."
+            },
+            "messages": {
+              "description": "Structured prompt messages.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/PromptMessage"
+              }
+            },
+            "model": {
+              "description": "Model identifier.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "output_schema": {
+              "description": "Output schema or structured-output contract."
+            },
+            "parameters": {
+              "description": "Provider parameters.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "provider": {
+              "description": "Provider identity.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Provider"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "template": {
+              "description": "Template body.",
+              "type": "string"
+            },
+            "template_format": {
+              "description": "Template format, such as `text`, `jinja`, or `chat`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool_refs": {
+              "description": "Tool references made available to this prompt.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Prompt"
+              ]
+            },
+            "variable_specs": {
+              "description": "Structured variable descriptors.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/PromptVariable"
+              }
+            },
+            "variables": {
+              "description": "Required variable names.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "description": "Tool card spec.",
+          "type": "object",
+          "required": [
+            "args_schema",
+            "description",
+            "name",
+            "tool_type",
+            "type"
+          ],
+          "properties": {
+            "allowed_tools": {
+              "description": "Allowed downstream tool names.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "api_config": {
+              "description": "API tool config.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "args_schema": {
+              "description": "Input argument schema."
+            },
+            "credential_refs": {
+              "description": "Credential references required by this tool.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CredentialRef"
+              }
+            },
+            "description": {
+              "description": "Tool description.",
+              "type": "string"
+            },
+            "details": {
+              "description": "Free-form details.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "hook_events": {
+              "description": "Hook event names.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "hook_matcher": {
+              "description": "Hook matcher metadata.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "mcp_server_name": {
+              "description": "MCP server name.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "description": "LLM-visible tool name.",
+              "type": "string"
+            },
+            "output_schema": {
+              "description": "Output schema."
+            },
+            "requires_approval": {
+              "description": "Whether approval is required before use.",
+              "default": false,
+              "type": "boolean"
+            },
+            "script_config": {
+              "description": "Script tool config.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "tool_type": {
+              "description": "Tool type, such as `script`, `api`, `mcp`, or `builtin`.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Tool"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Agent card spec.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "capabilities": {
+              "description": "Agent capabilities.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "default_input_modes": {
+              "description": "Default input modes.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "default_output_modes": {
+              "description": "Default output modes.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "description": {
+              "description": "Agent description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "details": {
+              "description": "Free-form details.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "documentation_url": {
+              "description": "Documentation URL.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "governance": {
+              "description": "Governance and audit controls.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Governance"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "icon_url": {
+              "description": "Icon URL.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "interfaces": {
+              "description": "Supported interfaces.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/AgentInterface"
+              }
+            },
+            "max_iterations": {
+              "description": "Maximum loop iterations.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "memory_ref": {
+              "description": "Memory profile reference.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "model": {
+              "description": "Preferred model.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "observation_hooks": {
+              "description": "Observation hooks.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ObservationHooks"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "prompt_ref": {
+              "description": "Primary prompt reference.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "prompt_refs": {
+              "description": "Additional prompt references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "protocol_profiles": {
+              "description": "Protocol profiles.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ProtocolProfile"
+              }
+            },
+            "provider": {
+              "description": "Preferred provider.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Provider"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "provider_metadata": {
+              "description": "Provider metadata and hints.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "security_requirements": {
+              "description": "Security requirements.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "security_schemes": {
+              "description": "Security scheme names or inline descriptors.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "signatures": {
+              "description": "Signature metadata.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "skill_refs": {
+              "description": "Skill references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "subagent_refs": {
+              "description": "Sub-agent references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "tool_refs": {
+              "description": "Tool references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Agent"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Workflow card spec.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "description": {
+              "description": "Workflow description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "details": {
+              "description": "Free-form details.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "governance": {
+              "description": "Governance and audit controls.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Governance"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "inputs": {
+              "description": "Typed workflow inputs.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/ParameterValue"
+              }
+            },
+            "observation_hooks": {
+              "description": "Observation hooks.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ObservationHooks"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "outputs": {
+              "description": "Output descriptors.",
+              "type": "object",
+              "additionalProperties": true
+            },
+            "steps": {
+              "description": "Workflow steps.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/WorkflowStep"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Workflow"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Eval card spec.",
+          "type": "object",
+          "required": [
+            "eval_type",
+            "type"
+          ],
+          "properties": {
+            "assertions": {
+              "description": "Assertion definitions.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/EvalAssertion"
+              }
+            },
+            "dataset_refs": {
+              "description": "Dataset references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "default_parameters": {
+              "description": "Default non-secret parameters for eval orchestration.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/ParameterValue"
+              }
+            },
+            "description": {
+              "description": "Eval description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "details": {
+              "description": "Free-form details.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "eval_type": {
+              "description": "Eval type, such as `judge`, `assertion`, or `benchmark`.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/EvalType"
+                }
+              ]
+            },
+            "governance": {
+              "description": "Governance and audit requirements.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Governance"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "judge_refs": {
+              "description": "Judge Card references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "observation_hooks": {
+              "description": "Observation routing for eval runs.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ObservationHooks"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "pass_gates": {
+              "description": "Pass gate definitions.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/EvalPassGate"
+              }
+            },
+            "profile": {
+              "description": "Reusable evaluation profile.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EvalProfile"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "target_refs": {
+              "description": "Target Card references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Eval"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Drift card spec.",
+          "type": "object",
+          "required": [
+            "method",
+            "type"
+          ],
+          "properties": {
+            "baseline_ref": {
+              "description": "Baseline data reference.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "description": {
+              "description": "Drift description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "details": {
+              "description": "Free-form details.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "features": {
+              "description": "Feature names.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "method": {
+              "description": "Drift method.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/DriftMethod"
+                }
+              ]
+            },
+            "profile": {
+              "description": "Method-specific profile.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/DriftProfile"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "target_refs": {
+              "description": "Target data/model/service references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "thresholds": {
+              "description": "Thresholds by metric.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "number",
+                "format": "double"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Drift"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Service card spec.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "components": {
+              "description": "Alias-bound components.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ServiceComponent"
+              }
+            },
+            "content_hash": {
+              "description": "Content hash.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "credential_refs": {
+              "description": "Credential references required by this service.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CredentialRef"
+              }
+            },
+            "deployment": {
+              "description": "Deployment metadata.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "description": {
+              "description": "Service description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "entry_point": {
+              "description": "Entry point descriptor.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "lock_hash": {
+              "description": "Lock hash.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "metadata": {
+              "description": "Free-form metadata.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "service_config": {
+              "description": "Service config.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "service_type": {
+              "description": "Service type.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Service"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Policy card spec.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "description": {
+              "description": "Policy description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "details": {
+              "description": "Free-form details.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "enforcement": {
+              "description": "Enforcement mode.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rules": {
+              "description": "Policy rules.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/PolicyRule"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Policy"
+              ]
+            }
+          }
+        },
+        {
+          "description": "MCP card spec.",
+          "type": "object",
+          "required": [
+            "server_name",
+            "type"
+          ],
+          "properties": {
+            "description": {
+              "description": "MCP description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "details": {
+              "description": "Free-form details.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "scopes": {
+              "description": "Required scopes.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "server_name": {
+              "description": "Server name.",
+              "type": "string"
+            },
+            "tool_refs": {
+              "description": "Tool references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "transport": {
+              "description": "Transport descriptor.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Mcp"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Skill card spec.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "description": {
+              "description": "Skill description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "details": {
+              "description": "Free-form details.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "input_schema": {
+              "description": "Input schema."
+            },
+            "output_schema": {
+              "description": "Output schema."
+            },
+            "prompt_refs": {
+              "description": "Prompt references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "tool_refs": {
+              "description": "Tool references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Skill"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Sub-agent card spec.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "background": {
+              "description": "Whether background execution is allowed by the harness.",
+              "default": false,
+              "type": "boolean"
+            },
+            "compatible_clis": {
+              "description": "Compatible CLI names.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "description": {
+              "description": "Sub-agent description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "details": {
+              "description": "Free-form details.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "disallowed_tools": {
+              "description": "Disallowed tool names.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "effort": {
+              "description": "Effort setting.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "governance": {
+              "description": "Governance and audit controls.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Governance"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "isolation": {
+              "description": "Isolation descriptor.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max_turns": {
+              "description": "Maximum turns.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "mcp_servers": {
+              "description": "MCP server references or names.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "memory": {
+              "description": "Memory descriptor.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "model": {
+              "description": "Model selector.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "observation_hooks": {
+              "description": "Observation hooks.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ObservationHooks"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "permission_mode": {
+              "description": "Permission mode.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sandbox_mode": {
+              "description": "Sandbox mode.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "skill_refs": {
+              "description": "Skill references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "system_prompt": {
+              "description": "System prompt or prompt reference text.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "temperature": {
+              "description": "Model temperature.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "float"
+            },
+            "tool_refs": {
+              "description": "Tool references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "SubAgent"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Audit card spec.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "description": {
+              "description": "Audit description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "details": {
+              "description": "Free-form details.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "evidence_refs": {
+              "description": "Evidence artifact references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "policy_refs": {
+              "description": "Policy references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "subject_refs": {
+              "description": "Subject Card references.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CardRef"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Audit"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Artifact card spec.",
+          "type": "object",
+          "required": [
+            "artifact_kind",
+            "type"
+          ],
+          "properties": {
+            "artifact_kind": {
+              "description": "Artifact kind.",
+              "type": "string"
+            },
+            "artifact_uris": {
+              "description": "Artifact URIs.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "content_type": {
+              "description": "MIME content type.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "external_uri": {
+              "description": "External URI.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "integrity": {
+              "description": "Integrity digest.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "metadata": {
+              "description": "Artifact metadata.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            },
+            "schema_ref": {
+              "description": "Schema Card reference.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "size_bytes": {
+              "description": "Size in bytes.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "Artifact"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "Status": {
+      "description": "Server-derived Card status.",
+      "type": "object",
+      "required": [
+        "phase"
+      ],
+      "properties": {
+        "message": {
+          "description": "Human-readable status message.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phase": {
+          "description": "Lifecycle phase such as `draft`, `active`, or `deprecated`.",
+          "type": "string"
+        },
+        "updated_at": {
+          "description": "Last status update timestamp.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    },
+    "VersionBlock": {
+      "description": "Semver-compatible version string.",
+      "type": "string"
+    },
+    "WorkflowAction": {
+      "description": "Workflow action target.",
+      "oneOf": [
+        {
+          "description": "Skill action.",
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/CardRef"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "skill"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Agent action.",
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/CardRef"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "agent"
+              ]
+            }
+          }
+        },
+        {
+          "description": "MCP server action.",
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/CardRef"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "mcp"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Tool action.",
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/CardRef"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tool"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Prompt action.",
+          "type": "object",
+          "required": [
+            "target",
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/definitions/CardRef"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "prompt"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "WorkflowRetryPolicy": {
+      "description": "Workflow retry policy.",
+      "type": "object",
+      "required": [
+        "max_retries"
+      ],
+      "properties": {
+        "initial_backoff_ms": {
+          "description": "Initial backoff in milliseconds.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_retries": {
+          "description": "Maximum retry attempts.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "WorkflowStep": {
+      "description": "One workflow step.",
+      "type": "object",
+      "required": [
+        "action",
+        "id"
+      ],
+      "properties": {
+        "action": {
+          "description": "Step action kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/WorkflowAction"
+            }
+          ]
+        },
+        "condition": {
+          "description": "Optional condition expression.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "depends_on": {
+          "description": "Dependency step IDs.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "display": {
+          "description": "Display metadata.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/NonSecretValue"
+          }
+        },
+        "id": {
+          "description": "Stable step ID.",
+          "type": "string"
+        },
+        "inputs": {
+          "description": "Step inputs.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/ParameterValue"
+          }
+        },
+        "retry": {
+          "description": "Retry policy.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WorkflowRetryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timeout_seconds": {
+          "description": "Timeout in seconds.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    }
+  }
+}

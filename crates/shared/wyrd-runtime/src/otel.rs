@@ -2,6 +2,13 @@
 
 use wyrd_spec::trace::TraceContext;
 
+/// Runtime telemetry install configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TelemetryConfig {
+    /// Optional OTLP endpoint URL.
+    pub endpoint: Option<String>,
+}
+
 /// Span context prepared for future server wiring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpanSeed {
@@ -19,3 +26,14 @@ pub fn prepare_span(name: impl Into<String>, trace_context: Option<TraceContext>
         name: name.into(),
     }
 }
+
+/// Install the runtime telemetry shell.
+///
+/// Phase 1 does not attach an SDK. The function preserves the server-boundary
+/// shape that later phases fill with concrete wiring.
+pub fn install(_config: TelemetryConfig) {}
+
+/// Attach an incoming trace context to the current runtime span.
+///
+/// Phase 1 keeps this as a no-op shell.
+pub fn attach(_context: &TraceContext) {}

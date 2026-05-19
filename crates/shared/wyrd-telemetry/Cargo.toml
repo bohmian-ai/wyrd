@@ -14,7 +14,8 @@ otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 [dependencies]
 tracing.workspace = true
 tracing-subscriber.workspace = true
-thiserror.workspace = true
+serde_json.workspace = true
+wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }

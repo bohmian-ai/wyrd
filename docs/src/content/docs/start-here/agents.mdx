@@ -1,0 +1,19 @@
+---
+title: For agents
+description: How an agent should read and update Wyrd.
+---
+
+# For agents
+
+Treat Wyrd as a repository with explicit contracts. Before changing behavior, find the card, schema, task, test, and docs page that describe the surface you are touching.
+
+## Agent checklist
+
+- Prefer generated schema docs when you need the field shape.
+- Prefer `mise run ...` tasks when you need to verify work.
+- Update public docs when a phase changes a public concept, command, API route, or generated artifact.
+- Preserve exact error messages and operation context when reporting a failure.
+
+## Good handoffs
+
+A useful handoff names the changed surface, the verification task that passed, and any known gap that still needs a later phase.

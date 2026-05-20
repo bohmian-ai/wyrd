@@ -1,0 +1,15 @@
+---
+title: MCP usage
+description: How Wyrd should expose agent-readable capabilities through MCP.
+---
+
+# MCP usage
+
+The MCP surface should let an agent discover cards, inspect schemas, invoke bounded tools, and return structured errors. It should not require the agent to scrape human prose for field names or operational rules.
+
+## Agent expectations
+
+- Tool names should be stable.
+- Inputs should match published schemas.
+- Errors should include a code, message, and remediation context.
+- Mutating tools should make policy and audit behavior explicit.

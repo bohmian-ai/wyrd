@@ -1,0 +1,20 @@
+---
+title: Wyrd docs
+description: Developer and agent documentation for Wyrd.
+---
+
+# Wyrd docs
+
+Wyrd is the AI-layer registry for cards, specs, runs, policies, services, and audit records. The docs are written for two readers: developers who need to build against Wyrd, and agents that need enough structure to act without guessing.
+
+Start with the local development guide if you are working in the repository. Start with cards if you are trying to understand how Wyrd names and governs work.
+
+## What is stable now
+
+- Card kinds and JSON Schemas live in the spec crate.
+- Generated schema docs are checked by the docs gate.
+- Public docs commands use `mise run ...` so the same workflow works locally and in CI.
+
+## What is still landing
+
+Some pages describe the intended developer contract before every CLI, Python, API, or deployment command has shipped. Those pages call that out directly instead of pretending the surface is complete.

@@ -1,0 +1,16 @@
+---
+title: Error remediation
+description: How agents should handle Wyrd errors.
+---
+
+# Error remediation
+
+An agent should not hide a Wyrd error behind a generic failure. Preserve the code, operation, card id, and relevant input summary.
+
+## Response shape
+
+- Name the operation that failed.
+- Quote the Wyrd error code if one exists.
+- Explain whether retrying is safe.
+- Suggest the smallest corrective action.
+- Re-run the relevant `mise run ...` task after changing repository files.

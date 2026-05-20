@@ -1,0 +1,26 @@
+---
+title: Register a card
+description: The expected shape of a card registration workflow.
+---
+
+# Register a card
+
+Card registration starts with a typed record. The exact CLI and Python commands land in later phases; the contract below is the shape those surfaces should preserve.
+
+```yaml
+apiVersion: wyrd/v1
+kind: Card
+metadata:
+  name: churn-risk-model
+spec:
+  type: Model
+  owner: growth
+  description: Scores churn risk for active accounts.
+```
+
+## Review before registration
+
+- The card name is stable and readable.
+- The spec type matches the asset.
+- Runtime dependencies are references, not prose.
+- Policy and audit requirements are explicit when they matter.

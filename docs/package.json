@@ -1,0 +1,20 @@
+{
+  "name": "@wyrd/docs",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.23.0",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "check": "astro check",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "@astrojs/check": "^0.9.9",
+    "@astrojs/starlight": "^0.39.2",
+    "astro": "^6.3.6",
+    "sharp": "^0.34.5",
+    "typescript": "^6.0.3"
+  }
+}

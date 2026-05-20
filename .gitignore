@@ -6,6 +6,7 @@ Cargo.lock.bak
 # Node / SvelteKit
 node_modules/
 .svelte-kit/
+.astro/
 build/
 .vite/
 dist/

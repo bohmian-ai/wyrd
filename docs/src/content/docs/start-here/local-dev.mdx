@@ -1,0 +1,27 @@
+---
+title: Local development
+description: Run the Wyrd checks and docs workflows from a fresh checkout.
+---
+
+# Local development
+
+The repository uses `mise` as the public task runner. Use the task names instead of calling underlying tools directly so local work matches CI.
+
+## Common tasks
+
+```sh
+mise install
+mise run check
+mise run codegen:check
+mise run docs:check
+```
+
+## Docs tasks
+
+```sh
+mise run docs:dev
+mise run docs:generate
+mise run docs:check
+```
+
+`docs:check` installs the docs dependencies, refreshes generated docs pages, checks public command snippets, validates local links, runs Astro checks, and builds the site.

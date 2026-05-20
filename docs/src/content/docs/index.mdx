@@ -3,18 +3,57 @@ title: Wyrd docs
 description: Developer and agent documentation for Wyrd.
 ---
 
-# Wyrd docs
+import WyrdHero from "../../components/WyrdHero.astro";
 
-Wyrd is the AI-layer registry for cards, specs, runs, policies, services, and audit records. The docs are written for two readers: developers who need to build against Wyrd, and agents that need enough structure to act without guessing.
+<WyrdHero
+  title="Wyrd"
+  tagline="The declarative AI layer for developers, engineers, and agents."
+  sub="A standardized ecosystem for every model, prompt, agent, and service you ship. Declare it once. Govern, evaluate, deploy, and observe it everywhere."
+/>
 
-Start with the local development guide if you are working in the repository. Start with cards if you are trying to understand how Wyrd names and governs work.
+<ul class="wyrd-stats">
+  <li><strong>1</strong><span>Envelope</span></li>
+  <li><strong>1</strong><span>Policy engine</span></li>
+  <li><strong>1</strong><span>Audit log</span></li>
+  <li><strong>1</strong><span>Lineage graph</span></li>
+</ul>
 
-## What is stable now
+## One platform, four jobs
 
-- Card kinds and JSON Schemas live in the spec crate.
-- Generated schema docs are checked by the docs gate.
-- Public docs commands use `mise run ...` so the same workflow works locally and in CI.
+<dl class="wyrd-defs">
+  <dt data-kind="service">Security</dt>
+  <dd>Policy as code. Immutable audit. Lineage from model to deployment. Auditor-ready in week one.</dd>
 
-## What is still landing
+  <dt data-kind="model">Infra</dt>
+  <dd>A real inventory of every model, prompt, agent, and service in production. Versioned, owned, locked.</dd>
 
-Some pages describe the intended developer contract before every CLI, Python, API, or deployment command has shipped. Those pages call that out directly instead of pretending the surface is complete.
+  <dt data-kind="prompt">Data Science</dt>
+  <dd>One standard path from notebook to deployment. Same envelope for every artifact.</dd>
+
+  <dt data-kind="experiment">Observability</dt>
+  <dd>Evals, drift, and behavior in a unified view. Every signal ties back to a Card version.</dd>
+</dl>
+
+## Start here
+
+| You are | Start with |
+| --- | --- |
+| New to Wyrd | [What is Wyrd?](/start-here/what-is-wyrd/) |
+| Data scientist or ML engineer | [Register a card](/guides/register-card/) |
+| Platform engineer | [Concepts overview](/concepts/) |
+| Agent or LLM caller | [For agents](/start-here/agents/) |
+| Security or compliance | [Policy and audit](/policy-audit/) |
+
+## What exists today
+
+JSON Schemas for all 18 Card kinds. Runtime, telemetry, and testing crate shells; behavior lands in Phase 5a. Generated reference pages for every Card kind, the OpenAPI surface, and the error catalog.
+
+CLI, Python SDK, HTTP routes, and MCP tools land in later phases. Pages for those surfaces exist already and name the phase that fills them in.
+
+## Reference
+
+The 18 Card kinds and their schemas live under [Card reference](/cards/). The seven primitives that compose them live under [Concepts](/concepts/).
+
+## For agents
+
+Machine-readable index at [`/llms.txt`](/llms.txt). Full schema dump at [`/llms-full.txt`](/llms-full.txt).

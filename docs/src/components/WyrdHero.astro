@@ -1,0 +1,15 @@
+---
+interface Props {
+  title: string;
+  tagline?: string;
+  sub?: string;
+}
+
+const { title, tagline, sub } = Astro.props;
+---
+
+<header class="wyrd-hero">
+  <h1 class="wyrd-hero__title">{title}</h1>
+  {tagline && <p class="wyrd-hero__tagline">{tagline}</p>}
+  {sub && <p class="wyrd-hero__sub">{sub}</p>}
+</header>

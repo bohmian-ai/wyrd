@@ -3,8 +3,47 @@ title: Observations
 description: Runtime signals Wyrd can attach to cards, services, and runs.
 ---
 
+import { Aside } from "@astrojs/starlight/components";
+import PhaseGate from "../../../components/PhaseGate.astro";
+
 # Observations
 
-An observation is a structured signal about behavior. It can describe a trace, a drift result, an evaluation score, a service health event, or another runtime fact that belongs with a card or run.
+<Aside title="TL;DR" data-variant="wyrd">
+An Observation is a structured behavioral signal attached to a Run. Drift, eval scores, and trace events all flow through this single shape.
+</Aside>
+
+<dl class="wyrd-defs">
+  <dt>Anchor</dt>
+  <dd>The Card version and Run an Observation belongs to.</dd>
+
+  <dt data-kind="drift">Kind</dt>
+  <dd>Drift result, eval score, trace event, health signal, or another typed kind.</dd>
+
+  <dt>Payload</dt>
+  <dd>The typed signal body, validated against the Observation kind's schema.</dd>
+
+  <dt>Timing</dt>
+  <dd>When it was emitted relative to the Run's lifecycle.</dd>
+</dl>
 
 Observations should be tied to stable identifiers. If a signal cannot be traced back to the asset or action that caused it, it is harder to use for remediation.
+
+<Aside title="What this isn't" data-variant="not">
+An Observation is **not** a metric in a TSDB. It is a typed registry record with lineage back to a Card version.
+</Aside>
+
+## Shape
+
+<PhaseGate phase="5a">
+Observation schemas land alongside the registry write path in Phase 5a.
+</PhaseGate>
+
+## Lifecycle
+
+<PhaseGate phase="5a">
+Emission, retention, and rollup rules for Observations land in Phase 5a.
+</PhaseGate>
+
+## Related cards
+
+See [Drift](/cards/drift/), [Eval](/cards/eval/), [Runs](/concepts/run/), and [Lineage](/concepts/lineage/).

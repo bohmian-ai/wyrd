@@ -10,3 +10,9 @@ This section is reserved for the command-line and MCP surfaces. Public commands 
 ## Documentation rule
 
 If a command is not available yet, document the intended contract and say that the concrete command lands in a later phase. Do not invent a working command.
+
+## MCP server
+
+The Wyrd MCP server exposes agent-readable tools for card discovery, schema inspection, run queries, and bounded write operations. The agent-facing contract, including the read/write tool split, write safety requirements, and error handling expectations, is documented in [MCP usage](/agents/mcp).
+
+The CLI MCP server is planned for a later phase. This page will expand with command reference and configuration once the server ships.

@@ -3,8 +3,47 @@ title: Runs
 description: Execution records that connect work to cards and outcomes.
 ---
 
+import { Aside } from "@astrojs/starlight/components";
+import PhaseGate from "../../../components/PhaseGate.astro";
+
 # Runs
 
-A run records execution against a card or workflow. It should connect intent, inputs, outputs, status, and any observation or audit record created along the way.
+<Aside title="TL;DR" data-variant="wyrd">
+A Run is the record of an execution tied to a specific Card version. Cards say what should exist; Runs show what happened.
+</Aside>
 
-Runs are the bridge between declaration and behavior. Cards say what should exist; runs show what happened.
+<dl class="wyrd-defs">
+  <dt>Target</dt>
+  <dd>The exact Card and version this execution was bound to.</dd>
+
+  <dt>Inputs/Outputs</dt>
+  <dd>What flowed in, what came back, and whether it matched the Spec.</dd>
+
+  <dt>Status</dt>
+  <dd>Started, succeeded, failed, or cancelled.</dd>
+
+  <dt data-kind="experiment">Observations</dt>
+  <dd>Structured behavioral signals emitted during or after the Run.</dd>
+</dl>
+
+Runs are the bridge between declaration and behavior. Without a Run reference, Observations and Audits have no execution to anchor against.
+
+<Aside title="What this isn't" data-variant="not">
+A Run is **not** a log line. It is a durable record the registry can trace to a Card version, an actor, and a chain of Observations.
+</Aside>
+
+## Shape
+
+<PhaseGate phase="5a">
+Run records, kinds, and ref shapes are checked in under `crates/wyrd-spec/schemas/run_ref.json` and `run_kind.json`.
+</PhaseGate>
+
+## Lifecycle
+
+<PhaseGate phase="5a">
+Start, transition, completion, and retention flows for Runs land in Phase 5a.
+</PhaseGate>
+
+## Related cards
+
+See [Observations](/concepts/observation/), [Audit](/concepts/audit/), and [Lineage](/concepts/lineage/).

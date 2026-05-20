@@ -21,13 +21,23 @@ export default defineConfig({
         },
       ],
       customCss: ["./src/styles/wyrd.css"],
+      expressiveCode: {
+        themes: ["github-light", "github-dark"],
+        defaultProps: { frame: "none" },
+        styleOverrides: {
+          borderWidth: "1px",
+          borderColor: "var(--sl-color-hairline)",
+          codeFontSize: "0.82rem",
+        },
+      },
       sidebar: [
+        { label: "Overview", link: "/" },
         {
-          label: "Start here",
+          label: "Get started",
           collapsed: true,
           items: [
-            { label: "Overview", link: "/start-here/" },
             { label: "What is Wyrd?", link: "/start-here/what-is-wyrd/" },
+            { label: "Quickstart", link: "/start-here/quickstart/" },
             { label: "Local development", link: "/start-here/local-dev/" },
             { label: "For agents", link: "/start-here/agents/" },
           ],
@@ -41,14 +51,14 @@ export default defineConfig({
             { label: "Specs", link: "/concepts/spec/" },
             { label: "Runs", link: "/concepts/run/" },
             { label: "Observations", link: "/concepts/observation/" },
-            { label: "Services", link: "/concepts/service-card/" },
             { label: "Policies", link: "/concepts/policy-card/" },
-            { label: "Lineage", link: "/concepts/lineage/" },
             { label: "Audit", link: "/concepts/audit/" },
+            { label: "Lineage", link: "/concepts/lineage/" },
+            { label: "Services", link: "/concepts/service-card/" },
           ],
         },
         {
-          label: "Cards",
+          label: "Card reference",
           collapsed: true,
           items: [
             { label: "Overview", link: "/cards/" },
@@ -73,25 +83,42 @@ export default defineConfig({
           ],
         },
         {
-          label: "Guides",
+          label: "Features",
           collapsed: true,
           items: [
-            { label: "Overview", link: "/guides/" },
-            { label: "Register a card", link: "/guides/register-card/" },
-            { label: "Lock and install a service", link: "/guides/lock-install-service/" },
+            {
+              label: "Essential",
+              collapsed: true,
+              items: [
+                { label: "Register a card", link: "/guides/register-card/" },
+                { label: "Lock and install a service", link: "/guides/lock-install-service/" },
+                { label: "Policy and audit", link: "/policy-audit/" },
+                { label: "Observability", link: "/observability/" },
+              ],
+            },
+            {
+              label: "Advanced",
+              collapsed: true,
+              items: [
+                { label: "Deploy", link: "/deploy/" },
+                { label: "Migration", link: "/migration/" },
+              ],
+            },
           ],
         },
         {
-          label: "Agents",
+          label: "Integrations",
           collapsed: true,
           items: [
-            { label: "Overview", link: "/agents/" },
+            { label: "Agents and MCP", link: "/agents/" },
             { label: "MCP usage", link: "/agents/mcp/" },
             { label: "Error remediation", link: "/agents/error-remediation/" },
+            { label: "CLI and MCP", link: "/cli-mcp/" },
+            { label: "Python SDK", link: "/python/" },
           ],
         },
         {
-          label: "API",
+          label: "API reference",
           collapsed: true,
           items: [
             { label: "Overview", link: "/api/" },
@@ -101,43 +128,11 @@ export default defineConfig({
           ],
         },
         {
-          label: "CLI and MCP",
-          collapsed: true,
-          items: [{ label: "Overview", link: "/cli-mcp/" }],
-        },
-        {
-          label: "Python",
-          collapsed: true,
-          items: [{ label: "Overview", link: "/python/" }],
-        },
-        {
-          label: "Observability",
-          collapsed: true,
-          items: [{ label: "Overview", link: "/observability/" }],
-        },
-        {
-          label: "Policy and audit",
-          collapsed: true,
-          items: [{ label: "Overview", link: "/policy-audit/" }],
-        },
-        {
-          label: "Deploy",
-          collapsed: true,
-          items: [{ label: "Overview", link: "/deploy/" }],
-        },
-        {
           label: "Reference",
           collapsed: true,
           items: [
             { label: "Overview", link: "/reference/" },
             { label: "Generated docs", link: "/reference/generated-docs/" },
-          ],
-        },
-        {
-          label: "Migration",
-          collapsed: true,
-          items: [
-            { label: "Overview", link: "/migration/" },
             { label: "Predecessor mapping", link: "/migration/predecessor-mapping/" },
           ],
         },

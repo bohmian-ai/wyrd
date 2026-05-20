@@ -8,6 +8,14 @@ import re
 from pathlib import Path
 
 
+def md_escape(value: str) -> str:
+    value = re.sub(r"[\n\r\t\x00-\x1f]", " ", value)
+    value = value.replace("|", r"\|")
+    value = value.replace("`", r"\`")
+    value = value.replace("<", "&lt;").replace(">", "&gt;")
+    return value
+
+
 DOCS_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = DOCS_ROOT.parent
 OPENAPI_PATH = REPO_ROOT / "openapi.yaml"
@@ -52,13 +60,13 @@ def render_openapi() -> str:
         "",
         "# OpenAPI",
         "",
-        f"The repository OpenAPI document is `{OPENAPI_PATH.relative_to(REPO_ROOT)}`. Its current title is `{title}` and its version is `{version}`.",
+        f"The repository OpenAPI document is `{md_escape(str(OPENAPI_PATH.relative_to(REPO_ROOT)))}`. Its current title is `{md_escape(title)}` and its version is `{md_escape(version)}`.",
         "",
         "## Routes",
         "",
     ]
     if routes:
-        lines.extend(f"- `{route}`" for route in routes)
+        lines.extend(f"- `{md_escape(route)}`" for route in routes)
     else:
         lines.append("No HTTP routes are published in the current OpenAPI document.")
 
@@ -97,7 +105,7 @@ def render_schemas() -> str:
             schema = {}
         title = schema.get("title") or schema_path.stem
         rel = schema_path.relative_to(REPO_ROOT)
-        lines.append(f"| `{rel}` | {title} |")
+        lines.append(f"| `{md_escape(str(rel))}` | {md_escape(str(title))} |")
 
     lines.append("")
     return "\n".join(lines)
@@ -113,14 +121,34 @@ def render_errors() -> str:
             "",
             "# Errors",
             "",
-            "The public error catalog is not emitted as a standalone file yet. Until that generator lands, treat errors as structured data that should be shown to a developer or handed back to an agent with the original operation, card id, and request context.",
+            "Wyrd returns errors as structured RFC 7807 Problem Details objects. Agents and SDK clients must preserve the full structure and must not collapse errors into prose.",
             "",
-            "## Client handling",
+            "## Error fields",
             "",
-            "- Preserve the original error code and message.",
+            "| Field | Description |",
+            "| --- | --- |",
+            "| `type` | URI identifying the error class |",
+            "| `title` | Human-readable summary of the error class (stable across instances) |",
+            "| `status` | HTTP status code (integer) |",
+            "| `code` | Wyrd-specific machine-readable error code (string, stable) |",
+            "| `detail` | Instance-specific description of what went wrong |",
+            "| `remediation` | Actionable guidance for the caller or agent |",
+            "| `context` / `details` | Structured key/value map with operation-specific fields |",
+            "| `request_id` | Present when the server can correlate the request |",
+            "| `trace_id` | Present when distributed tracing is active |",
+            "| `instance` | URI identifying the specific resource or operation that failed (when applicable) |",
+            "",
+            "## Agent handling",
+            "",
+            "- Preserve all structured fields; do not collapse errors into prose.",
+            "- Use `code` for programmatic branching, not `title` or `detail` (those are for humans).",
+            "- Surface policy and audit failures as decisions (not generic transport failures).",
             "- Keep retries bounded and tied to idempotent operations.",
-            "- Surface policy and audit failures as decisions, not as generic transport failures.",
             "- Link remediation steps to the card or run that caused the error.",
+            "",
+            "## Catalog",
+            "",
+            "The public error catalog is not emitted as a standalone file yet. Once that generator lands, this page will link to the full catalog with per-code remediation tables.",
             "",
         ]
     )

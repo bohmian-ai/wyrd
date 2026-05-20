@@ -1,0 +1,7 @@
+interface:
+  display_name: "Wyrd UI"
+  short_description: "Work on the Wyrd SvelteKit UI."
+  default_prompt: "Use $wyrd-ui to edit, debug, style, or extend the Wyrd UI in crates/wyrd/wyrd-server/wyrd-ui."
+
+policy:
+  allow_implicit_invocation: true

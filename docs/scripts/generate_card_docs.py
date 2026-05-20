@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 
@@ -34,7 +35,7 @@ CARD_SPECS = {
 }
 
 PURPOSES = {
-    "agent": "Declare an agent that can be evaluated, governed, installed, and invoked through Wyrd.",
+    "agent": "Declare an agent that Wyrd can describe, govern, evaluate, install references for, and observe. Execution stays in the user or framework runtime. Wyrd does not host user agent loops or execute user agent code.",
     "artifact": "Track an immutable artifact that belongs to a card, run, or service release.",
     "audit": "Represent a reviewable event or decision that needs durable provenance.",
     "data": "Describe a dataset, feature table, document set, or other data dependency.",
@@ -53,6 +54,14 @@ PURPOSES = {
     "trigger": "Describe an event source that can start a workflow or service action.",
     "workflow": "Describe a coordinated sequence of operators, tools, agents, or services.",
 }
+
+
+def md_escape(value: str) -> str:
+    value = re.sub(r"[\n\r\t\x00-\x1f]", " ", value)
+    value = value.replace("|", r"\|")
+    value = value.replace("`", r"\`")
+    value = value.replace("<", "&lt;").replace(">", "&gt;")
+    return value
 
 
 def load_schema(path: Path) -> dict:
@@ -89,6 +98,55 @@ def title_for(slug: str) -> str:
     return slug.title()
 
 
+CARD_KIND_GROUPS = {
+    "data": "data",
+    "model": "model",
+    "experiment": "experiment",
+    "drift": "experiment",
+    "eval": "experiment",
+    "prompt": "prompt",
+    "agent": "agent",
+    "subagent": "agent",
+    "skill": "agent",
+    "tool": "agent",
+    "mcp": "agent",
+    "operator": "agent",
+    "workflow": "agent",
+    "trigger": "agent",
+    "service": "service",
+    "artifact": "neutral",
+    "audit": "neutral",
+    "policy": "neutral",
+}
+
+
+def phase_gate(phase: str, body: str) -> str:
+    return (
+        f'<aside class="wyrd-phase-gate">'
+        f'<span class="wyrd-phase-gate__badge">Phase {phase}</span>'
+        f"{body}"
+        f"</aside>"
+    )
+
+
+def intro_dl(slug: str, schema: dict) -> str:
+    kind_attr = f' data-kind="{slug}"' if CARD_KIND_GROUPS.get(slug) != "neutral" else ""
+    rows = properties(schema)
+    required = [r for r in rows if r[2] == "yes"]
+    optional_count = len(rows) - len(required)
+    required_str = ", ".join(f"<code>{name}</code>" for name, *_ in required[:4]) or "none required"
+    return (
+        f'<dl class="wyrd-defs">'
+        f'<dt{kind_attr}>{title_for(slug)}</dt>'
+        f"<dd>{PURPOSES[slug]}</dd>"
+        f"<dt>Required</dt>"
+        f"<dd>{required_str}</dd>"
+        f"<dt>Optional</dt>"
+        f"<dd>{optional_count} additional spec fields — see table below.</dd>"
+        f"</dl>"
+    )
+
+
 def render(slug: str, schema_file: str) -> str:
     schema_path = SCHEMA_DIR / schema_file
     title = title_for(slug)
@@ -106,6 +164,8 @@ def render(slug: str, schema_file: str) -> str:
         "",
         PURPOSES[slug],
         "",
+        intro_dl(slug, schema),
+        "",
         "This page is generated from the checked-in JSON Schema. Edit the Rust spec, run the schema generator, then run `mise run docs:generate` to refresh this page.",
         "",
         "## Source",
@@ -119,18 +179,37 @@ def render(slug: str, schema_file: str) -> str:
     if rows:
         lines.extend(["| Field | Type | Required |", "| --- | --- | --- |"])
         for name, field_type, required in rows:
-            lines.append(f"| `{name}` | `{field_type}` | {required} |")
+            lines.append(f"| `{md_escape(name)}` | `{md_escape(field_type)}` | {required} |")
     else:
         lines.append("This schema does not expose top-level fields yet.")
 
     lines.extend(
         [
             "",
+            "## Shape",
+            "",
+            phase_gate(
+                "5a",
+                f"Copy-pasteable YAML for a {title}Card lands with the Card write path in Phase 5a. The JSON Schema at <code>{source}</code> is the current source of truth.",
+            ),
+            "",
+            "## Lifecycle",
+            "",
+            phase_gate(
+                "5a",
+                f"Write, version, transition, and retire flows for {title}Cards land in Phase 5a.",
+            ),
+            "",
             "## Authoring notes",
             "",
             "- Keep card names stable; downstream runs, policies, and audits refer to them by identity.",
             "- Put operational rules in the spec instead of burying them in free-form notes.",
             "- Prefer explicit references to other cards when a dependency matters at runtime.",
+            "",
+            "## Related",
+            "",
+            f"- [Concepts overview](/concepts/) — where {title} fits in the seven primitives.",
+            "- [Card reference index](/cards/) — every kind in one place.",
             "",
         ]
     )

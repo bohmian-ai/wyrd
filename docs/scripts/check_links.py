@@ -21,11 +21,20 @@ def markdown_pages() -> list[Path]:
     return sorted(path for path in CONTENT_ROOT.rglob("*") if path.suffix in {".md", ".mdx"})
 
 
-def route_to_file(route: str) -> Path:
+def route_to_file(route: str) -> Path | None:
     route = route.strip("/")
     if not route:
         return CONTENT_ROOT / "index.mdx"
-    return CONTENT_ROOT / route / "index.mdx"
+    candidates = [
+        CONTENT_ROOT / route / "index.mdx",
+        CONTENT_ROOT / route / "index.md",
+        CONTENT_ROOT / (route + ".mdx"),
+        CONTENT_ROOT / (route + ".md"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]  # default for existence check
 
 
 def local_target_exists(source: Path, raw_target: str) -> bool:
@@ -44,15 +53,25 @@ def local_target_exists(source: Path, raw_target: str) -> bool:
         public_file = PUBLIC_ROOT / path.lstrip("/")
         if public_file.exists():
             return True
-        route_file = route_to_file(path)
-        alt_md = route_file.with_suffix(".md")
-        return route_file.exists() or alt_md.exists()
+        route = path.strip("/")
+        candidates = [
+            CONTENT_ROOT / route / "index.mdx",
+            CONTENT_ROOT / route / "index.md",
+            CONTENT_ROOT / (route + ".mdx"),
+            CONTENT_ROOT / (route + ".md"),
+        ]
+        return any(c.exists() for c in candidates)
 
     candidate = (source.parent / path).resolve()
     if candidate.exists():
         return True
     if candidate.suffix == "":
-        return (candidate / "index.mdx").exists() or (candidate / "index.md").exists()
+        return (
+            (candidate / "index.mdx").exists()
+            or (candidate / "index.md").exists()
+            or candidate.with_suffix(".mdx").exists()
+            or candidate.with_suffix(".md").exists()
+        )
     return False
 
 
@@ -64,8 +83,9 @@ def main() -> int:
             for match in regex.finditer(text):
                 target = match.group(1)
                 if not local_target_exists(page, target):
+                    line_num = text[:match.start()].count("\n") + 1
                     rel = page.relative_to(DOCS_ROOT)
-                    failures.append(f"{rel}: missing local target `{target}`")
+                    failures.append(f"{rel}:{line_num}: missing local target `{target}`")
 
     if failures:
         print("Docs link check failed:")

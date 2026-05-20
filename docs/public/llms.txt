@@ -1,0 +1,40 @@
+# Wyrd
+
+> Wyrd is the declarative AI layer for developers, engineers, and agents. A standardized ecosystem for every model, prompt, tool, agent, workflow, eval, policy, audit, service, and observation. Declare it once; govern, evaluate, deploy, and observe it everywhere. Execution stays in the user runtime.
+
+## Concepts
+
+- [Cards](https://wyrd.ai/concepts/card/): The durable, versioned envelope for one thing Wyrd governs.
+- [Specs](https://wyrd.ai/concepts/spec/): The typed payload inside a Card. One schema per kind.
+- [Runs](https://wyrd.ai/concepts/run/): The record of an execution tied to a specific Card version.
+- [Observations](https://wyrd.ai/concepts/observation/): Structured behavioral signals attached to a Run.
+- [Policies](https://wyrd.ai/concepts/policy-card/): Decision rules evaluated when Cards are written or Runs are created.
+- [Audit](https://wyrd.ai/concepts/audit/): Immutable entries describing who or what made a decision.
+- [Lineage](https://wyrd.ai/concepts/lineage/): The typed graph that connects Cards to Cards, and Cards to Runs to Observations.
+- [Services](https://wyrd.ai/concepts/service-card/): The Card kind that packages a deployable AI surface.
+
+## Card kinds
+
+- [AgentCard](https://wyrd.ai/cards/agent/): Declare an agent that Wyrd can describe, govern, evaluate, install references for, and observe. Execution stays in the user or framework runtime.
+- [ArtifactCard](https://wyrd.ai/cards/artifact/): Track an immutable artifact that belongs to a card, run, or service release.
+- [AuditCard](https://wyrd.ai/cards/audit/): Represent a reviewable event or decision that needs durable provenance.
+- [DataCard](https://wyrd.ai/cards/data/): Describe a dataset, feature table, document set, or other data dependency.
+- [DriftCard](https://wyrd.ai/cards/drift/): Describe the drift contract Wyrd uses to watch behavior over time.
+- [EvalCard](https://wyrd.ai/cards/eval/): Define an evaluation suite, scoring rule, or acceptance check.
+- [ExperimentCard](https://wyrd.ai/cards/experiment/): Group work-in-progress runs and candidate changes under a single intent.
+- [MCPCard](https://wyrd.ai/cards/mcp/): Describe an MCP surface that tools and agents can discover consistently.
+- [ModelCard](https://wyrd.ai/cards/model/): Describe a model artifact, its interface, and the context needed to use it safely.
+- [OperatorCard](https://wyrd.ai/cards/operator/): Describe an operator that performs bounded work inside a workflow or service.
+- [PolicyCard](https://wyrd.ai/cards/policy/): Capture rules that decide whether a card, run, or action is allowed.
+- [PromptCard](https://wyrd.ai/cards/prompt/): Version prompt content and the contract around its inputs and outputs.
+- [ServiceCard](https://wyrd.ai/cards/service/): Describe a deployable service and the runtime rules Wyrd can lock.
+- [SkillCard](https://wyrd.ai/cards/skill/): Declare a reusable skill that an agent can select with predictable inputs.
+- [SubAgentCard](https://wyrd.ai/cards/subagent/): Describe a narrower agent role that can be called by a parent agent.
+- [ToolCard](https://wyrd.ai/cards/tool/): Declare an executable tool and the constraints around its use.
+- [TriggerCard](https://wyrd.ai/cards/trigger/): Describe an event source that can start a workflow or service action.
+- [WorkflowCard](https://wyrd.ai/cards/workflow/): Describe a coordinated sequence of operators, tools, agents, or services.
+
+## Machine-readable schemas
+
+- [llms-full.txt](https://wyrd.ai/llms-full.txt): every Card spec schema inline.
+- JSON Schemas: see `crates/wyrd-spec/schemas/` in the wyrd repository.

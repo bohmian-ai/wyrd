@@ -177,7 +177,7 @@ impl WyrdError {
         self.error_code().remediation()
     }
 
-    /// RFC 7807-style JSON problem payload.
+    /// RFC 9457 JSON problem payload.
     #[must_use]
     pub fn as_problem_json(&self) -> serde_json::Value {
         let (title, message, details) = match self {
@@ -195,8 +195,8 @@ impl WyrdError {
             "type": format!("https://wyrd.dev/problems/{}", self.code()),
             "title": title,
             "status": self.status(),
+            "detail": message,
             "code": self.code(),
-            "message": message,
             "details": details,
             "remediation": self.remediation(),
         })

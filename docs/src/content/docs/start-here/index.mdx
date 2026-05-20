@@ -1,18 +1,28 @@
 ---
 title: Start here
-description: The shortest path into Wyrd for developers and agents.
+description: Choose the path that matches your role.
 ---
 
 # Start here
 
-Use this section to get oriented before writing code or asking an agent to change the repository.
+Pick the path below that matches how you work with Wyrd.
 
-## First read
+## Data scientist / ML engineer
 
-- Read the card model before adding a new public concept.
-- Read local development before running checks.
-- Read the agent guide before delegating repository work.
+You use Wyrd to register models, prompts, datasets, and evals as versioned Cards and move them from local experimentation into governed production. Start with [what Wyrd is](./what-is-wyrd/) to understand the Card model, then read the [register a card guide](/guides/register-card/) for the first hands-on step.
 
-## Working rule
+## AI engineer / prompt or agent builder
 
-When docs and code disagree, treat the code as the source of truth and update the docs in the same phase. The docs gate exists to keep that habit visible.
+You work with PromptCards, ToolCards, AgentCards, and the MCP surface. Start with [what Wyrd is](./what-is-wyrd/), then see [agents and MCP](/agents/mcp/) for how to consume Wyrd through MCP tools and how structured errors are designed for agent use.
+
+## Platform engineer
+
+You use Wyrd to establish Card inventory, policy, audit, and deployment boundaries for your organization. Start with [what Wyrd is](./what-is-wyrd/) for the full framing, then read [ServiceCard](/cards/service/), [PolicyCard](/cards/policy/), and [AuditCard](/cards/audit/) to understand the governance surface.
+
+## Agent
+
+You consume Card schemas to understand types, use MCP tools to read and write Cards, parse structured errors to know what to fix, and follow task workflows defined in the guides. Wyrd does not run your code. See [use Wyrd through MCP](/agents/mcp/) and [error remediation](/agents/error-remediation/) for the primary agent-facing contracts.
+
+## Engineering leader
+
+Wyrd connects Security, Infra, Data Science, and Observability through a single Card-based substrate. Read [what Wyrd is](./what-is-wyrd/) for the full cross-cutting framing and the rationale for why point tools do not solve this alone.

@@ -1,0 +1,41 @@
+---
+interface Tile {
+  slug: string;
+  label: string;
+  kind: string;
+}
+
+const tiles: Tile[] = [
+  { slug: "agent", label: "Agent", kind: "agent" },
+  { slug: "artifact", label: "Artifact", kind: "artifact" },
+  { slug: "audit", label: "Audit", kind: "audit" },
+  { slug: "data", label: "Data", kind: "data" },
+  { slug: "drift", label: "Drift", kind: "drift" },
+  { slug: "eval", label: "Eval", kind: "eval" },
+  { slug: "experiment", label: "Experiment", kind: "experiment" },
+  { slug: "mcp", label: "MCP", kind: "mcp" },
+  { slug: "model", label: "Model", kind: "model" },
+  { slug: "operator", label: "Operator", kind: "operator" },
+  { slug: "policy", label: "Policy", kind: "policy" },
+  { slug: "prompt", label: "Prompt", kind: "prompt" },
+  { slug: "service", label: "Service", kind: "service" },
+  { slug: "skill", label: "Skill", kind: "skill" },
+  { slug: "subagent", label: "SubAgent", kind: "subagent" },
+  { slug: "tool", label: "Tool", kind: "tool" },
+  { slug: "trigger", label: "Trigger", kind: "trigger" },
+  { slug: "workflow", label: "Workflow", kind: "workflow" },
+];
+---
+
+<ul class="wyrd-tile-grid not-content">
+  {
+    tiles.map((tile) => (
+      <li>
+        <a href={`/cards/${tile.slug}/`} data-kind={tile.kind}>
+          {tile.label}
+          <small>card</small>
+        </a>
+      </li>
+    ))
+  }
+</ul>

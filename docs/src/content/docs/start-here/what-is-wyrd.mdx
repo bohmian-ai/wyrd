@@ -1,0 +1,75 @@
+---
+title: What is Wyrd
+description: The AI-native layer for production AI systems.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+# What is Wyrd
+
+<Aside title="TL;DR" data-variant="wyrd">
+Wyrd is the declarative AI layer for developers, engineers, and agents. One Card envelope for every model, prompt, tool, agent, workflow, eval, policy, audit, service, and observation. Declare it once. Govern, evaluate, deploy, and observe it everywhere. Execution stays in your runtime.
+</Aside>
+
+## What Wyrd governs
+
+<dl class="wyrd-defs">
+  <dt data-kind="model">Models</dt>
+  <dd>Versioned artifacts, interfaces, and the context needed to use them safely.</dd>
+
+  <dt data-kind="prompt">Prompts</dt>
+  <dd>Prompt content and the typed contract around its inputs and outputs.</dd>
+
+  <dt data-kind="agent">Tools</dt>
+  <dd>Executable surfaces and the constraints around their use.</dd>
+
+  <dt data-kind="agent">Agents</dt>
+  <dd>Agent declarations Wyrd describes and governs but never executes.</dd>
+
+  <dt data-kind="agent">Workflows</dt>
+  <dd>Coordinated sequences of operators, tools, agents, or services.</dd>
+
+  <dt data-kind="experiment">Evals</dt>
+  <dd>Suites, scoring rules, and acceptance checks bound to a Card version.</dd>
+
+  <dt>Policies</dt>
+  <dd>Rules that decide whether a Card, Run, or action is allowed.</dd>
+
+  <dt>Audits</dt>
+  <dd>Reviewable events and decisions with durable provenance.</dd>
+
+  <dt data-kind="service">Services</dt>
+  <dd>Deployable surfaces with locked runtime rules and bills-of-materials.</dd>
+
+  <dt data-kind="experiment">Observations</dt>
+  <dd>Drift, eval scores, trace events, and other typed behavioral signals.</dd>
+</dl>
+
+## The shared envelope
+
+Every AI system component in Wyrd is a Card. Cards share a common envelope: kind, name, owner, version, metadata, spec, and status. The spec field is typed per kind, so a ModelCard carries a `ModelSpec` and a PromptCard carries a `PromptSpec`, but the outer envelope is the same across all 18 card types.
+
+This matters for operations. Because every component shares the envelope, the inventory is traversable without bespoke queries per component type. Policy evaluation has a single entry point regardless of which kind of Card is being written. Audit records share a lineage graph that connects a PromptCard to the AgentCard that uses it to the ServiceCard that packages both. That connectivity does not exist when components live in separate point tools with separate schemas and separate storage.
+
+## Why point tools cannot solve this alone
+
+Point tools each solve one slice — a registry tracks models, a prompt tool tracks prompts, an observability backend tracks traces — but none of them share an envelope, a policy engine, or a lineage graph. The seams between tools become the failure mode: a model updates, the eval that validates it does not run against the new version, and no audit record ties the change to the service that packages both. Wyrd is the typed layer that keeps those connections explicit instead of inferred.
+
+## The runtime boundary
+
+Wyrd describes, governs, evaluates, installs references for, and observes AI system components. Execution stays in the user or framework runtime. Wyrd does not:
+
+- host user code
+- run user agent loops
+- serve user inference
+- manage user containers or processes
+
+This boundary is not a limitation. It is the reason Wyrd can be adopted incrementally by teams that already have orchestration frameworks, inference servers, and observability backends. Wyrd works alongside those systems as the governance and inventory layer, not as a replacement for them.
+
+## What exists today
+
+- 18 Card kinds with JSON Schemas (`crates/wyrd-spec/schemas/`).
+- Runtime, telemetry, and testing crate shells; behavior wiring lands in Phase 5a.
+- This docs site, with generated reference pages for Cards, OpenAPI, schemas, and error codes.
+
+CLI, Python SDK, HTTP routes, and MCP tools land in later phases. Their pages exist here and name the phase that fills them in.

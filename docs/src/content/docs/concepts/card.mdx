@@ -1,0 +1,49 @@
+---
+title: Cards
+description: How Wyrd names and governs durable AI-layer assets.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+import PhaseGate from "../../../components/PhaseGate.astro";
+
+# Cards
+
+<Aside title="TL;DR" data-variant="wyrd">
+A Card is the durable record for any Wyrd-governed asset. Same envelope across all 18 kinds; the typed Spec carries kind-specific fields.
+</Aside>
+
+<dl class="wyrd-defs">
+  <dt data-kind="model">Identity</dt>
+  <dd>kind, name, owner, version — stable across the lifetime of the asset.</dd>
+
+  <dt>Payload</dt>
+  <dd>A typed Spec validated against the schema for the card's kind.</dd>
+
+  <dt>Status</dt>
+  <dd>Where this version sits in its lifecycle (draft, released, retired).</dd>
+
+  <dt>References</dt>
+  <dd>Explicit links to other Cards that this one depends on at runtime.</dd>
+</dl>
+
+A Card should answer four questions without a side conversation: what is this, which typed Spec describes it, what other records does it depend on, and which rules apply when it is used.
+
+<Aside title="What this isn't" data-variant="not">
+A Card is **not** a file-system artifact, an ORM row, or a git blob. It is a typed, versioned record the registry owns end-to-end.
+</Aside>
+
+## Shape
+
+<PhaseGate phase="5a">
+The canonical YAML/JSON shape for a Card lands with the registry write path in Phase 5a. Until then, the JSON Schemas in `crates/wyrd-spec/schemas/card.json` are the source of truth.
+</PhaseGate>
+
+## Lifecycle
+
+<PhaseGate phase="5a">
+Write, version, transition, and retire flows land with the registry in Phase 5a.
+</PhaseGate>
+
+## Related cards
+
+For the full list of card kinds and their schemas, see the [Card reference](/cards/).

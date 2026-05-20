@@ -1,0 +1,49 @@
+---
+title: Specs
+description: Typed payloads that give cards their behavior.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+import PhaseGate from "../../../components/PhaseGate.astro";
+
+# Specs
+
+<Aside title="TL;DR" data-variant="wyrd">
+A Spec is the typed payload behind a Card. One schema per kind. Holds the operational truth Wyrd validates and uses at runtime.
+</Aside>
+
+<dl class="wyrd-defs">
+  <dt>Inputs</dt>
+  <dd>What the card consumes at runtime, with shape and constraints.</dd>
+
+  <dt>Outputs</dt>
+  <dd>What it produces, including types and validation contracts.</dd>
+
+  <dt>Budgets</dt>
+  <dd>Time, cost, and rate limits the runtime should enforce.</dd>
+
+  <dt>References</dt>
+  <dd>Pointers to other Cards (Model, Prompt, Tool) this Spec depends on.</dd>
+</dl>
+
+Specs should hold operational truth. Free-form notes are useful for context, but they should not be the only place a runtime rule exists.
+
+<Aside title="What this isn't" data-variant="not">
+A Spec is **not** a README. It is the typed contract the runtime, policy engine, and audit log all read from.
+</Aside>
+
+## Shape
+
+<PhaseGate phase="5a">
+Each card kind has its own Spec schema in `crates/wyrd-spec/schemas/`. The Rust types in `crates/wyrd-spec/src/` are the source of truth.
+</PhaseGate>
+
+## Lifecycle
+
+<PhaseGate phase="5a">
+Validation, evolution, and deprecation rules for Specs land in Phase 5a.
+</PhaseGate>
+
+## Related cards
+
+See the [Card reference](/cards/) for every kind and the field surface of its Spec.

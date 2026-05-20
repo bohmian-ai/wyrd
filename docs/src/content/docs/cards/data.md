@@ -1,0 +1,48 @@
+---
+title: Data
+description: Generated reference for the Wyrd Data card spec.
+---
+
+# Data
+
+Describe a dataset, feature table, document set, or other data dependency.
+
+<dl class="wyrd-defs"><dt data-kind="data">Data</dt><dd>Describe a dataset, feature table, document set, or other data dependency.</dd><dt>Required</dt><dd>none required</dd><dt>Optional</dt><dd>8 additional spec fields — see table below.</dd></dl>
+
+This page is generated from the checked-in JSON Schema. Edit the Rust spec, run the schema generator, then run `mise run docs:generate` to refresh this page.
+
+## Source
+
+- Schema: `crates/wyrd-spec/schemas/data_spec.json`
+
+## Fields
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `artifact_refs` | `array` | no |
+| `audit_ref` | `object` | no |
+| `data_type` | `string \| null` | no |
+| `description` | `string \| null` | no |
+| `details` | `object` | no |
+| `experiment_ref` | `object` | no |
+| `schema_ref` | `object` | no |
+| `source_uri` | `string \| null` | no |
+
+## Shape
+
+<aside class="wyrd-phase-gate"><span class="wyrd-phase-gate__badge">Phase 5a</span>Copy-pasteable YAML for a DataCard lands with the Card write path in Phase 5a. The JSON Schema at <code>crates/wyrd-spec/schemas/data_spec.json</code> is the current source of truth.</aside>
+
+## Lifecycle
+
+<aside class="wyrd-phase-gate"><span class="wyrd-phase-gate__badge">Phase 5a</span>Write, version, transition, and retire flows for DataCards land in Phase 5a.</aside>
+
+## Authoring notes
+
+- Keep card names stable; downstream runs, policies, and audits refer to them by identity.
+- Put operational rules in the spec instead of burying them in free-form notes.
+- Prefer explicit references to other cards when a dependency matters at runtime.
+
+## Related
+
+- [Concepts overview](/concepts/) — where Data fits in the seven primitives.
+- [Card reference index](/cards/) — every kind in one place.

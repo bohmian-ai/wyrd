@@ -1,0 +1,59 @@
+---
+title: Wyrd docs
+description: Developer and agent documentation for Wyrd.
+---
+
+import WyrdHero from "../../components/WyrdHero.astro";
+
+<WyrdHero
+  title="Wyrd"
+  tagline="The declarative AI layer for developers, engineers, and agents."
+  sub="A standardized ecosystem for every model, prompt, agent, and service you ship. Declare it once. Govern, evaluate, deploy, and observe it everywhere."
+/>
+
+<ul class="wyrd-stats">
+  <li><strong>1</strong><span>Envelope</span></li>
+  <li><strong>1</strong><span>Policy engine</span></li>
+  <li><strong>1</strong><span>Audit log</span></li>
+  <li><strong>1</strong><span>Lineage graph</span></li>
+</ul>
+
+## One platform, four jobs
+
+<dl class="wyrd-defs">
+  <dt data-kind="service">Security</dt>
+  <dd>Policy as code. Immutable audit. Lineage from model to deployment. Auditor-ready in week one.</dd>
+
+  <dt data-kind="model">Infra</dt>
+  <dd>A real inventory of every model, prompt, agent, and service in production. Versioned, owned, locked.</dd>
+
+  <dt data-kind="prompt">Data Science</dt>
+  <dd>One standard path from notebook to deployment. Same envelope for every artifact.</dd>
+
+  <dt data-kind="experiment">Observability</dt>
+  <dd>Evals, drift, and behavior in a unified view. Every signal ties back to a Card version.</dd>
+</dl>
+
+## Start here
+
+| You are | Start with |
+| --- | --- |
+| New to Wyrd | [What is Wyrd?](/start-here/what-is-wyrd/) |
+| Data scientist or ML engineer | [Register a card](/guides/register-card/) |
+| Platform engineer | [Concepts overview](/concepts/) |
+| Agent or LLM caller | [For agents](/start-here/agents/) |
+| Security or compliance | [Policy and audit](/policy-audit/) |
+
+## What exists today
+
+JSON Schemas for all 18 Card kinds. Runtime, telemetry, and testing crate shells; behavior lands in Phase 5a. Generated reference pages for every Card kind, the OpenAPI surface, and the error catalog.
+
+CLI, Python SDK, HTTP routes, and MCP tools land in later phases. Pages for those surfaces exist already and name the phase that fills them in.
+
+## Reference
+
+The 18 Card kinds and their schemas live under [Card reference](/cards/). The seven primitives that compose them live under [Concepts](/concepts/).
+
+## For agents
+
+Machine-readable index at [`/llms.txt`](/llms.txt). Full schema dump at [`/llms-full.txt`](/llms-full.txt).

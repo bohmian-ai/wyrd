@@ -1,0 +1,49 @@
+---
+title: Services
+description: How Wyrd describes deployable runtime surfaces.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+import PhaseGate from "../../../components/PhaseGate.astro";
+
+# Services
+
+<Aside title="TL;DR" data-variant="wyrd">
+A ServiceCard is the Card kind that packages a deployable AI surface. It references the Model, Prompt, Tool, and Agent Cards that make up the service.
+</Aside>
+
+<dl class="wyrd-defs">
+  <dt data-kind="service">Identity</dt>
+  <dd>Service name, version, and owner — the deployable unit's stable identity.</dd>
+
+  <dt>Composition</dt>
+  <dd>References to the Model, Prompt, Tool, and Agent Cards the service is built from.</dd>
+
+  <dt>Runtime</dt>
+  <dd>Adapter, environment, and runtime policy the deploy must satisfy.</dd>
+
+  <dt>Lock</dt>
+  <dd>The resolved, immutable bill-of-materials for the released version.</dd>
+</dl>
+
+The ServiceCard is the place to put runtime rules that need to survive beyond one deploy command.
+
+<Aside title="What this isn't" data-variant="not">
+A Service is **not** a Kubernetes manifest, a Helm chart, or a Dockerfile. It is the governed description that those artifacts are generated from or validated against.
+</Aside>
+
+## Shape
+
+<PhaseGate phase="5a">
+ServiceSpec and ServiceLock are checked in at `crates/wyrd-spec/schemas/service_spec.json` and `service_lock.json`.
+</PhaseGate>
+
+## Lifecycle
+
+<PhaseGate phase="5a">
+Lock, install, and rollback flows for Services land in Phase 5a.
+</PhaseGate>
+
+## Related cards
+
+See [Service reference](/cards/service/), [Model](/cards/model/), [Prompt](/cards/prompt/), [Tool](/cards/tool/), and [Agent](/cards/agent/).

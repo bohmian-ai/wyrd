@@ -1,0 +1,49 @@
+---
+title: Audit
+description: Durable records for decisions and sensitive operations.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+import PhaseGate from "../../../components/PhaseGate.astro";
+
+# Audit
+
+<Aside title="TL;DR" data-variant="wyrd">
+An Audit record is an immutable entry describing who or what made a decision. Every Card write, Policy outcome, and Run start emits one.
+</Aside>
+
+<dl class="wyrd-defs">
+  <dt>Actor</dt>
+  <dd>The user, service, or agent that took the action.</dd>
+
+  <dt>Target</dt>
+  <dd>The Card, Run, or resource the action operated on.</dd>
+
+  <dt>Reason</dt>
+  <dd>Why the action was allowed or denied — anchored to a Policy when one applied.</dd>
+
+  <dt>Status</dt>
+  <dd>The outcome of the action, captured at the moment it ran.</dd>
+</dl>
+
+An Audit record is not a log line. It is a durable fact another person or agent may need during review.
+
+<Aside title="What this isn't" data-variant="not">
+Audit is **not** stdout, structured logs, or a SIEM feed. It is a typed, queryable registry record with first-class lineage.
+</Aside>
+
+## Shape
+
+<PhaseGate phase="5a">
+AuditSpec is checked in at `crates/wyrd-spec/schemas/audit_spec.json`.
+</PhaseGate>
+
+## Lifecycle
+
+<PhaseGate phase="5a">
+Emission, retention, and review flows for Audit records land in Phase 5a.
+</PhaseGate>
+
+## Related cards
+
+See [Audit reference](/cards/audit/) and [Policy](/concepts/policy-card/).

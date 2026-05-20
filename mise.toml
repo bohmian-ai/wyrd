@@ -136,6 +136,58 @@ description = "SvelteKit dev server on :3000"
 dir = "crates/wyrd/wyrd-server/wyrd-ui"
 run = "pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000}"
 
+[tasks."docs:install"]
+description = "Install docs dependencies from the lockfile"
+dir = "docs"
+run = "pnpm install --frozen-lockfile"
+
+[tasks."docs:generate"]
+description = "Generate docs pages from Wyrd schemas and API metadata"
+dir = "docs"
+run = """
+python scripts/generate_card_docs.py
+python scripts/generate_api_docs.py
+python scripts/generate_llms_txt.py
+"""
+
+[tasks."docs:check:commands"]
+description = "Fail public docs snippets that bypass mise"
+dir = "docs"
+run = "python scripts/check_commands.py"
+
+[tasks."docs:linkcheck"]
+description = "Validate local Markdown links in the docs site"
+dir = "docs"
+run = "python scripts/check_links.py"
+
+[tasks."docs:astro:check"]
+description = "Run Astro type and content checks for the docs site"
+dir = "docs"
+run = "pnpm astro check"
+
+[tasks."docs:build"]
+description = "Build the Starlight docs site"
+dir = "docs"
+run = "pnpm astro build"
+
+[tasks."docs:check"]
+description = "Docs gate: install, generate, drift check, command check, link check, Astro check, and build"
+depends = ["docs:install"]
+run = """
+mise run docs:generate
+git diff --exit-code -- docs/src/content/docs/cards/ docs/src/content/docs/api/ || (echo "Generated docs are out of date. Run 'mise run docs:generate' and commit the result." && exit 1)
+mise run docs:check:commands
+mise run docs:linkcheck
+mise run docs:astro:check
+mise run docs:build
+"""
+
+[tasks."docs:dev"]
+description = "Run the Starlight docs dev server on :4321"
+depends = ["docs:install", "docs:generate"]
+dir = "docs"
+run = "pnpm astro dev --host 0.0.0.0 --port ${WYRD_DOCS_PORT:-4321}"
+
 [tasks."dev:both"]
 description = "Run wyrd-server (:8080) and UI (:3000) in parallel"
 run = """

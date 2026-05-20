@@ -1,0 +1,52 @@
+---
+title: MCP usage
+description: How Wyrd exposes agent-readable capabilities through MCP.
+---
+
+# MCP usage
+
+The MCP surface gives agents access to Wyrd's typed control plane through stable tool names, typed inputs, and structured errors. It exists so that agents can work with cards, runs, schemas, and policies without scraping human-readable prose for field names or operational rules. The contract described here is the intended shape; mark any surface noted as "planned" before calling it.
+
+## Read tools vs write tools
+
+Read tools have no side effects. An agent can call them freely to orient itself before issuing writes.
+
+Read tools cover:
+
+- Card discovery: list cards by kind, owner, or tag
+- Schema inspection: fetch the JSON Schema for a card kind
+- Run queries: retrieve run status, outputs, and associated observations
+- Policy listing: enumerate active policies and their conditions
+
+Write tools mutate state and are subject to policy and audit checks.
+
+Write tools cover:
+
+- Card registration: register a new card or update an existing one
+- Run creation: create a run record tied to a registered card
+- Observation recording: attach structured observations to a run
+- Policy application: apply or update a policy on a card or kind (planned)
+
+## Write tool contract
+
+Every write tool enforces the following contract:
+
+Scopes are required. An agent must hold the appropriate scope before attempting a write call. A write issued without the required scope returns a structured authorization error, not a silent failure.
+
+Writes must be idempotent. Include a stable client-generated idempotency key, or use the natural idempotency of the operation (for example, card registration is idempotent on the name/kind/owner triple). Submitting the same write twice with the same key returns the existing record without creating a duplicate.
+
+Policy and audit apply to every write. A write that fails a policy check produces a structured policy-denial error with a `code`, `detail`, and `context`. It is not a generic 400. See [Error remediation](/agents/error-remediation) for the full error shape and handling contract.
+
+Confirmation is explicit. An agent must not assume a write succeeded silently. The response for a successful write returns the committed Card or Run record. Inspect the returned record to confirm the committed state before proceeding.
+
+## Schemas and structured errors
+
+Before calling a write tool, an agent should fetch the JSON Schema for the relevant card kind using the schema inspection read tool. Validating inputs locally before issuing a write reduces round trips and produces clearer error attribution.
+
+Errors from all MCP tools return the full RFC 9457 shape described in [Error remediation](/agents/error-remediation). The `code` field is the stable, machine-readable identifier for programmatic handling. The `detail` field is instance-specific prose and must not be parsed for operational decisions.
+
+## Stability notice
+
+Do not invent tool names or capability surfaces not documented here. The MCP surface is being built incrementally; this page will update as tools land. Surfaces noted as "planned" above are not yet callable.
+
+The live MCP server is not yet published. The contract on this page describes the intended shape for the first release.

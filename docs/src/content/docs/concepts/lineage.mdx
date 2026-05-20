@@ -1,0 +1,49 @@
+---
+title: Lineage
+description: How Wyrd connects cards, runs, and artifacts.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+import PhaseGate from "../../../components/PhaseGate.astro";
+
+# Lineage
+
+<Aside title="TL;DR" data-variant="wyrd">
+Lineage is the typed graph connecting Cards to Cards, and Cards to Runs to Observations. The thing that answers "which Service runs this Model version".
+</Aside>
+
+<dl class="wyrd-defs">
+  <dt>Card → Card</dt>
+  <dd>A Service references a Model and a Prompt. A SubAgent references a Skill.</dd>
+
+  <dt>Card → Run</dt>
+  <dd>Every Run records which Card version it was bound to.</dd>
+
+  <dt data-kind="experiment">Run → Observation</dt>
+  <dd>Every Observation records the Run it was emitted from.</dd>
+
+  <dt>Card → Artifact</dt>
+  <dd>ArtifactCards bind immutable blobs to the Card version that produced them.</dd>
+</dl>
+
+Good lineage makes rollback, review, and agent remediation possible without reconstructing history from logs.
+
+<Aside title="What this isn't" data-variant="not">
+Lineage is **not** post-hoc graph inference from logs. It is explicit references declared in Card Specs and resolved by the registry.
+</Aside>
+
+## Shape
+
+<PhaseGate phase="5a">
+CardRef and RunRef are checked in at `crates/wyrd-spec/schemas/card_ref.json` and `run_ref.json`.
+</PhaseGate>
+
+## Lifecycle
+
+<PhaseGate phase="5a">
+Traversal, query, and resolution flows for Lineage land in Phase 5a.
+</PhaseGate>
+
+## Related cards
+
+See [Runs](/concepts/run/), [Observations](/concepts/observation/), and the [Card reference](/cards/).

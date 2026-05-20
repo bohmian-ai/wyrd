@@ -1,0 +1,87 @@
+---
+title: Concepts
+description: The seven primitives that make up Wyrd.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+import WyrdConceptsDiagram from "../../../components/WyrdConceptsDiagram.astro";
+
+# Concepts
+
+<Aside title="TL;DR" data-variant="wyrd">
+Wyrd is seven primitives: **Card**, **Spec**, **Run**, **Observation**, **Policy**, **Audit**, **Lineage**. **Service** is a Card kind that packages the rest into a deployable unit.
+</Aside>
+
+<dl class="wyrd-defs">
+  <dt data-kind="model">Card</dt>
+  <dd>The durable, versioned envelope for one thing Wyrd governs.</dd>
+
+  <dt>Spec</dt>
+  <dd>The typed payload inside a Card. One schema per kind.</dd>
+
+  <dt>Run</dt>
+  <dd>The record of an execution tied to a specific Card version.</dd>
+
+  <dt data-kind="experiment">Observation</dt>
+  <dd>A structured behavioral signal attached to a Run.</dd>
+
+  <dt>Policy</dt>
+  <dd>A decision rule evaluated when Cards are written or Runs are created.</dd>
+
+  <dt>Audit</dt>
+  <dd>An immutable entry describing who or what made a decision.</dd>
+
+  <dt>Lineage</dt>
+  <dd>The typed graph that connects Cards to Cards, and Cards to Runs to Observations.</dd>
+
+  <dt data-kind="service">Service</dt>
+  <dd>A Card kind that packages the other primitives into a deployable unit.</dd>
+</dl>
+
+## How they connect
+
+<WyrdConceptsDiagram />
+
+<details class="wyrd-ascii-fallback">
+<summary>ASCII version</summary>
+
+```
+                          +-------------+
+                          |   Policy    |
+                          |  (decides)  |
+                          +------+------+
+                                 | evaluates writes and runs
+                                 v
+           +---------+     +-------------+     +---------+
+           |  Spec   |<----|    Card     |---->|  Audit  |
+           | (typed) |     | (envelope)  |     |  (who)  |
+           +---------+     +------+------+     +---------+
+                                  | references
+                                  v
+                          +-------------+
+                          |   Lineage   |
+                          |   (graph)   |
+                          +------+------+
+                                 |
+                                 v
+                          +-------------+     +--------------+
+                          |     Run     |---->| Observation  |
+                          | (execution) |     |  (behavior)  |
+                          +-------------+     +--------------+
+```
+
+</details>
+
+<Aside title="What this isn't" data-variant="not">
+Cards are **not** file-system artifacts, ORM rows, or git blobs. They are typed, versioned records Wyrd owns end-to-end.
+</Aside>
+
+## Read next
+
+- [Cards](/concepts/card/) — the envelope shared by all 18 kinds.
+- [Specs](/concepts/spec/) — the typed payload per kind.
+- [Runs](/concepts/run/) and [Observations](/concepts/observation/) — execution and behavior records.
+- [Policies](/concepts/policy-card/) and [Audit](/concepts/audit/) — the decision and provenance surface.
+- [Lineage](/concepts/lineage/) — the graph that ties the rest together.
+- [Services](/concepts/service-card/) — the Card kind that packages a deployable unit.
+- [Card reference](/cards/) — every kind and its schema.

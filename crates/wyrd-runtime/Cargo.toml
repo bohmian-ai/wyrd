@@ -15,7 +15,7 @@ behavior = ["dep:axum", "dep:tower", "dep:tower-http"]
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
-wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
+wyrd-spec.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio.workspace = true

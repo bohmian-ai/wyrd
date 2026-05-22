@@ -1,17 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/wyrd/*",
+    "crates/wyrd-*",
     "crates/vala/*",
-    "crates/shared/*",
-    "crates/wyrd-spec",
+    "crates/skald/*",
     "python/py-wyrd",
 ]
 default-members = [
-    "crates/wyrd/wyrd-server",
-    "crates/wyrd/wyrd-cli",
-    "crates/wyrd/wyrd-mcp",
-    "crates/vala/wyrd-observability-server",
+    "crates/wyrd-*",
+    "crates/vala/*",
+    "crates/skald/*",
 ]
 
 [workspace.package]
@@ -23,6 +21,22 @@ repository = "https://github.com/wyrd-ai/wyrd"
 authors = ["Thorrester <sjforrester32@gmail.com>"]
 
 [workspace.dependencies]
+py-wyrd = { path = "python/py-wyrd", version = "0.0.1" }
+skald-spec = { path = "crates/skald/skald-spec", version = "0.0.1" }
+wyrd-auth = { path = "crates/wyrd-auth", version = "0.0.1" }
+wyrd-cli = { path = "crates/wyrd-cli", version = "0.0.1" }
+wyrd-crypt = { path = "crates/wyrd-crypt", version = "0.0.1" }
+wyrd-dev-fixtures = { path = "crates/wyrd-dev-fixtures", version = "0.0.1" }
+wyrd-error-derive = { path = "crates/wyrd-error-derive", version = "0.0.1" }
+wyrd-mcp = { path = "crates/wyrd-mcp", version = "0.0.1" }
+wyrd-observability-server = { path = "crates/vala/wyrd-observability-server", version = "0.0.1" }
+wyrd-runtime = { path = "crates/wyrd-runtime", version = "0.0.1" }
+wyrd-server = { path = "crates/wyrd-server", version = "0.0.1" }
+wyrd-spec = { path = "crates/wyrd-spec", version = "0.0.1" }
+wyrd-telemetry = { path = "crates/wyrd-telemetry", version = "0.0.1" }
+wyrd-testing = { path = "crates/wyrd-testing", version = "0.0.1" }
+wyrd-utils = { path = "crates/wyrd-utils", version = "0.0.1" }
+
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -43,7 +57,10 @@ zeroize = "1"
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
+pyo3 = { version = "0.28", features = ["abi3-py310", "extension-module", "anyhow", "serde", "chrono"] }
+pythonize = "0.28"
 jsonwebtoken = "9"
+postgresql_embedded = { version = "0.20.2", default-features = false, features = ["blocking"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"

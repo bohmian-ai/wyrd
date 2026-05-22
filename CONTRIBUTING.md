@@ -51,7 +51,7 @@ mise run pre-pr
 4. If your change touches the UI, also run:
 
 ```console
-cd crates/wyrd/wyrd-server/wyrd-ui
+cd crates/wyrd-server/wyrd-ui
 pnpm run check
 pnpm run build
 ```

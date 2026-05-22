@@ -12,5 +12,5 @@ default = []
 dev = ["dep:postgresql_embedded"]
 
 [dependencies]
-postgresql_embedded = { version = "0.20.2", optional = true, default-features = false, features = ["blocking"] }
-thiserror = "2.0"
+postgresql_embedded = { workspace = true, optional = true }
+thiserror.workspace = true

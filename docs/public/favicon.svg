@@ -1,4 +1,4 @@
-<!-- Source: crates/wyrd/wyrd-server/wyrd-ui/brand/logo.svg -->
+<!-- Source: crates/wyrd-server/wyrd-ui/brand/logo.svg -->
 <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Wyrd">
   <rect width="64" height="64" fill="#0b0b0e" />
   <text x="32" y="40" text-anchor="middle" fill="#ff5a3c" font-size="32" font-family="monospace">w</text>

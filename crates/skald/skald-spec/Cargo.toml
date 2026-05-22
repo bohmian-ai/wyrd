@@ -1,13 +1,15 @@
 [package]
-name = "wyrd-utils"
+name = "skald-spec"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
+description = "Skald provider-runtime contracts for Wyrd."
+
+[lib]
+path = "src/lib.rs"
 
 [dependencies]
-uuid = { workspace = true, features = ["std", "v7"] }
-semver.workspace = true
-thiserror.workspace = true
+serde.workspace = true

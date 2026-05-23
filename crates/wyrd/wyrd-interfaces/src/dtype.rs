@@ -1,5 +1,7 @@
 //! Data source detection and Python type guards.
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::path::Path;
 #[cfg(feature = "python")]
 use std::path::PathBuf;
@@ -9,9 +11,11 @@ use pyo3::exceptions::PyModuleNotFoundError;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 #[cfg(feature = "python")]
-use pyo3::types::{PyAny, PyDict, PyString};
+use pyo3::types::{PyAny, PyDict, PyString, PyTuple};
+use wyrd_spec::card::data::DataSchema;
+use wyrd_spec::card::field::{Dim, FieldSpec};
+use wyrd_spec::ids::ColumnName;
 
-#[cfg(feature = "python")]
 use crate::error::{CardPyResult, WyrdPyError};
 
 /// Detected Python data source family used to build a `DataInterface`.
@@ -61,6 +65,64 @@ pub fn is_parquet_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("parquet"))
+}
+
+/// Normalize a source-library dtype token to the canonical Wyrd Arrow string.
+///
+/// # Errors
+/// Returns `WYRD_DATA_400_UNKNOWN_DATA_TYPE` when the token is not in the
+/// locked dtype table.
+pub fn normalize_dtype(source: &str, value: &str) -> CardPyResult<String> {
+    let source = source.trim().to_ascii_lowercase();
+    let value = normalize_token(value);
+    match source.as_str() {
+        "pandas" => normalize_pandas_dtype(&value),
+        "polars" => normalize_polars_dtype(&value),
+        "pyarrow" | "arrow" | "parquet" => normalize_pyarrow_dtype(&value),
+        "numpy" => normalize_numpy_dtype(&value),
+        "torch" => normalize_torch_dtype(&value),
+        _ => Err(unknown_dtype(&source, &value)),
+    }
+}
+
+/// Infer a Wyrd `DataSchema` for a Python data object held by an interface.
+///
+/// # Errors
+/// Returns a Wyrd Python-boundary error when the object cannot be inspected or
+/// its dtype values are not in the locked normalization table.
+#[cfg(feature = "python")]
+pub fn infer_schema_for_interface(
+    _py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    kind: &str,
+) -> CardPyResult<DataSchema> {
+    match kind {
+        "Pandas" => infer_pandas_schema(data),
+        "Polars" => infer_polars_schema(data),
+        "Arrow" | "Parquet" => infer_arrow_schema(data),
+        "Numpy" => infer_numpy_schema(data),
+        "Torch" => infer_torch_schema(data),
+        "Sql" | "Image" | "Text" | "Huggingface" => Ok(DataSchema::empty()),
+        _ => Err(WyrdPyError::unknown_data_type(format!(
+            "unknown DataCard interface kind: {kind}"
+        ))),
+    }
+}
+
+/// Infer the canonical dtype for a NumPy object when present.
+#[cfg(feature = "python")]
+pub fn numpy_dtype(py: Python<'_>, data: Option<&Py<PyAny>>) -> Option<CardPyResult<String>> {
+    data.map(|value| {
+        let bound = value.bind(py);
+        let dtype = bound.getattr("dtype")?.str()?.extract::<String>()?;
+        normalize_dtype("numpy", &dtype)
+    })
+}
+
+/// Infer the shape for a NumPy object when present.
+#[cfg(feature = "python")]
+pub fn numpy_shape(py: Python<'_>, data: Option<&Py<PyAny>>) -> Option<CardPyResult<Vec<i64>>> {
+    data.map(|value| shape_values(value.bind(py)))
 }
 
 /// Detect the source family for a raw Python data object.

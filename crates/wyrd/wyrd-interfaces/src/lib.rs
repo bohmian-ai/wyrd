@@ -3,7 +3,7 @@
 #![deny(missing_docs)]
 
 /// Data interface dtype helpers.
-pub mod dtype {}
+pub mod dtype;
 /// Data interface error boundary.
 pub mod error;
 /// Data interface Python/Rust adapter types.

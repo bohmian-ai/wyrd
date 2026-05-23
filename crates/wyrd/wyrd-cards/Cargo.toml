@@ -1,5 +1,5 @@
 [package]
-name = "wyrd-utils"
+name = "wyrd-cards"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,18 +9,17 @@ authors.workspace = true
 
 [features]
 default = []
-python = ["dep:pyo3"]
+python = ["dep:pyo3", "wyrd-interfaces/python", "wyrd-utils/python"]
 
 [dependencies]
-uuid = { workspace = true, features = ["std", "v7"] }
-pythonize = { workspace = true }
-semver.workspace = true
-thiserror.workspace = true
+wyrd-spec.workspace = true
+wyrd-interfaces.workspace = true
+wyrd-utils.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-flate2.workspace = true
-zstd.workspace = true
-walkdir.workspace = true
-sha2.workspace = true
-wyrd-spec.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
 pyo3 = { workspace = true, optional = true }
+
+[lints]
+workspace = true

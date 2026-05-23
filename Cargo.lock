@@ -1639,15 +1639,8 @@ dependencies = [
 name = "py-wyrd"
 version = "0.0.1"
 dependencies = [
- "chrono",
- "flate2",
  "pyo3",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "walkdir",
- "wyrd-spec",
- "zstd",
+ "wyrd-cards",
 ]
 
 [[package]]
@@ -3453,6 +3446,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-cards"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "pyo3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "wyrd-interfaces",
+ "wyrd-spec",
+ "wyrd-utils",
+]
+
+[[package]]
 name = "wyrd-cli"
 version = "0.0.1"
 
@@ -3481,6 +3488,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "wyrd-interfaces"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "pyo3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "wyrd-spec",
+ "wyrd-utils",
 ]
 
 [[package]]
@@ -3553,10 +3573,17 @@ version = "0.0.1"
 name = "wyrd-utils"
 version = "0.0.1"
 dependencies = [
- "pythonize",
+ "flate2",
+ "pyo3",
  "semver",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "uuid",
+ "walkdir",
+ "wyrd-spec",
+ "zstd",
 ]
 
 [[package]]

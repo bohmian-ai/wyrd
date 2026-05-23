@@ -128,7 +128,6 @@ server/Python/client layers.
 
 ## 7. PyO3 Boundary Rules
 
-- Keep PyO3 in `python/py-wyrd*` unless an explicit allowlist says otherwise.
 - Keep `Python<'py>`, `Bound<'py, T>`, `Py<T>`, `PyErr` out of Rust-only core
   crates.
 - Convert Python inputs at the boundary, then call Rust-native APIs.

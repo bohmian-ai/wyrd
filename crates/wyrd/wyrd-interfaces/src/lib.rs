@@ -11,11 +11,11 @@ pub mod interfaces {}
 /// Data interface local IO helpers.
 pub mod io {}
 /// Data schema Python/Rust wrappers.
-pub mod schema {}
+pub mod schema;
 /// Data split Python/Rust wrappers.
 pub mod split {}
 /// Data stats Python/Rust wrappers.
-pub mod stats {}
+pub mod stats;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -26,5 +26,7 @@ use pyo3::types::PyModule;
 #[cfg(feature = "python")]
 pub fn register(_py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register_exceptions(parent)?;
+    schema::register(parent)?;
+    stats::register(parent)?;
     Ok(())
 }

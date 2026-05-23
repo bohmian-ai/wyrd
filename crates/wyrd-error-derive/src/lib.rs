@@ -6,7 +6,7 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, Lit, parse_macro_input};
 
-/// Derive stable `code()` and `status()` accessors from `#[wyrd_error(...)]`.
+/// Derive stable metadata accessors from `#[wyrd_error(...)]`.
 #[proc_macro_derive(WyrdError, attributes(wyrd_error))]
 pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
@@ -19,17 +19,19 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
 
     let mut code_arms = Vec::new();
     let mut status_arms = Vec::new();
+    let mut title_arms = Vec::new();
+    let mut remediation_arms = Vec::new();
 
     for variant in &data.variants {
-        let Some((code, status)) = parse_attr(variant) else {
+        let Some(metadata) = parse_attr(variant) else {
             return syn::Error::new_spanned(
                 variant,
-                "missing #[wyrd_error(code = \"WYRD_<DOMAIN>_<STATUS>_<SLUG>\", status = N)]",
+                "missing #[wyrd_error(code = \"WYRD_<DOMAIN>_<STATUS>_<SLUG>\", status = N, title = \"...\", remediation = \"...\")]",
             )
             .to_compile_error()
             .into();
         };
-        if let Err(message) = validate_code(&code, status) {
+        if let Err(message) = validate_code(&metadata.code, metadata.status) {
             return syn::Error::new_spanned(variant, message)
                 .to_compile_error()
                 .into();
@@ -41,8 +43,14 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
             Fields::Unnamed(_) => quote! { #name::#ident(..) },
             Fields::Named(_) => quote! { #name::#ident { .. } },
         };
+        let code = metadata.code;
+        let status = metadata.status;
+        let title = metadata.title;
+        let remediation = metadata.remediation;
         code_arms.push(quote! { #pattern => #code });
         status_arms.push(quote! { #pattern => #status });
+        title_arms.push(quote! { #pattern => #title });
+        remediation_arms.push(quote! { #pattern => #remediation });
     }
 
     quote! {
@@ -60,18 +68,41 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
                     #(#status_arms,)*
                 }
             }
+
+            /// Stable problem-title text.
+            pub fn title(&self) -> &'static str {
+                match self {
+                    #(#title_arms,)*
+                }
+            }
+
+            /// Operator-facing remediation hint.
+            pub fn remediation(&self) -> &'static str {
+                match self {
+                    #(#remediation_arms,)*
+                }
+            }
         }
     }
     .into()
 }
 
-fn parse_attr(variant: &syn::Variant) -> Option<(String, u16)> {
+struct ErrorMetadata {
+    code: String,
+    status: u16,
+    title: String,
+    remediation: String,
+}
+
+fn parse_attr(variant: &syn::Variant) -> Option<ErrorMetadata> {
     let attr = variant
         .attrs
         .iter()
         .find(|attr| attr.path().is_ident("wyrd_error"))?;
     let mut code = None;
     let mut status = None;
+    let mut title = None;
+    let mut remediation = None;
 
     attr.parse_nested_meta(|meta| {
         if meta.path.is_ident("code") {
@@ -90,11 +121,32 @@ fn parse_attr(variant: &syn::Variant) -> Option<(String, u16)> {
             status = Some(lit.base10_parse::<u16>()?);
             return Ok(());
         }
+        if meta.path.is_ident("title") {
+            let value = meta.value()?;
+            let Lit::Str(lit) = value.parse()? else {
+                return Err(meta.error("title must be a string literal"));
+            };
+            title = Some(lit.value());
+            return Ok(());
+        }
+        if meta.path.is_ident("remediation") {
+            let value = meta.value()?;
+            let Lit::Str(lit) = value.parse()? else {
+                return Err(meta.error("remediation must be a string literal"));
+            };
+            remediation = Some(lit.value());
+            return Ok(());
+        }
         Err(meta.error("unsupported wyrd_error attribute key"))
     })
     .ok()?;
 
-    Some((code?, status?))
+    Some(ErrorMetadata {
+        code: code?,
+        status: status?,
+        title: title?,
+        remediation: remediation?,
+    })
 }
 
 fn validate_code(code: &str, status: u16) -> Result<(), String> {
@@ -102,7 +154,7 @@ fn validate_code(code: &str, status: u16) -> Result<(), String> {
         return Err("status must be in 100..=599".to_string());
     }
     let parts: Vec<_> = code.split('_').collect();
-    if parts.len() < 5 || parts.first() != Some(&"WYRD") {
+    if parts.len() < 4 || parts.first() != Some(&"WYRD") {
         return Err("code must be WYRD_<DOMAIN>_<STATUS>_<SLUG>".to_string());
     }
     let code_status = parts[2]

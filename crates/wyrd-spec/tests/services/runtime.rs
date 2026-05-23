@@ -9,7 +9,7 @@ use wyrd_spec::format;
 
 #[test]
 fn legacy_service_spec_without_runtime_round_trips_without_runtime_key() {
-    let fixture = include_str!("fixtures/legacy-service-spec-without-runtime.json");
+    let fixture = include_str!("../fixtures/legacy-service-spec-without-runtime.json");
     let decoded: ServiceSpec = serde_json::from_str(fixture).unwrap();
     assert_eq!(decoded.runtime, None);
 
@@ -20,7 +20,8 @@ fn legacy_service_spec_without_runtime_round_trips_without_runtime_key() {
 #[test]
 fn service_runtime_fixture_round_trips() {
     let decoded: Card =
-        format::yaml::from_str(include_str!("fixtures/service-with-runtime-policy.yaml")).unwrap();
+        format::yaml::from_str(include_str!("../fixtures/service-with-runtime-policy.yaml"))
+            .unwrap();
     let Spec::Service(spec) = &decoded.spec else {
         panic!("expected Service spec");
     };

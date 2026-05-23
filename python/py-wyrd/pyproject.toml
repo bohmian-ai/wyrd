@@ -1,0 +1,58 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "wyrd"
+version = "0.0.1"
+description = "Python bindings for Wyrd"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Wyrd contributors" }]
+dependencies = [
+    "pyarrow>=18.0.0",
+]
+
+[project.optional-dependencies]
+pandas = ["pandas>=2.2,<3"]
+polars = ["polars>=1.10.0"]
+numpy = ["numpy>=1.26"]
+torch = ["torch>=2.4.0", "safetensors>=0.4.0"]
+huggingface = ["datasets>=2.20.0"]
+
+[dependency-groups]
+dev = [
+    "datasets>=2.20.0",
+    "maturin>=1.7,<2",
+    "numpy>=1.26",
+    "pandas>=2.2,<3",
+    "polars>=1.10.0",
+    "pyarrow>=18.0.0",
+    "pytest>=7.0.0,<9.0.0",
+    "pytest-cov>=5.0.0,<7.0.0",
+    "pyyaml>=6.0.0",
+    "ruff>=0.1.0,<1.0.0",
+    "safetensors>=0.4.0",
+    "torch>=2.4.0",
+    "ty>=0.0.35,<0.1.0",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "wyrd._native"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["python"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.uv]
+package = false

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SqlLogic",
+  "description": "SQL query bundle associated with SQL-backed DataCards.",
+  "type": "object",
+  "required": [
+    "queries"
+  ],
+  "properties": {
+    "default_query": {
+      "description": "Optional default query key.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/QueryName"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "queries": {
+      "description": "Named SQL queries.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    }
+  },
+  "definitions": {
+    "QueryName": {
+      "description": "DataCard SQL query key.",
+      "type": "string"
+    }
+  }
+}

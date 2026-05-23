@@ -9,5 +9,14 @@ authors.workspace = true
 publish = false
 
 [lib]
-crate-type = ["rlib"]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
+test = false
+doctest = false
+
+[dependencies]
+pyo3 = { workspace = true }
+
+[lints]
+workspace = true

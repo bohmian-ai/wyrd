@@ -7,10 +7,13 @@ use schemars::schema_for;
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::card::artifact::{ArtifactSpec, FrameworkAdapterRef};
 use wyrd_spec::card::audit::AuditSpec;
-use wyrd_spec::card::data::DataSpec;
+use wyrd_spec::card::data::{
+    DataInterface, DataSchema, DataSpec, DataSplit, DataStats, SplitStrategy, SqlLogic,
+};
 use wyrd_spec::card::drift::DriftSpec;
 use wyrd_spec::card::eval::EvalSpec;
 use wyrd_spec::card::experiment::ExperimentSpec;
+use wyrd_spec::card::field::FieldSpec;
 use wyrd_spec::card::mcp::McpSpec;
 use wyrd_spec::card::model::ModelSpec;
 use wyrd_spec::card::operator::{OperatorBudget, OperatorInput, OperatorSpec};
@@ -42,6 +45,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<RunRef>(out, golden, "run_ref")?;
     write::<ServiceLock>(out, golden, "service_lock")?;
     write::<LockedComponent>(out, golden, "locked_component")?;
+    write::<FieldSpec>(out, golden, "field_spec")?;
+    write::<DataSchema>(out, golden, "data_schema")?;
+    write::<SplitStrategy>(out, golden, "split_strategy")?;
+    write::<DataSplit>(out, golden, "data_split")?;
+    write::<DataInterface>(out, golden, "data_interface")?;
+    write::<SqlLogic>(out, golden, "sql_logic")?;
+    write::<DataStats>(out, golden, "data_stats")?;
     write::<DataSpec>(out, golden, "data_spec")?;
     write::<ModelSpec>(out, golden, "model_spec")?;
     write::<ExperimentSpec>(out, golden, "experiment_spec")?;

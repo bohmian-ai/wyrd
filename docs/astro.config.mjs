@@ -47,6 +47,7 @@ export default defineConfig({
           collapsed: true,
           items: [
             { label: "Overview", link: "/concepts/" },
+            { label: "Core doctrine", link: "/concepts/core-doctrine/" },
             { label: "Cards", link: "/concepts/card/" },
             { label: "Specs", link: "/concepts/spec/" },
             { label: "Runs", link: "/concepts/run/" },

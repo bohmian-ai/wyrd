@@ -68,6 +68,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+pyo3 = { version = "0.28", features = ["abi3-py310", "chrono"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

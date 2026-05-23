@@ -1,11 +1,21 @@
 //! Python-boundary helpers shared by PyO3-enabled Wyrd crates.
 
 use pyo3::IntoPyObjectExt;
-use pyo3::exceptions::{PyAttributeError, PyModuleNotFoundError, PyRuntimeError};
+use pyo3::create_exception;
+use pyo3::exceptions::{PyAttributeError, PyException, PyModuleNotFoundError, PyRuntimeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use pyo3::types::{
+    PyAny, PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyModule, PyString, PyTuple,
+};
 use serde_json::Value;
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::error::WyrdError as SpecWyrdError;
+
+create_exception!(
+    wyrd._native,
+    WyrdError,
+    PyException,
+    "Base Python exception for structured Wyrd errors."
+);
 
 /// Convert a JSON value to a Python object.
 ///
@@ -147,10 +157,23 @@ pub fn module_version(py: Python<'_>, name: &str) -> PyResult<Option<String>> {
     }
 }
 
-/// Convert a public Wyrd error into a Python runtime error.
+/// Register the base structured Wyrd Python exception on a module.
+///
+/// # Errors
+/// Returns a Python error when module registration fails.
+pub fn register_wyrd_error_exception(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add("WyrdError", module.py().get_type::<WyrdError>())
+}
+
+/// Convert a public Wyrd error into a structured Python Wyrd error.
 #[must_use]
-pub fn wyrd_error_to_py_err(error: WyrdError) -> PyErr {
-    PyRuntimeError::new_err(error.to_string())
+pub fn wyrd_error_to_py_err(error: SpecWyrdError) -> PyErr {
+    Python::attach(|py| match build_wyrd_py_err(py, error) {
+        Ok(error) => error,
+        Err(source) => PyRuntimeError::new_err(format!(
+            "failed to construct structured Wyrd Python error: {source}"
+        )),
+    })
 }
 
 fn py_iterable_to_json<'py>(iter: impl Iterator<Item = Bound<'py, PyAny>>) -> PyResult<Value> {
@@ -159,4 +182,38 @@ fn py_iterable_to_json<'py>(iter: impl Iterator<Item = Bound<'py, PyAny>>) -> Py
         values.push(pyobject_to_json(&item)?);
     }
     Ok(Value::Array(values))
+}
+
+fn build_wyrd_py_err(py: Python<'_>, error: SpecWyrdError) -> PyResult<PyErr> {
+    let display = error.to_string();
+    let problem = error.as_problem_json();
+    let code = problem_string(&problem, "code", error.code()).to_owned();
+    let title = problem_string(&problem, "title", error.title()).to_owned();
+    let status = problem
+        .get("status")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| u64::from(error.status()));
+    let message = problem_string(&problem, "detail", &display).to_owned();
+    let remediation = problem_string(&problem, "remediation", error.remediation()).to_owned();
+    let problem_type = problem
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let details = problem.get("details").cloned().unwrap_or(Value::Null);
+
+    let exception = py.get_type::<WyrdError>().call1((message.clone(),))?;
+    exception.setattr("code", code)?;
+    exception.setattr("message", message)?;
+    exception.setattr("details", json_to_pyobject(py, &details)?.bind(py))?;
+    exception.setattr("remediation", remediation)?;
+    exception.setattr("status", status)?;
+    exception.setattr("title", title)?;
+    exception.setattr("type", problem_type)?;
+    exception.setattr("problem", json_to_pyobject(py, &problem)?.bind(py))?;
+    Ok(PyErr::from_value(exception))
+}
+
+fn problem_string<'a>(problem: &'a Value, key: &str, fallback: &'a str) -> &'a str {
+    problem.get(key).and_then(Value::as_str).unwrap_or(fallback)
 }

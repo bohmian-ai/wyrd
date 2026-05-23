@@ -5,7 +5,7 @@
 /// Data interface dtype helpers.
 pub mod dtype {}
 /// Data interface error boundary.
-pub mod error {}
+pub mod error;
 /// Data interface Python/Rust adapter types.
 pub mod interfaces {}
 /// Data interface local IO helpers.
@@ -24,6 +24,7 @@ use pyo3::types::PyModule;
 
 /// Register interface Python objects under a parent module.
 #[cfg(feature = "python")]
-pub fn register(_py: Python<'_>, _parent: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn register(_py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
+    error::register_exceptions(parent)?;
     Ok(())
 }

@@ -13,7 +13,7 @@ pub mod io {}
 /// Data schema Python/Rust wrappers.
 pub mod schema;
 /// Data split Python/Rust wrappers.
-pub mod split {}
+pub mod split;
 /// Data stats Python/Rust wrappers.
 pub mod stats;
 
@@ -27,6 +27,7 @@ use pyo3::types::PyModule;
 pub fn register(_py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register_exceptions(parent)?;
     schema::register(parent)?;
+    split::register(parent)?;
     stats::register(parent)?;
     Ok(())
 }

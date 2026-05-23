@@ -21,22 +21,7 @@ repository = "https://github.com/wyrd-ai/wyrd"
 authors = ["Thorrester <sjforrester32@gmail.com>"]
 
 [workspace.dependencies]
-py-wyrd = { path = "python/py-wyrd", version = "0.0.1" }
-skald-spec = { path = "crates/skald/skald-spec", version = "0.0.1" }
-wyrd-auth = { path = "crates/wyrd-auth", version = "0.0.1" }
-wyrd-cli = { path = "crates/wyrd-cli", version = "0.0.1" }
-wyrd-crypt = { path = "crates/wyrd-crypt", version = "0.0.1" }
-wyrd-dev-fixtures = { path = "crates/wyrd-dev-fixtures", version = "0.0.1" }
-wyrd-error-derive = { path = "crates/wyrd-error-derive", version = "0.0.1" }
-wyrd-mcp = { path = "crates/wyrd-mcp", version = "0.0.1" }
-wyrd-observability-server = { path = "crates/vala/wyrd-observability-server", version = "0.0.1" }
-wyrd-runtime = { path = "crates/wyrd-runtime", version = "0.0.1" }
-wyrd-server = { path = "crates/wyrd-server", version = "0.0.1" }
 wyrd-spec = { path = "crates/wyrd-spec", version = "0.0.1" }
-wyrd-telemetry = { path = "crates/wyrd-telemetry", version = "0.0.1" }
-wyrd-testing = { path = "crates/wyrd-testing", version = "0.0.1" }
-wyrd-utils = { path = "crates/wyrd-utils", version = "0.0.1" }
-
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -46,6 +31,10 @@ schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 thiserror = "2.0"
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
+flate2 = "1.*"
+zstd = "0.13"
+walkdir = "2.*"
+sha2 = "0.10.*"
 uuid = { version = "1", default-features = false, features = ["serde"] }
 ulid = { version = "1", features = ["serde"] }
 semver = { version = "1", features = ["serde"] }
@@ -68,7 +57,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
-pyo3 = { version = "0.28", features = ["abi3-py310", "chrono"] }
+pyo3 = { version = "0.28", features = ["abi3-py310", "extension-module", "chrono"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

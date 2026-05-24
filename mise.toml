@@ -92,10 +92,40 @@ done
 """
 
 [tasks."check:pyo3-scope"]
-description = "Assert PyO3 stays out of foundation crates"
+description = "Assert PyO3 stays out of pure contracts and Python-free shared crates"
 run = """
-if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/wyrd-spec crates/wyrd-auth crates/wyrd-crypt crates/wyrd-runtime crates/wyrd-telemetry crates/wyrd-testing crates/wyrd-utils; then
-  echo 'PyO3 scope violation detected'
+set -eu
+
+if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/wyrd-spec; then
+  echo 'PyO3 scope violation detected in wyrd-spec'
+  exit 1
+fi
+
+if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/shared --glob '!crates/shared/wyrd-utils/**'; then
+  echo 'PyO3 scope violation detected in Python-free shared crates'
+  exit 1
+fi
+
+if ! rg -qF 'python = ["dep:pyo3"]' crates/shared/wyrd-utils/Cargo.toml; then
+  echo 'wyrd-utils must gate PyO3 behind its python feature'
+  exit 1
+fi
+
+if ! rg -q 'pyo3 = \\{ workspace = true, optional = true \\}' crates/shared/wyrd-utils/Cargo.toml; then
+  echo 'wyrd-utils PyO3 dependency must remain optional'
+  exit 1
+fi
+
+if ! rg -q '#\\[cfg\\(feature = "python"\\)\\]' crates/shared/wyrd-utils/src/lib.rs; then
+  echo 'wyrd-utils Python helpers must remain cfg-gated'
+  exit 1
+fi
+
+forbidden_utils_default=$(cargo tree -p wyrd-utils --no-default-features -e normal | \
+  rg '(^|[ ─└├])pyo3' || true)
+if [ -n "$forbidden_utils_default" ]; then
+  echo "FAIL: wyrd-utils pulls PyO3 without its python feature:"
+  echo "$forbidden_utils_default"
   exit 1
 fi
 """

@@ -1,4 +1,6 @@
-//! Small shared helpers with no server or Python dependencies.
+//! Small shared helpers with no server dependencies.
+//!
+//! Python boundary helpers live behind the optional `python` feature.
 
 #![deny(missing_docs)]
 

@@ -7,7 +7,7 @@ pub mod dtype;
 /// Data interface error boundary.
 pub mod error;
 /// Data interface Python/Rust adapter types.
-pub mod interfaces {}
+pub mod interfaces;
 /// Data interface local IO helpers.
 pub mod io {}
 /// Data schema Python/Rust wrappers.
@@ -26,6 +26,7 @@ use pyo3::types::PyModule;
 #[cfg(feature = "python")]
 pub fn register(_py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register_exceptions(parent)?;
+    interfaces::register(parent)?;
     schema::register(parent)?;
     split::register(parent)?;
     stats::register(parent)?;

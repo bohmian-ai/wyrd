@@ -58,7 +58,7 @@ impl From<PyDataStats> for DataStats {
 impl PyDataStats {
     #[new]
     #[pyo3(signature = (byte_count, sha256, row_count=None, col_count=None))]
-    fn py_new(
+    fn __new__(
         byte_count: u64,
         sha256: String,
         row_count: Option<u64>,

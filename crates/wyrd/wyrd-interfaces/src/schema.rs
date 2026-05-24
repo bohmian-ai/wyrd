@@ -64,7 +64,7 @@ impl From<PyFieldSpec> for FieldSpec {
 impl PyFieldSpec {
     #[new]
     #[pyo3(signature = (name, dtype, shape=None, nullable=false, extra=None))]
-    fn py_new(
+    fn __new__(
         name: &str,
         dtype: String,
         shape: Option<&Bound<'_, PyAny>>,
@@ -178,7 +178,7 @@ impl From<PyDataSchema> for DataSchema {
 impl PyDataSchema {
     #[new]
     #[pyo3(signature = (columns=None))]
-    fn py_new(columns: Option<&Bound<'_, PyAny>>) -> CardPyResult<Self> {
+    fn __new__(columns: Option<&Bound<'_, PyAny>>) -> CardPyResult<Self> {
         Ok(Self::from_inner(DataSchema::new(parse_columns(columns)?)))
     }
 

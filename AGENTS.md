@@ -139,6 +139,10 @@ server/Python/client layers.
 
 - Keep `Python<'py>`, `Bound<'py, T>`, `Py<T>`, `PyErr` out of Rust-only core
   crates.
+- Name the `#[new]` method `fn __new__` (not `fn new`) and give it an explicit
+  `#[pyo3(signature = (...))]`. The Rust source mirrors the Python slot it
+  exposes. Builder-only pyclasses constructed via `#[staticmethod]` take no
+  `#[new]`.
 - Convert Python inputs at the boundary, then call Rust-native APIs.
 - Use `Bound<'py, T>` for new PyO3 code.
 - Convert to `Py<T>` before storing Python objects across awaits, threads, or

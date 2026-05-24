@@ -106,6 +106,7 @@ def test_pandas_raw_data_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "pandas-raw"
 
     card = DataCard(data)
+    assert card.interface.kind == "Pandas"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -121,6 +122,7 @@ def test_polars_raw_data_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "polars-raw"
 
     card = DataCard(data)
+    assert card.interface.kind == "Polars"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -136,6 +138,7 @@ def test_pyarrow_raw_data_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "pyarrow-raw"
 
     card = DataCard(data)
+    assert card.interface.kind == "Arrow"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -151,6 +154,7 @@ def test_numpy_raw_data_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "numpy-raw"
 
     card = DataCard(data)
+    assert card.interface.kind == "Numpy"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -166,6 +170,7 @@ def test_torch_raw_data_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "torch-raw"
 
     card = DataCard(data)
+    assert card.interface.kind == "Torch"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -181,6 +186,7 @@ def test_sql_raw_data_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "sql-raw"
 
     card = DataCard(data)
+    assert card.interface.kind == "Sql"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -196,6 +202,7 @@ def test_huggingface_raw_data_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "huggingface-raw"
 
     card = DataCard(data)
+    assert card.interface.kind == "Huggingface"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -211,6 +218,7 @@ def test_parquet_path_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "parquet-path"
 
     card = DataCard(data)
+    assert card.interface.kind == "Parquet"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -226,6 +234,7 @@ def test_jsonl_path_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "jsonl-path"
 
     card = DataCard(data)
+    assert card.interface.kind == "Jsonl"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -241,6 +250,7 @@ def test_gzip_jsonl_path_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "jsonl-gzip-path"
 
     card = DataCard(data)
+    assert card.interface.kind == "Jsonl"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -256,6 +266,7 @@ def test_image_directory_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "image-directory"
 
     card = DataCard(data)
+    assert card.interface.kind == "Image"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -271,6 +282,7 @@ def test_text_directory_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "text-directory"
 
     card = DataCard(data)
+    assert card.interface.kind == "Text"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -287,6 +299,7 @@ def test_pandas_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "pandas-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Pandas"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -304,6 +317,7 @@ def test_polars_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "polars-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Polars"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -321,6 +335,7 @@ def test_arrow_parquet_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "arrow-parquet-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Arrow"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -338,6 +353,7 @@ def test_arrow_ipc_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "arrow-ipc-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Arrow"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -355,6 +371,7 @@ def test_parquet_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "parquet-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Parquet"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -372,6 +389,7 @@ def test_numpy_npy_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "numpy-npy-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Numpy"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -389,6 +407,7 @@ def test_numpy_npz_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "numpy-npz-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Numpy"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -406,6 +425,7 @@ def test_torch_safetensors_interface_datacard_save_and_load(tmp_path: Path) -> N
     path = tmp_path / "torch-safetensors-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Torch"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -423,6 +443,7 @@ def test_torch_pickle_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "torch-pickle-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Torch"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -439,6 +460,7 @@ def test_sql_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "sql-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Sql"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -455,6 +477,7 @@ def test_jsonl_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "jsonl-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Jsonl"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -471,6 +494,7 @@ def test_jsonl_gzip_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "jsonl-gzip-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Jsonl"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -487,6 +511,7 @@ def test_jsonl_zstd_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "jsonl-zstd-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Jsonl"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -504,6 +529,7 @@ def test_image_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "image-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Image"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -521,6 +547,7 @@ def test_text_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "text-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Text"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -538,6 +565,7 @@ def test_huggingface_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "huggingface-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Huggingface"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text())
@@ -554,6 +582,7 @@ def test_custom_interface_datacard_save_and_load(tmp_path: Path) -> None:
     path = tmp_path / "custom-interface"
 
     card = DataCard(interface)
+    assert card.interface.kind == "Custom"
     card.save(path)
 
     card = DataCard.model_validate_json((path / "card.json").read_text(), interface=JsonInterface)

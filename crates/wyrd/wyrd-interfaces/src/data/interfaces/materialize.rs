@@ -37,7 +37,7 @@ impl PandasInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for pandas calls.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_save_kwargs` - Reserved for future pandas-specific save options.
     ///
     /// # Returns
@@ -47,7 +47,7 @@ impl PandasInterface {
     /// # Errors
     ///
     /// Returns an error when source data is missing, the object is not a pandas
-    /// DataFrame, compression is invalid, pandas parquet writing fails, schema
+    /// `DataFrame`, compression is invalid, pandas parquet writing fails, schema
     /// inference fails, or local stats cannot be computed.
     pub fn save_inner(
         &self,
@@ -75,7 +75,7 @@ impl PandasInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for pandas calls.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_load_kwargs` - Reserved for future pandas-specific load options.
     ///
     /// # Errors
@@ -104,7 +104,7 @@ impl PolarsInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for polars calls.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_save_kwargs` - Reserved for future polars-specific save options.
     ///
     /// # Returns
@@ -114,7 +114,7 @@ impl PolarsInterface {
     /// # Errors
     ///
     /// Returns an error when source data is missing, the object is not a polars
-    /// DataFrame, compression is invalid, polars parquet writing fails, schema
+    /// `DataFrame`, compression is invalid, polars parquet writing fails, schema
     /// inference fails, or local stats cannot be computed.
     pub fn save_inner(
         &self,
@@ -143,7 +143,7 @@ impl PolarsInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for polars calls.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_load_kwargs` - Reserved for future polars-specific load options.
     ///
     /// # Errors
@@ -170,12 +170,12 @@ impl PolarsInterface {
 
 #[cfg(feature = "python")]
 impl ArrowInterface {
-    /// Save the held PyArrow table to the local artifact layout.
+    /// Save the held `PyArrow` table to the local artifact layout.
     ///
     /// # Arguments
     ///
-    /// * `py` - Active Python token used for PyArrow calls.
-    /// * `path` - Local DataCard materialization root.
+    /// * `py` - Active Python token used for `PyArrow` calls.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_save_kwargs` - Reserved for future Arrow-specific save options.
     ///
     /// # Returns
@@ -185,7 +185,7 @@ impl ArrowInterface {
     /// # Errors
     ///
     /// Returns an error when source data is missing, the object is not a
-    /// `pyarrow.Table`, format is invalid, PyArrow serialization fails, schema
+    /// `pyarrow.Table`, format is invalid, `PyArrow` serialization fails, schema
     /// inference fails, or local stats cannot be computed.
     pub fn save_inner(
         &self,
@@ -222,18 +222,18 @@ impl ArrowInterface {
         data_stats_for_file(&absolute_path, Some(&schema))
     }
 
-    /// Load a PyArrow table from the local artifact layout.
+    /// Load a `PyArrow` table from the local artifact layout.
     ///
     /// # Arguments
     ///
-    /// * `py` - Active Python token used for PyArrow calls.
-    /// * `path` - Local DataCard materialization root.
+    /// * `py` - Active Python token used for `PyArrow` calls.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_load_kwargs` - Reserved for future Arrow-specific load options.
     ///
     /// # Errors
     ///
     /// Returns an error when the expected Arrow artifact is missing, format is
-    /// invalid, or PyArrow cannot deserialize the artifact.
+    /// invalid, or `PyArrow` cannot deserialize the artifact.
     pub fn load_inner(
         &mut self,
         py: Python<'_>,
@@ -264,8 +264,8 @@ impl ParquetInterface {
     ///
     /// # Arguments
     ///
-    /// * `py` - Active Python token used for path detection or PyArrow calls.
-    /// * `path` - Local DataCard materialization root.
+    /// * `py` - Active Python token used for path detection or `PyArrow` calls.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_save_kwargs` - Reserved for future parquet-specific save options.
     ///
     /// # Returns
@@ -306,17 +306,17 @@ impl ParquetInterface {
         data_stats_for_file(&absolute_path, Some(&schema))
     }
 
-    /// Load a PyArrow table from the local parquet artifact.
+    /// Load a `PyArrow` table from the local parquet artifact.
     ///
     /// # Arguments
     ///
-    /// * `py` - Active Python token used for PyArrow calls.
-    /// * `path` - Local DataCard materialization root.
+    /// * `py` - Active Python token used for `PyArrow` calls.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_load_kwargs` - Reserved for future parquet-specific load options.
     ///
     /// # Errors
     ///
-    /// Returns an error when `data/data.parquet` is missing or PyArrow cannot
+    /// Returns an error when `data/data.parquet` is missing or `PyArrow` cannot
     /// read the parquet artifact.
     pub fn load_inner(
         &mut self,
@@ -337,13 +337,13 @@ impl ParquetInterface {
 
 #[cfg(feature = "python")]
 impl NumpyInterface {
-    /// Save the held NumPy array to the local artifact layout.
+    /// Save the held `NumPy` array to the local artifact layout.
     ///
     /// # Arguments
     ///
-    /// * `py` - Active Python token used for NumPy calls.
-    /// * `path` - Local DataCard materialization root.
-    /// * `_save_kwargs` - Reserved for future NumPy-specific save options.
+    /// * `py` - Active Python token used for `NumPy` calls.
+    /// * `path` - Local `DataCard` materialization root.
+    /// * `_save_kwargs` - Reserved for future `NumPy`-specific save options.
     ///
     /// # Returns
     ///
@@ -351,8 +351,8 @@ impl NumpyInterface {
     ///
     /// # Errors
     ///
-    /// Returns an error when source data is missing, the object is not a NumPy
-    /// ndarray, format is invalid, NumPy serialization fails, schema inference
+    /// Returns an error when source data is missing, the object is not a `NumPy`
+    /// ndarray, format is invalid, `NumPy` serialization fails, schema inference
     /// fails, or local stats cannot be computed.
     pub fn save_inner(
         &self,
@@ -384,18 +384,18 @@ impl NumpyInterface {
         data_stats_for_file(&absolute_path, Some(&schema))
     }
 
-    /// Load a NumPy array from the local artifact layout.
+    /// Load a `NumPy` array from the local artifact layout.
     ///
     /// # Arguments
     ///
-    /// * `py` - Active Python token used for NumPy calls.
-    /// * `path` - Local DataCard materialization root.
-    /// * `_load_kwargs` - Reserved for future NumPy-specific load options.
+    /// * `py` - Active Python token used for `NumPy` calls.
+    /// * `path` - Local `DataCard` materialization root.
+    /// * `_load_kwargs` - Reserved for future `NumPy`-specific load options.
     ///
     /// # Errors
     ///
-    /// Returns an error when the expected NumPy artifact is missing, format is
-    /// invalid, or NumPy cannot deserialize the artifact.
+    /// Returns an error when the expected `NumPy` artifact is missing, format is
+    /// invalid, or `NumPy` cannot deserialize the artifact.
     pub fn load_inner(
         &mut self,
         py: Python<'_>,
@@ -428,7 +428,7 @@ impl TorchInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for Torch or safetensors calls.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_save_kwargs` - Reserved for future Torch-specific save options.
     ///
     /// # Returns
@@ -478,7 +478,7 @@ impl TorchInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for Torch or safetensors calls.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_load_kwargs` - Reserved for future Torch-specific load options.
     ///
     /// # Errors
@@ -518,7 +518,7 @@ impl SqlInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for JSON conversion.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_save_kwargs` - Reserved for future SQL-specific save options.
     ///
     /// # Returns
@@ -547,7 +547,7 @@ impl SqlInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for JSON conversion.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_load_kwargs` - Reserved for future SQL-specific load options.
     ///
     /// # Errors
@@ -574,7 +574,7 @@ impl JsonlInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for JSON conversion.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_save_kwargs` - Reserved for future JSONL-specific save options.
     ///
     /// # Returns
@@ -612,7 +612,7 @@ impl JsonlInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for JSON conversion.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `load_kwargs` - Optional loader-specific keyword arguments.
     ///
     /// # Errors
@@ -649,7 +649,7 @@ impl ImageInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for manifest conversion.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `save_kwargs` - Optional keyword arguments. `copy_bytes=true` copies
     ///   referenced files into `data/images`.
     ///
@@ -691,7 +691,7 @@ impl ImageInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for JSON conversion.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_load_kwargs` - Reserved for future image-specific load options.
     ///
     /// # Errors
@@ -718,7 +718,7 @@ impl TextInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for manifest conversion.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `save_kwargs` - Optional keyword arguments. `copy_bytes=true` copies
     ///   referenced files into `data/files`.
     ///
@@ -760,7 +760,7 @@ impl TextInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for JSON conversion.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_load_kwargs` - Reserved for future text-specific load options.
     ///
     /// # Errors
@@ -787,7 +787,7 @@ impl HuggingfaceInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for dataset calls.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `_save_kwargs` - Reserved for future Hugging Face-specific save
     ///   options.
     ///
@@ -838,7 +838,7 @@ impl HuggingfaceInterface {
     /// # Arguments
     ///
     /// * `py` - Active Python token used for `datasets` calls.
-    /// * `path` - Local DataCard materialization root.
+    /// * `path` - Local `DataCard` materialization root.
     /// * `load_kwargs` - Optional keyword arguments. Remote pointer loading
     ///   requires `allow_remote=true`.
     ///

@@ -26,29 +26,29 @@ macro_rules! interface_struct {
 }
 
 interface_struct!(
-/// Data interface for pandas DataFrame values.
+/// Data interface for pandas `DataFrame` values.
 ///
-/// `save` validates a pandas DataFrame, writes `data/data.parquet` with the
+/// `save` validates a pandas `DataFrame`, writes `data/data.parquet` with the
 /// configured parquet compression, and returns deterministic `DataStats`.
-/// `load` reads the local parquet artifact back into a pandas DataFrame.
+/// `load` reads the local parquet artifact back into a pandas `DataFrame`.
 PandasInterface {
     data: Option<Py<PyAny>>,
     compression: String,
 });
 
 interface_struct!(
-/// Data interface for polars DataFrame values.
+/// Data interface for polars `DataFrame` values.
 ///
-/// `save` validates a polars DataFrame, writes `data/data.parquet` with the
+/// `save` validates a polars `DataFrame`, writes `data/data.parquet` with the
 /// configured parquet compression, and returns deterministic `DataStats`.
-/// `load` reads the local parquet artifact back into a polars DataFrame.
+/// `load` reads the local parquet artifact back into a polars `DataFrame`.
 PolarsInterface {
     data: Option<Py<PyAny>>,
     compression: String,
 });
 
 interface_struct!(
-/// Data interface for PyArrow table values.
+/// Data interface for `PyArrow` table values.
 ///
 /// `save` validates a `pyarrow.Table` and writes either `data/data.parquet` or
 /// `data/data.arrow` based on `format`. `load` restores the table from the
@@ -62,7 +62,7 @@ interface_struct!(
 /// Data interface for an existing parquet file or table-like parquet source.
 ///
 /// `save` copies a path-like parquet file or writes a table-like source to
-/// `data/data.parquet`. `load` restores the local artifact as a PyArrow table.
+/// `data/data.parquet`. `load` restores the local artifact as a `PyArrow` table.
 ParquetInterface {
     data: Option<Py<PyAny>>,
     compression: String,
@@ -70,9 +70,9 @@ ParquetInterface {
 });
 
 interface_struct!(
-/// Data interface for NumPy ndarray values.
+/// Data interface for `NumPy` ndarray values.
 ///
-/// `save` validates a NumPy array and writes `data/data.npy` or
+/// `save` validates a `NumPy` array and writes `data/data.npy` or
 /// `data/data.npz` based on `format`. `load` restores the saved array with
 /// pickle loading disabled.
 NumpyInterface {
@@ -168,7 +168,7 @@ macro_rules! impl_interface_methods {
             /// # Returns
             ///
             /// `true` when the interface contains a Python object that can be
-            /// saved into the local DataCard artifact layout. Sourceless
+            /// saved into the local `DataCard` artifact layout. Sourceless
             /// interfaces reconstructed from metadata return `false` until
             /// `load` attaches data.
             #[getter]
@@ -181,7 +181,7 @@ macro_rules! impl_interface_methods {
             /// # Returns
             ///
             /// A JSON-compatible dictionary containing the interface metadata
-            /// that will be stored in the DataCard spec.
+            /// that will be stored in the `DataCard` spec.
             ///
             /// # Errors
             ///
@@ -191,7 +191,7 @@ macro_rules! impl_interface_methods {
                 interface_to_dict(py, self.to_spec_interface(py)?)
             }
 
-            /// Save this interface's source data into the local DataCard layout.
+            /// Save this interface's source data into the local `DataCard` layout.
             ///
             /// The method validates the held Python object, materializes bytes
             /// under `path`, and returns deterministic byte statistics for the
@@ -201,7 +201,7 @@ macro_rules! impl_interface_methods {
             ///
             /// # Arguments
             ///
-            /// * `path` - Directory containing the local DataCard
+            /// * `path` - Directory containing the local `DataCard`
             ///   materialization.
             /// * `save_kwargs` - Optional Python keyword arguments for
             ///   interface-specific behavior. Manifest-backed interfaces use
@@ -228,7 +228,7 @@ macro_rules! impl_interface_methods {
                 self.save_inner(py, &path, save_kwargs).map(PyDataStats::from)
             }
 
-            /// Load this interface's source data from the local DataCard layout.
+            /// Load this interface's source data from the local `DataCard` layout.
             ///
             /// The method reads the convention path for the concrete interface
             /// from `path` and attaches the loaded Python object back to the
@@ -238,7 +238,7 @@ macro_rules! impl_interface_methods {
             ///
             /// # Arguments
             ///
-            /// * `path` - Directory containing the local DataCard
+            /// * `path` - Directory containing the local `DataCard`
             ///   materialization.
             /// * `load_kwargs` - Optional Python keyword arguments for
             ///   interface-specific behavior.
@@ -267,7 +267,7 @@ impl_interface_methods!(PandasInterface {
     ///
     /// # Arguments
     ///
-    /// * `data` - Optional pandas DataFrame to materialize when saving.
+    /// * `data` - Optional pandas `DataFrame` to materialize when saving.
     /// * `compression` - Parquet compression codec. Accepted values are
     ///   `none`, `snappy`, `gzip`, `zstd`, and `lz4`.
     ///
@@ -294,7 +294,7 @@ impl_interface_methods!(PolarsInterface {
     ///
     /// # Arguments
     ///
-    /// * `data` - Optional polars DataFrame to materialize when saving.
+    /// * `data` - Optional polars `DataFrame` to materialize when saving.
     /// * `compression` - Parquet compression codec. Accepted values are
     ///   `none`, `snappy`, `gzip`, `zstd`, and `lz4`.
     ///
@@ -317,7 +317,7 @@ impl_interface_methods!(PolarsInterface {
 
 #[cfg(feature = "python")]
 impl_interface_methods!(ArrowInterface {
-    /// Create a PyArrow table interface.
+    /// Create a `PyArrow` table interface.
     ///
     /// # Arguments
     ///
@@ -377,11 +377,11 @@ impl_interface_methods!(ParquetInterface {
 
 #[cfg(feature = "python")]
 impl_interface_methods!(NumpyInterface {
-    /// Create a NumPy data interface.
+    /// Create a `NumPy` data interface.
     ///
     /// # Arguments
     ///
-    /// * `data` - Optional NumPy ndarray to materialize when saving.
+    /// * `data` - Optional `NumPy` ndarray to materialize when saving.
     /// * `dtype` - Optional declared dtype. When omitted, Wyrd attempts to
     ///   infer it from `data`.
     /// * `shape` - Optional declared array shape. When omitted, Wyrd attempts
@@ -390,7 +390,7 @@ impl_interface_methods!(NumpyInterface {
     ///
     /// # Returns
     ///
-    /// A NumPy interface with kind `Numpy`.
+    /// A `NumPy` interface with kind `Numpy`.
     #[new]
     #[pyo3(signature = (*, data=None, dtype=None, shape=None, format="npy"))]
     fn __new__(
@@ -447,7 +447,7 @@ impl_interface_methods!(SqlInterface {
     /// # Arguments
     ///
     /// * `data` - Optional SQL query bundle or JSON-compatible SQL logic.
-    /// * `dialect` - SQL dialect label recorded in the DataCard spec.
+    /// * `dialect` - SQL dialect label recorded in the `DataCard` spec.
     /// * `connection_hint` - Optional human-readable connection hint.
     ///
     /// # Returns
@@ -554,7 +554,7 @@ impl_interface_methods!(TextInterface {
     /// # Arguments
     ///
     /// * `data` - Optional directory, path iterable, or manifest-like value.
-    /// * `encoding` - Text encoding label recorded in the DataCard spec.
+    /// * `encoding` - Text encoding label recorded in the `DataCard` spec.
     /// * `manifest_ref` - Optional CardRef pointing at an external manifest
     ///   card.
     ///

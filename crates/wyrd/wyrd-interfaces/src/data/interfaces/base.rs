@@ -62,7 +62,7 @@ impl DataInterface {
         let _ = (args, kwargs);
     }
 
-    /// Return the stable interface kind used in DataCard metadata.
+    /// Return the stable interface kind used in `DataCard` metadata.
     ///
     /// # Returns
     ///
@@ -72,18 +72,18 @@ impl DataInterface {
         &self.kind
     }
 
-    /// Build an interface instance from serialized DataCard metadata.
+    /// Build an interface instance from serialized `DataCard` metadata.
     ///
     /// Registry and client retrieval surfaces call this classmethod when a
     /// user passes a custom interface class such as
     /// `wyrd.cards.get(..., interface=MyInterface)`. The default implementation
     /// instantiates the concrete subclass with no arguments. Override this
     /// method when the subclass needs metadata values to reconstruct local
-    /// configuration before `DataCard.load(...)` hydrates data.
+    /// configuration before ``DataCard`.load(...)` hydrates data.
     ///
     /// # Arguments
     ///
-    /// * `metadata` - Python-facing DataCard metadata object parsed from the
+    /// * `metadata` - Python-facing `DataCard` metadata object parsed from the
     ///   serialized card envelope.
     ///
     /// # Returns
@@ -112,20 +112,20 @@ impl DataInterface {
             .unbind())
     }
 
-    /// Save custom data into a local DataCard artifact directory.
+    /// Save custom data into a local `DataCard` artifact directory.
     ///
     /// Custom Python subclasses must override this method. The base
     /// implementation never writes files; it raises a validation error so a
-    /// missing override fails before a `DataCard` can silently record an empty
+    /// missing override fails before a ``DataCard`` can silently record an empty
     /// artifact.
     ///
     /// # Arguments
     ///
-    /// * `path` - Directory containing the local DataCard materialization. A
+    /// * `path` - Directory containing the local `DataCard` materialization. A
     ///   custom implementation should write all artifact bytes under this
     ///   directory using the layout documented by the subclass.
     /// * `save_kwargs` - Optional Python keyword arguments passed through from
-    ///   `DataCard.save(...)` for custom implementation-specific behavior.
+    ///   ``DataCard`.save(...)` for custom implementation-specific behavior.
     ///
     /// # Returns
     ///
@@ -148,7 +148,7 @@ impl DataInterface {
         ))
     }
 
-    /// Load custom data from a local DataCard artifact directory.
+    /// Load custom data from a local `DataCard` artifact directory.
     ///
     /// Custom Python subclasses must override this method. The base
     /// implementation never mutates the interface; it raises a validation error
@@ -156,9 +156,9 @@ impl DataInterface {
     ///
     /// # Arguments
     ///
-    /// * `path` - Directory containing the local DataCard materialization.
+    /// * `path` - Directory containing the local `DataCard` materialization.
     /// * `load_kwargs` - Optional Python keyword arguments passed through from
-    ///   `DataCard.load(...)` for custom implementation-specific behavior.
+    ///   ``DataCard`.load(...)` for custom implementation-specific behavior.
     ///
     /// # Errors
     ///

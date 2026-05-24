@@ -753,7 +753,7 @@ fn read_jsonl_path_to_string(path: &Path) -> CardPyResult<String> {
                 "compression",
                 value,
                 ["none", "gzip", "zstd"],
-            ))
+            ));
         }
     };
     String::from_utf8(decoded).map_err(|error| WyrdPyError::Json(error.to_string()))

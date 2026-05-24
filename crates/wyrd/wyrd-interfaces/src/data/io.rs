@@ -29,7 +29,7 @@ pub struct ManifestEntry {
     pub path: String,
 }
 
-/// Image dataset manifest written under the local DataCard convention path.
+/// Image dataset manifest written under the local `DataCard` convention path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageManifest {
     /// Ordered image file entries.
@@ -40,7 +40,7 @@ pub struct ImageManifest {
     pub color_mode: ColorMode,
 }
 
-/// Text dataset manifest written under the local DataCard convention path.
+/// Text dataset manifest written under the local `DataCard` convention path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextManifest {
     /// Ordered text file entries.

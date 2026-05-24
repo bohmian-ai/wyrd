@@ -11,16 +11,13 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use wyrd_spec::card::data::{
-    ArrowFormat, ColorMode, DataInterface, DataSchema, HuggingfaceMeta, ImageFormat,
-    JsonlCompression, NumpyFormat, TorchSaveFormat,
-};
+use wyrd_spec::card::data::{ColorMode, DataSchema, ImageFormat, JsonlCompression};
 use wyrd_spec::card::field::FieldSpec;
 use wyrd_spec::ids::ColumnName;
 
-use crate::error::{CardPyResult, WyrdPyError};
 #[cfg(feature = "python")]
-use crate::stats::PyDataStats;
+use crate::data::stats::PyDataStats;
+use crate::error::{CardPyResult, WyrdPyError};
 #[cfg(feature = "python")]
 use wyrd_spec::card::data::{DataStats, SqlLogic};
 #[cfg(feature = "python")]
@@ -78,49 +75,6 @@ pub fn jsonl_relative_path_for(compression: JsonlCompression) -> PathBuf {
     }
 }
 
-/// Resolve a local DataCard artifact path from interface kind and metadata.
-///
-/// # Errors
-/// Returns a validation error when the supplied kind does not match the
-/// interface metadata variant.
-pub fn resolve_artifact_path(
-    base: &Path,
-    kind: &str,
-    interface: &DataInterface,
-) -> CardPyResult<PathBuf> {
-    if kind != interface.kind() {
-        return Err(WyrdPyError::validation_with_details(
-            "DataInterface kind does not match interface metadata",
-            json!({ "kind": kind, "interface_kind": interface.kind() }),
-        ));
-    }
-
-    let relative = match interface {
-        DataInterface::Pandas(_) | DataInterface::Polars(_) | DataInterface::Parquet(_) => {
-            PathBuf::from("data/data.parquet")
-        }
-        DataInterface::Arrow(meta) => match meta.format {
-            ArrowFormat::Ipc => PathBuf::from("data/data.arrow"),
-            ArrowFormat::Parquet => PathBuf::from("data/data.parquet"),
-        },
-        DataInterface::Numpy(meta) => match meta.format {
-            NumpyFormat::Npy => PathBuf::from("data/data.npy"),
-            NumpyFormat::Npz => PathBuf::from("data/data.npz"),
-        },
-        DataInterface::Torch(meta) => match meta.save_format {
-            TorchSaveFormat::Safetensors => PathBuf::from("data/data.safetensors"),
-            TorchSaveFormat::Pickle => PathBuf::from("data/data.pt"),
-        },
-        DataInterface::Sql(_) => PathBuf::from("data/sql.json"),
-        DataInterface::Jsonl(meta) => jsonl_relative_path_for(meta.compression),
-        DataInterface::Image(_) | DataInterface::Text(_) => PathBuf::from("data/manifest.json"),
-        DataInterface::Huggingface(meta) => huggingface_relative_path(meta),
-        DataInterface::Custom(_) => PathBuf::from("data/custom"),
-    };
-
-    Ok(base.join(relative))
-}
-
 /// Build the JSON value for a pinned Hugging Face dataset pointer.
 #[must_use]
 pub fn huggingface_pointer(
@@ -175,8 +129,8 @@ pub fn write_jsonl_normalized(
     path: &Path,
     compression: JsonlCompression,
 ) -> CardPyResult<u64> {
-    let bytes = if crate::dtype::is_path_like(py, &data)? {
-        let source = crate::dtype::extract_pathbuf(&data)?;
+    let bytes = if crate::data::dtype::is_path_like(py, &data)? {
+        let source = crate::data::dtype::extract_pathbuf(&data)?;
         wyrd_utils::fs::require_local_file(&source)
             .map_err(|error| WyrdPyError::Io(error.to_string()))?;
         let source_bytes = fs::read(&source)?;
@@ -415,14 +369,6 @@ pub fn load_data(
     Ok(())
 }
 
-fn huggingface_relative_path(meta: &HuggingfaceMeta) -> PathBuf {
-    if meta.revision.is_some() {
-        PathBuf::from("data/dataset_pointer.json")
-    } else {
-        PathBuf::from("data/dataset")
-    }
-}
-
 fn field(name: &str, dtype: &str) -> FieldSpec {
     FieldSpec::new(
         ColumnName::new(name).expect("static manifest schema field names are valid"),
@@ -454,7 +400,7 @@ fn decode_jsonl_bytes(bytes: &[u8], compression: JsonlCompression) -> CardPyResu
 
 #[cfg(feature = "python")]
 fn compression_from_path(path: &Path) -> Option<JsonlCompression> {
-    crate::dtype::jsonl_compression_for_path(path).and_then(|value| {
+    crate::data::dtype::jsonl_compression_for_path(path).and_then(|value| {
         parse_jsonl_compression_label(value)
             .ok()
             .or(Some(JsonlCompression::None))
@@ -480,8 +426,8 @@ fn manifest_entries_from_data(
     py: Python<'_>,
     data: Bound<'_, PyAny>,
 ) -> CardPyResult<Vec<ManifestEntry>> {
-    if crate::dtype::is_path_like(py, &data)? {
-        return manifest_entries_from_path(&crate::dtype::extract_pathbuf(&data)?);
+    if crate::data::dtype::is_path_like(py, &data)? {
+        return manifest_entries_from_path(&crate::data::dtype::extract_pathbuf(&data)?);
     }
 
     let value = wyrd_utils::py::pyobject_to_json(&data)?;
@@ -618,13 +564,8 @@ fn sql_logic_from_value(value: Value) -> CardPyResult<SqlLogic> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        image_manifest_schema, jsonl_relative_path_for, resolve_artifact_path, text_manifest_schema,
-    };
-    use wyrd_spec::card::data::{
-        ColorMode, DataInterface, HuggingfaceMeta, ImageFormat, ImageMeta, JsonlCompression,
-        JsonlMeta, PandasMeta, ParquetCompression, ParquetMeta,
-    };
+    use super::{image_manifest_schema, jsonl_relative_path_for, text_manifest_schema};
+    use wyrd_spec::card::data::JsonlCompression;
 
     #[test]
     fn jsonl_relative_path_tracks_compression() {
@@ -639,74 +580,6 @@ mod tests {
         assert_eq!(
             jsonl_relative_path_for(JsonlCompression::Zstd),
             std::path::PathBuf::from("data/data.jsonl.zst")
-        );
-    }
-
-    #[test]
-    fn resolve_artifact_path_matches_core_conventions() {
-        let base = std::path::Path::new("/tmp/card");
-        let pandas = DataInterface::Pandas(PandasMeta {
-            framework_version: "2.0.0".to_string(),
-            compression: ParquetCompression::Snappy,
-        });
-        let jsonl = DataInterface::Jsonl(JsonlMeta {
-            compression: JsonlCompression::Gzip,
-            lines_per_file: None,
-        });
-        let image = DataInterface::Image(ImageMeta {
-            format: ImageFormat::Mixed,
-            manifest_ref: None,
-            color_mode: ColorMode::Rgb,
-        });
-
-        assert_eq!(
-            resolve_artifact_path(base, "Pandas", &pandas).expect("pandas path should resolve"),
-            base.join("data/data.parquet")
-        );
-        assert_eq!(
-            resolve_artifact_path(base, "Jsonl", &jsonl).expect("jsonl path should resolve"),
-            base.join("data/data.jsonl.gz")
-        );
-        assert_eq!(
-            resolve_artifact_path(base, "Image", &image).expect("image path should resolve"),
-            base.join("data/manifest.json")
-        );
-    }
-
-    #[test]
-    fn resolve_artifact_path_rejects_kind_mismatch() {
-        let parquet = DataInterface::Parquet(ParquetMeta {
-            compression: ParquetCompression::Snappy,
-            row_group_size: None,
-        });
-
-        assert!(resolve_artifact_path(std::path::Path::new("."), "Jsonl", &parquet).is_err());
-    }
-
-    #[test]
-    fn huggingface_pointer_path_uses_pinned_revision() {
-        let base = std::path::Path::new("/tmp/card");
-        let pointer = DataInterface::Huggingface(HuggingfaceMeta {
-            dataset_id: "namespace/dataset".to_string(),
-            revision: Some("abcdef1".to_string()),
-            split: Some("train".to_string()),
-            config: None,
-        });
-        let local = DataInterface::Huggingface(HuggingfaceMeta {
-            dataset_id: "namespace/dataset".to_string(),
-            revision: None,
-            split: None,
-            config: None,
-        });
-
-        assert_eq!(
-            resolve_artifact_path(base, "Huggingface", &pointer)
-                .expect("pointer path should resolve"),
-            base.join("data/dataset_pointer.json")
-        );
-        assert_eq!(
-            resolve_artifact_path(base, "Huggingface", &local).expect("local path should resolve"),
-            base.join("data/dataset")
         );
     }
 

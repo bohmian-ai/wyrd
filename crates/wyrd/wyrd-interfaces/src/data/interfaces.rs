@@ -10,7 +10,7 @@ use pyo3::types::{PyAny, PyDict, PyModule};
 use wyrd_utils::py::{json_to_pyobject, module_version, pyobject_to_json};
 
 #[cfg(feature = "python")]
-use crate::dtype::{self, DataSourceKind};
+use crate::data::dtype::{self, DataSourceKind};
 use crate::error::{CardPyResult, WyrdPyError};
 use wyrd_spec::card::data::{
     ArrowFormat, ArrowMeta, ColorMode, CustomDataMeta, DataInterface as RustDataInterface,

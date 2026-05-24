@@ -286,6 +286,8 @@ fn dims_from_json(value: Value) -> CardPyResult<Vec<Dim>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{PyDataSchema, PyFieldSpec};
     use wyrd_spec::card::data::DataSchema;
     use wyrd_spec::card::field::{Dim, FieldSpec};
@@ -298,7 +300,7 @@ mod tests {
             dtype: "int64".to_string(),
             shape: vec![Dim::Fixed(3)],
             nullable: false,
-            extra: Default::default(),
+            extra: BTreeMap::default(),
         };
         let schema = DataSchema::new(vec![field]);
 
@@ -312,7 +314,7 @@ mod tests {
             dtype: "float64".to_string(),
             shape: Vec::new(),
             nullable: true,
-            extra: Default::default(),
+            extra: BTreeMap::default(),
         };
 
         assert_eq!(PyFieldSpec::from(field.clone()).into_inner(), field);

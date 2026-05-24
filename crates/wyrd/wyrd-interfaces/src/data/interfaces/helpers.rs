@@ -73,7 +73,7 @@ pub(super) fn write_json_sorted<T: Serialize>(
 }
 
 #[cfg(feature = "python")]
-pub(super) fn pyarrow_engine_kwargs<'py>(py: Python<'py>) -> CardPyResult<Bound<'py, PyDict>> {
+pub(super) fn pyarrow_engine_kwargs(py: Python<'_>) -> CardPyResult<Bound<'_, PyDict>> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("engine", "pyarrow")?;
     Ok(kwargs)
@@ -90,17 +90,17 @@ pub(super) fn pandas_to_parquet_kwargs<'py>(
 }
 
 #[cfg(feature = "python")]
-pub(super) fn parquet_compression_kwargs<'py>(
-    py: Python<'py>,
+pub(super) fn parquet_compression_kwargs(
+    py: Python<'_>,
     compression: ParquetCompression,
-) -> CardPyResult<Bound<'py, PyDict>> {
+) -> CardPyResult<Bound<'_, PyDict>> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("compression", parquet_compression_token(compression))?;
     Ok(kwargs)
 }
 
 #[cfg(feature = "python")]
-pub(super) fn numpy_no_pickle_kwargs<'py>(py: Python<'py>) -> CardPyResult<Bound<'py, PyDict>> {
+pub(super) fn numpy_no_pickle_kwargs(py: Python<'_>) -> CardPyResult<Bound<'_, PyDict>> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("allow_pickle", false)?;
     Ok(kwargs)
@@ -117,7 +117,7 @@ pub(super) fn numpy_npz_value_kwargs<'py>(
 }
 
 #[cfg(feature = "python")]
-pub(super) fn torch_weights_only_kwargs<'py>(py: Python<'py>) -> CardPyResult<Bound<'py, PyDict>> {
+pub(super) fn torch_weights_only_kwargs(py: Python<'_>) -> CardPyResult<Bound<'_, PyDict>> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("weights_only", true)?;
     Ok(kwargs)

@@ -602,7 +602,7 @@ impl JsonlInterface {
         let compression = meta.compression;
         let absolute_path = RustDataInterface::Jsonl(meta).artifact_path(path)?;
         ensure_parent_dir(&absolute_path)?;
-        write_jsonl_normalized(py, data.clone(), &absolute_path, compression)?;
+        write_jsonl_normalized(py, data, &absolute_path, compression)?;
         let schema = optional_schema_for_interface(py, data, "Jsonl");
         data_stats_for_file(&absolute_path, Some(&schema))
     }
@@ -676,13 +676,13 @@ impl ImageInterface {
         let data = source.bind(py);
         let copy_bytes = bool_kwarg(save_kwargs, "copy_bytes")?;
         let meta = self.to_rust(py)?;
-        let manifest = image_manifest_from_data(py, data.clone(), meta.format, meta.color_mode)?;
+        let manifest = image_manifest_from_data(py, data, meta.format, meta.color_mode)?;
         if copy_bytes {
             copy_manifest_entries(&manifest, &path.join("data/images"))?;
         }
         let absolute_path = RustDataInterface::Image(meta).artifact_path(path)?;
         write_json_sorted(&absolute_path, &manifest)?;
-        let schema = image_manifest_schema();
+        let schema = image_manifest_schema()?;
         data_stats_for_file(&absolute_path, Some(&schema))
     }
 
@@ -745,13 +745,13 @@ impl TextInterface {
         let data = source.bind(py);
         let copy_bytes = bool_kwarg(save_kwargs, "copy_bytes")?;
         let meta = self.to_rust(py)?;
-        let manifest = text_manifest_from_data(py, data.clone(), &meta.encoding)?;
+        let manifest = text_manifest_from_data(py, data, &meta.encoding)?;
         if copy_bytes {
             copy_manifest_entries(&manifest, &path.join("data/files"))?;
         }
         let absolute_path = RustDataInterface::Text(meta).artifact_path(path)?;
         write_json_sorted(&absolute_path, &manifest)?;
-        let schema = text_manifest_schema();
+        let schema = text_manifest_schema()?;
         data_stats_for_file(&absolute_path, Some(&schema))
     }
 

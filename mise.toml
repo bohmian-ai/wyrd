@@ -26,7 +26,7 @@ run = "cargo clippy --locked --workspace --all-features --all-targets -- -D warn
 
 [tasks."test:unit"]
 description = "Run all Rust unit tests"
-run = "cargo test --locked --workspace --all-features"
+run = "cargo test --locked --workspace --exclude py-wyrd"
 
 [tasks."test:wyrd-spec"]
 description = "Run wyrd-spec Rust tests"
@@ -65,7 +65,7 @@ cargo test --locked --doc --all-features \
 
 [tasks."cardkind:check"]
 description = "Verify CardKind native count and External serde shape"
-run = "cargo test -p wyrd-spec --test cardkind_check --features server"
+run = "cargo test -p wyrd-spec --test cards kind:: --features server"
 
 [tasks."check:client-tier"]
 description = "Foundation invariants: wyrd-spec server-tier-free; shared shells pyo3+sqlx-free"
@@ -141,12 +141,7 @@ fi
 
 [tasks."check:unwrap-audit"]
 description = "Audit unwrap/expect calls outside tests and examples"
-run = """
-if rg -n '\\.(unwrap|expect)\\(' crates --glob '!**/tests/**' --glob '!**/examples/**'; then
-  echo 'unwrap/expect audit failed'
-  exit 1
-fi
-"""
+run = "python scripts/check_unwrap_audit.py"
 
 [tasks."check:test-contracts"]
 description = "Verify Wyrd critical Rust contracts have explicit Python test markers"

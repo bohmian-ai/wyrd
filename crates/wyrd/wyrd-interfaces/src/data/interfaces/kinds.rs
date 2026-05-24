@@ -515,7 +515,7 @@ impl_interface_methods!(ImageInterface {
     ///   `webp`, and `mixed`.
     /// * `color_mode` - Declared color mode. Accepted values are `rgb`, `rgba`,
     ///   and `grayscale`.
-    /// * `manifest_ref` - Optional CardRef pointing at an external manifest
+    /// * `manifest_ref` - Optional `CardRef` pointing at an external manifest
     ///   card.
     ///
     /// # Returns
@@ -524,7 +524,7 @@ impl_interface_methods!(ImageInterface {
     ///
     /// # Errors
     ///
-    /// Returns a Wyrd error when `manifest_ref` cannot be parsed as a CardRef.
+    /// Returns a Wyrd error when `manifest_ref` cannot be parsed as a `CardRef`.
     #[new]
     #[pyo3(signature = (*, data=None, format="mixed", color_mode="rgb", manifest_ref=None))]
     fn __new__(
@@ -555,7 +555,7 @@ impl_interface_methods!(TextInterface {
     ///
     /// * `data` - Optional directory, path iterable, or manifest-like value.
     /// * `encoding` - Text encoding label recorded in the `DataCard` spec.
-    /// * `manifest_ref` - Optional CardRef pointing at an external manifest
+    /// * `manifest_ref` - Optional `CardRef` pointing at an external manifest
     ///   card.
     ///
     /// # Returns
@@ -564,7 +564,7 @@ impl_interface_methods!(TextInterface {
     ///
     /// # Errors
     ///
-    /// Returns a Wyrd error when `manifest_ref` cannot be parsed as a CardRef.
+    /// Returns a Wyrd error when `manifest_ref` cannot be parsed as a `CardRef`.
     #[new]
     #[pyo3(signature = (*, data=None, encoding="utf-8", manifest_ref=None))]
     fn __new__(

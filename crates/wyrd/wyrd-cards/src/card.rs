@@ -1,17 +1,18 @@
-//! DataCard local holder and Python boundary.
+//! `DataCard` local holder and Python boundary.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "python")]
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use wyrd_interfaces::error::{CardPyResult, WyrdPyError};
+use wyrd_interfaces::error::CardPyResult;
 use wyrd_spec::card::data::validate::DataCardError;
 use wyrd_spec::card::data::{
     CustomDataMeta, DataInterface as RustDataInterface, DataSchema, DataSpec, DataSplit, DataStats,
     SqlLogic,
 };
-use wyrd_spec::envelope::{CardKind, Metadata as EnvelopeMetadata, Spec};
+use wyrd_spec::envelope::Spec;
 use wyrd_spec::ids::{ColumnName, SplitName};
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
@@ -24,6 +25,7 @@ use {
     pyo3::pyclass::{PyTraverseError, PyVisit},
     pyo3::types::{PyAny, PyDict, PyType, PyTypeMethods},
     serde_json::json,
+    std::path::PathBuf,
     wyrd_interfaces::data::interfaces::{
         ArrowInterface, DataInterface, DataInterfaceHandle, HuggingfaceInterface, ImageInterface,
         JsonlInterface, NumpyInterface, PandasInterface, ParquetInterface, PolarsInterface,
@@ -33,23 +35,26 @@ use {
     wyrd_interfaces::data::io::{load_data, save_data},
     wyrd_interfaces::data::schema::PyDataSchema,
     wyrd_interfaces::data::stats::PyDataStats,
+    wyrd_interfaces::error::WyrdPyError,
+    wyrd_spec::envelope::{CardKind, Metadata as EnvelopeMetadata},
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
     wyrd_utils::py::json_to_pyobject,
 };
 
-/// Python-holder metadata accumulated by a local DataCard.
+/// Python-holder metadata accumulated by a local `DataCard`.
 ///
 /// This is not the durable registry record. It mirrors the locked Python holder
-/// contract from the DataCard plan and is converted into `DataSpec` when a
+/// contract from the `DataCard` plan and is converted into `DataSpec` when a
 /// Rust-only spec body is needed.
 #[cfg_attr(feature = "python", pyclass(module = "wyrd.data", from_py_object))]
+#[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DataCardMetadata {
-    /// Interface metadata that will be written into the DataSpec.
+    /// Interface metadata that will be written into the `DataSpec`.
     pub interface: RustDataInterface,
     /// Inferred or supplied data schema.
     pub schema: DataSchema,
-    /// Existing durable ArtifactCard references for this data card.
+    /// Existing durable `ArtifactCard` references for this data card.
     pub artifact_refs: Vec<CardRef>,
     /// Declared split strategies by split label.
     pub splits: HashMap<SplitName, DataSplit>,
@@ -104,27 +109,28 @@ impl DataCardMetadata {
     }
 }
 
-/// Local Python-facing DataCard holder.
+/// Local Python-facing `DataCard` holder.
 ///
-/// A DataCard owns local identity, holder metadata, and an optional live Python
+/// A `DataCard` owns local identity, holder metadata, and an optional live Python
 /// data interface. It can save and load local filesystem materialization, but
-/// it never registers itself and never creates ArtifactCards.
+/// it never registers itself and never creates `ArtifactCards`.
 #[cfg_attr(feature = "python", pyclass(module = "wyrd.data", skip_from_py_object))]
+#[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Serialize, Deserialize)]
 pub struct DataCard {
-    /// DataCard space.
+    /// `DataCard` space.
     pub space: String,
-    /// DataCard name.
+    /// `DataCard` name.
     pub name: String,
-    /// DataCard version.
+    /// `DataCard` version.
     pub version: String,
-    /// DataCard UID.
+    /// `DataCard` UID.
     pub uid: String,
     /// Queryable local labels.
     pub labels: Labels,
     /// Free-form local annotations.
     pub annotations: Annotations,
-    /// DataCard holder metadata.
+    /// `DataCard` holder metadata.
     pub metadata: DataCardMetadata,
     /// Local creation timestamp.
     pub created_at: DateTime<Utc>,
@@ -137,11 +143,12 @@ pub struct DataCard {
 }
 
 impl DataCard {
-    /// Write only the serialized DataCard JSON under `path/card.json`.
+    /// Write only the serialized `DataCard` JSON under `path/card.json`.
     ///
     /// # Errors
     /// Returns a Wyrd error when local filesystem writes or JSON serialization
     /// fail.
+    #[cfg(feature = "python")]
     fn write_card_json(&self, path: &Path) -> CardPyResult<()> {
         write_card_json_file(self, path)
     }
@@ -161,20 +168,20 @@ impl DataCard {
     /// live Python interface state.
     ///
     /// # Errors
-    /// Returns a DataCard validation error when the stored metadata does not
+    /// Returns a `DataCard` validation error when the stored metadata does not
     /// satisfy the durable spec contract.
     pub fn to_rust_card_body_from_metadata(&self) -> Result<Spec, DataCardError> {
         Ok(Spec::Data(self.to_data_spec_from_metadata()?))
     }
 
-    /// Convert serialized holder metadata into a pure Rust DataSpec.
+    /// Convert serialized holder metadata into a pure Rust `DataSpec`.
     ///
     /// This method is available without the `python` feature for server, UI,
-    /// and registry paths that need to inspect DataCard attributes without a
+    /// and registry paths that need to inspect `DataCard` attributes without a
     /// Python runtime.
     ///
     /// # Errors
-    /// Returns a DataCard validation error when the stored metadata does not
+    /// Returns a `DataCard` validation error when the stored metadata does not
     /// satisfy the durable spec contract.
     pub fn to_data_spec_from_metadata(&self) -> Result<DataSpec, DataCardError> {
         data_spec_from_metadata(&self.metadata, self.metadata.interface.clone())
@@ -238,7 +245,7 @@ struct SerializedDataCardEnvelope {
 #[cfg(feature = "python")]
 #[pymethods]
 impl DataCard {
-    /// Create a local DataCard from raw data, a data interface, or an ArtifactCard.
+    /// Create a local `DataCard` from raw data, a data interface, or an `ArtifactCard`.
     ///
     /// # Arguments
     /// * `data` - Raw framework data, a `DataInterface`, a Python subclass of
@@ -246,7 +253,7 @@ impl DataCard {
     /// * `space` - Optional card space. Defaults to `default`.
     /// * `name` - Optional card name. Defaults to `data`.
     /// * `version` - Optional semantic version. Defaults to `0.1.0`.
-    /// * `uid` - Optional UUIDv7 card UID. Defaults to a generated UID.
+    /// * `uid` - Optional `UUIDv7` card UID. Defaults to a generated UID.
     /// * `labels` - Optional queryable labels.
     /// * `annotations` - Optional free-form annotations.
     /// * `metadata` - Optional holder metadata to seed before inference.
@@ -285,7 +292,7 @@ impl DataCard {
             space: space.unwrap_or("default").to_owned(),
             name: name.unwrap_or("data").to_owned(),
             version: version.unwrap_or("0.1.0").to_owned(),
-            uid: uid.map(str::to_owned).unwrap_or_else(wyrd_utils::uuid7),
+            uid: uid.map_or_else(wyrd_utils::uuid7, str::to_owned),
             labels: labels_from_user(labels.unwrap_or_default())?,
             annotations: annotations_from_user(annotations.unwrap_or_default())?,
             metadata,
@@ -354,61 +361,61 @@ impl DataCard {
         ))
     }
 
-    /// Return the DataCard space.
+    /// Return the `DataCard` space.
     #[getter]
     pub fn space(&self) -> &str {
         &self.space
     }
 
-    /// Set the DataCard space.
+    /// Set the `DataCard` space.
     #[setter]
     pub fn set_space(&mut self, value: String) {
         self.space = value;
     }
 
-    /// Return the DataCard name.
+    /// Return the `DataCard` name.
     #[getter]
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Set the DataCard name.
+    /// Set the `DataCard` name.
     #[setter]
     pub fn set_name(&mut self, value: String) {
         self.name = value;
     }
 
-    /// Return the DataCard version.
+    /// Return the `DataCard` version.
     #[getter]
     pub fn version(&self) -> &str {
         &self.version
     }
 
-    /// Set the DataCard version.
+    /// Set the `DataCard` version.
     #[setter]
     pub fn set_version(&mut self, value: String) {
         self.version = value;
     }
 
-    /// Return the DataCard UID.
+    /// Return the `DataCard` UID.
     #[getter]
     pub fn uid(&self) -> &str {
         &self.uid
     }
 
-    /// Set the DataCard UID.
+    /// Set the `DataCard` UID.
     #[setter]
     pub fn set_uid(&mut self, value: String) {
         self.uid = value;
     }
 
-    /// Return queryable DataCard labels.
+    /// Return queryable `DataCard` labels.
     #[getter]
     pub fn labels(&self) -> BTreeMap<String, String> {
         labels_to_strings(&self.labels)
     }
 
-    /// Replace queryable DataCard labels.
+    /// Replace queryable `DataCard` labels.
     ///
     /// # Errors
     /// Returns a Wyrd error when a key or value is invalid for user-authored
@@ -419,13 +426,13 @@ impl DataCard {
         Ok(())
     }
 
-    /// Return free-form DataCard annotations.
+    /// Return free-form `DataCard` annotations.
     #[getter]
     pub fn annotations(&self) -> BTreeMap<String, String> {
         annotations_to_strings(&self.annotations)
     }
 
-    /// Replace free-form DataCard annotations.
+    /// Replace free-form `DataCard` annotations.
     ///
     /// # Errors
     /// Returns a Wyrd error when a key or value is invalid for user-authored
@@ -436,25 +443,25 @@ impl DataCard {
         Ok(())
     }
 
-    /// Return DataCard holder metadata.
+    /// Return `DataCard` holder metadata.
     #[getter]
     pub fn metadata(&self) -> DataCardMetadata {
         self.metadata.clone()
     }
 
-    /// Return the DataCard schema.
+    /// Return the `DataCard` schema.
     #[getter]
     pub fn schema(&self) -> PyDataSchema {
         PyDataSchema::from(self.metadata.schema.clone())
     }
 
-    /// Return the DataCard byte and shape statistics.
+    /// Return the `DataCard` byte and shape statistics.
     #[getter]
     pub fn stats(&self) -> PyDataStats {
         PyDataStats::from(self.metadata.stats.clone())
     }
 
-    /// Replace DataCard holder metadata.
+    /// Replace `DataCard` holder metadata.
     #[setter]
     pub fn set_metadata(&mut self, value: DataCardMetadata) {
         self.metadata = value;
@@ -482,13 +489,14 @@ impl DataCard {
     ///
     /// This method only performs local filesystem materialization. It updates
     /// interface metadata and byte stats, then writes `card.json`. It does not
-    /// create ArtifactCards, upload bytes, or register anything.
+    /// create `ArtifactCards`, upload bytes, or register anything.
     ///
     /// # Errors
     /// Returns a Wyrd error when no interface is attached, interface save
     /// fails, or card JSON cannot be written.
     #[wyrd_test_contract_macros::critical("python:DataCard.save")]
     #[pyo3(signature = (path, save_kwargs=None))]
+    #[allow(clippy::needless_pass_by_value)]
     pub fn save(
         &mut self,
         py: Python<'_>,
@@ -515,6 +523,7 @@ impl DataCard {
     /// fails.
     #[wyrd_test_contract_macros::critical("python:DataCard.load")]
     #[pyo3(signature = (path=None, load_kwargs=None))]
+    #[allow(clippy::needless_pass_by_value)]
     pub fn load(
         &mut self,
         py: Python<'_>,
@@ -527,7 +536,7 @@ impl DataCard {
         load_data(interface.bind(py), path, load_kwargs)
     }
 
-    /// Return this DataCard as a JSON string.
+    /// Return this `DataCard` as a JSON string.
     ///
     /// # Errors
     /// Returns a Wyrd error when serialization fails.
@@ -537,7 +546,7 @@ impl DataCard {
         self.model_dump_json()
     }
 
-    /// Build a DataCard from serialized JSON and an optional interface hook.
+    /// Build a `DataCard` from serialized JSON and an optional interface hook.
     ///
     /// When `interface` is omitted, Wyrd rebuilds built-in interfaces from
     /// serialized spec metadata. Python subclass-backed cards must pass
@@ -553,14 +562,15 @@ impl DataCard {
     #[pyo3(name = "model_validate_json", signature = (json_string, interface=None))]
     pub fn model_validate_json_py(
         py: Python<'_>,
-        json_string: String,
+        json_string: &str,
         interface: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<Self> {
-        let mut card = Self::from_card_json(&json_string)?;
+        let mut card = Self::from_card_json(json_string)?;
         card.attach_data(py, interface)?;
         Ok(card)
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(interface) = self.interface.as_ref() {
             visit.call(interface)?;
@@ -578,16 +588,16 @@ impl DataCard {
     /// Convert this local holder into the Rust card spec body.
     ///
     /// # Errors
-    /// Returns a Wyrd error when interface conversion or DataSpec validation
+    /// Returns a Wyrd error when interface conversion or `DataSpec` validation
     /// fails.
     pub fn to_rust_card_body(&self, py: Python<'_>) -> CardPyResult<Spec> {
         Ok(Spec::Data(self.to_data_spec(py)?))
     }
 
-    /// Convert this local holder into a pure Rust DataSpec.
+    /// Convert this local holder into a pure Rust `DataSpec`.
     ///
     /// # Errors
-    /// Returns a Wyrd error when interface conversion or DataSpec validation
+    /// Returns a Wyrd error when interface conversion or `DataSpec` validation
     /// fails.
     pub fn to_data_spec(&self, py: Python<'_>) -> CardPyResult<DataSpec> {
         let interface = self
@@ -636,8 +646,7 @@ impl DataCard {
                     .metadata
                     .space
                     .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "default".to_string()),
+                    .map_or_else(|| "default".to_string(), ToString::to_string),
                 name: envelope.metadata.name.to_string(),
                 version: envelope.metadata.version.to_string(),
                 uid: envelope
@@ -841,6 +850,7 @@ fn metadata_error(error: MetadataError) -> WyrdPyError {
     )
 }
 
+#[cfg(feature = "python")]
 fn write_card_json_file(card: &DataCard, path: &std::path::Path) -> CardPyResult<()> {
     wyrd_utils::json::write_json_sorted(path.join("card.json"), &card.to_card_envelope()?)
         .map_err(|error| WyrdPyError::Io(error.to_string()))

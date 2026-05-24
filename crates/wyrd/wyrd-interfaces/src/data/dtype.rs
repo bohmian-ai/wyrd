@@ -8,7 +8,7 @@ use {
     pyo3::exceptions::PyModuleNotFoundError,
     pyo3::prelude::*,
     pyo3::types::{PyAny, PyDict, PyString, PyTuple},
-    serde_json::Value,
+    serde_json::{Map, Value},
     std::collections::BTreeMap,
     std::path::PathBuf,
     wyrd_spec::card::data::DataSchema,
@@ -100,9 +100,8 @@ pub fn infer_schema_for_interface(
     match kind {
         "Pandas" => infer_pandas_schema(data),
         "Polars" => infer_polars_schema(data),
-        "Arrow" => infer_arrow_schema(data),
         "Parquet" if is_path_like(py, data)? => infer_parquet_path_schema(py, data),
-        "Parquet" => infer_arrow_schema(data),
+        "Arrow" | "Parquet" => infer_arrow_schema(data),
         "Numpy" => infer_numpy_schema(data),
         "Torch" => infer_torch_schema(data),
         "Jsonl" => infer_jsonl_schema(py, data),
@@ -718,13 +717,13 @@ fn infer_jsonl_schema(_py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<
             .find(|line| !line.trim().is_empty())
             .map(serde_json::from_str::<Value>)
             .transpose()?
-            .unwrap_or(Value::Object(Default::default()))
+            .unwrap_or(Value::Object(Map::default()))
     } else {
         match pyobject_to_json(data)? {
             Value::Array(values) => values
                 .into_iter()
                 .next()
-                .unwrap_or(Value::Object(Default::default())),
+                .unwrap_or(Value::Object(Map::default())),
             value => value,
         }
     };

@@ -1,4 +1,4 @@
-//! Minimal ArtifactCard holder used by DataCard artifact references.
+//! Minimal `ArtifactCard` holder used by `DataCard` artifact references.
 
 use serde::{Deserialize, Serialize};
 use wyrd_interfaces::error::{CardPyResult, WyrdPyError};
@@ -10,12 +10,13 @@ use wyrd_spec::version::VersionBlock;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
-/// Minimal local ArtifactCard holder.
+/// Minimal local `ArtifactCard` holder.
 ///
-/// This type is intentionally small in the DataCard slice. It is only the
-/// Python `isinstance` target and CardRef carrier needed when a DataCard points
-/// at an already existing artifact. Local DataCard save never constructs one.
+/// This type is intentionally small in the `DataCard` slice. It is only the
+/// Python `isinstance` target and `CardRef` carrier needed when a `DataCard` points
+/// at an already existing artifact. Local `DataCard` save never constructs one.
 #[cfg_attr(feature = "python", pyclass(module = "wyrd.data", from_py_object))]
+#[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactCard {
     /// Artifact card space.
@@ -29,7 +30,7 @@ pub struct ArtifactCard {
 }
 
 impl ArtifactCard {
-    /// Convert this local artifact holder into a Wyrd CardRef.
+    /// Convert this local artifact holder into a Wyrd `CardRef`.
     ///
     /// # Errors
     /// Returns a validation error when the identity fields are not valid Wyrd
@@ -48,13 +49,13 @@ impl ArtifactCard {
 #[cfg(feature = "python")]
 #[pymethods]
 impl ArtifactCard {
-    /// Create a minimal ArtifactCard reference holder.
+    /// Create a minimal `ArtifactCard` reference holder.
     ///
     /// # Arguments
     /// * `space` - Artifact card space. Defaults to `default`.
     /// * `name` - Artifact card name. Defaults to `artifact`.
     /// * `version` - Artifact card version. Defaults to `0.1.0`.
-    /// * `uid` - Artifact card UID. Defaults to a generated UUIDv7.
+    /// * `uid` - Artifact card UID. Defaults to a generated `UUIDv7`.
     #[new]
     #[pyo3(signature = (space=None, name=None, version=None, uid=None))]
     fn __new__(
@@ -67,7 +68,7 @@ impl ArtifactCard {
             space: space.unwrap_or("default").to_string(),
             name: name.unwrap_or("artifact").to_string(),
             version: version.unwrap_or("0.1.0").to_string(),
-            uid: uid.map(str::to_string).unwrap_or_else(wyrd_utils::uuid7),
+            uid: uid.map_or_else(wyrd_utils::uuid7, str::to_string),
         }
     }
 

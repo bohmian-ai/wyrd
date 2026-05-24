@@ -59,7 +59,7 @@ impl DataInterface {
     /// * `kwargs` - Keyword arguments supplied by a Python subclass.
     #[pyo3(signature = (*args, **kwargs))]
     fn __init__(&mut self, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) {
-        let _ = (args, kwargs);
+        let _ = (&self.kind, args, kwargs);
     }
 
     /// Return the stable interface kind used in `DataCard` metadata.
@@ -142,7 +142,7 @@ impl DataInterface {
         path: PathBuf,
         save_kwargs: Option<&Bound<'_, PyDict>>,
     ) -> CardPyResult<PyDataStats> {
-        let _ = (path, save_kwargs);
+        let _ = (&self.kind, path, save_kwargs);
         Err(WyrdPyError::validation(
             "DataInterface.save must be implemented by a concrete interface",
         ))
@@ -166,7 +166,7 @@ impl DataInterface {
     /// subclasses are required to implement their own load behavior.
     #[pyo3(signature = (path, load_kwargs=None))]
     fn load(&mut self, path: PathBuf, load_kwargs: Option<&Bound<'_, PyDict>>) -> CardPyResult<()> {
-        let _ = (path, load_kwargs);
+        let _ = (&self.kind, path, load_kwargs);
         Err(WyrdPyError::validation(
             "DataInterface.load must be implemented by a concrete interface",
         ))

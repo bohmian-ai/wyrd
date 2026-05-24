@@ -8,9 +8,9 @@ use wyrd_utils::py::{json_to_pyobject, pyobject_to_json};
 
 use crate::data::dtype;
 use crate::data::interfaces::kinds::{
-    ArrowInterface, CustomDataInterface, HuggingfaceInterface, ImageInterface, JsonlInterface,
-    NumpyInterface, PandasInterface, ParquetInterface, PolarsInterface, SqlInterface,
-    TextInterface, TorchInterface,
+    ArrowInterface, HuggingfaceInterface, ImageInterface, JsonlInterface, NumpyInterface,
+    PandasInterface, ParquetInterface, PolarsInterface, SqlInterface, TextInterface,
+    TorchInterface,
 };
 use crate::data::interfaces::options::parquet_compression_token;
 use crate::data::io::{ImageManifest, ManifestEntry, TextManifest};
@@ -315,10 +315,4 @@ impl_clone_for_handle!(HuggingfaceInterface {
     revision,
     split,
     config
-});
-#[cfg(feature = "python")]
-impl_clone_for_handle!(CustomDataInterface {
-    loader_module,
-    loader_class,
-    extra
 });

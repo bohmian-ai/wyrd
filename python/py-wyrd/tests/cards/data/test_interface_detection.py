@@ -10,7 +10,6 @@ import pytest
 from wyrd import DataCard, WyrdError
 from wyrd.data import (
     ArrowInterface,
-    CustomDataInterface,
     ImageInterface,
     JsonlInterface,
     NumpyInterface,
@@ -98,13 +97,11 @@ def test_datacard_rejects_non_data_interface() -> None:
 def test_explicit_interfaces_map_to_locked_meta(tmp_path) -> None:
     parquet = tmp_path / "data.parquet"
     parquet.write_bytes(b"PAR1")
-    custom = CustomDataInterface(data={"x": 1}, loader_module="json", loader_class="JSONDecoder")
 
     assert PandasInterface(compression="zstd").to_dict()["meta"]["compression"] == "Zstd"
     parquet_meta = ParquetInterface(data=parquet, row_group_size=128).to_dict()["meta"]
     assert parquet_meta["row_group_size"] == 128
     assert JsonlInterface(compression="gzip").to_dict()["meta"]["compression"] == "Gzip"
-    assert custom.to_dict()["meta"]["loader_module"] == "json"
 
 
 def test_split_builders_serialize_and_validate() -> None:

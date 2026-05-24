@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -14,16 +13,15 @@ use crate::data::interfaces::helpers::{
     write_json_sorted,
 };
 use crate::data::interfaces::kinds::{
-    ArrowInterface, CustomDataInterface, HuggingfaceInterface, ImageInterface, JsonlInterface,
-    NumpyInterface, PandasInterface, ParquetInterface, PolarsInterface, SqlInterface,
-    TextInterface, TorchInterface,
+    ArrowInterface, HuggingfaceInterface, ImageInterface, JsonlInterface, NumpyInterface,
+    PandasInterface, ParquetInterface, PolarsInterface, SqlInterface, TextInterface,
+    TorchInterface,
 };
 use crate::data::interfaces::options::{jsonl_compression_token, parquet_compression_token};
 use crate::data::io::{
-    custom_load_kwargs, huggingface_pointer, image_manifest_from_data, image_manifest_schema,
-    import_custom_loader, manifest_json_to_py, pointer_to_kwargs, read_huggingface_pointer,
-    read_jsonl_to_py, serde_json_file_to_py, sql_logic_from_data, string_map_to_kwargs,
-    text_manifest_from_data, text_manifest_schema, write_jsonl_normalized,
+    huggingface_pointer, image_manifest_from_data, image_manifest_schema, manifest_json_to_py,
+    pointer_to_kwargs, read_huggingface_pointer, read_jsonl_to_py, serde_json_file_to_py,
+    sql_logic_from_data, text_manifest_from_data, text_manifest_schema, write_jsonl_normalized,
 };
 use crate::data::layout::LocalArtifactLayout;
 use crate::error::{CardPyResult, WyrdPyError};
@@ -99,7 +97,6 @@ impl PandasInterface {
         Ok(())
     }
 }
-
 #[cfg(feature = "python")]
 impl PolarsInterface {
     /// Save the held polars dataframe to the local artifact layout.
@@ -258,7 +255,6 @@ impl ArrowInterface {
         Ok(())
     }
 }
-
 #[cfg(feature = "python")]
 impl ParquetInterface {
     /// Save a parquet path or table-like source to the local artifact layout.
@@ -875,75 +871,6 @@ impl HuggingfaceInterface {
                 .call_method1("load_from_disk", (&dataset_dir,))?
                 .unbind()
         });
-        Ok(())
-    }
-}
-
-#[cfg(feature = "python")]
-impl CustomDataInterface {
-    /// Save custom data through the declared custom loader.
-    ///
-    /// # Arguments
-    ///
-    /// * `py` - Active Python token used for importing and calling the loader.
-    /// * `path` - Local DataCard materialization root.
-    /// * `_save_kwargs` - Reserved for future declared-loader save options.
-    ///
-    /// # Returns
-    ///
-    /// Path statistics for `data/custom`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when source data is missing, the loader cannot be
-    /// imported, loader `save` fails, or local stats cannot be computed.
-    pub fn save_inner(
-        &self,
-        py: Python<'_>,
-        path: &Path,
-        _save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<DataStats> {
-        let source = self.data.as_ref().ok_or_else(|| {
-            WyrdPyError::missing_data_source("CustomDataInterface.save requires source data")
-        })?;
-        let data = source.bind(py);
-        let custom_dir = RustDataInterface::Custom(self.to_rust(py)?).artifact_path(path)?;
-        fs::create_dir_all(&custom_dir)?;
-        let loader = import_custom_loader(py, &self.loader_module, &self.loader_class)?;
-        let kwargs = string_map_to_kwargs(py, &self.extra)?;
-        loader.call_method("save", (data, &custom_dir), Some(&kwargs))?;
-        let schema = DataSchema::empty();
-        data_stats_for_path(&custom_dir, Some(&schema))
-    }
-
-    /// Load custom data through the declared custom loader.
-    ///
-    /// # Arguments
-    ///
-    /// * `py` - Active Python token used for importing and calling the loader.
-    /// * `path` - Local DataCard materialization root.
-    /// * `_load_kwargs` - Reserved for future declared-loader load options.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `data/custom` is missing, the loader cannot be
-    /// imported, or loader `load` fails.
-    pub fn load_inner(
-        &mut self,
-        py: Python<'_>,
-        path: &Path,
-        _load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
-        let custom_dir = RustDataInterface::Custom(self.to_rust(py)?).artifact_path(path)?;
-        require_local_path(&custom_dir)?;
-        let loader = import_custom_loader(py, &self.loader_module, &self.loader_class)?;
-        let metadata = BTreeMap::new();
-        let kwargs = custom_load_kwargs(py, &self.extra, &metadata)?;
-        self.data = Some(
-            loader
-                .call_method("load", (&custom_dir,), Some(&kwargs))?
-                .unbind(),
-        );
         Ok(())
     }
 }

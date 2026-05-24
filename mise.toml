@@ -296,7 +296,7 @@ test -f openapi.yaml || { echo 'openapi.yaml missing'; exit 1; }
 [tasks."codegen:stubs"]
 description = "Regenerate Python type stubs"
 dir = "python/py-wyrd"
-run = "uv run python scripts/generate_stubs.py"
+run = "uv run python scripts/assemble_stubs.py"
 
 [tasks."codegen:check"]
 description = "Fail if generated openapi/schemas/MCP/pyi drift from source"

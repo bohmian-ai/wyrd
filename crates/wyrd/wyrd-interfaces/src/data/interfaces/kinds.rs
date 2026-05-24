@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use crate::data::interfaces::DataInterface;
 use crate::error::CardPyResult;
 use wyrd_spec::reference::CardRef;
@@ -152,19 +150,6 @@ HuggingfaceInterface {
     revision: Option<String>,
     split: Option<String>,
     config: Option<String>,
-});
-
-interface_struct!(
-/// Data interface for declared custom Python loaders.
-///
-/// `save` imports `loader_module.loader_class` and calls its `save` method with
-/// the configured `extra` keyword arguments. `load` calls the same loader's
-/// `load` method against the local `data/custom` directory.
-CustomDataInterface {
-    data: Option<Py<PyAny>>,
-    loader_module: String,
-    loader_class: String,
-    extra: BTreeMap<String, String>,
 });
 
 #[cfg(feature = "python")]
@@ -620,43 +605,6 @@ impl_interface_methods!(HuggingfaceInterface {
                 config,
             },
             DataInterface::marker("Huggingface"),
-        )
-    }
-});
-
-#[cfg(feature = "python")]
-impl_interface_methods!(CustomDataInterface {
-    /// Create a declared custom loader interface.
-    ///
-    /// # Arguments
-    ///
-    /// * `data` - Optional Python source object passed to the custom loader's
-    ///   `save` method.
-    /// * `loader_module` - Importable Python module containing the custom
-    ///   loader class.
-    /// * `loader_class` - Loader class name to import from `loader_module`.
-    /// * `extra` - Optional string keyword arguments passed to the custom
-    ///   loader.
-    ///
-    /// # Returns
-    ///
-    /// A custom declared-loader interface with kind `Custom`.
-    #[new]
-    #[pyo3(signature = (*, data=None, loader_module, loader_class, extra=None))]
-    fn __new__(
-        data: Option<Py<PyAny>>,
-        loader_module: String,
-        loader_class: String,
-        extra: Option<BTreeMap<String, String>>,
-    ) -> (Self, DataInterface) {
-        (
-            Self {
-                data,
-                loader_module,
-                loader_class,
-                extra: extra.unwrap_or_default(),
-            },
-            DataInterface::marker("Custom"),
         )
     }
 });

@@ -24,9 +24,9 @@ use {
     pyo3::types::{PyAny, PyDict},
     serde_json::json,
     wyrd_interfaces::data::interfaces::{
-        ArrowInterface, CustomDataInterface, DataInterface, DataInterfaceHandle,
-        HuggingfaceInterface, ImageInterface, JsonlInterface, NumpyInterface, PandasInterface,
-        ParquetInterface, PolarsInterface, SqlInterface, TextInterface, TorchInterface,
+        ArrowInterface, DataInterface, DataInterfaceHandle, HuggingfaceInterface, ImageInterface,
+        JsonlInterface, NumpyInterface, PandasInterface, ParquetInterface, PolarsInterface,
+        SqlInterface, TextInterface, TorchInterface,
     },
     wyrd_interfaces::data::io::{load_data, save_data},
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
@@ -275,10 +275,23 @@ impl DataCard {
             WyrdPyError::validation("DataCard interface is required for data access")
         })?;
         let handle = DataInterfaceHandle::from_interface(interface.bind(py))?;
-        let data = handle
-            .source_ref()
-            .ok_or_else(|| WyrdPyError::validation("DataCard has no live local data attached"))?;
-        Ok(data.clone_ref(py))
+        if let Some(data) = handle.source_ref() {
+            return Ok(data.clone_ref(py));
+        }
+        if matches!(handle, DataInterfaceHandle::Subclass(_)) {
+            return Ok(interface
+                .bind(py)
+                .getattr("data")
+                .map_err(|_| {
+                    WyrdPyError::validation(
+                        "custom Python DataInterface must expose a data attribute for DataCard.data",
+                    )
+                })?
+                .unbind());
+        }
+        Err(WyrdPyError::validation(
+            "DataCard has no live local data attached",
+        ))
     }
 
     /// Return the DataCard space.
@@ -463,8 +476,9 @@ impl DataCard {
     ///
     /// Passing `data` attaches a raw object, explicit interface, Python
     /// subclass, or ArtifactCard. When `data` is omitted, Wyrd rebuilds
-    /// built-in and declared custom interfaces from the serialized spec
-    /// metadata. Python subclass-backed cards must pass `data=YourInterface()`.
+    /// built-in interfaces from serialized spec metadata. Python
+    /// subclass-backed cards must pass `data=YourInterface()` because Wyrd
+    /// cannot instantiate an arbitrary user class from card JSON alone.
     ///
     /// # Errors
     /// Returns a Wyrd error when JSON parsing fails or the serialized custom
@@ -627,13 +641,10 @@ fn interface_from_spec(py: Python<'_>, interface: &RustDataInterface) -> CardPyR
         RustDataInterface::Huggingface(_) => {
             DataInterfaceHandle::Huggingface(HuggingfaceInterface::from_spec_inner(interface)?)
         }
-        RustDataInterface::Custom(meta) => {
-            if meta.loader_module.is_empty() || meta.loader_class.is_empty() {
-                return Err(WyrdPyError::validation(
-                    "custom Python DataInterface cannot be rebuilt from JSON; pass data=YourInterface() to DataCard.model_validate_json",
-                ));
-            }
-            DataInterfaceHandle::Custom(CustomDataInterface::from_spec_inner(interface)?)
+        RustDataInterface::Custom(_) => {
+            return Err(WyrdPyError::validation(
+                "custom Python DataInterface cannot be rebuilt from JSON; pass data=YourInterface() to DataCard.model_validate_json",
+            ));
         }
     };
     handle.into_py_any(py)

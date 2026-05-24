@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 
 import numpy as np
 import pandas as pd
@@ -12,8 +13,9 @@ import torch
 from datasets import Dataset
 from wyrd.data import (
     ArrowInterface,
-    CustomDataInterface,
     DataCard,
+    DataInterface,
+    DataStats,
     HuggingfaceInterface,
     ImageInterface,
     JsonlInterface,
@@ -24,18 +26,27 @@ from wyrd.data import (
     SqlInterface,
     TextInterface,
     TorchInterface,
+    WyrdError,
 )
 
 
-class JsonLoader:
-    @staticmethod
-    def save(data, path, **_extra):
-        path.mkdir(parents=True, exist_ok=True)
-        (path / "data.json").write_text(json.dumps(data), encoding="utf-8")
+class JsonInterface(DataInterface):
+    def __init__(self, data=None):
+        super().__init__()
+        self.data = data
 
-    @staticmethod
-    def load(path, **_extra):
-        return json.loads((path / "data.json").read_text(encoding="utf-8"))
+    def save(self, path, save_kwargs=None):
+        output_dir = path / "data" / "custom"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(self.data).encode("utf-8")
+        (output_dir / "data.json").write_bytes(payload)
+        return DataStats(
+            byte_count=len(payload),
+            sha256=sha256(payload).hexdigest(),
+        )
+
+    def load(self, path, load_kwargs=None):
+        self.data = json.loads((path / "data" / "custom" / "data.json").read_text())
 
 
 def test_pandas_save_writes_parquet_and_card_json(tmp_path) -> None:
@@ -193,13 +204,26 @@ def test_huggingface_dataset_save_load_uses_real_datasets(tmp_path) -> None:
 
 
 def test_custom_interface_calls_user_save_and_load(tmp_path) -> None:
-    card = DataCard(
-        CustomDataInterface(
-            data={"x": 1},
-            loader_module=__name__,
-            loader_class="JsonLoader",
-        )
-    )
+    card = DataCard(JsonInterface(data={"x": 1}))
+
+    card.save(tmp_path)
+    serialized = card.model_dump_json()
+    reloaded = DataCard.model_validate_json(serialized, data=JsonInterface())
+    reloaded.load(tmp_path)
+
+    assert reloaded.data == {"x": 1}
+
+
+def test_custom_interface_json_requires_live_subclass(tmp_path) -> None:
+    card = DataCard(JsonInterface(data={"x": 1}))
+    card.save(tmp_path)
+
+    with pytest.raises(WyrdError, match="pass data=YourInterface"):
+        DataCard.model_validate_json(card.model_dump_json())
+
+
+def test_custom_interface_existing_card_can_load_with_live_subclass(tmp_path) -> None:
+    card = DataCard(JsonInterface(data={"x": 1}))
 
     card.save(tmp_path)
     card.load(tmp_path)

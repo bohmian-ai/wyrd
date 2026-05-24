@@ -1,7 +1,7 @@
 use crate::data::interfaces::kinds::{
-    ArrowInterface, CustomDataInterface, HuggingfaceInterface, ImageInterface, JsonlInterface,
-    NumpyInterface, PandasInterface, ParquetInterface, PolarsInterface, SqlInterface,
-    TextInterface, TorchInterface,
+    ArrowInterface, HuggingfaceInterface, ImageInterface, JsonlInterface, NumpyInterface,
+    PandasInterface, ParquetInterface, PolarsInterface, SqlInterface, TextInterface,
+    TorchInterface,
 };
 use crate::data::interfaces::options::{
     arrow_format_token, color_mode_token, image_format_token, jsonl_compression_token,
@@ -11,8 +11,8 @@ use crate::data::interfaces::options::{
 };
 use crate::error::{CardPyResult, WyrdPyError};
 use wyrd_spec::card::data::{
-    ArrowMeta, CustomDataMeta, DataInterface as RustDataInterface, HuggingfaceMeta, ImageMeta,
-    JsonlMeta, NumpyMeta, PandasMeta, ParquetMeta, PolarsMeta, SqlMeta, TextMeta, TorchMeta,
+    ArrowMeta, DataInterface as RustDataInterface, HuggingfaceMeta, ImageMeta, JsonlMeta,
+    NumpyMeta, PandasMeta, ParquetMeta, PolarsMeta, SqlMeta, TextMeta, TorchMeta,
 };
 
 #[cfg(feature = "python")]
@@ -315,31 +315,6 @@ impl HuggingfaceInterface {
             revision: meta.revision.clone(),
             split: meta.split.clone(),
             config: meta.config.clone(),
-        }
-    }
-}
-
-impl_to_spec!(
-    CustomDataInterface,
-    CustomDataMeta,
-    Custom,
-    "CustomDataInterface metadata must contain Custom metadata",
-    |value: &CustomDataInterface, _py| {
-        Ok(CustomDataMeta {
-            loader_module: value.loader_module.clone(),
-            loader_class: value.loader_class.clone(),
-            extra: value.extra.clone(),
-        })
-    }
-);
-
-impl CustomDataInterface {
-    fn from_meta(meta: &CustomDataMeta) -> Self {
-        Self {
-            data: None,
-            loader_module: meta.loader_module.clone(),
-            loader_class: meta.loader_class.clone(),
-            extra: meta.extra.clone(),
         }
     }
 }

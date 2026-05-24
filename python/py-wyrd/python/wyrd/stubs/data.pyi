@@ -1,68 +1,13 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-### header.pyi ###
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value, missing-final-newline
-# ruff: noqa: F401
-
-from __future__ import annotations
+#### begin imports ####
 
 import datetime
-import os
-import pathlib
 from collections.abc import Mapping, Sequence
-from typing import Any, Protocol, TypeAlias, overload
+from typing import Any, overload
 
-PathLike: TypeAlias = str | os.PathLike[str] | pathlib.Path
-JsonDict: TypeAlias = dict[str, Any]
-StringMap: TypeAlias = Mapping[str, str]
+from .header import CardRefLike, JsonDict, PathLike, StringMap
 
-class CardRefLike(Protocol):
-    """Object that can be represented as a Wyrd card reference."""
+#### end of imports ####
 
-    def to_dict(self) -> JsonDict:
-        """Return a JSON-compatible card reference dictionary."""
-
-### error.pyi ###
-class WyrdError(Exception):
-    """Python-facing Wyrd error with stable metadata.
-
-    Wyrd raises this exception for validation and boundary failures that have a
-    durable Wyrd error code. The attributes are intended for both humans and
-    agents: `code` is stable, `message` explains the failure, `details` carries
-    structured context, and `remediation` tells the caller what to change next.
-    """
-
-    code: str
-    message: str
-    detail: str
-    details: dict[str, Any] | None
-    remediation: str
-
-    def __init__(
-        self,
-        code: str,
-        message: str,
-        *,
-        details: dict[str, Any] | None = None,
-        remediation: str = ...,
-    ) -> None:
-        """Create a Wyrd error.
-
-        Users normally receive this from Wyrd rather than constructing it
-        directly. `code` is the machine-stable identifier; `message` is the
-        short human-readable failure; `details` is JSON-compatible context; and
-        `remediation` is the actionable recovery hint.
-
-        Args:
-            code (str): Stable Wyrd error code.
-            message (str): Human-readable failure message.
-            details (dict[str, Any] | None): Optional structured context for
-                the failure.
-            remediation (str): Actionable recovery guidance.
-        """
-        ...
-
-### data.pyi ###
 class FieldSpec:
     """One column or tensor field in a DataCard schema.
 
@@ -744,7 +689,6 @@ class DataCard:
         """
         ...
 
-### GLOBAL EXPORTS ###
 __all__ = [
     "ArrowInterface",
     "DataCard",
@@ -764,5 +708,4 @@ __all__ = [
     "SqlInterface",
     "TextInterface",
     "TorchInterface",
-    "WyrdError",
 ]

@@ -7,9 +7,9 @@ use crate::data::dtype::{self, DataSourceKind};
 use crate::data::interfaces::base::DataInterface;
 use crate::data::interfaces::helpers::{huggingface_dataset_id, huggingface_optional_attr};
 use crate::data::interfaces::kinds::{
-    ArrowInterface, CustomDataInterface, HuggingfaceInterface, ImageInterface, JsonlInterface,
-    NumpyInterface, PandasInterface, ParquetInterface, PolarsInterface, SqlInterface,
-    TextInterface, TorchInterface,
+    ArrowInterface, HuggingfaceInterface, ImageInterface, JsonlInterface, NumpyInterface,
+    PandasInterface, ParquetInterface, PolarsInterface, SqlInterface, TextInterface,
+    TorchInterface,
 };
 use crate::error::{CardPyResult, WyrdPyError};
 use wyrd_spec::card::data::{CustomDataMeta, DataInterface as RustDataInterface, DataSchema};
@@ -39,8 +39,6 @@ pub enum DataInterfaceHandle {
     Text(TextInterface),
     /// Hugging Face dataset interface.
     Huggingface(HuggingfaceInterface),
-    /// Custom loader interface.
-    Custom(CustomDataInterface),
     /// Python subclass of the base `DataInterface`.
     Subclass(Py<PyAny>),
 }
@@ -69,7 +67,6 @@ impl DataInterfaceHandle {
         extract_interface!(ImageInterface, Image);
         extract_interface!(TextInterface, Text);
         extract_interface!(HuggingfaceInterface, Huggingface);
-        extract_interface!(CustomDataInterface, Custom);
 
         if interface.is_instance_of::<DataInterface>() {
             return Ok(Self::Subclass(interface.clone().unbind()));
@@ -155,7 +152,6 @@ impl DataInterfaceHandle {
             Self::Image(value) => value.to_spec_interface(py),
             Self::Text(value) => value.to_spec_interface(py),
             Self::Huggingface(value) => value.to_spec_interface(py),
-            Self::Custom(value) => value.to_spec_interface(py),
             Self::Subclass(_) => Ok(RustDataInterface::Custom(CustomDataMeta {
                 loader_module: String::new(),
                 loader_class: String::new(),
@@ -183,7 +179,6 @@ impl DataInterfaceHandle {
             Self::Image(value) => into_py!(value, "Image"),
             Self::Text(value) => into_py!(value, "Text"),
             Self::Huggingface(value) => into_py!(value, "Huggingface"),
-            Self::Custom(value) => into_py!(value, "Custom"),
             Self::Subclass(value) => Ok(value),
         }
     }
@@ -202,7 +197,6 @@ impl DataInterfaceHandle {
             Self::Image(value) => value.data.take(),
             Self::Text(value) => value.data.take(),
             Self::Huggingface(value) => value.data.take(),
-            Self::Custom(value) => value.data.take(),
             Self::Subclass(_) => None,
         }
     }
@@ -221,7 +215,6 @@ impl DataInterfaceHandle {
             Self::Image(value) => value.data.as_ref(),
             Self::Text(value) => value.data.as_ref(),
             Self::Huggingface(value) => value.data.as_ref(),
-            Self::Custom(value) => value.data.as_ref(),
             Self::Subclass(_) => None,
         }
     }
@@ -253,7 +246,6 @@ impl DataInterfaceHandle {
             Self::Image(_) => "Image",
             Self::Text(_) => "Text",
             Self::Huggingface(_) => "Huggingface",
-            Self::Custom(_) => "Custom",
             Self::Subclass(_) => "Custom",
         }
     }

@@ -20,9 +20,9 @@ pub use base::DataInterface;
 pub use handle::DataInterfaceHandle;
 #[cfg(feature = "python")]
 pub use kinds::{
-    ArrowInterface, CustomDataInterface, HuggingfaceInterface, ImageInterface, JsonlInterface,
-    NumpyInterface, PandasInterface, ParquetInterface, PolarsInterface, SqlInterface,
-    TextInterface, TorchInterface,
+    ArrowInterface, HuggingfaceInterface, ImageInterface, JsonlInterface, NumpyInterface,
+    PandasInterface, ParquetInterface, PolarsInterface, SqlInterface, TextInterface,
+    TorchInterface,
 };
 pub use options::{
     parse_arrow_format, parse_color_mode, parse_image_format, parse_jsonl_compression,
@@ -47,6 +47,5 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ImageInterface>()?;
     module.add_class::<TextInterface>()?;
     module.add_class::<HuggingfaceInterface>()?;
-    module.add_class::<CustomDataInterface>()?;
     Ok(())
 }

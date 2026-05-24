@@ -277,35 +277,6 @@ pub fn pointer_to_kwargs<'py>(
 }
 
 #[cfg(feature = "python")]
-/// Import a declared custom loader class.
-///
-/// # Errors
-/// Returns an error when the module or class cannot be imported.
-pub fn import_custom_loader<'py>(
-    py: Python<'py>,
-    module: &str,
-    class: &str,
-) -> CardPyResult<Bound<'py, PyAny>> {
-    Ok(py.import(module)?.getattr(class)?)
-}
-
-#[cfg(feature = "python")]
-/// Convert a string map into Python keyword arguments.
-///
-/// # Errors
-/// Returns an error when Python dictionary creation fails.
-pub fn string_map_to_kwargs<'py>(
-    py: Python<'py>,
-    values: &BTreeMap<String, String>,
-) -> CardPyResult<Bound<'py, PyDict>> {
-    let kwargs = PyDict::new(py);
-    for (key, value) in values {
-        kwargs.set_item(key, value)?;
-    }
-    Ok(kwargs)
-}
-
-#[cfg(feature = "python")]
 /// Convert a Python JSON-like object into a string-keyed JSON map.
 ///
 /// # Errors
@@ -317,23 +288,6 @@ pub fn py_json_to_value_map(value: Bound<'_, PyAny>) -> CardPyResult<BTreeMap<St
             "expected a JSON object with string keys",
         )),
     }
-}
-
-#[cfg(feature = "python")]
-/// Merge custom string options and metadata into Python keyword arguments.
-///
-/// # Errors
-/// Returns an error when metadata cannot be converted to Python objects.
-pub fn custom_load_kwargs<'py>(
-    py: Python<'py>,
-    extra: &BTreeMap<String, String>,
-    metadata: &BTreeMap<String, Value>,
-) -> CardPyResult<Bound<'py, PyDict>> {
-    let kwargs = string_map_to_kwargs(py, extra)?;
-    for (key, value) in metadata {
-        kwargs.set_item(key, wyrd_utils::py::json_to_pyobject(py, value)?)?;
-    }
-    Ok(kwargs)
 }
 
 #[cfg(feature = "python")]

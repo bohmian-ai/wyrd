@@ -3590,12 +3590,16 @@ name = "wyrd-interfaces"
 version = "0.0.1"
 dependencies = [
  "chrono",
+ "flate2",
  "pyo3",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tracing",
+ "walkdir",
  "wyrd-spec",
  "wyrd-utils",
+ "zstd",
 ]
 
 [[package]]

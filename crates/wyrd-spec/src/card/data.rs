@@ -192,7 +192,7 @@ impl DataInterface {
             Self::Torch(_) => "application/vnd.safetensors",
             Self::Sql(_) => "application/vnd.wyrd.sql+json",
             Self::Jsonl(_) => "application/jsonl",
-            Self::Image(_) | Self::Text(_) => "application/x-parquet",
+            Self::Image(_) | Self::Text(_) => "application/json",
             Self::Huggingface(_) => "application/vnd.wyrd.huggingface+json",
             Self::Custom(_) => "application/octet-stream",
         }
@@ -207,7 +207,7 @@ impl DataInterface {
             Self::Torch(_) => "safetensors",
             Self::Sql(_) | Self::Huggingface(_) => "json",
             Self::Jsonl(_) => "jsonl",
-            Self::Image(_) | Self::Text(_) => "manifest.parquet",
+            Self::Image(_) | Self::Text(_) => "manifest.json",
             Self::Custom(_) => "bin",
         }
     }

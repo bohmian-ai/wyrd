@@ -8,7 +8,7 @@ repository = { workspace = true }
 authors = { workspace = true }
 [features]
 default = []
-python = ["dep:pyo3", "wyrd-utils/python"]
+python = ["dep:pyo3", "dep:flate2", "dep:zstd", "wyrd-utils/python"]
 
 [dependencies]
 wyrd-spec = { workspace = true }
@@ -18,6 +18,10 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 pyo3 = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
+tracing = { workspace = true }
+walkdir = { workspace = true }
 
 [lints]
 workspace = true

@@ -79,3 +79,14 @@ def test_user_metadata_rejects_invalid_reserved_and_secret_values() -> None:
         with pytest.raises(WyrdError) as exc:
             DataCard(PandasInterface(data=pd.DataFrame({"x": [1]})), **kwargs)
         assert exc.value.code == "WYRD_DATA_400_VALIDATION"
+
+
+def test_model_validate_json_rejects_wrong_card_kind() -> None:
+    payload = {
+        "apiVersion": "wyrd/v1",
+        "kind": "Prompt",
+        "metadata": {"name": "p", "version": "1.0.0"},
+        "spec": {"template": "hello"},
+    }
+    with pytest.raises(WyrdError):
+        DataCard.model_validate_json(json.dumps(payload))

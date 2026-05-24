@@ -316,17 +316,12 @@ fn is_instance_of_optional(
 
 #[cfg(feature = "python")]
 fn directory_contains_image_file(path: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return false;
-    };
-    entries.filter_map(Result::ok).any(|entry| {
-        let path = entry.path();
-        if path.is_dir() {
-            directory_contains_image_file(&path)
-        } else {
-            is_image_path(&path)
-        }
-    })
+    walkdir::WalkDir::new(path)
+        .max_depth(4)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .any(|entry| !entry.file_type().is_dir() && is_image_path(entry.path()))
 }
 
 #[cfg(feature = "python")]
@@ -357,7 +352,7 @@ fn normalize_pandas_dtype(value: &str) -> CardPyResult<String> {
     let value = value.to_ascii_lowercase();
     match value.as_str() {
         "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
-        | "float16" | "float32" | "float64" | "bool" => Ok(value.clone()),
+        | "float16" | "float32" | "float64" | "bool" => Ok(value),
         "object" | "string[python]" | "string[pyarrow]" => Ok("utf8".to_string()),
         "category" => Ok("dictionary<int32, utf8>".to_string()),
         "datetime64[ns]" => Ok("timestamp[ns]".to_string()),
@@ -535,16 +530,15 @@ fn normalize_arrow_dictionary(value: &str) -> CardPyResult<String> {
     let parts = split_top_level(inner, ',');
     let mut index = None;
     let mut values = None;
-    for part in parts {
+    for part in &parts {
         if part.contains("indices=") {
             index = Some(trim_key_value(part, "indices"));
         } else if part.contains("values=") {
             values = Some(trim_key_value(part, "values"));
         }
     }
-    let index = index.unwrap_or_else(|| split_top_level(inner, ',').first().copied().unwrap_or(""));
-    let values =
-        values.unwrap_or_else(|| split_top_level(inner, ',').get(1).copied().unwrap_or(""));
+    let index = index.unwrap_or_else(|| parts.first().copied().unwrap_or(""));
+    let values = values.unwrap_or_else(|| parts.get(1).copied().unwrap_or(""));
     Ok(format!(
         "dictionary<{}, {}>",
         normalize_pyarrow_dtype(index)?,
@@ -711,13 +705,12 @@ fn infer_pyarrow_schema_object(schema: &Bound<'_, PyAny>) -> CardPyResult<DataSc
 fn infer_jsonl_schema(_py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
     let sample = if is_path_like(data.py(), data)? {
         let path = extract_pathbuf(data)?;
-        let contents = read_jsonl_path_to_string(&path)?;
-        contents
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .map(serde_json::from_str::<Value>)
-            .transpose()?
-            .unwrap_or(Value::Object(Map::default()))
+        let first_line = read_first_jsonl_line(&path)?;
+        if first_line.is_empty() {
+            Value::Object(Map::default())
+        } else {
+            serde_json::from_str::<Value>(&first_line)?
+        }
     } else {
         match pyobject_to_json(data)? {
             Value::Array(values) => values
@@ -739,14 +732,19 @@ fn infer_jsonl_schema(_py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<
 }
 
 #[cfg(feature = "python")]
-fn read_jsonl_path_to_string(path: &Path) -> CardPyResult<String> {
-    let bytes = std::fs::read(path)?;
-    let decoded = match jsonl_compression_for_path(path) {
-        Some("gzip") => wyrd_utils::codec::gzip_decode(&bytes)
-            .map_err(|error| WyrdPyError::Io(error.to_string()))?,
-        Some("zstd") => wyrd_utils::codec::zstd_decode(&bytes)
-            .map_err(|error| WyrdPyError::Io(error.to_string()))?,
-        Some("none") | None => bytes,
+fn read_first_jsonl_line(path: &Path) -> CardPyResult<String> {
+    use std::io::{BufRead, BufReader};
+    // BLOCKING: synchronous filesystem I/O; do not call from an async executor
+    // without tokio::task::spawn_blocking.
+    let file = std::fs::File::open(path)?;
+    let mut reader: Box<dyn BufRead> = match jsonl_compression_for_path(path) {
+        Some("gzip") => Box::new(BufReader::new(flate2::read::GzDecoder::new(
+            BufReader::new(file),
+        ))),
+        Some("zstd") => Box::new(BufReader::new(
+            zstd::Decoder::new(file).map_err(|e| WyrdPyError::Io(e.to_string()))?,
+        )),
+        Some("none") | None => Box::new(BufReader::new(file)),
         Some(value) => {
             return Err(WyrdPyError::invalid_interface_option(
                 "compression",
@@ -755,7 +753,19 @@ fn read_jsonl_path_to_string(path: &Path) -> CardPyResult<String> {
             ));
         }
     };
-    String::from_utf8(decoded).map_err(|error| WyrdPyError::Json(error.to_string()))
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| WyrdPyError::Io(e.to_string()))?;
+        if n == 0 {
+            return Ok(String::new());
+        }
+        if !line.trim().is_empty() {
+            return Ok(line);
+        }
+    }
 }
 
 #[cfg(feature = "python")]

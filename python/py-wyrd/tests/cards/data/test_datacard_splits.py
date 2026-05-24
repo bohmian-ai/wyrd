@@ -96,3 +96,10 @@ def test_split_key_must_match_serialized_label() -> None:
 
 def test_datacard_does_not_expose_split_data_execution() -> None:
     assert not hasattr(DataCard(PandasInterface(data=pd.DataFrame({"x": [1]}))), "split_data")
+
+
+def test_split_indices_rejects_empty_list() -> None:
+    with pytest.raises(WyrdError) as exc:
+        Split.indices([])
+
+    assert exc.value.code == "WYRD_DATA_400_INVALID_SPLIT_RULE"

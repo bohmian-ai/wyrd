@@ -7,7 +7,7 @@ use {
     crate::data::interfaces::helpers::{interface_to_dict, parse_card_ref},
     crate::data::interfaces::options::{
         parse_arrow_format, parse_color_mode, parse_image_format, parse_jsonl_compression,
-        parse_numpy_format, parse_parquet_compression, parse_torch_save_format,
+        parse_numpy_format, parse_parquet_compression, parse_sql_dialect, parse_torch_save_format,
     },
     crate::data::stats::PyDataStats,
     pyo3::prelude::*,
@@ -457,17 +457,18 @@ impl_interface_methods!(SqlInterface {
     #[pyo3(signature = (*, data=None, dialect, connection_hint=None))]
     fn __new__(
         data: Option<Py<PyAny>>,
-        dialect: String,
+        dialect: &str,
         connection_hint: Option<String>,
-    ) -> (Self, DataInterface) {
-        (
+    ) -> CardPyResult<(Self, DataInterface)> {
+        let dialect = parse_sql_dialect(dialect)?;
+        Ok((
             Self {
                 data,
                 dialect,
                 connection_hint,
             },
             DataInterface::marker("Sql"),
-        )
+        ))
     }
 });
 

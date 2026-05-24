@@ -42,7 +42,7 @@ pub fn data_stats_for_file(path: &Path, schema: Option<&DataSchema>) -> WyrdUtil
     let (byte_count, sha256) = digest_file(path)?;
     Ok(DataStats {
         row_count: None,
-        col_count: schema.map(|schema| schema.columns.len() as u32),
+        col_count: schema.map(|schema| u32::try_from(schema.columns.len()).unwrap_or(u32::MAX)),
         byte_count,
         sha256,
     })
@@ -67,7 +67,7 @@ pub fn data_stats_for_path(path: &Path, schema: Option<&DataSchema>) -> WyrdUtil
 
     Ok(DataStats {
         row_count: None,
-        col_count: schema.map(|schema| schema.columns.len() as u32),
+        col_count: schema.map(|schema| u32::try_from(schema.columns.len()).unwrap_or(u32::MAX)),
         byte_count,
         sha256,
     })

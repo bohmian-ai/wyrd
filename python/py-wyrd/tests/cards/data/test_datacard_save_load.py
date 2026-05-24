@@ -610,3 +610,23 @@ def test_save_does_not_create_artifact_cards_or_artifact_refs(tmp_path: Path) ->
 
     payload = json.loads((tmp_path / "card.json").read_text(encoding="utf-8"))
     assert payload["spec"]["artifact_refs"] == []
+
+
+def test_huggingface_pointer_only_save_writes_pointer_json(tmp_path: Path) -> None:
+    interface = HuggingfaceInterface(dataset_id="acme/data", revision="abcdef0")
+    card = DataCard(interface)
+    card.save(tmp_path)
+
+    assert (tmp_path / "data" / "dataset_pointer.json").is_file()
+    _assert_card_json(tmp_path, "Huggingface")
+    _assert_stats(card)
+
+
+def test_huggingface_pointer_load_without_allow_remote_raises(tmp_path: Path) -> None:
+    interface = HuggingfaceInterface(dataset_id="acme/data", revision="abcdef0")
+    card = DataCard(interface)
+    card.save(tmp_path)
+
+    card2 = DataCard.model_validate_json((tmp_path / "card.json").read_text(encoding="utf-8"))
+    with pytest.raises(WyrdError):
+        card2.load(tmp_path)

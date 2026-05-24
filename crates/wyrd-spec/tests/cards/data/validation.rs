@@ -258,10 +258,12 @@ fn sha256_must_be_lowercase_hex_64() {
 }
 
 #[test]
-fn byte_count_zero_rejected() {
+fn byte_count_zero_allowed_for_draft_cards() {
+    // byte_count=0 is the draft sentinel; validate_data_spec is structural-only.
+    // Byte-count enforcement belongs to the save path, not load-time validation.
     let mut spec = pandas_spec();
     spec.stats.byte_count = 0;
-    assert_eq!(validate_data_spec(&spec), Err(DataCardError::ByteCountZero));
+    assert!(validate_data_spec(&spec).is_ok());
 }
 
 #[test]
@@ -327,4 +329,67 @@ fn datacard_error_maps_to_public_wyrd_error_codes() {
     let error: wyrd_spec::error::WyrdError =
         DataCardError::SplitRuleUnknownColumn("feature".to_string()).into();
     assert_eq!(error.code(), "WYRD_DATA_400_INVALID_SPLIT_RULE");
+}
+
+#[test]
+fn sql_interface_without_sql_block_rejected() {
+    let mut spec = valid_spec(DataInterface::Sql(SqlMeta {
+        dialect: "postgres".to_string(),
+        connection_hint: None,
+    }));
+    spec.sql = None;
+    assert_eq!(
+        validate_data_spec(&spec),
+        Err(DataCardError::SqlQueriesEmpty)
+    );
+}
+
+#[test]
+fn hf_revision_accepts_7_and_40_char_sha() {
+    for revision in ["abcdef0", &"a".repeat(40)] {
+        let spec = DataSpec {
+            interface: DataInterface::Huggingface(HuggingfaceMeta {
+                dataset_id: "acme/data".to_string(),
+                revision: Some(revision.to_string()),
+                split: None,
+                config: None,
+            }),
+            schema: DataSchema::empty(),
+            artifact_refs: Vec::new(),
+            splits: HashMap::new(),
+            target_columns: Vec::new(),
+            sql: None,
+            stats: valid_stats(),
+        };
+        assert!(
+            validate_data_spec(&spec).is_ok(),
+            "revision {revision} should be valid"
+        );
+    }
+}
+
+#[test]
+fn hf_revision_rejects_6_and_41_char() {
+    for revision in ["abcde0", &"a".repeat(41)] {
+        let spec = DataSpec {
+            interface: DataInterface::Huggingface(HuggingfaceMeta {
+                dataset_id: "acme/data".to_string(),
+                revision: Some(revision.to_string()),
+                split: None,
+                config: None,
+            }),
+            schema: DataSchema::empty(),
+            artifact_refs: Vec::new(),
+            splits: HashMap::new(),
+            target_columns: Vec::new(),
+            sql: None,
+            stats: valid_stats(),
+        };
+        assert_eq!(
+            validate_data_spec(&spec),
+            Err(DataCardError::HuggingfaceRevisionInvalid(
+                revision.to_string()
+            ))
+        );
+    }
 }

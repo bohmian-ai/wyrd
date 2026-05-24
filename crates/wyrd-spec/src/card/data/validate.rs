@@ -74,7 +74,6 @@ pub fn validate_data_spec(spec: &DataSpec) -> Result<(), DataCardError> {
     check_index_range_order(spec)?;
     check_indices_nonnegative_unique(spec)?;
     check_sha256(spec)?;
-    check_byte_count(spec)?;
     check_sql_queries_nonempty_for_sql(spec)?;
     check_sql_default_in_queries(spec)?;
     check_hf_revision(spec)?;

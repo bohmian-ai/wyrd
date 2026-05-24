@@ -129,7 +129,10 @@ pub(super) fn optional_schema_for_interface(
     data: &Bound<'_, PyAny>,
     kind: &str,
 ) -> DataSchema {
-    dtype::infer_schema_for_interface(py, data, kind).unwrap_or_else(|_| DataSchema::empty())
+    dtype::infer_schema_for_interface(py, data, kind).unwrap_or_else(|error| {
+        tracing::warn!(kind, %error, "schema inference failed; using empty schema");
+        DataSchema::empty()
+    })
 }
 
 #[cfg(feature = "python")]
@@ -174,9 +177,24 @@ impl FileManifest for TextManifest {
 #[cfg(feature = "python")]
 pub(super) fn copy_manifest_entries(manifest: &impl FileManifest, dest: &Path) -> CardPyResult<()> {
     fs::create_dir_all(dest)?;
+    let allowed_root = dest
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| WyrdPyError::validation("cannot determine card root for manifest copy"))?
+        .canonicalize()
+        .map_err(|e| WyrdPyError::Io(e.to_string()))?;
     for entry in manifest.files() {
         let source = PathBuf::from(&entry.path);
         require_local_file(&source)?;
+        let canonical = source
+            .canonicalize()
+            .map_err(|e| WyrdPyError::Io(e.to_string()))?;
+        if !canonical.starts_with(&allowed_root) {
+            return Err(WyrdPyError::validation_with_details(
+                "manifest path is outside the card data root",
+                serde_json::json!({ "path": entry.path }),
+            ));
+        }
         let file_name = source.file_name().ok_or_else(|| {
             WyrdPyError::validation_with_details(
                 "manifest file entries must include a file name",

@@ -217,3 +217,15 @@ def test_artifact_card_input_requires_or_infers_interface_metadata(tmp_path) -> 
 
     assert metadata["artifact_refs"][0]["kind"] == "Artifact"
     assert metadata["artifact_refs"][0]["name"] == "existing-data"
+
+
+def test_set_interface_replaces_spec_metadata_and_schema() -> None:
+    card = DataCard(PandasInterface(data=pd.DataFrame({"year": [2024]})))
+    assert card.interface.kind == "Pandas"
+    assert any(c.name == "year" for c in card.schema.columns)
+
+    card.interface = ArrowInterface(data=pa.table({"score": pa.array([1], type=pa.int64())}))
+
+    assert card.interface.kind == "Arrow"
+    assert any(c.name == "score" for c in card.schema.columns)
+    assert _payload(card)["spec"]["interface"]["kind"] == "Arrow"

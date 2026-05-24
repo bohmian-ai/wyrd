@@ -134,11 +134,13 @@ pub fn write_jsonl_normalized(
     data: &Bound<'_, PyAny>,
     path: &Path,
     compression: JsonlCompression,
-) -> CardPyResult<u64> {
+) -> CardPyResult<()> {
     let bytes = if crate::data::dtype::is_path_like(py, data)? {
         let source = crate::data::dtype::extract_pathbuf(data)?;
         wyrd_utils::fs::require_local_file(&source)
             .map_err(|error| WyrdPyError::Io(error.to_string()))?;
+        // BLOCKING: synchronous filesystem I/O; do not call from an async executor
+        // without tokio::task::spawn_blocking.
         let source_bytes = fs::read(&source)?;
         decode_jsonl_bytes(
             &source_bytes,
@@ -158,8 +160,10 @@ pub fn write_jsonl_normalized(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    // BLOCKING: synchronous filesystem I/O; do not call from an async executor
+    // without tokio::task::spawn_blocking.
     fs::write(path, encoded)?;
-    Ok(bytes.split(|byte| *byte == b'\n').count().saturating_sub(1) as u64)
+    Ok(())
 }
 
 #[cfg(feature = "python")]
@@ -174,6 +178,8 @@ pub fn read_jsonl_to_py<'py>(
     _load_kwargs: Option<&Bound<'_, PyDict>>,
 ) -> CardPyResult<Bound<'py, PyAny>> {
     wyrd_utils::fs::require_local_file(path).map_err(|error| WyrdPyError::Io(error.to_string()))?;
+    // BLOCKING: synchronous filesystem I/O; do not call from an async executor
+    // without tokio::task::spawn_blocking.
     let bytes = fs::read(path)?;
     let compression = compression
         .map(parse_jsonl_compression_label)

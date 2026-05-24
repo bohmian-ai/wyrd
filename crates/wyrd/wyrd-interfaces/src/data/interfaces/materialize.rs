@@ -501,6 +501,7 @@ impl TorchInterface {
                 .call_method1("load_file", (&absolute_path,))?
                 .unbind(),
             TorchSaveFormat::Pickle => {
+                // SECURITY: weights_only=true is RCE mitigation for Pickle deserialization.
                 let kwargs = torch_weights_only_kwargs(py)?;
                 py.import("torch")?
                     .call_method("load", (&absolute_path,), Some(&kwargs))?
@@ -810,8 +811,12 @@ impl HuggingfaceInterface {
         let (artifact_path, schema) = if let Some(source) = self.data.as_ref() {
             let data = source.bind(py);
             let dataset_path = path.join("data/dataset");
-            fs::create_dir_all(path.join("data"))?;
-            data.call_method1("save_to_disk", (&dataset_path,))?;
+            let data_dir = path.join("data");
+            fs::create_dir_all(&data_dir)?;
+            data.call_method1("save_to_disk", (&dataset_path,))
+                .inspect_err(|_| {
+                    let _ = fs::remove_dir_all(&data_dir);
+                })?;
             let schema = optional_schema_for_interface(py, data, "Huggingface");
             (dataset_path, schema)
         } else {

@@ -7,7 +7,6 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use wyrd_interfaces::error::CardPyResult;
-use wyrd_spec::card::data::validate::DataCardError;
 use wyrd_spec::card::data::{
     CustomDataMeta, DataInterface as RustDataInterface, DataSchema, DataSpec, DataSplit, DataStats,
     SqlLogic,
@@ -38,7 +37,6 @@ use {
     wyrd_interfaces::error::WyrdPyError,
     wyrd_spec::envelope::{CardKind, Metadata as EnvelopeMetadata},
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
-    wyrd_utils::py::json_to_pyobject,
 };
 
 /// Python-holder metadata accumulated by a local `DataCard`.
@@ -82,30 +80,10 @@ impl Default for DataCardMetadata {
             stats: DataStats {
                 row_count: None,
                 col_count: None,
-                byte_count: 1,
+                byte_count: 0,
                 sha256: "0".repeat(64),
             },
         }
-    }
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl DataCardMetadata {
-    /// Return the metadata as a JSON-compatible Python dictionary.
-    ///
-    /// # Errors
-    /// Returns a Wyrd error when metadata serialization fails.
-    fn to_dict(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
-        Ok(json_to_pyobject(py, &serde_json::to_value(self)?)?)
-    }
-
-    /// Return the metadata as a JSON string.
-    ///
-    /// # Errors
-    /// Returns a Wyrd error when metadata serialization fails.
-    fn model_dump_json(&self) -> CardPyResult<String> {
-        Ok(serde_json::to_string(self)?)
     }
 }
 
@@ -158,37 +136,31 @@ impl DataCard {
     /// # Errors
     /// Returns a Wyrd error when serialization fails.
     pub fn model_dump_json(&self) -> CardPyResult<String> {
-        Ok(serde_json::to_string(&self.to_card_envelope()?)?)
+        Ok(serde_json::to_string(&self.to_card_envelope())?)
     }
 
     /// Convert serialized holder metadata into the Rust card spec body.
     ///
     /// This method is available without the `python` feature. It uses only the
     /// metadata already stored in the local holder and never attempts to access
-    /// live Python interface state.
-    ///
-    /// # Errors
-    /// Returns a `DataCard` validation error when the stored metadata does not
-    /// satisfy the durable spec contract.
-    pub fn to_rust_card_body_from_metadata(&self) -> Result<Spec, DataCardError> {
-        Ok(Spec::Data(self.to_data_spec_from_metadata()?))
+    /// live Python interface state. Stats are not validated — call `spec.validate()`
+    /// if durable-contract invariants must be checked.
+    pub fn to_rust_card_body_from_metadata(&self) -> Spec {
+        Spec::Data(self.to_data_spec_from_metadata())
     }
 
     /// Convert serialized holder metadata into a pure Rust `DataSpec`.
     ///
     /// This method is available without the `python` feature for server, UI,
     /// and registry paths that need to inspect `DataCard` attributes without a
-    /// Python runtime.
-    ///
-    /// # Errors
-    /// Returns a `DataCard` validation error when the stored metadata does not
-    /// satisfy the durable spec contract.
-    pub fn to_data_spec_from_metadata(&self) -> Result<DataSpec, DataCardError> {
+    /// Python runtime. Stats are not validated here — call `spec.validate()` if
+    /// durable-contract invariants must be checked.
+    pub fn to_data_spec_from_metadata(&self) -> DataSpec {
         data_spec_from_metadata(&self.metadata, self.metadata.interface.clone())
     }
 
-    fn to_card_envelope(&self) -> CardPyResult<DataCardEnvelope<'_>> {
-        Ok(DataCardEnvelope {
+    fn to_card_envelope(&self) -> DataCardEnvelope<'_> {
+        DataCardEnvelope {
             api_version: ApiVersion::V1,
             kind: "Data",
             metadata: DataCardEnvelopeMetadata {
@@ -199,10 +171,10 @@ impl DataCard {
                 labels: &self.labels,
                 annotations: &self.annotations,
             },
-            spec: self.to_data_spec_from_metadata()?,
+            spec: self.to_data_spec_from_metadata(),
             relationships: Vec::new(),
             status: None,
-        })
+        }
     }
 }
 
@@ -240,6 +212,19 @@ struct SerializedDataCardEnvelope {
     kind: CardKind,
     metadata: EnvelopeMetadata,
     spec: DataSpec,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl DataCardMetadata {
+    /// Return this metadata as a Python-serializable dict for inspection.
+    pub fn to_dict(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+        wyrd_utils::py::json_to_pyobject(
+            py,
+            &serde_json::to_value(self).map_err(|e| WyrdPyError::Io(e.to_string()))?,
+        )
+        .map_err(Into::into)
+    }
 }
 
 #[cfg(feature = "python")]
@@ -467,24 +452,6 @@ impl DataCard {
         self.metadata = value;
     }
 
-    /// Return the local creation timestamp.
-    #[getter]
-    pub fn created_at(&self) -> DateTime<Utc> {
-        self.created_at
-    }
-
-    /// Set the local creation timestamp.
-    #[setter]
-    pub fn set_created_at(&mut self, value: DateTime<Utc>) {
-        self.created_at = value;
-    }
-
-    /// Return whether this object is a card holder.
-    #[getter]
-    pub fn is_card(&self) -> bool {
-        self.is_card
-    }
-
     /// Save local data artifacts and the card JSON under `path`.
     ///
     /// This method only performs local filesystem materialization. It updates
@@ -610,7 +577,7 @@ impl DataCard {
             .transpose()?
             .unwrap_or_else(|| self.metadata.interface.clone());
 
-        data_spec_from_metadata(&self.metadata, interface).map_err(WyrdPyError::from)
+        Ok(data_spec_from_metadata(&self.metadata, interface))
     }
 
     fn attach_data(&mut self, py: Python<'_>, data: Option<&Bound<'_, PyAny>>) -> CardPyResult<()> {
@@ -672,7 +639,9 @@ impl DataCard {
             });
         }
 
-        serde_json::from_str(json_string).map_err(Into::into)
+        Err(WyrdPyError::validation(
+            "DataCard JSON must use the Wyrd envelope: apiVersion wyrd/v1, kind Data, metadata, spec",
+        ))
     }
 }
 
@@ -852,23 +821,23 @@ fn metadata_error(error: MetadataError) -> WyrdPyError {
 
 #[cfg(feature = "python")]
 fn write_card_json_file(card: &DataCard, path: &std::path::Path) -> CardPyResult<()> {
-    wyrd_utils::json::write_json_sorted(path.join("card.json"), &card.to_card_envelope()?)
+    wyrd_utils::json::write_json_sorted(path.join("card.json"), &card.to_card_envelope())
         .map_err(|error| WyrdPyError::Io(error.to_string()))
 }
 
-fn data_spec_from_metadata(
-    metadata: &DataCardMetadata,
-    interface: RustDataInterface,
-) -> Result<DataSpec, DataCardError> {
-    DataSpec::new(
+fn data_spec_from_metadata(metadata: &DataCardMetadata, interface: RustDataInterface) -> DataSpec {
+    // Skip validation — used by model_dump_json for draft cards where stats are
+    // placeholder zeros. Validation runs on the deserialization path
+    // (model_validate_json → spec.validate()).
+    DataSpec {
         interface,
-        metadata.schema.clone(),
-        metadata.artifact_refs.clone(),
-        metadata.splits.clone(),
-        metadata.target_columns.clone(),
-        metadata.sql.clone(),
-        metadata.stats.clone(),
-    )
+        schema: metadata.schema.clone(),
+        artifact_refs: metadata.artifact_refs.clone(),
+        splits: metadata.splits.clone(),
+        target_columns: metadata.target_columns.clone(),
+        sql: metadata.sql.clone(),
+        stats: metadata.stats.clone(),
+    }
 }
 
 #[cfg(feature = "python")]
@@ -938,16 +907,12 @@ mod tests {
             interface: None,
         };
 
-        let spec = card
-            .to_data_spec_from_metadata()
-            .expect("valid metadata should build a DataSpec");
+        let spec = card.to_data_spec_from_metadata();
         assert_eq!(spec.interface_kind(), "Pandas");
         assert_eq!(spec.schema.columns.len(), 1);
         assert_eq!(spec.stats().byte_count, 128);
 
-        let body = card
-            .to_rust_card_body_from_metadata()
-            .expect("valid metadata should build a card spec body");
+        let body = card.to_rust_card_body_from_metadata();
         assert!(matches!(body, Spec::Data(_)));
 
         let serialized = card

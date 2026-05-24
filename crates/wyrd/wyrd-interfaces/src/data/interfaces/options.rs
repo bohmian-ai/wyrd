@@ -122,6 +122,22 @@ pub fn parse_color_mode(value: &str) -> CardPyResult<ColorMode> {
         )),
     }
 }
+/// Validate a SQL dialect label is non-empty.
+///
+/// # Errors
+/// Returns `WYRD_DATA_400_INVALID_INTERFACE_OPTION` for blank dialect strings.
+pub fn parse_sql_dialect(value: &str) -> CardPyResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(WyrdPyError::invalid_interface_option(
+            "dialect",
+            value,
+            ["duckdb", "postgres", "mysql", "sqlite"],
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 fn normalize_option(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace('-', "_")
 }

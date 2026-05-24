@@ -105,16 +105,6 @@ pub fn pyobject_to_json(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         }
         return Ok(Value::Object(map));
     }
-    if (obj.hasattr("__array__")? || obj.hasattr("tolist")?)
-        && let Ok(value) = obj.call_method0("tolist")
-    {
-        return pyobject_to_json(&value);
-    }
-    if obj.hasattr("to_dict")?
-        && let Ok(value) = obj.call_method0("to_dict")
-    {
-        return pyobject_to_json(&value);
-    }
     Ok(Value::String(obj.str()?.extract::<String>()?))
 }
 

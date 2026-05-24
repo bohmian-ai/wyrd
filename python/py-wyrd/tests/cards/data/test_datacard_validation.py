@@ -61,12 +61,12 @@ def test_bad_sha256_rejected_from_rust_validator() -> None:
         DataCard.model_validate_json(json.dumps(payload))
 
 
-def test_zero_byte_count_rejected_from_rust_validator() -> None:
+def test_zero_byte_count_allowed_for_draft_cards() -> None:
     payload = _payload()
     payload["spec"]["stats"]["byte_count"] = 0
 
-    with pytest.raises(WyrdError):
-        DataCard.model_validate_json(json.dumps(payload))
+    restored = DataCard.model_validate_json(json.dumps(payload))
+    assert restored.interface.kind == "Pandas"
 
 
 def test_sql_default_query_must_exist() -> None:

@@ -595,14 +595,6 @@ class ArtifactCard:
 class DataCardMetadata:
     """Python holder metadata used to build a durable DataCard spec."""
 
-    def to_dict(self) -> JsonDict:
-        """Return holder metadata as a JSON-compatible dictionary."""
-        ...
-
-    def model_dump_json(self) -> str:
-        """Return holder metadata as a JSON string."""
-        ...
-
 class DataCard:
     """Local DataCard holder and spec builder.
 
@@ -618,8 +610,6 @@ class DataCard:
     labels: dict[str, str]
     annotations: dict[str, str]
     metadata: DataCardMetadata
-    created_at: datetime.datetime
-    is_card: bool
     interface: DataInterface | None
     schema: DataSchema
     stats: DataStats

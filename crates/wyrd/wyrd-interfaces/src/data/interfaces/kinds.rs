@@ -5,6 +5,10 @@ use wyrd_spec::reference::CardRef;
 #[cfg(feature = "python")]
 use {
     crate::data::interfaces::helpers::{interface_to_dict, parse_card_ref},
+    crate::data::interfaces::options::{
+        parse_arrow_format, parse_color_mode, parse_image_format, parse_jsonl_compression,
+        parse_numpy_format, parse_parquet_compression, parse_torch_save_format,
+    },
     crate::data::stats::PyDataStats,
     pyo3::prelude::*,
     pyo3::types::{PyAny, PyDict},
@@ -272,14 +276,15 @@ impl_interface_methods!(PandasInterface {
     /// A pandas interface with kind `Pandas`.
     #[new]
     #[pyo3(signature = (*, data=None, compression="snappy"))]
-    fn __new__(data: Option<Py<PyAny>>, compression: &str) -> (Self, DataInterface) {
-        (
+    fn __new__(data: Option<Py<PyAny>>, compression: &str) -> CardPyResult<(Self, DataInterface)> {
+        parse_parquet_compression(compression)?;
+        Ok((
             Self {
                 data,
                 compression: compression.to_string(),
             },
             DataInterface::marker("Pandas"),
-        )
+        ))
     }
 });
 
@@ -298,14 +303,15 @@ impl_interface_methods!(PolarsInterface {
     /// A polars interface with kind `Polars`.
     #[new]
     #[pyo3(signature = (*, data=None, compression="snappy"))]
-    fn __new__(data: Option<Py<PyAny>>, compression: &str) -> (Self, DataInterface) {
-        (
+    fn __new__(data: Option<Py<PyAny>>, compression: &str) -> CardPyResult<(Self, DataInterface)> {
+        parse_parquet_compression(compression)?;
+        Ok((
             Self {
                 data,
                 compression: compression.to_string(),
             },
             DataInterface::marker("Polars"),
-        )
+        ))
     }
 });
 
@@ -324,14 +330,15 @@ impl_interface_methods!(ArrowInterface {
     /// An Arrow interface with kind `Arrow`.
     #[new]
     #[pyo3(signature = (*, data=None, format="parquet"))]
-    fn __new__(data: Option<Py<PyAny>>, format: &str) -> (Self, DataInterface) {
-        (
+    fn __new__(data: Option<Py<PyAny>>, format: &str) -> CardPyResult<(Self, DataInterface)> {
+        parse_arrow_format(format)?;
+        Ok((
             Self {
                 data,
                 format: format.to_string(),
             },
             DataInterface::marker("Arrow"),
-        )
+        ))
     }
 });
 
@@ -355,15 +362,16 @@ impl_interface_methods!(ParquetInterface {
         data: Option<Py<PyAny>>,
         compression: &str,
         row_group_size: Option<u32>,
-    ) -> (Self, DataInterface) {
-        (
+    ) -> CardPyResult<(Self, DataInterface)> {
+        parse_parquet_compression(compression)?;
+        Ok((
             Self {
                 data,
                 compression: compression.to_string(),
                 row_group_size,
             },
             DataInterface::marker("Parquet"),
-        )
+        ))
     }
 });
 
@@ -390,8 +398,9 @@ impl_interface_methods!(NumpyInterface {
         dtype: Option<String>,
         shape: Option<Vec<i64>>,
         format: &str,
-    ) -> (Self, DataInterface) {
-        (
+    ) -> CardPyResult<(Self, DataInterface)> {
+        parse_numpy_format(format)?;
+        Ok((
             Self {
                 data,
                 dtype,
@@ -399,7 +408,7 @@ impl_interface_methods!(NumpyInterface {
                 format: format.to_string(),
             },
             DataInterface::marker("Numpy"),
-        )
+        ))
     }
 });
 
@@ -419,14 +428,15 @@ impl_interface_methods!(TorchInterface {
     /// A Torch interface with kind `Torch`.
     #[new]
     #[pyo3(signature = (*, data=None, save_format="safetensors"))]
-    fn __new__(data: Option<Py<PyAny>>, save_format: &str) -> (Self, DataInterface) {
-        (
+    fn __new__(data: Option<Py<PyAny>>, save_format: &str) -> CardPyResult<(Self, DataInterface)> {
+        parse_torch_save_format(save_format)?;
+        Ok((
             Self {
                 data,
                 save_format: save_format.to_string(),
             },
             DataInterface::marker("Torch"),
-        )
+        ))
     }
 });
 
@@ -481,15 +491,16 @@ impl_interface_methods!(JsonlInterface {
         data: Option<Py<PyAny>>,
         compression: &str,
         lines_per_file: Option<u64>,
-    ) -> (Self, DataInterface) {
-        (
+    ) -> CardPyResult<(Self, DataInterface)> {
+        parse_jsonl_compression(compression)?;
+        Ok((
             Self {
                 data,
                 compression: compression.to_string(),
                 lines_per_file,
             },
             DataInterface::marker("Jsonl"),
-        )
+        ))
     }
 });
 
@@ -522,6 +533,8 @@ impl_interface_methods!(ImageInterface {
         color_mode: &str,
         manifest_ref: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<(Self, DataInterface)> {
+        parse_image_format(format)?;
+        parse_color_mode(color_mode)?;
         Ok((
             Self {
                 data,
@@ -595,8 +608,20 @@ impl_interface_methods!(HuggingfaceInterface {
         revision: Option<String>,
         split: Option<String>,
         config: Option<String>,
-    ) -> (Self, DataInterface) {
-        (
+    ) -> CardPyResult<(Self, DataInterface)> {
+        if let Some(revision) = revision.as_deref() {
+            if !(7..=40).contains(&revision.len())
+                || !revision
+                    .chars()
+                    .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+            {
+                return Err(crate::error::WyrdPyError::validation_with_details(
+                    "Huggingface revision must be a lowercase hex string between 7 and 40 characters",
+                    serde_json::json!({ "revision": revision }),
+                ));
+            }
+        }
+        Ok((
             Self {
                 data,
                 dataset_id,
@@ -605,6 +630,6 @@ impl_interface_methods!(HuggingfaceInterface {
                 config,
             },
             DataInterface::marker("Huggingface"),
-        )
+        ))
     }
 });

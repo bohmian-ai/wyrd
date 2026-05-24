@@ -4,7 +4,7 @@ use crate::error::{CardPyResult, WyrdPyError};
 use {
     crate::data::stats::PyDataStats,
     pyo3::prelude::*,
-    pyo3::types::{PyDict, PyTuple},
+    pyo3::types::{PyAny, PyDict, PyTuple, PyType},
     std::path::PathBuf,
 };
 
@@ -70,6 +70,46 @@ impl DataInterface {
     #[getter]
     fn kind(&self) -> &str {
         &self.kind
+    }
+
+    /// Build an interface instance from serialized DataCard metadata.
+    ///
+    /// Registry and client retrieval surfaces call this classmethod when a
+    /// user passes a custom interface class such as
+    /// `wyrd.cards.get(..., interface=MyInterface)`. The default implementation
+    /// instantiates the concrete subclass with no arguments. Override this
+    /// method when the subclass needs metadata values to reconstruct local
+    /// configuration before `DataCard.load(...)` hydrates data.
+    ///
+    /// # Arguments
+    ///
+    /// * `metadata` - Python-facing DataCard metadata object parsed from the
+    ///   serialized card envelope.
+    ///
+    /// # Returns
+    ///
+    /// An initialized interface instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Wyrd validation error when the concrete subclass cannot be
+    /// constructed with no arguments. In that case, override
+    /// `from_metadata(cls, metadata)`.
+    #[classmethod]
+    #[pyo3(signature = (metadata))]
+    fn from_metadata(
+        cls: &Bound<'_, PyType>,
+        metadata: &Bound<'_, PyAny>,
+    ) -> CardPyResult<Py<PyAny>> {
+        let _ = metadata;
+        Ok(cls
+            .call0()
+            .map_err(|error| {
+                WyrdPyError::validation(format!(
+                    "custom DataInterface class could not be reconstructed from metadata with the default from_metadata implementation; override from_metadata(cls, metadata): {error}"
+                ))
+            })?
+            .unbind())
     }
 
     /// Save custom data into a local DataCard artifact directory.

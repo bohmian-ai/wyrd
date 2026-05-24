@@ -11,6 +11,7 @@
   "properties": {
     "artifact_refs": {
       "description": "Durable ArtifactCard references linked to this data card.",
+      "default": [],
       "type": "array",
       "items": {
         "$ref": "#/definitions/CardRef"

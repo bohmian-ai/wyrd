@@ -92,13 +92,6 @@ fn empty_schema_rejected_for_tabular_interfaces() {
             }),
         ),
         (
-            "Sql",
-            DataInterface::Sql(SqlMeta {
-                dialect: "postgres".to_string(),
-                connection_hint: None,
-            }),
-        ),
-        (
             "Jsonl",
             DataInterface::Jsonl(JsonlMeta {
                 compression: JsonlCompression::None,
@@ -119,20 +112,39 @@ fn empty_schema_rejected_for_tabular_interfaces() {
 
 #[test]
 fn empty_schema_allowed_for_nontabular() {
-    let spec = DataSpec {
-        interface: DataInterface::Numpy(NumpyMeta {
-            dtype: "float32".to_string(),
-            shape: vec![2, 2],
-            format: NumpyFormat::Npy,
-        }),
-        schema: DataSchema::empty(),
-        artifact_refs: Vec::new(),
-        splits: HashMap::new(),
-        target_columns: vec![col("target")],
-        sql: None,
-        stats: valid_stats(),
-    };
-    assert!(validate_data_spec(&spec).is_ok());
+    let specs = [
+        DataSpec {
+            interface: DataInterface::Numpy(NumpyMeta {
+                dtype: "float32".to_string(),
+                shape: vec![2, 2],
+                format: NumpyFormat::Npy,
+            }),
+            schema: DataSchema::empty(),
+            artifact_refs: Vec::new(),
+            splits: HashMap::new(),
+            target_columns: vec![col("target")],
+            sql: None,
+            stats: valid_stats(),
+        },
+        DataSpec {
+            interface: DataInterface::Sql(SqlMeta {
+                dialect: "postgres".to_string(),
+                connection_hint: None,
+            }),
+            schema: DataSchema::empty(),
+            artifact_refs: Vec::new(),
+            splits: HashMap::new(),
+            target_columns: vec![col("target")],
+            sql: Some(SqlLogic {
+                queries: HashMap::from([(query("main"), "select * from t".to_string())]),
+                default_query: Some(query("main")),
+            }),
+            stats: valid_stats(),
+        },
+    ];
+    for spec in specs {
+        assert!(validate_data_spec(&spec).is_ok());
+    }
 }
 
 #[test]

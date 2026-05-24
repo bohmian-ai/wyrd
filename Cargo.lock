@@ -3550,6 +3550,7 @@ dependencies = [
  "thiserror 2.0.18",
  "wyrd-interfaces",
  "wyrd-spec",
+ "wyrd-test-contract-macros",
  "wyrd-utils",
 ]
 
@@ -3657,6 +3658,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wyrd-spec",
+]
+
+[[package]]
+name = "wyrd-test-contract-macros"
+version = "0.0.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

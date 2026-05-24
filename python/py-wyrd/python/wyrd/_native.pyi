@@ -230,6 +230,23 @@ class DataInterface:
         """Return whether this interface currently holds live Python data."""
         ...
 
+    @classmethod
+    def from_metadata(cls, metadata: DataCardMetadata) -> DataInterface:
+        """Build an interface instance from serialized DataCard metadata.
+
+        Registry and client retrieval surfaces call this hook when a user
+        passes a custom interface class, such as
+        `wyrd.cards.get(..., interface=MyInterface)`. The default
+        implementation constructs the subclass with no arguments. Override
+        this method when an interface needs metadata values to reconstruct
+        local configuration before `DataCard.load(...)` hydrates data.
+
+        Args:
+            metadata (DataCardMetadata): Metadata parsed from the serialized
+                DataCard envelope.
+        """
+        ...
+
     def to_dict(self) -> JsonDict:
         """Return interface metadata as a JSON-compatible dictionary.
 
@@ -543,6 +560,38 @@ class Split:
         """Return this split strategy as a JSON-compatible dictionary."""
         ...
 
+class ArtifactCard:
+    """Minimal Artifact card reference holder accepted by DataCard.
+
+    This PR1 holder exists so a DataCard can point at bytes that are already
+    durable without creating or uploading a new artifact during local save.
+    """
+
+    space: str
+    name: str
+    version: str
+    uid: str
+
+    def __init__(
+        self,
+        space: str | None = ...,
+        name: str | None = ...,
+        version: str | None = ...,
+        uid: str | None = ...,
+    ) -> None:
+        """Create an Artifact card reference holder.
+
+        Args:
+            space (str | None): Optional artifact space. Defaults to
+                `default`.
+            name (str | None): Optional artifact name. Defaults to `artifact`.
+            version (str | None): Optional semantic version. Defaults to
+                `0.1.0`.
+            uid (str | None): Optional artifact UID. Defaults to a generated
+                UID.
+        """
+        ...
+
 class DataCardMetadata:
     """Python holder metadata used to build a durable DataCard spec."""
 
@@ -721,32 +770,26 @@ class DataCard:
         """
         ...
 
-    def save_card(self, path: PathLike) -> None:
-        """Write only the serialized DataCard envelope to `path/card.json`.
-
-        Args:
-            path (PathLike): Local directory where Wyrd writes `card.json`.
-        """
-        ...
-
     def model_dump_json(self) -> str:
         """Return this DataCard envelope as JSON without filesystem IO."""
         ...
 
     @staticmethod
-    def model_validate_json(json_string: str, data: Any = ...) -> DataCard:
+    def model_validate_json(json_string: str, interface: Any = ...) -> DataCard:
         """Build a DataCard from serialized Wyrd card JSON.
 
         Args:
             json_string (str): Serialized DataCard envelope.
-            data (Any): Optional live data, built-in interface, Python
-                subclass, or ArtifactCard to attach after parsing.
+            interface (Any): Optional built-in interface, Python subclass
+                instance, Python subclass type reconstructed through
+                `from_metadata`, or ArtifactCard to attach after parsing.
         """
         ...
 
 ### GLOBAL EXPORTS ###
 __all__ = [
     "ArrowInterface",
+    "ArtifactCard",
     "DataCard",
     "DataCardMetadata",
     "DataInterface",

@@ -8,11 +8,13 @@ use {
     pyo3::exceptions::PyModuleNotFoundError,
     pyo3::prelude::*,
     pyo3::types::{PyAny, PyDict, PyString, PyTuple},
+    serde_json::Value,
     std::collections::BTreeMap,
     std::path::PathBuf,
     wyrd_spec::card::data::DataSchema,
     wyrd_spec::card::field::{Dim, FieldSpec},
     wyrd_spec::ids::ColumnName,
+    wyrd_utils::py::pyobject_to_json,
 };
 
 use crate::error::{CardPyResult, WyrdPyError};
@@ -91,16 +93,19 @@ pub fn normalize_dtype(source: &str, value: &str) -> CardPyResult<String> {
 /// its dtype values are not in the locked normalization table.
 #[cfg(feature = "python")]
 pub fn infer_schema_for_interface(
-    _py: Python<'_>,
+    py: Python<'_>,
     data: &Bound<'_, PyAny>,
     kind: &str,
 ) -> CardPyResult<DataSchema> {
     match kind {
         "Pandas" => infer_pandas_schema(data),
         "Polars" => infer_polars_schema(data),
-        "Arrow" | "Parquet" => infer_arrow_schema(data),
+        "Arrow" => infer_arrow_schema(data),
+        "Parquet" if is_path_like(py, data)? => infer_parquet_path_schema(py, data),
+        "Parquet" => infer_arrow_schema(data),
         "Numpy" => infer_numpy_schema(data),
         "Torch" => infer_torch_schema(data),
+        "Jsonl" => infer_jsonl_schema(py, data),
         "Sql" | "Image" | "Text" | "Huggingface" => Ok(DataSchema::empty()),
         _ => Err(WyrdPyError::unknown_data_type(format!(
             "unknown DataCard interface kind: {kind}"
@@ -675,6 +680,20 @@ fn infer_polars_schema(data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
 #[cfg(feature = "python")]
 fn infer_arrow_schema(data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
     let schema = data.getattr("schema")?;
+    infer_pyarrow_schema_object(&schema)
+}
+
+#[cfg(feature = "python")]
+fn infer_parquet_path_schema(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
+    let path = extract_pathbuf(data)?;
+    let schema = py
+        .import("pyarrow.parquet")?
+        .call_method1("read_schema", (path.to_string_lossy().as_ref(),))?;
+    infer_pyarrow_schema_object(&schema)
+}
+
+#[cfg(feature = "python")]
+fn infer_pyarrow_schema_object(schema: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
     let names = schema.getattr("names")?.extract::<Vec<String>>()?;
     let types = schema.getattr("types")?;
     let mut fields = Vec::new();
@@ -687,6 +706,70 @@ fn infer_arrow_schema(data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
         )?);
     }
     Ok(DataSchema::new(fields))
+}
+
+#[cfg(feature = "python")]
+fn infer_jsonl_schema(_py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
+    let sample = if is_path_like(data.py(), data)? {
+        let path = extract_pathbuf(data)?;
+        let contents = read_jsonl_path_to_string(&path)?;
+        contents
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(serde_json::from_str::<Value>)
+            .transpose()?
+            .unwrap_or(Value::Object(Default::default()))
+    } else {
+        match pyobject_to_json(data)? {
+            Value::Array(values) => values
+                .into_iter()
+                .next()
+                .unwrap_or(Value::Object(Default::default())),
+            value => value,
+        }
+    };
+
+    let Value::Object(values) = sample else {
+        return Ok(DataSchema::empty());
+    };
+    let mut fields = Vec::new();
+    for (name, value) in values {
+        fields.push(field_spec(&name, json_value_dtype(&value), Vec::new())?);
+    }
+    Ok(DataSchema::new(fields))
+}
+
+#[cfg(feature = "python")]
+fn read_jsonl_path_to_string(path: &Path) -> CardPyResult<String> {
+    let bytes = std::fs::read(path)?;
+    let decoded = match jsonl_compression_for_path(path) {
+        Some("gzip") => wyrd_utils::codec::gzip_decode(&bytes)
+            .map_err(|error| WyrdPyError::Io(error.to_string()))?,
+        Some("zstd") => wyrd_utils::codec::zstd_decode(&bytes)
+            .map_err(|error| WyrdPyError::Io(error.to_string()))?,
+        Some("none") | None => bytes,
+        Some(value) => {
+            return Err(WyrdPyError::invalid_interface_option(
+                "compression",
+                value,
+                ["none", "gzip", "zstd"],
+            ))
+        }
+    };
+    String::from_utf8(decoded).map_err(|error| WyrdPyError::Json(error.to_string()))
+}
+
+#[cfg(feature = "python")]
+fn json_value_dtype(value: &Value) -> String {
+    match value {
+        Value::Bool(_) => "bool",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "int64",
+        Value::Number(_) => "float64",
+        Value::String(_) => "utf8",
+        Value::Null => "null",
+        Value::Array(_) | Value::Object(_) => "json",
+    }
+    .to_string()
 }
 
 #[cfg(feature = "python")]
@@ -747,6 +830,9 @@ fn shape_values(data: &Bound<'_, PyAny>) -> CardPyResult<Vec<i64>> {
 #[cfg(feature = "python")]
 fn numpy_dtype_string(data: &Bound<'_, PyAny>) -> CardPyResult<String> {
     let dtype = data.getattr("dtype")?;
+    if let Ok(dtype_string) = dtype.extract::<String>() {
+        return Ok(dtype_string);
+    }
     let dtype_string = dtype.str()?.extract::<String>()?;
     if dtype_string.starts_with("datetime64[") {
         return Ok(dtype_string);

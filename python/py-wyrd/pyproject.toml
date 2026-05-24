@@ -46,6 +46,9 @@ features = ["pyo3/extension-module", "pyo3/abi3-py310"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["python"]
+markers = [
+    "wyrd_covers(contract): declares that a Python test covers a tagged Wyrd Rust contract",
+]
 
 [tool.ruff]
 line-length = 100

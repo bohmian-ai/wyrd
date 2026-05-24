@@ -1,11 +1,11 @@
 [package]
 name = "wyrd-spec"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-rust-version.workspace = true
-repository.workspace = true
-authors.workspace = true
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
 description = "Wyrd foundation types: Card envelope, SpecKinds, and pure data contracts."
 
 [lib]
@@ -17,21 +17,20 @@ server = ["dep:utoipa"]
 wasm = []
 
 [dependencies]
-serde.workspace = true
-serde_json.workspace = true
-serde_yaml.workspace = true
-schemars.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+schemars = { workspace = true }
 utoipa = { workspace = true, optional = true }
-thiserror.workspace = true
-chrono.workspace = true
-uuid.workspace = true
-semver.workspace = true
-hex.workspace = true
-wyrd-error-derive.workspace = true
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+semver = { workspace = true }
+hex = { workspace = true }
+wyrd-error-derive = { path = "../shared/wyrd-error-derive", version = "0.0.1" }
 
 [dev-dependencies]
-proptest.workspace = true
-
+proptest = { workspace = true }
 [[example]]
 name = "gen_schemas"
 path = "examples/gen_schemas.rs"

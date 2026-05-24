@@ -23,7 +23,7 @@ pub struct DataSpec {
     /// Ordered schema fields for tabular interfaces.
     pub schema: DataSchema,
     /// Durable ArtifactCard references linked to this data card.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub artifact_refs: Vec<CardRef>,
     /// Declared split strategies by stable split label.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -171,12 +171,7 @@ impl DataInterface {
     pub const fn requires_schema_columns(&self) -> bool {
         matches!(
             self,
-            Self::Pandas(_)
-                | Self::Polars(_)
-                | Self::Arrow(_)
-                | Self::Parquet(_)
-                | Self::Sql(_)
-                | Self::Jsonl(_)
+            Self::Pandas(_) | Self::Polars(_) | Self::Arrow(_) | Self::Parquet(_) | Self::Jsonl(_)
         )
     }
 

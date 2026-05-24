@@ -2,6 +2,7 @@
 
 from wyrd._native.cards.data import (
     ArrowInterface,
+    ArtifactCard,
     DataCard,
     DataInterface,
     DataSchema,
@@ -23,6 +24,7 @@ from wyrd._native.cards.data import (
 
 __all__ = [
     "ArrowInterface",
+    "ArtifactCard",
     "DataCard",
     "DataInterface",
     "DataSchema",

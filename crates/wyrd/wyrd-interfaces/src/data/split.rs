@@ -107,15 +107,19 @@ pub fn validate_index_range(start: i64, stop: i64) -> CardPyResult<()> {
 /// Returns `WYRD_DATA_400_INVALID_SPLIT_RULE` when the split is empty or any
 /// index is negative. Duplicate values are preserved for `DataSpec` validation.
 pub fn validate_indices(values: &[i64]) -> CardPyResult<()> {
+    let mut seen = std::collections::HashSet::new();
     if values.is_empty() {
         return Err(invalid_split_rule(
             "indices splits require at least one value",
             json!({ "values": values }),
         ));
     }
-    if values.iter().any(|value| *value < 0) {
+    if values
+        .iter()
+        .any(|value| *value < 0 || !seen.insert(*value))
+    {
         return Err(invalid_split_rule(
-            "indices splits require non-negative values",
+            "indices splits require non-negative unique values",
             json!({ "values": values }),
         ));
     }
@@ -296,14 +300,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_indices_rejects_empty_and_negative_values() {
+    fn validate_indices_rejects_empty_negative_and_duplicate_values() {
         assert_invalid_split_rule(validate_indices(&[]).expect_err("empty indices"));
         assert_invalid_split_rule(validate_indices(&[0, -1]).expect_err("negative index"));
-    }
-
-    #[test]
-    fn validate_indices_preserves_duplicates_for_spec_validation() {
-        validate_indices(&[1, 1]).expect("duplicates are handled by DataSpec validation");
+        assert_invalid_split_rule(validate_indices(&[1, 1]).expect_err("duplicate index"));
     }
 
     fn assert_invalid_split_rule(error: WyrdPyError) {

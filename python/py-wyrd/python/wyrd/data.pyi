@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from wyrd._native import (
         ArrowInterface,
+        ArtifactCard,
         DataCard,
         DataInterface,
         DataSchema,
@@ -26,6 +27,7 @@ else:
     # The runtime import mirrors `wyrd.data`.
     from wyrd._native.cards.data import (
         ArrowInterface,
+        ArtifactCard,
         DataCard,
         DataInterface,
         DataSchema,
@@ -47,6 +49,7 @@ else:
 
 __all__ = [
     "ArrowInterface",
+    "ArtifactCard",
     "DataCard",
     "DataInterface",
     "DataSchema",

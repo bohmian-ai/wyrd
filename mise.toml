@@ -148,6 +148,10 @@ if rg -n '\\.(unwrap|expect)\\(' crates --glob '!**/tests/**' --glob '!**/exampl
 fi
 """
 
+[tasks."check:test-contracts"]
+description = "Verify Wyrd critical Rust contracts have explicit Python test markers"
+run = "python scripts/check_test_contracts.py"
+
 [tasks."check:wasm"]
 description = "Build wyrd-spec for wasm32"
 run = "cargo check --locked --target wasm32-unknown-unknown -p wyrd-spec --features wasm"
@@ -322,7 +326,7 @@ diff -u "$BEFORE" "$AFTER" \
 
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks"
-depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:test:unit", "check:docs"]
+depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:test:unit", "check:docs"]
 
 [tasks."dev:pg:nuke"]
 description = "Wipe embedded pg cache"

@@ -131,7 +131,9 @@ impl PolarsInterface {
         let compression = parquet_compression_token(meta.compression);
         let absolute_path = RustDataInterface::Polars(meta).artifact_path(path)?;
         ensure_parent_dir(&absolute_path)?;
-        data.call_method1("write_parquet", (&absolute_path, compression))?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("compression", compression)?;
+        data.call_method("write_parquet", (&absolute_path,), Some(&kwargs))?;
         let schema = dtype::infer_schema_for_interface(py, data, "Polars")?;
         data_stats_for_file(&absolute_path, Some(&schema))
     }
@@ -208,7 +210,8 @@ impl ArrowInterface {
             ArrowFormat::Ipc => {
                 let pyarrow = py.import("pyarrow")?;
                 let ipc = py.import("pyarrow.ipc")?;
-                let sink = pyarrow.call_method1("OSFile", (&absolute_path, "wb"))?;
+                let sink = pyarrow
+                    .call_method1("OSFile", (absolute_path.to_string_lossy().as_ref(), "wb"))?;
                 let writer = ipc.call_method1("new_file", (&sink, data.getattr("schema")?))?;
                 writer.call_method1("write_table", (data,))?;
                 writer.call_method0("close")?;

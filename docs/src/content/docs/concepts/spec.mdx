@@ -4,46 +4,53 @@ description: Typed payloads that give cards their behavior.
 ---
 
 import { Aside } from "@astrojs/starlight/components";
-import PhaseGate from "../../../components/PhaseGate.astro";
 
 # Specs
 
 <Aside title="TL;DR" data-variant="wyrd">
-A Spec is the typed payload behind a Card. One schema per kind. Holds the operational truth Wyrd validates and uses at runtime.
+A Spec is the typed payload inside a Card. One schema per kind. It holds the durable facts Wyrd validates, stores, links, and exposes.
 </Aside>
 
 <dl class="wyrd-defs">
-  <dt>Inputs</dt>
-  <dd>What the card consumes at runtime, with shape and constraints.</dd>
-
-  <dt>Outputs</dt>
-  <dd>What it produces, including types and validation contracts.</dd>
-
-  <dt>Budgets</dt>
-  <dd>Time, cost, and rate limits the runtime should enforce.</dd>
+  <dt>Declared shape</dt>
+  <dd>The kind-specific contract: data schema, model interface, prompt variables, policy rule, service package, and similar fields.</dd>
 
   <dt>References</dt>
-  <dd>Pointers to other Cards (Model, Prompt, Tool) this Spec depends on.</dd>
+  <dd>`CardRef` values that connect this Card to other Cards.</dd>
+
+  <dt>Constraints</dt>
+  <dd>Validation, runtime, policy, and operational limits that belong in the durable contract.</dd>
+
+  <dt>Artifact links</dt>
+  <dd>References to durable `ArtifactCard` records when a card owns or consumes bytes.</dd>
 </dl>
 
-Specs should hold operational truth. Free-form notes are useful for context, but they should not be the only place a runtime rule exists.
+Specs should hold operational truth. Free-form notes are useful for context, but
+they should not be the only place a runtime rule exists.
 
 <Aside title="What this isn't" data-variant="not">
-A Spec is **not** a README. It is the typed contract the runtime, policy engine, and audit log all read from.
+A Spec is **not** a README. It is the typed contract Wyrd services and generated docs read from.
 </Aside>
 
 ## Shape
 
-<PhaseGate phase="5a">
-Each card kind has its own Spec schema in `crates/wyrd-spec/schemas/`. The Rust types in `crates/wyrd-spec/src/` are the source of truth.
-</PhaseGate>
+Each Card kind has its own Spec schema. The Rust contracts in `wyrd-spec` are
+the source of truth, and the docs generator publishes the generated reference
+pages under [Card reference](/cards/) and [schema reference](/api/schemas/).
+
+For Data cards, the generated reference is [Data](/cards/data/). The Python
+`DataCard` local holder builds this spec metadata from built-in data interfaces
+or custom Python `DataInterface` subclasses.
 
 ## Lifecycle
 
-<PhaseGate phase="5a">
-Validation, evolution, and deprecation rules for Specs land in Phase 5a.
-</PhaseGate>
+Specs are durable. Do not put live Python objects, open file handles, SDK
+clients, temporary paths, or process state into a spec. Local holders can own
+live state while user code is running; the serialized Card must remain valid
+after another process reads it.
 
 ## Related cards
 
-See the [Card reference](/cards/) for every kind and the field surface of its Spec.
+See the [Card reference](/cards/) for every kind and the field surface of its
+Spec. See [DataCard local workflow](/guides/data-card-local-workflow/) for a
+concrete local save/load path that produces a Data spec.

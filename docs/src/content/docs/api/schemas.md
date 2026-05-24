@@ -15,10 +15,15 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 | `crates/wyrd-spec/schemas/card.json` | Card |
 | `crates/wyrd-spec/schemas/card_kind.json` | CardKind |
 | `crates/wyrd-spec/schemas/card_ref.json` | CardRef |
+| `crates/wyrd-spec/schemas/data_interface.json` | DataInterface |
+| `crates/wyrd-spec/schemas/data_schema.json` | DataSchema |
 | `crates/wyrd-spec/schemas/data_spec.json` | DataSpec |
+| `crates/wyrd-spec/schemas/data_split.json` | DataSplit |
+| `crates/wyrd-spec/schemas/data_stats.json` | DataStats |
 | `crates/wyrd-spec/schemas/drift_spec.json` | DriftSpec |
 | `crates/wyrd-spec/schemas/eval_spec.json` | EvalSpec |
 | `crates/wyrd-spec/schemas/experiment_spec.json` | ExperimentSpec |
+| `crates/wyrd-spec/schemas/field_spec.json` | FieldSpec |
 | `crates/wyrd-spec/schemas/framework_adapter_ref.json` | FrameworkAdapterRef |
 | `crates/wyrd-spec/schemas/invoke_context.json` | InvokeContext |
 | `crates/wyrd-spec/schemas/invoke_outcome.json` | InvokeOutcome |
@@ -40,6 +45,8 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 | `crates/wyrd-spec/schemas/service_runtime_policy.json` | ServiceRuntimePolicy |
 | `crates/wyrd-spec/schemas/service_spec.json` | ServiceSpec |
 | `crates/wyrd-spec/schemas/skill_spec.json` | SkillSpec |
+| `crates/wyrd-spec/schemas/split_strategy.json` | SplitStrategy |
+| `crates/wyrd-spec/schemas/sql_logic.json` | SqlLogic |
 | `crates/wyrd-spec/schemas/subagent_spec.json` | SubAgentSpec |
 | `crates/wyrd-spec/schemas/tool_spec.json` | ToolSpec |
 | `crates/wyrd-spec/schemas/trigger_source.json` | TriggerSource |

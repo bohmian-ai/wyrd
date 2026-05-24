@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from wyrd._native import (
+    from ._native import (
         ArrowInterface,
         ArtifactCard,
         DataCard,
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 else:
     # R12 registers this private native submodule dynamically in `sys.modules`.
     # The runtime import mirrors `wyrd.data`.
-    from wyrd._native.cards.data import (
+    from ._native.cards.data import (
         ArrowInterface,
         ArtifactCard,
         DataCard,

@@ -131,12 +131,27 @@ metadata:
   space: prod
   name: churn-model
   version: "1.2.0"
+  labels:
+    domain: churn
+    stage: production
+  annotations:
+    example.com/source: training-job-42
 kind: Model
 spec:
   ...
 relationships: []
 status: null
 ```
+
+`metadata.labels` are short indexed classification fields. Use them for values
+you expect humans, agents, policy, or inventory views to filter on.
+
+`metadata.annotations` are descriptive metadata fields. Use them for longer
+context that should travel with the Card but should not be indexed as a primary
+classification field.
+
+`tags` are not Wyrd's public metadata contract. Public Card metadata uses
+`labels` and `annotations`.
 
 Do not create one-off top-level shapes for card kinds. If Wyrd needs to
 register it, browse it, version it, govern it, link it, install it, or expose it

@@ -186,6 +186,11 @@ description = "Run ty over the generated Python stub surface"
 dir = "python/py-wyrd"
 run = "uv run ty check python/wyrd/*.pyi tests/cards/data/test_public_surface.py"
 
+[tasks."examples:python:datacard"]
+description = "Run the local DataCard Python example"
+dir = "python/py-wyrd"
+run = "uv run python ../../examples/python/datacard_local_workflow.py"
+
 [tasks."dev:backend"]
 description = "Build and run wyrd-server on :8080"
 run = [

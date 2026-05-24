@@ -1,10 +1,3 @@
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use wyrd_utils::py::module_version;
-
-#[cfg(feature = "python")]
-use crate::data::dtype;
 use crate::data::interfaces::kinds::{
     ArrowInterface, CustomDataInterface, HuggingfaceInterface, ImageInterface, JsonlInterface,
     NumpyInterface, PandasInterface, ParquetInterface, PolarsInterface, SqlInterface,
@@ -21,6 +14,9 @@ use wyrd_spec::card::data::{
     ArrowMeta, CustomDataMeta, DataInterface as RustDataInterface, HuggingfaceMeta, ImageMeta,
     JsonlMeta, NumpyMeta, PandasMeta, ParquetMeta, PolarsMeta, SqlMeta, TextMeta, TorchMeta,
 };
+
+#[cfg(feature = "python")]
+use {crate::data::dtype, pyo3::prelude::*, wyrd_utils::py::module_version};
 
 macro_rules! impl_to_spec {
     ($type:ty, $meta:ty, $variant:ident, $message:literal, $body:expr) => {

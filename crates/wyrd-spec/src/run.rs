@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::SpaceName;
+use crate::metadata::Labels;
 
 /// Execution kind recorded as a Run.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
@@ -43,5 +44,5 @@ pub struct RunRef {
     pub space: Option<SpaceName>,
     /// Query/display labels.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub labels: BTreeMap<String, String>,
+    pub labels: Labels,
 }

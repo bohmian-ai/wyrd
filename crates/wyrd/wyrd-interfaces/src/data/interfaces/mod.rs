@@ -1,19 +1,24 @@
 //! Python-facing data interface holders and Rust metadata conversion.
 
+#[cfg(feature = "python")]
 mod base;
 #[cfg(feature = "python")]
 mod handle;
 #[cfg(feature = "python")]
 mod helpers;
+#[cfg(feature = "python")]
 mod kinds;
+#[cfg(feature = "python")]
 mod materialize;
+#[cfg(feature = "python")]
 mod metadata;
 mod options;
 
+#[cfg(feature = "python")]
 pub use base::DataInterface;
 #[cfg(feature = "python")]
-#[allow(unused_imports)]
-pub(crate) use handle::DataInterfaceHandle;
+pub use handle::DataInterfaceHandle;
+#[cfg(feature = "python")]
 pub use kinds::{
     ArrowInterface, CustomDataInterface, HuggingfaceInterface, ImageInterface, JsonlInterface,
     NumpyInterface, PandasInterface, ParquetInterface, PolarsInterface, SqlInterface,
@@ -25,9 +30,7 @@ pub use options::{
 };
 
 #[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyModule;
+use {pyo3::prelude::*, pyo3::types::PyModule};
 
 /// Register data interface classes on a Python module.
 #[cfg(feature = "python")]

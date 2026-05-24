@@ -8,9 +8,7 @@ pub mod data;
 pub mod error;
 
 #[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyModule;
+use {pyo3::prelude::*, pyo3::types::PyModule};
 
 /// Register interface Python objects under a parent module.
 #[cfg(feature = "python")]

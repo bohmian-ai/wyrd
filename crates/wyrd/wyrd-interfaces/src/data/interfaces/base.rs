@@ -1,14 +1,12 @@
-#[cfg(feature = "python")]
-use std::path::PathBuf;
-
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyTuple};
-
-#[cfg(feature = "python")]
-use crate::data::stats::PyDataStats;
 use crate::error::{CardPyResult, WyrdPyError};
+
+#[cfg(feature = "python")]
+use {
+    crate::data::stats::PyDataStats,
+    pyo3::prelude::*,
+    pyo3::types::{PyDict, PyTuple},
+    std::path::PathBuf,
+};
 
 /// Base class for Python data interfaces.
 ///

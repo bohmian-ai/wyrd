@@ -1,19 +1,17 @@
 use std::collections::BTreeMap;
-#[cfg(feature = "python")]
-use std::path::PathBuf;
-
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyAny, PyDict};
 
 use crate::data::interfaces::DataInterface;
-#[cfg(feature = "python")]
-use crate::data::interfaces::helpers::{interface_to_dict, parse_card_ref};
-#[cfg(feature = "python")]
-use crate::data::stats::PyDataStats;
 use crate::error::CardPyResult;
 use wyrd_spec::reference::CardRef;
+
+#[cfg(feature = "python")]
+use {
+    crate::data::interfaces::helpers::{interface_to_dict, parse_card_ref},
+    crate::data::stats::PyDataStats,
+    pyo3::prelude::*,
+    pyo3::types::{PyAny, PyDict},
+    std::path::PathBuf,
+};
 
 macro_rules! interface_struct {
     ($(#[$meta:meta])+ $name:ident { $($field:ident : $field_ty:ty),+ $(,)? }) => {

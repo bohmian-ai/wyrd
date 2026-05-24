@@ -32,6 +32,7 @@ use crate::card::tool::ToolSpec;
 use crate::card::trigger::TriggerSpec;
 use crate::card::workflow::WorkflowSpec;
 use crate::ids::{CardName, CardUid, SpaceName};
+use crate::metadata::{Annotations, Labels};
 use crate::version::{ApiVersion, VersionBlock};
 
 /// Universal registered Card envelope.
@@ -71,7 +72,7 @@ pub struct Metadata {
     pub uid: Option<CardUid>,
     /// Display labels.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub labels: BTreeMap<String, String>,
+    pub labels: Labels,
     /// Free-form annotations for automation, UI, and integration metadata.
     ///
     /// As of 2026-05-18, keys under `wyrd.io/*` MUST remain reserved for
@@ -80,7 +81,7 @@ pub struct Metadata {
     /// avoid collisions.
     // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-6
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub annotations: BTreeMap<String, String>,
+    pub annotations: Annotations,
     /// Spec content hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec_hash: Option<String>,

@@ -1,15 +1,14 @@
 //! Python/Rust wrappers for Wyrd data statistics value objects.
 
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyAny, PyModule};
-#[cfg(feature = "python")]
-use wyrd_utils::py::json_to_pyobject;
+use wyrd_spec::card::data::DataStats;
 
 #[cfg(feature = "python")]
-use crate::error::CardPyResult;
-use wyrd_spec::card::data::DataStats;
+use {
+    crate::error::CardPyResult,
+    pyo3::prelude::*,
+    pyo3::types::{PyAny, PyModule},
+    wyrd_utils::py::json_to_pyobject,
+};
 
 /// Python-facing wrapper for Wyrd `DataStats`.
 #[cfg_attr(

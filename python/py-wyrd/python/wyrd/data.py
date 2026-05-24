@@ -37,6 +37,109 @@ def _validation(message: str, *, code: str = "WYRD_DATA_400_VALIDATION") -> Wyrd
     return WyrdError(code, message)
 
 
+def _is_qualified_string(value: str) -> bool:
+    return (
+        bool(value)
+        and value[0].isalnum()
+        and value[-1].isalnum()
+        and all(ch.isalnum() or ch in "-_." for ch in value)
+    )
+
+
+def _validate_metadata_key(value: str) -> None:
+    if not value:
+        raise _validation("metadata key must not be empty")
+    if "/" in value:
+        prefix, name = value.rsplit("/", 1)
+        if not prefix or not name or len(prefix) > 253:
+            raise _validation("metadata key prefix is invalid")
+        parts = prefix.split(".")
+        if any(
+            not part
+            or len(part) > 63
+            or not part[0].isalnum()
+            or not part[-1].isalnum()
+            or any(not (ch.isalnum() or ch == "-") for ch in part)
+            for part in parts
+        ):
+            raise _validation("metadata key prefix is invalid")
+    else:
+        name = value
+    if len(name) > 63 or not _is_qualified_string(name):
+        raise _validation("metadata key name is invalid")
+
+
+def _looks_like_secret(value: str) -> bool:
+    lower = value.lower()
+    if lower.startswith(("sk-", "xoxb-", "ghp_")) or "bearer " in lower or "-----begin " in lower:
+        return True
+    tokens = [token for token in "".join(ch if ch.isalnum() else " " for ch in lower).split()]
+    return any(
+        token
+        in {
+            "secret",
+            "password",
+            "passwd",
+            "token",
+            "apikey",
+            "credential",
+            "credentials",
+            "privatekey",
+        }
+        for token in tokens
+    )
+
+
+def _validate_user_metadata_key(value: str) -> None:
+    _validate_metadata_key(value)
+    if value.startswith(("wyrd.io/", "internal.wyrd.io/")):
+        raise _validation("metadata key uses a reserved Wyrd prefix")
+    if _looks_like_secret(value):
+        raise _validation("metadata key appears to contain secret material")
+
+
+def _validate_label_value(value: str, *, user: bool = True) -> None:
+    if len(value) > 63:
+        raise _validation("label value must be at most 63 characters")
+    if value and not _is_qualified_string(value):
+        raise _validation("label value is invalid")
+    if user and _looks_like_secret(value):
+        raise _validation("label value appears to contain secret material")
+
+
+def _validate_annotation_value(value: str, *, user: bool = True) -> None:
+    if len(value) > 4096:
+        raise _validation("annotation value must be at most 4096 characters")
+    if user and _looks_like_secret(value):
+        raise _validation("annotation value appears to contain secret material")
+
+
+def _validate_labels(values: Mapping[str, str] | None, *, user: bool = True) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for key, value in dict(values or {}).items():
+        if user:
+            _validate_user_metadata_key(str(key))
+        else:
+            _validate_metadata_key(str(key))
+        label_value = str(value)
+        _validate_label_value(label_value, user=user)
+        result[str(key)] = label_value
+    return result
+
+
+def _validate_annotations(values: Mapping[str, str] | None, *, user: bool = True) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for key, value in dict(values or {}).items():
+        if user:
+            _validate_user_metadata_key(str(key))
+        else:
+            _validate_metadata_key(str(key))
+        annotation_value = str(value)
+        _validate_annotation_value(annotation_value, user=user)
+        result[str(key)] = annotation_value
+    return result
+
+
 @dataclass(slots=True)
 class FieldSpec:
     """One field in a DataCard schema.
@@ -481,17 +584,20 @@ class DataCard:
         name: str | None = None,
         version: str | None = None,
         uid: str | None = None,
-        tags: list[str] | None = None,
+        labels: Mapping[str, str] | None = None,
+        annotations: Mapping[str, str] | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> None:
         self.space = space or "default"
         self.name = name or "data"
         self.version = version or "0.1.0"
         self.uid = uid or _new_uid()
-        self.tags = list(tags or [])
+        self.labels = _validate_labels(labels)
+        self.annotations = _validate_annotations(
+            annotations if annotations is not None else metadata
+        )
         self.created_at = dt.datetime.now(dt.timezone.utc).isoformat()
         self.is_card = True
-        self._metadata = dict(metadata or {})
         self.interface = _coerce_interface(data)
         self._save_metadata: dict[str, Any] | None = None
         self.schema = self.interface.infer_schema()
@@ -499,11 +605,11 @@ class DataCard:
 
     @property
     def metadata(self) -> dict[str, Any]:
-        return self._metadata
+        return self.annotations
 
     @metadata.setter
     def metadata(self, value: Mapping[str, Any]) -> None:
-        self._metadata = dict(value)
+        self.annotations = _validate_annotations(value)
 
     @property
     def data(self) -> Any:
@@ -559,9 +665,9 @@ class DataCard:
             name=metadata.get("name"),
             version=metadata.get("version"),
             uid=metadata.get("uid"),
-            tags=metadata.get("tags", []),
-            metadata=metadata.get("annotations", {}),
         )
+        card.labels = _validate_labels(metadata.get("labels", {}), user=False)
+        card.annotations = _validate_annotations(metadata.get("annotations", {}), user=False)
         card._save_metadata = spec.get("save_metadata")
         return card
 
@@ -586,8 +692,8 @@ class DataCard:
                 "name": self.name,
                 "version": self.version,
                 "uid": self.uid,
-                "tags": list(self.tags),
-                "annotations": dict(self._metadata),
+                "labels": dict(self.labels),
+                "annotations": dict(self.annotations),
             },
             "spec": spec,
         }

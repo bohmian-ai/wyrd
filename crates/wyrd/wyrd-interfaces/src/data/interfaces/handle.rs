@@ -16,8 +16,7 @@ use wyrd_spec::card::data::{CustomDataMeta, DataInterface as RustDataInterface, 
 
 /// Python-compatible dispatch wrapper for local data interface holders.
 #[cfg(feature = "python")]
-#[allow(dead_code)]
-pub(crate) enum DataInterfaceHandle {
+pub enum DataInterfaceHandle {
     /// Pandas dataframe interface.
     Pandas(PandasInterface),
     /// Polars dataframe interface.
@@ -47,7 +46,6 @@ pub(crate) enum DataInterfaceHandle {
 }
 
 #[cfg(feature = "python")]
-#[allow(dead_code)]
 impl DataInterfaceHandle {
     /// Build a handle from an explicit Python `DataInterface` object.
     pub fn from_interface(interface: &Bound<'_, PyAny>) -> CardPyResult<Self> {

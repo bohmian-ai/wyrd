@@ -456,7 +456,8 @@ class DataCard:
     name: str
     version: str
     uid: str
-    tags: list[str]
+    labels: dict[str, str]
+    annotations: dict[str, str]
     created_at: str
     is_card: bool
     interface: DataInterface
@@ -471,16 +472,17 @@ class DataCard:
         name: str | None = ...,
         version: str | None = ...,
         uid: str | None = ...,
-        tags: list[str] | None = ...,
+        labels: Mapping[str, str] | None = ...,
+        annotations: Mapping[str, str] | None = ...,
         metadata: Mapping[str, Any] | None = ...,
     ) -> None:
         """Create a DataCard from an explicit DataInterface.
 
         `space`, `name`, and `version` default to `"default"`, `"data"`, and
-        `"0.1.0"`. `uid` defaults to a generated local identifier. `tags`
-        defaults to an empty list. `metadata` defaults to an empty mapping and
-        is copied into card annotations. Construction performs no filesystem IO
-        and raises `WyrdError` when the interface cannot infer its schema.
+        `"0.1.0"`. `uid` defaults to a generated local identifier. `labels`
+        and `annotations` default to empty mappings. Construction performs no
+        filesystem IO and raises `WyrdError` when the interface cannot infer
+        its schema.
         """
         ...
 
@@ -492,7 +494,8 @@ class DataCard:
         name: str | None = ...,
         version: str | None = ...,
         uid: str | None = ...,
-        tags: list[str] | None = ...,
+        labels: Mapping[str, str] | None = ...,
+        annotations: Mapping[str, str] | None = ...,
         metadata: Mapping[str, Any] | None = ...,
     ) -> None:
         """Create a DataCard from a direct local path or SQL query mapping.
@@ -511,7 +514,8 @@ class DataCard:
         name: str | None = ...,
         version: str | None = ...,
         uid: str | None = ...,
-        tags: list[str] | None = ...,
+        labels: Mapping[str, str] | None = ...,
+        annotations: Mapping[str, str] | None = ...,
         metadata: Mapping[str, Any] | None = ...,
     ) -> None:
         """Create a DataCard by inferring the interface from runtime data.

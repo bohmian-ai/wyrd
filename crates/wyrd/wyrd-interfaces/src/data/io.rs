@@ -1,27 +1,26 @@
 //! Data-specific local IO helpers for data interfaces.
 
-#[cfg(feature = "python")]
-use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyAny, PyDict};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use wyrd_spec::card::data::{ColorMode, DataSchema, ImageFormat, JsonlCompression};
 use wyrd_spec::card::field::FieldSpec;
 use wyrd_spec::ids::ColumnName;
 
-#[cfg(feature = "python")]
-use crate::data::stats::PyDataStats;
 use crate::error::{CardPyResult, WyrdPyError};
+
 #[cfg(feature = "python")]
-use wyrd_spec::card::data::{DataStats, SqlLogic};
-#[cfg(feature = "python")]
-use wyrd_spec::ids::QueryName;
+use {
+    crate::data::stats::PyDataStats,
+    pyo3::prelude::*,
+    pyo3::types::{PyAny, PyDict},
+    serde_json::json,
+    std::collections::{BTreeMap, HashMap},
+    wyrd_spec::card::data::{DataStats, SqlLogic},
+    wyrd_spec::ids::QueryName,
+};
 
 /// Manifest entry for image and text datasets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

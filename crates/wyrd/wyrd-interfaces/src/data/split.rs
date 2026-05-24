@@ -1,23 +1,21 @@
 //! Python/Rust wrappers for Wyrd data split declarations.
 
-#[cfg(feature = "python")]
-use chrono::{DateTime, Utc};
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyAny, PyBool, PyFloat, PyInt, PyList, PyModule, PyString};
 use serde_json::json;
-#[cfg(feature = "python")]
-use wyrd_utils::py::{json_to_pyobject, pyobject_to_json};
 
 use crate::error::{CardPyResult, WyrdPyError};
-use wyrd_spec::card::data::{ColValue, Inequality, SplitStrategy};
+use wyrd_spec::card::data::{Inequality, SplitStrategy};
+
 #[cfg(feature = "python")]
-use wyrd_spec::envelope::CardKind;
-#[cfg(feature = "python")]
-use wyrd_spec::ids::ColumnName;
-#[cfg(feature = "python")]
-use wyrd_spec::reference::CardRef;
+use {
+    chrono::{DateTime, Utc},
+    pyo3::prelude::*,
+    pyo3::types::{PyAny, PyBool, PyFloat, PyInt, PyList, PyModule, PyString},
+    wyrd_spec::card::data::ColValue,
+    wyrd_spec::envelope::CardKind,
+    wyrd_spec::ids::ColumnName,
+    wyrd_spec::reference::CardRef,
+    wyrd_utils::py::{json_to_pyobject, pyobject_to_json},
+};
 
 /// Python-facing builder for a Wyrd `SplitStrategy`.
 #[cfg_attr(

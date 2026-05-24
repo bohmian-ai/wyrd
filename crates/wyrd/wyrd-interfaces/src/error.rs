@@ -126,6 +126,7 @@ impl WyrdPyError {
         Self::Internal(message.into())
     }
 
+    #[cfg(feature = "python")]
     fn into_wyrd_error(self) -> WyrdError {
         match self {
             Self::Spec(error) => error,
@@ -199,6 +200,7 @@ pub fn register_exceptions(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> p
     wyrd_utils::py::register_wyrd_error_exception(module)
 }
 
+#[cfg(feature = "python")]
 fn data_validation_from_source(message: &str, source: &str) -> WyrdError {
     WyrdError::DataValidation {
         message: message.to_string(),

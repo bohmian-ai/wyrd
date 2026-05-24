@@ -9,7 +9,7 @@ authors.workspace = true
 
 [features]
 default = []
-python = ["dep:pyo3", "wyrd-interfaces/python", "wyrd-utils/python"]
+python = ["dep:pyo3", "chrono/clock", "wyrd-interfaces/python", "wyrd-utils/python"]
 
 [dependencies]
 wyrd-spec.workspace = true

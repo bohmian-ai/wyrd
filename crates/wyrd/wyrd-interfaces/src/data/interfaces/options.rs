@@ -126,6 +126,7 @@ fn normalize_option(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace('-', "_")
 }
 
+#[cfg(feature = "python")]
 pub(super) fn parquet_compression_token(value: ParquetCompression) -> &'static str {
     match value {
         ParquetCompression::None => "none",
@@ -136,6 +137,7 @@ pub(super) fn parquet_compression_token(value: ParquetCompression) -> &'static s
     }
 }
 
+#[cfg(feature = "python")]
 pub(super) fn arrow_format_token(value: ArrowFormat) -> &'static str {
     match value {
         ArrowFormat::Ipc => "ipc",
@@ -143,6 +145,7 @@ pub(super) fn arrow_format_token(value: ArrowFormat) -> &'static str {
     }
 }
 
+#[cfg(feature = "python")]
 pub(super) fn numpy_format_token(value: NumpyFormat) -> &'static str {
     match value {
         NumpyFormat::Npy => "npy",
@@ -150,6 +153,7 @@ pub(super) fn numpy_format_token(value: NumpyFormat) -> &'static str {
     }
 }
 
+#[cfg(feature = "python")]
 pub(super) fn torch_save_format_token(value: TorchSaveFormat) -> &'static str {
     match value {
         TorchSaveFormat::Safetensors => "safetensors",
@@ -157,6 +161,7 @@ pub(super) fn torch_save_format_token(value: TorchSaveFormat) -> &'static str {
     }
 }
 
+#[cfg(feature = "python")]
 pub(super) fn jsonl_compression_token(value: JsonlCompression) -> &'static str {
     match value {
         JsonlCompression::None => "none",
@@ -165,6 +170,7 @@ pub(super) fn jsonl_compression_token(value: JsonlCompression) -> &'static str {
     }
 }
 
+#[cfg(feature = "python")]
 pub(super) fn image_format_token(value: ImageFormat) -> &'static str {
     match value {
         ImageFormat::Png => "png",
@@ -174,6 +180,7 @@ pub(super) fn image_format_token(value: ImageFormat) -> &'static str {
     }
 }
 
+#[cfg(feature = "python")]
 pub(super) fn color_mode_token(value: ColorMode) -> &'static str {
     match value {
         ColorMode::Rgb => "rgb",

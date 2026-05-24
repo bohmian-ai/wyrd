@@ -1,21 +1,19 @@
 //! Python/Rust wrappers for Wyrd data schema value objects.
 
-use std::collections::BTreeMap;
-
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyAny, PyModule};
-#[cfg(feature = "python")]
-use serde_json::Value;
-#[cfg(feature = "python")]
-use wyrd_utils::py::{json_to_pyobject, pyobject_to_json};
-
-#[cfg(feature = "python")]
-use crate::error::{CardPyResult, WyrdPyError};
 use wyrd_spec::card::data::DataSchema;
-use wyrd_spec::card::field::{Dim, FieldSpec};
-use wyrd_spec::ids::ColumnName;
+use wyrd_spec::card::field::FieldSpec;
+
+#[cfg(feature = "python")]
+use {
+    crate::error::{CardPyResult, WyrdPyError},
+    pyo3::prelude::*,
+    pyo3::types::{PyAny, PyModule},
+    serde_json::Value,
+    std::collections::BTreeMap,
+    wyrd_spec::card::field::Dim,
+    wyrd_spec::ids::ColumnName,
+    wyrd_utils::py::{json_to_pyobject, pyobject_to_json},
+};
 
 /// Python-facing wrapper for a Wyrd `FieldSpec`.
 #[cfg_attr(

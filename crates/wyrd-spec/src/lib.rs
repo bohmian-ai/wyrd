@@ -14,6 +14,7 @@ pub mod envelope;
 pub mod error;
 pub mod format;
 pub mod ids;
+pub mod metadata;
 pub mod redaction;
 pub mod reference;
 pub mod request_id;
@@ -32,3 +33,6 @@ pub use card::data::{
 };
 pub use card::field::{Dim, FieldSpec};
 pub use ids::{ColumnName, QueryName, SplitName};
+pub use metadata::{
+    AnnotationKey, AnnotationValue, Annotations, LabelKey, LabelValue, Labels, MetadataError,
+};

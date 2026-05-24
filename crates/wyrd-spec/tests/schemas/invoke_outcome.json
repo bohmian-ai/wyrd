@@ -34,6 +34,10 @@
     }
   },
   "definitions": {
+    "LabelValue": {
+      "description": "Validated value for queryable Card and Run labels.",
+      "type": "string"
+    },
     "RunKind": {
       "description": "Execution kind recorded as a Run.",
       "oneOf": [
@@ -183,7 +187,7 @@
           "description": "Query/display labels.",
           "type": "object",
           "additionalProperties": {
-            "type": "string"
+            "$ref": "#/definitions/LabelValue"
           }
         },
         "space": {

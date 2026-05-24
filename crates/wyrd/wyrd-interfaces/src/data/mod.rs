@@ -16,9 +16,7 @@ pub mod split;
 pub mod stats;
 
 #[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyModule;
+use {pyo3::prelude::*, pyo3::types::PyModule};
 
 /// Register data interface Python objects under a parent module.
 #[cfg(feature = "python")]

@@ -192,6 +192,10 @@
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
+    "LabelValue": {
+      "description": "Validated value for queryable Card and Run labels.",
+      "type": "string"
+    },
     "MetricEntry": {
       "description": "Metric summary entry.",
       "type": "object",
@@ -596,7 +600,7 @@
           "description": "Query/display labels.",
           "type": "object",
           "additionalProperties": {
-            "type": "string"
+            "$ref": "#/definitions/LabelValue"
           }
         },
         "space": {

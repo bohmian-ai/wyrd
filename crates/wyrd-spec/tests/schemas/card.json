@@ -158,6 +158,10 @@
         }
       }
     },
+    "AnnotationValue": {
+      "description": "Validated value for free-form Card annotations.",
+      "type": "string"
+    },
     "ApiVersion": {
       "description": "Canonical Wyrd API version.",
       "type": "string"
@@ -1605,6 +1609,10 @@
         }
       }
     },
+    "LabelValue": {
+      "description": "Validated value for queryable Card and Run labels.",
+      "type": "string"
+    },
     "Metadata": {
       "description": "Card metadata common to every kind.",
       "type": "object",
@@ -1617,7 +1625,7 @@
           "description": "Free-form annotations for automation, UI, and integration metadata.\n\nAs of 2026-05-18, keys under `wyrd.io/*` MUST remain reserved for Wyrd-owned runtime and registry metadata. User and vendor annotations MUST use another DNS-style prefix, such as `acme.com/cost-center`, to avoid collisions.",
           "type": "object",
           "additionalProperties": {
-            "type": "string"
+            "$ref": "#/definitions/AnnotationValue"
           }
         },
         "artifact_hash": {
@@ -1631,7 +1639,7 @@
           "description": "Display labels.",
           "type": "object",
           "additionalProperties": {
-            "type": "string"
+            "$ref": "#/definitions/LabelValue"
           }
         },
         "name": {
@@ -2572,7 +2580,7 @@
           "description": "Query/display labels.",
           "type": "object",
           "additionalProperties": {
-            "type": "string"
+            "$ref": "#/definitions/LabelValue"
           }
         },
         "space": {

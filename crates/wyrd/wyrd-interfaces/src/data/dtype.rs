@@ -1,20 +1,19 @@
 //! Data source detection and Python type guards.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::path::Path;
-#[cfg(feature = "python")]
-use std::path::PathBuf;
 
 #[cfg(feature = "python")]
-use pyo3::exceptions::PyModuleNotFoundError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyAny, PyDict, PyString, PyTuple};
-use wyrd_spec::card::data::DataSchema;
-use wyrd_spec::card::field::{Dim, FieldSpec};
-use wyrd_spec::ids::ColumnName;
+use {
+    pyo3::exceptions::PyModuleNotFoundError,
+    pyo3::prelude::*,
+    pyo3::types::{PyAny, PyDict, PyString, PyTuple},
+    std::collections::BTreeMap,
+    std::path::PathBuf,
+    wyrd_spec::card::data::DataSchema,
+    wyrd_spec::card::field::{Dim, FieldSpec},
+    wyrd_spec::ids::ColumnName,
+};
 
 use crate::error::{CardPyResult, WyrdPyError};
 
@@ -758,6 +757,7 @@ fn numpy_dtype_string(data: &Bound<'_, PyAny>) -> CardPyResult<String> {
         .extract::<String>()?)
 }
 
+#[cfg(feature = "python")]
 fn field_spec(name: &str, dtype: String, shape: Vec<Dim>) -> CardPyResult<FieldSpec> {
     let name = ColumnName::new(name).map_err(|source| {
         WyrdPyError::validation_with_details(

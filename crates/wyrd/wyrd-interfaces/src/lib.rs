@@ -9,7 +9,7 @@ pub mod error;
 /// Data interface Python/Rust adapter types.
 pub mod interfaces;
 /// Data interface local IO helpers.
-pub mod io {}
+pub mod io;
 /// Data schema Python/Rust wrappers.
 pub mod schema;
 /// Data split Python/Rust wrappers.

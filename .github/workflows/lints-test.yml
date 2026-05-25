@@ -12,6 +12,7 @@ jobs:
   changes:
     name: detect changes
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       python: ${{ steps.filter.outputs.python }}
@@ -72,10 +73,11 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15, windows-2025]
+        os: [ubuntu-24.04, macos-15, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -96,6 +98,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.generated == 'true' || needs.changes.outputs.workflow == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -133,6 +136,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.generated == 'true' || needs.changes.outputs.workflow == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -153,6 +157,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.python == 'true' || needs.changes.outputs.workflow == 'true'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -186,6 +191,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs == 'true' || needs.changes.outputs.workflow == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -203,6 +209,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.ui == 'true' || needs.changes.outputs.workflow == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -224,6 +231,7 @@ jobs:
     needs: [changes, rust, rust-gates, codegen, python, docs, ui]
     if: always()
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Verify required jobs
         shell: bash

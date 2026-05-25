@@ -1,0 +1,13 @@
+[package]
+name = "wyrd-auth"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+[dependencies]
+jsonwebtoken = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }

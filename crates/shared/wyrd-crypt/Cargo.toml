@@ -1,0 +1,13 @@
+[package]
+name = "wyrd-crypt"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+[dependencies]
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }

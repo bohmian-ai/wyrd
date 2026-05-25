@@ -65,16 +65,13 @@ Locked cross-cutting decisions that any contributor must honor:
 
 - `crates/wyrd-spec`: pure contracts, ids, cards/specs, schema generation,
   request/response shapes, validation, stable error catalog.
-- `crates/wyrd-runtime`, `crates/wyrd-telemetry`, `crates/wyrd-auth`,
-  `crates/wyrd-crypt`, `crates/wyrd-testing`, `crates/wyrd-utils`, and
-  `crates/wyrd-error-derive`: shared runtime, telemetry, auth shell,
-  cryptography, testing, utilities, and derives.
+- `crates/shared/*`: shared runtime, telemetry, auth shell, cryptography,
+  testing, derives.
 - `crates/skald/*`: model/provider runtime, prompt/cache abstractions,
   orchestration, provider-specific wire handling.
 - `crates/vala/*`: observability, evaluation, drift, tracing, archival query,
   background data-plane behavior.
-- `crates/wyrd-server`, `crates/wyrd-cli`, and `crates/wyrd-mcp`: server, CLI,
-  MCP, application integration, and UI host.
+- `crates/wyrd/*`: server, CLI, MCP, application integration, UI host.
 - `python/py-wyrd`: PyO3 module root, Python package exports, stubs,
   Python-facing tests.
 
@@ -137,6 +134,7 @@ server/Python/client layers.
 
 ## 7. PyO3 Boundary Rules
 
+- Keep PyO3 in `python/py-wyrd*` unless an explicit allowlist says otherwise.
 - Keep `Python<'py>`, `Bound<'py, T>`, `Py<T>`, `PyErr` out of Rust-only core
   crates.
 - Name the `#[new]` method `fn __new__` (not `fn new`) and give it an explicit

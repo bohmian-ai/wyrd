@@ -1,15 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/wyrd-*",
+    "crates/wyrd/*",
     "crates/vala/*",
-    "crates/skald/*",
+    "crates/shared/*",
+    "crates/wyrd-spec",
     "python/py-wyrd",
 ]
 default-members = [
-    "crates/wyrd-*",
-    "crates/vala/*",
-    "crates/skald/*",
+    "crates/wyrd/wyrd-server",
+    "crates/wyrd/wyrd-cli",
+    "crates/wyrd/wyrd-mcp",
+    "crates/vala/wyrd-observability-server",
 ]
 
 [workspace.package]
@@ -50,10 +52,7 @@ zeroize = "1"
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
-pyo3 = { version = "0.28", features = ["abi3-py310", "extension-module", "anyhow", "serde", "chrono"] }
-pythonize = "0.28"
 jsonwebtoken = "9"
-postgresql_embedded = { version = "0.20.2", default-features = false, features = ["blocking"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"

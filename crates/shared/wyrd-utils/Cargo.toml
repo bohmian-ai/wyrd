@@ -1,0 +1,24 @@
+[package]
+name = "wyrd-utils"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+[features]
+default = []
+python = ["dep:pyo3"]
+
+[dependencies]
+uuid = { workspace = true, features = ["std", "v7"] }
+semver = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+flate2 = { workspace = true }
+zstd = { workspace = true }
+walkdir = { workspace = true }
+sha2 = { workspace = true }
+wyrd-spec = { workspace = true }
+pyo3 = { workspace = true, optional = true }

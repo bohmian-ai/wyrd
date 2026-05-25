@@ -10,7 +10,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
-      - run: sudo apt-get update && sudo apt-get install -y ripgrep
-      - run: rustup target add wasm32-unknown-unknown
-      - run: mise run pre-pr
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+      - name: Install system tools
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+      - name: mise run pre-pr
+        run: mise run pre-pr

@@ -189,6 +189,7 @@ run = "uv run ty check python/wyrd/*.pyi tests/cards/data/test_public_surface.py
 [tasks."examples:python:datacard"]
 description = "Run the local DataCard Python example"
 dir = "python/py-wyrd"
+depends = ["py:setup"]
 run = "uv run python ../../examples/python/datacard_local_workflow.py"
 
 [tasks."dev:backend"]
@@ -325,8 +326,8 @@ diff -u "$BEFORE" "$AFTER" \
 """
 
 [tasks."pre-pr"]
-description = "Aggregate gate: check + codegen:check + Python package checks"
-depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:test:unit", "check:docs"]
+description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
+depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:docs"]
 
 [tasks."dev:pg:nuke"]
 description = "Wipe embedded pg cache"

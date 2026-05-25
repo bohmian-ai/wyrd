@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 use crate::card::field::FieldSpec;
 use crate::reference::CardRef;
 
+/// Locked ModelCard validation rules.
+pub mod validate;
+
+pub use validate::ModelCardError;
+
 /// Body of a Model card.
 ///
 /// This pure contract describes which framework loads the model, which task it
@@ -30,6 +35,48 @@ pub struct ModelSpec {
 }
 
 impl ModelSpec {
+    /// Build a Model spec and run the locked validator.
+    ///
+    /// # Errors
+    /// Returns a [`ModelCardError`] when any locked ModelCard invariant fails.
+    pub fn new(
+        interface: ModelInterface,
+        task_type: TaskType,
+        signature: ModelSignature,
+        sample_input: Option<SampleInput>,
+        artifact_refs: Vec<CardRef>,
+    ) -> Result<Self, ModelCardError> {
+        let spec = Self {
+            interface,
+            task_type,
+            signature,
+            sample_input,
+            artifact_refs,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Re-run locked validation invariants on this spec.
+    ///
+    /// # Errors
+    /// Returns a [`ModelCardError`] when any locked ModelCard invariant fails.
+    pub fn validate(&self) -> Result<(), ModelCardError> {
+        validate::validate_model_spec(self)
+    }
+
+    /// Return the stable interface kind string used by Python, MCP, and docs.
+    #[must_use]
+    pub fn interface_kind(&self) -> &'static str {
+        self.interface.kind()
+    }
+
+    /// Return true when this spec declares a generative task.
+    #[must_use]
+    pub const fn is_generation(&self) -> bool {
+        matches!(self.task_type, TaskType::Generation)
+    }
+
     /// Iterate durable Artifact card references linked to this model card.
     pub fn artifact_refs(&self) -> impl Iterator<Item = &CardRef> {
         self.artifact_refs.iter()
@@ -59,6 +106,74 @@ pub enum ModelInterface {
     Huggingface(HuggingfaceMeta),
     /// User-supplied loader metadata.
     Custom(CustomMeta),
+}
+
+impl ModelInterface {
+    /// Stable variant name.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Sklearn(_) => "Sklearn",
+            Self::Xgboost(_) => "Xgboost",
+            Self::Lightgbm(_) => "Lightgbm",
+            Self::Catboost(_) => "Catboost",
+            Self::Torch(_) => "Torch",
+            Self::Lightning(_) => "Lightning",
+            Self::Tensorflow(_) => "Tensorflow",
+            Self::Huggingface(_) => "Huggingface",
+            Self::Custom(_) => "Custom",
+        }
+    }
+
+    /// Human-readable loader family used in docs, errors, and MCP output.
+    #[must_use]
+    pub const fn loader_family(&self) -> &'static str {
+        match self {
+            Self::Sklearn(_) => "sklearn",
+            Self::Xgboost(_) => "xgboost",
+            Self::Lightgbm(_) => "lightgbm",
+            Self::Catboost(_) => "catboost",
+            Self::Torch(_) => "torch",
+            Self::Lightning(_) => "pytorch-lightning",
+            Self::Tensorflow(_) => "tensorflow",
+            Self::Huggingface(_) => "huggingface-transformers",
+            Self::Custom(_) => "custom-python-loader",
+        }
+    }
+
+    /// Default media type produced by the model save path for this interface.
+    #[must_use]
+    pub const fn default_media_type(&self) -> &'static str {
+        match self {
+            Self::Sklearn(_) | Self::Xgboost(_) | Self::Lightgbm(_) | Self::Catboost(_) => {
+                "application/x-joblib"
+            }
+            Self::Torch(_) => "application/vnd.safetensors",
+            Self::Lightning(_) => "application/x-pytorch-ckpt",
+            Self::Tensorflow(_) => "application/vnd.keras+zip",
+            Self::Huggingface(_) => "application/vnd.huggingface+bundle",
+            Self::Custom(_) => "application/octet-stream",
+        }
+    }
+
+    /// Default file extension produced by the model save path.
+    #[must_use]
+    pub const fn default_extension(&self) -> &'static str {
+        match self {
+            Self::Sklearn(_) | Self::Xgboost(_) | Self::Lightgbm(_) | Self::Catboost(_) => "joblib",
+            Self::Torch(meta) => match meta.save_format {
+                TorchSaveFormat::Safetensors => "safetensors",
+                TorchSaveFormat::Pickle => "pt",
+            },
+            Self::Lightning(_) => "ckpt",
+            Self::Tensorflow(meta) => match meta.save_format {
+                TfSaveFormat::Keras => "keras",
+                TfSaveFormat::SavedModel => "savedmodel",
+            },
+            Self::Huggingface(_) => "huggingface",
+            Self::Custom(_) => "bin",
+        }
+    }
 }
 
 /// Config for the Sklearn model interface.
@@ -297,12 +412,68 @@ pub struct ModelSignature {
     pub outputs: Vec<FieldSpec>,
 }
 
+impl ModelSignature {
+    /// Build a signature from ordered input and output field lists.
+    #[must_use]
+    pub fn new(inputs: Vec<FieldSpec>, outputs: Vec<FieldSpec>) -> Self {
+        Self { inputs, outputs }
+    }
+
+    /// Build a signature and validate locked signature invariants.
+    ///
+    /// # Errors
+    /// Returns a [`ModelCardError`] when the signature is empty, duplicated, or
+    /// uses a non-canonical dtype or invalid shape.
+    pub fn from_fields(
+        inputs: Vec<FieldSpec>,
+        outputs: Vec<FieldSpec>,
+    ) -> Result<Self, ModelCardError> {
+        let signature = Self::new(inputs, outputs);
+        signature.validate()?;
+        Ok(signature)
+    }
+
+    /// Borrow input fields in declaration order.
+    #[must_use]
+    pub fn inputs(&self) -> &[FieldSpec] {
+        &self.inputs
+    }
+
+    /// Borrow output fields in declaration order.
+    #[must_use]
+    pub fn outputs(&self) -> &[FieldSpec] {
+        &self.outputs
+    }
+
+    /// Re-run locked signature invariants.
+    ///
+    /// # Errors
+    /// Returns a [`ModelCardError`] when any signature invariant fails.
+    pub fn validate(&self) -> Result<(), ModelCardError> {
+        validate::validate_signature(self)
+    }
+}
+
 /// Sample input description for loader-side rehydration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct SampleInput {
     /// Closed kind tag selecting the loader-side deserializer.
     pub kind: SampleInputKind,
+}
+
+impl SampleInput {
+    /// Build a sample input description from a kind tag.
+    #[must_use]
+    pub const fn new(kind: SampleInputKind) -> Self {
+        Self { kind }
+    }
+
+    /// Return the closed kind tag selecting loader-side deserialization.
+    #[must_use]
+    pub const fn kind(&self) -> SampleInputKind {
+        self.kind
+    }
 }
 
 /// Closed set of sample input shapes supported by Wyrd at the contract layer.

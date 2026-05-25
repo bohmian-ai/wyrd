@@ -197,6 +197,104 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// ModelCard validation failed.
+    #[error("[WYRD_MODEL_400_VALIDATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_VALIDATION",
+        status = 400,
+        title = "ModelCard validation failed",
+        remediation = "Fix the ModelCard signature, framework version, or interface configuration."
+    )]
+    ModelValidation {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A ModelCard signature was missing required fields.
+    #[error("[WYRD_MODEL_400_MISSING_SIGNATURE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_MISSING_SIGNATURE",
+        status = 400,
+        title = "Missing model signature",
+        remediation = "Pass signature fields explicitly or build a ModelSignature before registration."
+    )]
+    ModelMissingSignature {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A ModelCard signature dtype was not canonical.
+    #[error("[WYRD_MODEL_400_DTYPE_NORMALIZE_FAILED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_DTYPE_NORMALIZE_FAILED",
+        status = 400,
+        title = "Could not normalize signature dtype",
+        remediation = "Provide a FieldSpec with a canonical Arrow logical dtype string."
+    )]
+    ModelDtypeNormalizeFailed {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A ModelCard signature shape was invalid.
+    #[error("[WYRD_MODEL_400_SHAPE_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_SHAPE_INVALID",
+        status = 400,
+        title = "Invalid model signature shape",
+        remediation = "Use Dim::Fixed(n) with n > 0 or Dim::Dynamic(name) for unknown dimensions."
+    )]
+    ModelShapeInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A Hugging Face revision was invalid.
+    #[error("[WYRD_MODEL_400_HF_REVISION_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_HF_REVISION_INVALID",
+        status = 400,
+        title = "Invalid HuggingFace revision",
+        remediation = "Pass a 7-40 character lowercase hex revision from the HuggingFace repo."
+    )]
+    ModelHfRevisionInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A Hugging Face task was missing.
+    #[error("[WYRD_MODEL_400_HF_TASK_MISSING] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_HF_TASK_MISSING",
+        status = 400,
+        title = "Missing HuggingFace task",
+        remediation = "Set HuggingfaceMeta.hf_task before saving."
+    )]
+    ModelHfTaskMissing {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A custom loader declaration was invalid.
+    #[error("[WYRD_MODEL_400_CUSTOM_LOADER_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_CUSTOM_LOADER_INVALID",
+        status = 400,
+        title = "Invalid custom loader",
+        remediation = "Set CustomMeta.loader_module and CustomMeta.loader_class to non-empty values."
+    )]
+    ModelCustomLoaderInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
 }
 
 impl WyrdError {
@@ -229,7 +327,14 @@ impl WyrdError {
             | Self::DataInvalidSplitRule { message, details }
             | Self::DataTargetColumnUnknown { message, details }
             | Self::DataInvalidInterfaceOption { message, details }
-            | Self::DataInterfaceMetadataRequired { message, details } => (message, details),
+            | Self::DataInterfaceMetadataRequired { message, details }
+            | Self::ModelValidation { message, details }
+            | Self::ModelMissingSignature { message, details }
+            | Self::ModelDtypeNormalizeFailed { message, details }
+            | Self::ModelShapeInvalid { message, details }
+            | Self::ModelHfRevisionInvalid { message, details }
+            | Self::ModelHfTaskMissing { message, details }
+            | Self::ModelCustomLoaderInvalid { message, details } => (message, details),
         }
     }
 }

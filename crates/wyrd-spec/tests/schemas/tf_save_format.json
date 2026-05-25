@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TfSaveFormat",
+  "description": "Save format for the Tensorflow model interface.",
+  "oneOf": [
+    {
+      "description": "Keras v3 single-file archive.",
+      "type": "string",
+      "enum": [
+        "Keras"
+      ]
+    },
+    {
+      "description": "SavedModel directory layout.",
+      "type": "string",
+      "enum": [
+        "SavedModel"
+      ]
+    }
+  ]
+}

@@ -15,7 +15,10 @@ use wyrd_spec::card::eval::EvalSpec;
 use wyrd_spec::card::experiment::ExperimentSpec;
 use wyrd_spec::card::field::FieldSpec;
 use wyrd_spec::card::mcp::McpSpec;
-use wyrd_spec::card::model::ModelSpec;
+use wyrd_spec::card::model::{
+    HuggingFaceTask, ModelInterface, ModelSignature, ModelSpec, SampleInput, SampleInputKind,
+    TaskType, TfSaveFormat, TorchSaveFormat,
+};
 use wyrd_spec::card::operator::{OperatorBudget, OperatorInput, OperatorSpec};
 use wyrd_spec::card::policy::{InvokeContext, InvokeOutcome, PolicyDecision, PolicySpec};
 use wyrd_spec::card::prompt::PromptSpec;
@@ -54,6 +57,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<DataStats>(out, golden, "data_stats")?;
     write::<DataSpec>(out, golden, "data_spec")?;
     write::<ModelSpec>(out, golden, "model_spec")?;
+    write::<ModelInterface>(out, golden, "model_interface")?;
+    write::<TaskType>(out, golden, "task_type")?;
+    write::<ModelSignature>(out, golden, "model_signature")?;
+    write::<SampleInput>(out, golden, "sample_input")?;
+    write::<SampleInputKind>(out, golden, "sample_input_kind")?;
+    write::<TorchSaveFormat>(out, golden, "torch_save_format")?;
+    write::<TfSaveFormat>(out, golden, "tf_save_format")?;
+    write::<HuggingFaceTask>(out, golden, "hugging_face_task")?;
     write::<ExperimentSpec>(out, golden, "experiment_spec")?;
     write::<PromptSpec>(out, golden, "prompt_spec")?;
     write::<ToolSpec>(out, golden, "tool_spec")?;

@@ -164,6 +164,7 @@ run = ["uv sync --all-extras --group dev", "uv run maturin develop"]
 [tasks."py:test:unit"]
 description = "Run Python unit tests against real DataCard runtime dependencies"
 dir = "python/py-wyrd"
+depends = ["py:setup"]
 run = "uv run pytest -q"
 
 [tasks."py:format"]

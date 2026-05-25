@@ -10,5 +10,11 @@ mod data_validation;
 mod envelope_roundtrip;
 #[path = "cards/kind.rs"]
 mod kind;
+#[path = "cards/model/methods.rs"]
+mod model_methods;
+#[path = "cards/model/roundtrip.rs"]
+mod model_roundtrip;
+#[path = "cards/model/schema_drift.rs"]
+mod model_schema_drift;
 #[path = "cards/model/validation.rs"]
 mod model_validation;

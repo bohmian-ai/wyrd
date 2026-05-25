@@ -439,6 +439,13 @@ fn modelcard_error_maps_to_public_wyrd_error_codes_and_details() {
         json!({ "side": "inputs" })
     );
 
+    let error: WyrdError = ModelCardError::EmptyOutputs.into();
+    assert_eq!(error.code(), "WYRD_MODEL_400_MISSING_SIGNATURE");
+    assert_eq!(
+        error.as_problem_json()["details"],
+        json!({ "side": "outputs" })
+    );
+
     let error: WyrdError = ModelCardError::DuplicateFieldName {
         side: "outputs",
         name: "score".to_string(),
@@ -446,6 +453,13 @@ fn modelcard_error_maps_to_public_wyrd_error_codes_and_details() {
     .into();
     assert_eq!(error.code(), "WYRD_MODEL_400_VALIDATION");
     assert_eq!(error.as_problem_json()["details"]["name"], "score");
+
+    let error: WyrdError = ModelCardError::EmptyFrameworkVersion { variant: "Sklearn" }.into();
+    assert_eq!(error.code(), "WYRD_MODEL_400_VALIDATION");
+    assert_eq!(
+        error.as_problem_json()["details"]["interface_kind"],
+        "Sklearn"
+    );
 
     let error: WyrdError = ModelCardError::DtypeNormalizeFailed {
         dtype: "object".to_string(),
@@ -467,6 +481,10 @@ fn modelcard_error_maps_to_public_wyrd_error_codes_and_details() {
     }
     .into();
     assert_eq!(error.code(), "WYRD_MODEL_400_HF_REVISION_INVALID");
+
+    let error: WyrdError = ModelCardError::HuggingfaceRepoIdEmpty.into();
+    assert_eq!(error.code(), "WYRD_MODEL_400_VALIDATION");
+    assert_eq!(error.as_problem_json()["details"]["field"], "repo_id");
 
     let error: WyrdError = ModelCardError::HuggingfaceTaskMissing.into();
     assert_eq!(error.code(), "WYRD_MODEL_400_HF_TASK_MISSING");

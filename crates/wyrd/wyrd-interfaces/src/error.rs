@@ -3,6 +3,7 @@
 use serde_json::{Value, json};
 use thiserror::Error;
 use wyrd_spec::card::data::validate::DataCardError;
+use wyrd_spec::card::model::validate::ModelCardError;
 use wyrd_spec::error::WyrdError;
 
 /// Result alias used by Python-boundary card interface methods.
@@ -150,6 +151,12 @@ impl WyrdPyError {
 
 impl From<DataCardError> for WyrdPyError {
     fn from(error: DataCardError) -> Self {
+        WyrdError::from(error).into()
+    }
+}
+
+impl From<ModelCardError> for WyrdPyError {
+    fn from(error: ModelCardError) -> Self {
         WyrdError::from(error).into()
     }
 }

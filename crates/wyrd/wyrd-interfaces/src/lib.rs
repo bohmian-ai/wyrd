@@ -6,6 +6,8 @@
 pub mod data;
 /// Data interface error boundary.
 pub mod error;
+/// Model interface module family.
+pub mod model;
 
 #[cfg(feature = "python")]
 use {pyo3::prelude::*, pyo3::types::PyModule};
@@ -15,5 +17,6 @@ use {pyo3::prelude::*, pyo3::types::PyModule};
 pub fn register(_py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register_exceptions(parent)?;
     data::register(parent)?;
+    model::register(parent)?;
     Ok(())
 }

@@ -122,6 +122,24 @@ impl WyrdPyError {
         Self::validation(message)
     }
 
+    /// Build a `ModelCard` missing-signature error.
+    pub fn missing_signature(message: impl Into<String>) -> Self {
+        WyrdError::ModelMissingSignature {
+            message: message.into(),
+            details: Value::Null,
+        }
+        .into()
+    }
+
+    /// Build a `ModelCard` serializer-unavailable error.
+    pub fn serializer_unavailable(extra: &str) -> Self {
+        WyrdError::ModelSerializerUnavailable {
+            message: format!("required serializer unavailable: {extra}"),
+            details: json!({ "extra": extra }),
+        }
+        .into()
+    }
+
     /// Build an internal interface error.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())

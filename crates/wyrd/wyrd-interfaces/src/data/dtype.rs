@@ -112,6 +112,60 @@ pub fn infer_schema_for_interface(
     }
 }
 
+/// Normalize a live Python dtype object into a canonical Wyrd dtype string.
+///
+/// `source` selects the existing dtype normalization table. `NumPy` uses the
+/// same private dtype extraction path as `DataInterface` schema inference; other
+/// sources stringify the dtype object before normalization.
+///
+/// # Errors
+/// Returns a Wyrd Python-boundary error when dtype inspection fails or the
+/// resulting token is outside the locked normalization table.
+#[cfg(feature = "python")]
+pub fn dtype_string_from_py(
+    _py: Python<'_>,
+    source: &str,
+    obj: &Bound<'_, PyAny>,
+) -> CardPyResult<String> {
+    let dtype = if source.eq_ignore_ascii_case("numpy") {
+        numpy_dtype_string(obj)?
+    } else {
+        obj.str()?.extract::<String>()?
+    };
+    normalize_dtype(source, &dtype)
+}
+
+/// Infer ordered Wyrd field specs from a supported Python data object.
+///
+/// This promotes the existing `DataInterface` schema inference path for model
+/// signatures. Tabular objects return scalar fields; `NumPy` and `Torch` tensors
+/// return the existing tensor field shape emitted by `DataInterface`.
+///
+/// # Errors
+/// Returns a Wyrd Python-boundary error when the object is unsupported or its
+/// dtype/shape cannot be inspected.
+#[cfg(feature = "python")]
+pub fn fields_from_py(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<Vec<FieldSpec>> {
+    if is_pandas_dataframe(py, data)? {
+        return Ok(infer_pandas_schema(data)?.columns);
+    }
+    if is_polars_dataframe(py, data)? {
+        return Ok(infer_polars_schema(data)?.columns);
+    }
+    if is_pyarrow_table(py, data)? {
+        return Ok(infer_arrow_schema(data)?.columns);
+    }
+    if is_numpy_array(py, data)? {
+        return Ok(infer_numpy_schema(data)?.columns);
+    }
+    if is_torch_tensor(py, data)? {
+        return Ok(infer_torch_schema(data)?.columns);
+    }
+    Err(WyrdPyError::unknown_data_type(
+        "expected pandas.DataFrame, polars.DataFrame, pyarrow.Table, numpy.ndarray, or torch.Tensor",
+    ))
+}
+
 /// Infer the canonical dtype for a `NumPy` object when present.
 #[cfg(feature = "python")]
 pub fn numpy_dtype(py: Python<'_>, data: Option<&Py<PyAny>>) -> Option<CardPyResult<String>> {
@@ -268,38 +322,16 @@ fn ensure_kind(
     }
 }
 
+/// Return true when a Python object is an instance of an optional framework class.
+///
+/// Missing framework modules are treated as a non-match so ordered detection
+/// probes can run without requiring every optional dependency.
+///
+/// # Errors
+/// Returns a Python-boundary error when an installed module fails to import for
+/// reasons other than being absent, or when the class lookup/probe fails.
 #[cfg(feature = "python")]
-fn is_pandas_dataframe(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
-    is_instance_of_optional(py, data, "pandas", "DataFrame")
-}
-
-#[cfg(feature = "python")]
-fn is_polars_dataframe(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
-    is_instance_of_optional(py, data, "polars", "DataFrame")
-}
-
-#[cfg(feature = "python")]
-fn is_pyarrow_table(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
-    is_instance_of_optional(py, data, "pyarrow", "Table")
-}
-
-#[cfg(feature = "python")]
-fn is_numpy_array(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
-    is_instance_of_optional(py, data, "numpy", "ndarray")
-}
-
-#[cfg(feature = "python")]
-fn is_torch_tensor(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
-    is_instance_of_optional(py, data, "torch", "Tensor")
-}
-
-#[cfg(feature = "python")]
-fn is_huggingface_dataset(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
-    is_instance_of_optional(py, data, "datasets", "Dataset")
-}
-
-#[cfg(feature = "python")]
-fn is_instance_of_optional(
+pub fn is_framework_class(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
     module_name: &str,
@@ -312,6 +344,36 @@ fn is_instance_of_optional(
     };
     let class = module.getattr(class_name)?;
     Ok(data.is_instance(&class)?)
+}
+
+#[cfg(feature = "python")]
+fn is_pandas_dataframe(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
+    is_framework_class(py, data, "pandas", "DataFrame")
+}
+
+#[cfg(feature = "python")]
+fn is_polars_dataframe(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
+    is_framework_class(py, data, "polars", "DataFrame")
+}
+
+#[cfg(feature = "python")]
+fn is_pyarrow_table(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
+    is_framework_class(py, data, "pyarrow", "Table")
+}
+
+#[cfg(feature = "python")]
+fn is_numpy_array(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
+    is_framework_class(py, data, "numpy", "ndarray")
+}
+
+#[cfg(feature = "python")]
+fn is_torch_tensor(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
+    is_framework_class(py, data, "torch", "Tensor")
+}
+
+#[cfg(feature = "python")]
+fn is_huggingface_dataset(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
+    is_framework_class(py, data, "datasets", "Dataset")
 }
 
 #[cfg(feature = "python")]

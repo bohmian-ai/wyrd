@@ -295,6 +295,20 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A ModelCard sample or artifact serializer is unavailable.
+    #[error("[WYRD_MODEL_501_SERIALIZER_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_501_SERIALIZER_UNAVAILABLE",
+        status = 501,
+        title = "Required serializer unavailable",
+        remediation = "Install the Wyrd Python extra for the required framework serializer."
+    )]
+    ModelSerializerUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
 }
 
 impl WyrdError {
@@ -334,7 +348,8 @@ impl WyrdError {
             | Self::ModelShapeInvalid { message, details }
             | Self::ModelHfRevisionInvalid { message, details }
             | Self::ModelHfTaskMissing { message, details }
-            | Self::ModelCustomLoaderInvalid { message, details } => (message, details),
+            | Self::ModelCustomLoaderInvalid { message, details }
+            | Self::ModelSerializerUnavailable { message, details } => (message, details),
         }
     }
 }

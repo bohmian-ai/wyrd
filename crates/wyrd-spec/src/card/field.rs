@@ -39,7 +39,13 @@ impl FieldSpec {
     }
 }
 
-/// Return true when a dtype string is a canonical Arrow logical dtype.
+/// Return true when a dtype string is already a canonical Arrow logical dtype.
+///
+/// This is the pure `wyrd-spec` predicate used by card validators after a
+/// surface has normalized source-library dtypes. It intentionally does not
+/// inspect Python, pandas, NumPy, torch, or Arrow objects; that source-specific
+/// normalization belongs in `wyrd-interfaces`, while this function only checks
+/// the durable string grammar stored in [`FieldSpec::dtype`].
 #[must_use]
 pub fn is_canonical_dtype(value: &str) -> bool {
     if value.is_empty() || value.trim() != value {
@@ -48,6 +54,11 @@ pub fn is_canonical_dtype(value: &str) -> bool {
     is_dtype(value)
 }
 
+/// Dispatch to the supported scalar and structural dtype grammars.
+///
+/// Keeping the dispatcher private keeps the public contract narrow:
+/// validators need one boolean predicate, while the implementation can keep one
+/// small helper per grammar family for readability and targeted tests.
 fn is_dtype(value: &str) -> bool {
     is_leaf_dtype(value)
         || is_list_dtype(value, "list<")
@@ -57,6 +68,12 @@ fn is_dtype(value: &str) -> bool {
         || is_dictionary_dtype(value)
 }
 
+/// Return true for the canonical scalar Arrow logical dtype names.
+///
+/// These are the non-structural leaves that can appear directly in a
+/// [`FieldSpec`] or inside structural forms such as `list<...>` and
+/// `struct<...>`. Decimal forms delegate to [`is_decimal_dtype`] because they
+/// include precision and scale parameters.
 fn is_leaf_dtype(value: &str) -> bool {
     matches!(
         value,
@@ -97,6 +114,12 @@ fn is_leaf_dtype(value: &str) -> bool {
     ) || is_decimal_dtype(value)
 }
 
+/// Return true for `decimal128(precision, scale)` and `decimal256(...)`.
+///
+/// Decimal dtypes need a small parser because the canonical string carries two
+/// numeric parameters. The check rejects malformed values and scale values
+/// larger than precision so ModelCard signatures cannot store impossible
+/// decimal definitions.
 fn is_decimal_dtype(value: &str) -> bool {
     let Some(inner) = inner_for(value, "decimal128(").or_else(|| inner_for(value, "decimal256("))
     else {
@@ -115,10 +138,20 @@ fn is_decimal_dtype(value: &str) -> bool {
     scale <= precision
 }
 
+/// Return true for a variable-length list dtype using the supplied prefix.
+///
+/// `list<...>` and `large_list<...>` share the same recursive inner dtype
+/// grammar. The prefix parameter keeps the two public canonical spellings
+/// explicit without duplicating the parser.
 fn is_list_dtype(value: &str, prefix: &str) -> bool {
     inner_for(value, prefix).is_some_and(is_dtype)
 }
 
+/// Return true for `fixed_size_list<inner, n>` with a positive length.
+///
+/// Fixed-size lists are structural dtypes whose second parameter is a shape
+/// count, not another dtype. Validating that count here keeps shape-like dtype
+/// metadata deterministic before registry or runtime layers see it.
 fn is_fixed_size_list_dtype(value: &str) -> bool {
     let Some(inner) = inner_for(value, "fixed_size_list<") else {
         return false;
@@ -127,9 +160,15 @@ fn is_fixed_size_list_dtype(value: &str) -> bool {
     if parts.len() != 2 {
         return false;
     }
-    is_dtype(parts[0]) && parse_positive_i64(parts[1].trim()).is_some()
+    is_dtype(parts[0].trim()) && parse_positive_i64(parts[1].trim()).is_some()
 }
 
+/// Return true for `struct<field:dtype,...>` over canonical field dtypes.
+///
+/// Struct dtypes are allowed in signatures for nested model inputs and outputs.
+/// The validator checks field-name syntax locally and recursively validates
+/// each field dtype so invalid nested leaves cannot pass through the spec
+/// layer.
 fn is_struct_dtype(value: &str) -> bool {
     let Some(inner) = inner_for(value, "struct<") else {
         return false;
@@ -139,11 +178,17 @@ fn is_struct_dtype(value: &str) -> bool {
         return false;
     }
     fields.into_iter().all(|field| {
+        let field = field.trim();
         let parts = split_top_level(field, ':');
-        parts.len() == 2 && is_struct_field_name(parts[0]) && is_dtype(parts[1])
+        parts.len() == 2 && is_struct_field_name(parts[0].trim()) && is_dtype(parts[1].trim())
     })
 }
 
+/// Return true for `dictionary<index_dtype, value_dtype>`.
+///
+/// Dictionary values are how categorical columns are represented in canonical
+/// Wyrd strings. The index side is restricted to integer dtypes, while the
+/// value side can be any canonical dtype accepted by [`is_dtype`].
 fn is_dictionary_dtype(value: &str) -> bool {
     let Some(inner) = inner_for(value, "dictionary<") else {
         return false;
@@ -155,6 +200,11 @@ fn is_dictionary_dtype(value: &str) -> bool {
     is_dictionary_index_dtype(parts[0].trim()) && is_dtype(parts[1].trim())
 }
 
+/// Return true when a dtype is valid for dictionary indices.
+///
+/// Arrow dictionary indices are integer-like. Keeping this as a separate helper
+/// makes that narrower rule visible instead of hiding it in the general dtype
+/// predicate.
 fn is_dictionary_index_dtype(value: &str) -> bool {
     matches!(
         value,
@@ -162,6 +212,11 @@ fn is_dictionary_index_dtype(value: &str) -> bool {
     )
 }
 
+/// Return true when a struct field name is valid in a canonical dtype string.
+///
+/// These names are local to the dtype grammar, not Wyrd `ColumnName`s. The
+/// lighter rule permits common nested field labels while still rejecting empty
+/// or punctuation-only names that would make parsing ambiguous.
 fn is_struct_field_name(value: &str) -> bool {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -171,6 +226,11 @@ fn is_struct_field_name(value: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
+/// Return the delimited payload for a structural dtype prefix.
+///
+/// This helper verifies that the matching closing delimiter ends the string.
+/// That prevents accepting partial values such as `list<int64>extra` while
+/// still allowing nested delimiters inside the payload.
 fn inner_for<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     if !value.starts_with(prefix) {
         return None;
@@ -185,6 +245,12 @@ fn inner_for<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     (end == value.len() - 1).then_some(&value[start..end])
 }
 
+/// Return the byte index of the closing delimiter that matches an opener.
+///
+/// Structural dtype parsing needs delimiter matching rather than simple suffix
+/// stripping because nested values can contain their own `<...>` or `(...)`
+/// pairs. The caller supplies the opening delimiter index and expected closing
+/// delimiter.
 fn matching_delimiter(value: &str, open_index: usize, closing: char) -> Option<usize> {
     let opening = match closing {
         '>' => '<',
@@ -211,6 +277,11 @@ fn matching_delimiter(value: &str, open_index: usize, closing: char) -> Option<u
     None
 }
 
+/// Split a structural dtype payload on a delimiter at nesting depth zero.
+///
+/// Dtype forms such as `struct<a:list<int64>,b:utf8>` contain commas inside
+/// nested parameters. This helper only splits separators that belong to the
+/// current level so recursive parsers receive intact child dtype strings.
 fn split_top_level(value: &str, delimiter: char) -> Vec<&str> {
     if value.is_empty() {
         return Vec::new();
@@ -236,11 +307,20 @@ fn split_top_level(value: &str, delimiter: char) -> Vec<&str> {
     parts
 }
 
+/// Parse a positive integer parameter from a dtype string.
+///
+/// Decimal precision and fixed-size-list length must be greater than zero.
+/// Returning `Option` keeps parser callers simple and avoids introducing an
+/// error type for a private grammar helper.
 fn parse_positive_i64(value: &str) -> Option<i64> {
     let parsed = value.parse::<i64>().ok()?;
     (parsed > 0).then_some(parsed)
 }
 
+/// Parse a non-negative integer parameter from a dtype string.
+///
+/// Decimal scale may be zero but cannot be negative. This is separate from
+/// [`parse_positive_i64`] so decimal precision and scale rules remain explicit.
 fn parse_non_negative_i64(value: &str) -> Option<i64> {
     let parsed = value.parse::<i64>().ok()?;
     (parsed >= 0).then_some(parsed)

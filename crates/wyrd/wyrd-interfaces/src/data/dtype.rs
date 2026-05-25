@@ -877,6 +877,7 @@ mod tests {
     use super::{is_parquet_path, jsonl_compression_for_path, normalize_dtype};
     use crate::error::WyrdPyError;
     use std::path::Path;
+    use wyrd_spec::card::field::is_canonical_dtype;
 
     #[test]
     fn jsonl_compression_maps_locked_suffixes() {
@@ -1031,5 +1032,22 @@ mod tests {
             panic!("unknown dtype should map to a public WyrdError");
         };
         assert_eq!(error.code(), "WYRD_DATA_400_UNKNOWN_DATA_TYPE");
+    }
+
+    #[test]
+    fn normalized_dtypes_are_accepted_by_spec_predicate() {
+        for (source, dtype) in [
+            ("pandas", "category"),
+            ("polars", "List(Int64)"),
+            ("pyarrow", "StructType(a:int64,b:string)"),
+            ("numpy", "datetime64[ns]"),
+            ("torch", "torch.float32"),
+        ] {
+            let canonical = normalize_dtype(source, dtype).unwrap();
+            assert!(
+                is_canonical_dtype(&canonical),
+                "{source} dtype {dtype} normalized to non-canonical {canonical}"
+            );
+        }
     }
 }

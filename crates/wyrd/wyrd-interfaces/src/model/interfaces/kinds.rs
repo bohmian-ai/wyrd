@@ -1,12 +1,9 @@
-use std::collections::BTreeMap;
-
 use crate::model::interfaces::ModelInterface;
 use wyrd_spec::card::model::{HuggingFaceTask, TfSaveFormat, TorchSaveFormat};
 
 #[cfg(feature = "python")]
 use {
     crate::error::{CardPyResult, WyrdPyError},
-    crate::model::detect::python_version_string,
     crate::model::interfaces::options::{
         huggingface_task_token, parse_huggingface_task, parse_tf_save_format,
         parse_torch_save_format, tf_save_format_token, torch_save_format_token,
@@ -137,22 +134,6 @@ HuggingfaceInterface {
     hf_task: HuggingFaceTask,
     repo_id: Option<String>,
     revision: Option<String>,
-});
-
-model_interface_struct!(
-/// Python builder for the Custom model interface.
-#[cfg_attr(
-    feature = "python",
-    pyclass(module = "wyrd.model", name = "CustomInterface", extends = ModelInterface)
-)]
-CustomInterface {
-    model: Option<Py<PyAny>>,
-    preprocessor: Option<Py<PyAny>>,
-    framework_version: String,
-    model_subtype: Option<String>,
-    loader_module: String,
-    loader_class: String,
-    extra: BTreeMap<String, String>,
 });
 
 #[cfg(feature = "python")]
@@ -428,57 +409,6 @@ impl_model_interface_methods!(HuggingfaceInterface {
 });
 
 #[cfg(feature = "python")]
-impl_model_interface_methods!(CustomInterface {
-    /// Create a Custom model interface.
-    #[new]
-    #[pyo3(signature = (*, model=None, preprocessor=None, loader_module, loader_class, extra=None))]
-    fn __new__(
-        py: Python<'_>,
-        model: Option<Py<PyAny>>,
-        preprocessor: Option<Py<PyAny>>,
-        loader_module: String,
-        loader_class: String,
-        extra: Option<BTreeMap<String, String>>,
-    ) -> CardPyResult<(Self, ModelInterface)> {
-        if loader_module.trim().is_empty() || loader_class.trim().is_empty() {
-            return Err(WyrdPyError::validation(
-                "CustomInterface requires non-empty loader module and loader class",
-            ));
-        }
-        Ok((
-            Self {
-                model_subtype: model_subtype(py, model.as_ref())?,
-                model,
-                preprocessor,
-                framework_version: python_version_string(py)?,
-                loader_module,
-                loader_class,
-                extra: extra.unwrap_or_default(),
-            },
-            ModelInterface::marker("Custom"),
-        ))
-    }
-
-    /// Return the loader module path.
-    #[getter]
-    fn loader_module(&self) -> &str {
-        &self.loader_module
-    }
-
-    /// Return the loader class or callable name.
-    #[getter]
-    fn loader_class(&self) -> &str {
-        &self.loader_class
-    }
-
-    /// Return custom string metadata.
-    #[getter]
-    fn extra(&self) -> BTreeMap<String, String> {
-        self.extra.clone()
-    }
-});
-
-#[cfg(feature = "python")]
 fn package_version(py: Python<'_>, package: &str) -> CardPyResult<String> {
     Ok(module_version(py, package)?.unwrap_or_else(|| "unknown".to_string()))
 }
@@ -588,21 +518,6 @@ impl HuggingfaceInterface {
             hf_task: HuggingFaceTask::Other,
             repo_id: None,
             revision: None,
-        }
-    }
-}
-
-#[cfg(feature = "python")]
-impl CustomInterface {
-    pub(super) fn empty_live() -> Self {
-        Self {
-            model: None,
-            preprocessor: None,
-            framework_version: String::new(),
-            model_subtype: None,
-            loader_module: String::new(),
-            loader_class: String::new(),
-            extra: BTreeMap::new(),
         }
     }
 }

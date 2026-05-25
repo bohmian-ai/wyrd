@@ -1,10 +1,10 @@
 use crate::error::{CardPyResult, WyrdPyError};
 use crate::model::interfaces::kinds::{
-    CatboostInterface, CustomInterface, HuggingfaceInterface, LightgbmInterface,
-    LightningInterface, SklearnInterface, TensorflowInterface, TorchInterface, XgboostInterface,
+    CatboostInterface, HuggingfaceInterface, LightgbmInterface, LightningInterface,
+    SklearnInterface, TensorflowInterface, TorchInterface, XgboostInterface,
 };
 use wyrd_spec::card::model::{
-    CatboostMeta, CustomMeta, HuggingfaceMeta, LightgbmMeta, LightningMeta,
+    CatboostMeta, HuggingfaceMeta, LightgbmMeta, LightningMeta,
     ModelInterface as RustModelInterface, SklearnMeta, TensorflowMeta, TorchMeta, XgboostMeta,
 };
 
@@ -142,22 +142,6 @@ impl_to_spec!(
             hf_task: value.hf_task,
             repo_id: value.repo_id.clone(),
             revision: value.revision.clone(),
-        })
-    }
-);
-
-impl_to_spec!(
-    CustomInterface,
-    CustomMeta,
-    Custom,
-    "CustomInterface metadata must contain Custom metadata",
-    |value: &CustomInterface, _py| {
-        Ok(CustomMeta {
-            framework_version: value.framework_version.clone(),
-            model_subtype: value.model_subtype.clone(),
-            loader_module: value.loader_module.clone(),
-            loader_class: value.loader_class.clone(),
-            extra: value.extra.clone(),
         })
     }
 );

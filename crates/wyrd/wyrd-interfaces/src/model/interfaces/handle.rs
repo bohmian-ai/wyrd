@@ -6,8 +6,8 @@ use pyo3::types::PyAny;
 use crate::error::{CardPyResult, WyrdPyError};
 use crate::model::interfaces::ModelInterface;
 use crate::model::interfaces::kinds::{
-    CatboostInterface, CustomInterface, HuggingfaceInterface, LightgbmInterface,
-    LightningInterface, SklearnInterface, TensorflowInterface, TorchInterface, XgboostInterface,
+    CatboostInterface, HuggingfaceInterface, LightgbmInterface, LightningInterface,
+    SklearnInterface, TensorflowInterface, TorchInterface, XgboostInterface,
 };
 use wyrd_spec::card::model::{CustomMeta, ModelInterface as RustModelInterface};
 
@@ -29,8 +29,6 @@ pub enum ModelInterfaceHandle {
     Tensorflow(TensorflowInterface),
     /// Huggingface model interface.
     Huggingface(HuggingfaceInterface),
-    /// Custom model interface.
-    Custom(CustomInterface),
     /// Python subclass of the base `ModelInterface`.
     Subclass(Py<PyAny>),
 }
@@ -59,8 +57,6 @@ impl ModelInterfaceHandle {
         extract_interface!(LightningInterface, Lightning);
         extract_interface!(TensorflowInterface, Tensorflow);
         extract_interface!(HuggingfaceInterface, Huggingface);
-        extract_interface!(CustomInterface, Custom);
-
         if interface.is_instance_of::<ModelInterface>() {
             return Ok(Self::Subclass(interface.clone().unbind()));
         }
@@ -85,7 +81,6 @@ impl ModelInterfaceHandle {
             Self::Lightning(value) => value.to_spec_interface(py),
             Self::Tensorflow(value) => value.to_spec_interface(py),
             Self::Huggingface(value) => value.to_spec_interface(py),
-            Self::Custom(value) => value.to_spec_interface(py),
             Self::Subclass(_) => Ok(RustModelInterface::Custom(CustomMeta {
                 framework_version: String::new(),
                 model_subtype: None,

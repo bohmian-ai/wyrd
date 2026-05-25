@@ -18,8 +18,8 @@ pub use base::ModelInterface;
 pub use handle::ModelInterfaceHandle;
 #[cfg(feature = "python")]
 pub use kinds::{
-    CatboostInterface, CustomInterface, HuggingfaceInterface, LightgbmInterface,
-    LightningInterface, SklearnInterface, TensorflowInterface, TorchInterface, XgboostInterface,
+    CatboostInterface, HuggingfaceInterface, LightgbmInterface, LightningInterface,
+    SklearnInterface, TensorflowInterface, TorchInterface, XgboostInterface,
 };
 pub use options::{
     parse_huggingface_task, parse_sample_input_kind, parse_task_type, parse_tf_save_format,
@@ -41,6 +41,5 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<LightningInterface>()?;
     module.add_class::<TensorflowInterface>()?;
     module.add_class::<HuggingfaceInterface>()?;
-    module.add_class::<CustomInterface>()?;
     Ok(())
 }

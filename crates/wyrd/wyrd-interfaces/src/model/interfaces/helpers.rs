@@ -4,8 +4,8 @@ use crate::error::CardPyResult;
 use {
     pyo3::prelude::*,
     wyrd_spec::card::model::{
-        CatboostMeta, CustomMeta, HuggingfaceMeta, LightgbmMeta, LightningMeta, SklearnMeta,
-        TensorflowMeta, TorchMeta, XgboostMeta,
+        CatboostMeta, HuggingfaceMeta, LightgbmMeta, LightningMeta, SklearnMeta, TensorflowMeta,
+        TorchMeta, XgboostMeta,
     },
 };
 
@@ -88,13 +88,6 @@ clone_for_handle!(
     { framework_version, model_subtype, hf_task, repo_id, revision }
 );
 #[cfg(feature = "python")]
-clone_for_handle!(
-    crate::model::interfaces::kinds::CustomInterface,
-    { model, preprocessor },
-    { framework_version, model_subtype, loader_module, loader_class, extra }
-);
-
-#[cfg(feature = "python")]
 macro_rules! from_meta {
     ($type:ty, $meta:ty, { $($field:ident),* $(,)? }) => {
         impl $type {
@@ -155,10 +148,4 @@ from_meta!(
     crate::model::interfaces::kinds::HuggingfaceInterface,
     HuggingfaceMeta,
     { framework_version, model_subtype, hf_task, repo_id, revision }
-);
-#[cfg(feature = "python")]
-from_meta!(
-    crate::model::interfaces::kinds::CustomInterface,
-    CustomMeta,
-    { framework_version, model_subtype, loader_module, loader_class, extra }
 );

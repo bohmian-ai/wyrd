@@ -29,44 +29,10 @@ jobs:
       - name: Detect changed areas
         id: filter
         shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            base="${{ github.event.pull_request.base.sha }}"
-            head="${{ github.event.pull_request.head.sha }}"
-          else
-            base="${{ github.event.before }}"
-            head="${{ github.sha }}"
-          fi
-
-          git diff --name-only "$base" "$head" > /tmp/changed-files
-
-          set_output() {
-            local name="$1"
-            local pattern="$2"
-            if grep -Eq "$pattern" /tmp/changed-files; then
-              echo "$name=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "$name=false" >> "$GITHUB_OUTPUT"
-            fi
-          }
-
-          set_output rust '^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|deny\.toml|mise\.toml|crates/|python/py-wyrd/Cargo\.toml|python/py-wyrd/src/)'
-          set_output python '^(mise\.toml|Cargo\.toml|Cargo\.lock|crates/shared/wyrd-utils/|crates/wyrd/wyrd-cards/|crates/wyrd/wyrd-interfaces/|python/py-wyrd/|examples/python/)'
-          set_output docs '^(mise\.toml|docs/|openapi\.yaml|crates/wyrd-spec/schemas/|examples/)'
-          set_output ui '^(mise\.toml|crates/wyrd/wyrd-server/wyrd-ui/)'
-          set_output generated '^(mise\.toml|Cargo\.toml|Cargo\.lock|crates/wyrd-spec/|crates/wyrd/wyrd-cards/|crates/wyrd/wyrd-interfaces/|python/py-wyrd/)'
-          set_output workflow '^(\.github/workflows/)'
-
-          if [[ -s /tmp/changed-files ]]; then
-            echo "any=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "any=false" >> "$GITHUB_OUTPUT"
-          fi
-
-          echo "Changed files:"
-          sed 's/^/- /' /tmp/changed-files
+        env:
+          WYRD_CHANGE_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          WYRD_CHANGE_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: .github/scripts/detect-changes.sh
 
   rust:
     name: rust (${{ matrix.os }})

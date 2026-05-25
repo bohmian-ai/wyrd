@@ -7,8 +7,8 @@ import WyrdHero from "../../components/WyrdHero.astro";
 
 <WyrdHero
   title="Wyrd"
-  tagline="The declarative AI layer for developers, engineers, and agents."
-  sub="A standardized ecosystem for every model, prompt, agent, and service you ship. Declare it once. Govern, evaluate, deploy, and observe it everywhere."
+  tagline="The AI layer for human and agentic workflows."
+  sub="Cards declare durable AI system components. Specs define kind-specific contracts. Registry, policy, lineage, audit, observability, and install services operate on the same envelope."
 />
 
 <ul class="wyrd-stats">
@@ -18,20 +18,51 @@ import WyrdHero from "../../components/WyrdHero.astro";
   <li><strong>1</strong><span>Lineage graph</span></li>
 </ul>
 
-## One platform, four jobs
+## Start with a local DataCard
+
+```python
+from pathlib import Path
+
+import pandas as pd
+from wyrd.data import DataCard, PandasInterface
+
+path = Path("customer_churn_card")
+data = pd.DataFrame({"customer_id": [1, 2], "churned": [False, True]})
+
+card = DataCard(
+    PandasInterface(data=data),
+    name="customer-churn",
+    version="0.1.0",
+    labels={"domain": "customer", "stage": "example"},
+    annotations={"example.com/source": "docs quickstart"},
+)
+
+card.save(path)
+
+restored = DataCard.model_validate_json((path / "card.json").read_text())
+restored.load(path)
+
+print(restored.data)
+```
+
+Run the full example from the repo with
+[`examples/python/datacard_local_workflow.py`](https://github.com/wyrd-ai/wyrd/tree/main/examples/python).
+The [quickstart](/start-here/quickstart/) shows the exact setup command.
+
+## One envelope, several jobs
 
 <dl class="wyrd-defs">
   <dt data-kind="service">Security</dt>
-  <dd>Policy as code. Immutable audit. Lineage from model to deployment. Auditor-ready in week one.</dd>
+  <dd>Policy decisions, audit history, and lineage read the same Card envelope.</dd>
 
   <dt data-kind="model">Infra</dt>
-  <dd>A real inventory of every model, prompt, agent, and service in production. Versioned, owned, locked.</dd>
+  <dd>Inventory works across models, prompts, data, agents, workflows, and services without one-off schemas.</dd>
 
   <dt data-kind="prompt">Data Science</dt>
-  <dd>One standard path from notebook to deployment. Same envelope for every artifact.</dd>
+  <dd>Local holders such as `DataCard` can materialize data locally before registry and storage services take over durable registration.</dd>
 
   <dt data-kind="experiment">Observability</dt>
-  <dd>Evals, drift, and behavior in a unified view. Every signal ties back to a Card version.</dd>
+  <dd>Runs and observations tie measured behavior back to declared Card versions.</dd>
 </dl>
 
 ## Start here
@@ -39,20 +70,28 @@ import WyrdHero from "../../components/WyrdHero.astro";
 | You are | Start with |
 | --- | --- |
 | New to Wyrd | [What is Wyrd?](/start-here/what-is-wyrd/) |
-| Data scientist or ML engineer | [Register a card](/guides/register-card/) |
+| Data scientist or ML engineer | [DataCard local workflow](/guides/data-card-local-workflow/) |
 | Platform engineer | [Concepts overview](/concepts/) |
 | Agent or LLM caller | [For agents](/start-here/agents/) |
 | Security or compliance | [Policy and audit](/policy-audit/) |
 
 ## What exists today
 
-JSON Schemas for all 18 Card kinds. Runtime, telemetry, and testing crate shells; behavior lands in Phase 5a. Generated reference pages for every Card kind, the OpenAPI surface, and the error catalog.
+Wyrd has generated schemas for all 18 Card kinds, generated reference pages,
+and a Python DataCard surface for local data materialization. The DataCard
+surface supports public `wyrd.data` imports, built-in data interfaces, custom
+Python `DataInterface` subclasses, local `save`, local `load`, labels,
+annotations, and structured Wyrd errors.
 
-CLI, Python SDK, HTTP routes, and MCP tools land in later phases. Pages for those surfaces exist already and name the phase that fills them in.
+Registry, storage, HTTP, CLI, and MCP surfaces build on the same Card envelope.
+When those services own durable registration, card objects still remain local
+holders: user code runs, Wyrd records and governs.
 
 ## Reference
 
-The 18 Card kinds and their schemas live under [Card reference](/cards/). The seven primitives that compose them live under [Concepts](/concepts/).
+The 18 Card kinds and their schemas live under [Card reference](/cards/).
+The [Data card reference](/cards/data/) gives the generated Data spec shape.
+The shared primitives live under [Concepts](/concepts/).
 
 ## For agents
 

@@ -1,0 +1,70 @@
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ._native import (
+        ArrowInterface,
+        ArtifactCard,
+        DataCard,
+        DataInterface,
+        DataSchema,
+        DataStats,
+        FieldSpec,
+        HuggingfaceInterface,
+        ImageInterface,
+        JsonlInterface,
+        NumpyInterface,
+        PandasInterface,
+        ParquetInterface,
+        PolarsInterface,
+        Split,
+        SqlInterface,
+        TextInterface,
+        TorchInterface,
+        WyrdError,
+    )
+else:
+    # R12 registers this private native submodule dynamically in `sys.modules`.
+    # The runtime import mirrors `wyrd.data`.
+    from ._native.cards.data import (
+        ArrowInterface,
+        ArtifactCard,
+        DataCard,
+        DataInterface,
+        DataSchema,
+        DataStats,
+        FieldSpec,
+        HuggingfaceInterface,
+        ImageInterface,
+        JsonlInterface,
+        NumpyInterface,
+        PandasInterface,
+        ParquetInterface,
+        PolarsInterface,
+        Split,
+        SqlInterface,
+        TextInterface,
+        TorchInterface,
+        WyrdError,
+    )
+
+__all__ = [
+    "ArrowInterface",
+    "ArtifactCard",
+    "DataCard",
+    "DataInterface",
+    "DataSchema",
+    "DataStats",
+    "FieldSpec",
+    "HuggingfaceInterface",
+    "ImageInterface",
+    "JsonlInterface",
+    "NumpyInterface",
+    "PandasInterface",
+    "ParquetInterface",
+    "PolarsInterface",
+    "Split",
+    "SqlInterface",
+    "TextInterface",
+    "TorchInterface",
+    "WyrdError",
+]

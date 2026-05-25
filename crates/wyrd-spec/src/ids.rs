@@ -9,16 +9,7 @@ macro_rules! id_type {
     ($name:ident, $doc:literal, $validator:ident) => {
         #[doc = $doc]
         #[derive(
-            Debug,
-            Clone,
-            PartialEq,
-            Eq,
-            PartialOrd,
-            Ord,
-            Hash,
-            Serialize,
-            Deserialize,
-            schemars::JsonSchema,
+            Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, schemars::JsonSchema,
         )]
         #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
         pub struct $name(String);
@@ -60,6 +51,16 @@ macro_rules! id_type {
                 value.0
             }
         }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
     };
 }
 
@@ -87,9 +88,30 @@ id_type!(
     validate_opaque
 );
 id_type!(ArtifactKey, "Artifact storage key.", validate_token);
+id_type!(ColumnName, "DataCard column name.", validate_card_token);
+id_type!(SplitName, "DataCard split label.", validate_card_token);
+id_type!(QueryName, "DataCard SQL query key.", validate_card_token);
 
 fn validate_token(value: &str) -> Result<(), IdError> {
     if value.len() < 3 || value.len() > 64 {
+        return Err(IdError::InvalidToken);
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return Err(IdError::InvalidToken);
+    };
+    if !first.is_ascii_lowercase() {
+        return Err(IdError::InvalidToken);
+    }
+    if chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-') {
+        Ok(())
+    } else {
+        Err(IdError::InvalidToken)
+    }
+}
+
+fn validate_card_token(value: &str) -> Result<(), IdError> {
+    if value.is_empty() || value.len() > 64 {
         return Err(IdError::InvalidToken);
     }
     let mut chars = value.chars();

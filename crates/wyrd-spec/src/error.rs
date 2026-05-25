@@ -3,91 +3,26 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::error::derive::WyrdError as WyrdErrorMeta;
+
 /// Proc-macro re-export for Wyrd-coded error enums.
 pub mod derive {
     pub use wyrd_error_derive::WyrdError;
 }
 
-/// Stable Wyrd error code registry for foundation errors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ErrorCode {
-    /// Request payload failed validation.
-    WyrdSpec400Validation,
-    /// Requested entity was not found.
-    WyrdSpec404NotFound,
-    /// Write was rejected because of a conflict.
-    WyrdSpec409Conflict,
-    /// Caller lacks permission.
-    WyrdSpec403PermissionDenied,
-    /// Unexpected internal failure.
-    WyrdSpec500Internal,
-    /// Upstream dependency failed.
-    WyrdSpec502UpstreamFailure,
-    /// Operation timed out.
-    WyrdSpec504Timeout,
-}
-
-impl ErrorCode {
-    /// Stable string code.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::WyrdSpec400Validation => "WYRD_SPEC_400_VALIDATION",
-            Self::WyrdSpec404NotFound => "WYRD_SPEC_404_NOT_FOUND",
-            Self::WyrdSpec409Conflict => "WYRD_SPEC_409_CONFLICT",
-            Self::WyrdSpec403PermissionDenied => "WYRD_SPEC_403_PERMISSION_DENIED",
-            Self::WyrdSpec500Internal => "WYRD_SPEC_500_INTERNAL",
-            Self::WyrdSpec502UpstreamFailure => "WYRD_SPEC_502_UPSTREAM_FAILURE",
-            Self::WyrdSpec504Timeout => "WYRD_SPEC_504_TIMEOUT",
-        }
-    }
-
-    /// Suggested HTTP status.
-    #[must_use]
-    pub const fn status(self) -> u16 {
-        match self {
-            Self::WyrdSpec400Validation => 400,
-            Self::WyrdSpec404NotFound => 404,
-            Self::WyrdSpec409Conflict => 409,
-            Self::WyrdSpec403PermissionDenied => 403,
-            Self::WyrdSpec500Internal => 500,
-            Self::WyrdSpec502UpstreamFailure => 502,
-            Self::WyrdSpec504Timeout => 504,
-        }
-    }
-
-    /// Operator-facing remediation hint.
-    #[must_use]
-    pub const fn remediation(self) -> &'static str {
-        match self {
-            Self::WyrdSpec400Validation => {
-                "Check the submitted Card, Spec, Run, or helper value against the published schema."
-            }
-            Self::WyrdSpec404NotFound => "Check that the referenced Wyrd resource exists.",
-            Self::WyrdSpec409Conflict => {
-                "Refresh the resource and retry with the current version or idempotency key."
-            }
-            Self::WyrdSpec403PermissionDenied => {
-                "Check the caller scopes, actor identity, and policy decision."
-            }
-            Self::WyrdSpec500Internal => "Retry later or inspect server logs using the request ID.",
-            Self::WyrdSpec502UpstreamFailure => {
-                "Check the upstream dependency health and retry policy."
-            }
-            Self::WyrdSpec504Timeout => "Retry with a longer timeout or reduce the request scope.",
-        }
-    }
-}
-
 /// Top-level Wyrd error value passed across crate and wire boundaries.
-#[derive(Debug, Error, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Error, Serialize, Deserialize, schemars::JsonSchema, WyrdErrorMeta)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WyrdError {
     /// Request payload failed validation.
     #[error("[WYRD_SPEC_400_VALIDATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_400_VALIDATION",
+        status = 400,
+        title = "Validation failed",
+        remediation = "Check the submitted Wyrd request fields against the published schema and retry."
+    )]
     Validation {
         /// Human-readable error message.
         message: String,
@@ -96,6 +31,12 @@ pub enum WyrdError {
     },
     /// Requested entity was not found.
     #[error("[WYRD_SPEC_404_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_404_NOT_FOUND",
+        status = 404,
+        title = "Resource not found",
+        remediation = "Check that the referenced Wyrd resource exists."
+    )]
     NotFound {
         /// Human-readable error message.
         message: String,
@@ -104,6 +45,12 @@ pub enum WyrdError {
     },
     /// Write was rejected due to a duplicate key or concurrent change.
     #[error("[WYRD_SPEC_409_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_409_CONFLICT",
+        status = 409,
+        title = "Conflict",
+        remediation = "Refresh the resource and retry with the current version or idempotency key."
+    )]
     Conflict {
         /// Human-readable error message.
         message: String,
@@ -112,6 +59,12 @@ pub enum WyrdError {
     },
     /// Caller is authenticated but lacks permission.
     #[error("[WYRD_SPEC_403_PERMISSION_DENIED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_403_PERMISSION_DENIED",
+        status = 403,
+        title = "Permission denied",
+        remediation = "Check the caller scopes, actor identity, and policy decision."
+    )]
     PermissionDenied {
         /// Human-readable error message.
         message: String,
@@ -120,6 +73,12 @@ pub enum WyrdError {
     },
     /// Unexpected internal failure.
     #[error("[WYRD_SPEC_500_INTERNAL] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_500_INTERNAL",
+        status = 500,
+        title = "Internal error",
+        remediation = "Retry later or inspect server logs using the request ID."
+    )]
     Internal {
         /// Human-readable error message.
         message: String,
@@ -128,6 +87,12 @@ pub enum WyrdError {
     },
     /// Upstream dependency failed.
     #[error("[WYRD_SPEC_502_UPSTREAM_FAILURE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_502_UPSTREAM_FAILURE",
+        status = 502,
+        title = "Upstream dependency failed",
+        remediation = "Check the upstream dependency health and retry policy."
+    )]
     UpstreamFailure {
         /// Human-readable error message.
         message: String,
@@ -136,7 +101,97 @@ pub enum WyrdError {
     },
     /// Operation exceeded its deadline.
     #[error("[WYRD_SPEC_504_TIMEOUT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_504_TIMEOUT",
+        status = 504,
+        title = "Timeout",
+        remediation = "Retry with a longer timeout or reduce the request scope."
+    )]
     Timeout {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// DataCard validation failed.
+    #[error("[WYRD_DATA_400_VALIDATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_DATA_400_VALIDATION",
+        status = 400,
+        title = "DataCard validation failed",
+        remediation = "Fix the DataCard schema, artifact, stats, or interface metadata."
+    )]
+    DataValidation {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Python data input could not be classified as a supported DataCard source.
+    #[error("[WYRD_DATA_400_UNKNOWN_DATA_TYPE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_DATA_400_UNKNOWN_DATA_TYPE",
+        status = 400,
+        title = "Unknown DataCard data type",
+        remediation = "Pass a supported data object, path, or explicit DataInterface."
+    )]
+    DataUnknownDataType {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A DataCard split declaration is invalid.
+    #[error("[WYRD_DATA_400_INVALID_SPLIT_RULE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_DATA_400_INVALID_SPLIT_RULE",
+        status = 400,
+        title = "Invalid DataCard split rule",
+        remediation = "Use a supported split operator and reference schema columns that exist."
+    )]
+    DataInvalidSplitRule {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A DataCard target column is absent from the declared schema.
+    #[error("[WYRD_DATA_400_TARGET_COLUMN_UNKNOWN] {message}")]
+    #[wyrd_error(
+        code = "WYRD_DATA_400_TARGET_COLUMN_UNKNOWN",
+        status = 400,
+        title = "Unknown DataCard target column",
+        remediation = "Declare target columns that exist in the DataCard schema."
+    )]
+    DataTargetColumnUnknown {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A Python DataCard interface option was invalid.
+    #[error("[WYRD_DATA_400_INVALID_INTERFACE_OPTION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_DATA_400_INVALID_INTERFACE_OPTION",
+        status = 400,
+        title = "Invalid DataCard interface option",
+        remediation = "Use one of the supported interface option values."
+    )]
+    DataInvalidInterfaceOption {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Interface metadata was required but could not be inferred.
+    #[error("[WYRD_DATA_400_INTERFACE_METADATA_REQUIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_DATA_400_INTERFACE_METADATA_REQUIRED",
+        status = 400,
+        title = "DataCard interface metadata required",
+        remediation = "Pass an explicit DataInterface with enough metadata to describe the data source."
+    )]
+    DataInterfaceMetadataRequired {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -145,60 +200,36 @@ pub enum WyrdError {
 }
 
 impl WyrdError {
-    /// Stable error code.
-    #[must_use]
-    pub fn code(&self) -> &str {
-        self.error_code().as_str()
-    }
-
-    /// Suggested HTTP status.
-    #[must_use]
-    pub fn status(&self) -> u16 {
-        self.error_code().status()
-    }
-
-    /// Stable error-code enum.
-    #[must_use]
-    pub const fn error_code(&self) -> ErrorCode {
-        match self {
-            Self::Validation { .. } => ErrorCode::WyrdSpec400Validation,
-            Self::NotFound { .. } => ErrorCode::WyrdSpec404NotFound,
-            Self::Conflict { .. } => ErrorCode::WyrdSpec409Conflict,
-            Self::PermissionDenied { .. } => ErrorCode::WyrdSpec403PermissionDenied,
-            Self::Internal { .. } => ErrorCode::WyrdSpec500Internal,
-            Self::UpstreamFailure { .. } => ErrorCode::WyrdSpec502UpstreamFailure,
-            Self::Timeout { .. } => ErrorCode::WyrdSpec504Timeout,
-        }
-    }
-
-    /// Operator-facing remediation hint.
-    #[must_use]
-    pub fn remediation(&self) -> &'static str {
-        self.error_code().remediation()
-    }
-
     /// RFC 9457 JSON problem payload.
     #[must_use]
     pub fn as_problem_json(&self) -> serde_json::Value {
-        let (title, message, details) = match self {
-            Self::Validation { message, details } => ("Validation failed", message, details),
-            Self::NotFound { message, details } => ("Resource not found", message, details),
-            Self::Conflict { message, details } => ("Conflict", message, details),
-            Self::PermissionDenied { message, details } => ("Permission denied", message, details),
-            Self::Internal { message, details } => ("Internal error", message, details),
-            Self::UpstreamFailure { message, details } => {
-                ("Upstream dependency failed", message, details)
-            }
-            Self::Timeout { message, details } => ("Timeout", message, details),
-        };
+        let (message, details) = self.message_details();
         serde_json::json!({
             "type": format!("https://wyrd.dev/problems/{}", self.code()),
-            "title": title,
+            "title": self.title(),
             "status": self.status(),
             "detail": message,
             "code": self.code(),
             "details": details,
             "remediation": self.remediation(),
         })
+    }
+
+    fn message_details(&self) -> (&str, &serde_json::Value) {
+        match self {
+            Self::Validation { message, details }
+            | Self::NotFound { message, details }
+            | Self::Conflict { message, details }
+            | Self::PermissionDenied { message, details }
+            | Self::Internal { message, details }
+            | Self::UpstreamFailure { message, details }
+            | Self::Timeout { message, details }
+            | Self::DataValidation { message, details }
+            | Self::DataUnknownDataType { message, details }
+            | Self::DataInvalidSplitRule { message, details }
+            | Self::DataTargetColumnUnknown { message, details }
+            | Self::DataInvalidInterfaceOption { message, details }
+            | Self::DataInterfaceMetadataRequired { message, details } => (message, details),
+        }
     }
 }

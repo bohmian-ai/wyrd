@@ -1,14 +1,14 @@
 ---
-// Brutalist SVG of the 7-primitive connection graph.
+// Brutalist SVG of the Wyrd concept model.
 // Geometry: hard-shadowed boxes, 2.5px borders, 3px arrows.
 // All colors flow through wyrd.css tokens so light/dark both work.
 ---
 
 <svg
   class="wyrd-diagram"
-  viewBox="0 0 720 460"
+  viewBox="0 0 720 620"
   role="img"
-  aria-label="Wyrd primitives: Card, Spec, Run, Observation, Policy, Audit, Lineage"
+  aria-label="Wyrd concepts: Card and Spec declare intent, services produce lineage, policy decisions, audit history, Runs, and Observations"
   xmlns="http://www.w3.org/2000/svg"
 >
   <defs>
@@ -25,94 +25,108 @@
     </marker>
   </defs>
 
-  <!-- Policy (top) -->
-  <g transform="translate(300, 12)">
-    <rect class="node-shadow" x="6" y="6" width="120" height="56" />
-    <rect class="node-fill" x="0" y="0" width="120" height="56" />
-    <rect class="node-stroke" x="0" y="0" width="120" height="56" />
-    <text class="node-text" x="60" y="26">POLICY</text>
-    <text class="node-sub" x="60" y="44">decides</text>
+  <!-- Section labels -->
+  <text class="arrow-label" x="80" y="28">declared contract</text>
+  <text class="arrow-label" x="80" y="292">service-owned outcomes</text>
+  <text class="arrow-label" x="80" y="506">execution evidence</text>
+
+  <!-- Card -->
+  <g transform="translate(260, 44)">
+    <rect class="node-shadow" x="6" y="6" width="200" height="72" />
+    <rect class="node-fill-accent" x="0" y="0" width="200" height="72" />
+    <rect class="node-stroke" x="0" y="0" width="200" height="72" />
+    <text class="node-text node-text-on-accent" x="100" y="30">CARD</text>
+    <text class="node-sub node-sub-on-accent" x="100" y="50">envelope + kind</text>
   </g>
 
-  <!-- Card (center, accent) -->
-  <g transform="translate(300, 192)">
-    <rect class="node-shadow" x="6" y="6" width="120" height="64" />
-    <rect class="node-fill-accent" x="0" y="0" width="120" height="64" />
-    <rect class="node-stroke" x="0" y="0" width="120" height="64" />
-    <text class="node-text node-text-on-accent" x="60" y="30">CARD</text>
-    <text class="node-sub node-sub-on-accent" x="60" y="50">envelope</text>
+  <!-- Spec -->
+  <g transform="translate(260, 156)">
+    <rect class="node-shadow" x="6" y="6" width="200" height="64" />
+    <rect class="node-fill" x="0" y="0" width="200" height="64" />
+    <rect class="node-stroke" x="0" y="0" width="200" height="64" />
+    <text class="node-text" x="100" y="28">SPEC</text>
+    <text class="node-sub" x="100" y="48">declared intent + refs</text>
   </g>
 
-  <!-- Spec (left of Card) -->
-  <g transform="translate(80, 196)">
-    <rect class="node-shadow" x="6" y="6" width="120" height="56" />
-    <rect class="node-fill" x="0" y="0" width="120" height="56" />
-    <rect class="node-stroke" x="0" y="0" width="120" height="56" />
-    <text class="node-text" x="60" y="26">SPEC</text>
-    <text class="node-sub" x="60" y="44">typed payload</text>
+  <!-- Lineage -->
+  <g transform="translate(260, 252)">
+    <rect class="node-shadow" x="6" y="6" width="200" height="64" />
+    <rect class="node-fill" x="0" y="0" width="200" height="64" />
+    <rect class="node-stroke" x="0" y="0" width="200" height="64" />
+    <text class="node-text" x="100" y="28">LINEAGE</text>
+    <text class="node-sub" x="100" y="48">derived graph view</text>
   </g>
 
-  <!-- Audit (right of Card) -->
-  <g transform="translate(520, 196)">
-    <rect class="node-shadow" x="6" y="6" width="120" height="56" />
-    <rect class="node-fill" x="0" y="0" width="120" height="56" />
-    <rect class="node-stroke" x="0" y="0" width="120" height="56" />
-    <text class="node-text" x="60" y="26">AUDIT</text>
-    <text class="node-sub" x="60" y="44">who or what</text>
+  <!-- PolicyCard -->
+  <g transform="translate(70, 344)">
+    <rect class="node-shadow" x="6" y="6" width="160" height="60" />
+    <rect class="node-fill" x="0" y="0" width="160" height="60" />
+    <rect class="node-stroke" x="0" y="0" width="160" height="60" />
+    <text class="node-text" x="80" y="27">POLICYCARD</text>
+    <text class="node-sub" x="80" y="46">rule spec</text>
   </g>
 
-  <!-- Lineage (below Card) -->
-  <g transform="translate(300, 304)">
-    <rect class="node-shadow" x="6" y="6" width="120" height="56" />
-    <rect class="node-fill" x="0" y="0" width="120" height="56" />
-    <rect class="node-stroke" x="0" y="0" width="120" height="56" />
-    <text class="node-text" x="60" y="26">LINEAGE</text>
-    <text class="node-sub" x="60" y="44">graph</text>
+  <!-- Policy service -->
+  <g transform="translate(280, 344)">
+    <rect class="node-shadow" x="6" y="6" width="160" height="60" />
+    <rect class="node-fill" x="0" y="0" width="160" height="60" />
+    <rect class="node-stroke" x="0" y="0" width="160" height="60" />
+    <text class="node-text" x="80" y="27">POLICY</text>
+    <text class="node-sub" x="80" y="46">service decisions</text>
   </g>
 
-  <!-- Run (bottom-left) -->
-  <g transform="translate(150, 396)">
-    <rect class="node-shadow" x="6" y="6" width="120" height="56" />
-    <rect class="node-fill" x="0" y="0" width="120" height="56" />
-    <rect class="node-stroke" x="0" y="0" width="120" height="56" />
-    <text class="node-text" x="60" y="26">RUN</text>
-    <text class="node-sub" x="60" y="44">execution</text>
+  <!-- Audit history -->
+  <g transform="translate(490, 344)">
+    <rect class="node-shadow" x="6" y="6" width="160" height="60" />
+    <rect class="node-fill" x="0" y="0" width="160" height="60" />
+    <rect class="node-stroke" x="0" y="0" width="160" height="60" />
+    <text class="node-text" x="80" y="27">AUDIT HISTORY</text>
+    <text class="node-sub" x="80" y="46">who / what / why</text>
   </g>
 
-  <!-- Observation (bottom-right) -->
-  <g transform="translate(450, 396)">
-    <rect class="node-shadow" x="6" y="6" width="120" height="56" />
-    <rect class="node-fill" x="0" y="0" width="120" height="56" />
-    <rect class="node-stroke" x="0" y="0" width="120" height="56" />
-    <text class="node-text" x="60" y="26">OBSERVATION</text>
-    <text class="node-sub" x="60" y="44">behavior</text>
+  <!-- AuditCard -->
+  <g transform="translate(490, 424)">
+    <rect class="node-shadow" x="6" y="6" width="160" height="60" />
+    <rect class="node-fill" x="0" y="0" width="160" height="60" />
+    <rect class="node-stroke" x="0" y="0" width="160" height="60" />
+    <text class="node-text" x="80" y="27">AUDITCARD</text>
+    <text class="node-sub" x="80" y="46">evidence spec</text>
+  </g>
+
+  <!-- Run -->
+  <g transform="translate(170, 540)">
+    <rect class="node-shadow" x="6" y="6" width="160" height="60" />
+    <rect class="node-fill" x="0" y="0" width="160" height="60" />
+    <rect class="node-stroke" x="0" y="0" width="160" height="60" />
+    <text class="node-text" x="80" y="27">RUN</text>
+    <text class="node-sub" x="80" y="46">one execution</text>
+  </g>
+
+  <!-- Observation -->
+  <g transform="translate(390, 540)">
+    <rect class="node-shadow" x="6" y="6" width="160" height="60" />
+    <rect class="node-fill" x="0" y="0" width="160" height="60" />
+    <rect class="node-stroke" x="0" y="0" width="160" height="60" />
+    <text class="node-text" x="80" y="27">OBSERVATION</text>
+    <text class="node-sub" x="80" y="46">measured fact</text>
   </g>
 
   <!-- Arrows -->
-  <!-- Policy -> Card (evaluates) -->
-  <path class="arrow" d="M 360 70 L 360 190" />
-  <text class="arrow-label" x="368" y="132">evaluates</text>
+  <path class="arrow" d="M 360 118 L 360 154" />
+  <text class="arrow-label" x="372" y="140">kind selects</text>
 
-  <!-- Spec <- Card (typed payload) -->
-  <path class="arrow" d="M 296 224 L 204 224" />
-  <text class="arrow-label" x="210" y="216">typed</text>
+  <path class="arrow" d="M 360 222 L 360 250" />
+  <text class="arrow-label" x="372" y="240">server derives</text>
 
-  <!-- Card -> Audit (decision record) -->
-  <path class="arrow" d="M 424 224 L 516 224" />
-  <text class="arrow-label" x="430" y="216">records</text>
+  <path class="arrow" d="M 232 374 L 278 374" />
+  <text class="arrow-label" x="238" y="366">evaluates</text>
 
-  <!-- Card -> Lineage (references) -->
-  <path class="arrow" d="M 360 258 L 360 302" />
-  <text class="arrow-label" x="368" y="284">refs</text>
+  <path class="arrow" d="M 442 374 L 488 374" />
+  <text class="arrow-label" x="448" y="366">records</text>
 
-  <!-- Lineage -> Run -->
-  <path class="arrow" d="M 320 362 L 232 394" />
-  <text class="arrow-label" x="240" y="380">ties</text>
+  <path class="arrow" d="M 570 422 L 570 406" />
+  <text class="arrow-label" x="584" y="420">may reference</text>
 
-  <!-- Run -> Observation -->
-  <path class="arrow" d="M 274 424 L 446 424" />
-  <text class="arrow-label" x="320" y="416">emits</text>
-
-  <!-- Lineage -> Observation -->
-  <path class="arrow" d="M 400 362 L 508 394" />
+  <path class="arrow" d="M 332 570 L 388 570" />
+  <text class="arrow-label" x="340" y="562">produces</text>
 </svg>

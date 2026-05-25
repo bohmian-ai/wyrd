@@ -1279,6 +1279,47 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "definitions": {
+    "ArrowFormat": {
+      "description": "Arrow serialization formats accepted by DataCard.",
+      "oneOf": [
+        {
+          "description": "Arrow IPC file or stream.",
+          "enum": [
+            "Ipc"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Parquet output through Arrow.",
+          "enum": [
+            "Parquet"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ArrowMeta": {
+      "description": "Arrow interface metadata.",
+      "properties": {
+        "format": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ArrowFormat"
+            }
+          ],
+          "description": "Arrow serialization format."
+        },
+        "framework_version": {
+          "description": "Installed pyarrow version inferred by the Python boundary.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "format",
+        "framework_version"
+      ],
+      "type": "object"
+    },
     "CardKind": {
       "description": "Native Wyrd Card kind string or external kind object.",
       "oneOf": [
@@ -1398,193 +1439,1185 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
-    "NonSecretValue": {
-      "description": "Non-secret JSON-like configuration value.",
+    "ColValue": {
+      "anyOf": [
+        {
+          "description": "Signed integer predicate value.",
+          "format": "int64",
+          "type": "integer"
+        },
+        {
+          "description": "Floating-point predicate value.",
+          "format": "double",
+          "type": "number"
+        },
+        {
+          "description": "String predicate value.",
+          "type": "string"
+        },
+        {
+          "description": "Boolean predicate value.",
+          "type": "boolean"
+        },
+        {
+          "description": "UTC timestamp predicate value.",
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "description": "List predicate value used by membership checks.",
+          "items": {
+            "$ref": "#/definitions/ColValue"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "Literal value used by a column split predicate."
+    },
+    "ColorMode": {
+      "description": "Image color mode accepted by DataCard image manifests.",
       "oneOf": [
         {
-          "description": "String value.",
+          "description": "RGB color.",
+          "enum": [
+            "Rgb"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "RGBA color with alpha.",
+          "enum": [
+            "Rgba"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Single-channel grayscale.",
+          "enum": [
+            "Grayscale"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ColumnName": {
+      "description": "DataCard column name.",
+      "type": "string"
+    },
+    "CustomDataMeta": {
+      "description": "Custom Python loader metadata.",
+      "properties": {
+        "extra": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Loader-specific string options.",
+          "type": "object"
+        },
+        "loader_class": {
+          "description": "Python loader class name.",
+          "type": "string"
+        },
+        "loader_module": {
+          "description": "Importable Python module containing the loader class.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "loader_class",
+        "loader_module"
+      ],
+      "type": "object"
+    },
+    "DataInterface": {
+      "description": "Data source interface metadata.",
+      "oneOf": [
+        {
+          "description": "Pandas dataframe saved as parquet by default.",
           "properties": {
-            "type": {
+            "kind": {
               "enum": [
-                "str"
+                "Pandas"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/PandasMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Polars dataframe saved as parquet by default.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Polars"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/PolarsMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "PyArrow table saved as IPC or parquet.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Arrow"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/ArrowMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Existing parquet dataset or file.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Parquet"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/ParquetMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "NumPy array saved as NPY or NPZ.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Numpy"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/NumpyMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Torch tensor saved as safetensors or explicit pickle.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Torch"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/TorchMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "SQL query bundle.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Sql"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/SqlMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "JSON Lines data.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Jsonl"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/JsonlMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Image manifest data.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Image"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/ImageMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Text manifest data.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Text"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/TextMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Hugging Face dataset pointer or local dataset.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Huggingface"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/HuggingfaceMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Custom Python data loader.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Custom"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/CustomDataMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DataSchema": {
+      "description": "Ordered data schema for DataCard interfaces.",
+      "properties": {
+        "columns": {
+          "description": "Ordered columns; column order is part of the Wyrd contract.",
+          "items": {
+            "$ref": "#/definitions/FieldSpec"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "DataSplit": {
+      "description": "Named DataCard split declaration.",
+      "properties": {
+        "label": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SplitName"
+            }
+          ],
+          "description": "Stable split label, repeated to protect hand-authored map entries from drift."
+        },
+        "strategy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SplitStrategy"
+            }
+          ],
+          "description": "Split strategy declaration."
+        }
+      },
+      "required": [
+        "label",
+        "strategy"
+      ],
+      "type": "object"
+    },
+    "DataStats": {
+      "description": "Storage and byte-level statistics for a DataCard source.",
+      "properties": {
+        "byte_count": {
+          "description": "Number of bytes represented by this data artifact or source.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "col_count": {
+          "description": "Optional column count.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "row_count": {
+          "description": "Optional row count.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sha256": {
+          "description": "Lowercase SHA-256 hex digest for the represented bytes.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "byte_count",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "Dim": {
+      "description": "One dimension in a field shape.",
+      "oneOf": [
+        {
+          "description": "A fixed, known dimension length.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Fixed"
               ],
               "type": "string"
             },
             "value": {
-              "type": "string"
+              "format": "int64",
+              "type": "integer"
             }
           },
           "required": [
-            "type",
+            "kind",
             "value"
           ],
           "type": "object"
         },
         {
-          "description": "Numeric value.",
+          "description": "A dynamic dimension, optionally named for documentation and signatures.",
           "properties": {
-            "type": {
+            "kind": {
               "enum": [
-                "number"
+                "Dynamic"
               ],
               "type": "string"
             },
             "value": {
-              "format": "double",
-              "type": "number"
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
-            "type",
-            "value"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "Boolean value.",
-          "properties": {
-            "type": {
-              "enum": [
-                "bool"
-              ],
-              "type": "string"
-            },
-            "value": {
-              "type": "boolean"
-            }
-          },
-          "required": [
-            "type",
-            "value"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "List of non-secret values.",
-          "properties": {
-            "type": {
-              "enum": [
-                "list"
-              ],
-              "type": "string"
-            },
-            "value": {
-              "items": {
-                "$ref": "#/definitions/NonSecretValue"
-              },
-              "type": "array"
-            }
-          },
-          "required": [
-            "type",
-            "value"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "Object of non-secret values.",
-          "properties": {
-            "type": {
-              "enum": [
-                "object"
-              ],
-              "type": "string"
-            },
-            "value": {
-              "additionalProperties": {
-                "$ref": "#/definitions/NonSecretValue"
-              },
-              "type": "object"
-            }
-          },
-          "required": [
-            "type",
+            "kind",
             "value"
           ],
           "type": "object"
         }
       ]
     },
+    "FieldSpec": {
+      "description": "Ordered field declaration used by Wyrd data schemas and model signatures.",
+      "properties": {
+        "dtype": {
+          "description": "Canonical Arrow logical dtype string.",
+          "type": "string"
+        },
+        "extra": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Additional string metadata that does not change the Wyrd field contract.",
+          "type": "object"
+        },
+        "name": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ColumnName"
+            }
+          ],
+          "description": "Canonical column or feature name."
+        },
+        "nullable": {
+          "default": false,
+          "description": "Whether this field may contain null values.",
+          "type": "boolean"
+        },
+        "shape": {
+          "description": "Optional tensor or nested value shape; empty means scalar/tabular.",
+          "items": {
+            "$ref": "#/definitions/Dim"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "dtype",
+        "name"
+      ],
+      "type": "object"
+    },
+    "HuggingfaceMeta": {
+      "description": "Hugging Face dataset interface metadata.",
+      "properties": {
+        "config": {
+          "description": "Optional dataset config.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dataset_id": {
+          "description": "Dataset identifier.",
+          "type": "string"
+        },
+        "revision": {
+          "description": "Optional pinned git revision, represented as a 7- to 40-char lowercase hex SHA.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "split": {
+          "description": "Optional dataset split.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "dataset_id"
+      ],
+      "type": "object"
+    },
+    "ImageFormat": {
+      "description": "Image format family accepted by DataCard image manifests.",
+      "oneOf": [
+        {
+          "description": "PNG images.",
+          "enum": [
+            "Png"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "JPEG images.",
+          "enum": [
+            "Jpeg"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "WebP images.",
+          "enum": [
+            "Webp"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Mixed image formats.",
+          "enum": [
+            "Mixed"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ImageMeta": {
+      "description": "Image manifest interface metadata.",
+      "properties": {
+        "color_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ColorMode"
+            }
+          ],
+          "description": "Image color mode."
+        },
+        "format": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ImageFormat"
+            }
+          ],
+          "description": "Image file format family."
+        },
+        "manifest_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional manifest ArtifactCard reference."
+        }
+      },
+      "required": [
+        "color_mode",
+        "format"
+      ],
+      "type": "object"
+    },
+    "Inequality": {
+      "description": "Predicate operator for a column split.",
+      "oneOf": [
+        {
+          "description": "Equality comparison.",
+          "enum": [
+            "Eq"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Inequality comparison.",
+          "enum": [
+            "Ne"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Greater-than comparison.",
+          "enum": [
+            "Gt"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Greater-than-or-equal comparison.",
+          "enum": [
+            "Ge"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Less-than comparison.",
+          "enum": [
+            "Lt"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Less-than-or-equal comparison.",
+          "enum": [
+            "Le"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Membership comparison.",
+          "enum": [
+            "In"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "JsonlCompression": {
+      "description": "JSONL compression choices accepted by DataCard.",
+      "oneOf": [
+        {
+          "description": "No compression.",
+          "enum": [
+            "None"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Gzip compression.",
+          "enum": [
+            "Gzip"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Zstandard compression.",
+          "enum": [
+            "Zstd"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "JsonlMeta": {
+      "description": "JSON Lines interface metadata.",
+      "properties": {
+        "compression": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/JsonlCompression"
+            }
+          ],
+          "description": "JSONL compression."
+        },
+        "lines_per_file": {
+          "description": "Optional number of lines written per local file.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "compression"
+      ],
+      "type": "object"
+    },
+    "NumpyFormat": {
+      "description": "NumPy serialization formats accepted by DataCard.",
+      "oneOf": [
+        {
+          "description": "Single-array NPY format.",
+          "enum": [
+            "Npy"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Multi-array NPZ format.",
+          "enum": [
+            "Npz"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "NumpyMeta": {
+      "description": "NumPy interface metadata.",
+      "properties": {
+        "dtype": {
+          "description": "Canonical dtype string.",
+          "type": "string"
+        },
+        "format": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/NumpyFormat"
+            }
+          ],
+          "description": "NumPy serialization format."
+        },
+        "shape": {
+          "description": "Array shape inferred by the Python boundary.",
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "dtype",
+        "format"
+      ],
+      "type": "object"
+    },
+    "PandasMeta": {
+      "description": "Pandas interface metadata.",
+      "properties": {
+        "compression": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ParquetCompression"
+            }
+          ],
+          "default": "Snappy",
+          "description": "Parquet compression used by local materialization."
+        },
+        "framework_version": {
+          "description": "Installed pandas version inferred by the Python boundary.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "framework_version"
+      ],
+      "type": "object"
+    },
+    "ParquetCompression": {
+      "description": "Parquet compression choices accepted by the DataCard contract.",
+      "oneOf": [
+        {
+          "description": "No compression.",
+          "enum": [
+            "None"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Snappy compression.",
+          "enum": [
+            "Snappy"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Gzip compression.",
+          "enum": [
+            "Gzip"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Zstandard compression.",
+          "enum": [
+            "Zstd"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "LZ4 compression.",
+          "enum": [
+            "Lz4"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ParquetMeta": {
+      "description": "Parquet interface metadata.",
+      "properties": {
+        "compression": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ParquetCompression"
+            }
+          ],
+          "default": "Snappy",
+          "description": "Parquet compression used by local materialization."
+        },
+        "row_group_size": {
+          "description": "Optional parquet row group size.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PolarsMeta": {
+      "description": "Polars interface metadata.",
+      "properties": {
+        "compression": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ParquetCompression"
+            }
+          ],
+          "default": "Snappy",
+          "description": "Parquet compression used by local materialization."
+        },
+        "framework_version": {
+          "description": "Installed polars version inferred by the Python boundary.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "framework_version"
+      ],
+      "type": "object"
+    },
+    "QueryName": {
+      "description": "DataCard SQL query key.",
+      "type": "string"
+    },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
+    },
+    "SplitName": {
+      "description": "DataCard split label.",
+      "type": "string"
+    },
+    "SplitStrategy": {
+      "description": "Data split strategy.",
+      "oneOf": [
+        {
+          "description": "Reference to an already materialized split artifact.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Materialized"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/definitions/CardRef"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Predicate over a schema column.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Column"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "properties": {
+                "name": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/ColumnName"
+                    }
+                  ],
+                  "description": "Schema column referenced by the predicate."
+                },
+                "op": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/Inequality"
+                    }
+                  ],
+                  "description": "Predicate operator."
+                },
+                "value": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/ColValue"
+                    }
+                  ],
+                  "description": "Predicate comparison value."
+                }
+              },
+              "required": [
+                "name",
+                "op",
+                "value"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Positional range using inclusive start and exclusive stop.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "IndexRange"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "properties": {
+                "start": {
+                  "description": "Inclusive starting index.",
+                  "format": "int64",
+                  "type": "integer"
+                },
+                "stop": {
+                  "description": "Exclusive stopping index.",
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "start",
+                "stop"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Explicit positional indices.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Indices"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "items": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SqlLogic": {
+      "description": "SQL query bundle associated with SQL-backed DataCards.",
+      "properties": {
+        "default_query": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/QueryName"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional default query key."
+        },
+        "queries": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Named SQL queries.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "queries"
+      ],
+      "type": "object"
+    },
+    "SqlMeta": {
+      "description": "SQL interface metadata.",
+      "properties": {
+        "connection_hint": {
+          "description": "Optional connection hint for registry/runtime consumers.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dialect": {
+          "description": "SQL dialect name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "dialect"
+      ],
+      "type": "object"
+    },
+    "TextMeta": {
+      "description": "Text manifest interface metadata.",
+      "properties": {
+        "encoding": {
+          "default": "utf-8",
+          "description": "Text encoding used by local files.",
+          "type": "string"
+        },
+        "manifest_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional manifest ArtifactCard reference."
+        }
+      },
+      "type": "object"
+    },
+    "TorchMeta": {
+      "description": "Torch interface metadata.",
+      "properties": {
+        "framework_version": {
+          "description": "Installed torch version inferred by the Python boundary.",
+          "type": "string"
+        },
+        "save_format": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TorchSaveFormat"
+            }
+          ],
+          "description": "Torch serialization format."
+        }
+      },
+      "required": [
+        "framework_version",
+        "save_format"
+      ],
+      "type": "object"
+    },
+    "TorchSaveFormat": {
+      "description": "Torch serialization formats accepted by DataCard.",
+      "oneOf": [
+        {
+          "description": "Safetensors output.",
+          "enum": [
+            "Safetensors"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Explicit torch pickle output.",
+          "enum": [
+            "Pickle"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "VersionBlock": {
       "description": "Semver-compatible version string.",
       "type": "string"
     }
   },
-  "description": "Pure-data description of a dataset or data product.",
+  "description": "Pure-data contract for a Data Card.",
   "properties": {
     "artifact_refs": {
-      "description": "Artifact references.",
+      "default": [],
+      "description": "Durable ArtifactCard references linked to this data card.",
       "items": {
         "$ref": "#/definitions/CardRef"
       },
       "type": "array"
     },
-    "audit_ref": {
-      "anyOf": [
+    "interface": {
+      "allOf": [
         {
-          "$ref": "#/definitions/CardRef"
-        },
-        {
-          "type": "null"
+          "$ref": "#/definitions/DataInterface"
         }
       ],
-      "description": "Audit Card reference."
+      "description": "Declared interface family and interface-specific metadata."
     },
-    "data_type": {
-      "description": "Logical data type.",
-      "type": [
-        "string",
-        "null"
-      ]
+    "schema": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/DataSchema"
+        }
+      ],
+      "description": "Ordered schema fields for tabular interfaces."
     },
-    "description": {
-      "description": "Dataset description.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "details": {
+    "splits": {
       "additionalProperties": {
-        "$ref": "#/definitions/NonSecretValue"
+        "$ref": "#/definitions/DataSplit"
       },
-      "description": "Free-form details.",
+      "description": "Declared split strategies by stable split label.",
       "type": "object"
     },
-    "experiment_ref": {
+    "sql": {
       "anyOf": [
         {
-          "$ref": "#/definitions/CardRef"
+          "$ref": "#/definitions/SqlLogic"
         },
         {
           "type": "null"
         }
       ],
-      "description": "Producing or related experiment."
+      "description": "Optional SQL query bundle for SQL-backed data."
     },
-    "schema_ref": {
-      "anyOf": [
+    "stats": {
+      "allOf": [
         {
-          "$ref": "#/definitions/CardRef"
-        },
-        {
-          "type": "null"
+          "$ref": "#/definitions/DataStats"
         }
       ],
-      "description": "Schema Card reference."
+      "description": "Local or durable byte statistics captured for this data source."
     },
-    "source_uri": {
-      "description": "Dataset source URI.",
-      "type": [
-        "string",
-        "null"
-      ]
+    "target_columns": {
+      "description": "Target columns for supervised workflows.",
+      "items": {
+        "$ref": "#/definitions/ColumnName"
+      },
+      "type": "array"
     }
   },
+  "required": [
+    "interface",
+    "schema",
+    "stats"
+  ],
   "title": "DataSpec",
   "type": "object"
 }
@@ -3157,6 +4190,10 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
+    "LabelValue": {
+      "description": "Validated value for queryable Card and Run labels.",
+      "type": "string"
+    },
     "MetricEntry": {
       "description": "Metric summary entry.",
       "properties": {
@@ -3554,7 +4591,7 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
         },
         "labels": {
           "additionalProperties": {
-            "type": "string"
+            "$ref": "#/definitions/LabelValue"
           },
           "description": "Query/display labels.",
           "type": "object"

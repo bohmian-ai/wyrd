@@ -1,0 +1,20 @@
+# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value, missing-final-newline
+# ruff: noqa: F401
+
+from __future__ import annotations
+
+import datetime
+import os
+import pathlib
+from collections.abc import Mapping, Sequence
+from typing import Any, Protocol, TypeAlias, overload
+
+PathLike: TypeAlias = str | os.PathLike[str] | pathlib.Path
+JsonDict: TypeAlias = dict[str, Any]
+StringMap: TypeAlias = Mapping[str, str]
+
+class CardRefLike(Protocol):
+    """Object that can be represented as a Wyrd card reference."""
+
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-compatible card reference dictionary."""

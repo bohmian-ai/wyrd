@@ -47,6 +47,7 @@ export default defineConfig({
           collapsed: true,
           items: [
             { label: "Overview", link: "/concepts/" },
+            { label: "Core doctrine", link: "/concepts/core-doctrine/" },
             { label: "Cards", link: "/concepts/card/" },
             { label: "Specs", link: "/concepts/spec/" },
             { label: "Runs", link: "/concepts/run/" },
@@ -90,6 +91,7 @@ export default defineConfig({
               label: "Essential",
               collapsed: true,
               items: [
+                { label: "DataCard local workflow", link: "/guides/data-card-local-workflow/" },
                 { label: "Register a card", link: "/guides/register-card/" },
                 { label: "Lock and install a service", link: "/guides/lock-install-service/" },
                 { label: "Policy and audit", link: "/policy-audit/" },

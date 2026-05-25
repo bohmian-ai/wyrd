@@ -11,10 +11,15 @@ this repository. Reproduce useful patterns under Wyrd vocabulary and Wyrd paths.
 ## 1. First Pass Before Editing
 
 1. Read this file (AGENTS.md).
-2. Identify the owning crate or Python package (see §3 Ownership Boundaries).
-3. Inspect the nearest existing Wyrd implementation and tests.
-4. Check `mise.toml` for the canonical verification command.
-5. Check `Cargo.toml`, crate manifests, `pyproject.toml`, and lockfiles before
+2. Read `docs/src/content/docs/concepts/core-doctrine.mdx` before changing
+   Wyrd contracts, public or internal APIs, SDK surfaces, CLI, MCP, UI, docs,
+   generated schemas, or implementation behavior. The canonical planning
+   source is
+   `/Users/stevenforrester/Documents/GitHub/wyrd-plan/architecture/v1/00-foundations/core-doctrine.md`.
+3. Identify the owning crate or Python package (see §3 Ownership Boundaries).
+4. Inspect the nearest existing Wyrd implementation and tests.
+5. Check `mise.toml` for the canonical verification command.
+6. Check `Cargo.toml`, crate manifests, `pyproject.toml`, and lockfiles before
    relying on version-specific behavior.
 
 Do not invent a new architecture until the current Wyrd boundary proves wrong
@@ -30,6 +35,10 @@ session slug.
 
 Locked cross-cutting decisions that any contributor must honor:
 
+- The core doctrine in `docs/src/content/docs/concepts/core-doctrine.mdx`
+  is the first design filter for Wyrd nouns, layers, services, and public
+  surfaces. Internal APIs, external APIs, Python SDK, HTTP, CLI, MCP, UI, docs,
+  generated schemas, and agent-facing contracts must align with it.
 - Wyrd is the AI layer for human and agentic workflows, not a general-purpose framework or
   runtime for arbitrary code execution.
 - Every registered artifact is a `Card` with the shared envelope:
@@ -56,16 +65,13 @@ Locked cross-cutting decisions that any contributor must honor:
 
 - `crates/wyrd-spec`: pure contracts, ids, cards/specs, schema generation,
   request/response shapes, validation, stable error catalog.
-- `crates/wyrd-runtime`, `crates/wyrd-telemetry`, `crates/wyrd-auth`,
-  `crates/wyrd-crypt`, `crates/wyrd-testing`, `crates/wyrd-utils`, and
-  `crates/wyrd-error-derive`: shared runtime, telemetry, auth shell,
-  cryptography, testing, utilities, and derives.
+- `crates/shared/*`: shared runtime, telemetry, auth shell, cryptography,
+  testing, derives.
 - `crates/skald/*`: model/provider runtime, prompt/cache abstractions,
   orchestration, provider-specific wire handling.
 - `crates/vala/*`: observability, evaluation, drift, tracing, archival query,
   background data-plane behavior.
-- `crates/wyrd-server`, `crates/wyrd-cli`, and `crates/wyrd-mcp`: server, CLI,
-  MCP, application integration, and UI host.
+- `crates/wyrd/*`: server, CLI, MCP, application integration, UI host.
 - `python/py-wyrd`: PyO3 module root, Python package exports, stubs,
   Python-facing tests.
 
@@ -128,8 +134,13 @@ server/Python/client layers.
 
 ## 7. PyO3 Boundary Rules
 
+- Keep PyO3 in `python/py-wyrd*` unless an explicit allowlist says otherwise.
 - Keep `Python<'py>`, `Bound<'py, T>`, `Py<T>`, `PyErr` out of Rust-only core
   crates.
+- Name the `#[new]` method `fn __new__` (not `fn new`) and give it an explicit
+  `#[pyo3(signature = (...))]`. The Rust source mirrors the Python slot it
+  exposes. Builder-only pyclasses constructed via `#[staticmethod]` take no
+  `#[new]`.
 - Convert Python inputs at the boundary, then call Rust-native APIs.
 - Use `Bound<'py, T>` for new PyO3 code.
 - Convert to `Py<T>` before storing Python objects across awaits, threads, or

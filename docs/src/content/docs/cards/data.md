@@ -7,7 +7,7 @@ description: Generated reference for the Wyrd Data card spec.
 
 Describe a dataset, feature table, document set, or other data dependency.
 
-<dl class="wyrd-defs"><dt data-kind="data">Data</dt><dd>Describe a dataset, feature table, document set, or other data dependency.</dd><dt>Required</dt><dd>none required</dd><dt>Optional</dt><dd>8 additional spec fields — see table below.</dd></dl>
+<dl class="wyrd-defs"><dt data-kind="data">Data</dt><dd>Describe a dataset, feature table, document set, or other data dependency.</dd><dt>Required</dt><dd><code>interface</code>, <code>schema</code>, <code>stats</code></dd><dt>Optional</dt><dd>4 additional spec fields — see table below.</dd></dl>
 
 This page is generated from the checked-in JSON Schema. Edit the Rust spec, run the schema generator, then run `mise run docs:generate` to refresh this page.
 
@@ -20,13 +20,12 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 | Field | Type | Required |
 | --- | --- | --- |
 | `artifact_refs` | `array` | no |
-| `audit_ref` | `object` | no |
-| `data_type` | `string \| null` | no |
-| `description` | `string \| null` | no |
-| `details` | `object` | no |
-| `experiment_ref` | `object` | no |
-| `schema_ref` | `object` | no |
-| `source_uri` | `string \| null` | no |
+| `interface` | `object` | yes |
+| `schema` | `object` | yes |
+| `splits` | `object` | no |
+| `sql` | `object` | no |
+| `stats` | `object` | yes |
+| `target_columns` | `array` | no |
 
 ## Shape
 

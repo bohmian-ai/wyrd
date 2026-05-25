@@ -1,13 +1,23 @@
 [package]
 name = "py-wyrd"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-rust-version.workspace = true
-repository.workspace = true
-authors.workspace = true
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
 publish = false
 
 [lib]
-crate-type = ["rlib"]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
+test = false
+doctest = false
+
+[dependencies]
+pyo3 = { workspace = true, features = ["extension-module", "abi3-py310", "chrono"] }
+wyrd-cards = { workspace = true, features = ["python"] }
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 ---
 title: Concepts
-description: The seven primitives that make up Wyrd.
+description: The core nouns and service concepts that make up Wyrd.
 ---
 
 import { Aside } from "@astrojs/starlight/components";
@@ -9,7 +9,7 @@ import WyrdConceptsDiagram from "../../../components/WyrdConceptsDiagram.astro";
 # Concepts
 
 <Aside title="TL;DR" data-variant="wyrd">
-Wyrd is seven primitives: **Card**, **Spec**, **Run**, **Observation**, **Policy**, **Audit**, **Lineage**. **Service** is a Card kind that packages the rest into a deployable unit.
+Wyrd has four core nouns: **Card**, **Spec**, **Run**, and **Observation**. **Policy** and **Audit** are card kinds when users need to declare them, and service behavior when Wyrd evaluates rules or records accountability. **Lineage** is a derived graph, not a separate public object model.
 </Aside>
 
 <dl class="wyrd-defs">
@@ -23,22 +23,27 @@ Wyrd is seven primitives: **Card**, **Spec**, **Run**, **Observation**, **Policy
   <dd>The record of an execution tied to a specific Card version.</dd>
 
   <dt data-kind="experiment">Observation</dt>
-  <dd>A structured behavioral signal attached to a Run.</dd>
+  <dd>A measured fact attached to a Run, Card, service, or workflow.</dd>
 
   <dt>Policy</dt>
-  <dd>A decision rule evaluated when Cards are written or Runs are created.</dd>
+  <dd>A Card kind for declared rules, plus a service that evaluates those rules.</dd>
 
   <dt>Audit</dt>
-  <dd>An immutable entry describing who or what made a decision.</dd>
+  <dd>A Card kind for audit scope or evidence, plus service-owned accountability history.</dd>
 
   <dt>Lineage</dt>
-  <dd>The typed graph that connects Cards to Cards, and Cards to Runs to Observations.</dd>
+  <dd>The graph Wyrd derives from CardRefs and relationships.</dd>
 
   <dt data-kind="service">Service</dt>
-  <dd>A Card kind that packages the other primitives into a deployable unit.</dd>
+  <dd>A Card kind that packages declared AI behavior into a deployable boundary.</dd>
 </dl>
 
 ## How they connect
+
+The diagram splits the model into three parts. Cards and specs are the declared
+contract. Services turn those contracts into derived state, policy decisions,
+audit history, runs, and observations. Lineage is the graph view over
+relationships; it is not a fifth noun beside Card or Run.
 
 <WyrdConceptsDiagram />
 
@@ -46,40 +51,96 @@ Wyrd is seven primitives: **Card**, **Spec**, **Run**, **Observation**, **Policy
 <summary>ASCII version</summary>
 
 ```
-                          +-------------+
-                          |   Policy    |
-                          |  (decides)  |
-                          +------+------+
-                                 | evaluates writes and runs
-                                 v
-           +---------+     +-------------+     +---------+
-           |  Spec   |<----|    Card     |---->|  Audit  |
-           | (typed) |     | (envelope)  |     |  (who)  |
-           +---------+     +------+------+     +---------+
-                                  | references
-                                  v
-                          +-------------+
-                          |   Lineage   |
-                          |   (graph)   |
-                          +------+------+
-                                 |
-                                 v
-                          +-------------+     +--------------+
-                          |     Run     |---->| Observation  |
-                          | (execution) |     |  (behavior)  |
-                          +-------------+     +--------------+
+                       declared contract
+              +--------------------------------+
+              |              Card              |
+              | apiVersion, metadata, kind     |
+              | spec, relationships, status    |
+              +---------------+----------------+
+                              |
+                              | kind selects typed spec
+                              v
+              +--------------------------------+
+              |              Spec              |
+              | declared intent + CardRefs     |
+              +---------------+----------------+
+                              |
+                              | server derives
+                              v
+              +--------------------------------+
+              | Relationships / lineage graph  |
+              +--------------------------------+
+
+
+                       service-owned outcomes
+
+      +----------------+     evaluates      +----------------+
+      | Policy service |<-------------------| PolicyCard     |
+      | decisions      |                    | rule spec      |
+      +-------+--------+                    +----------------+
+              |
+              | records accountability
+              v
+      +----------------+     may reference  +----------------+
+      | Audit history  |<-------------------| AuditCard      |
+      | who/what/why   |                    | audit spec     |
+      +----------------+                    +----------------+
+
+
+                       execution evidence
+
+      +----------------+      produces      +----------------+
+      | Run            |------------------->| Observation    |
+      | one execution  |                    | measured fact  |
+      +----------------+                    +----------------+
 ```
 
 </details>
 
 <Aside title="What this isn't" data-variant="not">
-Cards are **not** file-system artifacts, ORM rows, or git blobs. They are typed, versioned records Wyrd owns end-to-end.
+Cards are **not** file-system artifacts, ORM rows, git blobs, or event records.
+They are typed, versioned declarations Wyrd can register, inspect, govern, link,
+install, and expose to people or agents.
 </Aside>
+
+## Why there is no core Event noun
+
+Wyrd can use internal events, outbox rows, audit rows, trigger deliveries, and
+replayable service logs. Those are implementation details unless users need to
+declare, version, govern, browse, or link them as Wyrd objects.
+
+The public contract uses more specific words:
+
+| Concept | Use it when |
+|---|---|
+| Card | The thing declares durable intent and needs identity, versioning, governance, or installation. |
+| Spec | The data gives a Card its kind-specific meaning. |
+| CardRef | The data links one Card to another. |
+| Relationship | The server-derived edge should be visible in lineage. |
+| Run | The record is one execution of declared behavior. |
+| Observation | The record is a measured or derived fact about a Run, Card, service, or workflow. |
+| PolicyCard | The user declares a governable rule. |
+| AuditCard | The user declares audit scope, requirements, source material, or an evidence package. |
+| Audit history | Wyrd records who did what, when, why, and with what result. |
+| Internal event | A service needs a signal, outbox message, replay log, or background-processing input. |
+
+```
+If it declares durable intent, model it as a Card or Spec.
+If it links Cards, use CardRef and derive relationships.
+If it records one execution, use Run.
+If it records evidence or measurement, use Observation.
+If it governs behavior, use PolicyCard plus the policy service.
+If it explains accountability, use audit history or AuditCard.
+If it only drives internal processing, keep it as an internal event.
+```
 
 ## Read next
 
 - [Cards](/concepts/card/) — the envelope shared by all 18 kinds.
 - [Specs](/concepts/spec/) — the typed payload per kind.
+- [DataCard local workflow](/guides/data-card-local-workflow/) — create, save, and load a local Data card from Python.
+- [Python SDK](/python/) — public imports and DataCard behavior.
+- [Data card reference](/cards/data/) — generated Data spec fields.
 - [Runs](/concepts/run/) and [Observations](/concepts/observation/) — execution and behavior records.
 - [Policies](/concepts/policy-card/) and [Audit](/concepts/audit/) — the decision and provenance surface.
 - [Lineage](/concepts/lineage/) — the graph that ties the rest together.

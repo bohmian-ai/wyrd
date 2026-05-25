@@ -1,0 +1,852 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DataInterface",
+  "description": "Data source interface metadata.",
+  "oneOf": [
+    {
+      "description": "Pandas dataframe saved as parquet by default.",
+      "type": "object",
+      "required": [
+        "kind",
+        "meta"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "Pandas"
+          ]
+        },
+        "meta": {
+          "$ref": "#/definitions/PandasMeta"
+        }
+      }
+    },
+    {
+      "description": "Polars dataframe saved as parquet by default.",
+      "type": "object",
+      "required": [
+        "kind",
+        "meta"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "Polars"
+          ]
+        },
+        "meta": {
+          "$ref": "#/definitions/PolarsMeta"
+        }
+      }
+    },
+    {
+      "description": "PyArrow table saved as IPC or parquet.",
+      "type": "object",
+      "required": [
+        "kind",
+        "meta"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "Arrow"
+          ]
+        },
+        "meta": {
+          "$ref": "#/definitions/ArrowMeta"
+        }
+      }
+    },
+    {
+      "description": "Existing parquet dataset or file.",
+      "type": "object",
+      "required": [
+        "kind",
+        "meta"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "Parquet"
+          ]
+        },
+        "meta": {
+          "$ref": "#/definitions/ParquetMeta"
+        }
+      }
+    },
+    {
+      "description": "NumPy array saved as NPY or NPZ.",
+      "type": "object",
+      "required": [
+        "kind",
+        "meta"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "Numpy"
+          ]
+        },
+        "meta": {
+          "$ref": "#/definitions/NumpyMeta"
+        }
+      }
+    },
+    {
+      "description": "Torch tensor saved as safetensors or explicit pickle.",
+      "type": "object",
+      "required": [
+        "kind",
+        "meta"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "Torch"
+          ]
+        },
+        "meta": {
+          "$ref": "#/definitions/TorchMeta"
+        }
+      }
+    },
+    {
+      "description": "SQL query bundle.",
+      "type": "object",
+      "required": [
+        "kind",
+        "meta"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "Sql"
+          ]
+        },
+        "meta": {
+          "$ref": "#/definitions/SqlMeta"
+        }
+      }
+    },
+    {
+      "description": "JSON Lines data.",
+      "type": "object",
+      "required": [
+        "kind",
+        "meta"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "Jsonl"
+          ]
+        },
+        "meta": {
+          "$ref": "#/definitions/JsonlMeta"
+        }
+      }
+    },
+    {
+      "description": "Image manifest data.",
+      "type": "object",
+      "required": [
+        "kind",
+        "meta"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "Image"
+          ]
+        },
+        "meta": {
+          "$ref": "#/definitions/ImageMeta"
+        }
+      }
+    },
+    {
+      "description": "Text manifest data.",
+      "type": "object",
+      "required": [
+        "kind",
+        "meta"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "Text"
+          ]
+        },
+        "meta": {
+          "$ref": "#/definitions/TextMeta"
+        }
+      }
+    },
+    {
+      "description": "Hugging Face dataset pointer or local dataset.",
+      "type": "object",
+      "required": [
+        "kind",
+        "meta"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "Huggingface"
+          ]
+        },
+        "meta": {
+          "$ref": "#/definitions/HuggingfaceMeta"
+        }
+      }
+    },
+    {
+      "description": "Custom Python data loader.",
+      "type": "object",
+      "required": [
+        "kind",
+        "meta"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "Custom"
+          ]
+        },
+        "meta": {
+          "$ref": "#/definitions/CustomDataMeta"
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "ArrowFormat": {
+      "description": "Arrow serialization formats accepted by DataCard.",
+      "oneOf": [
+        {
+          "description": "Arrow IPC file or stream.",
+          "type": "string",
+          "enum": [
+            "Ipc"
+          ]
+        },
+        {
+          "description": "Parquet output through Arrow.",
+          "type": "string",
+          "enum": [
+            "Parquet"
+          ]
+        }
+      ]
+    },
+    "ArrowMeta": {
+      "description": "Arrow interface metadata.",
+      "type": "object",
+      "required": [
+        "format",
+        "framework_version"
+      ],
+      "properties": {
+        "format": {
+          "description": "Arrow serialization format.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ArrowFormat"
+            }
+          ]
+        },
+        "framework_version": {
+          "description": "Installed pyarrow version inferred by the Python boundary.",
+          "type": "string"
+        }
+      }
+    },
+    "CardKind": {
+      "title": "CardKind",
+      "description": "Native Wyrd Card kind string or external kind object.",
+      "oneOf": [
+        {
+          "title": "NativeCardKind",
+          "description": "Native Wyrd Card kind.",
+          "type": "string",
+          "enum": [
+            "Data",
+            "Model",
+            "Experiment",
+            "Prompt",
+            "Tool",
+            "Agent",
+            "Workflow",
+            "Eval",
+            "Drift",
+            "Service",
+            "Policy",
+            "Mcp",
+            "Skill",
+            "SubAgent",
+            "Audit",
+            "Artifact",
+            "Trigger",
+            "Operator"
+          ]
+        },
+        {
+          "title": "ExternalCardKind",
+          "description": "External Card kind with schema hash.",
+          "type": "object",
+          "required": [
+            "kind",
+            "schema_hash"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"
+            },
+            "schema_hash": {
+              "type": "string",
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardRef": {
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Referenced Card kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "Referenced Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "space": {
+          "description": "Optional space; omitted means current/default space.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Optional resolved UID.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Exact referenced Card version.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VersionBlock"
+            }
+          ]
+        }
+      }
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "ColorMode": {
+      "description": "Image color mode accepted by DataCard image manifests.",
+      "oneOf": [
+        {
+          "description": "RGB color.",
+          "type": "string",
+          "enum": [
+            "Rgb"
+          ]
+        },
+        {
+          "description": "RGBA color with alpha.",
+          "type": "string",
+          "enum": [
+            "Rgba"
+          ]
+        },
+        {
+          "description": "Single-channel grayscale.",
+          "type": "string",
+          "enum": [
+            "Grayscale"
+          ]
+        }
+      ]
+    },
+    "CustomDataMeta": {
+      "description": "Custom Python loader metadata.",
+      "type": "object",
+      "required": [
+        "loader_class",
+        "loader_module"
+      ],
+      "properties": {
+        "extra": {
+          "description": "Loader-specific string options.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "loader_class": {
+          "description": "Python loader class name.",
+          "type": "string"
+        },
+        "loader_module": {
+          "description": "Importable Python module containing the loader class.",
+          "type": "string"
+        }
+      }
+    },
+    "HuggingfaceMeta": {
+      "description": "Hugging Face dataset interface metadata.",
+      "type": "object",
+      "required": [
+        "dataset_id"
+      ],
+      "properties": {
+        "config": {
+          "description": "Optional dataset config.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dataset_id": {
+          "description": "Dataset identifier.",
+          "type": "string"
+        },
+        "revision": {
+          "description": "Optional pinned git revision, represented as a 7- to 40-char lowercase hex SHA.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "split": {
+          "description": "Optional dataset split.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ImageFormat": {
+      "description": "Image format family accepted by DataCard image manifests.",
+      "oneOf": [
+        {
+          "description": "PNG images.",
+          "type": "string",
+          "enum": [
+            "Png"
+          ]
+        },
+        {
+          "description": "JPEG images.",
+          "type": "string",
+          "enum": [
+            "Jpeg"
+          ]
+        },
+        {
+          "description": "WebP images.",
+          "type": "string",
+          "enum": [
+            "Webp"
+          ]
+        },
+        {
+          "description": "Mixed image formats.",
+          "type": "string",
+          "enum": [
+            "Mixed"
+          ]
+        }
+      ]
+    },
+    "ImageMeta": {
+      "description": "Image manifest interface metadata.",
+      "type": "object",
+      "required": [
+        "color_mode",
+        "format"
+      ],
+      "properties": {
+        "color_mode": {
+          "description": "Image color mode.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ColorMode"
+            }
+          ]
+        },
+        "format": {
+          "description": "Image file format family.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ImageFormat"
+            }
+          ]
+        },
+        "manifest_ref": {
+          "description": "Optional manifest ArtifactCard reference.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "JsonlCompression": {
+      "description": "JSONL compression choices accepted by DataCard.",
+      "oneOf": [
+        {
+          "description": "No compression.",
+          "type": "string",
+          "enum": [
+            "None"
+          ]
+        },
+        {
+          "description": "Gzip compression.",
+          "type": "string",
+          "enum": [
+            "Gzip"
+          ]
+        },
+        {
+          "description": "Zstandard compression.",
+          "type": "string",
+          "enum": [
+            "Zstd"
+          ]
+        }
+      ]
+    },
+    "JsonlMeta": {
+      "description": "JSON Lines interface metadata.",
+      "type": "object",
+      "required": [
+        "compression"
+      ],
+      "properties": {
+        "compression": {
+          "description": "JSONL compression.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/JsonlCompression"
+            }
+          ]
+        },
+        "lines_per_file": {
+          "description": "Optional number of lines written per local file.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "NumpyFormat": {
+      "description": "NumPy serialization formats accepted by DataCard.",
+      "oneOf": [
+        {
+          "description": "Single-array NPY format.",
+          "type": "string",
+          "enum": [
+            "Npy"
+          ]
+        },
+        {
+          "description": "Multi-array NPZ format.",
+          "type": "string",
+          "enum": [
+            "Npz"
+          ]
+        }
+      ]
+    },
+    "NumpyMeta": {
+      "description": "NumPy interface metadata.",
+      "type": "object",
+      "required": [
+        "dtype",
+        "format"
+      ],
+      "properties": {
+        "dtype": {
+          "description": "Canonical dtype string.",
+          "type": "string"
+        },
+        "format": {
+          "description": "NumPy serialization format.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/NumpyFormat"
+            }
+          ]
+        },
+        "shape": {
+          "description": "Array shape inferred by the Python boundary.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      }
+    },
+    "PandasMeta": {
+      "description": "Pandas interface metadata.",
+      "type": "object",
+      "required": [
+        "framework_version"
+      ],
+      "properties": {
+        "compression": {
+          "description": "Parquet compression used by local materialization.",
+          "default": "Snappy",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ParquetCompression"
+            }
+          ]
+        },
+        "framework_version": {
+          "description": "Installed pandas version inferred by the Python boundary.",
+          "type": "string"
+        }
+      }
+    },
+    "ParquetCompression": {
+      "description": "Parquet compression choices accepted by the DataCard contract.",
+      "oneOf": [
+        {
+          "description": "No compression.",
+          "type": "string",
+          "enum": [
+            "None"
+          ]
+        },
+        {
+          "description": "Snappy compression.",
+          "type": "string",
+          "enum": [
+            "Snappy"
+          ]
+        },
+        {
+          "description": "Gzip compression.",
+          "type": "string",
+          "enum": [
+            "Gzip"
+          ]
+        },
+        {
+          "description": "Zstandard compression.",
+          "type": "string",
+          "enum": [
+            "Zstd"
+          ]
+        },
+        {
+          "description": "LZ4 compression.",
+          "type": "string",
+          "enum": [
+            "Lz4"
+          ]
+        }
+      ]
+    },
+    "ParquetMeta": {
+      "description": "Parquet interface metadata.",
+      "type": "object",
+      "properties": {
+        "compression": {
+          "description": "Parquet compression used by local materialization.",
+          "default": "Snappy",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ParquetCompression"
+            }
+          ]
+        },
+        "row_group_size": {
+          "description": "Optional parquet row group size.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "PolarsMeta": {
+      "description": "Polars interface metadata.",
+      "type": "object",
+      "required": [
+        "framework_version"
+      ],
+      "properties": {
+        "compression": {
+          "description": "Parquet compression used by local materialization.",
+          "default": "Snappy",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ParquetCompression"
+            }
+          ]
+        },
+        "framework_version": {
+          "description": "Installed polars version inferred by the Python boundary.",
+          "type": "string"
+        }
+      }
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "SqlMeta": {
+      "description": "SQL interface metadata.",
+      "type": "object",
+      "required": [
+        "dialect"
+      ],
+      "properties": {
+        "connection_hint": {
+          "description": "Optional connection hint for registry/runtime consumers.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dialect": {
+          "description": "SQL dialect name.",
+          "type": "string"
+        }
+      }
+    },
+    "TextMeta": {
+      "description": "Text manifest interface metadata.",
+      "type": "object",
+      "properties": {
+        "encoding": {
+          "description": "Text encoding used by local files.",
+          "default": "utf-8",
+          "type": "string"
+        },
+        "manifest_ref": {
+          "description": "Optional manifest ArtifactCard reference.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "TorchMeta": {
+      "description": "Torch interface metadata.",
+      "type": "object",
+      "required": [
+        "framework_version",
+        "save_format"
+      ],
+      "properties": {
+        "framework_version": {
+          "description": "Installed torch version inferred by the Python boundary.",
+          "type": "string"
+        },
+        "save_format": {
+          "description": "Torch serialization format.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TorchSaveFormat"
+            }
+          ]
+        }
+      }
+    },
+    "TorchSaveFormat": {
+      "description": "Torch serialization formats accepted by DataCard.",
+      "oneOf": [
+        {
+          "description": "Safetensors output.",
+          "type": "string",
+          "enum": [
+            "Safetensors"
+          ]
+        },
+        {
+          "description": "Explicit torch pickle output.",
+          "type": "string",
+          "enum": [
+            "Pickle"
+          ]
+        }
+      ]
+    },
+    "VersionBlock": {
+      "description": "Semver-compatible version string.",
+      "type": "string"
+    }
+  }
+}

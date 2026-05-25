@@ -12,7 +12,7 @@ protoc = "33.2"
 env_shell_expand = false
 
 [env]
-UI_DIR = "crates/wyrd-server/wyrd-ui"
+UI_DIR = "crates/wyrd/wyrd-server/wyrd-ui"
 PY_DIR = "python/py-wyrd"
 WYRD_DEV_PG_CACHE = "${HOME}/.cache/wyrd/pg"
 
@@ -26,7 +26,19 @@ run = "cargo clippy --locked --workspace --all-features --all-targets -- -D warn
 
 [tasks."test:unit"]
 description = "Run all Rust unit tests"
-run = "cargo test --locked --workspace --all-features"
+run = "cargo test --locked --workspace --exclude py-wyrd"
+
+[tasks."test:wyrd-spec"]
+description = "Run wyrd-spec Rust tests"
+run = "cargo test -p wyrd-spec --all-features"
+
+[tasks."test:wyrd-spec:doc"]
+description = "Run wyrd-spec Rust doc tests"
+run = "cargo test --locked --doc --all-features -p wyrd-spec"
+
+[tasks."test:wyrd-error-derive"]
+description = "Run wyrd-error-derive tests"
+run = "cargo test -p wyrd-error-derive --all-features"
 
 [tasks."check:docs"]
 description = "Build public Rust docs and doctests"
@@ -53,7 +65,7 @@ cargo test --locked --doc --all-features \
 
 [tasks."cardkind:check"]
 description = "Verify CardKind native count and External serde shape"
-run = "cargo test -p wyrd-spec --test cardkind_check --features server"
+run = "cargo test -p wyrd-spec --test cards kind:: --features server"
 
 [tasks."check:client-tier"]
 description = "Foundation invariants: wyrd-spec server-tier-free; shared shells pyo3+sqlx-free"
@@ -80,10 +92,40 @@ done
 """
 
 [tasks."check:pyo3-scope"]
-description = "Assert PyO3 stays out of foundation crates"
+description = "Assert PyO3 stays out of pure contracts and Python-free shared crates"
 run = """
-if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/wyrd-spec crates/wyrd-auth crates/wyrd-crypt crates/wyrd-runtime crates/wyrd-telemetry crates/wyrd-testing crates/wyrd-utils; then
-  echo 'PyO3 scope violation detected'
+set -eu
+
+if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/wyrd-spec; then
+  echo 'PyO3 scope violation detected in wyrd-spec'
+  exit 1
+fi
+
+if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/shared --glob '!crates/shared/wyrd-utils/**'; then
+  echo 'PyO3 scope violation detected in Python-free shared crates'
+  exit 1
+fi
+
+if ! rg -qF 'python = ["dep:pyo3"]' crates/shared/wyrd-utils/Cargo.toml; then
+  echo 'wyrd-utils must gate PyO3 behind its python feature'
+  exit 1
+fi
+
+if ! rg -q 'pyo3 = \\{ workspace = true, optional = true \\}' crates/shared/wyrd-utils/Cargo.toml; then
+  echo 'wyrd-utils PyO3 dependency must remain optional'
+  exit 1
+fi
+
+if ! rg -q '#\\[cfg\\(feature = "python"\\)\\]' crates/shared/wyrd-utils/src/lib.rs; then
+  echo 'wyrd-utils Python helpers must remain cfg-gated'
+  exit 1
+fi
+
+forbidden_utils_default=$(cargo tree -p wyrd-utils --no-default-features -e normal | \
+  rg '(^|[ ─└├])pyo3' || true)
+if [ -n "$forbidden_utils_default" ]; then
+  echo "FAIL: wyrd-utils pulls PyO3 without its python feature:"
+  echo "$forbidden_utils_default"
   exit 1
 fi
 """
@@ -91,7 +133,7 @@ fi
 [tasks."check:mocks-scope"]
 description = "Assert mock helpers stay out of production source"
 run = """
-if rg -n 'mockall|wiremock|mockito' crates --glob '!crates/wyrd-testing/**'; then
+if rg -n 'mockall|wiremock|mockito' crates --glob '!crates/shared/wyrd-testing/**'; then
   echo 'mock dependency leaked outside wyrd-testing'
   exit 1
 fi
@@ -99,12 +141,11 @@ fi
 
 [tasks."check:unwrap-audit"]
 description = "Audit unwrap/expect calls outside tests and examples"
-run = """
-if rg -n '\\.(unwrap|expect)\\(' crates --glob '!**/tests/**' --glob '!**/examples/**'; then
-  echo 'unwrap/expect audit failed'
-  exit 1
-fi
-"""
+run = "python scripts/check_unwrap_audit.py"
+
+[tasks."check:test-contracts"]
+description = "Verify Wyrd critical Rust contracts have explicit Python test markers"
+run = "python scripts/check_test_contracts.py"
 
 [tasks."check:wasm"]
 description = "Build wyrd-spec for wasm32"
@@ -115,14 +156,42 @@ description = "cargo-deny check (licenses, advisories, sources, bans)"
 run = "cargo deny check"
 
 [tasks."py:setup"]
-description = "uv sync placeholder for the future Python package"
+description = "Sync Python dev dependencies and build the Wyrd native extension"
 dir = "python/py-wyrd"
-run = "true"
+depends = ["codegen:stubs"]
+run = ["uv sync --all-extras --group dev", "uv run maturin develop"]
 
 [tasks."py:test:unit"]
-description = "Run Python unit tests"
+description = "Run Python unit tests against real DataCard runtime dependencies"
 dir = "python/py-wyrd"
-run = "true"
+depends = ["py:setup"]
+run = "uv run pytest -q"
+
+[tasks."py:format"]
+description = "Format Wyrd Python package and tests with Ruff"
+dir = "python/py-wyrd"
+run = ["uv run ruff format python/wyrd tests scripts", "uv run ruff check --fix python/wyrd tests scripts"]
+
+[tasks."py:format:check"]
+description = "Check Wyrd Python formatting"
+dir = "python/py-wyrd"
+run = "uv run ruff format --check python/wyrd tests scripts"
+
+[tasks."py:lints"]
+description = "Run Wyrd Python Ruff lint checks"
+dir = "python/py-wyrd"
+run = "uv run ruff check python/wyrd tests scripts"
+
+[tasks."py:typecheck"]
+description = "Run ty over the generated Python stub surface"
+dir = "python/py-wyrd"
+run = "uv run ty check python/wyrd/*.pyi tests/cards/data/test_public_surface.py"
+
+[tasks."examples:python:datacard"]
+description = "Run the local DataCard Python example"
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = "uv run python ../../examples/python/datacard_local_workflow.py"
 
 [tasks."dev:backend"]
 description = "Build and run wyrd-server on :8080"
@@ -133,7 +202,7 @@ run = [
 
 [tasks."dev:frontend"]
 description = "SvelteKit dev server on :3000"
-dir = "crates/wyrd-server/wyrd-ui"
+dir = "crates/wyrd/wyrd-server/wyrd-ui"
 run = "pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000}"
 
 [tasks."docs:install"]
@@ -194,7 +263,7 @@ run = """
 cargo build -p wyrd-server
 WYRD_SERVER_PORT=${WYRD_SERVER_PORT:-8080} ./target/debug/wyrd-server &
 BACKEND_PID=$!
-cd crates/wyrd-server/wyrd-ui && pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000} &
+cd crates/wyrd/wyrd-server/wyrd-ui && pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000} &
 FRONTEND_PID=$!
 trap 'kill $BACKEND_PID $FRONTEND_PID 2>/dev/null' EXIT INT TERM
 wait $BACKEND_PID $FRONTEND_PID
@@ -208,7 +277,7 @@ WYRD_SERVER_PORT=${WYRD_SERVER_PORT:-8080} ./target/debug/wyrd-server &
 SERVER_PID=$!
 WYRD_OBS_SERVER_PORT=${WYRD_OBS_SERVER_PORT:-8090} ./target/debug/wyrd-observability-server &
 OBS_PID=$!
-cd crates/wyrd-server/wyrd-ui && pnpm install --frozen-lockfile && pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000} &
+cd crates/wyrd/wyrd-server/wyrd-ui && pnpm install --frozen-lockfile && pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000} &
 UI_PID=$!
 trap 'kill $SERVER_PID $OBS_PID $UI_PID 2>/dev/null' EXIT INT TERM
 wait $SERVER_PID $OBS_PID $UI_PID
@@ -226,20 +295,40 @@ cargo check --locked --workspace --all-features
 description = "Regenerate OpenAPI / JSON schemas / MCP tool list / pyi stubs from source"
 run = """
 cargo run --locked -p wyrd-spec --example gen_schemas --features server
+mise run codegen:stubs
 test -f openapi.yaml || { echo 'openapi.yaml missing'; exit 1; }
 """
+
+[tasks."codegen:stubs"]
+description = "Regenerate Python type stubs"
+dir = "python/py-wyrd"
+run = "uv run python scripts/assemble_stubs.py"
 
 [tasks."codegen:check"]
 description = "Fail if generated openapi/schemas/MCP/pyi drift from source"
 run = """
+snapshot_codegen() {
+  {
+    test -f openapi.yaml && printf '%s\n' openapi.yaml
+    find crates/wyrd-spec/schemas crates/wyrd-spec/tests/schemas -type f -name '*.json'
+    find python/py-wyrd/python/wyrd -maxdepth 1 -type f -name '*.pyi'
+  } | sort | while IFS= read -r file; do
+    shasum -a 256 "$file"
+  done
+}
+BEFORE=$(mktemp)
+AFTER=$(mktemp)
+trap 'rm -f "$BEFORE" "$AFTER"' EXIT
+snapshot_codegen > "$BEFORE"
 mise run codegen:regen
-git diff --exit-code -- openapi.yaml crates/wyrd-spec/schemas/ crates/wyrd-spec/tests/schemas/ python/py-wyrd/ \
+snapshot_codegen > "$AFTER"
+diff -u "$BEFORE" "$AFTER" \
   || { echo 'codegen drift detected - run mise run codegen:regen and commit'; exit 1; }
 """
 
 [tasks."pre-pr"]
-description = "Aggregate gate: check + codegen:check"
-depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:wasm", "check:deny", "check:docs"]
+description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
+depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:docs"]
 
 [tasks."dev:pg:nuke"]
 description = "Wipe embedded pg cache"

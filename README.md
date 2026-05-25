@@ -16,9 +16,10 @@ mise run dev:full
 
 ## Layout
 
-- `crates/wyrd-*` - Wyrd contracts, shared infrastructure, CLI, MCP, UI, and server crates.
+- `crates/wyrd/` - registry, cards, services, CLI, MCP, UI, server.
 - `crates/vala/` - observability, evaluation, traces, and analytical storage.
 - `crates/skald/` - LLM providers, prompts, and agents.
+- `crates/shared/` - shared infrastructure.
 - `python/py-wyrd/` - Python wheel source.
 
 ## License

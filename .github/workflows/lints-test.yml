@@ -5,21 +5,239 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  lints-test:
-    runs-on: ubuntu-latest
+  changes:
+    name: detect changes
+    runs-on: ubuntu-24.04
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      python: ${{ steps.filter.outputs.python }}
+      docs: ${{ steps.filter.outputs.docs }}
+      ui: ${{ steps.filter.outputs.ui }}
+      generated: ${{ steps.filter.outputs.generated }}
+      workflow: ${{ steps.filter.outputs.workflow }}
+      any: ${{ steps.filter.outputs.any }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed areas
+        id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+
+          git diff --name-only "$base" "$head" > /tmp/changed-files
+
+          set_output() {
+            local name="$1"
+            local pattern="$2"
+            if grep -Eq "$pattern" /tmp/changed-files; then
+              echo "$name=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$name=false" >> "$GITHUB_OUTPUT"
+            fi
+          }
+
+          set_output rust '^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|deny\.toml|mise\.toml|crates/|python/py-wyrd/Cargo\.toml|python/py-wyrd/src/)'
+          set_output python '^(mise\.toml|Cargo\.toml|Cargo\.lock|crates/shared/wyrd-utils/|crates/wyrd/wyrd-cards/|crates/wyrd/wyrd-interfaces/|python/py-wyrd/|examples/python/)'
+          set_output docs '^(mise\.toml|docs/|openapi\.yaml|crates/wyrd-spec/schemas/|examples/)'
+          set_output ui '^(mise\.toml|crates/wyrd/wyrd-server/wyrd-ui/)'
+          set_output generated '^(mise\.toml|Cargo\.toml|Cargo\.lock|crates/wyrd-spec/|crates/wyrd/wyrd-cards/|crates/wyrd/wyrd-interfaces/|python/py-wyrd/)'
+          set_output workflow '^(\.github/workflows/)'
+
+          if [[ -s /tmp/changed-files ]]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Changed files:"
+          sed 's/^/- /' /tmp/changed-files
+
+  rust:
+    name: rust (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Set up mise
         uses: jdx/mise-action@v3
         with:
           install: true
           cache: true
+
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
+
+      - name: Test Rust workspace
+        run: mise run test:unit
+
+  rust-gates:
+    name: rust gates
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.generated == 'true' || needs.changes.outputs.workflow == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
       - name: Install system tools
         run: sudo apt-get update && sudo apt-get install -y ripgrep
+
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown
-      - name: mise run pre-pr
-        run: mise run pre-pr
+
+      - name: Format, lint, and check
+        run: mise run check
+
+      - name: Boundary checks
+        run: |
+          mise run cardkind:check
+          mise run check:client-tier
+          mise run check:pyo3-scope
+          mise run check:mocks-scope
+          mise run check:unwrap-audit
+          mise run check:test-contracts
+          mise run check:wasm
+          mise run check:deny
+
+  codegen:
+    name: codegen
+    needs: changes
+    if: needs.changes.outputs.generated == 'true' || needs.changes.outputs.workflow == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check generated contracts
+        run: mise run codegen:check
+
+  python:
+    name: python (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.python == 'true' || needs.changes.outputs.workflow == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Python format and lint
+        run: |
+          mise run py:format:check
+          mise run py:lints
+          mise run py:typecheck
+
+      - name: Python tests
+        run: mise run py:test:unit
+
+      - name: Python examples
+        run: mise run examples:python:datacard
+
+  docs:
+    name: docs
+    needs: changes
+    if: needs.changes.outputs.docs == 'true' || needs.changes.outputs.workflow == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Check docs
+        run: mise run docs:check
+
+  ui:
+    name: ui
+    needs: changes
+    if: needs.changes.outputs.ui == 'true' || needs.changes.outputs.workflow == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Check UI package
+        working-directory: crates/wyrd/wyrd-server/wyrd-ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec svelte-kit sync
+          pnpm exec vite --version
+
+  ci-complete:
+    name: ci complete
+    needs: [changes, rust, rust-gates, codegen, python, docs, ui]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify required jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for result in \
+            "${{ needs.rust.result }}" \
+            "${{ needs.rust-gates.result }}" \
+            "${{ needs.codegen.result }}" \
+            "${{ needs.python.result }}" \
+            "${{ needs.docs.result }}" \
+            "${{ needs.ui.result }}"; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "CI job failed or was cancelled: $result"; exit 1 ;;
+            esac
+          done

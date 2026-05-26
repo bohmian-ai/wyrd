@@ -223,7 +223,10 @@ impl Role {
         SEEDED_ROLE_DEFINITIONS
             .iter()
             .map(|definition| Role {
-                name: RoleName::new(definition.name).expect("seed role name is a valid token"),
+                name: match RoleName::new(definition.name) {
+                    Ok(name) => name,
+                    Err(error) => panic!("seed role name is a valid token: {error}"),
+                },
                 scopes: definition.scopes.iter().copied().collect(),
             })
             .collect()

@@ -2120,6 +2120,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3479,6 +3488,22 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "wyrd-auth-issue"
+version = "0.0.1"
+dependencies = [
+ "argon2",
+ "chrono",
+ "jsonwebtoken",
+ "password-hash",
+ "secrecy",
+ "serde",
+ "thiserror 2.0.18",
+ "wyrd-auth-verify",
+ "wyrd-spec",
+ "zeroize",
+]
 
 [[package]]
 name = "wyrd-auth-verify"

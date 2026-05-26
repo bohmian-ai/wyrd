@@ -3553,6 +3553,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-enterprise"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "jsonwebtoken",
+ "serde",
+ "thiserror 2.0.18",
+ "wyrd-auth-verify",
+]
+
+[[package]]
 name = "wyrd-error-derive"
 version = "0.0.1"
 dependencies = [
@@ -3607,6 +3618,7 @@ version = "0.0.1"
 dependencies = [
  "axum 0.8.9",
  "tokio",
+ "wyrd-enterprise",
 ]
 
 [[package]]

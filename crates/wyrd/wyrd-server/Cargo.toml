@@ -6,6 +6,10 @@ license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
+
+[features]
+enterprise = ["dep:wyrd-enterprise"]
+
 [[bin]]
 name = "wyrd-server"
 path = "src/main.rs"
@@ -13,3 +17,4 @@ path = "src/main.rs"
 [dependencies]
 tokio = { workspace = true }
 axum = { workspace = true }
+wyrd-enterprise = { path = "../wyrd-enterprise", version = "0.0.1", optional = true }

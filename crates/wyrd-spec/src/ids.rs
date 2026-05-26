@@ -88,6 +88,7 @@ id_type!(
     validate_opaque
 );
 id_type!(ArtifactKey, "Artifact storage key.", validate_token);
+id_type!(RoleName, "RBAC role identifier.", validate_token);
 id_type!(ColumnName, "DataCard column name.", validate_card_token);
 id_type!(SplitName, "DataCard split label.", validate_card_token);
 id_type!(QueryName, "DataCard SQL query key.", validate_card_token);

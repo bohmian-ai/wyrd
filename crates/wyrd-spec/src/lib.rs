@@ -25,7 +25,7 @@ pub mod storage;
 pub mod trace;
 pub mod version;
 
-pub use authz::{Role, Scope};
+pub use authz::{Principal, Role, Scope};
 pub use card::data::{
     ArrowFormat, ArrowMeta, ColValue, ColorMode, CustomDataMeta, DataInterface, DataSchema,
     DataSpec, DataSplit, DataStats, HuggingfaceMeta, ImageFormat, ImageMeta, Inequality,

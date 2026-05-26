@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::actor::Actor;
 use crate::ids::RoleName;
 
 /// A single control-plane capability.
@@ -229,11 +230,61 @@ impl Role {
     }
 }
 
+/// An authenticated subject with its resolved capability set.
+///
+/// `scopes` is already flattened from the subject's roles at authentication
+/// time. It is never derived from `actor` at check time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct Principal {
+    /// Who the subject is.
+    pub actor: Actor,
+    /// Capabilities the subject holds for this session.
+    pub scopes: BTreeSet<Scope>,
+}
+
+impl Principal {
+    /// Construct from an actor and an already-resolved scope set.
+    #[must_use]
+    pub fn new(actor: Actor, scopes: BTreeSet<Scope>) -> Self {
+        Self { actor, scopes }
+    }
+
+    /// Flatten a set of roles into a single scope set for `actor`.
+    ///
+    /// This is the canonical resolution step: assigned roles collapse to the
+    /// union of their scopes.
+    #[must_use]
+    pub fn from_roles<'a>(actor: Actor, roles: impl IntoIterator<Item = &'a Role>) -> Self {
+        let scopes = roles
+            .into_iter()
+            .flat_map(|role| role.scopes.iter().copied())
+            .collect();
+        Self { actor, scopes }
+    }
+
+    /// True if the principal holds `scope`.
+    #[must_use]
+    pub fn has_scope(&self, scope: Scope) -> bool {
+        self.scopes.contains(&scope)
+    }
+
+    /// True only if the principal holds every scope in `required`.
+    #[must_use]
+    pub fn has_all(&self, required: impl IntoIterator<Item = Scope>) -> bool {
+        required
+            .into_iter()
+            .all(|scope| self.scopes.contains(&scope))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{Role, Scope};
+    use crate::actor::Actor;
+
+    use super::{Principal, Role, Scope};
 
     #[test]
     fn scope_roundtrips_through_wire_string() {
@@ -311,5 +362,71 @@ mod tests {
             token_issuers,
             BTreeSet::from(["platform_admin", "token_issuer"])
         );
+    }
+
+    #[test]
+    fn from_roles_unions_scopes() {
+        let roles = Role::seeded();
+        let ml_engineer = find_role(&roles, "ml_engineer");
+        let auditor = find_role(&roles, "auditor");
+        let principal = Principal::from_roles(test_actor(), [ml_engineer, auditor]);
+        let expected = ml_engineer
+            .scopes
+            .iter()
+            .chain(auditor.scopes.iter())
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(principal.scopes, expected);
+    }
+
+    #[test]
+    fn from_roles_empty_is_no_scopes() {
+        let roles = Vec::<Role>::new();
+        let principal = Principal::from_roles(test_actor(), roles.iter());
+
+        assert!(principal.scopes.is_empty());
+        assert!(!principal.has_scope(Scope::CardRead));
+    }
+
+    #[test]
+    fn has_scope_reflects_membership() {
+        let principal = Principal::new(test_actor(), BTreeSet::from([Scope::CardRead]));
+
+        assert!(principal.has_scope(Scope::CardRead));
+        assert!(!principal.has_scope(Scope::CardWrite));
+    }
+
+    #[test]
+    fn has_all_requires_every_scope() {
+        let principal = Principal::new(
+            test_actor(),
+            BTreeSet::from([Scope::CardRead, Scope::CardWrite]),
+        );
+
+        assert!(principal.has_all([Scope::CardRead]));
+        assert!(!principal.has_all([Scope::CardRead, Scope::GateRun]));
+    }
+
+    #[test]
+    fn platform_admin_principal_has_every_scope() {
+        let roles = Role::seeded();
+        let platform_admin = find_role(&roles, "platform_admin");
+        let principal = Principal::from_roles(test_actor(), [platform_admin]);
+
+        assert!(principal.has_all(Scope::all()));
+    }
+
+    fn test_actor() -> Actor {
+        Actor::Service {
+            name: "test-service".to_owned(),
+        }
+    }
+
+    fn find_role<'a>(roles: &'a [Role], name: &str) -> &'a Role {
+        roles
+            .iter()
+            .find(|role| role.name.as_str() == name)
+            .expect("seeded role exists")
     }
 }

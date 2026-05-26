@@ -48,7 +48,7 @@ RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links" cargo doc --lo
   -p wyrd-runtime \
   -p wyrd-telemetry \
   -p wyrd-testing \
-  -p wyrd-auth \
+  -p wyrd-auth-verify \
   -p wyrd-crypt \
   -p wyrd-utils \
   -p wyrd-error-derive
@@ -57,7 +57,7 @@ cargo test --locked --doc --all-features \
   -p wyrd-runtime \
   -p wyrd-telemetry \
   -p wyrd-testing \
-  -p wyrd-auth \
+  -p wyrd-auth-verify \
   -p wyrd-crypt \
   -p wyrd-utils \
   -p wyrd-error-derive
@@ -80,7 +80,7 @@ if [ -n "$forbidden_spec" ]; then
   exit 1
 fi
 
-for crate in wyrd-runtime wyrd-telemetry wyrd-auth; do
+for crate in wyrd-runtime wyrd-telemetry wyrd-auth-verify; do
   forbidden_shared=$(cargo tree -p "$crate" --all-features -e normal | \
     rg '(^|[ ─└├])(pyo3|sqlx)' || true)
   if [ -n "$forbidden_shared" ]; then

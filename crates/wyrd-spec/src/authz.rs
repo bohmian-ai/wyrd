@@ -62,31 +62,28 @@ pub enum Scope {
     ServiceAccountManage,
 }
 
+const ALL_SCOPES: &[Scope] = &[
+    Scope::CardRead,
+    Scope::CardWrite,
+    Scope::CardRegister,
+    Scope::PolicyAuthorOrg,
+    Scope::PolicyAuthorService,
+    Scope::GateRun,
+    Scope::TokenIssue,
+    Scope::AuditRead,
+    Scope::AuditSignoff,
+    Scope::ObservationRead,
+    Scope::UserManage,
+    Scope::ServiceAccountManage,
+];
+
 impl Scope {
     /// Every scope in declaration order.
     ///
     /// This is seed data, not a wildcard authorization token.
     #[must_use]
     pub fn all() -> Vec<Scope> {
-        use Scope::{
-            AuditRead, AuditSignoff, CardRead, CardRegister, CardWrite, GateRun, ObservationRead,
-            PolicyAuthorOrg, PolicyAuthorService, ServiceAccountManage, TokenIssue, UserManage,
-        };
-
-        vec![
-            CardRead,
-            CardWrite,
-            CardRegister,
-            PolicyAuthorOrg,
-            PolicyAuthorService,
-            GateRun,
-            TokenIssue,
-            AuditRead,
-            AuditSignoff,
-            ObservationRead,
-            UserManage,
-            ServiceAccountManage,
-        ]
+        ALL_SCOPES.to_vec()
     }
 
     /// Stable wire string for this scope.
@@ -155,6 +152,62 @@ pub struct Role {
     pub scopes: BTreeSet<Scope>,
 }
 
+struct SeedRoleDefinition {
+    name: &'static str,
+    scopes: &'static [Scope],
+}
+
+const PLATFORM_ADMIN_SCOPES: &[Scope] = ALL_SCOPES;
+const ML_ENGINEER_SCOPES: &[Scope] = &[
+    Scope::CardRead,
+    Scope::CardWrite,
+    Scope::CardRegister,
+    Scope::GateRun,
+    Scope::ObservationRead,
+];
+const DATA_SCIENTIST_SCOPES: &[Scope] =
+    &[Scope::CardRead, Scope::CardWrite, Scope::ObservationRead];
+const AUDITOR_SCOPES: &[Scope] = &[
+    Scope::CardRead,
+    Scope::AuditRead,
+    Scope::AuditSignoff,
+    Scope::ObservationRead,
+];
+const POLICY_MANAGER_SCOPES: &[Scope] = &[
+    Scope::CardRead,
+    Scope::PolicyAuthorOrg,
+    Scope::PolicyAuthorService,
+    Scope::AuditRead,
+];
+const TOKEN_ISSUER_SCOPES: &[Scope] = &[Scope::CardRead, Scope::TokenIssue];
+
+const SEEDED_ROLE_DEFINITIONS: &[SeedRoleDefinition] = &[
+    SeedRoleDefinition {
+        name: "platform_admin",
+        scopes: PLATFORM_ADMIN_SCOPES,
+    },
+    SeedRoleDefinition {
+        name: "ml_engineer",
+        scopes: ML_ENGINEER_SCOPES,
+    },
+    SeedRoleDefinition {
+        name: "data_scientist",
+        scopes: DATA_SCIENTIST_SCOPES,
+    },
+    SeedRoleDefinition {
+        name: "auditor",
+        scopes: AUDITOR_SCOPES,
+    },
+    SeedRoleDefinition {
+        name: "policy_manager",
+        scopes: POLICY_MANAGER_SCOPES,
+    },
+    SeedRoleDefinition {
+        name: "token_issuer",
+        scopes: TOKEN_ISSUER_SCOPES,
+    },
+];
+
 impl Role {
     /// The six seeded default roles.
     ///
@@ -166,33 +219,13 @@ impl Role {
     /// invariant.
     #[must_use]
     pub fn seeded() -> Vec<Role> {
-        let role = |name: &str, scopes: &[Scope]| Role {
-            name: RoleName::new(name).expect("seed role name is a valid token"),
-            scopes: scopes.iter().copied().collect(),
-        };
-
-        use Scope::{
-            AuditRead, AuditSignoff, CardRead, CardRegister, CardWrite, GateRun, ObservationRead,
-            PolicyAuthorOrg, PolicyAuthorService, TokenIssue,
-        };
-
-        vec![
-            role("platform_admin", &Scope::all()),
-            role(
-                "ml_engineer",
-                &[CardRead, CardWrite, CardRegister, GateRun, ObservationRead],
-            ),
-            role("data_scientist", &[CardRead, CardWrite, ObservationRead]),
-            role(
-                "auditor",
-                &[CardRead, AuditRead, AuditSignoff, ObservationRead],
-            ),
-            role(
-                "policy_manager",
-                &[CardRead, PolicyAuthorOrg, PolicyAuthorService, AuditRead],
-            ),
-            role("token_issuer", &[CardRead, TokenIssue]),
-        ]
+        SEEDED_ROLE_DEFINITIONS
+            .iter()
+            .map(|definition| Role {
+                name: RoleName::new(definition.name).expect("seed role name is a valid token"),
+                scopes: definition.scopes.iter().copied().collect(),
+            })
+            .collect()
     }
 }
 

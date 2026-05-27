@@ -131,6 +131,29 @@ impl WyrdPyError {
         .into()
     }
 
+    /// Build a `ModelCard` validation error.
+    pub fn model_validation(message: impl Into<String>) -> Self {
+        WyrdError::ModelValidation {
+            message: message.into(),
+            details: Value::Null,
+        }
+        .into()
+    }
+
+    /// Build a `ModelCard` unknown-model-type error.
+    pub fn unknown_model_type(module: impl Into<String>, type_name: impl Into<String>) -> Self {
+        let module = module.into();
+        let type_name = type_name.into();
+        WyrdError::ModelUnknownModelType {
+            message: format!("unsupported model object type: {module}.{type_name}"),
+            details: json!({
+                "module": module,
+                "type_name": type_name,
+            }),
+        }
+        .into()
+    }
+
     /// Build a `ModelCard` serializer-unavailable error.
     pub fn serializer_unavailable(extra: &str) -> Self {
         WyrdError::ModelSerializerUnavailable {

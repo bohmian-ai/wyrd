@@ -3,7 +3,7 @@ use wyrd_spec::card::model::{HuggingFaceTask, TfSaveFormat, TorchSaveFormat};
 
 #[cfg(feature = "python")]
 use {
-    crate::error::{CardPyResult, WyrdPyError},
+    crate::error::CardPyResult,
     crate::model::interfaces::options::{
         huggingface_task_token, parse_huggingface_task, parse_tf_save_format,
         parse_torch_save_format, tf_save_format_token, torch_save_format_token,
@@ -161,30 +161,26 @@ macro_rules! impl_model_interface_methods {
                 self.model_subtype.as_deref()
             }
 
-            /// Save is deferred to a later `ModelCard` stage.
+            /// Save the held model through this interface's local artifact layout.
             #[pyo3(signature = (path, save_kwargs=None))]
             fn save(
                 &self,
+                py: Python<'_>,
                 path: PathBuf,
                 save_kwargs: Option<&Bound<'_, PyDict>>,
             ) -> CardPyResult<()> {
-                let _ = (path, save_kwargs);
-                Err(WyrdPyError::validation(
-                    "model interface save is not implemented in this stage",
-                ))
+                self.save_inner(py, &path, save_kwargs)
             }
 
-            /// Load is deferred to a later `ModelCard` stage.
+            /// Load the held model through this interface's local artifact layout.
             #[pyo3(signature = (path, load_kwargs=None))]
             fn load(
                 &mut self,
+                py: Python<'_>,
                 path: PathBuf,
                 load_kwargs: Option<&Bound<'_, PyDict>>,
             ) -> CardPyResult<()> {
-                let _ = (path, load_kwargs);
-                Err(WyrdPyError::validation(
-                    "model interface load is not implemented in this stage",
-                ))
+                self.load_inner(py, &path, load_kwargs)
             }
         }
     };

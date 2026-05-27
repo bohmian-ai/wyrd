@@ -64,7 +64,7 @@ impl ModelInterface {
     #[pyo3(signature = (path, save_kwargs=None))]
     fn save(&self, path: PathBuf, save_kwargs: Option<&Bound<'_, PyDict>>) -> CardPyResult<()> {
         let _ = (&self.kind, path, save_kwargs);
-        Err(WyrdPyError::validation(
+        Err(WyrdPyError::model_validation(
             "ModelInterface.save must be implemented by a concrete interface",
         ))
     }
@@ -73,7 +73,7 @@ impl ModelInterface {
     #[pyo3(signature = (path, load_kwargs=None))]
     fn load(&mut self, path: PathBuf, load_kwargs: Option<&Bound<'_, PyDict>>) -> CardPyResult<()> {
         let _ = (&self.kind, path, load_kwargs);
-        Err(WyrdPyError::validation(
+        Err(WyrdPyError::model_validation(
             "ModelInterface.load must be implemented by a concrete interface",
         ))
     }

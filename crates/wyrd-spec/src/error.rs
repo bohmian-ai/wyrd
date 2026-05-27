@@ -253,6 +253,20 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Python model input could not be classified as a supported ModelCard interface.
+    #[error("[WYRD_MODEL_400_UNKNOWN_MODEL_TYPE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_UNKNOWN_MODEL_TYPE",
+        status = 400,
+        title = "Unknown ModelCard model type",
+        remediation = "Pass a supported model object or an explicit ModelInterface."
+    )]
+    ModelUnknownModelType {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// ModelCard validation failed.
     #[error("[WYRD_MODEL_400_VALIDATION] {message}")]
     #[wyrd_error(
@@ -402,6 +416,7 @@ impl WyrdError {
             | Self::DataTargetColumnUnknown { message, details }
             | Self::DataInvalidInterfaceOption { message, details }
             | Self::DataInterfaceMetadataRequired { message, details }
+            | Self::ModelUnknownModelType { message, details }
             | Self::ModelValidation { message, details }
             | Self::ModelMissingSignature { message, details }
             | Self::ModelDtypeNormalizeFailed { message, details }

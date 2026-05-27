@@ -1,4 +1,4 @@
-use crate::error::CardPyResult;
+use crate::error::{CardPyResult, WyrdPyError};
 
 #[cfg(feature = "python")]
 use {
@@ -19,6 +19,47 @@ pub(crate) fn qualname_of(_py: Python<'_>, obj: &Bound<'_, PyAny>) -> CardPyResu
         .get_type()
         .getattr("__qualname__")?
         .extract::<String>()?)
+}
+
+/// Ensure every package required by a model interface path is importable.
+///
+/// # Errors
+/// Returns `WYRD_MODEL_501_SERIALIZER_UNAVAILABLE` when a required Python
+/// import is unavailable in the active interpreter.
+#[cfg(feature = "python")]
+pub(crate) fn ensure_extras(py: Python<'_>, extras: &str, required: &[&str]) -> CardPyResult<()> {
+    for package in required {
+        if py.import(package).is_err() {
+            return Err(WyrdPyError::serializer_unavailable(&format!(
+                "wyrd[{extras}] (missing import: {package})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Required Python imports for model interface local IO paths.
+#[cfg(feature = "python")]
+pub(crate) mod required {
+    /// Imports required by the sklearn model interface.
+    pub(crate) const SKLEARN: (&str, &[&str]) = ("sklearn", &["joblib", "sklearn"]);
+    /// Imports required by the `XGBoost` model interface.
+    pub(crate) const XGBOOST: (&str, &[&str]) = ("xgboost", &["joblib", "xgboost"]);
+    /// Imports required by the `LightGBM` model interface.
+    pub(crate) const LIGHTGBM: (&str, &[&str]) = ("lightgbm", &["joblib", "lightgbm"]);
+    /// Imports required by the `CatBoost` model interface.
+    pub(crate) const CATBOOST: (&str, &[&str]) = ("catboost", &["joblib", "catboost"]);
+    /// Imports required by the Torch safetensors model interface path.
+    pub(crate) const TORCH_SAFETENSORS: (&str, &[&str]) =
+        ("torch", &["torch", "safetensors.torch"]);
+    /// Imports required by the Torch pickle model interface path.
+    pub(crate) const TORCH_PICKLE: (&str, &[&str]) = ("torch", &["torch"]);
+    /// Imports required by the Lightning model interface path.
+    pub(crate) const LIGHTNING: (&str, &[&str]) = ("lightning", &["pytorch_lightning", "torch"]);
+    /// Imports required by the TensorFlow model interface path.
+    pub(crate) const TENSORFLOW: (&str, &[&str]) = ("tensorflow", &["tensorflow"]);
+    /// Imports required by the Hugging Face model interface path.
+    pub(crate) const HUGGINGFACE: (&str, &[&str]) = ("huggingface", &["transformers"]);
 }
 
 #[cfg(feature = "python")]

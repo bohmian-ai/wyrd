@@ -3506,7 +3506,9 @@ dependencies = [
  "chrono",
  "jsonwebtoken",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
+ "tracing",
  "wyrd-auth-verify",
 ]
 
@@ -3593,7 +3595,6 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
- "wyrd-spec",
 ]
 
 [[package]]

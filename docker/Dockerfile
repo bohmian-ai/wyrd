@@ -9,9 +9,9 @@ RUN --mount=type=cache,target=/build/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
     set -eux; \
     if [ "$WYRD_FLAVOR" = "enterprise" ]; then \
-        cargo build --release -p wyrd-server --features enterprise; \
+        cargo build --release --locked -p wyrd-server --features enterprise; \
     else \
-        cargo build --release -p wyrd-server; \
+        cargo build --release --locked -p wyrd-server; \
     fi; \
     cp target/release/wyrd-server /build/wyrd-server
 

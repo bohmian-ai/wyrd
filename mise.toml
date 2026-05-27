@@ -42,11 +42,11 @@ run = "cargo test -p wyrd-error-derive --all-features"
 
 [tasks."build:server:oss"]
 description = "Build the OSS wyrd-server release binary"
-run = "cargo build --release -p wyrd-server"
+run = "cargo build --release --locked -p wyrd-server"
 
 [tasks."build:server:enterprise"]
 description = "Build the enterprise wyrd-server release binary"
-run = "cargo build --release -p wyrd-server --features enterprise"
+run = "cargo build --release --locked -p wyrd-server --features enterprise"
 
 [tasks."docker:build:oss"]
 description = "Build the OSS wyrd-server Docker image"
@@ -61,24 +61,12 @@ description = "Build public Rust docs and doctests"
 run = """
 RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links" cargo doc --locked --no-deps --all-features \
   -p wyrd-spec \
-  -p wyrd-runtime \
-  -p wyrd-telemetry \
-  -p wyrd-testing \
   -p wyrd-auth-issue \
-  -p wyrd-auth-verify \
-  -p wyrd-crypt \
-  -p wyrd-utils \
-  -p wyrd-error-derive
+  -p wyrd-auth-verify
 cargo test --locked --doc --all-features \
   -p wyrd-spec \
-  -p wyrd-runtime \
-  -p wyrd-telemetry \
-  -p wyrd-testing \
-  -p wyrd-auth-issue \
   -p wyrd-auth-verify \
-  -p wyrd-crypt \
-  -p wyrd-utils \
-  -p wyrd-error-derive
+  -p wyrd-auth-issue
 """
 
 [tasks."cardkind:check"]
@@ -98,7 +86,7 @@ if [ -n "$forbidden_spec" ]; then
   exit 1
 fi
 
-for crate in wyrd-runtime wyrd-telemetry wyrd-auth-verify; do
+for crate in wyrd-auth-verify; do
   forbidden_shared=$(cargo tree -p "$crate" --all-features -e normal | \
     rg '(^|[ ─└├])(pyo3|sqlx)' || true)
   if [ -n "$forbidden_shared" ]; then

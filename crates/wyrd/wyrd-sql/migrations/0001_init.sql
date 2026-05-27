@@ -62,6 +62,11 @@ CREATE TABLE refresh_tokens (
     revoked_at TIMESTAMPTZ
 );
 
+-- governance_tokens intentionally has no expires_at column.
+-- These tokens are long-lived service identity credentials for registered
+-- service cards. A card has exactly one active governance token at a time.
+-- Lifecycle is managed via `status` and `revoked_at` only; there is no
+-- token rotation or refresh path at the governance level.
 CREATE TABLE governance_tokens (
     token_id TEXT PRIMARY KEY,
     card_uid TEXT NOT NULL,
@@ -76,3 +81,5 @@ CREATE INDEX idx_api_keys_sa ON api_keys(sa_id);
 CREATE INDEX idx_api_keys_prefix ON api_keys(prefix);
 CREATE INDEX idx_refresh_tokens_user ON refresh_tokens(user_id);
 CREATE INDEX idx_governance_tokens_card ON governance_tokens(card_uid);
+CREATE UNIQUE INDEX idx_refresh_tokens_token_hash ON refresh_tokens(token_hash);
+CREATE INDEX idx_refresh_tokens_active_hash ON refresh_tokens(token_hash) WHERE revoked_at IS NULL;

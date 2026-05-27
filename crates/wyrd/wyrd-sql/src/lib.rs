@@ -8,11 +8,11 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
     /// Database connection failed.
-    #[error("database connection failed: {0}")]
-    Connect(String),
+    #[error("database connection failed")]
+    Connect(#[from] sqlx::Error),
     /// Database migration failed.
-    #[error("migration failed: {0}")]
-    Migrate(String),
+    #[error("migration failed")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
 }
 
 /// Control-plane Postgres handle.
@@ -35,7 +35,7 @@ impl SqlStore {
             .max_connections(max_connections)
             .connect(database_url)
             .await
-            .map_err(|source| SqlError::Connect(source.to_string()))?;
+            .map_err(SqlError::Connect)?;
         Ok(Self { pool })
     }
 
@@ -47,7 +47,7 @@ impl SqlStore {
         sqlx::migrate!("./migrations")
             .run(&self.pool)
             .await
-            .map_err(|source| SqlError::Migrate(source.to_string()))
+            .map_err(SqlError::Migrate)
     }
 
     /// Borrow the underlying Postgres pool.

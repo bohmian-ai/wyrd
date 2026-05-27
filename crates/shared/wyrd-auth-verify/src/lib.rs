@@ -14,8 +14,8 @@ use wyrd_spec::authz::{Principal, Scope};
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     /// JWT verification failed.
-    #[error("jwt error: {0}")]
-    Jwt(String),
+    #[error("jwt error")]
+    Jwt(#[source] jsonwebtoken::errors::Error),
 }
 
 /// Resolved Wyrd access-token claims.
@@ -59,7 +59,7 @@ pub fn verify_eddsa_with<C: DeserializeOwned>(
     validation.algorithms = vec![Algorithm::EdDSA];
     jsonwebtoken::decode::<C>(token, public_key, &validation)
         .map(|data| data.claims)
-        .map_err(|source| AuthError::Jwt(source.to_string()))
+        .map_err(AuthError::Jwt)
 }
 
 /// Verify an EdDSA Wyrd token with the standard access-token policy.
@@ -90,7 +90,7 @@ pub fn verify_eddsa<C: DeserializeOwned>(
 pub fn decode_kid(token: &str) -> Result<Option<String>, AuthError> {
     jsonwebtoken::decode_header(token)
         .map(|header| header.kid)
-        .map_err(|source| AuthError::Jwt(source.to_string()))
+        .map_err(AuthError::Jwt)
 }
 
 /// Build an EdDSA public decoding key from PEM bytes.
@@ -98,7 +98,7 @@ pub fn decode_kid(token: &str) -> Result<Option<String>, AuthError> {
 /// # Errors
 /// Returns an error when the PEM bytes are not a valid EdDSA public key.
 pub fn public_key_from_pem(pem: &[u8]) -> Result<DecodingKey, AuthError> {
-    DecodingKey::from_ed_pem(pem).map_err(|source| AuthError::Jwt(source.to_string()))
+    DecodingKey::from_ed_pem(pem).map_err(AuthError::Jwt)
 }
 
 #[cfg(test)]

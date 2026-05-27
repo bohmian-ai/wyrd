@@ -133,7 +133,7 @@ pub enum WyrdError {
         code = "WYRD_AUTH_401_TOKEN_EXPIRED",
         status = 401,
         title = "Token expired",
-        remediation = "Refresh the session via /auth/refresh and retry with the new token."
+        remediation = "Re-authenticate to obtain a fresh token."
     )]
     TokenExpired {
         /// Human-readable error message.
@@ -467,6 +467,66 @@ mod tests {
         let value = serde_json::to_value(error).expect("auth error serializes");
 
         assert_eq!(value["kind"], "insufficient_scope");
+    }
+
+    #[test]
+    fn token_expired_problem_json() {
+        let error = WyrdError::TokenExpired {
+            message: "token expired".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let problem = error.as_problem_json();
+
+        assert_eq!(problem["code"], "WYRD_AUTH_401_TOKEN_EXPIRED");
+        assert_eq!(problem["status"], 401);
+        assert_eq!(problem["title"], "Token expired");
+        assert!(
+            problem["type"]
+                .as_str()
+                .expect("problem type is a string")
+                .ends_with("WYRD_AUTH_401_TOKEN_EXPIRED")
+        );
+    }
+
+    #[test]
+    fn token_expired_serde_tag() {
+        let error = WyrdError::TokenExpired {
+            message: "token expired".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let value = serde_json::to_value(error).expect("auth error serializes");
+
+        assert_eq!(value["kind"], "token_expired");
+    }
+
+    #[test]
+    fn invalid_token_problem_json() {
+        let error = WyrdError::InvalidToken {
+            message: "signature mismatch".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let problem = error.as_problem_json();
+
+        assert_eq!(problem["code"], "WYRD_AUTH_401_INVALID_TOKEN");
+        assert_eq!(problem["status"], 401);
+        assert_eq!(problem["title"], "Invalid token");
+        assert!(
+            problem["type"]
+                .as_str()
+                .expect("problem type is a string")
+                .ends_with("WYRD_AUTH_401_INVALID_TOKEN")
+        );
+    }
+
+    #[test]
+    fn invalid_token_serde_tag() {
+        let error = WyrdError::InvalidToken {
+            message: "signature mismatch".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let value = serde_json::to_value(error).expect("auth error serializes");
+
+        assert_eq!(value["kind"], "invalid_token");
     }
 
     fn auth_errors() -> [WyrdError; 4] {

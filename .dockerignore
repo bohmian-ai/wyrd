@@ -5,4 +5,22 @@ node_modules/
 **/node_modules/
 *.pem
 **/*.pem
+
+# Local secrets and credentials
+.env
+.env.*
+**/.env
+**/.env.*
+*.key
+**/*.key
+credentials/
+**/credentials/
+
+# Local caches, logs, and review artifacts
+.dev/
+**/.dev/
+.cache/
+**/.cache/
+*.log
+**/*.log
 !crates/wyrd/wyrd-enterprise/keys/license-pub.pem

@@ -13,4 +13,8 @@ jsonwebtoken = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+tracing = { workspace = true }
 wyrd-auth-verify = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

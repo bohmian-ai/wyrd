@@ -77,8 +77,10 @@ impl ModelInterfaceHandle {
     /// type metadata cannot be inspected.
     pub fn from_raw(py: Python<'_>, model: &Bound<'_, PyAny>) -> CardPyResult<Self> {
         let model_py = model.clone().unbind();
-        let model_subtype =
-            Some(crate::model::interfaces::helpers::qualname_of(py, model_py.bind(py))?);
+        let model_subtype = Some(crate::model::interfaces::helpers::qualname_of(
+            py,
+            model_py.bind(py),
+        )?);
         match detect_interface_variant(py, model)? {
             ModelInterfaceKind::Huggingface => Ok(Self::Huggingface(HuggingfaceInterface {
                 model: Some(model_py),
@@ -161,7 +163,7 @@ impl ModelInterfaceHandle {
                     model_subtype: Some(format!("{loader_module}.{loader_class}")),
                     loader_module,
                     loader_class,
-                extra: BTreeMap::new(),
+                    extra: BTreeMap::new(),
                 }))
             }
         }

@@ -12,6 +12,7 @@ STUB_FILES = [
     "header.pyi",
     "error.pyi",
     "data.pyi",
+    "model.pyi",
 ]
 
 

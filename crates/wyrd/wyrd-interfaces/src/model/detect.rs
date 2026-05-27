@@ -7,17 +7,17 @@ use crate::error::CardPyResult;
 pub enum ModelInterfaceKind {
     /// Hugging Face `transformers.PreTrainedModel`.
     Huggingface,
-    /// PyTorch Lightning module.
+    /// `PyTorch` Lightning module.
     Lightning,
     /// Torch `nn.Module`.
     Torch,
     /// TensorFlow or Keras model.
     Tensorflow,
-    /// XGBoost sklearn-style model.
+    /// `XGBoost` sklearn-style model.
     Xgboost,
-    /// LightGBM sklearn-style model.
+    /// `LightGBM` sklearn-style model.
     Lightgbm,
-    /// CatBoost model.
+    /// `CatBoost` model.
     Catboost,
     /// sklearn estimator.
     Sklearn,
@@ -43,7 +43,7 @@ impl ModelInterfaceKind {
 /// Detect the model interface variant for a raw Python framework model object.
 ///
 /// Detection order is locked most-specific first: Hugging Face, Lightning,
-/// Torch, TensorFlow/Keras, XGBoost, LightGBM, CatBoost, then sklearn.
+/// `Torch`, `TensorFlow`/`Keras`, `XGBoost`, `LightGBM`, `CatBoost`, then sklearn.
 ///
 /// # Errors
 /// Returns `WYRD_MODEL_400_UNKNOWN_MODEL_TYPE` when no built-in model interface

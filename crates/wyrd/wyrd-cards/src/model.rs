@@ -373,6 +373,12 @@ impl ModelCard {
         self.metadata.clone()
     }
 
+    /// Return the canonical model task type token.
+    #[getter]
+    pub fn task_type(&self) -> &'static str {
+        task_type_token(self.metadata.task_type)
+    }
+
     /// Replace `ModelCard` holder metadata.
     ///
     /// # Errors
@@ -744,6 +750,19 @@ fn model_spec_from_metadata(
         signature: metadata.signature.clone(),
         sample_input: metadata.sample_input.clone(),
         artifact_refs: metadata.artifact_refs.clone(),
+    }
+}
+
+fn task_type_token(value: TaskType) -> &'static str {
+    match value {
+        TaskType::BinaryClassification => "binary_classification",
+        TaskType::MultiClassClassification => "multi_class_classification",
+        TaskType::Regression => "regression",
+        TaskType::Clustering => "clustering",
+        TaskType::AnomalyDetection => "anomaly_detection",
+        TaskType::Forecasting => "forecasting",
+        TaskType::Generation => "generation",
+        TaskType::Other => "other",
     }
 }
 

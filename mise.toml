@@ -168,10 +168,16 @@ depends = ["codegen:stubs"]
 run = ["uv sync --all-extras --group dev", "uv run maturin develop"]
 
 [tasks."py:test:unit"]
-description = "Run Python unit tests against real DataCard runtime dependencies"
+description = "Run Python unit tests except TensorFlow-marked tests"
 dir = "python/py-wyrd"
 depends = ["py:setup"]
-run = "uv run pytest -q"
+run = "uv run pytest -q -m \"not tensorflow\""
+
+[tasks."py:test:tensorflow"]
+description = "Run TensorFlow-marked Python unit tests"
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = "uv run pytest -q -m tensorflow"
 
 [tasks."py:format"]
 description = "Format Wyrd Python package and tests with Ruff"

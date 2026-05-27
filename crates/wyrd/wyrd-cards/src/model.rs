@@ -8,8 +8,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use wyrd_interfaces::error::CardPyResult;
 use wyrd_spec::card::model::{
-    CustomMeta as CustomModelMeta, ModelInterface as RustModelInterface,
-    ModelSignature as RustModelSignature, ModelSpec, SampleInput as RustSampleInput, TaskType,
+    CustomMeta as CustomModelMeta, HuggingFaceTask, HuggingfaceMeta,
+    ModelInterface as RustModelInterface, ModelSignature as RustModelSignature, ModelSpec,
+    SampleInput as RustSampleInput, TaskType, TensorflowMeta, TfSaveFormat, TorchMeta,
+    TorchSaveFormat,
 };
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::metadata::{Annotations, Labels};
@@ -22,6 +24,7 @@ use {
     pyo3::pyclass::{PyTraverseError, PyVisit},
     pyo3::types::{PyAny, PyDict, PyType, PyTypeMethods},
     std::path::PathBuf,
+    wyrd_interfaces::data::dtype::{extract_pathbuf, is_path_like},
     wyrd_interfaces::error::WyrdPyError,
     wyrd_interfaces::model::interfaces::{
         CatboostInterface as ModelCatboostInterface,
@@ -29,13 +32,14 @@ use {
         LightgbmInterface as ModelLightgbmInterface, LightningInterface as ModelLightningInterface,
         ModelInterface, ModelInterfaceHandle, SklearnInterface as ModelSklearnInterface,
         TensorflowInterface as ModelTensorflowInterface, TorchInterface as ModelTorchInterface,
-        XgboostInterface as ModelXgboostInterface,
+        XgboostInterface as ModelXgboostInterface, parse_task_type,
     },
     wyrd_interfaces::model::io::{load_model, save_model},
     wyrd_interfaces::model::sample::SampleInput,
     wyrd_interfaces::model::signature::ModelSignature,
     wyrd_spec::envelope::{CardKind, Metadata as EnvelopeMetadata},
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
+    wyrd_utils::py::pyobject_to_json,
 };
 
 /// Python-holder metadata accumulated by a local `ModelCard`.
@@ -202,6 +206,30 @@ struct SerializedModelCardEnvelope {
 #[cfg(feature = "python")]
 #[pymethods]
 impl ModelCardMetadata {
+    /// Create `ModelCard` holder metadata from Python values.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when task type, signature, sample input, interface,
+    /// or artifact reference values cannot be parsed into the Rust spec shape.
+    #[new]
+    #[pyo3(signature = (*, interface=None, task_type="other", signature=None, sample_input=None, artifact_refs=None))]
+    pub fn __new__(
+        py: Python<'_>,
+        interface: Option<&Bound<'_, PyAny>>,
+        task_type: &str,
+        signature: Option<&Bound<'_, PyAny>>,
+        sample_input: Option<&Bound<'_, PyAny>>,
+        artifact_refs: Option<&Bound<'_, PyAny>>,
+    ) -> CardPyResult<Self> {
+        Ok(Self {
+            interface: parse_metadata_interface(py, interface)?,
+            task_type: parse_task_type(task_type)?,
+            signature: parse_metadata_signature(signature)?,
+            sample_input: parse_metadata_sample_input(sample_input)?,
+            artifact_refs: parse_metadata_artifact_refs(artifact_refs)?,
+        })
+    }
+
     /// Return this metadata as a Python-serializable dict for inspection.
     ///
     /// # Errors
@@ -597,8 +625,13 @@ impl ModelCard {
 
 #[cfg(feature = "python")]
 enum ModelCardInput {
+    /// Local model artifact path using one of Wyrd's model save layouts.
+    ArtifactPath(PathBuf),
+    /// Raw framework model object to auto-detect.
     Raw(Py<PyAny>),
+    /// Initialized model interface object.
     Interface(ModelInterfaceHandle),
+    /// Python subclass used only when rehydrating custom JSON metadata.
     InterfaceClass(Py<PyAny>),
 }
 
@@ -608,6 +641,10 @@ impl ModelCardInput {
         model_or_interface: &Bound<'_, PyAny>,
         allow_interface_class: bool,
     ) -> CardPyResult<Self> {
+        if is_path_like(model_or_interface.py(), model_or_interface)? {
+            return Ok(Self::ArtifactPath(extract_pathbuf(model_or_interface)?));
+        }
+
         if model_or_interface.is_instance_of::<ModelInterface>() {
             return Ok(Self::Interface(ModelInterfaceHandle::from_interface(
                 model_or_interface,
@@ -634,6 +671,7 @@ impl ModelCardInput {
         metadata: &ModelCardMetadata,
     ) -> CardPyResult<ModelInterfaceHandle> {
         match self {
+            Self::ArtifactPath(path) => load_handle_from_artifact_path(py, &path, metadata),
             Self::Raw(model) => ModelInterfaceHandle::from_raw(py, model.bind(py)),
             Self::Interface(interface) => Ok(interface),
             Self::InterfaceClass(interface_class) => {
@@ -644,6 +682,166 @@ impl ModelCardInput {
             }
         }
     }
+}
+
+#[cfg(feature = "python")]
+/// Build a live model interface by loading a Wyrd model artifact path.
+///
+/// The path may be either a Wyrd model materialization root or one of the
+/// convention filenames/directories under that root. Signature metadata still
+/// comes from the caller because Wyrd cannot infer a model signature from model
+/// bytes safely.
+///
+/// # Errors
+/// Returns a Wyrd error when the path cannot be mapped to a supported
+/// interface, the interface requires extra live state, or local load fails.
+fn load_handle_from_artifact_path(
+    py: Python<'_>,
+    path: &Path,
+    metadata: &ModelCardMetadata,
+) -> CardPyResult<ModelInterfaceHandle> {
+    let root = model_artifact_root(path);
+    let interface = model_interface_for_artifact_path(py, path, metadata)?;
+    let py_interface = interface_from_model_spec(py, &interface)?;
+    load_model(py_interface.bind(py), Some(root), None)?;
+    ModelInterfaceHandle::from_interface(py_interface.bind(py))
+}
+
+#[cfg(feature = "python")]
+/// Select the model interface metadata to use for a local artifact path.
+///
+/// Explicit `metadata.interface` wins for ambiguous layouts such as
+/// `model.joblib`, which is shared by several tree/tabular frameworks.
+/// Otherwise this function infers only layouts that are unambiguous and can be
+/// loaded without an extra Python class or model instance.
+///
+/// # Errors
+/// Returns a Wyrd validation error for ambiguous or stateful layouts and an
+/// unknown-model-type error for paths that do not match a Wyrd model artifact
+/// convention.
+fn model_interface_for_artifact_path(
+    py: Python<'_>,
+    path: &Path,
+    metadata: &ModelCardMetadata,
+) -> CardPyResult<RustModelInterface> {
+    if !is_default_custom_interface(&metadata.interface) {
+        return Ok(metadata.interface.clone());
+    }
+
+    let root = model_artifact_root(path);
+    if path.ends_with("model.pt") || root.join("model.pt").is_file() {
+        return Ok(RustModelInterface::Torch(TorchMeta {
+            framework_version: module_version_or_unknown(py, "torch"),
+            model_subtype: None,
+            save_format: TorchSaveFormat::Pickle,
+        }));
+    }
+    if path.ends_with("model.keras") || root.join("model.keras").is_file() {
+        return Ok(RustModelInterface::Tensorflow(TensorflowMeta {
+            framework_version: module_version_or_unknown(py, "tensorflow"),
+            model_subtype: None,
+            save_format: TfSaveFormat::Keras,
+        }));
+    }
+    if path.ends_with("savedmodel") || root.join("savedmodel").is_dir() {
+        return Ok(RustModelInterface::Tensorflow(TensorflowMeta {
+            framework_version: module_version_or_unknown(py, "tensorflow"),
+            model_subtype: None,
+            save_format: TfSaveFormat::SavedModel,
+        }));
+    }
+    if path.ends_with("model") || root.join("model").join("config.json").is_file() {
+        return Ok(RustModelInterface::Huggingface(HuggingfaceMeta {
+            framework_version: module_version_or_unknown(py, "transformers"),
+            model_subtype: None,
+            hf_task: HuggingFaceTask::Other,
+            repo_id: None,
+            revision: None,
+        }));
+    }
+
+    if path.ends_with("model.joblib") || root.join("model.joblib").is_file() {
+        return Err(WyrdPyError::model_validation(
+            "ModelCard path input for model.joblib requires metadata.interface because joblib artifacts are shared by Sklearn, Xgboost, Lightgbm, and Catboost",
+        ));
+    }
+    if path.ends_with("model.safetensors") || root.join("model.safetensors").is_file() {
+        return Err(WyrdPyError::model_validation(
+            "ModelCard path input for model.safetensors requires an explicit TorchInterface with an attached nn.Module; construct the interface and call load(path)",
+        ));
+    }
+    if path.ends_with("model.ckpt") || root.join("model.ckpt").is_file() {
+        return Err(WyrdPyError::model_validation(
+            "ModelCard path input for model.ckpt requires an explicit LightningInterface with an attached LightningModule class or instance; construct the interface and call load(path)",
+        ));
+    }
+
+    Err(WyrdPyError::unknown_model_type(
+        "path",
+        path.to_string_lossy(),
+    ))
+}
+
+#[cfg(feature = "python")]
+/// Return whether metadata still has the constructor's empty custom sentinel.
+fn is_default_custom_interface(interface: &RustModelInterface) -> bool {
+    matches!(
+        interface,
+        RustModelInterface::Custom(meta)
+            if meta.framework_version.is_empty()
+                && meta.loader_module.is_empty()
+                && meta.loader_class.is_empty()
+                && meta.model_subtype.is_none()
+                && meta.extra.is_empty()
+    )
+}
+
+#[cfg(feature = "python")]
+/// Normalize a model artifact path to the Wyrd materialization root.
+///
+/// Built-in loaders read from convention paths such as `path/model.joblib` or
+/// `path/model.keras`. When callers pass the convention file or subdirectory
+/// itself, this helper returns its parent so the existing loader can be reused.
+fn model_artifact_root(path: &Path) -> PathBuf {
+    if path.is_file()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                matches!(
+                    name,
+                    "model.joblib"
+                        | "model.pt"
+                        | "model.safetensors"
+                        | "model.ckpt"
+                        | "model.keras"
+                )
+            })
+    {
+        return path
+            .parent()
+            .map_or_else(|| path.to_path_buf(), Path::to_path_buf);
+    }
+    if path.is_dir()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "model" || name == "savedmodel")
+    {
+        return path
+            .parent()
+            .map_or_else(|| path.to_path_buf(), Path::to_path_buf);
+    }
+    path.to_path_buf()
+}
+
+#[cfg(feature = "python")]
+/// Return an installed Python package version, falling back to `unknown`.
+fn module_version_or_unknown(py: Python<'_>, package: &str) -> String {
+    wyrd_utils::py::module_version(py, package)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[cfg(feature = "python")]
@@ -764,6 +962,64 @@ fn task_type_token(value: TaskType) -> &'static str {
         TaskType::Generation => "generation",
         TaskType::Other => "other",
     }
+}
+
+#[cfg(feature = "python")]
+fn parse_metadata_interface(
+    py: Python<'_>,
+    value: Option<&Bound<'_, PyAny>>,
+) -> CardPyResult<RustModelInterface> {
+    let Some(value) = value else {
+        return Ok(ModelCardMetadata::default().interface);
+    };
+    if value.is_none() {
+        return Ok(ModelCardMetadata::default().interface);
+    }
+    if let Ok(handle) = ModelInterfaceHandle::from_interface(value) {
+        return handle.to_spec_interface(py);
+    }
+    Ok(serde_json::from_value(pyobject_to_json(value)?)?)
+}
+
+#[cfg(feature = "python")]
+fn parse_metadata_signature(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<RustModelSignature> {
+    let Some(value) = value else {
+        return Ok(ModelCardMetadata::default().signature);
+    };
+    if value.is_none() {
+        return Ok(ModelCardMetadata::default().signature);
+    }
+    if let Ok(signature) = value.extract::<PyRef<'_, ModelSignature>>() {
+        return Ok(signature.inner().clone());
+    }
+    Ok(serde_json::from_value(pyobject_to_json(value)?)?)
+}
+
+#[cfg(feature = "python")]
+fn parse_metadata_sample_input(
+    value: Option<&Bound<'_, PyAny>>,
+) -> CardPyResult<Option<RustSampleInput>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+    if let Ok(sample_input) = value.extract::<PyRef<'_, SampleInput>>() {
+        return Ok(Some(sample_input.to_rust()));
+    }
+    Ok(Some(serde_json::from_value(pyobject_to_json(value)?)?))
+}
+
+#[cfg(feature = "python")]
+fn parse_metadata_artifact_refs(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Vec<CardRef>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.is_none() {
+        return Ok(Vec::new());
+    }
+    Ok(serde_json::from_value(pyobject_to_json(value)?)?)
 }
 
 #[cfg(feature = "python")]

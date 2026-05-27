@@ -714,7 +714,7 @@ class ModelCard:
     @overload
     def __init__(
         self,
-        model_or_interface: PathLike | Mapping[str, Any],
+        model_or_interface: PathLike,
         space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
@@ -723,11 +723,12 @@ class ModelCard:
         annotations: StringMap | None = ...,
         metadata: ModelCardMetadata | None = ...,
     ) -> None:
-        """Create a ModelCard from a local artifact path or metadata mapping.
+        """Create a ModelCard from a local model artifact path.
 
         Args:
-            model_or_interface (PathLike | Mapping[str, Any]): Local model
-                artifact path or serialized model metadata mapping.
+            model_or_interface (PathLike): Wyrd model materialization root or a
+                convention artifact path such as `model.joblib`, `model.pt`,
+                `model.keras`, `savedmodel`, or `model/`.
             space (str | None): Optional card space. Defaults to `default`.
             name (str | None): Optional card name. Defaults to `model`.
             version (str | None): Optional semantic version. Defaults to
@@ -739,7 +740,9 @@ class ModelCard:
             annotations (StringMap | None): Free-form user annotations copied
                 into the card metadata.
             metadata (ModelCardMetadata | None): Existing holder metadata to
-                seed before interface inference.
+                seed before interface inference. A valid signature is required.
+                Joblib artifacts require `metadata.interface` because the file
+                layout is shared by Sklearn, XGBoost, LightGBM, and CatBoost.
 
         Raises:
             WyrdError: If Wyrd cannot infer a supported model interface or the

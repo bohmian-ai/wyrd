@@ -4,12 +4,16 @@ use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
 use crate::error::{CardPyResult, WyrdPyError};
+use crate::model::detect::{ModelInterfaceKind, detect_interface_variant};
 use crate::model::interfaces::ModelInterface;
 use crate::model::interfaces::kinds::{
     CatboostInterface, HuggingfaceInterface, LightgbmInterface, LightningInterface,
     SklearnInterface, TensorflowInterface, TorchInterface, XgboostInterface,
 };
-use wyrd_spec::card::model::{CustomMeta, ModelInterface as RustModelInterface};
+use wyrd_spec::card::model::{
+    CustomMeta, HuggingFaceTask, ModelInterface as RustModelInterface, TfSaveFormat,
+    TorchSaveFormat,
+};
 
 /// Python-compatible dispatch wrapper for local model interface holders.
 pub enum ModelInterfaceHandle {
@@ -66,6 +70,73 @@ impl ModelInterfaceHandle {
         ))
     }
 
+    /// Detect and build a default interface holder from a raw Python model.
+    ///
+    /// # Errors
+    /// Returns a public Wyrd error when the model object is not supported or
+    /// type metadata cannot be inspected.
+    pub fn from_raw(py: Python<'_>, model: &Bound<'_, PyAny>) -> CardPyResult<Self> {
+        let model_py = model.clone().unbind();
+        let model_subtype =
+            Some(crate::model::interfaces::helpers::qualname_of(py, model_py.bind(py))?);
+        match detect_interface_variant(py, model)? {
+            ModelInterfaceKind::Huggingface => Ok(Self::Huggingface(HuggingfaceInterface {
+                model: Some(model_py),
+                processor: None,
+                framework_version: package_version(py, "transformers"),
+                model_subtype,
+                hf_task: HuggingFaceTask::Other,
+                repo_id: None,
+                revision: None,
+            })),
+            ModelInterfaceKind::Lightning => Ok(Self::Lightning(LightningInterface {
+                model: Some(model_py),
+                trainer: None,
+                preprocessor: None,
+                framework_version: package_version(py, "pytorch-lightning"),
+                model_subtype,
+            })),
+            ModelInterfaceKind::Torch => Ok(Self::Torch(TorchInterface {
+                model: Some(model_py),
+                preprocessor: None,
+                framework_version: package_version(py, "torch"),
+                model_subtype,
+                save_format: TorchSaveFormat::Safetensors,
+            })),
+            ModelInterfaceKind::Tensorflow => Ok(Self::Tensorflow(TensorflowInterface {
+                model: Some(model_py),
+                preprocessor: None,
+                framework_version: package_version(py, "tensorflow"),
+                model_subtype,
+                save_format: TfSaveFormat::Keras,
+            })),
+            ModelInterfaceKind::Xgboost => Ok(Self::Xgboost(XgboostInterface {
+                model: Some(model_py),
+                preprocessor: None,
+                framework_version: package_version(py, "xgboost"),
+                model_subtype,
+            })),
+            ModelInterfaceKind::Lightgbm => Ok(Self::Lightgbm(LightgbmInterface {
+                model: Some(model_py),
+                preprocessor: None,
+                framework_version: package_version(py, "lightgbm"),
+                model_subtype,
+            })),
+            ModelInterfaceKind::Catboost => Ok(Self::Catboost(CatboostInterface {
+                model: Some(model_py),
+                preprocessor: None,
+                framework_version: package_version(py, "catboost"),
+                model_subtype,
+            })),
+            ModelInterfaceKind::Sklearn => Ok(Self::Sklearn(SklearnInterface {
+                model: Some(model_py),
+                preprocessor: None,
+                framework_version: package_version(py, "scikit-learn"),
+                model_subtype,
+            })),
+        }
+    }
+
     /// Convert this holder into Rust-only interface metadata.
     ///
     /// # Errors
@@ -81,13 +152,65 @@ impl ModelInterfaceHandle {
             Self::Lightning(value) => value.to_spec_interface(py),
             Self::Tensorflow(value) => value.to_spec_interface(py),
             Self::Huggingface(value) => value.to_spec_interface(py),
-            Self::Subclass(_) => Ok(RustModelInterface::Custom(CustomMeta {
-                framework_version: String::new(),
-                model_subtype: None,
-                loader_module: String::new(),
-                loader_class: String::new(),
+            Self::Subclass(value) => {
+                let ty = value.bind(py).get_type();
+                let loader_module = ty.getattr("__module__")?.extract::<String>()?;
+                let loader_class = ty.getattr("__qualname__")?.extract::<String>()?;
+                Ok(RustModelInterface::Custom(CustomMeta {
+                    framework_version: "custom".to_string(),
+                    model_subtype: Some(format!("{loader_module}.{loader_class}")),
+                    loader_module,
+                    loader_class,
                 extra: BTreeMap::new(),
-            })),
+                }))
+            }
         }
     }
+
+    /// Convert this handle back into a Python interface object.
+    ///
+    /// # Errors
+    /// Returns a Python-boundary error when the interface object cannot be
+    /// allocated.
+    pub fn into_py_any(self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+        macro_rules! into_py {
+            ($value:expr, $kind:literal) => {
+                Ok(Py::new(py, ($value, ModelInterface::marker($kind)))?.into_any())
+            };
+        }
+        match self {
+            Self::Sklearn(value) => into_py!(value, "Sklearn"),
+            Self::Xgboost(value) => into_py!(value, "Xgboost"),
+            Self::Lightgbm(value) => into_py!(value, "Lightgbm"),
+            Self::Catboost(value) => into_py!(value, "Catboost"),
+            Self::Torch(value) => into_py!(value, "Torch"),
+            Self::Lightning(value) => into_py!(value, "Lightning"),
+            Self::Tensorflow(value) => into_py!(value, "Tensorflow"),
+            Self::Huggingface(value) => into_py!(value, "Huggingface"),
+            Self::Subclass(value) => Ok(value),
+        }
+    }
+
+    /// Borrow the held live model object, if one exists.
+    #[must_use]
+    pub fn model_ref(&self) -> Option<&Py<PyAny>> {
+        match self {
+            Self::Sklearn(value) => value.model.as_ref(),
+            Self::Xgboost(value) => value.model.as_ref(),
+            Self::Lightgbm(value) => value.model.as_ref(),
+            Self::Catboost(value) => value.model.as_ref(),
+            Self::Torch(value) => value.model.as_ref(),
+            Self::Lightning(value) => value.model.as_ref(),
+            Self::Tensorflow(value) => value.model.as_ref(),
+            Self::Huggingface(value) => value.model.as_ref(),
+            Self::Subclass(_) => None,
+        }
+    }
+}
+
+fn package_version(py: Python<'_>, package: &str) -> String {
+    wyrd_utils::py::module_version(py, package)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".to_string())
 }

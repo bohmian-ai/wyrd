@@ -85,7 +85,6 @@ server/Python/client layers.
   duplicate implementation.
 - Use domain types instead of raw strings for durable identifiers
   (`TenantId`, `RunId`, `CardUid`, etc.).
-- Use `#[non_exhaustive]` on public `wyrd-spec` structs and enums.
 - Prefer `&str`, `&Path`, `&[T]`, and typed references when ownership is not
   needed.
 - Treat `.clone()` as a design question. Allowed only for concrete ownership

@@ -3,6 +3,7 @@
 use serde_json::{Value, json};
 use thiserror::Error;
 use wyrd_spec::card::data::validate::DataCardError;
+use wyrd_spec::card::model::validate::ModelCardError;
 use wyrd_spec::error::WyrdError;
 
 /// Result alias used by Python-boundary card interface methods.
@@ -121,6 +122,24 @@ impl WyrdPyError {
         Self::validation(message)
     }
 
+    /// Build a `ModelCard` missing-signature error.
+    pub fn missing_signature(message: impl Into<String>) -> Self {
+        WyrdError::ModelMissingSignature {
+            message: message.into(),
+            details: Value::Null,
+        }
+        .into()
+    }
+
+    /// Build a `ModelCard` serializer-unavailable error.
+    pub fn serializer_unavailable(extra: &str) -> Self {
+        WyrdError::ModelSerializerUnavailable {
+            message: format!("required serializer unavailable: {extra}"),
+            details: json!({ "extra": extra }),
+        }
+        .into()
+    }
+
     /// Build an internal interface error.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
@@ -150,6 +169,12 @@ impl WyrdPyError {
 
 impl From<DataCardError> for WyrdPyError {
     fn from(error: DataCardError) -> Self {
+        WyrdError::from(error).into()
+    }
+}
+
+impl From<ModelCardError> for WyrdPyError {
+    fn from(error: ModelCardError) -> Self {
         WyrdError::from(error).into()
     }
 }

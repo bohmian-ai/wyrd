@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskType",
+  "description": "Closed Wyrd ML task taxonomy.",
+  "oneOf": [
+    {
+      "description": "Two-class classification.",
+      "type": "string",
+      "enum": [
+        "BinaryClassification"
+      ]
+    },
+    {
+      "description": "Classification with more than two classes.",
+      "type": "string",
+      "enum": [
+        "MultiClassClassification"
+      ]
+    },
+    {
+      "description": "Continuous-valued regression.",
+      "type": "string",
+      "enum": [
+        "Regression"
+      ]
+    },
+    {
+      "description": "Unsupervised clustering.",
+      "type": "string",
+      "enum": [
+        "Clustering"
+      ]
+    },
+    {
+      "description": "Anomaly or outlier detection.",
+      "type": "string",
+      "enum": [
+        "AnomalyDetection"
+      ]
+    },
+    {
+      "description": "Time-series forecasting.",
+      "type": "string",
+      "enum": [
+        "Forecasting"
+      ]
+    },
+    {
+      "description": "Generative model task.",
+      "type": "string",
+      "enum": [
+        "Generation"
+      ]
+    },
+    {
+      "description": "Long-tail task described by interface metadata.",
+      "type": "string",
+      "enum": [
+        "Other"
+      ]
+    }
+  ]
+}

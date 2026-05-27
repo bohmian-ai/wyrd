@@ -28,6 +28,7 @@ wyrd-utils = { path = "crates/shared/wyrd-utils", version = "0.0.1" }
 wyrd-test-contract-macros = { path = "crates/shared/wyrd-test-contract-macros", version = "0.0.1" }
 wyrd-interfaces = { path = "crates/wyrd/wyrd-interfaces", version = "0.0.1" }
 wyrd-cards = { path = "crates/wyrd/wyrd-cards", version = "0.0.1" }
+wyrd-auth-verify = { path = "crates/shared/wyrd-auth-verify", version = "0.0.1" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -36,7 +37,7 @@ serde_yaml = "0.9"
 schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 thiserror = "2.0"
-chrono = { version = "0.4", default-features = false, features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 flate2 = "1.*"
 zstd = "0.13"
 walkdir = "2.*"
@@ -48,11 +49,14 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 proptest = "1"
 aes-gcm = "0.10"
 argon2 = "0.5"
+password-hash = { version = "0.5", features = ["getrandom"] }
+secrecy = "0.10"
 zeroize = "1"
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
 jsonwebtoken = "9"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "uuid", "chrono"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"

@@ -6,6 +6,8 @@ const DEFAULT_PORT: u16 = 8080;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    enterprise_on_start();
+
     let port: u16 = std::env::var(PORT_ENV)
         .ok()
         .and_then(|s| s.parse().ok())
@@ -16,3 +18,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
     Ok(())
 }
+
+#[cfg(feature = "enterprise")]
+fn enterprise_on_start() {
+    wyrd_enterprise::on_server_start();
+}
+
+#[cfg(not(feature = "enterprise"))]
+fn enterprise_on_start() {}

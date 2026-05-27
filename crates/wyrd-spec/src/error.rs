@@ -113,6 +113,62 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Caller presented no credential or an unparseable one.
+    #[error("[WYRD_AUTH_401_UNAUTHENTICATED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_UNAUTHENTICATED",
+        status = 401,
+        title = "Not authenticated",
+        remediation = "Present a valid Wyrd token in the Authorization header."
+    )]
+    Unauthenticated {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Token signature and shape were valid but the token is past its expiry.
+    #[error("[WYRD_AUTH_401_TOKEN_EXPIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_TOKEN_EXPIRED",
+        status = 401,
+        title = "Token expired",
+        remediation = "Re-authenticate to obtain a fresh token."
+    )]
+    TokenExpired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Token was malformed, had a bad signature, or failed a claim check.
+    #[error("[WYRD_AUTH_401_INVALID_TOKEN] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_INVALID_TOKEN",
+        status = 401,
+        title = "Invalid token",
+        remediation = "Re-authenticate to obtain a valid token signed by the current issuer key."
+    )]
+    InvalidToken {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Caller is authenticated but the resolved scopes do not cover the action.
+    #[error("[WYRD_AUTH_403_INSUFFICIENT_SCOPE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_403_INSUFFICIENT_SCOPE",
+        status = 403,
+        title = "Insufficient scope",
+        remediation = "Request a role that grants the required scope for this action."
+    )]
+    InsufficientScope {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// DataCard validation failed.
     #[error("[WYRD_DATA_400_VALIDATION] {message}")]
     #[wyrd_error(
@@ -197,6 +253,118 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// ModelCard validation failed.
+    #[error("[WYRD_MODEL_400_VALIDATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_VALIDATION",
+        status = 400,
+        title = "ModelCard validation failed",
+        remediation = "Fix the ModelCard signature, framework version, or interface configuration."
+    )]
+    ModelValidation {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A ModelCard signature was missing required fields.
+    #[error("[WYRD_MODEL_400_MISSING_SIGNATURE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_MISSING_SIGNATURE",
+        status = 400,
+        title = "Missing model signature",
+        remediation = "Pass signature fields explicitly or build a ModelSignature before registration."
+    )]
+    ModelMissingSignature {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A ModelCard signature dtype was not canonical.
+    #[error("[WYRD_MODEL_400_DTYPE_NORMALIZE_FAILED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_DTYPE_NORMALIZE_FAILED",
+        status = 400,
+        title = "Could not normalize signature dtype",
+        remediation = "Provide a FieldSpec with a canonical Arrow logical dtype string."
+    )]
+    ModelDtypeNormalizeFailed {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A ModelCard signature shape was invalid.
+    #[error("[WYRD_MODEL_400_SHAPE_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_SHAPE_INVALID",
+        status = 400,
+        title = "Invalid model signature shape",
+        remediation = "Use Dim::Fixed(n) with n > 0 or Dim::Dynamic(name) for unknown dimensions."
+    )]
+    ModelShapeInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A Hugging Face revision was invalid.
+    #[error("[WYRD_MODEL_400_HF_REVISION_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_HF_REVISION_INVALID",
+        status = 400,
+        title = "Invalid HuggingFace revision",
+        remediation = "Pass a 7-40 character lowercase hex revision from the HuggingFace repo."
+    )]
+    ModelHfRevisionInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A Hugging Face task was missing.
+    #[error("[WYRD_MODEL_400_HF_TASK_MISSING] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_HF_TASK_MISSING",
+        status = 400,
+        title = "Missing HuggingFace task",
+        remediation = "Set HuggingfaceMeta.hf_task before saving."
+    )]
+    ModelHfTaskMissing {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A custom loader declaration was invalid.
+    #[error("[WYRD_MODEL_400_CUSTOM_LOADER_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_CUSTOM_LOADER_INVALID",
+        status = 400,
+        title = "Invalid custom loader",
+        remediation = "Set CustomMeta.loader_module and CustomMeta.loader_class to non-empty values."
+    )]
+    ModelCustomLoaderInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A ModelCard sample or artifact serializer is unavailable.
+    #[error("[WYRD_MODEL_501_SERIALIZER_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_501_SERIALIZER_UNAVAILABLE",
+        status = 501,
+        title = "Required serializer unavailable",
+        remediation = "Install the Wyrd Python extra for the required framework serializer."
+    )]
+    ModelSerializerUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
 }
 
 impl WyrdError {
@@ -224,12 +392,161 @@ impl WyrdError {
             | Self::Internal { message, details }
             | Self::UpstreamFailure { message, details }
             | Self::Timeout { message, details }
+            | Self::Unauthenticated { message, details }
+            | Self::TokenExpired { message, details }
+            | Self::InvalidToken { message, details }
+            | Self::InsufficientScope { message, details }
             | Self::DataValidation { message, details }
             | Self::DataUnknownDataType { message, details }
             | Self::DataInvalidSplitRule { message, details }
             | Self::DataTargetColumnUnknown { message, details }
             | Self::DataInvalidInterfaceOption { message, details }
-            | Self::DataInterfaceMetadataRequired { message, details } => (message, details),
+            | Self::DataInterfaceMetadataRequired { message, details }
+            | Self::ModelValidation { message, details }
+            | Self::ModelMissingSignature { message, details }
+            | Self::ModelDtypeNormalizeFailed { message, details }
+            | Self::ModelShapeInvalid { message, details }
+            | Self::ModelHfRevisionInvalid { message, details }
+            | Self::ModelHfTaskMissing { message, details }
+            | Self::ModelCustomLoaderInvalid { message, details }
+            | Self::ModelSerializerUnavailable { message, details } => (message, details),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WyrdError;
+
+    #[test]
+    fn auth_codes_match_status() {
+        for error in auth_errors() {
+            let status = error
+                .code()
+                .split('_')
+                .nth(2)
+                .expect("error code has status segment")
+                .parse::<u16>()
+                .expect("status segment is numeric");
+
+            assert_eq!(status, error.status());
+        }
+    }
+
+    #[test]
+    fn auth_variant_problem_json_roundtrips() {
+        let error = WyrdError::Unauthenticated {
+            message: "missing bearer token".to_owned(),
+            details: serde_json::json!({ "header": "authorization" }),
+        };
+        let problem = error.as_problem_json();
+
+        assert_eq!(problem["code"], "WYRD_AUTH_401_UNAUTHENTICATED");
+        assert_eq!(problem["status"], 401);
+        assert_eq!(problem["title"], "Not authenticated");
+        assert_eq!(
+            problem["remediation"],
+            "Present a valid Wyrd token in the Authorization header."
+        );
+        assert_eq!(problem["detail"], "missing bearer token");
+        assert_eq!(problem["details"]["header"], "authorization");
+        assert!(
+            problem["type"]
+                .as_str()
+                .expect("problem type is a string")
+                .ends_with("WYRD_AUTH_401_UNAUTHENTICATED")
+        );
+    }
+
+    #[test]
+    fn auth_variants_serde_tag() {
+        let error = WyrdError::InsufficientScope {
+            message: "card:write is required".to_owned(),
+            details: serde_json::json!({ "required": "card:write" }),
+        };
+        let value = serde_json::to_value(error).expect("auth error serializes");
+
+        assert_eq!(value["kind"], "insufficient_scope");
+    }
+
+    #[test]
+    fn token_expired_problem_json() {
+        let error = WyrdError::TokenExpired {
+            message: "token expired".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let problem = error.as_problem_json();
+
+        assert_eq!(problem["code"], "WYRD_AUTH_401_TOKEN_EXPIRED");
+        assert_eq!(problem["status"], 401);
+        assert_eq!(problem["title"], "Token expired");
+        assert!(
+            problem["type"]
+                .as_str()
+                .expect("problem type is a string")
+                .ends_with("WYRD_AUTH_401_TOKEN_EXPIRED")
+        );
+    }
+
+    #[test]
+    fn token_expired_serde_tag() {
+        let error = WyrdError::TokenExpired {
+            message: "token expired".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let value = serde_json::to_value(error).expect("auth error serializes");
+
+        assert_eq!(value["kind"], "token_expired");
+    }
+
+    #[test]
+    fn invalid_token_problem_json() {
+        let error = WyrdError::InvalidToken {
+            message: "signature mismatch".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let problem = error.as_problem_json();
+
+        assert_eq!(problem["code"], "WYRD_AUTH_401_INVALID_TOKEN");
+        assert_eq!(problem["status"], 401);
+        assert_eq!(problem["title"], "Invalid token");
+        assert!(
+            problem["type"]
+                .as_str()
+                .expect("problem type is a string")
+                .ends_with("WYRD_AUTH_401_INVALID_TOKEN")
+        );
+    }
+
+    #[test]
+    fn invalid_token_serde_tag() {
+        let error = WyrdError::InvalidToken {
+            message: "signature mismatch".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let value = serde_json::to_value(error).expect("auth error serializes");
+
+        assert_eq!(value["kind"], "invalid_token");
+    }
+
+    fn auth_errors() -> [WyrdError; 4] {
+        [
+            WyrdError::Unauthenticated {
+                message: "missing bearer token".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::TokenExpired {
+                message: "token expired".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::InvalidToken {
+                message: "token rejected".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::InsufficientScope {
+                message: "scope missing".to_owned(),
+                details: serde_json::json!({}),
+            },
+        ]
     }
 }

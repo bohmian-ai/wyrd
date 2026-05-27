@@ -9,6 +9,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod actor;
+pub mod authz;
 pub mod card;
 pub mod envelope;
 pub mod error;
@@ -24,6 +25,7 @@ pub mod storage;
 pub mod trace;
 pub mod version;
 
+pub use authz::{Principal, Role, Scope};
 pub use card::data::{
     ArrowFormat, ArrowMeta, ColValue, ColorMode, CustomDataMeta, DataInterface, DataSchema,
     DataSpec, DataSplit, DataStats, HuggingfaceMeta, ImageFormat, ImageMeta, Inequality,
@@ -32,7 +34,7 @@ pub use card::data::{
     TorchSaveFormat,
 };
 pub use card::field::{Dim, FieldSpec};
-pub use ids::{ColumnName, QueryName, SplitName};
+pub use ids::{ColumnName, QueryName, RoleName, SplitName};
 pub use metadata::{
     AnnotationKey, AnnotationValue, Annotations, LabelKey, LabelValue, Labels, MetadataError,
 };

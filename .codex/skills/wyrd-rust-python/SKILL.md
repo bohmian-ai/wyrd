@@ -69,7 +69,6 @@ through server/Python/client layers.
 - Keep core behavior in Rust. Python should be typed and ergonomic, not a
   duplicate implementation.
 - Use domain types instead of raw strings for durable identifiers.
-- Use `#[non_exhaustive]` on public `wyrd-spec` structs and enums.
 - Prefer `&str`, `&Path`, `&[T]`, and typed references when ownership is not
   needed.
 - Treat `.clone()` as a design question. Use it only for concrete ownership

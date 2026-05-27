@@ -1,0 +1,20 @@
+[package]
+name = "wyrd-enterprise"
+version = { workspace = true }
+edition = { workspace = true }
+license = "LicenseRef-WyrdCommercial"
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+
+[dependencies]
+jsonwebtoken = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+wyrd-auth-verify = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

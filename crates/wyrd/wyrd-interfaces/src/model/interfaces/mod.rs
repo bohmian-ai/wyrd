@@ -9,6 +9,8 @@ mod helpers;
 #[cfg(feature = "python")]
 mod kinds;
 #[cfg(feature = "python")]
+mod materialize;
+#[cfg(feature = "python")]
 mod metadata;
 pub(crate) mod options;
 

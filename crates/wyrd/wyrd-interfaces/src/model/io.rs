@@ -34,7 +34,7 @@ pub fn load_model(
     load_kwargs: Option<&Bound<'_, PyDict>>,
 ) -> CardPyResult<()> {
     let path =
-        path.ok_or_else(|| WyrdPyError::validation("local model artifact path is required"))?;
+        path.ok_or_else(|| WyrdPyError::model_validation("local model artifact path is required"))?;
     interface.call_method("load", (path, load_kwargs), None)?;
     Ok(())
 }

@@ -25,10 +25,13 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 | `crates/wyrd-spec/schemas/experiment_spec.json` | ExperimentSpec |
 | `crates/wyrd-spec/schemas/field_spec.json` | FieldSpec |
 | `crates/wyrd-spec/schemas/framework_adapter_ref.json` | FrameworkAdapterRef |
+| `crates/wyrd-spec/schemas/hugging_face_task.json` | HuggingFaceTask |
 | `crates/wyrd-spec/schemas/invoke_context.json` | InvokeContext |
 | `crates/wyrd-spec/schemas/invoke_outcome.json` | InvokeOutcome |
 | `crates/wyrd-spec/schemas/locked_component.json` | LockedComponent |
 | `crates/wyrd-spec/schemas/mcp_spec.json` | McpSpec |
+| `crates/wyrd-spec/schemas/model_interface.json` | ModelInterface |
+| `crates/wyrd-spec/schemas/model_signature.json` | ModelSignature |
 | `crates/wyrd-spec/schemas/model_spec.json` | ModelSpec |
 | `crates/wyrd-spec/schemas/operator_budget.json` | OperatorBudget |
 | `crates/wyrd-spec/schemas/operator_input.json` | OperatorInput |
@@ -38,6 +41,8 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 | `crates/wyrd-spec/schemas/prompt_spec.json` | PromptSpec |
 | `crates/wyrd-spec/schemas/run_kind.json` | RunKind |
 | `crates/wyrd-spec/schemas/run_ref.json` | RunRef |
+| `crates/wyrd-spec/schemas/sample_input.json` | SampleInput |
+| `crates/wyrd-spec/schemas/sample_input_kind.json` | SampleInputKind |
 | `crates/wyrd-spec/schemas/service_lock.json` | ServiceLock |
 | `crates/wyrd-spec/schemas/service_runtime.json` | ServiceRuntime |
 | `crates/wyrd-spec/schemas/service_runtime_kind.json` | ServiceRuntimeKind |
@@ -48,7 +53,10 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 | `crates/wyrd-spec/schemas/split_strategy.json` | SplitStrategy |
 | `crates/wyrd-spec/schemas/sql_logic.json` | SqlLogic |
 | `crates/wyrd-spec/schemas/subagent_spec.json` | SubAgentSpec |
+| `crates/wyrd-spec/schemas/task_type.json` | TaskType |
+| `crates/wyrd-spec/schemas/tf_save_format.json` | TfSaveFormat |
 | `crates/wyrd-spec/schemas/tool_spec.json` | ToolSpec |
+| `crates/wyrd-spec/schemas/torch_save_format.json` | TorchSaveFormat |
 | `crates/wyrd-spec/schemas/trigger_source.json` | TriggerSource |
 | `crates/wyrd-spec/schemas/trigger_spec.json` | TriggerSpec |
 | `crates/wyrd-spec/schemas/workflow_spec.json` | WorkflowSpec |

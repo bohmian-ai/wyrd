@@ -722,7 +722,10 @@ fn trim_quotes(value: &str) -> &str {
 
 #[cfg(feature = "python")]
 fn infer_pandas_schema(data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
-    let items = data.getattr("dtypes")?.call_method0("items")?;
+    let dtypes = data
+        .getattr("dtypes")
+        .map_err(|_| WyrdPyError::validation("PandasInterface data must be a pandas.DataFrame"))?;
+    let items = dtypes.call_method0("items")?;
     schema_from_items(&items, "pandas")
 }
 

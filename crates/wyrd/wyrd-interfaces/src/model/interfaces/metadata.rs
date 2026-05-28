@@ -30,7 +30,7 @@ macro_rules! impl_to_spec {
             pub fn from_spec_inner(interface: &RustModelInterface) -> CardPyResult<Self> {
                 match interface {
                     RustModelInterface::$variant(meta) => Ok(Self::from_meta(meta)),
-                    _ => Err(WyrdPyError::validation($message)),
+                    _ => Err(WyrdPyError::model_validation($message)),
                 }
             }
         }

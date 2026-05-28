@@ -22,7 +22,9 @@ huggingface = ["datasets>=2.20.0"]
 
 [dependency-groups]
 dev = [
+    "catboost>=1.2.0",
     "datasets>=2.20.0",
+    "lightgbm>=4.5.0",
     "maturin>=1.7,<2",
     "numpy>=1.26",
     "pandas>=2.2,<3",
@@ -33,8 +35,13 @@ dev = [
     "pyyaml>=6.0.0",
     "ruff>=0.1.0,<1.0.0",
     "safetensors>=0.4.0",
+    "scikit-learn>=1.5.0",
+    "tensorflow>=2.18.0",
     "torch>=2.4.0",
+    "transformers>=4.44.0",
     "ty>=0.0.35,<0.1.0",
+    "xgboost>=2.1.0",
+    "pytorch-lightning>=2.4.0",
 ]
 
 [tool.maturin]
@@ -47,6 +54,7 @@ features = ["pyo3/extension-module", "pyo3/abi3-py310"]
 testpaths = ["tests"]
 pythonpath = ["python"]
 markers = [
+    "tensorflow: marks TensorFlow tests that run in the dedicated TensorFlow task",
     "wyrd_covers(contract): declares that a Python test covers a tagged Wyrd Rust contract",
 ]
 

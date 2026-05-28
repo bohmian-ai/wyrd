@@ -1,12 +1,11 @@
 [tools]
-node = "latest"
-python = "3.12"
-uv = "latest"
-rust = "stable"
-"npm:pnpm" = "latest"
+node = "26.2.0"
+uv = "0.11.16"
+rust = "1.95.0"
+"npm:pnpm" = "11.4.0"
 cmake = "3.26.4"
 protoc = "33.2"
-"cargo:cargo-deny" = "latest"
+"cargo:cargo-deny" = "0.19.8"
 
 [settings]
 env_shell_expand = false
@@ -168,10 +167,16 @@ depends = ["codegen:stubs"]
 run = ["uv sync --all-extras --group dev", "uv run maturin develop"]
 
 [tasks."py:test:unit"]
-description = "Run Python unit tests against real DataCard runtime dependencies"
+description = "Run Python unit tests except TensorFlow-marked tests"
 dir = "python/py-wyrd"
 depends = ["py:setup"]
-run = "uv run pytest -q"
+run = "uv run python scripts/run_unit_tests.py"
+
+[tasks."py:test:tensorflow"]
+description = "Run TensorFlow-marked Python unit tests"
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = "uv run pytest -q -m tensorflow"
 
 [tasks."py:format"]
 description = "Format Wyrd Python package and tests with Ruff"

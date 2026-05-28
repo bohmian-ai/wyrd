@@ -62,19 +62,27 @@ CREATE TABLE refresh_tokens (
     revoked_at TIMESTAMPTZ
 );
 
--- governance_tokens intentionally has no expires_at column.
--- These tokens are long-lived service identity credentials for registered
--- service cards. A card has exactly one active governance token at a time.
--- Lifecycle is managed via `status` and `revoked_at` only; there is no
--- token rotation or refresh path at the governance level.
+-- governance_tokens: emit-only, card-scoped credential issued after a gate pass.
+-- This is NOT an identity credential — it is a governance capability bound to
+-- card_uid. token_id is the non-secret JWT `jti` / database surrogate used for
+-- revocation and rotation lookups; the signed bearer token is never stored here,
+-- so this table intentionally does not mirror api_keys.token_hash. Revocation is
+-- server-side: flip `status` / set `revoked_at`; ingest checks card_uid->status
+-- (moka-cached). Revocation latency = cache TTL, not expires_at. expires_at is
+-- defense-in-depth (~90d); it does not drive revocation. Rotation is
+-- pipeline-driven (rotated_from links the chain); the running service never
+-- refreshes or polls. workload_binding is reserved for post-MVP SPIFFE/mTLS
+-- token-binding; nullable until that path is built.
 CREATE TABLE governance_tokens (
     token_id TEXT PRIMARY KEY,
     card_uid TEXT NOT NULL,
     issuer TEXT NOT NULL,
     issued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL,
     status TEXT NOT NULL,
     rotated_from TEXT REFERENCES governance_tokens(token_id),
-    revoked_at TIMESTAMPTZ
+    revoked_at TIMESTAMPTZ,
+    workload_binding TEXT
 );
 
 CREATE INDEX idx_api_keys_sa ON api_keys(sa_id);

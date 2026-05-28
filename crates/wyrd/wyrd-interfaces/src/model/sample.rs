@@ -188,7 +188,7 @@ fn classify(py: Python<'_>, obj: &Bound<'_, PyAny>) -> CardPyResult<SampleInputK
         return Ok(SampleInputKindSpec::Str);
     }
     let type_name: String = obj.get_type().getattr("__qualname__")?.extract()?;
-    Err(WyrdPyError::validation_with_details(
+    Err(WyrdPyError::model_validation_with_details(
         "unsupported sample input shape; pass a DataFrame, Table, ndarray, tensor, dict, list, tuple, str, or None",
         serde_json::json!({ "kind": type_name }),
     ))
@@ -203,7 +203,7 @@ fn write_to(
 ) -> CardPyResult<()> {
     match (kind, py_obj) {
         (SampleInputKindSpec::None, _) => Ok(()),
-        (_, None) => Err(WyrdPyError::validation(format!(
+        (_, None) => Err(WyrdPyError::model_validation(format!(
             "SampleInput kind {kind:?} requires a Python object at save time"
         ))),
         (SampleInputKindSpec::Pandas, Some(obj)) => write_pandas(py, path, obj),
@@ -411,7 +411,7 @@ fn sample_path(path: &Path, kind: SampleInputKindSpec) -> CardPyResult<PathBuf> 
 fn target_path_str(path: &Path) -> CardPyResult<String> {
     path.to_str()
         .map(str::to_string)
-        .ok_or_else(|| WyrdPyError::validation("sample input path is not valid UTF-8"))
+        .ok_or_else(|| WyrdPyError::model_validation("sample input path is not valid UTF-8"))
 }
 
 #[cfg(feature = "python")]

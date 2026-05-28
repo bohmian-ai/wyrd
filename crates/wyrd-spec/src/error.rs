@@ -169,6 +169,20 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Credential (API key, governance token, or refresh token) has been revoked.
+    #[error("[WYRD_AUTH_401_CREDENTIAL_REVOKED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_CREDENTIAL_REVOKED",
+        status = 401,
+        title = "Credential revoked",
+        remediation = "The credential was explicitly revoked. Re-authenticate or request a new credential."
+    )]
+    CredentialRevoked {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// DataCard validation failed.
     #[error("[WYRD_DATA_400_VALIDATION] {message}")]
     #[wyrd_error(
@@ -248,6 +262,20 @@ pub enum WyrdError {
         remediation = "Pass an explicit DataInterface with enough metadata to describe the data source."
     )]
     DataInterfaceMetadataRequired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Python model input could not be classified as a supported ModelCard interface.
+    #[error("[WYRD_MODEL_400_UNKNOWN_MODEL_TYPE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_MODEL_400_UNKNOWN_MODEL_TYPE",
+        status = 400,
+        title = "Unknown ModelCard model type",
+        remediation = "Pass a supported model object or an explicit ModelInterface."
+    )]
+    ModelUnknownModelType {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -396,12 +424,14 @@ impl WyrdError {
             | Self::TokenExpired { message, details }
             | Self::InvalidToken { message, details }
             | Self::InsufficientScope { message, details }
+            | Self::CredentialRevoked { message, details }
             | Self::DataValidation { message, details }
             | Self::DataUnknownDataType { message, details }
             | Self::DataInvalidSplitRule { message, details }
             | Self::DataTargetColumnUnknown { message, details }
             | Self::DataInvalidInterfaceOption { message, details }
             | Self::DataInterfaceMetadataRequired { message, details }
+            | Self::ModelUnknownModelType { message, details }
             | Self::ModelValidation { message, details }
             | Self::ModelMissingSignature { message, details }
             | Self::ModelDtypeNormalizeFailed { message, details }
@@ -529,7 +559,37 @@ mod tests {
         assert_eq!(value["kind"], "invalid_token");
     }
 
-    fn auth_errors() -> [WyrdError; 4] {
+    #[test]
+    fn credential_revoked_problem_json() {
+        let error = WyrdError::CredentialRevoked {
+            message: "api key wyrd_sk_abc revoked".to_owned(),
+            details: serde_json::json!({ "prefix": "wyrd_sk_abc" }),
+        };
+        let problem = error.as_problem_json();
+
+        assert_eq!(problem["code"], "WYRD_AUTH_401_CREDENTIAL_REVOKED");
+        assert_eq!(problem["status"], 401);
+        assert_eq!(problem["title"], "Credential revoked");
+        assert!(
+            problem["type"]
+                .as_str()
+                .expect("problem type is a string")
+                .ends_with("WYRD_AUTH_401_CREDENTIAL_REVOKED")
+        );
+    }
+
+    #[test]
+    fn credential_revoked_serde_tag() {
+        let error = WyrdError::CredentialRevoked {
+            message: "credential revoked".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let value = serde_json::to_value(error).expect("auth error serializes");
+
+        assert_eq!(value["kind"], "credential_revoked");
+    }
+
+    fn auth_errors() -> [WyrdError; 5] {
         [
             WyrdError::Unauthenticated {
                 message: "missing bearer token".to_owned(),
@@ -545,6 +605,10 @@ mod tests {
             },
             WyrdError::InsufficientScope {
                 message: "scope missing".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::CredentialRevoked {
+                message: "credential revoked".to_owned(),
                 details: serde_json::json!({}),
             },
         ]

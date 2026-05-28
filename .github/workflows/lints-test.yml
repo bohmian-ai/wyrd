@@ -232,6 +232,12 @@ jobs:
         env:
           UV_PYTHON: ${{ matrix.python-version }}
 
+      - name: TensorFlow Python tests
+        if: runner.os == 'Linux' && matrix.python-version == '3.12'
+        run: mise run py:test:tensorflow
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+
       - name: Python examples
         run: mise run examples:python:datacard
         env:

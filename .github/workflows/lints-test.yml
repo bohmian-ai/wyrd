@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+env:
+  MISE_LOCKED: "true"
+  MISE_PYTHON_GITHUB_ATTESTATIONS: "false"
+
 jobs:
   changes:
     name: detect changes

@@ -1,12 +1,12 @@
 [tools]
-node = "latest"
-python = "3.12"
-uv = "latest"
-rust = "stable"
-"npm:pnpm" = "latest"
+node = "26.2.0"
+python = "3.12.13"
+uv = "0.11.16"
+rust = "1.95.0"
+"npm:pnpm" = "11.4.0"
 cmake = "3.26.4"
 protoc = "33.2"
-"cargo:cargo-deny" = "latest"
+"cargo:cargo-deny" = "0.19.8"
 
 [settings]
 env_shell_expand = false

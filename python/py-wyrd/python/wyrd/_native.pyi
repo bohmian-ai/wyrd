@@ -1,4 +1,5 @@
 # AUTO-GENERATED STUB FILE. DO NOT EDIT.
+# ruff: noqa: F811
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
 ### header.pyi ###
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value, missing-final-newline
@@ -1401,7 +1402,7 @@ class ModelCardMetadata:
 
     def __init__(
         self,
-        interface: JsonDict | None = ...,
+        interface: ModelInterface | JsonDict | None = ...,
         task_type: str = ...,
         signature: ModelSignature | JsonDict | None = ...,
         sample_input: SampleInput | JsonDict | None = ...,
@@ -1410,7 +1411,8 @@ class ModelCardMetadata:
         """Create ModelCard holder metadata.
 
         Args:
-            interface (JsonDict | None): Serialized model interface metadata.
+            interface (ModelInterface | JsonDict | None): Model interface
+                instance or serialized model interface metadata.
             task_type (str): Task type token stored in the Model spec.
             signature (ModelSignature | JsonDict | None): Model signature
                 metadata.

@@ -53,7 +53,7 @@ impl ModelInterface {
         Ok(cls
             .call0()
             .map_err(|error| {
-                WyrdPyError::validation(format!(
+                WyrdPyError::model_validation(format!(
                     "custom ModelInterface class could not be reconstructed from metadata with the default from_metadata implementation; override from_metadata(cls, metadata): {error}"
                 ))
             })?

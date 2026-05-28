@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, overload
 
 from .data import FieldSpec
+from .error import WyrdError
 from .header import CardRefLike, JsonDict, PathLike, StringMap
 
 #### end of imports ####
@@ -632,7 +633,7 @@ class ModelCardMetadata:
 
     def __init__(
         self,
-        interface: JsonDict | None = ...,
+        interface: ModelInterface | JsonDict | None = ...,
         task_type: str = ...,
         signature: ModelSignature | JsonDict | None = ...,
         sample_input: SampleInput | JsonDict | None = ...,
@@ -641,7 +642,8 @@ class ModelCardMetadata:
         """Create ModelCard holder metadata.
 
         Args:
-            interface (JsonDict | None): Serialized model interface metadata.
+            interface (ModelInterface | JsonDict | None): Model interface
+                instance or serialized model interface metadata.
             task_type (str): Task type token stored in the Model spec.
             signature (ModelSignature | JsonDict | None): Model signature
                 metadata.

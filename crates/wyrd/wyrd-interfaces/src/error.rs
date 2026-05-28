@@ -6,6 +6,11 @@ use wyrd_spec::card::data::validate::DataCardError;
 use wyrd_spec::card::model::validate::ModelCardError;
 use wyrd_spec::error::WyrdError;
 
+#[cfg(feature = "python")]
+use pyo3::Python;
+#[cfg(feature = "python")]
+use pyo3::types::PyAnyMethods;
+
 /// Result alias used by Python-boundary card interface methods.
 pub type CardPyResult<T> = Result<T, WyrdPyError>;
 
@@ -133,9 +138,14 @@ impl WyrdPyError {
 
     /// Build a `ModelCard` validation error.
     pub fn model_validation(message: impl Into<String>) -> Self {
+        Self::model_validation_with_details(message, Value::Null)
+    }
+
+    /// Build a `ModelCard` validation error with structured details.
+    pub fn model_validation_with_details(message: impl Into<String>, details: Value) -> Self {
         WyrdError::ModelValidation {
             message: message.into(),
-            details: Value::Null,
+            details,
         }
         .into()
     }
@@ -172,18 +182,14 @@ impl WyrdPyError {
     fn into_wyrd_error(self) -> WyrdError {
         match self {
             Self::Spec(error) => error,
-            Self::Python(source) => {
-                data_validation_from_source("DataCard Python boundary failed", &source)
-            }
+            Self::Python(source) => internal_from_source("Python boundary failed", &source),
             Self::Downcast(source) => {
-                data_validation_from_source("DataCard Python object downcast failed", &source)
+                internal_from_source("Python object downcast failed", &source)
             }
-            Self::Json(source) => {
-                data_validation_from_source("DataCard JSON conversion failed", &source)
-            }
-            Self::Io(source) => data_validation_from_source("DataCard local IO failed", &source),
+            Self::Json(source) => internal_from_source("JSON conversion failed", &source),
+            Self::Io(source) => internal_from_source("local IO failed", &source),
             Self::Internal(source) => WyrdError::Internal {
-                message: "DataCard interface failed internally".to_string(),
+                message: "card interface failed internally".to_string(),
                 details: json!({ "source": source }),
             },
         }
@@ -231,7 +237,7 @@ impl<'a, 'py> From<pyo3::CastError<'a, 'py>> for WyrdPyError {
 #[cfg(feature = "python")]
 impl From<pyo3::PyErr> for WyrdPyError {
     fn from(error: pyo3::PyErr) -> Self {
-        Self::Python(error.to_string())
+        Python::attach(|py| wyrd_py_error_from_py_err(py, &error))
     }
 }
 
@@ -249,9 +255,60 @@ pub fn register_exceptions(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> p
 }
 
 #[cfg(feature = "python")]
-fn data_validation_from_source(message: &str, source: &str) -> WyrdError {
-    WyrdError::DataValidation {
+fn internal_from_source(message: &str, source: &str) -> WyrdError {
+    WyrdError::Internal {
         message: message.to_string(),
         details: json!({ "source": source }),
     }
+}
+
+#[cfg(feature = "python")]
+fn wyrd_py_error_from_py_err(py: Python<'_>, error: &pyo3::PyErr) -> WyrdPyError {
+    if !error.is_instance_of::<wyrd_utils::py::WyrdError>(py) {
+        return WyrdPyError::Python(error.to_string());
+    }
+
+    let value = error.value(py);
+    let code = py_error_attr_string(value, "code");
+    let message = py_error_attr_string(value, "message").unwrap_or_else(|| error.to_string());
+    let details = value
+        .getattr("details")
+        .ok()
+        .and_then(|details| wyrd_utils::py::pyobject_to_json(&details).ok())
+        .unwrap_or(Value::Null);
+
+    match code.as_deref() {
+        Some("WYRD_DATA_400_VALIDATION") => WyrdError::DataValidation { message, details }.into(),
+        Some("WYRD_MODEL_400_VALIDATION") => WyrdError::ModelValidation { message, details }.into(),
+        Some("WYRD_MODEL_400_UNKNOWN_MODEL_TYPE") => {
+            WyrdError::ModelUnknownModelType { message, details }.into()
+        }
+        Some("WYRD_MODEL_400_MISSING_SIGNATURE") => {
+            WyrdError::ModelMissingSignature { message, details }.into()
+        }
+        Some("WYRD_MODEL_400_DTYPE_NORMALIZE_FAILED") => {
+            WyrdError::ModelDtypeNormalizeFailed { message, details }.into()
+        }
+        Some("WYRD_MODEL_400_SHAPE_INVALID") => {
+            WyrdError::ModelShapeInvalid { message, details }.into()
+        }
+        Some("WYRD_MODEL_400_HF_REVISION_INVALID") => {
+            WyrdError::ModelHfRevisionInvalid { message, details }.into()
+        }
+        Some("WYRD_MODEL_400_HF_TASK_MISSING") => {
+            WyrdError::ModelHfTaskMissing { message, details }.into()
+        }
+        Some("WYRD_MODEL_400_CUSTOM_LOADER_INVALID") => {
+            WyrdError::ModelCustomLoaderInvalid { message, details }.into()
+        }
+        Some("WYRD_MODEL_501_SERIALIZER_UNAVAILABLE") => {
+            WyrdError::ModelSerializerUnavailable { message, details }.into()
+        }
+        _ => WyrdPyError::Python(error.to_string()),
+    }
+}
+
+#[cfg(feature = "python")]
+fn py_error_attr_string(value: &pyo3::Bound<'_, pyo3::types::PyAny>, name: &str) -> Option<String> {
+    value.getattr(name).ok()?.extract::<String>().ok()
 }

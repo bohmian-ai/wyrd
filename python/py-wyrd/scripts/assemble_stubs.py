@@ -38,6 +38,7 @@ def assemble() -> None:
     """Write the assembled native extension stub."""
     final_content = [
         "# AUTO-GENERATED STUB FILE. DO NOT EDIT.",
+        "# ruff: noqa: F811",
         "# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value",
     ]
     master_all: list[str] = []
@@ -79,7 +80,12 @@ def assemble() -> None:
 def write_public_model_stub() -> None:
     """Write the public wyrd.model re-export stub."""
     exports = extract_all((STUB_DIR / "model.pyi").read_text(encoding="utf-8"))
-    lines = ["from typing import TYPE_CHECKING", "", "if TYPE_CHECKING:", "    from ._native import ("]
+    lines = [
+        "from typing import TYPE_CHECKING",
+        "",
+        "if TYPE_CHECKING:",
+        "    from ._native import (",
+    ]
     lines.extend(f"        {name}," for name in exports)
     lines.extend(
         [

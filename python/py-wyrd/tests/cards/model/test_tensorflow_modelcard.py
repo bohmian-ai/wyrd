@@ -38,6 +38,24 @@ def test_tensorflow_interface_round_trips_with_keras_artifact(tmp_path: Path) ->
     assert_model_card_json(path, "Tensorflow")
 
 
+def test_tensorflow_savedmodel_round_trips(tmp_path: Path) -> None:
+    card = ModelCard(
+        TensorflowInterface(model=_tensorflow_model(), save_format="savedmodel"),
+        metadata=model_metadata("regression"),
+    )
+    path = tmp_path / "tensorflow-savedmodel"
+
+    card.save(path)
+    restored = ModelCard.model_validate_json((path / "card.json").read_text())
+    restored.load(path)
+
+    assert restored.interface.kind == "Tensorflow"
+    assert restored.interface.has_model is True
+    assert restored.interface.save_format == "savedmodel"
+    assert (path / "savedmodel").is_dir()
+    assert_model_card_json(path, "Tensorflow")
+
+
 def test_tensorflow_artifact_path_modelcard_save_and_load(tmp_path: Path) -> None:
     source = tmp_path / "source-tensorflow"
     ModelCard(

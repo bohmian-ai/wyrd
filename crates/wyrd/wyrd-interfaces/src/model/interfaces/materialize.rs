@@ -218,8 +218,9 @@ impl TorchInterface {
             }
             TorchSaveFormat::Pickle => {
                 ensure_extras_pair(py, required::TORCH_PICKLE)?;
+                let state_dict = model.bind(py).call_method0("state_dict")?;
                 py.import("torch")?
-                    .call_method1("save", (model.bind(py), &path.join("model.pt")))?;
+                    .call_method1("save", (state_dict, &path.join("model.pt")))?;
             }
         }
         save_preprocessor_joblib(py, path, self.preprocessor.as_ref(), "torch")
@@ -257,6 +258,7 @@ impl TorchInterface {
                 ensure_extras_pair(py, required::TORCH_PICKLE)?;
                 let kwargs = PyDict::new(py);
                 kwargs.set_item("map_location", "cpu")?;
+                kwargs.set_item("weights_only", true)?;
                 let model = py.import("torch")?.call_method(
                     "load",
                     (&path.join("model.pt"),),
@@ -293,8 +295,10 @@ impl LightningInterface {
                 .call_method1("save_checkpoint", (&checkpoint_path,))?;
         } else {
             let state_dict = model.bind(py).call_method0("state_dict")?;
+            let checkpoint = PyDict::new(py);
+            checkpoint.set_item("state_dict", state_dict)?;
             py.import("torch")?
-                .call_method1("save", (state_dict, &checkpoint_path))?;
+                .call_method1("save", (checkpoint, &checkpoint_path))?;
         }
         save_preprocessor_joblib(py, path, self.preprocessor.as_ref(), "lightning")
     }
@@ -486,11 +490,13 @@ fn load_joblib_model(
 ) -> CardPyResult<()> {
     ensure_extras_pair(py, required)?;
     let joblib = py.import("joblib")?;
-    *model = Some(
-        joblib
-            .call_method1("load", (&path.join("model.joblib"),))?
-            .unbind(),
-    );
+    let loaded = joblib.call_method1("load", (&path.join("model.joblib"),))?;
+    if loaded.is_none() {
+        return Err(WyrdPyError::model_validation(
+            "joblib model artifact loaded as None",
+        ));
+    }
+    *model = Some(loaded.unbind());
     *preprocessor = load_preprocessor_joblib(py, path, required.0)?;
     Ok(())
 }

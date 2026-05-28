@@ -65,7 +65,7 @@ impl ModelInterfaceHandle {
             return Ok(Self::Subclass(interface.clone().unbind()));
         }
 
-        Err(WyrdPyError::validation(
+        Err(WyrdPyError::model_validation(
             "ModelCard requires a supported model interface",
         ))
     }
@@ -103,7 +103,7 @@ impl ModelInterfaceHandle {
                 preprocessor: None,
                 framework_version: package_version(py, "torch"),
                 model_subtype,
-                save_format: TorchSaveFormat::Safetensors,
+                save_format: TorchSaveFormat::Pickle,
             })),
             ModelInterfaceKind::Tensorflow => Ok(Self::Tensorflow(TensorflowInterface {
                 model: Some(model_py),

@@ -64,11 +64,14 @@ CREATE TABLE refresh_tokens (
 
 -- governance_tokens: emit-only, card-scoped credential issued after a gate pass.
 -- This is NOT an identity credential — it is a governance capability bound to
--- card_uid. Revocation is server-side: flip `status` / set `revoked_at`; ingest
--- checks card_uid->status (moka-cached). Revocation latency = cache TTL, not
--- expires_at. expires_at is defense-in-depth (~90d); it does not drive revocation.
--- Rotation is pipeline-driven (rotated_from links the chain); the running service
--- never refreshes or polls. workload_binding is reserved for post-MVP SPIFFE/mTLS
+-- card_uid. token_id is the non-secret JWT `jti` / database surrogate used for
+-- revocation and rotation lookups; the signed bearer token is never stored here,
+-- so this table intentionally does not mirror api_keys.token_hash. Revocation is
+-- server-side: flip `status` / set `revoked_at`; ingest checks card_uid->status
+-- (moka-cached). Revocation latency = cache TTL, not expires_at. expires_at is
+-- defense-in-depth (~90d); it does not drive revocation. Rotation is
+-- pipeline-driven (rotated_from links the chain); the running service never
+-- refreshes or polls. workload_binding is reserved for post-MVP SPIFFE/mTLS
 -- token-binding; nullable until that path is built.
 CREATE TABLE governance_tokens (
     token_id TEXT PRIMARY KEY,

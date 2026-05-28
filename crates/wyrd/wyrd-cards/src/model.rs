@@ -65,6 +65,7 @@ pub struct ModelCardMetadata {
 impl Default for ModelCardMetadata {
     fn default() -> Self {
         Self {
+            // Keep this sentinel in sync with `is_default_custom_interface`.
             interface: RustModelInterface::Custom(CustomModelMeta {
                 framework_version: String::new(),
                 model_subtype: None,
@@ -107,7 +108,10 @@ pub struct ModelCard {
     pub annotations: Annotations,
     /// `ModelCard` holder metadata.
     pub metadata: ModelCardMetadata,
-    /// Local creation timestamp.
+    /// Local holder creation timestamp.
+    ///
+    /// This is construction state for the in-process holder, not part of the
+    /// durable Wyrd Card envelope emitted by `model_dump_json`.
     pub created_at: DateTime<Utc>,
     /// Marker used by Python registry/client code to identify card holders.
     pub is_card: bool,
@@ -778,7 +782,7 @@ fn model_interface_for_artifact_path(
 
     Err(WyrdPyError::unknown_model_type(
         "path",
-        path.to_string_lossy(),
+        safe_path_label(path),
     ))
 }
 
@@ -794,6 +798,14 @@ fn is_default_custom_interface(interface: &RustModelInterface) -> bool {
                 && meta.model_subtype.is_none()
                 && meta.extra.is_empty()
     )
+}
+
+#[cfg(feature = "python")]
+fn safe_path_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "<path>".to_string())
 }
 
 #[cfg(feature = "python")]
@@ -1031,7 +1043,7 @@ fn utc_now() -> DateTime<Utc> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use chrono::{DateTime, Utc};
+    use chrono::Utc;
     use wyrd_spec::card::field::FieldSpec;
     use wyrd_spec::card::model::{
         ModelInterface as RustModelInterface, ModelSignature as RustModelSignature, SklearnMeta,
@@ -1045,14 +1057,8 @@ mod tests {
 
     fn valid_signature() -> RustModelSignature {
         RustModelSignature::new(
-            vec![FieldSpec::new(
-                ColumnName::new("feature").expect("static column name is valid"),
-                "float64",
-            )],
-            vec![FieldSpec::new(
-                ColumnName::new("prediction").expect("static column name is valid"),
-                "float64",
-            )],
+            vec![FieldSpec::new(column_name("feature"), "float64")],
+            vec![FieldSpec::new(column_name("prediction"), "float64")],
         )
     }
 
@@ -1071,9 +1077,10 @@ mod tests {
 
     #[test]
     fn model_card_envelope_serializes_kind_model() {
-        let serialized = model_card()
-            .model_dump_json()
-            .expect("ModelCard holder should serialize");
+        let serialized = match model_card().model_dump_json() {
+            Ok(value) => value,
+            Err(error) => panic!("ModelCard holder should serialize: {error}"),
+        };
 
         assert!(serialized.contains(r#""apiVersion":"wyrd/v1""#));
         assert!(serialized.contains(r#""kind":"Model""#));
@@ -1083,14 +1090,11 @@ mod tests {
 
     fn model_card() -> ModelCard {
         let mut labels = BTreeMap::new();
-        labels.insert(
-            LabelKey::new("domain").expect("static label key is valid"),
-            LabelValue::new("churn").expect("static label value is valid"),
-        );
+        labels.insert(label_key("domain"), label_value("churn"));
         let mut annotations = BTreeMap::new();
         annotations.insert(
-            AnnotationKey::new("acme.com/source").expect("static annotation key is valid"),
-            AnnotationValue::new("training-run-1").expect("static annotation value is valid"),
+            annotation_key("acme.com/source"),
+            annotation_value("training-run-1"),
         );
         ModelCard {
             space: "default".to_string(),
@@ -1109,11 +1113,45 @@ mod tests {
                 sample_input: None,
                 artifact_refs: Vec::new(),
             },
-            created_at: DateTime::<Utc>::from_timestamp(0, 0)
-                .expect("unix epoch timestamp is valid"),
+            created_at: Utc::now(),
             is_card: true,
             #[cfg(feature = "python")]
             interface: None,
+        }
+    }
+
+    fn column_name(value: &str) -> ColumnName {
+        match ColumnName::new(value) {
+            Ok(name) => name,
+            Err(error) => panic!("static column name is valid: {error}"),
+        }
+    }
+
+    fn label_key(value: &str) -> LabelKey {
+        match LabelKey::new(value) {
+            Ok(key) => key,
+            Err(error) => panic!("static label key is valid: {error}"),
+        }
+    }
+
+    fn label_value(value: &str) -> LabelValue {
+        match LabelValue::new(value) {
+            Ok(label_value) => label_value,
+            Err(error) => panic!("static label value is valid: {error}"),
+        }
+    }
+
+    fn annotation_key(value: &str) -> AnnotationKey {
+        match AnnotationKey::new(value) {
+            Ok(key) => key,
+            Err(error) => panic!("static annotation key is valid: {error}"),
+        }
+    }
+
+    fn annotation_value(value: &str) -> AnnotationValue {
+        match AnnotationValue::new(value) {
+            Ok(annotation_value) => annotation_value,
+            Err(error) => panic!("static annotation value is valid: {error}"),
         }
     }
 }

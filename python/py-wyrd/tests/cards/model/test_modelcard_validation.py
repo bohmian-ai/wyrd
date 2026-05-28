@@ -6,7 +6,14 @@ import pytest
 from _helpers import model_metadata, model_signature
 from test_modelcard_save_load import _huggingface_model, _sklearn_model
 from wyrd.data import FieldSpec
-from wyrd.model import HuggingfaceInterface, ModelCard, ModelCardMetadata, ModelSignature, WyrdError
+from wyrd.model import (
+    HuggingfaceInterface,
+    ModelCard,
+    ModelCardMetadata,
+    ModelSignature,
+    SklearnInterface,
+    WyrdError,
+)
 
 
 def test_missing_signature_raises_stable_model_error_code() -> None:
@@ -46,6 +53,56 @@ def test_invalid_signature_shape_raises_stable_model_error_code() -> None:
         )
 
     assert exc.value.code == "WYRD_MODEL_400_SHAPE_INVALID"
+
+
+def test_unsupported_raw_model_object_raises_stable_model_error_code() -> None:
+    with pytest.raises(WyrdError) as exc:
+        ModelCard(object(), metadata=model_metadata("regression"))
+
+    assert exc.value.code == "WYRD_MODEL_400_UNKNOWN_MODEL_TYPE"
+
+
+def test_interface_class_passed_to_constructor_raises_model_error() -> None:
+    with pytest.raises(WyrdError) as exc:
+        ModelCard(SklearnInterface, metadata=model_metadata("regression"))
+
+    assert exc.value.code == "WYRD_MODEL_400_VALIDATION"
+    assert "DataCard" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("filename", "message"),
+    [
+        ("model.safetensors", "explicit TorchInterface"),
+        ("model.ckpt", "explicit LightningInterface"),
+        ("model.joblib", "requires metadata.interface"),
+    ],
+)
+def test_ambiguous_model_artifact_paths_require_explicit_interface(
+    tmp_path,
+    filename: str,
+    message: str,
+) -> None:
+    artifact = tmp_path / filename
+    artifact.write_bytes(b"placeholder")
+
+    with pytest.raises(WyrdError) as exc:
+        ModelCard(artifact, metadata=model_metadata("regression"))
+
+    assert exc.value.code == "WYRD_MODEL_400_VALIDATION"
+    assert message in str(exc.value)
+
+
+def test_unknown_model_artifact_path_does_not_leak_absolute_path(tmp_path) -> None:
+    artifact = tmp_path / "private-model.bin"
+    artifact.write_bytes(b"placeholder")
+
+    with pytest.raises(WyrdError) as exc:
+        ModelCard(artifact, metadata=model_metadata("regression"))
+
+    assert exc.value.code == "WYRD_MODEL_400_UNKNOWN_MODEL_TYPE"
+    assert "private-model.bin" in str(exc.value)
+    assert str(tmp_path) not in str(exc.value)
 
 
 def test_invalid_huggingface_revision_raises_stable_model_error_code() -> None:

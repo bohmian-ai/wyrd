@@ -7,7 +7,7 @@ description: Generated reference for the Wyrd Model card spec.
 
 Describe a model artifact, its interface, and the context needed to use it safely.
 
-<dl class="wyrd-defs"><dt data-kind="model">Model</dt><dd>Describe a model artifact, its interface, and the context needed to use it safely.</dd><dt>Required</dt><dd>none required</dd><dt>Optional</dt><dd>8 additional spec fields — see table below.</dd></dl>
+<dl class="wyrd-defs"><dt data-kind="model">Model</dt><dd>Describe a model artifact, its interface, and the context needed to use it safely.</dd><dt>Required</dt><dd><code>interface</code>, <code>signature</code>, <code>task_type</code></dd><dt>Optional</dt><dd>2 additional spec fields — see table below.</dd></dl>
 
 This page is generated from the checked-in JSON Schema. Edit the Rust spec, run the schema generator, then run `mise run docs:generate` to refresh this page.
 
@@ -20,13 +20,10 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 | Field | Type | Required |
 | --- | --- | --- |
 | `artifact_refs` | `array` | no |
-| `audit_ref` | `object` | no |
-| `data_ref` | `object` | no |
-| `description` | `string \| null` | no |
-| `details` | `object` | no |
-| `experiment_ref` | `object` | no |
-| `framework` | `string \| null` | no |
-| `task_type` | `string \| null` | no |
+| `interface` | `object` | yes |
+| `sample_input` | `object` | no |
+| `signature` | `object` | yes |
+| `task_type` | `object` | yes |
 
 ## Shape
 

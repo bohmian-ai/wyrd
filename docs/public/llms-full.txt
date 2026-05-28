@@ -5128,193 +5128,1009 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
-    "NonSecretValue": {
-      "description": "Non-secret JSON-like configuration value.",
+    "CatboostMeta": {
+      "description": "Config for the Catboost model interface.",
+      "properties": {
+        "framework_version": {
+          "description": "Installed catboost version captured for reproducibility.",
+          "type": "string"
+        },
+        "model_subtype": {
+          "description": "Concrete model subtype, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "framework_version"
+      ],
+      "type": "object"
+    },
+    "ColumnName": {
+      "description": "DataCard column name.",
+      "type": "string"
+    },
+    "CustomMeta": {
+      "description": "Config for the Custom model interface.",
+      "properties": {
+        "extra": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Free-form string metadata that does not change the Wyrd contract.",
+          "type": "object"
+        },
+        "framework_version": {
+          "description": "Reported framework version of the user-supplied loader environment.",
+          "type": "string"
+        },
+        "loader_class": {
+          "description": "Loader class or callable name.",
+          "type": "string"
+        },
+        "loader_module": {
+          "description": "Python module path containing the user-supplied loader.",
+          "type": "string"
+        },
+        "model_subtype": {
+          "description": "Optional informational subtype string.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "framework_version",
+        "loader_class",
+        "loader_module"
+      ],
+      "type": "object"
+    },
+    "Dim": {
+      "description": "One dimension in a field shape.",
       "oneOf": [
         {
-          "description": "String value.",
+          "description": "A fixed, known dimension length.",
           "properties": {
-            "type": {
+            "kind": {
               "enum": [
-                "str"
+                "Fixed"
               ],
               "type": "string"
             },
             "value": {
-              "type": "string"
+              "format": "int64",
+              "type": "integer"
             }
           },
           "required": [
-            "type",
+            "kind",
             "value"
           ],
           "type": "object"
         },
         {
-          "description": "Numeric value.",
+          "description": "A dynamic dimension, optionally named for documentation and signatures.",
           "properties": {
-            "type": {
+            "kind": {
               "enum": [
-                "number"
+                "Dynamic"
               ],
               "type": "string"
             },
             "value": {
-              "format": "double",
-              "type": "number"
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
-            "type",
-            "value"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "Boolean value.",
-          "properties": {
-            "type": {
-              "enum": [
-                "bool"
-              ],
-              "type": "string"
-            },
-            "value": {
-              "type": "boolean"
-            }
-          },
-          "required": [
-            "type",
-            "value"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "List of non-secret values.",
-          "properties": {
-            "type": {
-              "enum": [
-                "list"
-              ],
-              "type": "string"
-            },
-            "value": {
-              "items": {
-                "$ref": "#/definitions/NonSecretValue"
-              },
-              "type": "array"
-            }
-          },
-          "required": [
-            "type",
-            "value"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "Object of non-secret values.",
-          "properties": {
-            "type": {
-              "enum": [
-                "object"
-              ],
-              "type": "string"
-            },
-            "value": {
-              "additionalProperties": {
-                "$ref": "#/definitions/NonSecretValue"
-              },
-              "type": "object"
-            }
-          },
-          "required": [
-            "type",
+            "kind",
             "value"
           ],
           "type": "object"
         }
       ]
+    },
+    "FieldSpec": {
+      "description": "Ordered field declaration used by Wyrd data schemas and model signatures.",
+      "properties": {
+        "dtype": {
+          "description": "Canonical Arrow logical dtype string.",
+          "type": "string"
+        },
+        "extra": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Additional string metadata that does not change the Wyrd field contract.",
+          "type": "object"
+        },
+        "name": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ColumnName"
+            }
+          ],
+          "description": "Canonical column or feature name."
+        },
+        "nullable": {
+          "default": false,
+          "description": "Whether this field may contain null values.",
+          "type": "boolean"
+        },
+        "shape": {
+          "description": "Optional tensor or nested value shape; empty means scalar/tabular.",
+          "items": {
+            "$ref": "#/definitions/Dim"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "dtype",
+        "name"
+      ],
+      "type": "object"
+    },
+    "HuggingFaceTask": {
+      "description": "Hugging Face task identifier.",
+      "oneOf": [
+        {
+          "description": "text-classification",
+          "enum": [
+            "TextClassification"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "token-classification",
+          "enum": [
+            "TokenClassification"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "question-answering",
+          "enum": [
+            "QuestionAnswering"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "summarization",
+          "enum": [
+            "Summarization"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "translation",
+          "enum": [
+            "Translation"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "text-generation",
+          "enum": [
+            "TextGeneration"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "fill-mask",
+          "enum": [
+            "FillMask"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "zero-shot-classification",
+          "enum": [
+            "ZeroShotClassification"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "image-classification",
+          "enum": [
+            "ImageClassification"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "object-detection",
+          "enum": [
+            "ObjectDetection"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "image-segmentation",
+          "enum": [
+            "ImageSegmentation"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "image-to-text",
+          "enum": [
+            "ImageToText"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "image-to-image",
+          "enum": [
+            "ImageToImage"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "text-to-image",
+          "enum": [
+            "TextToImage"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "depth-estimation",
+          "enum": [
+            "DepthEstimation"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "audio-classification",
+          "enum": [
+            "AudioClassification"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "automatic-speech-recognition",
+          "enum": [
+            "AutomaticSpeechRecognition"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "audio-to-audio",
+          "enum": [
+            "AudioToAudio"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "text-to-speech",
+          "enum": [
+            "TextToSpeech"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "tabular-classification",
+          "enum": [
+            "TabularClassification"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "tabular-regression",
+          "enum": [
+            "TabularRegression"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "feature-extraction",
+          "enum": [
+            "FeatureExtraction"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "sentence-similarity",
+          "enum": [
+            "SentenceSimilarity"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "conversational",
+          "enum": [
+            "Conversational"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "document-question-answering",
+          "enum": [
+            "DocumentQuestionAnswering"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "visual-question-answering",
+          "enum": [
+            "VisualQuestionAnswering"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "table-question-answering",
+          "enum": [
+            "TableQuestionAnswering"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "embedding",
+          "enum": [
+            "Embedding"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "multiple-choice",
+          "enum": [
+            "MultipleChoice"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Long-tail task identifier not yet first-class.",
+          "enum": [
+            "Other"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "HuggingfaceMeta": {
+      "description": "Config for the Huggingface model interface.",
+      "properties": {
+        "framework_version": {
+          "description": "Installed transformers or diffusers version captured for reproducibility.",
+          "type": "string"
+        },
+        "hf_task": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/HuggingFaceTask"
+            }
+          ],
+          "description": "Hugging Face task identifier required for rehydration."
+        },
+        "model_subtype": {
+          "description": "Concrete model class name, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo_id": {
+          "description": "Optional Hugging Face Hub repo id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "description": "Optional pinned revision.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "framework_version",
+        "hf_task"
+      ],
+      "type": "object"
+    },
+    "LightgbmMeta": {
+      "description": "Config for the Lightgbm model interface.",
+      "properties": {
+        "framework_version": {
+          "description": "Installed lightgbm version captured for reproducibility.",
+          "type": "string"
+        },
+        "model_subtype": {
+          "description": "Concrete model subtype, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "framework_version"
+      ],
+      "type": "object"
+    },
+    "LightningMeta": {
+      "description": "Config for the Lightning model interface.",
+      "properties": {
+        "framework_version": {
+          "description": "Installed pytorch-lightning version captured for reproducibility.",
+          "type": "string"
+        },
+        "model_subtype": {
+          "description": "Concrete LightningModule class name, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "framework_version"
+      ],
+      "type": "object"
+    },
+    "ModelInterface": {
+      "description": "Framework interface tag for a Model spec.",
+      "oneOf": [
+        {
+          "description": "scikit-learn estimator persisted through the sklearn loader.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Sklearn"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/SklearnMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "XGBoost model persisted through the xgboost loader.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Xgboost"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/XgboostMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "LightGBM model persisted through the lightgbm loader.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Lightgbm"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/LightgbmMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "CatBoost model persisted through the catboost loader.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Catboost"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/CatboostMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "PyTorch module persisted through the torch loader.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Torch"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/TorchMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "PyTorch Lightning module persisted as a trainer checkpoint.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Lightning"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/LightningMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "TensorFlow or Keras model persisted through the tensorflow loader.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Tensorflow"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/TensorflowMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Hugging Face model persisted through a local snapshot or pinned repo.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Huggingface"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/HuggingfaceMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "User-supplied loader metadata.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Custom"
+              ],
+              "type": "string"
+            },
+            "meta": {
+              "$ref": "#/definitions/CustomMeta"
+            }
+          },
+          "required": [
+            "kind",
+            "meta"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ModelSignature": {
+      "description": "Typed input and output schema for a Model spec.",
+      "properties": {
+        "inputs": {
+          "description": "Ordered input field schema.",
+          "items": {
+            "$ref": "#/definitions/FieldSpec"
+          },
+          "type": "array"
+        },
+        "outputs": {
+          "description": "Ordered output field schema.",
+          "items": {
+            "$ref": "#/definitions/FieldSpec"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "inputs",
+        "outputs"
+      ],
+      "type": "object"
+    },
+    "SampleInput": {
+      "description": "Sample input description for loader-side rehydration.",
+      "properties": {
+        "kind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SampleInputKind"
+            }
+          ],
+          "description": "Closed kind tag selecting the loader-side deserializer."
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "SampleInputKind": {
+      "description": "Closed set of sample input shapes supported by Wyrd at the contract layer.",
+      "oneOf": [
+        {
+          "description": "pandas dataframe serialized as parquet.",
+          "enum": [
+            "Pandas"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "polars dataframe serialized as parquet.",
+          "enum": [
+            "Polars"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "pyarrow table or record batch serialized as IPC.",
+          "enum": [
+            "Arrow"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "numpy array serialized as npz.",
+          "enum": [
+            "Numpy"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "torch tensor dict serialized as safetensors.",
+          "enum": [
+            "Torch"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "TensorFlow tensor dict serialized as npz.",
+          "enum": [
+            "Tf"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "JSON-safe Python dict serialized as json.",
+          "enum": [
+            "Dict"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "JSON-safe Python list serialized as json.",
+          "enum": [
+            "List"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "JSON-safe Python tuple serialized as json.",
+          "enum": [
+            "Tuple"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Plain UTF-8 string serialized as text.",
+          "enum": [
+            "Str"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "No sample input declared.",
+          "enum": [
+            "None"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SklearnMeta": {
+      "description": "Config for the Sklearn model interface.",
+      "properties": {
+        "framework_version": {
+          "description": "Installed sklearn version captured for reproducibility.",
+          "type": "string"
+        },
+        "model_subtype": {
+          "description": "Concrete estimator class name, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "framework_version"
+      ],
+      "type": "object"
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
     },
+    "TaskType": {
+      "description": "Closed Wyrd ML task taxonomy.",
+      "oneOf": [
+        {
+          "description": "Two-class classification.",
+          "enum": [
+            "BinaryClassification"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Classification with more than two classes.",
+          "enum": [
+            "MultiClassClassification"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Continuous-valued regression.",
+          "enum": [
+            "Regression"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unsupervised clustering.",
+          "enum": [
+            "Clustering"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Anomaly or outlier detection.",
+          "enum": [
+            "AnomalyDetection"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Time-series forecasting.",
+          "enum": [
+            "Forecasting"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Generative model task.",
+          "enum": [
+            "Generation"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Long-tail task described by interface metadata.",
+          "enum": [
+            "Other"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "TensorflowMeta": {
+      "description": "Config for the Tensorflow model interface.",
+      "properties": {
+        "framework_version": {
+          "description": "Installed tensorflow or keras version captured for reproducibility.",
+          "type": "string"
+        },
+        "model_subtype": {
+          "description": "Concrete model class name, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "save_format": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TfSaveFormat"
+            }
+          ],
+          "description": "Save format for the tensorflow artifact."
+        }
+      },
+      "required": [
+        "framework_version",
+        "save_format"
+      ],
+      "type": "object"
+    },
+    "TfSaveFormat": {
+      "description": "Save format for the Tensorflow model interface.",
+      "oneOf": [
+        {
+          "description": "Keras v3 single-file archive.",
+          "enum": [
+            "Keras"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "SavedModel directory layout.",
+          "enum": [
+            "SavedModel"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "TorchMeta": {
+      "description": "Config for the Torch model interface.",
+      "properties": {
+        "framework_version": {
+          "description": "Installed torch version captured for reproducibility.",
+          "type": "string"
+        },
+        "model_subtype": {
+          "description": "Concrete module class name, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "save_format": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TorchSaveFormat"
+            }
+          ],
+          "description": "Save format for the torch artifact."
+        }
+      },
+      "required": [
+        "framework_version",
+        "save_format"
+      ],
+      "type": "object"
+    },
+    "TorchSaveFormat": {
+      "description": "Save format for the Torch model interface.",
+      "oneOf": [
+        {
+          "description": "Tensors-only safetensors state dict.",
+          "enum": [
+            "Safetensors"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Pickle-backed torch save format.",
+          "enum": [
+            "Pickle"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "VersionBlock": {
       "description": "Semver-compatible version string.",
       "type": "string"
+    },
+    "XgboostMeta": {
+      "description": "Config for the Xgboost model interface.",
+      "properties": {
+        "framework_version": {
+          "description": "Installed xgboost version captured for reproducibility.",
+          "type": "string"
+        },
+        "model_subtype": {
+          "description": "Concrete model subtype, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "framework_version"
+      ],
+      "type": "object"
     }
   },
-  "description": "Pure-data description of a model.",
+  "description": "Body of a Model card.\n\nThis pure contract describes which framework loads the model, which task it performs, which fields it consumes and produces, and which Artifact cards hold model-related bytes.",
   "properties": {
     "artifact_refs": {
-      "description": "Model artifact references.",
+      "default": [],
+      "description": "Durable Artifact card references linked to this model card.",
       "items": {
         "$ref": "#/definitions/CardRef"
       },
       "type": "array"
     },
-    "audit_ref": {
+    "interface": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ModelInterface"
+        }
+      ],
+      "description": "Framework interface tag and per-interface config metadata."
+    },
+    "sample_input": {
       "anyOf": [
         {
-          "$ref": "#/definitions/CardRef"
+          "$ref": "#/definitions/SampleInput"
         },
         {
           "type": "null"
         }
       ],
-      "description": "Audit Card reference."
+      "description": "Optional canonical sample input description."
     },
-    "data_ref": {
-      "anyOf": [
+    "signature": {
+      "allOf": [
         {
-          "$ref": "#/definitions/CardRef"
-        },
-        {
-          "type": "null"
+          "$ref": "#/definitions/ModelSignature"
         }
       ],
-      "description": "Data Card reference."
-    },
-    "description": {
-      "description": "Model description.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "details": {
-      "additionalProperties": {
-        "$ref": "#/definitions/NonSecretValue"
-      },
-      "description": "Free-form details.",
-      "type": "object"
-    },
-    "experiment_ref": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/CardRef"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Experiment Card reference."
-    },
-    "framework": {
-      "description": "Framework name.",
-      "type": [
-        "string",
-        "null"
-      ]
+      "description": "Typed input and output schema."
     },
     "task_type": {
-      "description": "Model task type.",
-      "type": [
-        "string",
-        "null"
-      ]
+      "allOf": [
+        {
+          "$ref": "#/definitions/TaskType"
+        }
+      ],
+      "description": "Closed Wyrd ML task taxonomy."
     }
   },
+  "required": [
+    "interface",
+    "signature",
+    "task_type"
+  ],
   "title": "ModelSpec",
   "type": "object"
 }

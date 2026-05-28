@@ -83,6 +83,9 @@ jobs:
           enable-cache: true
           python-version: "3.12"
 
+      - name: Install Rust components
+        run: rustup component add --toolchain "$RUSTUP_TOOLCHAIN" rustfmt clippy
+
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
 
@@ -180,6 +183,27 @@ jobs:
         with:
           install: true
           cache: true
+
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: "3.x"
+
+      - name: Install Protocol Buffers Compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "33.2"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install build dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev pkg-config
+
+      - name: Install libomp on macOS
+        if: runner.os == 'macOS'
+        run: brew install libomp curl openssl pkg-config
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

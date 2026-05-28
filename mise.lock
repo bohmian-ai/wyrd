@@ -53,25 +53,6 @@ url = "https://github.com/protocolbuffers/protobuf/releases/download/v33.2/proto
 checksum = "sha256:376770cd4073beb63db56fdd339260edb9957b3c4472e05a75f5f9ec8f98d8f5"
 url = "https://github.com/protocolbuffers/protobuf/releases/download/v33.2/protoc-33.2-win64.zip"
 
-[[tools.python]]
-version = "3.12.13"
-backend = "core:python"
-
-[tools.python."platforms.linux-x64"]
-checksum = "sha256:d480f5d5878910ecbae212bf23bd7c25d7b209eb8cf5e98823c977384d272e88"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.12.13+20260510-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
-provenance = "github-attestations"
-
-[tools.python."platforms.macos-arm64"]
-checksum = "sha256:55bc1a5edbc8ac4da0081f4f5731ed2d1ed10c57cb37a820b2a0dbc7cad742e9"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.12.13+20260510-aarch64-apple-darwin-install_only_stripped.tar.gz"
-provenance = "github-attestations"
-
-[tools.python."platforms.windows-x64"]
-checksum = "sha256:24168aff2e7d93784c6a436124c4ebb79b076a4e289bde4902c08333507b71d0"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.12.13+20260510-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
-provenance = "github-attestations"
-
 [[tools.rust]]
 version = "1.95.0"
 backend = "core:rust"

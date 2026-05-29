@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/wyrd/*",
     "crates/vala/*",
+    "crates/skald/*",
     "crates/shared/*",
     "crates/wyrd-spec",
     "python/py-wyrd",
@@ -37,6 +38,8 @@ serde_yaml = "0.9"
 schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 thiserror = "2.0"
+base64 = "0.22"
+insta = "1.43"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 flate2 = "1.*"
 zstd = "0.13"

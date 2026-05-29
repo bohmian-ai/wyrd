@@ -11,9 +11,13 @@ use crate::wire::openai_chat::OpenAiChatMessage;
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum MessageNum {
+    /// OpenAI chat message.
     OpenAi(OpenAiChatMessage),
+    /// Anthropic message.
     Anthropic(AnthropicMessage),
+    /// Google Gemini content turn.
     Gemini(GoogleContent),
+    /// Raw provider message body that no typed variant claimed.
     RawV1(Box<RawValue>),
 }
 
@@ -24,6 +28,9 @@ impl<'de> Deserialize<'de> for MessageNum {
     {
         let value = Value::deserialize(deserializer)?;
 
+        // MessageNum is the workflow handoff unit. Keep provider-native
+        // messages typed when their shape is known; otherwise retain the exact
+        // JSON so the caller can reject or handle the unknown shape later.
         if let Ok(message) = serde_json::from_value::<OpenAiChatMessage>(value.clone()) {
             return Ok(Self::OpenAi(message));
         }

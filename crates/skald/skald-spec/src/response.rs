@@ -7,14 +7,20 @@ use crate::wire::google_generate::GoogleGenerateContentResponse;
 use crate::wire::openai_chat::OpenAiChatResponse;
 use crate::wire::openai_responses::OpenAiResponsesResponse;
 
+/// One native LLM provider response.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum ProviderResponse {
+    /// OpenAI Chat Completions response.
     OpenAiChatCompletion(OpenAiChatResponse),
+    /// OpenAI Responses API response.
     OpenAiResponses(OpenAiResponsesResponse),
+    /// Anthropic Messages response.
     AnthropicMessage(AnthropicMessagesResponse),
+    /// Google Gemini GenerateContent response.
     GeminiGenerateContent(GoogleGenerateContentResponse),
+    /// Raw provider response body that no typed variant claimed.
     RawV1(Box<RawValue>),
 }
 
@@ -25,6 +31,9 @@ impl<'de> Deserialize<'de> for ProviderResponse {
     {
         let value = Value::deserialize(deserializer)?;
 
+        // Responses do not carry an outer provider discriminator. Try the
+        // strict typed envelopes first, then preserve any unclaimed JSON as
+        // RawV1 instead of accepting it as an overly-permissive provider shape.
         if let Ok(response) = serde_json::from_value::<OpenAiChatResponse>(value.clone()) {
             return Ok(Self::OpenAiChatCompletion(response));
         }
@@ -61,6 +70,7 @@ impl PartialEq for ProviderResponse {
 }
 
 impl ProviderResponse {
+    /// Borrow response text, tool calls, usage, structured output, and finish reason.
     pub const fn adapter(&self) -> crate::adapter::ResponseAdapter<'_> {
         crate::adapter::ResponseAdapter::new(self)
     }

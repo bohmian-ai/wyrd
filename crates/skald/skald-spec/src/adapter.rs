@@ -23,18 +23,23 @@ pub struct ResponseAdapter<'a> {
 /// Provider tool/function call view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallView<'a> {
+    /// Provider call identifier.
     pub id: Cow<'a, str>,
+    /// Provider tool or function name.
     pub name: Cow<'a, str>,
+    /// Provider-emitted arguments as JSON text when available.
     pub arguments: Cow<'a, str>,
 }
 
 /// Provider usage reduced into the shared adapter atom.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageView {
+    /// Token usage normalized from the provider-specific response.
     pub usage: TokenUsage,
 }
 
 impl<'a> ResponseAdapter<'a> {
+    /// Create a borrowed adapter over a provider response.
     pub const fn new(response: &'a ProviderResponse) -> Self {
         Self { response }
     }
@@ -82,6 +87,9 @@ impl<'a> ResponseAdapter<'a> {
                     AnthropicContentBlock::ToolUse { id, name, input } => Some(ToolCallView {
                         id: Cow::Borrowed(id),
                         name: Cow::Borrowed(name),
+                        // Anthropic stores tool input as JSON, not a raw
+                        // string. Serialize here so callers get the same
+                        // `arguments` view OpenAI exposes natively.
                         arguments: Cow::Owned(input.to_string()),
                     }),
                     _ => None,
@@ -99,6 +107,8 @@ impl<'a> ResponseAdapter<'a> {
                             GooglePart::FunctionCall { function_call } => Some(ToolCallView {
                                 id: Cow::Borrowed(&function_call.name),
                                 name: Cow::Borrowed(&function_call.name),
+                                // Gemini function calls do not expose a
+                                // separate call id and store args as JSON.
                                 arguments: Cow::Owned(function_call.args.to_string()),
                             }),
                             _ => None,
@@ -111,6 +121,9 @@ impl<'a> ResponseAdapter<'a> {
     }
 
     /// Parse the first text payload that is valid JSON as structured output.
+    ///
+    /// Providers in S02 store structured output as assistant text, so this
+    /// method returns an owned raw JSON value parsed from that text.
     pub fn structured_output(&self) -> Option<Box<RawValue>> {
         let text = self.text()?;
         RawValue::from_string(text.into_owned()).ok()
@@ -177,6 +190,8 @@ impl<'a> ResponseAdapter<'a> {
 }
 
 fn openai_tool_call_view(call: &OpenAiToolCall) -> ToolCallView<'_> {
+    // OpenAI already stores all tool-call view fields as strings, so the view
+    // can borrow without allocation.
     ToolCallView {
         id: Cow::Borrowed(&call.id),
         name: Cow::Borrowed(&call.function.name),
@@ -192,6 +207,8 @@ fn openai_chat_text(response: &OpenAiChatResponse) -> Option<Cow<'_, str>> {
 }
 
 fn text_from_openai_parts(parts: &[OpenAiContentPart]) -> Option<Cow<'_, str>> {
+    // Prefer a borrowed return for the common one-text-part case. Only allocate
+    // when the provider split assistant text across multiple content parts.
     let mut text_parts = parts.iter().filter_map(|part| match part {
         OpenAiContentPart::Text { text } => Some(text.as_str()),
         _ => None,
@@ -211,6 +228,9 @@ fn text_from_openai_parts(parts: &[OpenAiContentPart]) -> Option<Cow<'_, str>> {
 }
 
 fn openai_responses_text(response: &OpenAiResponsesResponse) -> Option<Cow<'_, str>> {
+    // Responses output is an ordered list of output items. The adapter reduces
+    // only text content parts and leaves reasoning/tool items to their own
+    // accessors.
     let mut texts = response.output.iter().flat_map(|item| match item {
         OpenAiResponseItem::Message { content, .. } => content
             .iter()
@@ -237,6 +257,8 @@ fn openai_responses_text(response: &OpenAiResponsesResponse) -> Option<Cow<'_, s
 }
 
 fn anthropic_text(response: &AnthropicMessagesResponse) -> Option<Cow<'_, str>> {
+    // Anthropic can return several text blocks in one assistant message. Keep
+    // a borrow when there is one block; concatenate only when needed.
     let mut texts = response.content.iter().filter_map(|block| match block {
         AnthropicContentBlock::Text { text, .. } => Some(text.as_str()),
         _ => None,
@@ -256,6 +278,8 @@ fn anthropic_text(response: &AnthropicMessagesResponse) -> Option<Cow<'_, str>> 
 }
 
 fn google_text(response: &GoogleGenerateContentResponse) -> Option<Cow<'_, str>> {
+    // Gemini text lives inside the first candidate's parts. Thought text is
+    // included because it is text-bearing provider output in the same stream.
     let mut texts = response
         .candidates
         .first()?
@@ -281,6 +305,7 @@ fn google_text(response: &GoogleGenerateContentResponse) -> Option<Cow<'_, str>>
 }
 
 fn openai_finish_reason(reason: &str) -> FinishReason {
+    // Keep provider spelling at the edge and expose only the small adapter atom.
     match reason {
         "stop" => FinishReason::Stop,
         "length" => FinishReason::Length,
@@ -291,6 +316,8 @@ fn openai_finish_reason(reason: &str) -> FinishReason {
 }
 
 fn anthropic_finish_reason(reason: &AnthropicStopReason) -> FinishReason {
+    // Anthropic stop reasons have richer names; this is the intentionally
+    // reduced branching surface shared by the runtime.
     match reason {
         AnthropicStopReason::EndTurn | AnthropicStopReason::StopSequence => FinishReason::Stop,
         AnthropicStopReason::MaxTokens => FinishReason::Length,
@@ -301,6 +328,8 @@ fn anthropic_finish_reason(reason: &AnthropicStopReason) -> FinishReason {
 }
 
 fn google_finish_reason(reason: &GoogleFinishReason) -> FinishReason {
+    // Gemini has several policy/safety endings. Collapse them into
+    // ContentFilter so callers do not need provider-specific policy branches.
     match reason {
         GoogleFinishReason::Stop => FinishReason::Stop,
         GoogleFinishReason::MaxTokens => FinishReason::Length,

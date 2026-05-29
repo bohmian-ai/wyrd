@@ -13,13 +13,21 @@ use crate::wire::vertex_generate::VertexGenerateContentRequest;
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum ProviderRequest {
+    /// OpenAI Chat Completions request.
     OpenAiChatCompletion(OpenAiChatRequest),
+    /// OpenAI Responses API request.
     OpenAiResponses(OpenAiResponsesRequest),
+    /// Anthropic Messages request.
     AnthropicMessage(AnthropicMessagesRequest),
+    /// Google Gemini GenerateContent request.
     GeminiGenerateContent(GoogleGenerateContentRequest),
+    /// Vertex GenerateContent request.
     Vertex(VertexGenerateContentRequest),
+    /// Raw provider request body that no typed variant claimed.
     RawV1 {
+        /// Provider dispatch target for the raw body.
         provider: ProviderName,
+        /// Unmodified raw provider request JSON.
         body: Box<RawValue>,
     },
 }
@@ -31,6 +39,10 @@ impl<'de> Deserialize<'de> for ProviderRequest {
     {
         let value = Value::deserialize(deserializer)?;
 
+        // Keep the S01 untagged ordering explicit while still giving RawV1 a
+        // dependable fallback. Deriving `Deserialize` directly would ask
+        // `Box<RawValue>` to deserialize from any JSON value and can make
+        // fallback behavior hard to reason about as typed variants evolve.
         if let Ok(request) = serde_json::from_value::<OpenAiChatRequest>(value.clone()) {
             return Ok(Self::OpenAiChatCompletion(request));
         }
@@ -43,6 +55,9 @@ impl<'de> Deserialize<'de> for ProviderRequest {
         if let Ok(request) = serde_json::from_value::<GoogleGenerateContentRequest>(value.clone()) {
             return Ok(Self::GeminiGenerateContent(request));
         }
+        // Vertex generate is transparent over the Google request shape. This
+        // branch is retained for direct deserialization compatibility, but a
+        // bare body that also matches Google is claimed by Google first.
         if let Ok(request) = serde_json::from_value::<VertexGenerateContentRequest>(value.clone()) {
             return Ok(Self::Vertex(request));
         }
@@ -95,10 +110,15 @@ impl PartialEq for ProviderRequest {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderName {
+    /// OpenAI provider.
     OpenAi,
+    /// Anthropic provider.
     Anthropic,
+    /// Google AI Studio provider.
     Google,
+    /// Google Vertex AI provider.
     Vertex,
+    /// Provider not modeled by skald-spec.
     Custom(String),
 }
 

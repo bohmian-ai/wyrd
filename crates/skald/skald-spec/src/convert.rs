@@ -16,11 +16,15 @@ use crate::wire::openai_chat::{
 
 /// Directed native-to-native message conversion.
 pub trait MessageConversion<Target> {
+    /// Convert this provider-native message into the target provider shape.
     fn convert(&self) -> SkaldResult<Target>;
 }
 
 impl MessageConversion<AnthropicMessage> for OpenAiChatMessage {
     fn convert(&self) -> SkaldResult<AnthropicMessage> {
+        // OpenAI tool-result turns are separate `role: tool` messages.
+        // Anthropic carries the same handoff as a user-side `tool_result`
+        // content block.
         if self.role == "tool" {
             return Ok(AnthropicMessage {
                 role: "user".to_string(),
@@ -56,6 +60,8 @@ impl MessageConversion<AnthropicMessage> for OpenAiChatMessage {
 
 impl MessageConversion<GoogleContent> for OpenAiChatMessage {
     fn convert(&self) -> SkaldResult<GoogleContent> {
+        // Gemini represents tool results as function responses inside user
+        // content, so OpenAI's tool message becomes one function_response part.
         if self.role == "tool" {
             return Ok(GoogleContent {
                 role: "user".to_string(),
@@ -87,6 +93,8 @@ impl MessageConversion<GoogleContent> for OpenAiChatMessage {
 
 impl MessageConversion<OpenAiChatMessage> for AnthropicMessage {
     fn convert(&self) -> SkaldResult<OpenAiChatMessage> {
+        // Pull Anthropic tool_use blocks up to OpenAI's assistant-level
+        // `tool_calls` array. Text/image blocks remain in message content.
         let tool_calls = self
             .content
             .iter()
@@ -103,6 +111,7 @@ impl MessageConversion<OpenAiChatMessage> for AnthropicMessage {
             })
             .collect::<Vec<_>>();
 
+        // Anthropic tool_result blocks map to OpenAI's dedicated tool role.
         if let Some((tool_use_id, content)) = anthropic_tool_result(&self.content) {
             return Ok(OpenAiChatMessage {
                 role: "tool".to_string(),
@@ -133,6 +142,9 @@ impl MessageConversion<OpenAiChatMessage> for AnthropicMessage {
 
 impl MessageConversion<GoogleContent> for AnthropicMessage {
     fn convert(&self) -> SkaldResult<GoogleContent> {
+        // Directly map Anthropic text/tool blocks to Gemini parts. Media and
+        // document blocks are intentionally omitted here until S02 has a
+        // provider-safe binary/media bridge.
         let parts = self
             .content
             .iter()
@@ -169,6 +181,8 @@ impl MessageConversion<GoogleContent> for AnthropicMessage {
 
 impl MessageConversion<OpenAiChatMessage> for GoogleContent {
     fn convert(&self) -> SkaldResult<OpenAiChatMessage> {
+        // Gemini function_call parts become OpenAI assistant tool calls. Gemini
+        // does not have a separate call id, so the function name is reused.
         let tool_calls = self
             .parts
             .iter()
@@ -185,6 +199,8 @@ impl MessageConversion<OpenAiChatMessage> for GoogleContent {
             })
             .collect::<Vec<_>>();
 
+        // Gemini function_response parts represent tool results, which OpenAI
+        // expects as role=tool messages linked by tool_call_id.
         if let Some((name, response)) = google_function_response(&self.parts) {
             return Ok(OpenAiChatMessage {
                 role: "tool".to_string(),
@@ -215,6 +231,8 @@ impl MessageConversion<OpenAiChatMessage> for GoogleContent {
 
 impl MessageConversion<AnthropicMessage> for GoogleContent {
     fn convert(&self) -> SkaldResult<AnthropicMessage> {
+        // Gemini content has no neutral intermediate. Text, function_call, and
+        // function_response parts map directly into Anthropic blocks.
         let content = self
             .parts
             .iter()
@@ -255,6 +273,9 @@ impl MessageConversion<AnthropicMessage> for GoogleContent {
 }
 
 /// Convert a provider message using runtime provider names.
+///
+/// Same-provider conversion returns a cloned identity value. `RawV1` messages
+/// and unsupported provider pairs return `SkaldError::UnsupportedConversion`.
 pub fn convert_message_dyn(
     src: ProviderName,
     dst: ProviderName,
@@ -291,6 +312,8 @@ pub fn convert_message_dyn(
 }
 
 fn openai_role_to_anthropic(role: &str) -> &str {
+    // Anthropic accepts only user/assistant messages; system/developer OpenAI
+    // roles become user content when a standalone message is converted.
     if role == "assistant" {
         "assistant"
     } else {
@@ -299,10 +322,14 @@ fn openai_role_to_anthropic(role: &str) -> &str {
 }
 
 fn openai_role_to_google(role: &str) -> &str {
+    // Gemini uses `model` for assistant output and `user` for all input-side
+    // turns.
     if role == "assistant" { "model" } else { "user" }
 }
 
 fn anthropic_role_to_openai(role: &str) -> &str {
+    // Anthropic roles line up with OpenAI except for unsupported future roles,
+    // which degrade to user-side content.
     if role == "assistant" {
         "assistant"
     } else {
@@ -311,18 +338,23 @@ fn anthropic_role_to_openai(role: &str) -> &str {
 }
 
 fn anthropic_role_to_google(role: &str) -> &str {
+    // Gemini uses `model` instead of `assistant`.
     if role == "assistant" { "model" } else { "user" }
 }
 
 fn google_role_to_openai(role: &str) -> &str {
+    // Gemini's `model` role is OpenAI's assistant role.
     if role == "model" { "assistant" } else { "user" }
 }
 
 fn google_role_to_anthropic(role: &str) -> &str {
+    // Gemini's `model` role is Anthropic's assistant role.
     if role == "model" { "assistant" } else { "user" }
 }
 
 fn openai_message_text(message: &OpenAiChatMessage) -> String {
+    // Tool-result conversions need a plain text payload. Non-text content is
+    // ignored rather than serialized into a made-up neutral media envelope.
     match &message.content {
         Some(OpenAiMessageContent::Text(text)) => text.clone(),
         Some(OpenAiMessageContent::Parts(parts)) => parts
@@ -340,6 +372,9 @@ fn openai_message_text(message: &OpenAiChatMessage) -> String {
 fn openai_content_to_anthropic(
     content: Option<&OpenAiMessageContent>,
 ) -> Vec<AnthropicContentBlock> {
+    // Map only content types with a direct Anthropic native equivalent in S02.
+    // Audio/file parts are left out until a later media-specific stage defines
+    // provider-safe handling.
     match content {
         Some(OpenAiMessageContent::Text(text)) => vec![AnthropicContentBlock::Text {
             text: text.clone(),
@@ -368,6 +403,8 @@ fn openai_content_to_anthropic(
 }
 
 fn openai_content_to_google(content: Option<&OpenAiMessageContent>) -> Vec<GooglePart> {
+    // Text maps directly. Image URLs become Gemini file_data URIs because that
+    // is the closest native Gemini shape without downloading bytes.
     match content {
         Some(OpenAiMessageContent::Text(text)) => vec![GooglePart::Text { text: text.clone() }],
         Some(OpenAiMessageContent::Parts(parts)) => parts
@@ -388,6 +425,9 @@ fn openai_content_to_google(content: Option<&OpenAiMessageContent>) -> Vec<Googl
 }
 
 fn anthropic_content_to_openai(content: &[AnthropicContentBlock]) -> Vec<OpenAiContentPart> {
+    // This helper maps only message content. Anthropic tool_use/tool_result
+    // blocks are handled by the caller because OpenAI stores them outside the
+    // normal content array.
     content
         .iter()
         .filter_map(|block| match block {
@@ -405,6 +445,8 @@ fn anthropic_content_to_openai(content: &[AnthropicContentBlock]) -> Vec<OpenAiC
 }
 
 fn google_content_to_openai(parts: &[GooglePart]) -> Vec<OpenAiContentPart> {
+    // Gemini function calls/responses are handled by the caller; this helper is
+    // only for content parts that fit inside OpenAI message content.
     parts
         .iter()
         .filter_map(|part| match part {
@@ -425,6 +467,8 @@ fn google_content_to_openai(parts: &[GooglePart]) -> Vec<OpenAiContentPart> {
 fn anthropic_image_url(
     source: &crate::wire::anthropic_messages::AnthropicImageSource,
 ) -> Option<String> {
+    // Only URL-backed images can cross without inventing storage or byte
+    // transfer behavior inside skald-spec.
     match source {
         crate::wire::anthropic_messages::AnthropicImageSource::Url { url } => Some(url.clone()),
         _ => None,
@@ -432,6 +476,8 @@ fn anthropic_image_url(
 }
 
 fn anthropic_tool_result(content: &[AnthropicContentBlock]) -> Option<(String, String)> {
+    // Anthropic can mix tool results with other blocks; OpenAI needs a single
+    // tool message, so conversion uses the first tool_result block.
     content.iter().find_map(|block| match block {
         AnthropicContentBlock::ToolResult {
             tool_use_id,
@@ -446,6 +492,8 @@ fn anthropic_tool_result(content: &[AnthropicContentBlock]) -> Option<(String, S
 }
 
 fn anthropic_tool_result_content_text(content: &AnthropicToolResultContent) -> String {
+    // Tool result content may be either raw text or blocks. Keep text blocks and
+    // ignore non-text blocks rather than fabricating a neutral representation.
     match content {
         AnthropicToolResultContent::Text(text) => text.clone(),
         AnthropicToolResultContent::Blocks(blocks) => blocks
@@ -460,6 +508,8 @@ fn anthropic_tool_result_content_text(content: &AnthropicToolResultContent) -> S
 }
 
 fn google_function_response(parts: &[GooglePart]) -> Option<(String, Value)> {
+    // Gemini can include several parts in one turn. OpenAI conversion emits one
+    // tool message, so use the first function_response part.
     parts.iter().find_map(|part| match part {
         GooglePart::FunctionResponse { function_response } => Some((
             function_response.name.clone(),

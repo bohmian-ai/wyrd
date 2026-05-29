@@ -6,19 +6,31 @@ pub type SkaldResult<T> = Result<T, SkaldError>;
 /// Stable skald-spec error catalog.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum SkaldError {
+    /// A declared prompt variable was not supplied to `Prompt::render`.
     #[error("render variable missing: {0}")]
     MissingVariable(String),
+    /// A native provider request could not be serialized before rendering.
     #[error("native request serialize failed: {0}")]
     Serialize(String),
+    /// Rendered JSON did not deserialize back into a native provider request.
     #[error("native request deserialize failed: {0}")]
     Deserialize(String),
+    /// No direct native message conversion exists for the requested providers.
     #[error("unsupported message conversion from {src:?} to {dst:?}")]
     UnsupportedConversion {
+        /// Source provider.
         src: ProviderName,
+        /// Destination provider.
         dst: ProviderName,
     },
+    /// A provider does not support the requested operation.
     #[error("provider {provider:?} does not support operation {op}")]
-    ProviderUnsupported { provider: ProviderName, op: String },
+    ProviderUnsupported {
+        /// Provider that rejected or cannot perform the operation.
+        provider: ProviderName,
+        /// Operation name, such as `embeddings` or `responses`.
+        op: String,
+    },
 }
 
 impl SkaldError {

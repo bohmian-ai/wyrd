@@ -503,6 +503,11 @@ impl ModelCard {
         self.model_dump_json()
     }
 
+    /// Return a pretty JSON representation for interactive inspection.
+    pub fn __str__(&self) -> String {
+        wyrd_utils::json::pretty_json_string(&self.to_card_envelope())
+    }
+
     /// Build a `ModelCard` from serialized JSON and an optional interface hook.
     ///
     /// # Errors

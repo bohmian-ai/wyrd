@@ -63,6 +63,34 @@ fn render_missing_variable_value_returns_skald_error() {
 }
 
 #[test]
+fn bind_returns_new_prompt_and_tracks_remaining_variables() {
+    let request = ProviderRequest::AnthropicMessage(common::anthropic_request());
+    let original = prompt(request, vec!["name", "topic"]);
+    let bound = original.bind(&[("name", "Ada")]).unwrap();
+
+    assert_eq!(original.variables, vec!["name", "topic"]);
+    assert_eq!(bound.variables, vec!["topic"]);
+    let ProviderRequest::AnthropicMessage(request) = &bound.request else {
+        panic!("bind should preserve provider variant");
+    };
+    let AnthropicContentBlock::Text { text, .. } = &request.messages[0].content[0] else {
+        panic!("expected text block");
+    };
+    assert_eq!(text, "Hello Ada");
+}
+
+#[test]
+fn bind_mut_supports_incremental_parameter_injection() {
+    let request = ProviderRequest::OpenAiChatCompletion(common::openai_chat_request());
+    let mut prompt = prompt(request, vec!["name"]);
+    prompt.bind_mut(&[("name", "Grace")]).unwrap();
+
+    assert!(prompt.variables.is_empty());
+    let rendered = prompt.render(&[]).unwrap();
+    assert!(serde_json::to_string(&rendered).unwrap().contains("Grace"));
+}
+
+#[test]
 fn render_escapes_json_special_characters_and_blocks_injection() {
     let request = ProviderRequest::OpenAiChatCompletion(common::openai_chat_request());
     let rendered = prompt(request, vec!["name"])

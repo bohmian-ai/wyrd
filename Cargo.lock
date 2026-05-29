@@ -1936,6 +1936,7 @@ name = "py-wyrd"
 version = "0.0.1"
 dependencies = [
  "pyo3",
+ "skald-prompt",
  "wyrd-cards",
 ]
 

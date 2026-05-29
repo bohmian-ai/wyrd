@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::{SkaldError, SkaldResult};
 use crate::request::ProviderRequest;
@@ -40,39 +41,63 @@ pub enum ResponseType {
 }
 
 impl Prompt {
+    /// Return a copy with the supplied `{{name}}` placeholders bound.
+    ///
+    /// This is the reusable primitive behind higher-level prompt binding. It performs
+    /// replacement inside JSON string leaves after serializing the native
+    /// request, then deserializes back into the same provider-native enum.
+    pub fn bind(&self, vars: &[(&str, &str)]) -> SkaldResult<Self> {
+        let mut prompt = self.clone();
+        prompt.bind_mut(vars)?;
+        Ok(prompt)
+    }
+
+    /// Bind supplied `{{name}}` placeholders into this prompt in place.
+    ///
+    /// Unlike `render`, this may bind only a subset of declared variables. Any
+    /// names still present in `variables` remain required for a later render.
+    pub fn bind_mut(&mut self, vars: &[(&str, &str)]) -> SkaldResult<()> {
+        let mut request = serde_json::to_value(&self.request).map_err(SkaldError::serialize)?;
+        replace_string_leaves(&mut request, vars);
+        self.request = serde_json::from_value(request).map_err(SkaldError::deserialize)?;
+        self.variables
+            .retain(|name| !vars.iter().any(|(key, _)| key == name));
+        Ok(())
+    }
+
     /// Render declared `{{name}}` placeholders into the native request.
     ///
     /// Values are escaped as JSON string content before substitution, so a
     /// variable value cannot inject new fields into the serialized provider
     /// request. The returned request remains in the same provider-native shape.
     pub fn render(&self, vars: &[(&str, &str)]) -> SkaldResult<ProviderRequest> {
-        let mut json = serde_json::to_string(&self.request).map_err(SkaldError::serialize)?;
-
         for name in &self.variables {
-            let value = vars
-                .iter()
+            vars.iter()
                 .find(|(key, _)| key == name)
-                .map(|(_, value)| *value)
                 .ok_or_else(|| SkaldError::missing_variable(name))?;
-            json = json.replace(
-                &format!("{{{{{name}}}}}"),
-                &escape_json_string_content(value)?,
-            );
         }
 
-        serde_json::from_str(&json).map_err(SkaldError::deserialize)
+        Ok(self.bind(vars)?.request)
     }
 }
 
-fn escape_json_string_content(value: &str) -> SkaldResult<String> {
-    // `Prompt::render` substitutes inside a JSON string that already has
-    // surrounding quotes from `serde_json::to_string(&request)`. Encode as a
-    // JSON string, then remove only those wrapper quotes so escape sequences
-    // like `\"` and `\\` remain intact in the provider request JSON.
-    let encoded = serde_json::to_string(value).map_err(SkaldError::serialize)?;
-    Ok(encoded
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(&encoded)
-        .to_string())
+fn replace_string_leaves(value: &mut Value, vars: &[(&str, &str)]) {
+    match value {
+        Value::String(text) => {
+            for (name, replacement) in vars {
+                *text = text.replace(&format!("{{{{{name}}}}}"), replacement);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                replace_string_leaves(value, vars);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                replace_string_leaves(value, vars);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }

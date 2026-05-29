@@ -513,6 +513,11 @@ impl DataCard {
         self.model_dump_json()
     }
 
+    /// Return a pretty JSON representation for interactive inspection.
+    pub fn __str__(&self) -> String {
+        wyrd_utils::json::pretty_json_string(&self.to_card_envelope())
+    }
+
     /// Build a `DataCard` from serialized JSON and an optional interface hook.
     ///
     /// When `interface` is omitted, Wyrd rebuilds built-in interfaces from

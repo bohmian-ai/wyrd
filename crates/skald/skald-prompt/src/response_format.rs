@@ -134,4 +134,21 @@ impl ResponseFormat {
             }
         }
     }
+
+    /// Return a pretty JSON string for interactive inspection.
+    pub fn __str__(&self) -> String {
+        match &self.kind {
+            ResponseFormatKind::Text => {
+                wyrd_utils::json::pretty_json_string(&serde_json::json!({ "type": "text" }))
+            }
+            ResponseFormatKind::JsonObject => {
+                wyrd_utils::json::pretty_json_string(&serde_json::json!({ "type": "json_object" }))
+            }
+            ResponseFormatKind::JsonSchema { name, schema } => {
+                wyrd_utils::json::pretty_json_string(
+                    &serde_json::json!({ "type": "json_schema", "name": name, "schema": schema }),
+                )
+            }
+        }
+    }
 }

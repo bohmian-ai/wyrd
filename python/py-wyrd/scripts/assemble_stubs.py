@@ -8,6 +8,7 @@ from pathlib import Path
 STUB_DIR = Path("python/wyrd/stubs")
 OUTPUT_FILE = Path("python/wyrd/_native.pyi")
 PUBLIC_MODEL_FILE = Path("python/wyrd/model.pyi")
+PUBLIC_PROMPT_FILE = Path("python/wyrd/prompt.pyi")
 PUBLIC_INIT_FILE = Path("python/wyrd/__init__.pyi")
 
 STUB_FILES = [
@@ -15,6 +16,7 @@ STUB_FILES = [
     "error.pyi",
     "data.pyi",
     "model.pyi",
+    "prompt.pyi",
 ]
 
 
@@ -73,6 +75,7 @@ def assemble() -> None:
 
     OUTPUT_FILE.write_text("\n".join(final_content) + "\n", encoding="utf-8")
     write_public_model_stub()
+    write_public_prompt_stub()
     write_public_init_stub()
     print(f"Compiled {len(master_all)} exports into {OUTPUT_FILE}")
 
@@ -101,27 +104,59 @@ def write_public_model_stub() -> None:
     PUBLIC_MODEL_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def write_public_prompt_stub() -> None:
+    """Write the public wyrd.prompt re-export stub."""
+    exports = extract_all((STUB_DIR / "prompt.pyi").read_text(encoding="utf-8"))
+    lines = [
+        "from typing import TYPE_CHECKING",
+        "",
+        "if TYPE_CHECKING:",
+        "    from ._native import (",
+    ]
+    lines.extend(f"        {name}," for name in exports)
+    lines.extend(
+        [
+            "    )",
+            "else:",
+            "    from ._native.prompt import (",
+        ]
+    )
+    lines.extend(f"        {name}," for name in exports)
+    lines.extend(["    )", "", "__all__ = ["])
+    lines.extend(f'    "{name}",' for name in exports)
+    lines.append("]")
+    PUBLIC_PROMPT_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def write_public_init_stub() -> None:
     """Write the package root re-export stub."""
     lines = [
         "from . import data as data",
         "from . import model as model",
+        "from . import prompt as prompt",
         "from .data import DataCard as DataCard",
         "from .data import Split as Split",
         "from .data import WyrdError as WyrdError",
         "from .model import ModelCard as ModelCard",
         "from .model import ModelSignature as ModelSignature",
         "from .model import SampleInput as SampleInput",
+        "from .prompt import Prompt as Prompt",
+        "from .prompt import ProviderRequest as ProviderRequest",
+        "from .prompt import ResponseFormat as ResponseFormat",
         "",
         "__all__ = [",
         '    "DataCard",',
         '    "ModelCard",',
         '    "ModelSignature",',
+        '    "Prompt",',
+        '    "ProviderRequest",',
+        '    "ResponseFormat",',
         '    "SampleInput",',
         '    "Split",',
         '    "WyrdError",',
         '    "data",',
         '    "model",',
+        '    "prompt",',
         "]",
     ]
     PUBLIC_INIT_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")

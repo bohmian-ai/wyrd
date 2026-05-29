@@ -49,6 +49,13 @@ def test_serialized_datacard_contains_spec_interface_metadata_not_python_state(t
     assert "data" not in payload["spec"]["interface"]["meta"]
 
 
+def test_datacard_str_is_pretty_card_json() -> None:
+    payload = json.loads(str(DataCard(JsonlInterface(data=[{"x": 1}]))))
+
+    assert payload["apiVersion"] == "wyrd/v1"
+    assert payload["kind"] == "Data"
+
+
 def test_labels_annotations_replace_tags_in_metadata() -> None:
     card = DataCard(
         PandasInterface(data=pd.DataFrame({"x": [1]})),

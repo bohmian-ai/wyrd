@@ -215,6 +215,7 @@ pub struct GoogleFunctionCallingConfig {
 /// Response envelope.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct GoogleGenerateContentResponse {
     #[serde(default)]
     pub candidates: Vec<GoogleCandidate>,

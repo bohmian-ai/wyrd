@@ -4,12 +4,20 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+pub mod adapter;
+pub mod convert;
+pub mod error;
 pub mod message;
+pub mod prompt;
 pub mod request;
 pub mod response;
 pub mod wire;
 
+pub use adapter::{ResponseAdapter, ToolCallView, UsageView};
+pub use convert::{MessageConversion, convert_message_dyn};
+pub use error::{SkaldError, SkaldResult};
 pub use message::MessageNum;
+pub use prompt::{Prompt, ResponseType};
 pub use request::{ProviderName, ProviderRequest};
 pub use response::ProviderResponse;
 pub use wire::anthropic_citation::AnthropicCitationV1;

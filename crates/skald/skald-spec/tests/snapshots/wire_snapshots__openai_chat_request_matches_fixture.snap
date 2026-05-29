@@ -1,0 +1,63 @@
+---
+source: crates/skald/skald-spec/tests/wire_snapshots.rs
+expression: "common::openai_chat_request()"
+---
+{
+  "model": "gpt-4o",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You answer {{topic}}."
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Hello {{name}}"
+        }
+      ]
+    }
+  ],
+  "temperature": 0.2,
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "answer",
+      "schema": {
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "strict": true
+    }
+  },
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup",
+        "description": "Lookup a thing",
+        "parameters": {
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "strict": true
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "function",
+    "function": {
+      "name": "lookup"
+    }
+  },
+  "prompt_cache_key": "cache-key"
+}

@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use serde_json::value::RawValue;
 
 use crate::wire::anthropic_messages::AnthropicMessagesRequest;
@@ -8,7 +9,7 @@ use crate::wire::openai_responses::OpenAiResponsesRequest;
 use crate::wire::vertex_generate::VertexGenerateContentRequest;
 
 /// One native LLM request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum ProviderRequest {
@@ -21,6 +22,47 @@ pub enum ProviderRequest {
         provider: ProviderName,
         body: Box<RawValue>,
     },
+}
+
+impl<'de> Deserialize<'de> for ProviderRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+
+        if let Ok(request) = serde_json::from_value::<OpenAiChatRequest>(value.clone()) {
+            return Ok(Self::OpenAiChatCompletion(request));
+        }
+        if let Ok(request) = serde_json::from_value::<OpenAiResponsesRequest>(value.clone()) {
+            return Ok(Self::OpenAiResponses(request));
+        }
+        if let Ok(request) = serde_json::from_value::<AnthropicMessagesRequest>(value.clone()) {
+            return Ok(Self::AnthropicMessage(request));
+        }
+        if let Ok(request) = serde_json::from_value::<GoogleGenerateContentRequest>(value.clone()) {
+            return Ok(Self::GeminiGenerateContent(request));
+        }
+        if let Ok(request) = serde_json::from_value::<VertexGenerateContentRequest>(value.clone()) {
+            return Ok(Self::Vertex(request));
+        }
+        if let Ok(raw) = serde_json::from_value::<RawProviderRequest>(value) {
+            return Ok(Self::RawV1 {
+                provider: raw.provider,
+                body: raw.body,
+            });
+        }
+
+        Err(serde::de::Error::custom(
+            "data did not match any ProviderRequest variant",
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+struct RawProviderRequest {
+    provider: ProviderName,
+    body: Box<RawValue>,
 }
 
 impl PartialEq for ProviderRequest {

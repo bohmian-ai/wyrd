@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use serde_json::value::RawValue;
 
 use crate::wire::anthropic_messages::AnthropicMessage;
@@ -6,7 +7,7 @@ use crate::wire::google_generate::GoogleContent;
 use crate::wire::openai_chat::OpenAiChatMessage;
 
 /// One native message in a provider's own shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum MessageNum {
@@ -14,6 +15,29 @@ pub enum MessageNum {
     Anthropic(AnthropicMessage),
     Gemini(GoogleContent),
     RawV1(Box<RawValue>),
+}
+
+impl<'de> Deserialize<'de> for MessageNum {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+
+        if let Ok(message) = serde_json::from_value::<OpenAiChatMessage>(value.clone()) {
+            return Ok(Self::OpenAi(message));
+        }
+        if let Ok(message) = serde_json::from_value::<AnthropicMessage>(value.clone()) {
+            return Ok(Self::Anthropic(message));
+        }
+        if let Ok(message) = serde_json::from_value::<GoogleContent>(value.clone()) {
+            return Ok(Self::Gemini(message));
+        }
+
+        RawValue::from_string(value.to_string())
+            .map(Self::RawV1)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl PartialEq for MessageNum {

@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
+use crate::wire::common::TokenUsage;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -397,6 +399,24 @@ pub struct OpenAiResponsesInputTokensDetails {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct OpenAiResponsesOutputTokensDetails {
     pub reasoning_tokens: u64,
+}
+
+impl From<OpenAiResponsesUsage> for TokenUsage {
+    fn from(u: OpenAiResponsesUsage) -> Self {
+        Self {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: u
+                .input_tokens_details
+                .map(|details| details.cached_tokens)
+                .unwrap_or(0),
+            reasoning_tokens: u
+                .output_tokens_details
+                .map(|details| details.reasoning_tokens)
+                .unwrap_or(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

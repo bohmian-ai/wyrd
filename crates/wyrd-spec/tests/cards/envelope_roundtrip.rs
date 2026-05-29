@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use skald_spec::wire::openai_chat::OpenAiMessageContent;
+use skald_spec::{OpenAiChatMessage, OpenAiChatRequest, Prompt, ProviderRequest, ResponseType};
 use wyrd_spec::card::prompt::PromptSpec;
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
 use wyrd_spec::format;
@@ -21,10 +23,7 @@ fn card_yaml_round_trip() {
             spec_hash: None,
             artifact_hash: None,
         },
-        spec: Spec::Prompt(PromptSpec {
-            template: "Answer carefully.".to_string(),
-            ..PromptSpec::default()
-        }),
+        spec: Spec::Prompt(prompt_spec()),
         relationships: Relationships::default(),
         status: None,
     };
@@ -35,6 +34,56 @@ fn card_yaml_round_trip() {
     assert!(!yaml.contains("api_version:"));
     let decoded = format::yaml::from_str(&yaml).unwrap();
     assert_eq!(decoded, card);
+}
+
+fn prompt_spec() -> PromptSpec {
+    PromptSpec::new(Prompt {
+        request: ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
+            model: "gpt-4o".to_owned(),
+            messages: vec![OpenAiChatMessage {
+                role: "user".to_owned(),
+                content: Some(OpenAiMessageContent::Text("Answer carefully.".to_owned())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                refusal: None,
+            }],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            n: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            logit_bias: None,
+            user: None,
+            reasoning_effort: None,
+            modalities: None,
+            audio: None,
+            prediction: None,
+            response_format: None,
+            stream: None,
+            stream_options: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            prompt_cache_key: None,
+            service_tier: None,
+            safety_identifier: None,
+            store: None,
+            metadata: None,
+            logprobs: None,
+            top_logprobs: None,
+            extra: serde_json::Map::new(),
+        }),
+        model: "gpt-4o".to_owned(),
+        version: None,
+        variables: Vec::new(),
+        response_type: ResponseType::Text,
+    })
+    .expect("static prompt spec is valid")
 }
 
 #[test]

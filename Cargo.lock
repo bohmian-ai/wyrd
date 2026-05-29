@@ -2634,6 +2634,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "skald-runtime"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "skald-cache",
+ "skald-providers",
+ "skald-spec",
+ "skald-tool",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "skald-spec"
 version = "0.1.0"
 dependencies = [
@@ -4185,11 +4200,14 @@ dependencies = [
  "chrono",
  "hex",
  "proptest",
+ "regex",
  "schemars",
  "semver",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
+ "skald-spec",
  "thiserror 2.0.18",
  "utoipa",
  "uuid",

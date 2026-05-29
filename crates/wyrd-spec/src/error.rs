@@ -393,6 +393,244 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// PromptCard variable name was invalid.
+    #[error("[WYRD_PROMPT_400_INVALID_VARIABLE_NAME] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_400_INVALID_VARIABLE_NAME",
+        status = 400,
+        title = "Invalid variable name",
+        remediation = "Variable names must match ^[a-zA-Z_][a-zA-Z0-9_]*$."
+    )]
+    PromptInvalidVariableName {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// PromptCard declared the same variable more than once.
+    #[error("[WYRD_PROMPT_409_DUPLICATE_VARIABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_409_DUPLICATE_VARIABLE",
+        status = 409,
+        title = "Duplicate variable name",
+        remediation = "Each entry in prompt.variables must be unique."
+    )]
+    PromptDuplicateVariable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// PromptCard request referenced an undeclared placeholder.
+    #[error("[WYRD_PROMPT_422_UNDECLARED_PLACEHOLDER] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_422_UNDECLARED_PLACEHOLDER",
+        status = 422,
+        title = "Undeclared placeholder in request",
+        remediation = "Add the placeholder name to prompt.variables, or remove it from the request."
+    )]
+    PromptUndeclaredPlaceholder {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// PromptCard declared a variable that the request never references.
+    #[error("[WYRD_PROMPT_422_UNREFERENCED_VARIABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_422_UNREFERENCED_VARIABLE",
+        status = 422,
+        title = "Declared variable is never referenced",
+        remediation = "Reference the variable somewhere in the native request, or drop it from prompt.variables."
+    )]
+    PromptUnreferencedVariable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// PromptCard model string was empty.
+    #[error("[WYRD_PROMPT_400_EMPTY_MODEL] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_400_EMPTY_MODEL",
+        status = 400,
+        title = "Prompt model is empty",
+        remediation = "Set prompt.model to a non-empty provider model id."
+    )]
+    PromptEmptyModel {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// PromptCard JSON Schema response type was not an object schema.
+    #[error("[WYRD_PROMPT_400_INVALID_RESPONSE_SCHEMA] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_400_INVALID_RESPONSE_SCHEMA",
+        status = 400,
+        title = "JsonSchema response_type schema is not an object",
+        remediation = "The schema of ResponseType::JsonSchema must be a JSON object."
+    )]
+    PromptInvalidResponseSchema {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// PromptCard codec extension was unsupported.
+    #[error("[WYRD_PROMPT_400_LOADER_BAD_EXTENSION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_400_LOADER_BAD_EXTENSION",
+        status = 400,
+        title = "Loader extension not supported",
+        remediation = "Use .json, .yaml, or .yml."
+    )]
+    PromptLoaderBadExtension {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// PromptCard loader IO failed in an IO-owning crate.
+    #[error("[WYRD_PROMPT_500_LOADER_IO] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_500_LOADER_IO",
+        status = 500,
+        title = "Loader IO failure",
+        remediation = "Inspect the OS error; usually missing path or permission denied."
+    )]
+    PromptLoaderIo {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// PromptCard request serialization failed during validation.
+    #[error("[WYRD_PROMPT_500_SERIALIZE_REQUEST] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_500_SERIALIZE_REQUEST",
+        status = 500,
+        title = "Serialize native request failed during validation",
+        remediation = "The native request could not be serialized to JSON. Capture the spec and file an issue."
+    )]
+    PromptSerializeRequest {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Provider authentication failed at a prompt boundary.
+    #[error("[WYRD_PROMPT_401_PROVIDER_AUTH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_401_PROVIDER_AUTH",
+        status = 401,
+        title = "Provider authentication failed",
+        remediation = "Check the provider credentials environment variables."
+    )]
+    PromptProviderAuth {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Provider rate-limited a prompt request.
+    #[error("[WYRD_PROMPT_429_PROVIDER_RATE_LIMIT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_429_PROVIDER_RATE_LIMIT",
+        status = 429,
+        title = "Provider rate limit",
+        remediation = "Back off, lower concurrency, or upgrade provider tier."
+    )]
+    PromptProviderRateLimit {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Provider returned an upstream failure for a prompt request.
+    #[error("[WYRD_PROMPT_502_PROVIDER_UPSTREAM] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_502_PROVIDER_UPSTREAM",
+        status = 502,
+        title = "Provider upstream error",
+        remediation = "Retry with backoff; provider returned a 5xx."
+    )]
+    PromptProviderUpstream {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Provider prompt request timed out.
+    #[error("[WYRD_PROMPT_504_PROVIDER_TIMEOUT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_504_PROVIDER_TIMEOUT",
+        status = 504,
+        title = "Provider request timed out",
+        remediation = "Retry; raise the per-request timeout if this is chronic."
+    )]
+    PromptProviderTimeout {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Prompt request variant did not match the dialed provider.
+    #[error("[WYRD_PROMPT_400_PROVIDER_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_400_PROVIDER_MISMATCH",
+        status = 400,
+        title = "Request shape did not match the dialed provider",
+        remediation = "Pick the matching provider client or dispatch through the runtime registry."
+    )]
+    PromptProviderMismatch {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Prompt render call omitted a declared variable.
+    #[error("[WYRD_PROMPT_422_MISSING_VARIABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_422_MISSING_VARIABLE",
+        status = 422,
+        title = "Render variable missing",
+        remediation = "Supply every declared variable when calling Prompt::render."
+    )]
+    PromptMissingVariable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Prompt message handoff conversion is unsupported.
+    #[error("[WYRD_PROMPT_501_UNSUPPORTED_HANDOFF] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_501_UNSUPPORTED_HANDOFF",
+        status = 501,
+        title = "Unsupported message conversion",
+        remediation = "Use a same-provider handoff or convert manually."
+    )]
+    PromptUnsupportedHandoff {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Prompt runtime response did not satisfy the response schema.
+    #[error("[WYRD_PROMPT_422_RESPONSE_DECODE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_422_RESPONSE_DECODE",
+        status = 422,
+        title = "Response did not match requested schema",
+        remediation = "Inspect the provider response or relax the prompt response schema."
+    )]
+    PromptResponseDecode {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
 }
 
 impl WyrdError {
@@ -439,7 +677,55 @@ impl WyrdError {
             | Self::ModelHfRevisionInvalid { message, details }
             | Self::ModelHfTaskMissing { message, details }
             | Self::ModelCustomLoaderInvalid { message, details }
-            | Self::ModelSerializerUnavailable { message, details } => (message, details),
+            | Self::ModelSerializerUnavailable { message, details }
+            | Self::PromptInvalidVariableName { message, details }
+            | Self::PromptDuplicateVariable { message, details }
+            | Self::PromptUndeclaredPlaceholder { message, details }
+            | Self::PromptUnreferencedVariable { message, details }
+            | Self::PromptEmptyModel { message, details }
+            | Self::PromptInvalidResponseSchema { message, details }
+            | Self::PromptLoaderBadExtension { message, details }
+            | Self::PromptLoaderIo { message, details }
+            | Self::PromptSerializeRequest { message, details }
+            | Self::PromptProviderAuth { message, details }
+            | Self::PromptProviderRateLimit { message, details }
+            | Self::PromptProviderUpstream { message, details }
+            | Self::PromptProviderTimeout { message, details }
+            | Self::PromptProviderMismatch { message, details }
+            | Self::PromptMissingVariable { message, details }
+            | Self::PromptUnsupportedHandoff { message, details }
+            | Self::PromptResponseDecode { message, details } => (message, details),
+        }
+    }
+
+    /// Creates an internal error that preserves the source Skald code.
+    #[must_use]
+    pub fn internal_from_skald(code: &'static str, message: String) -> Self {
+        Self::Internal {
+            message,
+            details: serde_json::json!({ "skald_code": code }),
+        }
+    }
+}
+
+impl From<skald_spec::SkaldError> for WyrdError {
+    fn from(error: skald_spec::SkaldError) -> Self {
+        let message = error.to_string();
+        match error {
+            skald_spec::SkaldError::MissingVariable(name) => Self::PromptMissingVariable {
+                message,
+                details: serde_json::json!({ "name": name }),
+            },
+            skald_spec::SkaldError::UnsupportedConversion { src, dst } => {
+                Self::PromptUnsupportedHandoff {
+                    message,
+                    details: serde_json::json!({
+                        "src": format!("{src:?}"),
+                        "dst": format!("{dst:?}"),
+                    }),
+                }
+            }
+            other => Self::internal_from_skald(other.code(), other.to_string()),
         }
     }
 }

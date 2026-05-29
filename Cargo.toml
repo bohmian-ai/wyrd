@@ -25,6 +25,7 @@ authors = ["Thorrester <sjforrester32@gmail.com>"]
 
 [workspace.dependencies]
 wyrd-spec = { path = "crates/wyrd-spec", version = "0.0.1" }
+skald-spec = { path = "crates/skald/skald-spec", version = "0.1.0" }
 wyrd-utils = { path = "crates/shared/wyrd-utils", version = "0.0.1" }
 wyrd-test-contract-macros = { path = "crates/shared/wyrd-test-contract-macros", version = "0.0.1" }
 wyrd-interfaces = { path = "crates/wyrd/wyrd-interfaces", version = "0.0.1" }
@@ -64,6 +65,7 @@ rand = "0.9"
 url = "2"
 urlencoding = "2"
 httpdate = "1"
+regex = "1"
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"

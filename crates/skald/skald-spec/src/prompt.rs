@@ -5,6 +5,7 @@ use crate::request::ProviderRequest;
 
 /// Authored native prompt request plus render metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Prompt {
     /// Native provider-shaped request authored with `{{variable}}` placeholders.
     pub request: ProviderRequest,

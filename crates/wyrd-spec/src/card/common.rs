@@ -131,39 +131,3 @@ pub struct ObservationHooks {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<String>,
 }
-
-/// Provider identity for LLM and agentic specs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "PascalCase")]
-pub enum Provider {
-    /// OpenAI-compatible provider.
-    OpenAi,
-    /// Anthropic-compatible provider.
-    Anthropic,
-    /// Gemini-compatible provider.
-    Gemini,
-    /// Vertex-compatible provider.
-    Vertex,
-    /// Bedrock-compatible provider.
-    Bedrock,
-    /// Google ADK-compatible provider.
-    GoogleAdk,
-    /// Other named provider.
-    Other(String),
-}
-
-/// Chat prompt role.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum PromptRole {
-    /// System instruction.
-    System,
-    /// User message.
-    User,
-    /// Assistant message.
-    Assistant,
-    /// Tool result message.
-    Tool,
-}

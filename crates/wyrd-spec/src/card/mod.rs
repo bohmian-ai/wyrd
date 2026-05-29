@@ -24,7 +24,7 @@ pub mod workflow;
 pub use crate::ids::{ColumnName, QueryName, SplitName};
 pub use common::{
     AgentInterface, CredentialRef, Governance, MetricEntry, NonSecretValue, ObservationHooks,
-    ParameterValue, PromptRole, ProtocolProfile, Provider,
+    ParameterValue, ProtocolProfile,
 };
 pub use data::{ColValue, Inequality};
 pub use field::{Dim, FieldSpec};

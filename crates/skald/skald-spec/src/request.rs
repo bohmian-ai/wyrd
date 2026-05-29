@@ -13,6 +13,7 @@ use crate::wire::vertex_predict::VertexPredictRequest;
 
 /// One native LLM request.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum ProviderRequest {
@@ -37,6 +38,7 @@ pub enum ProviderRequest {
         /// Provider dispatch target for the raw body.
         provider: ProviderName,
         /// Unmodified raw provider request JSON.
+        #[cfg_attr(feature = "schemars", schemars(with = "serde_json::Value"))]
         body: Box<RawValue>,
     },
 }

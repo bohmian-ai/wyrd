@@ -1,0 +1,1 @@
+{"id":"msg_test","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"hello back"},{"type":"tool_use","id":"toolu_1","name":"lookup_weather","input":{"city":"Austin"}}],"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":4,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}

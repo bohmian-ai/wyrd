@@ -1,0 +1,1 @@
+{"id":"resp_test","object":"response","model":"gpt-4o-mini","status":"completed","created_at":1700000000,"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello back"}]},{"type":"reasoning","summary":"brief","encrypted_content":"redacted"}],"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}

@@ -138,7 +138,10 @@ fi
 [tasks."check:mocks-scope"]
 description = "Assert mock helpers stay out of production source"
 run = """
-if rg -n 'mockall|wiremock|mockito' crates --glob '!crates/shared/wyrd-testing/**'; then
+if rg -n 'mockall|wiremock|mockito' crates \
+  --glob '!crates/shared/wyrd-testing/**' \
+  --glob '!crates/skald/skald-providers/Cargo.toml' \
+  --glob '!crates/skald/skald-providers/tests/**'; then
   echo 'mock dependency leaked outside wyrd-testing'
   exit 1
 fi

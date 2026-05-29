@@ -1,0 +1,1 @@
+{"candidates":[{"content":{"role":"model","parts":[{"text":"hello back"},{"function_call":{"name":"lookup_weather","args":{"city":"Austin"}}}]},"finish_reason":"STOP","index":0,"safety_ratings":[]}],"usage_metadata":{"prompt_token_count":5,"candidates_token_count":3,"total_token_count":8}}

@@ -31,6 +31,8 @@ wyrd-interfaces = { path = "crates/wyrd/wyrd-interfaces", version = "0.0.1" }
 wyrd-cards = { path = "crates/wyrd/wyrd-cards", version = "0.0.1" }
 wyrd-auth-verify = { path = "crates/shared/wyrd-auth-verify", version = "0.0.1" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "stream"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -40,6 +42,8 @@ utoipa = { version = "5", features = ["chrono", "uuid"] }
 thiserror = "2.0"
 base64 = "0.22"
 insta = { version = "1.43", features = ["json"] }
+wiremock = "0.6"
+temp-env = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 flate2 = "1.*"
 zstd = "0.13"
@@ -55,6 +59,11 @@ argon2 = "0.5"
 password-hash = { version = "0.5", features = ["getrandom"] }
 secrecy = "0.10"
 zeroize = "1"
+governor = "0.10"
+rand = "0.9"
+url = "2"
+urlencoding = "2"
+httpdate = "1"
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"

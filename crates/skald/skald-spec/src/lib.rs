@@ -27,7 +27,8 @@ pub use wire::anthropic_messages::{
 };
 pub use wire::common::{FinishReason, TokenUsage};
 pub use wire::google_embeddings::{
-    GoogleBatchEmbedRequest, GoogleBatchEmbedResponse, GoogleEmbedding,
+    GoogleBatchEmbedRequest, GoogleBatchEmbedResponse, GoogleEmbedContent, GoogleEmbedPart,
+    GoogleEmbedRequest, GoogleEmbedding,
 };
 pub use wire::google_generate::{
     GoogleCandidate, GoogleContent, GoogleFinishReason, GoogleGenerateContentRequest,
@@ -38,7 +39,7 @@ pub use wire::openai_chat::{
     OpenAiChatRequest, OpenAiChatResponse, OpenAiChatStreamChunk, OpenAiToolCall, OpenAiUsage,
 };
 pub use wire::openai_embeddings::{
-    OpenAiEmbeddingVector, OpenAiEmbeddingsRequest, OpenAiEmbeddingsResponse,
+    OpenAiEmbeddingVector, OpenAiEmbeddingsInput, OpenAiEmbeddingsRequest, OpenAiEmbeddingsResponse,
 };
 pub use wire::openai_responses::{
     OpenAiResponseItem, OpenAiResponsesRequest, OpenAiResponsesResponse, OpenAiResponsesStreamEvent,

@@ -1,0 +1,1 @@
+{"requests":[{"model":"models/text-embedding-004","content":{"parts":[{"text":"alpha"}]},"output_dimensionality":3},{"model":"models/text-embedding-004","content":{"parts":[{"text":"beta"}]},"output_dimensionality":3}]}

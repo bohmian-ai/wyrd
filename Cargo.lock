@@ -4114,6 +4114,8 @@ dependencies = [
  "pyo3",
  "serde",
  "serde_json",
+ "skald-prompt",
+ "skald-spec",
  "thiserror 2.0.18",
  "wyrd-interfaces",
  "wyrd-spec",

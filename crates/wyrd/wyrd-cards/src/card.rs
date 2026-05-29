@@ -2,3 +2,4 @@
 
 pub use crate::data::{DataCard, DataCardMetadata};
 pub use crate::model::{ModelCard, ModelCardMetadata};
+pub use crate::prompt::{PromptCard, PromptCardMetadata};

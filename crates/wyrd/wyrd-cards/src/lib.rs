@@ -10,6 +10,8 @@ pub mod card;
 pub mod data;
 /// ModelCard implementation module.
 pub mod model;
+/// PromptCard implementation module.
+pub mod prompt;
 
 #[cfg(feature = "python")]
 use {pyo3::prelude::*, pyo3::types::PyModule};
@@ -20,6 +22,7 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let cards = PyModule::new(py, "cards")?;
     let data = PyModule::new(py, "data")?;
     let model = PyModule::new(py, "model")?;
+    let prompt = PyModule::new(py, "prompt")?;
 
     wyrd_interfaces::error::register_exceptions(&data)?;
     wyrd_interfaces::data::register(&data)?;
@@ -32,12 +35,19 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     model.add_class::<model::ModelCard>()?;
     model.add_class::<model::ModelCardMetadata>()?;
 
+    wyrd_interfaces::error::register_exceptions(&prompt)?;
+    skald_prompt::register_prompt(&prompt)?;
+    prompt.add_class::<prompt::PromptCard>()?;
+    prompt.add_class::<prompt::PromptCardMetadata>()?;
+
     cards.add_submodule(&data)?;
     cards.add_submodule(&model)?;
+    cards.add_submodule(&prompt)?;
     parent.add_submodule(&cards)?;
     register_submodule(py, "wyrd._native.cards", &cards)?;
     register_submodule(py, "wyrd._native.cards.data", &data)?;
     register_submodule(py, "wyrd._native.cards.model", &model)?;
+    register_submodule(py, "wyrd._native.cards.prompt", &prompt)?;
     Ok(())
 }
 

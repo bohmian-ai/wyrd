@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
 use crate::wire::common::TokenUsage;
 
@@ -29,17 +30,17 @@ pub struct OpenAiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub logit_bias: Option<Map<String, Value>>,
+    pub logit_bias: Option<BTreeMap<String, i32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
+    pub reasoning_effort: Option<OpenAiReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub modalities: Option<Vec<String>>,
+    pub modalities: Option<Vec<OpenAiResponseModality>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub audio: Option<Value>,
+    pub audio: Option<OpenAiChatAudio>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prediction: Option<Value>,
+    pub prediction: Option<OpenAiPredictionContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<OpenAiResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -49,7 +50,7 @@ pub struct OpenAiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<OpenAiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<Value>,
+    pub tool_choice: Option<OpenAiChatToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,7 +62,7 @@ pub struct OpenAiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<Map<String, Value>>,
+    pub metadata: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,12 +79,118 @@ pub enum OpenAiStop {
     Many(Vec<String>),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiResponseModality {
+    Text,
+    Audio,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiChatAudio {
+    pub voice: OpenAiVoice,
+    pub format: OpenAiAudioFormat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum OpenAiVoice {
+    BuiltIn(OpenAiBuiltInVoice),
+    Custom(OpenAiCustomVoice),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiBuiltInVoice {
+    Alloy,
+    Ash,
+    Ballad,
+    Coral,
+    Echo,
+    Fable,
+    Nova,
+    Onyx,
+    Sage,
+    Shimmer,
+    Marin,
+    Cedar,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiCustomVoice {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiAudioFormat {
+    Wav,
+    Aac,
+    Mp3,
+    Flac,
+    Opus,
+    Pcm16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiPredictionContent {
+    #[serde(rename = "type")]
+    pub kind: OpenAiPredictionKind,
+    pub content: OpenAiPredictionPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiPredictionKind {
+    Content,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum OpenAiPredictionPayload {
+    Text(String),
+    Parts(Vec<OpenAiPredictionContentPart>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OpenAiPredictionContentPart {
+    Text { text: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct OpenAiStreamOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_usage: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_obfuscation: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -102,22 +209,18 @@ pub struct OpenAiJsonSchema {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub schema: Value,
-    #[serde(default = "default_strict")]
-    pub strict: bool,
-}
-
-const fn default_strict() -> bool {
-    true
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Map<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
-pub struct OpenAiTool {
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub function: OpenAiFunction,
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OpenAiTool {
+    Function { function: OpenAiFunction },
+    Custom { custom: OpenAiCustomTool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -127,9 +230,142 @@ pub struct OpenAiFunction {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub parameters: Value,
-    #[serde(default = "default_strict")]
-    pub strict: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Map<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiCustomTool {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<OpenAiCustomToolFormat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OpenAiCustomToolFormat {
+    Text,
+    Grammar { grammar: OpenAiGrammar },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiGrammar {
+    pub definition: String,
+    pub syntax: OpenAiGrammarSyntax,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiGrammarSyntax {
+    Lark,
+    Regex,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum OpenAiChatToolChoice {
+    Mode(OpenAiToolChoiceMode),
+    Allowed(OpenAiAllowedToolsChoice),
+    Function(OpenAiNamedFunctionToolChoice),
+    Custom(OpenAiNamedCustomToolChoice),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiToolChoiceMode {
+    None,
+    Auto,
+    Required,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiAllowedToolsChoice {
+    #[serde(rename = "type")]
+    pub kind: OpenAiAllowedToolsKind,
+    pub allowed_tools: OpenAiAllowedTools,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiAllowedToolsKind {
+    AllowedTools,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiAllowedTools {
+    pub mode: OpenAiAllowedToolsMode,
+    pub tools: Vec<Map<String, Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiAllowedToolsMode {
+    Auto,
+    Required,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiNamedFunctionToolChoice {
+    #[serde(rename = "type")]
+    pub kind: OpenAiNamedFunctionToolChoiceKind,
+    pub function: OpenAiFunctionChoice,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiNamedFunctionToolChoiceKind {
+    Function,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiFunctionChoice {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiNamedCustomToolChoice {
+    #[serde(rename = "type")]
+    pub kind: OpenAiNamedCustomToolChoiceKind,
+    pub custom: OpenAiCustomChoice,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiNamedCustomToolChoiceKind {
+    Custom,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiCustomChoice {
+    pub name: String,
 }
 
 /// One chat message on the wire.
@@ -259,9 +495,31 @@ pub struct OpenAiUsage {
     pub completion_tokens: u64,
     pub total_tokens: u64,
     #[serde(default)]
-    pub prompt_tokens_details: Option<Value>,
+    pub prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
     #[serde(default)]
-    pub completion_tokens_details: Option<Value>,
+    pub completion_tokens_details: Option<OpenAiCompletionTokensDetails>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    pub audio_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct OpenAiCompletionTokensDetails {
+    #[serde(default)]
+    pub accepted_prediction_tokens: u64,
+    #[serde(default)]
+    pub audio_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    #[serde(default)]
+    pub rejected_prediction_tokens: u64,
 }
 
 impl From<OpenAiUsage> for TokenUsage {
@@ -269,14 +527,12 @@ impl From<OpenAiUsage> for TokenUsage {
         let cache_read = u
             .prompt_tokens_details
             .as_ref()
-            .and_then(|v| v.get("cached_tokens"))
-            .and_then(Value::as_u64)
+            .map(|details| details.cached_tokens)
             .unwrap_or(0);
         let reasoning = u
             .completion_tokens_details
             .as_ref()
-            .and_then(|v| v.get("reasoning_tokens"))
-            .and_then(Value::as_u64)
+            .map(|details| details.reasoning_tokens)
             .unwrap_or(0);
         Self {
             input_tokens: u.prompt_tokens,

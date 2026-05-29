@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -16,13 +17,13 @@ pub struct OpenAiResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<Value>,
+    pub reasoning: Option<OpenAiReasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<OpenAiResponsesText>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<OpenAiResponsesTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<Value>,
+    pub tool_choice: Option<OpenAiResponsesToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -34,7 +35,7 @@ pub struct OpenAiResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<Map<String, Value>>,
+    pub metadata: Option<BTreeMap<String, String>>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -44,7 +45,209 @@ pub struct OpenAiResponsesRequest {
 #[serde(deny_unknown_fields)]
 pub struct OpenAiResponsesText {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub format: Option<Value>,
+    pub format: Option<OpenAiTextResponseFormat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiReasoning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<OpenAiReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<OpenAiReasoningSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generate_summary: Option<OpenAiReasoningSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiReasoningSummary {
+    Auto,
+    Concise,
+    Detailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OpenAiTextResponseFormat {
+    Text,
+    JsonObject,
+    JsonSchema {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        schema: Option<Map<String, Value>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum OpenAiResponsesToolChoice {
+    Mode(OpenAiResponsesToolChoiceMode),
+    Allowed(OpenAiResponsesAllowedToolsChoice),
+    Hosted(OpenAiResponsesHostedToolChoice),
+    Function(OpenAiResponsesFunctionToolChoice),
+    Mcp(OpenAiResponsesMcpToolChoice),
+    Custom(OpenAiResponsesCustomToolChoice),
+    ApplyPatch(OpenAiResponsesApplyPatchToolChoice),
+    Shell(OpenAiResponsesShellToolChoice),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiResponsesToolChoiceMode {
+    None,
+    Auto,
+    Required,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiResponsesAllowedToolsChoice {
+    #[serde(rename = "type")]
+    pub kind: OpenAiResponsesAllowedToolsKind,
+    pub mode: OpenAiResponsesAllowedToolsMode,
+    pub tools: Vec<Map<String, Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiResponsesAllowedToolsKind {
+    AllowedTools,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiResponsesAllowedToolsMode {
+    Auto,
+    Required,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiResponsesHostedToolChoice {
+    #[serde(rename = "type")]
+    pub kind: OpenAiResponsesHostedToolKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiResponsesHostedToolKind {
+    FileSearch,
+    WebSearchPreview,
+    Computer,
+    ComputerUsePreview,
+    ComputerUse,
+    #[serde(rename = "web_search_preview_2025_03_11")]
+    WebSearchPreview20250311,
+    ImageGeneration,
+    CodeInterpreter,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiResponsesFunctionToolChoice {
+    #[serde(rename = "type")]
+    pub kind: OpenAiResponsesFunctionToolKind,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiResponsesFunctionToolKind {
+    Function,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiResponsesMcpToolChoice {
+    #[serde(rename = "type")]
+    pub kind: OpenAiResponsesMcpToolKind,
+    pub server_label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiResponsesMcpToolKind {
+    Mcp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiResponsesCustomToolChoice {
+    #[serde(rename = "type")]
+    pub kind: OpenAiResponsesCustomToolKind,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiResponsesCustomToolKind {
+    Custom,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiResponsesApplyPatchToolChoice {
+    #[serde(rename = "type")]
+    pub kind: OpenAiResponsesApplyPatchToolKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiResponsesApplyPatchToolKind {
+    ApplyPatch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiResponsesShellToolChoice {
+    #[serde(rename = "type")]
+    pub kind: OpenAiResponsesShellToolKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiResponsesShellToolKind {
+    #[serde(rename = "shell")]
+    Shell,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -106,9 +309,12 @@ pub enum OpenAiResponseContentPart {
 pub enum OpenAiResponsesTool {
     Function {
         name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
         description: Option<String>,
-        parameters: Value,
-        strict: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parameters: Option<Map<String, Value>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
     },
     WebSearchPreview {},
     FileSearch {
@@ -123,8 +329,35 @@ pub enum OpenAiResponsesTool {
     },
     Custom {
         name: String,
-        parameters: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        format: Option<OpenAiResponsesCustomToolFormat>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OpenAiResponsesCustomToolFormat {
+    Text,
+    Grammar { grammar: OpenAiResponsesGrammar },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiResponsesGrammar {
+    pub definition: String,
+    pub syntax: OpenAiResponsesGrammarSyntax,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiResponsesGrammarSyntax {
+    Lark,
+    Regex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -149,48 +382,54 @@ pub struct OpenAiResponsesUsage {
     pub output_tokens: u64,
     pub total_tokens: u64,
     #[serde(default)]
-    pub output_tokens_details: Option<Value>,
+    pub input_tokens_details: Option<OpenAiResponsesInputTokensDetails>,
     #[serde(default)]
-    pub input_tokens_details: Option<Value>,
+    pub output_tokens_details: Option<OpenAiResponsesOutputTokensDetails>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct OpenAiResponsesInputTokensDetails {
+    pub cached_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct OpenAiResponsesOutputTokensDetails {
+    pub reasoning_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OpenAiResponsesStreamEvent {
-    ResponseCreated {
-        response: OpenAiResponsesResponse,
-    },
-    ResponseInProgress {
-        response: OpenAiResponsesResponse,
-    },
+    #[serde(rename = "response.created")]
+    ResponseCreated { response: OpenAiResponsesResponse },
+    #[serde(rename = "response.in_progress")]
+    ResponseInProgress { response: OpenAiResponsesResponse },
+    #[serde(rename = "response.output_item.added")]
     OutputItemAdded {
         output_index: u32,
         item: OpenAiResponseItem,
     },
+    #[serde(rename = "response.output_text.delta")]
     OutputTextDelta {
         item_id: String,
         output_index: u32,
         delta: String,
     },
+    #[serde(rename = "response.output_text.done")]
     OutputTextDone {
         item_id: String,
         output_index: u32,
         text: String,
     },
-    FunctionCallArgumentsDelta {
-        item_id: String,
-        delta: String,
-    },
-    FunctionCallArgumentsDone {
-        item_id: String,
-        arguments: String,
-    },
-    ResponseCompleted {
-        response: OpenAiResponsesResponse,
-    },
-    ResponseFailed {
-        response: OpenAiResponsesResponse,
-        error: Value,
-    },
+    #[serde(rename = "response.function_call_arguments.delta")]
+    FunctionCallArgumentsDelta { item_id: String, delta: String },
+    #[serde(rename = "response.function_call_arguments.done")]
+    FunctionCallArgumentsDone { item_id: String, arguments: String },
+    #[serde(rename = "response.completed")]
+    ResponseCompleted { response: OpenAiResponsesResponse },
+    #[serde(rename = "response.failed")]
+    ResponseFailed { response: OpenAiResponsesResponse },
 }

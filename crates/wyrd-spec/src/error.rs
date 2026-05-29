@@ -449,6 +449,160 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// PromptCard request referenced an undeclared media placeholder.
+    #[error("[WYRD_PROMPT_422_UNDECLARED_MEDIA_PLACEHOLDER] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_422_UNDECLARED_MEDIA_PLACEHOLDER",
+        status = 422,
+        title = "Undeclared media placeholder in request",
+        remediation = "Add the media placeholder name to prompt.media_variables, or remove it from the request."
+    )]
+    PromptUndeclaredMediaPlaceholder {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// PromptCard declared a media variable that the request never references.
+    #[error("[WYRD_PROMPT_422_UNREFERENCED_MEDIA_VARIABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_422_UNREFERENCED_MEDIA_VARIABLE",
+        status = 422,
+        title = "Declared media variable is never referenced",
+        remediation = "Reference the media variable as ${media:name}, or drop it from prompt.media_variables."
+    )]
+    PromptUnreferencedMediaVariable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Media placeholder was not isolated in its own text part.
+    #[error("[WYRD_PROMPT_422_MEDIA_PLACEHOLDER_NOT_ISOLATED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_422_MEDIA_PLACEHOLDER_NOT_ISOLATED",
+        status = 422,
+        title = "Media placeholder is not isolated",
+        remediation = "Ensure each ${media:name} token occupies its own native text part before binding."
+    )]
+    PromptMediaPlaceholderNotIsolated {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Media placeholder appeared in system content.
+    #[error("[WYRD_PROMPT_400_MEDIA_IN_SYSTEM_MESSAGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_400_MEDIA_IN_SYSTEM_MESSAGE",
+        status = 400,
+        title = "Media placeholder in system message",
+        remediation = "Move media placeholders to user or assistant content."
+    )]
+    PromptMediaInSystemMessage {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Provider does not support this media kind/source.
+    #[error("[WYRD_PROMPT_400_UNSUPPORTED_MEDIA_FOR_PROVIDER] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_400_UNSUPPORTED_MEDIA_FOR_PROVIDER",
+        status = 400,
+        title = "Unsupported media for provider",
+        remediation = "Use a media source supported by the selected provider."
+    )]
+    PromptUnsupportedMediaForProvider {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Media MIME type or URI was invalid.
+    #[error("[WYRD_PROMPT_400_INVALID_MEDIA_TYPE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_400_INVALID_MEDIA_TYPE",
+        status = 400,
+        title = "Invalid media type",
+        remediation = "Supply the required MIME type and a provider-supported URI."
+    )]
+    PromptInvalidMediaType {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Prompt render call omitted a declared media variable.
+    #[error("[WYRD_PROMPT_422_MISSING_MEDIA_VARIABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_422_MISSING_MEDIA_VARIABLE",
+        status = 422,
+        title = "Media variable missing",
+        remediation = "Bind every declared media variable before rendering the prompt."
+    )]
+    PromptMissingMediaVariable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Media path was not a regular file.
+    #[error("[WYRD_PROMPT_400_MEDIA_NOT_REGULAR_FILE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_400_MEDIA_NOT_REGULAR_FILE",
+        status = 400,
+        title = "Media path is not a regular file",
+        remediation = "Pass a regular local file path."
+    )]
+    PromptMediaNotRegularFile {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Media file exceeded the allowed byte limit.
+    #[error("[WYRD_PROMPT_400_MEDIA_TOO_LARGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_400_MEDIA_TOO_LARGE",
+        status = 400,
+        title = "Media file too large",
+        remediation = "Use a smaller media file or upload it to the provider and bind a file URI."
+    )]
+    PromptMediaTooLarge {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Media file extension could not be mapped to a supported MIME type.
+    #[error("[WYRD_PROMPT_400_MEDIA_INVALID_EXTENSION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_400_MEDIA_INVALID_EXTENSION",
+        status = 400,
+        title = "Media file extension is unsupported",
+        remediation = "Use a supported image or document extension."
+    )]
+    PromptMediaInvalidExtension {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Media path helper IO failed.
+    #[error("[WYRD_PROMPT_500_MEDIA_IO] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_500_MEDIA_IO",
+        status = 500,
+        title = "Media IO failure",
+        remediation = "Inspect the OS error; usually missing path or permission denied."
+    )]
+    PromptMediaIo {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// PromptCard model string was empty.
     #[error("[WYRD_PROMPT_400_EMPTY_MODEL] {message}")]
     #[wyrd_error(
@@ -682,6 +836,17 @@ impl WyrdError {
             | Self::PromptDuplicateVariable { message, details }
             | Self::PromptUndeclaredPlaceholder { message, details }
             | Self::PromptUnreferencedVariable { message, details }
+            | Self::PromptUndeclaredMediaPlaceholder { message, details }
+            | Self::PromptUnreferencedMediaVariable { message, details }
+            | Self::PromptMediaPlaceholderNotIsolated { message, details }
+            | Self::PromptMediaInSystemMessage { message, details }
+            | Self::PromptUnsupportedMediaForProvider { message, details }
+            | Self::PromptInvalidMediaType { message, details }
+            | Self::PromptMissingMediaVariable { message, details }
+            | Self::PromptMediaNotRegularFile { message, details }
+            | Self::PromptMediaTooLarge { message, details }
+            | Self::PromptMediaInvalidExtension { message, details }
+            | Self::PromptMediaIo { message, details }
             | Self::PromptEmptyModel { message, details }
             | Self::PromptInvalidResponseSchema { message, details }
             | Self::PromptLoaderBadExtension { message, details }
@@ -715,6 +880,65 @@ impl From<skald_spec::SkaldError> for WyrdError {
             skald_spec::SkaldError::MissingVariable(name) => Self::PromptMissingVariable {
                 message,
                 details: serde_json::json!({ "name": name }),
+            },
+            skald_spec::SkaldError::MediaPlaceholderNotFound { name } => {
+                Self::PromptUndeclaredMediaPlaceholder {
+                    message,
+                    details: serde_json::json!({ "name": name }),
+                }
+            }
+            skald_spec::SkaldError::MediaPlaceholderNotIsolated { name } => {
+                Self::PromptMediaPlaceholderNotIsolated {
+                    message,
+                    details: serde_json::json!({ "name": name }),
+                }
+            }
+            skald_spec::SkaldError::MediaInSystemMessage { name } => {
+                Self::PromptMediaInSystemMessage {
+                    message,
+                    details: serde_json::json!({ "name": name }),
+                }
+            }
+            skald_spec::SkaldError::UnsupportedMediaForProvider { provider, kind } => {
+                Self::PromptUnsupportedMediaForProvider {
+                    message,
+                    details: serde_json::json!({
+                        "provider": format!("{provider:?}"),
+                        "kind": format!("{kind:?}"),
+                    }),
+                }
+            }
+            skald_spec::SkaldError::InvalidMediaType(source) => Self::PromptInvalidMediaType {
+                message,
+                details: serde_json::json!({ "source": source }),
+            },
+            skald_spec::SkaldError::MissingMediaVariable { name } => {
+                Self::PromptMissingMediaVariable {
+                    message,
+                    details: serde_json::json!({ "name": name }),
+                }
+            }
+            skald_spec::SkaldError::MediaNotRegularFile { path } => {
+                Self::PromptMediaNotRegularFile {
+                    message,
+                    details: serde_json::json!({ "path": path }),
+                }
+            }
+            skald_spec::SkaldError::MediaTooLarge { path, size, limit } => {
+                Self::PromptMediaTooLarge {
+                    message,
+                    details: serde_json::json!({ "path": path, "size": size, "limit": limit }),
+                }
+            }
+            skald_spec::SkaldError::MediaInvalidExtension { path, kind } => {
+                Self::PromptMediaInvalidExtension {
+                    message,
+                    details: serde_json::json!({ "path": path, "kind": format!("{kind:?}") }),
+                }
+            }
+            skald_spec::SkaldError::MediaIo(source) => Self::PromptMediaIo {
+                message,
+                details: serde_json::json!({ "source": source }),
             },
             skald_spec::SkaldError::UnsupportedConversion { src, dst } => {
                 Self::PromptUnsupportedHandoff {

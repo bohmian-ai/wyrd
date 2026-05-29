@@ -43,6 +43,23 @@ fn invariant_unreferenced_variable_rejected() {
 }
 
 #[test]
+fn invariant_undeclared_media_placeholder_rejected() {
+    let err = PromptSpec::new(prompt(openai_chat_request("${media:logo}"), Vec::new()))
+        .expect_err("undeclared media placeholder rejected");
+
+    assert_eq!(err.code(), "WYRD_PROMPT_422_UNDECLARED_MEDIA_PLACEHOLDER");
+}
+
+#[test]
+fn invariant_unreferenced_media_variable_rejected() {
+    let mut prompt = prompt(openai_chat_request("hello"), Vec::new());
+    prompt.media_variables = vec!["logo".to_owned()];
+    let err = PromptSpec::new(prompt).expect_err("unreferenced media variable rejected");
+
+    assert_eq!(err.code(), "WYRD_PROMPT_422_UNREFERENCED_MEDIA_VARIABLE");
+}
+
+#[test]
 fn invariant_empty_model_rejected() {
     let mut prompt = prompt(openai_chat_request("hello"), Vec::new());
     prompt.model = "   ".to_owned();

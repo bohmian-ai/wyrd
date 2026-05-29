@@ -19,6 +19,7 @@ struct HashProjection<'a> {
     request: &'a ProviderRequest,
     model: &'a str,
     variables: &'a [String],
+    media_variables: &'a [String],
     response_type: &'a ResponseType,
 }
 
@@ -28,6 +29,7 @@ impl<'a> From<&'a Prompt> for HashProjection<'a> {
             request: &prompt.request,
             model: &prompt.model,
             variables: &prompt.variables,
+            media_variables: &prompt.media_variables,
             response_type: &prompt.response_type,
         }
     }

@@ -5,7 +5,9 @@ use std::collections::HashSet;
 use serde_json::json;
 use thiserror::Error;
 
-use crate::card::prompt::{ParameterName, PromptSpec, extract_placeholders};
+use crate::card::prompt::{
+    ParameterName, PromptSpec, extract_media_placeholders, extract_text_placeholders,
+};
 use crate::error::WyrdError;
 
 /// PromptCard validation and boundary-mapping failures.
@@ -34,6 +36,80 @@ pub enum PromptError {
     UnreferencedVariable {
         /// Variable name that was never referenced.
         name: String,
+    },
+    /// A `${media:name}` placeholder was present but not declared.
+    #[error("undeclared media placeholder: {name}")]
+    UndeclaredMediaPlaceholder {
+        /// Placeholder name that was not declared.
+        name: String,
+    },
+    /// A declared media variable was not referenced in the native request.
+    #[error("unreferenced media variable: {name}")]
+    UnreferencedMediaVariable {
+        /// Media variable name that was never referenced.
+        name: String,
+    },
+    /// A media placeholder was not isolated in its own text part.
+    #[error("media placeholder is not isolated: {name}")]
+    MediaPlaceholderNotIsolated {
+        /// Placeholder name.
+        name: String,
+    },
+    /// A media placeholder appeared in system content.
+    #[error("media placeholder in system message: {name}")]
+    MediaInSystemMessage {
+        /// Placeholder name.
+        name: String,
+    },
+    /// Provider rejected a media kind/source combination.
+    #[error("unsupported media kind {kind} for provider {provider}")]
+    UnsupportedMediaForProvider {
+        /// Provider name.
+        provider: String,
+        /// Media kind.
+        kind: String,
+    },
+    /// Media type or URI was invalid.
+    #[error("invalid media type: {message}")]
+    InvalidMediaType {
+        /// Validation message.
+        message: String,
+    },
+    /// Render was attempted with an unbound media variable.
+    #[error("missing media variable: {name}")]
+    MissingMediaVariable {
+        /// Missing media variable name.
+        name: String,
+    },
+    /// Media path was not a regular file.
+    #[error("media path is not a regular file: {path}")]
+    MediaNotRegularFile {
+        /// Local path.
+        path: String,
+    },
+    /// Media path exceeded the byte limit.
+    #[error("media file too large: {path}")]
+    MediaTooLarge {
+        /// Local path.
+        path: String,
+        /// Observed size.
+        size: u64,
+        /// Maximum size.
+        limit: u64,
+    },
+    /// Media path extension was not recognized.
+    #[error("invalid media extension for {kind}: {path}")]
+    MediaInvalidExtension {
+        /// Local path.
+        path: String,
+        /// Media kind.
+        kind: String,
+    },
+    /// Media IO failed.
+    #[error("media io error: {message}")]
+    MediaIo {
+        /// IO message.
+        message: String,
     },
     /// The native prompt model string was empty.
     #[error("prompt model must be non-empty")]
@@ -133,6 +209,23 @@ impl PromptError {
             Self::DuplicateVariable { .. } => "WYRD_PROMPT_409_DUPLICATE_VARIABLE",
             Self::UndeclaredPlaceholder { .. } => "WYRD_PROMPT_422_UNDECLARED_PLACEHOLDER",
             Self::UnreferencedVariable { .. } => "WYRD_PROMPT_422_UNREFERENCED_VARIABLE",
+            Self::UndeclaredMediaPlaceholder { .. } => {
+                "WYRD_PROMPT_422_UNDECLARED_MEDIA_PLACEHOLDER"
+            }
+            Self::UnreferencedMediaVariable { .. } => "WYRD_PROMPT_422_UNREFERENCED_MEDIA_VARIABLE",
+            Self::MediaPlaceholderNotIsolated { .. } => {
+                "WYRD_PROMPT_422_MEDIA_PLACEHOLDER_NOT_ISOLATED"
+            }
+            Self::MediaInSystemMessage { .. } => "WYRD_PROMPT_400_MEDIA_IN_SYSTEM_MESSAGE",
+            Self::UnsupportedMediaForProvider { .. } => {
+                "WYRD_PROMPT_400_UNSUPPORTED_MEDIA_FOR_PROVIDER"
+            }
+            Self::InvalidMediaType { .. } => "WYRD_PROMPT_400_INVALID_MEDIA_TYPE",
+            Self::MissingMediaVariable { .. } => "WYRD_PROMPT_422_MISSING_MEDIA_VARIABLE",
+            Self::MediaNotRegularFile { .. } => "WYRD_PROMPT_400_MEDIA_NOT_REGULAR_FILE",
+            Self::MediaTooLarge { .. } => "WYRD_PROMPT_400_MEDIA_TOO_LARGE",
+            Self::MediaInvalidExtension { .. } => "WYRD_PROMPT_400_MEDIA_INVALID_EXTENSION",
+            Self::MediaIo { .. } => "WYRD_PROMPT_500_MEDIA_IO",
             Self::EmptyModel => "WYRD_PROMPT_400_EMPTY_MODEL",
             Self::InvalidResponseSchema => "WYRD_PROMPT_400_INVALID_RESPONSE_SCHEMA",
             Self::LoaderBadExtension { .. } => "WYRD_PROMPT_400_LOADER_BAD_EXTENSION",
@@ -167,12 +260,46 @@ pub fn validate(spec: &PromptSpec) -> Result<(), WyrdError> {
         }
     }
 
-    let referenced = extract_placeholders(spec)?;
+    for name in &spec.prompt.media_variables {
+        ParameterName::new(name.clone())?;
+    }
+
+    let mut declared_seen = HashSet::new();
+    for name in &spec.prompt.media_variables {
+        if !declared_seen.insert(name.as_str()) {
+            return Err(PromptError::DuplicateVariable { name: name.clone() }.into());
+        }
+    }
+
+    let referenced = extract_text_placeholders(spec)?;
     let declared: HashSet<&str> = spec.prompt.variables.iter().map(String::as_str).collect();
     let referenced_set: HashSet<&str> = referenced.iter().map(String::as_str).collect();
 
     if let Some(name) = referenced_set.difference(&declared).next() {
         return Err(PromptError::UndeclaredPlaceholder {
+            name: (*name).to_owned(),
+        }
+        .into());
+    }
+
+    let media_referenced = extract_media_placeholders(spec)?;
+    let media_declared: HashSet<&str> = spec
+        .prompt
+        .media_variables
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let media_referenced_set: HashSet<&str> = media_referenced.iter().map(String::as_str).collect();
+
+    if let Some(name) = media_referenced_set.difference(&media_declared).next() {
+        return Err(PromptError::UndeclaredMediaPlaceholder {
+            name: (*name).to_owned(),
+        }
+        .into());
+    }
+
+    if let Some(name) = media_declared.difference(&media_referenced_set).next() {
+        return Err(PromptError::UnreferencedMediaVariable {
             name: (*name).to_owned(),
         }
         .into());
@@ -213,6 +340,62 @@ impl From<PromptError> for WyrdError {
             PromptError::UnreferencedVariable { name } => WyrdError::PromptUnreferencedVariable {
                 message,
                 details: json!({ "name": name }),
+            },
+            PromptError::UndeclaredMediaPlaceholder { name } => {
+                WyrdError::PromptUndeclaredMediaPlaceholder {
+                    message,
+                    details: json!({ "name": name }),
+                }
+            }
+            PromptError::UnreferencedMediaVariable { name } => {
+                WyrdError::PromptUnreferencedMediaVariable {
+                    message,
+                    details: json!({ "name": name }),
+                }
+            }
+            PromptError::MediaPlaceholderNotIsolated { name } => {
+                WyrdError::PromptMediaPlaceholderNotIsolated {
+                    message,
+                    details: json!({ "name": name }),
+                }
+            }
+            PromptError::MediaInSystemMessage { name } => WyrdError::PromptMediaInSystemMessage {
+                message,
+                details: json!({ "name": name }),
+            },
+            PromptError::UnsupportedMediaForProvider { provider, kind } => {
+                WyrdError::PromptUnsupportedMediaForProvider {
+                    message,
+                    details: json!({ "provider": provider, "kind": kind }),
+                }
+            }
+            PromptError::InvalidMediaType { message: source } => {
+                WyrdError::PromptInvalidMediaType {
+                    message,
+                    details: json!({ "source": source }),
+                }
+            }
+            PromptError::MissingMediaVariable { name } => WyrdError::PromptMissingMediaVariable {
+                message,
+                details: json!({ "name": name }),
+            },
+            PromptError::MediaNotRegularFile { path } => WyrdError::PromptMediaNotRegularFile {
+                message,
+                details: json!({ "path": path }),
+            },
+            PromptError::MediaTooLarge { path, size, limit } => WyrdError::PromptMediaTooLarge {
+                message,
+                details: json!({ "path": path, "size": size, "limit": limit }),
+            },
+            PromptError::MediaInvalidExtension { path, kind } => {
+                WyrdError::PromptMediaInvalidExtension {
+                    message,
+                    details: json!({ "path": path, "kind": kind }),
+                }
+            }
+            PromptError::MediaIo { message: source } => WyrdError::PromptMediaIo {
+                message,
+                details: json!({ "source": source }),
             },
             PromptError::EmptyModel => WyrdError::PromptEmptyModel {
                 message,

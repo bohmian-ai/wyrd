@@ -10,6 +10,7 @@ fn prompt(request: ProviderRequest, variables: Vec<&str>) -> Prompt {
         model: "model".to_string(),
         version: None,
         variables: variables.into_iter().map(str::to_string).collect(),
+        media_variables: Vec::new(),
         response_type: ResponseType::Text,
     }
 }

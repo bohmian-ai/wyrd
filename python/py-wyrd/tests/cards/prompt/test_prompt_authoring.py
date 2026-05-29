@@ -1,7 +1,7 @@
 import json
 
 import pytest
-from wyrd.prompt import Prompt, ProviderRequest, ResponseFormat, WyrdError
+from wyrd.prompt import MediaRef, Prompt, ProviderRequest, ResponseFormat, WyrdError
 
 
 def test_prompt_new_builds_openai_chat_by_default() -> None:
@@ -44,21 +44,21 @@ def test_bind_returns_new_prompt_and_bind_mut_updates_in_place() -> None:
 
 
 def test_bind_media_replaces_native_media_placeholder() -> None:
-    prompt = Prompt("What logo is this?", "gpt-4o", provider="openai").user(
-        Prompt.openai_image_url("{{logo}}")
-    )
+    prompt = Prompt("What logo is this? ${media:logo}", "gpt-4o", provider="openai")
+    assert prompt.media_variables == ["logo"]
 
-    bound = prompt.bind_media("logo", "https://example.test/logo.png")
+    bound = prompt.bind_media("logo", MediaRef.image_url("https://example.test/logo.png"))
     body = bound.request.model_dump()
-    image = body["messages"][1]["content"][0]["image_url"]["url"]
+    image = body["messages"][0]["content"][1]["image_url"]["url"]
     assert image == "https://example.test/logo.png"
+    assert bound.media_variables == []
 
 
 def test_bind_media_requires_existing_placeholder() -> None:
     prompt = Prompt("What logo is this?", "gpt-4o", provider="openai")
 
     with pytest.raises(WyrdError):
-        prompt.bind_media("logo", "https://example.test/logo.png")
+        prompt.bind_media("logo", MediaRef.image_url("https://example.test/logo.png"))
 
 
 def test_prompt_response_format_and_str_are_json_inspectable() -> None:

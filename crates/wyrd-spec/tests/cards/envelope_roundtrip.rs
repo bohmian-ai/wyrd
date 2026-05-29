@@ -81,6 +81,7 @@ fn prompt_spec() -> PromptSpec {
         model: "gpt-4o".to_owned(),
         version: None,
         variables: Vec::new(),
+        media_variables: Vec::new(),
         response_type: ResponseType::Text,
     })
     .expect("static prompt spec is valid")

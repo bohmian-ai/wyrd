@@ -1,3 +1,4 @@
+use crate::media::MediaKind;
 use crate::request::ProviderName;
 
 /// Crate-local result type for skald-spec behavior.
@@ -31,6 +32,70 @@ pub enum SkaldError {
         /// Operation name, such as `embeddings` or `responses`.
         op: String,
     },
+    /// A media placeholder was not present as an isolated text part.
+    #[error("media placeholder not found: {name}")]
+    MediaPlaceholderNotFound {
+        /// Placeholder name.
+        name: String,
+    },
+    /// A media placeholder was present but not isolated in its own text part.
+    #[error("media placeholder '{name}' is not isolated; it must occupy its own text part")]
+    MediaPlaceholderNotIsolated {
+        /// Placeholder name.
+        name: String,
+    },
+    /// A media placeholder appeared in system content.
+    #[error(
+        "media placeholder '{name}' found in a system message; media is not allowed in system content"
+    )]
+    MediaInSystemMessage {
+        /// Placeholder name.
+        name: String,
+    },
+    /// The selected provider does not support this media kind/source.
+    #[error("media kind {kind:?} unsupported for provider {provider:?}")]
+    UnsupportedMediaForProvider {
+        /// Provider that rejected the media.
+        provider: ProviderName,
+        /// Media kind that was rejected.
+        kind: MediaKind,
+    },
+    /// A media MIME type or URI was invalid for the selected provider.
+    #[error("invalid media type: {0}")]
+    InvalidMediaType(String),
+    /// A declared media variable remained unbound at render time.
+    #[error("media variable '{name}' was declared but never bound before render")]
+    MissingMediaVariable {
+        /// Missing media variable name.
+        name: String,
+    },
+    /// A media path helper was given a path that is not a regular file.
+    #[error("media path {path} is not a regular file")]
+    MediaNotRegularFile {
+        /// Local path.
+        path: String,
+    },
+    /// A media path helper rejected an oversized file.
+    #[error("media file {path} is {size} bytes; exceeds limit of {limit}")]
+    MediaTooLarge {
+        /// Local path.
+        path: String,
+        /// Observed byte size.
+        size: u64,
+        /// Maximum allowed byte size.
+        limit: u64,
+    },
+    /// A media path helper could not infer a MIME type from the extension.
+    #[error("media file {path} has unrecognized extension for kind {kind:?}")]
+    MediaInvalidExtension {
+        /// Local path.
+        path: String,
+        /// Expected media kind.
+        kind: MediaKind,
+    },
+    /// Media path helper IO failed.
+    #[error("media io error: {0}")]
+    MediaIo(String),
 }
 
 impl SkaldError {
@@ -70,6 +135,20 @@ impl SkaldError {
             Self::Deserialize(_) => "SKALD_SPEC_422_DESERIALIZE",
             Self::UnsupportedConversion { .. } => "SKALD_SPEC_501_UNSUPPORTED_CONVERSION",
             Self::ProviderUnsupported { .. } => "SKALD_SPEC_501_PROVIDER_UNSUPPORTED",
+            Self::MediaPlaceholderNotFound { .. } => "SKALD_SPEC_422_MEDIA_PLACEHOLDER_NOT_FOUND",
+            Self::MediaPlaceholderNotIsolated { .. } => {
+                "SKALD_SPEC_422_MEDIA_PLACEHOLDER_NOT_ISOLATED"
+            }
+            Self::MediaInSystemMessage { .. } => "SKALD_SPEC_400_MEDIA_IN_SYSTEM_MESSAGE",
+            Self::UnsupportedMediaForProvider { .. } => {
+                "SKALD_SPEC_400_UNSUPPORTED_MEDIA_FOR_PROVIDER"
+            }
+            Self::InvalidMediaType(_) => "SKALD_SPEC_400_INVALID_MEDIA_TYPE",
+            Self::MissingMediaVariable { .. } => "SKALD_SPEC_422_MISSING_MEDIA_VARIABLE",
+            Self::MediaNotRegularFile { .. } => "SKALD_PROMPT_400_MEDIA_NOT_REGULAR_FILE",
+            Self::MediaTooLarge { .. } => "SKALD_PROMPT_400_MEDIA_TOO_LARGE",
+            Self::MediaInvalidExtension { .. } => "SKALD_PROMPT_400_MEDIA_INVALID_EXTENSION",
+            Self::MediaIo(_) => "SKALD_PROMPT_500_MEDIA_IO",
         }
     }
 }

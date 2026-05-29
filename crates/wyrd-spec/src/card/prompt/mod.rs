@@ -15,7 +15,10 @@ pub use codec::{
     CardLoadFormat, parse_card_bytes, parse_spec_bytes, serialize_card, serialize_spec_bytes,
 };
 pub use hash::compute as content_hash;
-pub use parameter::{ParameterName, extract_placeholders, is_valid_parameter_name};
+pub use parameter::{
+    ParameterName, extract_media_placeholders, extract_placeholders, extract_text_placeholders,
+    is_valid_parameter_name,
+};
 pub use promptref::PromptRef;
 pub use spec::PromptSpec;
 pub use validate::{PromptError, validate};

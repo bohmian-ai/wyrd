@@ -7,6 +7,7 @@
 pub mod adapter;
 pub mod convert;
 pub mod error;
+pub mod media;
 pub mod message;
 pub mod prompt;
 pub mod request;
@@ -16,6 +17,7 @@ pub mod wire;
 pub use adapter::{ResponseAdapter, ToolCallView, UsageView};
 pub use convert::{MessageConversion, convert_message_dyn};
 pub use error::{SkaldError, SkaldResult};
+pub use media::{MediaKind, MediaRef, MediaSource};
 pub use message::MessageNum;
 pub use prompt::{Prompt, ResponseType};
 pub use request::{ProviderName, ProviderRequest};

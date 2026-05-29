@@ -52,7 +52,7 @@ pub fn is_valid_parameter_name(value: &str) -> bool {
 }
 
 /// Returns the compiled `{{name}}` placeholder regex used by PromptCard validation.
-pub fn placeholder_regex() -> &'static Regex {
+pub fn text_placeholder_regex() -> &'static Regex {
     static PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
     PLACEHOLDER_RE.get_or_init(|| {
         Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}")
@@ -60,11 +60,37 @@ pub fn placeholder_regex() -> &'static Regex {
     })
 }
 
+/// Returns the compiled `${media:name}` placeholder regex used by PromptCard validation.
+pub fn media_placeholder_regex() -> &'static Regex {
+    static PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
+    PLACEHOLDER_RE.get_or_init(|| {
+        Regex::new(r"\$\{media:([a-zA-Z_][a-zA-Z0-9_]*)\}")
+            .expect("PromptCard media placeholder regex is static and valid")
+    })
+}
+
 /// Extracts declared-style `{{name}}` placeholders from the native request JSON.
 ///
 /// Results are deterministic: first-seen order is preserved and repeated names
 /// appear once.
+pub fn extract_text_placeholders(spec: &PromptSpec) -> Result<Vec<String>, WyrdError> {
+    extract_with_regex(spec, text_placeholder_regex())
+}
+
+/// Extracts `${media:name}` placeholders from the native request JSON.
+///
+/// Results are deterministic: first-seen order is preserved and repeated names
+/// appear once.
+pub fn extract_media_placeholders(spec: &PromptSpec) -> Result<Vec<String>, WyrdError> {
+    extract_with_regex(spec, media_placeholder_regex())
+}
+
+/// Extracts text placeholders from the native request JSON.
 pub fn extract_placeholders(spec: &PromptSpec) -> Result<Vec<String>, WyrdError> {
+    extract_text_placeholders(spec)
+}
+
+fn extract_with_regex(spec: &PromptSpec, regex: &Regex) -> Result<Vec<String>, WyrdError> {
     let json = serde_json::to_string(&spec.prompt.request).map_err(|error| {
         WyrdError::from(PromptError::SerializeRequest {
             message: error.to_string(),
@@ -72,7 +98,7 @@ pub fn extract_placeholders(spec: &PromptSpec) -> Result<Vec<String>, WyrdError>
     })?;
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for capture in placeholder_regex().captures_iter(&json) {
+    for capture in regex.captures_iter(&json) {
         let name = capture[1].to_owned();
         if seen.insert(name.clone()) {
             out.push(name);

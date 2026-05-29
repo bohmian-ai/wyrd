@@ -2610,6 +2610,7 @@ dependencies = [
 name = "skald-prompt"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "pyo3",
  "serde",
  "serde_json",
@@ -2669,6 +2670,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "insta",
+ "regex",
  "schemars",
  "serde",
  "serde_json",

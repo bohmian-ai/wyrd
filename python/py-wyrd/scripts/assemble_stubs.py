@@ -28,8 +28,8 @@ def strip_imports_section(content: str) -> str:
 
 def extract_all(raw_text: str) -> list[str]:
     """Return the literal names from a stub-level __all__ block."""
-    all_pattern = re.compile(r"__all__\s*=\s*\[(.*?)\]", re.DOTALL)
-    match = all_pattern.search(raw_text)
+    all_pattern = r"__all__\s*=\s*\[(.*?)\]"
+    match = re.search(all_pattern, raw_text, flags=re.DOTALL)
     if not match:
         return []
     items = re.findall(r'"([^"]+)"|\'([^\']+)\'', match.group(1))
@@ -44,7 +44,7 @@ def assemble() -> None:
         "# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value",
     ]
     master_all: list[str] = []
-    all_pattern = re.compile(r"__all__\s*=\s*\[(.*?)\]", re.DOTALL)
+    all_pattern = r"__all__\s*=\s*\[(.*?)\]"
 
     for filename in STUB_FILES:
         file_path = STUB_DIR / filename
@@ -55,11 +55,11 @@ def assemble() -> None:
         if filename != "header.pyi":
             raw_text = strip_imports_section(raw_text)
 
-        match = all_pattern.search(raw_text)
+        match = re.search(all_pattern, raw_text, flags=re.DOTALL)
         if match:
             items = re.findall(r'"([^"]+)"|\'([^\']+)\'', match.group(1))
             master_all.extend(a or b for a, b in items)
-            text_to_append = all_pattern.sub("", raw_text)
+            text_to_append = re.sub(all_pattern, "", raw_text, flags=re.DOTALL)
         else:
             text_to_append = raw_text
 
@@ -140,12 +140,14 @@ def write_public_init_stub() -> None:
         "from .model import ModelCard as ModelCard",
         "from .model import ModelSignature as ModelSignature",
         "from .model import SampleInput as SampleInput",
+        "from .prompt import MediaRef as MediaRef",
         "from .prompt import Prompt as Prompt",
         "from .prompt import ProviderRequest as ProviderRequest",
         "from .prompt import ResponseFormat as ResponseFormat",
         "",
         "__all__ = [",
         '    "DataCard",',
+        '    "MediaRef",',
         '    "ModelCard",',
         '    "ModelSignature",',
         '    "Prompt",',

@@ -160,7 +160,7 @@ pub fn openai_chat(
     }
     messages.extend(options.messages.into_iter().map(openai_user_message));
 
-    Ok(Prompt::from_native(skald_spec::Prompt {
+    finalize_prompt(skald_spec::Prompt {
         request: ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
             model: model.clone(),
             messages,
@@ -201,8 +201,9 @@ pub fn openai_chat(
         model,
         version: options.version,
         variables: options.variables,
+        media_variables: Vec::new(),
         response_type,
-    }))
+    })
 }
 
 /// Builds a native `OpenAI` Responses prompt.
@@ -218,7 +219,7 @@ pub fn openai_responses(
         .map(openai_response_user_item)
         .collect();
 
-    Ok(Prompt::from_native(skald_spec::Prompt {
+    finalize_prompt(skald_spec::Prompt {
         request: ProviderRequest::OpenAiResponses(OpenAiResponsesRequest {
             model: model.clone(),
             input,
@@ -245,8 +246,9 @@ pub fn openai_responses(
         model,
         version: options.version,
         variables: options.variables,
+        media_variables: Vec::new(),
         response_type,
-    }))
+    })
 }
 
 /// Builds a native Anthropic Messages prompt.
@@ -265,7 +267,7 @@ pub fn anthropic(
         })
         .collect();
 
-    Ok(Prompt::from_native(skald_spec::Prompt {
+    finalize_prompt(skald_spec::Prompt {
         request: ProviderRequest::AnthropicMessage(AnthropicMessagesRequest {
             model: model.clone(),
             messages,
@@ -287,8 +289,9 @@ pub fn anthropic(
         model,
         version: options.version,
         variables: options.variables,
+        media_variables: Vec::new(),
         response_type,
-    }))
+    })
 }
 
 /// Builds a native Google Gemini `GenerateContent` prompt.
@@ -315,13 +318,14 @@ pub fn raw(
         .map_err(|error| PromptBuilderError::InvalidRawJson(error.to_string()))?;
     let body = RawValue::from_string(body.to_owned())
         .map_err(|error| PromptBuilderError::InvalidRawJson(error.to_string()))?;
-    Ok(Prompt::from_native(skald_spec::Prompt {
+    finalize_prompt(skald_spec::Prompt {
         request: ProviderRequest::RawV1 { provider, body },
         model,
         version: None,
         variables: Vec::new(),
+        media_variables: Vec::new(),
         response_type: ResponseType::Text,
-    }))
+    })
 }
 
 fn google_prompt(
@@ -351,7 +355,7 @@ fn google_prompt(
         cached_content: None,
         labels: None,
     };
-    Ok(Prompt::from_native(skald_spec::Prompt {
+    finalize_prompt(skald_spec::Prompt {
         request: if vertex_target {
             ProviderRequest::Vertex(VertexGenerateContentRequest(request))
         } else {
@@ -360,8 +364,14 @@ fn google_prompt(
         model,
         version: options.version,
         variables: options.variables,
+        media_variables: Vec::new(),
         response_type,
-    }))
+    })
+}
+
+fn finalize_prompt(mut prompt: skald_spec::Prompt) -> PromptBuilderResult<Prompt> {
+    prompt.normalize_media_placeholders_mut()?;
+    Ok(Prompt::from_native(prompt))
 }
 
 fn response_type(format: Option<&ResponseFormat>) -> ResponseType {

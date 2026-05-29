@@ -83,6 +83,7 @@ impl Prompt {
             }
             other => return unsupported_role(other, "system"),
         }
+        prompt.inner.normalize_media_placeholders_mut()?;
         Ok(prompt)
     }
 
@@ -137,6 +138,7 @@ impl Prompt {
             }
             other => return unsupported_role(other, "tool_result"),
         }
+        prompt.inner.normalize_media_placeholders_mut()?;
         Ok(prompt)
     }
 
@@ -175,6 +177,7 @@ impl Prompt {
             }
             other => return unsupported_role(other, role),
         }
+        prompt.inner.normalize_media_placeholders_mut()?;
         Ok(prompt)
     }
 }
@@ -251,6 +254,7 @@ fn provider_name_to_string(provider: &skald_spec::ProviderName) -> String {
 use {
     crate::builder::{AnthropicOptions, GeminiOptions, OpenAiChatOptions, OpenAiResponsesOptions},
     crate::coerce::{provider_name_from_py, provider_name_from_str, strings_from_py},
+    crate::media::PyMediaRef,
     crate::response_format::ResponseFormat,
     pyo3::{
         prelude::*,
@@ -810,23 +814,21 @@ impl Prompt {
     }
 
     /// Return a copy with a media placeholder bound to a provider-native value.
-    pub fn bind_media(&self, name: &str, media: &Bound<'_, PyAny>) -> CardPyResult<Self> {
-        let value = media_binding_value(media)?;
-        ensure_placeholder_present(&self.inner, name)?;
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn bind_media(&self, name: &str, media: PyRef<'_, PyMediaRef>) -> CardPyResult<Self> {
         Ok(Self::from_native(
             self.inner
-                .bind(&[(name, value.as_str())])
+                .bind_media(name, media.native())
                 .map_err(PromptBuilderError::from)?,
         ))
     }
 
     /// Bind a media placeholder in place.
-    pub fn bind_media_mut(&mut self, name: &str, media: &Bound<'_, PyAny>) -> CardPyResult<()> {
-        let value = media_binding_value(media)?;
-        ensure_placeholder_present(&self.inner, name)?;
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn bind_media_mut(&mut self, name: &str, media: PyRef<'_, PyMediaRef>) -> CardPyResult<()> {
         Ok(self
             .inner
-            .bind_mut(&[(name, value.as_str())])
+            .bind_media_mut(name, media.native())
             .map_err(PromptBuilderError::from)?)
     }
 
@@ -909,6 +911,12 @@ impl Prompt {
     #[getter]
     pub fn variables(&self) -> Vec<String> {
         self.inner.variables.clone()
+    }
+
+    /// Return declared media variables.
+    #[getter]
+    pub fn media_variables(&self) -> Vec<String> {
+        self.inner.media_variables.clone()
     }
 
     /// Set declared render variables.
@@ -1098,27 +1106,6 @@ fn require_binding_args(owned: &[(String, String)]) -> CardPyResult<()> {
 }
 
 #[cfg(feature = "python")]
-fn media_binding_value(media: &Bound<'_, PyAny>) -> CardPyResult<String> {
-    if media.is_instance_of::<PyString>() {
-        return Ok(media.extract::<String>()?);
-    }
-    Ok(serde_json::to_string(&wyrd_utils::py::pyobject_to_json(
-        media,
-    )?)?)
-}
-
-#[cfg(feature = "python")]
-fn ensure_placeholder_present(prompt: &skald_spec::Prompt, name: &str) -> CardPyResult<()> {
-    let request = serde_json::to_string(&prompt.request)?;
-    if !request.contains(&format!("{{{{{name}}}}}")) {
-        return Err(
-            PromptBuilderError::Validation(format!("media placeholder not found: {name}")).into(),
-        );
-    }
-    Ok(())
-}
-
-#[cfg(feature = "python")]
 fn provider_request_from_py(value: &Bound<'_, PyAny>) -> CardPyResult<ProviderRequest> {
     if let Ok(request) = value.extract::<PyRef<'_, PyProviderRequest>>() {
         return Ok(request.inner.clone());
@@ -1288,6 +1275,9 @@ fn append_native_json_content(
             .into());
         }
     }
+    out.inner
+        .normalize_media_placeholders_mut()
+        .map_err(PromptBuilderError::from)?;
     Ok(out)
 }
 

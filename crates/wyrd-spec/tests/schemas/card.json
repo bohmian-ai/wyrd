@@ -6275,6 +6275,14 @@
         "request"
       ],
       "properties": {
+        "media_variables": {
+          "description": "Declared media placeholder names expected by `bind_media`.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "model": {
           "description": "Model identifier used for indexing and selection.",
           "type": "string"
@@ -6297,7 +6305,7 @@
           ]
         },
         "variables": {
-          "description": "Declared placeholder names expected by `render`.",
+          "description": "Declared text placeholder names expected by `render`.",
           "default": [],
           "type": "array",
           "items": {

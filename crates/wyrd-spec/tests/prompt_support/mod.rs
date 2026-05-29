@@ -29,6 +29,7 @@ pub fn prompt(request: ProviderRequest, variables: Vec<&str>) -> Prompt {
         model: "test-model".to_owned(),
         version: None,
         variables: variables.into_iter().map(ToOwned::to_owned).collect(),
+        media_variables: Vec::new(),
         response_type: ResponseType::Text,
     }
 }

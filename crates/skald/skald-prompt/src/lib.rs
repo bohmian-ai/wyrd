@@ -14,6 +14,8 @@ pub mod coerce;
 pub mod error;
 /// Filesystem loader/dumper for the Prompt builder.
 pub mod loader;
+/// Media reference helpers for prompt media binding.
+pub mod media;
 /// Native message and content helper functions.
 pub mod messages;
 /// Prompt wrapper and rendered request wrapper.
@@ -26,6 +28,7 @@ pub use builder::{
     anthropic, gemini, openai_chat, openai_responses, raw, vertex,
 };
 pub use error::{PromptBuilderError, PromptBuilderResult};
+pub use media::{MAX_MEDIA_FILE_BYTES, PyMediaRef, document_path, image_path};
 pub use prompt::{Prompt, PyProviderRequest};
 pub use response_format::{ResponseFormat, ResponseFormatKind};
 
@@ -38,6 +41,7 @@ pub fn register_prompt(module: &Bound<'_, PyModule>) -> PyResult<()> {
     wyrd_interfaces::error::register_exceptions(module)?;
     module.add_class::<Prompt>()?;
     module.add_class::<PyProviderRequest>()?;
+    module.add_class::<PyMediaRef>()?;
     module.add_class::<ResponseFormat>()?;
     Ok(())
 }

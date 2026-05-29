@@ -67,6 +67,29 @@ pub fn serialize_card(format: CardLoadFormat, card: &Card) -> Result<Vec<u8>, Wy
     }
 }
 
+/// Serializes a bare PromptSpec body to bytes.
+pub fn serialize_spec_bytes(
+    format: CardLoadFormat,
+    spec: &PromptSpec,
+) -> Result<Vec<u8>, WyrdError> {
+    match format {
+        CardLoadFormat::Json => {
+            serde_json::to_vec_pretty(spec).map_err(|error| WyrdError::Internal {
+                message: "failed to serialize prompt spec JSON".to_owned(),
+                details: serde_json::json!({ "source": error.to_string() }),
+            })
+        }
+        CardLoadFormat::Yaml => {
+            serde_yaml::to_string(spec)
+                .map(String::into_bytes)
+                .map_err(|error| WyrdError::Internal {
+                    message: "failed to serialize prompt spec YAML".to_owned(),
+                    details: serde_json::json!({ "source": error.to_string() }),
+                })
+        }
+    }
+}
+
 /// Parses a bare PromptSpec body from bytes.
 pub fn parse_spec_bytes(format: CardLoadFormat, bytes: &[u8]) -> Result<PromptSpec, WyrdError> {
     match format {

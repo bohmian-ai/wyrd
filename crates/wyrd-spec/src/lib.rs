@@ -36,7 +36,7 @@ pub use card::data::{
 pub use card::field::{Dim, FieldSpec};
 pub use card::prompt::{
     CardLoadFormat, ParameterName, PromptRef, PromptSpec, extract_placeholders, parse_card_bytes,
-    parse_spec_bytes, serialize_card,
+    parse_spec_bytes, serialize_card, serialize_spec_bytes,
 };
 pub use ids::{ColumnName, QueryName, RoleName, SplitName};
 pub use metadata::{

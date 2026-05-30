@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
 use skald_spec::wire::openai_chat::OpenAiMessageContent;
-use skald_spec::{OpenAiChatMessage, OpenAiChatRequest, Prompt, ProviderRequest, ResponseType};
+use skald_spec::{
+    OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, Prompt, ProviderRequest, ResponseType,
+};
 use wyrd_spec::card::prompt::PromptSpec;
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
 use wyrd_spec::format;
@@ -48,35 +50,13 @@ fn prompt_spec() -> PromptSpec {
                 tool_call_id: None,
                 refusal: None,
             }],
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
-            max_completion_tokens: None,
-            n: None,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            seed: None,
-            logit_bias: None,
-            user: None,
-            reasoning_effort: None,
-            modalities: None,
-            audio: None,
-            prediction: None,
             response_format: None,
             stream: None,
             stream_options: None,
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
-            prompt_cache_key: None,
-            service_tier: None,
-            safety_identifier: None,
-            store: None,
-            metadata: None,
-            logprobs: None,
-            top_logprobs: None,
-            extra: serde_json::Map::new(),
+            settings: OpenAiChatSettings::default(),
         }),
         model: "gpt-4o".to_owned(),
         version: None,

@@ -20,6 +20,15 @@ STUB_FILES = [
 ]
 
 
+def validate_source_stub(filename: str, raw_text: str) -> None:
+    """Validate hand-authored stub conventions before assembly."""
+    if re.search(r"^\s*def\s+__new__\s*\(", raw_text, flags=re.MULTILINE):
+        raise SystemExit(
+            f"{STUB_DIR / filename}: public stubs must document constructors as "
+            "__init__, not __new__"
+        )
+
+
 def strip_imports_section(content: str) -> str:
     """Remove a module-local import block from a source stub."""
     pattern = r"####\s*begin\s+imports\s*####.*?####\s*end\s+of\s+imports\s*####\s*\n?"
@@ -52,6 +61,7 @@ def assemble() -> None:
             continue
 
         raw_text = file_path.read_text(encoding="utf-8")
+        validate_source_stub(filename, raw_text)
         if filename != "header.pyi":
             raw_text = strip_imports_section(raw_text)
 
@@ -118,7 +128,7 @@ def write_public_prompt_stub() -> None:
         [
             "    )",
             "else:",
-            "    from ._native.prompt import (",
+            "    from ._native.cards.prompt import (",
         ]
     )
     lines.extend(f"        {name}," for name in exports)
@@ -141,16 +151,28 @@ def write_public_init_stub() -> None:
         "from .model import ModelSignature as ModelSignature",
         "from .model import SampleInput as SampleInput",
         "from .prompt import MediaRef as MediaRef",
+        "from .prompt import OpenAIResponsesSettings as OpenAIResponsesSettings",
+        "from .prompt import OpenAISettings as OpenAISettings",
+        "from .prompt import AnthropicSettings as AnthropicSettings",
+        "from .prompt import GeminiSettings as GeminiSettings",
         "from .prompt import Prompt as Prompt",
+        "from .prompt import PromptCard as PromptCard",
+        "from .prompt import PromptCardMetadata as PromptCardMetadata",
         "from .prompt import ProviderRequest as ProviderRequest",
         "from .prompt import ResponseFormat as ResponseFormat",
         "",
         "__all__ = [",
+        '    "AnthropicSettings",',
         '    "DataCard",',
+        '    "GeminiSettings",',
         '    "MediaRef",',
         '    "ModelCard",',
         '    "ModelSignature",',
+        '    "OpenAIResponsesSettings",',
+        '    "OpenAISettings",',
         '    "Prompt",',
+        '    "PromptCard",',
+        '    "PromptCardMetadata",',
         '    "ProviderRequest",',
         '    "ResponseFormat",',
         '    "SampleInput",',

@@ -44,35 +44,13 @@ fn typed_prompt_card() -> PromptCard {
             tool_call_id: None,
             refusal: None,
         }],
-        temperature: None,
-        top_p: None,
-        max_tokens: None,
-        max_completion_tokens: None,
-        n: None,
-        stop: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        seed: None,
-        logit_bias: None,
-        user: None,
-        reasoning_effort: None,
-        modalities: None,
-        audio: None,
-        prediction: None,
         response_format: None,
         stream: None,
         stream_options: None,
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
-        prompt_cache_key: None,
-        service_tier: None,
-        safety_identifier: None,
-        store: None,
-        metadata: None,
-        logprobs: None,
-        top_logprobs: None,
-        extra: serde_json::Map::new(),
+        settings: skald_spec::OpenAiChatSettings::default(),
     };
     let prompt = skald_spec::Prompt::new(
         skald_spec::ProviderRequest::OpenAiChatCompletion(request),
@@ -105,6 +83,48 @@ fn yaml_write_read_round_trip() {
     let loaded = read_card_file(&path).expect("read succeeds");
 
     assert_eq!(loaded, card);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn yaml_prompt_card_envelope_with_model_settings_loads() {
+    let path = temp_path("authored_card.yaml");
+    std::fs::write(
+        &path,
+        r#"
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: yaml-prompt
+  version: 0.1.0
+spec:
+  type: Prompt
+  prompt:
+    request:
+      model: gpt-4o
+      messages:
+        - role: user
+          content: hello
+      seed: 123
+      future_knob:
+        enabled: true
+    model: gpt-4o
+"#,
+    )
+    .expect("write fixture");
+
+    let loaded = read_card_file(&path).expect("yaml prompt card loads");
+    let card = PromptCard::from_card(loaded).expect("prompt card holder loads");
+    let skald_spec::ProviderRequest::OpenAiChatCompletion(request) = card.metadata.prompt.request
+    else {
+        panic!("loaded prompt should be OpenAI chat");
+    };
+
+    assert_eq!(request.settings.seed, Some(123));
+    assert_eq!(
+        request.settings.extra["future_knob"],
+        serde_json::json!({ "enabled": true })
+    );
     let _ = std::fs::remove_file(path);
 }
 

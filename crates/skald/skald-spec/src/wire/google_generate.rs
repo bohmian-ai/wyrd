@@ -6,23 +6,37 @@ use crate::wire::common::TokenUsage;
 /// `POST /v1beta/models/{model}:generateContent`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
 pub struct GoogleGenerateContentRequest {
     pub contents: Vec<GoogleContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_instruction: Option<GoogleContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub generation_config: Option<GoogleGenerationConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub safety_settings: Option<Vec<GoogleSafetySetting>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<GoogleTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_config: Option<GoogleToolConfig>,
+    #[serde(flatten)]
+    pub settings: GoogleGenerateSettings,
+}
+
+/// Native Google GenerateContent request settings flattened into the request body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct GoogleGenerateSettings {
+    /// Native Google generationConfig object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_config: Option<GoogleGenerationConfig>,
+    /// Native Google safetySettings list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_settings: Option<Vec<GoogleSafetySetting>>,
+    /// Cached content resource name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_content: Option<String>,
+    /// Provider labels object.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub labels: Option<Map<String, Value>>,
+    /// Unmodeled Google request fields, flattened to the native request location.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// One Google content turn.
@@ -122,34 +136,51 @@ pub struct GoogleCodeExecutionResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GoogleGenerationConfig {
+    /// Sampling temperature.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Nucleus sampling probability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    /// Top-k sampling limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
+    /// Number of candidate responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_count: Option<u32>,
+    /// Maximum output-token count.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// Stop sequences.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
+    /// Response MIME type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_mime_type: Option<String>,
+    /// Response schema object.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_schema: Option<Value>,
+    /// Presence penalty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f32>,
+    /// Frequency penalty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f32>,
+    /// Provider best-effort deterministic seed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
+    /// Requested output modalities.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_modalities: Option<Vec<String>>,
+    /// Gemini thinking configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_config: Option<GoogleThinkingConfig>,
+    /// Speech configuration object.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speech_config: Option<Value>,
+    /// Unmodeled Google generation-config fields.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

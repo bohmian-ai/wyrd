@@ -18,7 +18,6 @@ doctest = false
 [dependencies]
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py310", "chrono"] }
 wyrd-cards = { workspace = true, features = ["python"] }
-skald-prompt = { workspace = true, features = ["python"] }
 
 [lints]
 workspace = true

@@ -19,13 +19,13 @@ pub use convert::{MessageConversion, convert_message_dyn};
 pub use error::{SkaldError, SkaldResult};
 pub use media::{MediaKind, MediaRef, MediaSource};
 pub use message::MessageNum;
-pub use prompt::{Prompt, ResponseType};
+pub use prompt::{Prompt, ProviderSettingsRef, ResponseType};
 pub use request::{ProviderName, ProviderRequest};
 pub use response::ProviderResponse;
 pub use wire::anthropic_citation::AnthropicCitationV1;
 pub use wire::anthropic_messages::{
     AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest, AnthropicMessagesResponse,
-    AnthropicStopReason, AnthropicStreamEvent, AnthropicUsage,
+    AnthropicMessagesSettings, AnthropicStopReason, AnthropicStreamEvent, AnthropicUsage,
 };
 pub use wire::common::{FinishReason, TokenUsage};
 pub use wire::google_embeddings::{
@@ -34,17 +34,20 @@ pub use wire::google_embeddings::{
 };
 pub use wire::google_generate::{
     GoogleCandidate, GoogleContent, GoogleFinishReason, GoogleGenerateContentRequest,
-    GoogleGenerateContentResponse, GooglePart, GoogleSafetyRating, GoogleUsageMetadata,
+    GoogleGenerateContentResponse, GoogleGenerateSettings, GooglePart, GoogleSafetyRating,
+    GoogleUsageMetadata,
 };
 pub use wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatChoiceDelta, OpenAiChatLogprobs, OpenAiChatMessage,
-    OpenAiChatRequest, OpenAiChatResponse, OpenAiChatStreamChunk, OpenAiToolCall, OpenAiUsage,
+    OpenAiChatRequest, OpenAiChatResponse, OpenAiChatSettings, OpenAiChatStreamChunk,
+    OpenAiToolCall, OpenAiUsage,
 };
 pub use wire::openai_embeddings::{
     OpenAiEmbeddingVector, OpenAiEmbeddingsInput, OpenAiEmbeddingsRequest, OpenAiEmbeddingsResponse,
 };
 pub use wire::openai_responses::{
-    OpenAiResponseItem, OpenAiResponsesRequest, OpenAiResponsesResponse, OpenAiResponsesStreamEvent,
+    OpenAiResponseItem, OpenAiResponsesRequest, OpenAiResponsesResponse, OpenAiResponsesSettings,
+    OpenAiResponsesStreamEvent,
 };
 pub use wire::vertex_generate::VertexGenerateContentRequest;
 pub use wire::vertex_predict::{VertexPredictRequest, VertexPredictResponse, VertexPrediction};

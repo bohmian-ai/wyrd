@@ -1,5 +1,6 @@
 ---
 source: crates/skald/skald-spec/tests/wire_snapshots.rs
+assertion_line: 15
 expression: "common::openai_responses_request()"
 ---
 {
@@ -42,10 +43,6 @@ expression: "common::openai_responses_request()"
     }
   ],
   "instructions": "Answer tersely.",
-  "reasoning": {
-    "effort": "low",
-    "summary": "auto"
-  },
   "text": {
     "format": {
       "type": "json_schema",
@@ -70,5 +67,9 @@ expression: "common::openai_responses_request()"
     "type": "function",
     "name": "lookup"
   },
-  "previous_response_id": "resp_prev"
+  "previous_response_id": "resp_prev",
+  "reasoning": {
+    "effort": "low",
+    "summary": "auto"
+  }
 }

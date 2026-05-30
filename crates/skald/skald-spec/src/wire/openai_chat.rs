@@ -1,46 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
 
 use crate::wire::common::TokenUsage;
 
 /// `POST /v1/chat/completions`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
 pub struct OpenAiChatRequest {
     pub model: String,
     pub messages: Vec<OpenAiChatMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_completion_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub n: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop: Option<OpenAiStop>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub presence_penalty: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub frequency_penalty: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub seed: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logit_bias: Option<BTreeMap<String, i32>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<OpenAiReasoningEffort>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modalities: Option<Vec<OpenAiResponseModality>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub audio: Option<OpenAiChatAudio>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prediction: Option<OpenAiPredictionContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<OpenAiResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,20 +21,81 @@ pub struct OpenAiChatRequest {
     pub tool_choice: Option<OpenAiChatToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
+    #[serde(flatten)]
+    pub settings: OpenAiChatSettings,
+}
+
+/// Native OpenAI Chat generation settings flattened into the request body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct OpenAiChatSettings {
+    /// Sampling temperature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Nucleus sampling probability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Legacy maximum generated-token count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Maximum completion-token count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
+    /// Number of completions to generate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    /// Stop sequence or sequences.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<OpenAiStop>,
+    /// Presence penalty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    /// Frequency penalty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// Provider best-effort deterministic seed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    /// Token-bias map keyed by token id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<Map<String, Value>>,
+    /// Provider-visible end-user identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Requested reasoning effort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<OpenAiReasoningEffort>,
+    /// Requested output modalities.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modalities: Option<Vec<OpenAiResponseModality>>,
+    /// Audio output settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<OpenAiChatAudio>,
+    /// Prediction content hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prediction: Option<OpenAiPredictionContent>,
+    /// OpenAI prompt cache key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    /// OpenAI service tier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+    /// Safety identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safety_identifier: Option<String>,
+    /// Whether the provider may store the response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
+    /// Provider metadata object.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<BTreeMap<String, String>>,
+    pub metadata: Option<Map<String, Value>>,
+    /// Whether to return token log probabilities.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<bool>,
+    /// Number of top token log probabilities.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_logprobs: Option<u32>,
+    /// Unmodeled OpenAI Chat fields, flattened to the native request location.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }

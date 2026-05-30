@@ -177,6 +177,22 @@ pub enum PromptError {
         /// Dialed provider name.
         provider: String,
     },
+    /// A typed model_settings object belonged to a different provider.
+    #[error("model_settings provider mismatch: expected {expected}, got {got}")]
+    SettingsProviderMismatch {
+        /// Expected provider.
+        expected: String,
+        /// Supplied settings provider.
+        got: String,
+    },
+    /// A model_settings value could not decode into native settings.
+    #[error("model_settings for {provider} failed to decode: {message}")]
+    SettingsDecode {
+        /// Provider being decoded.
+        provider: String,
+        /// Decode failure message.
+        message: String,
+    },
     /// Render-time variable was missing.
     #[error("missing render variable: {name}")]
     MissingVariable {
@@ -236,6 +252,8 @@ impl PromptError {
             Self::ProviderUpstream { .. } => "WYRD_PROMPT_502_PROVIDER_UPSTREAM",
             Self::ProviderTimeout { .. } => "WYRD_PROMPT_504_PROVIDER_TIMEOUT",
             Self::ProviderMismatch { .. } => "WYRD_PROMPT_400_PROVIDER_MISMATCH",
+            Self::SettingsProviderMismatch { .. } => "WYRD_PROMPT_400_SETTINGS_PROVIDER_MISMATCH",
+            Self::SettingsDecode { .. } => "WYRD_PROMPT_400_SETTINGS_DECODE",
             Self::MissingVariable { .. } => "WYRD_PROMPT_422_MISSING_VARIABLE",
             Self::UnsupportedHandoff { .. } => "WYRD_PROMPT_501_UNSUPPORTED_HANDOFF",
             Self::ResponseDecode { .. } => "WYRD_PROMPT_422_RESPONSE_DECODE",
@@ -448,6 +466,19 @@ impl From<PromptError> for WyrdError {
             PromptError::ProviderMismatch { sent, provider } => WyrdError::PromptProviderMismatch {
                 message,
                 details: json!({ "sent": sent, "provider": provider }),
+            },
+            PromptError::SettingsProviderMismatch { expected, got } => {
+                WyrdError::PromptSettingsProviderMismatch {
+                    message,
+                    details: json!({ "expected": expected, "got": got }),
+                }
+            }
+            PromptError::SettingsDecode {
+                provider,
+                message: source,
+            } => WyrdError::PromptSettingsDecode {
+                message,
+                details: json!({ "provider": provider, "source": source }),
             },
             PromptError::MissingVariable { name } => WyrdError::PromptMissingVariable {
                 message,

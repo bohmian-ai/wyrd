@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,10 +10,11 @@ use skald_spec::wire::anthropic_messages::{AnthropicSystem, AnthropicUsage};
 use skald_spec::wire::openai_chat::OpenAiMessageContent;
 use skald_spec::{
     AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest, AnthropicMessagesResponse,
-    AnthropicStopReason, GoogleCandidate, GoogleContent, GoogleFinishReason,
-    GoogleGenerateContentRequest, GoogleGenerateContentResponse, GooglePart, GoogleUsageMetadata,
-    OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiUsage,
-    ProviderRequest, ProviderResponse,
+    AnthropicMessagesSettings, AnthropicStopReason, GoogleCandidate, GoogleContent,
+    GoogleFinishReason, GoogleGenerateContentRequest, GoogleGenerateContentResponse,
+    GoogleGenerateSettings, GooglePart, GoogleUsageMetadata, OpenAiChatChoice, OpenAiChatMessage,
+    OpenAiChatRequest, OpenAiChatResponse, OpenAiChatSettings, OpenAiUsage, ProviderRequest,
+    ProviderResponse,
 };
 
 pub fn runtime_with(mock: &MockProvider) -> SkaldRuntime {
@@ -35,35 +35,13 @@ pub fn openai_request(text: &str) -> ProviderRequest {
             tool_call_id: None,
             refusal: None,
         }],
-        temperature: None,
-        top_p: None,
-        max_tokens: None,
-        max_completion_tokens: None,
-        n: None,
-        stop: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        seed: None,
-        logit_bias: None,
-        user: None,
-        reasoning_effort: None,
-        modalities: None,
-        audio: None,
-        prediction: None,
         response_format: None,
         stream: None,
         stream_options: None,
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
-        prompt_cache_key: None,
-        service_tier: None,
-        safety_identifier: None,
-        store: None,
-        metadata: None,
-        logprobs: None,
-        top_logprobs: None,
-        extra: Map::new(),
+        settings: OpenAiChatSettings::default(),
     })
 }
 
@@ -109,18 +87,14 @@ pub fn anthropic_request(text: &str) -> ProviderRequest {
                 citations: None,
             }],
         }],
-        max_tokens: 128,
         system: Some(AnthropicSystem::Text("Answer directly.".to_owned())),
-        temperature: None,
-        top_p: None,
-        top_k: None,
-        stop_sequences: None,
-        metadata: None,
         stream: None,
         tools: None,
         tool_choice: None,
-        thinking: None,
-        extra: Map::new(),
+        settings: AnthropicMessagesSettings {
+            max_tokens: 128,
+            ..AnthropicMessagesSettings::default()
+        },
     })
 }
 
@@ -155,12 +129,9 @@ pub fn google_request(text: &str) -> ProviderRequest {
             }],
         }],
         system_instruction: None,
-        generation_config: None,
-        safety_settings: None,
         tools: None,
         tool_config: None,
-        cached_content: None,
-        labels: None,
+        settings: GoogleGenerateSettings::default(),
     })
 }
 
@@ -197,11 +168,12 @@ pub fn openai_request_with_options() -> ProviderRequest {
         ProviderRequest::OpenAiChatCompletion(request) => request,
         _ => unreachable!("helper returns OpenAI chat"),
     };
-    request.prompt_cache_key = Some("cache-key".to_owned());
+    request.settings.prompt_cache_key = Some("cache-key".to_owned());
     request
+        .settings
         .extra
         .insert("extra_body".to_owned(), json!({"enabled": true}));
-    request.metadata = Some(BTreeMap::from([("purpose".to_owned(), "test".to_owned())]));
+    request.settings.metadata = Some(Map::from_iter([("purpose".to_owned(), json!("test"))]));
     ProviderRequest::OpenAiChatCompletion(request)
 }
 
@@ -210,6 +182,6 @@ pub fn google_request_with_options() -> ProviderRequest {
         ProviderRequest::GeminiGenerateContent(request) => request,
         _ => unreachable!("helper returns Google generate"),
     };
-    request.cached_content = Some("cachedContents/abc".to_owned());
+    request.settings.cached_content = Some("cachedContents/abc".to_owned());
     ProviderRequest::GeminiGenerateContent(request)
 }

@@ -60,15 +60,15 @@ fn chat_request_uses_typed_openai_fields() {
     let request: OpenAiChatRequest = serde_json::from_value(body.clone()).unwrap();
 
     assert!(matches!(
-        request.audio.as_ref().unwrap().voice,
+        request.settings.audio.as_ref().unwrap().voice,
         OpenAiVoice::BuiltIn(_)
     ));
     assert_eq!(
-        request.audio.as_ref().unwrap().format,
+        request.settings.audio.as_ref().unwrap().format,
         OpenAiAudioFormat::Mp3
     );
     assert!(matches!(
-        request.prediction.as_ref().unwrap().content,
+        request.settings.prediction.as_ref().unwrap().content,
         OpenAiPredictionPayload::Parts(_)
     ));
     assert!(matches!(
@@ -80,7 +80,13 @@ fn chat_request_uses_typed_openai_fields() {
         OpenAiTool::Function { .. }
     ));
     assert_eq!(
-        request.metadata.as_ref().unwrap().get("purpose").unwrap(),
+        request
+            .settings
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get("purpose")
+            .unwrap(),
         "review"
     );
     assert!(matches!(
@@ -134,7 +140,7 @@ fn responses_request_uses_typed_openai_fields() {
 
     let request: OpenAiResponsesRequest = serde_json::from_value(body.clone()).unwrap();
 
-    assert!(request.reasoning.is_some());
+    assert!(request.settings.reasoning.is_some());
     assert!(matches!(
         request.text.as_ref().unwrap().format.as_ref().unwrap(),
         OpenAiTextResponseFormat::JsonSchema { .. }
@@ -144,7 +150,13 @@ fn responses_request_uses_typed_openai_fields() {
         OpenAiResponsesToolChoice::Mcp(_)
     ));
     assert_eq!(
-        request.metadata.as_ref().unwrap().get("purpose").unwrap(),
+        request
+            .settings
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get("purpose")
+            .unwrap(),
         "review"
     );
 

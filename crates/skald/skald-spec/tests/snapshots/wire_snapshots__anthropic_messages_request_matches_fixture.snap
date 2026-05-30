@@ -1,5 +1,6 @@
 ---
 source: crates/skald/skald-spec/tests/wire_snapshots.rs
+assertion_line: 25
 expression: "common::anthropic_request()"
 ---
 {
@@ -35,7 +36,6 @@ expression: "common::anthropic_request()"
       ]
     }
   ],
-  "max_tokens": 256,
   "system": [
     {
       "type": "text",
@@ -55,6 +55,7 @@ expression: "common::anthropic_request()"
       }
     }
   ],
+  "max_tokens": 256,
   "thinking": {
     "type": "enabled",
     "budget_tokens": 128

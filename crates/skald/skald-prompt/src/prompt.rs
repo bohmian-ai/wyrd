@@ -256,7 +256,13 @@ use {
     crate::coerce::{provider_name_from_py, provider_name_from_str, strings_from_py},
     crate::media::PyMediaRef,
     crate::response_format::ResponseFormat,
+    crate::settings::{
+        PyAnthropicSettings, PyGoogleGenerateSettings, PyOpenAiChatSettings,
+        PyOpenAiResponsesSettings, resolve_anthropic_settings, resolve_google_settings,
+        resolve_openai_chat_settings, resolve_openai_responses_settings,
+    },
     pyo3::{
+        IntoPyObjectExt,
         prelude::*,
         types::{PyAny, PyBytes, PyDict, PyList, PyString, PyTuple},
     },
@@ -269,7 +275,7 @@ use {
 impl Prompt {
     /// Build a vendor-native prompt from provider and message inputs.
     #[new]
-    #[pyo3(signature = (messages, model, *, provider, system=None, response_format=None, operation=None, temperature=None, top_p=None, max_tokens=None, max_output_tokens=None, top_k=None, variables=None, version=None))]
+    #[pyo3(signature = (messages, model, *, provider, system=None, response_format=None, operation=None, cache=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn __new__(
         messages: &Bound<'_, PyAny>,
@@ -278,11 +284,8 @@ impl Prompt {
         system: Option<String>,
         response_format: Option<&Bound<'_, PyAny>>,
         operation: Option<&str>,
-        temperature: Option<f32>,
-        top_p: Option<f32>,
-        max_tokens: Option<u32>,
-        max_output_tokens: Option<u32>,
-        top_k: Option<u32>,
+        cache: Option<&Bound<'_, PyAny>>,
+        model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
@@ -300,9 +303,7 @@ impl Prompt {
                     OpenAiResponsesOptions {
                         instructions: system,
                         response_format,
-                        temperature,
-                        top_p,
-                        max_output_tokens: max_output_tokens.or(max_tokens),
+                        settings: resolve_openai_responses_settings(model_settings)?,
                         variables,
                         version,
                         ..OpenAiResponsesOptions::default()
@@ -314,9 +315,8 @@ impl Prompt {
                 OpenAiChatOptions {
                     system,
                     response_format,
-                    temperature,
-                    top_p,
-                    max_tokens,
+                    prompt_cache_key: cache_prompt_key(cache)?,
+                    settings: resolve_openai_chat_settings(model_settings)?,
                     variables,
                     version,
                     ..OpenAiChatOptions::default()
@@ -327,10 +327,7 @@ impl Prompt {
                 AnthropicOptions {
                     system,
                     response_format,
-                    temperature,
-                    top_p,
-                    top_k,
-                    max_tokens: max_tokens.unwrap_or(1024),
+                    settings: resolve_anthropic_settings(model_settings)?,
                     variables,
                     version,
                     ..AnthropicOptions::default()
@@ -340,10 +337,7 @@ impl Prompt {
                 let options = GeminiOptions {
                     system,
                     response_format,
-                    temperature,
-                    top_p,
-                    top_k,
-                    max_output_tokens: max_output_tokens.or(max_tokens),
+                    settings: resolve_google_settings(model_settings)?,
                     variables,
                     version,
                     ..GeminiOptions::default()
@@ -354,10 +348,7 @@ impl Prompt {
                 let options = GeminiOptions {
                     system,
                     response_format,
-                    temperature,
-                    top_p,
-                    top_k,
-                    max_output_tokens: max_output_tokens.or(max_tokens),
+                    settings: resolve_google_settings(model_settings)?,
                     variables,
                     version,
                     ..GeminiOptions::default()
@@ -377,16 +368,15 @@ impl Prompt {
 
     /// Build an `OpenAI` Chat prompt from native constructor arguments.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, temperature=None, top_p=None, max_tokens=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, cache=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn openai_chat(
         model: String,
         system: Option<String>,
         messages: Option<&Bound<'_, PyAny>>,
         response_format: Option<&Bound<'_, PyAny>>,
-        temperature: Option<f32>,
-        top_p: Option<f32>,
-        max_tokens: Option<u32>,
+        cache: Option<&Bound<'_, PyAny>>,
+        model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
@@ -397,12 +387,10 @@ impl Prompt {
                 system,
                 messages: strings_from_py(messages)?,
                 response_format: response_format_from_py(response_format)?,
-                temperature,
-                top_p,
-                max_tokens,
+                prompt_cache_key: cache_prompt_key(cache)?,
+                settings: resolve_openai_chat_settings(model_settings)?,
                 variables: variables.unwrap_or_default(),
                 version,
-                ..OpenAiChatOptions::default()
             },
         )?;
         auto_assign_variables(prompt, auto_variables)
@@ -410,16 +398,14 @@ impl Prompt {
 
     /// Build an `OpenAI` Responses prompt from native constructor arguments.
     #[staticmethod]
-    #[pyo3(signature = (model, *, instructions=None, messages=None, response_format=None, temperature=None, top_p=None, max_output_tokens=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, instructions=None, messages=None, response_format=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn openai_responses(
         model: String,
         instructions: Option<String>,
         messages: Option<&Bound<'_, PyAny>>,
         response_format: Option<&Bound<'_, PyAny>>,
-        temperature: Option<f32>,
-        top_p: Option<f32>,
-        max_output_tokens: Option<u32>,
+        model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
@@ -430,12 +416,9 @@ impl Prompt {
                 instructions,
                 messages: strings_from_py(messages)?,
                 response_format: response_format_from_py(response_format)?,
-                temperature,
-                top_p,
-                max_output_tokens,
+                settings: resolve_openai_responses_settings(model_settings)?,
                 variables: variables.unwrap_or_default(),
                 version,
-                ..OpenAiResponsesOptions::default()
             },
         )?;
         auto_assign_variables(prompt, auto_variables)
@@ -443,17 +426,14 @@ impl Prompt {
 
     /// Build an Anthropic Messages prompt from native constructor arguments.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, max_tokens=1024, response_format=None, temperature=None, top_p=None, top_k=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn anthropic(
         model: String,
         system: Option<String>,
         messages: Option<&Bound<'_, PyAny>>,
-        max_tokens: u32,
         response_format: Option<&Bound<'_, PyAny>>,
-        temperature: Option<f32>,
-        top_p: Option<f32>,
-        top_k: Option<u32>,
+        model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
@@ -463,14 +443,10 @@ impl Prompt {
             AnthropicOptions {
                 system,
                 messages: strings_from_py(messages)?,
-                max_tokens,
                 response_format: response_format_from_py(response_format)?,
-                temperature,
-                top_p,
-                top_k,
+                settings: resolve_anthropic_settings(model_settings)?,
                 variables: variables.unwrap_or_default(),
                 version,
-                ..AnthropicOptions::default()
             },
         )?;
         auto_assign_variables(prompt, auto_variables)
@@ -478,17 +454,14 @@ impl Prompt {
 
     /// Build a Google Gemini `GenerateContent` prompt from native constructor arguments.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, temperature=None, top_p=None, top_k=None, max_output_tokens=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn gemini(
         model: String,
         system: Option<String>,
         messages: Option<&Bound<'_, PyAny>>,
         response_format: Option<&Bound<'_, PyAny>>,
-        temperature: Option<f32>,
-        top_p: Option<f32>,
-        top_k: Option<u32>,
-        max_output_tokens: Option<u32>,
+        model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
@@ -497,10 +470,7 @@ impl Prompt {
             system,
             messages: strings_from_py(messages)?,
             response_format: response_format_from_py(response_format)?,
-            temperature,
-            top_p,
-            top_k,
-            max_output_tokens,
+            settings: resolve_google_settings(model_settings)?,
             variables: variables.unwrap_or_default(),
             version,
         };
@@ -510,17 +480,14 @@ impl Prompt {
 
     /// Build a Vertex `GenerateContent` prompt from native constructor arguments.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, temperature=None, top_p=None, top_k=None, max_output_tokens=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn vertex(
         model: String,
         system: Option<String>,
         messages: Option<&Bound<'_, PyAny>>,
         response_format: Option<&Bound<'_, PyAny>>,
-        temperature: Option<f32>,
-        top_p: Option<f32>,
-        top_k: Option<u32>,
-        max_output_tokens: Option<u32>,
+        model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
@@ -529,10 +496,7 @@ impl Prompt {
             system,
             messages: strings_from_py(messages)?,
             response_format: response_format_from_py(response_format)?,
-            temperature,
-            top_p,
-            top_k,
-            max_output_tokens,
+            settings: resolve_google_settings(model_settings)?,
             variables: variables.unwrap_or_default(),
             version,
         };
@@ -842,6 +806,26 @@ impl Prompt {
     #[getter]
     pub fn request(&self) -> PyProviderRequest {
         PyProviderRequest::from_native(self.inner.request.clone())
+    }
+
+    /// Return typed provider generation settings, or `None` for raw prompts.
+    #[getter]
+    pub fn model_settings(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+        Ok(match self.inner.settings_ref() {
+            Some(skald_spec::ProviderSettingsRef::OpenAiChat(settings)) => {
+                Some(PyOpenAiChatSettings::from_native(settings.clone()).into_py_any(py)?)
+            }
+            Some(skald_spec::ProviderSettingsRef::OpenAiResponses(settings)) => {
+                Some(PyOpenAiResponsesSettings::from_native(settings.clone()).into_py_any(py)?)
+            }
+            Some(skald_spec::ProviderSettingsRef::Anthropic(settings)) => {
+                Some(PyAnthropicSettings::from_native(settings.clone()).into_py_any(py)?)
+            }
+            Some(skald_spec::ProviderSettingsRef::Google(settings)) => {
+                Some(PyGoogleGenerateSettings::from_native(settings.clone()).into_py_any(py)?)
+            }
+            None => None,
+        })
     }
 
     /// Return native request messages or content turns as Python objects.
@@ -1190,6 +1174,25 @@ fn response_format_from_py(
 
     let schema = crate::coerce::schema_from_py(value)?;
     Ok(Some(ResponseFormat::json_schema("response", schema)?))
+}
+
+#[cfg(feature = "python")]
+fn cache_prompt_key(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Option<String>> {
+    let Some(value) = value.filter(|value| !value.is_none()) else {
+        return Ok(None);
+    };
+    if let Ok(text) = value.extract::<String>() {
+        return Ok(Some(text));
+    }
+    if let Ok(dict) = value.cast::<PyDict>() {
+        if let Ok(Some(item)) = dict.get_item("prompt_cache_key") {
+            return Ok(Some(item.extract::<String>()?));
+        }
+        if let Ok(Some(item)) = dict.get_item("key") {
+            return Ok(Some(item.extract::<String>()?));
+        }
+    }
+    Ok(Some(value.str()?.extract::<String>()?))
 }
 
 #[cfg(feature = "python")]

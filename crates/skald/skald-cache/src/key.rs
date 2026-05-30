@@ -59,6 +59,7 @@ impl CacheKey {
     pub fn from_request(request: &ProviderRequest) -> SkaldCacheResult<Option<Self>> {
         match request {
             ProviderRequest::OpenAiChatCompletion(request) => Ok(request
+                .settings
                 .prompt_cache_key
                 .as_deref()
                 .map(|prompt_cache_key| Self {

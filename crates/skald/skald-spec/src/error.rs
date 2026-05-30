@@ -32,6 +32,22 @@ pub enum SkaldError {
         /// Operation name, such as `embeddings` or `responses`.
         op: String,
     },
+    /// A typed `model_settings` object belonged to a different provider.
+    #[error("model_settings provider mismatch: expected {expected:?}, got {got:?}")]
+    SettingsProviderMismatch {
+        /// Provider expected by the prompt constructor.
+        expected: ProviderName,
+        /// Provider carried by the supplied settings object.
+        got: ProviderName,
+    },
+    /// A `model_settings` object or dict failed to decode into native settings.
+    #[error("model_settings for {provider:?} failed to decode: {message}")]
+    SettingsDecode {
+        /// Provider whose settings were being decoded.
+        provider: ProviderName,
+        /// Decode failure message.
+        message: String,
+    },
     /// A media placeholder was not present as an isolated text part.
     #[error("media placeholder not found: {name}")]
     MediaPlaceholderNotFound {
@@ -135,6 +151,8 @@ impl SkaldError {
             Self::Deserialize(_) => "SKALD_SPEC_422_DESERIALIZE",
             Self::UnsupportedConversion { .. } => "SKALD_SPEC_501_UNSUPPORTED_CONVERSION",
             Self::ProviderUnsupported { .. } => "SKALD_SPEC_501_PROVIDER_UNSUPPORTED",
+            Self::SettingsProviderMismatch { .. } => "SKALD_SPEC_400_SETTINGS_PROVIDER_MISMATCH",
+            Self::SettingsDecode { .. } => "SKALD_SPEC_400_SETTINGS_DECODE",
             Self::MediaPlaceholderNotFound { .. } => "SKALD_SPEC_422_MEDIA_PLACEHOLDER_NOT_FOUND",
             Self::MediaPlaceholderNotIsolated { .. } => {
                 "SKALD_SPEC_422_MEDIA_PLACEHOLDER_NOT_ISOLATED"

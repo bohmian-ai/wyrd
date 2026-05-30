@@ -1413,7 +1413,7 @@ class ModelCardMetadata:
         Args:
             interface (ModelInterface | JsonDict | None): Model interface
                 instance or serialized model interface metadata.
-            task_type (str): Task type token stored in the Model spec.
+            task_type (str): model task type token stored in the Model spec.
             signature (ModelSignature | JsonDict | None): Model signature
                 metadata.
             sample_input (SampleInput | JsonDict | None): Optional sample input
@@ -1796,7 +1796,11 @@ class MediaRef:
         ...
 
     def __repr__(self) -> str:
-        """Return a concise representation without payload bytes or URLs."""
+        """Return a concise representation without payload bytes or URLs.
+
+        Returns:
+            str: Redacted media reference representation.
+        """
         ...
 
 class ProviderRequest:
@@ -1808,19 +1812,35 @@ class ProviderRequest:
     system: Any
 
     def model_dump(self) -> JsonDict:
-        """Return the native provider request as a Python dictionary."""
+        """Return the native provider request as a Python dictionary.
+
+        Returns:
+            JsonDict: JSON-compatible provider request.
+        """
         ...
 
     def model_dump_json(self) -> str:
-        """Return the native provider request as JSON."""
+        """Return the native provider request as JSON.
+
+        Returns:
+            str: Serialized provider request JSON.
+        """
         ...
 
     def to_json(self) -> str:
-        """Return the native provider request as JSON."""
+        """Return the native provider request as JSON.
+
+        Returns:
+            str: Serialized provider request JSON.
+        """
         ...
 
     def __str__(self) -> str:
-        """Return pretty JSON for interactive inspection."""
+        """Return pretty JSON for interactive inspection.
+
+        Returns:
+            str: Pretty JSON representation of the provider request.
+        """
         ...
 
 class ResponseFormat:
@@ -1828,25 +1848,278 @@ class ResponseFormat:
 
     @staticmethod
     def text() -> ResponseFormat:
-        """Request plain-text output."""
+        """Request plain-text output.
+
+        Returns:
+            ResponseFormat: Response-format helper for plain text.
+        """
         ...
 
     @staticmethod
     def json_object() -> ResponseFormat:
-        """Request provider-native JSON object output."""
+        """Request provider-native JSON object output.
+
+        Returns:
+            ResponseFormat: Response-format helper for provider JSON object
+                mode.
+        """
         ...
 
     @staticmethod
     def json_schema(name: str, schema: JsonDict) -> ResponseFormat:
-        """Request structured JSON output matching `schema`."""
+        """Request structured JSON output matching `schema`.
+
+        Args:
+            name (str): Provider-visible schema name.
+            schema (JsonDict): JSON Schema object that the response must
+                satisfy.
+
+        Returns:
+            ResponseFormat: Response-format helper for provider JSON Schema
+                mode.
+        """
         ...
 
     def to_dict(self) -> JsonDict:
-        """Return the response format as a Python dictionary."""
+        """Return the response format as a Python dictionary.
+
+        Returns:
+            JsonDict: JSON-compatible response format configuration.
+        """
         ...
 
     def __str__(self) -> str:
-        """Return pretty JSON for interactive inspection."""
+        """Return pretty JSON for interactive inspection.
+
+        Returns:
+            str: Pretty JSON representation of the response format.
+        """
+        ...
+
+class OpenAISettings:
+    """OpenAI Chat generation settings.
+
+    These fields serialize at the top level of the native Chat Completions
+    request. Unknown keyword arguments are preserved and emitted at the same
+    top-level location.
+
+    Args:
+        temperature (float | None): Sampling temperature.
+        top_p (float | None): Nucleus sampling probability.
+        max_tokens (int | None): Legacy Chat output-token cap.
+        max_completion_tokens (int | None): Chat completion-token cap.
+        n (int | None): Number of completions to generate.
+        stop (str | list[str] | None): Stop sequence or sequences.
+        presence_penalty (float | None): Presence penalty.
+        frequency_penalty (float | None): Frequency penalty.
+        seed (int | None): Provider best-effort deterministic seed.
+        logit_bias (Mapping[str, Any] | None): Token-bias map keyed by token id.
+        user (str | None): Provider-visible end-user identifier.
+        reasoning_effort (str | None): Reasoning effort label.
+        modalities (list[str] | None): Requested output modalities.
+        audio (JsonDict | None): Audio output settings.
+        prediction (JsonDict | None): Prediction content hint.
+        prompt_cache_key (str | None): OpenAI prompt cache key.
+        service_tier (str | None): OpenAI service tier.
+        safety_identifier (str | None): Safety identifier.
+        store (bool | None): Whether the provider may store the response.
+        metadata (Mapping[str, Any] | None): Provider metadata object.
+        logprobs (bool | None): Whether to return token log probabilities.
+        top_logprobs (int | None): Number of top token log probabilities.
+        **extra (Any): Unmodeled OpenAI Chat fields.
+    """
+
+    def __init__(
+        self,
+        *,
+        temperature: float | None = ...,
+        top_p: float | None = ...,
+        max_tokens: int | None = ...,
+        max_completion_tokens: int | None = ...,
+        n: int | None = ...,
+        stop: str | list[str] | None = ...,
+        presence_penalty: float | None = ...,
+        frequency_penalty: float | None = ...,
+        seed: int | None = ...,
+        logit_bias: Mapping[str, Any] | None = ...,
+        user: str | None = ...,
+        reasoning_effort: str | None = ...,
+        modalities: list[str] | None = ...,
+        audio: JsonDict | None = ...,
+        prediction: JsonDict | None = ...,
+        prompt_cache_key: str | None = ...,
+        service_tier: str | None = ...,
+        safety_identifier: str | None = ...,
+        store: bool | None = ...,
+        metadata: Mapping[str, Any] | None = ...,
+        logprobs: bool | None = ...,
+        top_logprobs: int | None = ...,
+        **extra: Any,
+    ) -> None:
+        """Create OpenAI Chat settings from keyword arguments."""
+        ...
+
+    @staticmethod
+    def from_dict(value: Mapping[str, Any]) -> OpenAISettings:
+        """Create OpenAI Chat settings from a mapping."""
+        ...
+
+    def to_dict(self) -> JsonDict:
+        """Return settings as a JSON-compatible dictionary."""
+        ...
+
+    def model_dump_json(self) -> str:
+        """Return settings as JSON."""
+        ...
+
+    def __repr__(self) -> str:
+        """Return a concise settings representation."""
+        ...
+
+class OpenAIResponsesSettings:
+    """OpenAI Responses generation settings.
+
+    These fields serialize at the top level of the native Responses request.
+    Unknown keyword arguments are preserved and emitted at the same top-level
+    location.
+
+    Args:
+        temperature (float | None): Sampling temperature.
+        top_p (float | None): Nucleus sampling probability.
+        max_output_tokens (int | None): Responses output-token cap.
+        reasoning (JsonDict | None): Responses reasoning configuration.
+        store (bool | None): Whether the provider may store the response.
+        include (list[str] | None): Additional response fields to include.
+        metadata (Mapping[str, Any] | None): Provider metadata object.
+        **extra (Any): Unmodeled OpenAI Responses fields.
+    """
+
+    def __init__(
+        self,
+        *,
+        temperature: float | None = ...,
+        top_p: float | None = ...,
+        max_output_tokens: int | None = ...,
+        reasoning: JsonDict | None = ...,
+        store: bool | None = ...,
+        include: list[str] | None = ...,
+        metadata: Mapping[str, Any] | None = ...,
+        **extra: Any,
+    ) -> None:
+        """Create OpenAI Responses settings from keyword arguments."""
+        ...
+
+    @staticmethod
+    def from_dict(value: Mapping[str, Any]) -> OpenAIResponsesSettings:
+        """Create OpenAI Responses settings from a mapping."""
+        ...
+
+    def to_dict(self) -> JsonDict:
+        """Return settings as a JSON-compatible dictionary."""
+        ...
+
+    def model_dump_json(self) -> str:
+        """Return settings as JSON."""
+        ...
+
+    def __repr__(self) -> str:
+        """Return a concise settings representation."""
+        ...
+
+class AnthropicSettings:
+    """Anthropic Messages generation settings.
+
+    These fields serialize at the top level of the native Messages request.
+    `max_tokens` defaults to `4096`. Unknown keyword arguments are preserved
+    and emitted at the same top-level location.
+
+    Args:
+        max_tokens (int): Maximum output tokens.
+        temperature (float | None): Sampling temperature.
+        top_p (float | None): Nucleus sampling probability.
+        top_k (int | None): Top-k sampling limit.
+        stop_sequences (list[str] | None): Stop sequences.
+        metadata (Mapping[str, Any] | None): Provider metadata object.
+        thinking (JsonDict | None): Anthropic thinking configuration.
+        **extra (Any): Unmodeled Anthropic Messages fields.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_tokens: int = ...,
+        temperature: float | None = ...,
+        top_p: float | None = ...,
+        top_k: int | None = ...,
+        stop_sequences: list[str] | None = ...,
+        metadata: Mapping[str, Any] | None = ...,
+        thinking: JsonDict | None = ...,
+        **extra: Any,
+    ) -> None:
+        """Create Anthropic settings from keyword arguments."""
+        ...
+
+    @staticmethod
+    def from_dict(value: Mapping[str, Any]) -> AnthropicSettings:
+        """Create Anthropic settings from a mapping."""
+        ...
+
+    def to_dict(self) -> JsonDict:
+        """Return settings as a JSON-compatible dictionary."""
+        ...
+
+    def model_dump_json(self) -> str:
+        """Return settings as JSON."""
+        ...
+
+    def __repr__(self) -> str:
+        """Return a concise settings representation."""
+        ...
+
+class GeminiSettings:
+    """Gemini and Vertex GenerateContent settings.
+
+    These fields serialize at the top level of the native GenerateContent
+    request. Generation knobs such as `temperature`, `top_p`, `top_k`,
+    `max_output_tokens`, and `thinking_config` live inside
+    `generation_config`. Unknown keyword arguments are preserved and emitted at
+    the request top level.
+
+    Args:
+        generation_config (JsonDict | None): Native Google generationConfig object.
+        safety_settings (list[JsonDict] | None): Native Google safetySettings list.
+        cached_content (str | None): Cached content resource name.
+        labels (Mapping[str, Any] | None): Provider labels object.
+        **extra (Any): Unmodeled Gemini or Vertex request fields.
+    """
+
+    def __init__(
+        self,
+        *,
+        generation_config: JsonDict | None = ...,
+        safety_settings: list[JsonDict] | None = ...,
+        cached_content: str | None = ...,
+        labels: Mapping[str, Any] | None = ...,
+        **extra: Any,
+    ) -> None:
+        """Create Gemini or Vertex settings from keyword arguments."""
+        ...
+
+    @staticmethod
+    def from_dict(value: Mapping[str, Any]) -> GeminiSettings:
+        """Create Gemini or Vertex settings from a mapping."""
+        ...
+
+    def to_dict(self) -> JsonDict:
+        """Return settings as a JSON-compatible dictionary."""
+        ...
+
+    def model_dump_json(self) -> str:
+        """Return settings as JSON."""
+        ...
+
+    def __repr__(self) -> str:
+        """Return a concise settings representation."""
         ...
 
 class Prompt:
@@ -1884,9 +2157,10 @@ class Prompt:
     version: str | None
     variables: list[str]
     media_variables: list[str]
+    model_settings: OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | None
 
-    def __new__(
-        cls,
+    def __init__(
+        self,
         messages: Any,
         model: str,
         *,
@@ -1894,15 +2168,36 @@ class Prompt:
         system: str | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
         operation: str | None = ...,
-        temperature: float | None = ...,
-        top_p: float | None = ...,
-        max_tokens: int | None = ...,
-        max_output_tokens: int | None = ...,
-        top_k: int | None = ...,
+        cache: str | Mapping[str, Any] | None = ...,
+        model_settings: OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
         version: str | None = ...,
-    ) -> Prompt:
-        """Build a provider-native prompt from dynamic authoring inputs."""
+    ) -> None:
+        """Build a provider-native prompt from dynamic authoring inputs.
+
+        Args:
+            messages (Any): Provider-shaped message input. Strings are treated
+                as user text; sequences and mappings are coerced into the
+                target provider's native request shape.
+            model (str): Provider model identifier to store on the native
+                prompt and request.
+            provider (str): Provider name. Accepted values are `openai`,
+                `anthropic`, `gemini`, `google`, `vertex`, or a custom provider
+                accepted by the raw passthrough path.
+            system (str | None): Optional system instruction when supported by
+                the selected provider.
+            response_format (ResponseFormat | JsonDict | None): Optional
+                structured-output helper or schema dictionary.
+            operation (str | None): Optional provider operation selector used
+                by provider families with more than one request shape.
+            cache (str | Mapping[str, Any] | None): Optional cache sugar for
+                providers with a native cache key.
+            model_settings (OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | Mapping[str, Any] | None): Native provider generation settings object or mapping. Explicit settings take precedence over cache sugar.
+            variables (list[str] | None): Declared text variables. When
+                omitted, Wyrd infers `{{name}}` placeholders from the request.
+            version (str | None): Optional prompt version string stored on the
+                native prompt.
+        """
         ...
 
     @staticmethod
@@ -1912,13 +2207,28 @@ class Prompt:
         system: str | None = ...,
         messages: Any | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
-        temperature: float | None = ...,
-        top_p: float | None = ...,
-        max_tokens: int | None = ...,
+        cache: str | Mapping[str, Any] | None = ...,
+        model_settings: OpenAISettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
         version: str | None = ...,
     ) -> Prompt:
-        """Build an OpenAI Chat prompt."""
+        """Build an OpenAI Chat prompt.
+
+        Args:
+            model (str): OpenAI model identifier.
+            system (str | None): Optional system message prepended to the chat.
+            messages (Any | None): Optional user-authored chat messages.
+            response_format (ResponseFormat | JsonDict | None): Optional
+                response-format helper or schema dictionary.
+            cache (str | Mapping[str, Any] | None): Optional prompt cache key.
+            model_settings (OpenAISettings | Mapping[str, Any] | None): OpenAI settings object or mapping.
+            variables (list[str] | None): Declared text variables. When
+                omitted, Wyrd infers `{{name}}` placeholders.
+            version (str | None): Optional prompt version string.
+
+        Returns:
+            Prompt: Prompt wrapping an OpenAI Chat Completions request.
+        """
         ...
 
     @staticmethod
@@ -1928,13 +2238,26 @@ class Prompt:
         instructions: str | None = ...,
         messages: Any | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
-        temperature: float | None = ...,
-        top_p: float | None = ...,
-        max_output_tokens: int | None = ...,
+        model_settings: OpenAIResponsesSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
         version: str | None = ...,
     ) -> Prompt:
-        """Build an OpenAI Responses prompt."""
+        """Build an OpenAI Responses prompt.
+
+        Args:
+            model (str): OpenAI model identifier.
+            instructions (str | None): Optional Responses API instructions.
+            messages (Any | None): Optional Responses API input items.
+            response_format (ResponseFormat | JsonDict | None): Optional
+                response-format helper or schema dictionary.
+            model_settings (OpenAIResponsesSettings | Mapping[str, Any] | None): OpenAI Responses settings object or mapping.
+            variables (list[str] | None): Declared text variables. When
+                omitted, Wyrd infers `{{name}}` placeholders.
+            version (str | None): Optional prompt version string.
+
+        Returns:
+            Prompt: Prompt wrapping an OpenAI Responses request.
+        """
         ...
 
     @staticmethod
@@ -1943,15 +2266,27 @@ class Prompt:
         *,
         system: str | None = ...,
         messages: Any | None = ...,
-        max_tokens: int = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
-        temperature: float | None = ...,
-        top_p: float | None = ...,
-        top_k: int | None = ...,
+        model_settings: AnthropicSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
         version: str | None = ...,
     ) -> Prompt:
-        """Build an Anthropic Messages prompt."""
+        """Build an Anthropic Messages prompt.
+
+        Args:
+            model (str): Anthropic model identifier.
+            system (str | None): Optional system instruction.
+            messages (Any | None): Optional Anthropic message list.
+            response_format (ResponseFormat | JsonDict | None): Optional
+                response-format helper or schema dictionary.
+            model_settings (AnthropicSettings | Mapping[str, Any] | None): Anthropic settings object or mapping.
+            variables (list[str] | None): Declared text variables. When
+                omitted, Wyrd infers `{{name}}` placeholders.
+            version (str | None): Optional prompt version string.
+
+        Returns:
+            Prompt: Prompt wrapping an Anthropic Messages request.
+        """
         ...
 
     @staticmethod
@@ -1961,14 +2296,26 @@ class Prompt:
         system: str | None = ...,
         messages: Any | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
-        temperature: float | None = ...,
-        top_p: float | None = ...,
-        top_k: int | None = ...,
-        max_output_tokens: int | None = ...,
+        model_settings: GeminiSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
         version: str | None = ...,
     ) -> Prompt:
-        """Build a Gemini GenerateContent prompt."""
+        """Build a Gemini GenerateContent prompt.
+
+        Args:
+            model (str): Gemini model identifier.
+            system (str | None): Optional system instruction.
+            messages (Any | None): Optional Gemini content turns.
+            response_format (ResponseFormat | JsonDict | None): Optional
+                response-format helper or schema dictionary.
+            model_settings (GeminiSettings | Mapping[str, Any] | None): Gemini settings object or mapping.
+            variables (list[str] | None): Declared text variables. When
+                omitted, Wyrd infers `{{name}}` placeholders.
+            version (str | None): Optional prompt version string.
+
+        Returns:
+            Prompt: Prompt wrapping a Gemini GenerateContent request.
+        """
         ...
 
     @staticmethod
@@ -1978,47 +2325,121 @@ class Prompt:
         system: str | None = ...,
         messages: Any | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
-        temperature: float | None = ...,
-        top_p: float | None = ...,
-        top_k: int | None = ...,
-        max_output_tokens: int | None = ...,
+        model_settings: GeminiSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
         version: str | None = ...,
     ) -> Prompt:
-        """Build a Vertex GenerateContent prompt."""
+        """Build a Vertex GenerateContent prompt.
+
+        Args:
+            model (str): Vertex model identifier.
+            system (str | None): Optional system instruction.
+            messages (Any | None): Optional Vertex content turns.
+            response_format (ResponseFormat | JsonDict | None): Optional
+                response-format helper or schema dictionary.
+            model_settings (GeminiSettings | Mapping[str, Any] | None): Gemini settings object or mapping.
+            variables (list[str] | None): Declared text variables. When
+                omitted, Wyrd infers `{{name}}` placeholders.
+            version (str | None): Optional prompt version string.
+
+        Returns:
+            Prompt: Prompt wrapping a Vertex GenerateContent request.
+        """
         ...
 
     @staticmethod
     def raw(provider: str, model: str, body: bytes) -> Prompt:
-        """Build a raw JSON passthrough prompt."""
+        """Build a raw JSON passthrough prompt.
+
+        Args:
+            provider (str): Provider dispatch target for the raw body.
+            model (str): Model identifier used for indexing and selection.
+            body (bytes): Raw provider request JSON bytes.
+
+        Returns:
+            Prompt: Prompt wrapping a raw provider request.
+        """
         ...
 
     def system(self, text: str) -> Prompt:
-        """Return a copy with a system message applied."""
+        """Return a copy with a system message applied.
+
+        Args:
+            text (str): System instruction text.
+
+        Returns:
+            Prompt: New prompt with the system instruction applied.
+        """
         ...
 
     def user(self, content: Any) -> Prompt:
-        """Return a copy with a user message appended."""
+        """Return a copy with a user message appended.
+
+        Args:
+            content (Any): Provider-compatible user message content.
+
+        Returns:
+            Prompt: New prompt with the user message appended.
+        """
         ...
 
     def assistant(self, content: Any) -> Prompt:
-        """Return a copy with an assistant message appended."""
+        """Return a copy with an assistant message appended.
+
+        Args:
+            content (Any): Provider-compatible assistant message content.
+
+        Returns:
+            Prompt: New prompt with the assistant message appended.
+        """
         ...
 
     def tool_result(self, tool_use_id: str, content: str, is_error: bool = ...) -> Prompt:
-        """Return a copy with a native tool-result message appended."""
+        """Return a copy with a native tool-result message appended.
+
+        Args:
+            tool_use_id (str): Provider tool-call identifier being answered.
+            content (str): Tool result text.
+            is_error (bool): Whether the tool result represents an error.
+
+        Returns:
+            Prompt: New prompt with the tool-result message appended.
+        """
         ...
 
     def render(self, **kwargs: str) -> ProviderRequest:
-        """Render declared variables and return a provider request."""
+        """Render declared variables and return a provider request.
+
+        Args:
+            **kwargs (str): Text variable bindings keyed by variable name.
+
+        Returns:
+            ProviderRequest: Rendered provider-native request.
+        """
         ...
 
     def bind(self, name: str | None = ..., value: Any | None = ..., **kwargs: Any) -> Prompt:
-        """Return a copy with one or more variables bound."""
+        """Return a copy with one or more variables bound.
+
+        Args:
+            name (str | None): Optional single text variable name.
+            value (Any | None): Optional value for `name`.
+            **kwargs (Any): Additional text variable bindings.
+
+        Returns:
+            Prompt: New prompt with bound text variables removed from
+                `variables`.
+        """
         ...
 
     def bind_mut(self, name: str | None = ..., value: Any | None = ..., **kwargs: Any) -> None:
-        """Bind one or more variables in place."""
+        """Bind one or more variables in place.
+
+        Args:
+            name (str | None): Optional single text variable name.
+            value (Any | None): Optional value for `name`.
+            **kwargs (Any): Additional text variable bindings.
+        """
         ...
 
     def bind_media(self, name: str, media: MediaRef) -> Prompt:
@@ -2056,77 +2477,345 @@ class Prompt:
         ...
 
     def model_dump(self) -> JsonDict:
-        """Return the native prompt as a Python dictionary."""
+        """Return the native prompt as a Python dictionary.
+
+        Returns:
+            JsonDict: JSON-compatible native prompt representation.
+        """
         ...
 
     def model_dump_json(self) -> str:
-        """Return the native prompt as JSON."""
+        """Return the native prompt as JSON.
+
+        Returns:
+            str: Serialized native prompt JSON.
+        """
         ...
 
     def to_json(self) -> str:
-        """Return the native prompt as JSON."""
+        """Return the native prompt as JSON.
+
+        Returns:
+            str: Serialized native prompt JSON.
+        """
         ...
 
     @staticmethod
     def from_json(data: str) -> Prompt:
-        """Build a prompt from serialized native prompt JSON."""
+        """Build a prompt from serialized native prompt JSON.
+
+        Args:
+            data (str): Serialized native prompt JSON.
+
+        Returns:
+            Prompt: Prompt rebuilt from the serialized native prompt.
+        """
         ...
 
     @staticmethod
     def load(path: PathLike) -> Prompt:
-        """Load a bare native prompt from JSON or YAML."""
+        """Load a bare native prompt from JSON or YAML.
+
+        Args:
+            path (PathLike): Source `.json`, `.yaml`, or `.yml` prompt file.
+
+        Returns:
+            Prompt: Prompt loaded from the bare prompt spec file.
+        """
         ...
 
     def dump(self, path: PathLike) -> None:
-        """Dump a bare native prompt to JSON or YAML."""
+        """Dump a bare native prompt to JSON or YAML.
+
+        Args:
+            path (PathLike): Target `.json`, `.yaml`, or `.yml` prompt file.
+        """
         ...
 
     @staticmethod
     def openai_image_url(url: str, detail: str | None = ...) -> JsonDict:
-        """Return an OpenAI image URL content part."""
+        """Return an OpenAI image URL content part.
+
+        Args:
+            url (str): Image URL.
+            detail (str | None): Optional OpenAI image detail hint.
+
+        Returns:
+            JsonDict: OpenAI image URL content part.
+        """
         ...
 
     @staticmethod
     def anthropic_image_base64(media_type: str, data: str) -> JsonDict:
-        """Return an Anthropic base64 image content block."""
+        """Return an Anthropic base64 image content block.
+
+        Args:
+            media_type (str): Image MIME type.
+            data (str): Base64 image payload.
+
+        Returns:
+            JsonDict: Anthropic image content block.
+        """
         ...
 
     @staticmethod
     def google_file_data(mime_type: str, file_uri: str) -> JsonDict:
-        """Return a Google file-data content part."""
+        """Return a Google file-data content part.
+
+        Args:
+            mime_type (str): File MIME type.
+            file_uri (str): Google file URI.
+
+        Returns:
+            JsonDict: Google file-data content part.
+        """
         ...
 
     @staticmethod
     def image_url(url: str, *, detail: str | None = ..., provider: str = ...) -> JsonDict:
-        """Return an image URL content helper."""
+        """Return an image URL content helper.
+
+        Args:
+            url (str): Image URL.
+            detail (str | None): Optional image detail hint.
+            provider (str): Provider-specific helper target.
+
+        Returns:
+            JsonDict: Provider-specific image URL content value.
+        """
         ...
 
     @staticmethod
     def image_base64(media_type: str, data: str) -> JsonDict:
-        """Return a base64 image content helper."""
+        """Return a base64 image content helper.
+
+        Args:
+            media_type (str): Image MIME type.
+            data (str): Base64 image payload.
+
+        Returns:
+            JsonDict: Provider-specific base64 image content value.
+        """
         ...
 
     @staticmethod
     def file_uri(mime_type: str, file_uri: str) -> JsonDict:
-        """Return a file URI content helper."""
+        """Return a file URI content helper.
+
+        Args:
+            mime_type (str): File MIME type.
+            file_uri (str): Provider file URI.
+
+        Returns:
+            JsonDict: Provider-specific file URI content value.
+        """
         ...
 
     @staticmethod
     def file_id(file_id: str) -> JsonDict:
-        """Return a file-id content helper."""
+        """Return a file-id content helper.
+
+        Args:
+            file_id (str): Provider file identifier.
+
+        Returns:
+            JsonDict: Provider-specific file-id content value.
+        """
         ...
 
     @staticmethod
     def document_text(media_type: str, data: str, title: str | None = ...) -> JsonDict:
-        """Return a text document content helper."""
+        """Return a text document content helper.
+
+        Args:
+            media_type (str): Document MIME type.
+            data (str): Document text payload.
+            title (str | None): Optional document title.
+
+        Returns:
+            JsonDict: Provider-specific text document content value.
+        """
         ...
 
     def __str__(self) -> str:
-        """Return pretty JSON for interactive inspection."""
+        """Return pretty JSON for interactive inspection.
+
+        Returns:
+            str: Pretty JSON representation of the native prompt.
+        """
+        ...
+
+class PromptCardMetadata:
+    """Local holder metadata used when serializing a `PromptCard`.
+
+    The metadata stores the native prompt body that becomes
+    `PromptSpec.prompt` in the Wyrd card envelope.
+    """
+
+    prompt: Prompt
+
+    def __init__(
+        self,
+        prompt: Prompt | None = ...,
+        *,
+        model_settings: OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | Mapping[str, Any] | None = ...,
+    ) -> None:
+        """Create prompt card metadata from an optional `Prompt`.
+
+        Args:
+            prompt (Prompt | None): Native prompt builder to store in metadata.
+                When omitted, Wyrd creates placeholder metadata that callers can
+                replace before serialization.
+            model_settings (OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | Mapping[str, Any] | None): Provider-native generation settings to apply to `prompt` before storing metadata.
+        """
+        ...
+
+    def to_dict(self) -> JsonDict:
+        """Return this metadata as a Python dictionary.
+
+        Returns:
+            JsonDict: JSON-compatible holder metadata.
+        """
+        ...
+
+    def to_spec(self) -> JsonDict:
+        """Return the validated PromptSpec body as a Python dictionary.
+
+        Returns:
+            JsonDict: JSON-compatible `PromptSpec` body containing the native
+                prompt.
+
+        Raises:
+            WyrdError: If the stored prompt violates PromptCard validation.
+        """
+        ...
+
+class PromptCard:
+    """Local PromptCard holder for filesystem materialization.
+
+    A `PromptCard` wraps a live `Prompt`, local card identity, labels,
+    annotations, and metadata. It can save and load local JSON or YAML card
+    envelopes, but registration belongs to registry/client surfaces.
+    """
+
+    space: str
+    name: str
+    version: str
+    uid: str
+    labels: dict[str, str]
+    annotations: dict[str, str]
+    metadata: PromptCardMetadata
+    prompt: Prompt
+    model_settings: OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | None
+    content_hash: str
+    parameters: list[str]
+    is_fully_bound: bool
+    card_ref: str
+    is_card: bool
+
+    def __init__(
+        self,
+        prompt: Prompt,
+        space: str | None = ...,
+        name: str | None = ...,
+        version: str | None = ...,
+        uid: str | None = ...,
+        labels: Mapping[str, str] | None = ...,
+        annotations: Mapping[str, str] | None = ...,
+        metadata: PromptCardMetadata | None = ...,
+        model_settings: OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | Mapping[str, Any] | None = ...,
+    ) -> None:
+        """Create a local `PromptCard` from a `Prompt`.
+
+        Args:
+            prompt (Prompt): Live prompt builder to store in the PromptCard
+                spec body.
+            space (str | None): Optional card space. Defaults to `default`.
+            name (str | None): Optional card name. Defaults to `prompt`.
+            version (str | None): Optional semantic version. Defaults to
+                `0.1.0`.
+            uid (str | None): Optional card UID. Defaults to a generated UID.
+            labels (Mapping[str, str] | None): Queryable user labels copied
+                into card metadata.
+            annotations (Mapping[str, str] | None): Free-form user annotations
+                copied into card metadata.
+            metadata (PromptCardMetadata | None): Existing holder metadata to
+                seed before the live prompt is captured.
+            model_settings (OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | Mapping[str, Any] | None): Provider-native generation settings to apply to the captured prompt. Typed settings must match the prompt provider; mappings decode into the active provider shape.
+
+        Raises:
+            WyrdError: If labels, annotations, identity fields, or prompt
+                metadata violate the PromptCard contract.
+        """
+        ...
+
+    def save(self, path: PathLike) -> None:
+        """Save this PromptCard envelope to a local JSON or YAML file.
+
+        Args:
+            path (PathLike): Target `.json`, `.yaml`, or `.yml` file path.
+
+        Raises:
+            WyrdError: If the path extension is unsupported, the card cannot be
+                serialized, or filesystem IO fails.
+        """
+        ...
+
+    @staticmethod
+    def load(path: PathLike) -> PromptCard:
+        """Load a PromptCard envelope from a local JSON or YAML file.
+
+        Args:
+            path (PathLike): Source `.json`, `.yaml`, or `.yml` file path.
+
+        Returns:
+            PromptCard: Local holder rebuilt from the serialized envelope.
+
+        Raises:
+            WyrdError: If the file cannot be read, parsed, or validated as a
+                PromptCard envelope.
+        """
+        ...
+
+    def model_dump_json(self) -> str:
+        """Return this PromptCard as a JSON envelope string.
+
+        Returns:
+            str: Serialized Wyrd card envelope.
+
+        Raises:
+            WyrdError: If the prompt or holder identity cannot be converted
+                into a valid PromptCard envelope.
+        """
+        ...
+
+    @staticmethod
+    def model_validate_json(json_string: str) -> PromptCard:
+        """Build a PromptCard from serialized card-envelope JSON.
+
+        Args:
+            json_string (str): Serialized Wyrd PromptCard envelope.
+
+        Returns:
+            PromptCard: Local holder rebuilt from the JSON envelope.
+
+        Raises:
+            WyrdError: If the JSON is invalid or does not contain a
+                `apiVersion: wyrd/v1`, `kind: Prompt` envelope.
+        """
+        ...
+
+    def __str__(self) -> str:
+        """Return pretty JSON for interactive inspection.
+
+        Returns:
+            str: Pretty JSON representation of the PromptCard envelope.
+        """
         ...
 
 ### GLOBAL EXPORTS ###
 __all__ = [
+    "AnthropicSettings",
     "ArrowInterface",
     "ArtifactCard",
     "CatboostInterface",
@@ -2136,6 +2825,7 @@ __all__ = [
     "DataSchema",
     "DataStats",
     "FieldSpec",
+    "GeminiSettings",
     "HuggingfaceInterface",
     "ImageInterface",
     "JsonlInterface",
@@ -2147,10 +2837,14 @@ __all__ = [
     "ModelInterface",
     "ModelSignature",
     "NumpyInterface",
+    "OpenAIResponsesSettings",
+    "OpenAISettings",
     "PandasInterface",
     "ParquetInterface",
     "PolarsInterface",
     "Prompt",
+    "PromptCard",
+    "PromptCardMetadata",
     "ProviderRequest",
     "ResponseFormat",
     "SampleInput",

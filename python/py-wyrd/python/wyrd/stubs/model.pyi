@@ -644,7 +644,7 @@ class ModelCardMetadata:
         Args:
             interface (ModelInterface | JsonDict | None): Model interface
                 instance or serialized model interface metadata.
-            task_type (str): Task type token stored in the Model spec.
+            task_type (str): model task type token stored in the Model spec.
             signature (ModelSignature | JsonDict | None): Model signature
                 metadata.
             sample_input (SampleInput | JsonDict | None): Optional sample input

@@ -22,6 +22,8 @@ pub mod messages;
 pub mod prompt;
 /// Response format helpers for provider-native structured output fields.
 pub mod response_format;
+/// Provider-native generation settings wrappers.
+pub mod settings;
 
 pub use builder::{
     AnthropicOptions, GeminiOptions, OpenAiChatOptions, OpenAiResponsesOptions, VertexOptions,
@@ -31,6 +33,11 @@ pub use error::{PromptBuilderError, PromptBuilderResult};
 pub use media::{MAX_MEDIA_FILE_BYTES, PyMediaRef, document_path, image_path};
 pub use prompt::{Prompt, PyProviderRequest};
 pub use response_format::{ResponseFormat, ResponseFormatKind};
+pub use settings::{
+    PyAnthropicSettings, PyGoogleGenerateSettings, PyOpenAiChatSettings, PyOpenAiResponsesSettings,
+};
+#[cfg(feature = "python")]
+pub use settings::{apply_model_settings, model_settings_py, prompt_py};
 
 #[cfg(feature = "python")]
 use pyo3::{prelude::*, types::PyModule};
@@ -43,5 +50,9 @@ pub fn register_prompt(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyProviderRequest>()?;
     module.add_class::<PyMediaRef>()?;
     module.add_class::<ResponseFormat>()?;
+    module.add_class::<PyOpenAiChatSettings>()?;
+    module.add_class::<PyOpenAiResponsesSettings>()?;
+    module.add_class::<PyAnthropicSettings>()?;
+    module.add_class::<PyGoogleGenerateSettings>()?;
     Ok(())
 }

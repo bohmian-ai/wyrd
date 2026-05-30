@@ -1350,7 +1350,7 @@
           }
         }
       },
-      "additionalProperties": false
+      "additionalProperties": true
     },
     "GoogleGenerationConfig": {
       "type": "object",
@@ -1450,7 +1450,8 @@
           ],
           "format": "float"
         }
-      }
+      },
+      "additionalProperties": true
     },
     "GoogleInlineData": {
       "type": "object",
@@ -1803,10 +1804,7 @@
             "object",
             "null"
           ],
-          "additionalProperties": {
-            "type": "integer",
-            "format": "int32"
-          }
+          "additionalProperties": true
         },
         "logprobs": {
           "type": [
@@ -1841,9 +1839,7 @@
             "object",
             "null"
           ],
-          "additionalProperties": {
-            "type": "string"
-          }
+          "additionalProperties": true
         },
         "modalities": {
           "type": [
@@ -3109,6 +3105,7 @@
       ]
     },
     "OpenAiResponsesRequest": {
+      "description": "Native OpenAI Responses generation settings flattened into the request body.",
       "type": "object",
       "required": [
         "input",
@@ -3149,9 +3146,7 @@
             "object",
             "null"
           ],
-          "additionalProperties": {
-            "type": "string"
-          }
+          "additionalProperties": true
         },
         "model": {
           "type": "string"

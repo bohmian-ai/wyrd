@@ -10,16 +10,18 @@ use crate::media::{MediaKind, MediaRef, MediaSource};
 use crate::request::{ProviderName, ProviderRequest};
 use crate::wire::anthropic_messages::{
     AnthropicContentBlock, AnthropicDocumentSource, AnthropicImageSource, AnthropicMessagesRequest,
-    AnthropicSystem, AnthropicSystemBlock,
+    AnthropicMessagesSettings, AnthropicSystem, AnthropicSystemBlock,
 };
 use crate::wire::google_generate::{
-    GoogleContent, GoogleFileData, GoogleGenerateContentRequest, GoogleInlineData, GooglePart,
+    GoogleContent, GoogleFileData, GoogleGenerateContentRequest, GoogleGenerateSettings,
+    GoogleInlineData, GooglePart,
 };
 use crate::wire::openai_chat::{
-    OpenAiChatRequest, OpenAiContentPart, OpenAiFilePart, OpenAiImageUrl, OpenAiMessageContent,
+    OpenAiChatRequest, OpenAiChatSettings, OpenAiContentPart, OpenAiFilePart, OpenAiImageUrl,
+    OpenAiMessageContent,
 };
 use crate::wire::openai_responses::{
-    OpenAiResponseContentPart, OpenAiResponseItem, OpenAiResponsesRequest,
+    OpenAiResponseContentPart, OpenAiResponseItem, OpenAiResponsesRequest, OpenAiResponsesSettings,
 };
 
 /// Authored native prompt request plus render metadata.
@@ -42,6 +44,18 @@ pub struct Prompt {
     /// Expected response shape for runtime validation.
     #[serde(default)]
     pub response_type: ResponseType,
+}
+
+/// Borrowed view of native generation settings for the active provider.
+pub enum ProviderSettingsRef<'a> {
+    /// OpenAI Chat settings.
+    OpenAiChat(&'a OpenAiChatSettings),
+    /// OpenAI Responses settings.
+    OpenAiResponses(&'a OpenAiResponsesSettings),
+    /// Anthropic Messages settings.
+    Anthropic(&'a AnthropicMessagesSettings),
+    /// Google Gemini or Vertex GenerateContent settings.
+    Google(&'a GoogleGenerateSettings),
 }
 
 /// Expected response shape for a rendered prompt.
@@ -130,6 +144,31 @@ impl Prompt {
         prompt.normalize_media_placeholders_mut()?;
         prompt.variables = extract_text_variables(&prompt.request)?;
         Ok(prompt)
+    }
+
+    /// Borrow native generation settings for the request's active provider.
+    pub fn settings_ref(&self) -> Option<ProviderSettingsRef<'_>> {
+        match &self.request {
+            ProviderRequest::OpenAiChatCompletion(request) => {
+                Some(ProviderSettingsRef::OpenAiChat(&request.settings))
+            }
+            ProviderRequest::OpenAiResponses(request) => {
+                Some(ProviderSettingsRef::OpenAiResponses(&request.settings))
+            }
+            ProviderRequest::AnthropicMessage(request) => {
+                Some(ProviderSettingsRef::Anthropic(&request.settings))
+            }
+            ProviderRequest::GeminiGenerateContent(request) => {
+                Some(ProviderSettingsRef::Google(&request.settings))
+            }
+            ProviderRequest::Vertex(request) => {
+                Some(ProviderSettingsRef::Google(&request.0.settings))
+            }
+            ProviderRequest::OpenAiEmbeddings(_)
+            | ProviderRequest::GoogleBatchEmbed(_)
+            | ProviderRequest::VertexPredict(_)
+            | ProviderRequest::RawV1 { .. } => None,
+        }
     }
 
     /// Split `${media:name}` tokens into isolated provider-native text parts.

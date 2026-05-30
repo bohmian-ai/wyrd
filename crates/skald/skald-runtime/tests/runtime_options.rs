@@ -46,6 +46,6 @@ fn google_cached_content_option_stays_native() {
     assert!(matches!(
         request,
         ProviderRequest::GeminiGenerateContent(inner)
-            if inner.cached_content.as_deref() == Some("cachedContents/abc")
+            if inner.settings.cached_content.as_deref() == Some("cachedContents/abc")
     ));
 }

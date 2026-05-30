@@ -743,6 +743,34 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Prompt model_settings object did not match the selected provider.
+    #[error("[WYRD_PROMPT_400_SETTINGS_PROVIDER_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_400_SETTINGS_PROVIDER_MISMATCH",
+        status = 400,
+        title = "model_settings provider mismatch",
+        remediation = "Pass the settings type for this provider, or pass a dict."
+    )]
+    PromptSettingsProviderMismatch {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Prompt model_settings value failed to decode.
+    #[error("[WYRD_PROMPT_400_SETTINGS_DECODE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_400_SETTINGS_DECODE",
+        status = 400,
+        title = "model_settings decode failed",
+        remediation = "Check model_settings field names and types; unknown fields are allowed and pass through."
+    )]
+    PromptSettingsDecode {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Prompt render call omitted a declared variable.
     #[error("[WYRD_PROMPT_422_MISSING_VARIABLE] {message}")]
     #[wyrd_error(
@@ -857,6 +885,8 @@ impl WyrdError {
             | Self::PromptProviderUpstream { message, details }
             | Self::PromptProviderTimeout { message, details }
             | Self::PromptProviderMismatch { message, details }
+            | Self::PromptSettingsProviderMismatch { message, details }
+            | Self::PromptSettingsDecode { message, details }
             | Self::PromptMissingVariable { message, details }
             | Self::PromptUnsupportedHandoff { message, details }
             | Self::PromptResponseDecode { message, details } => (message, details),
@@ -949,6 +979,25 @@ impl From<skald_spec::SkaldError> for WyrdError {
                     }),
                 }
             }
+            skald_spec::SkaldError::SettingsProviderMismatch { expected, got } => {
+                Self::PromptSettingsProviderMismatch {
+                    message,
+                    details: serde_json::json!({
+                        "expected": format!("{expected:?}"),
+                        "got": format!("{got:?}"),
+                    }),
+                }
+            }
+            skald_spec::SkaldError::SettingsDecode {
+                provider,
+                message: source,
+            } => Self::PromptSettingsDecode {
+                message,
+                details: serde_json::json!({
+                    "provider": format!("{provider:?}"),
+                    "source": source,
+                }),
+            },
             other => Self::internal_from_skald(other.code(), other.to_string()),
         }
     }

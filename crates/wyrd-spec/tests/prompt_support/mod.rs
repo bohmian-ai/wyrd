@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 use skald_spec::wire::anthropic_messages::{
     AnthropicCacheControl, AnthropicSystem, AnthropicSystemBlock, AnthropicToolResultContent,
 };
@@ -10,9 +10,10 @@ use skald_spec::wire::openai_chat::OpenAiMessageContent;
 use skald_spec::wire::openai_responses::{OpenAiResponseContentPart, OpenAiResponseItem};
 use skald_spec::wire::vertex_generate::VertexGenerateContentRequest;
 use skald_spec::{
-    AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest, GoogleContent,
-    GoogleGenerateContentRequest, GooglePart, OpenAiChatMessage, OpenAiChatRequest,
-    OpenAiResponsesRequest, Prompt, ProviderName, ProviderRequest, ResponseType,
+    AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest, AnthropicMessagesSettings,
+    GoogleContent, GoogleGenerateContentRequest, GoogleGenerateSettings, GooglePart,
+    OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, OpenAiResponsesRequest,
+    OpenAiResponsesSettings, Prompt, ProviderName, ProviderRequest, ResponseType,
 };
 use wyrd_spec::card::prompt::PromptSpec;
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
@@ -65,35 +66,13 @@ pub fn openai_chat_request(text: &str) -> ProviderRequest {
             tool_call_id: None,
             refusal: None,
         }],
-        temperature: None,
-        top_p: None,
-        max_tokens: None,
-        max_completion_tokens: None,
-        n: None,
-        stop: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        seed: None,
-        logit_bias: None,
-        user: None,
-        reasoning_effort: None,
-        modalities: None,
-        audio: None,
-        prediction: None,
         response_format: None,
         stream: None,
         stream_options: None,
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
-        prompt_cache_key: None,
-        service_tier: None,
-        safety_identifier: None,
-        store: None,
-        metadata: None,
-        logprobs: None,
-        top_logprobs: None,
-        extra: Map::new(),
+        settings: OpenAiChatSettings::default(),
     })
 }
 
@@ -107,20 +86,13 @@ pub fn openai_responses_request(text: &str) -> ProviderRequest {
             }],
         }],
         instructions: None,
-        temperature: None,
-        top_p: None,
-        max_output_tokens: None,
-        reasoning: None,
         text: None,
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
         previous_response_id: None,
-        store: None,
         stream: None,
-        include: None,
-        metadata: None,
-        extra: Map::new(),
+        settings: OpenAiResponsesSettings::default(),
     })
 }
 
@@ -135,18 +107,14 @@ pub fn anthropic_request(text: &str) -> ProviderRequest {
                 citations: None,
             }],
         }],
-        max_tokens: 128,
         system: None,
-        temperature: None,
-        top_p: None,
-        top_k: None,
-        stop_sequences: None,
-        metadata: None,
         stream: None,
         tools: None,
         tool_choice: None,
-        thinking: None,
-        extra: Map::new(),
+        settings: AnthropicMessagesSettings {
+            max_tokens: 128,
+            ..AnthropicMessagesSettings::default()
+        },
     })
 }
 
@@ -199,12 +167,9 @@ pub fn google_request(text: &str) -> ProviderRequest {
             }],
         }],
         system_instruction: None,
-        generation_config: None,
-        safety_settings: None,
         tools: None,
         tool_config: None,
-        cached_content: None,
-        labels: None,
+        settings: GoogleGenerateSettings::default(),
     })
 }
 

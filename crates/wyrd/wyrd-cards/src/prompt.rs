@@ -229,14 +229,18 @@ impl PromptCardMetadata {
     /// Create `PromptCard` metadata from an optional Python `Prompt`.
     ///
     /// # Errors
-    /// Returns a Wyrd error when `prompt` is not a `wyrd.prompt.Prompt`.
+    /// Returns a Wyrd error when `prompt` or `model_settings` is invalid.
     #[new]
-    #[pyo3(signature = (prompt=None))]
-    pub fn __new__(prompt: Option<&Bound<'_, PyAny>>) -> CardPyResult<Self> {
+    #[pyo3(signature = (prompt=None, *, model_settings=None))]
+    pub fn __new__(
+        prompt: Option<&Bound<'_, PyAny>>,
+        model_settings: Option<&Bound<'_, PyAny>>,
+    ) -> CardPyResult<Self> {
         let prompt = prompt
             .map(native_prompt_from_py)
             .transpose()?
             .unwrap_or_else(default_prompt);
+        let prompt = skald_prompt::apply_model_settings(&prompt, model_settings)?;
         Ok(Self { prompt })
     }
 
@@ -277,13 +281,15 @@ impl PromptCard {
     /// * `labels` - Optional queryable labels.
     /// * `annotations` - Optional free-form annotations.
     /// * `metadata` - Optional holder metadata to seed before prompt capture.
+    /// * `model_settings` - Optional provider-native generation settings.
     ///
     /// # Errors
-    /// Returns a Wyrd error when the prompt or metadata labels are invalid.
+    /// Returns a Wyrd error when the prompt, settings, or metadata labels are invalid.
     #[new]
-    #[pyo3(signature = (prompt, space=None, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None))]
+    #[pyo3(signature = (prompt, space=None, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None, model_settings=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn __new__(
+        py: Python<'_>,
         prompt: &Bound<'_, PyAny>,
         space: Option<&str>,
         name: Option<&str>,
@@ -292,11 +298,18 @@ impl PromptCard {
         labels: Option<BTreeMap<String, String>>,
         annotations: Option<BTreeMap<String, String>>,
         metadata: Option<PromptCardMetadata>,
+        model_settings: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<Self> {
         let mut metadata = metadata.unwrap_or(PromptCardMetadata {
             prompt: default_prompt(),
         });
-        metadata.prompt = native_prompt_from_py(prompt)?;
+        metadata.prompt =
+            skald_prompt::apply_model_settings(&native_prompt_from_py(prompt)?, model_settings)?;
+        let prompt = if model_settings.is_some_and(|value| !value.is_none()) {
+            Some(skald_prompt::prompt_py(metadata.prompt.clone(), py)?)
+        } else {
+            Some(prompt.clone().unbind())
+        };
 
         Ok(Self {
             space: space.unwrap_or("default").to_owned(),
@@ -308,7 +321,7 @@ impl PromptCard {
             metadata,
             created_at: Utc::now(),
             is_card: true,
-            prompt: Some(prompt.clone().unbind()),
+            prompt,
         })
     }
 
@@ -318,11 +331,7 @@ impl PromptCard {
         if let Some(prompt) = self.prompt.as_ref() {
             return Ok(prompt.clone_ref(py));
         }
-        Ok(Py::new(
-            py,
-            skald_prompt::Prompt::from_native(self.metadata.prompt.clone()),
-        )?
-        .into_any())
+        skald_prompt::prompt_py(self.metadata.prompt.clone(), py)
     }
 
     /// Replace the held live prompt and `PromptCard` metadata.
@@ -334,6 +343,12 @@ impl PromptCard {
         self.metadata.prompt = native_prompt_from_py(prompt)?;
         self.prompt = Some(prompt.clone().unbind());
         Ok(())
+    }
+
+    /// Return typed provider generation settings, or `None` for raw prompts.
+    #[getter]
+    pub fn model_settings(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+        skald_prompt::model_settings_py(&self.metadata.prompt, py)
     }
 
     /// Return the `PromptCard` space.
@@ -499,13 +514,7 @@ impl PromptCard {
     #[allow(clippy::needless_pass_by_value)]
     pub fn load(py: Python<'_>, path: PathBuf) -> CardPyResult<Self> {
         let mut card = Self::from_card(io::read_card_file(&path)?)?;
-        card.prompt = Some(
-            Py::new(
-                py,
-                skald_prompt::Prompt::from_native(card.metadata.prompt.clone()),
-            )?
-            .into_any(),
-        );
+        card.prompt = Some(skald_prompt::prompt_py(card.metadata.prompt.clone(), py)?);
         Ok(card)
     }
 
@@ -528,13 +537,7 @@ impl PromptCard {
     #[pyo3(name = "model_validate_json")]
     pub fn model_validate_json_py(py: Python<'_>, json_string: &str) -> CardPyResult<Self> {
         let mut card = Self::from_card(serde_json::from_str(json_string)?)?;
-        card.prompt = Some(
-            Py::new(
-                py,
-                skald_prompt::Prompt::from_native(card.metadata.prompt.clone()),
-            )?
-            .into_any(),
-        );
+        card.prompt = Some(skald_prompt::prompt_py(card.metadata.prompt.clone(), py)?);
         Ok(card)
     }
 

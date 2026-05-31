@@ -131,7 +131,8 @@ fi
 
 if rg -n 'pyo3|pymodule|pyclass|pymethods|Python|Bound<|Py<|PyErr' crates/skald \
   --glob '!crates/skald/skald-prompt/**' \
-  --glob '!crates/skald/skald-agent/Cargo.toml'; then
+  --glob '!crates/skald/skald-agent/Cargo.toml' \
+  --glob '!crates/skald/skald-workflow/Cargo.toml'; then
   echo 'PyO3 scope violation detected in Python-free Skald engine crates'
   exit 1
 fi

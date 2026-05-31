@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use skald_agent::{Agent, Observer, ToolRegistry};
 use skald_runtime::ProviderRegistry;
-use skald_spec::ProviderResponse;
+use skald_spec::{MessageNum, Prompt, ProviderName, ProviderRequest, ProviderResponse};
+use tokio::sync::RwLock;
 
 use crate::context::Context;
 use crate::def::WorkflowDef;
@@ -86,11 +87,13 @@ impl Workflow {
     ///
     /// Returns `WorkflowError` when no ready tasks remain, agent execution
     /// fails, task locks fail, or a spawned task cannot return an outcome.
-    pub async fn run(self: &Arc<Self>, _context: Context) -> WorkflowResult<WorkflowRun> {
+    pub async fn run(self: &Arc<Self>, context: Context) -> WorkflowResult<WorkflowRun> {
+        let context = Arc::new(RwLock::new(context));
         let events = Arc::new(Mutex::new(Vec::new()));
         loop {
             if self.task_list.is_complete()? {
                 let final_events = finish_events(events)?;
+                let _final_context = finish_context(context).await;
                 return self.collect_run(final_events);
             }
 
@@ -103,8 +106,9 @@ impl Workflow {
             for task in ready {
                 let workflow = Arc::clone(self);
                 let events = Arc::clone(&events);
+                let context = Arc::clone(&context);
                 handles.push(tokio::spawn(async move {
-                    workflow.run_one_with_retries(task, &events).await
+                    workflow.run_one_with_retries(task, &events, context).await
                 }));
             }
 
@@ -187,8 +191,9 @@ impl Workflow {
         &self,
         task: SharedTask,
         events: &Mutex<Vec<TaskEvent>>,
+        context: Arc<RwLock<Context>>,
     ) -> WorkflowResult<()> {
-        let (agent_id, prompt, max_retries, task_id) = {
+        let (agent_id, prompt, max_retries, task_id, dependencies) = {
             let mut guard = task.write().map_err(|_| WorkflowError::Lock)?;
             guard.status = TaskStatus::Running;
             guard.retry_count = 0;
@@ -197,6 +202,7 @@ impl Workflow {
                 guard.prompt.clone(),
                 guard.max_retries,
                 guard.id.clone(),
+                guard.dependencies().to_vec(),
             )
         };
 
@@ -207,7 +213,10 @@ impl Workflow {
 
         for attempt in 0..=max_retries {
             let started_at = now_ms();
-            let response = match agent.run_prompt(&prompt, &[]).await {
+            let prompt_for_run = self
+                .prompt_with_handoff(&prompt, &dependencies, &agent.provider_name, &context)
+                .await?;
+            let response = match agent.run_prompt(&prompt_for_run, &[]).await {
                 Ok(run) => run.output,
                 Err(_err) if attempt == max_retries => {
                     let error = WorkflowError::MaxRetriesExceeded(task_id.clone());
@@ -227,10 +236,19 @@ impl Workflow {
             };
             match validation {
                 Ok(()) => {
-                    let mut guard = task.write().map_err(|_| WorkflowError::Lock)?;
-                    guard.status = TaskStatus::Completed;
-                    guard.result = Some(response);
-                    drop(guard);
+                    let task_messages = crate::handoff::extract_messages_for_handoff(
+                        &response,
+                        &agent.provider_name,
+                    )?;
+                    {
+                        let mut guard = task.write().map_err(|_| WorkflowError::Lock)?;
+                        guard.status = TaskStatus::Completed;
+                        guard.result = Some(response);
+                    }
+                    {
+                        let mut ctx_guard = context.write().await;
+                        ctx_guard.record_task_messages(task_id.clone(), task_messages);
+                    }
                     self.record_completion(&task_id, attempt, started_at, events)?;
                     return Ok(());
                 }
@@ -245,6 +263,126 @@ impl Workflow {
         }
 
         Err(WorkflowError::MaxRetriesExceeded(task_id))
+    }
+
+    async fn prompt_with_handoff(
+        &self,
+        prompt: &Prompt,
+        dependencies: &[String],
+        dst_provider: &ProviderName,
+        context: &RwLock<Context>,
+    ) -> WorkflowResult<Prompt> {
+        let mut prompt_for_run = prompt.clone();
+        let upstream = self
+            .translated_upstream_messages(dependencies, dst_provider, context)
+            .await?;
+        self.prepend_handoff_messages(&mut prompt_for_run.request, dst_provider, &upstream)?;
+        Ok(prompt_for_run)
+    }
+
+    async fn translated_upstream_messages(
+        &self,
+        dependencies: &[String],
+        dst_provider: &ProviderName,
+        context: &RwLock<Context>,
+    ) -> WorkflowResult<Vec<MessageNum>> {
+        let snapshots = {
+            let ctx_guard = context.read().await;
+            dependencies
+                .iter()
+                .filter_map(|dep_id| {
+                    ctx_guard
+                        .task_messages_for(dep_id)
+                        .map(|messages| (dep_id.clone(), messages.to_vec()))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut upstream = Vec::new();
+        for (dep_id, messages) in snapshots {
+            let src_provider = self.upstream_provider(&dep_id)?;
+            let translated =
+                crate::handoff::handoff_messages(&src_provider, dst_provider, &messages)?;
+            upstream.extend(translated);
+        }
+        Ok(upstream)
+    }
+
+    fn prepend_handoff_messages(
+        &self,
+        request: &mut ProviderRequest,
+        dst_provider: &ProviderName,
+        upstream: &[MessageNum],
+    ) -> WorkflowResult<()> {
+        if upstream.is_empty() {
+            return Ok(());
+        }
+
+        match request {
+            ProviderRequest::OpenAiChatCompletion(req) => {
+                let messages = upstream
+                    .iter()
+                    .map(|msg| match msg {
+                        MessageNum::OpenAi(message) => Ok(message.clone()),
+                        _ => Err(unsupported_handoff(dst_provider)),
+                    })
+                    .collect::<WorkflowResult<Vec<_>>>()?;
+                req.messages.splice(0..0, messages);
+            }
+            ProviderRequest::AnthropicMessage(req) => {
+                let messages = upstream
+                    .iter()
+                    .map(|msg| match msg {
+                        MessageNum::Anthropic(message) => Ok(message.clone()),
+                        _ => Err(unsupported_handoff(dst_provider)),
+                    })
+                    .collect::<WorkflowResult<Vec<_>>>()?;
+                req.messages.splice(0..0, messages);
+            }
+            ProviderRequest::GeminiGenerateContent(req) => {
+                let messages = upstream
+                    .iter()
+                    .map(|msg| match msg {
+                        MessageNum::Gemini(message) => Ok(message.clone()),
+                        _ => Err(unsupported_handoff(dst_provider)),
+                    })
+                    .collect::<WorkflowResult<Vec<_>>>()?;
+                req.contents.splice(0..0, messages);
+            }
+            ProviderRequest::Vertex(req) => {
+                let messages = upstream
+                    .iter()
+                    .map(|msg| match msg {
+                        MessageNum::Gemini(message) => Ok(message.clone()),
+                        _ => Err(unsupported_handoff(dst_provider)),
+                    })
+                    .collect::<WorkflowResult<Vec<_>>>()?;
+                req.0.contents.splice(0..0, messages);
+            }
+            ProviderRequest::OpenAiResponses(_)
+            | ProviderRequest::OpenAiEmbeddings(_)
+            | ProviderRequest::GoogleBatchEmbed(_)
+            | ProviderRequest::VertexPredict(_)
+            | ProviderRequest::RawV1 { .. } => return Err(unsupported_handoff(dst_provider)),
+            _ => return Err(unsupported_handoff(dst_provider)),
+        }
+        Ok(())
+    }
+
+    fn upstream_provider(&self, dep_id: &str) -> WorkflowResult<ProviderName> {
+        let task = self
+            .task_list
+            .get_task(dep_id)
+            .ok_or_else(|| WorkflowError::TaskNotFound(dep_id.to_owned()))?;
+        let agent_id = {
+            let guard = task.read().map_err(|_| WorkflowError::Lock)?;
+            guard.agent_id.clone()
+        };
+        let agent = self
+            .agents
+            .get(&agent_id)
+            .ok_or_else(|| WorkflowError::AgentNotFound(agent_id.clone()))?;
+        Ok(agent.provider_name.clone())
     }
 
     fn record_completion(
@@ -342,6 +480,13 @@ fn push_event(events: &Mutex<Vec<TaskEvent>>, event: TaskEvent) -> WorkflowResul
     Ok(())
 }
 
+fn unsupported_handoff(provider: &ProviderName) -> WorkflowError {
+    WorkflowError::UnsupportedHandoff {
+        src: provider.clone(),
+        dst: provider.clone(),
+    }
+}
+
 fn finish_events(events: Arc<Mutex<Vec<TaskEvent>>>) -> WorkflowResult<Vec<TaskEvent>> {
     match Arc::try_unwrap(events) {
         Ok(mutex) => mutex.into_inner().map_err(|_| WorkflowError::Lock),
@@ -349,6 +494,13 @@ fn finish_events(events: Arc<Mutex<Vec<TaskEvent>>>) -> WorkflowResult<Vec<TaskE
             .lock()
             .map(|events| events.clone())
             .map_err(|_| WorkflowError::Lock),
+    }
+}
+
+async fn finish_context(context: Arc<RwLock<Context>>) -> Context {
+    match Arc::try_unwrap(context) {
+        Ok(lock) => lock.into_inner(),
+        Err(shared) => shared.read().await.clone(),
     }
 }
 

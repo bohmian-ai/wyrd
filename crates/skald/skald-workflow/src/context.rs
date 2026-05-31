@@ -41,6 +41,16 @@ impl Context {
             ..Self::default()
         }
     }
+
+    /// Records the messages a completed task contributes to successor inputs.
+    pub fn record_task_messages(&mut self, task_id: impl Into<String>, msgs: Vec<MessageNum>) {
+        self.task_messages.insert(task_id.into(), msgs);
+    }
+
+    /// Returns the messages recorded for an upstream task, when present.
+    pub fn task_messages_for(&self, task_id: &str) -> Option<&[MessageNum]> {
+        self.task_messages.get(task_id).map(Vec::as_slice)
+    }
 }
 
 /// Serialization wrapper used when persisting a context.

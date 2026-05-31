@@ -16,8 +16,7 @@ pub use codec::{
 };
 pub use hash::compute as content_hash;
 pub use parameter::{
-    ParameterName, extract_media_placeholders, extract_placeholders, extract_text_placeholders,
-    is_valid_parameter_name,
+    ParameterName, extract_media_placeholders, extract_text_placeholders, is_valid_parameter_name,
 };
 pub use promptref::PromptRef;
 pub use spec::PromptSpec;

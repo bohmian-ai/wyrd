@@ -12,7 +12,7 @@ pub mod mock;
 pub mod provider;
 pub mod runtime;
 
-pub use dispatch::dispatch;
+pub use dispatch::{dispatch, dispatch_stream};
 pub use error::{SkaldRuntimeError, SkaldRuntimeResult};
 pub use mock::{MockExchange, MockExpectation, MockProvider};
 pub use provider::{Provider, ProviderRegistry};

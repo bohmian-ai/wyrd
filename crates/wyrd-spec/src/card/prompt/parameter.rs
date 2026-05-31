@@ -87,11 +87,6 @@ pub fn extract_media_placeholders(spec: &PromptSpec) -> Result<Vec<String>, Wyrd
     extract_with_regex(spec, media_placeholder_regex())
 }
 
-/// Extracts text placeholders from the native request JSON.
-pub fn extract_placeholders(spec: &PromptSpec) -> Result<Vec<String>, WyrdError> {
-    extract_text_placeholders(spec)
-}
-
 fn extract_with_regex(spec: &PromptSpec, regex: &Regex) -> Result<Vec<String>, WyrdError> {
     let json = serde_json::to_string(&spec.prompt.request).map_err(|error| {
         WyrdError::from(PromptError::SerializeRequest {

@@ -32,6 +32,15 @@ impl GoogleApiKeyAuth {
             })?;
         let mut auth = Self::new(api_key);
         if let Ok(base_url) = std::env::var("GOOGLE_API_BASE_URL") {
+            let parsed = Url::parse(&base_url).map_err(|_| {
+                ProviderError::auth("google", "GOOGLE_API_BASE_URL is not a valid URL")
+            })?;
+            if parsed.scheme() != "https" {
+                return Err(ProviderError::auth(
+                    "google",
+                    "GOOGLE_API_BASE_URL must use https scheme",
+                ));
+            }
             auth.base_url = base_url;
         }
         Ok(auth)

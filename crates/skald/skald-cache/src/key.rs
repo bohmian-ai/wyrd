@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use skald_spec::wire::anthropic_messages::{
-    AnthropicContentBlock, AnthropicMessagesRequest, AnthropicSystem, AnthropicSystemBlock,
+    AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest, AnthropicSystem,
+    AnthropicSystemBlock,
 };
 use skald_spec::{ProviderName, ProviderRequest};
 
@@ -74,14 +75,16 @@ impl CacheKey {
                     return Ok(None);
                 }
 
-                // Anthropic cache directives live on native system, message,
-                // and tool blocks. Hash the typed request after confirming at
-                // least one native directive is present.
-                let body = serde_json::to_vec(request).map_err(SkaldCacheError::serialize)?;
+                // Hash only the static cache-controlled prefix (system blocks
+                // + leading messages with cache_control) so that multi-turn
+                // conversations with a stable system prompt and prefix produce
+                // cache hits regardless of trailing message count.
+                let prefix_bytes =
+                    anthropic_cache_prefix_bytes(request).map_err(SkaldCacheError::serialize)?;
                 Ok(Some(Self {
                     provider: ProviderName::Anthropic,
                     model: request.model.clone(),
-                    request_prefix_hash: hash_bytes(&body),
+                    request_prefix_hash: hash_bytes(&prefix_bytes),
                 }))
             }
             ProviderRequest::RawV1 { .. } => Err(SkaldCacheError::OpaqueRequest),
@@ -91,6 +94,37 @@ impl CacheKey {
             _ => Ok(None),
         }
     }
+}
+
+/// Serializes the cache-controlled prefix of an Anthropic request for hashing.
+///
+/// The prefix is the system (when any block carries cache_control) plus the
+/// contiguous leading messages (from index 0) that have at least one content
+/// block with cache_control. Hashing only this prefix means multi-turn
+/// conversations produce cache hits as long as the prefix is stable.
+fn anthropic_cache_prefix_bytes(
+    request: &AnthropicMessagesRequest,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let system_bytes: Vec<u8> = if request
+        .system
+        .as_ref()
+        .is_some_and(system_has_cache_control)
+    {
+        serde_json::to_vec(&request.system)?
+    } else {
+        Vec::new()
+    };
+
+    let prefix_messages: Vec<&AnthropicMessage> = request
+        .messages
+        .iter()
+        .take_while(|msg| msg.content.iter().any(content_has_cache_control))
+        .collect();
+    let messages_bytes = serde_json::to_vec(&prefix_messages)?;
+
+    let mut bytes = system_bytes;
+    bytes.extend_from_slice(&messages_bytes);
+    Ok(bytes)
 }
 
 /// Finds any native Anthropic cache directive that makes this request cacheable.

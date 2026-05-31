@@ -1,14 +1,14 @@
-//! Synchronous in-memory cache backend for native Skald cache keys.
+//! Synchronous in-memory cache backend backed by mini-moka.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+use mini_moka::sync::Cache;
 
 use crate::{CacheKey, CacheValue};
 
 /// Minimal synchronous cache API for prompt cache implementations.
 pub trait PromptCache {
-    /// Returns a value for `key`, refreshing its LRU position when present.
+    /// Returns a value for `key` when present and not expired.
     fn get(&self, key: &CacheKey) -> Option<CacheValue>;
 
     /// Stores `value` for `key` with a per-entry TTL.
@@ -18,34 +18,32 @@ pub trait PromptCache {
     fn invalidate(&self, key: &CacheKey);
 }
 
-/// Capacity-limited in-memory prompt cache with TTL and LRU eviction.
-#[derive(Debug)]
+/// Capacity-limited in-memory prompt cache with per-entry TTL and TinyLFU eviction.
+///
+/// Per-entry TTL is tracked via an expiry `Instant` stored alongside each value.
+/// mini-moka manages capacity eviction; this wrapper manages TTL expiry on access.
+#[derive(Clone)]
 pub struct InMemoryCache {
-    capacity: usize,
+    inner: Cache<CacheKey, (CacheValue, Instant)>,
     default_ttl: Duration,
-    inner: Mutex<Inner>,
 }
 
-#[derive(Debug, Default)]
-struct Inner {
-    entries: HashMap<CacheKey, Entry>,
-    order: VecDeque<CacheKey>,
-}
-
-#[derive(Debug, Clone)]
-struct Entry {
-    value: CacheValue,
-    inserted_at: Instant,
-    ttl: Duration,
+impl std::fmt::Debug for InMemoryCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InMemoryCache")
+            .field("capacity", &self.inner.policy().max_capacity())
+            .field("default_ttl", &self.default_ttl)
+            .finish()
+    }
 }
 
 impl InMemoryCache {
-    /// Creates a bounded in-memory cache.
+    /// Creates a bounded in-memory cache with the given capacity and default TTL.
     pub fn new(capacity: usize, default_ttl: Duration) -> Self {
         Self {
-            capacity,
+            inner: Cache::builder().max_capacity(capacity as u64).build(),
             default_ttl,
-            inner: Mutex::new(Inner::default()),
         }
     }
 
@@ -54,83 +52,33 @@ impl InMemoryCache {
         self.put(key, value, self.default_ttl);
     }
 
-    /// Returns the current number of live entries after removing expired ones.
+    /// Returns the approximate number of live entries in the cache.
     pub fn len(&self) -> usize {
-        let mut inner = self.lock_inner();
-        inner.remove_expired();
-        inner.entries.len()
+        self.inner.entry_count() as usize
     }
 
-    /// Returns whether the cache currently has no live entries.
+    /// Returns whether the cache has no entries.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    fn lock_inner(&self) -> MutexGuard<'_, Inner> {
-        match self.inner.lock() {
-            Ok(inner) => inner,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        self.inner.entry_count() == 0
     }
 }
 
 impl PromptCache for InMemoryCache {
     fn get(&self, key: &CacheKey) -> Option<CacheValue> {
-        let mut inner = self.lock_inner();
-        inner.remove_expired();
-
-        let value = inner.entries.get(key).map(|entry| entry.value.clone())?;
-        inner.touch(key);
+        let (value, expiry) = self.inner.get(key)?;
+        if Instant::now() >= expiry {
+            // TTL elapsed — remove the entry and report a miss.
+            self.inner.invalidate(key);
+            return None;
+        }
         Some(value)
     }
 
     fn put(&self, key: CacheKey, value: CacheValue, ttl: Duration) {
-        if self.capacity == 0 {
-            return;
-        }
-
-        let mut inner = self.lock_inner();
-        inner.remove_expired();
-        inner.entries.insert(
-            key.clone(),
-            Entry {
-                value,
-                inserted_at: Instant::now(),
-                ttl,
-            },
-        );
-        inner.touch(&key);
-        inner.evict_to_capacity(self.capacity);
+        self.inner.insert(key, (value, Instant::now() + ttl));
     }
 
     fn invalidate(&self, key: &CacheKey) {
-        let mut inner = self.lock_inner();
-        inner.entries.remove(key);
-        inner.order.retain(|candidate| candidate != key);
-    }
-}
-
-impl Inner {
-    fn touch(&mut self, key: &CacheKey) {
-        self.order.retain(|candidate| candidate != key);
-        self.order.push_back(key.clone());
-    }
-
-    fn remove_expired(&mut self) {
-        let now = Instant::now();
-        self.entries
-            .retain(|_, entry| now.duration_since(entry.inserted_at) < entry.ttl);
-        self.order
-            .retain(|candidate| self.entries.contains_key(candidate));
-    }
-
-    fn evict_to_capacity(&mut self, capacity: usize) {
-        while self.entries.len() > capacity {
-            if let Some(key) = self.order.pop_front() {
-                self.entries.remove(&key);
-            } else {
-                break;
-            }
-        }
+        self.inner.invalidate(key);
     }
 }

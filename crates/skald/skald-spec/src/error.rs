@@ -171,10 +171,10 @@ impl SkaldError {
             }
             Self::InvalidMediaType(_) => "SKALD_SPEC_400_INVALID_MEDIA_TYPE",
             Self::MissingMediaVariable { .. } => "SKALD_SPEC_422_MISSING_MEDIA_VARIABLE",
-            Self::MediaNotRegularFile { .. } => "SKALD_PROMPT_400_MEDIA_NOT_REGULAR_FILE",
-            Self::MediaTooLarge { .. } => "SKALD_PROMPT_400_MEDIA_TOO_LARGE",
-            Self::MediaInvalidExtension { .. } => "SKALD_PROMPT_400_MEDIA_INVALID_EXTENSION",
-            Self::MediaIo(_) => "SKALD_PROMPT_500_MEDIA_IO",
+            Self::MediaNotRegularFile { .. } => "SKALD_SPEC_400_MEDIA_NOT_REGULAR_FILE",
+            Self::MediaTooLarge { .. } => "SKALD_SPEC_400_MEDIA_TOO_LARGE",
+            Self::MediaInvalidExtension { .. } => "SKALD_SPEC_400_MEDIA_INVALID_EXTENSION",
+            Self::MediaIo(_) => "SKALD_SPEC_500_MEDIA_IO",
             Self::PromptDraftInvalid { .. } => "SKALD_SPEC_400_PROMPT_DRAFT_INVALID",
         }
     }

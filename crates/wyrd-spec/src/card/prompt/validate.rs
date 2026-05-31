@@ -276,24 +276,18 @@ pub fn validate(spec: &PromptSpec) -> Result<(), WyrdError> {
         return Err(PromptError::EmptyModel.into());
     }
 
+    let mut variable_seen = HashSet::new();
     for name in &spec.prompt.variables {
         ParameterName::new(name.clone())?;
-    }
-
-    let mut declared_seen = HashSet::new();
-    for name in &spec.prompt.variables {
-        if !declared_seen.insert(name.as_str()) {
+        if !variable_seen.insert(name.as_str()) {
             return Err(PromptError::DuplicateVariable { name: name.clone() }.into());
         }
     }
 
+    let mut media_seen = HashSet::new();
     for name in &spec.prompt.media_variables {
         ParameterName::new(name.clone())?;
-    }
-
-    let mut declared_seen = HashSet::new();
-    for name in &spec.prompt.media_variables {
-        if !declared_seen.insert(name.as_str()) {
+        if !media_seen.insert(name.as_str()) {
             return Err(PromptError::DuplicateVariable { name: name.clone() }.into());
         }
     }

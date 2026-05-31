@@ -4,6 +4,7 @@ use std::fmt;
 
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
+use url::Url;
 
 use crate::error::{ProviderError, ProviderResult};
 
@@ -35,6 +36,14 @@ impl OpenAiAuth {
         auth.organization = std::env::var("OPENAI_ORG_ID").ok();
         auth.project = std::env::var("OPENAI_PROJECT_ID").ok();
         if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+            let parsed = Url::parse(&base_url)
+                .map_err(|_| ProviderError::auth("openai", "OPENAI_BASE_URL is not a valid URL"))?;
+            if parsed.scheme() != "https" {
+                return Err(ProviderError::auth(
+                    "openai",
+                    "OPENAI_BASE_URL must use https scheme",
+                ));
+            }
             auth.base_url = base_url;
         }
         Ok(auth)

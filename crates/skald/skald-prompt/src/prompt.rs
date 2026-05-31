@@ -1019,7 +1019,7 @@ fn extract_prompt_variables(prompt: &Prompt) -> CardPyResult<Vec<String>> {
     let spec = wyrd_spec::PromptSpec {
         prompt: prompt.inner.clone(),
     };
-    Ok(wyrd_spec::extract_placeholders(&spec)?)
+    Ok(wyrd_spec::extract_text_placeholders(&spec)?)
 }
 
 #[cfg(feature = "python")]

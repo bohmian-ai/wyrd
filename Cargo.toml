@@ -59,6 +59,7 @@ uuid = { version = "1", default-features = false, features = ["serde"] }
 ulid = { version = "1", features = ["serde"] }
 semver = { version = "1", features = ["serde"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
+mini-moka = { version = "0.10", features = ["sync"] }
 proptest = "1"
 aes-gcm = "0.10"
 argon2 = "0.5"

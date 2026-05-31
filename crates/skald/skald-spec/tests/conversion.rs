@@ -1,7 +1,9 @@
 mod common;
 
 use serde_json::{json, value::RawValue};
-use skald_spec::wire::anthropic_messages::{AnthropicContentBlock, AnthropicToolResultContent};
+use skald_spec::wire::anthropic_messages::{
+    AnthropicContentBlock, AnthropicMessage, AnthropicToolResultContent,
+};
 use skald_spec::wire::google_generate::GooglePart;
 use skald_spec::wire::openai_chat::{OpenAiMessageContent, OpenAiToolCall};
 use skald_spec::{MessageConversion, MessageNum, ProviderName, SkaldError, convert_message_dyn};
@@ -146,4 +148,47 @@ fn raw_v1_message_cannot_be_converted_returns_skald_spec_501() {
     let raw = MessageNum::RawV1(RawValue::from_string(json!({"x": 1}).to_string()).unwrap());
     let err = convert_message_dyn(ProviderName::OpenAi, ProviderName::Anthropic, &raw).unwrap_err();
     assert_eq!(err.code(), "SKALD_SPEC_501_UNSUPPORTED_CONVERSION");
+}
+
+#[test]
+fn anthropic_tool_result_blocks_content_converts_text_only() {
+    // AnthropicToolResultContent::Blocks with mixed text and non-text blocks.
+    // Conversion to OpenAI should join only the text blocks and discard images.
+    let message = AnthropicMessage {
+        role: "user".to_string(),
+        content: vec![AnthropicContentBlock::ToolResult {
+            tool_use_id: "call_blocks".to_string(),
+            content: AnthropicToolResultContent::Blocks(vec![
+                AnthropicContentBlock::Text {
+                    text: "first text".to_string(),
+                    cache_control: None,
+                    citations: None,
+                },
+                AnthropicContentBlock::Image {
+                    source: skald_spec::wire::anthropic_messages::AnthropicImageSource::Base64 {
+                        media_type: "image/png".to_string(),
+                        data: "aGVsbG8=".to_string(),
+                    },
+                    cache_control: None,
+                },
+                AnthropicContentBlock::Text {
+                    text: " second text".to_string(),
+                    cache_control: None,
+                    citations: None,
+                },
+            ]),
+            is_error: None,
+            cache_control: None,
+        }],
+    };
+
+    let converted: skald_spec::wire::openai_chat::OpenAiChatMessage = message.convert().unwrap();
+    assert_eq!(converted.role, "tool");
+    assert_eq!(converted.tool_call_id.as_deref(), Some("call_blocks"));
+    // Only text blocks are joined; the image block is discarded.
+    let content_text = match converted.content {
+        Some(OpenAiMessageContent::Text(text)) => text,
+        other => panic!("expected Text content, got {other:?}"),
+    };
+    assert_eq!(content_text, "first text second text");
 }

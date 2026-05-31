@@ -1,18 +1,21 @@
-//! Google OAuth token loading for ADC-style mocked provider tests.
+//! Google OAuth token loading for ADC-style provider authentication.
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use secrecy::SecretString;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::error::{ProviderError, ProviderResult};
 
 const METADATA_PATH: &str = "/computeMetadata/v1/instance/service-accounts/default/token";
+const JWT_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+const TOKEN_URI_ALLOWED_HOSTS: &[&str] = &["oauth2.googleapis.com", "accounts.google.com"];
 
 /// Cached OAuth bearer token.
 #[derive(Clone)]
@@ -37,7 +40,9 @@ impl fmt::Debug for GoogleOAuthToken {
 pub struct GoogleOAuth {
     source: GoogleOAuthSource,
     http: reqwest::Client,
-    cache: Mutex<Option<CachedToken>>,
+    // tokio::sync::Mutex held across the async fetch to prevent concurrent
+    // token refreshes for the same instance.
+    cache: tokio::sync::Mutex<Option<CachedToken>>,
 }
 
 #[derive(Clone)]
@@ -57,6 +62,17 @@ struct TokenJson {
     access_token: Option<String>,
     expires_in: Option<u64>,
     token_uri: Option<String>,
+    client_email: Option<String>,
+    private_key: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JwtClaims {
+    iss: String,
+    scope: String,
+    aud: String,
+    iat: u64,
+    exp: u64,
 }
 
 impl GoogleOAuth {
@@ -97,7 +113,17 @@ impl GoogleOAuth {
         }
         let base_url = std::env::var("GCE_METADATA_HOST")
             .map(|host| format!("http://{host}"))
+            // GCE metadata uses plain HTTP by design; no https enforcement here.
             .unwrap_or_else(|_| "http://metadata.google.internal".to_owned());
+        let parsed = Url::parse(&base_url).map_err(|_| {
+            ProviderError::auth("google", "GCE_METADATA_HOST produced an invalid base URL")
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(ProviderError::auth(
+                "google",
+                "GCE_METADATA_HOST must resolve to an http or https URL",
+            ));
+        }
         Self::from_metadata_server(base_url)
     }
 
@@ -108,16 +134,22 @@ impl GoogleOAuth {
         Ok(Self {
             source,
             http,
-            cache: Mutex::new(None),
+            cache: tokio::sync::Mutex::new(None),
         })
     }
 
     /// Returns a bearer token, reusing cached tokens until the refresh grace.
+    ///
+    /// The async mutex is held across the fetch so at most one in-flight token
+    /// refresh happens per `GoogleOAuth` instance.
     pub async fn token(&self) -> ProviderResult<GoogleOAuthToken> {
-        if let Some(token) = self.cached_token() {
-            return Ok(token);
+        let mut cache = self.cache.lock().await;
+        if let Some(cached) = cache.as_ref() {
+            let refresh_grace = Duration::from_secs(30);
+            if cached.expires_at > Instant::now() + refresh_grace {
+                return Ok(cached.token.clone());
+            }
         }
-
         let token = match &self.source {
             GoogleOAuthSource::InlineJson(json) => self.token_from_json(json).await?,
             GoogleOAuthSource::CredentialsFile(path) => {
@@ -127,31 +159,12 @@ impl GoogleOAuth {
             }
             GoogleOAuthSource::Metadata { base_url } => self.token_from_metadata(base_url).await?,
         };
-        self.store_token(token.clone());
-        Ok(token)
-    }
-
-    fn cached_token(&self) -> Option<GoogleOAuthToken> {
-        let cache = self.lock_cache();
-        let cached = cache.as_ref()?;
-        let refresh_grace = Duration::from_secs(30);
-        if cached.expires_at > Instant::now() + refresh_grace {
-            Some(cached.token.clone())
-        } else {
-            None
-        }
-    }
-
-    fn store_token(&self, token: GoogleOAuthToken) {
         let expires_at = Instant::now() + Duration::from_secs(token.expires_in);
-        *self.lock_cache() = Some(CachedToken { token, expires_at });
-    }
-
-    fn lock_cache(&self) -> MutexGuard<'_, Option<CachedToken>> {
-        match self.cache.lock() {
-            Ok(cache) => cache,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        *cache = Some(CachedToken {
+            token: token.clone(),
+            expires_at,
+        });
+        Ok(token)
     }
 
     async fn token_from_json(&self, json: &str) -> ProviderResult<GoogleOAuthToken> {
@@ -169,12 +182,26 @@ impl GoogleOAuth {
                 "ADC JSON did not contain access_token or token_uri",
             ));
         };
+        validate_token_uri(&token_uri)?;
+        let Some(client_email) = parsed.client_email else {
+            return Err(ProviderError::auth(
+                "google",
+                "ADC JSON service account must include client_email",
+            ));
+        };
+        let Some(private_key) = parsed.private_key else {
+            return Err(ProviderError::auth(
+                "google",
+                "ADC JSON service account must include private_key",
+            ));
+        };
+        let assertion = sign_service_account_jwt(&client_email, &token_uri, &private_key)?;
         let response = self
             .http
-            .post(token_uri)
+            .post(&token_uri)
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-                ("assertion", "mocked-jwt-assertion"),
+                ("assertion", &assertion),
             ])
             .send()
             .await
@@ -203,6 +230,54 @@ impl fmt::Debug for GoogleOAuth {
             .field("cache", &"<redacted>")
             .finish()
     }
+}
+
+fn validate_token_uri(token_uri: &str) -> ProviderResult<()> {
+    let parsed = Url::parse(token_uri)
+        .map_err(|_| ProviderError::auth("google", "token_uri is not a valid URL"))?;
+    if parsed.scheme() != "https" {
+        return Err(ProviderError::auth(
+            "google",
+            "token_uri must use https scheme",
+        ));
+    }
+    let host = parsed.host_str().unwrap_or("");
+    if !TOKEN_URI_ALLOWED_HOSTS.contains(&host) {
+        return Err(ProviderError::auth(
+            "google",
+            format!(
+                "token_uri hostname '{host}' is not allowed; permitted: {}",
+                TOKEN_URI_ALLOWED_HOSTS.join(", ")
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn sign_service_account_jwt(
+    client_email: &str,
+    token_uri: &str,
+    private_key: &str,
+) -> ProviderResult<String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_secs();
+    let claims = JwtClaims {
+        iss: client_email.to_owned(),
+        scope: JWT_SCOPE.to_owned(),
+        aud: token_uri.to_owned(),
+        iat: now,
+        exp: now + 3600,
+    };
+    let encoding_key = EncodingKey::from_rsa_pem(private_key.as_bytes()).map_err(|error| {
+        ProviderError::auth(
+            "google",
+            format!("invalid private_key in ADC JSON: {error}"),
+        )
+    })?;
+    encode(&Header::new(Algorithm::RS256), &claims, &encoding_key)
+        .map_err(|error| ProviderError::auth("google", format!("JWT signing failed: {error}")))
 }
 
 async fn decode_token_response(response: reqwest::Response) -> ProviderResult<GoogleOAuthToken> {

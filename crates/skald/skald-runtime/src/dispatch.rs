@@ -81,6 +81,9 @@ fn request_model(request: &ProviderRequest) -> Option<&str> {
         | ProviderRequest::Vertex(_)
         | ProviderRequest::VertexPredict(_)
         | ProviderRequest::RawV1 { .. } => None,
+        // ProviderRequest is #[non_exhaustive]. Any new variant that carries a
+        // model field must be added above; this arm exists only for forward
+        // compatibility and will silently omit model telemetry for unknown variants.
         _ => None,
     }
 }

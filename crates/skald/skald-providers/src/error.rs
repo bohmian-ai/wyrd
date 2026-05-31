@@ -1,6 +1,9 @@
 //! Provider error catalog with stable `SKALD_PROVIDERS_*` codes.
 
 use reqwest::StatusCode;
+use tracing::debug;
+
+const MAX_BODY_BYTES: usize = 512;
 
 /// Result alias for provider operations.
 pub type ProviderResult<T> = Result<T, ProviderError>;
@@ -96,6 +99,7 @@ impl ProviderError {
     ) -> Self {
         let provider = provider.into();
         let body = body.into();
+        let truncated = truncate_body(&body);
         match status.as_u16() {
             401 | 403 => Self::auth(provider, "provider rejected credentials"),
             408 => Self::timeout(provider),
@@ -103,8 +107,8 @@ impl ProviderError {
                 provider,
                 retry_after_ms,
             },
-            500..=599 => Self::upstream(provider, status.as_u16(), body),
-            _ => Self::bad_request(provider, body),
+            500..=599 => Self::upstream(provider, status.as_u16(), truncated),
+            _ => Self::bad_request(provider, truncated),
         }
     }
 
@@ -119,5 +123,14 @@ impl ProviderError {
             Self::Decode { .. } => "SKALD_PROVIDERS_502_DECODE",
             Self::VariantMismatch { .. } => "SKALD_PROVIDERS_400_VARIANT_MISMATCH",
         }
+    }
+}
+
+fn truncate_body(body: &str) -> String {
+    debug!(full_body = %body, "provider upstream response body");
+    if body.len() <= MAX_BODY_BYTES {
+        body.to_owned()
+    } else {
+        format!("{}…[truncated]", &body[..MAX_BODY_BYTES])
     }
 }

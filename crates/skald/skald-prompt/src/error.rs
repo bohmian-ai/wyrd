@@ -87,13 +87,16 @@ impl From<PromptBuilderError> for wyrd_interfaces::error::WyrdPyError {
                 details: json!({ "provider": provider }),
             }
             .into(),
-            PromptBuilderError::InvalidRawJson(source) | PromptBuilderError::Validation(source) => {
-                WyrdError::PromptSerializeRequest {
-                    message,
-                    details: json!({ "source": source }),
-                }
-                .into()
+            PromptBuilderError::InvalidRawJson(source) => WyrdError::PromptSerializeRequest {
+                message,
+                details: json!({ "source": source }),
             }
+            .into(),
+            PromptBuilderError::Validation(source) => WyrdError::PromptDraftInvalid {
+                message,
+                details: json!({ "source": source }),
+            }
+            .into(),
             PromptBuilderError::UnsupportedRole { provider, role } => {
                 WyrdError::PromptProviderMismatch {
                     message,

@@ -12,8 +12,10 @@ use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 
 /// Runtime provider seam over the concrete Skald provider clients.
 ///
-/// This trait mirrors [`ProviderClient`] for send/stream behavior and adds a
-/// stable provider name used by [`ProviderRegistry`] dispatch.
+/// This trait is intentionally separate from [`ProviderClient`] (in
+/// `skald-providers`) to keep `skald-runtime` decoupled from the concrete
+/// client crate. The `provider_client_impl!` macro bridges them by delegation.
+/// Any new method added to `ProviderClient` must be mirrored here manually.
 #[async_trait]
 pub trait Provider: Send + Sync + 'static {
     /// Sends one native provider request.

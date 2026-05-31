@@ -1,7 +1,7 @@
 mod support;
 
 use serde_json::value::to_raw_value;
-use skald_runtime::{MockProvider, ProviderRegistry, SkaldRuntimeError, dispatch};
+use skald_runtime::{MockProvider, ProviderRegistry, SkaldRuntimeError, dispatch, dispatch_stream};
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 use support::{openai_request, openai_response, runtime_with};
 
@@ -44,6 +44,21 @@ async fn raw_v1_uses_embedded_provider_for_dispatch() {
 #[tokio::test]
 async fn unregistered_provider_returns_runtime_error() {
     let err = dispatch(&ProviderRegistry::new(), openai_request("hello"))
+        .await
+        .expect_err("provider is missing");
+
+    assert!(matches!(
+        err,
+        SkaldRuntimeError::ProviderNotRegistered {
+            provider: ProviderName::OpenAi
+        }
+    ));
+    assert_eq!(err.code(), "SKALD_RUNTIME_404_PROVIDER");
+}
+
+#[tokio::test]
+async fn dispatch_stream_unregistered_provider_returns_runtime_error() {
+    let err = dispatch_stream(&ProviderRegistry::new(), openai_request("hello"))
         .await
         .expect_err("provider is missing");
 

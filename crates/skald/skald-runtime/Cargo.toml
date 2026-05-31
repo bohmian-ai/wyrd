@@ -1,0 +1,27 @@
+[package]
+name = "skald-runtime"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "Native Skald provider runtime dispatch and mock provider seam."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+skald-spec = { workspace = true }
+skald-providers = { workspace = true }
+skald-cache = { workspace = true }
+skald-tool = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }

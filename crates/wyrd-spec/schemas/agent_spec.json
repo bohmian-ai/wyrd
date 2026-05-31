@@ -136,13 +136,9 @@
     },
     "provider": {
       "description": "Preferred provider.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/Provider"
-        },
-        {
-          "type": "null"
-        }
+      "type": [
+        "string",
+        "null"
       ]
     },
     "provider_metadata": {
@@ -542,66 +538,6 @@
           ]
         }
       }
-    },
-    "Provider": {
-      "description": "Provider identity for LLM and agentic specs.",
-      "oneOf": [
-        {
-          "description": "OpenAI-compatible provider.",
-          "type": "string",
-          "enum": [
-            "OpenAi"
-          ]
-        },
-        {
-          "description": "Anthropic-compatible provider.",
-          "type": "string",
-          "enum": [
-            "Anthropic"
-          ]
-        },
-        {
-          "description": "Gemini-compatible provider.",
-          "type": "string",
-          "enum": [
-            "Gemini"
-          ]
-        },
-        {
-          "description": "Vertex-compatible provider.",
-          "type": "string",
-          "enum": [
-            "Vertex"
-          ]
-        },
-        {
-          "description": "Bedrock-compatible provider.",
-          "type": "string",
-          "enum": [
-            "Bedrock"
-          ]
-        },
-        {
-          "description": "Google ADK-compatible provider.",
-          "type": "string",
-          "enum": [
-            "GoogleAdk"
-          ]
-        },
-        {
-          "description": "Other named provider.",
-          "type": "object",
-          "required": [
-            "Other"
-          ],
-          "properties": {
-            "Other": {
-              "type": "string"
-            }
-          },
-          "additionalProperties": false
-        }
-      ]
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",

@@ -21,7 +21,7 @@ use wyrd_spec::card::model::{
 };
 use wyrd_spec::card::operator::{OperatorBudget, OperatorInput, OperatorSpec};
 use wyrd_spec::card::policy::{InvokeContext, InvokeOutcome, PolicyDecision, PolicySpec};
-use wyrd_spec::card::prompt::PromptSpec;
+use wyrd_spec::card::prompt::{ParameterName, PromptRef, PromptSpec};
 use wyrd_spec::card::service::{LockedComponent, ServiceLock};
 use wyrd_spec::card::service::{
     ServiceRuntime, ServiceRuntimeKind, ServiceRuntimeMode, ServiceRuntimePolicy, ServiceSpec,
@@ -67,6 +67,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<HuggingFaceTask>(out, golden, "hugging_face_task")?;
     write::<ExperimentSpec>(out, golden, "experiment_spec")?;
     write::<PromptSpec>(out, golden, "prompt_spec")?;
+    write::<PromptRef>(out, golden, "prompt_ref")?;
+    write::<ParameterName>(out, golden, "parameter_name")?;
     write::<ToolSpec>(out, golden, "tool_spec")?;
     write::<AgentSpec>(out, golden, "agent_spec")?;
     write::<WorkflowSpec>(out, golden, "workflow_spec")?;

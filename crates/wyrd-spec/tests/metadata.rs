@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
 
+use skald_spec::wire::openai_chat::OpenAiMessageContent;
+use skald_spec::{
+    OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, Prompt, ProviderRequest, ResponseType,
+};
 use wyrd_spec::card::prompt::PromptSpec;
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
 use wyrd_spec::format;
@@ -32,10 +36,7 @@ fn labels_and_annotations_round_trip_as_string_maps() {
             spec_hash: None,
             artifact_hash: None,
         },
-        spec: Spec::Prompt(PromptSpec {
-            template: "Answer carefully.".to_string(),
-            ..PromptSpec::default()
-        }),
+        spec: Spec::Prompt(prompt_spec()),
         relationships: Relationships::default(),
         status: None,
     };
@@ -49,6 +50,35 @@ fn labels_and_annotations_round_trip_as_string_maps() {
     let yaml = format::yaml::to_string(&card).expect("card should serialize to yaml");
     let decoded: Card = format::yaml::from_str(&yaml).expect("card should deserialize from yaml");
     assert_eq!(decoded, card);
+}
+
+fn prompt_spec() -> PromptSpec {
+    PromptSpec::new(Prompt {
+        request: ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
+            model: "gpt-4o".to_owned(),
+            messages: vec![OpenAiChatMessage {
+                role: "user".to_owned(),
+                content: Some(OpenAiMessageContent::Text("Answer carefully.".to_owned())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                refusal: None,
+            }],
+            response_format: None,
+            stream: None,
+            stream_options: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            settings: OpenAiChatSettings::default(),
+        }),
+        model: "gpt-4o".to_owned(),
+        version: None,
+        variables: Vec::new(),
+        media_variables: Vec::new(),
+        response_type: ResponseType::Text,
+    })
+    .expect("static prompt spec is valid")
 }
 
 #[test]

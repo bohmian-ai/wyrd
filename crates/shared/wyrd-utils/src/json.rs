@@ -9,6 +9,18 @@ use serde_json::{Map, Value};
 
 use crate::WyrdUtilsResult;
 
+/// Return a stable pretty JSON string for Python `__str__` implementations.
+///
+/// Python special methods should be infallible. When serialization fails, the
+/// returned string names the failure instead of panicking.
+#[must_use]
+pub fn pretty_json_string<T: Serialize + ?Sized>(value: &T) -> String {
+    match serde_json::to_string_pretty(value) {
+        Ok(json) => json,
+        Err(error) => format!("failed to serialize JSON: {error}"),
+    }
+}
+
 /// Write JSON with recursively sorted object keys.
 ///
 /// # Errors

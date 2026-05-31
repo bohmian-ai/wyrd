@@ -8,8 +8,6 @@ metadata:
   version: 1.0.0
 
 spec:
-  type: Trigger
-
   source:
     kind: drift_observation
     card:

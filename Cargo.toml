@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/wyrd/*",
     "crates/vala/*",
+    "crates/skald/*",
     "crates/shared/*",
     "crates/wyrd-spec",
     "python/py-wyrd",
@@ -24,12 +25,20 @@ authors = ["Thorrester <sjforrester32@gmail.com>"]
 
 [workspace.dependencies]
 wyrd-spec = { path = "crates/wyrd-spec", version = "0.0.1" }
+skald-spec = { path = "crates/skald/skald-spec", version = "0.1.0" }
+skald-cache = { path = "crates/skald/skald-cache", version = "0.0.1" }
+skald-tool = { path = "crates/skald/skald-tool", version = "0.0.1" }
+skald-providers = { path = "crates/skald/skald-providers", version = "0.0.1" }
+skald-runtime = { path = "crates/skald/skald-runtime", version = "0.0.1" }
+skald-prompt = { path = "crates/skald/skald-prompt", version = "0.0.1" }
 wyrd-utils = { path = "crates/shared/wyrd-utils", version = "0.0.1" }
 wyrd-test-contract-macros = { path = "crates/shared/wyrd-test-contract-macros", version = "0.0.1" }
 wyrd-interfaces = { path = "crates/wyrd/wyrd-interfaces", version = "0.0.1" }
 wyrd-cards = { path = "crates/wyrd/wyrd-cards", version = "0.0.1" }
 wyrd-auth-verify = { path = "crates/shared/wyrd-auth-verify", version = "0.0.1" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "stream"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -37,21 +46,32 @@ serde_yaml = "0.9"
 schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 thiserror = "2.0"
+base64 = "0.22"
+insta = { version = "1.43", features = ["json"] }
+wiremock = "0.6"
+temp-env = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 flate2 = "1.*"
 zstd = "0.13"
 walkdir = "2.*"
-sha2 = "0.10.*"
+sha2 = "0.10"
 uuid = { version = "1", default-features = false, features = ["serde"] }
 ulid = { version = "1", features = ["serde"] }
 semver = { version = "1", features = ["serde"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
+mini-moka = { version = "0.10", features = ["sync"] }
 proptest = "1"
 aes-gcm = "0.10"
 argon2 = "0.5"
 password-hash = { version = "0.5", features = ["getrandom"] }
 secrecy = "0.10"
 zeroize = "1"
+governor = "0.10"
+rand = "0.9"
+url = "2"
+urlencoding = "2"
+httpdate = "1"
+regex = "1"
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"

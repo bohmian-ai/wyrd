@@ -94,6 +94,24 @@ for crate in wyrd-auth-verify; do
     exit 1
   fi
 done
+
+forbidden_skald_prompt=$(cargo tree -p skald-prompt --all-features -e normal | \
+  rg '(^|[ ─└├])(reqwest|tokio|hyper|axum|sqlx|opentelemetry|skald-runtime|skald-providers|skald-cache|skald-tool)' || true)
+if [ -n "$forbidden_skald_prompt" ]; then
+  echo "FAIL: skald-prompt pulls forbidden client-unsafe deps:"
+  echo "$forbidden_skald_prompt"
+  exit 1
+fi
+
+if rg -n 'wyrd_spec|wyrd-' crates/skald --glob '!crates/skald/skald-prompt/**'; then
+  echo 'Skald engine crates must remain free of wyrd-* references'
+  exit 1
+fi
+
+if ! rg -q 'wyrd-(spec|interfaces|utils)' crates/skald/skald-prompt/Cargo.toml; then
+  echo 'skald-prompt must remain the documented Skald/Wyrd boundary crate'
+  exit 1
+fi
 """
 
 [tasks."check:pyo3-scope"]
@@ -108,6 +126,22 @@ fi
 
 if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/shared --glob '!crates/shared/wyrd-utils/**'; then
   echo 'PyO3 scope violation detected in Python-free shared crates'
+  exit 1
+fi
+
+if rg -n 'pyo3|pymodule|pyclass|pymethods|Python|Bound|Py<|PyErr' crates/skald \
+  --glob '!crates/skald/skald-prompt/**'; then
+  echo 'PyO3 scope violation detected in Python-free Skald engine crates'
+  exit 1
+fi
+
+if ! rg -q 'python = \\[.*dep:pyo3' crates/skald/skald-prompt/Cargo.toml; then
+  echo 'skald-prompt must gate PyO3 behind its python feature'
+  exit 1
+fi
+
+if ! rg -q 'pyo3 = \\{ workspace = true, optional = true \\}' crates/skald/skald-prompt/Cargo.toml; then
+  echo 'skald-prompt PyO3 dependency must remain optional'
   exit 1
 fi
 
@@ -138,7 +172,10 @@ fi
 [tasks."check:mocks-scope"]
 description = "Assert mock helpers stay out of production source"
 run = """
-if rg -n 'mockall|wiremock|mockito' crates --glob '!crates/shared/wyrd-testing/**'; then
+if rg -n 'mockall|wiremock|mockito' crates \
+  --glob '!crates/shared/wyrd-testing/**' \
+  --glob '!crates/skald/skald-providers/Cargo.toml' \
+  --glob '!crates/skald/skald-providers/tests/**'; then
   echo 'mock dependency leaked outside wyrd-testing'
   exit 1
 fi

@@ -1,0 +1,1 @@
+{"instances":[{"content":"alpha","task_type":"RETRIEVAL_DOCUMENT"},{"content":"beta","task_type":"RETRIEVAL_DOCUMENT"}],"parameters":{"auto_truncate":true,"output_dimensionality":3}}

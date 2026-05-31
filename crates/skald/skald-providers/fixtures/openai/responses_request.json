@@ -1,0 +1,1 @@
+{"model":"gpt-4o-mini","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"instructions":"be brief","reasoning":{"effort":"low"}}

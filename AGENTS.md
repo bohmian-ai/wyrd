@@ -51,7 +51,7 @@ Locked cross-cutting decisions that any contributor must honor:
   CardBody { Model(ModelSpec), Data(DataSpec), ... }` flattened into the
   envelope. **Locked 2026-05-21.**
 - `CardRef` carries `kind`, `name`, one `version` field, optional `space`, and
-  optional `uid`. Do not introduce `version_req`.
+  optional `uid`. Do not introduce a separate version requirement field.
 - `wyrd-spec` is PyO3-free, IO-free, async-free, and foundational.
 - Client-tier crates do not depend on `sqlx`, cloud SDKs, `datafusion`, or
   `deltalake`.

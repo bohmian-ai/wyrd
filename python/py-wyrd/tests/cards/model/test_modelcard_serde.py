@@ -32,6 +32,17 @@ def test_model_dump_json_round_trips_through_public_validator() -> None:
     assert "tags" not in payload["metadata"]
 
 
+def test_modelcard_str_is_pretty_card_json() -> None:
+    card = ModelCard(
+        SklearnInterface(model=_sklearn_model()),
+        metadata=model_metadata("binary_classification"),
+    )
+    payload = json.loads(str(card))
+
+    assert payload["apiVersion"] == "wyrd/v1"
+    assert payload["kind"] == "Model"
+
+
 def test_model_validate_json_rejects_wrong_card_kind() -> None:
     payload = {
         "apiVersion": "wyrd/v1",

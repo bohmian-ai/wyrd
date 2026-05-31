@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::card::common::{
-    AgentInterface, Governance, NonSecretValue, ObservationHooks, ProtocolProfile, Provider,
+    AgentInterface, Governance, NonSecretValue, ObservationHooks, ProtocolProfile,
 };
 use crate::reference::CardRef;
 
@@ -48,7 +48,7 @@ pub struct AgentSpec {
     pub max_iterations: Option<u32>,
     /// Preferred provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<Provider>,
+    pub provider: Option<String>,
     /// Preferred model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,

@@ -103,6 +103,16 @@ if [ -n "$forbidden_skald_prompt" ]; then
   exit 1
 fi
 
+for crate in skald-agent skald-workflow; do
+  forbidden_skald_member=$(cargo tree -p "$crate" --all-features -e normal | \
+    rg '(^|[ ─└├])(wyrd-|vala-)' || true)
+  if [ -n "$forbidden_skald_member" ]; then
+    echo "FAIL: $crate pulls forbidden wyrd/vala deps:"
+    echo "$forbidden_skald_member"
+    exit 1
+  fi
+done
+
 if rg -n 'wyrd_spec|wyrd-' crates/skald --glob '!crates/skald/skald-prompt/**'; then
   echo 'Skald engine crates must remain free of wyrd-* references'
   exit 1

@@ -1,0 +1,23 @@
+[package]
+name = "wyrd"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "Public Wyrd Rust umbrella crate; sanctioned re-exports for downstream consumers."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+skald-spec = { workspace = true }
+skald-agent = { workspace = true }
+skald-workflow = { workspace = true }
+wyrd-spec = { workspace = true }
+wyrd-cards = { workspace = true }

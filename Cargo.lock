@@ -3917,6 +3917,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vala-client"
+version = "0.0.1"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "wyrd-runtime",
+ "wyrd-spec",
+]
+
+[[package]]
 name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4624,6 +4636,20 @@ version = "0.0.1"
 dependencies = [
  "axum 0.8.9",
  "tokio",
+]
+
+[[package]]
+name = "wyrd-observe"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "skald-agent",
+ "tracing",
+ "vala-client",
+ "wyrd-spec",
+ "wyrd-utils",
 ]
 
 [[package]]

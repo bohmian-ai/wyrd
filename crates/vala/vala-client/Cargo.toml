@@ -1,0 +1,24 @@
+[package]
+name = "vala-client"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "Client-tier Vala observation boundary."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+wyrd-spec = { workspace = true }
+wyrd-runtime = { path = "../../shared/wyrd-runtime", version = "0.0.1" }
+reqwest = { workspace = true }

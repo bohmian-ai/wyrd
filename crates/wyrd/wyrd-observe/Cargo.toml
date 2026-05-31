@@ -1,0 +1,29 @@
+[package]
+name = "wyrd-observe"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "Wyrd-side observer adapter for Skald agent runs."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+skald-agent = { workspace = true }
+vala-client = { workspace = true }
+wyrd-spec = { workspace = true }
+wyrd-utils = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true, features = ["raw_value"] }

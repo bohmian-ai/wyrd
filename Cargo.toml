@@ -33,6 +33,8 @@ skald-runtime = { path = "crates/skald/skald-runtime", version = "0.0.1" }
 skald-prompt = { path = "crates/skald/skald-prompt", version = "0.0.1" }
 skald-agent = { path = "crates/skald/skald-agent", version = "0.0.1" }
 skald-workflow = { path = "crates/skald/skald-workflow", version = "0.0.1" }
+vala-client = { path = "crates/vala/vala-client", version = "0.0.1" }
+wyrd-observe = { path = "crates/wyrd/wyrd-observe", version = "0.0.1" }
 wyrd-utils = { path = "crates/shared/wyrd-utils", version = "0.0.1" }
 wyrd-test-contract-macros = { path = "crates/shared/wyrd-test-contract-macros", version = "0.0.1" }
 wyrd-interfaces = { path = "crates/wyrd/wyrd-interfaces", version = "0.0.1" }

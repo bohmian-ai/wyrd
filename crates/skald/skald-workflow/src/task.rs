@@ -1,14 +1,33 @@
 //! Live task state and output validation.
 
 use std::fmt;
+use std::sync::Arc;
 
+use jsonschema::{SchemaResolver, SchemaResolverError};
 use serde_json::Value;
 use skald_spec::{Prompt, ProviderResponse, ResponseType};
+use url::Url;
 
 use crate::def::TaskDef;
 use crate::error::{WorkflowError, WorkflowResult};
 
 type OutputValidator = jsonschema::JSONSchema;
+
+/// Rejects all external schema URIs to prevent outbound HTTP during schema compile.
+struct NoRemoteResolver;
+
+impl SchemaResolver for NoRemoteResolver {
+    fn resolve(
+        &self,
+        _root_schema: &Value,
+        url: &Url,
+        _original_reference: &str,
+    ) -> Result<Arc<Value>, SchemaResolverError> {
+        Err(anyhow::anyhow!(
+            "remote schema resolution is disabled: {url}"
+        ))
+    }
+}
 
 /// Lifecycle status of a task during execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,7 +153,9 @@ fn compile_validator(
 ) -> WorkflowResult<Option<OutputValidator>> {
     match response_type {
         ResponseType::Text => Ok(None),
-        ResponseType::JsonSchema { schema, .. } => jsonschema::JSONSchema::compile(schema)
+        ResponseType::JsonSchema { schema, .. } => jsonschema::JSONSchema::options()
+            .with_resolver(NoRemoteResolver)
+            .compile(schema)
             .map(Some)
             .map_err(|err| WorkflowError::ResponseValidationFailed {
                 task_id: task_id.to_owned(),

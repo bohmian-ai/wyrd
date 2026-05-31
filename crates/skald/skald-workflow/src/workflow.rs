@@ -324,7 +324,7 @@ impl Workflow {
                     .iter()
                     .map(|msg| match msg {
                         MessageNum::OpenAi(message) => Ok(message.clone()),
-                        _ => Err(unsupported_handoff(dst_provider)),
+                        _ => Err(unsupported_handoff(&provider_of_message(msg), dst_provider)),
                     })
                     .collect::<WorkflowResult<Vec<_>>>()?;
                 req.messages.splice(0..0, messages);
@@ -334,7 +334,7 @@ impl Workflow {
                     .iter()
                     .map(|msg| match msg {
                         MessageNum::Anthropic(message) => Ok(message.clone()),
-                        _ => Err(unsupported_handoff(dst_provider)),
+                        _ => Err(unsupported_handoff(&provider_of_message(msg), dst_provider)),
                     })
                     .collect::<WorkflowResult<Vec<_>>>()?;
                 req.messages.splice(0..0, messages);
@@ -344,7 +344,7 @@ impl Workflow {
                     .iter()
                     .map(|msg| match msg {
                         MessageNum::Gemini(message) => Ok(message.clone()),
-                        _ => Err(unsupported_handoff(dst_provider)),
+                        _ => Err(unsupported_handoff(&provider_of_message(msg), dst_provider)),
                     })
                     .collect::<WorkflowResult<Vec<_>>>()?;
                 req.contents.splice(0..0, messages);
@@ -354,7 +354,7 @@ impl Workflow {
                     .iter()
                     .map(|msg| match msg {
                         MessageNum::Gemini(message) => Ok(message.clone()),
-                        _ => Err(unsupported_handoff(dst_provider)),
+                        _ => Err(unsupported_handoff(&provider_of_message(msg), dst_provider)),
                     })
                     .collect::<WorkflowResult<Vec<_>>>()?;
                 req.0.contents.splice(0..0, messages);
@@ -363,8 +363,10 @@ impl Workflow {
             | ProviderRequest::OpenAiEmbeddings(_)
             | ProviderRequest::GoogleBatchEmbed(_)
             | ProviderRequest::VertexPredict(_)
-            | ProviderRequest::RawV1 { .. } => return Err(unsupported_handoff(dst_provider)),
-            _ => return Err(unsupported_handoff(dst_provider)),
+            | ProviderRequest::RawV1 { .. } => {
+                return Err(unsupported_handoff(dst_provider, dst_provider));
+            }
+            _ => return Err(unsupported_handoff(dst_provider, dst_provider)),
         }
         Ok(())
     }
@@ -480,10 +482,19 @@ fn push_event(events: &Mutex<Vec<TaskEvent>>, event: TaskEvent) -> WorkflowResul
     Ok(())
 }
 
-fn unsupported_handoff(provider: &ProviderName) -> WorkflowError {
+fn unsupported_handoff(src: &ProviderName, dst: &ProviderName) -> WorkflowError {
     WorkflowError::UnsupportedHandoff {
-        src: provider.clone(),
-        dst: provider.clone(),
+        src: src.clone(),
+        dst: dst.clone(),
+    }
+}
+
+fn provider_of_message(msg: &MessageNum) -> ProviderName {
+    match msg {
+        MessageNum::OpenAi(_) => ProviderName::OpenAi,
+        MessageNum::Anthropic(_) => ProviderName::Anthropic,
+        MessageNum::Gemini(_) => ProviderName::Google,
+        _ => ProviderName::Custom("unknown".to_owned()),
     }
 }
 

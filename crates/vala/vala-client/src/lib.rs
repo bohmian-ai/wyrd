@@ -126,7 +126,7 @@ pub struct AgentErrorRecord {
     pub envelope: ObservationEnvelope,
     /// Stable Skald error code.
     pub code: String,
-    /// Human-readable error detail.
+    /// Human-readable error detail. Capped at `max_content_chars` by the Wyrd redaction policy before emission.
     pub detail: String,
     /// Optional Wyrd-side error classification.
     pub wyrd_error_code: Option<String>,

@@ -180,8 +180,8 @@ pub fn build_request(agent: &Agent, messages: &[MessageNum]) -> AgentResult<Prov
         ProviderName::OpenAi => build_openai_request(agent, messages),
         ProviderName::Anthropic => build_anthropic_request(agent, messages),
         ProviderName::Google | ProviderName::Vertex => build_google_request(agent, messages),
-        ProviderName::Custom(_) => Err(AgentError::SystemPrompt {
-            provider: agent.provider_name.clone(),
+        ProviderName::Custom(_) => Err(AgentError::Prompt {
+            agent: String::new(),
             detail: "custom provider request assembly is not supported by skald-agent".to_owned(),
         }),
     }
@@ -203,7 +203,7 @@ fn build_openai_request(agent: &Agent, messages: &[MessageNum]) -> AgentResult<P
         match msg {
             MessageNum::OpenAi(message) => chat_messages.push(message.clone()),
             _ => {
-                return Err(AgentError::SystemPrompt {
+                return Err(AgentError::LoopMessageType {
                     provider: ProviderName::OpenAi,
                     detail: "non-OpenAI message in loop history".to_owned(),
                 });
@@ -265,7 +265,7 @@ fn build_anthropic_request(agent: &Agent, messages: &[MessageNum]) -> AgentResul
             }
             MessageNum::Anthropic(_) => {}
             _ => {
-                return Err(AgentError::SystemPrompt {
+                return Err(AgentError::LoopMessageType {
                     provider: ProviderName::Anthropic,
                     detail: "non-Anthropic message in loop history".to_owned(),
                 });
@@ -331,7 +331,7 @@ fn build_google_request(agent: &Agent, messages: &[MessageNum]) -> AgentResult<P
             }
             MessageNum::Gemini(_) => {}
             _ => {
-                return Err(AgentError::SystemPrompt {
+                return Err(AgentError::LoopMessageType {
                     provider: ProviderName::Google,
                     detail: "non-Google message in loop history".to_owned(),
                 });

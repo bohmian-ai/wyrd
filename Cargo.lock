@@ -3051,6 +3051,7 @@ dependencies = [
 name = "skald-workflow"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "async-trait",
  "futures",
  "jsonschema",
@@ -3064,6 +3065,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

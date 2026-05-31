@@ -61,6 +61,14 @@ pub enum AgentError {
         /// Underlying render or projection failure message.
         detail: String,
     },
+    /// A message in the loop history does not match the agent's bound provider.
+    #[error("loop history contains a non-{provider:?} message: {detail}")]
+    LoopMessageType {
+        /// Provider the agent is bound to.
+        provider: ProviderName,
+        /// Description of the mismatch.
+        detail: String,
+    },
     /// `Agent::run_prompt` was given a prompt whose rendered provider does not
     /// match the agent's bound provider.
     #[error(
@@ -93,12 +101,10 @@ impl AgentError {
             Self::InvalidToolArgs { .. } => "SKALD_AGENT_422_TOOL_ARGS",
             Self::SystemPrompt { .. } => "SKALD_AGENT_422_SYSTEM_PROMPT",
             Self::Prompt { .. } => "SKALD_AGENT_422_PROMPT",
+            Self::LoopMessageType { .. } => "SKALD_AGENT_422_LOOP_MESSAGE_TYPE",
             Self::ProviderMismatch { .. } => "SKALD_AGENT_409_PROVIDER_MISMATCH",
             Self::MaxIterations { .. } => "SKALD_AGENT_500_MAX_ITERATIONS",
-            Self::Provider(source) => match source.code() {
-                "SKALD_RUNTIME_404_PROVIDER" => "SKALD_AGENT_404_PROVIDER",
-                other => other,
-            },
+            Self::Provider(_) => "SKALD_AGENT_502_PROVIDER",
             Self::Tool(source) => source.code(),
         }
     }

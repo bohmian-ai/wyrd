@@ -44,7 +44,6 @@ pub use def::{TaskDef, WorkflowDef, default_max_retries};
 pub use error::{WorkflowError, WorkflowResult};
 pub use handoff::{extract_messages_for_handoff, handoff_messages};
 pub use run::{TaskEvent, TaskOutcome, WorkflowRun};
-pub use schedule::execution_plan;
 pub use task::{Task, TaskStatus};
-pub use tasklist::{SharedTask, TaskList};
+pub use tasklist::TaskList;
 pub use workflow::Workflow;

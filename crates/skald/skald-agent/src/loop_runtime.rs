@@ -50,7 +50,7 @@ impl Agent {
         vars: &[(&str, &str)],
     ) -> AgentResult<AgentRun> {
         let span = debug_span!(
-            "skald_agent.run",
+            "skald_agent.run_prompt",
             agent_id = self.id.as_str(),
             provider = ?self.provider_name,
             cap = self.run_config.max_iterations,
@@ -193,8 +193,8 @@ fn initial_user_message(provider: &ProviderName, input: &str) -> AgentResult<Mes
                 text: input.to_owned(),
             }],
         })),
-        ProviderName::Custom(_) => Err(AgentError::SystemPrompt {
-            provider: provider.clone(),
+        ProviderName::Custom(_) => Err(AgentError::Prompt {
+            agent: String::new(),
             detail: "custom providers must construct initial messages directly".to_owned(),
         }),
     }

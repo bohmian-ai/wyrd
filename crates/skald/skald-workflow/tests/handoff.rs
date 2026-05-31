@@ -13,7 +13,7 @@ use skald_spec::wire::openai_chat::{
 use skald_spec::{
     MessageNum, Prompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
 };
-use skald_workflow::{Context, TaskDef, Workflow, WorkflowDef};
+use skald_workflow::{Context, TaskDef, Workflow, WorkflowDef, extract_messages_for_handoff};
 
 fn openai_prompt() -> Prompt {
     Prompt {
@@ -287,4 +287,30 @@ fn handoff_messages_rejects_missing_conversion() {
     .expect_err("custom conversion is unsupported");
 
     assert_eq!(err.code(), "SKALD_WORKFLOW_501_UNSUPPORTED_HANDOFF");
+}
+
+#[test]
+fn extract_messages_for_handoff_rejects_mismatched_response_provider() {
+    let response = openai_text("hello");
+    let err = extract_messages_for_handoff(&response, &ProviderName::Anthropic)
+        .expect_err("OpenAI response with Anthropic provider label must fail");
+    assert_eq!(err.code(), "SKALD_WORKFLOW_501_UNSUPPORTED_HANDOFF");
+}
+
+#[test]
+fn extract_messages_for_handoff_returns_assistant_message_for_openai() {
+    let response = openai_text("result");
+    let msgs = extract_messages_for_handoff(&response, &ProviderName::OpenAi)
+        .expect("matching OpenAI provider must succeed");
+    assert_eq!(msgs.len(), 1);
+    assert!(matches!(msgs[0], MessageNum::OpenAi(_)));
+}
+
+#[test]
+fn extract_messages_for_handoff_returns_assistant_message_for_anthropic() {
+    let response = anthropic_text("result");
+    let msgs = extract_messages_for_handoff(&response, &ProviderName::Anthropic)
+        .expect("matching Anthropic provider must succeed");
+    assert_eq!(msgs.len(), 1);
+    assert!(matches!(msgs[0], MessageNum::Anthropic(_)));
 }

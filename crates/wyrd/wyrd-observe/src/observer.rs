@@ -131,7 +131,7 @@ impl Observer for WyrdObserver {
         let record = AgentErrorRecord {
             envelope: self.envelope(agent_id),
             code: code.to_owned(),
-            detail: detail.to_owned(),
+            detail: self.redaction.redact_response_text(detail),
             wyrd_error_code: map_skald_code(code).map(|variant| variant.code()),
         };
         let _ = self.vala_client.observe_agent_error(record);

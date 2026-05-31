@@ -7,6 +7,10 @@ use serde_json::{Map, Value};
 pub const REDACTED_PLACEHOLDER: &str = "<REDACTED>";
 
 /// Redaction policy for tool arguments and provider content.
+///
+/// Redaction operates on JSON field names only. Values that contain secret
+/// patterns (e.g. an API key echoed back in a response body) are not redacted
+/// unless the enclosing field name is in the blocklist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedactionPolicy {
     /// Case-insensitive tool argument field names to replace.
@@ -94,23 +98,14 @@ fn redact_in_place(value: &mut Value, blocked_lower: &[String]) {
 }
 
 fn redact_object(map: &mut Map<String, Value>, blocked_lower: &[String]) {
-    let blocked_keys: Vec<String> = map
-        .keys()
-        .filter(|key| {
-            blocked_lower
-                .iter()
-                .any(|blocked| blocked == &key.to_lowercase())
-        })
-        .cloned()
-        .collect();
-    for key in &blocked_keys {
-        if let Some(value) = map.get_mut(key) {
+    for (key, value) in map.iter_mut() {
+        if blocked_lower
+            .iter()
+            .any(|blocked| blocked == &key.to_lowercase())
+        {
             *value = Value::String(REDACTED_PLACEHOLDER.to_owned());
-        }
-    }
-    for (key, child) in map {
-        if !blocked_keys.contains(key) {
-            redact_in_place(child, blocked_lower);
+        } else {
+            redact_in_place(value, blocked_lower);
         }
     }
 }

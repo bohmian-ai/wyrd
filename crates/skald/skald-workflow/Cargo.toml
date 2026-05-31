@@ -28,6 +28,8 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 futures = "0.3"
 jsonschema = { workspace = true }
+anyhow = "1"
+url = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]

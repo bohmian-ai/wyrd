@@ -1,7 +1,5 @@
 //! Model interface auto-detection.
 
-use crate::error::CardPyResult;
-
 /// Auto-detectable built-in model interface variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelInterfaceKind {
@@ -52,7 +50,7 @@ impl ModelInterfaceKind {
 pub fn detect_interface_variant(
     py: pyo3::Python<'_>,
     model: &pyo3::Bound<'_, pyo3::types::PyAny>,
-) -> CardPyResult<ModelInterfaceKind> {
+) -> crate::error::CardPyResult<ModelInterfaceKind> {
     use crate::data::dtype::is_framework_class;
     use crate::error::WyrdPyError;
     use pyo3::types::PyAnyMethods;

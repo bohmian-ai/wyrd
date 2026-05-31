@@ -126,6 +126,7 @@ pub fn parse_color_mode(value: &str) -> CardPyResult<ColorMode> {
 ///
 /// # Errors
 /// Returns `WYRD_DATA_400_INVALID_INTERFACE_OPTION` for blank dialect strings.
+#[cfg(feature = "python")]
 pub fn parse_sql_dialect(value: &str) -> CardPyResult<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {

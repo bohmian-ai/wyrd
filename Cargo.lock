@@ -2688,6 +2688,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "skald-agent"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "futures",
+ "pyo3",
+ "serde",
+ "serde_json",
+ "skald-runtime",
+ "skald-spec",
+ "skald-tool",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "skald-cache"
 version = "0.0.1"
 dependencies = [

@@ -1,7 +1,7 @@
 //! Live agent: identity, bound provider, system instruction, tools, run config.
 //!
 //! Built once via [`Agent::from_def`] or [`crate::AgentBuilder`], then immutable.
-//! The bounded tool loop is added in a later stage.
+//! The bounded tool loop methods are implemented in [`crate::loop_runtime`].
 
 use std::fmt;
 use std::sync::Arc;

@@ -2,22 +2,22 @@
 
 use skald_spec::{
     AnthropicMessagesSettings, GoogleGenerateSettings, OpenAiChatSettings, OpenAiResponsesSettings,
-    ProviderName, ProviderRequest, SkaldError,
 };
 
 #[cfg(feature = "python")]
 use {
     pyo3::IntoPyObjectExt,
     pyo3::{prelude::*, types::PyDict},
+    skald_spec::{ProviderName, ProviderRequest, SkaldError},
     wyrd_interfaces::error::{CardPyResult, WyrdPyError},
 };
 
 #[cfg(feature = "python")]
 use crate::prompt::Prompt;
 
-/// Python wrapper for native OpenAI Chat generation settings.
+/// Python wrapper for native `OpenAI` Chat generation settings.
 ///
-/// Keyword arguments map directly to OpenAI Chat Completions request fields and
+/// Keyword arguments map directly to `OpenAI` Chat Completions request fields and
 /// serialize at the native request top level. Unknown keyword arguments are
 /// preserved in the native settings `extra` map.
 #[cfg_attr(
@@ -29,9 +29,9 @@ pub struct PyOpenAiChatSettings {
     pub(crate) inner: OpenAiChatSettings,
 }
 
-/// Python wrapper for native OpenAI Responses generation settings.
+/// Python wrapper for native `OpenAI` Responses generation settings.
 ///
-/// Keyword arguments map directly to OpenAI Responses request fields and
+/// Keyword arguments map directly to `OpenAI` Responses request fields and
 /// serialize at the native request top level. Unknown keyword arguments are
 /// preserved in the native settings `extra` map.
 #[cfg_attr(
@@ -383,15 +383,6 @@ pub fn apply_model_settings(
         }
         ProviderRequest::Vertex(request) => {
             request.0.settings = resolve_google_settings(Some(value))?;
-        }
-        ProviderRequest::OpenAiEmbeddings(_)
-        | ProviderRequest::GoogleBatchEmbed(_)
-        | ProviderRequest::VertexPredict(_)
-        | ProviderRequest::RawV1 { .. } => {
-            return Err(settings_decode(
-                prompt.request.provider(),
-                "this prompt request does not support model_settings",
-            ));
         }
         _ => {
             return Err(settings_decode(

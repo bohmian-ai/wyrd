@@ -4,7 +4,10 @@ use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use skald_spec::{MediaKind, MediaRef, MediaSource, SkaldError, SkaldResult};
+use skald_spec::{MediaKind, MediaRef, SkaldError, SkaldResult};
+
+#[cfg(feature = "python")]
+use skald_spec::MediaSource;
 
 #[cfg(feature = "python")]
 use pyo3::types::PyBytesMethods;

@@ -16,10 +16,10 @@ path = "src/lib.rs"
 default = []
 
 [dependencies]
-skald-spec = { path = "../skald-spec" }
-skald-providers = { path = "../skald-providers" }
-skald-cache = { path = "../skald-cache" }
-skald-tool = { path = "../skald-tool" }
+skald-spec = { workspace = true }
+skald-providers = { workspace = true }
+skald-cache = { workspace = true }
+skald-tool = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 async-trait = { workspace = true }
 thiserror = { workspace = true }

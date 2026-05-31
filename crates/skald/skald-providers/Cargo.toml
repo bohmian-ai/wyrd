@@ -11,9 +11,9 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-skald-spec = { path = "../skald-spec" }
-skald-cache = { path = "../skald-cache" }
-skald-tool = { path = "../skald-tool" }
+skald-spec = { workspace = true }
+skald-cache = { workspace = true }
+skald-tool = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }

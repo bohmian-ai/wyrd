@@ -1827,14 +1827,6 @@ class ProviderRequest:
         """
         ...
 
-    def to_json(self) -> str:
-        """Return the native provider request as JSON.
-
-        Returns:
-            str: Serialized provider request JSON.
-        """
-        ...
-
     def __str__(self) -> str:
         """Return pretty JSON for interactive inspection.
 
@@ -2499,16 +2491,8 @@ class Prompt:
         """
         ...
 
-    def to_json(self) -> str:
-        """Return the native prompt as JSON.
-
-        Returns:
-            str: Serialized native prompt JSON.
-        """
-        ...
-
     @staticmethod
-    def from_json(data: str) -> Prompt:
+    def model_validate_json(data: str) -> Prompt:
         """Build a prompt from serialized native prompt JSON.
 
         Args:
@@ -2653,7 +2637,11 @@ class Prompt:
         ...
 
 class PromptRef:
-    """Reference to a registered PromptCard or inline Prompt spec."""
+    """Python-facing Wyrd prompt reference.
+
+    A prompt reference points at either a registered Prompt Card or an inline
+    Prompt spec.
+    """
 
     kind: str
 

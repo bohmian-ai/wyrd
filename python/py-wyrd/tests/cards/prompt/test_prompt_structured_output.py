@@ -39,7 +39,7 @@ def provider_prompts(response_format: object) -> list[Prompt]:
 @pytest.mark.parametrize("prompt", provider_prompts(Recipe))
 def test_pydantic_basemodel_schema_extraction(prompt: Prompt) -> None:
     schema = schema_from_request(prompt)
-    round_tripped = Prompt.from_json(prompt.model_dump_json())
+    round_tripped = Prompt.model_validate_json(prompt.model_dump_json())
 
     assert schema["type"] == "object"
     assert "ingredients" in schema["properties"]

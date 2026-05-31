@@ -26,6 +26,10 @@ authors = ["Thorrester <sjforrester32@gmail.com>"]
 [workspace.dependencies]
 wyrd-spec = { path = "crates/wyrd-spec", version = "0.0.1" }
 skald-spec = { path = "crates/skald/skald-spec", version = "0.1.0" }
+skald-cache = { path = "crates/skald/skald-cache", version = "0.0.1" }
+skald-tool = { path = "crates/skald/skald-tool", version = "0.0.1" }
+skald-providers = { path = "crates/skald/skald-providers", version = "0.0.1" }
+skald-runtime = { path = "crates/skald/skald-runtime", version = "0.0.1" }
 skald-prompt = { path = "crates/skald/skald-prompt", version = "0.0.1" }
 wyrd-utils = { path = "crates/shared/wyrd-utils", version = "0.0.1" }
 wyrd-test-contract-macros = { path = "crates/shared/wyrd-test-contract-macros", version = "0.0.1" }

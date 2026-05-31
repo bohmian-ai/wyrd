@@ -1,5 +1,6 @@
 //! `PromptCard` local holder and Python boundary.
 
+#[cfg(feature = "python")]
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
@@ -39,11 +40,15 @@ pub struct PromptCardMetadata {
     pub prompt: skald_spec::Prompt,
 }
 
-/// Python-facing wrapper around a Wyrd `PromptRef`.
+/// Python-facing Wyrd prompt reference.
+///
+/// A prompt reference points at either a registered Prompt Card or an inline
+/// Prompt spec.
 #[cfg_attr(
     feature = "python",
     pyclass(module = "wyrd.prompt", name = "PromptRef", skip_from_py_object)
 )]
+#[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromptRef {
     /// Wrapped native prompt reference.
@@ -245,7 +250,7 @@ impl PromptCard {
 #[cfg(feature = "python")]
 #[pymethods]
 impl PromptRef {
-    /// Build a PromptRef that points at a registered Prompt Card.
+    /// Build a `PromptRef` that points at a registered Prompt Card.
     ///
     /// # Errors
     /// Returns a Wyrd error when the card identity fields are invalid.
@@ -267,7 +272,7 @@ impl PromptRef {
         Ok(Self::from_native(NativePromptRef::Card(card_ref)))
     }
 
-    /// Build an inline PromptRef from a Python `Prompt`.
+    /// Build an inline `PromptRef` from a Python `Prompt`.
     ///
     /// # Errors
     /// Returns a Wyrd error when the prompt is invalid.
@@ -303,7 +308,7 @@ impl PromptRef {
         Ok(serde_json::to_string(&self.inner)?)
     }
 
-    /// Rebuild a PromptRef from JSON.
+    /// Rebuild a `PromptRef` from JSON.
     ///
     /// # Errors
     /// Returns a Wyrd error when JSON parsing or validation fails.
@@ -748,18 +753,24 @@ fn metadata_error(error: MetadataError) -> WyrdPyError {
     )
 }
 
+#[cfg(any(feature = "python", test))]
 fn default_prompt() -> skald_spec::Prompt {
-    skald_spec::Prompt::new(
+    let body = match serde_json::value::RawValue::from_string("{}".to_owned()) {
+        Ok(body) => body,
+        Err(error) => panic!("static raw JSON object is valid: {error}"),
+    };
+    match skald_spec::Prompt::new(
         skald_spec::ProviderRequest::RawV1 {
             provider: skald_spec::ProviderName::Custom("placeholder".to_owned()),
-            body: serde_json::value::RawValue::from_string("{}".to_owned())
-                .expect("static raw JSON object is valid"),
+            body,
         },
         "placeholder",
         None,
         skald_spec::ResponseType::Text,
-    )
-    .expect("static placeholder prompt is valid")
+    ) {
+        Ok(prompt) => prompt,
+        Err(error) => panic!("static placeholder prompt is valid: {error}"),
+    }
 }
 
 fn card_name(field: &str, value: &str) -> Result<CardName, WyrdError> {

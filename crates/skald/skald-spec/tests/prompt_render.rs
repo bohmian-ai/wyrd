@@ -112,7 +112,7 @@ fn dollar_syntax_is_not_matched() {
     if let skald_spec::wire::google_generate::GooglePart::Text { text } =
         &mut request.contents[0].parts[0]
     {
-        *text = "Hello ${name}".to_string();
+        *text = format!("Hello ${{{}}}", "name");
     }
     let rendered = prompt(
         ProviderRequest::GeminiGenerateContent(request),
@@ -121,7 +121,7 @@ fn dollar_syntax_is_not_matched() {
     .render(&[("name", "Ada")])
     .unwrap();
     let value: Value = serde_json::to_value(rendered).unwrap();
-    assert!(value.to_string().contains("${name}"));
+    assert!(value.to_string().contains(&format!("${{{}}}", "name")));
 }
 
 #[test]

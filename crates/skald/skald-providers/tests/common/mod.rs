@@ -77,5 +77,9 @@ pub async fn assert_received_body(server: &MockServer, expected: &str) {
         .await
         .expect("wiremock records received requests");
     let actual = String::from_utf8(requests[0].body.clone()).expect("body is UTF-8");
-    assert_eq!(actual, expected);
+    let actual_json: serde_json::Value =
+        serde_json::from_str(&actual).expect("actual body is JSON");
+    let expected_json: serde_json::Value =
+        serde_json::from_str(expected).expect("expected body is JSON");
+    assert_eq!(actual_json, expected_json);
 }

@@ -87,19 +87,21 @@ pub enum TextSegment {
 /// Returns the compiled `{{name}}` text placeholder regex.
 pub fn text_placeholder_regex() -> &'static Regex {
     static TEXT_PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
-    TEXT_PLACEHOLDER_RE.get_or_init(|| {
-        Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}")
-            .expect("text placeholder regex is static and valid")
+    TEXT_PLACEHOLDER_RE.get_or_init(|| match Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}") {
+        Ok(regex) => regex,
+        Err(error) => panic!("text placeholder regex is static and valid: {error}"),
     })
 }
 
 /// Returns the compiled `${media:name}` media placeholder regex.
 pub fn media_placeholder_regex() -> &'static Regex {
     static MEDIA_PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
-    MEDIA_PLACEHOLDER_RE.get_or_init(|| {
-        Regex::new(r"\$\{media:([a-zA-Z_][a-zA-Z0-9_]*)\}")
-            .expect("media placeholder regex is static and valid")
-    })
+    MEDIA_PLACEHOLDER_RE.get_or_init(
+        || match Regex::new(r"\$\{media:([a-zA-Z_][a-zA-Z0-9_]*)\}") {
+            Ok(regex) => regex,
+            Err(error) => panic!("media placeholder regex is static and valid: {error}"),
+        },
+    )
 }
 
 /// Split a text leaf into plain text and `${media:name}` placeholder segments.

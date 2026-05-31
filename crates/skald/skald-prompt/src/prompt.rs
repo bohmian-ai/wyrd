@@ -916,17 +916,12 @@ impl Prompt {
 
     /// Return this prompt as a JSON string.
     pub fn model_dump_json(&self) -> CardPyResult<String> {
-        self.to_json()
-    }
-
-    /// Serialize the native prompt as JSON.
-    pub fn to_json(&self) -> CardPyResult<String> {
         Ok(serde_json::to_string(&self.inner)?)
     }
 
-    /// Deserialize a native prompt from JSON.
+    /// Build a prompt from serialized native prompt JSON.
     #[staticmethod]
-    pub fn from_json(data: &str) -> CardPyResult<Self> {
+    pub fn model_validate_json(data: &str) -> CardPyResult<Self> {
         Ok(Self::from_native(serde_json::from_str(data)?))
     }
 
@@ -959,11 +954,6 @@ impl Prompt {
 #[cfg(feature = "python")]
 #[pyo3::pymethods]
 impl PyProviderRequest {
-    /// Serialize the native provider request as JSON.
-    pub fn to_json(&self) -> CardPyResult<String> {
-        Ok(serde_json::to_string(&self.inner)?)
-    }
-
     /// Return the native provider request as a Python dictionary.
     pub fn model_dump(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
         py_value(py, &self.inner)
@@ -971,7 +961,7 @@ impl PyProviderRequest {
 
     /// Return the native provider request as a JSON string.
     pub fn model_dump_json(&self) -> CardPyResult<String> {
-        self.to_json()
+        Ok(serde_json::to_string(&self.inner)?)
     }
 
     /// Return the provider name for the rendered request.
@@ -1099,6 +1089,7 @@ fn provider_request_from_py(value: &Bound<'_, PyAny>) -> CardPyResult<ProviderRe
     )?)?)
 }
 
+#[cfg(feature = "python")]
 fn request_model(request: &ProviderRequest) -> Option<&str> {
     match request {
         ProviderRequest::OpenAiChatCompletion(request) => Some(&request.model),
@@ -1113,6 +1104,7 @@ fn request_model(request: &ProviderRequest) -> Option<&str> {
     }
 }
 
+#[cfg(feature = "python")]
 fn set_request_model(request: &mut ProviderRequest, model: String) {
     match request {
         ProviderRequest::OpenAiChatCompletion(request) => request.model = model,
@@ -1128,6 +1120,7 @@ fn set_request_model(request: &mut ProviderRequest, model: String) {
     }
 }
 
+#[cfg(feature = "python")]
 fn request_messages_value(request: &ProviderRequest) -> serde_json::Value {
     match request {
         ProviderRequest::OpenAiChatCompletion(request) => serde_json::to_value(&request.messages),
@@ -1140,6 +1133,7 @@ fn request_messages_value(request: &ProviderRequest) -> serde_json::Value {
     .unwrap_or(serde_json::Value::Null)
 }
 
+#[cfg(feature = "python")]
 fn request_system_value(request: &ProviderRequest) -> serde_json::Value {
     match request {
         ProviderRequest::OpenAiChatCompletion(request) => serde_json::to_value(

@@ -54,19 +54,21 @@ pub fn is_valid_parameter_name(value: &str) -> bool {
 /// Returns the compiled `{{name}}` placeholder regex used by PromptCard validation.
 pub fn text_placeholder_regex() -> &'static Regex {
     static PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
-    PLACEHOLDER_RE.get_or_init(|| {
-        Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}")
-            .expect("PromptCard placeholder regex is static and valid")
+    PLACEHOLDER_RE.get_or_init(|| match Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}") {
+        Ok(regex) => regex,
+        Err(error) => panic!("PromptCard placeholder regex is static and valid: {error}"),
     })
 }
 
 /// Returns the compiled `${media:name}` placeholder regex used by PromptCard validation.
 pub fn media_placeholder_regex() -> &'static Regex {
     static PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
-    PLACEHOLDER_RE.get_or_init(|| {
-        Regex::new(r"\$\{media:([a-zA-Z_][a-zA-Z0-9_]*)\}")
-            .expect("PromptCard media placeholder regex is static and valid")
-    })
+    PLACEHOLDER_RE.get_or_init(
+        || match Regex::new(r"\$\{media:([a-zA-Z_][a-zA-Z0-9_]*)\}") {
+            Ok(regex) => regex,
+            Err(error) => panic!("PromptCard media placeholder regex is static and valid: {error}"),
+        },
+    )
 }
 
 /// Extracts declared-style `{{name}}` placeholders from the native request JSON.

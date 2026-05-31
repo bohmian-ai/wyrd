@@ -91,25 +91,22 @@ fn yaml_prompt_card_envelope_with_model_settings_loads() {
     let path = temp_path("authored_card.yaml");
     std::fs::write(
         &path,
-        r#"
+        r"
 apiVersion: wyrd/v1
 kind: Prompt
 metadata:
   name: yaml-prompt
   version: 0.1.0
 spec:
-  type: Prompt
-  prompt:
-    request:
-      model: gpt-4o
-      messages:
-        - role: user
-          content: hello
-      seed: 123
-      future_knob:
-        enabled: true
-    model: gpt-4o
-"#,
+  provider: openai
+  model: gpt-4o
+  messages:
+    - hello
+  model_settings:
+    seed: 123
+    future_knob:
+      enabled: true
+",
     )
     .expect("write fixture");
 

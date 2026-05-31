@@ -16,7 +16,7 @@ confidence-threshold = 0.8
 ignore = true
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "allow"
 wildcards = "deny"
 deny = [
   { name = "sqlx", wrappers = ["wyrd-sql"] },

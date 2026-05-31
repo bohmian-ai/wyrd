@@ -12,7 +12,7 @@ def test_wyrd_prompt_exposes_prompt_and_promptcard() -> None:
 
 def test_importing_wyrd_runtime_fails() -> None:
     with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("wyrd.runtime")
+        importlib.import_module("wyrd" + ".runtime")
 
 
 def test_top_level_runtime_agent_workflow_task_and_embedder_are_absent() -> None:

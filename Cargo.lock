@@ -3058,6 +3058,7 @@ dependencies = [
  "serde",
  "serde_json",
  "skald-agent",
+ "skald-providers",
  "skald-runtime",
  "skald-spec",
  "thiserror 2.0.18",

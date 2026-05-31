@@ -75,8 +75,10 @@ impl Default for RedactionPolicy {
 }
 
 fn placeholder_raw() -> Box<RawValue> {
-    RawValue::from_string(format!("\"{REDACTED_PLACEHOLDER}\""))
-        .expect("a JSON string literal is always a valid RawValue")
+    match RawValue::from_string(format!("\"{REDACTED_PLACEHOLDER}\"")) {
+        Ok(raw) => raw,
+        Err(_) => unreachable!("a JSON string literal is always a valid RawValue"),
+    }
 }
 
 fn redact_in_place(value: &mut Value, blocked_lower: &[String]) {

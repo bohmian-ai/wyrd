@@ -2,6 +2,8 @@
 //!
 //! Skald owns the agent-loop hook. This crate implements that hook on the
 //! Wyrd side and emits Vala records through [`vala_client::ValaClient`].
+//! Skald never depends on this crate; Wyrd injects the adapter where it binds
+//! live agents or workflows.
 
 #![deny(missing_docs)]
 #![allow(clippy::module_name_repetitions)]

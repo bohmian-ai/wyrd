@@ -1,4 +1,8 @@
 //! Skald observer implementation that emits Vala observation records.
+//!
+//! Observation enqueue calls are fire-and-forget by design. Vala emission must
+//! not change the agent or workflow error path, so enqueue failures are ignored
+//! after the client boundary has a chance to record them internally.
 
 use std::sync::Arc;
 
@@ -53,6 +57,8 @@ impl WyrdObserver {
 }
 
 impl Observer for WyrdObserver {
+    /// Emit every agent-start event because it creates the run envelope used by
+    /// later sampled observations.
     fn on_agent_start(&self, agent_id: &str, iteration_cap: u32) {
         let record = AgentStartRecord {
             envelope: self.envelope(agent_id),
@@ -61,6 +67,7 @@ impl Observer for WyrdObserver {
         let _ = self.vala_client.observe_agent_start(record);
     }
 
+    /// Emit sampled iteration events according to [`SamplingPolicy`].
     fn on_iteration(&self, agent_id: &str, iteration: u32) {
         if !self
             .sampling
@@ -82,6 +89,7 @@ impl Observer for WyrdObserver {
         let _ = self.vala_client.observe_iteration(record);
     }
 
+    /// Emit sampled tool-call events after applying [`RedactionPolicy`].
     fn on_tool_call(&self, agent_id: &str, tool: &str, args: &RawValue) {
         if !self.sampling.should_sample_tool_call(&self.run_id, tool) {
             return;
@@ -97,6 +105,7 @@ impl Observer for WyrdObserver {
         let _ = self.vala_client.observe_tool_call(record);
     }
 
+    /// Emit every tool-result event so sampled calls have a terminal outcome.
     fn on_tool_result(&self, agent_id: &str, tool: &str, ok: bool) {
         let record = ToolResultRecord {
             envelope: self.envelope(agent_id),
@@ -106,6 +115,7 @@ impl Observer for WyrdObserver {
         let _ = self.vala_client.observe_tool_result(record);
     }
 
+    /// Emit every agent-finish event because it closes the run envelope.
     fn on_agent_finish(&self, agent_id: &str, finish: FinishReason, iterations: u32) {
         let record = AgentFinishRecord {
             envelope: self.envelope(agent_id),
@@ -115,6 +125,8 @@ impl Observer for WyrdObserver {
         let _ = self.vala_client.observe_agent_finish(record);
     }
 
+    /// Emit every agent-error event so failures remain observable even when
+    /// high-volume iteration and tool-call events are sampled.
     fn on_agent_error(&self, agent_id: &str, code: &'static str, detail: &str) {
         let record = AgentErrorRecord {
             envelope: self.envelope(agent_id),

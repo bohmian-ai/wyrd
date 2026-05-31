@@ -7,7 +7,7 @@ description: Generated reference for the Wyrd Prompt card spec.
 
 Version prompt content and the contract around its inputs and outputs.
 
-<dl class="wyrd-defs"><dt data-kind="prompt">Prompt</dt><dd>Version prompt content and the contract around its inputs and outputs.</dd><dt>Required</dt><dd><code>template</code></dd><dt>Optional</dt><dd>15 additional spec fields — see table below.</dd></dl>
+<dl class="wyrd-defs"><dt data-kind="prompt">Prompt</dt><dd>Version prompt content and the contract around its inputs and outputs.</dd><dt>Required</dt><dd><code>model</code>, <code>request</code></dd><dt>Optional</dt><dd>4 additional spec fields — see table below.</dd></dl>
 
 This page is generated from the checked-in JSON Schema. Edit the Rust spec, run the schema generator, then run `mise run docs:generate` to refresh this page.
 
@@ -19,22 +19,12 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 
 | Field | Type | Required |
 | --- | --- | --- |
-| `audit_ref` | `object` | no |
-| `content_hash` | `string \| null` | no |
-| `description` | `string \| null` | no |
-| `details` | `object` | no |
-| `experiment_ref` | `object` | no |
-| `input_schema` | `object` | no |
-| `messages` | `array` | no |
-| `model` | `string \| null` | no |
-| `output_schema` | `object` | no |
-| `parameters` | `object` | no |
-| `provider` | `object` | no |
-| `template` | `string` | yes |
-| `template_format` | `string \| null` | no |
-| `tool_refs` | `array` | no |
-| `variable_specs` | `array` | no |
+| `media_variables` | `array` | no |
+| `model` | `string` | yes |
+| `request` | `object` | yes |
+| `response_type` | `object` | no |
 | `variables` | `array` | no |
+| `version` | `string \| null` | no |
 
 ## Shape
 

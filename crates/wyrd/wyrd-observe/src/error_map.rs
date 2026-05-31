@@ -42,6 +42,12 @@ impl WyrdErrorVariant {
 }
 
 /// Look up the Wyrd-side classification for a stable Skald code.
+///
+/// This local [`WyrdErrorVariant`] mirror disappears when the future
+/// `AgentCard` and `WorkflowCard` phase adds canonical `#[wyrd_error(...)]`
+/// metadata to Wyrd's public error catalog. Until then, every known
+/// `SKALD_AGENT_*` and `SKALD_WORKFLOW_*` code is enumerated here for Vala
+/// observation records.
 #[must_use]
 pub fn map_skald_code(code: &str) -> Option<WyrdErrorVariant> {
     match code {

@@ -29,15 +29,19 @@ impl RunId {
     }
 
     /// Deterministic bucket assignment for stable sampling decisions.
+    ///
+    /// The algorithm is stable across versions and platforms: compute Sha-256
+    /// over the run id bytes, read the first eight digest bytes as a
+    /// big-endian `u64`, then take modulo `buckets`. A pinned-value test locks
+    /// this choice so sampling assignments do not drift.
     #[must_use]
     pub fn hash_bucket(&self, buckets: u32) -> u32 {
         if buckets == 0 {
             return 0;
         }
         let digest = Sha256::digest(self.0.as_bytes());
-        let prefix: [u8; 8] = digest[..8]
-            .try_into()
-            .expect("sha256 output is always 32 bytes, slice of 8 always succeeds");
+        let mut prefix = [0_u8; 8];
+        prefix.copy_from_slice(&digest[..8]);
         let value = u64::from_be_bytes(prefix);
         (value % u64::from(buckets)) as u32
     }

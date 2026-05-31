@@ -5,6 +5,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod adapter;
+pub mod authoring;
 pub mod convert;
 pub mod error;
 pub mod media;
@@ -15,6 +16,7 @@ pub mod response;
 pub mod wire;
 
 pub use adapter::{ResponseAdapter, ToolCallView, UsageView};
+pub use authoring::{DraftMessages, PromptDraft};
 pub use convert::{MessageConversion, convert_message_dyn};
 pub use error::{SkaldError, SkaldResult};
 pub use media::{MediaKind, MediaRef, MediaSource};

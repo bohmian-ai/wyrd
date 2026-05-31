@@ -215,6 +215,14 @@ pub enum PromptError {
         /// Decode or validation message.
         message: String,
     },
+    /// A declarative `PromptDraft` failed to compile into a native prompt.
+    #[error("prompt draft compile failed for provider {provider}: {message}")]
+    DraftInvalid {
+        /// Provider name from the draft.
+        provider: String,
+        /// Compile failure message.
+        message: String,
+    },
 }
 
 impl PromptError {
@@ -257,6 +265,7 @@ impl PromptError {
             Self::MissingVariable { .. } => "WYRD_PROMPT_422_MISSING_VARIABLE",
             Self::UnsupportedHandoff { .. } => "WYRD_PROMPT_501_UNSUPPORTED_HANDOFF",
             Self::ResponseDecode { .. } => "WYRD_PROMPT_422_RESPONSE_DECODE",
+            Self::DraftInvalid { .. } => "WYRD_PROMPT_400_DRAFT_INVALID",
         }
     }
 }
@@ -494,6 +503,13 @@ impl From<PromptError> for WyrdError {
             } => WyrdError::PromptResponseDecode {
                 message,
                 details: json!({ "schema_name": schema_name, "source": source }),
+            },
+            PromptError::DraftInvalid {
+                provider,
+                message: source,
+            } => WyrdError::PromptDraftInvalid {
+                message,
+                details: json!({ "provider": provider, "source": source }),
             },
         }
     }

@@ -1176,6 +1176,25 @@ class PromptCard:
         """
         ...
 
+    @staticmethod
+    def from_path(path: PathLike) -> PromptCard:
+        """Load a PromptCard envelope from a local JSON or YAML file.
+
+        Accepts both the stored native format and the declarative authoring
+        format (when the spec has a ``provider`` key instead of ``request``).
+
+        Args:
+            path (PathLike): Source `.json`, `.yaml`, or `.yml` file path.
+
+        Returns:
+            PromptCard: Local holder rebuilt from the serialized envelope.
+
+        Raises:
+            WyrdError: If the file cannot be read, parsed, or validated as a
+                PromptCard envelope.
+        """
+        ...
+
     def model_dump_json(self) -> str:
         """Return this PromptCard as a JSON envelope string.
 

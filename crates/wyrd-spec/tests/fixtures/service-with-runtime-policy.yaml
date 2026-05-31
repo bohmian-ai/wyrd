@@ -11,8 +11,6 @@ metadata:
     team: retention
 
 spec:
-  type: Service
-
   description: Autonomous churn remediation operator + drift trigger
   service_type: agent
 

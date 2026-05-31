@@ -1,16 +1,22 @@
-//! PromptCard envelope type.
-
 use serde::{Deserialize, Serialize};
 
 use crate::card::prompt::{ParameterName, validate};
 use crate::error::WyrdError;
 
 /// PromptCard spec body wrapping the native Skald prompt.
+///
+/// Serializes with the `prompt` fields flattened directly into the spec body
+/// (no `prompt:` nesting key on the wire). Accepts two input forms:
+///
+/// - **Declarative** (`provider` present, `request` absent): a `PromptDraft`
+///   that is compiled into the native provider request.
+/// - **Native** (`request` present): the stored native `Prompt` shape, as
+///   produced by `save()`.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
 pub struct PromptSpec {
     /// Native authored prompt. Provider-specific request shape lives here.
+    #[serde(flatten)]
     #[cfg_attr(feature = "server", schema(value_type = serde_json::Value))]
     pub prompt: skald_spec::Prompt,
 }
@@ -48,14 +54,19 @@ impl<'de> Deserialize<'de> for PromptSpec {
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Raw {
-            prompt: skald_spec::Prompt,
-        }
+        let value = serde_json::Value::deserialize(deserializer)?;
 
-        let raw = Raw::deserialize(deserializer)?;
-        let spec = Self { prompt: raw.prompt };
+        let prompt = if value.get("provider").is_some() && value.get("request").is_none() {
+            // Declarative path: compile via PromptDraft.
+            let draft: skald_spec::PromptDraft =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            draft.compile().map_err(serde::de::Error::custom)?
+        } else {
+            // Native path: deserialize the stored Prompt shape directly.
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?
+        };
+
+        let spec = Self { prompt };
         validate(&spec).map_err(serde::de::Error::custom)?;
         Ok(spec)
     }

@@ -8,8 +8,6 @@ metadata:
   version: 1.0.0
 
 spec:
-  type: Operator
-
   adapter:
     name: langgraph
     version: "^0.2"

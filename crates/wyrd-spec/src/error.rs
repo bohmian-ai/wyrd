@@ -743,6 +743,20 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Declarative prompt draft failed to compile into a native prompt.
+    #[error("[WYRD_PROMPT_400_DRAFT_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_400_DRAFT_INVALID",
+        status = 400,
+        title = "Declarative prompt draft compile failed",
+        remediation = "Check the provider, model, messages, and model_settings fields in your prompt YAML."
+    )]
+    PromptDraftInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Prompt model_settings object did not match the selected provider.
     #[error("[WYRD_PROMPT_400_SETTINGS_PROVIDER_MISMATCH] {message}")]
     #[wyrd_error(
@@ -889,7 +903,8 @@ impl WyrdError {
             | Self::PromptSettingsDecode { message, details }
             | Self::PromptMissingVariable { message, details }
             | Self::PromptUnsupportedHandoff { message, details }
-            | Self::PromptResponseDecode { message, details } => (message, details),
+            | Self::PromptResponseDecode { message, details }
+            | Self::PromptDraftInvalid { message, details } => (message, details),
         }
     }
 
@@ -997,6 +1012,13 @@ impl From<skald_spec::SkaldError> for WyrdError {
                     "provider": format!("{provider:?}"),
                     "source": source,
                 }),
+            },
+            skald_spec::SkaldError::PromptDraftInvalid {
+                provider,
+                message: source,
+            } => Self::PromptDraftInvalid {
+                message,
+                details: serde_json::json!({ "provider": provider, "source": source }),
             },
             other => Self::internal_from_skald(other.code(), other.to_string()),
         }

@@ -506,6 +506,9 @@ impl PromptCard {
 
     /// Load a local `PromptCard` envelope from a JSON or YAML file.
     ///
+    /// Accepts both the stored native format and the declarative authoring
+    /// format (when the `spec` has a `provider` key). Alias for `from_path`.
+    ///
     /// # Errors
     /// Returns a Wyrd error when filesystem IO, parsing, or envelope validation
     /// fails.
@@ -513,6 +516,25 @@ impl PromptCard {
     #[staticmethod]
     #[allow(clippy::needless_pass_by_value)]
     pub fn load(py: Python<'_>, path: PathBuf) -> CardPyResult<Self> {
+        let mut card = Self::from_card(io::read_card_file(&path)?)?;
+        card.prompt = Some(skald_prompt::prompt_py(card.metadata.prompt.clone(), py)?);
+        Ok(card)
+    }
+
+    /// Load a local `PromptCard` envelope from a JSON or YAML file.
+    ///
+    /// Accepts both the stored native format and the declarative authoring
+    /// format (when the `spec` has a `provider` key). Preferred alias for
+    /// `load`.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when filesystem IO, parsing, or envelope validation
+    /// fails.
+    #[wyrd_test_contract_macros::critical("python:PromptCard.from_path")]
+    #[staticmethod]
+    #[pyo3(name = "from_path")]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn from_path_py(py: Python<'_>, path: PathBuf) -> CardPyResult<Self> {
         let mut card = Self::from_card(io::read_card_file(&path)?)?;
         card.prompt = Some(skald_prompt::prompt_py(card.metadata.prompt.clone(), py)?);
         Ok(card)

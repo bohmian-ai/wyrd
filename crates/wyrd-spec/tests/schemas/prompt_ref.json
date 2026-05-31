@@ -712,6 +712,7 @@
       ],
       "properties": {
         "max_tokens": {
+          "description": "Maximum output-token count. Defaults to `4096`.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
@@ -723,6 +724,7 @@
           }
         },
         "metadata": {
+          "description": "Provider metadata object.",
           "type": [
             "object",
             "null"
@@ -733,6 +735,7 @@
           "type": "string"
         },
         "stop_sequences": {
+          "description": "Stop sequences.",
           "type": [
             "array",
             "null"
@@ -758,6 +761,7 @@
           ]
         },
         "temperature": {
+          "description": "Sampling temperature.",
           "type": [
             "number",
             "null"
@@ -765,6 +769,7 @@
           "format": "float"
         },
         "thinking": {
+          "description": "Anthropic thinking configuration.",
           "anyOf": [
             {
               "$ref": "#/definitions/AnthropicThinkingConfig"
@@ -785,6 +790,7 @@
           }
         },
         "top_k": {
+          "description": "Top-k sampling limit.",
           "type": [
             "integer",
             "null"
@@ -793,6 +799,7 @@
           "minimum": 0.0
         },
         "top_p": {
+          "description": "Nucleus sampling probability.",
           "type": [
             "number",
             "null"
@@ -1283,6 +1290,7 @@
       ],
       "properties": {
         "cached_content": {
+          "description": "Cached content resource name.",
           "type": [
             "string",
             "null"
@@ -1295,6 +1303,7 @@
           }
         },
         "generation_config": {
+          "description": "Native Google generationConfig object.",
           "anyOf": [
             {
               "$ref": "#/definitions/GoogleGenerationConfig"
@@ -1305,6 +1314,7 @@
           ]
         },
         "labels": {
+          "description": "Provider labels object.",
           "type": [
             "object",
             "null"
@@ -1312,6 +1322,7 @@
           "additionalProperties": true
         },
         "safety_settings": {
+          "description": "Native Google safetySettings list.",
           "type": [
             "array",
             "null"
@@ -1356,6 +1367,7 @@
       "type": "object",
       "properties": {
         "candidate_count": {
+          "description": "Number of candidate responses.",
           "type": [
             "integer",
             "null"
@@ -1364,6 +1376,7 @@
           "minimum": 0.0
         },
         "frequency_penalty": {
+          "description": "Frequency penalty.",
           "type": [
             "number",
             "null"
@@ -1371,6 +1384,7 @@
           "format": "float"
         },
         "max_output_tokens": {
+          "description": "Maximum output-token count.",
           "type": [
             "integer",
             "null"
@@ -1379,6 +1393,7 @@
           "minimum": 0.0
         },
         "presence_penalty": {
+          "description": "Presence penalty.",
           "type": [
             "number",
             "null"
@@ -1386,12 +1401,14 @@
           "format": "float"
         },
         "response_mime_type": {
+          "description": "Response MIME type.",
           "type": [
             "string",
             "null"
           ]
         },
         "response_modalities": {
+          "description": "Requested output modalities.",
           "type": [
             "array",
             "null"
@@ -1400,16 +1417,22 @@
             "type": "string"
           }
         },
-        "response_schema": true,
+        "response_schema": {
+          "description": "Response schema object."
+        },
         "seed": {
+          "description": "Provider best-effort deterministic seed.",
           "type": [
             "integer",
             "null"
           ],
           "format": "int64"
         },
-        "speech_config": true,
+        "speech_config": {
+          "description": "Speech configuration object."
+        },
         "stop_sequences": {
+          "description": "Stop sequences.",
           "type": [
             "array",
             "null"
@@ -1419,6 +1442,7 @@
           }
         },
         "temperature": {
+          "description": "Sampling temperature.",
           "type": [
             "number",
             "null"
@@ -1426,6 +1450,7 @@
           "format": "float"
         },
         "thinking_config": {
+          "description": "Gemini thinking configuration.",
           "anyOf": [
             {
               "$ref": "#/definitions/GoogleThinkingConfig"
@@ -1436,6 +1461,7 @@
           ]
         },
         "top_k": {
+          "description": "Top-k sampling limit.",
           "type": [
             "integer",
             "null"
@@ -1444,6 +1470,7 @@
           "minimum": 0.0
         },
         "top_p": {
+          "description": "Nucleus sampling probability.",
           "type": [
             "number",
             "null"
@@ -1783,6 +1810,7 @@
       ],
       "properties": {
         "audio": {
+          "description": "Audio output settings.",
           "anyOf": [
             {
               "$ref": "#/definitions/OpenAiChatAudio"
@@ -1793,6 +1821,7 @@
           ]
         },
         "frequency_penalty": {
+          "description": "Frequency penalty.",
           "type": [
             "number",
             "null"
@@ -1800,6 +1829,7 @@
           "format": "float"
         },
         "logit_bias": {
+          "description": "Token-bias map keyed by token id.",
           "type": [
             "object",
             "null"
@@ -1807,12 +1837,14 @@
           "additionalProperties": true
         },
         "logprobs": {
+          "description": "Whether to return token log probabilities.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "max_completion_tokens": {
+          "description": "Maximum completion-token count.",
           "type": [
             "integer",
             "null"
@@ -1821,6 +1853,7 @@
           "minimum": 0.0
         },
         "max_tokens": {
+          "description": "Legacy maximum generated-token count.",
           "type": [
             "integer",
             "null"
@@ -1835,6 +1868,7 @@
           }
         },
         "metadata": {
+          "description": "Provider metadata object.",
           "type": [
             "object",
             "null"
@@ -1842,6 +1876,7 @@
           "additionalProperties": true
         },
         "modalities": {
+          "description": "Requested output modalities.",
           "type": [
             "array",
             "null"
@@ -1854,6 +1889,7 @@
           "type": "string"
         },
         "n": {
+          "description": "Number of completions to generate.",
           "type": [
             "integer",
             "null"
@@ -1868,6 +1904,7 @@
           ]
         },
         "prediction": {
+          "description": "Prediction content hint.",
           "anyOf": [
             {
               "$ref": "#/definitions/OpenAiPredictionContent"
@@ -1878,6 +1915,7 @@
           ]
         },
         "presence_penalty": {
+          "description": "Presence penalty.",
           "type": [
             "number",
             "null"
@@ -1885,12 +1923,14 @@
           "format": "float"
         },
         "prompt_cache_key": {
+          "description": "OpenAI prompt cache key.",
           "type": [
             "string",
             "null"
           ]
         },
         "reasoning_effort": {
+          "description": "Requested reasoning effort.",
           "anyOf": [
             {
               "$ref": "#/definitions/OpenAiReasoningEffort"
@@ -1911,12 +1951,14 @@
           ]
         },
         "safety_identifier": {
+          "description": "Safety identifier.",
           "type": [
             "string",
             "null"
           ]
         },
         "seed": {
+          "description": "Provider best-effort deterministic seed.",
           "type": [
             "integer",
             "null"
@@ -1924,12 +1966,14 @@
           "format": "int64"
         },
         "service_tier": {
+          "description": "OpenAI service tier.",
           "type": [
             "string",
             "null"
           ]
         },
         "stop": {
+          "description": "Stop sequence or sequences.",
           "anyOf": [
             {
               "$ref": "#/definitions/OpenAiStop"
@@ -1940,6 +1984,7 @@
           ]
         },
         "store": {
+          "description": "Whether the provider may store the response.",
           "type": [
             "boolean",
             "null"
@@ -1962,6 +2007,7 @@
           ]
         },
         "temperature": {
+          "description": "Sampling temperature.",
           "type": [
             "number",
             "null"
@@ -1988,6 +2034,7 @@
           }
         },
         "top_logprobs": {
+          "description": "Number of top token log probabilities.",
           "type": [
             "integer",
             "null"
@@ -1996,6 +2043,7 @@
           "minimum": 0.0
         },
         "top_p": {
+          "description": "Nucleus sampling probability.",
           "type": [
             "number",
             "null"
@@ -2003,6 +2051,7 @@
           "format": "float"
         },
         "user": {
+          "description": "Provider-visible end-user identifier.",
           "type": [
             "string",
             "null"
@@ -3113,6 +3162,7 @@
       ],
       "properties": {
         "include": {
+          "description": "Additional response fields to include.",
           "type": [
             "array",
             "null"
@@ -3134,6 +3184,7 @@
           ]
         },
         "max_output_tokens": {
+          "description": "Maximum output-token count.",
           "type": [
             "integer",
             "null"
@@ -3142,6 +3193,7 @@
           "minimum": 0.0
         },
         "metadata": {
+          "description": "Provider metadata object.",
           "type": [
             "object",
             "null"
@@ -3164,6 +3216,7 @@
           ]
         },
         "reasoning": {
+          "description": "OpenAI Responses reasoning configuration.",
           "anyOf": [
             {
               "$ref": "#/definitions/OpenAiReasoning"
@@ -3174,6 +3227,7 @@
           ]
         },
         "store": {
+          "description": "Whether the provider may store the response.",
           "type": [
             "boolean",
             "null"
@@ -3186,6 +3240,7 @@
           ]
         },
         "temperature": {
+          "description": "Sampling temperature.",
           "type": [
             "number",
             "null"
@@ -3222,6 +3277,7 @@
           }
         },
         "top_p": {
+          "description": "Nucleus sampling probability.",
           "type": [
             "number",
             "null"
@@ -3669,8 +3725,8 @@
         }
       ]
     },
-    "Prompt": {
-      "description": "Authored native prompt request plus render metadata.",
+    "PromptSpec": {
+      "description": "PromptCard spec body wrapping the native Skald prompt.\n\nSerializes with the `prompt` fields flattened directly into the spec body (no `prompt:` nesting key on the wire). Accepts two input forms:\n\n- **Declarative** (`provider` present, `request` absent): a `PromptDraft` that is compiled into the native provider request. - **Native** (`request` present): the stored native `Prompt` shape, as produced by `save()`.",
       "type": "object",
       "required": [
         "model",
@@ -3722,24 +3778,6 @@
           ]
         }
       }
-    },
-    "PromptSpec": {
-      "description": "PromptCard spec body wrapping the native Skald prompt.",
-      "type": "object",
-      "required": [
-        "prompt"
-      ],
-      "properties": {
-        "prompt": {
-          "description": "Native authored prompt. Provider-specific request shape lives here.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/Prompt"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false
     },
     "ProviderName": {
       "description": "Which provider a request targets.",

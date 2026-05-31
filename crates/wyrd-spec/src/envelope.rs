@@ -36,17 +36,19 @@ use crate::metadata::{Annotations, Labels};
 use crate::version::{ApiVersion, VersionBlock};
 
 /// Universal registered Card envelope.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct Card {
     /// API version. Must be `wyrd/v1` for v1 Cards.
-    #[serde(rename = "apiVersion")]
+    #[serde(rename = "apiVersion", default)]
     pub api_version: ApiVersion,
     /// Card kind discriminator.
     pub kind: CardKind,
     /// Card metadata.
     pub metadata: Metadata,
     /// Kind-specific spec payload.
+    #[schemars(with = "serde_json::Value")]
+    #[cfg_attr(feature = "server", schema(value_type = serde_json::Value))]
     pub spec: Spec,
     /// Server-derived relationship summary.
     #[serde(default)]
@@ -91,10 +93,9 @@ pub struct Metadata {
 }
 
 /// Kind-specific Card spec payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[allow(clippy::large_enum_variant)]
-#[serde(tag = "type", rename_all = "PascalCase")]
 pub enum Spec {
     /// Data card spec.
     Data(DataSpec),
@@ -491,5 +492,124 @@ impl JsonSchema for CardKind {
             ..SchemaObject::default()
         }
         .into()
+    }
+}
+
+impl Serialize for Spec {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Data(s) => s.serialize(serializer),
+            Self::Model(s) => s.serialize(serializer),
+            Self::Experiment(s) => s.serialize(serializer),
+            Self::Prompt(s) => s.serialize(serializer),
+            Self::Tool(s) => s.serialize(serializer),
+            Self::Agent(s) => s.serialize(serializer),
+            Self::Workflow(s) => s.serialize(serializer),
+            Self::Eval(s) => s.serialize(serializer),
+            Self::Drift(s) => s.serialize(serializer),
+            Self::Service(s) => s.serialize(serializer),
+            Self::Policy(s) => s.serialize(serializer),
+            Self::Mcp(s) => s.serialize(serializer),
+            Self::Skill(s) => s.serialize(serializer),
+            Self::SubAgent(s) => s.serialize(serializer),
+            Self::Audit(s) => s.serialize(serializer),
+            Self::Artifact(s) => s.serialize(serializer),
+            Self::Trigger(s) => s.serialize(serializer),
+            Self::Operator(s) => s.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Card {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct CardHelper {
+            #[serde(rename = "apiVersion", default)]
+            api_version: ApiVersion,
+            kind: CardKind,
+            metadata: Metadata,
+            spec: serde_json::Value,
+            #[serde(default)]
+            relationships: Relationships,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            status: Option<Status>,
+        }
+
+        let helper = CardHelper::deserialize(deserializer)?;
+        let spec =
+            spec_from_kind_value(&helper.kind, helper.spec).map_err(serde::de::Error::custom)?;
+
+        Ok(Card {
+            api_version: helper.api_version,
+            kind: helper.kind,
+            metadata: helper.metadata,
+            spec,
+            relationships: helper.relationships,
+            status: helper.status,
+        })
+    }
+}
+
+fn spec_from_kind_value(kind: &CardKind, mut value: serde_json::Value) -> Result<Spec, String> {
+    // Strip legacy `type` field — present in older serialized cards.
+    if let serde_json::Value::Object(ref mut map) = value {
+        map.remove("type");
+    }
+    match kind {
+        CardKind::Data => serde_json::from_value(value)
+            .map(Spec::Data)
+            .map_err(|e| e.to_string()),
+        CardKind::Model => serde_json::from_value(value)
+            .map(Spec::Model)
+            .map_err(|e| e.to_string()),
+        CardKind::Experiment => serde_json::from_value(value)
+            .map(Spec::Experiment)
+            .map_err(|e| e.to_string()),
+        CardKind::Prompt => serde_json::from_value(value)
+            .map(Spec::Prompt)
+            .map_err(|e| e.to_string()),
+        CardKind::Tool => serde_json::from_value(value)
+            .map(Spec::Tool)
+            .map_err(|e| e.to_string()),
+        CardKind::Agent => serde_json::from_value(value)
+            .map(Spec::Agent)
+            .map_err(|e| e.to_string()),
+        CardKind::Workflow => serde_json::from_value(value)
+            .map(Spec::Workflow)
+            .map_err(|e| e.to_string()),
+        CardKind::Eval => serde_json::from_value(value)
+            .map(Spec::Eval)
+            .map_err(|e| e.to_string()),
+        CardKind::Drift => serde_json::from_value(value)
+            .map(Spec::Drift)
+            .map_err(|e| e.to_string()),
+        CardKind::Service => serde_json::from_value(value)
+            .map(Spec::Service)
+            .map_err(|e| e.to_string()),
+        CardKind::Policy => serde_json::from_value(value)
+            .map(Spec::Policy)
+            .map_err(|e| e.to_string()),
+        CardKind::Mcp => serde_json::from_value(value)
+            .map(Spec::Mcp)
+            .map_err(|e| e.to_string()),
+        CardKind::Skill => serde_json::from_value(value)
+            .map(Spec::Skill)
+            .map_err(|e| e.to_string()),
+        CardKind::SubAgent => serde_json::from_value(value)
+            .map(Spec::SubAgent)
+            .map_err(|e| e.to_string()),
+        CardKind::Audit => serde_json::from_value(value)
+            .map(Spec::Audit)
+            .map_err(|e| e.to_string()),
+        CardKind::Artifact => serde_json::from_value(value)
+            .map(Spec::Artifact)
+            .map_err(|e| e.to_string()),
+        CardKind::Trigger => serde_json::from_value(value)
+            .map(Spec::Trigger)
+            .map_err(|e| e.to_string()),
+        CardKind::Operator => serde_json::from_value(value)
+            .map(Spec::Operator)
+            .map_err(|e| e.to_string()),
+        CardKind::External { name, .. } => Err(format!("unsupported external card kind: {name}")),
     }
 }

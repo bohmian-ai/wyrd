@@ -4,14 +4,15 @@ from . import data, model, prompt
 from .data import DataCard, Split, WyrdError
 from .model import ModelCard, ModelSignature, SampleInput
 from .prompt import (
+    AnthropicSettings,
+    GeminiSettings,
     MediaRef,
     OpenAIResponsesSettings,
     OpenAISettings,
-    AnthropicSettings,
-    GeminiSettings,
     Prompt,
     PromptCard,
     PromptCardMetadata,
+    PromptRef,
     ProviderRequest,
     ResponseFormat,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "Prompt",
     "PromptCard",
     "PromptCardMetadata",
+    "PromptRef",
     "ProviderRequest",
     "ResponseFormat",
     "SampleInput",

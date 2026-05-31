@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wyrd_interfaces::error::CardPyResult;
-use wyrd_spec::card::prompt::PromptSpec;
+use wyrd_spec::card::prompt::{PromptRef as NativePromptRef, PromptSpec};
 use wyrd_spec::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
@@ -37,6 +37,25 @@ use {
 pub struct PromptCardMetadata {
     /// Native Skald prompt stored in the `PromptCard` spec body.
     pub prompt: skald_spec::Prompt,
+}
+
+/// Python-facing wrapper around a Wyrd `PromptRef`.
+#[cfg_attr(
+    feature = "python",
+    pyclass(module = "wyrd.prompt", name = "PromptRef", skip_from_py_object)
+)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromptRef {
+    /// Wrapped native prompt reference.
+    pub inner: NativePromptRef,
+}
+
+impl PromptRef {
+    /// Wrap a native prompt reference.
+    #[must_use]
+    pub const fn from_native(inner: NativePromptRef) -> Self {
+        Self { inner }
+    }
 }
 
 impl PromptCardMetadata {
@@ -220,6 +239,82 @@ impl PromptCard {
             spec_hash: Some(spec.content_hash()),
             artifact_hash: None,
         })
+    }
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PromptRef {
+    /// Build a PromptRef that points at a registered Prompt Card.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the card identity fields are invalid.
+    #[staticmethod]
+    #[pyo3(signature = (name, version, *, space=None, uid=None))]
+    pub fn card(
+        name: &str,
+        version: &str,
+        space: Option<&str>,
+        uid: Option<&str>,
+    ) -> CardPyResult<Self> {
+        let card_ref = CardRef {
+            kind: CardKind::Prompt,
+            name: card_name("name", name)?,
+            version: version_block(version)?,
+            space: space.map_or(Ok(None), optional_space_name)?,
+            uid: uid.map_or(Ok(None), optional_card_uid)?,
+        };
+        Ok(Self::from_native(NativePromptRef::Card(card_ref)))
+    }
+
+    /// Build an inline PromptRef from a Python `Prompt`.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the prompt is invalid.
+    #[staticmethod]
+    pub fn inline(prompt: &Bound<'_, PyAny>) -> CardPyResult<Self> {
+        let spec = PromptSpec::new(native_prompt_from_py(prompt)?)?;
+        Ok(Self::from_native(NativePromptRef::Inline(Box::new(spec))))
+    }
+
+    /// Return `card` or `inline`.
+    #[getter]
+    pub fn kind(&self) -> &'static str {
+        match self.inner {
+            NativePromptRef::Card(_) => "card",
+            NativePromptRef::Inline(_) => "inline",
+        }
+    }
+
+    /// Return this prompt reference as a Python dictionary.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when JSON conversion fails.
+    pub fn model_dump(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+        wyrd_utils::py::json_to_pyobject(py, &serde_json::to_value(&self.inner)?)
+            .map_err(Into::into)
+    }
+
+    /// Return this prompt reference as JSON.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when JSON serialization fails.
+    pub fn model_dump_json(&self) -> CardPyResult<String> {
+        Ok(serde_json::to_string(&self.inner)?)
+    }
+
+    /// Rebuild a PromptRef from JSON.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when JSON parsing or validation fails.
+    #[staticmethod]
+    pub fn model_validate_json(data: &str) -> CardPyResult<Self> {
+        Ok(Self::from_native(serde_json::from_str(data)?))
+    }
+
+    /// Return a concise Python representation.
+    pub fn __repr__(&self) -> String {
+        format!("PromptRef(kind={:?})", self.kind())
     }
 }
 

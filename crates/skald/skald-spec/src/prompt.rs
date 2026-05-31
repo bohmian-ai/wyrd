@@ -200,7 +200,8 @@ impl Prompt {
     pub fn bind_mut(&mut self, vars: &[(&str, &str)]) -> SkaldResult<()> {
         let mut request = serde_json::to_value(&self.request).map_err(SkaldError::serialize)?;
         replace_string_leaves(&mut request, vars);
-        self.request = serde_json::from_value(request).map_err(SkaldError::deserialize)?;
+        self.request =
+            deserialize_request_like(&self.request, request).map_err(SkaldError::deserialize)?;
         self.variables
             .retain(|name| !vars.iter().any(|(key, _)| key == name));
         Ok(())
@@ -289,6 +290,37 @@ fn replace_string_leaves(value: &mut Value, vars: &[(&str, &str)]) {
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
+}
+
+fn deserialize_request_like(
+    original: &ProviderRequest,
+    value: Value,
+) -> serde_json::Result<ProviderRequest> {
+    Ok(match original {
+        ProviderRequest::OpenAiChatCompletion(_) => {
+            ProviderRequest::OpenAiChatCompletion(serde_json::from_value(value)?)
+        }
+        ProviderRequest::OpenAiResponses(_) => {
+            ProviderRequest::OpenAiResponses(serde_json::from_value(value)?)
+        }
+        ProviderRequest::OpenAiEmbeddings(_) => {
+            ProviderRequest::OpenAiEmbeddings(serde_json::from_value(value)?)
+        }
+        ProviderRequest::AnthropicMessage(_) => {
+            ProviderRequest::AnthropicMessage(serde_json::from_value(value)?)
+        }
+        ProviderRequest::GeminiGenerateContent(_) => {
+            ProviderRequest::GeminiGenerateContent(serde_json::from_value(value)?)
+        }
+        ProviderRequest::GoogleBatchEmbed(_) => {
+            ProviderRequest::GoogleBatchEmbed(serde_json::from_value(value)?)
+        }
+        ProviderRequest::Vertex(_) => ProviderRequest::Vertex(serde_json::from_value(value)?),
+        ProviderRequest::VertexPredict(_) => {
+            ProviderRequest::VertexPredict(serde_json::from_value(value)?)
+        }
+        ProviderRequest::RawV1 { .. } => serde_json::from_value(value)?,
+    })
 }
 
 fn extract_text_variables(request: &ProviderRequest) -> SkaldResult<Vec<String>> {

@@ -6,7 +6,7 @@ use thiserror::Error;
 pub type PromptBuilderResult<T> = Result<T, PromptBuilderError>;
 
 /// Failures raised while converting authoring inputs into native provider wire structs.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum PromptBuilderError {
     /// Prompt model was empty.
     #[error("prompt model must be non-empty")]
@@ -31,9 +31,12 @@ pub enum PromptBuilderError {
     /// Native prompt validation failed.
     #[error("prompt validation failed: {0}")]
     Validation(String),
+    /// Public Wyrd validation or codec error.
+    #[error(transparent)]
+    Wyrd(#[from] wyrd_spec::error::WyrdError),
     /// Prompt render failed.
-    #[error("prompt render failed: {0}")]
-    Render(String),
+    #[error(transparent)]
+    Skald(#[from] skald_spec::SkaldError),
     /// Filesystem IO failed in the loader boundary.
     #[error("prompt loader IO failed at {path}: {message}")]
     Io {
@@ -46,7 +49,7 @@ pub enum PromptBuilderError {
 
 impl PromptBuilderError {
     /// Returns the stable builder error code.
-    pub const fn code(&self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Self::EmptyModel => "SKALD_PROMPT_400_EMPTY_MODEL",
             Self::InvalidProvider(_) => "SKALD_PROMPT_400_INVALID_PROVIDER",
@@ -54,21 +57,10 @@ impl PromptBuilderError {
             Self::InvalidResponseSchema => "SKALD_PROMPT_400_INVALID_RESPONSE_SCHEMA",
             Self::UnsupportedRole { .. } => "SKALD_PROMPT_400_UNSUPPORTED_ROLE",
             Self::Validation(_) => "SKALD_PROMPT_422_VALIDATION",
-            Self::Render(_) => "SKALD_PROMPT_422_RENDER",
+            Self::Wyrd(error) => error.code(),
+            Self::Skald(error) => error.code(),
             Self::Io { .. } => "SKALD_PROMPT_500_IO",
         }
-    }
-}
-
-impl From<wyrd_spec::error::WyrdError> for PromptBuilderError {
-    fn from(error: wyrd_spec::error::WyrdError) -> Self {
-        Self::Validation(error.to_string())
-    }
-}
-
-impl From<skald_spec::SkaldError> for PromptBuilderError {
-    fn from(error: skald_spec::SkaldError) -> Self {
-        Self::Render(error.to_string())
     }
 }
 
@@ -88,18 +80,20 @@ impl From<PromptBuilderError> for wyrd_interfaces::error::WyrdPyError {
             PromptBuilderError::Io { path, message } => {
                 WyrdError::from(PromptError::LoaderIo { path, message }).into()
             }
+            PromptBuilderError::Wyrd(error) => error.into(),
+            PromptBuilderError::Skald(error) => WyrdError::from(error).into(),
             PromptBuilderError::InvalidProvider(provider) => WyrdError::PromptProviderMismatch {
                 message,
                 details: json!({ "provider": provider }),
             }
             .into(),
-            PromptBuilderError::InvalidRawJson(source)
-            | PromptBuilderError::Validation(source)
-            | PromptBuilderError::Render(source) => WyrdError::PromptSerializeRequest {
-                message,
-                details: json!({ "source": source }),
+            PromptBuilderError::InvalidRawJson(source) | PromptBuilderError::Validation(source) => {
+                WyrdError::PromptSerializeRequest {
+                    message,
+                    details: json!({ "source": source }),
+                }
+                .into()
             }
-            .into(),
             PromptBuilderError::UnsupportedRole { provider, role } => {
                 WyrdError::PromptProviderMismatch {
                     message,

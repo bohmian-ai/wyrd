@@ -20,7 +20,7 @@ use crate::wire::vertex_generate::VertexGenerateContentRequest;
 
 /// Declarative prompt draft that compiles into a native `Prompt`.
 ///
-/// Both the YAML authoring path and the Python `Prompt(provider=…)` constructor
+/// Both the YAML authoring path and the py-wyrd `Prompt(provider=…)` constructor
 /// compile through here, ensuring one canonical assembly per provider.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PromptDraft {

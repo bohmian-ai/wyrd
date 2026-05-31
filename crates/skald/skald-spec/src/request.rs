@@ -50,10 +50,22 @@ impl<'de> Deserialize<'de> for ProviderRequest {
     {
         let value = Value::deserialize(deserializer)?;
 
+        if let Ok(raw) = serde_json::from_value::<RawProviderRequest>(value.clone()) {
+            return Ok(Self::RawV1 {
+                provider: raw.provider,
+                body: raw.body,
+            });
+        }
+
         // Keep the S01 untagged ordering explicit while still giving RawV1 a
         // dependable fallback. Deriving `Deserialize` directly would ask
         // `Box<RawValue>` to deserialize from any JSON value and can make
         // fallback behavior hard to reason about as typed variants evolve.
+        if value.get("max_tokens").is_some() {
+            if let Ok(request) = serde_json::from_value::<AnthropicMessagesRequest>(value.clone()) {
+                return Ok(Self::AnthropicMessage(request));
+            }
+        }
         if let Ok(request) = serde_json::from_value::<OpenAiChatRequest>(value.clone()) {
             return Ok(Self::OpenAiChatCompletion(request));
         }
@@ -81,13 +93,6 @@ impl<'de> Deserialize<'de> for ProviderRequest {
         if let Ok(request) = serde_json::from_value::<VertexPredictRequest>(value.clone()) {
             return Ok(Self::VertexPredict(request));
         }
-        if let Ok(raw) = serde_json::from_value::<RawProviderRequest>(value) {
-            return Ok(Self::RawV1 {
-                provider: raw.provider,
-                body: raw.body,
-            });
-        }
-
         Err(serde::de::Error::custom(
             "data did not match any ProviderRequest variant",
         ))

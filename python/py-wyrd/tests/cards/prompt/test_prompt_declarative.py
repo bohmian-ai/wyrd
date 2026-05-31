@@ -9,12 +9,10 @@ Covers:
 """
 
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
 from wyrd.prompt import Prompt, PromptCard, WyrdError
-
 
 OPENAI_DECLARATIVE_YAML = """\
 apiVersion: wyrd/v1

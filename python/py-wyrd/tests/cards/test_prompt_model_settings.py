@@ -2,7 +2,6 @@ import inspect
 import json
 
 import pytest
-
 from wyrd import (
     AnthropicSettings,
     GeminiSettings,
@@ -13,7 +12,11 @@ from wyrd import (
 )
 from wyrd.prompt import (
     AnthropicSettings as PromptAnthropicSettings,
+)
+from wyrd.prompt import (
     GeminiSettings as PromptGeminiSettings,
+)
+from wyrd.prompt import (
     OpenAISettings as PromptOpenAISettings,
 )
 
@@ -189,17 +192,13 @@ metadata:
   name: yaml-prompt
   version: 0.1.0
 spec:
-  type: Prompt
-  prompt:
-    request:
-      model: gpt-4o
-      messages:
-        - role: user
-          content: hello
-      seed: 123
-      future_knob:
-        enabled: true
-    model: gpt-4o
+  provider: openai
+  model: gpt-4o
+  messages: hello
+  model_settings:
+    seed: 123
+    future_knob:
+      enabled: true
 """
     )
 

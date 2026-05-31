@@ -2157,7 +2157,9 @@ class Prompt:
     version: str | None
     variables: list[str]
     media_variables: list[str]
-    model_settings: OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | None
+    model_settings: (
+        OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | None
+    )
 
     def __init__(
         self,
@@ -2169,7 +2171,12 @@ class Prompt:
         response_format: ResponseFormat | JsonDict | None = ...,
         operation: str | None = ...,
         cache: str | Mapping[str, Any] | None = ...,
-        model_settings: OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | Mapping[str, Any] | None = ...,
+        model_settings: OpenAISettings
+        | OpenAIResponsesSettings
+        | AnthropicSettings
+        | GeminiSettings
+        | Mapping[str, Any]
+        | None = ...,
         variables: list[str] | None = ...,
         version: str | None = ...,
     ) -> None:
@@ -2645,6 +2652,36 @@ class Prompt:
         """
         ...
 
+class PromptRef:
+    """Reference to a registered PromptCard or inline Prompt spec."""
+
+    kind: str
+
+    @staticmethod
+    def card(
+        name: str, version: str, *, space: str | None = ..., uid: str | None = ...
+    ) -> PromptRef:
+        """Create a reference to a registered Prompt Card."""
+        ...
+
+    @staticmethod
+    def inline(prompt: Prompt) -> PromptRef:
+        """Create an inline prompt reference from a Prompt."""
+        ...
+
+    def model_dump(self) -> JsonDict:
+        """Return this prompt reference as a Python dictionary."""
+        ...
+
+    def model_dump_json(self) -> str:
+        """Return this prompt reference as JSON."""
+        ...
+
+    @staticmethod
+    def model_validate_json(data: str) -> PromptRef:
+        """Build a prompt reference from serialized JSON."""
+        ...
+
 class PromptCardMetadata:
     """Local holder metadata used when serializing a `PromptCard`.
 
@@ -2658,7 +2695,12 @@ class PromptCardMetadata:
         self,
         prompt: Prompt | None = ...,
         *,
-        model_settings: OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | Mapping[str, Any] | None = ...,
+        model_settings: OpenAISettings
+        | OpenAIResponsesSettings
+        | AnthropicSettings
+        | GeminiSettings
+        | Mapping[str, Any]
+        | None = ...,
     ) -> None:
         """Create prompt card metadata from an optional `Prompt`.
 
@@ -2706,7 +2748,9 @@ class PromptCard:
     annotations: dict[str, str]
     metadata: PromptCardMetadata
     prompt: Prompt
-    model_settings: OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | None
+    model_settings: (
+        OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | None
+    )
     content_hash: str
     parameters: list[str]
     is_fully_bound: bool
@@ -2723,7 +2767,12 @@ class PromptCard:
         labels: Mapping[str, str] | None = ...,
         annotations: Mapping[str, str] | None = ...,
         metadata: PromptCardMetadata | None = ...,
-        model_settings: OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | Mapping[str, Any] | None = ...,
+        model_settings: OpenAISettings
+        | OpenAIResponsesSettings
+        | AnthropicSettings
+        | GeminiSettings
+        | Mapping[str, Any]
+        | None = ...,
     ) -> None:
         """Create a local `PromptCard` from a `Prompt`.
 
@@ -2764,6 +2813,25 @@ class PromptCard:
     @staticmethod
     def load(path: PathLike) -> PromptCard:
         """Load a PromptCard envelope from a local JSON or YAML file.
+
+        Args:
+            path (PathLike): Source `.json`, `.yaml`, or `.yml` file path.
+
+        Returns:
+            PromptCard: Local holder rebuilt from the serialized envelope.
+
+        Raises:
+            WyrdError: If the file cannot be read, parsed, or validated as a
+                PromptCard envelope.
+        """
+        ...
+
+    @staticmethod
+    def from_path(path: PathLike) -> PromptCard:
+        """Load a PromptCard envelope from a local JSON or YAML file.
+
+        Accepts both the stored native format and the declarative authoring
+        format (when the spec has a ``provider`` key instead of ``request``).
 
         Args:
             path (PathLike): Source `.json`, `.yaml`, or `.yml` file path.
@@ -2845,6 +2913,7 @@ __all__ = [
     "Prompt",
     "PromptCard",
     "PromptCardMetadata",
+    "PromptRef",
     "ProviderRequest",
     "ResponseFormat",
     "SampleInput",

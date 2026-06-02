@@ -18,12 +18,30 @@ pub enum ToolError {
     /// Tool output failed JSON serialization.
     #[error("tool output could not be serialized to JSON: {0}")]
     OutputSerialization(String),
+
+    /// Tool name is already registered.
+    #[error("tool name `{name}` is already registered")]
+    NameTaken {
+        /// Name that collided.
+        name: String,
+    },
+
+    /// Tool lookup failed for an unknown name.
+    #[error("tool name `{name}` is not registered (available: {available:?})")]
+    NotRegistered {
+        /// Name requested by caller.
+        name: String,
+        /// Registered names, sorted lexicographically.
+        available: Vec<String>,
+    },
 }
 
 impl ToolError {
     /// Stable machine-readable code for this tool invocation failure.
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::NameTaken { .. } => "SKALD_TOOL_409_NAME_TAKEN",
+            Self::NotRegistered { .. } => "SKALD_TOOL_404_NOT_REGISTERED",
             Self::InvalidInput(_) => "SKALD_TOOL_422_INPUT",
             Self::Invocation { .. } => "SKALD_TOOL_500_CALL",
             Self::OutputSerialization(_) => "SKALD_TOOL_500_OUTPUT",
@@ -33,6 +51,8 @@ impl ToolError {
     /// Suggested HTTP status for this failure.
     pub const fn status(&self) -> u16 {
         match self {
+            Self::NameTaken { .. } => 409,
+            Self::NotRegistered { .. } => 404,
             Self::InvalidInput(_) => 422,
             Self::Invocation { .. } | Self::OutputSerialization(_) => 500,
         }
@@ -41,6 +61,8 @@ impl ToolError {
     /// Stable problem-title text.
     pub const fn title(&self) -> &'static str {
         match self {
+            Self::NameTaken { .. } => "Tool name already registered",
+            Self::NotRegistered { .. } => "Tool name not registered",
             Self::InvalidInput(_) => {
                 "Tool invocation input did not match the declared input schema"
             }
@@ -52,6 +74,12 @@ impl ToolError {
     /// Operator-facing remediation hint.
     pub const fn remediation(&self) -> &'static str {
         match self {
+            Self::NameTaken { .. } => {
+                "Use ToolRegistry::register_force to overwrite or pick a unique tool name."
+            }
+            Self::NotRegistered { .. } => {
+                "Register the tool (Tool::function + registry.register) before loading the agent, or call default_registry() prior to from_wire."
+            }
             Self::InvalidInput(_) => {
                 "Adjust the tool call arguments to match the schema returned by tool.input_schema()."
             }

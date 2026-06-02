@@ -8,6 +8,8 @@
 pub mod def;
 pub mod error;
 pub mod helpers;
+pub mod registry;
+pub mod resolver;
 mod toolerror;
 mod trait_;
 
@@ -17,5 +19,7 @@ pub use helpers::{
     anthropic_tool_result_block, anthropic_tool_use_block, google_function_call_part,
     google_function_response_part, openai_function_tool_call, openai_tool_result_message,
 };
+pub use registry::{ToolRegistry, default_registry};
+pub use resolver::ToolResolver;
 pub use toolerror::{ToolError, ToolResult};
 pub use trait_::AgentTool;

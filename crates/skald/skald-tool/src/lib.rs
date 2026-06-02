@@ -8,6 +8,8 @@
 pub mod def;
 pub mod error;
 pub mod helpers;
+mod toolerror;
+mod trait_;
 
 pub use def::ToolDef;
 pub use error::{SkaldToolError, SkaldToolResult};
@@ -15,3 +17,5 @@ pub use helpers::{
     anthropic_tool_result_block, anthropic_tool_use_block, google_function_call_part,
     google_function_response_part, openai_function_tool_call, openai_tool_result_message,
 };
+pub use toolerror::{ToolError, ToolResult};
+pub use trait_::AgentTool;

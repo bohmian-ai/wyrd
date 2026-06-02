@@ -3041,10 +3041,13 @@ dependencies = [
 name = "skald-tool"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
+ "schemars",
  "serde",
  "serde_json",
  "skald-spec",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

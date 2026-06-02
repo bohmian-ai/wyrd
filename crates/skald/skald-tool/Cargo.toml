@@ -11,6 +11,8 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+async-trait = { workspace = true }
+schemars = { workspace = true }
 skald-spec = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -18,3 +20,6 @@ thiserror = { workspace = true }
 
 [features]
 default = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

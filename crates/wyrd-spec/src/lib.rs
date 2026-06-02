@@ -23,6 +23,7 @@ pub mod run;
 pub mod schema;
 pub mod storage;
 pub mod trace;
+pub mod vala;
 pub mod version;
 
 pub use authz::{Principal, Role, Scope};

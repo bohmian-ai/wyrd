@@ -1,35 +1,15 @@
-//! Live Skald agent runtime: identity, native prompt execution, and a bounded
-//! tool-dispatch loop.
+//! Agentic runtime for bounded Skald loops, tool execution, callbacks, session
+//! memory, journals, and observers.
 //!
-//! This crate sits above [`skald_runtime`] and below the Wyrd API holders that
-//! will project skald agents into the public card surface. The runtime is
-//! provider-native end to end: every request is a
-//! [`skald_spec::ProviderRequest`] built for the agent's chosen provider, and
-//! every response is read via [`skald_spec::ResponseAdapter`].
+//! Users enter through [`Agent`]: `Agent::new(prompt).with_tool(tool).run("draft
+//! the doc").await?`. `Agent::new` takes an already-resolved
+//! [`skald_prompt::Prompt`] and is infallible; execution errors surface from
+//! [`Agent::run`].
 //!
-//! ## Independence
-//!
-//! `skald-agent` depends on `skald-spec`, `skald-runtime`, `skald-tool`, and
-//! neutral infrastructure only. There is no dependency on Wyrd or Vala crates.
-//!
-//! ## Live binding
-//!
-//! Construct [`Agent`] directly from an already-resolved [`skald_prompt::Prompt`]
-//! and register runtime clients at call time.
-//!
-//! ## Bounded loop
-//!
-//! [`Agent::run`] runs a bounded tool-dispatch loop with a configurable
-//! [`RunConfig::max_iterations`] cap. Each iteration sends a native
-//! [`skald_spec::ProviderRequest`], reads the [`skald_spec::ProviderResponse`]
-//! via [`skald_spec::ResponseAdapter`], and either terminates when there are no
-//! tool calls or dispatches each tool through the registered [`AgentTool`]
-//! implementations and continues.
-//!
-//! ## Errors
-//!
-//! All public failures surface as [`AgentError`] with stable `SKALD_AGENT_*`
-//! codes for boundary mapping.
+//! Adjacent crates own adjacent surfaces: [`wyrd_spec::AgentCard`] is the
+//! durable on-disk envelope, [`skald_tool::AgentTool`] and [`AgentDelegateTool`]
+//! provide callable tools and delegation, and `wyrd-observe` auto-attaches
+//! observers when configured by the Wyrd runtime.
 
 #![deny(missing_docs)]
 #![allow(clippy::module_name_repetitions)]

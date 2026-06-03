@@ -120,7 +120,47 @@ pub struct AgentCallbacks {
     pub after_tool: Vec<AfterToolFn>,
 }
 
-/// User-facing Wyrd Agent and live Skald bounded-loop runtime.
+/// Runnable Wyrd Agent with local card projection and Skald loop execution.
+///
+/// Use `Agent::new(prompt)` for an already-resolved prompt and
+/// `Agent::try_from_ref(prompt_ref, resolver)` when a durable Prompt Card must
+/// be resolved before execution.
+///
+/// Provider, model, and system-prompt identity live on [`Prompt`]; retarget the
+/// agent with [`Agent::with_prompt`] or [`Agent::try_with_prompt`].
+///
+/// # Example
+///
+/// ```no_run
+/// use std::sync::Arc;
+///
+/// use skald_agent::Agent;
+/// use skald_prompt::{OpenAiChatOptions, openai_chat};
+/// use skald_runtime::{MockProvider, ProviderRegistry};
+/// use skald_spec::ProviderName;
+///
+/// # async fn run_example() -> Result<(), Box<dyn std::error::Error>> {
+/// let prompt = openai_chat(
+///     "gpt-4o-mini",
+///     OpenAiChatOptions {
+///         messages: vec!["be helpful".to_owned()],
+///         ..Default::default()
+///     },
+/// )?;
+///
+/// let mock = MockProvider::new(ProviderName::OpenAi);
+/// let mut providers = ProviderRegistry::new();
+/// providers.register(Arc::new(mock));
+///
+/// let agent = Agent::new(prompt)
+///     .name("planner")
+///     .version("0.3.0")
+///     .with_providers(Arc::new(providers));
+///
+/// let _run = agent.run("draft the doc").await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 #[cfg_attr(
     feature = "python",
@@ -166,21 +206,30 @@ impl fmt::Debug for Agent {
 }
 
 impl Agent {
-    /// Build an agent from an already-resolved prompt.
+    /// Build an Agent from an already-resolved Prompt.
+    ///
+    /// Use this infallible constructor when the prompt is inline and ready to
+    /// run.
     #[must_use]
     pub fn new(prompt: Prompt) -> Self {
         let prompt_ref = PromptRef::from(prompt.clone().into_native());
         Self::from_resolved_parts(generate_agent_id(), prompt_ref, prompt)
     }
 
-    /// Build an agent from an already-shared resolved prompt.
+    /// Build an Agent from an already-shared resolved Prompt.
+    ///
+    /// Use this when a caller already owns the stable runtime id and shared
+    /// prompt handle.
     #[must_use]
     pub fn from_resolved(id: impl Into<String>, prompt: Arc<Prompt>) -> Self {
         let prompt_ref = PromptRef::from(prompt.as_ref().clone().into_native());
         Self::from_resolved_arc_parts(id.into(), prompt_ref, prompt)
     }
 
-    /// Build an agent from a prompt reference and resolver.
+    /// Build an Agent from a PromptRef and resolver.
+    ///
+    /// Use this fallible constructor when the prompt may be a durable Prompt
+    /// Card reference.
     ///
     /// # Errors
     /// Returns resolver errors for card-backed prompt references.
@@ -196,14 +245,14 @@ impl Agent {
         ))
     }
 
-    /// Rebuilds the agent with a stable runtime id.
+    /// Return a copy with a stable runtime id.
     #[must_use]
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         self.id = id.into();
         self
     }
 
-    /// Rebuilds the agent with a new resolved prompt.
+    /// Return a copy retargeted to a resolved Prompt.
     #[must_use]
     pub fn with_prompt(mut self, prompt: impl Into<Arc<Prompt>>) -> Self {
         let prompt = prompt.into();
@@ -212,7 +261,7 @@ impl Agent {
         self
     }
 
-    /// Rebuilds the agent with a prompt reference and resolver.
+    /// Return a copy retargeted through a PromptRef and resolver.
     ///
     /// # Errors
     /// Returns resolver errors for card-backed prompt references.
@@ -226,7 +275,7 @@ impl Agent {
         Ok(self)
     }
 
-    /// Appends one runtime-local tool to the agent cache.
+    /// Return a copy with one runtime-local tool appended.
     #[must_use]
     pub fn with_tool(mut self, tool: Arc<dyn AgentTool>) -> Self {
         self.tool_names.push(tool.name().to_owned());
@@ -234,13 +283,13 @@ impl Agent {
         self
     }
 
-    /// Appends one runtime-local tool to the agent cache.
+    /// Return a copy with one runtime-local tool appended.
     #[must_use]
     pub fn add_tool(self, tool: Arc<dyn AgentTool>) -> Self {
         self.with_tool(tool)
     }
 
-    /// Replaces the full runtime-local tool cache.
+    /// Return a copy with the full runtime-local tool cache replaced.
     #[must_use]
     pub fn with_tools<I>(mut self, tools: I) -> Self
     where
@@ -255,34 +304,34 @@ impl Agent {
         self
     }
 
-    /// Replaces the full runtime-local tool cache.
+    /// Return a copy with the full runtime-local tool cache replaced.
     #[must_use]
     pub fn set_tools(self, tools: Vec<Arc<dyn AgentTool>>) -> Self {
         self.with_tools(tools)
     }
 
-    /// Rebuilds the agent with a new run configuration.
+    /// Return a copy with a new run configuration.
     #[must_use]
     pub fn with_run_config(mut self, run_config: RunConfig) -> Self {
         self.run_config = run_config;
         self
     }
 
-    /// Replaces the session memory backend.
+    /// Return a copy with a session memory backend.
     #[must_use]
     pub fn with_session(mut self, session: Arc<dyn SessionMemory>) -> Self {
         self.session = session;
         self
     }
 
-    /// Replaces the run journal backend.
+    /// Return a copy with a run journal backend.
     #[must_use]
     pub fn with_journal(mut self, journal: Arc<dyn Journal>) -> Self {
         self.journal = journal;
         self
     }
 
-    /// Rebuilds the agent with a provider registry used by [`Agent::run`].
+    /// Return a copy with a provider registry used by [`Agent::run`].
     #[must_use]
     pub fn with_providers(mut self, providers: Arc<ProviderRegistry>) -> Self {
         self.providers = Some(providers);

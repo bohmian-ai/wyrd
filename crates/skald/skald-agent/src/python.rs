@@ -1,4 +1,4 @@
-//! Python boundary for the engine-direct Skald agent surface.
+//! Python docstrings and PyO3 glue for the Rust-backed `wyrd.agent` surface.
 
 #![cfg(feature = "python")]
 
@@ -27,7 +27,11 @@ use crate::{
 
 #[pymethods]
 impl Agent {
-    /// Build a runnable Agent from a resolved Prompt.
+    /// Build a runnable, savable Agent.
+    ///
+    /// Args: prompt is a `Prompt` or PromptRef-like mapping; name, version,
+    /// space, id, tools, providers, run_config, callbacks, session, labels, and
+    /// annotations configure the local authoring object.
     #[new]
     #[pyo3(signature = (
         *,
@@ -126,61 +130,61 @@ impl Agent {
         Ok(agent)
     }
 
-    /// Optional card name.
+    /// Optional envelope name.
     #[getter(name)]
     pub fn py_name(&self) -> Option<&str> {
         self.name_str()
     }
 
-    /// Optional card version.
+    /// Optional envelope version.
     #[getter(version)]
     pub fn py_version(&self) -> Option<&str> {
         self.version_str()
     }
 
-    /// Optional card space.
+    /// Optional envelope space.
     #[getter(space)]
     pub fn py_space(&self) -> Option<&str> {
         self.space_str()
     }
 
-    /// Runtime agent id.
+    /// Stable runtime id used for diagnostics.
     #[getter(id)]
     pub fn py_id(&self) -> &str {
         self.id()
     }
 
-    /// Resolved prompt.
+    /// Resolved Prompt that owns provider and model identity.
     #[getter(prompt)]
     pub fn py_prompt(&self) -> Prompt {
         self.prompt.as_ref().clone()
     }
 
-    /// Prompt provider name.
+    /// Provider name read from the resolved Prompt.
     #[getter]
     pub fn provider(&self) -> String {
         self.prompt.provider()
     }
 
-    /// Prompt model name.
+    /// Model name read from the resolved Prompt.
     #[getter]
     pub fn model(&self) -> &str {
         &self.prompt.native().model
     }
 
-    /// Runtime-local tool names attached to this agent.
+    /// Runtime-local tool names attached to this Agent.
     #[getter(tool_names)]
     pub fn py_tool_names(&self) -> Vec<String> {
         self.tool_names().to_vec()
     }
 
-    /// Save this Agent Card YAML envelope to local disk.
+    /// Save this Agent as a YAML Agent Card on local disk.
     #[pyo3(name = "save")]
     pub fn py_save(&self, path: PathBuf) -> AgentPyResult<()> {
         Ok(Agent::save(self, path)?)
     }
 
-    /// Load an Agent Card YAML envelope from local disk.
+    /// Load an Agent from a YAML Agent Card on local disk.
     #[staticmethod]
     pub fn from_yaml(path: PathBuf) -> AgentPyResult<Self> {
         Ok(Self::from_yaml_path(
@@ -190,7 +194,7 @@ impl Agent {
         )?)
     }
 
-    /// Return this Agent Card as a YAML string.
+    /// Return this Agent Card envelope as a YAML string.
     #[pyo3(name = "to_yaml_string")]
     pub fn py_to_yaml_string(&self) -> AgentPyResult<String> {
         Ok(Agent::to_yaml_string(self)?)
@@ -221,13 +225,13 @@ impl Agent {
         )?)
     }
 
-    /// Validate whether this local Agent Card can be durably registered.
+    /// Validate whether this local Agent can be durably registered.
     #[pyo3(name = "validate_registrable")]
     pub fn py_validate_registrable(&self) -> AgentPyResult<()> {
         Ok(Agent::validate_registrable(self)?)
     }
 
-    /// Run the bounded tool loop.
+    /// Run the bounded tool loop and return an AgentRun value.
     #[pyo3(name = "run")]
     #[pyo3(signature = (input, *, session_id=None))]
     pub fn py_run(
@@ -269,7 +273,7 @@ impl Agent {
         Ok(())
     }
 
-    /// Replace the resolved prompt in place.
+    /// Replace the resolved Prompt in place.
     #[pyo3(name = "with_prompt")]
     pub fn py_with_prompt(&mut self, prompt: &Bound<'_, PyAny>) -> AgentPyResult<()> {
         let next = self.clone().with_prompt(prompt_from_py(prompt)?);
@@ -295,7 +299,7 @@ impl Agent {
         Ok(())
     }
 
-    /// Return this agent as a runtime-local delegate tool.
+    /// Return this Agent as a runtime-local delegate tool.
     #[pyo3(name = "as_tool")]
     #[pyo3(signature = (*, description=None))]
     pub fn py_as_tool(

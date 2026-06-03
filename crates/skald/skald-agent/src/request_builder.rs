@@ -5,7 +5,7 @@ use skald_spec::wire::anthropic_messages::{
 };
 use skald_spec::wire::google_generate::{GoogleContent, GoogleFunctionResponse, GooglePart};
 use skald_spec::wire::openai_chat::{OpenAiChatMessage, OpenAiMessageContent};
-use skald_spec::{MessageNum, ProviderRequest, ProviderResponse};
+use skald_spec::{MessageNum, ProviderName, ProviderRequest, ProviderResponse};
 
 use crate::conversation::{Conversation, ConversationTurn};
 use crate::error::{AgentError, AgentResult};
@@ -165,9 +165,9 @@ pub fn reset_messages(
     mut template: ProviderRequest,
     new_messages: &[MessageNum],
 ) -> AgentResult<ProviderRequest> {
-    let mismatch = |provider: &'static str| AgentError::Prompt {
-        agent: "<run_prompt>".to_owned(),
-        detail: format!("non-{provider} message in loop history"),
+    let mismatch = |provider: ProviderName| AgentError::LoopMessageType {
+        provider,
+        detail: "provider-native loop history contains a mismatched message variant".to_owned(),
     };
 
     match &mut template {
@@ -177,7 +177,7 @@ pub fn reset_messages(
             for msg in new_messages {
                 match msg {
                     MessageNum::OpenAi(message) => req.messages.push(message.clone()),
-                    _ => return Err(mismatch("OpenAI")),
+                    _ => return Err(mismatch(ProviderName::OpenAi)),
                 }
             }
         }
@@ -189,7 +189,7 @@ pub fn reset_messages(
                         req.messages.push(message.clone());
                     }
                     MessageNum::Anthropic(_) => {}
-                    _ => return Err(mismatch("Anthropic")),
+                    _ => return Err(mismatch(ProviderName::Anthropic)),
                 }
             }
         }
@@ -201,7 +201,7 @@ pub fn reset_messages(
                         req.contents.push(message.clone());
                     }
                     MessageNum::Gemini(_) => {}
-                    _ => return Err(mismatch("Google")),
+                    _ => return Err(mismatch(ProviderName::Google)),
                 }
             }
         }
@@ -213,7 +213,7 @@ pub fn reset_messages(
                         req.0.contents.push(message.clone());
                     }
                     MessageNum::Gemini(_) => {}
-                    _ => return Err(mismatch("Vertex")),
+                    _ => return Err(mismatch(ProviderName::Vertex)),
                 }
             }
         }

@@ -18,17 +18,32 @@
 //! - `status` — `EvalStatus` (mirrors `eval_inbox.status`).
 //! - `workflow` — `Workflow`, `WorkflowFieldType` (optional declared shape).
 //! - (`media` — deferred; lands with its first real consumer.)
+//! - `condition` — `EvalCondition` gate predicates shared by tasks.
+//! - `assertion` — `AssertionTask` programmatic assertions.
+//! - `llm_judge` — `LlmJudgeTask` prompt-backed judge task.
+//! - `trace` — `TraceAssertionTask` trace document assertions.
+//! - `agent` — `AgentAssertionTask` workflow envelope assertions.
 //!
 //! Later commits add the remaining task, plan, result, and spec modules.
 
+pub mod agent;
+pub mod assertion;
+pub mod condition;
 pub mod ids;
+pub mod llm_judge;
 pub mod operator;
 pub mod status;
+pub mod trace;
 pub mod workflow;
 
+pub use agent::AgentAssertionTask;
+pub use assertion::AssertionTask;
+pub use condition::{ConditionCombinator, EvalCondition, MAX_CONDITION_DEPTH};
 pub use ids::{
     EntityUid, JsonPath, RecordId, ScenarioId, SessionId, SpanId, TaskId, TraceId, WorkflowUid,
 };
+pub use llm_judge::LlmJudgeTask;
 pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
 pub use status::EvalStatus;
+pub use trace::TraceAssertionTask;
 pub use workflow::{Workflow, WorkflowFieldType};

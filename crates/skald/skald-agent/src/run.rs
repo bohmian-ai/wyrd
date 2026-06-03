@@ -16,7 +16,7 @@ pub struct RunConfig {
     /// Maximum recent session turns to recall at run start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_recent_limit: Option<usize>,
-    /// Overall run timeout. C06 records the setting; enforcement lands later.
+    /// Overall run timeout. `None` disables timeout enforcement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<std::time::Duration>,
 }

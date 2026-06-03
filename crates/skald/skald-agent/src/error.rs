@@ -1,5 +1,7 @@
 //! Agent error catalog.
 
+use std::time::Duration;
+
 use crate::journal::JournalError;
 use crate::session::SessionError;
 use skald_runtime::SkaldRuntimeError;
@@ -112,6 +114,12 @@ pub enum AgentError {
         /// Backend failure.
         source: JournalError,
     },
+    /// Agent run exceeded the configured timeout.
+    #[error("agent run exceeded configured timeout ({duration:?})")]
+    Timeout {
+        /// Configured timeout duration.
+        duration: Duration,
+    },
 }
 
 impl AgentError {
@@ -140,6 +148,7 @@ impl AgentError {
             Self::SessionRecentFailed { .. } => "SKALD_SESSION_500_RECENT",
             Self::SessionAppendFailed { .. } => "SKALD_SESSION_500_APPEND",
             Self::JournalAppendFailed { .. } => "SKALD_AGENT_500_JOURNAL",
+            Self::Timeout { .. } => "SKALD_AGENT_504_TIMEOUT",
         }
     }
 
@@ -157,6 +166,7 @@ impl AgentError {
             | Self::SessionRecentFailed { .. }
             | Self::SessionAppendFailed { .. }
             | Self::JournalAppendFailed { .. } => 500,
+            Self::Timeout { .. } => 504,
             Self::Provider(_) => 502,
             Self::Tool(_) => 400,
         }
@@ -179,6 +189,7 @@ impl AgentError {
             Self::SessionRecentFailed { .. } => "Session memory recent fetch failed",
             Self::SessionAppendFailed { .. } => "Session memory append failed",
             Self::JournalAppendFailed { .. } => "Journal append failed",
+            Self::Timeout { .. } => "Agent run exceeded configured timeout",
         }
     }
 
@@ -222,6 +233,9 @@ impl AgentError {
             }
             Self::JournalAppendFailed { .. } => {
                 "Inspect the journal backend; for NoopJournal this should never fire."
+            }
+            Self::Timeout { .. } => {
+                "Increase RunConfig.timeout or reduce iteration count / tool latency."
             }
         }
     }

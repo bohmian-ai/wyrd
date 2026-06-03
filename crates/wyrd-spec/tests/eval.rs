@@ -22,6 +22,8 @@ mod operator_catalog;
 mod pass_gate;
 #[path = "eval/result.rs"]
 mod result;
+#[path = "eval/scenario.rs"]
+mod scenario;
 #[path = "eval/spec.rs"]
 mod spec;
 #[path = "eval/status.rs"]

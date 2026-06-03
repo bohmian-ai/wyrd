@@ -27,6 +27,7 @@
 //! - `plan` — DAG validation and topological execution stages.
 //! - `result` — per-task result records and workflow-level pass gates.
 //! - `spec` — `EvalSpec`, dataset references, and sampling policy.
+//! - `scenario` — offline scenario payloads for eval DataCards.
 //!
 //! Later commits add the remaining spec modules.
 
@@ -38,6 +39,7 @@ pub mod llm_judge;
 pub mod operator;
 pub mod plan;
 pub mod result;
+pub mod scenario;
 pub mod spec;
 pub mod status;
 pub mod task;
@@ -54,6 +56,10 @@ pub use llm_judge::LlmJudgeTask;
 pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
 pub use plan::{DagError, ExecutionPlan, Stage, validate_dag};
 pub use result::{AssertionResult, EvalPassGate};
+pub use scenario::{
+    EvalScenario, EvalScenarioCollection, MAX_SCENARIOS_PER_COLLECTION, MAX_TURNS_HARD_CAP,
+    ScenarioTask,
+};
 pub use spec::{DatasetRef, EvalSampling, EvalSpec, EvalSpecError};
 pub use status::EvalStatus;
 pub use task::EvalTask;

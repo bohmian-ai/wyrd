@@ -32,6 +32,7 @@ pub mod resource;
 pub mod span;
 pub mod span_event;
 pub mod span_link;
+pub mod trace_summary;
 
 pub use attribute_value::AttributeValue;
 pub use instrumentation_scope::InstrumentationScope;
@@ -39,5 +40,6 @@ pub use resource::Resource;
 pub use span::{SpanKind, SpanRecord, SpanStatus};
 pub use span_event::SpanEvent;
 pub use span_link::SpanLink;
+pub use trace_summary::TraceSummaryRecord;
 // `attributes` is a constants module; consumers use `attributes::FOO`,
 // not a glob re-export.

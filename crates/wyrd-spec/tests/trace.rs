@@ -23,3 +23,6 @@ mod instrumentation_scope;
 
 #[path = "trace/span_record.rs"]
 mod span_record;
+
+#[path = "trace/trace_summary_record.rs"]
+mod trace_summary_record;

@@ -28,6 +28,7 @@
 pub mod attribute_value;
 pub mod attributes;
 pub mod gen_ai_eval_result;
+pub mod gen_ai_span;
 pub mod instrumentation_scope;
 pub mod resource;
 pub mod span;
@@ -37,6 +38,7 @@ pub mod trace_summary;
 
 pub use attribute_value::AttributeValue;
 pub use gen_ai_eval_result::GenAiEvalResult;
+pub use gen_ai_span::GenAiSpanRecord;
 pub use instrumentation_scope::InstrumentationScope;
 pub use resource::Resource;
 pub use span::{SpanKind, SpanRecord, SpanStatus};

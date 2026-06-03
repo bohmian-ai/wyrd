@@ -11,3 +11,4 @@
 //! `architecture/v1/06-crates/wyrd-spec.md` and AGENTS.md §9.
 
 pub mod eval;
+pub mod trace;

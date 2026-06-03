@@ -27,7 +27,11 @@
 
 pub mod attribute_value;
 pub mod attributes;
+pub mod span_event;
+pub mod span_link;
 
 pub use attribute_value::AttributeValue;
+pub use span_event::SpanEvent;
+pub use span_link::SpanLink;
 // `attributes` is a constants module; consumers use `attributes::FOO`,
 // not a glob re-export.

@@ -35,16 +35,27 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod agent;
+pub mod callbacks;
+pub mod conversation;
 pub mod error;
+pub mod journal;
 pub mod loop_runtime;
 pub mod registry;
 pub mod request_builder;
 pub mod run;
+pub mod session;
 
 pub use agent::Agent;
+pub use callbacks::{
+    AfterAgentFn, AfterModelFn, AfterToolFn, AgentContext, BeforeAgentFn, BeforeModelFn,
+    BeforeToolFn, CallbackOutcome,
+};
+pub use conversation::{Conversation, ConversationTurn};
 pub use error::{AgentError, AgentResult};
+pub use journal::{Journal, JournalError, JournalEvent, NoopJournal};
 pub use registry::system_messages;
 pub use run::{AgentRun, RunConfig};
+pub use session::{NoSession, Role, SessionError, SessionId, SessionMemory, SessionTurn};
 
 // Re-export `FinishReason` so callers do not depend on `skald-spec` directly
 // just to inspect agent termination cause.

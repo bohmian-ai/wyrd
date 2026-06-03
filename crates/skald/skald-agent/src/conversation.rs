@@ -22,6 +22,32 @@ impl Conversation {
         self.turns.push(turn);
     }
 
+    /// Appends a user turn.
+    pub fn append_user(&mut self, content: impl Into<String>) {
+        self.push(ConversationTurn::User {
+            content: content.into(),
+        });
+    }
+
+    /// Appends a provider-native assistant turn.
+    pub fn append_assistant(&mut self, message: MessageNum) {
+        self.push(ConversationTurn::Assistant { message });
+    }
+
+    /// Appends a tool result turn.
+    pub fn append_tool_result(
+        &mut self,
+        call_id: impl Into<String>,
+        ok: bool,
+        content: serde_json::Value,
+    ) {
+        self.push(ConversationTurn::ToolResult {
+            call_id: call_id.into(),
+            ok,
+            content,
+        });
+    }
+
     /// Returns the number of turns.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -37,6 +63,12 @@ impl Conversation {
     /// Iterates over turns in insertion order.
     pub fn iter(&self) -> std::slice::Iter<'_, ConversationTurn> {
         self.turns.iter()
+    }
+
+    /// Borrows turns in insertion order.
+    #[must_use]
+    pub fn turns(&self) -> &[ConversationTurn] {
+        &self.turns
     }
 }
 

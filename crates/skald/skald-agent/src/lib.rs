@@ -54,9 +54,5 @@ pub use conversation::{Conversation, ConversationTurn};
 pub use error::{AgentError, AgentResult};
 pub use journal::{Journal, JournalError, JournalEvent, NoopJournal};
 pub use registry::system_messages;
-pub use run::{AgentRun, RunConfig};
+pub use run::{AgentRun, FinishReason, RunConfig, RunError};
 pub use session::{NoSession, Role, SessionError, SessionId, SessionMemory, SessionTurn};
-
-// Re-export `FinishReason` so callers do not depend on `skald-spec` directly
-// just to inspect agent termination cause.
-pub use skald_spec::FinishReason;

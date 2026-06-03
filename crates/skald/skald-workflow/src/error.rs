@@ -28,6 +28,9 @@ pub enum WorkflowError {
     /// Retries exhausted on a task.
     #[error("task '{0}' exceeded max retries")]
     MaxRetriesExceeded(String),
+    /// Agent run completed without a provider response the workflow can consume.
+    #[error("task '{0}' agent run produced no final provider response")]
+    AgentMissingFinalResponse(String),
     /// Output validation failed for a task.
     #[error("task '{task_id}' output failed schema validation: {received}")]
     ResponseValidationFailed {
@@ -70,6 +73,7 @@ impl WorkflowError {
             Self::TaskAlreadyExists(_) => "SKALD_WORKFLOW_409_TASK_EXISTS",
             Self::TaskDependsOnItself(_) => "SKALD_WORKFLOW_422_SELF_DEP",
             Self::MaxRetriesExceeded(_) => "SKALD_WORKFLOW_500_MAX_RETRIES",
+            Self::AgentMissingFinalResponse(_) => "SKALD_WORKFLOW_500_AGENT_RESPONSE_MISSING",
             Self::ResponseValidationFailed { .. } => "SKALD_WORKFLOW_422_OUTPUT_SCHEMA",
             Self::Stalled(_) => "SKALD_WORKFLOW_500_STALLED",
             Self::UnsupportedHandoff { .. } => "SKALD_WORKFLOW_501_UNSUPPORTED_HANDOFF",

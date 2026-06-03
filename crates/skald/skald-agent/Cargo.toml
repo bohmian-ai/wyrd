@@ -31,5 +31,6 @@ futures = "0.3"
 pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 serde_json = { workspace = true }
+skald-providers = { workspace = true }

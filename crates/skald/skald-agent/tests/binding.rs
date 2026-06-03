@@ -72,7 +72,10 @@ fn agent_with_prompt_overrides_prompt_reference() {
 
 #[test]
 fn agent_with_run_config_preserves_config() {
-    let _agent = Agent::new("a", openai_prompt()).with_run_config(RunConfig { max_iterations: 7 });
+    let _agent = Agent::new("a", openai_prompt()).with_run_config(RunConfig {
+        max_iterations: 7,
+        ..Default::default()
+    });
 
     // Run-time behavior is validated in loop tests; this call is intentionally
     // limited to construction-time verification for the C03 shape.

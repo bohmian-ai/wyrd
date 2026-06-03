@@ -99,7 +99,10 @@ fn agent_with_prompt_returns_new_agent_with_same_tools() {
 
 #[test]
 fn agent_with_run_config_preserves_config() {
-    let config = RunConfig { max_iterations: 3 };
+    let config = RunConfig {
+        max_iterations: 3,
+        ..Default::default()
+    };
 
     let agent = Agent::new("a", test_prompt("gpt-4o")).with_run_config(config.clone());
 

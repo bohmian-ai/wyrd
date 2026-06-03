@@ -4,8 +4,7 @@ use skald_agent::{Agent, RunConfig};
 use skald_prompt::Prompt;
 use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::{
-    FinishReason, Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse,
-    ResponseType,
+    Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
     wire::openai_chat::{
         OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse,
         OpenAiChatSettings, OpenAiMessageContent, OpenAiResponseFormat, OpenAiToolCall,
@@ -24,7 +23,10 @@ fn build_agent(
     let prompt = Arc::new(Prompt::from_native(
         SpecPrompt::new(request, "gpt-4o", None, ResponseType::Text).expect("prompt should build"),
     ));
-    let agent = Agent::new("a", prompt).with_run_config(RunConfig { max_iterations });
+    let agent = Agent::new("a", prompt).with_run_config(RunConfig {
+        max_iterations,
+        ..Default::default()
+    });
     (agent, providers)
 }
 
@@ -118,7 +120,8 @@ async fn single_turn_no_tool_calls_returns_immediately() {
         .expect("single-turn run must succeed");
 
     assert_eq!(run.iterations, 1);
-    assert_eq!(run.output.adapter().finish_reason(), FinishReason::Stop);
+    assert_eq!(run.output, "hi");
+    assert!(run.final_response.is_some());
 }
 
 #[tokio::test]
@@ -143,12 +146,12 @@ async fn tool_call_response_now_returns_tool_not_found() {
     let err = agent
         .run(&providers, "ask")
         .await
-        .expect_err("tool invocation unsupported without per-agent tool wiring");
+        .expect_err("tool invocation requires per-agent tool wiring");
 
-    assert_eq!(err.code(), "SKALD_AGENT_404_TOOL");
+    assert_eq!(err.code(), "SKALD_AGENT_404_TOOL_NOT_IN_AGENT");
     match err {
-        skald_agent::AgentError::ToolNotFound { name } => assert_eq!(name, "echo"),
-        other => panic!("expected ToolNotFound, got {other:?}"),
+        skald_agent::AgentError::ToolNotInAgent { name } => assert_eq!(name, "echo"),
+        other => panic!("expected ToolNotInAgent, got {other:?}"),
     }
 }
 
@@ -228,7 +231,10 @@ async fn run_prompt_sends_rendered_prompt_verbatim_on_first_turn() {
     let prompt = Arc::new(Prompt::from_native(
         SpecPrompt::new(template_request.clone(), "gpt-4o", None, ResponseType::Text).unwrap(),
     ));
-    let agent = Agent::new("a", prompt).with_run_config(RunConfig { max_iterations: 10 });
+    let agent = Agent::new("a", prompt).with_run_config(RunConfig {
+        max_iterations: 10,
+        ..Default::default()
+    });
 
     let run = agent
         .run_prompt(

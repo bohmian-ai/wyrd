@@ -2944,6 +2944,7 @@ dependencies = [
  "serde",
  "serde_json",
  "skald-prompt",
+ "skald-providers",
  "skald-runtime",
  "skald-spec",
  "skald-tool",

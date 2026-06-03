@@ -19,6 +19,12 @@ pub enum AgentError {
         /// Tool name from the provider response.
         name: String,
     },
+    /// The model requested a tool that is not attached to this agent.
+    #[error("tool '{name}' is not attached to this agent")]
+    ToolNotInAgent {
+        /// Tool name from the provider response.
+        name: String,
+    },
     /// Tool argument validation rejected a provider-emitted call payload.
     #[error("tool '{tool}' arguments invalid: {detail}")]
     InvalidToolArgs {
@@ -121,6 +127,7 @@ impl AgentError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::ToolNotFound { .. } => "SKALD_AGENT_404_TOOL",
+            Self::ToolNotInAgent { .. } => "SKALD_AGENT_404_TOOL_NOT_IN_AGENT",
             Self::InvalidToolArgs { .. } => "SKALD_AGENT_422_TOOL_ARGS",
             Self::Prompt { .. } => "SKALD_AGENT_422_PROMPT",
             Self::LoopMessageType { .. } => "SKALD_AGENT_422_LOOP_MESSAGE_TYPE",
@@ -139,7 +146,7 @@ impl AgentError {
     /// Suggested HTTP status for this failure.
     pub const fn status(&self) -> u16 {
         match self {
-            Self::ToolNotFound { .. } => 404,
+            Self::ToolNotFound { .. } | Self::ToolNotInAgent { .. } => 404,
             Self::InvalidToolArgs { .. } | Self::Prompt { .. } | Self::LoopMessageType { .. } => {
                 422
             }
@@ -159,6 +166,7 @@ impl AgentError {
     pub const fn title(&self) -> &'static str {
         match self {
             Self::ToolNotFound { .. } => "Tool not registered for agent",
+            Self::ToolNotInAgent { .. } => "Tool not attached to agent",
             Self::InvalidToolArgs { .. } => "Tool arguments invalid",
             Self::MaxIterations { .. } => "Agent exceeded max iterations",
             Self::Provider(_) => "Provider call failed",
@@ -179,6 +187,9 @@ impl AgentError {
         match self {
             Self::ToolNotFound { .. } => {
                 "Register the tool before running the agent or remove the tool call from the provider response."
+            }
+            Self::ToolNotInAgent { .. } => {
+                "Attach the runtime-local tool to this agent or adjust the model response."
             }
             Self::InvalidToolArgs { .. } => {
                 "Adjust the provider-emitted tool arguments to match the tool input schema."

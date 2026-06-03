@@ -166,7 +166,9 @@ impl Workflow {
         let prompt = RuntimePrompt::from_native(prompt);
         for attempt in 0..=max_retries {
             let response = match agent.run_prompt(&self.providers, &prompt, &[]).await {
-                Ok(run) => run.output,
+                Ok(run) => run
+                    .final_response
+                    .ok_or_else(|| WorkflowError::AgentMissingFinalResponse(task_id.to_owned()))?,
                 Err(_err) if attempt == max_retries => {
                     return Err(WorkflowError::MaxRetriesExceeded(task_id.to_owned()));
                 }
@@ -226,7 +228,9 @@ impl Workflow {
                 .run_prompt(&self.providers, &runtime_prompt, &[])
                 .await
             {
-                Ok(run) => run.output,
+                Ok(run) => run
+                    .final_response
+                    .ok_or_else(|| WorkflowError::AgentMissingFinalResponse(task_id.clone()))?,
                 Err(_err) if attempt == max_retries => {
                     let error = WorkflowError::MaxRetriesExceeded(task_id.clone());
                     self.record_failure(&task, &task_id, attempt, started_at, events, &error)?;

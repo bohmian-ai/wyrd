@@ -78,7 +78,7 @@ impl ToolError {
                 "Use ToolRegistry::register_force to overwrite or pick a unique tool name."
             }
             Self::NotRegistered { .. } => {
-                "Register the tool (Tool::function + registry.register) before loading the agent, or call default_registry() prior to from_wire."
+                "Register the tool (Tool::function + registry.register) before loading the agent, or call default_registry() before resolving agent tools."
             }
             Self::InvalidInput(_) => {
                 "Adjust the tool call arguments to match the schema returned by tool.input_schema()."

@@ -18,6 +18,7 @@ python = ["dep:pyo3"]
 
 [dependencies]
 skald-spec = { workspace = true }
+skald-prompt = { workspace = true }
 skald-runtime = { workspace = true }
 skald-tool = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

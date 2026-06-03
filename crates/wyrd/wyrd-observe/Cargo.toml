@@ -16,7 +16,6 @@ path = "src/lib.rs"
 default = []
 
 [dependencies]
-skald-agent = { workspace = true }
 vala-client = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-utils = { workspace = true }

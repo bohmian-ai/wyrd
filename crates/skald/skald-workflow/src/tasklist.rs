@@ -47,7 +47,7 @@ impl TaskList {
             }
         }
 
-        let task = Task::from_def(def)?;
+        let task = Task::build(def)?;
         let id = task.id.clone();
         let previous_order = self.execution_order.clone();
         self.tasks.insert(id.clone(), Arc::new(RwLock::new(task)));

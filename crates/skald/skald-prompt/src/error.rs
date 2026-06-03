@@ -68,37 +68,45 @@ impl PromptBuilderError {
 impl From<PromptBuilderError> for wyrd_interfaces::error::WyrdPyError {
     fn from(error: PromptBuilderError) -> Self {
         use serde_json::json;
-        use wyrd_spec::card::prompt::validate::PromptError;
-        use wyrd_spec::error::WyrdError;
-
         let message = error.to_string();
         match error {
-            PromptBuilderError::EmptyModel => WyrdError::from(PromptError::EmptyModel).into(),
-            PromptBuilderError::InvalidResponseSchema => {
-                WyrdError::from(PromptError::InvalidResponseSchema).into()
-            }
-            PromptBuilderError::Io { path, message } => {
-                WyrdError::from(PromptError::LoaderIo { path, message }).into()
-            }
+            PromptBuilderError::EmptyModel => wyrd_spec::error::WyrdError::from(
+                wyrd_spec::card::prompt::validate::PromptError::EmptyModel,
+            )
+            .into(),
+            PromptBuilderError::InvalidResponseSchema => wyrd_spec::error::WyrdError::from(
+                wyrd_spec::card::prompt::validate::PromptError::InvalidResponseSchema,
+            )
+            .into(),
+            PromptBuilderError::Io { path, message } => wyrd_spec::error::WyrdError::from(
+                wyrd_spec::card::prompt::validate::PromptError::LoaderIo { path, message },
+            )
+            .into(),
             PromptBuilderError::Wyrd(error) => error.into(),
-            PromptBuilderError::Skald(error) => WyrdError::from(error).into(),
-            PromptBuilderError::InvalidProvider(provider) => WyrdError::PromptProviderMismatch {
-                message,
-                details: json!({ "provider": provider }),
+            PromptBuilderError::Skald(error) => wyrd_spec::error::WyrdError::from(error).into(),
+            PromptBuilderError::InvalidProvider(provider) => {
+                wyrd_spec::error::WyrdError::PromptProviderMismatch {
+                    message,
+                    details: json!({ "provider": provider }),
+                }
+                .into()
             }
-            .into(),
-            PromptBuilderError::InvalidRawJson(source) => WyrdError::PromptSerializeRequest {
-                message,
-                details: json!({ "source": source }),
+            PromptBuilderError::InvalidRawJson(source) => {
+                wyrd_spec::error::WyrdError::PromptSerializeRequest {
+                    message,
+                    details: json!({ "source": source }),
+                }
+                .into()
             }
-            .into(),
-            PromptBuilderError::Validation(source) => WyrdError::PromptDraftInvalid {
-                message,
-                details: json!({ "source": source }),
+            PromptBuilderError::Validation(source) => {
+                wyrd_spec::error::WyrdError::PromptDraftInvalid {
+                    message,
+                    details: json!({ "source": source }),
+                }
+                .into()
             }
-            .into(),
             PromptBuilderError::UnsupportedRole { provider, role } => {
-                WyrdError::PromptProviderMismatch {
+                wyrd_spec::error::WyrdError::PromptProviderMismatch {
                     message,
                     details: json!({ "provider": provider, "role": role }),
                 }

@@ -6,10 +6,7 @@
 
 #[allow(unused_imports)]
 mod _agent {
-    use wyrd::agent::{
-        Agent, AgentBuilder, AgentDef, AgentError, AgentResult, AgentRun, AgentTool,
-        AgentToolError, FinishReason, NoopObserver, Observer, RunConfig, ToolRegistry,
-    };
+    use wyrd::agent::{Agent, AgentError, AgentResult, AgentRun, FinishReason, RunConfig};
 }
 
 #[allow(unused_imports)]

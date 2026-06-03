@@ -3,16 +3,12 @@
 /// Local mirror for Wyrd agent/workflow error classifications.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WyrdErrorVariant {
-    /// Agent provider was not found.
-    AgentProviderNotFound,
     /// Agent tool was not found.
     AgentToolNotFound,
     /// Agent and prompt providers differed.
     AgentProviderMismatch,
     /// Tool arguments failed validation.
     AgentToolArgs,
-    /// System prompt could not be represented for the provider.
-    AgentSystemPrompt,
     /// Prompt rendering or shaping failed.
     AgentPrompt,
     /// Agent hit its iteration cap.
@@ -28,11 +24,9 @@ impl WyrdErrorVariant {
     #[must_use]
     pub fn code(&self) -> String {
         match self {
-            Self::AgentProviderNotFound => "WYRD_AGENT_404_PROVIDER".to_owned(),
             Self::AgentToolNotFound => "WYRD_AGENT_404_TOOL".to_owned(),
             Self::AgentProviderMismatch => "WYRD_AGENT_409_PROVIDER_MISMATCH".to_owned(),
             Self::AgentToolArgs => "WYRD_AGENT_422_TOOL_ARGS".to_owned(),
-            Self::AgentSystemPrompt => "WYRD_AGENT_422_SYSTEM_PROMPT".to_owned(),
             Self::AgentPrompt => "WYRD_AGENT_422_PROMPT".to_owned(),
             Self::AgentMaxIterations => "WYRD_AGENT_500_MAX_ITERATIONS".to_owned(),
             Self::AgentProvider => "WYRD_AGENT_502_PROVIDER".to_owned(),
@@ -51,11 +45,9 @@ impl WyrdErrorVariant {
 #[must_use]
 pub fn map_skald_code(code: &str) -> Option<WyrdErrorVariant> {
     match code {
-        "SKALD_AGENT_404_PROVIDER" => Some(WyrdErrorVariant::AgentProviderNotFound),
         "SKALD_AGENT_404_TOOL" => Some(WyrdErrorVariant::AgentToolNotFound),
         "SKALD_AGENT_409_PROVIDER_MISMATCH" => Some(WyrdErrorVariant::AgentProviderMismatch),
         "SKALD_AGENT_422_TOOL_ARGS" => Some(WyrdErrorVariant::AgentToolArgs),
-        "SKALD_AGENT_422_SYSTEM_PROMPT" => Some(WyrdErrorVariant::AgentSystemPrompt),
         "SKALD_AGENT_422_PROMPT" => Some(WyrdErrorVariant::AgentPrompt),
         "SKALD_AGENT_500_MAX_ITERATIONS" => Some(WyrdErrorVariant::AgentMaxIterations),
         "SKALD_AGENT_502_PROVIDER" => Some(WyrdErrorVariant::AgentProvider),

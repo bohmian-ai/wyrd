@@ -2,8 +2,6 @@
 
 use std::path::Path;
 
-use wyrd_spec::{CardLoadFormat, PromptSpec, parse_spec_bytes, serialize_spec_bytes};
-
 use crate::error::{PromptBuilderError, PromptBuilderResult};
 use crate::prompt::Prompt;
 
@@ -16,7 +14,7 @@ pub fn load_prompt(path: impl AsRef<Path>) -> PromptBuilderResult<Prompt> {
     let path = path.as_ref();
     let bytes = std::fs::read(path).map_err(|error| loader_io(path, &error))?;
     let format = format_from_path(path)?;
-    let spec = parse_spec_bytes(format, &bytes)?;
+    let spec = wyrd_spec::parse_spec_bytes(format, &bytes)?;
     Ok(Prompt::from_native(spec.prompt))
 }
 
@@ -24,13 +22,13 @@ pub fn load_prompt(path: impl AsRef<Path>) -> PromptBuilderResult<Prompt> {
 pub fn dump_prompt(prompt: &Prompt, path: impl AsRef<Path>) -> PromptBuilderResult<()> {
     let path = path.as_ref();
     let format = format_from_path(path)?;
-    let spec = PromptSpec::new(prompt.native().clone())?;
-    let bytes = serialize_spec_bytes(format, &spec)?;
+    let spec = wyrd_spec::PromptSpec::new(prompt.native().clone())?;
+    let bytes = wyrd_spec::serialize_spec_bytes(format, &spec)?;
     std::fs::write(path, bytes).map_err(|error| loader_io(path, &error))
 }
 
-fn format_from_path(path: &Path) -> PromptBuilderResult<CardLoadFormat> {
-    CardLoadFormat::from_extension(path.extension().and_then(std::ffi::OsStr::to_str))
+fn format_from_path(path: &Path) -> PromptBuilderResult<wyrd_spec::CardLoadFormat> {
+    wyrd_spec::CardLoadFormat::from_extension(path.extension().and_then(std::ffi::OsStr::to_str))
         .map_err(Into::into)
 }
 

@@ -11,12 +11,6 @@ pub type AgentResult<T> = Result<T, AgentError>;
 /// Failures the agent surface can raise.
 #[derive(Debug, Error)]
 pub enum AgentError {
-    /// The provider registry returned no client for the agent's provider name.
-    #[error("provider not registered: {provider:?}")]
-    ProviderNotFound {
-        /// Missing provider name from the agent def.
-        provider: ProviderName,
-    },
     /// The agent dispatched a tool name that is not in its tool registry.
     #[error("tool '{name}' is not registered for this agent")]
     ToolNotFound {
@@ -29,14 +23,6 @@ pub enum AgentError {
         /// Tool name from the call.
         tool: String,
         /// Reason the args failed validation.
-        detail: String,
-    },
-    /// The system prompt failed to render into native messages at bind time.
-    #[error("system prompt invalid for {provider:?}: {detail}")]
-    SystemPrompt {
-        /// Provider the system prompt was being shaped for.
-        provider: ProviderName,
-        /// Reason the conversion failed.
         detail: String,
     },
     /// Bounded loop hit the iteration cap.
@@ -96,10 +82,8 @@ impl AgentError {
     /// Stable machine-readable code for cross-boundary mapping.
     pub fn code(&self) -> &'static str {
         match self {
-            Self::ProviderNotFound { .. } => "SKALD_AGENT_404_PROVIDER",
             Self::ToolNotFound { .. } => "SKALD_AGENT_404_TOOL",
             Self::InvalidToolArgs { .. } => "SKALD_AGENT_422_TOOL_ARGS",
-            Self::SystemPrompt { .. } => "SKALD_AGENT_422_SYSTEM_PROMPT",
             Self::Prompt { .. } => "SKALD_AGENT_422_PROMPT",
             Self::LoopMessageType { .. } => "SKALD_AGENT_422_LOOP_MESSAGE_TYPE",
             Self::ProviderMismatch { .. } => "SKALD_AGENT_409_PROVIDER_MISMATCH",

@@ -1,5 +1,5 @@
 use serde_json::json;
-use skald_agent::{AgentDef, RunConfig};
+use skald_agent::RunConfig;
 use skald_spec::wire::google_embeddings::{
     GoogleBatchEmbedRequest, GoogleEmbedContent, GoogleEmbedPart, GoogleEmbedRequest,
 };
@@ -11,6 +11,7 @@ use skald_spec::wire::openai_embeddings::{OpenAiEmbeddingsInput, OpenAiEmbedding
 use skald_spec::wire::openai_responses::OpenAiResponsesRequest;
 use skald_spec::wire::vertex_predict::{VertexEmbedInstance, VertexPredictRequest};
 use skald_spec::{Prompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType};
+use skald_workflow::WorkflowAgent;
 use skald_workflow::{
     Context, ContextSnapshot, Task, TaskDef, TaskStatus, WorkflowDef, WorkflowError,
     default_max_retries,
@@ -59,13 +60,10 @@ fn openai_chat_request() -> OpenAiChatRequest {
     }
 }
 
-fn agent_def() -> AgentDef {
-    AgentDef {
+fn agent_def() -> WorkflowAgent {
+    WorkflowAgent {
         id: "a".to_owned(),
-        provider: ProviderName::OpenAi,
-        system_prompt: None,
-        model: None,
-        tool_names: Vec::new(),
+        prompt: fixture_prompt(false),
         run_config: RunConfig::default(),
     }
 }
@@ -115,7 +113,7 @@ fn openai_response(content: Option<&str>) -> ProviderResponse {
 }
 
 fn assert_task_prompt_rejected(prompt: Prompt) {
-    let err = Task::from_def(TaskDef {
+    let err = Task::build(TaskDef {
         id: "t".to_owned(),
         agent_id: "a".to_owned(),
         prompt,
@@ -173,8 +171,8 @@ fn task_def_default_max_retries_is_three() {
 }
 
 #[test]
-fn task_from_def_text_response_has_no_validator() {
-    let task = Task::from_def(task_def("t", Vec::new())).expect("text task compiles");
+fn task_build_text_response_has_no_validator() {
+    let task = Task::build(task_def("t", Vec::new())).expect("text task compiles");
     assert!(task.output_validator.is_none());
     assert_eq!(task.status, TaskStatus::Pending);
     assert_eq!(task.retry_count, 0);
@@ -182,8 +180,8 @@ fn task_from_def_text_response_has_no_validator() {
 }
 
 #[test]
-fn task_from_def_compiles_jsonschema_validator() {
-    let task = Task::from_def(TaskDef {
+fn task_build_compiles_jsonschema_validator() {
+    let task = Task::build(TaskDef {
         prompt: fixture_prompt(true),
         ..task_def("t", Vec::new())
     })
@@ -193,14 +191,14 @@ fn task_from_def_compiles_jsonschema_validator() {
 
 #[test]
 fn task_validate_response_passes_for_text_type() {
-    let task = Task::from_def(task_def("t", Vec::new())).expect("text task compiles");
+    let task = Task::build(task_def("t", Vec::new())).expect("text task compiles");
     task.validate_response(&openai_response(Some("ok")))
         .expect("text response passes");
 }
 
 #[test]
 fn task_validate_response_passes_for_matching_structured_output() {
-    let task = Task::from_def(TaskDef {
+    let task = Task::build(TaskDef {
         prompt: fixture_prompt(true),
         ..task_def("t", Vec::new())
     })
@@ -211,7 +209,7 @@ fn task_validate_response_passes_for_matching_structured_output() {
 
 #[test]
 fn task_validate_response_rejects_invalid_schema_output() {
-    let task = Task::from_def(TaskDef {
+    let task = Task::build(TaskDef {
         prompt: fixture_prompt(true),
         ..task_def("t", Vec::new())
     })
@@ -224,7 +222,7 @@ fn task_validate_response_rejects_invalid_schema_output() {
 
 #[test]
 fn task_validate_response_rejects_missing_structured_output() {
-    let task = Task::from_def(TaskDef {
+    let task = Task::build(TaskDef {
         prompt: fixture_prompt(true),
         ..task_def("t", Vec::new())
     })
@@ -236,7 +234,7 @@ fn task_validate_response_rejects_missing_structured_output() {
 }
 
 #[test]
-fn task_from_def_rejects_openai_responses_prompt_upfront() {
+fn task_build_rejects_openai_responses_prompt_upfront() {
     let mut prompt = fixture_prompt(false);
     prompt.request = ProviderRequest::OpenAiResponses(OpenAiResponsesRequest {
         model: "gpt-4o".to_owned(),
@@ -254,7 +252,7 @@ fn task_from_def_rejects_openai_responses_prompt_upfront() {
 }
 
 #[test]
-fn task_from_def_rejects_openai_embedding_prompt_upfront() {
+fn task_build_rejects_openai_embedding_prompt_upfront() {
     let mut prompt = fixture_prompt(false);
     prompt.request = ProviderRequest::OpenAiEmbeddings(OpenAiEmbeddingsRequest {
         model: "text-embedding-3-small".to_owned(),
@@ -267,7 +265,7 @@ fn task_from_def_rejects_openai_embedding_prompt_upfront() {
 }
 
 #[test]
-fn task_from_def_rejects_google_batch_embed_prompt_upfront() {
+fn task_build_rejects_google_batch_embed_prompt_upfront() {
     let mut prompt = fixture_prompt(false);
     prompt.request = ProviderRequest::GoogleBatchEmbed(GoogleBatchEmbedRequest {
         requests: vec![GoogleEmbedRequest {
@@ -286,7 +284,7 @@ fn task_from_def_rejects_google_batch_embed_prompt_upfront() {
 }
 
 #[test]
-fn task_from_def_rejects_vertex_predict_prompt_upfront() {
+fn task_build_rejects_vertex_predict_prompt_upfront() {
     let mut prompt = fixture_prompt(false);
     prompt.request = ProviderRequest::VertexPredict(VertexPredictRequest {
         instances: vec![VertexEmbedInstance {
@@ -300,7 +298,7 @@ fn task_from_def_rejects_vertex_predict_prompt_upfront() {
 }
 
 #[test]
-fn task_from_def_rejects_raw_v1_prompt_upfront() {
+fn task_build_rejects_raw_v1_prompt_upfront() {
     let mut prompt = fixture_prompt(false);
     prompt.request = ProviderRequest::RawV1 {
         provider: ProviderName::Custom("preview".to_owned()),

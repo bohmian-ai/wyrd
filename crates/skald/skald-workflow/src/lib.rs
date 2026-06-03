@@ -32,7 +32,6 @@ pub mod context;
 pub mod def;
 pub mod error;
 pub mod handoff;
-pub mod observer_ext;
 pub mod run;
 pub mod schedule;
 pub mod task;
@@ -40,7 +39,7 @@ pub mod tasklist;
 pub mod workflow;
 
 pub use context::{Context, ContextSnapshot};
-pub use def::{TaskDef, WorkflowDef, default_max_retries};
+pub use def::{TaskDef, WorkflowAgent, WorkflowDef, default_max_retries};
 pub use error::{WorkflowError, WorkflowResult};
 pub use handoff::{extract_messages_for_handoff, handoff_messages};
 pub use run::{TaskEvent, TaskOutcome, WorkflowRun};

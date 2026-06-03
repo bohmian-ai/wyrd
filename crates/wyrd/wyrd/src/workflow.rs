@@ -6,7 +6,7 @@
 //!
 //! # Public Surface
 //!
-//! - `Workflow` is the live workflow, built via `Workflow::from_def`.
+//! - `Workflow` is the live workflow, built via `Workflow::from_definition`.
 //! - `WorkflowDef` is the declarative form, including graph validation.
 //! - `TaskDef`, `Task`, and `TaskStatus` are task shapes.
 //! - `Context` and `ContextSnapshot` are per-run shared state.

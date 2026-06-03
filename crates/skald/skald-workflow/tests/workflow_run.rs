@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use skald_agent::{AgentDef, NoopObserver, Observer, RunConfig, ToolRegistry};
+use skald_agent::RunConfig;
 use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse,
     OpenAiMessageContent,
 };
 use skald_spec::{Prompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType};
+use skald_workflow::WorkflowAgent;
 use skald_workflow::{Context, TaskDef, TaskStatus, Workflow, WorkflowDef};
 
 fn prompt() -> Prompt {
@@ -67,12 +68,9 @@ async fn workflow_run_carries_outcomes_events_last_task() {
     let def = WorkflowDef {
         id: "wf".to_owned(),
         name: "n".to_owned(),
-        agents: vec![AgentDef {
+        agents: vec![WorkflowAgent {
             id: "a".to_owned(),
-            provider: ProviderName::OpenAi,
-            system_prompt: None,
-            model: None,
-            tool_names: Vec::new(),
+            prompt: prompt(),
             run_config: RunConfig::default(),
         }],
         tasks: vec![
@@ -98,14 +96,9 @@ async fn workflow_run_carries_outcomes_events_last_task() {
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(mock));
     let workflow = Arc::new(
-        Workflow::from_def(
-            def,
-            &providers,
-            &ToolRegistry::new(),
-            Arc::new(NoopObserver) as Arc<dyn Observer>,
-        )
-        .await
-        .expect("workflow builds"),
+        Workflow::build(def, &providers)
+            .await
+            .expect("workflow builds"),
     );
 
     let run = workflow.run(Context::new()).await.expect("run succeeds");

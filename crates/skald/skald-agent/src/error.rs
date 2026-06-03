@@ -15,7 +15,10 @@ pub type AgentResult<T> = Result<T, AgentError>;
 /// Failures the agent surface can raise.
 #[derive(Debug, Error)]
 pub enum AgentError {
-    /// The agent dispatched a tool name that is not in its tool registry.
+    /// Tool lookup failed in one of two post-S12B contexts:
+    /// build-time resolution while `Agent::from_wire` / `Agent::from_card`
+    /// hydrate runtime-local tool names, or loop runtime call-time dispatch
+    /// after a provider emits a tool call.
     #[error("tool '{name}' is not registered for this agent")]
     ToolNotFound {
         /// Tool name from the provider response.

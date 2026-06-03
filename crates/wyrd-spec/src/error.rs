@@ -911,6 +911,20 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Agent loop history contains a provider message type mismatch.
+    #[error("[WYRD_AGENT_422_LOOP_MESSAGE_TYPE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_LOOP_MESSAGE_TYPE",
+        status = 422,
+        title = "Loop message type mismatch",
+        remediation = "Re-render the conversation message against the active provider; loop messages must match the provider's message schema (OpenAi / Anthropic / Gemini / Custom)."
+    )]
+    AgentLoopMessageType {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
 }
 
 impl WyrdError {
@@ -994,7 +1008,8 @@ impl WyrdError {
             | Self::AgentMissingVersion { message, details }
             | Self::AgentPromptCardNotFound { message, details }
             | Self::AgentRuntimeLocalToolNotFound { message, details }
-            | Self::AgentRuntimeLocalToolsNotRegistrable { message, details } => (message, details),
+            | Self::AgentRuntimeLocalToolsNotRegistrable { message, details }
+            | Self::AgentLoopMessageType { message, details } => (message, details),
         }
     }
 

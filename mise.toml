@@ -221,6 +221,31 @@ fi
 description = "Audit unwrap/expect calls outside tests and examples"
 run = "python scripts/check_unwrap_audit.py"
 
+[tasks."check:error-coverage"]
+description = "Assert emitted Skald error codes are mapped for observability"
+run = """
+set -eu
+
+emitted=$(mktemp)
+mapped=$(mktemp)
+trap 'rm -f "$emitted" "$mapped"' EXIT
+
+{
+  rg --no-filename -oN 'SKALD_AGENT_[0-9]{3}_[A-Z_]+' crates/skald/skald-agent/src || true
+  rg --no-filename -oN 'SKALD_SESSION_[0-9]{3}_[A-Z_]+' crates/skald/skald-agent/src || true
+  rg --no-filename -oN 'SKALD_WORKFLOW_[0-9]{3}_[A-Z_]+' crates/skald/skald-workflow/src || true
+} | sort -u > "$emitted"
+
+rg --no-filename -oN 'SKALD_(AGENT|SESSION|WORKFLOW)_[0-9]{3}_[A-Z_]+' \
+  crates/wyrd/wyrd-observe/src/error_map.rs \
+  | sort -u > "$mapped"
+
+if comm -23 "$emitted" "$mapped" | rg .; then
+  echo 'Observed Skald error map is missing emitted source codes'
+  exit 1
+fi
+"""
+
 [tasks."check:test-contracts"]
 description = "Verify Wyrd critical Rust contracts have explicit Python test markers"
 run = "python scripts/check_test_contracts.py"
@@ -412,7 +437,7 @@ diff -u "$BEFORE" "$AFTER" \
 
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
-depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:docs"]
+depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:error-coverage", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:docs"]
 
 [tasks."dev:pg:nuke"]
 description = "Wipe embedded pg cache"

@@ -17,6 +17,7 @@ server = ["dep:utoipa"]
 wasm = []
 
 [dependencies]
+base64 = { workspace = true }
 skald-spec = { workspace = true, features = ["schemars"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

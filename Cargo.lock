@@ -4694,6 +4694,7 @@ dependencies = [
 name = "wyrd-spec"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "chrono",
  "hex",
  "petgraph",

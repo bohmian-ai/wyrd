@@ -24,3 +24,10 @@
 //!
 //! Trace and span ids live in [`crate::vala::ids`] (commit 02 of the
 //! trace-primitive plan promotes them from `vala::eval::ids`).
+
+pub mod attribute_value;
+pub mod attributes;
+
+pub use attribute_value::AttributeValue;
+// `attributes` is a constants module; consumers use `attributes::FOO`,
+// not a glob re-export.

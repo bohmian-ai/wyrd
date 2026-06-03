@@ -1,6 +1,6 @@
 """Public Prompt re-exports."""
 
-from ._native.cards.prompt import (
+from ._wyrd.cards.prompt import (
     AnthropicSettings,
     GeminiSettings,
     MediaRef,

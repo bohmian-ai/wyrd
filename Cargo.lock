@@ -2276,7 +2276,12 @@ name = "py-wyrd"
 version = "0.0.1"
 dependencies = [
  "pyo3",
+ "skald-agent",
+ "skald-prompt",
+ "skald-runtime",
+ "skald-tool",
  "wyrd-cards",
+ "wyrd-observe-impl",
 ]
 
 [[package]]
@@ -2951,6 +2956,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "wyrd-runtime",
 ]
 
 [[package]]
@@ -3015,6 +3021,7 @@ name = "skald-runtime"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "pyo3",
  "serde_json",
  "skald-cache",
  "skald-providers",
@@ -3044,12 +3051,15 @@ name = "skald-tool"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "pyo3",
  "schemars",
  "serde",
  "serde_json",
  "skald-spec",
  "thiserror 2.0.18",
  "tokio",
+ "wyrd-runtime",
+ "wyrd-utils",
 ]
 
 [[package]]
@@ -4594,6 +4604,7 @@ dependencies = [
  "tokio",
  "ulid",
  "wyrd-interfaces",
+ "wyrd-runtime",
  "wyrd-spec",
  "wyrd-test-contract-macros",
  "wyrd-utils",
@@ -4689,6 +4700,7 @@ name = "wyrd-observe-impl"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "pyo3",
  "skald-agent",
  "tokio",
  "wyrd-observe",

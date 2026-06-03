@@ -5,7 +5,10 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
-use skald_agent::{Agent, AgentError, AgentRun, Journal, RunConfig, SessionId, SessionMemory};
+use skald_agent::{
+    AfterAgentFn, AfterModelFn, AfterToolFn, Agent, AgentError, AgentRun, BeforeAgentFn,
+    BeforeModelFn, BeforeToolFn, Journal, RunConfig, SessionId, SessionMemory,
+};
 use skald_prompt::Prompt;
 use skald_runtime::ProviderRegistry;
 use skald_tool::{AgentTool, ToolError, ToolResolver, default_registry};
@@ -336,6 +339,36 @@ impl AgentWithMeta {
         self.agent = self.agent.clone().with_journal(journal);
     }
 
+    /// Add a before-agent callback in place.
+    pub fn add_before_agent_in_place(&mut self, callback: BeforeAgentFn) {
+        self.agent = self.agent.clone().before_agent(callback);
+    }
+
+    /// Add an after-agent callback in place.
+    pub fn add_after_agent_in_place(&mut self, callback: AfterAgentFn) {
+        self.agent = self.agent.clone().after_agent(callback);
+    }
+
+    /// Add a before-model callback in place.
+    pub fn add_before_model_in_place(&mut self, callback: BeforeModelFn) {
+        self.agent = self.agent.clone().before_model(callback);
+    }
+
+    /// Add an after-model callback in place.
+    pub fn add_after_model_in_place(&mut self, callback: AfterModelFn) {
+        self.agent = self.agent.clone().after_model(callback);
+    }
+
+    /// Add a before-tool callback in place.
+    pub fn add_before_tool_in_place(&mut self, callback: BeforeToolFn) {
+        self.agent = self.agent.clone().before_tool(callback);
+    }
+
+    /// Add an after-tool callback in place.
+    pub fn add_after_tool_in_place(&mut self, callback: AfterToolFn) {
+        self.agent = self.agent.clone().after_tool(callback);
+    }
+
     /// Return a copy with an inline prompt.
     #[must_use]
     pub fn with_prompt(mut self, prompt: Prompt) -> Self {
@@ -418,6 +451,12 @@ pub struct AgentBuilder {
     run_config: RunConfig,
     session: Option<Arc<dyn SessionMemory>>,
     journal: Option<Arc<dyn Journal>>,
+    before_agent: Vec<BeforeAgentFn>,
+    after_agent: Vec<AfterAgentFn>,
+    before_model: Vec<BeforeModelFn>,
+    after_model: Vec<AfterModelFn>,
+    before_tool: Vec<BeforeToolFn>,
+    after_tool: Vec<AfterToolFn>,
 }
 
 impl AgentBuilder {
@@ -512,6 +551,48 @@ impl AgentBuilder {
         self
     }
 
+    /// Append a before-agent callback.
+    #[must_use]
+    pub fn before_agent(mut self, callback: BeforeAgentFn) -> Self {
+        self.before_agent.push(callback);
+        self
+    }
+
+    /// Append an after-agent callback.
+    #[must_use]
+    pub fn after_agent(mut self, callback: AfterAgentFn) -> Self {
+        self.after_agent.push(callback);
+        self
+    }
+
+    /// Append a before-model callback.
+    #[must_use]
+    pub fn before_model(mut self, callback: BeforeModelFn) -> Self {
+        self.before_model.push(callback);
+        self
+    }
+
+    /// Append an after-model callback.
+    #[must_use]
+    pub fn after_model(mut self, callback: AfterModelFn) -> Self {
+        self.after_model.push(callback);
+        self
+    }
+
+    /// Append a before-tool callback.
+    #[must_use]
+    pub fn before_tool(mut self, callback: BeforeToolFn) -> Self {
+        self.before_tool.push(callback);
+        self
+    }
+
+    /// Append an after-tool callback.
+    #[must_use]
+    pub fn after_tool(mut self, callback: AfterToolFn) -> Self {
+        self.after_tool.push(callback);
+        self
+    }
+
     /// Build an Agent holder.
     ///
     /// # Errors
@@ -529,6 +610,24 @@ impl AgentBuilder {
         }
         if let Some(journal) = self.journal {
             agent = agent.with_journal(journal);
+        }
+        for callback in self.before_agent {
+            agent = agent.before_agent(callback);
+        }
+        for callback in self.after_agent {
+            agent = agent.after_agent(callback);
+        }
+        for callback in self.before_model {
+            agent = agent.before_model(callback);
+        }
+        for callback in self.after_model {
+            agent = agent.after_model(callback);
+        }
+        for callback in self.before_tool {
+            agent = agent.before_tool(callback);
+        }
+        for callback in self.after_tool {
+            agent = agent.after_tool(callback);
         }
         agent = agent.set_tools(self.tools_resolved);
         Ok(AgentWithMeta {

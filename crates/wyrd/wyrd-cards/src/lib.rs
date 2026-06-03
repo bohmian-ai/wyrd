@@ -25,7 +25,7 @@ pub mod python;
 #[cfg(feature = "python")]
 use {pyo3::prelude::*, pyo3::types::PyModule};
 
-/// Register card Python objects under `wyrd._native.cards`.
+/// Register card Python objects under `wyrd._wyrd.cards`.
 #[cfg(feature = "python")]
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let cards = PyModule::new(py, "cards")?;
@@ -52,18 +52,18 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     prompt.add_class::<prompt::PromptCardMetadata>()?;
 
     wyrd_interfaces::error::register_exceptions(&agent)?;
-    python::register(&agent)?;
+    python::python_register(&agent)?;
 
     cards.add_submodule(&data)?;
     cards.add_submodule(&model)?;
     cards.add_submodule(&prompt)?;
     cards.add_submodule(&agent)?;
     parent.add_submodule(&cards)?;
-    register_submodule(py, "wyrd._native.cards", &cards)?;
-    register_submodule(py, "wyrd._native.cards.data", &data)?;
-    register_submodule(py, "wyrd._native.cards.model", &model)?;
-    register_submodule(py, "wyrd._native.cards.prompt", &prompt)?;
-    register_submodule(py, "wyrd._native.cards.agent", &agent)?;
+    register_submodule(py, "wyrd._wyrd.cards", &cards)?;
+    register_submodule(py, "wyrd._wyrd.cards.data", &data)?;
+    register_submodule(py, "wyrd._wyrd.cards.model", &model)?;
+    register_submodule(py, "wyrd._wyrd.cards.prompt", &prompt)?;
+    register_submodule(py, "wyrd._wyrd.cards.agent", &agent)?;
     Ok(())
 }
 

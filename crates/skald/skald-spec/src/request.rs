@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{Map, Value};
 use serde_json::value::RawValue;
+use serde_json::{Map, Value};
 
 use crate::wire::anthropic_messages::AnthropicMessagesRequest;
 use crate::wire::anthropic_messages::AnthropicTool;
@@ -24,6 +24,13 @@ use crate::wire::vertex_predict::VertexPredictRequest;
 pub enum ProviderRequest {
     /// OpenAI Chat Completions request.
     OpenAiChatCompletion(OpenAiChatRequest),
+    /// Custom provider that accepts OpenAI Chat Completions request semantics.
+    OpenAiChatCompatible {
+        /// Provider dispatch target.
+        provider: ProviderName,
+        /// OpenAI Chat-shaped request body.
+        request: OpenAiChatRequest,
+    },
     /// OpenAI Responses API request.
     OpenAiResponses(OpenAiResponsesRequest),
     /// OpenAI Embeddings request.
@@ -59,6 +66,12 @@ impl<'de> Deserialize<'de> for ProviderRequest {
             return Ok(Self::RawV1 {
                 provider: raw.provider,
                 body: raw.body,
+            });
+        }
+        if let Ok(request) = serde_json::from_value::<OpenAiChatCompatibleRequest>(value.clone()) {
+            return Ok(Self::OpenAiChatCompatible {
+                provider: request.provider,
+                request: request.request,
             });
         }
 
@@ -110,10 +123,26 @@ struct RawProviderRequest {
     body: Box<RawValue>,
 }
 
+#[derive(Deserialize)]
+struct OpenAiChatCompatibleRequest {
+    provider: ProviderName,
+    request: OpenAiChatRequest,
+}
+
 impl PartialEq for ProviderRequest {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::OpenAiChatCompletion(left), Self::OpenAiChatCompletion(right)) => left == right,
+            (
+                Self::OpenAiChatCompatible {
+                    provider: left_provider,
+                    request: left_request,
+                },
+                Self::OpenAiChatCompatible {
+                    provider: right_provider,
+                    request: right_request,
+                },
+            ) => left_provider == right_provider && left_request == right_request,
             (Self::OpenAiResponses(left), Self::OpenAiResponses(right)) => left == right,
             (Self::OpenAiEmbeddings(left), Self::OpenAiEmbeddings(right)) => left == right,
             (Self::AnthropicMessage(left), Self::AnthropicMessage(right)) => left == right,
@@ -174,6 +203,7 @@ impl ProviderRequest {
             Self::OpenAiChatCompletion(_)
             | Self::OpenAiResponses(_)
             | Self::OpenAiEmbeddings(_) => ProviderName::OpenAi,
+            Self::OpenAiChatCompatible { provider, .. } => provider.clone(),
             Self::AnthropicMessage(_) => ProviderName::Anthropic,
             Self::GeminiGenerateContent(_) | Self::GoogleBatchEmbed(_) => ProviderName::Google,
             Self::Vertex(_) | Self::VertexPredict(_) => ProviderName::Vertex,
@@ -189,6 +219,9 @@ impl ProviderRequest {
 
         match &mut self {
             Self::OpenAiChatCompletion(request) => {
+                request.tools = Some(tools.iter().map(openai_chat_tool).collect());
+            }
+            Self::OpenAiChatCompatible { request, .. } => {
                 request.tools = Some(tools.iter().map(openai_chat_tool).collect());
             }
             Self::OpenAiResponses(request) => {

@@ -32,7 +32,3 @@ fn build_echo_tool(name: &str, version: &'static str) -> Arc<dyn skald_tool::Age
 pub fn echo_tool(name: &str) -> Arc<dyn skald_tool::AgentTool> {
     build_echo_tool(name, "v1")
 }
-
-pub fn echo_tool_v2(name: &str) -> Arc<dyn skald_tool::AgentTool> {
-    build_echo_tool(name, "v2")
-}

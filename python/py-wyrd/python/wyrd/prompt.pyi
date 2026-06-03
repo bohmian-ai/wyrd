@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ._native import (
+    from ._wyrd import (
         AnthropicSettings,
         GeminiSettings,
         MediaRef,
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
         WyrdError,
     )
 else:
-    from ._native.cards.prompt import (
+    from ._wyrd.cards.prompt import (
         AnthropicSettings,
         GeminiSettings,
         MediaRef,

@@ -19,6 +19,7 @@
 /// agent runs to resolve observers through Wyrd observer state.
 pub fn init() {
     wyrd_observe_impl::init();
+    skald_runtime::refresh_default_registry_from_env();
 }
 
 /// Agent runtime: identity, single-provider binding, bounded tool loop,

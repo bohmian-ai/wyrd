@@ -11,7 +11,7 @@ use serde_json::Value;
 use wyrd_spec::error::WyrdError as SpecWyrdError;
 
 create_exception!(
-    wyrd._native,
+    wyrd._wyrd,
     WyrdError,
     PyException,
     "Base Python exception for structured Wyrd errors."

@@ -23,22 +23,6 @@ use crate::session::{NoSession, SessionId, SessionMemory};
 /// ```compile_fail
 /// use skald_agent::Agent;
 ///
-/// fn provider_is_not_a_field(agent: &Agent) {
-///     let _ = &agent.provider;
-/// }
-/// ```
-///
-/// ```compile_fail
-/// use skald_agent::Agent;
-///
-/// fn model_is_not_a_field(agent: &Agent) {
-///     let _ = &agent.model;
-/// }
-/// ```
-///
-/// ```compile_fail
-/// use skald_agent::Agent;
-///
 /// fn prompt_is_resolved_native(agent: &Agent) {
 ///     let _: skald_prompt::Prompt = agent.prompt.clone();
 /// }

@@ -1,6 +1,6 @@
 """Public ModelCard re-exports."""
 
-from ._native.cards.model import (
+from ._wyrd.cards.model import (
     CatboostInterface,
     HuggingfaceInterface,
     LightgbmInterface,

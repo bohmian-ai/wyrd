@@ -17,9 +17,20 @@ skald-spec = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+pyo3 = { workspace = true, optional = true }
 
 [features]
 default = []
+python = ["dep:pyo3", "dep:wyrd-utils", "dep:wyrd-runtime"]
+
+[dependencies.wyrd-utils]
+workspace = true
+optional = true
+features = ["python"]
+
+[dependencies.wyrd-runtime]
+workspace = true
+optional = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

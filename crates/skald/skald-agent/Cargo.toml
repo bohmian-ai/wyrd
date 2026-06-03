@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-python = ["dep:pyo3"]
+python = ["dep:pyo3", "skald-prompt/python", "skald-runtime/python", "wyrd-runtime"]
 
 [dependencies]
 skald-spec = { workspace = true }
@@ -29,6 +29,7 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 futures = "0.3"
 pyo3 = { workspace = true, optional = true }
+wyrd-runtime = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

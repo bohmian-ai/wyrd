@@ -14,10 +14,12 @@ path = "src/lib.rs"
 
 [features]
 default = []
+python = ["dep:pyo3"]
 
 [dependencies]
 skald-agent = { workspace = true }
 wyrd-observe = { workspace = true }
+pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

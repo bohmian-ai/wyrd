@@ -1,6 +1,6 @@
 """Public DataCard re-exports."""
 
-from ._native.cards.data import (
+from ._wyrd.cards.data import (
     ArrowInterface,
     ArtifactCard,
     DataCard,

@@ -8,7 +8,7 @@ repository = { workspace = true }
 authors = { workspace = true }
 [features]
 default = []
-python = ["dep:pyo3", "chrono/clock", "wyrd-interfaces/python", "wyrd-utils/python", "skald-prompt/python"]
+python = ["dep:pyo3", "chrono/clock", "wyrd-interfaces/python", "wyrd-utils/python", "skald-agent/python", "skald-prompt/python", "skald-runtime/python", "skald-tool/python", "wyrd-runtime"]
 
 [dependencies]
 skald-agent = { workspace = true }
@@ -27,6 +27,7 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 ulid = { workspace = true }
 pyo3 = { workspace = true, optional = true }
+wyrd-runtime = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

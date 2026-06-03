@@ -57,7 +57,8 @@ impl Prompt {
         let mut prompt = self.clone();
         let text = text.into();
         match &mut prompt.inner.request {
-            ProviderRequest::OpenAiChatCompletion(request) => {
+            ProviderRequest::OpenAiChatCompletion(request)
+            | ProviderRequest::OpenAiChatCompatible { request, .. } => {
                 request.messages.insert(0, openai_message("system", text));
             }
             ProviderRequest::OpenAiResponses(request) => {
@@ -108,7 +109,8 @@ impl Prompt {
         let tool_use_id = tool_use_id.into();
         let content = content.into();
         match &mut prompt.inner.request {
-            ProviderRequest::OpenAiChatCompletion(request) => {
+            ProviderRequest::OpenAiChatCompletion(request)
+            | ProviderRequest::OpenAiChatCompatible { request, .. } => {
                 let mut message = openai_message("tool", content);
                 message.tool_call_id = Some(tool_use_id);
                 request.messages.push(message);
@@ -146,7 +148,8 @@ impl Prompt {
         let mut prompt = self.clone();
         let text = text.into();
         match &mut prompt.inner.request {
-            ProviderRequest::OpenAiChatCompletion(request) => {
+            ProviderRequest::OpenAiChatCompletion(request)
+            | ProviderRequest::OpenAiChatCompatible { request, .. } => {
                 request.messages.push(openai_message(role, text));
             }
             ProviderRequest::OpenAiResponses(request) => {
@@ -293,6 +296,7 @@ impl Prompt {
         let response_format = response_format_from_py(response_format)?;
         let auto_variables = variables.is_none();
         let variables = variables.unwrap_or_default();
+        let append_messages = !matches!(provider, skald_spec::ProviderName::Custom(_));
         let mut prompt = match provider {
             skald_spec::ProviderName::OpenAi
                 if operation
@@ -355,11 +359,39 @@ impl Prompt {
                 };
                 crate::builder::vertex(model, options)?
             }
-            skald_spec::ProviderName::Custom(value) => {
-                return Err(PromptBuilderError::InvalidProvider(value).into());
+            skald_spec::ProviderName::Custom(custom) => {
+                let prompt = crate::builder::openai_chat(
+                    model,
+                    OpenAiChatOptions {
+                        system,
+                        messages: strings_from_py(Some(messages))?,
+                        response_format,
+                        settings: resolve_openai_chat_settings(model_settings)?,
+                        variables,
+                        version,
+                        ..OpenAiChatOptions::default()
+                    },
+                )?;
+                let mut native = prompt.into_native();
+                let request = match native.request {
+                    skald_spec::ProviderRequest::OpenAiChatCompletion(request) => request,
+                    _ => {
+                        return Err(PromptBuilderError::Validation(
+                            "custom provider prompt must build an OpenAI chat request".to_owned(),
+                        )
+                        .into());
+                    }
+                };
+                native.request = skald_spec::ProviderRequest::OpenAiChatCompatible {
+                    provider: skald_spec::ProviderName::Custom(custom),
+                    request,
+                };
+                Prompt::from_native(native)
             }
         };
-        prompt = append_py_messages(prompt, messages)?;
+        if append_messages {
+            prompt = append_py_messages(prompt, messages)?;
+        }
         if auto_variables {
             prompt.inner.variables = extract_prompt_variables(&prompt)?;
         }
@@ -1092,7 +1124,8 @@ fn provider_request_from_py(value: &Bound<'_, PyAny>) -> CardPyResult<ProviderRe
 #[cfg(feature = "python")]
 fn request_model(request: &ProviderRequest) -> Option<&str> {
     match request {
-        ProviderRequest::OpenAiChatCompletion(request) => Some(&request.model),
+        ProviderRequest::OpenAiChatCompletion(request)
+        | ProviderRequest::OpenAiChatCompatible { request, .. } => Some(&request.model),
         ProviderRequest::OpenAiResponses(request) => Some(&request.model),
         ProviderRequest::OpenAiEmbeddings(request) => Some(&request.model),
         ProviderRequest::AnthropicMessage(request) => Some(&request.model),
@@ -1107,7 +1140,8 @@ fn request_model(request: &ProviderRequest) -> Option<&str> {
 #[cfg(feature = "python")]
 fn set_request_model(request: &mut ProviderRequest, model: String) {
     match request {
-        ProviderRequest::OpenAiChatCompletion(request) => request.model = model,
+        ProviderRequest::OpenAiChatCompletion(request)
+        | ProviderRequest::OpenAiChatCompatible { request, .. } => request.model = model,
         ProviderRequest::OpenAiResponses(request) => request.model = model,
         ProviderRequest::OpenAiEmbeddings(request) => request.model = model,
         ProviderRequest::AnthropicMessage(request) => request.model = model,
@@ -1123,7 +1157,10 @@ fn set_request_model(request: &mut ProviderRequest, model: String) {
 #[cfg(feature = "python")]
 fn request_messages_value(request: &ProviderRequest) -> serde_json::Value {
     match request {
-        ProviderRequest::OpenAiChatCompletion(request) => serde_json::to_value(&request.messages),
+        ProviderRequest::OpenAiChatCompletion(request)
+        | ProviderRequest::OpenAiChatCompatible { request, .. } => {
+            serde_json::to_value(&request.messages)
+        }
         ProviderRequest::OpenAiResponses(request) => serde_json::to_value(&request.input),
         ProviderRequest::AnthropicMessage(request) => serde_json::to_value(&request.messages),
         ProviderRequest::GeminiGenerateContent(request) => serde_json::to_value(&request.contents),
@@ -1136,7 +1173,8 @@ fn request_messages_value(request: &ProviderRequest) -> serde_json::Value {
 #[cfg(feature = "python")]
 fn request_system_value(request: &ProviderRequest) -> serde_json::Value {
     match request {
-        ProviderRequest::OpenAiChatCompletion(request) => serde_json::to_value(
+        ProviderRequest::OpenAiChatCompletion(request)
+        | ProviderRequest::OpenAiChatCompatible { request, .. } => serde_json::to_value(
             request
                 .messages
                 .iter()
@@ -1214,7 +1252,8 @@ fn append_native_json_content(
 ) -> CardPyResult<Prompt> {
     let mut out = prompt.clone();
     match &mut out.inner.request {
-        ProviderRequest::OpenAiChatCompletion(request) => {
+        ProviderRequest::OpenAiChatCompletion(request)
+        | ProviderRequest::OpenAiChatCompatible { request, .. } => {
             let parts = json_parts::<skald_spec::wire::openai_chat::OpenAiContentPart>(value)?;
             request.messages.push(OpenAiChatMessage {
                 role: role.to_owned(),

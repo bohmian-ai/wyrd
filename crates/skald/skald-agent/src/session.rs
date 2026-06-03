@@ -25,6 +25,10 @@ impl SessionId {
 }
 
 /// Role of one session turn.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "wyrd.session", name = "Role", eq, eq_int, from_py_object)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -39,6 +43,10 @@ pub enum Role {
 }
 
 /// Persistable text-oriented session turn.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "wyrd.session", name = "SessionTurn", skip_from_py_object)
+)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionTurn {
     /// Role for this turn.

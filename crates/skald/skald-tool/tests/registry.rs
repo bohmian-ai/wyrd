@@ -5,7 +5,7 @@ use serde_json::json;
 use skald_tool::{ToolError, ToolRegistry, ToolResolver, default_registry};
 
 mod fixtures;
-use fixtures::{echo_tool, echo_tool_v2};
+use fixtures::echo_tool;
 
 #[test]
 fn test_registry_register_and_resolve_round_trip() {
@@ -34,22 +34,6 @@ fn test_registry_register_duplicate_returns_name_taken() {
 
     assert!(matches!(err, ToolError::NameTaken { ref name } if name == "echo"));
     assert_eq!(err.code(), "SKALD_TOOL_409_NAME_TAKEN");
-}
-
-#[test]
-fn test_registry_register_force_overwrites_silently() {
-    let reg = ToolRegistry::new();
-
-    reg.register(echo_tool("echo")).expect("register v1");
-    reg.register_force(echo_tool_v2("echo"));
-    let arc = reg.resolve("echo").expect("resolve");
-
-    let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let out = rt
-        .block_on(arc.invoke(json!({"text": "hi"})))
-        .expect("invoke v2");
-
-    assert_eq!(out, json!({"echoed": "hi", "version": "v2"}));
 }
 
 #[test]
@@ -93,7 +77,8 @@ fn test_default_registry_is_process_global_singleton() {
     let r2 = default_registry();
 
     assert!(std::ptr::eq(r1, r2));
-    r1.register_force(echo_tool("c02-singleton-probe"));
+    r1.register(echo_tool("c02-singleton-probe"))
+        .expect("global register");
 
     let arc = r2.resolve("c02-singleton-probe").expect("global resolve");
     assert_eq!(arc.name(), "c02-singleton-probe");
@@ -103,7 +88,9 @@ fn test_default_registry_is_process_global_singleton() {
 fn test_default_registry_persists_across_test_threads() {
     let probe = "c02-thread-probe".to_string();
     let handle = thread::spawn(move || {
-        default_registry().register_force(echo_tool(&probe));
+        default_registry()
+            .register(echo_tool(&probe))
+            .expect("thread register");
     });
     handle.join().expect("thread join");
 

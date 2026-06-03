@@ -6,6 +6,12 @@ use std::sync::{Arc, OnceLock};
 
 use skald_agent::{Observer, ObserverProvider};
 
+#[cfg(feature = "python")]
+/// Python initialization hook.
+pub mod python;
+#[cfg(feature = "python")]
+pub use python::python_register;
+
 /// Observer provider installed into `skald-agent`.
 pub struct WyrdObserverProvider;
 

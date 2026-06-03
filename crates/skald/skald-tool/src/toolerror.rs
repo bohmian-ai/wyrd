@@ -75,7 +75,7 @@ impl ToolError {
     pub const fn remediation(&self) -> &'static str {
         match self {
             Self::NameTaken { .. } => {
-                "Use ToolRegistry::register_force to overwrite or pick a unique tool name."
+                "Pick a unique tool name or clear the registry before registering the replacement."
             }
             Self::NotRegistered { .. } => {
                 "Register the tool (Tool::function + registry.register) before loading the agent, or call default_registry() before resolving agent tools."

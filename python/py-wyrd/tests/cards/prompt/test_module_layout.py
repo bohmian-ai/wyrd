@@ -16,5 +16,5 @@ def test_importing_wyrd_runtime_fails() -> None:
 
 
 def test_top_level_runtime_agent_workflow_task_and_embedder_are_absent() -> None:
-    for name in ("SkaldRuntime", "Agent", "Workflow", "Task", "Embedder"):
+    for name in ("SkaldRuntime", "Workflow", "Task", "Embedder"):
         assert not hasattr(wyrd, name), name

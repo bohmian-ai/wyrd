@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ._native import (
+    from ._wyrd import (
         CatboostInterface,
         HuggingfaceInterface,
         LightgbmInterface,
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
         XgboostInterface,
     )
 else:
-    from ._native.cards.model import (
+    from ._wyrd.cards.model import (
         CatboostInterface,
         HuggingfaceInterface,
         LightgbmInterface,

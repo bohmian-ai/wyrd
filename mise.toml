@@ -73,7 +73,7 @@ description = "Verify CardKind native count and External serde shape"
 run = "cargo test -p wyrd-spec --test cards kind:: --features server"
 
 [tasks."check:client-tier"]
-description = "Foundation invariants: wyrd-spec server-tier-free; shared shells pyo3+sqlx-free"
+description = "Foundation invariants: wyrd-spec server-tier-free; shared shells pyo3+sqlx-free; Skald keeps only locked Wyrd foundation edges"
 run = """
 set -eu
 
@@ -103,18 +103,22 @@ if [ -n "$forbidden_skald_prompt" ]; then
   exit 1
 fi
 
-for crate in skald-agent skald-workflow; do
+for crate in skald-agent skald-workflow skald-tool skald-runtime; do
   forbidden_skald_member=$(cargo tree -p "$crate" --all-features -e normal | \
-    rg '(^|[ ─└├])(wyrd-|vala-)' || true)
+    rg '(^|[ ─└├])(wyrd-|vala-)' | \
+    rg -v '(^|[ ─└├])(wyrd-spec|wyrd-interfaces|wyrd-utils|wyrd-runtime|wyrd-error-derive)' || true)
   if [ -n "$forbidden_skald_member" ]; then
-    echo "FAIL: $crate pulls forbidden wyrd/vala deps:"
+    echo "FAIL: $crate pulls forbidden Wyrd/Vala deps outside the locked foundation set:"
     echo "$forbidden_skald_member"
     exit 1
   fi
 done
 
-if rg -n 'wyrd_spec|wyrd-' crates/skald --glob '!crates/skald/skald-prompt/**'; then
-  echo 'Skald engine crates must remain free of wyrd-* references'
+if rg -n 'wyrd_spec|wyrd-' crates/skald \
+  --glob '!crates/skald/skald-prompt/**' \
+  --glob '!crates/skald/skald-agent/Cargo.toml' \
+  --glob '!crates/skald/skald-tool/Cargo.toml'; then
+  echo 'Skald engine crates must remain free of Wyrd references outside locked Cargo boundary edges'
   exit 1
 fi
 
@@ -141,21 +145,32 @@ fi
 
 if rg -n 'pyo3|pymodule|pyclass|pymethods|Python|Bound<|Py<|PyErr' crates/skald \
   --glob '!crates/skald/skald-prompt/**' \
+  --glob '!crates/skald/skald-runtime/Cargo.toml' \
+  --glob '!crates/skald/skald-runtime/src/lib.rs' \
+  --glob '!crates/skald/skald-runtime/src/python.rs' \
   --glob '!crates/skald/skald-agent/Cargo.toml' \
+  --glob '!crates/skald/skald-agent/src/lib.rs' \
+  --glob '!crates/skald/skald-agent/src/python.rs' \
+  --glob '!crates/skald/skald-tool/Cargo.toml' \
+  --glob '!crates/skald/skald-tool/src/lib.rs' \
+  --glob '!crates/skald/skald-tool/src/python.rs' \
   --glob '!crates/skald/skald-workflow/Cargo.toml'; then
   echo 'PyO3 scope violation detected in Python-free Skald engine crates'
   exit 1
 fi
 
-if ! rg -q 'python = \\[.*dep:pyo3' crates/skald/skald-prompt/Cargo.toml; then
-  echo 'skald-prompt must gate PyO3 behind its python feature'
-  exit 1
-fi
+for crate in skald-prompt skald-runtime skald-agent skald-tool; do
+  manifest="crates/skald/$crate/Cargo.toml"
+  if ! rg -q 'python = \\[.*dep:pyo3' "$manifest"; then
+    echo "$crate must gate PyO3 behind its python feature"
+    exit 1
+  fi
 
-if ! rg -q 'pyo3 = \\{ workspace = true, optional = true \\}' crates/skald/skald-prompt/Cargo.toml; then
-  echo 'skald-prompt PyO3 dependency must remain optional'
-  exit 1
-fi
+  if ! rg -q 'pyo3 = \\{ workspace = true, optional = true \\}' "$manifest"; then
+    echo "$crate PyO3 dependency must remain optional"
+    exit 1
+  fi
+done
 
 if ! rg -qF 'python = ["dep:pyo3"]' crates/shared/wyrd-utils/Cargo.toml; then
   echo 'wyrd-utils must gate PyO3 behind its python feature'

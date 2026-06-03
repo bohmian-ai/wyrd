@@ -39,15 +39,6 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Register a tool name, replacing any existing registration.
-    ///
-    /// This is intended for fixture and test code.
-    pub fn register_force(&self, tool: Arc<dyn AgentTool>) {
-        let name = tool.name().to_string();
-        let mut guard = self.inner.write().expect("ToolRegistry lock poisoned");
-        guard.insert(name, tool);
-    }
-
     /// Resolve a tool by name.
     ///
     /// Returns `SKALD_TOOL_404_NOT_REGISTERED` when missing, with sorted names.

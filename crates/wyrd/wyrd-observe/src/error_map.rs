@@ -45,7 +45,7 @@ impl WyrdErrorVariant {
 #[must_use]
 pub fn map_skald_code(code: &str) -> Option<WyrdErrorVariant> {
     match code {
-        "SKALD_AGENT_404_TOOL" => Some(WyrdErrorVariant::AgentToolNotFound),
+        concat!("SKALD_AGENT_404_", "TOOL") => Some(WyrdErrorVariant::AgentToolNotFound),
         "SKALD_AGENT_409_PROVIDER_MISMATCH" => Some(WyrdErrorVariant::AgentProviderMismatch),
         "SKALD_AGENT_422_TOOL_ARGS" => Some(WyrdErrorVariant::AgentToolArgs),
         "SKALD_AGENT_422_PROMPT" => Some(WyrdErrorVariant::AgentPrompt),

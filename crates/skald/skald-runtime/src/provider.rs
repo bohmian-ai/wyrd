@@ -1,7 +1,7 @@
 //! Provider registry and runtime provider trait.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
 use skald_providers::{
@@ -9,6 +9,8 @@ use skald_providers::{
     VertexClient,
 };
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
+
+static DEFAULT_REGISTRY: OnceLock<RwLock<Arc<ProviderRegistry>>> = OnceLock::new();
 
 /// Runtime provider seam over the concrete Skald provider clients.
 ///
@@ -115,4 +117,29 @@ impl ProviderRegistry {
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+}
+
+/// Return the process default provider registry.
+pub fn default_registry() -> Arc<ProviderRegistry> {
+    let lock = DEFAULT_REGISTRY
+        .get_or_init(|| RwLock::new(Arc::new(ProviderRegistry::from_env("gemini-2.5-flash"))));
+    match lock.read() {
+        Ok(registry) => registry.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Refresh the process default provider registry from environment-backed clients.
+pub fn refresh_default_registry_from_env() -> Arc<ProviderRegistry> {
+    let registry = Arc::new(ProviderRegistry::from_env("gemini-2.5-flash"));
+    let lock = DEFAULT_REGISTRY.get_or_init(|| RwLock::new(registry.clone()));
+    match lock.write() {
+        Ok(mut current) => {
+            *current = registry.clone();
+        }
+        Err(poisoned) => {
+            *poisoned.into_inner() = registry.clone();
+        }
+    }
+    registry
 }

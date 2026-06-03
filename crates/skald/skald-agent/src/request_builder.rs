@@ -112,7 +112,7 @@ pub fn request_from_conversation(
     for turn in conversation.turns() {
         append_turn_message(agent, provider, &mut messages, turn)?;
     }
-    reset_messages(template, &messages)
+    rebuild_request_messages(template, &messages)
 }
 
 /// Extract the provider-native assistant message from one model response.
@@ -161,7 +161,7 @@ pub fn assistant_message(agent: &str, response: &ProviderResponse) -> AgentResul
 }
 
 /// Replace the messages of a provider-native request with accumulated history.
-pub fn reset_messages(
+pub fn rebuild_request_messages(
     mut template: ProviderRequest,
     new_messages: &[MessageNum],
 ) -> AgentResult<ProviderRequest> {
@@ -398,7 +398,7 @@ mod tests {
     use skald_spec::wire::vertex_generate::VertexGenerateContentRequest;
     use skald_spec::{MessageNum, ProviderRequest};
 
-    use super::{extract_messages, reset_messages};
+    use super::{extract_messages, rebuild_request_messages};
 
     fn anthropic_request(messages: Vec<AnthropicMessage>) -> ProviderRequest {
         ProviderRequest::AnthropicMessage(AnthropicMessagesRequest {
@@ -496,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_messages_anthropic_filters_out_system_role() {
+    fn rebuild_request_messages_anthropic_filters_out_system_role() {
         let template = anthropic_request(vec![]);
         let new_messages = vec![
             MessageNum::Anthropic(anthropic_message("system", "ignored")),
@@ -504,7 +504,8 @@ mod tests {
             MessageNum::Anthropic(anthropic_message("assistant", "kept")),
         ];
 
-        let result = reset_messages(template, &new_messages).expect("Anthropic reset must succeed");
+        let result = rebuild_request_messages(template, &new_messages)
+            .expect("Anthropic rebuild must succeed");
         let ProviderRequest::AnthropicMessage(request) = result else {
             panic!("expected Anthropic request");
         };
@@ -518,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_messages_gemini_filters_out_system_role() {
+    fn rebuild_request_messages_gemini_filters_out_system_role() {
         let template = gemini_request(vec![]);
         let new_messages = vec![
             MessageNum::Gemini(google_message("system", "ignored")),
@@ -526,7 +527,8 @@ mod tests {
             MessageNum::Gemini(google_message("model", "kept")),
         ];
 
-        let result = reset_messages(template, &new_messages).expect("Gemini reset must succeed");
+        let result =
+            rebuild_request_messages(template, &new_messages).expect("Gemini rebuild must succeed");
         let ProviderRequest::GeminiGenerateContent(request) = result else {
             panic!("expected Gemini request");
         };
@@ -540,11 +542,12 @@ mod tests {
     }
 
     #[test]
-    fn reset_messages_rejects_mismatched_variant() {
+    fn rebuild_request_messages_rejects_mismatched_variant() {
         let template = anthropic_request(vec![]);
         let new_messages = vec![MessageNum::OpenAi(openai_message("user", "wrong provider"))];
 
-        let err = reset_messages(template, &new_messages).expect_err("variant mismatch must fail");
+        let err = rebuild_request_messages(template, &new_messages)
+            .expect_err("variant mismatch must fail");
 
         assert_eq!(err.code(), "SKALD_AGENT_422_LOOP_MESSAGE_TYPE");
     }

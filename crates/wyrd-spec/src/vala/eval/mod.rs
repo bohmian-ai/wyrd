@@ -13,6 +13,8 @@
 //! Module map:
 //! - `ids` — `TaskId`, `SessionId`, `RecordId`, `WorkflowUid`, `EntityUid`,
 //!   `TraceId`, `SpanId`, `JsonPath`.
+//! - `operator` — `ComparisonOperator`, `JsonValueType`,
+//!   `DivergenceMetric`.
 //! - `status` — `EvalStatus` (mirrors `eval_inbox.status`).
 //! - `workflow` — `Workflow`, `WorkflowFieldType` (optional declared shape).
 //! - (`media` — deferred; lands with its first real consumer.)
@@ -20,11 +22,13 @@
 //! Later commits add the remaining task, plan, result, and spec modules.
 
 pub mod ids;
+pub mod operator;
 pub mod status;
 pub mod workflow;
 
 pub use ids::{
     EntityUid, JsonPath, RecordId, ScenarioId, SessionId, SpanId, TaskId, TraceId, WorkflowUid,
 };
+pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
 pub use status::EvalStatus;
 pub use workflow::{Workflow, WorkflowFieldType};

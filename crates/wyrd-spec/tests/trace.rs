@@ -14,3 +14,9 @@ mod span_event;
 
 #[path = "trace/span_link.rs"]
 mod span_link;
+
+#[path = "trace/resource.rs"]
+mod resource;
+
+#[path = "trace/instrumentation_scope.rs"]
+mod instrumentation_scope;

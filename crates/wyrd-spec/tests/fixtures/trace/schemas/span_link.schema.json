@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SpanLink",
+  "description": "OTel-canonical span link.\n\nFields:\n\n- `trace_id` / `span_id` — linked span identity. Both are typed (commit 02); the wire shape is hex strings. - `trace_state` — W3C TraceContext `tracestate` of the linked span (vendor list, comma-separated). Defaults to empty. - `flags` — full OTel proto `Link.flags` fixed32 bitfield. The low byte carries W3C trace flags (bit 0 = `sampled`); the upper bits are reserved by the OTel spec for SDK-internal signaling. Stored as `u32` so we don't truncate non-W3C bits at the contract layer. - `attributes` — typed key/value bag, same shape as [`super::SpanEvent::attributes`]. - `dropped_attributes_count` — count of attributes the SDK dropped before sending.",
+  "type": "object",
+  "required": [
+    "span_id",
+    "trace_id"
+  ],
+  "properties": {
+    "attributes": {
+      "description": "Link attribute bag.",
+      "default": {},
+      "type": "object",
+      "additionalProperties": true
+    },
+    "dropped_attributes_count": {
+      "description": "Count of attributes the SDK dropped before sending.",
+      "default": 0,
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "flags": {
+      "description": "OTel proto `Link.flags` fixed32 bitfield. Bit 0 = `sampled`; upper bits reserved.",
+      "default": 0,
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "span_id": {
+      "description": "Linked span id.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SpanId"
+        }
+      ]
+    },
+    "trace_id": {
+      "description": "Linked trace id.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TraceId"
+        }
+      ]
+    },
+    "trace_state": {
+      "description": "W3C tracestate header value for the linked span.",
+      "default": "",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "SpanId": {
+      "type": "string",
+      "maxLength": 16,
+      "minLength": 16,
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "TraceId": {
+      "type": "string",
+      "maxLength": 32,
+      "minLength": 32,
+      "pattern": "^[0-9a-f]{32}$"
+    }
+  }
+}

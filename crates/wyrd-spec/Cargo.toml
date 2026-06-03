@@ -35,6 +35,7 @@ regex = { workspace = true }
 wyrd-error-derive = { path = "../shared/wyrd-error-derive", version = "0.0.1" }
 
 [dev-dependencies]
+pretty_assertions = "1"
 proptest = { workspace = true }
 [[example]]
 name = "gen_schemas"

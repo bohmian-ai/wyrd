@@ -32,3 +32,12 @@ mod gen_ai_eval_result;
 
 #[path = "trace/gen_ai_span_record.rs"]
 mod gen_ai_span_record;
+
+#[path = "trace/key_array_sync.rs"]
+mod key_array_sync;
+
+#[path = "trace/otel_proto_parity.rs"]
+mod otel_proto_parity;
+
+#[path = "trace/schema_drift.rs"]
+mod schema_drift;

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SpanKind",
+  "description": "OTel canonical span kind. (Proto: `Span.SpanKind`.)",
+  "oneOf": [
+    {
+      "description": "Default internal operation inside the service.",
+      "type": "string",
+      "enum": [
+        "internal"
+      ]
+    },
+    {
+      "description": "Inbound RPC or HTTP handler.",
+      "type": "string",
+      "enum": [
+        "server"
+      ]
+    },
+    {
+      "description": "Outbound RPC or HTTP call.",
+      "type": "string",
+      "enum": [
+        "client"
+      ]
+    },
+    {
+      "description": "Asynchronous message producer.",
+      "type": "string",
+      "enum": [
+        "producer"
+      ]
+    },
+    {
+      "description": "Asynchronous message consumer.",
+      "type": "string",
+      "enum": [
+        "consumer"
+      ]
+    }
+  ]
+}

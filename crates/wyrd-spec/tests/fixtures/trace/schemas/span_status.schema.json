@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SpanStatus",
+  "description": "OTel canonical span status. (Proto: `Span.Status`.)",
+  "oneOf": [
+    {
+      "description": "No status set; OTel default.",
+      "type": "object",
+      "required": [
+        "code"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "unset"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Operation completed successfully.",
+      "type": "object",
+      "required": [
+        "code"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Operation failed with an optional human-readable description.",
+      "type": "object",
+      "required": [
+        "code"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "error"
+          ]
+        },
+        "description": {
+          "description": "Optional status description.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

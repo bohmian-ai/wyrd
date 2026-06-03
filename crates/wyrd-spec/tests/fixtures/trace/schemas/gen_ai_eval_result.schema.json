@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GenAiEvalResult",
+  "description": "One evaluation result sourced from a `gen_ai.evaluation.result` event on the parent GenAI span.",
+  "type": "object",
+  "required": [
+    "name"
+  ],
+  "properties": {
+    "explanation": {
+      "description": "`gen_ai.evaluation.explanation` - optional human-readable explanation.\n\nThe explanation is length-bounded at 4096 characters.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
+      "description": "`gen_ai.evaluation.name` - required free-form identifier of the evaluation, such as `\"factuality\"`, `\"safety\"`, or `\"toxicity\"`.",
+      "type": "string"
+    },
+    "response_id": {
+      "description": "`gen_ai.response.id` - optional link to the model response that was evaluated.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "score_label": {
+      "description": "`gen_ai.evaluation.score.label` - optional categorical label, such as `\"pass\"`, `\"fail\"`, or `\"borderline\"`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "score_value": {
+      "description": "`gen_ai.evaluation.score.value` - optional finite numeric score.\n\nNaN and infinite values are rejected by [`GenAiEvalResult::validate`].",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    }
+  },
+  "additionalProperties": false
+}

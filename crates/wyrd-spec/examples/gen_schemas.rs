@@ -38,6 +38,10 @@ use wyrd_spec::vala::eval::{
     ComparisonOperator, DagError, EvalCondition, EvalPassGate, EvalSampling,
     EvalScenarioCollection, EvalSpec, EvalTask, ExecutionPlan,
 };
+use wyrd_spec::vala::trace::{
+    AttributeValue, GenAiEvalResult, GenAiSpanRecord, InstrumentationScope, Resource, SpanEvent,
+    SpanKind, SpanLink, SpanRecord, SpanStatus, TraceSummaryRecord,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = Path::new("crates/wyrd-spec/schemas");
@@ -110,6 +114,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_fixture::<EvalScenarioCollection>(eval_fixtures, "eval_scenario_collection")?;
     write_fixture::<EvalPassGate>(eval_fixtures, "eval_pass_gate")?;
     write_fixture::<EvalSampling>(eval_fixtures, "eval_sampling")?;
+
+    let trace_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/trace/schemas");
+    fs::create_dir_all(trace_fixtures)?;
+    write_fixture::<SpanRecord>(trace_fixtures, "span_record")?;
+    write_fixture::<SpanKind>(trace_fixtures, "span_kind")?;
+    write_fixture::<SpanStatus>(trace_fixtures, "span_status")?;
+    write_fixture::<SpanEvent>(trace_fixtures, "span_event")?;
+    write_fixture::<SpanLink>(trace_fixtures, "span_link")?;
+    write_fixture::<Resource>(trace_fixtures, "resource")?;
+    write_fixture::<InstrumentationScope>(trace_fixtures, "instrumentation_scope")?;
+    write_fixture::<TraceSummaryRecord>(trace_fixtures, "trace_summary_record")?;
+    write_fixture::<GenAiSpanRecord>(trace_fixtures, "gen_ai_span_record")?;
+    write_fixture::<GenAiEvalResult>(trace_fixtures, "gen_ai_eval_result")?;
+    write_fixture::<AttributeValue>(trace_fixtures, "attribute_value")?;
     Ok(())
 }
 

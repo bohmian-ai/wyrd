@@ -41,11 +41,9 @@ impl Workflow {
         let mut agents = HashMap::with_capacity(def.agents.len());
         for agent_def in def.agents {
             let id = agent_def.id.clone();
-            let agent = Agent::new(
-                agent_def.id,
-                Arc::new(RuntimePrompt::from_native(agent_def.prompt)),
-            )
-            .with_run_config(agent_def.run_config);
+            let agent = Agent::new(RuntimePrompt::from_native(agent_def.prompt))
+                .with_id(agent_def.id)
+                .with_run_config(agent_def.run_config);
             agents.insert(id, Arc::new(agent));
         }
 

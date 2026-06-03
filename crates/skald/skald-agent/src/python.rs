@@ -9,23 +9,13 @@ use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyModule};
-use skald_prompt::{Prompt, PyProviderRequest};
-use skald_runtime::ProviderRegistry;
+use skald_prompt::PyProviderRequest;
 use skald_spec::{ProviderRequest, ProviderResponse};
 
 use crate::{
-    AfterAgentFn, AfterModelFn, AfterToolFn, Agent, AgentContext, AgentError, AgentRun,
-    BeforeAgentFn, BeforeModelFn, BeforeToolFn, CallbackOutcome, Role, RunConfig, SessionError,
-    SessionId, SessionMemory, SessionTurn,
+    AfterAgentFn, AfterModelFn, AfterToolFn, AgentContext, AgentRun, BeforeAgentFn, BeforeModelFn,
+    BeforeToolFn, CallbackOutcome, Role, SessionError, SessionId, SessionMemory, SessionTurn,
 };
-
-/// Engine-direct Python wrapper for `skald_agent::Agent`.
-#[pyclass(module = "wyrd._wyrd.agent", name = "_AgentInner", skip_from_py_object)]
-#[derive(Clone)]
-pub struct PyAgentInner {
-    inner: Agent,
-    providers: Arc<ProviderRegistry>,
-}
 
 #[pymethods]
 impl Role {
@@ -105,66 +95,6 @@ impl SessionTurn {
             role_as_str(self.role),
             self.content,
             self.call_id
-        )
-    }
-}
-
-#[pymethods]
-impl PyAgentInner {
-    /// Build an engine-direct agent.
-    #[new]
-    #[pyo3(signature = (id, prompt, run_config=None, providers=None))]
-    pub fn __new__(
-        py: Python<'_>,
-        id: String,
-        prompt: Py<PyAny>,
-        run_config: Option<Py<PyAny>>,
-        providers: Option<Py<PyAny>>,
-    ) -> PyResult<Self> {
-        let prompt = prompt_from_py(py, &prompt)?;
-        let run_config = match run_config {
-            Some(value) => run_config_from_py(py, value)?,
-            None => RunConfig::default(),
-        };
-        let providers = match providers {
-            Some(value) => provider_registry_from_py(py, value)?,
-            None => skald_runtime::default_registry(),
-        };
-        let inner = Agent::new(id, Arc::new(prompt)).with_run_config(run_config);
-        Ok(Self { inner, providers })
-    }
-
-    /// Run this engine-direct agent.
-    pub fn run(
-        &self,
-        py: Python<'_>,
-        input: &str,
-        session_id: Option<String>,
-    ) -> PyResult<Py<PyAny>> {
-        let providers = self.providers.clone();
-        let agent = self.inner.clone();
-        let session_id = session_id.map(SessionId::new);
-        let run = py.detach(|| {
-            wyrd_runtime::runtime()
-                .block_on(async move { agent.run(providers.as_ref(), session_id, input).await })
-        });
-        match run {
-            Ok(run) => agent_run_to_py(py, run),
-            Err(error) => Err(agent_error_to_py_err(py, error)),
-        }
-    }
-
-    /// Runtime-local tool names attached to this engine-direct agent.
-    #[getter]
-    pub fn tool_names(&self) -> Vec<String> {
-        self.inner.tool_names()
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "_AgentInner(id={:?}, tools={:?})",
-            self.inner.id,
-            self.inner.tool_names()
         )
     }
 }
@@ -382,56 +312,9 @@ impl SessionMemory for PySessionMemory {
 /// # Errors
 /// Returns PyO3 registration errors.
 pub fn python_register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<PyAgentInner>()?;
     module.add_class::<Role>()?;
     module.add_class::<SessionTurn>()?;
     Ok(())
-}
-
-fn prompt_from_py(py: Python<'_>, prompt: &Py<PyAny>) -> PyResult<Prompt> {
-    let borrowed: PyRef<'_, Prompt> = prompt
-        .bind(py)
-        .extract()
-        .map_err(|_| PyTypeError::new_err("prompt must be a wyrd.Prompt instance"))?;
-    Ok(borrowed.clone())
-}
-
-fn provider_registry_from_py(
-    py: Python<'_>,
-    providers: Py<PyAny>,
-) -> PyResult<Arc<ProviderRegistry>> {
-    let borrowed: PyRef<'_, skald_runtime::python::PyProviderRegistryInner> = providers
-        .bind(py)
-        .extract()
-        .map_err(|_| PyTypeError::new_err("providers must be a wyrd.ProviderRegistry instance"))?;
-    Ok(borrowed.inner.clone())
-}
-
-fn run_config_from_py(py: Python<'_>, value: Py<PyAny>) -> PyResult<RunConfig> {
-    if value.bind(py).is_none() {
-        return Ok(RunConfig::default());
-    }
-    let json = wyrd_utils_like_py_to_json(value.bind(py))?;
-    let mut config = RunConfig::default();
-    if let Some(max_iterations) = json
-        .get("max_iterations")
-        .and_then(serde_json::Value::as_u64)
-    {
-        config.max_iterations = u32::try_from(max_iterations).unwrap_or(u32::MAX);
-    }
-    if let Some(limit) = json
-        .get("session_recent_limit")
-        .and_then(serde_json::Value::as_u64)
-    {
-        config.session_recent_limit = Some(usize::try_from(limit).unwrap_or(usize::MAX));
-    }
-    if let Some(cap) = json
-        .get("tool_concurrency_cap")
-        .and_then(serde_json::Value::as_u64)
-    {
-        config.tool_concurrency_cap = Some(usize::try_from(cap).unwrap_or(usize::MAX));
-    }
-    Ok(config)
 }
 
 fn invoke_callback<T>(
@@ -612,22 +495,6 @@ fn finish_reason_str(reason: crate::FinishReason) -> &'static str {
         crate::FinishReason::ProviderError => "provider_error",
         crate::FinishReason::ToolError => "tool_error",
         crate::FinishReason::Timeout => "timeout",
-    }
-}
-
-fn agent_error_to_py_err(py: Python<'_>, error: AgentError) -> PyErr {
-    let detail = error.to_string();
-    match py
-        .get_type::<pyo3::exceptions::PyRuntimeError>()
-        .call1((detail,))
-    {
-        Ok(exception) => {
-            let _ = exception.setattr("code", error.code());
-            let _ = exception.setattr("status", error.status());
-            let _ = exception.setattr("http_status", error.status());
-            PyErr::from_value(exception)
-        }
-        Err(source) => PyRuntimeError::new_err(source.to_string()),
     }
 }
 

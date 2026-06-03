@@ -20,15 +20,13 @@ async fn agent_run_via_umbrella_imports() {
     mock.push_response(openai_text_response("done"));
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(mock));
-    let agent = Agent::builder()
+    let agent = Agent::new(Prompt::from_native(prompt()))
+        .with_id("planner-agent")
         .name("planner-agent")
-        .version("0.3.0")
-        .prompt(prompt())
-        .build()
-        .expect("agent builds");
+        .version("0.3.0");
 
     let run = agent
-        .run(&providers, None, "make a plan")
+        .run_with(&providers, None, "make a plan")
         .await
         .expect("agent run succeeds");
 
@@ -53,16 +51,14 @@ async fn wyrd_init_attaches_observer_provider() {
     mock.push_response(openai_text_response("done"));
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(mock));
-    let agent = Agent::builder()
+    let agent = Agent::new(Prompt::from_native(prompt()))
+        .with_id("planner-agent")
         .name("planner-agent")
-        .version("0.3.0")
-        .prompt(prompt())
-        .build()
-        .expect("agent builds");
+        .version("0.3.0");
 
     wyrd::init();
     let run = agent
-        .run(&providers, None, "make a plan")
+        .run_with(&providers, None, "make a plan")
         .await
         .expect("agent run succeeds");
 
@@ -86,18 +82,16 @@ async fn agent_run_scoped_observer_overrides_global() {
     mock.push_response(openai_text_response("done"));
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(mock));
-    let agent = Agent::builder()
+    let agent = Agent::new(Prompt::from_native(prompt()))
+        .with_id("planner-agent")
         .name("planner-agent")
-        .version("0.3.0")
-        .prompt(prompt())
-        .build()
-        .expect("agent builds");
+        .version("0.3.0");
 
     wyrd::init();
     let scoped_observer: Arc<dyn Observer> = scoped.clone();
     let run = wyrd_observe::with_observer(scoped_observer, async {
         agent
-            .run(&providers, None, "make a plan")
+            .run_with(&providers, None, "make a plan")
             .await
             .expect("agent run succeeds")
     })

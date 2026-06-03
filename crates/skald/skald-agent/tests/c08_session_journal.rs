@@ -29,7 +29,7 @@ async fn session_recent_fires_once_per_run() {
         openai_text_response("done"),
     ]);
     let providers = registry(provider);
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .add_tool(fixed_tool("tool_a", json!({"ok": true})))
         .with_session(session.clone())
         .with_journal(journal)
@@ -39,7 +39,7 @@ async fn session_recent_fires_once_per_run() {
         });
 
     let run = agent
-        .run(&providers, Some(SessionId::new("s1")), "hello")
+        .run_with(&providers, Some(SessionId::new("s1")), "hello")
         .await
         .expect("run ok");
 
@@ -52,11 +52,14 @@ async fn session_is_not_called_without_session_id() {
     let session = Arc::new(RecordingSession::new());
     let journal = Arc::new(RecordingJournal::new());
     let providers = registry(RecordingProvider::new(vec![openai_text_response("done")]));
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .with_session(session.clone())
         .with_journal(journal);
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
     assert_eq!(session.recent_call_count(), 0);
@@ -66,18 +69,18 @@ async fn session_is_not_called_without_session_id() {
 #[tokio::test]
 async fn session_recent_limit_defaults_to_50_and_honors_config() {
     let default_session = Arc::new(RecordingSession::new());
-    let default_agent = Agent::new("default", test_prompt())
+    let default_agent = Agent::from_resolved("default", test_prompt())
         .with_session(default_session.clone())
         .with_journal(Arc::new(RecordingJournal::new()));
     let default_providers = registry(RecordingProvider::new(vec![openai_text_response("done")]));
 
     default_agent
-        .run(&default_providers, Some(SessionId::new("default")), "hello")
+        .run_with(&default_providers, Some(SessionId::new("default")), "hello")
         .await
         .expect("default run ok");
 
     let configured_session = Arc::new(RecordingSession::new());
-    let configured_agent = Agent::new("configured", test_prompt())
+    let configured_agent = Agent::from_resolved("configured", test_prompt())
         .with_session(configured_session.clone())
         .with_journal(Arc::new(RecordingJournal::new()))
         .with_run_config(RunConfig {
@@ -87,7 +90,7 @@ async fn session_recent_limit_defaults_to_50_and_honors_config() {
     let configured_providers = registry(RecordingProvider::new(vec![openai_text_response("done")]));
 
     configured_agent
-        .run(
+        .run_with(
             &configured_providers,
             Some(SessionId::new("configured")),
             "hello",
@@ -116,12 +119,12 @@ async fn recent_turns_seed_conversation_before_new_user_input() {
     let providers = registry(RecordingProvider::new(vec![openai_text_response(
         "second answer",
     )]));
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .with_session(session)
         .with_journal(Arc::new(RecordingJournal::new()));
 
     let run = agent
-        .run(&providers, Some(SessionId::new("s1")), "second question")
+        .run_with(&providers, Some(SessionId::new("s1")), "second question")
         .await
         .expect("run ok");
 
@@ -139,12 +142,12 @@ async fn recent_turns_seed_conversation_before_new_user_input() {
 async fn user_turn_appends_after_recent_and_before_model_work() {
     let session = Arc::new(RecordingSession::new());
     let providers = registry(RecordingProvider::new(vec![openai_text_response("done")]));
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .with_session(session.clone())
         .with_journal(Arc::new(RecordingJournal::new()));
 
     agent
-        .run(&providers, Some(SessionId::new("s1")), "hello")
+        .run_with(&providers, Some(SessionId::new("s1")), "hello")
         .await
         .expect("run ok");
 
@@ -165,7 +168,7 @@ async fn assistant_turn_appends_after_each_successful_provider_response() {
         openai_text_response("done"),
     ]);
     let providers = registry(provider);
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .add_tool(fixed_tool("tool_a", json!({"ok": true})))
         .with_session(session.clone())
         .with_journal(Arc::new(RecordingJournal::new()))
@@ -175,7 +178,7 @@ async fn assistant_turn_appends_after_each_successful_provider_response() {
         });
 
     agent
-        .run(&providers, Some(SessionId::new("s1")), "hello")
+        .run_with(&providers, Some(SessionId::new("s1")), "hello")
         .await
         .expect("run ok");
 
@@ -200,7 +203,7 @@ async fn tool_turn_appends_only_after_successful_tool_invocation() {
         openai_text_response("done"),
     ]);
     let providers = registry(provider);
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .add_tool(fixed_tool("tool_ok", json!({"ok": true})))
         .add_tool(Arc::new(FailingTool))
         .with_session(session.clone())
@@ -212,7 +215,7 @@ async fn tool_turn_appends_only_after_successful_tool_invocation() {
         });
 
     agent
-        .run(&providers, Some(SessionId::new("s1")), "hello")
+        .run_with(&providers, Some(SessionId::new("s1")), "hello")
         .await
         .expect("run ok");
 
@@ -230,12 +233,12 @@ async fn session_recent_failure_propagates_and_journals_agent_error() {
     let session = Arc::new(RecordingSession::new().fail_recent());
     let journal = Arc::new(RecordingJournal::new());
     let providers = registry(RecordingProvider::new(vec![openai_text_response("unused")]));
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .with_session(session)
         .with_journal(journal.clone());
 
     let error = agent
-        .run(&providers, Some(SessionId::new("s1")), "hello")
+        .run_with(&providers, Some(SessionId::new("s1")), "hello")
         .await
         .expect_err("recent failure should propagate");
 
@@ -252,12 +255,12 @@ async fn session_append_failure_propagates_and_journals_agent_error() {
     let session = Arc::new(RecordingSession::new().fail_on_append(2));
     let journal = Arc::new(RecordingJournal::new());
     let providers = registry(RecordingProvider::new(vec![openai_text_response("done")]));
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .with_session(session)
         .with_journal(journal.clone());
 
     let error = agent
-        .run(&providers, Some(SessionId::new("s1")), "hello")
+        .run_with(&providers, Some(SessionId::new("s1")), "hello")
         .await
         .expect_err("append failure should propagate");
 
@@ -273,9 +276,12 @@ async fn session_append_failure_propagates_and_journals_agent_error() {
 async fn journal_records_exactly_one_start_and_finish_on_success() {
     let journal = Arc::new(RecordingJournal::new());
     let providers = registry(RecordingProvider::new(vec![openai_text_response("done")]));
-    let agent = Agent::new("test", test_prompt()).with_journal(journal.clone());
+    let agent = Agent::from_resolved("test", test_prompt()).with_journal(journal.clone());
 
-    agent.run(&providers, None, "hello").await.expect("run ok");
+    agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     let events = journal.events();
     assert!(matches!(
@@ -306,10 +312,10 @@ async fn journal_records_exactly_one_start_and_finish_on_success() {
 async fn provider_error_journals_synthetic_model_result_then_agent_error() {
     let journal = Arc::new(RecordingJournal::new());
     let providers = registry(RecordingProvider::new(Vec::new()));
-    let agent = Agent::new("test", test_prompt()).with_journal(journal.clone());
+    let agent = Agent::from_resolved("test", test_prompt()).with_journal(journal.clone());
 
     let error = agent
-        .run(&providers, None, "hello")
+        .run_with(&providers, None, "hello")
         .await
         .expect_err("empty provider queue should fail");
 
@@ -335,11 +341,14 @@ async fn provider_error_journals_synthetic_model_result_then_agent_error() {
 async fn before_model_skip_journals_synthetic_model_result_then_agent_finish() {
     let journal = Arc::new(RecordingJournal::new());
     let providers = registry(RecordingProvider::new(vec![openai_text_response("unused")]));
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .before_model(Arc::new(|_ctx, _request| CallbackOutcome::Skip))
         .with_journal(journal.clone());
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     assert_eq!(run.finish_reason, FinishReason::CallbackSkipped);
     let events = journal.events();
@@ -367,7 +376,7 @@ async fn tool_results_are_journaled_and_conversation_order_is_deterministic() {
         openai_tool_call_response(calls),
         openai_text_response("done"),
     ]));
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .add_tool(Arc::new(SleeperTool { max: 5 }))
         .with_journal(journal.clone())
         .with_run_config(RunConfig {
@@ -376,7 +385,10 @@ async fn tool_results_are_journaled_and_conversation_order_is_deterministic() {
             ..Default::default()
         });
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     let tool_result_ids: Vec<_> = run
         .conversation
@@ -405,7 +417,7 @@ async fn tool_results_are_journaled_and_conversation_order_is_deterministic() {
 #[tokio::test]
 async fn same_session_id_round_trips_history_across_runs() {
     let session = Arc::new(RecordingSession::new());
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .with_session(session.clone())
         .with_journal(Arc::new(RecordingJournal::new()));
     let session_id = SessionId::new("hitl");
@@ -414,7 +426,7 @@ async fn same_session_id_round_trips_history_across_runs() {
         "what color?",
     )]));
     let first = agent
-        .run(&first_providers, Some(session_id.clone()), "hello")
+        .run_with(&first_providers, Some(session_id.clone()), "hello")
         .await
         .expect("first run ok");
     assert_eq!(first.finish_reason, FinishReason::ModelStopped);
@@ -423,7 +435,7 @@ async fn same_session_id_round_trips_history_across_runs() {
         "blue ok",
     )]));
     let second = agent
-        .run(&second_providers, Some(session_id), "blue")
+        .run_with(&second_providers, Some(session_id), "blue")
         .await
         .expect("second run ok");
 

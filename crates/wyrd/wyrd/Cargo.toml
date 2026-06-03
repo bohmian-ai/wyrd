@@ -20,9 +20,9 @@ skald-agent = { workspace = true }
 skald-prompt = { workspace = true }
 skald-runtime = { workspace = true }
 skald-tool = { workspace = true }
-wyrd-cards = { workspace = true }
 wyrd-observe = { workspace = true }
 wyrd-observe-impl = { workspace = true }
+wyrd-spec = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

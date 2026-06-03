@@ -51,7 +51,7 @@ fn tool_def(name: &str) -> ToolDef {
 #[test]
 fn agent_new_has_default_public_fields() {
     let prompt = test_prompt("gpt-4o");
-    let agent = Agent::new("planner", prompt);
+    let agent = Agent::from_resolved("planner", prompt);
 
     assert_eq!(agent.id, "planner");
     assert_eq!(agent.run_config, RunConfig::default());
@@ -63,7 +63,7 @@ fn agent_add_tool_appends_to_cache_order() {
     let first = Arc::new(tool_def("t1"));
     let second = Arc::new(tool_def("t2"));
 
-    let agent = Agent::new("a", test_prompt("gpt-4o"))
+    let agent = Agent::from_resolved("a", test_prompt("gpt-4o"))
         .add_tool(first)
         .add_tool(second);
 
@@ -76,7 +76,7 @@ fn agent_set_tools_replaces_full_list() {
     let second = Arc::new(tool_def("t2"));
     let third = Arc::new(tool_def("t3"));
 
-    let agent = Agent::new("a", test_prompt("gpt-4o"))
+    let agent = Agent::from_resolved("a", test_prompt("gpt-4o"))
         .add_tool(first)
         .set_tools(vec![second, third]);
 
@@ -88,7 +88,7 @@ fn agent_with_prompt_returns_new_agent_with_same_tools() {
     let original_prompt = test_prompt("gpt-4o");
     let replacement_prompt = test_prompt("gpt-4o-mini");
     let tool = Arc::new(tool_def("echo"));
-    let agent = Agent::new("a", original_prompt.clone()).add_tool(tool);
+    let agent = Agent::from_resolved("a", original_prompt.clone()).add_tool(tool);
 
     let replaced = agent.clone().with_prompt(replacement_prompt.clone());
 
@@ -104,7 +104,7 @@ fn agent_with_run_config_preserves_config() {
         ..Default::default()
     };
 
-    let agent = Agent::new("a", test_prompt("gpt-4o")).with_run_config(config.clone());
+    let agent = Agent::from_resolved("a", test_prompt("gpt-4o")).with_run_config(config.clone());
 
     assert_eq!(agent.run_config, config);
 }
@@ -113,7 +113,7 @@ fn agent_with_run_config_preserves_config() {
 fn agent_tool_names_reflect_tool_internal_name() {
     let tool = Arc::new(tool_def("echo"));
 
-    let agent = Agent::new("a", test_prompt("gpt-4o")).add_tool(tool);
+    let agent = Agent::from_resolved("a", test_prompt("gpt-4o")).add_tool(tool);
 
     assert_eq!(agent.tool_names(), vec!["echo".to_owned()]);
 }
@@ -121,7 +121,7 @@ fn agent_tool_names_reflect_tool_internal_name() {
 #[test]
 fn agent_clone_bumps_prompt_arc() {
     let prompt = test_prompt("gpt-4o");
-    let agent = Agent::new("a", prompt.clone())
+    let agent = Agent::from_resolved("a", prompt.clone())
         .add_tool(Arc::new(tool_def("t1")))
         .add_tool(Arc::new(tool_def("t2")))
         .add_tool(Arc::new(tool_def("t3")));

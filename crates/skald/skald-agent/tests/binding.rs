@@ -32,7 +32,7 @@ fn openai_prompt() -> Arc<Prompt> {
 
 #[test]
 fn agent_new_uses_resolved_prompt_and_default_run_config() {
-    let agent = Agent::new("writer", openai_prompt());
+    let agent = Agent::from_resolved("writer", openai_prompt());
 
     assert_eq!(agent.id, "writer");
     assert_eq!(agent.prompt.native().model, "gpt-4o");
@@ -65,14 +65,14 @@ fn agent_with_prompt_overrides_prompt_reference() {
     prompt.version = Some("1".to_string());
     let replacement = Arc::new(Prompt::from_native(prompt));
 
-    let agent = Agent::new("a", original).with_prompt(replacement.clone());
+    let agent = Agent::from_resolved("a", original).with_prompt(replacement.clone());
 
     assert_eq!(agent.prompt.native().version.as_deref(), Some("1"));
 }
 
 #[test]
 fn agent_with_run_config_preserves_config() {
-    let _agent = Agent::new("a", openai_prompt()).with_run_config(RunConfig {
+    let _agent = Agent::from_resolved("a", openai_prompt()).with_run_config(RunConfig {
         max_iterations: 7,
         ..Default::default()
     });

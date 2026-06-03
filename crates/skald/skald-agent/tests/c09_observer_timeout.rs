@@ -29,9 +29,12 @@ async fn agent_run_observer_auto_attached_via_provider() {
     let _guard = TEST_LOCK.lock().await;
     let observer = install_observer(RecordingObserver::new());
     let providers = registry(RecordingProvider::new(vec![openai_text_response("done")]));
-    let agent = Agent::new("test", test_prompt());
+    let agent = Agent::from_resolved("test", test_prompt());
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
     assert_eq!(
@@ -52,7 +55,7 @@ async fn agent_run_prompt_observer_auto_attached_via_provider() {
     let observer = install_observer(RecordingObserver::new());
     let providers = registry(RecordingProvider::new(vec![openai_text_response("done")]));
     let prompt = test_prompt();
-    let agent = Agent::new("test", Arc::clone(&prompt));
+    let agent = Agent::from_resolved("test", Arc::clone(&prompt));
 
     let run = agent
         .run_prompt(&providers, &prompt, &[])
@@ -81,7 +84,7 @@ async fn agent_observer_mirrors_journal() {
         openai_tool_call_response(vec![tool_call("c1", "tool_a", json!({"q": "x"}))]),
         openai_text_response("done"),
     ]));
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .add_tool(fixed_tool("tool_a", json!({"ok": true})))
         .with_journal(journal.clone())
         .with_run_config(RunConfig {
@@ -89,7 +92,10 @@ async fn agent_observer_mirrors_journal() {
             ..Default::default()
         });
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
     let journal_projection: Vec<_> = journal.events().iter().map(project_journal).collect();
@@ -108,7 +114,7 @@ async fn agent_observer_captured_once_per_run_then_cloned_into_spawned_tool_futu
         openai_tool_call_response(vec![tool_call("c1", "waiter", json!({}))]),
         openai_text_response("done"),
     ]));
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .add_tool(Arc::new(ControlledTool {
             started: Arc::clone(&started),
             release: Arc::clone(&release),
@@ -119,7 +125,7 @@ async fn agent_observer_captured_once_per_run_then_cloned_into_spawned_tool_futu
             ..Default::default()
         });
 
-    let handle = tokio::spawn(async move { agent.run(&providers, None, "hello").await });
+    let handle = tokio::spawn(async move { agent.run_with(&providers, None, "hello").await });
     started.notified().await;
     observer_slot().set(observer_b.clone());
     release.notify_one();
@@ -147,7 +153,7 @@ async fn agent_run_timeout_terminates_cleanly() {
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let timeout = Duration::from_millis(50);
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .add_tool(Arc::new(ControlledTool {
             started,
             release,
@@ -161,7 +167,7 @@ async fn agent_run_timeout_terminates_cleanly() {
         });
 
     let error = agent
-        .run(&providers, None, "hello")
+        .run_with(&providers, None, "hello")
         .await
         .expect_err("run should time out");
 
@@ -198,7 +204,7 @@ async fn agent_run_no_timeout_runs_to_completion() {
         openai_tool_call_response(vec![tool_call("c1", "slow", json!({}))]),
         openai_text_response("done"),
     ]));
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .add_tool(Arc::new(SlowTool {
             delay: Duration::from_millis(200),
         }))
@@ -210,7 +216,10 @@ async fn agent_run_no_timeout_runs_to_completion() {
         });
     let started_at = Instant::now();
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
     assert!(started_at.elapsed() >= Duration::from_millis(200));

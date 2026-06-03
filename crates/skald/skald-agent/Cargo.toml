@@ -21,13 +21,17 @@ skald-spec = { workspace = true }
 skald-prompt = { workspace = true }
 skald-runtime = { workspace = true }
 skald-tool = { workspace = true }
+wyrd-spec = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 futures = "0.3"
+chrono = { workspace = true }
+ulid = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 wyrd-runtime = { workspace = true, optional = true }
 

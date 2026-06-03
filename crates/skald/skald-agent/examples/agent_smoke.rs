@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 
+use skald_agent::Agent;
 use skald_prompt::{OpenAiChatOptions, openai_chat};
-use wyrd_cards::agent::AgentWithMeta;
-use wyrd_spec::reference::PromptRef;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut save_path = PathBuf::from("/tmp/planner_rust.yaml");
@@ -26,12 +25,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    let agent = AgentWithMeta::builder()
+    let agent = Agent::new(prompt)
         .name("planner-agent")
         .version("0.3.0")
-        .space("research")
-        .prompt(PromptRef::from(prompt.into_native()))
-        .build()?;
+        .space("research");
 
     agent.save(save_path)?;
     Ok(())

@@ -51,7 +51,11 @@ pub mod request_builder;
 pub mod run;
 pub mod session;
 
-pub use agent::Agent;
+pub use agent::{
+    Agent, AgentCallbacks, AgentWire, LocalPromptResolver, PromptResolver,
+    agent_run_config_spec_from_run_config, clear_prompt_card_registry, default_prompt_resolver,
+    derive_cascade_children, register_prompt_card, run_config_from_agent_run_config_spec,
+};
 pub use callbacks::{
     AfterAgentFn, AfterModelFn, AfterToolFn, AgentContext, BeforeAgentFn, BeforeModelFn,
     BeforeToolFn, CallbackOutcome,

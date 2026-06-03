@@ -124,7 +124,7 @@ impl AgentTool for AgentDelegateTool {
             .scope(depth + 1, async {
                 WYRD_AGENT_DELEGATION_CHAIN
                     .scope(std::cell::RefCell::new(chain), async {
-                        self.agent.run(&self.providers, None, &input_str).await
+                        self.agent.run_with(&self.providers, None, &input_str).await
                     })
                     .await
             })

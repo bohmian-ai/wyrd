@@ -27,7 +27,7 @@ async fn agent_run_callbacks_fire_in_order() {
     let before_model_order = Arc::clone(&order);
     let after_model_order = Arc::clone(&order);
     let after_agent_order = Arc::clone(&order);
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .before_agent(Arc::new(move |ctx, input| {
             assert_eq!(ctx.agent_id, "test");
             assert_eq!(ctx.iteration, 0);
@@ -62,7 +62,10 @@ async fn agent_run_callbacks_fire_in_order() {
             CallbackOutcome::ReplaceWith(run.clone())
         }));
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     assert_eq!(run.output, "done");
     assert_eq!(
@@ -75,12 +78,13 @@ async fn agent_run_callbacks_fire_in_order() {
 async fn agent_run_before_agent_replace_changes_user_turn() {
     let provider = RecordingProvider::new(vec![openai_text_response("done")]);
     let providers = registry(provider.clone());
-    let agent = Agent::new("test", test_prompt()).before_agent(Arc::new(|_ctx, _input| {
-        CallbackOutcome::ReplaceWith("replacement".to_owned())
-    }));
+    let agent =
+        Agent::from_resolved("test", test_prompt()).before_agent(Arc::new(|_ctx, _input| {
+            CallbackOutcome::ReplaceWith("replacement".to_owned())
+        }));
 
     let run = agent
-        .run(&providers, None, "original")
+        .run_with(&providers, None, "original")
         .await
         .expect("run ok");
 
@@ -105,14 +109,17 @@ async fn agent_run_before_agent_skip_returns_callback_skipped() {
     let providers = registry(provider.clone());
     let after_agent_count = Arc::new(Mutex::new(0_u32));
     let after_agent_count_cb = Arc::clone(&after_agent_count);
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .before_agent(Arc::new(|_ctx, _input| CallbackOutcome::Skip))
         .after_agent(Arc::new(move |_ctx, run| {
             *after_agent_count_cb.lock().expect("counter lock") += 1;
             CallbackOutcome::ReplaceWith(run.clone())
         }));
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     assert_eq!(run.finish_reason, FinishReason::CallbackSkipped);
     assert_eq!(run.iterations, 0);
@@ -125,18 +132,22 @@ async fn agent_run_before_agent_skip_returns_callback_skipped() {
 async fn agent_run_before_model_replace_swaps_native_request() {
     let provider = RecordingProvider::new(vec![openai_text_response("done")]);
     let providers = registry(provider.clone());
-    let agent = Agent::new("test", test_prompt()).before_model(Arc::new(|_ctx, request| {
-        let mut replacement = request.clone();
-        match &mut replacement {
-            ProviderRequest::OpenAiChatCompletion(request) => {
-                request.model = "replacement-model".to_owned();
+    let agent =
+        Agent::from_resolved("test", test_prompt()).before_model(Arc::new(|_ctx, request| {
+            let mut replacement = request.clone();
+            match &mut replacement {
+                ProviderRequest::OpenAiChatCompletion(request) => {
+                    request.model = "replacement-model".to_owned();
+                }
+                other => panic!("expected OpenAiChatCompletion, got {other:?}"),
             }
-            other => panic!("expected OpenAiChatCompletion, got {other:?}"),
-        }
-        CallbackOutcome::ReplaceWith(replacement)
-    }));
+            CallbackOutcome::ReplaceWith(replacement)
+        }));
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
     match provider.requests().first().expect("request captured") {
@@ -153,14 +164,17 @@ async fn agent_run_before_model_skip_skips_provider_and_after_model() {
     let providers = registry(provider.clone());
     let after_model_count = Arc::new(Mutex::new(0_u32));
     let after_model_count_cb = Arc::clone(&after_model_count);
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .before_model(Arc::new(|_ctx, _request| CallbackOutcome::Skip))
         .after_model(Arc::new(move |_ctx, response| {
             *after_model_count_cb.lock().expect("counter lock") += 1;
             CallbackOutcome::ReplaceWith(response.clone())
         }));
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     assert_eq!(run.finish_reason, FinishReason::CallbackSkipped);
     assert_eq!(run.iterations, 1);
@@ -172,11 +186,15 @@ async fn agent_run_before_model_skip_skips_provider_and_after_model() {
 async fn agent_run_after_model_replace_swaps_response() {
     let provider = RecordingProvider::new(vec![openai_text_response("original")]);
     let providers = registry(provider);
-    let agent = Agent::new("test", test_prompt()).after_model(Arc::new(|_ctx, _response| {
-        CallbackOutcome::ReplaceWith(openai_text_response("replacement"))
-    }));
+    let agent =
+        Agent::from_resolved("test", test_prompt()).after_model(Arc::new(|_ctx, _response| {
+            CallbackOutcome::ReplaceWith(openai_text_response("replacement"))
+        }));
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     assert_eq!(run.output, "replacement");
     assert_eq!(last_assistant_text(&run), Some("replacement"));
@@ -186,13 +204,16 @@ async fn agent_run_after_model_replace_swaps_response() {
 async fn agent_run_after_agent_replace_can_alter_run() {
     let provider = RecordingProvider::new(vec![openai_text_response("model")]);
     let providers = registry(provider);
-    let agent = Agent::new("test", test_prompt()).after_agent(Arc::new(|_ctx, run| {
+    let agent = Agent::from_resolved("test", test_prompt()).after_agent(Arc::new(|_ctx, run| {
         let mut replacement = run.clone();
         replacement.output = "after-agent".to_owned();
         CallbackOutcome::ReplaceWith(replacement)
     }));
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     assert_eq!(run.output, "after-agent");
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
@@ -206,7 +227,7 @@ async fn agent_run_before_tool_replace_changes_tool_args() {
     ]);
     let providers = registry(provider);
     let tool = Arc::new(RecordingTool::new("recorder", json!({"tool": "ok"})));
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .add_tool(tool.clone())
         .before_tool(Arc::new(|_ctx, tool, _args| {
             assert_eq!(tool.name(), "recorder");
@@ -217,7 +238,10 @@ async fn agent_run_before_tool_replace_changes_tool_args() {
             ..Default::default()
         });
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     assert_eq!(run.output, "done");
     assert_eq!(tool.calls(), vec![json!({"replacement": true})]);
@@ -233,7 +257,7 @@ async fn agent_run_before_tool_skip_records_sentinel_result() {
     let tool = Arc::new(RecordingTool::new("recorder", json!({"tool": "ok"})));
     let after_tool_count = Arc::new(Mutex::new(0_u32));
     let after_tool_count_cb = Arc::clone(&after_tool_count);
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .add_tool(tool.clone())
         .before_tool(Arc::new(|_ctx, _tool, _args| CallbackOutcome::Skip))
         .after_tool(Arc::new(move |_ctx, _tool, result| {
@@ -248,7 +272,10 @@ async fn agent_run_before_tool_skip_records_sentinel_result() {
             ..Default::default()
         });
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     assert_eq!(tool.calls().len(), 0);
     assert_eq!(*after_tool_count.lock().expect("counter lock"), 0);
@@ -267,7 +294,7 @@ async fn agent_run_after_tool_replace_changes_tool_result() {
     ]);
     let providers = registry(provider);
     let tool = Arc::new(RecordingTool::new("recorder", json!({"original": true})));
-    let agent = Agent::new("test", test_prompt())
+    let agent = Agent::from_resolved("test", test_prompt())
         .add_tool(tool)
         .after_tool(Arc::new(|_ctx, tool, _result| {
             assert_eq!(tool.name(), "recorder");
@@ -278,7 +305,10 @@ async fn agent_run_after_tool_replace_changes_tool_result() {
             ..Default::default()
         });
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     assert!(run.conversation.turns().iter().any(|turn| matches!(
         turn,
@@ -291,12 +321,13 @@ async fn agent_run_after_tool_replace_changes_tool_result() {
 async fn agent_run_callback_panic_maps_to_agent_error() {
     let provider = RecordingProvider::new(vec![openai_text_response("unused")]);
     let providers = registry(provider);
-    let agent = Agent::new("test", test_prompt()).before_model(Arc::new(|_ctx, _request| {
-        panic!("callback exploded");
-    }));
+    let agent =
+        Agent::from_resolved("test", test_prompt()).before_model(Arc::new(|_ctx, _request| {
+            panic!("callback exploded");
+        }));
 
     let error = agent
-        .run(&providers, None, "hello")
+        .run_with(&providers, None, "hello")
         .await
         .expect_err("callback panic should map to AgentError");
 

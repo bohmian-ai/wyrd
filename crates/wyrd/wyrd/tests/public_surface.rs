@@ -3,11 +3,11 @@
 #[test]
 fn use_wyrd_agent_module_imports_compile() {
     use wyrd::agent::Agent;
-    use wyrd::agent::{AgentBuilder, AgentTool, CallbackOutcome, ToolDef};
+    use wyrd::agent::{AgentCard, AgentTool, CallbackOutcome, ToolDef};
     use wyrd::agent::{AgentDelegateTool, Journal, NoSession, NoopJournal, SessionMemory};
 
     let _: Option<&Agent> = None;
-    let _: Option<&AgentBuilder> = None;
+    let _: Option<&AgentCard> = None;
     let _: Option<&dyn AgentTool> = None;
     let _: Option<&ToolDef> = None;
     let _: Option<&CallbackOutcome<String>> = None;

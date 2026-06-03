@@ -18,9 +18,12 @@ use skald_spec::{
 async fn agent_run_no_observer_provider_uses_noop() {
     let observer = RecordingObserver::default();
     let providers = registry(RecordingProvider::new(vec![openai_text_response("done")]));
-    let agent = Agent::new("test", test_prompt());
+    let agent = Agent::from_resolved("test", test_prompt());
 
-    let run = agent.run(&providers, None, "hello").await.expect("run ok");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
 
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
     assert_eq!(observer.count(), 0);

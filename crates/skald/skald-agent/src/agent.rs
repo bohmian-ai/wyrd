@@ -1,14 +1,21 @@
-//! Live agent: identity and prompt-bound bounded loop configuration.
-//!
-//! Build an [`Agent`] directly once the resolved prompt is ready, then run the
-//! bounded tool loop.
+//! User-facing Skald agent with card-authoring lifecycle projection.
 
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
 
 use skald_prompt::Prompt;
 use skald_runtime::ProviderRegistry;
-use skald_tool::AgentTool;
+use skald_tool::{AgentTool, ToolError, ToolResolver};
+use wyrd_spec::{
+    AgentCard, AgentCardError, AgentRunConfigSpec, AgentSpec, CardMetadata,
+    envelope::CardKind,
+    error::WyrdError,
+    metadata::{Annotations, Labels},
+    reference::{CardRef, PromptRef},
+};
 
 use crate::callbacks::{
     AfterAgentFn, AfterModelFn, AfterToolFn, BeforeAgentFn, BeforeModelFn, BeforeToolFn,
@@ -18,43 +25,130 @@ use crate::journal::{Journal, NoopJournal};
 use crate::run::RunConfig;
 use crate::session::{NoSession, SessionId, SessionMemory};
 
-/// Live agent ready to run the bounded tool loop.
+/// Wire form for a durable Agent Card.
+pub type AgentWire = AgentCard;
+
+/// Resolves durable prompt references into runtime prompts.
+pub trait PromptResolver: Send + Sync {
+    /// Resolve a prompt reference into a runtime prompt.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when a referenced Prompt Card cannot be resolved.
+    fn resolve(&self, prompt_ref: &PromptRef) -> Result<Prompt, WyrdError>;
+}
+
+impl<T: PromptResolver + ?Sized> PromptResolver for &T {
+    fn resolve(&self, prompt_ref: &PromptRef) -> Result<Prompt, WyrdError> {
+        (**self).resolve(prompt_ref)
+    }
+}
+
+/// Process-local prompt resolver used by tests and local YAML loading.
+#[derive(Debug, Default)]
+pub struct LocalPromptResolver;
+
+impl PromptResolver for LocalPromptResolver {
+    fn resolve(&self, prompt_ref: &PromptRef) -> Result<Prompt, WyrdError> {
+        match prompt_ref {
+            PromptRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),
+            PromptRef::Card(card_ref) => prompt_registry()
+                .read()
+                .map_err(|error| {
+                    WyrdError::from(AgentCardError::validation(format!(
+                        "Agent prompt registry lock poisoned: {error}"
+                    )))
+                })?
+                .get(&prompt_key(card_ref))
+                .map(|prompt| prompt.as_ref().clone())
+                .ok_or_else(|| {
+                    AgentCardError::PromptCardNotFound {
+                        card_ref: card_ref.clone(),
+                    }
+                    .into()
+                }),
+        }
+    }
+}
+
+/// Return the process-local prompt resolver.
+#[must_use]
+pub fn default_prompt_resolver() -> &'static LocalPromptResolver {
+    static RESOLVER: LocalPromptResolver = LocalPromptResolver;
+    &RESOLVER
+}
+
+/// Register a prompt in the local Agent prompt resolver.
 ///
-/// ```compile_fail
-/// use skald_agent::Agent;
-///
-/// fn prompt_is_resolved_native(agent: &Agent) {
-///     let _: skald_prompt::Prompt = agent.prompt.clone();
-/// }
-/// ```
+/// # Errors
+/// Returns validation errors when the reference is not a Prompt Card reference.
+pub fn register_prompt_card(card_ref: &CardRef, prompt: Prompt) -> Result<(), WyrdError> {
+    if card_ref.kind != CardKind::Prompt {
+        return Err(
+            AgentCardError::validation("prompt registry accepts only Prompt Card refs").into(),
+        );
+    }
+    let mut registry = prompt_registry().write().map_err(|error| {
+        WyrdError::from(AgentCardError::validation(format!(
+            "Agent prompt registry lock poisoned: {error}"
+        )))
+    })?;
+    registry.insert(prompt_key(card_ref), Arc::new(prompt));
+    Ok(())
+}
+
+/// Remove all process-local Agent prompt resolver entries.
+pub fn clear_prompt_card_registry() {
+    if let Ok(mut registry) = prompt_registry().write() {
+        registry.clear();
+    }
+}
+
+/// Six-callback bundle for a live agent.
+#[derive(Clone, Default)]
+pub struct AgentCallbacks {
+    /// Callbacks fired before the agent run begins.
+    pub before_agent: Vec<BeforeAgentFn>,
+    /// Callbacks fired after the agent run completes.
+    pub after_agent: Vec<AfterAgentFn>,
+    /// Callbacks fired before provider model calls.
+    pub before_model: Vec<BeforeModelFn>,
+    /// Callbacks fired after provider model calls.
+    pub after_model: Vec<AfterModelFn>,
+    /// Callbacks fired before tool invocations.
+    pub before_tool: Vec<BeforeToolFn>,
+    /// Callbacks fired after tool invocations.
+    pub after_tool: Vec<AfterToolFn>,
+}
+
+/// User-facing Wyrd Agent and live Skald bounded-loop runtime.
 #[derive(Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "wyrd.agent", name = "Agent", skip_from_py_object)
+)]
 pub struct Agent {
+    /// Local Card metadata used for envelope projection.
+    pub(crate) meta: CardMetadata,
+    /// Preserved durable prompt reference.
+    pub(crate) prompt_ref: PromptRef,
+    /// Runtime-local tool names preserved for YAML round trips.
+    pub(crate) tool_names: Vec<String>,
     /// Stable id used for tracing and diagnostics.
     pub id: String,
     /// Resolved native prompt.
-    ///
-    /// Provider and model identities live in `prompt.request` and `prompt.model`.
     pub prompt: Arc<Prompt>,
     /// Loop execution settings.
     pub run_config: RunConfig,
     /// Per-agent runtime-local tool cache.
     pub(crate) tools: Vec<Arc<dyn AgentTool>>,
-    /// Callbacks fired before the agent run begins.
-    pub(crate) before_agent: Vec<BeforeAgentFn>,
-    /// Callbacks fired after the agent run completes.
-    pub(crate) after_agent: Vec<AfterAgentFn>,
-    /// Callbacks fired before provider model calls.
-    pub(crate) before_model: Vec<BeforeModelFn>,
-    /// Callbacks fired after provider model calls.
-    pub(crate) after_model: Vec<AfterModelFn>,
-    /// Callbacks fired before tool invocations.
-    pub(crate) before_tool: Vec<BeforeToolFn>,
-    /// Callbacks fired after tool invocations.
-    pub(crate) after_tool: Vec<AfterToolFn>,
     /// Session memory backend for this agent.
     pub(crate) session: Arc<dyn SessionMemory>,
     /// Run journal backend for this agent.
     pub(crate) journal: Arc<dyn Journal>,
+    /// Runtime callback chains.
+    pub(crate) callbacks: AgentCallbacks,
+    /// Optional provider registry used by [`Agent::run`].
+    pub(crate) providers: Option<Arc<ProviderRegistry>>,
 }
 
 impl fmt::Debug for Agent {
@@ -62,115 +156,449 @@ impl fmt::Debug for Agent {
         formatter
             .debug_struct("Agent")
             .field("id", &self.id)
+            .field("name", &self.meta.name)
+            .field("version", &self.meta.version)
             .field("prompt_model", &self.prompt.native().model)
             .field("run_config", &self.run_config)
-            .field("tool_names", &self.tool_names())
+            .field("tool_names", &self.tool_names)
             .finish()
     }
 }
 
 impl Agent {
-    /// Builds a new runnable agent.
-    pub fn new(id: impl Into<String>, prompt: Arc<Prompt>) -> Self {
-        Self {
-            id: id.into(),
-            prompt,
-            run_config: RunConfig::default(),
-            tools: Vec::new(),
-            before_agent: Vec::new(),
-            after_agent: Vec::new(),
-            before_model: Vec::new(),
-            after_model: Vec::new(),
-            before_tool: Vec::new(),
-            after_tool: Vec::new(),
-            session: Arc::new(NoSession),
-            journal: Arc::new(NoopJournal),
-        }
+    /// Build an agent from an already-resolved prompt.
+    #[must_use]
+    pub fn new(prompt: Prompt) -> Self {
+        let prompt_ref = PromptRef::from(prompt.clone().into_native());
+        Self::from_resolved_parts(generate_agent_id(), prompt_ref, prompt)
     }
 
-    /// Rebuilds the agent with a new prompt.
-    pub fn with_prompt(mut self, prompt: Arc<Prompt>) -> Self {
+    /// Build an agent from an already-shared resolved prompt.
+    #[must_use]
+    pub fn from_resolved(id: impl Into<String>, prompt: Arc<Prompt>) -> Self {
+        let prompt_ref = PromptRef::from(prompt.as_ref().clone().into_native());
+        Self::from_resolved_arc_parts(id.into(), prompt_ref, prompt)
+    }
+
+    /// Build an agent from a prompt reference and resolver.
+    ///
+    /// # Errors
+    /// Returns resolver errors for card-backed prompt references.
+    pub fn try_from_ref(
+        prompt_ref: PromptRef,
+        resolver: &dyn PromptResolver,
+    ) -> Result<Self, WyrdError> {
+        let prompt = resolve_prompt_ref(&prompt_ref, resolver)?;
+        Ok(Self::from_resolved_parts(
+            generate_agent_id(),
+            prompt_ref,
+            prompt,
+        ))
+    }
+
+    /// Rebuilds the agent with a stable runtime id.
+    #[must_use]
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
+    }
+
+    /// Rebuilds the agent with a new resolved prompt.
+    #[must_use]
+    pub fn with_prompt(mut self, prompt: impl Into<Arc<Prompt>>) -> Self {
+        let prompt = prompt.into();
+        self.prompt_ref = PromptRef::from(prompt.as_ref().clone().into_native());
         self.prompt = prompt;
         self
     }
 
+    /// Rebuilds the agent with a prompt reference and resolver.
+    ///
+    /// # Errors
+    /// Returns resolver errors for card-backed prompt references.
+    pub fn try_with_prompt(
+        mut self,
+        prompt_ref: PromptRef,
+        resolver: &dyn PromptResolver,
+    ) -> Result<Self, WyrdError> {
+        self.prompt = Arc::new(resolve_prompt_ref(&prompt_ref, resolver)?);
+        self.prompt_ref = prompt_ref;
+        Ok(self)
+    }
+
+    /// Appends one runtime-local tool to the agent cache.
+    #[must_use]
+    pub fn with_tool(mut self, tool: Arc<dyn AgentTool>) -> Self {
+        self.tool_names.push(tool.name().to_owned());
+        self.tools.push(tool);
+        self
+    }
+
+    /// Appends one runtime-local tool to the agent cache.
+    #[must_use]
+    pub fn add_tool(self, tool: Arc<dyn AgentTool>) -> Self {
+        self.with_tool(tool)
+    }
+
+    /// Replaces the full runtime-local tool cache.
+    #[must_use]
+    pub fn with_tools<I>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = Arc<dyn AgentTool>>,
+    {
+        self.tools = tools.into_iter().collect();
+        self.tool_names = self
+            .tools
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .collect();
+        self
+    }
+
+    /// Replaces the full runtime-local tool cache.
+    #[must_use]
+    pub fn set_tools(self, tools: Vec<Arc<dyn AgentTool>>) -> Self {
+        self.with_tools(tools)
+    }
+
     /// Rebuilds the agent with a new run configuration.
+    #[must_use]
     pub fn with_run_config(mut self, run_config: RunConfig) -> Self {
         self.run_config = run_config;
         self
     }
 
-    /// Appends one runtime-local tool to the agent cache.
-    pub fn add_tool(mut self, tool: Arc<dyn AgentTool>) -> Self {
-        self.tools.push(tool);
-        self
-    }
-
-    /// Replaces the full runtime-local tool cache.
-    pub fn set_tools(mut self, tools: Vec<Arc<dyn AgentTool>>) -> Self {
-        self.tools = tools;
-        self
-    }
-
-    /// Returns tool names in their current cache order.
-    #[must_use]
-    pub fn tool_names(&self) -> Vec<String> {
-        self.tools
-            .iter()
-            .map(|tool| tool.name().to_owned())
-            .collect()
-    }
-
-    /// Registers a callback fired before the agent run begins.
-    pub fn before_agent(mut self, callback: BeforeAgentFn) -> Self {
-        self.before_agent.push(callback);
-        self
-    }
-
-    /// Registers a callback fired after the agent run completes.
-    pub fn after_agent(mut self, callback: AfterAgentFn) -> Self {
-        self.after_agent.push(callback);
-        self
-    }
-
-    /// Registers a callback fired before one provider request is sent.
-    pub fn before_model(mut self, callback: BeforeModelFn) -> Self {
-        self.before_model.push(callback);
-        self
-    }
-
-    /// Registers a callback fired after one provider response is received.
-    pub fn after_model(mut self, callback: AfterModelFn) -> Self {
-        self.after_model.push(callback);
-        self
-    }
-
-    /// Registers a callback fired before one tool invocation.
-    pub fn before_tool(mut self, callback: BeforeToolFn) -> Self {
-        self.before_tool.push(callback);
-        self
-    }
-
-    /// Registers a callback fired after one tool invocation.
-    pub fn after_tool(mut self, callback: AfterToolFn) -> Self {
-        self.after_tool.push(callback);
-        self
-    }
-
     /// Replaces the session memory backend.
+    #[must_use]
     pub fn with_session(mut self, session: Arc<dyn SessionMemory>) -> Self {
         self.session = session;
         self
     }
 
     /// Replaces the run journal backend.
+    #[must_use]
     pub fn with_journal(mut self, journal: Arc<dyn Journal>) -> Self {
         self.journal = journal;
         self
     }
 
+    /// Rebuilds the agent with a provider registry used by [`Agent::run`].
+    #[must_use]
+    pub fn with_providers(mut self, providers: Arc<ProviderRegistry>) -> Self {
+        self.providers = Some(providers);
+        self
+    }
+
+    /// Return a copy with a card name.
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.meta.name = Some(name.into());
+        self
+    }
+
+    /// Return a copy with a card version.
+    #[must_use]
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.meta.version = Some(version.into());
+        self
+    }
+
+    /// Return a copy with a card space.
+    #[must_use]
+    pub fn space(mut self, space: impl Into<String>) -> Self {
+        self.meta.space = Some(space.into());
+        self
+    }
+
+    /// Return a copy with labels.
+    #[must_use]
+    pub fn labels(mut self, labels: Labels) -> Self {
+        self.meta.labels = labels;
+        self
+    }
+
+    /// Return a copy with annotations.
+    #[must_use]
+    pub fn annotations(mut self, annotations: Annotations) -> Self {
+        self.meta.annotations = annotations;
+        self
+    }
+
+    /// Registers a callback fired before the agent run begins.
+    #[must_use]
+    pub fn before_agent(mut self, callback: BeforeAgentFn) -> Self {
+        self.callbacks.before_agent.push(callback);
+        self
+    }
+
+    /// Registers a callback fired after the agent run completes.
+    #[must_use]
+    pub fn after_agent(mut self, callback: AfterAgentFn) -> Self {
+        self.callbacks.after_agent.push(callback);
+        self
+    }
+
+    /// Registers a callback fired before one provider request is sent.
+    #[must_use]
+    pub fn before_model(mut self, callback: BeforeModelFn) -> Self {
+        self.callbacks.before_model.push(callback);
+        self
+    }
+
+    /// Registers a callback fired after one provider response is received.
+    #[must_use]
+    pub fn after_model(mut self, callback: AfterModelFn) -> Self {
+        self.callbacks.after_model.push(callback);
+        self
+    }
+
+    /// Registers a callback fired before one tool invocation.
+    #[must_use]
+    pub fn before_tool(mut self, callback: BeforeToolFn) -> Self {
+        self.callbacks.before_tool.push(callback);
+        self
+    }
+
+    /// Registers a callback fired after one tool invocation.
+    #[must_use]
+    pub fn after_tool(mut self, callback: AfterToolFn) -> Self {
+        self.callbacks.after_tool.push(callback);
+        self
+    }
+
+    /// Borrow the runtime id.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Borrow the resolved prompt.
+    #[must_use]
+    pub fn prompt(&self) -> &Arc<Prompt> {
+        &self.prompt
+    }
+
+    /// Borrow the run configuration.
+    #[must_use]
+    pub fn run_config(&self) -> &RunConfig {
+        &self.run_config
+    }
+
+    /// Borrow resolved runtime-local tools.
+    #[must_use]
+    pub fn tools(&self) -> &[Arc<dyn AgentTool>] {
+        &self.tools
+    }
+
+    /// Borrow local Card metadata.
+    #[must_use]
+    pub fn meta(&self) -> &CardMetadata {
+        &self.meta
+    }
+
+    /// Return the optional card name.
+    #[must_use]
+    pub fn name_str(&self) -> Option<&str> {
+        self.meta.name.as_deref()
+    }
+
+    /// Return the optional card version.
+    #[must_use]
+    pub fn version_str(&self) -> Option<&str> {
+        self.meta.version.as_deref()
+    }
+
+    /// Return the optional card space.
+    #[must_use]
+    pub fn space_str(&self) -> Option<&str> {
+        self.meta.space.as_deref()
+    }
+
+    /// Return the preserved prompt reference.
+    #[must_use]
+    pub fn prompt_ref(&self) -> &PromptRef {
+        &self.prompt_ref
+    }
+
+    /// Return preserved runtime-local tool names.
+    #[must_use]
+    pub fn tool_names(&self) -> &[String] {
+        &self.tool_names
+    }
+
+    /// Return this agent's card reference when name and version are set.
+    ///
+    /// # Errors
+    /// Returns validation errors when identity fields are malformed.
+    pub fn card_ref(&self) -> Result<Option<CardRef>, WyrdError> {
+        if self.meta.name.is_none() || self.meta.version.is_none() {
+            return Ok(None);
+        }
+        let Some(card) = self.identity_card()? else {
+            return Ok(None);
+        };
+        card.card_ref().map(Some)
+    }
+
+    /// Save this Agent Card YAML envelope to local disk.
+    ///
+    /// # Errors
+    /// Returns identity, IO, YAML, or validation errors.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), WyrdError> {
+        let path = path.as_ref();
+        let yaml = self.to_yaml_string()?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| AgentCardError::io(parent.display().to_string(), &error))?;
+        }
+        std::fs::write(path, yaml)
+            .map_err(|error| AgentCardError::io(path.display().to_string(), &error))?;
+        Ok(())
+    }
+
+    /// Load an Agent Card from YAML using explicit tool and prompt resolvers.
+    ///
+    /// # Errors
+    /// Returns card load, prompt resolution, or tool resolution errors.
+    pub fn from_yaml_path(
+        path: impl AsRef<Path>,
+        tool_resolver: &dyn ToolResolver,
+        prompt_resolver: &dyn PromptResolver,
+    ) -> Result<Self, WyrdError> {
+        let path = path.as_ref();
+        let yaml = std::fs::read_to_string(path)
+            .map_err(|error| AgentCardError::io(path.display().to_string(), &error))?;
+        Self::from_yaml_str(&yaml, tool_resolver, prompt_resolver)
+    }
+
+    /// Load an Agent Card from a YAML string using explicit resolvers.
+    ///
+    /// # Errors
+    /// Returns YAML, prompt resolution, or tool resolution errors.
+    pub fn from_yaml_str(
+        input: &str,
+        tool_resolver: &dyn ToolResolver,
+        prompt_resolver: &dyn PromptResolver,
+    ) -> Result<Self, WyrdError> {
+        let card: AgentCard =
+            serde_yaml::from_str(input).map_err(|error| AgentCardError::yaml(&error))?;
+        Self::from_card(card, tool_resolver, prompt_resolver)
+    }
+
+    /// Convert this Agent Card to a YAML string.
+    ///
+    /// # Errors
+    /// Returns identity, validation, or YAML errors.
+    pub fn to_yaml_string(&self) -> Result<String, WyrdError> {
+        serde_yaml::to_string(&self.to_card()?).map_err(|error| AgentCardError::yaml(&error).into())
+    }
+
+    /// Convert this agent into a typed Agent Card envelope.
+    ///
+    /// # Errors
+    /// Returns missing identity or invalid identity errors.
+    pub fn to_card(&self) -> Result<AgentCard, WyrdError> {
+        let mut card = self.identity_card()?.ok_or(AgentCardError::MissingName)?;
+        if self.meta.version.is_none() {
+            return Err(AgentCardError::MissingVersion.into());
+        }
+        card.spec = self.to_spec();
+        card.cascade_children = derive_cascade_children(&card.spec);
+        Ok(card)
+    }
+
+    /// Alias for projecting this agent into wire envelope form.
+    ///
+    /// # Errors
+    /// Returns missing identity or invalid identity errors.
+    pub fn to_wire(&self) -> Result<AgentWire, WyrdError> {
+        self.to_card()
+    }
+
+    /// Reconstruct an agent from a typed Agent Card envelope.
+    ///
+    /// # Errors
+    /// Returns prompt resolution or tool resolution errors.
+    pub fn from_card(
+        card: AgentCard,
+        tool_resolver: &dyn ToolResolver,
+        prompt_resolver: &dyn PromptResolver,
+    ) -> Result<Self, WyrdError> {
+        let mut tools = Vec::with_capacity(card.spec.tool_names.len());
+        for name in &card.spec.tool_names {
+            tools.push(tool_resolver.resolve(name).map_err(tool_resolution_error)?);
+        }
+
+        let mut agent = Self::try_from_ref(card.spec.prompt.clone(), prompt_resolver)?
+            .with_id(card.name.clone())
+            .with_run_config(run_config_from_agent_run_config_spec(&card.spec.run_config))
+            .with_tools(tools);
+        agent.meta = CardMetadata {
+            name: Some(card.name),
+            version: Some(card.version),
+            space: Some(card.space),
+            uid: (!card.uid.is_empty()).then_some(card.uid),
+            labels: card.labels,
+            annotations: card.annotations,
+        };
+        agent.tool_names = card.spec.tool_names;
+        Ok(agent)
+    }
+
+    /// Alias for reconstructing this agent from wire envelope form.
+    ///
+    /// # Errors
+    /// Returns prompt resolution or tool resolution errors.
+    pub fn from_wire(
+        wire: AgentWire,
+        tool_resolver: &dyn ToolResolver,
+        prompt_resolver: &dyn PromptResolver,
+    ) -> Result<Self, WyrdError> {
+        Self::from_card(wire, tool_resolver, prompt_resolver)
+    }
+
+    /// Validate whether this local Agent Card can be durably registered.
+    ///
+    /// # Errors
+    /// Returns `WYRD_AGENT_422_RUNTIME_LOCAL_TOOLS_NOT_REGISTRABLE` when
+    /// runtime-local tool names are present.
+    pub fn validate_registrable(&self) -> Result<(), WyrdError> {
+        if self.tool_names.is_empty() {
+            Ok(())
+        } else {
+            Err(AgentCardError::RuntimeLocalToolsNotRegistrable {
+                tool_names: self.tool_names.clone(),
+            }
+            .into())
+        }
+    }
+
+    /// Derive cascade children from this agent's durable spec.
+    #[must_use]
+    pub fn cascade_children(&self) -> Vec<CardRef> {
+        derive_cascade_children(&self.to_spec())
+    }
+
+    /// Run the bounded tool loop using the stored or default provider registry.
+    ///
+    /// # Errors
+    /// Returns Skald agent runtime errors.
+    pub async fn run(&self, input: &str) -> AgentResult<crate::run::AgentRun> {
+        let providers = self
+            .providers
+            .clone()
+            .unwrap_or_else(skald_runtime::default_registry);
+        crate::loop_runtime::run(self, providers.as_ref(), None, input).await
+    }
+
     /// Run the bounded tool loop against a live provider registry.
-    pub async fn run(
+    ///
+    /// # Errors
+    /// Returns Skald agent runtime errors.
+    pub async fn run_with(
         &self,
         providers: &ProviderRegistry,
         session_id: Option<SessionId>,
@@ -181,6 +609,9 @@ impl Agent {
 
     /// Run the bounded tool loop driven by a rendered prompt with variable
     /// substitution.
+    ///
+    /// # Errors
+    /// Returns Skald agent runtime errors.
     pub async fn run_prompt(
         &self,
         providers: &ProviderRegistry,
@@ -189,208 +620,158 @@ impl Agent {
     ) -> AgentResult<crate::run::AgentRun> {
         crate::loop_runtime::run_prompt(self, providers, prompt, vars).await
     }
+
+    fn from_resolved_parts(id: String, prompt_ref: PromptRef, prompt: Prompt) -> Self {
+        Self::from_resolved_arc_parts(id, prompt_ref, Arc::new(prompt))
+    }
+
+    fn from_resolved_arc_parts(id: String, prompt_ref: PromptRef, prompt: Arc<Prompt>) -> Self {
+        Self {
+            meta: CardMetadata::default(),
+            prompt_ref,
+            tool_names: Vec::new(),
+            id,
+            prompt,
+            run_config: RunConfig::default(),
+            tools: Vec::new(),
+            session: Arc::new(NoSession),
+            journal: Arc::new(NoopJournal),
+            callbacks: AgentCallbacks::default(),
+            providers: None,
+        }
+    }
+
+    fn to_spec(&self) -> AgentSpec {
+        AgentSpec {
+            prompt: self.prompt_ref.clone(),
+            tool_names: self.tool_names.clone(),
+            run_config: agent_run_config_spec_from_run_config(&self.run_config),
+        }
+    }
+
+    fn identity_card(&self) -> Result<Option<AgentCard>, WyrdError> {
+        let Some(name) = self.meta.name.clone() else {
+            return Ok(None);
+        };
+        let Some(version) = self.meta.version.clone() else {
+            return Ok(Some(AgentCard {
+                space: self
+                    .meta
+                    .space
+                    .clone()
+                    .unwrap_or_else(|| "default".to_owned()),
+                name,
+                version: String::new(),
+                uid: self.meta.uid.clone().unwrap_or_default(),
+                labels: self.meta.labels.clone(),
+                annotations: self.meta.annotations.clone(),
+                spec: self.to_spec(),
+                cascade_children: self.cascade_children(),
+                created_at: chrono::Utc::now(),
+            }));
+        };
+        Ok(Some(AgentCard {
+            space: self
+                .meta
+                .space
+                .clone()
+                .unwrap_or_else(|| "default".to_owned()),
+            name,
+            version,
+            uid: self.meta.uid.clone().unwrap_or_default(),
+            labels: self.meta.labels.clone(),
+            annotations: self.meta.annotations.clone(),
+            spec: self.to_spec(),
+            cascade_children: self.cascade_children(),
+            created_at: chrono::Utc::now(),
+        }))
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::{Arc, Mutex};
+/// Convert Skald `RunConfig` into the pure Agent Card spec mirror.
+#[must_use]
+pub fn agent_run_config_spec_from_run_config(run_config: &RunConfig) -> AgentRunConfigSpec {
+    AgentRunConfigSpec {
+        max_iterations: Some(run_config.max_iterations),
+        tool_concurrency_cap: run_config.tool_concurrency_cap,
+        session_recent_limit: run_config.session_recent_limit,
+        timeout_ms: run_config.timeout.map(duration_to_millis),
+    }
+}
 
-    use async_trait::async_trait;
-    use serde_json::json;
-    use skald_prompt::Prompt;
-    use skald_spec::{
-        Prompt as SpecPrompt, ProviderRequest, ResponseType,
-        wire::openai_chat::{
-            OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, OpenAiMessageContent,
+/// Convert the pure Agent Card run config mirror into Skald `RunConfig`.
+#[must_use]
+pub fn run_config_from_agent_run_config_spec(spec: &AgentRunConfigSpec) -> RunConfig {
+    let mut run_config = RunConfig::default();
+    if let Some(max_iterations) = spec.max_iterations {
+        run_config.max_iterations = max_iterations;
+    }
+    if let Some(tool_concurrency_cap) = spec.tool_concurrency_cap {
+        run_config.tool_concurrency_cap = Some(tool_concurrency_cap);
+    }
+    if let Some(session_recent_limit) = spec.session_recent_limit {
+        run_config.session_recent_limit = Some(session_recent_limit);
+    }
+    if let Some(timeout_ms) = spec.timeout_ms {
+        run_config.timeout = Some(Duration::from_millis(timeout_ms));
+    }
+    run_config
+}
+
+/// Derive `CardRef` cascade children from an Agent spec.
+#[must_use]
+pub fn derive_cascade_children(spec: &AgentSpec) -> Vec<CardRef> {
+    match &spec.prompt {
+        PromptRef::Card(card_ref) => vec![card_ref.clone()],
+        PromptRef::Inline(_) => Vec::new(),
+    }
+}
+
+fn resolve_prompt_ref(
+    prompt_ref: &PromptRef,
+    resolver: &dyn PromptResolver,
+) -> Result<Prompt, WyrdError> {
+    match prompt_ref {
+        PromptRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),
+        PromptRef::Card(_) => resolver.resolve(prompt_ref),
+    }
+}
+
+fn prompt_registry() -> &'static RwLock<HashMap<String, Arc<Prompt>>> {
+    static REGISTRY: OnceLock<RwLock<HashMap<String, Arc<Prompt>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn prompt_key(card_ref: &CardRef) -> String {
+    let space = card_ref
+        .space
+        .as_ref()
+        .map_or_else(|| "default".to_owned(), ToString::to_string);
+    format!(
+        "{space}/{}:{}@{}",
+        card_ref.kind.wire_name(),
+        card_ref.name,
+        card_ref.version
+    )
+}
+
+fn tool_resolution_error(error: ToolError) -> AgentCardError {
+    match error {
+        ToolError::NotRegistered { name, available } => {
+            AgentCardError::RuntimeLocalToolNotFound { name, available }
+        }
+        other => AgentCardError::RuntimeLocalToolNotFound {
+            name: "unknown".to_owned(),
+            available: vec![other.to_string()],
         },
-    };
-
-    use super::Agent;
-    use crate::callbacks::CallbackOutcome;
-    use crate::journal::{Journal, JournalError, JournalEvent};
-    use crate::session::{Role, SessionError, SessionId, SessionMemory, SessionTurn};
-
-    fn test_prompt() -> Arc<Prompt> {
-        let request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
-            model: "gpt-4o".to_owned(),
-            messages: vec![OpenAiChatMessage {
-                role: "system".to_owned(),
-                content: Some(OpenAiMessageContent::Text("system".to_owned())),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                refusal: None,
-            }],
-            response_format: None,
-            stream: None,
-            stream_options: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            settings: OpenAiChatSettings::default(),
-        });
-        Arc::new(Prompt::from_native(
-            SpecPrompt::new(request, "gpt-4o", None, ResponseType::Text)
-                .expect("test prompt should build"),
-        ))
     }
+}
 
-    #[test]
-    fn agent_new_has_default_field_lengths() {
-        let agent = Agent::new("a", test_prompt());
+fn duration_to_millis(duration: Duration) -> u64 {
+    let millis = duration.as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
 
-        assert!(agent.tools.is_empty());
-        assert_eq!(agent.before_agent.len(), 0);
-        assert_eq!(agent.after_agent.len(), 0);
-        assert_eq!(agent.before_model.len(), 0);
-        assert_eq!(agent.after_model.len(), 0);
-        assert_eq!(agent.before_tool.len(), 0);
-        assert_eq!(agent.after_tool.len(), 0);
-    }
-
-    #[test]
-    fn agent_all_six_callbacks_append_independently() {
-        let agent = Agent::new("a", test_prompt())
-            .before_agent(Arc::new(|_, input| {
-                CallbackOutcome::ReplaceWith(input.to_owned())
-            }))
-            .after_agent(Arc::new(|_, run| CallbackOutcome::ReplaceWith(run.clone())))
-            .before_model(Arc::new(|_, request| {
-                CallbackOutcome::ReplaceWith(request.clone())
-            }))
-            .after_model(Arc::new(|_, response| {
-                CallbackOutcome::ReplaceWith(response.clone())
-            }))
-            .before_tool(Arc::new(|_, _, args| {
-                CallbackOutcome::ReplaceWith(args.clone())
-            }))
-            .after_tool(Arc::new(|_, _, _| CallbackOutcome::Continue));
-
-        assert_eq!(agent.before_agent.len(), 1);
-        assert_eq!(agent.after_agent.len(), 1);
-        assert_eq!(agent.before_model.len(), 1);
-        assert_eq!(agent.after_model.len(), 1);
-        assert_eq!(agent.before_tool.len(), 1);
-        assert_eq!(agent.after_tool.len(), 1);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn agent_default_session_and_journal_drop_successfully() {
-        let agent = Agent::new("a", test_prompt());
-        let recent = agent
-            .session
-            .recent(&SessionId::new("s"), 10)
-            .await
-            .expect("default session recent succeeds");
-
-        assert!(recent.is_empty());
-        agent
-            .session
-            .append(
-                &SessionId::new("s"),
-                SessionTurn {
-                    role: Role::User,
-                    content: "hi".to_owned(),
-                    call_id: None,
-                },
-            )
-            .await
-            .expect("default session append succeeds");
-        agent
-            .journal
-            .append(JournalEvent::Iteration { index: 0 })
-            .await
-            .expect("default journal append succeeds");
-    }
-
-    #[derive(Default)]
-    struct RecordingSession {
-        turns: Mutex<Vec<SessionTurn>>,
-    }
-
-    #[async_trait]
-    impl SessionMemory for RecordingSession {
-        async fn recent(
-            &self,
-            _session_id: &SessionId,
-            limit: usize,
-        ) -> Result<Vec<SessionTurn>, SessionError> {
-            let turns = self.turns.lock().expect("recording session lock");
-            Ok(turns.iter().rev().take(limit).cloned().collect())
-        }
-
-        async fn append(
-            &self,
-            _session_id: &SessionId,
-            turn: SessionTurn,
-        ) -> Result<(), SessionError> {
-            self.turns
-                .lock()
-                .expect("recording session lock")
-                .push(turn);
-            Ok(())
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn agent_with_session_swaps_default() {
-        let recording = Arc::new(RecordingSession::default());
-        let agent = Agent::new("a", test_prompt()).with_session(recording.clone());
-
-        agent
-            .session
-            .append(
-                &SessionId::new("s"),
-                SessionTurn {
-                    role: Role::User,
-                    content: "hi".to_owned(),
-                    call_id: None,
-                },
-            )
-            .await
-            .expect("recording session append succeeds");
-
-        assert_eq!(
-            recording.turns.lock().expect("recorded turns lock").len(),
-            1
-        );
-    }
-
-    #[derive(Default)]
-    struct RecordingJournal {
-        events: Mutex<Vec<JournalEvent>>,
-    }
-
-    #[async_trait]
-    impl Journal for RecordingJournal {
-        async fn append(&self, event: JournalEvent) -> Result<(), JournalError> {
-            self.events
-                .lock()
-                .expect("recording journal lock")
-                .push(event);
-            Ok(())
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn agent_with_journal_swaps_default() {
-        let recording = Arc::new(RecordingJournal::default());
-        let agent = Agent::new("a", test_prompt()).with_journal(recording.clone());
-
-        agent
-            .journal
-            .append(JournalEvent::ToolResult {
-                iteration: 0,
-                call_id: "call_1".to_owned(),
-                ok: true,
-                output: json!({ "ok": true }),
-            })
-            .await
-            .expect("recording journal append succeeds");
-
-        assert_eq!(
-            recording.events.lock().expect("recorded events lock").len(),
-            1
-        );
-    }
+fn generate_agent_id() -> String {
+    ulid::Ulid::new().to_string()
 }

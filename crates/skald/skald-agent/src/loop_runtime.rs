@@ -85,7 +85,7 @@ pub(crate) async fn run(
             .await?;
             let ctx = agent_context_with_session(this, session_id.as_ref(), 0, &conversation);
             match apply_before_agent_chain_with_panic_catch(
-                &this.before_agent,
+                &this.callbacks.before_agent,
                 &ctx,
                 input.to_owned(),
                 "before_agent",
@@ -248,7 +248,7 @@ async fn run_loop(
         }
 
         request = match apply_chain_with_panic_catch(
-            &this.before_model,
+            &this.callbacks.before_model,
             &ctx,
             request.clone(),
             "before_model",
@@ -300,13 +300,17 @@ async fn run_loop(
             }
         }
         let response = response.map_err(AgentError::Provider)?;
-        let response =
-            match apply_chain_with_panic_catch(&this.after_model, &ctx, response, "after_model")? {
-                ChainResult::Skip => {
-                    unreachable!("after_model callbacks cannot skip a completed provider call")
-                }
-                ChainResult::Replaced(replacement) => replacement,
-            };
+        let response = match apply_chain_with_panic_catch(
+            &this.callbacks.after_model,
+            &ctx,
+            response,
+            "after_model",
+        )? {
+            ChainResult::Skip => {
+                unreachable!("after_model callbacks cannot skip a completed provider call")
+            }
+            ChainResult::Replaced(replacement) => replacement,
+        };
         let assistant = assistant_message(&this.id, &response)?;
         conversation.append_assistant(assistant);
         append_session_turn(
@@ -339,8 +343,12 @@ async fn run_loop(
                 conversation,
                 errors: Vec::new(),
             };
-            return match apply_chain_with_panic_catch(&this.after_agent, &ctx, run, "after_agent")?
-            {
+            return match apply_chain_with_panic_catch(
+                &this.callbacks.after_agent,
+                &ctx,
+                run,
+                "after_agent",
+            )? {
                 ChainResult::Skip => {
                     unreachable!("after_agent callbacks cannot skip a completed agent run")
                 }
@@ -350,8 +358,8 @@ async fn run_loop(
 
         validate_tools_attached(this, &tool_calls)?;
         let tools_snapshot = this.tools.clone();
-        let before_tool = this.before_tool.clone();
-        let after_tool = this.after_tool.clone();
+        let before_tool = this.callbacks.before_tool.clone();
+        let after_tool = this.callbacks.after_tool.clone();
         let journal = Arc::clone(&this.journal);
         let session = Arc::clone(&this.session);
         let session_id_owned = session_id.cloned();

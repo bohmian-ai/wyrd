@@ -2944,10 +2944,12 @@ name = "skald-agent"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures",
  "pyo3",
  "serde",
  "serde_json",
+ "serde_yaml",
  "skald-prompt",
  "skald-providers",
  "skald-runtime",
@@ -2956,7 +2958,9 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "ulid",
  "wyrd-runtime",
+ "wyrd-spec",
 ]
 
 [[package]]
@@ -4555,9 +4559,9 @@ dependencies = [
  "skald-spec",
  "skald-tool",
  "tokio",
- "wyrd-cards",
  "wyrd-observe",
  "wyrd-observe-impl",
+ "wyrd-spec",
 ]
 
 [[package]]
@@ -4595,16 +4599,12 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "skald-agent",
  "skald-prompt",
- "skald-runtime",
  "skald-spec",
- "skald-tool",
  "thiserror 2.0.18",
  "tokio",
  "ulid",
  "wyrd-interfaces",
- "wyrd-runtime",
  "wyrd-spec",
  "wyrd-test-contract-macros",
  "wyrd-utils",

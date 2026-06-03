@@ -869,20 +869,6 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// AgentBuilder is missing a prompt.
-    #[error("[WYRD_AGENT_422_MISSING_PROMPT] {message}")]
-    #[wyrd_error(
-        code = "WYRD_AGENT_422_MISSING_PROMPT",
-        status = 422,
-        title = "Agent prompt is missing",
-        remediation = "Set an inline prompt or Prompt Card reference before building the agent."
-    )]
-    AgentMissingPrompt {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
     /// Referenced Prompt Card was not available in the local prompt registry.
     #[error("[WYRD_AGENT_404_PROMPT_CARD] {message}")]
     #[wyrd_error(
@@ -1006,7 +992,6 @@ impl WyrdError {
             | Self::AgentValidation { message, details }
             | Self::AgentMissingName { message, details }
             | Self::AgentMissingVersion { message, details }
-            | Self::AgentMissingPrompt { message, details }
             | Self::AgentPromptCardNotFound { message, details }
             | Self::AgentRuntimeLocalToolNotFound { message, details }
             | Self::AgentRuntimeLocalToolsNotRegistrable { message, details } => (message, details),

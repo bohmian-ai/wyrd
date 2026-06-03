@@ -187,7 +187,7 @@ async fn agent_delegate_tool_input_missing_returns_invalid_input() {
 }
 
 fn test_agent(id: &str) -> Agent {
-    Agent::new(id, test_prompt()).with_run_config(RunConfig {
+    Agent::from_resolved(id, test_prompt()).with_run_config(RunConfig {
         max_iterations: 3,
         ..Default::default()
     })

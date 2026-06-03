@@ -23,7 +23,7 @@ fn build_agent(
     let prompt = Arc::new(Prompt::from_native(
         SpecPrompt::new(request, "gpt-4o", None, ResponseType::Text).expect("prompt should build"),
     ));
-    let agent = Agent::new("a", prompt).with_run_config(RunConfig {
+    let agent = Agent::from_resolved("a", prompt).with_run_config(RunConfig {
         max_iterations,
         ..Default::default()
     });
@@ -115,7 +115,7 @@ async fn single_turn_no_tool_calls_returns_immediately() {
     });
     let (agent, providers) = build_agent(request, mock, 10);
     let run = agent
-        .run(&providers, None, "hello")
+        .run_with(&providers, None, "hello")
         .await
         .expect("single-turn run must succeed");
 
@@ -144,7 +144,7 @@ async fn tool_call_response_now_returns_tool_not_found() {
     });
     let (agent, providers) = build_agent(request, mock, 10);
     let err = agent
-        .run(&providers, None, "ask")
+        .run_with(&providers, None, "ask")
         .await
         .expect_err("tool invocation requires per-agent tool wiring");
 
@@ -172,7 +172,7 @@ async fn provider_failure_surfaces_provider_code() {
     let (agent, providers) = build_agent(request, mock, 10);
 
     let err = agent
-        .run(&providers, None, "x")
+        .run_with(&providers, None, "x")
         .await
         .expect_err("empty mock queue must fail");
     assert_eq!(err.code(), "SKALD_AGENT_502_PROVIDER");
@@ -231,7 +231,7 @@ async fn run_prompt_sends_rendered_prompt_verbatim_on_first_turn() {
     let prompt = Arc::new(Prompt::from_native(
         SpecPrompt::new(template_request.clone(), "gpt-4o", None, ResponseType::Text).unwrap(),
     ));
-    let agent = Agent::new("a", prompt).with_run_config(RunConfig {
+    let agent = Agent::from_resolved("a", prompt).with_run_config(RunConfig {
         max_iterations: 10,
         ..Default::default()
     });

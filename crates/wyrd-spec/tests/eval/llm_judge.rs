@@ -47,7 +47,8 @@ fn new_rejects_non_prompt_kind() {
         ComparisonOperator::Equals,
         serde_json::json!("pass"),
     );
-    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), "WYRD_VALA_400_EVAL_REF_KIND_MISMATCH");
 }
 
 #[test]
@@ -63,7 +64,8 @@ fn validate_catches_deserialized_kind_mismatch() {
     value["judge_ref"]["kind"] = serde_json::json!("Data");
     let bad: LlmJudgeTask = serde_json::from_value(value).unwrap();
 
-    assert!(bad.validate().is_err());
+    let err = bad.validate().unwrap_err();
+    assert_eq!(err.code(), "WYRD_VALA_400_EVAL_REF_KIND_MISMATCH");
 }
 
 #[test]

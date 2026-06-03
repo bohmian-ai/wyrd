@@ -72,8 +72,10 @@ impl EvalSpec {
     /// pass gate. Call [`EvalSpec::validate`] after mutating optional fields.
     ///
     /// # Errors
-    /// Returns [`EvalSpecError::Dag`] when the task map is not a DAG.
+    /// Returns [`EvalSpecError::Wyrd`] when a task map key does not match its
+    /// inner id, or [`EvalSpecError::Dag`] when the task map is not a DAG.
     pub fn new(tasks: BTreeMap<TaskId, EvalTask>) -> Result<Self, EvalSpecError> {
+        validate_task_keys(&tasks).map_err(EvalSpecError::Wyrd)?;
         validate_dag(&tasks).map_err(EvalSpecError::Dag)?;
         Ok(Self {
             target_ref: None,
@@ -95,6 +97,7 @@ impl EvalSpec {
     /// Returns [`EvalSpecError`] when DAG validation fails or a nested Wyrd
     /// validation rule rejects the spec.
     pub fn validate(&self) -> Result<(), EvalSpecError> {
+        validate_task_keys(&self.tasks).map_err(EvalSpecError::Wyrd)?;
         validate_dag(&self.tasks).map_err(EvalSpecError::Dag)?;
 
         for task in self.tasks.values() {
@@ -140,6 +143,35 @@ pub enum EvalSpecError {
     Wyrd(#[from] WyrdError),
 }
 
+impl From<EvalSpecError> for WyrdError {
+    fn from(error: EvalSpecError) -> Self {
+        match error {
+            EvalSpecError::Dag(error) => error.into(),
+            EvalSpecError::Wyrd(error) => error,
+        }
+    }
+}
+
+fn validate_task_keys(tasks: &BTreeMap<TaskId, EvalTask>) -> Result<(), WyrdError> {
+    for (key, task) in tasks {
+        if key != task.id() {
+            return Err(WyrdError::Validation {
+                message: format!(
+                    "eval_spec.tasks key {:?} must match inner task id {:?}",
+                    key.as_str(),
+                    task.id().as_str()
+                ),
+                details: serde_json::json!({
+                    "field": "tasks",
+                    "key": key.as_str(),
+                    "task_id": task.id().as_str(),
+                }),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Thin `CardRef` wrapper constraining the referenced kind to `Data`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(transparent)]
@@ -177,9 +209,13 @@ impl DatasetRef {
     }
 
     fn kind_mismatch(kind: &CardKind) -> WyrdError {
-        WyrdError::Validation {
+        WyrdError::ValaEvalRefKindMismatch {
             message: format!("dataset_ref must reference a Data card; got {kind:?}"),
-            details: serde_json::Value::Null,
+            details: serde_json::json!({
+                "field": "dataset",
+                "expected": "Data",
+                "got": format!("{kind:?}"),
+            }),
         }
     }
 }

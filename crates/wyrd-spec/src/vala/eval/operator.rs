@@ -4,9 +4,10 @@
 //! ## Variant stability
 //!
 //! Adding a variant in a minor release is allowed. Renaming or removing a
-//! variant is a breaking change. The `serde(tag)` discriminator is the
-//! `snake_case` of the Rust variant name (`Equals` -> `"equals"`,
-//! `WithinAbsTolerance` -> `"within_abs_tolerance"`).
+//! variant is a breaking change. Parameterless variants serialize as scalar
+//! `snake_case` strings (`"equals"`). Parameterized variants serialize as
+//! objects with a `kind` discriminator and named parameters
+//! (`{"kind":"in_range","min":0.0,"max":1.0,"inclusive":true}`).
 //!
 //! ## Catalog families
 //!
@@ -20,7 +21,9 @@
 
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeError;
+use serde::ser::Serializer;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::WyrdError;
 
@@ -29,9 +32,8 @@ use crate::error::WyrdError;
 ///
 /// Runtime semantics are owned by `vala-eval::operators` (PR4.4). The shape
 /// here is the wire contract.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(tag = "operator", content = "params", rename_all = "snake_case")]
 pub enum ComparisonOperator {
     /// Requires exact equality.
     Equals,
@@ -236,6 +238,315 @@ pub enum ComparisonOperator {
     },
 }
 
+impl Serialize for ComparisonOperator {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if let Some(parameterized) = ParameterizedComparisonOperator::from_operator(self) {
+            parameterized.serialize(serializer)
+        } else {
+            serializer.serialize_str(self.discriminator())
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ComparisonOperator {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(discriminator) => {
+                Self::from_discriminator_parameterless(&discriminator).map_err(D::Error::custom)
+            }
+            serde_json::Value::Object(_) => {
+                let parameterized = ParameterizedComparisonOperator::deserialize(value)
+                    .map_err(D::Error::custom)?;
+                Ok(parameterized.into())
+            }
+            other => Err(D::Error::custom(format!(
+                "operator must be a scalar discriminator or parameterized object; got {other}"
+            ))),
+        }
+    }
+}
+
+impl schemars::JsonSchema for ComparisonOperator {
+    fn schema_name() -> String {
+        "ComparisonOperator".to_string()
+    }
+
+    fn json_schema(schema_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        <ComparisonOperatorWireSchema as schemars::JsonSchema>::json_schema(schema_gen)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ParameterizedComparisonOperator {
+    InRange {
+        min: f64,
+        max: f64,
+        inclusive: bool,
+    },
+    NotInRange {
+        min: f64,
+        max: f64,
+        inclusive: bool,
+    },
+    ApproximatelyEquals {
+        tolerance: f64,
+    },
+    MatchesRegex {
+        pattern: String,
+    },
+    NotMatchesRegex {
+        pattern: String,
+    },
+    HasMinLength {
+        min: usize,
+    },
+    HasMaxLength {
+        max: usize,
+    },
+    Length {
+        expected: usize,
+    },
+    LengthGreaterThan {
+        min: usize,
+    },
+    LengthLessThan {
+        max: usize,
+    },
+    IsType {
+        expected: JsonValueType,
+    },
+    WithinAbsTolerance {
+        tolerance: f64,
+    },
+    WithinPctTolerance {
+        pct: f64,
+    },
+    WithinStdDev {
+        sigma: f64,
+        mean: f64,
+        std_dev: f64,
+    },
+    BetweenPercentiles {
+        lower_pct: f64,
+        upper_pct: f64,
+    },
+    DivergenceLessThan {
+        metric: DivergenceMetric,
+        threshold: f64,
+    },
+    CosineSimilarityAtLeast {
+        threshold: f64,
+    },
+}
+
+impl ParameterizedComparisonOperator {
+    fn from_operator(operator: &ComparisonOperator) -> Option<Self> {
+        use ComparisonOperator::*;
+
+        Some(match operator {
+            InRange {
+                min,
+                max,
+                inclusive,
+            } => Self::InRange {
+                min: *min,
+                max: *max,
+                inclusive: *inclusive,
+            },
+            NotInRange {
+                min,
+                max,
+                inclusive,
+            } => Self::NotInRange {
+                min: *min,
+                max: *max,
+                inclusive: *inclusive,
+            },
+            ApproximatelyEquals { tolerance } => Self::ApproximatelyEquals {
+                tolerance: *tolerance,
+            },
+            MatchesRegex { pattern } => Self::MatchesRegex {
+                pattern: pattern.clone(),
+            },
+            NotMatchesRegex { pattern } => Self::NotMatchesRegex {
+                pattern: pattern.clone(),
+            },
+            HasMinLength { min } => Self::HasMinLength { min: *min },
+            HasMaxLength { max } => Self::HasMaxLength { max: *max },
+            Length { expected } => Self::Length {
+                expected: *expected,
+            },
+            LengthGreaterThan { min } => Self::LengthGreaterThan { min: *min },
+            LengthLessThan { max } => Self::LengthLessThan { max: *max },
+            IsType { expected } => Self::IsType {
+                expected: *expected,
+            },
+            WithinAbsTolerance { tolerance } => Self::WithinAbsTolerance {
+                tolerance: *tolerance,
+            },
+            WithinPctTolerance { pct } => Self::WithinPctTolerance { pct: *pct },
+            WithinStdDev {
+                sigma,
+                mean,
+                std_dev,
+            } => Self::WithinStdDev {
+                sigma: *sigma,
+                mean: *mean,
+                std_dev: *std_dev,
+            },
+            BetweenPercentiles {
+                lower_pct,
+                upper_pct,
+            } => Self::BetweenPercentiles {
+                lower_pct: *lower_pct,
+                upper_pct: *upper_pct,
+            },
+            DivergenceLessThan { metric, threshold } => Self::DivergenceLessThan {
+                metric: *metric,
+                threshold: *threshold,
+            },
+            CosineSimilarityAtLeast { threshold } => Self::CosineSimilarityAtLeast {
+                threshold: *threshold,
+            },
+            Equals | NotEquals | GreaterThan | GreaterThanOrEquals | LessThan
+            | LessThanOrEquals | IsPositive | IsNegative | IsZero | Contains | NotContains
+            | ContainsIgnoreCase | StartsWith | EndsWith | IsEmail | IsUrl | IsUuid | IsIpv4
+            | IsIpv6 | IsJson | In | NotIn | IsSubset | IsSuperset | IsDisjoint | AllOf | AnyOf
+            | NoneOf | IsEmpty | IsNonEmpty | UniqueValues | IsTruthy | IsFalsy | IsNull
+            | IsNotNull | IsString | IsNumber | IsBoolean | IsObject => return None,
+        })
+    }
+}
+
+impl From<ParameterizedComparisonOperator> for ComparisonOperator {
+    fn from(operator: ParameterizedComparisonOperator) -> Self {
+        match operator {
+            ParameterizedComparisonOperator::InRange {
+                min,
+                max,
+                inclusive,
+            } => Self::InRange {
+                min,
+                max,
+                inclusive,
+            },
+            ParameterizedComparisonOperator::NotInRange {
+                min,
+                max,
+                inclusive,
+            } => Self::NotInRange {
+                min,
+                max,
+                inclusive,
+            },
+            ParameterizedComparisonOperator::ApproximatelyEquals { tolerance } => {
+                Self::ApproximatelyEquals { tolerance }
+            }
+            ParameterizedComparisonOperator::MatchesRegex { pattern } => {
+                Self::MatchesRegex { pattern }
+            }
+            ParameterizedComparisonOperator::NotMatchesRegex { pattern } => {
+                Self::NotMatchesRegex { pattern }
+            }
+            ParameterizedComparisonOperator::HasMinLength { min } => Self::HasMinLength { min },
+            ParameterizedComparisonOperator::HasMaxLength { max } => Self::HasMaxLength { max },
+            ParameterizedComparisonOperator::Length { expected } => Self::Length { expected },
+            ParameterizedComparisonOperator::LengthGreaterThan { min } => {
+                Self::LengthGreaterThan { min }
+            }
+            ParameterizedComparisonOperator::LengthLessThan { max } => Self::LengthLessThan { max },
+            ParameterizedComparisonOperator::IsType { expected } => Self::IsType { expected },
+            ParameterizedComparisonOperator::WithinAbsTolerance { tolerance } => {
+                Self::WithinAbsTolerance { tolerance }
+            }
+            ParameterizedComparisonOperator::WithinPctTolerance { pct } => {
+                Self::WithinPctTolerance { pct }
+            }
+            ParameterizedComparisonOperator::WithinStdDev {
+                sigma,
+                mean,
+                std_dev,
+            } => Self::WithinStdDev {
+                sigma,
+                mean,
+                std_dev,
+            },
+            ParameterizedComparisonOperator::BetweenPercentiles {
+                lower_pct,
+                upper_pct,
+            } => Self::BetweenPercentiles {
+                lower_pct,
+                upper_pct,
+            },
+            ParameterizedComparisonOperator::DivergenceLessThan { metric, threshold } => {
+                Self::DivergenceLessThan { metric, threshold }
+            }
+            ParameterizedComparisonOperator::CosineSimilarityAtLeast { threshold } => {
+                Self::CosineSimilarityAtLeast { threshold }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ParameterlessComparisonOperatorSchema {
+    Equals,
+    NotEquals,
+    GreaterThan,
+    GreaterThanOrEquals,
+    LessThan,
+    LessThanOrEquals,
+    IsPositive,
+    IsNegative,
+    IsZero,
+    Contains,
+    NotContains,
+    ContainsIgnoreCase,
+    StartsWith,
+    EndsWith,
+    IsEmail,
+    IsUrl,
+    IsUuid,
+    IsIpv4,
+    IsIpv6,
+    IsJson,
+    In,
+    NotIn,
+    IsSubset,
+    IsSuperset,
+    IsDisjoint,
+    AllOf,
+    AnyOf,
+    NoneOf,
+    IsEmpty,
+    IsNonEmpty,
+    UniqueValues,
+    IsTruthy,
+    IsFalsy,
+    IsNull,
+    IsNotNull,
+    IsString,
+    IsNumber,
+    IsBoolean,
+    IsObject,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+enum ComparisonOperatorWireSchema {
+    Parameterless(ParameterlessComparisonOperatorSchema),
+    Parameterized(ParameterizedComparisonOperator),
+}
+
 impl ComparisonOperator {
     /// Stable `snake_case` discriminator for this variant.
     ///
@@ -303,6 +614,23 @@ impl ComparisonOperator {
             DivergenceLessThan { .. } => "divergence_less_than",
             CosineSimilarityAtLeast { .. } => "cosine_similarity_at_least",
         }
+    }
+
+    /// Stable `snake_case` name for this variant.
+    ///
+    /// This is an alias for [`ComparisonOperator::discriminator`].
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        self.discriminator()
+    }
+
+    /// Parses a parameterless operator from its discriminator.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when the discriminator is unknown or
+    /// names a parameterized variant that requires object parameters.
+    pub fn from_discriminator(s: &str) -> Result<Self, WyrdError> {
+        Self::from_discriminator_parameterless(s)
     }
 
     /// Parses a parameterless operator from its discriminator.

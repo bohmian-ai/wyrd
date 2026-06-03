@@ -43,7 +43,7 @@ fn assertion_result_with_message() {
 fn assertion_result_rejects_unknown_field() {
     let json = r#"{
         "task_id":"a","passed":true,"actual":0,"expected":0,
-        "operator":{"operator":"equals"},
+        "operator":"equals",
         "stage":0,"started_at":"1970-01-01T00:00:00Z","duration_ms":0,
         "extra":"nope"
     }"#;

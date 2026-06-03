@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use wyrd_spec::envelope::CardKind;
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardName;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::assertion::AssertionTask;
@@ -77,7 +78,37 @@ fn spec_with_full_fields_round_trip() {
 
 #[test]
 fn dataset_ref_rejects_non_data_kind() {
-    assert!(DatasetRef::new(prompt_ref("prompt")).is_err());
+    let err = DatasetRef::new(prompt_ref("prompt")).unwrap_err();
+    assert_eq!(err.code(), "WYRD_VALA_400_EVAL_REF_KIND_MISMATCH");
+}
+
+#[test]
+fn validate_catches_deserialized_task_key_id_mismatch() {
+    let spec = EvalSpec::new(one_task_map()).unwrap();
+    let mut value = serde_json::to_value(&spec).unwrap();
+    let tasks = value["tasks"].as_object_mut().unwrap();
+    let task = tasks.remove("a").unwrap();
+    tasks.insert("map_key_only".to_string(), task);
+
+    let bad: EvalSpec = serde_json::from_value(value).unwrap();
+    let err = bad.validate().unwrap_err();
+    let public: WyrdError = err.into();
+
+    assert_eq!(public.code(), "WYRD_SPEC_400_VALIDATION");
+    assert!(public.to_string().contains("must match inner task id"));
+}
+
+#[test]
+fn new_catches_task_key_id_mismatch() {
+    let mut tasks = one_task_map();
+    let task = tasks.remove(&TaskId::new("a").unwrap()).unwrap();
+    tasks.insert(TaskId::new("map_key_only").unwrap(), task);
+
+    let err = EvalSpec::new(tasks).unwrap_err();
+    let public: WyrdError = err.into();
+
+    assert_eq!(public.code(), "WYRD_SPEC_400_VALIDATION");
+    assert!(public.to_string().contains("must match inner task id"));
 }
 
 #[test]
@@ -102,7 +133,9 @@ fn validate_catches_cycle_after_mutation() {
         assertion.depends_on.push(id);
     }
 
-    assert!(spec.validate().is_err());
+    let err = spec.validate().unwrap_err();
+    let public: WyrdError = err.into();
+    assert_eq!(public.code(), "WYRD_VALA_400_TASK_DAG_CYCLE");
 }
 
 #[test]

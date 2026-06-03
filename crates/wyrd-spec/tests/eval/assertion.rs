@@ -47,7 +47,7 @@ fn assertion_round_trip_with_depends_on_and_condition() {
 #[test]
 fn assertion_rejects_unknown_field() {
     let json = r#"{
-        "id":"a","operator":{"operator":"equals"},"expected":0,
+        "id":"a","operator":"equals","expected":0,
         "context_path":"$.x","extra":"nope"
     }"#;
     let result: Result<AssertionTask, _> = serde_json::from_str(json);

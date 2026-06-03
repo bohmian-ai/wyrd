@@ -10,6 +10,8 @@ use petgraph::graphmap::DiGraphMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::error::WyrdError;
+
 use super::ids::TaskId;
 use super::task::EvalTask;
 
@@ -68,6 +70,31 @@ pub enum DagError {
         /// The task with the self-dependency.
         task: TaskId,
     },
+}
+
+impl From<DagError> for WyrdError {
+    fn from(error: DagError) -> Self {
+        let details = match &error {
+            DagError::Cycle { cycle } => serde_json::json!({
+                "kind": "cycle",
+                "cycle": cycle.iter().map(TaskId::as_str).collect::<Vec<_>>(),
+            }),
+            DagError::MissingDependency { task, dep } => serde_json::json!({
+                "kind": "missing_dependency",
+                "task": task.as_str(),
+                "dep": dep.as_str(),
+            }),
+            DagError::SelfLoop { task } => serde_json::json!({
+                "kind": "self_loop",
+                "task": task.as_str(),
+            }),
+        };
+
+        WyrdError::ValaTaskDagCycle {
+            message: error.to_string(),
+            details,
+        }
+    }
 }
 
 /// Validate the task map as a DAG.

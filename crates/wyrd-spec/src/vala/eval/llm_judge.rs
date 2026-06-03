@@ -89,9 +89,13 @@ impl LlmJudgeTask {
     }
 
     fn kind_mismatch(kind: &CardKind) -> WyrdError {
-        WyrdError::Validation {
+        WyrdError::ValaEvalRefKindMismatch {
             message: format!("llm_judge_task.judge_ref must reference a Prompt card; got {kind:?}"),
-            details: serde_json::Value::Null,
+            details: serde_json::json!({
+                "field": "llm_judge.judge_ref",
+                "expected": "Prompt",
+                "got": format!("{kind:?}"),
+            }),
         }
     }
 }

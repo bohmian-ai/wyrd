@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::eval::assertion::AssertionTask;
 use wyrd_spec::vala::eval::ids::{JsonPath, TaskId};
 use wyrd_spec::vala::eval::operator::ComparisonOperator;
@@ -18,6 +19,20 @@ fn task(id: &str, deps: &[&str]) -> (TaskId, EvalTask) {
         condition: None,
     });
     (task_id, task)
+}
+
+#[test]
+fn cycle_converts_to_public_vala_error_code() {
+    let mut tasks = BTreeMap::new();
+    let (task_id, eval_task) = task("a", &["b"]);
+    tasks.insert(task_id, eval_task);
+    let (task_id, eval_task) = task("b", &["a"]);
+    tasks.insert(task_id, eval_task);
+
+    let err = validate_dag(&tasks).unwrap_err();
+    let public: WyrdError = err.into();
+
+    assert_eq!(public.code(), "WYRD_VALA_400_TASK_DAG_CYCLE");
 }
 
 #[test]

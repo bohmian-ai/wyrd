@@ -83,7 +83,7 @@ fn chain_depth_exceeds_max_rejected() {
 #[test]
 fn rejects_unknown_field() {
     let json = r#"{
-        "path": "$.x", "operator": {"operator":"equals"},
+        "path": "$.x", "operator": "equals",
         "expected": 0, "noise": true
     }"#;
     let result: Result<EvalCondition, _> = serde_json::from_str(json);

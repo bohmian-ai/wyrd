@@ -6,7 +6,7 @@ use wyrd_spec::vala::eval::operator::{ComparisonOperator, DivergenceMetric, Json
 fn parameterless_round_trip_equals() {
     let op = ComparisonOperator::Equals;
     let json = serde_json::to_string(&op).expect("operator serializes");
-    assert_eq!(json, r#"{"operator":"equals"}"#);
+    assert_eq!(json, r#""equals""#);
     let back: ComparisonOperator = serde_json::from_str(&json).expect("operator deserializes");
     assert_eq!(op, back);
 }
@@ -21,7 +21,7 @@ fn parameterized_round_trip_in_range() {
     let json = serde_json::to_string(&op).expect("operator serializes");
     assert_eq!(
         json,
-        r#"{"operator":"in_range","params":{"min":0.0,"max":1.0,"inclusive":true}}"#,
+        r#"{"kind":"in_range","min":0.0,"max":1.0,"inclusive":true}"#,
     );
     let back: ComparisonOperator = serde_json::from_str(&json).expect("operator deserializes");
     assert_eq!(op, back);
@@ -43,12 +43,31 @@ fn parameterized_round_trip_is_type() {
         expected: JsonValueType::String,
     };
     let json = serde_json::to_string(&op).expect("operator serializes");
-    assert_eq!(
-        json,
-        r#"{"operator":"is_type","params":{"expected":"string"}}"#
-    );
+    assert_eq!(json, r#"{"kind":"is_type","expected":"string"}"#);
     let back: ComparisonOperator = serde_json::from_str(&json).expect("operator deserializes");
     assert_eq!(op, back);
+}
+
+#[test]
+fn redundant_object_shape_is_rejected() {
+    let err = serde_json::from_str::<ComparisonOperator>(r#"{"operator":"is_not_null"}"#)
+        .expect_err("redundant object shape must be rejected");
+
+    assert!(
+        err.to_string().contains("kind"),
+        "error should point callers to the parameterized object discriminator: {err}"
+    );
+}
+
+#[test]
+fn parameterless_object_shape_is_rejected() {
+    let err = serde_json::from_str::<ComparisonOperator>(r#"{"kind":"is_not_null"}"#)
+        .expect_err("parameterless operators must use scalar strings");
+
+    assert!(
+        err.to_string().contains("is_not_null"),
+        "error should name the bad discriminator: {err}"
+    );
 }
 
 #[test]
@@ -90,8 +109,13 @@ fn discriminator_matches_serde_tag() {
 
     for (op, want) in pairs {
         assert_eq!(op.discriminator(), *want);
+        assert_eq!(op.as_str(), *want);
         let value = serde_json::to_value(op).expect("operator converts to json");
-        assert_eq!(value["operator"].as_str(), Some(*want));
+        if value.is_string() {
+            assert_eq!(value.as_str(), Some(*want));
+        } else {
+            assert_eq!(value["kind"].as_str(), Some(*want));
+        }
     }
 }
 
@@ -99,6 +123,10 @@ fn discriminator_matches_serde_tag() {
 fn from_str_parses_parameterless() {
     assert_eq!(
         ComparisonOperator::from_str("equals").expect("equals parses"),
+        ComparisonOperator::Equals,
+    );
+    assert_eq!(
+        ComparisonOperator::from_discriminator("equals").expect("equals parses"),
         ComparisonOperator::Equals,
     );
     assert_eq!(

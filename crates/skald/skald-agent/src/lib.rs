@@ -37,6 +37,8 @@
 pub mod agent;
 pub mod callbacks;
 pub mod conversation;
+pub mod delegate;
+pub mod delegation;
 pub mod error;
 pub mod journal;
 pub mod loop_runtime;
@@ -53,6 +55,7 @@ pub use callbacks::{
     BeforeToolFn, CallbackOutcome,
 };
 pub use conversation::{Conversation, ConversationTurn};
+pub use delegate::AgentDelegateTool;
 pub use error::{AgentError, AgentResult};
 pub use journal::{Journal, JournalError, JournalEvent, NoopJournal};
 pub use observer::{NoopObserver, Observer};

@@ -29,12 +29,14 @@ pub mod attribute_value;
 pub mod attributes;
 pub mod instrumentation_scope;
 pub mod resource;
+pub mod span;
 pub mod span_event;
 pub mod span_link;
 
 pub use attribute_value::AttributeValue;
 pub use instrumentation_scope::InstrumentationScope;
 pub use resource::Resource;
+pub use span::{SpanKind, SpanRecord, SpanStatus};
 pub use span_event::SpanEvent;
 pub use span_link::SpanLink;
 // `attributes` is a constants module; consumers use `attributes::FOO`,

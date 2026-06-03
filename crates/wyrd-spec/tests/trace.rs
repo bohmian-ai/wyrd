@@ -20,3 +20,6 @@ mod resource;
 
 #[path = "trace/instrumentation_scope.rs"]
 mod instrumentation_scope;
+
+#[path = "trace/span_record.rs"]
+mod span_record;

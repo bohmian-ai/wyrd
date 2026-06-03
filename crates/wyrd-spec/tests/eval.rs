@@ -18,6 +18,10 @@ mod ids;
 mod llm_judge;
 #[path = "eval/operator_catalog.rs"]
 mod operator_catalog;
+#[path = "eval/pass_gate.rs"]
+mod pass_gate;
+#[path = "eval/result.rs"]
+mod result;
 #[path = "eval/status.rs"]
 mod status;
 #[path = "eval/task_enum.rs"]

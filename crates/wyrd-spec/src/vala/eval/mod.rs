@@ -25,8 +25,9 @@
 //! - `agent` — `AgentAssertionTask` workflow envelope assertions.
 //! - `task` — `EvalTask` executable task enum.
 //! - `plan` — DAG validation and topological execution stages.
+//! - `result` — per-task result records and workflow-level pass gates.
 //!
-//! Later commits add the remaining plan, result, and spec modules.
+//! Later commits add the remaining spec modules.
 
 pub mod agent;
 pub mod assertion;
@@ -35,6 +36,7 @@ pub mod ids;
 pub mod llm_judge;
 pub mod operator;
 pub mod plan;
+pub mod result;
 pub mod status;
 pub mod task;
 pub mod trace;
@@ -49,6 +51,7 @@ pub use ids::{
 pub use llm_judge::LlmJudgeTask;
 pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
 pub use plan::{DagError, ExecutionPlan, Stage, validate_dag};
+pub use result::{AssertionResult, EvalPassGate};
 pub use status::EvalStatus;
 pub use task::EvalTask;
 pub use trace::TraceAssertionTask;

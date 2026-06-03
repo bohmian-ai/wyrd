@@ -112,6 +112,7 @@ pub enum Spec {
     /// Workflow card spec.
     Workflow(WorkflowSpec),
     /// Eval card spec.
+    #[cfg_attr(feature = "server", schema(value_type = serde_json::Value))]
     Eval(EvalSpec),
     /// Drift card spec.
     Drift(DriftSpec),

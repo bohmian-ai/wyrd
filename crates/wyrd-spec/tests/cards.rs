@@ -8,6 +8,8 @@ mod data_roundtrip;
 mod data_validation;
 #[path = "cards/envelope_roundtrip.rs"]
 mod envelope_roundtrip;
+#[path = "cards/eval.rs"]
+mod eval;
 #[path = "cards/kind.rs"]
 mod kind;
 #[path = "cards/model/methods.rs"]

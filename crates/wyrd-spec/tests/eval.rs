@@ -1,3 +1,7 @@
+// Top-level test mount for the `vala::eval` surface. Each module is its
+// own file under `tests/eval/`; declare with `#[path]` so the test binary
+// remains a single Cargo target.
+
 #[path = "eval/agent_assertion.rs"]
 mod agent_assertion;
 #[path = "eval/assertion.rs"]
@@ -24,6 +28,8 @@ mod pass_gate;
 mod result;
 #[path = "eval/scenario.rs"]
 mod scenario;
+#[path = "eval/schema_drift.rs"]
+mod schema_drift;
 #[path = "eval/spec.rs"]
 mod spec;
 #[path = "eval/status.rs"]

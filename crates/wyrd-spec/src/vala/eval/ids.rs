@@ -318,7 +318,8 @@ impl schemars::JsonSchema for JsonPath {
 
 fn task_id_regex() -> &'static Regex {
     static TASK_ID_REGEX: OnceLock<Regex> = OnceLock::new();
-    TASK_ID_REGEX.get_or_init(|| {
-        Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_-]*$").expect("task_id regex is a compile-time constant")
+    TASK_ID_REGEX.get_or_init(|| match Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_-]*$") {
+        Ok(regex) => regex,
+        Err(error) => panic!("task_id regex is static and valid: {error}"),
     })
 }

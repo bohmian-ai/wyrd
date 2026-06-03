@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DagError",
+  "description": "DAG-validation failures.",
+  "oneOf": [
+    {
+      "description": "One or more cycles were detected.\n\n`cycle` is the smallest closed walk reachable from the offending SCC, sorted starting from the lexicographically smallest id and wrapping back to it for clarity.",
+      "type": "object",
+      "required": [
+        "cycle",
+        "kind"
+      ],
+      "properties": {
+        "cycle": {
+          "description": "The deterministic closed-walk witness.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TaskId"
+          }
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "cycle"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "A `depends_on` entry references a task id absent from the supplied map.",
+      "type": "object",
+      "required": [
+        "dep",
+        "kind",
+        "task"
+      ],
+      "properties": {
+        "dep": {
+          "description": "The missing dependency id.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TaskId"
+            }
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "missing_dependency"
+          ]
+        },
+        "task": {
+          "description": "The task declaring the dependency.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TaskId"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "A task lists itself in `depends_on`.",
+      "type": "object",
+      "required": [
+        "kind",
+        "task"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "self_loop"
+          ]
+        },
+        "task": {
+          "description": "The task with the self-dependency.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TaskId"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "definitions": {
+    "TaskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]*$"
+    }
+  }
+}

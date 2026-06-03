@@ -1,0 +1,2019 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvalSpec",
+  "description": "The typed spec body for an `Eval` card.\n\nThis struct does not carry a discriminator; the outer `CardBody` enum carries the envelope-level `kind: Eval` and `spec: { ... }` wire shape.\n\nAuthors declare: - `target_ref` — canonical card this rubric evaluates. - `dataset` — source data, typically a `Data` card with eval scenarios. - `tasks` — the rubric DAG. - `workflow` — optional declared workflow shape. - `sampling` — optional production sampling policy. - `pass_gate` — optional workflow-level pass criterion.\n\nThis struct does not carry envelope identity, tenant partitioning, triggers, or alert dispatch. Alert wiring is deferred until the drift primitives and secret reference model are locked.",
+  "type": "object",
+  "required": [
+    "tasks"
+  ],
+  "properties": {
+    "dataset": {
+      "description": "Source data for offline runs.\n\nValidation enforces `dataset.kind == Data`.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CardRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "pass_gate": {
+      "description": "Optional workflow-level pass gate.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/EvalPassGate"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sampling": {
+      "description": "Optional sampling policy applied at the record-ingest boundary.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/EvalSampling"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "target_ref": {
+      "description": "Declarative target.\n\nWhen `Some`, registration can derive an `evaluates` relationship. Runtime records may still supply the target when this is `None`.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CardRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "tasks": {
+      "description": "Task DAG keyed by `TaskId`.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/EvalTask"
+      }
+    },
+    "workflow": {
+      "description": "Optional declared workflow shape used as a path validation hint.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Workflow"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "CardKind": {
+      "title": "CardKind",
+      "description": "Native Wyrd Card kind string or external kind object.",
+      "oneOf": [
+        {
+          "title": "NativeCardKind",
+          "description": "Native Wyrd Card kind.",
+          "type": "string",
+          "enum": [
+            "Data",
+            "Model",
+            "Experiment",
+            "Prompt",
+            "Tool",
+            "Agent",
+            "Workflow",
+            "Eval",
+            "Drift",
+            "Service",
+            "Policy",
+            "Mcp",
+            "Skill",
+            "SubAgent",
+            "Audit",
+            "Artifact",
+            "Trigger",
+            "Operator"
+          ]
+        },
+        {
+          "title": "ExternalCardKind",
+          "description": "External Card kind with schema hash.",
+          "type": "object",
+          "required": [
+            "kind",
+            "schema_hash"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"
+            },
+            "schema_hash": {
+              "type": "string",
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardRef": {
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Referenced Card kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "Referenced Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "space": {
+          "description": "Optional space; omitted means current/default space.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Optional resolved UID.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Exact referenced Card version.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VersionBlock"
+            }
+          ]
+        }
+      }
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "ComparisonOperator": {
+      "description": "One comparison operator selected by an assertion, judge, trace, agent, condition, or scenario task.\n\nRuntime semantics are owned by `vala-eval::operators` (PR4.4). The shape here is the wire contract.",
+      "oneOf": [
+        {
+          "description": "Requires exact equality.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "equals"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires values to differ.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "not_equals"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to be strictly greater than the expected value.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "greater_than"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to be greater than or equal to the expected value.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "greater_than_or_equals"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to be strictly less than the expected value.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "less_than"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to be less than or equal to the expected value.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "less_than_or_equals"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to fall within the given range.\n\nRuntime rejects `min > max`.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "in_range"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "inclusive",
+                "max",
+                "min"
+              ],
+              "properties": {
+                "inclusive": {
+                  "description": "Whether the range endpoints are inclusive.",
+                  "type": "boolean"
+                },
+                "max": {
+                  "description": "Upper bound of the accepted range.",
+                  "type": "number",
+                  "format": "double"
+                },
+                "min": {
+                  "description": "Lower bound of the accepted range.",
+                  "type": "number",
+                  "format": "double"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to fall outside the given range.\n\nRuntime rejects `min > max`.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "not_in_range"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "inclusive",
+                "max",
+                "min"
+              ],
+              "properties": {
+                "inclusive": {
+                  "description": "Whether the range endpoints are inclusive.",
+                  "type": "boolean"
+                },
+                "max": {
+                  "description": "Upper bound of the excluded range.",
+                  "type": "number",
+                  "format": "double"
+                },
+                "min": {
+                  "description": "Lower bound of the excluded range.",
+                  "type": "number",
+                  "format": "double"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to be within the given absolute tolerance of the expected value.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "approximately_equals"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "tolerance"
+              ],
+              "properties": {
+                "tolerance": {
+                  "description": "Absolute tolerance accepted by the comparison.",
+                  "type": "number",
+                  "format": "double"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires the observed numeric value to be positive.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_positive"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed numeric value to be negative.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_negative"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed numeric value to be zero.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_zero"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed string to contain the expected substring.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "contains"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed string not to contain the expected substring.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "not_contains"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed string to contain the expected substring, ignoring case.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "contains_ignore_case"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed string to start with the expected prefix.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "starts_with"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed string to end with the expected suffix.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "ends_with"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed string to match the given regex pattern.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "matches_regex"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "pattern"
+              ],
+              "properties": {
+                "pattern": {
+                  "description": "Regex pattern used for matching.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires the observed string not to match the given regex pattern.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "not_matches_regex"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "pattern"
+              ],
+              "properties": {
+                "pattern": {
+                  "description": "Regex pattern used for matching.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires the observed string to be a valid email address.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_email"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed string to be a valid URL.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_url"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed string to be a valid UUID.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_uuid"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed string to be a valid IPv4 address.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_ipv4"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed string to be a valid IPv6 address.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_ipv6"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed string length to be at least `min`.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "has_min_length"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "min"
+              ],
+              "properties": {
+                "min": {
+                  "description": "Minimum accepted string length.",
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0.0
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires the observed string length to be at most `max`.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "has_max_length"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "max"
+              ],
+              "properties": {
+                "max": {
+                  "description": "Maximum accepted string length.",
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0.0
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires the observed string to parse as JSON.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_json"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to be contained in the expected collection.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "in"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value not to be contained in the expected collection.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "not_in"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed collection to be a subset of the expected collection.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_subset"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed collection to be a superset of the expected collection.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_superset"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed and expected collections to be disjoint.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_disjoint"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires all expected predicates or members to match.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "all_of"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires at least one expected predicate or member to match.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "any_of"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires no expected predicates or members to match.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "none_of"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed collection to be empty.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_empty"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed collection to be non-empty.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_non_empty"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed collection length to match `expected`.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "length"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "expected"
+              ],
+              "properties": {
+                "expected": {
+                  "description": "Exact required collection length.",
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0.0
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires the observed collection length to be greater than `min`.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "length_greater_than"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "min"
+              ],
+              "properties": {
+                "min": {
+                  "description": "Strict lower bound for collection length.",
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0.0
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires the observed collection length to be less than `max`.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "length_less_than"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "max"
+              ],
+              "properties": {
+                "max": {
+                  "description": "Strict upper bound for collection length.",
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0.0
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires all observed collection values to be unique.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "unique_values"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to be truthy under runtime semantics.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_truthy"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to be falsy under runtime semantics.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_falsy"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to be JSON null.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_null"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value not to be JSON null.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_not_null"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to match the declared JSON type.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_type"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "expected"
+              ],
+              "properties": {
+                "expected": {
+                  "description": "Expected JSON value type.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/JsonValueType"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to be a JSON string.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_string"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to be a JSON number.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_number"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to be a JSON boolean.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_boolean"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to be a JSON object.",
+          "type": "object",
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "is_object"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Requires the observed and expected values to be within the given absolute tolerance.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "within_abs_tolerance"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "tolerance"
+              ],
+              "properties": {
+                "tolerance": {
+                  "description": "Absolute tolerance accepted by the comparison.",
+                  "type": "number",
+                  "format": "double"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires the observed and expected values to be within the given percentage tolerance.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "within_pct_tolerance"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "pct"
+              ],
+              "properties": {
+                "pct": {
+                  "description": "Percentage tolerance accepted by the comparison.",
+                  "type": "number",
+                  "format": "double"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to be within `sigma` standard deviations of `mean`.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "within_std_dev"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "mean",
+                "sigma",
+                "std_dev"
+              ],
+              "properties": {
+                "mean": {
+                  "description": "Distribution mean used by the comparison.",
+                  "type": "number",
+                  "format": "double"
+                },
+                "sigma": {
+                  "description": "Number of standard deviations allowed.",
+                  "type": "number",
+                  "format": "double"
+                },
+                "std_dev": {
+                  "description": "Distribution standard deviation used by the comparison.",
+                  "type": "number",
+                  "format": "double"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires the observed value to fall between the given percentiles.\n\nRuntime enforces `0.0 <= lower_pct <= upper_pct <= 1.0`.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "between_percentiles"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "lower_pct",
+                "upper_pct"
+              ],
+              "properties": {
+                "lower_pct": {
+                  "description": "Lower percentile bound.",
+                  "type": "number",
+                  "format": "double"
+                },
+                "upper_pct": {
+                  "description": "Upper percentile bound.",
+                  "type": "number",
+                  "format": "double"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires the measured divergence to remain below `threshold`.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "divergence_less_than"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "metric",
+                "threshold"
+              ],
+              "properties": {
+                "metric": {
+                  "description": "Divergence metric used by the comparison.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/DivergenceMetric"
+                    }
+                  ]
+                },
+                "threshold": {
+                  "description": "Maximum allowed divergence.",
+                  "type": "number",
+                  "format": "double"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Requires cosine similarity to be at least `threshold`.",
+          "type": "object",
+          "required": [
+            "operator",
+            "params"
+          ],
+          "properties": {
+            "operator": {
+              "type": "string",
+              "enum": [
+                "cosine_similarity_at_least"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "required": [
+                "threshold"
+              ],
+              "properties": {
+                "threshold": {
+                  "description": "Minimum accepted cosine similarity.",
+                  "type": "number",
+                  "format": "double"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ConditionCombinator": {
+      "description": "Logical combinator between two adjacent [`EvalCondition`] nodes.",
+      "oneOf": [
+        {
+          "description": "`lhs AND rhs`, short-circuiting on false.",
+          "type": "string",
+          "enum": [
+            "and"
+          ]
+        },
+        {
+          "description": "`lhs OR rhs`, short-circuiting on true.",
+          "type": "string",
+          "enum": [
+            "or"
+          ]
+        }
+      ]
+    },
+    "DivergenceMetric": {
+      "description": "Probability-divergence metric used by [`ComparisonOperator::DivergenceLessThan`].",
+      "oneOf": [
+        {
+          "description": "Kullback-Leibler divergence.",
+          "type": "string",
+          "enum": [
+            "kl"
+          ]
+        },
+        {
+          "description": "Jensen-Shannon divergence.",
+          "type": "string",
+          "enum": [
+            "js"
+          ]
+        },
+        {
+          "description": "Wasserstein distance.",
+          "type": "string",
+          "enum": [
+            "wasserstein"
+          ]
+        }
+      ]
+    },
+    "EvalCondition": {
+      "description": "A typed predicate evaluated against one JSON value extracted from workflow context or scenario payload.\n\nTo chain conditions, set both [`EvalCondition::combinator`] and [`EvalCondition::subsequent`]. The whole chain is evaluated left-to-right with `AND` short-circuit on false and `OR` short-circuit on true.",
+      "type": "object",
+      "required": [
+        "expected",
+        "operator",
+        "path"
+      ],
+      "properties": {
+        "combinator": {
+          "description": "Optional combinator for chaining.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ConditionCombinator"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expected": {
+          "description": "Right-hand side of the comparison."
+        },
+        "operator": {
+          "description": "Comparison applied to `(value-at-path, expected)`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ComparisonOperator"
+            }
+          ]
+        },
+        "path": {
+          "description": "JSONPath into the workflow context or scenario payload.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/JsonPath"
+            }
+          ]
+        },
+        "subsequent": {
+          "description": "Next link in the chain.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EvalCondition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "EvalPassGate": {
+      "description": "Workflow-level pass criterion.\n\nSelects how [`AssertionResult`] rows roll up into the workflow's `pass / fail` outcome. Thresholds are in `[0.0, 1.0]`; out-of-range values are rejected by [`EvalPassGate::validate`].",
+      "oneOf": [
+        {
+          "description": "Pass iff `(passed_tasks / total_tasks) >= threshold`.",
+          "type": "object",
+          "required": [
+            "kind",
+            "threshold"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "overall_pass_rate"
+              ]
+            },
+            "threshold": {
+              "description": "Minimum accepted overall pass rate in `[0.0, 1.0]`.",
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Pass iff every `LlmJudge` task passes at the per-judge threshold.\n\nComputed per judge, then AND-reduced across judges.",
+          "type": "object",
+          "required": [
+            "kind",
+            "threshold"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "per_judge_pass_rate"
+              ]
+            },
+            "threshold": {
+              "description": "Minimum accepted per-judge pass rate in `[0.0, 1.0]`.",
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Pass iff every task passes.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "all_pass"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "EvalSampling": {
+      "description": "Sampling policy applied at the record-ingest boundary.\n\n`vala-eval` enforces the policy when records are admitted for evaluation.",
+      "oneOf": [
+        {
+          "description": "Probabilistic selection.",
+          "type": "object",
+          "required": [
+            "kind",
+            "ratio"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "ratio"
+              ]
+            },
+            "ratio": {
+              "description": "Selection ratio in `[0.0, 1.0]`.",
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Deterministic 1-in-N selection by hashing a stable key path.",
+          "type": "object",
+          "required": [
+            "bucket",
+            "key_path",
+            "kind",
+            "modulus"
+          ],
+          "properties": {
+            "bucket": {
+              "description": "Selected bucket. Must be less than `modulus`.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "key_path": {
+              "description": "JSONPath selecting the stable key to hash.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/JsonPath"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "deterministic_by_hash"
+              ]
+            },
+            "modulus": {
+              "description": "Positive modulus for bucket assignment.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Every Nth record.",
+          "type": "object",
+          "required": [
+            "kind",
+            "n"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "every_nth"
+              ]
+            },
+            "n": {
+              "description": "Positive interval. Must be at least 1.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "EvalTask": {
+      "description": "One task in an `EvalSpec` DAG. Adjacently-tagged on the wire by `\"kind\"`; the inner record fields live alongside.",
+      "oneOf": [
+        {
+          "description": "Programmatic assertion against the workflow context.",
+          "type": "object",
+          "required": [
+            "expected",
+            "id",
+            "kind",
+            "operator"
+          ],
+          "properties": {
+            "condition": {
+              "description": "Optional gate evaluated before the task runs.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EvalCondition"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "context_path": {
+              "description": "Path to the single value to assert against.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/JsonPath"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "depends_on": {
+              "description": "IDs of upstream tasks that must complete before this task runs.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/TaskId"
+              }
+            },
+            "expected": {
+              "description": "Right-hand side of the comparison."
+            },
+            "id": {
+              "description": "Unique identifier within the enclosing eval task map.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TaskId"
+                }
+              ]
+            },
+            "item_context_path": {
+              "description": "Path to an array the runtime iterates and asserts per item.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/JsonPath"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "assertion"
+              ]
+            },
+            "operator": {
+              "description": "Comparison applied to the observed value and expected value.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ComparisonOperator"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "LLM-as-judge evaluation via a `Prompt` card.",
+          "type": "object",
+          "required": [
+            "expected",
+            "id",
+            "judge_ref",
+            "kind",
+            "operator"
+          ],
+          "properties": {
+            "condition": {
+              "description": "Optional gate evaluated before the task runs.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EvalCondition"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "context_path": {
+              "description": "Optional JSONPath selecting the context passed to the judge.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/JsonPath"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "depends_on": {
+              "description": "IDs of upstream tasks that must complete before this task runs.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/TaskId"
+              }
+            },
+            "expected": {
+              "description": "Right-hand side of the comparison."
+            },
+            "id": {
+              "description": "Unique identifier within the enclosing eval task map.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TaskId"
+                }
+              ]
+            },
+            "judge_ref": {
+              "description": "Reference to a `Prompt` card.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "llm_judge"
+              ]
+            },
+            "max_retries": {
+              "description": "Maximum retries on transient runtime failures.",
+              "default": 2,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "operator": {
+              "description": "Comparison applied to the judge response and expected value.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ComparisonOperator"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Assertion over the assembled OTel trace document.",
+          "type": "object",
+          "required": [
+            "expected",
+            "id",
+            "kind",
+            "operator",
+            "span_selector"
+          ],
+          "properties": {
+            "condition": {
+              "description": "Optional gate evaluated before the task runs.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EvalCondition"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "depends_on": {
+              "description": "IDs of upstream tasks that must complete before this task runs.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/TaskId"
+              }
+            },
+            "expected": {
+              "description": "Right-hand side of the comparison."
+            },
+            "id": {
+              "description": "Unique identifier within the enclosing eval task map.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TaskId"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "trace_assertion"
+              ]
+            },
+            "operator": {
+              "description": "Comparison applied to the selected trace value and expected value.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ComparisonOperator"
+                }
+              ]
+            },
+            "span_selector": {
+              "description": "JSONPath into the assembled trace document.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/JsonPath"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Assertion over the assembled GenAI workflow envelope.",
+          "type": "object",
+          "required": [
+            "expected",
+            "id",
+            "kind",
+            "operator",
+            "workflow_field_path"
+          ],
+          "properties": {
+            "condition": {
+              "description": "Optional gate evaluated before the task runs.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EvalCondition"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "depends_on": {
+              "description": "IDs of upstream tasks that must complete before this task runs.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/TaskId"
+              }
+            },
+            "expected": {
+              "description": "Right-hand side of the comparison."
+            },
+            "id": {
+              "description": "Unique identifier within the enclosing eval task map.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TaskId"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "agent_assertion"
+              ]
+            },
+            "operator": {
+              "description": "Comparison applied to the selected workflow value and expected value.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ComparisonOperator"
+                }
+              ]
+            },
+            "workflow_field_path": {
+              "description": "JSONPath into the GenAI workflow envelope.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/JsonPath"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "JsonPath": {
+      "type": "string",
+      "maxLength": 1024,
+      "minLength": 1,
+      "pattern": "^\\$.*$"
+    },
+    "JsonValueType": {
+      "description": "JSON value-type set used by [`ComparisonOperator::IsType`].",
+      "oneOf": [
+        {
+          "description": "JSON null.",
+          "type": "string",
+          "enum": [
+            "null"
+          ]
+        },
+        {
+          "description": "JSON boolean.",
+          "type": "string",
+          "enum": [
+            "bool"
+          ]
+        },
+        {
+          "description": "JSON number.",
+          "type": "string",
+          "enum": [
+            "number"
+          ]
+        },
+        {
+          "description": "JSON string.",
+          "type": "string",
+          "enum": [
+            "string"
+          ]
+        },
+        {
+          "description": "JSON array.",
+          "type": "string",
+          "enum": [
+            "array"
+          ]
+        },
+        {
+          "description": "JSON object.",
+          "type": "string",
+          "enum": [
+            "object"
+          ]
+        }
+      ]
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "TaskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]*$"
+    },
+    "VersionBlock": {
+      "description": "Semver-compatible version string.",
+      "type": "string"
+    },
+    "Workflow": {
+      "description": "Author-declared workflow field map for eval task inputs and outputs.",
+      "type": "object",
+      "required": [
+        "fields"
+      ],
+      "properties": {
+        "fields": {
+          "description": "Map from workflow field name to the expected JSON shape at that key.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/WorkflowFieldType"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "WorkflowFieldType": {
+      "description": "Declared JSON shape for one workflow field.",
+      "oneOf": [
+        {
+          "description": "String-shaped field.",
+          "type": "string",
+          "enum": [
+            "string"
+          ]
+        },
+        {
+          "description": "Integer-shaped field.",
+          "type": "string",
+          "enum": [
+            "integer"
+          ]
+        },
+        {
+          "description": "Floating-point field.",
+          "type": "string",
+          "enum": [
+            "float"
+          ]
+        },
+        {
+          "description": "Boolean-shaped field.",
+          "type": "string",
+          "enum": [
+            "boolean"
+          ]
+        },
+        {
+          "description": "Object-shaped field.",
+          "type": "string",
+          "enum": [
+            "object"
+          ]
+        },
+        {
+          "description": "Array-shaped field.",
+          "type": "string",
+          "enum": [
+            "array"
+          ]
+        },
+        {
+          "description": "Field with no declared shape restriction.",
+          "type": "string",
+          "enum": [
+            "any"
+          ]
+        }
+      ]
+    }
+  }
+}

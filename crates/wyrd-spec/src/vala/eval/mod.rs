@@ -46,6 +46,11 @@ pub mod task;
 pub mod trace;
 pub mod workflow;
 
+// ─── Public re-exports ───────────────────────────────────────────────────
+//
+// External crates should reach this surface through these names.
+// Adding a re-export here is a public-API change; review per AGENTS.md §3.
+
 pub use agent::AgentAssertionTask;
 pub use assertion::AssertionTask;
 pub use condition::{ConditionCombinator, EvalCondition, MAX_CONDITION_DEPTH};

@@ -370,7 +370,7 @@ run = """
 snapshot_codegen() {
   {
     test -f openapi.yaml && printf '%s\n' openapi.yaml
-    find crates/wyrd-spec/schemas crates/wyrd-spec/tests/schemas -type f -name '*.json'
+    find crates/wyrd-spec/schemas crates/wyrd-spec/tests/schemas crates/wyrd-spec/tests/fixtures/eval/schemas -type f -name '*.json'
     find python/py-wyrd/python/wyrd -maxdepth 1 -type f -name '*.pyi'
   } | sort | while IFS= read -r file; do
     shasum -a 256 "$file"

@@ -16,7 +16,7 @@ use crate::callbacks::{
 use crate::error::AgentResult;
 use crate::journal::{Journal, NoopJournal};
 use crate::run::RunConfig;
-use crate::session::{NoSession, SessionMemory};
+use crate::session::{NoSession, SessionId, SessionMemory};
 
 /// Live agent ready to run the bounded tool loop.
 ///
@@ -189,9 +189,10 @@ impl Agent {
     pub async fn run(
         &self,
         providers: &ProviderRegistry,
+        session_id: Option<SessionId>,
         input: &str,
     ) -> AgentResult<crate::run::AgentRun> {
-        crate::loop_runtime::run(self, providers, input).await
+        crate::loop_runtime::run(self, providers, session_id, input).await
     }
 
     /// Run the bounded tool loop driven by a rendered prompt with variable

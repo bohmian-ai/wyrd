@@ -62,7 +62,7 @@ async fn agent_run_callbacks_fire_in_order() {
             CallbackOutcome::ReplaceWith(run.clone())
         }));
 
-    let run = agent.run(&providers, "hello").await.expect("run ok");
+    let run = agent.run(&providers, None, "hello").await.expect("run ok");
 
     assert_eq!(run.output, "done");
     assert_eq!(
@@ -79,7 +79,10 @@ async fn agent_run_before_agent_replace_changes_user_turn() {
         CallbackOutcome::ReplaceWith("replacement".to_owned())
     }));
 
-    let run = agent.run(&providers, "original").await.expect("run ok");
+    let run = agent
+        .run(&providers, None, "original")
+        .await
+        .expect("run ok");
 
     assert_eq!(user_turn_text(&run), Some("replacement"));
     match provider.requests().first().expect("request captured") {
@@ -109,7 +112,7 @@ async fn agent_run_before_agent_skip_returns_callback_skipped() {
             CallbackOutcome::ReplaceWith(run.clone())
         }));
 
-    let run = agent.run(&providers, "hello").await.expect("run ok");
+    let run = agent.run(&providers, None, "hello").await.expect("run ok");
 
     assert_eq!(run.finish_reason, FinishReason::CallbackSkipped);
     assert_eq!(run.iterations, 0);
@@ -133,7 +136,7 @@ async fn agent_run_before_model_replace_swaps_native_request() {
         CallbackOutcome::ReplaceWith(replacement)
     }));
 
-    let run = agent.run(&providers, "hello").await.expect("run ok");
+    let run = agent.run(&providers, None, "hello").await.expect("run ok");
 
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
     match provider.requests().first().expect("request captured") {
@@ -157,7 +160,7 @@ async fn agent_run_before_model_skip_skips_provider_and_after_model() {
             CallbackOutcome::ReplaceWith(response.clone())
         }));
 
-    let run = agent.run(&providers, "hello").await.expect("run ok");
+    let run = agent.run(&providers, None, "hello").await.expect("run ok");
 
     assert_eq!(run.finish_reason, FinishReason::CallbackSkipped);
     assert_eq!(run.iterations, 1);
@@ -173,7 +176,7 @@ async fn agent_run_after_model_replace_swaps_response() {
         CallbackOutcome::ReplaceWith(openai_text_response("replacement"))
     }));
 
-    let run = agent.run(&providers, "hello").await.expect("run ok");
+    let run = agent.run(&providers, None, "hello").await.expect("run ok");
 
     assert_eq!(run.output, "replacement");
     assert_eq!(last_assistant_text(&run), Some("replacement"));
@@ -189,7 +192,7 @@ async fn agent_run_after_agent_replace_can_alter_run() {
         CallbackOutcome::ReplaceWith(replacement)
     }));
 
-    let run = agent.run(&providers, "hello").await.expect("run ok");
+    let run = agent.run(&providers, None, "hello").await.expect("run ok");
 
     assert_eq!(run.output, "after-agent");
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
@@ -214,7 +217,7 @@ async fn agent_run_before_tool_replace_changes_tool_args() {
             ..Default::default()
         });
 
-    let run = agent.run(&providers, "hello").await.expect("run ok");
+    let run = agent.run(&providers, None, "hello").await.expect("run ok");
 
     assert_eq!(run.output, "done");
     assert_eq!(tool.calls(), vec![json!({"replacement": true})]);
@@ -245,7 +248,7 @@ async fn agent_run_before_tool_skip_records_sentinel_result() {
             ..Default::default()
         });
 
-    let run = agent.run(&providers, "hello").await.expect("run ok");
+    let run = agent.run(&providers, None, "hello").await.expect("run ok");
 
     assert_eq!(tool.calls().len(), 0);
     assert_eq!(*after_tool_count.lock().expect("counter lock"), 0);
@@ -275,7 +278,7 @@ async fn agent_run_after_tool_replace_changes_tool_result() {
             ..Default::default()
         });
 
-    let run = agent.run(&providers, "hello").await.expect("run ok");
+    let run = agent.run(&providers, None, "hello").await.expect("run ok");
 
     assert!(run.conversation.turns().iter().any(|turn| matches!(
         turn,
@@ -293,7 +296,7 @@ async fn agent_run_callback_panic_maps_to_agent_error() {
     }));
 
     let error = agent
-        .run(&providers, "hello")
+        .run(&providers, None, "hello")
         .await
         .expect_err("callback panic should map to AgentError");
 

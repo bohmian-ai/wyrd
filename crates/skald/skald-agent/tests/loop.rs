@@ -115,7 +115,7 @@ async fn single_turn_no_tool_calls_returns_immediately() {
     });
     let (agent, providers) = build_agent(request, mock, 10);
     let run = agent
-        .run(&providers, "hello")
+        .run(&providers, None, "hello")
         .await
         .expect("single-turn run must succeed");
 
@@ -144,7 +144,7 @@ async fn tool_call_response_now_returns_tool_not_found() {
     });
     let (agent, providers) = build_agent(request, mock, 10);
     let err = agent
-        .run(&providers, "ask")
+        .run(&providers, None, "ask")
         .await
         .expect_err("tool invocation requires per-agent tool wiring");
 
@@ -172,7 +172,7 @@ async fn provider_failure_surfaces_provider_code() {
     let (agent, providers) = build_agent(request, mock, 10);
 
     let err = agent
-        .run(&providers, "x")
+        .run(&providers, None, "x")
         .await
         .expect_err("empty mock queue must fail");
     assert_eq!(err.code(), "SKALD_AGENT_502_PROVIDER");

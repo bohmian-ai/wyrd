@@ -26,7 +26,7 @@ async fn agent_run_executes_bounded_loop_against_recording_provider() {
         ..Default::default()
     });
 
-    let run = agent.run(&providers, "hello").await.expect("run ok");
+    let run = agent.run(&providers, None, "hello").await.expect("run ok");
 
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
     assert_eq!(run.iterations, 1);
@@ -42,7 +42,7 @@ async fn agent_render_populates_provider_request_tools_from_agent_tools() {
         .add_tool(fixed_tool("tool_a", json!({"a": true})))
         .add_tool(fixed_tool("tool_b", json!({"b": true})));
 
-    let _ = agent.run(&providers, "hello").await.expect("run ok");
+    let _ = agent.run(&providers, None, "hello").await.expect("run ok");
 
     match provider.requests().first().expect("captured request") {
         ProviderRequest::OpenAiChatCompletion(request) => {
@@ -61,7 +61,7 @@ async fn agent_render_omits_tools_when_agent_has_none() {
     let providers = registry(provider.clone());
     let agent = Agent::new("test", test_prompt());
 
-    let _ = agent.run(&providers, "hello").await.expect("run ok");
+    let _ = agent.run(&providers, None, "hello").await.expect("run ok");
 
     match provider.requests().first().expect("captured request") {
         ProviderRequest::OpenAiChatCompletion(request) => {
@@ -81,7 +81,7 @@ async fn agent_loop_threads_tool_result_to_next_iteration() {
     let agent =
         Agent::new("test", test_prompt()).add_tool(fixed_tool("tool_a", json!({"score": 0.9})));
 
-    let run = agent.run(&providers, "hello").await.expect("run ok");
+    let run = agent.run(&providers, None, "hello").await.expect("run ok");
 
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
     assert_eq!(run.iterations, 2);
@@ -116,7 +116,7 @@ async fn agent_tool_results_appended_in_call_order_under_concurrency() {
             ..Default::default()
         });
 
-    let run = agent.run(&providers, "go").await.expect("run ok");
+    let run = agent.run(&providers, None, "go").await.expect("run ok");
 
     let call_ids: Vec<String> = run
         .conversation
@@ -136,7 +136,7 @@ async fn agent_terminates_when_model_emits_no_tool_calls() {
     let providers = registry(provider);
     let agent = Agent::new("test", test_prompt());
 
-    let run = agent.run(&providers, "hi").await.expect("ok");
+    let run = agent.run(&providers, None, "hi").await.expect("ok");
 
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
     assert_eq!(run.iterations, 1);
@@ -159,7 +159,7 @@ async fn agent_max_iterations_exhausted_returns_error() {
         });
 
     let err = agent
-        .run(&providers, "loop")
+        .run(&providers, None, "loop")
         .await
         .expect_err("should hit cap");
 
@@ -188,7 +188,7 @@ async fn agent_conversation_grows_across_iterations_without_session() {
             ..Default::default()
         });
 
-    let run = agent.run(&providers, "begin").await.expect("ok");
+    let run = agent.run(&providers, None, "begin").await.expect("ok");
 
     assert_eq!(run.iterations, 3);
     let kinds: Vec<&str> = run
@@ -221,7 +221,7 @@ async fn agent_conversation_serializes_via_serde_round_trip() {
     let providers = registry(provider);
     let agent = Agent::new("test", test_prompt());
 
-    let run = agent.run(&providers, "hi").await.expect("ok");
+    let run = agent.run(&providers, None, "hi").await.expect("ok");
     let json = serde_json::to_string(&run).expect("serialize");
     let back: skald_agent::AgentRun = serde_json::from_str(&json).expect("deserialize");
 

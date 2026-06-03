@@ -13,6 +13,9 @@ pub struct RunConfig {
     /// Maximum concurrent tool calls per model iteration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_concurrency_cap: Option<usize>,
+    /// Maximum recent session turns to recall at run start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_recent_limit: Option<usize>,
     /// Overall run timeout. C06 records the setting; enforcement lands later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<std::time::Duration>,
@@ -23,6 +26,7 @@ impl Default for RunConfig {
         Self {
             max_iterations: 10,
             tool_concurrency_cap: Some(8),
+            session_recent_limit: None,
             timeout: None,
         }
     }

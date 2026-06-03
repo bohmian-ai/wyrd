@@ -23,8 +23,9 @@
 //! - `llm_judge` — `LlmJudgeTask` prompt-backed judge task.
 //! - `trace` — `TraceAssertionTask` trace document assertions.
 //! - `agent` — `AgentAssertionTask` workflow envelope assertions.
+//! - `task` — `EvalTask` executable task enum.
 //!
-//! Later commits add the remaining task, plan, result, and spec modules.
+//! Later commits add the remaining plan, result, and spec modules.
 
 pub mod agent;
 pub mod assertion;
@@ -33,6 +34,7 @@ pub mod ids;
 pub mod llm_judge;
 pub mod operator;
 pub mod status;
+pub mod task;
 pub mod trace;
 pub mod workflow;
 
@@ -45,5 +47,6 @@ pub use ids::{
 pub use llm_judge::LlmJudgeTask;
 pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
 pub use status::EvalStatus;
+pub use task::EvalTask;
 pub use trace::TraceAssertionTask;
 pub use workflow::{Workflow, WorkflowFieldType};

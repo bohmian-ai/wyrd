@@ -12,6 +12,8 @@ mod llm_judge;
 mod operator_catalog;
 #[path = "eval/status.rs"]
 mod status;
+#[path = "eval/task_enum.rs"]
+mod task_enum;
 #[path = "eval/trace_assertion.rs"]
 mod trace_assertion;
 #[path = "eval/workflow.rs"]

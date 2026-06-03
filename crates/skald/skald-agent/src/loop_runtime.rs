@@ -11,6 +11,11 @@ use skald_tool::AgentTool;
 use tracing::{Instrument, debug_span};
 
 use crate::agent::Agent;
+use crate::callbacks::{
+    AgentContext, ChainResult, apply_before_agent_chain_with_panic_catch,
+    apply_chain_with_panic_catch, apply_chain_with_panic_catch_tool,
+    apply_chain_with_panic_catch_tool_result,
+};
 use crate::conversation::{Conversation, ConversationTurn};
 use crate::error::{AgentError, AgentResult};
 use crate::request_builder::{assistant_message, extract_messages, request_from_conversation};
@@ -37,6 +42,27 @@ pub(crate) async fn run(
         entry = "input",
     );
     async move {
+        let mut conversation = Conversation::new();
+        conversation.append_user(input);
+        let ctx = agent_context(this, 0, &conversation);
+        match apply_before_agent_chain_with_panic_catch(
+            &this.before_agent,
+            &ctx,
+            input.to_owned(),
+            "before_agent",
+        )? {
+            ChainResult::Skip => {
+                return Ok(AgentRun {
+                    output: String::new(),
+                    final_response: None,
+                    iterations: 0,
+                    finish_reason: FinishReason::CallbackSkipped,
+                    conversation,
+                    errors: Vec::new(),
+                });
+            }
+            ChainResult::Replaced(input) => replace_seed_user_turn(&mut conversation, input),
+        }
         let rendered = this
             .prompt
             .render_native(&[])
@@ -45,8 +71,6 @@ pub(crate) async fn run(
                 detail: err.to_string(),
             })?;
         let seed_messages = extract_messages(&this.id, &rendered)?;
-        let mut conversation = Conversation::new();
-        conversation.append_user(input);
         run_loop(this, providers, rendered, seed_messages, conversation).await
     }
     .instrument(span)
@@ -114,15 +138,42 @@ async fn run_loop(
     let concurrency_cap = this.run_config.tool_concurrency_cap.unwrap_or(8).max(1);
 
     for iteration in 0..this.run_config.max_iterations {
+        let ctx = agent_context(this, iteration, &conversation);
         let mut request =
             request_from_conversation(&this.id, template.clone(), &seed_messages, &conversation)?;
         if !this.tools.is_empty() {
             request = request.with_tools(tool_descriptors(&this.tools));
         }
 
+        request = match apply_chain_with_panic_catch(
+            &this.before_model,
+            &ctx,
+            request,
+            "before_model",
+        )? {
+            ChainResult::Skip => {
+                return Ok(AgentRun {
+                    output: String::new(),
+                    final_response: None,
+                    iterations: iteration + 1,
+                    finish_reason: FinishReason::CallbackSkipped,
+                    conversation,
+                    errors: Vec::new(),
+                });
+            }
+            ChainResult::Replaced(replacement) => replacement,
+        };
+
         let response = dispatch(providers, request)
             .await
             .map_err(AgentError::Provider)?;
+        let response =
+            match apply_chain_with_panic_catch(&this.after_model, &ctx, response, "after_model")? {
+                ChainResult::Skip => {
+                    unreachable!("after_model callbacks cannot skip a completed provider call")
+                }
+                ChainResult::Replaced(replacement) => replacement,
+            };
         let assistant = assistant_message(&this.id, &response)?;
         conversation.append_assistant(assistant);
 
@@ -133,29 +184,72 @@ async fn run_loop(
                 .text()
                 .map(std::borrow::Cow::into_owned)
                 .unwrap_or_default();
-            return Ok(AgentRun {
+            let run = AgentRun {
                 output,
                 final_response: Some(response),
                 iterations: iteration + 1,
                 finish_reason: FinishReason::ModelStopped,
                 conversation,
                 errors: Vec::new(),
-            });
+            };
+            return match apply_chain_with_panic_catch(&this.after_agent, &ctx, run, "after_agent")?
+            {
+                ChainResult::Skip => {
+                    unreachable!("after_agent callbacks cannot skip a completed agent run")
+                }
+                ChainResult::Replaced(replacement) => Ok(replacement),
+            };
         }
 
         validate_tools_attached(this, &tool_calls)?;
         let tools_snapshot = this.tools.clone();
+        let before_tool = this.before_tool.clone();
+        let after_tool = this.after_tool.clone();
         let indexed_calls = tool_calls.into_iter().enumerate();
         let mut results: Vec<(usize, ConversationTurn)> = stream::iter(indexed_calls)
             .map(|(idx, call)| {
                 let tools_snapshot = tools_snapshot.clone();
+                let before_tool = before_tool.clone();
+                let after_tool = after_tool.clone();
+                let ctx = ctx.clone();
                 async move {
                     let tool = tools_snapshot
                         .iter()
                         .find(|tool| tool.name() == call.name)
                         .cloned()
                         .expect("tool presence pre-validated");
-                    let result = tool.invoke(call.args).await;
+                    let args = match apply_chain_with_panic_catch_tool(
+                        &before_tool,
+                        &ctx,
+                        tool.as_ref(),
+                        call.args,
+                        "before_tool",
+                    )? {
+                        ChainResult::Skip => {
+                            return Ok((
+                                idx,
+                                ConversationTurn::ToolResult {
+                                    call_id: call.id,
+                                    ok: true,
+                                    content: serde_json::json!({ "skipped": true }),
+                                },
+                            ));
+                        }
+                        ChainResult::Replaced(replacement) => replacement,
+                    };
+                    let result = tool.invoke(args).await;
+                    let result = match apply_chain_with_panic_catch_tool_result(
+                        &after_tool,
+                        &ctx,
+                        tool.as_ref(),
+                        result,
+                        "after_tool",
+                    )? {
+                        ChainResult::Skip => {
+                            unreachable!("after_tool callbacks cannot skip a completed tool call")
+                        }
+                        ChainResult::Replaced(replacement) => replacement,
+                    };
                     let (ok, content) = match result {
                         Ok(value) => (true, value),
                         Err(error) => (
@@ -166,19 +260,21 @@ async fn run_loop(
                             }),
                         ),
                     };
-                    (
+                    Ok((
                         idx,
                         ConversationTurn::ToolResult {
                             call_id: call.id,
                             ok,
                             content,
                         },
-                    )
+                    ))
                 }
             })
             .buffer_unordered(concurrency_cap)
-            .collect()
-            .await;
+            .collect::<Vec<AgentResult<(usize, ConversationTurn)>>>()
+            .await
+            .into_iter()
+            .collect::<AgentResult<Vec<_>>>()?;
 
         results.sort_by_key(|(idx, _)| *idx);
         for (_, turn) in results {
@@ -233,4 +329,19 @@ fn validate_tools_attached(this: &Agent, calls: &[ToolCall]) -> AgentResult<()> 
         }
     }
     Ok(())
+}
+
+fn agent_context(this: &Agent, iteration: u32, conversation: &Conversation) -> AgentContext {
+    AgentContext {
+        agent_id: this.id.clone(),
+        session_id: None,
+        iteration,
+        conversation: Arc::new(conversation.clone()),
+    }
+}
+
+fn replace_seed_user_turn(conversation: &mut Conversation, input: String) {
+    if let Some(ConversationTurn::User { content }) = conversation.turns.get_mut(0) {
+        *content = input;
+    }
 }

@@ -1,11 +1,13 @@
 //! Callback type aliases and context snapshots for agent runs.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use skald_spec::{ProviderRequest, ProviderResponse};
-use skald_tool::AgentTool;
+use skald_tool::{AgentTool, ToolError};
 
 use crate::conversation::Conversation;
+use crate::error::{AgentError, AgentResult};
 
 /// Outcome a callback can return to control its associated operation.
 pub enum CallbackOutcome<T> {
@@ -15,6 +17,14 @@ pub enum CallbackOutcome<T> {
     Skip,
     /// Replace the value the original operation would have returned.
     ReplaceWith(T),
+}
+
+/// Result of applying a callback chain in registration order.
+pub(crate) enum ChainResult<T> {
+    /// A callback skipped the current operation.
+    Skip,
+    /// Effective current value after all callbacks continue or replace.
+    Replaced(T),
 }
 
 /// Snapshot passed to every agent callback.
@@ -66,3 +76,108 @@ pub type AfterToolFn = Arc<
         + Send
         + Sync,
 >;
+
+pub(crate) fn apply_chain_with_panic_catch<T, F>(
+    chain: &[Arc<F>],
+    ctx: &AgentContext,
+    value: T,
+    hook: &'static str,
+) -> AgentResult<ChainResult<T>>
+where
+    F: Fn(&AgentContext, &T) -> CallbackOutcome<T> + ?Sized,
+{
+    let mut current = value;
+    for callback in chain {
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(ctx, &current)));
+        match outcome {
+            Ok(CallbackOutcome::Continue) => {}
+            Ok(CallbackOutcome::Skip) => return Ok(ChainResult::Skip),
+            Ok(CallbackOutcome::ReplaceWith(replacement)) => current = replacement,
+            Err(payload) => return Err(callback_panic(hook, payload)),
+        }
+    }
+    Ok(ChainResult::Replaced(current))
+}
+
+pub(crate) fn apply_before_agent_chain_with_panic_catch(
+    chain: &[BeforeAgentFn],
+    ctx: &AgentContext,
+    value: String,
+    hook: &'static str,
+) -> AgentResult<ChainResult<String>> {
+    let mut current = value;
+    for callback in chain {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            callback(ctx, current.as_str())
+        }));
+        match outcome {
+            Ok(CallbackOutcome::Continue) => {}
+            Ok(CallbackOutcome::Skip) => return Ok(ChainResult::Skip),
+            Ok(CallbackOutcome::ReplaceWith(replacement)) => current = replacement,
+            Err(payload) => return Err(callback_panic(hook, payload)),
+        }
+    }
+    Ok(ChainResult::Replaced(current))
+}
+
+pub(crate) fn apply_chain_with_panic_catch_tool(
+    chain: &[BeforeToolFn],
+    ctx: &AgentContext,
+    tool: &dyn AgentTool,
+    args: serde_json::Value,
+    hook: &'static str,
+) -> AgentResult<ChainResult<serde_json::Value>> {
+    let mut current = args;
+    for callback in chain {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            callback(ctx, tool, &current)
+        }));
+        match outcome {
+            Ok(CallbackOutcome::Continue) => {}
+            Ok(CallbackOutcome::Skip) => return Ok(ChainResult::Skip),
+            Ok(CallbackOutcome::ReplaceWith(replacement)) => current = replacement,
+            Err(payload) => return Err(callback_panic(hook, payload)),
+        }
+    }
+    Ok(ChainResult::Replaced(current))
+}
+
+pub(crate) fn apply_chain_with_panic_catch_tool_result(
+    chain: &[AfterToolFn],
+    ctx: &AgentContext,
+    tool: &dyn AgentTool,
+    result: Result<serde_json::Value, ToolError>,
+    hook: &'static str,
+) -> AgentResult<ChainResult<Result<serde_json::Value, ToolError>>> {
+    let mut current = result;
+    for callback in chain {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            callback(ctx, tool, &current)
+        }));
+        match outcome {
+            Ok(CallbackOutcome::Continue) => {}
+            Ok(CallbackOutcome::Skip) => return Ok(ChainResult::Skip),
+            Ok(CallbackOutcome::ReplaceWith(replacement)) => current = replacement,
+            Err(payload) => return Err(callback_panic(hook, payload)),
+        }
+    }
+    Ok(ChainResult::Replaced(current))
+}
+
+fn callback_panic(hook: &'static str, payload: Box<dyn Any + Send>) -> AgentError {
+    AgentError::CallbackPanic {
+        hook: hook.to_owned(),
+        payload: extract_panic_message(payload),
+    }
+}
+
+fn extract_panic_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_owned()
+    } else {
+        "<non-string panic payload>".to_owned()
+    }
+}

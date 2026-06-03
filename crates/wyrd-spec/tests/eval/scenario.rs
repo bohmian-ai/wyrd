@@ -2,7 +2,8 @@ use wyrd_spec::vala::eval::condition::{ConditionCombinator, EvalCondition};
 use wyrd_spec::vala::eval::ids::{JsonPath, ScenarioId, TaskId};
 use wyrd_spec::vala::eval::operator::ComparisonOperator;
 use wyrd_spec::vala::eval::scenario::{
-    EvalScenario, EvalScenarioCollection, MAX_TURNS_HARD_CAP, ScenarioTask,
+    EvalScenario, EvalScenarioCollection, MAX_SCENARIOS_PER_COLLECTION, MAX_TURNS_HARD_CAP,
+    ScenarioTask,
 };
 
 fn task(id: &str) -> ScenarioTask {
@@ -143,4 +144,16 @@ fn collection_rejects_unknown_field() {
     }"#;
     let r: Result<EvalScenarioCollection, _> = serde_json::from_str(json);
     assert!(r.is_err());
+}
+
+#[test]
+fn collection_rejects_over_cap() {
+    let scenarios: Vec<EvalScenario> = (0..=MAX_SCENARIOS_PER_COLLECTION)
+        .map(|i| scenario(&format!("s{i}")))
+        .collect();
+    let c = EvalScenarioCollection {
+        collection_id: "big".into(),
+        scenarios,
+    };
+    assert!(c.validate().is_err());
 }

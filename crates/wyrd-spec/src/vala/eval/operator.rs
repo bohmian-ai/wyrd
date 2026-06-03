@@ -21,11 +21,36 @@
 
 use std::str::FromStr;
 
+use regex::Regex;
 use serde::de::Error as DeError;
 use serde::ser::Serializer;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::WyrdError;
+
+/// Maximum byte length of a user-supplied regex pattern stored by
+/// [`ComparisonOperator::MatchesRegex`] or [`ComparisonOperator::NotMatchesRegex`].
+///
+/// Patterns longer than this are rejected at spec validation time to bound
+/// regex-compilation cost in eval workers.
+pub const MAX_REGEX_PATTERN_LEN: usize = 4096;
+
+pub(super) fn validate_regex_pattern(pattern: &str) -> Result<(), WyrdError> {
+    if pattern.len() > MAX_REGEX_PATTERN_LEN {
+        return Err(WyrdError::Validation {
+            message: format!(
+                "regex pattern length {} exceeds MAX_REGEX_PATTERN_LEN {MAX_REGEX_PATTERN_LEN}",
+                pattern.len()
+            ),
+            details: serde_json::Value::Null,
+        });
+    }
+    Regex::new(pattern).map_err(|e| WyrdError::Validation {
+        message: format!("regex pattern is invalid: {e}"),
+        details: serde_json::Value::Null,
+    })?;
+    Ok(())
+}
 
 /// One comparison operator selected by an assertion, judge, trace, agent,
 /// condition, or scenario task.
@@ -622,15 +647,6 @@ impl ComparisonOperator {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         self.discriminator()
-    }
-
-    /// Parses a parameterless operator from its discriminator.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] when the discriminator is unknown or
-    /// names a parameterized variant that requires object parameters.
-    pub fn from_discriminator(s: &str) -> Result<Self, WyrdError> {
-        Self::from_discriminator_parameterless(s)
     }
 
     /// Parses a parameterless operator from its discriminator.

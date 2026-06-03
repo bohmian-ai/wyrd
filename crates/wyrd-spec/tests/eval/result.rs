@@ -8,7 +8,7 @@ fn assertion_result_round_trip_minimal() {
     let r = AssertionResult {
         task_id: TaskId::new("a").unwrap(),
         passed: true,
-        actual: serde_json::json!("hello"),
+        actual: Some(serde_json::json!("hello")),
         expected: serde_json::json!("hello"),
         operator: ComparisonOperator::Equals,
         message: None,
@@ -26,7 +26,7 @@ fn assertion_result_with_message() {
     let r = AssertionResult {
         task_id: TaskId::new("a").unwrap(),
         passed: false,
-        actual: serde_json::json!("hi"),
+        actual: Some(serde_json::json!("hi")),
         expected: serde_json::json!("hello"),
         operator: ComparisonOperator::Equals,
         message: Some("equality mismatch at byte 1".into()),

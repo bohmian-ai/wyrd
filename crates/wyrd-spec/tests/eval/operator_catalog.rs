@@ -126,7 +126,7 @@ fn from_str_parses_parameterless() {
         ComparisonOperator::Equals,
     );
     assert_eq!(
-        ComparisonOperator::from_discriminator("equals").expect("equals parses"),
+        ComparisonOperator::from_discriminator_parameterless("equals").expect("equals parses"),
         ComparisonOperator::Equals,
     );
     assert_eq!(

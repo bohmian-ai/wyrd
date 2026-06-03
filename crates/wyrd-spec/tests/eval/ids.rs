@@ -166,6 +166,20 @@ fn json_path_deserialize_rejects_unbalanced_bracket() {
 }
 
 #[test]
+fn json_path_accepts_key_ending_in_escaped_backslash() {
+    // $['a\\'] means the key "a\" (backslash at end).
+    // Old code rejected this: the second `\` was `previous`, so it mistakenly
+    // treated the closing `'` as escaped and never closed in_single_quote.
+    // New code (escaped boolean) correctly toggles in_single_quote on the `'`.
+    JsonPath::new(r"$['a\\']").expect("key ending with escaped backslash is valid");
+}
+
+#[test]
+fn json_path_accepts_escaped_backslash_then_bracket() {
+    JsonPath::new(r"$['a\\'][0]").expect("escaped backslash then bracket is valid");
+}
+
+#[test]
 fn json_path_deserialize_rejects_unbalanced_quote() {
     let result: Result<JsonPath, _> = serde_json::from_str("\"$['unterminated\"");
     assert!(result.is_err());

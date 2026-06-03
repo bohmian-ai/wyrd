@@ -6,6 +6,27 @@ use serde::{Deserialize, Serialize};
 use super::ids::TaskId;
 use super::operator::ComparisonOperator;
 
+/// Declares how `vala-eval` populates [`AssertionResult::actual`] when writing
+/// result rows to `eval_task_results`.
+///
+/// Evaluation correctness ([`AssertionResult::passed`]) is unaffected by this
+/// setting. Only the stored snapshot of the extracted value changes.
+///
+/// Set at the [`super::spec::EvalSpec`] level via `context_capture`. Absent
+/// means `Full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalContextCapture {
+    /// Store the raw value extracted at the context path. Default for offline evals.
+    Full,
+    /// Store a SHA-256 hex digest of the extracted value. Allows determinism
+    /// checks without persisting PII.
+    Hash,
+    /// Do not populate `actual`. Use when the eval runs over production traffic
+    /// where context fields may contain PII.
+    Redact,
+}
+
 /// Result of one evaluated task.
 ///
 /// Emitted by `vala-eval` per task per workflow run; persisted to the OLAP
@@ -19,9 +40,12 @@ pub struct AssertionResult {
     pub passed: bool,
     /// JSON value extracted at the task's context path.
     ///
-    /// Captured so an operator can replay the comparison from the result row
-    /// alone.
-    pub actual: serde_json::Value,
+    /// `None` when [`EvalContextCapture::Redact`] is set on the enclosing spec.
+    /// A SHA-256 hex digest string when [`EvalContextCapture::Hash`].
+    /// Populated verbatim when [`EvalContextCapture::Full`] or when
+    /// `context_capture` is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual: Option<serde_json::Value>,
     /// Right-hand side the task declared.
     pub expected: serde_json::Value,
     /// Operator the task declared.

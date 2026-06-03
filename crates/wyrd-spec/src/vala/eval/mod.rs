@@ -60,12 +60,12 @@ pub use ids::{
 pub use llm_judge::LlmJudgeTask;
 pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
 pub use plan::{DagError, ExecutionPlan, Stage, validate_dag};
-pub use result::{AssertionResult, EvalPassGate};
+pub use result::{AssertionResult, EvalContextCapture, EvalPassGate};
 pub use scenario::{
     EvalScenario, EvalScenarioCollection, MAX_SCENARIOS_PER_COLLECTION, MAX_TURNS_HARD_CAP,
     ScenarioTask,
 };
-pub use spec::{DatasetRef, EvalSampling, EvalSpec, EvalSpecError};
+pub use spec::{DatasetRef, EvalSampling, EvalSpec, EvalSpecError, MAX_EVAL_TASKS};
 pub use status::EvalStatus;
 pub use task::EvalTask;
 pub use trace::TraceAssertionTask;

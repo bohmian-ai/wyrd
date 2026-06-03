@@ -26,20 +26,7 @@ impl TaskId {
     /// than 128 characters, or does not match the task-id grammar.
     pub fn new(value: impl Into<String>) -> Result<Self, WyrdError> {
         let value = value.into();
-        if value.is_empty() || value.len() > 128 {
-            return Err(WyrdError::Validation {
-                message: format!("task_id length must be 1..=128, got {}", value.len()),
-                details: serde_json::Value::Null,
-            });
-        }
-
-        if !task_id_regex().is_match(&value) {
-            return Err(WyrdError::Validation {
-                message: format!("task_id {value:?} must match ^[a-zA-Z_][a-zA-Z0-9_-]*$"),
-                details: serde_json::Value::Null,
-            });
-        }
-
+        validate_id_grammar("task_id", &value)?;
         Ok(Self(value))
     }
 
@@ -103,20 +90,7 @@ impl ScenarioId {
     /// than 128 characters, or does not match the shared scenario-id grammar.
     pub fn new(value: impl Into<String>) -> Result<Self, WyrdError> {
         let value = value.into();
-        if value.is_empty() || value.len() > 128 {
-            return Err(WyrdError::Validation {
-                message: format!("scenario_id length must be 1..=128, got {}", value.len()),
-                details: serde_json::Value::Null,
-            });
-        }
-
-        if !task_id_regex().is_match(&value) {
-            return Err(WyrdError::Validation {
-                message: format!("scenario_id {value:?} must match ^[a-zA-Z_][a-zA-Z0-9_-]*$"),
-                details: serde_json::Value::Null,
-            });
-        }
-
+        validate_id_grammar("scenario_id", &value)?;
         Ok(Self(value))
     }
 
@@ -236,7 +210,7 @@ impl JsonPath {
         let mut bracket_depth = 0_i32;
         let mut in_single_quote = false;
         let mut in_double_quote = false;
-        let mut previous = ' ';
+        let mut escaped = false;
         for ch in value.chars() {
             if ch.is_control() {
                 return Err(WyrdError::Validation {
@@ -245,9 +219,14 @@ impl JsonPath {
                 });
             }
 
+            if ch == '\\' {
+                escaped = !escaped;
+                continue;
+            }
+
             match ch {
-                '\'' if !in_double_quote && previous != '\\' => in_single_quote = !in_single_quote,
-                '"' if !in_single_quote && previous != '\\' => in_double_quote = !in_double_quote,
+                '\'' if !in_double_quote && !escaped => in_single_quote = !in_single_quote,
+                '"' if !in_single_quote && !escaped => in_double_quote = !in_double_quote,
                 '[' if !in_single_quote && !in_double_quote => bracket_depth += 1,
                 ']' if !in_single_quote && !in_double_quote => {
                     bracket_depth -= 1;
@@ -260,7 +239,7 @@ impl JsonPath {
                 }
                 _ => {}
             }
-            previous = ch;
+            escaped = false;
         }
 
         if bracket_depth != 0 || in_single_quote || in_double_quote {
@@ -314,6 +293,22 @@ impl schemars::JsonSchema for JsonPath {
         }
         .into()
     }
+}
+
+fn validate_id_grammar(field_name: &str, value: &str) -> Result<(), WyrdError> {
+    if value.is_empty() || value.len() > 128 {
+        return Err(WyrdError::Validation {
+            message: format!("{field_name} length must be 1..=128, got {}", value.len()),
+            details: serde_json::Value::Null,
+        });
+    }
+    if !task_id_regex().is_match(value) {
+        return Err(WyrdError::Validation {
+            message: format!("{field_name} {value:?} must match ^[a-zA-Z_][a-zA-Z0-9_-]*$"),
+            details: serde_json::Value::Null,
+        });
+    }
+    Ok(())
 }
 
 fn task_id_regex() -> &'static Regex {

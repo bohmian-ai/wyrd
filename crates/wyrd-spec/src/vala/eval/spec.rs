@@ -5,17 +5,25 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::envelope::CardKind;
 use crate::error::WyrdError;
 use crate::reference::CardRef;
 
 use super::ids::{JsonPath, TaskId};
+use super::operator::{ComparisonOperator, validate_regex_pattern};
 use super::plan::{DagError, ExecutionPlan, validate_dag};
-use super::result::EvalPassGate;
+use super::result::{EvalContextCapture, EvalPassGate};
 use super::task::EvalTask;
 use super::workflow::Workflow;
+
+/// Maximum number of tasks allowed in an [`EvalSpec`] task DAG.
+///
+/// Guards against unbounded O(V+E) allocation in DAG validation before any
+/// auth or quota check. Mirrors `MAX_SCENARIOS_PER_COLLECTION` on the scenario
+/// side.
+pub const MAX_EVAL_TASKS: usize = 512;
 
 /// The typed spec body for an `Eval` card.
 ///
@@ -63,6 +71,14 @@ pub struct EvalSpec {
     /// Optional workflow-level pass gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass_gate: Option<EvalPassGate>,
+
+    /// How `vala-eval` captures extracted values in [`AssertionResult::actual`].
+    ///
+    /// Set to [`EvalContextCapture::Redact`] when this eval runs over
+    /// production traffic where context fields may contain PII. Absent means
+    /// [`EvalContextCapture::Full`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_capture: Option<EvalContextCapture>,
 }
 
 impl EvalSpec {
@@ -75,6 +91,15 @@ impl EvalSpec {
     /// Returns [`EvalSpecError::Wyrd`] when a task map key does not match its
     /// inner id, or [`EvalSpecError::Dag`] when the task map is not a DAG.
     pub fn new(tasks: BTreeMap<TaskId, EvalTask>) -> Result<Self, EvalSpecError> {
+        if tasks.len() > MAX_EVAL_TASKS {
+            return Err(EvalSpecError::Wyrd(WyrdError::Validation {
+                message: format!(
+                    "eval_spec.tasks count {} exceeds MAX_EVAL_TASKS {MAX_EVAL_TASKS}",
+                    tasks.len()
+                ),
+                details: serde_json::Value::Null,
+            }));
+        }
         validate_task_keys(&tasks).map_err(EvalSpecError::Wyrd)?;
         validate_dag(&tasks).map_err(EvalSpecError::Dag)?;
         Ok(Self {
@@ -84,6 +109,7 @@ impl EvalSpec {
             workflow: None,
             sampling: None,
             pass_gate: None,
+            context_capture: None,
         })
     }
 
@@ -97,6 +123,15 @@ impl EvalSpec {
     /// Returns [`EvalSpecError`] when DAG validation fails or a nested Wyrd
     /// validation rule rejects the spec.
     pub fn validate(&self) -> Result<(), EvalSpecError> {
+        if self.tasks.len() > MAX_EVAL_TASKS {
+            return Err(EvalSpecError::Wyrd(WyrdError::Validation {
+                message: format!(
+                    "eval_spec.tasks count {} exceeds MAX_EVAL_TASKS {MAX_EVAL_TASKS}",
+                    self.tasks.len()
+                ),
+                details: serde_json::Value::Null,
+            }));
+        }
         validate_task_keys(&self.tasks).map_err(EvalSpecError::Wyrd)?;
         validate_dag(&self.tasks).map_err(EvalSpecError::Dag)?;
 
@@ -107,6 +142,7 @@ impl EvalSpec {
             if let Some(condition) = task.condition() {
                 condition.validate().map_err(EvalSpecError::Wyrd)?;
             }
+            validate_task_operator(task).map_err(EvalSpecError::Wyrd)?;
         }
 
         if let Some(dataset) = &self.dataset {
@@ -152,6 +188,20 @@ impl From<EvalSpecError> for WyrdError {
     }
 }
 
+fn validate_task_operator(task: &EvalTask) -> Result<(), WyrdError> {
+    let operator = match task {
+        EvalTask::Assertion(t) => &t.operator,
+        EvalTask::LlmJudge(t) => &t.operator,
+        EvalTask::TraceAssertion(t) => &t.operator,
+        EvalTask::AgentAssertion(t) => &t.operator,
+    };
+    match operator {
+        ComparisonOperator::MatchesRegex { pattern }
+        | ComparisonOperator::NotMatchesRegex { pattern } => validate_regex_pattern(pattern),
+        _ => Ok(()),
+    }
+}
+
 fn validate_task_keys(tasks: &BTreeMap<TaskId, EvalTask>) -> Result<(), WyrdError> {
     for (key, task) in tasks {
         if key != task.id() {
@@ -173,9 +223,20 @@ fn validate_task_keys(tasks: &BTreeMap<TaskId, EvalTask>) -> Result<(), WyrdErro
 }
 
 /// Thin `CardRef` wrapper constraining the referenced kind to `Data`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+///
+/// Deserialization routes through [`DatasetRef::new`] so kind enforcement fires
+/// at the wire boundary, consistent with [`super::ids::TaskId`] and
+/// [`super::ids::JsonPath`].
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct DatasetRef(pub CardRef);
+
+impl<'de> Deserialize<'de> for DatasetRef {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let card_ref = CardRef::deserialize(deserializer)?;
+        Self::new(card_ref).map_err(serde::de::Error::custom)
+    }
+}
 
 impl DatasetRef {
     /// Construct a dataset reference, rejecting non-`Data` card kinds.

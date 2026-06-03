@@ -7,6 +7,17 @@
     "tasks"
   ],
   "properties": {
+    "context_capture": {
+      "description": "How `vala-eval` captures extracted values in [`AssertionResult::actual`].\n\nSet to [`EvalContextCapture::Redact`] when this eval runs over production traffic where context fields may contain PII. Absent means [`EvalContextCapture::Full`].",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/EvalContextCapture"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "dataset": {
       "description": "Source data for offline runs.\n\nValidation enforces `dataset.kind == Data`.",
       "anyOf": [
@@ -298,6 +309,32 @@
         }
       },
       "additionalProperties": false
+    },
+    "EvalContextCapture": {
+      "description": "Declares how `vala-eval` populates [`AssertionResult::actual`] when writing result rows to `eval_task_results`.\n\nEvaluation correctness ([`AssertionResult::passed`]) is unaffected by this setting. Only the stored snapshot of the extracted value changes.\n\nSet at the [`super::spec::EvalSpec`] level via `context_capture`. Absent means `Full`.",
+      "oneOf": [
+        {
+          "description": "Store the raw value extracted at the context path. Default for offline evals.",
+          "type": "string",
+          "enum": [
+            "full"
+          ]
+        },
+        {
+          "description": "Store a SHA-256 hex digest of the extracted value. Allows determinism checks without persisting PII.",
+          "type": "string",
+          "enum": [
+            "hash"
+          ]
+        },
+        {
+          "description": "Do not populate `actual`. Use when the eval runs over production traffic where context fields may contain PII.",
+          "type": "string",
+          "enum": [
+            "redact"
+          ]
+        }
+      ]
     },
     "EvalPassGate": {
       "description": "Workflow-level pass criterion.\n\nSelects how [`AssertionResult`] rows roll up into the workflow's `pass / fail` outcome. Thresholds are in `[0.0, 1.0]`; out-of-range values are rejected by [`EvalPassGate::validate`].",

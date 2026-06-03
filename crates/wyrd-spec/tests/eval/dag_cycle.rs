@@ -32,7 +32,7 @@ fn cycle_converts_to_public_vala_error_code() {
     let err = validate_dag(&tasks).unwrap_err();
     let public: WyrdError = err.into();
 
-    assert_eq!(public.code(), "WYRD_VALA_400_TASK_DAG_CYCLE");
+    assert_eq!(public.code(), "WYRD_VALA_400_TASK_DAG_INVALID");
 }
 
 #[test]

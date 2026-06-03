@@ -113,15 +113,15 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Vala eval task graph is not a DAG.
-    #[error("[WYRD_VALA_400_TASK_DAG_CYCLE] {message}")]
+    /// Vala eval task graph failed DAG validation (cycle, self-loop, or missing dependency).
+    #[error("[WYRD_VALA_400_TASK_DAG_INVALID] {message}")]
     #[wyrd_error(
-        code = "WYRD_VALA_400_TASK_DAG_CYCLE",
+        code = "WYRD_VALA_400_TASK_DAG_INVALID",
         status = 400,
         title = "Eval task DAG validation failed",
         remediation = "Remove cycles, self-dependencies, or references to missing eval tasks."
     )]
-    ValaTaskDagCycle {
+    ValaTaskDagInvalid {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -882,7 +882,7 @@ impl WyrdError {
             | Self::Internal { message, details }
             | Self::UpstreamFailure { message, details }
             | Self::Timeout { message, details }
-            | Self::ValaTaskDagCycle { message, details }
+            | Self::ValaTaskDagInvalid { message, details }
             | Self::ValaEvalRefKindMismatch { message, details }
             | Self::Unauthenticated { message, details }
             | Self::TokenExpired { message, details }

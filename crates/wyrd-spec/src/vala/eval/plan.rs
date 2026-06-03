@@ -90,7 +90,7 @@ impl From<DagError> for WyrdError {
             }),
         };
 
-        WyrdError::ValaTaskDagCycle {
+        WyrdError::ValaTaskDagInvalid {
             message: error.to_string(),
             details,
         }

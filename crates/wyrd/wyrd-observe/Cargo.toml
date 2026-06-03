@@ -16,13 +16,17 @@ path = "src/lib.rs"
 default = []
 
 [dependencies]
+skald-agent = { workspace = true }
 vala-client = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-utils = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

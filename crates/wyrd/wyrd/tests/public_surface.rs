@@ -1,25 +1,37 @@
-//! Pin the sanctioned `wyrd::agent` and `wyrd::workflow` Rust surface.
-//!
-//! This is a compile-test fixture: every line below must compile. If a
-//! `skald-agent` or `skald-workflow` rename breaks one of these paths, this test
-//! fails and the re-export must be updated.
+//! Pin the sanctioned C12 `wyrd::agent` Rust surface.
 
-#[allow(unused_imports)]
-mod _agent {
-    use wyrd::agent::{Agent, AgentError, AgentResult, AgentRun, FinishReason, RunConfig};
-}
+#[test]
+fn use_wyrd_agent_module_imports_compile() {
+    use wyrd::agent::Agent;
+    use wyrd::agent::{AgentBuilder, AgentTool, CallbackOutcome, ToolDef};
+    use wyrd::agent::{AgentDelegateTool, Journal, NoSession, NoopJournal, SessionMemory};
 
-#[allow(unused_imports)]
-mod _workflow {
-    use wyrd::workflow::{
-        Context, ContextSnapshot, Task, TaskDef, TaskEvent, TaskOutcome, TaskStatus, Workflow,
-        WorkflowDef, WorkflowError, WorkflowResult, WorkflowRun, default_max_retries,
-    };
+    let _: Option<&Agent> = None;
+    let _: Option<&AgentBuilder> = None;
+    let _: Option<&dyn AgentTool> = None;
+    let _: Option<&ToolDef> = None;
+    let _: Option<&CallbackOutcome<String>> = None;
+    let _: Option<&AgentDelegateTool> = None;
+    let _: Option<&dyn Journal> = None;
+    let _: Option<&NoSession> = None;
+    let _: Option<&NoopJournal> = None;
+    let _: Option<&dyn SessionMemory> = None;
 }
 
 #[test]
-fn surface_is_callable() {
-    let _ = wyrd::agent::RunConfig::default();
-    let _ = wyrd::agent::Agent::run_prompt;
-    let _ = wyrd::workflow::default_max_retries();
+fn use_wyrd_agent_observer_imports_compile() {
+    use wyrd::agent::{NoopObserver, Observer};
+
+    let _: Option<&NoopObserver> = None;
+    fn _takes_observer(_observer: std::sync::Arc<dyn Observer>) {}
+}
+
+#[test]
+fn use_wyrd_agent_runconfig_imports_compile() {
+    use wyrd::agent::{AgentContext, AgentRun, FinishReason, RunConfig};
+
+    let _: Option<&RunConfig> = None;
+    let _: Option<&AgentRun> = None;
+    let _: Option<&AgentContext> = None;
+    let _: Option<&FinishReason> = None;
 }

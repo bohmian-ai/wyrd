@@ -1,19 +1,18 @@
-//! Sanctioned `skald-agent` re-exports.
+//! User-facing agent surface.
 //!
-//! Importing from `wyrd::agent` is the supported way to reach the agent runtime
-//! surface in Rust. Direct `skald_agent::*` imports work inside the workspace
-//! but are not part of the stable public API.
+//! The canonical import path is `use wyrd::agent::Agent;`.
 //!
 //! # Public Surface
 //!
-//! - `Agent` is the live agent, built from a resolved native prompt. It runs the
-//!   bounded tool loop through `Agent::run` or `Agent::run_prompt`.
-//! - `AgentRun` is the output of one successful run.
-//! - `AgentError` carries stable `SKALD_AGENT_*` codes.
-//! - `RunConfig` configures bounded execution.
-//! - `FinishReason` reports why execution stopped.
-//!
-//! Internal modules such as loop runtime, message extraction, request building,
-//! and registry helpers are intentionally not re-exported here.
+//! `Agent` is the Wyrd card authoring holder for an agent with resolved runtime
+//! state. Advanced envelope access remains under `wyrd_cards::envelope`.
 
-pub use skald_agent::{Agent, AgentError, AgentResult, AgentRun, FinishReason, RunConfig};
+pub use skald_agent::observer::{NoopObserver, Observer};
+pub use skald_agent::{
+    AgentContext, AgentDelegateTool, AgentRun, CallbackOutcome, Conversation, ConversationTurn,
+    FinishReason, Journal, JournalEvent, NoSession, NoopJournal, Role, RunConfig, SessionId,
+    SessionMemory, SessionTurn,
+};
+pub use skald_prompt::Prompt;
+pub use skald_tool::{AgentTool, ToolDef, ToolError};
+pub use wyrd_cards::agent::{AgentBuilder, AgentMetadata, AgentWithMeta as Agent};

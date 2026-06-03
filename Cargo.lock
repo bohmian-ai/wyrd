@@ -4538,11 +4538,16 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 name = "wyrd"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "skald-agent",
+ "skald-prompt",
+ "skald-runtime",
  "skald-spec",
- "skald-workflow",
+ "skald-tool",
+ "tokio",
  "wyrd-cards",
- "wyrd-spec",
+ "wyrd-observe",
+ "wyrd-observe-impl",
 ]
 
 [[package]]
@@ -4667,13 +4672,26 @@ dependencies = [
 name = "wyrd-observe"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "serde",
  "serde_json",
  "sha2",
+ "skald-agent",
+ "tokio",
  "tracing",
  "vala-client",
  "wyrd-spec",
  "wyrd-utils",
+]
+
+[[package]]
+name = "wyrd-observe-impl"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "skald-agent",
+ "tokio",
+ "wyrd-observe",
 ]
 
 [[package]]

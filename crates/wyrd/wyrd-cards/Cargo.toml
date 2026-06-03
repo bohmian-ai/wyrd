@@ -11,17 +11,25 @@ default = []
 python = ["dep:pyo3", "chrono/clock", "wyrd-interfaces/python", "wyrd-utils/python", "skald-prompt/python"]
 
 [dependencies]
+skald-agent = { workspace = true }
 skald-spec = { workspace = true }
 skald-prompt = { workspace = true }
+skald-runtime = { workspace = true }
+skald-tool = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-interfaces = { workspace = true }
 wyrd-utils = { workspace = true }
 wyrd-test-contract-macros = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
+ulid = { workspace = true }
 pyo3 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
 
 [lints]
 workspace = true

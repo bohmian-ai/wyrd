@@ -1,88 +1,42 @@
 //! Agent Card spec.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
-use crate::card::common::{
-    AgentInterface, Governance, NonSecretValue, ObservationHooks, ProtocolProfile,
-};
-use crate::reference::CardRef;
+use crate::reference::PromptRef;
 
-/// Protocol-neutral agent metadata and composition.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+/// Pure-serde mirror of the Skald agent run configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct AgentSpec {
-    /// Agent description.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Agent capabilities.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub capabilities: Vec<String>,
-    /// Default input modes.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub default_input_modes: Vec<String>,
-    /// Default output modes.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub default_output_modes: Vec<String>,
-    /// Primary prompt reference.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_ref: Option<CardRef>,
-    /// Additional prompt references.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub prompt_refs: Vec<CardRef>,
-    /// Tool references.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_refs: Vec<CardRef>,
-    /// Skill references.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub skill_refs: Vec<CardRef>,
-    /// Sub-agent references.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub subagent_refs: Vec<CardRef>,
-    /// Memory profile reference.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_ref: Option<CardRef>,
-    /// Maximum loop iterations.
+pub struct AgentRunConfigSpec {
+    /// Maximum loop iterations before the agent stops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_iterations: Option<u32>,
-    /// Preferred provider.
+    /// Maximum concurrent runtime-local tool calls per model iteration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-    /// Preferred model.
+    pub tool_concurrency_cap: Option<usize>,
+    /// Maximum recent session turns loaded at run start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Supported interfaces.
+    pub session_recent_limit: Option<usize>,
+    /// Overall agent run timeout in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// Agent authoring body inside a Wyrd Agent Card envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct AgentSpec {
+    /// Prompt reference preserved on disk and resolved by `wyrd-cards`.
+    #[cfg_attr(feature = "server", schema(value_type = serde_json::Value))]
+    pub prompt: PromptRef,
+    /// Runtime-local tool names resolved from a local Skald tool registry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub interfaces: Vec<AgentInterface>,
-    /// Protocol profiles.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub protocol_profiles: Vec<ProtocolProfile>,
-    /// Security scheme names or inline descriptors.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub security_schemes: Vec<String>,
-    /// Security requirements.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub security_requirements: Vec<String>,
-    /// Provider metadata and hints.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub provider_metadata: BTreeMap<String, NonSecretValue>,
-    /// Governance and audit controls.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub governance: Option<Governance>,
-    /// Observation hooks.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub observation_hooks: Option<ObservationHooks>,
-    /// Documentation URL.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub documentation_url: Option<String>,
-    /// Icon URL.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub icon_url: Option<String>,
-    /// Signature metadata.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub signatures: BTreeMap<String, NonSecretValue>,
-    /// Free-form details.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub details: BTreeMap<String, NonSecretValue>,
+    pub tool_names: Vec<String>,
+    /// Agent run configuration.
+    #[serde(default, skip_serializing_if = "is_default_run_config")]
+    pub run_config: AgentRunConfigSpec,
+}
+
+fn is_default_run_config(config: &AgentRunConfigSpec) -> bool {
+    config == &AgentRunConfigSpec::default()
 }

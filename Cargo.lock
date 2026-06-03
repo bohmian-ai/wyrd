@@ -3792,6 +3792,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
 
 [[package]]
+name = "ulid"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
+dependencies = [
+ "rand 0.9.4",
+ "serde",
+ "web-time",
+]
+
+[[package]]
 name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4568,9 +4579,15 @@ dependencies = [
  "pyo3",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "skald-agent",
  "skald-prompt",
+ "skald-runtime",
  "skald-spec",
+ "skald-tool",
  "thiserror 2.0.18",
+ "tokio",
+ "ulid",
  "wyrd-interfaces",
  "wyrd-spec",
  "wyrd-test-contract-macros",

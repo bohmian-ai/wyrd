@@ -827,6 +827,104 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// AgentCard validation failed.
+    #[error("[WYRD_AGENT_422_VALIDATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_VALIDATION",
+        status = 422,
+        title = "AgentCard validation failed",
+        remediation = "Fix the Agent Card envelope, metadata, prompt reference, tools, or run_config fields."
+    )]
+    AgentValidation {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// AgentCard save or envelope projection is missing a name.
+    #[error("[WYRD_AGENT_422_MISSING_NAME] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_MISSING_NAME",
+        status = 422,
+        title = "AgentCard name is missing",
+        remediation = "Set a card name before saving or projecting the agent to a card envelope."
+    )]
+    AgentMissingName {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// AgentCard save or envelope projection is missing a version.
+    #[error("[WYRD_AGENT_422_MISSING_VERSION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_MISSING_VERSION",
+        status = 422,
+        title = "AgentCard version is missing",
+        remediation = "Set a concrete semantic version before saving or projecting the agent to a card envelope."
+    )]
+    AgentMissingVersion {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// AgentBuilder is missing a prompt.
+    #[error("[WYRD_AGENT_422_MISSING_PROMPT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_MISSING_PROMPT",
+        status = 422,
+        title = "Agent prompt is missing",
+        remediation = "Set an inline prompt or Prompt Card reference before building the agent."
+    )]
+    AgentMissingPrompt {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Referenced Prompt Card was not available in the local prompt registry.
+    #[error("[WYRD_AGENT_404_PROMPT_CARD] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_404_PROMPT_CARD",
+        status = 404,
+        title = "Prompt Card not found",
+        remediation = "Load or register the referenced Prompt Card in the local prompt registry before resolving the agent."
+    )]
+    AgentPromptCardNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Runtime-local tool name was not found.
+    #[error("[WYRD_AGENT_404_RUNTIME_LOCAL_TOOL_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_404_RUNTIME_LOCAL_TOOL_NOT_FOUND",
+        status = 404,
+        title = "Runtime-local tool not found",
+        remediation = "Register the named tool in the local Skald tool registry before loading the Agent Card."
+    )]
+    AgentRuntimeLocalToolNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Runtime-local tool names cannot be durably registered yet.
+    #[error("[WYRD_AGENT_422_RUNTIME_LOCAL_TOOLS_NOT_REGISTRABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_RUNTIME_LOCAL_TOOLS_NOT_REGISTRABLE",
+        status = 422,
+        title = "Runtime-local tools are not registrable",
+        remediation = "Remove runtime-local tool names before registration; local save, load, and run remain available."
+    )]
+    AgentRuntimeLocalToolsNotRegistrable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
 }
 
 impl WyrdError {
@@ -904,7 +1002,14 @@ impl WyrdError {
             | Self::PromptMissingVariable { message, details }
             | Self::PromptUnsupportedHandoff { message, details }
             | Self::PromptResponseDecode { message, details }
-            | Self::PromptDraftInvalid { message, details } => (message, details),
+            | Self::PromptDraftInvalid { message, details }
+            | Self::AgentValidation { message, details }
+            | Self::AgentMissingName { message, details }
+            | Self::AgentMissingVersion { message, details }
+            | Self::AgentMissingPrompt { message, details }
+            | Self::AgentPromptCardNotFound { message, details }
+            | Self::AgentRuntimeLocalToolNotFound { message, details }
+            | Self::AgentRuntimeLocalToolsNotRegistrable { message, details } => (message, details),
         }
     }
 

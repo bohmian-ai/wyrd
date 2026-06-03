@@ -1,232 +1,981 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "AgentSpec",
-  "description": "Protocol-neutral agent metadata and composition.",
+  "description": "Agent authoring body inside a Wyrd Agent Card envelope.",
   "type": "object",
+  "required": [
+    "prompt"
+  ],
   "properties": {
-    "capabilities": {
-      "description": "Agent capabilities.",
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "default_input_modes": {
-      "description": "Default input modes.",
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "default_output_modes": {
-      "description": "Default output modes.",
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "description": {
-      "description": "Agent description.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "details": {
-      "description": "Free-form details.",
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/definitions/NonSecretValue"
-      }
-    },
-    "documentation_url": {
-      "description": "Documentation URL.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "governance": {
-      "description": "Governance and audit controls.",
-      "anyOf": [
+    "prompt": {
+      "description": "Prompt reference preserved on disk and resolved by `wyrd-cards`.",
+      "allOf": [
         {
-          "$ref": "#/definitions/Governance"
-        },
-        {
-          "type": "null"
+          "$ref": "#/definitions/PromptRef"
         }
       ]
     },
-    "icon_url": {
-      "description": "Icon URL.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "interfaces": {
-      "description": "Supported interfaces.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/AgentInterface"
-      }
-    },
-    "max_iterations": {
-      "description": "Maximum loop iterations.",
-      "type": [
-        "integer",
-        "null"
-      ],
-      "format": "uint32",
-      "minimum": 0.0
-    },
-    "memory_ref": {
-      "description": "Memory profile reference.",
-      "anyOf": [
+    "run_config": {
+      "description": "Agent run configuration.",
+      "allOf": [
         {
-          "$ref": "#/definitions/CardRef"
-        },
-        {
-          "type": "null"
+          "$ref": "#/definitions/AgentRunConfigSpec"
         }
       ]
     },
-    "model": {
-      "description": "Preferred model.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "observation_hooks": {
-      "description": "Observation hooks.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/ObservationHooks"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "prompt_ref": {
-      "description": "Primary prompt reference.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/CardRef"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "prompt_refs": {
-      "description": "Additional prompt references.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/CardRef"
-      }
-    },
-    "protocol_profiles": {
-      "description": "Protocol profiles.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/ProtocolProfile"
-      }
-    },
-    "provider": {
-      "description": "Preferred provider.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "provider_metadata": {
-      "description": "Provider metadata and hints.",
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/definitions/NonSecretValue"
-      }
-    },
-    "security_requirements": {
-      "description": "Security requirements.",
+    "tool_names": {
+      "description": "Runtime-local tool names resolved from a local Skald tool registry.",
       "type": "array",
       "items": {
         "type": "string"
-      }
-    },
-    "security_schemes": {
-      "description": "Security scheme names or inline descriptors.",
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "signatures": {
-      "description": "Signature metadata.",
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/definitions/NonSecretValue"
-      }
-    },
-    "skill_refs": {
-      "description": "Skill references.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/CardRef"
-      }
-    },
-    "subagent_refs": {
-      "description": "Sub-agent references.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/CardRef"
-      }
-    },
-    "tool_refs": {
-      "description": "Tool references.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/CardRef"
       }
     }
   },
   "definitions": {
-    "AgentInterface": {
-      "description": "Agent-facing interface declaration.",
+    "AgentRunConfigSpec": {
+      "description": "Pure-serde mirror of the Skald agent run configuration.",
+      "type": "object",
+      "properties": {
+        "max_iterations": {
+          "description": "Maximum loop iterations before the agent stops.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "session_recent_limit": {
+          "description": "Maximum recent session turns loaded at run start.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "timeout_ms": {
+          "description": "Overall agent run timeout in milliseconds.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tool_concurrency_cap": {
+          "description": "Maximum concurrent runtime-local tool calls per model iteration.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "AnthropicCacheControl": {
       "type": "object",
       "required": [
-        "mode",
-        "name"
+        "type"
       ],
       "properties": {
-        "metadata": {
-          "description": "Interface metadata.",
+        "ttl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AnthropicCitationToggle": {
+      "type": "object",
+      "required": [
+        "enabled"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AnthropicCitationV1": {
+      "description": "Anthropic citation block.",
+      "oneOf": [
+        {
           "type": "object",
-          "additionalProperties": {
-            "$ref": "#/definitions/NonSecretValue"
+          "required": [
+            "cited_text",
+            "document_index",
+            "end_char_index",
+            "start_char_index",
+            "type"
+          ],
+          "properties": {
+            "cited_text": {
+              "type": "string"
+            },
+            "document_index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "document_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "end_char_index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "start_char_index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "char_location"
+              ]
+            }
           }
         },
-        "mode": {
-          "description": "Interface mode, such as `text`, `json`, `audio`, or `tool`.",
+        {
+          "type": "object",
+          "required": [
+            "cited_text",
+            "document_index",
+            "end_page_number",
+            "start_page_number",
+            "type"
+          ],
+          "properties": {
+            "cited_text": {
+              "type": "string"
+            },
+            "document_index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "document_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "end_page_number": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "start_page_number": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "page_location"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "cited_text",
+            "document_index",
+            "end_block_index",
+            "start_block_index",
+            "type"
+          ],
+          "properties": {
+            "cited_text": {
+              "type": "string"
+            },
+            "document_index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "document_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "end_block_index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "start_block_index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "content_block_location"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "cited_text",
+            "type",
+            "url"
+          ],
+          "properties": {
+            "cited_text": {
+              "type": "string"
+            },
+            "encrypted_index": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "web_search_result_location"
+              ]
+            },
+            "url": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "cited_text",
+            "end_block_index",
+            "search_result_index",
+            "source",
+            "start_block_index",
+            "type"
+          ],
+          "properties": {
+            "cited_text": {
+              "type": "string"
+            },
+            "end_block_index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "search_result_index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "source": {
+              "type": "string"
+            },
+            "start_block_index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "search_result_location"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "AnthropicContentBlock": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "text",
+            "type"
+          ],
+          "properties": {
+            "cache_control": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AnthropicCacheControl"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "citations": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/definitions/AnthropicCitationV1"
+              }
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "text"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "source",
+            "type"
+          ],
+          "properties": {
+            "cache_control": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AnthropicCacheControl"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "source": {
+              "$ref": "#/definitions/AnthropicImageSource"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "image"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "source",
+            "type"
+          ],
+          "properties": {
+            "cache_control": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AnthropicCacheControl"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "citations": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AnthropicCitationToggle"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "context": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "$ref": "#/definitions/AnthropicDocumentSource"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "document"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "signature",
+            "thinking",
+            "type"
+          ],
+          "properties": {
+            "signature": {
+              "type": "string"
+            },
+            "thinking": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "thinking"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "redacted_thinking"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "input",
+            "name",
+            "type"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "input": true,
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tool_use"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "content",
+            "tool_use_id",
+            "type"
+          ],
+          "properties": {
+            "cache_control": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AnthropicCacheControl"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "content": {
+              "$ref": "#/definitions/AnthropicToolResultContent"
+            },
+            "is_error": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "tool_use_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tool_result"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "AnthropicDocumentSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "media_type",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "type": "string"
+            },
+            "media_type": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "base64"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "url"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "url"
+              ]
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "file_id",
+            "type"
+          ],
+          "properties": {
+            "file_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "file_id"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "media_type",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "type": "string"
+            },
+            "media_type": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "text"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "content",
+            "type"
+          ],
+          "properties": {
+            "content": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/AnthropicContentBlock"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "content"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "AnthropicImageSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "media_type",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "type": "string"
+            },
+            "media_type": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "base64"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "url"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "url"
+              ]
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "file_id",
+            "type"
+          ],
+          "properties": {
+            "file_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "file_id"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "AnthropicMessage": {
+      "description": "One Anthropic message.",
+      "type": "object",
+      "required": [
+        "content",
+        "role"
+      ],
+      "properties": {
+        "content": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AnthropicContentBlock"
+          }
+        },
+        "role": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AnthropicMessagesRequest": {
+      "description": "`POST /v1/messages`.",
+      "type": "object",
+      "required": [
+        "max_tokens",
+        "messages",
+        "model"
+      ],
+      "properties": {
+        "max_tokens": {
+          "description": "Maximum output-token count. Defaults to `4096`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AnthropicMessage"
+          }
+        },
+        "metadata": {
+          "description": "Provider metadata object.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "model": {
           "type": "string"
         },
-        "name": {
-          "description": "Interface name.",
-          "type": "string"
+        "stop_sequences": {
+          "description": "Stop sequences.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
         },
-        "schema_ref": {
-          "description": "Optional schema Card reference.",
+        "stream": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "system": {
           "anyOf": [
             {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/AnthropicSystem"
             },
             {
               "type": "null"
             }
           ]
+        },
+        "temperature": {
+          "description": "Sampling temperature.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "thinking": {
+          "description": "Anthropic thinking configuration.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AnthropicThinkingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tool_choice": true,
+        "tools": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/AnthropicTool"
+          }
+        },
+        "top_k": {
+          "description": "Top-k sampling limit.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "top_p": {
+          "description": "Nucleus sampling probability.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
         }
-      }
+      },
+      "additionalProperties": true
+    },
+    "AnthropicSystem": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AnthropicSystemBlock"
+          }
+        }
+      ]
+    },
+    "AnthropicSystemBlock": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "text",
+            "type"
+          ],
+          "properties": {
+            "cache_control": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AnthropicCacheControl"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "text"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "AnthropicThinkingConfig": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "budget_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AnthropicTool": {
+      "type": "object",
+      "required": [
+        "input_schema",
+        "name"
+      ],
+      "properties": {
+        "cache_control": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AnthropicCacheControl"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_height_px": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "display_number": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "display_width_px": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "input_schema": true,
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AnthropicToolResultContent": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AnthropicContentBlock"
+          }
+        }
+      ]
     },
     "CardKind": {
       "title": "CardKind",
@@ -347,197 +1096,2912 @@
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
-    "Governance": {
-      "description": "Declarative governance and audit hooks.",
+    "GoogleBatchEmbedRequest": {
       "type": "object",
+      "required": [
+        "requests"
+      ],
       "properties": {
-        "approval_requirements": {
-          "description": "Required approval labels or scopes.",
+        "requests": {
           "type": "array",
+          "items": {
+            "$ref": "#/definitions/GoogleEmbedRequest"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "GoogleCodeExecutionResult": {
+      "type": "object",
+      "required": [
+        "outcome",
+        "output"
+      ],
+      "properties": {
+        "outcome": {
+          "type": "string"
+        },
+        "output": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GoogleContent": {
+      "description": "One Google content turn.",
+      "type": "object",
+      "required": [
+        "parts",
+        "role"
+      ],
+      "properties": {
+        "parts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GooglePart"
+          }
+        },
+        "role": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GoogleEmbedContent": {
+      "type": "object",
+      "required": [
+        "parts"
+      ],
+      "properties": {
+        "parts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GoogleEmbedPart"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "GoogleEmbedPart": {
+      "type": "object",
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GoogleEmbedRequest": {
+      "type": "object",
+      "required": [
+        "content",
+        "model"
+      ],
+      "properties": {
+        "content": {
+          "$ref": "#/definitions/GoogleEmbedContent"
+        },
+        "model": {
+          "type": "string"
+        },
+        "output_dimensionality": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "task_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "GoogleExecutableCode": {
+      "type": "object",
+      "required": [
+        "code",
+        "language"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GoogleFileData": {
+      "type": "object",
+      "required": [
+        "file_uri",
+        "mime_type"
+      ],
+      "properties": {
+        "file_uri": {
+          "type": "string"
+        },
+        "mime_type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GoogleFunctionCall": {
+      "type": "object",
+      "required": [
+        "args",
+        "name"
+      ],
+      "properties": {
+        "args": true,
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GoogleFunctionCallingConfig": {
+      "type": "object",
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "allowed_function_names": {
+          "type": [
+            "array",
+            "null"
+          ],
           "items": {
             "type": "string"
           }
         },
-        "audit_ref": {
-          "description": "Audit Card reference.",
+        "mode": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GoogleFunctionDeclaration": {
+      "type": "object",
+      "required": [
+        "name",
+        "parameters"
+      ],
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "parameters": true
+      },
+      "additionalProperties": false
+    },
+    "GoogleFunctionResponse": {
+      "type": "object",
+      "required": [
+        "name",
+        "response"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "response": true
+      },
+      "additionalProperties": false
+    },
+    "GoogleGenerateContentRequest": {
+      "description": "`POST /v1beta/models/{model}:generateContent`.",
+      "type": "object",
+      "required": [
+        "contents"
+      ],
+      "properties": {
+        "cached_content": {
+          "description": "Cached content resource name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GoogleContent"
+          }
+        },
+        "generation_config": {
+          "description": "Native Google generationConfig object.",
           "anyOf": [
             {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/GoogleGenerationConfig"
             },
             {
               "type": "null"
             }
           ]
         },
-        "metadata": {
-          "description": "Governance metadata.",
-          "type": "object",
-          "additionalProperties": {
-            "$ref": "#/definitions/NonSecretValue"
+        "labels": {
+          "description": "Provider labels object.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "safety_settings": {
+          "description": "Native Google safetySettings list.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/GoogleSafetySetting"
           }
         },
-        "policy_refs": {
-          "description": "Policy Card references.",
-          "type": "array",
+        "system_instruction": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GoogleContent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tool_config": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GoogleToolConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tools": {
+          "type": [
+            "array",
+            "null"
+          ],
           "items": {
-            "$ref": "#/definitions/CardRef"
+            "$ref": "#/definitions/GoogleTool"
           }
         }
-      }
+      },
+      "additionalProperties": true
     },
-    "NonSecretValue": {
-      "description": "Non-secret JSON-like configuration value.",
-      "oneOf": [
+    "GoogleGenerationConfig": {
+      "type": "object",
+      "properties": {
+        "candidate_count": {
+          "description": "Number of candidate responses.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "frequency_penalty": {
+          "description": "Frequency penalty.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "max_output_tokens": {
+          "description": "Maximum output-token count.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "presence_penalty": {
+          "description": "Presence penalty.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "response_mime_type": {
+          "description": "Response MIME type.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "response_modalities": {
+          "description": "Requested output modalities.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "response_schema": {
+          "description": "Response schema object."
+        },
+        "seed": {
+          "description": "Provider best-effort deterministic seed.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "speech_config": {
+          "description": "Speech configuration object."
+        },
+        "stop_sequences": {
+          "description": "Stop sequences.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "temperature": {
+          "description": "Sampling temperature.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "thinking_config": {
+          "description": "Gemini thinking configuration.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GoogleThinkingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "top_k": {
+          "description": "Top-k sampling limit.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "top_p": {
+          "description": "Nucleus sampling probability.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        }
+      },
+      "additionalProperties": true
+    },
+    "GoogleInlineData": {
+      "type": "object",
+      "required": [
+        "data",
+        "mime_type"
+      ],
+      "properties": {
+        "data": {
+          "type": "string"
+        },
+        "mime_type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GooglePart": {
+      "anyOf": [
         {
-          "description": "String value.",
           "type": "object",
           "required": [
-            "type",
-            "value"
+            "text"
           ],
           "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "str"
-              ]
-            },
-            "value": {
+            "text": {
               "type": "string"
             }
           }
         },
         {
-          "description": "Numeric value.",
           "type": "object",
           "required": [
-            "type",
-            "value"
+            "inline_data"
           ],
           "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "number"
-              ]
-            },
-            "value": {
-              "type": "number",
-              "format": "double"
+            "inline_data": {
+              "$ref": "#/definitions/GoogleInlineData"
             }
           }
         },
         {
-          "description": "Boolean value.",
           "type": "object",
           "required": [
-            "type",
-            "value"
+            "file_data"
           ],
           "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "bool"
-              ]
+            "file_data": {
+              "$ref": "#/definitions/GoogleFileData"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "function_call"
+          ],
+          "properties": {
+            "function_call": {
+              "$ref": "#/definitions/GoogleFunctionCall"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "function_response"
+          ],
+          "properties": {
+            "function_response": {
+              "$ref": "#/definitions/GoogleFunctionResponse"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "text",
+            "thought"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
             },
-            "value": {
+            "thought": {
               "type": "boolean"
             }
           }
         },
         {
-          "description": "List of non-secret values.",
           "type": "object",
           "required": [
-            "type",
-            "value"
+            "executable_code"
           ],
           "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "list"
-              ]
-            },
-            "value": {
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/NonSecretValue"
-              }
+            "executable_code": {
+              "$ref": "#/definitions/GoogleExecutableCode"
             }
           }
         },
         {
-          "description": "Object of non-secret values.",
           "type": "object",
           "required": [
-            "type",
-            "value"
+            "code_execution_result"
           ],
           "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "object"
-              ]
-            },
-            "value": {
-              "type": "object",
-              "additionalProperties": {
-                "$ref": "#/definitions/NonSecretValue"
-              }
+            "code_execution_result": {
+              "$ref": "#/definitions/GoogleCodeExecutionResult"
             }
           }
         }
       ]
     },
-    "ObservationHooks": {
-      "description": "Observation routing hooks for Cards that produce runs or events.",
+    "GoogleSafetySetting": {
+      "type": "object",
+      "required": [
+        "category",
+        "threshold"
+      ],
+      "properties": {
+        "category": {
+          "type": "string"
+        },
+        "threshold": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GoogleThinkingConfig": {
       "type": "object",
       "properties": {
-        "events": {
-          "description": "Event names to observe.",
+        "include_thoughts": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "thinking_budget": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GoogleTool": {
+      "type": "object",
+      "properties": {
+        "code_execution": true,
+        "function_declarations": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/GoogleFunctionDeclaration"
+          }
+        },
+        "google_search": true,
+        "google_search_retrieval": true,
+        "url_context": true
+      },
+      "additionalProperties": false
+    },
+    "GoogleToolConfig": {
+      "type": "object",
+      "required": [
+        "function_calling_config"
+      ],
+      "properties": {
+        "function_calling_config": {
+          "$ref": "#/definitions/GoogleFunctionCallingConfig"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiAllowedTools": {
+      "type": "object",
+      "required": [
+        "mode",
+        "tools"
+      ],
+      "properties": {
+        "mode": {
+          "$ref": "#/definitions/OpenAiAllowedToolsMode"
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiAllowedToolsChoice": {
+      "type": "object",
+      "required": [
+        "allowed_tools",
+        "type"
+      ],
+      "properties": {
+        "allowed_tools": {
+          "$ref": "#/definitions/OpenAiAllowedTools"
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiAllowedToolsKind"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiAllowedToolsKind": {
+      "type": "string",
+      "enum": [
+        "allowed_tools"
+      ]
+    },
+    "OpenAiAllowedToolsMode": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "required"
+      ]
+    },
+    "OpenAiAudioFormat": {
+      "type": "string",
+      "enum": [
+        "wav",
+        "aac",
+        "mp3",
+        "flac",
+        "opus",
+        "pcm16"
+      ]
+    },
+    "OpenAiBuiltInVoice": {
+      "type": "string",
+      "enum": [
+        "alloy",
+        "ash",
+        "ballad",
+        "coral",
+        "echo",
+        "fable",
+        "nova",
+        "onyx",
+        "sage",
+        "shimmer",
+        "marin",
+        "cedar"
+      ]
+    },
+    "OpenAiChatAudio": {
+      "type": "object",
+      "required": [
+        "format",
+        "voice"
+      ],
+      "properties": {
+        "format": {
+          "$ref": "#/definitions/OpenAiAudioFormat"
+        },
+        "voice": {
+          "$ref": "#/definitions/OpenAiVoice"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiChatMessage": {
+      "description": "One chat message on the wire.",
+      "type": "object",
+      "required": [
+        "role"
+      ],
+      "properties": {
+        "content": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiMessageContent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "refusal": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": "string"
+        },
+        "tool_call_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tool_calls": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/OpenAiToolCall"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiChatRequest": {
+      "description": "`POST /v1/chat/completions`.",
+      "type": "object",
+      "required": [
+        "messages",
+        "model"
+      ],
+      "properties": {
+        "audio": {
+          "description": "Audio output settings.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiChatAudio"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "frequency_penalty": {
+          "description": "Frequency penalty.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "logit_bias": {
+          "description": "Token-bias map keyed by token id.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "logprobs": {
+          "description": "Whether to return token log probabilities.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "max_completion_tokens": {
+          "description": "Maximum completion-token count.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "max_tokens": {
+          "description": "Legacy maximum generated-token count.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/OpenAiChatMessage"
+          }
+        },
+        "metadata": {
+          "description": "Provider metadata object.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "modalities": {
+          "description": "Requested output modalities.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/OpenAiResponseModality"
+          }
+        },
+        "model": {
+          "type": "string"
+        },
+        "n": {
+          "description": "Number of completions to generate.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "parallel_tool_calls": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "prediction": {
+          "description": "Prediction content hint.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiPredictionContent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "presence_penalty": {
+          "description": "Presence penalty.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "prompt_cache_key": {
+          "description": "OpenAI prompt cache key.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasoning_effort": {
+          "description": "Requested reasoning effort.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "response_format": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiResponseFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "safety_identifier": {
+          "description": "Safety identifier.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seed": {
+          "description": "Provider best-effort deterministic seed.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "service_tier": {
+          "description": "OpenAI service tier.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stop": {
+          "description": "Stop sequence or sequences.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiStop"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "store": {
+          "description": "Whether the provider may store the response.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "stream": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "stream_options": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiStreamOptions"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "temperature": {
+          "description": "Sampling temperature.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "tool_choice": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiChatToolChoice"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tools": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/OpenAiTool"
+          }
+        },
+        "top_logprobs": {
+          "description": "Number of top token log probabilities.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "top_p": {
+          "description": "Nucleus sampling probability.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "user": {
+          "description": "Provider-visible end-user identifier.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "OpenAiChatToolChoice": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/OpenAiToolChoiceMode"
+        },
+        {
+          "$ref": "#/definitions/OpenAiAllowedToolsChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiNamedFunctionToolChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiNamedCustomToolChoice"
+        }
+      ]
+    },
+    "OpenAiContentPart": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "text",
+            "type"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "text"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "image_url",
+            "type"
+          ],
+          "properties": {
+            "image_url": {
+              "$ref": "#/definitions/OpenAiImageUrl"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "image_url"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "input_audio",
+            "type"
+          ],
+          "properties": {
+            "input_audio": {
+              "$ref": "#/definitions/OpenAiInputAudio"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "input_audio"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "file",
+            "type"
+          ],
+          "properties": {
+            "file": {
+              "$ref": "#/definitions/OpenAiFilePart"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "file"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "OpenAiCustomChoice": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiCustomTool": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "format": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiCustomToolFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiCustomToolFormat": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "text"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "grammar",
+            "type"
+          ],
+          "properties": {
+            "grammar": {
+              "$ref": "#/definitions/OpenAiGrammar"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "grammar"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "OpenAiCustomVoice": {
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiEmbeddingsInput": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
           "type": "array",
           "items": {
             "type": "string"
           }
         },
-        "route_refs": {
-          "description": "Observation route Card references.",
+        {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/CardRef"
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0.0
+          }
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
           }
         }
-      }
+      ]
     },
-    "ProtocolProfile": {
-      "description": "Protocol-specific public metadata for an agent or service interface.",
+    "OpenAiEmbeddingsRequest": {
       "type": "object",
       "required": [
-        "protocol"
+        "input",
+        "model"
       ],
       "properties": {
-        "metadata": {
-          "description": "Protocol-specific declarative metadata.",
-          "type": "object",
-          "additionalProperties": {
-            "$ref": "#/definitions/NonSecretValue"
-          }
+        "dimensions": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
         },
-        "protocol": {
-          "description": "Protocol name, such as `a2a`, `ag_ui`, `a2ui`, `mcp`, or `http`.",
+        "encoding_format": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input": {
+          "$ref": "#/definitions/OpenAiEmbeddingsInput"
+        },
+        "model": {
           "type": "string"
         },
+        "user": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiFilePart": {
+      "type": "object",
+      "properties": {
+        "file_data": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filename": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiFunction": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "parameters": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "strict": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiFunctionChoice": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiGrammar": {
+      "type": "object",
+      "required": [
+        "definition",
+        "syntax"
+      ],
+      "properties": {
+        "definition": {
+          "type": "string"
+        },
+        "syntax": {
+          "$ref": "#/definitions/OpenAiGrammarSyntax"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiGrammarSyntax": {
+      "type": "string",
+      "enum": [
+        "lark",
+        "regex"
+      ]
+    },
+    "OpenAiImageUrl": {
+      "type": "object",
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiInputAudio": {
+      "type": "object",
+      "required": [
+        "data",
+        "format"
+      ],
+      "properties": {
+        "data": {
+          "type": "string"
+        },
+        "format": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiJsonSchema": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "schema": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "strict": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiMessageContent": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/OpenAiContentPart"
+          }
+        }
+      ]
+    },
+    "OpenAiNamedCustomToolChoice": {
+      "type": "object",
+      "required": [
+        "custom",
+        "type"
+      ],
+      "properties": {
+        "custom": {
+          "$ref": "#/definitions/OpenAiCustomChoice"
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiNamedCustomToolChoiceKind"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiNamedCustomToolChoiceKind": {
+      "type": "string",
+      "enum": [
+        "custom"
+      ]
+    },
+    "OpenAiNamedFunctionToolChoice": {
+      "type": "object",
+      "required": [
+        "function",
+        "type"
+      ],
+      "properties": {
+        "function": {
+          "$ref": "#/definitions/OpenAiFunctionChoice"
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiNamedFunctionToolChoiceKind"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiNamedFunctionToolChoiceKind": {
+      "type": "string",
+      "enum": [
+        "function"
+      ]
+    },
+    "OpenAiPredictionContent": {
+      "type": "object",
+      "required": [
+        "content",
+        "type"
+      ],
+      "properties": {
+        "content": {
+          "$ref": "#/definitions/OpenAiPredictionPayload"
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiPredictionKind"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiPredictionContentPart": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "text",
+            "type"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "text"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "OpenAiPredictionKind": {
+      "type": "string",
+      "enum": [
+        "content"
+      ]
+    },
+    "OpenAiPredictionPayload": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/OpenAiPredictionContentPart"
+          }
+        }
+      ]
+    },
+    "OpenAiReasoning": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiReasoningEffort2"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "generate_summary": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiReasoningSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "summary": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiReasoningSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiReasoningEffort": {
+      "type": "string",
+      "enum": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ]
+    },
+    "OpenAiReasoningEffort2": {
+      "type": "string",
+      "enum": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ]
+    },
+    "OpenAiReasoningSummary": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "concise",
+        "detailed"
+      ]
+    },
+    "OpenAiResponseContentPart": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "text",
+            "type"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "input_text"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "text",
+            "type"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "output_text"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "image_url",
+            "type"
+          ],
+          "properties": {
+            "detail": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "image_url": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "input_image"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "file_id",
+            "type"
+          ],
+          "properties": {
+            "file_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "input_file"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "OpenAiResponseFormat": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "text"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "json_object"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "json_schema",
+            "type"
+          ],
+          "properties": {
+            "json_schema": {
+              "$ref": "#/definitions/OpenAiJsonSchema"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "json_schema"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "OpenAiResponseItem": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "content",
+            "role",
+            "type"
+          ],
+          "properties": {
+            "content": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/OpenAiResponseContentPart"
+              }
+            },
+            "role": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "message"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "arguments",
+            "call_id",
+            "name",
+            "type"
+          ],
+          "properties": {
+            "arguments": {
+              "type": "string"
+            },
+            "call_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "function_call"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "call_id",
+            "output",
+            "type"
+          ],
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "output": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "function_call_output"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "encrypted_content": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "summary": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "reasoning"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "file_id",
+            "type"
+          ],
+          "properties": {
+            "file_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "input_file"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "image_url",
+            "type"
+          ],
+          "properties": {
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "image_url": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "input_image"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "OpenAiResponseModality": {
+      "type": "string",
+      "enum": [
+        "text",
+        "audio"
+      ]
+    },
+    "OpenAiResponsesAllowedToolsChoice": {
+      "type": "object",
+      "required": [
+        "mode",
+        "tools",
+        "type"
+      ],
+      "properties": {
+        "mode": {
+          "$ref": "#/definitions/OpenAiResponsesAllowedToolsMode"
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiResponsesAllowedToolsKind"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiResponsesAllowedToolsKind": {
+      "type": "string",
+      "enum": [
+        "allowed_tools"
+      ]
+    },
+    "OpenAiResponsesAllowedToolsMode": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "required"
+      ]
+    },
+    "OpenAiResponsesApplyPatchToolChoice": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "$ref": "#/definitions/OpenAiResponsesApplyPatchToolKind"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiResponsesApplyPatchToolKind": {
+      "type": "string",
+      "enum": [
+        "apply_patch"
+      ]
+    },
+    "OpenAiResponsesCustomToolChoice": {
+      "type": "object",
+      "required": [
+        "name",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiResponsesCustomToolKind"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiResponsesCustomToolFormat": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "text"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "grammar",
+            "type"
+          ],
+          "properties": {
+            "grammar": {
+              "$ref": "#/definitions/OpenAiResponsesGrammar"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "grammar"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "OpenAiResponsesCustomToolKind": {
+      "type": "string",
+      "enum": [
+        "custom"
+      ]
+    },
+    "OpenAiResponsesFunctionToolChoice": {
+      "type": "object",
+      "required": [
+        "name",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiResponsesFunctionToolKind"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiResponsesFunctionToolKind": {
+      "type": "string",
+      "enum": [
+        "function"
+      ]
+    },
+    "OpenAiResponsesGrammar": {
+      "type": "object",
+      "required": [
+        "definition",
+        "syntax"
+      ],
+      "properties": {
+        "definition": {
+          "type": "string"
+        },
+        "syntax": {
+          "$ref": "#/definitions/OpenAiResponsesGrammarSyntax"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiResponsesGrammarSyntax": {
+      "type": "string",
+      "enum": [
+        "lark",
+        "regex"
+      ]
+    },
+    "OpenAiResponsesHostedToolChoice": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "$ref": "#/definitions/OpenAiResponsesHostedToolKind"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiResponsesHostedToolKind": {
+      "type": "string",
+      "enum": [
+        "file_search",
+        "web_search_preview",
+        "computer",
+        "computer_use_preview",
+        "computer_use",
+        "web_search_preview_2025_03_11",
+        "image_generation",
+        "code_interpreter"
+      ]
+    },
+    "OpenAiResponsesMcpToolChoice": {
+      "type": "object",
+      "required": [
+        "server_label",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_label": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiResponsesMcpToolKind"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiResponsesMcpToolKind": {
+      "type": "string",
+      "enum": [
+        "mcp"
+      ]
+    },
+    "OpenAiResponsesRequest": {
+      "description": "Native OpenAI Responses generation settings flattened into the request body.",
+      "type": "object",
+      "required": [
+        "input",
+        "model"
+      ],
+      "properties": {
+        "include": {
+          "description": "Additional response fields to include.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "input": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/OpenAiResponseItem"
+          }
+        },
+        "instructions": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_output_tokens": {
+          "description": "Maximum output-token count.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "metadata": {
+          "description": "Provider metadata object.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "model": {
+          "type": "string"
+        },
+        "parallel_tool_calls": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "previous_response_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasoning": {
+          "description": "OpenAI Responses reasoning configuration.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiReasoning"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "store": {
+          "description": "Whether the provider may store the response.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "stream": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "temperature": {
+          "description": "Sampling temperature.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "text": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiResponsesText"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tool_choice": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiResponsesToolChoice"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tools": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/OpenAiResponsesTool"
+          }
+        },
+        "top_p": {
+          "description": "Nucleus sampling probability.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        }
+      },
+      "additionalProperties": true
+    },
+    "OpenAiResponsesShellToolChoice": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "$ref": "#/definitions/OpenAiResponsesShellToolKind"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiResponsesShellToolKind": {
+      "type": "string",
+      "enum": [
+        "shell"
+      ]
+    },
+    "OpenAiResponsesText": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiTextResponseFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiResponsesTool": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "name",
+            "type"
+          ],
+          "properties": {
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "parameters": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": true
+            },
+            "strict": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "function"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "web_search_preview"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "vector_store_ids"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "file_search"
+              ]
+            },
+            "vector_store_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "code_interpreter"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "image_generation"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "server_label",
+            "server_url",
+            "type"
+          ],
+          "properties": {
+            "allowed_tools": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "server_label": {
+              "type": "string"
+            },
+            "server_url": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "mcp"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "name",
+            "type"
+          ],
+          "properties": {
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "format": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/OpenAiResponsesCustomToolFormat"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "custom"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "OpenAiResponsesToolChoice": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/OpenAiResponsesToolChoiceMode"
+        },
+        {
+          "$ref": "#/definitions/OpenAiResponsesAllowedToolsChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiResponsesHostedToolChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiResponsesFunctionToolChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiResponsesMcpToolChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiResponsesCustomToolChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiResponsesApplyPatchToolChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiResponsesShellToolChoice"
+        }
+      ]
+    },
+    "OpenAiResponsesToolChoiceMode": {
+      "type": "string",
+      "enum": [
+        "none",
+        "auto",
+        "required"
+      ]
+    },
+    "OpenAiStop": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "OpenAiStreamOptions": {
+      "type": "object",
+      "properties": {
+        "include_obfuscation": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "include_usage": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiTextResponseFormat": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "text"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "json_object"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "name",
+            "type"
+          ],
+          "properties": {
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "schema": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": true
+            },
+            "strict": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "json_schema"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "OpenAiTool": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "function",
+            "type"
+          ],
+          "properties": {
+            "function": {
+              "$ref": "#/definitions/OpenAiFunction"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "function"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "custom",
+            "type"
+          ],
+          "properties": {
+            "custom": {
+              "$ref": "#/definitions/OpenAiCustomTool"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "custom"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "OpenAiToolCall": {
+      "type": "object",
+      "required": [
+        "function",
+        "id",
+        "type"
+      ],
+      "properties": {
+        "function": {
+          "$ref": "#/definitions/OpenAiToolFunctionCall"
+        },
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiToolChoiceMode": {
+      "type": "string",
+      "enum": [
+        "none",
+        "auto",
+        "required"
+      ]
+    },
+    "OpenAiToolFunctionCall": {
+      "type": "object",
+      "required": [
+        "arguments",
+        "name"
+      ],
+      "properties": {
+        "arguments": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiVoice": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/OpenAiBuiltInVoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiCustomVoice"
+        }
+      ]
+    },
+    "Prompt": {
+      "description": "Authored native prompt request plus render metadata.",
+      "type": "object",
+      "required": [
+        "model",
+        "request"
+      ],
+      "properties": {
+        "media_variables": {
+          "description": "Declared media placeholder names expected by `bind_media`.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "model": {
+          "description": "Model identifier used for indexing and selection.",
+          "type": "string"
+        },
+        "request": {
+          "description": "Native provider-shaped request authored with `{{variable}}` placeholders.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProviderRequest"
+            }
+          ]
+        },
+        "response_type": {
+          "description": "Expected response shape for runtime validation.",
+          "default": "text",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ResponseType"
+            }
+          ]
+        },
+        "variables": {
+          "description": "Declared text placeholder names expected by `render`.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "version": {
-          "description": "Protocol version.",
+          "description": "Optional author-assigned prompt version.",
           "type": [
             "string",
             "null"
           ]
         }
       }
+    },
+    "PromptRef": {
+      "description": "Reference to an agent prompt, either inline or by Prompt Card reference.",
+      "anyOf": [
+        {
+          "description": "Inline native prompt payload.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Prompt"
+            }
+          ]
+        },
+        {
+          "description": "Reference to a registered Prompt Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        }
+      ]
+    },
+    "ProviderName": {
+      "description": "Which provider a request targets.",
+      "oneOf": [
+        {
+          "description": "OpenAI provider.",
+          "type": "string",
+          "enum": [
+            "open_ai"
+          ]
+        },
+        {
+          "description": "Anthropic provider.",
+          "type": "string",
+          "enum": [
+            "anthropic"
+          ]
+        },
+        {
+          "description": "Google AI Studio provider.",
+          "type": "string",
+          "enum": [
+            "google"
+          ]
+        },
+        {
+          "description": "Google Vertex AI provider.",
+          "type": "string",
+          "enum": [
+            "vertex"
+          ]
+        },
+        {
+          "description": "Provider not modeled by skald-spec.",
+          "type": "object",
+          "required": [
+            "custom"
+          ],
+          "properties": {
+            "custom": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ProviderRequest": {
+      "description": "One native LLM request.",
+      "anyOf": [
+        {
+          "description": "OpenAI Chat Completions request.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OpenAiChatRequest"
+            }
+          ]
+        },
+        {
+          "description": "OpenAI Responses API request.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OpenAiResponsesRequest"
+            }
+          ]
+        },
+        {
+          "description": "OpenAI Embeddings request.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OpenAiEmbeddingsRequest"
+            }
+          ]
+        },
+        {
+          "description": "Anthropic Messages request.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AnthropicMessagesRequest"
+            }
+          ]
+        },
+        {
+          "description": "Google Gemini GenerateContent request.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GoogleGenerateContentRequest"
+            }
+          ]
+        },
+        {
+          "description": "Google Gemini BatchEmbedContents request.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GoogleBatchEmbedRequest"
+            }
+          ]
+        },
+        {
+          "description": "Vertex GenerateContent request.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GoogleGenerateContentRequest"
+            }
+          ]
+        },
+        {
+          "description": "Vertex Predict request.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VertexPredictRequest"
+            }
+          ]
+        },
+        {
+          "description": "Raw provider request body that no typed variant claimed.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "description": "Unmodified raw provider request JSON."
+            },
+            "provider": {
+              "description": "Provider dispatch target for the raw body.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ProviderName"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "ResponseType": {
+      "description": "Expected response shape for a rendered prompt.",
+      "oneOf": [
+        {
+          "description": "Plain text response.",
+          "type": "string",
+          "enum": [
+            "text"
+          ]
+        },
+        {
+          "description": "JSON response validated against a named schema by the runtime.",
+          "type": "object",
+          "required": [
+            "json_schema"
+          ],
+          "properties": {
+            "json_schema": {
+              "type": "object",
+              "required": [
+                "name",
+                "schema"
+              ],
+              "properties": {
+                "name": {
+                  "description": "Schema name used in diagnostics and provider-native structured output fields.",
+                  "type": "string"
+                },
+                "schema": {
+                  "description": "JSON Schema object."
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
@@ -546,6 +4010,74 @@
     "VersionBlock": {
       "description": "Semver-compatible version string.",
       "type": "string"
+    },
+    "VertexEmbedInstance": {
+      "type": "object",
+      "required": [
+        "content"
+      ],
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "task_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "VertexEmbedParameters": {
+      "type": "object",
+      "properties": {
+        "auto_truncate": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "output_dimensionality": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "VertexPredictRequest": {
+      "type": "object",
+      "required": [
+        "instances"
+      ],
+      "properties": {
+        "instances": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/VertexEmbedInstance"
+          }
+        },
+        "parameters": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/VertexEmbedParameters"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

@@ -10,12 +10,14 @@ OUTPUT_FILE = Path("python/wyrd/_wyrd.pyi")
 PUBLIC_MODEL_FILE = Path("python/wyrd/model.pyi")
 PUBLIC_PROMPT_FILE = Path("python/wyrd/prompt.pyi")
 PUBLIC_DATA_FILE = Path("python/wyrd/data.pyi")
+PUBLIC_AGENT_FILE = Path("python/wyrd/agent.pyi")
 PUBLIC_SESSION_FILE = Path("python/wyrd/session.pyi")
 PUBLIC_INIT_FILE = Path("python/wyrd/__init__.pyi")
 
 STUB_FILES = [
     "header.pyi",
     "error.pyi",
+    "agent.pyi",
     "data.pyi",
     "model.pyi",
     "prompt.pyi",
@@ -87,6 +89,7 @@ def assemble() -> None:
 
     OUTPUT_FILE.write_text("\n".join(final_content) + "\n", encoding="utf-8")
     write_public_data_stub()
+    write_public_agent_stub()
     write_public_model_stub()
     write_public_prompt_stub()
     write_public_session_stub()
@@ -116,6 +119,30 @@ def write_public_data_stub() -> None:
     lines.extend(f'    "{name}",' for name in exports)
     lines.append("]")
     PUBLIC_DATA_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_public_agent_stub() -> None:
+    """Write the public wyrd.agent re-export stub."""
+    exports = extract_all((STUB_DIR / "agent.pyi").read_text(encoding="utf-8"))
+    lines = [
+        "from typing import TYPE_CHECKING",
+        "",
+        "if TYPE_CHECKING:",
+        "    from ._wyrd import (",
+    ]
+    lines.extend(f"        {name}," for name in exports)
+    lines.extend(
+        [
+            "    )",
+            "else:",
+            "    from ._wyrd.agent import (",
+        ]
+    )
+    lines.extend(f"        {name}," for name in exports)
+    lines.extend(["    )", "", "__all__ = ["])
+    lines.extend(f'    "{name}",' for name in exports)
+    lines.append("]")
+    PUBLIC_AGENT_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def write_public_model_stub() -> None:

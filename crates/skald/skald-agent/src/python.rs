@@ -2,20 +2,365 @@
 
 #![cfg(feature = "python")]
 
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList, PyModule};
-use skald_prompt::PyProviderRequest;
+use pyo3::types::{PyAny, PyDict, PyList, PyModule, PyString};
+use skald_prompt::{Prompt, PyProviderRequest};
+use skald_runtime::python::PyProviderRegistryInner;
 use skald_spec::{ProviderRequest, ProviderResponse};
+use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue};
+use wyrd_spec::reference::PromptRef;
 
+use crate::py_error::{AgentPyError, AgentPyResult};
 use crate::{
-    AfterAgentFn, AfterModelFn, AfterToolFn, AgentContext, AgentRun, BeforeAgentFn, BeforeModelFn,
-    BeforeToolFn, CallbackOutcome, Role, SessionError, SessionId, SessionMemory, SessionTurn,
+    AfterAgentFn, AfterModelFn, AfterToolFn, Agent, AgentContext, AgentRun, BeforeAgentFn,
+    BeforeModelFn, BeforeToolFn, CallbackOutcome, Role, RunConfig, SessionError, SessionId,
+    SessionMemory, SessionTurn, default_prompt_resolver,
 };
+
+#[pymethods]
+impl Agent {
+    /// Build a runnable Agent from a resolved Prompt.
+    #[new]
+    #[pyo3(signature = (
+        *,
+        prompt,
+        name = None,
+        version = None,
+        space = None,
+        id = None,
+        tools = None,
+        providers = None,
+        run_config = None,
+        before_agent_callback = None,
+        after_agent_callback = None,
+        before_model_callback = None,
+        after_model_callback = None,
+        before_tool_callback = None,
+        after_tool_callback = None,
+        session = None,
+        labels = None,
+        annotations = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn __new__(
+        py: Python<'_>,
+        prompt: &Bound<'_, PyAny>,
+        name: Option<String>,
+        version: Option<String>,
+        space: Option<String>,
+        id: Option<String>,
+        tools: Option<Vec<Py<PyAny>>>,
+        providers: Option<&Bound<'_, PyAny>>,
+        run_config: Option<&Bound<'_, PyAny>>,
+        before_agent_callback: Option<Py<PyAny>>,
+        after_agent_callback: Option<Py<PyAny>>,
+        before_model_callback: Option<Py<PyAny>>,
+        after_model_callback: Option<Py<PyAny>>,
+        before_tool_callback: Option<Py<PyAny>>,
+        after_tool_callback: Option<Py<PyAny>>,
+        session: Option<Py<PyAny>>,
+        labels: Option<HashMap<String, String>>,
+        annotations: Option<HashMap<String, String>>,
+    ) -> AgentPyResult<Self> {
+        let mut agent = agent_from_prompt_py(prompt)?;
+
+        if let Some(id) = id {
+            agent = agent.with_id(id);
+        }
+        if let Some(run_config) = run_config {
+            agent = agent.with_run_config(run_config_from_py(run_config)?);
+        }
+        if let Some(session) = session {
+            agent = agent.with_session(wrap_session(py, session)?);
+        }
+        if let Some(providers) = providers {
+            agent = agent.with_providers(provider_registry_from_py(providers)?);
+        }
+        for tool in tools.unwrap_or_default() {
+            agent = agent.with_tool(skald_tool::python::wrap_callable(py, tool)?);
+        }
+
+        if let Some(name) = name {
+            agent = agent.name(name);
+        }
+        if let Some(version) = version {
+            agent = agent.version(version);
+        }
+        if let Some(space) = space {
+            agent = agent.space(space);
+        }
+        if let Some(labels) = labels {
+            agent = agent.labels(labels_from_py(labels)?);
+        }
+        if let Some(annotations) = annotations {
+            agent = agent.annotations(annotations_from_py(annotations)?);
+        }
+
+        if let Some(callback) = before_agent_callback {
+            agent = agent.before_agent(wrap_before_agent(py, callback)?);
+        }
+        if let Some(callback) = after_agent_callback {
+            agent = agent.after_agent(wrap_after_agent(py, callback)?);
+        }
+        if let Some(callback) = before_model_callback {
+            agent = agent.before_model(wrap_before_model(py, callback)?);
+        }
+        if let Some(callback) = after_model_callback {
+            agent = agent.after_model(wrap_after_model(py, callback)?);
+        }
+        if let Some(callback) = before_tool_callback {
+            agent = agent.before_tool(wrap_before_tool(py, callback)?);
+        }
+        if let Some(callback) = after_tool_callback {
+            agent = agent.after_tool(wrap_after_tool(py, callback)?);
+        }
+
+        Ok(agent)
+    }
+
+    /// Optional card name.
+    #[getter(name)]
+    pub fn py_name(&self) -> Option<&str> {
+        self.name_str()
+    }
+
+    /// Optional card version.
+    #[getter(version)]
+    pub fn py_version(&self) -> Option<&str> {
+        self.version_str()
+    }
+
+    /// Optional card space.
+    #[getter(space)]
+    pub fn py_space(&self) -> Option<&str> {
+        self.space_str()
+    }
+
+    /// Runtime agent id.
+    #[getter(id)]
+    pub fn py_id(&self) -> &str {
+        self.id()
+    }
+
+    /// Resolved prompt.
+    #[getter(prompt)]
+    pub fn py_prompt(&self) -> Prompt {
+        self.prompt.as_ref().clone()
+    }
+
+    /// Prompt provider name.
+    #[getter]
+    pub fn provider(&self) -> String {
+        self.prompt.provider()
+    }
+
+    /// Prompt model name.
+    #[getter]
+    pub fn model(&self) -> &str {
+        &self.prompt.native().model
+    }
+
+    /// Runtime-local tool names attached to this agent.
+    #[getter(tool_names)]
+    pub fn py_tool_names(&self) -> Vec<String> {
+        self.tool_names().to_vec()
+    }
+
+    /// Save this Agent Card YAML envelope to local disk.
+    #[pyo3(name = "save")]
+    pub fn py_save(&self, path: PathBuf) -> AgentPyResult<()> {
+        Ok(Agent::save(self, path)?)
+    }
+
+    /// Load an Agent Card YAML envelope from local disk.
+    #[staticmethod]
+    pub fn from_yaml(path: PathBuf) -> AgentPyResult<Self> {
+        Ok(Self::from_yaml_path(
+            path,
+            skald_tool::default_registry(),
+            default_prompt_resolver(),
+        )?)
+    }
+
+    /// Return this Agent Card as a YAML string.
+    #[pyo3(name = "to_yaml_string")]
+    pub fn py_to_yaml_string(&self) -> AgentPyResult<String> {
+        Ok(Agent::to_yaml_string(self)?)
+    }
+
+    /// Return this Agent Card as a JSON-serializable Python mapping.
+    #[pyo3(name = "to_card")]
+    pub fn py_to_card(&self, py: Python<'_>) -> AgentPyResult<Py<PyAny>> {
+        let card = Agent::to_card(self)?;
+        let value = serde_json::to_value(card)?;
+        Ok(wyrd_utils::py::json_to_pyobject(py, &value)?)
+    }
+
+    /// Return this Agent Card envelope as JSON.
+    #[pyo3(name = "model_dump_json")]
+    pub fn py_model_dump_json(&self) -> AgentPyResult<String> {
+        Ok(serde_json::to_string(&Agent::to_card(self)?)?)
+    }
+
+    /// Validate an Agent Card envelope JSON payload into an Agent.
+    #[staticmethod]
+    pub fn model_validate_json(data: &str) -> AgentPyResult<Self> {
+        let card = serde_json::from_str(data)?;
+        Ok(Self::from_card(
+            card,
+            skald_tool::default_registry(),
+            default_prompt_resolver(),
+        )?)
+    }
+
+    /// Validate whether this local Agent Card can be durably registered.
+    #[pyo3(name = "validate_registrable")]
+    pub fn py_validate_registrable(&self) -> AgentPyResult<()> {
+        Ok(Agent::validate_registrable(self)?)
+    }
+
+    /// Run the bounded tool loop.
+    #[pyo3(name = "run")]
+    #[pyo3(signature = (input, *, session_id=None))]
+    pub fn py_run(
+        &self,
+        py: Python<'_>,
+        input: &Bound<'_, PyAny>,
+        session_id: Option<String>,
+    ) -> AgentPyResult<Py<PyAny>> {
+        let input = input_to_string(input)?;
+        let providers = self
+            .providers
+            .clone()
+            .unwrap_or_else(skald_runtime::default_registry);
+        let session_id = session_id.map(SessionId::new);
+        let run = py.detach(|| {
+            wyrd_runtime::runtime().block_on(self.run_with(providers.as_ref(), session_id, &input))
+        })?;
+        Ok(agent_run_to_py(py, run)?)
+    }
+
+    /// Add one runtime-local tool in place.
+    #[pyo3(name = "add_tool")]
+    pub fn py_add_tool(&mut self, py: Python<'_>, tool: Py<PyAny>) -> AgentPyResult<()> {
+        let next = self
+            .clone()
+            .with_tool(skald_tool::python::wrap_callable(py, tool)?);
+        *self = next;
+        Ok(())
+    }
+
+    /// Replace runtime-local tools in place.
+    #[pyo3(name = "set_tools")]
+    pub fn py_set_tools(&mut self, py: Python<'_>, tools: Vec<Py<PyAny>>) -> AgentPyResult<()> {
+        let mut resolved = Vec::with_capacity(tools.len());
+        for tool in tools {
+            resolved.push(skald_tool::python::wrap_callable(py, tool)?);
+        }
+        *self = self.clone().with_tools(resolved);
+        Ok(())
+    }
+
+    /// Replace the resolved prompt in place.
+    #[pyo3(name = "with_prompt")]
+    pub fn py_with_prompt(&mut self, prompt: &Bound<'_, PyAny>) -> AgentPyResult<()> {
+        let next = self.clone().with_prompt(prompt_from_py(prompt)?);
+        *self = next;
+        Ok(())
+    }
+
+    /// Replace the session memory backend in place.
+    #[pyo3(name = "with_session")]
+    pub fn py_with_session(&mut self, py: Python<'_>, session: Py<PyAny>) -> AgentPyResult<()> {
+        let next = self.clone().with_session(wrap_session(py, session)?);
+        *self = next;
+        Ok(())
+    }
+
+    /// Replace run configuration in place.
+    #[pyo3(name = "with_run_config")]
+    pub fn py_with_run_config(&mut self, run_config: &Bound<'_, PyAny>) -> AgentPyResult<()> {
+        let next = self
+            .clone()
+            .with_run_config(run_config_from_py(run_config)?);
+        *self = next;
+        Ok(())
+    }
+
+    /// Return this agent as a runtime-local delegate tool.
+    #[pyo3(name = "as_tool")]
+    #[pyo3(signature = (*, description=None))]
+    pub fn py_as_tool(
+        &self,
+        py: Python<'_>,
+        description: Option<String>,
+    ) -> AgentPyResult<Py<PyAny>> {
+        let providers = self
+            .providers
+            .clone()
+            .unwrap_or_else(skald_runtime::default_registry);
+        let delegate = crate::AgentDelegateTool::new(Arc::new(self.clone()), providers);
+        let tool = match description {
+            Some(description) => delegate.with_description(description).into_tool(),
+            None => delegate.into_tool(),
+        };
+        Ok(skald_tool::python::tool_callable_py(py, tool)?)
+    }
+
+    /// Register a before-agent callback in place.
+    pub fn add_before_agent(&mut self, py: Python<'_>, callback: Py<PyAny>) -> AgentPyResult<()> {
+        *self = self.clone().before_agent(wrap_before_agent(py, callback)?);
+        Ok(())
+    }
+
+    /// Register an after-agent callback in place.
+    pub fn add_after_agent(&mut self, py: Python<'_>, callback: Py<PyAny>) -> AgentPyResult<()> {
+        *self = self.clone().after_agent(wrap_after_agent(py, callback)?);
+        Ok(())
+    }
+
+    /// Register a before-model callback in place.
+    pub fn add_before_model(&mut self, py: Python<'_>, callback: Py<PyAny>) -> AgentPyResult<()> {
+        *self = self.clone().before_model(wrap_before_model(py, callback)?);
+        Ok(())
+    }
+
+    /// Register an after-model callback in place.
+    pub fn add_after_model(&mut self, py: Python<'_>, callback: Py<PyAny>) -> AgentPyResult<()> {
+        *self = self.clone().after_model(wrap_after_model(py, callback)?);
+        Ok(())
+    }
+
+    /// Register a before-tool callback in place.
+    pub fn add_before_tool(&mut self, py: Python<'_>, callback: Py<PyAny>) -> AgentPyResult<()> {
+        *self = self.clone().before_tool(wrap_before_tool(py, callback)?);
+        Ok(())
+    }
+
+    /// Register an after-tool callback in place.
+    pub fn add_after_tool(&mut self, py: Python<'_>, callback: Py<PyAny>) -> AgentPyResult<()> {
+        *self = self.clone().after_tool(wrap_after_tool(py, callback)?);
+        Ok(())
+    }
+
+    /// Return a concise Python representation.
+    pub fn __repr__(&self) -> String {
+        format!(
+            "Agent(name={:?}, version={:?}, model={:?})",
+            self.name_str(),
+            self.version_str(),
+            self.prompt.native().model
+        )
+    }
+}
 
 #[pymethods]
 impl Role {
@@ -312,9 +657,125 @@ impl SessionMemory for PySessionMemory {
 /// # Errors
 /// Returns PyO3 registration errors.
 pub fn python_register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    wyrd_utils::py::register_wyrd_error_exception(module)?;
+    module.add_class::<Agent>()?;
     module.add_class::<Role>()?;
     module.add_class::<SessionTurn>()?;
     Ok(())
+}
+
+fn agent_from_prompt_py(value: &Bound<'_, PyAny>) -> AgentPyResult<Agent> {
+    if let Ok(prompt) = value.extract::<PyRef<'_, Prompt>>() {
+        return Ok(Agent::new(prompt.clone()));
+    }
+    let prompt_ref = prompt_ref_from_py(value)?;
+    Ok(Agent::try_from_ref(prompt_ref, default_prompt_resolver())?)
+}
+
+fn prompt_from_py(value: &Bound<'_, PyAny>) -> AgentPyResult<Prompt> {
+    Ok(value
+        .extract::<PyRef<'_, Prompt>>()
+        .map_err(|error| PyTypeError::new_err(error.to_string()))?
+        .clone())
+}
+
+fn prompt_ref_from_py(value: &Bound<'_, PyAny>) -> AgentPyResult<PromptRef> {
+    if let Ok(json) = value.call_method0("model_dump_json") {
+        let data = json.extract::<String>()?;
+        return Ok(serde_json::from_str(&data)?);
+    }
+    let json = wyrd_utils::py::pyobject_to_json(value)?;
+    Ok(serde_json::from_value(json)?)
+}
+
+fn provider_registry_from_py(
+    value: &Bound<'_, PyAny>,
+) -> AgentPyResult<Arc<skald_runtime::ProviderRegistry>> {
+    if let Ok(registry) = value.extract::<PyRef<'_, PyProviderRegistryInner>>() {
+        return Ok(registry.inner.clone());
+    }
+    if let Ok(inner) = value.getattr("_inner") {
+        let registry = inner
+            .extract::<PyRef<'_, PyProviderRegistryInner>>()
+            .map_err(|error| PyTypeError::new_err(error.to_string()))?;
+        return Ok(registry.inner.clone());
+    }
+    Err(PyTypeError::new_err("providers must be a wyrd ProviderRegistry").into())
+}
+
+fn run_config_from_py(value: &Bound<'_, PyAny>) -> AgentPyResult<RunConfig> {
+    if let Ok(json) = wyrd_utils::py::pyobject_to_json(value) {
+        if let Ok(spec) = serde_json::from_value(json) {
+            return Ok(crate::run_config_from_agent_run_config_spec(&spec));
+        }
+    }
+
+    let mut config = RunConfig::default();
+    if let Some(max_iterations) = optional_attr::<u32>(value, "max_iterations")? {
+        config.max_iterations = max_iterations;
+    }
+    config.tool_concurrency_cap = optional_attr(value, "tool_concurrency_cap")?;
+    config.session_recent_limit = optional_attr(value, "session_recent_limit")?;
+    if let Some(timeout_ms) = optional_attr::<u64>(value, "timeout_ms")? {
+        config.timeout = Some(Duration::from_millis(timeout_ms));
+    }
+    Ok(config)
+}
+
+fn optional_attr<T>(value: &Bound<'_, PyAny>, name: &str) -> PyResult<Option<T>>
+where
+    for<'py> T: FromPyObject<'py, 'py, Error = PyErr>,
+{
+    match value.getattr(name) {
+        Ok(attr) if attr.is_none() => Ok(None),
+        Ok(attr) => attr.extract().map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
+fn labels_from_py(
+    values: HashMap<String, String>,
+) -> AgentPyResult<BTreeMap<LabelKey, LabelValue>> {
+    values
+        .into_iter()
+        .map(|(key, value)| {
+            Ok((
+                LabelKey::new_user(key).map_err(metadata_py_error)?,
+                LabelValue::new_user(value).map_err(metadata_py_error)?,
+            ))
+        })
+        .collect()
+}
+
+fn annotations_from_py(
+    values: HashMap<String, String>,
+) -> AgentPyResult<BTreeMap<AnnotationKey, AnnotationValue>> {
+    values
+        .into_iter()
+        .map(|(key, value)| {
+            Ok((
+                AnnotationKey::new_user(key).map_err(metadata_py_error)?,
+                AnnotationValue::new_user(value).map_err(metadata_py_error)?,
+            ))
+        })
+        .collect()
+}
+
+fn metadata_py_error(error: wyrd_spec::metadata::MetadataError) -> AgentPyError {
+    PyTypeError::new_err(error.to_string()).into()
+}
+
+fn input_to_string(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok(value) = value.extract::<String>() {
+        return Ok(value);
+    }
+    if value.is_instance_of::<PyString>() {
+        return value.extract();
+    }
+    Ok(
+        serde_json::to_string(&wyrd_utils::py::pyobject_to_json(value)?)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+    )
 }
 
 fn invoke_callback<T>(

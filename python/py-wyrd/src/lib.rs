@@ -12,6 +12,22 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_submodule(py, "wyrd._wyrd.agent", &agent)?;
 
     wyrd_cards::register(py, m)?;
+    register_submodule(py, "wyrd._wyrd.cards", &m.getattr("cards")?.cast_into()?)?;
+    register_submodule(
+        py,
+        "wyrd._wyrd.cards.data",
+        &m.getattr("cards")?.getattr("data")?.cast_into()?,
+    )?;
+    register_submodule(
+        py,
+        "wyrd._wyrd.cards.model",
+        &m.getattr("cards")?.getattr("model")?.cast_into()?,
+    )?;
+    register_submodule(
+        py,
+        "wyrd._wyrd.cards.prompt",
+        &m.getattr("cards")?.getattr("prompt")?.cast_into()?,
+    )?;
 
     let tool = PyModule::new(py, "tool")?;
     skald_tool::python_register(&tool)?;

@@ -45,6 +45,8 @@ pub mod loop_runtime;
 pub mod observer;
 pub mod observer_provider;
 #[cfg(feature = "python")]
+pub mod py_error;
+#[cfg(feature = "python")]
 pub mod python;
 pub mod registry;
 pub mod request_builder;

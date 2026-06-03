@@ -4,6 +4,14 @@ mod agent_assertion;
 mod assertion;
 #[path = "eval/condition.rs"]
 mod condition;
+#[path = "eval/dag_cycle.rs"]
+mod dag_cycle;
+#[path = "eval/dag_happy.rs"]
+mod dag_happy;
+#[path = "eval/dag_missing.rs"]
+mod dag_missing;
+#[path = "eval/dag_self_loop.rs"]
+mod dag_self_loop;
 #[path = "eval/ids.rs"]
 mod ids;
 #[path = "eval/llm_judge.rs"]

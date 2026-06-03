@@ -22,6 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 schemars = { workspace = true }
+petgraph = { version = "0.6", default-features = false, features = ["graphmap"] }
 utoipa = { workspace = true, optional = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }

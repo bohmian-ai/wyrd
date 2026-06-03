@@ -1,0 +1,151 @@
+use std::collections::BTreeMap;
+
+use wyrd_spec::envelope::CardKind;
+use wyrd_spec::ids::CardName;
+use wyrd_spec::reference::CardRef;
+use wyrd_spec::vala::eval::assertion::AssertionTask;
+use wyrd_spec::vala::eval::ids::{JsonPath, TaskId};
+use wyrd_spec::vala::eval::operator::ComparisonOperator;
+use wyrd_spec::vala::eval::result::EvalPassGate;
+use wyrd_spec::vala::eval::spec::{DatasetRef, EvalSampling, EvalSpec};
+use wyrd_spec::vala::eval::task::EvalTask;
+use wyrd_spec::version::VersionBlock;
+
+fn data_ref(name: &str) -> CardRef {
+    CardRef {
+        kind: CardKind::Data,
+        name: CardName::new(name).unwrap(),
+        version: VersionBlock::parse("1.0.0").unwrap(),
+        space: None,
+        uid: None,
+    }
+}
+
+fn prompt_ref(name: &str) -> CardRef {
+    CardRef {
+        kind: CardKind::Prompt,
+        name: CardName::new(name).unwrap(),
+        version: VersionBlock::parse("1.0.0").unwrap(),
+        space: None,
+        uid: None,
+    }
+}
+
+fn one_task_map() -> BTreeMap<TaskId, EvalTask> {
+    let mut tasks = BTreeMap::new();
+    let id = TaskId::new("a").unwrap();
+    tasks.insert(
+        id.clone(),
+        EvalTask::Assertion(AssertionTask {
+            id,
+            context_path: Some(JsonPath::new("$.x").unwrap()),
+            item_context_path: None,
+            operator: ComparisonOperator::IsNotNull,
+            expected: serde_json::Value::Null,
+            depends_on: vec![],
+            condition: None,
+        }),
+    );
+    tasks
+}
+
+#[test]
+fn spec_new_validates_dag() {
+    EvalSpec::new(one_task_map()).expect("valid");
+}
+
+#[test]
+fn spec_minimal_round_trip() {
+    let spec = EvalSpec::new(one_task_map()).unwrap();
+    let serialized = serde_json::to_string(&spec).unwrap();
+    let back: EvalSpec = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(spec, back);
+}
+
+#[test]
+fn spec_with_full_fields_round_trip() {
+    let mut spec = EvalSpec::new(one_task_map()).unwrap();
+    spec.target_ref = Some(prompt_ref("retriever-quality"));
+    spec.dataset = Some(DatasetRef::new(data_ref("eval-set")).unwrap());
+    spec.sampling = Some(EvalSampling::Ratio { ratio: 0.1 });
+    spec.pass_gate = Some(EvalPassGate::OverallPassRate { threshold: 0.9 });
+
+    let serialized = serde_json::to_string(&spec).unwrap();
+    let back: EvalSpec = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(spec, back);
+}
+
+#[test]
+fn dataset_ref_rejects_non_data_kind() {
+    assert!(DatasetRef::new(prompt_ref("prompt")).is_err());
+}
+
+#[test]
+fn validate_catches_cycle_after_mutation() {
+    let mut spec = EvalSpec::new(one_task_map()).unwrap();
+    let id = TaskId::new("b").unwrap();
+    spec.tasks.insert(
+        id.clone(),
+        EvalTask::Assertion(AssertionTask {
+            id: id.clone(),
+            context_path: Some(JsonPath::new("$.y").unwrap()),
+            item_context_path: None,
+            operator: ComparisonOperator::IsNotNull,
+            expected: serde_json::Value::Null,
+            depends_on: vec![TaskId::new("a").unwrap()],
+            condition: None,
+        }),
+    );
+
+    if let EvalTask::Assertion(assertion) = spec.tasks.get_mut(&TaskId::new("a").unwrap()).unwrap()
+    {
+        assertion.depends_on.push(id);
+    }
+
+    assert!(spec.validate().is_err());
+}
+
+#[test]
+fn validate_catches_bad_sampling() {
+    let mut spec = EvalSpec::new(one_task_map()).unwrap();
+    spec.sampling = Some(EvalSampling::Ratio { ratio: 2.0 });
+    assert!(spec.validate().is_err());
+}
+
+#[test]
+fn validate_catches_bad_pass_gate() {
+    let mut spec = EvalSpec::new(one_task_map()).unwrap();
+    spec.pass_gate = Some(EvalPassGate::PerJudgePassRate { threshold: -0.1 });
+    assert!(spec.validate().is_err());
+}
+
+#[test]
+fn spec_with_workflow_round_trip() {
+    use wyrd_spec::vala::eval::workflow::{Workflow, WorkflowFieldType};
+
+    let mut spec = EvalSpec::new(one_task_map()).unwrap();
+    let mut fields = BTreeMap::new();
+    fields.insert("response".to_string(), WorkflowFieldType::String);
+    fields.insert("score".to_string(), WorkflowFieldType::Float);
+    fields.insert("tool_calls".to_string(), WorkflowFieldType::Array);
+    spec.workflow = Some(Workflow { fields });
+
+    let serialized = serde_json::to_string(&spec).unwrap();
+    let back: EvalSpec = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(spec, back);
+}
+
+#[test]
+fn sampling_deterministic_validates_bucket_lt_modulus() {
+    let bad = EvalSampling::DeterministicByHash {
+        key_path: JsonPath::new("$.user_id").unwrap(),
+        modulus: 10,
+        bucket: 10,
+    };
+    assert!(bad.validate().is_err());
+}
+
+#[test]
+fn sampling_every_nth_validates_nonzero() {
+    assert!(EvalSampling::EveryNth { n: 0 }.validate().is_err());
+}

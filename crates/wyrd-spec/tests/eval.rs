@@ -22,6 +22,8 @@ mod operator_catalog;
 mod pass_gate;
 #[path = "eval/result.rs"]
 mod result;
+#[path = "eval/spec.rs"]
+mod spec;
 #[path = "eval/status.rs"]
 mod status;
 #[path = "eval/task_enum.rs"]

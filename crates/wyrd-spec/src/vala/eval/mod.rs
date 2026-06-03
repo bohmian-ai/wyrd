@@ -26,6 +26,7 @@
 //! - `task` — `EvalTask` executable task enum.
 //! - `plan` — DAG validation and topological execution stages.
 //! - `result` — per-task result records and workflow-level pass gates.
+//! - `spec` — `EvalSpec`, dataset references, and sampling policy.
 //!
 //! Later commits add the remaining spec modules.
 
@@ -37,6 +38,7 @@ pub mod llm_judge;
 pub mod operator;
 pub mod plan;
 pub mod result;
+pub mod spec;
 pub mod status;
 pub mod task;
 pub mod trace;
@@ -52,6 +54,7 @@ pub use llm_judge::LlmJudgeTask;
 pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
 pub use plan::{DagError, ExecutionPlan, Stage, validate_dag};
 pub use result::{AssertionResult, EvalPassGate};
+pub use spec::{DatasetRef, EvalSampling, EvalSpec, EvalSpecError};
 pub use status::EvalStatus;
 pub use task::EvalTask;
 pub use trace::TraceAssertionTask;

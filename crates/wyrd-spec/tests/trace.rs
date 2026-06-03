@@ -26,3 +26,6 @@ mod span_record;
 
 #[path = "trace/trace_summary_record.rs"]
 mod trace_summary_record;
+
+#[path = "trace/gen_ai_eval_result.rs"]
+mod gen_ai_eval_result;

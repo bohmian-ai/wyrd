@@ -384,3 +384,168 @@ fn openai_message(role: &str, content: &str) -> OpenAiChatMessage {
         refusal: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use skald_spec::wire::anthropic_messages::{
+        AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest,
+        AnthropicMessagesSettings,
+    };
+    use skald_spec::wire::google_generate::{
+        GoogleContent, GoogleGenerateContentRequest, GoogleGenerateSettings, GooglePart,
+    };
+    use skald_spec::wire::openai_chat::{OpenAiChatMessage, OpenAiMessageContent};
+    use skald_spec::wire::vertex_generate::VertexGenerateContentRequest;
+    use skald_spec::{MessageNum, ProviderRequest};
+
+    use super::{extract_messages, reset_messages};
+
+    fn anthropic_request(messages: Vec<AnthropicMessage>) -> ProviderRequest {
+        ProviderRequest::AnthropicMessage(AnthropicMessagesRequest {
+            model: "claude-3-5-sonnet".to_owned(),
+            messages,
+            system: None,
+            stream: None,
+            tools: None,
+            tool_choice: None,
+            settings: AnthropicMessagesSettings::default(),
+        })
+    }
+
+    fn anthropic_message(role: &str, text: &str) -> AnthropicMessage {
+        AnthropicMessage {
+            role: role.to_owned(),
+            content: vec![AnthropicContentBlock::Text {
+                text: text.to_owned(),
+                cache_control: None,
+                citations: None,
+            }],
+        }
+    }
+
+    fn google_request(contents: Vec<GoogleContent>) -> GoogleGenerateContentRequest {
+        GoogleGenerateContentRequest {
+            contents,
+            system_instruction: None,
+            tools: None,
+            tool_config: None,
+            settings: GoogleGenerateSettings::default(),
+        }
+    }
+
+    fn gemini_request(contents: Vec<GoogleContent>) -> ProviderRequest {
+        ProviderRequest::GeminiGenerateContent(google_request(contents))
+    }
+
+    fn vertex_request(contents: Vec<GoogleContent>) -> ProviderRequest {
+        ProviderRequest::Vertex(VertexGenerateContentRequest(google_request(contents)))
+    }
+
+    fn google_message(role: &str, text: &str) -> GoogleContent {
+        GoogleContent {
+            role: role.to_owned(),
+            parts: vec![GooglePart::Text {
+                text: text.to_owned(),
+            }],
+        }
+    }
+
+    fn openai_message(role: &str, text: &str) -> OpenAiChatMessage {
+        OpenAiChatMessage {
+            role: role.to_owned(),
+            content: Some(OpenAiMessageContent::Text(text.to_owned())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            refusal: None,
+        }
+    }
+
+    #[test]
+    fn extract_messages_gemini_returns_gemini_variants() {
+        let request = gemini_request(vec![
+            google_message("user", "hello"),
+            google_message("model", "hi"),
+        ]);
+
+        let messages = extract_messages("agent", &request).expect("Gemini messages must extract");
+
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages
+                .iter()
+                .all(|message| matches!(message, MessageNum::Gemini(_)))
+        );
+    }
+
+    #[test]
+    fn extract_messages_vertex_returns_gemini_variants() {
+        let request = vertex_request(vec![
+            google_message("user", "hello"),
+            google_message("model", "hi"),
+        ]);
+
+        let messages = extract_messages("agent", &request).expect("Vertex messages must extract");
+
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages
+                .iter()
+                .all(|message| matches!(message, MessageNum::Gemini(_)))
+        );
+    }
+
+    #[test]
+    fn reset_messages_anthropic_filters_out_system_role() {
+        let template = anthropic_request(vec![]);
+        let new_messages = vec![
+            MessageNum::Anthropic(anthropic_message("system", "ignored")),
+            MessageNum::Anthropic(anthropic_message("user", "kept")),
+            MessageNum::Anthropic(anthropic_message("assistant", "kept")),
+        ];
+
+        let result = reset_messages(template, &new_messages).expect("Anthropic reset must succeed");
+        let ProviderRequest::AnthropicMessage(request) = result else {
+            panic!("expected Anthropic request");
+        };
+        let roles = request
+            .messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(roles, vec!["user", "assistant"]);
+    }
+
+    #[test]
+    fn reset_messages_gemini_filters_out_system_role() {
+        let template = gemini_request(vec![]);
+        let new_messages = vec![
+            MessageNum::Gemini(google_message("system", "ignored")),
+            MessageNum::Gemini(google_message("user", "kept")),
+            MessageNum::Gemini(google_message("model", "kept")),
+        ];
+
+        let result = reset_messages(template, &new_messages).expect("Gemini reset must succeed");
+        let ProviderRequest::GeminiGenerateContent(request) = result else {
+            panic!("expected Gemini request");
+        };
+        let roles = request
+            .contents
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(roles, vec!["user", "model"]);
+    }
+
+    #[test]
+    fn reset_messages_rejects_mismatched_variant() {
+        let template = anthropic_request(vec![]);
+        let new_messages = vec![MessageNum::OpenAi(openai_message("user", "wrong provider"))];
+
+        let err = reset_messages(template, &new_messages).expect_err("variant mismatch must fail");
+
+        assert_eq!(err.code(), "SKALD_AGENT_422_LOOP_MESSAGE_TYPE");
+    }
+}

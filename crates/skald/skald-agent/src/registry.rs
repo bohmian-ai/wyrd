@@ -45,3 +45,19 @@ pub fn system_messages(prompt: &str, provider: &ProviderName) -> AgentResult<Vec
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use skald_spec::ProviderName;
+
+    use super::system_messages;
+
+    #[test]
+    fn system_messages_custom_provider_errors() {
+        let provider = ProviderName::Custom("llama".to_owned());
+
+        let err = system_messages("be helpful", &provider).expect_err("custom providers must fail");
+
+        assert_eq!(err.code(), "SKALD_AGENT_422_PROMPT");
+    }
+}

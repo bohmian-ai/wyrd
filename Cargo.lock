@@ -4470,6 +4470,8 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-stdout",
  "opentelemetry_sdk",
+ "schemars",
+ "serde",
  "skald-agent",
  "skald-prompt",
  "skald-runtime",

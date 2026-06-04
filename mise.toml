@@ -308,6 +308,30 @@ dir = "python/py-wyrd"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/datacard_local_workflow.py"
 
+[tasks."examples:python:workflow:openai"]
+description = "Run the sequential OpenAI workflow example"
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = "uv run python ../../examples/python/workflow_openai.py"
+
+[tasks."examples:python:workflow:anthropic"]
+description = "Run the sequential Anthropic workflow example"
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = "uv run python ../../examples/python/workflow_anthropic.py"
+
+[tasks."examples:python:workflow:gemini"]
+description = "Run the sequential Gemini workflow example"
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = "uv run python ../../examples/python/workflow_gemini.py"
+
+[tasks."examples:python:workflow:gateway"]
+description = "Run the split-registry gateway workflow example"
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = "uv run python ../../examples/python/workflow_gateway.py"
+
 [tasks."dev:backend"]
 description = "Build and run wyrd-server on :8080"
 run = [

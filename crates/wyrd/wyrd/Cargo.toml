@@ -17,6 +17,22 @@ name = "tracing_stdout"
 path = "examples/tracing_stdout.rs"
 required-features = ["otel"]
 
+[[example]]
+name = "workflow_openai"
+path = "examples/workflow_openai.rs"
+
+[[example]]
+name = "workflow_anthropic"
+path = "examples/workflow_anthropic.rs"
+
+[[example]]
+name = "workflow_gemini"
+path = "examples/workflow_gemini.rs"
+
+[[example]]
+name = "workflow_gateway"
+path = "examples/workflow_gateway.rs"
+
 [features]
 default = []
 otel = ["wyrd-observe/otel"]
@@ -36,5 +52,7 @@ async-trait = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-stdout = { version = "0.27", features = ["trace"] }
+schemars = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 skald-spec = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

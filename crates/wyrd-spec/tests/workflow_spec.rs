@@ -22,6 +22,8 @@ fn prompt() -> skald_spec::Prompt {
                 tool_calls: None,
                 tool_call_id: None,
                 refusal: None,
+                annotations: Vec::new(),
+                audio: None,
             }],
             response_format: None,
             stream: None,

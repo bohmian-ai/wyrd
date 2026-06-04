@@ -1,9 +1,10 @@
-"""Public DataCard re-exports."""
+"""Public DataCard package."""
 
-from ._native.cards.data import (
+from .._wyrd.cards.data import (
     ArrowInterface,
     ArtifactCard,
     DataCard,
+    DataCardMetadata,
     DataInterface,
     DataSchema,
     DataStats,
@@ -26,6 +27,7 @@ __all__ = [
     "ArrowInterface",
     "ArtifactCard",
     "DataCard",
+    "DataCardMetadata",
     "DataInterface",
     "DataSchema",
     "DataStats",

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- skald-agentic: `skald-agent` (live agent, bounded tool loop, Observer hook,
+  and `SKALD_AGENT_*` catalog) and `skald-workflow` (DAG executor,
+  `execute_task`, retries, and cross-provider handoff via shared
+  `MessageConversion` with `SKALD_WORKFLOW_*` catalog) land as independent
+  skald sub-package crates. The engine remains PyO3-free, observability is
+  injected through the `Observer` trait and tracing spans, and skald does not
+  depend on `wyrd-*` or `vala-*`.
+
 ## PR3 - PromptCard + Skald Native-Canonical Surface
 
 - Added the native-canonical `skald-spec` prompt/provider contract with native

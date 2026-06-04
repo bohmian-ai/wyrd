@@ -1,12 +1,20 @@
 //! Tool declaration contract and lightweight schema validation.
 
+use std::fmt;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{SkaldToolError, SkaldToolResult};
+use crate::toolerror::{ToolError, ToolResult};
+use crate::trait_::AgentTool;
 
 /// Declaration data for a callable tool.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ToolDef {
     /// Stable tool name used in provider-native tool calls.
     pub name: String,
@@ -14,6 +22,31 @@ pub struct ToolDef {
     pub description: String,
     /// JSON object schema for the tool's input arguments.
     pub input_schema: Value,
+    /// JSON schema for the tool's output value.
+    #[serde(default = "default_output_schema")]
+    pub output_schema: Value,
+    #[serde(skip)]
+    call: Option<Arc<dyn Fn(Value) -> ToolResult<Value> + Send + Sync>>,
+}
+
+impl fmt::Debug for ToolDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolDef")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("input_schema", &self.input_schema)
+            .field("output_schema", &self.output_schema)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ToolDef {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.description == other.description
+            && self.input_schema == other.input_schema
+            && self.output_schema == other.output_schema
+    }
 }
 
 impl ToolDef {
@@ -27,9 +60,48 @@ impl ToolDef {
             name: name.into(),
             description: description.into(),
             input_schema,
+            output_schema: default_output_schema(),
+            call: None,
         };
         tool.validate()?;
         Ok(tool)
+    }
+
+    /// Creates an executable tool from a synchronous typed Rust closure.
+    pub fn function<F, In, Out>(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        f: F,
+    ) -> Self
+    where
+        F: Fn(In) -> ToolResult<Out> + Send + Sync + 'static,
+        In: DeserializeOwned + JsonSchema + Send + 'static,
+        Out: Serialize + JsonSchema + 'static,
+    {
+        let input_schema = match serde_json::to_value(schemars::schema_for!(In)) {
+            Ok(value) => value,
+            Err(error) => serde_json::json!({ "error": error.to_string() }),
+        };
+        let output_schema = match serde_json::to_value(schemars::schema_for!(Out)) {
+            Ok(value) => value,
+            Err(error) => serde_json::json!({ "error": error.to_string() }),
+        };
+
+        let call = Arc::new(move |args: Value| -> ToolResult<Value> {
+            let typed_in: In =
+                serde_json::from_value(args).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+            let typed_out: Out = f(typed_in)?;
+            serde_json::to_value(typed_out)
+                .map_err(|e| ToolError::OutputSerialization(e.to_string()))
+        });
+
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            output_schema,
+            call: Some(call),
+        }
     }
 
     /// Validates the declaration using provider-safe local rules.
@@ -43,6 +115,37 @@ impl ToolDef {
         }
         validate_input_schema(&self.name, &self.input_schema)
     }
+}
+
+#[async_trait]
+impl AgentTool for ToolDef {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn input_schema(&self) -> Value {
+        self.input_schema.clone()
+    }
+
+    fn output_schema(&self) -> Value {
+        self.output_schema.clone()
+    }
+
+    async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
+        let call = self.call.as_ref().ok_or_else(|| ToolError::Invocation {
+            detail: format!("tool '{}' has no executable closure", self.name),
+            cause: None,
+        })?;
+        call(args)
+    }
+}
+
+fn default_output_schema() -> Value {
+    serde_json::json!({})
 }
 
 fn validate_name(name: &str) -> SkaldToolResult<()> {

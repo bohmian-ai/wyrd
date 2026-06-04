@@ -11,7 +11,7 @@ pub mod derive {
 }
 
 /// Top-level Wyrd error value passed across crate and wire boundaries.
-#[derive(Debug, Error, Serialize, Deserialize, schemars::JsonSchema, WyrdErrorMeta)]
+#[derive(Debug, Clone, Error, Serialize, Deserialize, schemars::JsonSchema, WyrdErrorMeta)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WyrdError {
@@ -827,6 +827,132 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// AgentCard validation failed.
+    #[error("[WYRD_AGENT_422_VALIDATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_VALIDATION",
+        status = 422,
+        title = "AgentCard validation failed",
+        remediation = "Fix the Agent Card envelope, metadata, prompt reference, tools, or run_config fields."
+    )]
+    AgentValidation {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// AgentCard save or envelope projection is missing a name.
+    #[error("[WYRD_AGENT_422_MISSING_NAME] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_MISSING_NAME",
+        status = 422,
+        title = "AgentCard name is missing",
+        remediation = "Set a card name before saving or projecting the agent to a card envelope."
+    )]
+    AgentMissingName {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// AgentCard save or envelope projection is missing a version.
+    #[error("[WYRD_AGENT_422_MISSING_VERSION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_MISSING_VERSION",
+        status = 422,
+        title = "AgentCard version is missing",
+        remediation = "Set a concrete semantic version before saving or projecting the agent to a card envelope."
+    )]
+    AgentMissingVersion {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Referenced Prompt Card was not available in the local prompt registry.
+    #[error("[WYRD_AGENT_404_PROMPT_CARD] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_404_PROMPT_CARD",
+        status = 404,
+        title = "Prompt Card not found",
+        remediation = "Load or register the referenced Prompt Card in the local prompt registry before resolving the agent."
+    )]
+    AgentPromptCardNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Runtime-local tool name was not found.
+    #[error("[WYRD_AGENT_404_RUNTIME_LOCAL_TOOL_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_404_RUNTIME_LOCAL_TOOL_NOT_FOUND",
+        status = 404,
+        title = "Runtime-local tool not found",
+        remediation = "Register the named tool in the local Skald tool registry before loading the Agent Card."
+    )]
+    AgentRuntimeLocalToolNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Runtime-local tool names cannot be durably registered yet.
+    #[error("[WYRD_AGENT_422_RUNTIME_LOCAL_TOOLS_NOT_REGISTRABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_RUNTIME_LOCAL_TOOLS_NOT_REGISTRABLE",
+        status = 422,
+        title = "Runtime-local tools are not registrable",
+        remediation = "Remove runtime-local tool names before registration; local save, load, and run remain available."
+    )]
+    AgentRuntimeLocalToolsNotRegistrable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Python callback returned a value that could not replace the target.
+    #[error("[WYRD_AGENT_422_CALLBACK_RETURN_TYPE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_CALLBACK_RETURN_TYPE",
+        status = 422,
+        title = "Callback returned wrong type",
+        remediation = "Return None to continue, return a replacement value of the expected type, or raise an exception to abort the run."
+    )]
+    AgentCallbackReturnType {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Agent callback aborted the run.
+    #[error("[WYRD_AGENT_499_CALLBACK_ABORTED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_499_CALLBACK_ABORTED",
+        status = 499,
+        title = "Callback aborted run",
+        remediation = "Inspect the callback exception and either return None to continue or return a valid replacement value."
+    )]
+    AgentCallbackAborted {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Agent loop history contains a provider message type mismatch.
+    #[error("[WYRD_AGENT_422_LOOP_MESSAGE_TYPE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_LOOP_MESSAGE_TYPE",
+        status = 422,
+        title = "Loop message type mismatch",
+        remediation = "Re-render the conversation message against the active provider; loop messages must match the provider's message schema (OpenAi / Anthropic / Gemini / Custom)."
+    )]
+    AgentLoopMessageType {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
 }
 
 impl WyrdError {
@@ -904,7 +1030,16 @@ impl WyrdError {
             | Self::PromptMissingVariable { message, details }
             | Self::PromptUnsupportedHandoff { message, details }
             | Self::PromptResponseDecode { message, details }
-            | Self::PromptDraftInvalid { message, details } => (message, details),
+            | Self::PromptDraftInvalid { message, details }
+            | Self::AgentValidation { message, details }
+            | Self::AgentMissingName { message, details }
+            | Self::AgentMissingVersion { message, details }
+            | Self::AgentPromptCardNotFound { message, details }
+            | Self::AgentRuntimeLocalToolNotFound { message, details }
+            | Self::AgentRuntimeLocalToolsNotRegistrable { message, details }
+            | Self::AgentCallbackReturnType { message, details }
+            | Self::AgentCallbackAborted { message, details }
+            | Self::AgentLoopMessageType { message, details } => (message, details),
         }
     }
 

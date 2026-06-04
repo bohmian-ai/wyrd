@@ -175,7 +175,10 @@ Wyrd ships three products from one source tree, sharing `wyrd-spec`:
 
 - **wyrd**: the control plane: registry, storage, lineage, policy, install, audit.
 - **vala**: observability: drift, eval execution, OTel ingest, OLAP query.
-- **skald**: the LLM runtime: providers, agents, workflows, prompt execution.
+- **skald**: the LLM runtime, split across `skald-spec` (native wire types),
+  `skald-runtime` (provider dispatch and registry), `skald-providers`,
+  `skald-cache`, `skald-tool`, `skald-prompt` (Python builder), `skald-agent`
+  (bounded tool loop), and `skald-workflow` (DAG scheduling and handoff).
 
 The registry stores cards. Storage stores artifact bytes and metadata. Lineage
 reads CardRefs and relationships. Policy evaluates declared state. Install

@@ -3,6 +3,7 @@
 from collections.abc import Mapping, Sequence
 from typing import Any, overload
 
+from .error import WyrdError
 from .header import CardRefLike, JsonDict, PathLike, StringMap
 
 #### end of imports ####
@@ -740,4 +741,5 @@ __all__ = [
     "SqlInterface",
     "TextInterface",
     "TorchInterface",
+    "WyrdError",
 ]

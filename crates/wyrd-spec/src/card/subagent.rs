@@ -14,9 +14,9 @@ pub struct SubAgentSpec {
     /// Sub-agent description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// System prompt or prompt reference text.
+    /// Prompt text or prompt reference text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system_prompt: Option<String>,
+    pub prompt: Option<String>,
     /// Model selector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,

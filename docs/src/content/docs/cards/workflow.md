@@ -33,7 +33,17 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 
 ## Lifecycle
 
-<aside class="wyrd-phase-gate"><span class="wyrd-phase-gate__badge">Phase 5a</span>Write, version, transition, and retire flows for WorkflowCards land in Phase 5a.</aside>
+A `WorkflowCard` is the declarative spec; the live workflow engine lives in
+`skald-workflow`. A Wyrd consumer turns a `WorkflowCard` into a live
+`Workflow` by unwrapping the inner `WorkflowDef` and calling
+`Workflow::from_def(def, providers, tools, observer)`. The engine binds every
+agent, validates the task graph, and produces a runnable workflow.
+
+`Workflow::run` returns a `WorkflowRun` with per-task outcomes, events, and the
+terminal task id. `Workflow::execute_task` runs one task at a time for callers
+that own their own loop.
+
+See [agent runtime](/concepts/agent-runtime/) for handoff and observability.
 
 ## Authoring notes
 
@@ -44,4 +54,5 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 ## Related
 
 - [Concepts overview](/concepts/) — where Workflow fits in the seven primitives.
+- [Agent runtime](/concepts/agent-runtime/) — how WorkflowCards lower into live Skald workflows.
 - [Card reference index](/cards/) — every kind in one place.

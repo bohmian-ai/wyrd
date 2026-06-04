@@ -15,12 +15,12 @@ use crate::wire::openai_chat::{
 };
 
 /// Directed native-to-native message conversion.
-pub trait MessageConversion<Target> {
+pub trait ProviderMessageConversion<Target> {
     /// Convert this provider-native message into the target provider shape.
     fn convert(&self) -> SkaldResult<Target>;
 }
 
-impl MessageConversion<AnthropicMessage> for OpenAiChatMessage {
+impl ProviderMessageConversion<AnthropicMessage> for OpenAiChatMessage {
     fn convert(&self) -> SkaldResult<AnthropicMessage> {
         // OpenAI tool-result turns are separate `role: tool` messages.
         // Anthropic carries the same handoff as a user-side `tool_result`
@@ -58,7 +58,7 @@ impl MessageConversion<AnthropicMessage> for OpenAiChatMessage {
     }
 }
 
-impl MessageConversion<GoogleContent> for OpenAiChatMessage {
+impl ProviderMessageConversion<GoogleContent> for OpenAiChatMessage {
     fn convert(&self) -> SkaldResult<GoogleContent> {
         // Gemini represents tool results as function responses inside user
         // content, so OpenAI's tool message becomes one function_response part.
@@ -91,7 +91,7 @@ impl MessageConversion<GoogleContent> for OpenAiChatMessage {
     }
 }
 
-impl MessageConversion<OpenAiChatMessage> for AnthropicMessage {
+impl ProviderMessageConversion<OpenAiChatMessage> for AnthropicMessage {
     fn convert(&self) -> SkaldResult<OpenAiChatMessage> {
         // Pull Anthropic tool_use blocks up to OpenAI's assistant-level
         // `tool_calls` array. Text/image blocks remain in message content.
@@ -140,7 +140,7 @@ impl MessageConversion<OpenAiChatMessage> for AnthropicMessage {
     }
 }
 
-impl MessageConversion<GoogleContent> for AnthropicMessage {
+impl ProviderMessageConversion<GoogleContent> for AnthropicMessage {
     fn convert(&self) -> SkaldResult<GoogleContent> {
         // Directly map Anthropic text/tool blocks to Gemini parts. Media and
         // document blocks are intentionally omitted here until S02 has a
@@ -179,7 +179,7 @@ impl MessageConversion<GoogleContent> for AnthropicMessage {
     }
 }
 
-impl MessageConversion<OpenAiChatMessage> for GoogleContent {
+impl ProviderMessageConversion<OpenAiChatMessage> for GoogleContent {
     fn convert(&self) -> SkaldResult<OpenAiChatMessage> {
         // Gemini function_call parts become OpenAI assistant tool calls. Gemini
         // does not have a separate call id, so the function name is reused.
@@ -229,7 +229,7 @@ impl MessageConversion<OpenAiChatMessage> for GoogleContent {
     }
 }
 
-impl MessageConversion<AnthropicMessage> for GoogleContent {
+impl ProviderMessageConversion<AnthropicMessage> for GoogleContent {
     fn convert(&self) -> SkaldResult<AnthropicMessage> {
         // Gemini content has no neutral intermediate. Text, function_call, and
         // function_response parts map directly into Anthropic blocks.

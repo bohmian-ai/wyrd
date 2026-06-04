@@ -261,7 +261,12 @@ fn sign_service_account_jwt(
 ) -> ProviderResult<String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock is after Unix epoch")
+        .map_err(|error| {
+            ProviderError::auth(
+                "google",
+                format!("system clock is before Unix epoch: {error}"),
+            )
+        })?
         .as_secs();
     let claims = JwtClaims {
         iss: client_email.to_owned(),

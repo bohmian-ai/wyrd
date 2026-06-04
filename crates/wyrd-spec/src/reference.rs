@@ -23,3 +23,25 @@ pub struct CardRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<CardUid>,
 }
+
+/// Reference to an agent prompt, either inline or by Prompt Card reference.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum PromptRef {
+    /// Inline native prompt payload.
+    Inline(Box<skald_spec::Prompt>),
+    /// Reference to a registered Prompt Card.
+    Card(CardRef),
+}
+
+impl From<skald_spec::Prompt> for PromptRef {
+    fn from(prompt: skald_spec::Prompt) -> Self {
+        Self::Inline(Box::new(prompt))
+    }
+}
+
+impl From<CardRef> for PromptRef {
+    fn from(card_ref: CardRef) -> Self {
+        Self::Card(card_ref)
+    }
+}

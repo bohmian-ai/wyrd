@@ -12,8 +12,8 @@ from those paths in notebooks, services, tests, docs, and agent-generated code.
 from wyrd.data import DataCard, DataInterface, DataStats, PandasInterface
 ```
 
-Do not import `wyrd._native`. It is the private extension module behind the
-public package.
+Do not import private native-extension modules directly. They are implementation
+details behind the public package.
 
 ## Local DataCard workflow
 

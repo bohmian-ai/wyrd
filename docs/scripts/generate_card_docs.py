@@ -129,6 +129,39 @@ def phase_gate(phase: str, body: str) -> str:
     )
 
 
+LIFECYCLE_NOTES = {
+    "agent": [
+        "An `AgentCard` is the declarative spec; the live agent runtime lives in",
+        "`skald-agent`. A Wyrd consumer turns an `AgentCard` into a live `Agent` by",
+        "unwrapping the inner `AgentDef`, binding a provider client from the",
+        "`skald-runtime` `ProviderRegistry`, resolving tools from the Wyrd-side tool",
+        "registry, and constructing the live agent via `Agent::from_def`.",
+        "",
+        "See [agent runtime](/concepts/agent-runtime/) for the layering and the",
+        "`Observer` hook surface.",
+    ],
+    "workflow": [
+        "A `WorkflowCard` is the declarative spec; the live workflow engine lives in",
+        "`skald-workflow`. A Wyrd consumer turns a `WorkflowCard` into a live",
+        "`Workflow` by unwrapping the inner `WorkflowDef` and calling",
+        "`Workflow::from_def(def, providers, tools, observer)`. The engine binds every",
+        "agent, validates the task graph, and produces a runnable workflow.",
+        "",
+        "`Workflow::run` returns a `WorkflowRun` with per-task outcomes, events, and the",
+        "terminal task id. `Workflow::execute_task` runs one task at a time for callers",
+        "that own their own loop.",
+        "",
+        "See [agent runtime](/concepts/agent-runtime/) for handoff and observability.",
+    ],
+}
+
+
+RELATED_NOTES = {
+    "agent": "- [Agent runtime](/concepts/agent-runtime/) — how AgentCards lower into live Skald agents.",
+    "workflow": "- [Agent runtime](/concepts/agent-runtime/) — how WorkflowCards lower into live Skald workflows.",
+}
+
+
 def intro_dl(slug: str, schema: dict) -> str:
     kind_attr = f' data-kind="{slug}"' if CARD_KIND_GROUPS.get(slug) != "neutral" else ""
     rows = properties(schema)
@@ -183,6 +216,16 @@ def render(slug: str, schema_file: str) -> str:
     else:
         lines.append("This schema does not expose top-level fields yet.")
 
+    lifecycle = LIFECYCLE_NOTES.get(
+        slug,
+        [
+            phase_gate(
+                "5a",
+                f"Write, version, transition, and retire flows for {title}Cards land in Phase 5a.",
+            )
+        ],
+    )
+
     lines.extend(
         [
             "",
@@ -195,10 +238,7 @@ def render(slug: str, schema_file: str) -> str:
             "",
             "## Lifecycle",
             "",
-            phase_gate(
-                "5a",
-                f"Write, version, transition, and retire flows for {title}Cards land in Phase 5a.",
-            ),
+            *lifecycle,
             "",
             "## Authoring notes",
             "",
@@ -209,6 +249,12 @@ def render(slug: str, schema_file: str) -> str:
             "## Related",
             "",
             f"- [Concepts overview](/concepts/) — where {title} fits in the seven primitives.",
+        ]
+    )
+    if related_note := RELATED_NOTES.get(slug):
+        lines.append(related_note)
+    lines.extend(
+        [
             "- [Card reference index](/cards/) — every kind in one place.",
             "",
         ]

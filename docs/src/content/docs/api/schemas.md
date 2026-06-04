@@ -36,8 +36,10 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 | `crates/wyrd-spec/schemas/operator_budget.json` | OperatorBudget |
 | `crates/wyrd-spec/schemas/operator_input.json` | OperatorInput |
 | `crates/wyrd-spec/schemas/operator_spec.json` | OperatorSpec |
+| `crates/wyrd-spec/schemas/parameter_name.json` | String |
 | `crates/wyrd-spec/schemas/policy_decision.json` | PolicyDecision |
 | `crates/wyrd-spec/schemas/policy_spec.json` | PolicySpec |
+| `crates/wyrd-spec/schemas/prompt_ref.json` | PromptRef |
 | `crates/wyrd-spec/schemas/prompt_spec.json` | PromptSpec |
 | `crates/wyrd-spec/schemas/run_kind.json` | RunKind |
 | `crates/wyrd-spec/schemas/run_ref.json` | RunRef |

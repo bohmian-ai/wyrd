@@ -1,4 +1,4 @@
-//! Validated metadata labels and annotations.
+//! Validated metadata labels, annotations, and local Card metadata.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -11,6 +11,35 @@ pub type Labels = BTreeMap<LabelKey, LabelValue>;
 
 /// Free-form metadata annotations.
 pub type Annotations = BTreeMap<AnnotationKey, AnnotationValue>;
+
+/// Optional local Card metadata used by authoring objects before registration.
+///
+/// The shared envelope [`crate::envelope::Metadata`] contains validated,
+/// registration-ready identity. `CardMetadata` is the local authoring mirror:
+/// name and version may be absent until a caller projects a holder into a
+/// durable Card envelope.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CardMetadata {
+    /// Optional Card name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Optional exact Card version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Optional Card space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<String>,
+    /// Optional server-assigned Card UID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+    /// Queryable labels.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: Labels,
+    /// Free-form annotations.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub annotations: Annotations,
+}
 
 macro_rules! metadata_string_type {
     ($name:ident, $doc:literal, $validator:ident) => {

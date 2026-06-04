@@ -9,14 +9,14 @@ import wyrd.model as model_module
 PACKAGE_ROOT = Path(__file__).resolve().parents[3] / "python" / "wyrd"
 
 
-def _init_pyi_exports() -> set[str]:
-    tree = ast.parse((PACKAGE_ROOT / "__init__.pyi").read_text(encoding="utf-8"))
-    names: set[str] = set()
+def _init_py_all_exports() -> set[str]:
+    tree = ast.parse((PACKAGE_ROOT / "__init__.py").read_text(encoding="utf-8"))
     for node in tree.body:
-        if isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                names.add(alias.asname or alias.name)
-    return names
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "__all__":
+                    return set(ast.literal_eval(node.value))
+    raise AssertionError("wyrd.__init__ must define __all__")
 
 
 def _args_doc_lines(docstring: str) -> list[str]:
@@ -24,14 +24,18 @@ def _args_doc_lines(docstring: str) -> list[str]:
     if "Args:" not in lines:
         return []
     start = lines.index("Args:") + 1
-    return [
-        line.strip()
-        for line in lines[start:]
-        if line.startswith("    ")
-        and not line.startswith("        ")
-        and line.strip()
-        and ":" in line
-    ]
+    out: list[str] = []
+    for line in lines[start:]:
+        if line and not line.startswith(" ") and line.endswith(":"):
+            break
+        if (
+            line.startswith("    ")
+            and not line.startswith("        ")
+            and line.strip()
+            and ":" in line
+        ):
+            out.append(line.strip())
+    return out
 
 
 def test_wyrd_model_all_exports_are_importable() -> None:
@@ -39,18 +43,18 @@ def test_wyrd_model_all_exports_are_importable() -> None:
         assert getattr(model_module, name) is not None
 
 
-def test_top_level_model_exports_match_generated_init_stub() -> None:
-    pyi_exports = _init_pyi_exports()
+def test_top_level_model_exports_match_init_all() -> None:
+    init_exports = _init_py_all_exports()
 
     assert "model" in wyrd.__all__
     assert "ModelCard" in wyrd.__all__
     assert "ModelSignature" in wyrd.__all__
     assert "SampleInput" in wyrd.__all__
-    assert set(wyrd.__all__) == pyi_exports
+    assert set(wyrd.__all__) == init_exports
 
 
 def test_model_stub_public_classes_and_methods_have_docstrings() -> None:
-    tree = ast.parse((PACKAGE_ROOT / "model.pyi").read_text(encoding="utf-8"))
+    tree = ast.parse((PACKAGE_ROOT / "stubs" / "model.pyi").read_text(encoding="utf-8"))
     missing: list[str] = []
 
     for node in tree.body:
@@ -70,7 +74,7 @@ def test_model_stub_public_classes_and_methods_have_docstrings() -> None:
 
 
 def test_model_stub_args_docs_use_name_type_description_format() -> None:
-    tree = ast.parse((PACKAGE_ROOT / "model.pyi").read_text(encoding="utf-8"))
+    tree = ast.parse((PACKAGE_ROOT / "stubs" / "model.pyi").read_text(encoding="utf-8"))
     bad_lines: list[str] = []
 
     for node in ast.walk(tree):

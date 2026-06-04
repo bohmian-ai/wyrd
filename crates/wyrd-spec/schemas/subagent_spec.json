@@ -110,6 +110,13 @@
         "null"
       ]
     },
+    "prompt": {
+      "description": "Prompt text or prompt reference text.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "sandbox_mode": {
       "description": "Sandbox mode.",
       "type": [
@@ -123,13 +130,6 @@
       "items": {
         "$ref": "#/definitions/CardRef"
       }
-    },
-    "system_prompt": {
-      "description": "System prompt or prompt reference text.",
-      "type": [
-        "string",
-        "null"
-      ]
     },
     "temperature": {
       "description": "Model temperature.",

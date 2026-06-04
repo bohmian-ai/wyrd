@@ -1,0 +1,78 @@
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+use async_trait::async_trait;
+use skald_agent::Observer;
+
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static GLOBAL_RECORDER: OnceLock<Arc<RecordingObserver>> = OnceLock::new();
+
+#[tokio::test]
+async fn wyrd_observe_impl_init_idempotent() {
+    let _guard = TEST_LOCK.lock().await;
+    let global = global_recorder();
+
+    for _ in 0..5 {
+        wyrd_observe_impl::init();
+    }
+    skald_agent::current_observer()
+        .on_agent_start("agent-id", "run-id", None)
+        .await;
+
+    assert_eq!(global.count(), 1);
+}
+
+#[tokio::test]
+async fn wyrd_observe_impl_init_resolves_through_provider() {
+    let _guard = TEST_LOCK.lock().await;
+    let global = global_recorder();
+
+    wyrd_observe_impl::init();
+    skald_agent::current_observer()
+        .on_agent_start("agent-id", "run-id", None)
+        .await;
+
+    assert_eq!(global.count(), 1);
+}
+
+fn global_recorder() -> Arc<RecordingObserver> {
+    let recorder = GLOBAL_RECORDER
+        .get_or_init(|| {
+            let recorder = Arc::new(RecordingObserver::default());
+            let observer: Arc<dyn Observer> = recorder.clone();
+            wyrd_observe::set_global(observer);
+            recorder
+        })
+        .clone();
+    recorder.clear();
+    recorder
+}
+
+#[derive(Default)]
+struct RecordingObserver {
+    events: Mutex<Vec<String>>,
+}
+
+impl RecordingObserver {
+    fn count(&self) -> usize {
+        self.lock().len()
+    }
+
+    fn clear(&self) {
+        self.lock().clear();
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<String>> {
+        match self.events.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+#[async_trait]
+impl Observer for RecordingObserver {
+    async fn on_agent_start(&self, agent_id: &str, input: &str, session_id: Option<&str>) {
+        self.lock()
+            .push(format!("{agent_id}:{input}:{}", session_id.unwrap_or("")));
+    }
+}

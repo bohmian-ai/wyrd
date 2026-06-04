@@ -35,7 +35,7 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 | `prompt_ref` | `object` | no |
 | `prompt_refs` | `array` | no |
 | `protocol_profiles` | `array` | no |
-| `provider` | `object` | no |
+| `provider` | `string \| null` | no |
 | `provider_metadata` | `object` | no |
 | `security_requirements` | `array` | no |
 | `security_schemes` | `array` | no |
@@ -50,7 +50,14 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 
 ## Lifecycle
 
-<aside class="wyrd-phase-gate"><span class="wyrd-phase-gate__badge">Phase 5a</span>Write, version, transition, and retire flows for AgentCards land in Phase 5a.</aside>
+An `AgentCard` is the declarative spec; the live agent runtime lives in
+`skald-agent`. A Wyrd consumer turns an `AgentCard` into a live `Agent` by
+unwrapping the inner `AgentDef`, binding a provider client from the
+`skald-runtime` `ProviderRegistry`, resolving tools from the Wyrd-side tool
+registry, and constructing the live agent via `Agent::from_def`.
+
+See [agent runtime](/concepts/agent-runtime/) for the layering and the
+`Observer` hook surface.
 
 ## Authoring notes
 
@@ -61,4 +68,5 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 ## Related
 
 - [Concepts overview](/concepts/) — where Agent fits in the seven primitives.
+- [Agent runtime](/concepts/agent-runtime/) — how AgentCards lower into live Skald agents.
 - [Card reference index](/cards/) — every kind in one place.

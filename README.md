@@ -18,7 +18,7 @@ mise run dev:full
 
 - `crates/wyrd/` - registry, cards, services, CLI, MCP, UI, server.
 - `crates/vala/` - observability, evaluation, traces, and analytical storage.
-- `crates/skald/` - LLM providers, prompts, and agents.
+- `crates/skald/` - LLM providers, prompts, agents, and workflows.
 - `crates/shared/` - shared infrastructure.
 - `python/py-wyrd/` - Python wheel source.
 

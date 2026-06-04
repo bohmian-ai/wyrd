@@ -8,10 +8,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use wyrd_interfaces::error::CardPyResult;
 use wyrd_spec::card::model::{
-    CustomMeta as CustomModelMeta, HuggingFaceTask, HuggingfaceMeta,
-    ModelInterface as RustModelInterface, ModelSignature as RustModelSignature, ModelSpec,
-    SampleInput as RustSampleInput, TaskType, TensorflowMeta, TfSaveFormat, TorchMeta,
-    TorchSaveFormat,
+    CustomMeta as CustomModelMeta, ModelInterface as RustModelInterface,
+    ModelSignature as RustModelSignature, ModelSpec, SampleInput as RustSampleInput, TaskType,
 };
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::metadata::{Annotations, Labels};
@@ -37,6 +35,9 @@ use {
     wyrd_interfaces::model::io::{load_model, save_model},
     wyrd_interfaces::model::sample::SampleInput,
     wyrd_interfaces::model::signature::ModelSignature,
+    wyrd_spec::card::model::{
+        HuggingFaceTask, HuggingfaceMeta, TensorflowMeta, TfSaveFormat, TorchMeta, TorchSaveFormat,
+    },
     wyrd_spec::envelope::{CardKind, Metadata as EnvelopeMetadata},
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
     wyrd_utils::py::pyobject_to_json,
@@ -968,6 +969,7 @@ fn model_spec_from_metadata(
     }
 }
 
+#[cfg(feature = "python")]
 fn task_type_token(value: TaskType) -> &'static str {
     match value {
         TaskType::BinaryClassification => "binary_classification",

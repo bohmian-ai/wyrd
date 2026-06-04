@@ -1,7 +1,8 @@
 # Skald Architecture
 
-Skald is Wyrd's LLM runtime crate family. PR3 keeps the core Rust crates
-provider-native and keeps Python at the authoring/card boundary only.
+Skald is Wyrd's LLM runtime crate family. It stays provider-native and depends
+on neutral infrastructure plus Skald crates only. Wyrd and Vala depend on Skald;
+Skald does not depend on `wyrd-*` or `vala-*`.
 
 ## Crate Map
 
@@ -21,6 +22,12 @@ provider-native and keeps Python at the authoring/card boundary only.
 - `skald-runtime`: internal Rust dispatch and orchestration. It routes native
   requests to registered providers and returns native `ProviderResponse`.
   `MockProvider` is public here for offline runtime tests.
+- `skald-agent`: live agent runtime. It owns `Agent`, `AgentDef`, the bounded
+  tool loop, `Observer`, `AgentTool`, `ToolRegistry`, and the
+  `SKALD_AGENT_*` error catalog.
+- `skald-workflow`: workflow runtime. It owns `Workflow`, `WorkflowDef`,
+  `Task`/`TaskDef`, `Context`, the DAG executor, `execute_task`,
+  `MessageConversion`-routed handoff, and the `SKALD_WORKFLOW_*` error catalog.
 - `skald-prompt`: Python authoring boundary. It builds native prompt/request
   values and exposes the `wyrd.prompt.Prompt` Python class.
 
@@ -30,9 +37,21 @@ provider-native and keeps Python at the authoring/card boundary only.
 that need prompt/provider shapes depend upward on `skald-spec`; Skald engine
 crates do not depend on `wyrd-spec`.
 
-The only PR3 Skald-to-Wyrd boundary crate is `skald-prompt`, because it is the
-Python authoring layer and uses Wyrd Python error/stub utilities. The runtime,
-providers, cache, tool, and spec crates remain Rust-native engine crates.
+The dependency layers are:
+
+```text
+skald-workflow -> skald-agent -> skald-runtime
+                                  |
+                                  v
+                {skald-providers, skald-cache, skald-tool} -> skald-spec
+                                                           ^
+                                                           |
+                                                skald-prompt
+```
+
+`skald-prompt` is the Python authoring boundary and uses Wyrd Python
+error/stub utilities. The runtime, providers, cache, tool, spec, agent, and
+workflow crates remain Rust-native engine crates.
 
 ## Runtime Boundary
 
@@ -43,12 +62,18 @@ read provider output through `ResponseAdapter`.
 `MockProvider` is a public `skald-runtime` type so runtime behavior can be
 tested without credentials or live provider calls.
 
+`skald-agent` and `skald-workflow` observe runtime activity through the injected
+`Observer` trait and `tracing` spans. They never link `vala-client`; Wyrd/Vala
+consumers provide observer implementations from their own layer.
+
 ## PyO3 Scope
 
-Only two PR3 crates opt into Python:
+Only the authoring and Wyrd-card boundary crates opt into Python:
 
 - `skald-prompt`, for the ergonomic Python `Prompt` builder and helper classes;
 - `wyrd-cards`, for the local `PromptCard` holder.
 
 `skald-spec`, `skald-cache`, `skald-tool`, `skald-providers`, `skald-runtime`,
-and `wyrd-spec` remain PyO3-free.
+`skald-agent`, `skald-workflow`, and `wyrd-spec` remain PyO3-free at the engine.
+Their manifests may carry optional Python feature scaffolding, but source-level
+PyO3 belongs outside the engine path.

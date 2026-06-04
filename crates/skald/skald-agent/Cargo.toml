@@ -1,0 +1,50 @@
+[package]
+name = "skald-agent"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "Live Skald agent: identity, single provider, tools, bounded tool loop."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+python = [
+    "dep:pyo3",
+    "dep:wyrd-runtime",
+    "dep:wyrd-utils",
+    "skald-prompt/python",
+    "skald-runtime/python",
+    "skald-tool/python",
+    "wyrd-utils/python",
+]
+
+[dependencies]
+skald-spec = { workspace = true }
+skald-prompt = { workspace = true }
+skald-runtime = { workspace = true }
+skald-tool = { workspace = true }
+wyrd-spec = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+futures = "0.3"
+chrono = { workspace = true }
+ulid = { workspace = true }
+pyo3 = { workspace = true, optional = true }
+wyrd-runtime = { workspace = true, optional = true }
+wyrd-utils = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+serde_json = { workspace = true }
+skald-providers = { workspace = true }

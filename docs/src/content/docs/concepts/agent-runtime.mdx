@@ -1,0 +1,115 @@
+---
+title: Agent runtime
+description: Layering and execution surface for skald-agent and skald-workflow.
+---
+
+# Agent runtime
+
+Wyrd's agent and workflow runtime lives in the Skald sub-package. This page
+describes the layering, execution surface, and observability hook a Wyrd
+consumer relies on when turning an `AgentCard` or `WorkflowCard` into a live
+agent or workflow.
+
+## Layering
+
+Skald is independent of `wyrd-*` and `vala-*`. Dependencies flow up only:
+
+```text
+skald-workflow -> skald-agent -> skald-runtime -> skald-providers -> skald-spec
+                                                -> skald-cache, skald-tool
+skald-prompt (Python builder; emits skald-spec native requests)
+```
+
+`wyrd-spec`, `wyrd-cards`, and the Wyrd server consume Skald crates. Skald never
+depends back up. Observability is injected through the `Observer` hook;
+`skald-agent` and `skald-workflow` do not depend on `vala-client`.
+
+## Execution surface
+
+A live `Agent` is built from an `AgentDef` by `Agent::from_def`, which binds one
+provider through the `skald-runtime` `ProviderRegistry`. The agent's `run(input)`
+method runs a bounded tool-dispatch loop:
+
+1. Build a provider-native request for the agent's provider.
+2. Call `provider.send(request).await` and receive a `ProviderResponse`.
+3. Read the response through `ResponseAdapter`: `text`, `tool_calls`, `usage`,
+   and `finish_reason`.
+4. Return `AgentRun` when there are no tool calls.
+5. Dispatch each tool call through the registered `AgentTool` implementations,
+   append native tool-result messages, and continue.
+6. Stop at `RunConfig::max_iterations` (default 10). Exhaustion surfaces
+   `SKALD_AGENT_500_MAX_ITERATIONS`.
+
+Native provider types flow end to end. There is no neutral message intermediate
+on the hot path.
+
+## Workflows
+
+A `Workflow` is built from a `WorkflowDef`. It owns one bound `Agent` per
+`AgentDef`, a `TaskList` with a topological execution order, and two execution
+entrypoints:
+
+| Entrypoint | Caller |
+| --- | --- |
+| `Workflow::run` | Runs the level-parallel DAG schedule and returns a `WorkflowRun`. |
+| `Workflow::execute_task` | Runs one task for callers that own their own loop. |
+
+Each task retries up to `max_retries` on provider failure or output-schema
+validation failure. Validation failures surface
+`SKALD_WORKFLOW_422_OUTPUT_SCHEMA`; provider failure exhaustion surfaces
+`SKALD_WORKFLOW_500_MAX_RETRIES`.
+
+## Cross-provider handoff
+
+When an OpenAI task feeds an Anthropic task, the downstream input messages need
+to be in Anthropic shape. Skald translates carried messages through
+`skald_spec::convert::convert_message_dyn`, the same converter the Wyrd LLM
+gateway uses. Same-provider handoff is a clone. Unsupported provider pairs or
+`RawV1` messages surface `SKALD_WORKFLOW_501_UNSUPPORTED_HANDOFF`.
+
+## Observer hook
+
+Both crates emit lifecycle events through `skald_agent::Observer`. The trait
+has default no-op methods, so a consumer overrides only the hooks it needs:
+
+- `on_agent_start(agent_id, iteration_cap)`
+- `on_iteration(agent_id, iteration)`
+- `on_tool_call(agent_id, tool, args)`
+- `on_tool_result(agent_id, tool, ok)`
+- `on_agent_finish(agent_id, finish, iterations)`
+
+Workflow task lifecycle is forwarded through `on_iteration` with a `task:{id}`
+prefix and through `skald_workflow.task` tracing spans. The Wyrd-side
+`wyrd-observe` crate implements this hook and routes sampled, redacted events
+through `vala-client`; observability failures do not propagate into the agent
+or workflow error path.
+
+## Public Rust imports
+
+Rust consumers import the sanctioned surface from the `wyrd` umbrella crate:
+
+```rust
+use wyrd::agent::{Agent, AgentDef, RunConfig, ToolRegistry};
+use wyrd::workflow::{Workflow, WorkflowDef, default_max_retries};
+```
+
+Direct imports from `skald-agent` and `skald-workflow` are workspace-internal
+unless the item is re-exported by `wyrd::agent` or `wyrd::workflow`.
+
+## Future Python surface
+
+The runtime crates are Python-free in this phase. A later Wyrd-layer card phase
+will add Python-visible `AgentCard` and `WorkflowCard` holders that lower into
+`AgentDef` and `WorkflowDef`. Those Python methods must document arguments,
+returns, and raised Wyrd error codes in their docstrings.
+
+## Not in v1
+
+The following are deferred:
+
+- Memory and session stores. Agents are stateless across runs; conversation
+  state lives in `Context`.
+- Completion criteria. Termination is "no tool calls" plus the iteration cap.
+- Pause/resume and human-in-the-loop execution.
+- Sequential or parallel orchestration wrappers above `Workflow`.
+- Cross-provider tool-call replay. v1 handoff is text-only.

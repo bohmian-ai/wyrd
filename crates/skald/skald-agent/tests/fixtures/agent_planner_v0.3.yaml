@@ -1,0 +1,20 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: planner-agent
+  version: 0.3.0
+  space: research
+spec:
+  prompt:
+    kind: Prompt
+    name: planner-prompt
+    version: 0.3.0
+    space: research
+  run_config:
+    max_iterations: 6
+    tool_concurrency_cap: 2
+    session_recent_limit: 4
+    timeout_ms: 2500
+relationships:
+  outbound: []
+status: null

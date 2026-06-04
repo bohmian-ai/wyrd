@@ -4,6 +4,9 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ['v*']
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -37,16 +40,39 @@ jobs:
           WYRD_CHANGE_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: .github/scripts/detect-changes.sh
 
+  matrix-plan:
+    name: matrix plan
+    needs: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    outputs:
+      os: ${{ steps.plan.outputs.os }}
+      python: ${{ steps.plan.outputs.python }}
+    steps:
+      - id: plan
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo 'os=["ubuntu-24.04"]'                                >> "$GITHUB_OUTPUT"
+            echo 'python=["3.12"]'                                    >> "$GITHUB_OUTPUT"
+            echo "scope=pr"                                           >> "$GITHUB_OUTPUT"
+          else
+            echo 'os=["ubuntu-24.04","macos-15","windows-latest"]'    >> "$GITHUB_OUTPUT"
+            echo 'python=["3.10","3.11","3.12"]'                      >> "$GITHUB_OUTPUT"
+            echo "scope=release"                                      >> "$GITHUB_OUTPUT"
+          fi
+          cat "$GITHUB_OUTPUT"
+
   rust:
     name: rust (${{ matrix.os }})
-    needs: changes
+    needs: [changes, matrix-plan]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15, windows-latest]
+        os: ${{ fromJSON(needs.matrix-plan.outputs.os) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -138,32 +164,15 @@ jobs:
 
   python:
     name: python (${{ matrix.os }} / py${{ matrix.python-version }})
-    needs: changes
+    needs: [changes, matrix-plan]
     if: needs.changes.outputs.python == 'true' || needs.changes.outputs.workflow == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            python-version: "3.10"
-          - os: ubuntu-24.04
-            python-version: "3.11"
-          - os: ubuntu-24.04
-            python-version: "3.12"
-          - os: macos-15
-            python-version: "3.10"
-          - os: macos-15
-            python-version: "3.11"
-          - os: macos-15
-            python-version: "3.12"
-          - os: windows-latest
-            python-version: "3.10"
-          - os: windows-latest
-            python-version: "3.11"
-          - os: windows-latest
-            python-version: "3.12"
+        os: ${{ fromJSON(needs.matrix-plan.outputs.os) }}
+        python-version: ${{ fromJSON(needs.matrix-plan.outputs.python) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -239,6 +248,7 @@ jobs:
           UV_PYTHON: ${{ matrix.python-version }}
 
       - name: Python examples
+        if: matrix.os == 'ubuntu-24.04' && matrix.python-version == '3.12'
         run: mise run examples:python:datacard
         env:
           UV_PYTHON: ${{ matrix.python-version }}
@@ -291,7 +301,7 @@ jobs:
 
   ci-complete:
     name: ci complete
-    needs: [changes, rust, rust-gates, codegen, python, docs, ui]
+    needs: [changes, matrix-plan, rust, rust-gates, codegen, python, docs, ui]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

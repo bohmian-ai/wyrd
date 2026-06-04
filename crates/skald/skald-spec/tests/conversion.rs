@@ -34,6 +34,8 @@ fn openai_to_anthropic_message_converts_tool_result() {
         tool_calls: None,
         tool_call_id: Some("call_1".to_string()),
         refusal: None,
+        annotations: Vec::new(),
+        audio: None,
     };
     let converted: skald_spec::wire::anthropic_messages::AnthropicMessage =
         message.convert().unwrap();

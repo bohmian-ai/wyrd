@@ -26,6 +26,15 @@ pub fn init() {
 /// observer hook, and `SKALD_AGENT_*` error catalog.
 pub mod agent;
 
+/// Prompt authoring helpers and structured-output response formats.
+pub mod prompt {
+    pub use skald_prompt::{
+        AnthropicOptions, GeminiOptions, OpenAiChatOptions, OpenAiResponsesOptions, Prompt,
+        ResponseFormat, ResponseFormatKind, anthropic, gemini, openai_chat, openai_responses,
+        vertex,
+    };
+}
+
 pub use skald_agent::Agent;
 pub use skald_runtime::ProviderRegistry;
 pub use skald_workflow::Workflow;

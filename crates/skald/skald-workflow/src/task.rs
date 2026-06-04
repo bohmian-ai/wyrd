@@ -175,7 +175,7 @@ fn compile_validator(
     }
 }
 
-fn response_schema_name(response_type: &ResponseType) -> String {
+pub(crate) fn response_schema_name(response_type: &ResponseType) -> String {
     match response_type {
         ResponseType::JsonSchema { name, .. } => name.clone(),
         ResponseType::Text => String::new(),

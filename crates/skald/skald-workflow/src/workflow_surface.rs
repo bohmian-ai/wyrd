@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::Utc;
+use serde_json::{Map, Value};
 use skald_agent::Agent;
 use wyrd_spec::card::workflow::{
     WorkflowAction, WorkflowCard, WorkflowCardError, WorkflowSpec, WorkflowStep,
@@ -23,6 +24,69 @@ use crate::def::{TaskDef, WorkflowAgent, WorkflowDef, default_max_retries};
 use crate::error::{WorkflowError, WorkflowResult};
 use crate::run::WorkflowRun;
 use crate::workflow::DagExecutor;
+
+/// Workflow-level input accepted by [`Workflow::run`].
+#[derive(Debug, Clone)]
+pub enum WorkflowInput {
+    /// Single text input exposed as the `input` template variable.
+    Text(String),
+    /// Pre-shaped variable bindings.
+    Vars(Map<String, Value>),
+}
+
+impl From<&str> for WorkflowInput {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_owned())
+    }
+}
+
+impl From<String> for WorkflowInput {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<Map<String, Value>> for WorkflowInput {
+    fn from(value: Map<String, Value>) -> Self {
+        Self::Vars(value)
+    }
+}
+
+impl From<HashMap<String, String>> for WorkflowInput {
+    fn from(value: HashMap<String, String>) -> Self {
+        let mut map = Map::new();
+        for (key, item) in value {
+            map.insert(key, Value::String(item));
+        }
+        Self::Vars(map)
+    }
+}
+
+impl From<Value> for WorkflowInput {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::Object(map) => Self::Vars(map),
+            other => {
+                let mut map = Map::new();
+                map.insert("input".to_owned(), other);
+                Self::Vars(map)
+            }
+        }
+    }
+}
+
+impl WorkflowInput {
+    pub(crate) fn into_context_input(self) -> Map<String, Value> {
+        match self {
+            Self::Text(text) => {
+                let mut map = Map::new();
+                map.insert("input".to_owned(), Value::String(text));
+                map
+            }
+            Self::Vars(map) => map,
+        }
+    }
+}
 
 /// User-facing workflow surface: meta + spec + resolved agents + cascade.
 ///
@@ -331,7 +395,7 @@ impl Workflow {
     /// # Errors
     /// Returns runtime errors when an agent is missing, the DAG cannot run, or
     /// any per-step retries are exhausted.
-    pub async fn run(&self, input: &str) -> WorkflowResult<WorkflowRun> {
+    pub async fn run(&self, input: impl Into<WorkflowInput>) -> WorkflowResult<WorkflowRun> {
         let providers = skald_runtime::default_registry();
         self.run_with(providers.as_ref(), input).await
     }
@@ -347,11 +411,13 @@ impl Workflow {
     pub async fn run_with(
         &self,
         providers: &skald_runtime::ProviderRegistry,
-        input: &str,
+        input: impl Into<WorkflowInput>,
     ) -> WorkflowResult<WorkflowRun> {
-        let def = self.to_workflow_def(input)?;
+        let def = self.to_workflow_def()?;
         let executor = DagExecutor::build(def, providers).await?;
-        Arc::new(executor).run(Context::new()).await
+        let mut ctx = Context::new();
+        ctx.input = input.into().into_context_input();
+        Arc::new(executor).run(ctx).await
     }
 
     fn append_agent_step(&mut self, agent: Agent, deps: Vec<String>) -> WorkflowResult<String> {
@@ -422,7 +488,7 @@ impl Workflow {
         self.cascade_children.dedup();
     }
 
-    fn to_workflow_def(&self, _input: &str) -> WorkflowResult<WorkflowDef> {
+    fn to_workflow_def(&self) -> WorkflowResult<WorkflowDef> {
         let mut agents = Vec::with_capacity(self.spec.steps.len());
         let mut tasks = Vec::with_capacity(self.spec.steps.len());
         for step in &self.spec.steps {

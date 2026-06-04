@@ -631,6 +631,34 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Prompt output schema helper received an invalid shape.
+    #[error("[WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA",
+        status = 422,
+        title = "Invalid output schema",
+        remediation = "Pass a dict[str, type], raw JSON Schema object, ResponseFormat, or pydantic BaseModel subclass."
+    )]
+    PromptInvalidOutputSchema {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Prompt output schema helper needs pydantic for a class input.
+    #[error("[WYRD_PROMPT_422_PYDANTIC_REQUIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_422_PYDANTIC_REQUIRED",
+        status = 422,
+        title = "Pydantic required",
+        remediation = "Install pydantic or use the stdlib dict[str, type] output schema path."
+    )]
+    PromptPydanticRequired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// PromptCard codec extension was unsupported.
     #[error("[WYRD_PROMPT_400_LOADER_BAD_EXTENSION] {message}")]
     #[wyrd_error(
@@ -1101,6 +1129,8 @@ impl WyrdError {
             | Self::PromptMediaIo { message, details }
             | Self::PromptEmptyModel { message, details }
             | Self::PromptInvalidResponseSchema { message, details }
+            | Self::PromptInvalidOutputSchema { message, details }
+            | Self::PromptPydanticRequired { message, details }
             | Self::PromptLoaderBadExtension { message, details }
             | Self::PromptLoaderIo { message, details }
             | Self::PromptSerializeRequest { message, details }

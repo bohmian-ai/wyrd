@@ -20,6 +20,8 @@ fn openai_assistant_message(content: &str) -> MessageNum {
         tool_calls: None,
         tool_call_id: None,
         refusal: None,
+        annotations: Vec::new(),
+        audio: None,
     })
 }
 

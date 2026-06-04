@@ -58,5 +58,6 @@ opentelemetry_sdk = { workspace = true }
 opentelemetry-stdout = { version = "0.27", features = ["trace"] }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 skald-spec = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

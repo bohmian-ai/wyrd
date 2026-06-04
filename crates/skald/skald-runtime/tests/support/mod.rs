@@ -91,6 +91,7 @@ pub fn anthropic_request(text: &str) -> ProviderRequest {
         stream: None,
         tools: None,
         tool_choice: None,
+        output_config: None,
         settings: AnthropicMessagesSettings {
             max_tokens: 128,
             ..AnthropicMessagesSettings::default()

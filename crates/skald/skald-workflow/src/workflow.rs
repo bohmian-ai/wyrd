@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use skald_agent::Agent;
+use serde_json::Value;
 use skald_agent::observer_provider::current_observer;
+use skald_agent::{Agent, AgentError};
 use skald_prompt::Prompt as RuntimePrompt;
 use skald_runtime::ProviderRegistry;
 use skald_spec::{MessageNum, Prompt, ProviderName, ProviderRequest, ProviderResponse};
@@ -16,7 +17,7 @@ use crate::def::WorkflowDef;
 use crate::error::{WorkflowError, WorkflowResult};
 use crate::run::{TaskEvent, TaskOutcome, WorkflowRun, now_ms};
 use crate::schedule::execution_plan;
-use crate::task::TaskStatus;
+use crate::task::{TaskStatus, response_schema_name};
 use crate::tasklist::{SharedTask, TaskList};
 
 /// Live workflow built from a validated [`WorkflowDef`].
@@ -100,11 +101,11 @@ impl DagExecutor {
         loop {
             if self.task_list.is_complete()? {
                 let final_events = finish_events(events)?;
-                let _final_context = finish_context(context).await;
+                let final_context = finish_context(context).await;
                 observer
                     .on_workflow_finish(&workflow_run_id, &self.id, workflow_started_at.elapsed())
                     .await;
-                return self.collect_run(final_events);
+                return self.collect_run(final_events, final_context.parameters);
             }
 
             let ready = self.task_list.get_ready_tasks()?;
@@ -177,7 +178,8 @@ impl DagExecutor {
             .get(&agent_id)
             .ok_or_else(|| WorkflowError::AgentNotFound(agent_id.clone()))?;
 
-        let prompt = RuntimePrompt::from_native(prompt);
+        let native_prompt = prompt;
+        let prompt = RuntimePrompt::from_native(native_prompt.clone());
         for attempt in 0..=max_retries {
             let response = match agent
                 .run_prompt(
@@ -191,8 +193,8 @@ impl DagExecutor {
                 Ok(run) => run
                     .final_response
                     .ok_or_else(|| WorkflowError::AgentMissingFinalResponse(task_id.to_owned()))?,
-                Err(_err) if attempt == max_retries => {
-                    return Err(WorkflowError::MaxRetriesExceeded(task_id.to_owned()));
+                Err(err) if attempt == max_retries => {
+                    return Err(terminal_agent_error(&task_id, &native_prompt, err));
                 }
                 Err(_err) => continue,
             };
@@ -238,16 +240,29 @@ impl DagExecutor {
 
         for attempt in 0..=max_retries {
             let started_at = now_ms();
+            let bindings = {
+                let ctx_guard = context.read().await;
+                bindings_from_context(&task_id, &prompt, &ctx_guard)?
+            };
+            let bound_prompt = {
+                let pairs: Vec<(&str, &str)> = bindings
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str()))
+                    .collect();
+                prompt
+                    .bind(&pairs)
+                    .map_err(|error| WorkflowError::Other(error.to_string()))?
+            };
             let prompt_for_run = self
                 .prompt_with_handoff(
-                    &prompt,
+                    &bound_prompt,
                     &dependencies,
                     &agent.prompt.native().request.provider(),
                     &context,
                 )
                 .await?;
             let runtime_prompt = RuntimePrompt::from_native(prompt_for_run);
-            let response = match agent
+            let agent_run = match agent
                 .run_prompt(
                     agent.effective_providers(&self.providers),
                     &runtime_prompt,
@@ -256,11 +271,9 @@ impl DagExecutor {
                 )
                 .await
             {
-                Ok(run) => run
-                    .final_response
-                    .ok_or_else(|| WorkflowError::AgentMissingFinalResponse(task_id.clone()))?,
-                Err(_err) if attempt == max_retries => {
-                    let error = WorkflowError::MaxRetriesExceeded(task_id.clone());
+                Ok(run) => run,
+                Err(err) if attempt == max_retries => {
+                    let error = terminal_agent_error(&task_id, &prompt, err);
                     self.record_failure(&task, &task_id, attempt, started_at, events, &error)?;
                     return Err(error);
                 }
@@ -270,6 +283,11 @@ impl DagExecutor {
                     continue;
                 }
             };
+            let response = agent_run
+                .final_response
+                .clone()
+                .ok_or_else(|| WorkflowError::AgentMissingFinalResponse(task_id.clone()))?;
+            let structured_output = agent_run.structured_output.clone();
 
             let validation = {
                 let guard = task.read().map_err(|_| WorkflowError::Lock)?;
@@ -289,6 +307,9 @@ impl DagExecutor {
                     {
                         let mut ctx_guard = context.write().await;
                         ctx_guard.record_task_messages(task_id.clone(), task_messages);
+                        if let Some(map) = structured_output {
+                            ctx_guard.ingest_structured_output(&map);
+                        }
                     }
                     self.record_completion(&task_id, attempt, started_at, events)?;
                     return Ok(());
@@ -361,6 +382,16 @@ impl DagExecutor {
 
         match request {
             ProviderRequest::OpenAiChatCompletion(req) => {
+                let messages = upstream
+                    .iter()
+                    .map(|msg| match msg {
+                        MessageNum::OpenAi(message) => Ok(message.clone()),
+                        _ => Err(unsupported_handoff(&provider_of_message(msg), dst_provider)),
+                    })
+                    .collect::<WorkflowResult<Vec<_>>>()?;
+                req.messages.splice(0..0, messages);
+            }
+            ProviderRequest::OpenAiChatCompatible { request: req, .. } => {
                 let messages = upstream
                     .iter()
                     .map(|msg| match msg {
@@ -494,7 +525,11 @@ impl DagExecutor {
         push_event(events, event)
     }
 
-    fn collect_run(&self, events: Vec<TaskEvent>) -> WorkflowResult<WorkflowRun> {
+    fn collect_run(
+        &self,
+        events: Vec<TaskEvent>,
+        parameters: serde_json::Map<String, Value>,
+    ) -> WorkflowResult<WorkflowRun> {
         let mut tasks = HashMap::new();
         for (id, shared) in self.task_list.iter_in_order() {
             let guard = shared.read().map_err(|_| WorkflowError::Lock)?;
@@ -507,10 +542,19 @@ impl DagExecutor {
                 },
             );
         }
+        let last_task_id = self.task_list.get_last_task_id().map(str::to_owned);
+        let final_output = last_task_id
+            .as_ref()
+            .and_then(|id| tasks.get(id))
+            .and_then(|outcome| outcome.result.as_ref())
+            .and_then(|response| response.adapter().text())
+            .map(std::borrow::Cow::into_owned);
         Ok(WorkflowRun {
             tasks,
             events,
-            last_task_id: self.task_list.get_last_task_id().map(str::to_owned),
+            last_task_id,
+            parameters,
+            final_output,
         })
     }
 }
@@ -533,6 +577,47 @@ fn provider_of_message(msg: &MessageNum) -> ProviderName {
         MessageNum::Anthropic(_) => ProviderName::Anthropic,
         MessageNum::Gemini(_) => ProviderName::Google,
         _ => ProviderName::Custom("unknown".to_owned()),
+    }
+}
+
+fn bindings_from_context(
+    step_id: &str,
+    prompt: &Prompt,
+    ctx: &Context,
+) -> WorkflowResult<Vec<(String, String)>> {
+    let mut out = Vec::with_capacity(prompt.variables.len());
+    for name in &prompt.variables {
+        let value = ctx
+            .lookup_variable(name)
+            .ok_or_else(|| WorkflowError::MissingParameter {
+                step_id: step_id.to_owned(),
+                name: name.clone(),
+            })?;
+        out.push((name.clone(), value_to_template_string(value)?));
+    }
+    Ok(out)
+}
+
+fn value_to_template_string(value: &Value) -> WorkflowResult<String> {
+    match value {
+        Value::String(text) => Ok(text.clone()),
+        Value::Null => Ok(String::new()),
+        other => {
+            serde_json::to_string(other).map_err(|error| WorkflowError::Other(error.to_string()))
+        }
+    }
+}
+
+fn terminal_agent_error(task_id: &str, prompt: &Prompt, error: AgentError) -> WorkflowError {
+    match error {
+        AgentError::StructuredOutputDecode { detail, .. } => {
+            WorkflowError::ResponseValidationFailed {
+                task_id: task_id.to_owned(),
+                expected_schema: response_schema_name(&prompt.response_type),
+                received: detail,
+            }
+        }
+        _ => WorkflowError::MaxRetriesExceeded(task_id.to_owned()),
     }
 }
 

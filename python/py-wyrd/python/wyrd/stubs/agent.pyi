@@ -179,6 +179,11 @@ if True:
             """Return the structured terminal error when the run aborted."""
             ...
 
+        @property
+        def structured_output(self) -> dict[str, Any] | None:
+            """Return parsed JSON output when the prompt declared an output schema."""
+            ...
+
 class Agent:
     """Declarative and runnable Wyrd Agent."""
 
@@ -440,6 +445,16 @@ class WorkflowRun:
         """Return the ordered per-step events captured during the run."""
         ...
 
+    @property
+    def parameters(self) -> dict[str, Any]:
+        """Return the accumulated parameter map from structured outputs."""
+        ...
+
+    @property
+    def final_output(self) -> str | None:
+        """Return the terminal step's assistant text, when present."""
+        ...
+
 class Workflow:
     """Authoring + run surface for a DAG of agents."""
 
@@ -605,18 +620,21 @@ class Workflow:
         """
         ...
 
-    def run(self, input: str) -> WorkflowRun:
+    def run(self, input: str | Mapping[str, Any]) -> WorkflowRun:
         """Run this workflow against the process-local provider registry.
 
         Args:
-            input (str): User-facing input string forwarded to every step.
+            input (str | Mapping[str, Any]): Workflow input. A string lands as
+                the `input` template variable; a mapping exposes every key as a
+                discrete template variable.
 
         Returns:
-            WorkflowRun: Final run envelope with per-step outcomes and events.
+            WorkflowRun: Final run envelope with per-step outcomes, events, and
+            cross-step parameter map.
 
         Raises:
             WyrdError: When a provider call fails, retries exhaust, or any
-                step's output validation fails.
+                step references an undefined variable.
         """
         ...
 

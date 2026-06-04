@@ -19,7 +19,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent = Agent::new(prompt);
     let providers = skald_runtime::default_registry();
     let run = agent
-        .run_prompt(providers.as_ref(), &agent.prompt, &[("topic", "the Rust borrow checker")], None)
+        .run_prompt(
+            providers.as_ref(),
+            &agent.prompt,
+            &[("topic", "the Rust borrow checker")],
+            None,
+        )
         .await?;
 
     println!("finish: {:?}", run.finish_reason);

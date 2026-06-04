@@ -7,7 +7,7 @@ use futures::StreamExt;
 use futures::stream;
 use skald_prompt::Prompt;
 use skald_runtime::{ProviderRegistry, dispatch};
-use skald_spec::{ProviderName, ProviderRequest, ProviderResponse, ToolDescriptor};
+use skald_spec::{ProviderName, ProviderRequest, ProviderResponse, ResponseType, ToolDescriptor};
 use skald_tool::AgentTool;
 use tracing::{Instrument, debug_span};
 
@@ -110,6 +110,7 @@ pub(crate) async fn run(
                         conversation,
                         error: Some(error),
                         errors: Vec::new(),
+                        structured_output: None,
                     });
                 }
                 ChainResult::Replaced(input) => replace_seed_user_turn(&mut conversation, input),
@@ -295,6 +296,7 @@ async fn run_loop(
                     conversation,
                     error: Some(error),
                     errors: Vec::new(),
+                    structured_output: None,
                 });
             }
             ChainResult::Replaced(replacement) => replacement,
@@ -362,6 +364,7 @@ async fn run_loop(
                 .text()
                 .map(std::borrow::Cow::into_owned)
                 .unwrap_or_default();
+            let structured_output = parse_structured_output(this, &output)?;
             let run = AgentRun {
                 output,
                 final_response: Some(response),
@@ -370,6 +373,7 @@ async fn run_loop(
                 conversation,
                 error: None,
                 errors: Vec::new(),
+                structured_output,
             };
             return match apply_chain_with_panic_catch(
                 &this.callbacks.after_agent,
@@ -794,6 +798,31 @@ fn response_finish_reason(response: &ProviderResponse) -> String {
             .map(|reason| format!("{reason:?}").to_lowercase())
             .unwrap_or_else(|| "other".to_owned()),
         _ => format!("{:?}", response.adapter().finish_reason()).to_lowercase(),
+    }
+}
+
+fn parse_structured_output(
+    this: &Agent,
+    output: &str,
+) -> AgentResult<Option<serde_json::Map<String, serde_json::Value>>> {
+    match &this.prompt.native().response_type {
+        ResponseType::Text => Ok(None),
+        ResponseType::JsonSchema { .. } => {
+            let value: serde_json::Value =
+                serde_json::from_str(output.trim()).map_err(|error| {
+                    AgentError::StructuredOutputDecode {
+                        agent: this.id.clone(),
+                        detail: error.to_string(),
+                    }
+                })?;
+            let serde_json::Value::Object(map) = value else {
+                return Err(AgentError::StructuredOutputDecode {
+                    agent: this.id.clone(),
+                    detail: "structured output must be a JSON object".to_owned(),
+                });
+            };
+            Ok(Some(map))
+        }
     }
 }
 

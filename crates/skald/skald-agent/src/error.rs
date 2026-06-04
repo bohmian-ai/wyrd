@@ -123,6 +123,14 @@ pub enum AgentError {
         /// Configured timeout duration.
         duration: Duration,
     },
+    /// Provider returned non-object JSON for a structured-output prompt.
+    #[error("agent '{agent}' returned a non-JSON structured response: {detail}")]
+    StructuredOutputDecode {
+        /// Agent id.
+        agent: String,
+        /// Parser detail.
+        detail: String,
+    },
 }
 
 impl AgentError {
@@ -152,6 +160,7 @@ impl AgentError {
             Self::SessionAppendFailed { .. } => "SKALD_SESSION_500_APPEND",
             Self::JournalAppendFailed { .. } => "SKALD_AGENT_500_JOURNAL",
             Self::Timeout { .. } => "SKALD_AGENT_504_TIMEOUT",
+            Self::StructuredOutputDecode { .. } => "SKALD_AGENT_422_STRUCTURED_DECODE",
         }
     }
 
@@ -170,6 +179,7 @@ impl AgentError {
             | Self::SessionAppendFailed { .. }
             | Self::JournalAppendFailed { .. } => 500,
             Self::Timeout { .. } => 504,
+            Self::StructuredOutputDecode { .. } => 422,
             Self::Provider(_) => 502,
             Self::Tool(_) => 400,
         }
@@ -193,6 +203,7 @@ impl AgentError {
             Self::SessionAppendFailed { .. } => "Session memory append failed",
             Self::JournalAppendFailed { .. } => "Journal append failed",
             Self::Timeout { .. } => "Agent run exceeded configured timeout",
+            Self::StructuredOutputDecode { .. } => "Structured response decode failed",
         }
     }
 
@@ -239,6 +250,9 @@ impl AgentError {
             }
             Self::Timeout { .. } => {
                 "Increase RunConfig.timeout or reduce iteration count / tool latency."
+            }
+            Self::StructuredOutputDecode { .. } => {
+                "Inspect the model output; structured-output prompts must return a JSON object."
             }
         }
     }

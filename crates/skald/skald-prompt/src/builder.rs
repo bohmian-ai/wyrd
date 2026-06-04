@@ -32,6 +32,8 @@ pub struct OpenAiChatOptions {
     pub messages: Vec<String>,
     /// Optional response format emitted into `response_format`.
     pub response_format: Option<ResponseFormat>,
+    /// Optional structured-output schema. Wins over `response_format` when set.
+    pub output: Option<ResponseFormat>,
     /// Optional `OpenAI` prompt cache key.
     pub prompt_cache_key: Option<String>,
     /// Native `OpenAI` Chat generation settings.
@@ -51,6 +53,8 @@ pub struct OpenAiResponsesOptions {
     pub messages: Vec<String>,
     /// Optional response format emitted into `text.format`.
     pub response_format: Option<ResponseFormat>,
+    /// Optional structured-output schema. Wins over `response_format` when set.
+    pub output: Option<ResponseFormat>,
     /// Native `OpenAI` Responses generation settings.
     pub settings: OpenAiResponsesSettings,
     /// Declared render variables.
@@ -68,6 +72,8 @@ pub struct AnthropicOptions {
     pub messages: Vec<String>,
     /// Optional response format recorded on the native Prompt metadata.
     pub response_format: Option<ResponseFormat>,
+    /// Optional structured-output schema. Wins over `response_format` when set.
+    pub output: Option<ResponseFormat>,
     /// Native Anthropic generation settings.
     pub settings: AnthropicMessagesSettings,
     /// Declared render variables.
@@ -85,6 +91,8 @@ pub struct GeminiOptions {
     pub messages: Vec<String>,
     /// Optional response format emitted into `generation_config`.
     pub response_format: Option<ResponseFormat>,
+    /// Optional structured-output schema. Wins over `response_format` when set.
+    pub output: Option<ResponseFormat>,
     /// Native Google/Gemini request settings.
     pub settings: GoogleGenerateSettings,
     /// Declared render variables.
@@ -102,7 +110,10 @@ pub fn openai_chat(
     options: OpenAiChatOptions,
 ) -> PromptBuilderResult<Prompt> {
     let model = checked_model(model)?;
-    let response_type = response_type(options.response_format.as_ref());
+    let effective =
+        effective_response_format(options.response_format.as_ref(), options.output.as_ref());
+    let response_type = response_type(effective);
+    let response_format = effective.map(openai_chat_response_format).transpose()?;
     let mut settings = options.settings;
     if settings.prompt_cache_key.is_none() {
         settings.prompt_cache_key = options.prompt_cache_key;
@@ -121,11 +132,7 @@ pub fn openai_chat(
         request: ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
             model: model.clone(),
             messages,
-            response_format: options
-                .response_format
-                .as_ref()
-                .map(openai_chat_response_format)
-                .transpose()?,
+            response_format,
             stream: None,
             stream_options: None,
             tools: None,
@@ -147,7 +154,10 @@ pub fn openai_responses(
     options: OpenAiResponsesOptions,
 ) -> PromptBuilderResult<Prompt> {
     let model = checked_model(model)?;
-    let response_type = response_type(options.response_format.as_ref());
+    let effective =
+        effective_response_format(options.response_format.as_ref(), options.output.as_ref());
+    let response_type = response_type(effective);
+    let text = effective.map(openai_responses_text).transpose()?;
     let input = options
         .messages
         .into_iter()
@@ -159,11 +169,7 @@ pub fn openai_responses(
             model: model.clone(),
             input,
             instructions: options.instructions,
-            text: options
-                .response_format
-                .as_ref()
-                .map(openai_responses_text)
-                .transpose()?,
+            text,
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
@@ -185,7 +191,13 @@ pub fn anthropic(
     options: AnthropicOptions,
 ) -> PromptBuilderResult<Prompt> {
     let model = checked_model(model)?;
-    let response_type = response_type(options.response_format.as_ref());
+    let effective =
+        effective_response_format(options.response_format.as_ref(), options.output.as_ref());
+    let response_type = response_type(effective);
+    let output_config = effective
+        .map(anthropic_output_config)
+        .transpose()?
+        .flatten();
     let messages = options
         .messages
         .into_iter()
@@ -205,6 +217,7 @@ pub fn anthropic(
             stream: None,
             tools: None,
             tool_choice: None,
+            output_config,
             settings: options.settings,
         }),
         model,
@@ -254,8 +267,10 @@ fn google_prompt(
     options: GeminiOptions,
     vertex_target: bool,
 ) -> PromptBuilderResult<Prompt> {
-    let response_type = response_type(options.response_format.as_ref());
-    let settings = google_settings(&options)?;
+    let effective =
+        effective_response_format(options.response_format.as_ref(), options.output.as_ref());
+    let response_type = response_type(effective);
+    let settings = google_settings(&options, effective)?;
     let request = GoogleGenerateContentRequest {
         contents: options
             .messages
@@ -288,12 +303,28 @@ fn google_prompt(
 }
 
 fn finalize_prompt(mut prompt: skald_spec::Prompt) -> PromptBuilderResult<Prompt> {
-    prompt.normalize_media_placeholders_mut()?;
+    if prompt.variables.is_empty() {
+        prompt = skald_spec::Prompt::new(
+            prompt.request,
+            prompt.model,
+            prompt.version,
+            prompt.response_type,
+        )?;
+    } else {
+        prompt.normalize_media_placeholders_mut()?;
+    }
     Ok(Prompt::from_native(prompt))
 }
 
 fn response_type(format: Option<&ResponseFormat>) -> ResponseType {
     format.map_or(ResponseType::Text, ResponseFormat::response_type)
+}
+
+fn effective_response_format<'a>(
+    response_format: Option<&'a ResponseFormat>,
+    output: Option<&'a ResponseFormat>,
+) -> Option<&'a ResponseFormat> {
+    output.or(response_format)
 }
 
 fn openai_user_message(content: String) -> skald_spec::OpenAiChatMessage {
@@ -345,10 +376,31 @@ fn openai_responses_text(format: &ResponseFormat) -> PromptBuilderResult<OpenAiR
     })
 }
 
-fn google_settings(options: &GeminiOptions) -> PromptBuilderResult<GoogleGenerateSettings> {
+fn anthropic_output_config(
+    format: &ResponseFormat,
+) -> PromptBuilderResult<Option<skald_spec::wire::anthropic_messages::AnthropicOutputConfig>> {
+    use skald_spec::wire::anthropic_messages::{AnthropicOutputConfig, AnthropicOutputFormat};
+
+    Ok(match format.kind() {
+        ResponseFormatKind::Text | ResponseFormatKind::JsonObject => None,
+        ResponseFormatKind::JsonSchema { schema, .. } => {
+            schema_object(schema)?;
+            Some(AnthropicOutputConfig {
+                format: AnthropicOutputFormat::JsonSchema {
+                    schema: schema.clone(),
+                },
+            })
+        }
+    })
+}
+
+fn google_settings(
+    options: &GeminiOptions,
+    format: Option<&ResponseFormat>,
+) -> PromptBuilderResult<GoogleGenerateSettings> {
     let mut settings = options.settings.clone();
     let mut config = settings.generation_config.take().unwrap_or_default();
-    if let Some(format) = &options.response_format {
+    if let Some(format) = format {
         match format.kind() {
             ResponseFormatKind::Text => {}
             ResponseFormatKind::JsonObject => {

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyModule, PyString};
+use pyo3::types::{PyAny, PyDict, PyList, PyModule, PyString};
 use skald_agent::Agent;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, Labels};
@@ -15,7 +15,7 @@ use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, 
 use crate::error::WorkflowError;
 use crate::run::{TaskEvent, TaskOutcome, WorkflowRun};
 use crate::task::TaskStatus;
-use crate::workflow_surface::Workflow;
+use crate::workflow_surface::{Workflow, WorkflowInput};
 
 fn workflow_error_to_py(error: WorkflowError) -> PyErr {
     let wyrd: WyrdError = match error {
@@ -24,16 +24,56 @@ fn workflow_error_to_py(error: WorkflowError) -> PyErr {
             message,
             details: serde_json::json!({}),
         },
-        other => WyrdError::Internal {
-            message: format!("{other}"),
-            details: serde_json::json!({ "code": other.code() }),
-        },
+        other => return skald_workflow_error_to_py(other),
     };
     wyrd_utils::py::wyrd_error_to_py_err(wyrd)
 }
 
+fn skald_workflow_error_to_py(error: WorkflowError) -> PyErr {
+    Python::attach(|py| {
+        let message = error.to_string();
+        let code = error.code();
+        let exception = match py
+            .get_type::<wyrd_utils::py::WyrdError>()
+            .call1((message.clone(),))
+        {
+            Ok(exception) => exception,
+            Err(source) => return source,
+        };
+        if let Err(source) = exception.setattr("code", code) {
+            return source;
+        }
+        if let Err(source) = exception.setattr("message", message) {
+            return source;
+        }
+        let details = match wyrd_utils::py::json_to_pyobject(py, &serde_json::json!({})) {
+            Ok(details) => details,
+            Err(source) => return source,
+        };
+        if let Err(source) = exception.setattr("details", details.bind(py)) {
+            return source;
+        }
+        if let Err(source) = exception.setattr("status", 422u16) {
+            return source;
+        }
+        if let Err(source) = exception.setattr("title", "Workflow execution failed") {
+            return source;
+        }
+        PyErr::from_value(exception)
+    })
+}
+
 fn wyrd_error_to_py(error: WyrdError) -> PyErr {
     wyrd_utils::py::wyrd_error_to_py_err(error)
+}
+
+fn workflow_input_from_py(value: &Bound<'_, PyAny>) -> Result<WorkflowInput, WorkflowError> {
+    if let Ok(text) = value.extract::<String>() {
+        return Ok(WorkflowInput::Text(text));
+    }
+    let json = wyrd_utils::py::pyobject_to_json(value)
+        .map_err(|error| WorkflowError::Other(error.to_string()))?;
+    Ok(WorkflowInput::from(json))
 }
 
 fn coerce_labels(labels: Option<HashMap<String, String>>) -> Result<Labels, PyErr> {
@@ -340,7 +380,8 @@ impl Workflow {
     /// Run this workflow against the process-local provider registry.
     ///
     /// Args:
-    ///     input (str): User-facing input string forwarded to every step.
+    ///     input (str | dict): Workflow input. Strings bind as `input`; mappings
+    ///         expose every key as a template variable.
     ///
     /// Returns:
     ///     WorkflowRun: Final run envelope with per-step outcomes and events.
@@ -349,10 +390,11 @@ impl Workflow {
     ///     WyrdError: When a provider call fails, retries exhaust, or any
     ///         step's output validation fails.
     #[pyo3(name = "run", signature = (input))]
-    pub fn py_run(&self, py: Python<'_>, input: String) -> PyResult<Py<PyAny>> {
+    pub fn py_run(&self, py: Python<'_>, input: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let input = workflow_input_from_py(input).map_err(workflow_error_to_py)?;
         let providers = skald_runtime::default_registry();
         let run = py.detach(|| {
-            wyrd_runtime::runtime().block_on(Workflow::run_with(self, providers.as_ref(), &input))
+            wyrd_runtime::runtime().block_on(Workflow::run_with(self, providers.as_ref(), input))
         });
         let run = run.map_err(workflow_error_to_py)?;
         Ok(Py::new(py, run)?.into_any())
@@ -385,6 +427,19 @@ impl WorkflowRun {
             items.push(Py::new(py, event.clone())?);
         }
         Ok(PyList::new(py, items)?.into())
+    }
+
+    /// Return accumulated structured-output parameters.
+    #[getter]
+    pub fn parameters(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = serde_json::Value::Object(self.parameters.clone());
+        wyrd_utils::py::json_to_pyobject(py, &value)
+    }
+
+    /// Return terminal assistant output, when present.
+    #[getter]
+    pub fn final_output(&self) -> Option<&str> {
+        self.final_output.as_deref()
     }
 }
 

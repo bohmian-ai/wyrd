@@ -56,7 +56,7 @@ pub use run::{StepEvent, StepOutcome, TaskEvent, TaskOutcome, WorkflowRun};
 pub use task::{Task, TaskStatus};
 pub use tasklist::TaskList;
 pub use workflow::DagExecutor;
-pub use workflow_surface::Workflow;
+pub use workflow_surface::{Workflow, WorkflowInput};
 
 #[cfg(feature = "python")]
 pub use python::python_register;

@@ -182,6 +182,9 @@ pub struct AgentRun {
     /// Errors recorded without aborting the run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<RunError>,
+    /// Parsed JSON object for prompts that declared a structured output schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[cfg(feature = "python")]
@@ -262,6 +265,22 @@ impl AgentRun {
             .clone()
             .map(|error| wyrd_utils::py::wyrd_error_to_py_object(py, error))
             .and_then(Result::ok)
+    }
+
+    /// Return parsed structured output, when the prompt declared an output schema.
+    ///
+    /// Returns:
+    ///     dict[str, Any] | None: Parsed JSON object for structured-output prompts.
+    #[getter]
+    pub fn structured_output(
+        &self,
+        py: pyo3::Python<'_>,
+    ) -> pyo3::PyResult<Option<pyo3::Py<pyo3::PyAny>>> {
+        let Some(map) = self.structured_output.as_ref() else {
+            return Ok(None);
+        };
+        let value = serde_json::Value::Object(map.clone());
+        wyrd_utils::py::json_to_pyobject(py, &value).map(Some)
     }
 
     /// Return a concise Python representation.

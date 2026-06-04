@@ -275,7 +275,7 @@ use {
 impl Prompt {
     /// Build a vendor-native prompt from provider and message inputs.
     #[new]
-    #[pyo3(signature = (messages, model, *, provider, system=None, response_format=None, operation=None, cache=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (messages, model, *, provider, system=None, response_format=None, output=None, operation=None, cache=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_lines)]
     pub fn __new__(
@@ -284,6 +284,7 @@ impl Prompt {
         provider: &Bound<'_, PyAny>,
         system: Option<String>,
         response_format: Option<&Bound<'_, PyAny>>,
+        output: Option<&Bound<'_, PyAny>>,
         operation: Option<&str>,
         cache: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
@@ -292,7 +293,8 @@ impl Prompt {
     ) -> CardPyResult<Self> {
         let provider = provider_name_from_py(provider)?;
         let response_format = response_format_from_py(response_format)?;
-        let auto_variables = variables.is_none();
+        let output = output_from_py(output)?;
+        let explicit_variables = variables.clone();
         let variables = variables.unwrap_or_default();
         let append_messages = !matches!(provider, skald_spec::ProviderName::Custom(_));
         let mut prompt = match provider {
@@ -305,6 +307,7 @@ impl Prompt {
                     OpenAiResponsesOptions {
                         instructions: system,
                         response_format,
+                        output,
                         settings: resolve_openai_responses_settings(model_settings)?,
                         variables,
                         version,
@@ -317,6 +320,7 @@ impl Prompt {
                 OpenAiChatOptions {
                     system,
                     response_format,
+                    output,
                     prompt_cache_key: cache_prompt_key(cache)?,
                     settings: resolve_openai_chat_settings(model_settings)?,
                     variables,
@@ -329,6 +333,7 @@ impl Prompt {
                 AnthropicOptions {
                     system,
                     response_format,
+                    output,
                     settings: resolve_anthropic_settings(model_settings)?,
                     variables,
                     version,
@@ -339,6 +344,7 @@ impl Prompt {
                 let options = GeminiOptions {
                     system,
                     response_format,
+                    output,
                     settings: resolve_google_settings(model_settings)?,
                     variables,
                     version,
@@ -350,6 +356,7 @@ impl Prompt {
                 let options = GeminiOptions {
                     system,
                     response_format,
+                    output,
                     settings: resolve_google_settings(model_settings)?,
                     variables,
                     version,
@@ -364,6 +371,7 @@ impl Prompt {
                         system,
                         messages: strings_from_py(Some(messages))?,
                         response_format,
+                        output,
                         settings: resolve_openai_chat_settings(model_settings)?,
                         variables,
                         version,
@@ -388,148 +396,155 @@ impl Prompt {
         if append_messages {
             prompt = append_py_messages(prompt, messages)?;
         }
-        if auto_variables {
-            prompt.inner.variables = extract_prompt_variables(&prompt)?;
-        }
-        Ok(prompt)
+        assign_variables(prompt, explicit_variables)
     }
 
     /// Build an `OpenAI` Chat prompt from native constructor arguments.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, cache=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, cache=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn openai_chat(
         model: String,
         system: Option<String>,
         messages: Option<&Bound<'_, PyAny>>,
         response_format: Option<&Bound<'_, PyAny>>,
+        output: Option<&Bound<'_, PyAny>>,
         cache: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
-        let auto_variables = variables.is_none();
+        let explicit_variables = variables.clone();
         let prompt = crate::builder::openai_chat(
             model,
             OpenAiChatOptions {
                 system,
                 messages: strings_from_py(messages)?,
                 response_format: response_format_from_py(response_format)?,
+                output: output_from_py(output)?,
                 prompt_cache_key: cache_prompt_key(cache)?,
                 settings: resolve_openai_chat_settings(model_settings)?,
                 variables: variables.unwrap_or_default(),
                 version,
             },
         )?;
-        auto_assign_variables(prompt, auto_variables)
+        assign_variables(prompt, explicit_variables)
     }
 
     /// Build an `OpenAI` Responses prompt from native constructor arguments.
     #[staticmethod]
-    #[pyo3(signature = (model, *, instructions=None, messages=None, response_format=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, instructions=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn openai_responses(
         model: String,
         instructions: Option<String>,
         messages: Option<&Bound<'_, PyAny>>,
         response_format: Option<&Bound<'_, PyAny>>,
+        output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
-        let auto_variables = variables.is_none();
+        let explicit_variables = variables.clone();
         let prompt = crate::builder::openai_responses(
             model,
             OpenAiResponsesOptions {
                 instructions,
                 messages: strings_from_py(messages)?,
                 response_format: response_format_from_py(response_format)?,
+                output: output_from_py(output)?,
                 settings: resolve_openai_responses_settings(model_settings)?,
                 variables: variables.unwrap_or_default(),
                 version,
             },
         )?;
-        auto_assign_variables(prompt, auto_variables)
+        assign_variables(prompt, explicit_variables)
     }
 
     /// Build an Anthropic Messages prompt from native constructor arguments.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn anthropic(
         model: String,
         system: Option<String>,
         messages: Option<&Bound<'_, PyAny>>,
         response_format: Option<&Bound<'_, PyAny>>,
+        output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
-        let auto_variables = variables.is_none();
+        let explicit_variables = variables.clone();
         let prompt = crate::builder::anthropic(
             model,
             AnthropicOptions {
                 system,
                 messages: strings_from_py(messages)?,
                 response_format: response_format_from_py(response_format)?,
+                output: output_from_py(output)?,
                 settings: resolve_anthropic_settings(model_settings)?,
                 variables: variables.unwrap_or_default(),
                 version,
             },
         )?;
-        auto_assign_variables(prompt, auto_variables)
+        assign_variables(prompt, explicit_variables)
     }
 
     /// Build a Google Gemini `GenerateContent` prompt from native constructor arguments.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn gemini(
         model: String,
         system: Option<String>,
         messages: Option<&Bound<'_, PyAny>>,
         response_format: Option<&Bound<'_, PyAny>>,
+        output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
-        let auto_variables = variables.is_none();
+        let explicit_variables = variables.clone();
         let options = GeminiOptions {
             system,
             messages: strings_from_py(messages)?,
             response_format: response_format_from_py(response_format)?,
+            output: output_from_py(output)?,
             settings: resolve_google_settings(model_settings)?,
             variables: variables.unwrap_or_default(),
             version,
         };
         let prompt = crate::builder::gemini(model, options)?;
-        auto_assign_variables(prompt, auto_variables)
+        assign_variables(prompt, explicit_variables)
     }
 
     /// Build a Vertex `GenerateContent` prompt from native constructor arguments.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn vertex(
         model: String,
         system: Option<String>,
         messages: Option<&Bound<'_, PyAny>>,
         response_format: Option<&Bound<'_, PyAny>>,
+        output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
-        let auto_variables = variables.is_none();
+        let explicit_variables = variables.clone();
         let options = GeminiOptions {
             system,
             messages: strings_from_py(messages)?,
             response_format: response_format_from_py(response_format)?,
+            output: output_from_py(output)?,
             settings: resolve_google_settings(model_settings)?,
             variables: variables.unwrap_or_default(),
             version,
         };
         let prompt = crate::builder::vertex(model, options)?;
-        auto_assign_variables(prompt, auto_variables)
+        assign_variables(prompt, explicit_variables)
     }
 
     /// Build a raw JSON passthrough prompt with a required provider target.
@@ -1035,10 +1050,14 @@ impl PyProviderRequest {
 }
 
 #[cfg(feature = "python")]
-fn auto_assign_variables(mut prompt: Prompt, auto_variables: bool) -> CardPyResult<Prompt> {
-    if auto_variables {
-        prompt.inner.variables = extract_prompt_variables(&prompt)?;
-    }
+fn assign_variables(
+    mut prompt: Prompt,
+    explicit_variables: Option<Vec<String>>,
+) -> CardPyResult<Prompt> {
+    prompt.inner.variables = match explicit_variables {
+        Some(variables) => variables,
+        None => extract_prompt_variables(&prompt)?,
+    };
     Ok(prompt)
 }
 
@@ -1202,6 +1221,33 @@ fn response_format_from_py(
 
     let schema = crate::coerce::schema_from_py(value)?;
     Ok(Some(ResponseFormat::json_schema("response", schema)?))
+}
+
+#[cfg(feature = "python")]
+fn output_from_py(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Option<ResponseFormat>> {
+    let Some(value) = value.filter(|value| !value.is_none()) else {
+        return Ok(None);
+    };
+
+    if let Ok(format) = value.extract::<PyRef<'_, ResponseFormat>>() {
+        return Ok(Some(format.clone()));
+    }
+
+    let py = value.py();
+    let helper = py
+        .import("wyrd._schema")?
+        .getattr("output_to_json_schema")?;
+    let result = helper.call1((value,))?;
+    let tuple = result.cast::<PyTuple>()?;
+    if tuple.len() != 2 {
+        return Err(PromptBuilderError::Validation(
+            "output_to_json_schema must return (name, schema)".to_owned(),
+        )
+        .into());
+    }
+    let name = tuple.get_item(0)?.extract::<String>()?;
+    let schema = crate::coerce::schema_from_py(&tuple.get_item(1)?)?;
+    Ok(Some(ResponseFormat::json_schema(name, schema)?))
 }
 
 #[cfg(feature = "python")]

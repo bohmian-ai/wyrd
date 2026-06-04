@@ -4472,6 +4472,7 @@ dependencies = [
  "opentelemetry_sdk",
  "schemars",
  "serde",
+ "serde_json",
  "skald-agent",
  "skald-prompt",
  "skald-runtime",

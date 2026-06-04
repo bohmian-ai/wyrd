@@ -18,6 +18,9 @@ pub struct AnthropicMessagesRequest {
     pub tools: Option<Vec<AnthropicTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<Value>,
+    /// Provider-side structured-output declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<AnthropicOutputConfig>,
     #[serde(flatten)]
     pub settings: AnthropicMessagesSettings,
 }
@@ -215,6 +218,26 @@ pub struct AnthropicTool {
     pub display_height_px: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_number: Option<u32>,
+}
+
+/// Anthropic `output_config` block on a `/v1/messages` request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct AnthropicOutputConfig {
+    /// Declared output format.
+    pub format: AnthropicOutputFormat,
+}
+
+/// Anthropic output-format variants.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicOutputFormat {
+    /// JSON schema enforced by Anthropic at generation time.
+    JsonSchema {
+        /// JSON Schema object describing the response shape.
+        schema: Value,
+    },
 }
 
 /// Response envelope.

@@ -405,6 +405,7 @@ mod tests {
             stream: None,
             tools: None,
             tool_choice: None,
+            output_config: None,
             settings: AnthropicMessagesSettings::default(),
         })
     }
@@ -455,6 +456,8 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             refusal: None,
+            annotations: Vec::new(),
+            audio: None,
         }
     }
 

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::{Map, Value};
 use skald_spec::ProviderResponse;
 
 use crate::task::TaskStatus;
@@ -20,6 +21,10 @@ pub struct WorkflowRun {
     pub events: Vec<TaskEvent>,
     /// Last task id in topological execution order.
     pub last_task_id: Option<String>,
+    /// Final accumulated structured-output parameter map.
+    pub parameters: Map<String, Value>,
+    /// Terminal step assistant text, when present.
+    pub final_output: Option<String>,
 }
 
 impl WorkflowRun {

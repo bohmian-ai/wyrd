@@ -222,6 +222,7 @@ fn build_anthropic(
             stream: None,
             tools: None,
             tool_choice: None,
+            output_config: None,
             settings,
         },
     ))

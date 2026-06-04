@@ -53,6 +53,7 @@ fn anthropic_default_max_tokens_is_wire_default() {
         stream: None,
         tools: None,
         tool_choice: None,
+        output_config: None,
         settings: AnthropicMessagesSettings::default(),
     };
     assert_eq!(serde_json::to_value(request).unwrap()["max_tokens"], 4096);

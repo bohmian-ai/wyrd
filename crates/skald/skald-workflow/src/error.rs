@@ -41,6 +41,16 @@ pub enum WorkflowError {
         /// Validator, parse, or missing-output detail.
         received: String,
     },
+    /// A step prompt referenced a variable absent from input and upstream output.
+    #[error(
+        "step '{step_id}' references variable '{name}' not present in workflow input or upstream output"
+    )]
+    MissingParameter {
+        /// Step id whose prompt references the variable.
+        step_id: String,
+        /// Variable name that failed to resolve.
+        name: String,
+    },
     /// No ready tasks remain but the workflow is not complete.
     #[error("workflow stalled; pending: {0:?}")]
     Stalled(Vec<String>),
@@ -81,6 +91,7 @@ impl WorkflowError {
             Self::MaxRetriesExceeded(_) => "SKALD_WORKFLOW_500_MAX_RETRIES",
             Self::AgentMissingFinalResponse(_) => "SKALD_WORKFLOW_500_AGENT_RESPONSE_MISSING",
             Self::ResponseValidationFailed { .. } => "SKALD_WORKFLOW_422_OUTPUT_SCHEMA",
+            Self::MissingParameter { .. } => "SKALD_WORKFLOW_422_MISSING_PARAMETER",
             Self::Stalled(_) => "SKALD_WORKFLOW_500_STALLED",
             Self::UnsupportedHandoff { .. } => "SKALD_WORKFLOW_501_UNSUPPORTED_HANDOFF",
             Self::Cycle(_) => "SKALD_WORKFLOW_422_CYCLE",

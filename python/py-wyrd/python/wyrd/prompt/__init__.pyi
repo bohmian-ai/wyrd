@@ -562,6 +562,7 @@ class Prompt:
         provider: str,
         system: str | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
+        output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         operation: str | None = ...,
         cache: str | Mapping[str, Any] | None = ...,
         model_settings: OpenAISettings
@@ -588,13 +589,14 @@ class Prompt:
                 the selected provider.
             response_format (ResponseFormat | JsonDict | None): Optional
                 structured-output helper or schema dictionary.
+            output (dict[str, type] | type | JsonDict | ResponseFormat | None): Optional structured-output declaration. Accepts dict[str, type], raw JSON Schema, ResponseFormat, or pydantic BaseModel subclass. When set, output wins over response_format.
             operation (str | None): Optional provider operation selector used
                 by provider families with more than one request shape.
             cache (str | Mapping[str, Any] | None): Optional cache sugar for
                 providers with a native cache key.
             model_settings (OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | Mapping[str, Any] | None): Native provider generation settings object or mapping. Explicit settings take precedence over cache sugar.
             variables (list[str] | None): Declared text variables. When
-                omitted, Wyrd infers `{{name}}` placeholders from the request.
+                omitted, Wyrd infers `${name}` and `{{name}}` placeholders from the request.
             version (str | None): Optional prompt version string stored on the
                 native prompt.
         """
@@ -607,6 +609,7 @@ class Prompt:
         system: str | None = ...,
         messages: Any | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
+        output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         cache: str | Mapping[str, Any] | None = ...,
         model_settings: OpenAISettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
@@ -620,10 +623,11 @@ class Prompt:
             messages (Any | None): Optional user-authored chat messages.
             response_format (ResponseFormat | JsonDict | None): Optional
                 response-format helper or schema dictionary.
+            output (dict[str, type] | type | JsonDict | ResponseFormat | None): Optional structured-output declaration. When set, output wins over response_format.
             cache (str | Mapping[str, Any] | None): Optional prompt cache key.
             model_settings (OpenAISettings | Mapping[str, Any] | None): OpenAI settings object or mapping.
             variables (list[str] | None): Declared text variables. When
-                omitted, Wyrd infers `{{name}}` placeholders.
+                omitted, Wyrd infers `${name}` and `{{name}}` placeholders.
             version (str | None): Optional prompt version string.
 
         Returns:
@@ -638,6 +642,7 @@ class Prompt:
         instructions: str | None = ...,
         messages: Any | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
+        output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: OpenAIResponsesSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
         version: str | None = ...,
@@ -650,9 +655,10 @@ class Prompt:
             messages (Any | None): Optional Responses API input items.
             response_format (ResponseFormat | JsonDict | None): Optional
                 response-format helper or schema dictionary.
+            output (dict[str, type] | type | JsonDict | ResponseFormat | None): Optional structured-output declaration. When set, output wins over response_format.
             model_settings (OpenAIResponsesSettings | Mapping[str, Any] | None): OpenAI Responses settings object or mapping.
             variables (list[str] | None): Declared text variables. When
-                omitted, Wyrd infers `{{name}}` placeholders.
+                omitted, Wyrd infers `${name}` and `{{name}}` placeholders.
             version (str | None): Optional prompt version string.
 
         Returns:
@@ -667,6 +673,7 @@ class Prompt:
         system: str | None = ...,
         messages: Any | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
+        output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: AnthropicSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
         version: str | None = ...,
@@ -679,9 +686,10 @@ class Prompt:
             messages (Any | None): Optional Anthropic message list.
             response_format (ResponseFormat | JsonDict | None): Optional
                 response-format helper or schema dictionary.
+            output (dict[str, type] | type | JsonDict | ResponseFormat | None): Optional structured-output declaration. When set, output wins over response_format.
             model_settings (AnthropicSettings | Mapping[str, Any] | None): Anthropic settings object or mapping.
             variables (list[str] | None): Declared text variables. When
-                omitted, Wyrd infers `{{name}}` placeholders.
+                omitted, Wyrd infers `${name}` and `{{name}}` placeholders.
             version (str | None): Optional prompt version string.
 
         Returns:
@@ -696,6 +704,7 @@ class Prompt:
         system: str | None = ...,
         messages: Any | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
+        output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: GeminiSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
         version: str | None = ...,
@@ -708,9 +717,10 @@ class Prompt:
             messages (Any | None): Optional Gemini content turns.
             response_format (ResponseFormat | JsonDict | None): Optional
                 response-format helper or schema dictionary.
+            output (dict[str, type] | type | JsonDict | ResponseFormat | None): Optional structured-output declaration. When set, output wins over response_format.
             model_settings (GeminiSettings | Mapping[str, Any] | None): Gemini settings object or mapping.
             variables (list[str] | None): Declared text variables. When
-                omitted, Wyrd infers `{{name}}` placeholders.
+                omitted, Wyrd infers `${name}` and `{{name}}` placeholders.
             version (str | None): Optional prompt version string.
 
         Returns:
@@ -725,6 +735,7 @@ class Prompt:
         system: str | None = ...,
         messages: Any | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
+        output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: GeminiSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
         version: str | None = ...,
@@ -737,9 +748,10 @@ class Prompt:
             messages (Any | None): Optional Vertex content turns.
             response_format (ResponseFormat | JsonDict | None): Optional
                 response-format helper or schema dictionary.
+            output (dict[str, type] | type | JsonDict | ResponseFormat | None): Optional structured-output declaration. When set, output wins over response_format.
             model_settings (GeminiSettings | Mapping[str, Any] | None): Gemini settings object or mapping.
             variables (list[str] | None): Declared text variables. When
-                omitted, Wyrd infers `{{name}}` placeholders.
+                omitted, Wyrd infers `${name}` and `{{name}}` placeholders.
             version (str | None): Optional prompt version string.
 
         Returns:

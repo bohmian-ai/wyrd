@@ -65,6 +65,8 @@ pub fn openai_chat_request(text: &str) -> ProviderRequest {
             tool_calls: None,
             tool_call_id: None,
             refusal: None,
+            annotations: Vec::new(),
+            audio: None,
         }],
         response_format: None,
         stream: None,
@@ -111,6 +113,7 @@ pub fn anthropic_request(text: &str) -> ProviderRequest {
         stream: None,
         tools: None,
         tool_choice: None,
+        output_config: None,
         settings: AnthropicMessagesSettings {
             max_tokens: 128,
             ..AnthropicMessagesSettings::default()

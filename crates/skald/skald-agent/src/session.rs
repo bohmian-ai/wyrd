@@ -134,12 +134,10 @@ pub(crate) fn session_turn_to_conversation_turn(
                         citations: None,
                     }],
                 }),
-                ProviderName::Google | ProviderName::Vertex => {
-                    MessageNum::Gemini(GoogleContent {
-                        role: "model".to_owned(),
-                        parts: vec![GooglePart::Text { text: turn.content }],
-                    })
-                }
+                ProviderName::Google | ProviderName::Vertex => MessageNum::Gemini(GoogleContent {
+                    role: "model".to_owned(),
+                    parts: vec![GooglePart::Text { text: turn.content }],
+                }),
                 ProviderName::OpenAi | ProviderName::Custom(_) => {
                     MessageNum::OpenAi(OpenAiChatMessage {
                         role: "assistant".to_owned(),

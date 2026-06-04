@@ -1,7 +1,8 @@
-"""Public Python package for Wyrd."""
-
+# AUTO-GENERATED STUB FILE. DO NOT EDIT.
+# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
+#### begin imports ####
 from . import data, model, prompt
-from ._wyrd import AgentError, SessionError, ToolError, WyrdError, _init
+from ._wyrd import AgentError, SessionError, ToolError, WyrdError
 from .agent import Agent, AgentRun, FinishReason, RunConfig, local_registry, tool
 from .data import DataCard, Split
 from .model import ModelCard, ModelSignature, SampleInput
@@ -20,7 +21,7 @@ from .prompt import (
 )
 from .session import NoSession, Role, SessionMemory, SessionTurn
 
-_init()
+#### end of imports ####
 
 __all__ = [
     "Agent",

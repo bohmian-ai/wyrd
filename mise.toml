@@ -159,6 +159,7 @@ if rg -n 'pyo3|pymodule|pyclass|pymethods|Python|Bound<|Py<|PyErr' crates/skald 
   --glob '!crates/skald/skald-agent/src/lib.rs' \
   --glob '!crates/skald/skald-agent/src/py_error.rs' \
   --glob '!crates/skald/skald-agent/src/python.rs' \
+  --glob '!crates/skald/skald-agent/src/run.rs' \
   --glob '!crates/skald/skald-agent/src/session.rs' \
   --glob '!crates/skald/skald-tool/Cargo.toml' \
   --glob '!crates/skald/skald-tool/src/lib.rs' \
@@ -294,7 +295,7 @@ run = "uv run ruff check python/wyrd tests scripts"
 [tasks."py:typecheck"]
 description = "Run ty over the generated Python stub surface"
 dir = "python/py-wyrd"
-run = "uv run ty check python/wyrd/*.pyi tests/cards/data/test_public_surface.py"
+run = "uv run ty check python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/cards/data/test_public_surface.py"
 
 [tasks."examples:python:datacard"]
 description = "Run the local DataCard Python example"
@@ -420,7 +421,8 @@ snapshot_codegen() {
   {
     test -f openapi.yaml && printf '%s\n' openapi.yaml
     find crates/wyrd-spec/schemas crates/wyrd-spec/tests/schemas -type f -name '*.json'
-    find python/py-wyrd/python/wyrd -maxdepth 1 -type f -name '*.pyi'
+    find python/py-wyrd/python/wyrd -type f -name '*.pyi' \
+      ! -path 'python/py-wyrd/python/wyrd/stubs/*'
   } | sort | while IFS= read -r file; do
     shasum -a 256 "$file"
   done

@@ -13,8 +13,10 @@ def test_agent_constructs_from_prompt() -> None:
     assert agent.model == "gpt-4o-mini"
 
 
-def test_agent_rejects_banned_kwargs_but_not_providers() -> None:
+def test_agent_rejects_banned_provider_kwargs() -> None:
     prompt = Prompt.openai_chat("gpt-4o-mini", messages=["hello"])
 
     with pytest.raises(TypeError):
-        Agent(prompt=prompt, provider="openai")
+        Agent(prompt=prompt, **{"provider": "openai"})
+    with pytest.raises(TypeError):
+        Agent(prompt=prompt, **{"providers": object()})

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use skald_spec::{ProviderRequest, ProviderResponse};
 use skald_tool::{AgentTool, ToolError};
+use wyrd_spec::error::WyrdError;
 
 use crate::conversation::Conversation;
 use crate::error::{AgentError, AgentResult};
@@ -13,16 +14,16 @@ use crate::error::{AgentError, AgentResult};
 pub enum CallbackOutcome<T> {
     /// Let the original operation run.
     Continue,
-    /// Skip the original operation.
-    Skip,
     /// Replace the value the original operation would have returned.
     ReplaceWith(T),
+    /// Terminate the agent run with this error as the cause.
+    Abort(WyrdError),
 }
 
 /// Result of applying a callback chain in registration order.
 pub(crate) enum ChainResult<T> {
-    /// A callback skipped the current operation.
-    Skip,
+    /// A callback aborted the current operation.
+    Abort(WyrdError),
     /// Effective current value after all callbacks continue or replace.
     Replaced(T),
 }
@@ -92,8 +93,8 @@ where
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(ctx, &current)));
         match outcome {
             Ok(CallbackOutcome::Continue) => {}
-            Ok(CallbackOutcome::Skip) => return Ok(ChainResult::Skip),
             Ok(CallbackOutcome::ReplaceWith(replacement)) => current = replacement,
+            Ok(CallbackOutcome::Abort(error)) => return Ok(ChainResult::Abort(error)),
             Err(payload) => return Err(callback_panic(hook, payload)),
         }
     }
@@ -113,8 +114,8 @@ pub(crate) fn apply_before_agent_chain_with_panic_catch(
         }));
         match outcome {
             Ok(CallbackOutcome::Continue) => {}
-            Ok(CallbackOutcome::Skip) => return Ok(ChainResult::Skip),
             Ok(CallbackOutcome::ReplaceWith(replacement)) => current = replacement,
+            Ok(CallbackOutcome::Abort(error)) => return Ok(ChainResult::Abort(error)),
             Err(payload) => return Err(callback_panic(hook, payload)),
         }
     }
@@ -135,8 +136,8 @@ pub(crate) fn apply_chain_with_panic_catch_tool(
         }));
         match outcome {
             Ok(CallbackOutcome::Continue) => {}
-            Ok(CallbackOutcome::Skip) => return Ok(ChainResult::Skip),
             Ok(CallbackOutcome::ReplaceWith(replacement)) => current = replacement,
+            Ok(CallbackOutcome::Abort(error)) => return Ok(ChainResult::Abort(error)),
             Err(payload) => return Err(callback_panic(hook, payload)),
         }
     }
@@ -157,8 +158,8 @@ pub(crate) fn apply_chain_with_panic_catch_tool_result(
         }));
         match outcome {
             Ok(CallbackOutcome::Continue) => {}
-            Ok(CallbackOutcome::Skip) => return Ok(ChainResult::Skip),
             Ok(CallbackOutcome::ReplaceWith(replacement)) => current = replacement,
+            Ok(CallbackOutcome::Abort(error)) => return Ok(ChainResult::Abort(error)),
             Err(payload) => return Err(callback_panic(hook, payload)),
         }
     }

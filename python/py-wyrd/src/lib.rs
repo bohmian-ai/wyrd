@@ -6,6 +6,8 @@ use pyo3::types::PyModule;
 /// Native extension entry point mounted as `wyrd._wyrd`.
 #[pymodule]
 fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    wyrd_utils::py::register_wyrd_error_exception(m)?;
+
     let agent = PyModule::new(py, "agent")?;
     skald_agent::python_register(&agent)?;
     m.add_submodule(&agent)?;

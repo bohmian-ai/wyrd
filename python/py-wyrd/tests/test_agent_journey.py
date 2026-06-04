@@ -4,8 +4,7 @@ from pathlib import Path
 
 import pytest
 import wyrd
-from wyrd import Agent, CallbackOutcome, FinishReason, Prompt, RunConfig, tool
-from wyrd.providers import mock_registry
+from wyrd import Agent, FinishReason, Prompt, RunConfig, tool
 
 
 @tool(name="t", description="echoes text")
@@ -30,7 +29,6 @@ def test_journey_author_save_load_run(tmp_path: Path) -> None:
         name=loaded.name,
         version=loaded.version,
         run_config=RunConfig(max_iterations=3),
-        providers=mock_registry("done"),
     )
     run = runner.run("draft the doc")
 
@@ -38,7 +36,7 @@ def test_journey_author_save_load_run(tmp_path: Path) -> None:
     assert loaded.version == "0.3.0"
     assert loaded.tool_names == ["t"]
     assert run.finish_reason == FinishReason.ModelStopped
-    assert run.output == "done"
+    assert "draft the doc" in run.output
 
 
 def test_journey_to_card_round_trip(tmp_path: Path) -> None:
@@ -72,12 +70,11 @@ def test_journey_delegate_via_agent_delegate_tool() -> None:
         prompt=Prompt(["child"], "mock-model", provider="mock"),
         name="researcher",
         version="0.3.0",
-        providers=mock_registry("researched"),
     )
 
     delegate = child.as_tool(description="Research the request")
 
-    assert delegate({"input": "draft the doc"}) == "researched"
+    assert "draft the doc" in delegate({"input": "draft the doc"})
 
 
 def test_journey_callbacks_fire_in_registration_order() -> None:
@@ -85,25 +82,24 @@ def test_journey_callbacks_fire_in_registration_order() -> None:
 
     def before_agent(ctx, input_text):
         calls.append(("before_agent", input_text))
-        return CallbackOutcome.Continue
+        return None
 
     def before_model(ctx, request):
         calls.append(("before_model", ctx["agent_id"]))
-        return CallbackOutcome.Continue
+        return None
 
     def after_model(ctx, response):
         calls.append(("after_model", ctx["agent_id"]))
-        return CallbackOutcome.Continue
+        return None
 
     def after_agent(ctx, run):
-        calls.append(("after_agent", run["output"]))
-        return CallbackOutcome.Continue
+        calls.append(("after_agent", run.output))
+        return None
 
     agent = Agent(
         prompt=Prompt(["hello"], "mock-model", provider="mock"),
         name="planner",
         version="0.3.0",
-        providers=mock_registry("done"),
         before_agent_callback=before_agent,
         before_model_callback=before_model,
         after_model_callback=after_model,
@@ -112,7 +108,7 @@ def test_journey_callbacks_fire_in_registration_order() -> None:
 
     run = agent.run("draft the doc")
 
-    assert run.output == "done"
+    assert "draft the doc" in run.output
     assert [name for name, _ in calls] == [
         "before_agent",
         "before_model",

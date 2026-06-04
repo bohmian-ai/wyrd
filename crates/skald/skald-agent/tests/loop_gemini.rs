@@ -65,15 +65,15 @@ async fn agent_run_executes_gemini_loop_against_mock_provider() {
         )
         .expect("Gemini prompt should build"),
     );
-    let agent = Agent::new(prompt)
-        .with_id("g")
-        .with_run_config(RunConfig {
-            max_iterations: 3,
-            ..Default::default()
-        })
-        .with_providers(Arc::new(providers));
+    let agent = Agent::new(prompt).with_id("g").with_run_config(RunConfig {
+        max_iterations: 3,
+        ..Default::default()
+    });
 
-    let run = agent.run("hello").await.expect("Gemini loop must run");
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("Gemini loop must run");
 
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
     assert_eq!(run.iterations, 1);

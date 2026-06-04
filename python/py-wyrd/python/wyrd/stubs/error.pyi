@@ -43,6 +43,81 @@ class WyrdError(Exception):
         """
         ...
 
+class AgentError(WyrdError):
+    """Agent-specific Wyrd error.
+
+    Raised for structured errors produced by Agent runtime behavior.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+        remediation: str = ...,
+    ) -> None:
+        """Create an Agent error.
+
+        Args:
+            code (str): Stable Wyrd error code.
+            message (str): Human-readable failure message.
+            details (dict[str, Any] | None): Optional structured context.
+            remediation (str): Actionable recovery guidance.
+        """
+        ...
+
+class ToolError(WyrdError):
+    """Tool-specific Wyrd error.
+
+    Raised for structured errors produced by tool registration or invocation.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+        remediation: str = ...,
+    ) -> None:
+        """Create a Tool error.
+
+        Args:
+            code (str): Stable Wyrd error code.
+            message (str): Human-readable failure message.
+            details (dict[str, Any] | None): Optional structured context.
+            remediation (str): Actionable recovery guidance.
+        """
+        ...
+
+class SessionError(WyrdError):
+    """Session-specific Wyrd error.
+
+    Raised for structured errors produced by session memory behavior.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+        remediation: str = ...,
+    ) -> None:
+        """Create a Session error.
+
+        Args:
+            code (str): Stable Wyrd error code.
+            message (str): Human-readable failure message.
+            details (dict[str, Any] | None): Optional structured context.
+            remediation (str): Actionable recovery guidance.
+        """
+        ...
+
 __all__ = [
+    "AgentError",
+    "SessionError",
+    "ToolError",
     "WyrdError",
 ]

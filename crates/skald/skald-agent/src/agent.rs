@@ -7,7 +7,6 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use skald_prompt::Prompt;
-use skald_runtime::ProviderRegistry;
 use skald_tool::{AgentTool, ToolError, ToolResolver};
 use wyrd_spec::{
     AgentCard, AgentCardError, AgentRunConfigSpec, AgentSpec, CardMetadata,
@@ -139,12 +138,8 @@ pub struct AgentCallbacks {
 /// # Example
 ///
 /// ```no_run
-/// use std::sync::Arc;
-///
 /// use skald_agent::Agent;
 /// use skald_prompt::{OpenAiChatOptions, openai_chat};
-/// use skald_runtime::{MockProvider, ProviderRegistry};
-/// use skald_spec::ProviderName;
 ///
 /// # async fn run_example() -> Result<(), Box<dyn std::error::Error>> {
 /// let prompt = openai_chat(
@@ -155,14 +150,9 @@ pub struct AgentCallbacks {
 ///     },
 /// )?;
 ///
-/// let mock = MockProvider::new(ProviderName::OpenAi);
-/// let mut providers = ProviderRegistry::new();
-/// providers.register(Arc::new(mock));
-///
 /// let agent = Agent::new(prompt)
 ///     .name("planner")
-///     .version("0.3.0")
-///     .with_providers(Arc::new(providers));
+///     .version("0.3.0");
 ///
 /// let _run = agent.run("draft the doc").await?;
 /// # Ok(())
@@ -194,8 +184,6 @@ pub struct Agent {
     pub(crate) journal: Arc<dyn Journal>,
     /// Runtime callback chains.
     pub(crate) callbacks: AgentCallbacks,
-    /// Optional provider registry used by [`Agent::run`].
-    pub(crate) providers: Option<Arc<ProviderRegistry>>,
 }
 
 impl fmt::Debug for Agent {
@@ -335,13 +323,6 @@ impl Agent {
     #[must_use]
     pub fn with_journal(mut self, journal: Arc<dyn Journal>) -> Self {
         self.journal = journal;
-        self
-    }
-
-    /// Return a copy with a provider registry used by [`Agent::run`].
-    #[must_use]
-    pub fn with_providers(mut self, providers: Arc<ProviderRegistry>) -> Self {
-        self.providers = Some(providers);
         self
     }
 
@@ -643,10 +624,7 @@ impl Agent {
     /// # Errors
     /// Returns Skald agent runtime errors.
     pub async fn run(&self, input: &str) -> AgentResult<crate::run::AgentRun> {
-        let providers = self
-            .providers
-            .clone()
-            .unwrap_or_else(skald_runtime::default_registry);
+        let providers = skald_runtime::default_registry();
         crate::loop_runtime::run(self, providers.as_ref(), None, input).await
     }
 
@@ -656,7 +634,7 @@ impl Agent {
     /// Returns Skald agent runtime errors.
     pub async fn run_with(
         &self,
-        providers: &ProviderRegistry,
+        providers: &skald_runtime::ProviderRegistry,
         session_id: Option<SessionId>,
         input: &str,
     ) -> AgentResult<crate::run::AgentRun> {
@@ -670,7 +648,7 @@ impl Agent {
     /// Returns Skald agent runtime errors.
     pub async fn run_prompt(
         &self,
-        providers: &ProviderRegistry,
+        providers: &skald_runtime::ProviderRegistry,
         prompt: &Prompt,
         vars: &[(&str, &str)],
     ) -> AgentResult<crate::run::AgentRun> {
@@ -693,7 +671,6 @@ impl Agent {
             session: Arc::new(NoSession),
             journal: Arc::new(NoopJournal),
             callbacks: AgentCallbacks::default(),
-            providers: None,
         }
     }
 

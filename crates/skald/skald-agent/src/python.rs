@@ -5,14 +5,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyModule, PyString};
 use skald_prompt::{Prompt, PyProviderRequest};
-use skald_runtime::python::PyProviderRegistryInner;
 use skald_spec::{ProviderRequest, ProviderResponse};
 use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue};
 use wyrd_spec::reference::PromptRef;
@@ -20,17 +18,37 @@ use wyrd_spec::reference::PromptRef;
 use crate::py_error::{AgentPyError, AgentPyResult};
 use crate::{
     AfterAgentFn, AfterModelFn, AfterToolFn, Agent, AgentContext, AgentRun, BeforeAgentFn,
-    BeforeModelFn, BeforeToolFn, CallbackOutcome, Role, RunConfig, SessionError, SessionId,
-    SessionMemory, SessionTurn, default_prompt_resolver,
+    BeforeModelFn, BeforeToolFn, CallbackOutcome, FinishReason, Role, RunConfig, SessionError,
+    SessionId, SessionMemory, SessionTurn, default_prompt_resolver,
 };
 
 #[pymethods]
 impl Agent {
     /// Build a runnable, savable Agent.
     ///
-    /// Args: prompt is a `Prompt` or PromptRef-like mapping; name, version,
-    /// space, id, tools, providers, run_config, callbacks, session, labels, and
-    /// annotations configure the local authoring object.
+    /// Args:
+    ///     prompt (Prompt | dict): Resolved prompt or PromptRef-like mapping.
+    ///     name (str | None): Optional envelope name.
+    ///     version (str | None): Optional envelope version.
+    ///     space (str | None): Optional envelope space.
+    ///     id (str | None): Optional stable runtime id.
+    ///     tools (list | None): Optional runtime-local decorated tools.
+    ///     run_config (RunConfig | None): Optional run configuration.
+    ///     before_agent_callback (Callable | None): Optional callback fired before the run starts. Return None to continue, return replacement input text, or raise to abort.
+    ///     after_agent_callback (Callable | None): Optional callback fired after the run completes. Return None to continue, return a replacement AgentRun, or raise to abort.
+    ///     before_model_callback (Callable | None): Optional callback fired before each model invocation. Return None to continue, return a ProviderRequest replacement, or raise to abort.
+    ///     after_model_callback (Callable | None): Optional callback fired after each model invocation. Return None to continue, return a ProviderResponse replacement, or raise to abort.
+    ///     before_tool_callback (Callable | None): Optional callback fired before each tool invocation. Return None to continue, return replacement tool arguments, or raise to abort.
+    ///     after_tool_callback (Callable | None): Optional callback fired after each tool invocation. Return None to continue, return replacement tool output, or raise to abort.
+    ///     session (SessionMemory | None): Optional session memory object with recent and append methods.
+    ///     labels (dict[str, str] | None): Optional envelope labels.
+    ///     annotations (dict[str, str] | None): Optional envelope annotations.
+    ///
+    /// Returns:
+    ///     Agent: New Agent ready to run.
+    ///
+    /// Raises:
+    ///     WyrdError: When validation fails.
     #[new]
     #[pyo3(signature = (
         *,
@@ -40,7 +58,6 @@ impl Agent {
         space = None,
         id = None,
         tools = None,
-        providers = None,
         run_config = None,
         before_agent_callback = None,
         after_agent_callback = None,
@@ -61,8 +78,7 @@ impl Agent {
         space: Option<String>,
         id: Option<String>,
         tools: Option<Vec<Py<PyAny>>>,
-        providers: Option<&Bound<'_, PyAny>>,
-        run_config: Option<&Bound<'_, PyAny>>,
+        run_config: Option<Py<RunConfig>>,
         before_agent_callback: Option<Py<PyAny>>,
         after_agent_callback: Option<Py<PyAny>>,
         before_model_callback: Option<Py<PyAny>>,
@@ -79,13 +95,10 @@ impl Agent {
             agent = agent.with_id(id);
         }
         if let Some(run_config) = run_config {
-            agent = agent.with_run_config(run_config_from_py(run_config)?);
+            agent = agent.with_run_config(run_config.borrow(py).clone());
         }
         if let Some(session) = session {
             agent = agent.with_session(wrap_session(py, session)?);
-        }
-        if let Some(providers) = providers {
-            agent = agent.with_providers(provider_registry_from_py(providers)?);
         }
         for tool in tools.unwrap_or_default() {
             agent = agent.with_tool(skald_tool::python::wrap_callable(py, tool)?);
@@ -240,15 +253,12 @@ impl Agent {
         session_id: Option<String>,
     ) -> AgentPyResult<Py<PyAny>> {
         let input = input_to_string(input)?;
-        let providers = self
-            .providers
-            .clone()
-            .unwrap_or_else(skald_runtime::default_registry);
+        let providers = skald_runtime::default_registry();
         let session_id = session_id.map(SessionId::new);
         let run = py.detach(|| {
             wyrd_runtime::runtime().block_on(self.run_with(providers.as_ref(), session_id, &input))
         })?;
-        Ok(agent_run_to_py(py, run)?)
+        Ok(Py::new(py, run)?.into_any())
     }
 
     /// Add one runtime-local tool in place.
@@ -290,10 +300,12 @@ impl Agent {
 
     /// Replace run configuration in place.
     #[pyo3(name = "with_run_config")]
-    pub fn py_with_run_config(&mut self, run_config: &Bound<'_, PyAny>) -> AgentPyResult<()> {
-        let next = self
-            .clone()
-            .with_run_config(run_config_from_py(run_config)?);
+    pub fn py_with_run_config(
+        &mut self,
+        py: Python<'_>,
+        run_config: Py<RunConfig>,
+    ) -> AgentPyResult<()> {
+        let next = self.clone().with_run_config(run_config.borrow(py).clone());
         *self = next;
         Ok(())
     }
@@ -306,10 +318,7 @@ impl Agent {
         py: Python<'_>,
         description: Option<String>,
     ) -> AgentPyResult<Py<PyAny>> {
-        let providers = self
-            .providers
-            .clone()
-            .unwrap_or_else(skald_runtime::default_registry);
+        let providers = skald_runtime::default_registry();
         let delegate = crate::AgentDelegateTool::new(Arc::new(self.clone()), providers);
         let tool = match description {
             Some(description) => delegate.with_description(description).into_tool(),
@@ -447,41 +456,6 @@ impl SessionTurn {
     }
 }
 
-/// Convert a Skald agent run to the public Python dataclass.
-///
-/// # Errors
-/// Returns Python import or object construction errors.
-pub fn agent_run_to_py(py: Python<'_>, run: AgentRun) -> PyResult<Py<PyAny>> {
-    let module = py.import("wyrd.run")?;
-    let cls = module.getattr("AgentRun")?;
-    let kwargs = PyDict::new(py);
-    kwargs.set_item("finish_reason", finish_reason_str(run.finish_reason))?;
-    kwargs.set_item("output", run.output)?;
-    kwargs.set_item("iterations", run.iterations)?;
-    let usage = run
-        .final_response
-        .as_ref()
-        .and_then(|response| response.adapter().usage())
-        .map(|usage| usage.usage);
-    kwargs.set_item(
-        "tokens_in",
-        usage.as_ref().map_or(0, |usage| usage.input_tokens),
-    )?;
-    kwargs.set_item(
-        "tokens_out",
-        usage.as_ref().map_or(0, |usage| usage.output_tokens),
-    )?;
-    kwargs.set_item(
-        "conversation",
-        wyrd_utils::py::json_to_pyobject(
-            py,
-            &serde_json::to_value(&run.conversation)
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
-        )?,
-    )?;
-    Ok(cls.call((), Some(&kwargs))?.unbind())
-}
-
 /// Wrap a callable as a before-agent callback.
 ///
 /// # Errors
@@ -496,7 +470,6 @@ pub fn wrap_before_agent(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<BeforeAgent
             },
             extract_string_replacement,
         )
-        .unwrap_or_else(|e| panic!("{e}"))
     }))
 }
 
@@ -509,15 +482,11 @@ pub fn wrap_after_agent(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterAgentFn
         invoke_callback(
             &cb,
             |py| {
-                let args = (
-                    ctx_to_py(py, ctx)?,
-                    wyrd_utils::py::json_to_pyobject(py, &serde_json::to_value(run).unwrap_or_default())?,
-                );
+                let args = (ctx_to_py(py, ctx)?, Py::new(py, run.clone())?.into_any());
                 cb.bind(py).call1(args)
             },
             extract_agent_run_replacement,
         )
-        .unwrap_or_else(|e| panic!("{e}"))
     }))
 }
 
@@ -541,7 +510,6 @@ pub fn wrap_before_model(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<BeforeModel
             },
             extract_provider_request_replacement,
         )
-        .unwrap_or_else(|e| panic!("{e}"))
     }))
 }
 
@@ -565,7 +533,6 @@ pub fn wrap_after_model(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterModelFn
             },
             extract_provider_response_replacement,
         )
-        .unwrap_or_else(|e| panic!("{e}"))
     }))
 }
 
@@ -587,7 +554,6 @@ pub fn wrap_before_tool(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<BeforeToolFn
             },
             extract_json_replacement,
         )
-        .unwrap_or_else(|e| panic!("{e}"))
     }))
 }
 
@@ -615,7 +581,6 @@ pub fn wrap_after_tool(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterToolFn> 
             },
             extract_tool_result_replacement,
         )
-        .unwrap_or_else(|e| panic!("{e}"))
     }))
 }
 
@@ -668,6 +633,9 @@ impl SessionMemory for PySessionMemory {
 pub fn python_register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     wyrd_utils::py::register_wyrd_error_exception(module)?;
     module.add_class::<Agent>()?;
+    module.add_class::<AgentRun>()?;
+    module.add_class::<FinishReason>()?;
+    module.add_class::<RunConfig>()?;
     module.add_class::<Role>()?;
     module.add_class::<SessionTurn>()?;
     Ok(())
@@ -695,51 +663,6 @@ fn prompt_ref_from_py(value: &Bound<'_, PyAny>) -> AgentPyResult<PromptRef> {
     }
     let json = wyrd_utils::py::pyobject_to_json(value)?;
     Ok(serde_json::from_value(json)?)
-}
-
-fn provider_registry_from_py(
-    value: &Bound<'_, PyAny>,
-) -> AgentPyResult<Arc<skald_runtime::ProviderRegistry>> {
-    if let Ok(registry) = value.extract::<PyRef<'_, PyProviderRegistryInner>>() {
-        return Ok(registry.inner.clone());
-    }
-    if let Ok(inner) = value.getattr("_inner") {
-        let registry = inner
-            .extract::<PyRef<'_, PyProviderRegistryInner>>()
-            .map_err(|error| PyTypeError::new_err(error.to_string()))?;
-        return Ok(registry.inner.clone());
-    }
-    Err(PyTypeError::new_err("providers must be a wyrd ProviderRegistry").into())
-}
-
-fn run_config_from_py(value: &Bound<'_, PyAny>) -> AgentPyResult<RunConfig> {
-    if let Ok(json) = wyrd_utils::py::pyobject_to_json(value) {
-        if let Ok(spec) = serde_json::from_value(json) {
-            return Ok(crate::run_config_from_agent_run_config_spec(&spec));
-        }
-    }
-
-    let mut config = RunConfig::default();
-    if let Some(max_iterations) = optional_attr::<u32>(value, "max_iterations")? {
-        config.max_iterations = max_iterations;
-    }
-    config.tool_concurrency_cap = optional_attr(value, "tool_concurrency_cap")?;
-    config.session_recent_limit = optional_attr(value, "session_recent_limit")?;
-    if let Some(timeout_ms) = optional_attr::<u64>(value, "timeout_ms")? {
-        config.timeout = Some(Duration::from_millis(timeout_ms));
-    }
-    Ok(config)
-}
-
-fn optional_attr<T>(value: &Bound<'_, PyAny>, name: &str) -> PyResult<Option<T>>
-where
-    for<'py> T: FromPyObject<'py, 'py, Error = PyErr>,
-{
-    match value.getattr(name) {
-        Ok(attr) if attr.is_none() => Ok(None),
-        Ok(attr) => attr.extract().map(Some),
-        Err(_) => Ok(None),
-    }
 }
 
 fn labels_from_py(
@@ -781,17 +704,15 @@ fn input_to_string(value: &Bound<'_, PyAny>) -> PyResult<String> {
     if value.is_instance_of::<PyString>() {
         return value.extract();
     }
-    Ok(
-        serde_json::to_string(&wyrd_utils::py::pyobject_to_json(value)?)
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
-    )
+    serde_json::to_string(&wyrd_utils::py::pyobject_to_json(value)?)
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }
 
 fn invoke_callback<T>(
     cb: &Py<PyAny>,
     call: impl for<'py> FnOnce(Python<'py>) -> PyResult<Bound<'py, PyAny>>,
     replacement: fn(&Bound<'_, PyAny>) -> PyResult<T>,
-) -> PyResult<CallbackOutcome<T>> {
+) -> CallbackOutcome<T> {
     Python::attach(|py| {
         if let Err(error) = cb
             .bind(py)
@@ -799,9 +720,14 @@ fn invoke_callback<T>(
             .then_some(())
             .ok_or_else(|| PyTypeError::new_err("agent callback must be callable"))
         {
-            return Err(error);
+            return CallbackOutcome::Abort(wyrd_utils::py::py_err_to_wyrd_error(py, error));
         }
-        let result = call(py)?;
+        let result = match call(py) {
+            Ok(result) => result,
+            Err(error) => {
+                return CallbackOutcome::Abort(wyrd_utils::py::py_err_to_wyrd_error(py, error));
+            }
+        };
         callback_outcome(&result, replacement)
     })
 }
@@ -809,29 +735,18 @@ fn invoke_callback<T>(
 fn callback_outcome<T>(
     result: &Bound<'_, PyAny>,
     replacement: fn(&Bound<'_, PyAny>) -> PyResult<T>,
-) -> PyResult<CallbackOutcome<T>> {
+) -> CallbackOutcome<T> {
     if result.is_none() {
-        return Ok(CallbackOutcome::Continue);
+        return CallbackOutcome::Continue;
     }
-    let type_name = result.get_type().name()?;
-    if let Ok(value) = result.getattr("value") {
-        if type_name == "_ReplaceWith" {
-            return replacement(&value).map(CallbackOutcome::ReplaceWith);
+    match replacement(result) {
+        Ok(value) => CallbackOutcome::ReplaceWith(value),
+        Err(error) => {
+            CallbackOutcome::Abort(wyrd_spec::error::WyrdError::AgentCallbackReturnType {
+                message: format!("callback returned wrong type: {error}"),
+                details: serde_json::json!({ "source": error.to_string() }),
+            })
         }
-        let outcome = value.extract::<String>()?;
-        return callback_outcome_from_str(&outcome);
-    }
-    let outcome = result.str()?.extract::<String>()?;
-    callback_outcome_from_str(&outcome)
-}
-
-fn callback_outcome_from_str<T>(outcome: &str) -> PyResult<CallbackOutcome<T>> {
-    match outcome {
-        "skip" | "CallbackOutcome.Skip" => Ok(CallbackOutcome::Skip),
-        "continue" | "CallbackOutcome.Continue" => Ok(CallbackOutcome::Continue),
-        other => Err(PyTypeError::new_err(format!(
-            "callback returned unsupported outcome {other:?}"
-        ))),
     }
 }
 
@@ -956,15 +871,3 @@ fn extract_agent_run_replacement(value: &Bound<'_, PyAny>) -> PyResult<AgentRun>
     serde_json::from_value(wyrd_utils::py::pyobject_to_json(value)?)
         .map_err(|error| PyTypeError::new_err(error.to_string()))
 }
-
-fn finish_reason_str(reason: crate::FinishReason) -> &'static str {
-    match reason {
-        crate::FinishReason::ModelStopped => "model_stopped",
-        crate::FinishReason::MaxIterations => "max_iterations",
-        crate::FinishReason::CallbackSkipped => "callback_skipped",
-        crate::FinishReason::ProviderError => "provider_error",
-        crate::FinishReason::ToolError => "tool_error",
-        crate::FinishReason::Timeout => "timeout",
-    }
-}
-

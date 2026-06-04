@@ -1,3 +1,5 @@
+# AUTO-GENERATED STUB FILE. DO NOT EDIT.
+# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
 #### begin imports ####
 from __future__ import annotations
 
@@ -5,9 +7,8 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from typing import Any, Protocol
 
-from .error import WyrdError
-from .header import JsonDict, PathLike
-from .prompt import Prompt
+from .._wyrd import JsonDict, PathLike, WyrdError
+from ..prompt import Prompt
 
 #### end of imports ####
 

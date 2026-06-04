@@ -11,7 +11,7 @@ pub mod derive {
 }
 
 /// Top-level Wyrd error value passed across crate and wire boundaries.
-#[derive(Debug, Error, Serialize, Deserialize, schemars::JsonSchema, WyrdErrorMeta)]
+#[derive(Debug, Clone, Error, Serialize, Deserialize, schemars::JsonSchema, WyrdErrorMeta)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WyrdError {
@@ -911,6 +911,34 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Python callback returned a value that could not replace the target.
+    #[error("[WYRD_AGENT_422_CALLBACK_RETURN_TYPE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_CALLBACK_RETURN_TYPE",
+        status = 422,
+        title = "Callback returned wrong type",
+        remediation = "Return None to continue, return a replacement value of the expected type, or raise an exception to abort the run."
+    )]
+    AgentCallbackReturnType {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Agent callback aborted the run.
+    #[error("[WYRD_AGENT_499_CALLBACK_ABORTED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_499_CALLBACK_ABORTED",
+        status = 499,
+        title = "Callback aborted run",
+        remediation = "Inspect the callback exception and either return None to continue or return a valid replacement value."
+    )]
+    AgentCallbackAborted {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Agent loop history contains a provider message type mismatch.
     #[error("[WYRD_AGENT_422_LOOP_MESSAGE_TYPE] {message}")]
     #[wyrd_error(
@@ -1009,6 +1037,8 @@ impl WyrdError {
             | Self::AgentPromptCardNotFound { message, details }
             | Self::AgentRuntimeLocalToolNotFound { message, details }
             | Self::AgentRuntimeLocalToolsNotRegistrable { message, details }
+            | Self::AgentCallbackReturnType { message, details }
+            | Self::AgentCallbackAborted { message, details }
             | Self::AgentLoopMessageType { message, details } => (message, details),
         }
     }

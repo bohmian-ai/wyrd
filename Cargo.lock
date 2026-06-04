@@ -2172,6 +2172,7 @@ dependencies = [
  "skald-tool",
  "wyrd-cards",
  "wyrd-observe-impl",
+ "wyrd-utils",
 ]
 
 [[package]]

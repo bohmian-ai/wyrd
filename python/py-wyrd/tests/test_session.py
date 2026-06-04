@@ -1,6 +1,5 @@
 import pytest
 from wyrd import Agent, Prompt, Role, SessionTurn
-from wyrd.providers import mock_registry
 
 
 class RecordingMemory:
@@ -35,7 +34,6 @@ def test_python_session_receives_appends() -> None:
     memory = RecordingMemory()
     agent = Agent(
         prompt=Prompt(["hello"], "mock-model", provider="mock"),
-        providers=mock_registry("done"),
         session=memory,
     )
 
@@ -60,7 +58,6 @@ def test_python_session_recent_can_return_dicts() -> None:
 
     agent = Agent(
         prompt=Prompt(["hello"], "mock-model", provider="mock"),
-        providers=mock_registry("done"),
         session=memory,
         before_model_callback=before_model,
     )
@@ -76,7 +73,6 @@ def test_invalid_session_object_is_rejected() -> None:
     with pytest.raises(TypeError, match="recent"):
         Agent(
             prompt=Prompt(["hello"], "mock-model", provider="mock"),
-            providers=mock_registry("done"),
             session=object(),
         )
 
@@ -85,12 +81,9 @@ def test_python_journal_surface_is_not_public() -> None:
     with pytest.raises(TypeError, match="unexpected keyword"):
         Agent(
             prompt=Prompt(["hello"], "mock-model", provider="mock"),
-            providers=mock_registry("done"),
             journal=object(),
         )
 
-    agent = Agent(
-        prompt=Prompt(["hello"], "mock-model", provider="mock"),
-        providers=mock_registry("done"),
-    )
+    prompt = Prompt(["hello"], "mock-model", provider="mock")
+    agent = Agent(prompt=prompt)
     assert not hasattr(agent, "with_journal")

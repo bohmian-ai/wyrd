@@ -280,6 +280,7 @@ impl Prompt {
     #[new]
     #[pyo3(signature = (messages, model, *, provider, system=None, response_format=None, operation=None, cache=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     pub fn __new__(
         messages: &Bound<'_, PyAny>,
         model: String,
@@ -373,14 +374,12 @@ impl Prompt {
                     },
                 )?;
                 let mut native = prompt.into_native();
-                let request = match native.request {
-                    skald_spec::ProviderRequest::OpenAiChatCompletion(request) => request,
-                    _ => {
-                        return Err(PromptBuilderError::Validation(
-                            "custom provider prompt must build an OpenAI chat request".to_owned(),
-                        )
-                        .into());
-                    }
+                let skald_spec::ProviderRequest::OpenAiChatCompletion(request) = native.request
+                else {
+                    return Err(PromptBuilderError::Validation(
+                        "custom provider prompt must build an OpenAI chat request".to_owned(),
+                    )
+                    .into());
                 };
                 native.request = skald_spec::ProviderRequest::OpenAiChatCompatible {
                     provider: skald_spec::ProviderName::Custom(custom),

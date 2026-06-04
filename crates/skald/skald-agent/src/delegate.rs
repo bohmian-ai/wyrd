@@ -19,7 +19,7 @@ use crate::error::AgentError;
 /// [`AgentTool`] without wrapping a `ToolDef`.
 pub struct AgentDelegateTool {
     agent: Arc<Agent>,
-    providers: Arc<ProviderRegistry>,
+    registry: Arc<ProviderRegistry>,
     name: String,
     description: String,
     input_schema: Value,
@@ -28,7 +28,7 @@ pub struct AgentDelegateTool {
 
 impl AgentDelegateTool {
     /// Constructs a typed delegate tool for `agent`.
-    pub fn new(agent: Arc<Agent>, providers: Arc<ProviderRegistry>) -> Self {
+    pub fn new(agent: Arc<Agent>, registry: Arc<ProviderRegistry>) -> Self {
         let name = agent.id.clone();
         let description = format!("Delegate to agent {name}");
         let input_schema = json!({
@@ -48,7 +48,7 @@ impl AgentDelegateTool {
 
         Self {
             agent,
-            providers,
+            registry,
             name,
             description,
             input_schema,
@@ -68,8 +68,8 @@ impl AgentDelegateTool {
     }
 
     /// Constructs and erases a delegate tool with the default description.
-    pub fn from_agent(agent: Arc<Agent>, providers: Arc<ProviderRegistry>) -> Arc<dyn AgentTool> {
-        Self::new(agent, providers).into_tool()
+    pub fn from_agent(agent: Arc<Agent>, registry: Arc<ProviderRegistry>) -> Arc<dyn AgentTool> {
+        Self::new(agent, registry).into_tool()
     }
 }
 
@@ -124,7 +124,7 @@ impl AgentTool for AgentDelegateTool {
             .scope(depth + 1, async {
                 WYRD_AGENT_DELEGATION_CHAIN
                     .scope(std::cell::RefCell::new(chain), async {
-                        self.agent.run_with(&self.providers, None, &input_str).await
+                        self.agent.run_with(&self.registry, None, &input_str).await
                     })
                     .await
             })

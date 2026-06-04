@@ -29,7 +29,10 @@ impl ToolRegistry {
     /// is already registered.
     pub fn register(&self, tool: Arc<dyn AgentTool>) -> Result<(), ToolError> {
         let name = tool.name().to_string();
-        let mut guard = self.inner.write().expect("ToolRegistry lock poisoned");
+        let mut guard = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
 
         if guard.contains_key(&name) {
             return Err(ToolError::NameTaken { name });
@@ -43,7 +46,10 @@ impl ToolRegistry {
     ///
     /// Returns `SKALD_TOOL_404_NOT_REGISTERED` when missing, with sorted names.
     pub fn resolve(&self, name: &str) -> Result<Arc<dyn AgentTool>, ToolError> {
-        let guard = self.inner.read().expect("ToolRegistry lock poisoned");
+        let guard = match self.inner.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if let Some(tool) = guard.get(name) {
             return Ok(Arc::clone(tool));
         }
@@ -59,13 +65,11 @@ impl ToolRegistry {
 
     /// List all registered tool names in sorted order.
     pub fn names(&self) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .inner
-            .read()
-            .expect("ToolRegistry lock poisoned")
-            .keys()
-            .cloned()
-            .collect();
+        let guard = match self.inner.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut out: Vec<String> = guard.keys().cloned().collect();
         out.sort();
         out
     }
@@ -74,7 +78,10 @@ impl ToolRegistry {
     ///
     /// Existing resolved `Arc<dyn AgentTool>` values remain valid.
     pub fn clear(&self) {
-        let mut guard = self.inner.write().expect("ToolRegistry lock poisoned");
+        let mut guard = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         guard.clear();
     }
 }

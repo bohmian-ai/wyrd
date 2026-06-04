@@ -10,6 +10,8 @@ use skald_providers::{
 };
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 
+use crate::mock::MockProvider;
+
 static DEFAULT_REGISTRY: OnceLock<RwLock<Arc<ProviderRegistry>>> = OnceLock::new();
 
 /// Runtime provider seam over the concrete Skald provider clients.
@@ -78,6 +80,7 @@ impl ProviderRegistry {
     /// still register explicit clients or mocks afterwards.
     pub fn from_env(default_google_model: impl AsRef<str>) -> Self {
         let mut registry = Self::new();
+        registry.register(Arc::new(MockProvider::echo()));
         if let Ok(client) = OpenAiClient::from_env() {
             registry.register(Arc::new(client));
         }

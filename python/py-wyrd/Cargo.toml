@@ -23,6 +23,7 @@ skald-prompt = { workspace = true, features = ["python"] }
 skald-runtime = { workspace = true, features = ["python"] }
 wyrd-cards = { workspace = true, features = ["python"] }
 wyrd-observe-impl = { workspace = true, features = ["python"] }
+wyrd-utils = { workspace = true, features = ["python"] }
 
 [lints]
 workspace = true

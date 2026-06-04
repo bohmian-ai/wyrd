@@ -17,6 +17,7 @@ use skald_spec::{
     Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
 };
 use skald_tool::{AgentTool, ToolError};
+use wyrd_spec::error::WyrdError;
 
 #[tokio::test]
 async fn agent_run_callbacks_fire_in_order() {
@@ -104,13 +105,13 @@ async fn agent_run_before_agent_replace_changes_user_turn() {
 }
 
 #[tokio::test]
-async fn agent_run_before_agent_skip_returns_callback_skipped() {
+async fn agent_run_before_agent_abort_returns_callback_aborted() {
     let provider = RecordingProvider::new(vec![openai_text_response("unused")]);
     let providers = registry(provider.clone());
     let after_agent_count = Arc::new(Mutex::new(0_u32));
     let after_agent_count_cb = Arc::clone(&after_agent_count);
     let agent = Agent::from_resolved("test", test_prompt())
-        .before_agent(Arc::new(|_ctx, _input| CallbackOutcome::Skip))
+        .before_agent(Arc::new(|_ctx, _input| callback_abort()))
         .after_agent(Arc::new(move |_ctx, run| {
             *after_agent_count_cb.lock().expect("counter lock") += 1;
             CallbackOutcome::ReplaceWith(run.clone())
@@ -121,7 +122,8 @@ async fn agent_run_before_agent_skip_returns_callback_skipped() {
         .await
         .expect("run ok");
 
-    assert_eq!(run.finish_reason, FinishReason::CallbackSkipped);
+    assert_eq!(run.finish_reason, FinishReason::CallbackAborted);
+    assert!(run.error.is_some());
     assert_eq!(run.iterations, 0);
     assert_eq!(run.output, "");
     assert_eq!(provider.requests().len(), 0);
@@ -159,13 +161,13 @@ async fn agent_run_before_model_replace_swaps_native_request() {
 }
 
 #[tokio::test]
-async fn agent_run_before_model_skip_skips_provider_and_after_model() {
+async fn agent_run_before_model_abort_skips_provider_and_after_model() {
     let provider = RecordingProvider::new(vec![openai_text_response("unused")]);
     let providers = registry(provider.clone());
     let after_model_count = Arc::new(Mutex::new(0_u32));
     let after_model_count_cb = Arc::clone(&after_model_count);
     let agent = Agent::from_resolved("test", test_prompt())
-        .before_model(Arc::new(|_ctx, _request| CallbackOutcome::Skip))
+        .before_model(Arc::new(|_ctx, _request| callback_abort()))
         .after_model(Arc::new(move |_ctx, response| {
             *after_model_count_cb.lock().expect("counter lock") += 1;
             CallbackOutcome::ReplaceWith(response.clone())
@@ -176,7 +178,8 @@ async fn agent_run_before_model_skip_skips_provider_and_after_model() {
         .await
         .expect("run ok");
 
-    assert_eq!(run.finish_reason, FinishReason::CallbackSkipped);
+    assert_eq!(run.finish_reason, FinishReason::CallbackAborted);
+    assert!(run.error.is_some());
     assert_eq!(run.iterations, 1);
     assert_eq!(provider.requests().len(), 0);
     assert_eq!(*after_model_count.lock().expect("counter lock"), 0);
@@ -248,7 +251,7 @@ async fn agent_run_before_tool_replace_changes_tool_args() {
 }
 
 #[tokio::test]
-async fn agent_run_before_tool_skip_records_sentinel_result() {
+async fn agent_run_before_tool_abort_records_error_result() {
     let provider = RecordingProvider::new(vec![
         openai_tool_call_response(vec![tool_call("c1", "recorder", json!({"original": true}))]),
         openai_text_response("done"),
@@ -259,7 +262,7 @@ async fn agent_run_before_tool_skip_records_sentinel_result() {
     let after_tool_count_cb = Arc::clone(&after_tool_count);
     let agent = Agent::from_resolved("test", test_prompt())
         .add_tool(tool.clone())
-        .before_tool(Arc::new(|_ctx, _tool, _args| CallbackOutcome::Skip))
+        .before_tool(Arc::new(|_ctx, _tool, _args| callback_abort()))
         .after_tool(Arc::new(move |_ctx, _tool, result| {
             *after_tool_count_cb.lock().expect("counter lock") += 1;
             match result {
@@ -282,7 +285,7 @@ async fn agent_run_before_tool_skip_records_sentinel_result() {
     assert!(run.conversation.turns().iter().any(|turn| matches!(
         turn,
         ConversationTurn::ToolResult { call_id, ok, content }
-            if call_id == "c1" && *ok && content == &json!({"skipped": true})
+            if call_id == "c1" && !*ok && content["code"] == "WYRD_AGENT_499_CALLBACK_ABORTED"
     )));
 }
 
@@ -456,6 +459,13 @@ fn registry(provider: RecordingProvider) -> ProviderRegistry {
     providers
 }
 
+fn callback_abort<T>() -> CallbackOutcome<T> {
+    CallbackOutcome::Abort(WyrdError::AgentCallbackAborted {
+        message: "test abort".to_owned(),
+        details: serde_json::json!({}),
+    })
+}
+
 fn test_prompt() -> Arc<Prompt> {
     let request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
         model: "gpt-4o".to_owned(),
@@ -554,11 +564,10 @@ fn last_assistant_text(run: &AgentRun) -> Option<&str> {
         .iter()
         .rev()
         .find_map(|turn| match turn {
-            ConversationTurn::Assistant { message } => match message {
-                skald_spec::MessageNum::OpenAi(message) => match message.content.as_ref() {
-                    Some(OpenAiMessageContent::Text(text)) => Some(text.as_str()),
-                    _ => None,
-                },
+            ConversationTurn::Assistant {
+                message: skald_spec::MessageNum::OpenAi(message),
+            } => match message.content.as_ref() {
+                Some(OpenAiMessageContent::Text(text)) => Some(text.as_str()),
                 _ => None,
             },
             _ => None,

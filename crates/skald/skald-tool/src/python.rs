@@ -189,7 +189,7 @@ pub fn wrap_callable(py: Python<'_>, callable: Py<PyAny>) -> PyResult<Arc<dyn Ag
 /// # Errors
 /// Returns Python object construction errors.
 pub fn tool_callable_py(py: Python<'_>, tool: Arc<dyn AgentTool>) -> PyResult<Py<PyAny>> {
-    let module = py.import("wyrd.tool")?;
+    let module = py.import("wyrd.agent.tool")?;
     let cls = module.getattr("_ToolCallable")?;
     let kwargs = PyDict::new(py);
     let callable = Py::new(py, PyToolInvoker { tool: tool.clone() })?;

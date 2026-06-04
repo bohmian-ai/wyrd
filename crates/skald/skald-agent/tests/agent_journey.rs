@@ -34,15 +34,18 @@ async fn journey_author_save_load_run() {
 
     let tools = ToolRegistry::new();
     tools.register(tool).expect("tool registers");
-    let loaded = Agent::from_yaml_path(&path, &tools, default_prompt_resolver())
-        .expect("agent loads from yaml")
-        .with_providers(mock_providers("done"));
+    let loaded =
+        Agent::from_yaml_path(&path, &tools, default_prompt_resolver()).expect("agent loads");
 
     assert_eq!(loaded.name_str(), Some("planner"));
     assert_eq!(loaded.version_str(), Some("0.3.0"));
     assert_eq!(loaded.tool_names(), &["t".to_owned()]);
 
-    let run = loaded.run("draft the doc").await.expect("agent runs");
+    let providers = mock_providers("done");
+    let run = loaded
+        .run_with(&providers, None, "draft the doc")
+        .await
+        .expect("agent runs");
 
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
     assert_eq!(run.output, "done");
@@ -58,12 +61,15 @@ async fn journey_try_from_ref_resolves_card_prompt() {
     let agent = Agent::try_from_ref(PromptRef::from(card_ref.clone()), default_prompt_resolver())
         .expect("prompt card resolves")
         .name("planner")
-        .version("0.3.0")
-        .with_providers(mock_providers("resolved"));
+        .version("0.3.0");
 
     assert_eq!(agent.cascade_children(), vec![card_ref]);
 
-    let run = agent.run("draft the doc").await.expect("agent runs");
+    let providers = mock_providers("resolved");
+    let run = agent
+        .run_with(&providers, None, "draft the doc")
+        .await
+        .expect("agent runs");
 
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
     assert_eq!(run.output, "resolved");

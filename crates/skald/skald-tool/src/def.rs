@@ -78,10 +78,14 @@ impl ToolDef {
         In: DeserializeOwned + JsonSchema + Send + 'static,
         Out: Serialize + JsonSchema + 'static,
     {
-        let input_schema = serde_json::to_value(schemars::schema_for!(In))
-            .expect("derived JsonSchema is JSON-serializable");
-        let output_schema = serde_json::to_value(schemars::schema_for!(Out))
-            .expect("derived JsonSchema is JSON-serializable");
+        let input_schema = match serde_json::to_value(schemars::schema_for!(In)) {
+            Ok(value) => value,
+            Err(error) => serde_json::json!({ "error": error.to_string() }),
+        };
+        let output_schema = match serde_json::to_value(schemars::schema_for!(Out)) {
+            Ok(value) => value,
+            Err(error) => serde_json::json!({ "error": error.to_string() }),
+        };
 
         let call = Arc::new(move |args: Value| -> ToolResult<Value> {
             let typed_in: In =

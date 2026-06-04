@@ -8,7 +8,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
-from ._wyrd.tool import (
+from .._wyrd.tool import (
     _pop_tool_registry_scope,
     _push_tool_registry_scope,
     _register_tool,

@@ -19,6 +19,7 @@ use skald_spec::{
     Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
 };
 use skald_tool::{AgentTool, ToolError};
+use wyrd_spec::error::WyrdError;
 
 #[tokio::test]
 async fn session_recent_fires_once_per_run() {
@@ -338,11 +339,16 @@ async fn provider_error_journals_synthetic_model_result_then_agent_error() {
 }
 
 #[tokio::test]
-async fn before_model_skip_journals_synthetic_model_result_then_agent_finish() {
+async fn before_model_abort_journals_synthetic_model_result_then_agent_finish() {
     let journal = Arc::new(RecordingJournal::new());
     let providers = registry(RecordingProvider::new(vec![openai_text_response("unused")]));
     let agent = Agent::from_resolved("test", test_prompt())
-        .before_model(Arc::new(|_ctx, _request| CallbackOutcome::Skip))
+        .before_model(Arc::new(|_ctx, _request| {
+            CallbackOutcome::Abort(WyrdError::AgentCallbackAborted {
+                message: "test abort".to_owned(),
+                details: serde_json::json!({}),
+            })
+        }))
         .with_journal(journal.clone());
 
     let run = agent
@@ -350,7 +356,7 @@ async fn before_model_skip_journals_synthetic_model_result_then_agent_finish() {
         .await
         .expect("run ok");
 
-    assert_eq!(run.finish_reason, FinishReason::CallbackSkipped);
+    assert_eq!(run.finish_reason, FinishReason::CallbackAborted);
     let events = journal.events();
     assert!(matches!(events[0], JournalEvent::AgentStart { .. }));
     assert!(matches!(events[1], JournalEvent::Iteration { index: 0 }));
@@ -361,7 +367,7 @@ async fn before_model_skip_journals_synthetic_model_result_then_agent_finish() {
             synthetic: true,
             ref finish_reason,
             ..
-        } if finish_reason == "callback_skipped"
+        } if finish_reason == "callback_aborted"
     ));
     assert!(matches!(events[4], JournalEvent::AgentFinish { .. }));
 }

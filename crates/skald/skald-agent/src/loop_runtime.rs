@@ -97,13 +97,14 @@ pub(crate) async fn run(
                 input.to_owned(),
                 "before_agent",
             )? {
-                ChainResult::Skip => {
+                ChainResult::Abort(error) => {
                     return Ok(AgentRun {
                         output: String::new(),
                         final_response: None,
                         iterations: 0,
-                        finish_reason: FinishReason::CallbackSkipped,
+                        finish_reason: FinishReason::CallbackAborted,
                         conversation,
+                        error: Some(error),
                         errors: Vec::new(),
                     });
                 }
@@ -260,12 +261,12 @@ async fn run_loop(
             request.clone(),
             "before_model",
         )? {
-            ChainResult::Skip => {
+            ChainResult::Abort(error) => {
                 append_model_journal_call_result(
                     this,
                     iteration,
                     &request,
-                    "callback_skipped".to_owned(),
+                    "callback_aborted".to_owned(),
                     true,
                     &*observer,
                 )
@@ -274,8 +275,9 @@ async fn run_loop(
                     output: String::new(),
                     final_response: None,
                     iterations: iteration + 1,
-                    finish_reason: FinishReason::CallbackSkipped,
+                    finish_reason: FinishReason::CallbackAborted,
                     conversation,
+                    error: Some(error),
                     errors: Vec::new(),
                 });
             }
@@ -313,7 +315,7 @@ async fn run_loop(
             response,
             "after_model",
         )? {
-            ChainResult::Skip => {
+            ChainResult::Abort(_) => {
                 unreachable!("after_model callbacks cannot skip a completed provider call")
             }
             ChainResult::Replaced(replacement) => replacement,
@@ -348,6 +350,7 @@ async fn run_loop(
                 iterations: iteration + 1,
                 finish_reason: FinishReason::ModelStopped,
                 conversation,
+                error: None,
                 errors: Vec::new(),
             };
             return match apply_chain_with_panic_catch(
@@ -356,7 +359,7 @@ async fn run_loop(
                 run,
                 "after_agent",
             )? {
-                ChainResult::Skip => {
+                ChainResult::Abort(_) => {
                     unreachable!("after_agent callbacks cannot skip a completed agent run")
                 }
                 ChainResult::Replaced(replacement) => Ok(replacement),
@@ -386,7 +389,9 @@ async fn run_loop(
                         .iter()
                         .find(|tool| tool.name() == call.name)
                         .cloned()
-                        .expect("tool presence pre-validated");
+                        .ok_or_else(|| AgentError::ToolNotInAgent {
+                            name: call.name.clone(),
+                        })?;
                     journal
                         .append(JournalEvent::ToolCall {
                             iteration,
@@ -406,7 +411,7 @@ async fn run_loop(
                         call.args,
                         "before_tool",
                     )? {
-                        ChainResult::Skip => {
+                        ChainResult::Abort(error) => {
                             let content = serde_json::json!({ "skipped": true });
                             journal
                                 .append(JournalEvent::ToolResult {
@@ -424,8 +429,11 @@ async fn run_loop(
                                 idx,
                                 ConversationTurn::ToolResult {
                                     call_id: call.id,
-                                    ok: true,
-                                    content,
+                                    ok: false,
+                                    content: serde_json::json!({
+                                        "code": error.code(),
+                                        "error": error.to_string(),
+                                    }),
                                 },
                             ));
                         }
@@ -439,7 +447,7 @@ async fn run_loop(
                         result,
                         "after_tool",
                     )? {
-                        ChainResult::Skip => {
+                        ChainResult::Abort(_) => {
                             unreachable!("after_tool callbacks cannot skip a completed tool call")
                         }
                         ChainResult::Replaced(replacement) => replacement,

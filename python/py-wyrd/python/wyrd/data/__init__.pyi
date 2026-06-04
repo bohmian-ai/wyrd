@@ -1,10 +1,11 @@
+# AUTO-GENERATED STUB FILE. DO NOT EDIT.
+# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
 #### begin imports ####
 
 from collections.abc import Mapping, Sequence
 from typing import Any, overload
 
-from .error import WyrdError
-from .header import CardRefLike, JsonDict, PathLike, StringMap
+from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError
 
 #### end of imports ####
 

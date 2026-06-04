@@ -1,7 +1,19 @@
 #### begin imports ####
 from . import data, model, prompt
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError
-from .agent import Agent, AgentRun, FinishReason, RunConfig, local_registry, tool
+from .agent import (
+    Agent,
+    AgentRun,
+    FinishReason,
+    RunConfig,
+    StepEvent,
+    StepOutcome,
+    StepStatus,
+    Workflow,
+    WorkflowRun,
+    local_registry,
+    tool,
+)
 from .data import DataCard, Split
 from .model import ModelCard, ModelSignature, SampleInput
 from .prompt import (
@@ -48,7 +60,12 @@ __all__ = [
     "SessionMemory",
     "SessionTurn",
     "Split",
+    "StepEvent",
+    "StepOutcome",
+    "StepStatus",
     "ToolError",
+    "Workflow",
+    "WorkflowRun",
     "WyrdError",
     "data",
     "local_registry",

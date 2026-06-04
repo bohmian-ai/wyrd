@@ -27,11 +27,5 @@ pub fn init() {
 pub mod agent;
 
 pub use skald_agent::Agent;
-pub use wyrd_spec::AgentCard;
-
-/// Negative public-surface pins.
-///
-/// ```compile_fail
-/// use wyrd::Workflow;
-/// ```
-pub mod __doc_neg_pins {}
+pub use skald_workflow::Workflow;
+pub use wyrd_spec::{AgentCard, WorkflowCard};

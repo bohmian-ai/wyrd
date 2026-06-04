@@ -292,12 +292,271 @@ def local_registry() -> AbstractContextManager[None]:
     """
     ...
 
+class StepStatus:
+    """Lifecycle status of one workflow step."""
+
+    Pending: StepStatus
+    Running: StepStatus
+    Completed: StepStatus
+    Failed: StepStatus
+
+class StepOutcome:
+    """Per-step final outcome captured after a workflow run."""
+
+    @property
+    def status(self) -> StepStatus:
+        """Return the final step status."""
+        ...
+
+    @property
+    def retries(self) -> int:
+        """Return the number of retries consumed before reaching the final status."""
+        ...
+
+class StepEvent:
+    """One observable step transition during a workflow run."""
+
+    @property
+    def step_id(self) -> str:
+        """Return the step id this event refers to."""
+        ...
+
+    @property
+    def status(self) -> StepStatus:
+        """Return the step status recorded for this transition."""
+        ...
+
+    @property
+    def started_at(self) -> int:
+        """Return the Unix epoch milliseconds when the attempt started."""
+        ...
+
+    @property
+    def ended_at(self) -> int:
+        """Return the Unix epoch milliseconds when the attempt ended."""
+        ...
+
+    @property
+    def attempt(self) -> int:
+        """Return the attempt index, starting at 1."""
+        ...
+
+    @property
+    def error(self) -> str | None:
+        """Return the stable error code for failed attempts, or None for completed ones."""
+        ...
+
+class WorkflowRun:
+    """Final envelope returned by a successful `Workflow.run` call."""
+
+    @property
+    def final_step_id(self) -> str | None:
+        """Return the terminal step's id when the workflow produced one."""
+        ...
+
+    @property
+    def outcomes(self) -> Mapping[str, StepOutcome]:
+        """Return per-step outcomes keyed by step id."""
+        ...
+
+    @property
+    def events(self) -> Sequence[StepEvent]:
+        """Return the ordered per-step events captured during the run."""
+        ...
+
+class Workflow:
+    """Authoring + run surface for a DAG of agents."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        version: str | None = ...,
+        space: str | None = ...,
+        labels: Mapping[str, str] | None = ...,
+        annotations: Mapping[str, str] | None = ...,
+    ) -> None:
+        """Build an empty Workflow with the given name and optional metadata.
+
+        Args:
+            name (str): Workflow name.
+            version (str | None): Optional semantic version.
+            space (str | None): Optional logical space.
+            labels (Mapping[str, str] | None): Optional queryable labels.
+            annotations (Mapping[str, str] | None): Optional free-form annotations.
+        """
+        ...
+
+    @staticmethod
+    def sequential(name: str, *agents: Agent) -> Workflow:
+        """Build a workflow whose steps run sequentially.
+
+        Args:
+            name (str): Workflow name.
+            *agents (Agent): One or more Agent values to chain.
+
+        Returns:
+            Workflow: Workflow with each agent depending on the previous one.
+
+        Raises:
+            WyrdError: When the resulting DAG is invalid.
+        """
+        ...
+
+    @staticmethod
+    def parallel(name: str, *agents: Agent) -> Workflow:
+        """Build a workflow whose steps run in parallel with no dependencies.
+
+        Args:
+            name (str): Workflow name.
+            *agents (Agent): One or more Agent values to run in parallel.
+
+        Returns:
+            Workflow: Workflow with each agent as an independent root step.
+
+        Raises:
+            WyrdError: When the resulting DAG is invalid.
+        """
+        ...
+
+    def add(self, agent: Agent) -> Workflow:
+        """Append `agent` as a new step with no dependencies.
+
+        Args:
+            agent (Agent): Agent to append.
+
+        Returns:
+            Workflow: This workflow (for chaining).
+
+        Raises:
+            WyrdError: When the resulting DAG is invalid.
+        """
+        ...
+
+    def add_after(
+        self, agent: Agent, after: Agent | str | Sequence[Agent | str]
+    ) -> Workflow:
+        """Append `agent` as a new step depending on the supplied predecessors.
+
+        Args:
+            agent (Agent): Agent to append.
+            after (Agent | str | Sequence[Agent | str]): Predecessor step ids
+                or Agent values (their names are used as ids).
+
+        Returns:
+            Workflow: This workflow (for chaining).
+
+        Raises:
+            WyrdError: When the resulting DAG is invalid.
+        """
+        ...
+
+    def set_version(self, version: str) -> None:
+        """Set the workflow's semantic version in place."""
+        ...
+
+    def set_space(self, space: str) -> None:
+        """Set the workflow's space in place."""
+        ...
+
+    @property
+    def name(self) -> str | None:
+        """Return the workflow name."""
+        ...
+
+    @property
+    def version(self) -> str | None:
+        """Return the workflow version."""
+        ...
+
+    @property
+    def space(self) -> str | None:
+        """Return the workflow space."""
+        ...
+
+    @property
+    def steps(self) -> Sequence[str]:
+        """Return the ordered step ids."""
+        ...
+
+    def to_yaml(self) -> str:
+        """Serialize this workflow to a canonical envelope YAML string.
+
+        Returns:
+            str: Canonical envelope YAML body.
+
+        Raises:
+            WyrdError: When identity or codec fails.
+        """
+        ...
+
+    def save(self, path: PathLike) -> None:
+        """Save this workflow to disk as canonical envelope YAML.
+
+        Args:
+            path (PathLike): Filesystem path.
+
+        Raises:
+            WyrdError: When identity, IO, or codec fails.
+        """
+        ...
+
+    @staticmethod
+    def load(path: PathLike) -> Workflow:
+        """Load a workflow from disk.
+
+        Args:
+            path (PathLike): Filesystem path.
+
+        Returns:
+            Workflow: Reconstructed workflow with eager inline agent resolution.
+
+        Raises:
+            WyrdError: When IO, codec, or resolution fails.
+        """
+        ...
+
+    @staticmethod
+    def from_yaml(yaml: str) -> Workflow:
+        """Parse a workflow from a canonical envelope YAML string.
+
+        Args:
+            yaml (str): Envelope YAML body.
+
+        Returns:
+            Workflow: Reconstructed workflow with eager inline agent resolution.
+
+        Raises:
+            WyrdError: When parse or resolution fails.
+        """
+        ...
+
+    def run(self, input: str) -> WorkflowRun:
+        """Run this workflow against the process-local provider registry.
+
+        Args:
+            input (str): User-facing input string forwarded to every step.
+
+        Returns:
+            WorkflowRun: Final run envelope with per-step outcomes and events.
+
+        Raises:
+            WyrdError: When a provider call fails, retries exhaust, or any
+                step's output validation fails.
+        """
+        ...
+
 __all__ = [
     "Agent",
     "AgentRun",
     "FinishReason",
     "RunConfig",
     "SessionMemory",
+    "StepEvent",
+    "StepOutcome",
+    "StepStatus",
+    "Workflow",
+    "WorkflowRun",
     "local_registry",
     "tool",
 ]

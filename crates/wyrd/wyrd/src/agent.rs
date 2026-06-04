@@ -5,7 +5,8 @@
 //! # Public Surface
 //!
 //! `Agent` is the Wyrd card authoring holder and Skald runtime for an agent
-//! with resolved prompt state.
+//! with resolved prompt state. `Workflow` lives in the same module because a
+//! Wyrd workflow is composition of agents.
 
 pub use skald_agent::observer::{NoopObserver, Observer};
 pub use skald_agent::{
@@ -16,4 +17,5 @@ pub use skald_agent::{
 };
 pub use skald_prompt::Prompt;
 pub use skald_tool::{AgentTool, ToolDef, ToolError};
-pub use wyrd_spec::AgentCard;
+pub use skald_workflow::{StepEvent, StepOutcome, TaskStatus as StepStatus, Workflow, WorkflowRun};
+pub use wyrd_spec::{AgentCard, WorkflowCard};

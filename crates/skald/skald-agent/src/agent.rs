@@ -184,6 +184,9 @@ pub struct Agent {
     pub(crate) journal: Arc<dyn Journal>,
     /// Runtime callback chains.
     pub(crate) callbacks: AgentCallbacks,
+    /// Per-agent provider registry override. When set, overrides the global
+    /// default registry for this agent's runs only. Not serialized.
+    pub(crate) provider_override: Option<Arc<skald_runtime::ProviderRegistry>>,
 }
 
 impl fmt::Debug for Agent {
@@ -268,6 +271,30 @@ impl Agent {
         self.prompt = Arc::new(resolve_prompt_ref(&prompt_ref, resolver)?);
         self.prompt_ref = prompt_ref;
         Ok(self)
+    }
+
+    /// Return a copy with a per-agent provider registry override.
+    ///
+    /// When set, this registry is used instead of the process-global default
+    /// for every run driven by this agent. The override is purely runtime
+    /// state — it is not serialized into the `AgentCard` or `AgentSpec`.
+    #[must_use]
+    pub fn with_provider_registry(
+        mut self,
+        registry: Arc<skald_runtime::ProviderRegistry>,
+    ) -> Self {
+        self.provider_override = Some(registry);
+        self
+    }
+
+    /// Return the effective provider registry for this agent.
+    ///
+    /// Returns the per-agent override when set, otherwise `fallback`.
+    pub fn effective_providers<'a>(
+        &'a self,
+        fallback: &'a skald_runtime::ProviderRegistry,
+    ) -> &'a skald_runtime::ProviderRegistry {
+        self.provider_override.as_deref().unwrap_or(fallback)
     }
 
     /// Return a copy with one runtime-local tool appended.
@@ -671,6 +698,7 @@ impl Agent {
             session: Arc::new(NoSession),
             journal: Arc::new(NoopJournal),
             callbacks: AgentCallbacks::default(),
+            provider_override: None,
         }
     }
 

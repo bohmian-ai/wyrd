@@ -352,7 +352,7 @@ impl Workflow {
     pub fn py_run(&self, py: Python<'_>, input: String) -> PyResult<Py<PyAny>> {
         let providers = skald_runtime::default_registry();
         let run = py.detach(|| {
-            wyrd_runtime::runtime().block_on(Workflow::run(self, providers.as_ref(), &input))
+            wyrd_runtime::runtime().block_on(Workflow::run_with(self, providers.as_ref(), &input))
         });
         let run = run.map_err(workflow_error_to_py)?;
         Ok(Py::new(py, run)?.into_any())

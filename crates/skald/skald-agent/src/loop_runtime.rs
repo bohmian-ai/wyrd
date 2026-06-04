@@ -40,6 +40,7 @@ pub(crate) async fn run(
     session_id: Option<SessionId>,
     input: &str,
 ) -> AgentResult<AgentRun> {
+    let providers = this.effective_providers(providers);
     let observer = current_observer();
     let started_at = Instant::now();
     let span = debug_span!(
@@ -155,6 +156,7 @@ pub(crate) async fn run_prompt(
     prompt: &Prompt,
     vars: &[(&str, &str)],
 ) -> AgentResult<AgentRun> {
+    let providers = this.effective_providers(providers);
     let observer = current_observer();
     let started_at = Instant::now();
     let span = debug_span!(

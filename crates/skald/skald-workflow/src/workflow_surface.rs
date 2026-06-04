@@ -331,7 +331,20 @@ impl Workflow {
     /// # Errors
     /// Returns runtime errors when an agent is missing, the DAG cannot run, or
     /// any per-step retries are exhausted.
-    pub async fn run(
+    pub async fn run(&self, input: &str) -> WorkflowResult<WorkflowRun> {
+        let providers = skald_runtime::default_registry();
+        self.run_with(providers.as_ref(), input).await
+    }
+
+    /// Run the DAG against an explicit provider registry.
+    ///
+    /// Prefer [`run`](Self::run) for the common case. Use this variant when
+    /// injecting a test registry or a non-default provider configuration.
+    ///
+    /// # Errors
+    /// Returns runtime errors when an agent is missing, the DAG cannot run, or
+    /// any per-step retries are exhausted.
+    pub async fn run_with(
         &self,
         providers: &skald_runtime::ProviderRegistry,
         input: &str,

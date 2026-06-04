@@ -201,6 +201,8 @@ class Agent:
         session: SessionMemory | None = ...,
         labels: Mapping[str, str] | None = ...,
         annotations: Mapping[str, str] | None = ...,
+        provider_base_url: str | None = ...,
+        provider_api_key: str | None = ...,
     ) -> None:
         """Create an Agent.
 
@@ -221,6 +223,11 @@ class Agent:
             session (SessionMemory | None): Optional session memory object.
             labels (Mapping[str, str] | None): Optional envelope labels.
             annotations (Mapping[str, str] | None): Optional envelope annotations.
+            provider_base_url (str | None): Override the provider endpoint for this agent only.
+                Useful for routing through an AI gateway such as LiteLLM. When omitted the
+                process-global default registry is used.
+            provider_api_key (str | None): API key for the overridden endpoint. When omitted
+                the standard environment variable for the prompt's provider is used.
         """
         ...
 

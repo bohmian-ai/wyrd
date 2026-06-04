@@ -27,5 +27,6 @@ pub fn init() {
 pub mod agent;
 
 pub use skald_agent::Agent;
+pub use skald_runtime::ProviderRegistry;
 pub use skald_workflow::Workflow;
 pub use wyrd_spec::{AgentCard, WorkflowCard};

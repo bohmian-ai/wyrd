@@ -16,6 +16,7 @@ pub use skald_agent::{
     clear_prompt_card_registry, default_prompt_resolver, register_prompt_card,
 };
 pub use skald_prompt::Prompt;
+pub use skald_runtime::ProviderRegistry;
 pub use skald_tool::{AgentTool, ToolDef, ToolError};
 pub use skald_workflow::{StepEvent, StepOutcome, TaskStatus as StepStatus, Workflow, WorkflowRun};
 pub use wyrd_spec::{AgentCard, WorkflowCard};

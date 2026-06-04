@@ -163,7 +163,7 @@ impl DagExecutor {
 
         let prompt = RuntimePrompt::from_native(prompt);
         for attempt in 0..=max_retries {
-            let response = match agent.run_prompt(&self.providers, &prompt, &[]).await {
+            let response = match agent.run_prompt(agent.effective_providers(&self.providers), &prompt, &[]).await {
                 Ok(run) => run
                     .final_response
                     .ok_or_else(|| WorkflowError::AgentMissingFinalResponse(task_id.to_owned()))?,
@@ -223,7 +223,7 @@ impl DagExecutor {
                 .await?;
             let runtime_prompt = RuntimePrompt::from_native(prompt_for_run);
             let response = match agent
-                .run_prompt(&self.providers, &runtime_prompt, &[])
+                .run_prompt(agent.effective_providers(&self.providers), &runtime_prompt, &[])
                 .await
             {
                 Ok(run) => run

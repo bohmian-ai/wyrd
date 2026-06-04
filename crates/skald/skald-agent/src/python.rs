@@ -43,6 +43,11 @@ impl Agent {
     ///     session (SessionMemory | None): Optional session memory object with recent and append methods.
     ///     labels (dict[str, str] | None): Optional envelope labels.
     ///     annotations (dict[str, str] | None): Optional envelope annotations.
+    ///     provider_base_url (str | None): Override the provider endpoint for this agent only.
+    ///         Useful for routing through an AI gateway (e.g. LiteLLM). Falls back to the
+    ///         standard environment variable when `provider_api_key` is not supplied.
+    ///     provider_api_key (str | None): API key for the overridden provider endpoint.
+    ///         When omitted, the standard environment variable for the prompt's provider is used.
     ///
     /// Returns:
     ///     Agent: New Agent ready to run.
@@ -67,7 +72,9 @@ impl Agent {
         after_tool_callback = None,
         session = None,
         labels = None,
-        annotations = None
+        annotations = None,
+        provider_base_url = None,
+        provider_api_key = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn __new__(
@@ -88,6 +95,8 @@ impl Agent {
         session: Option<Py<PyAny>>,
         labels: Option<HashMap<String, String>>,
         annotations: Option<HashMap<String, String>>,
+        provider_base_url: Option<String>,
+        provider_api_key: Option<String>,
     ) -> AgentPyResult<Self> {
         let mut agent = agent_from_prompt_py(prompt)?;
 
@@ -137,6 +146,17 @@ impl Agent {
         }
         if let Some(callback) = after_tool_callback {
             agent = agent.after_tool(wrap_after_tool(py, callback)?);
+        }
+
+        if let Some(base_url) = provider_base_url {
+            let provider_name = agent.prompt.native().request.provider();
+            let registry = skald_runtime::ProviderRegistry::for_provider(
+                &provider_name,
+                base_url,
+                provider_api_key,
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            agent = agent.with_provider_registry(Arc::new(registry));
         }
 
         Ok(agent)

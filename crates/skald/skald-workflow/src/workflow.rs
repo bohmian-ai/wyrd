@@ -117,8 +117,11 @@ impl DagExecutor {
                 let workflow = Arc::clone(self);
                 let events = Arc::clone(&events);
                 let context = Arc::clone(&context);
+                let parent_run_id = workflow_run_id.clone();
                 handles.push(tokio::spawn(async move {
-                    workflow.run_one_with_retries(task, &events, context).await
+                    workflow
+                        .run_one_with_retries(task, &events, context, &parent_run_id)
+                        .await
                 }));
             }
 
@@ -177,7 +180,12 @@ impl DagExecutor {
         let prompt = RuntimePrompt::from_native(prompt);
         for attempt in 0..=max_retries {
             let response = match agent
-                .run_prompt(agent.effective_providers(&self.providers), &prompt, &[])
+                .run_prompt(
+                    agent.effective_providers(&self.providers),
+                    &prompt,
+                    &[],
+                    None,
+                )
                 .await
             {
                 Ok(run) => run
@@ -208,6 +216,7 @@ impl DagExecutor {
         task: SharedTask,
         events: &Mutex<Vec<TaskEvent>>,
         context: Arc<RwLock<Context>>,
+        parent_run_id: &str,
     ) -> WorkflowResult<()> {
         let (agent_id, prompt, max_retries, task_id, dependencies) = {
             let mut guard = task.write().map_err(|_| WorkflowError::Lock)?;
@@ -243,6 +252,7 @@ impl DagExecutor {
                     agent.effective_providers(&self.providers),
                     &runtime_prompt,
                     &[],
+                    Some(parent_run_id),
                 )
                 .await
             {

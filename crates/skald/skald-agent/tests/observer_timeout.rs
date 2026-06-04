@@ -58,7 +58,7 @@ async fn agent_run_prompt_observer_auto_attached_via_provider() {
     let agent = Agent::from_resolved("test", Arc::clone(&prompt));
 
     let run = agent
-        .run_prompt(&providers, &prompt, &[])
+        .run_prompt(&providers, &prompt, &[], None)
         .await
         .expect("run ok");
 

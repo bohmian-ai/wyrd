@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use opentelemetry::global::{self, BoxedSpan, BoxedTracer};
-use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
+use opentelemetry::trace::{Span, SpanContext, SpanKind, Status, TraceContextExt, Tracer};
 use skald_agent::observer::Observer;
 
 /// Span store - keyed by run_id (and run_id + suffix for sub-spans).
@@ -21,7 +21,18 @@ use skald_agent::observer::Observer;
 /// (set_attribute + end take &mut self). Different run_ids never contend.
 type SpanStore = Arc<RwLock<HashMap<String, Mutex<BoxedSpan>>>>;
 
+/// SpanContext store for parent-child linking.
+/// SpanContext is Clone and contains only IDs — no Mutex needed.
+/// Stored separately so child span creation never needs to hold the span mutex.
+type ContextStore = Arc<RwLock<HashMap<String, SpanContext>>>;
+
 /// OTel observer. Creates and ends spans for each agent lifecycle event.
+///
+/// Span hierarchy:
+/// - `wyrd.workflow.run` (trace root, from `on_workflow_start`)
+///   - `wyrd.agent.run` (child of workflow when `parent_run_id` is set)
+///     - `wyrd.model.call` (child of agent span)
+///     - `wyrd.tool.call` (child of agent span)
 ///
 /// Thread-safe for concurrent workflow steps. Each step uses a unique run_id
 /// so span store operations for different runs never collide.
@@ -39,6 +50,8 @@ type SpanStore = Arc<RwLock<HashMap<String, Mutex<BoxedSpan>>>>;
 pub struct OtelObserver {
     tracer: BoxedTracer,
     spans: SpanStore,
+    /// SpanContexts stored separately for parent lookup without holding span mutex.
+    contexts: ContextStore,
 }
 
 impl OtelObserver {
@@ -48,6 +61,7 @@ impl OtelObserver {
         Self {
             tracer: global::tracer("wyrd"),
             spans: Arc::new(RwLock::new(HashMap::new())),
+            contexts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -57,17 +71,42 @@ impl OtelObserver {
         Self {
             tracer: global::tracer(scope),
             spans: Arc::new(RwLock::new(HashMap::new())),
+            contexts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     fn insert_span(&self, key: String, span: BoxedSpan) {
+        // Extract SpanContext (just IDs, Clone-able) before moving span into mutex.
+        let sc = span.span_context().clone();
         if let Ok(mut store) = self.spans.write() {
-            store.insert(key, Mutex::new(span));
+            store.insert(key.clone(), Mutex::new(span));
+        }
+        if let Ok(mut ctxs) = self.contexts.write() {
+            ctxs.insert(key, sc);
         }
     }
 
     fn remove_span(&self, key: &str) -> Option<Mutex<BoxedSpan>> {
+        if let Ok(mut ctxs) = self.contexts.write() {
+            ctxs.remove(key);
+        }
         self.spans.write().ok()?.remove(key)
+    }
+
+    /// Build an OTel Context that makes `parent_key`'s span the parent of a new span.
+    ///
+    /// Returns the current ambient context when the parent key is not found —
+    /// this produces a new trace root, which is correct for standalone agent runs.
+    fn make_parent_context(&self, parent_key: &str) -> opentelemetry::Context {
+        let sc = self
+            .contexts
+            .read()
+            .ok()
+            .and_then(|store| store.get(parent_key).cloned());
+        match sc {
+            Some(sc) => opentelemetry::Context::current().with_remote_span_context(sc),
+            None => opentelemetry::Context::current(),
+        }
     }
 }
 
@@ -82,11 +121,17 @@ impl Observer for OtelObserver {
     async fn on_agent_start(
         &self,
         run_id: &str,
-        _parent_run_id: Option<&str>,
+        parent_run_id: Option<&str>,
         agent_id: &str,
         _input: &str,
         _session_id: Option<&str>,
     ) {
+        // When this agent is a workflow step, the workflow span is the parent.
+        // Workflow spans are keyed "wf.{workflow_run_id}".
+        // When parent_run_id is None (standalone run), this is a new trace root.
+        let parent_cx = parent_run_id
+            .map(|id| self.make_parent_context(&format!("wf.{id}")))
+            .unwrap_or_else(opentelemetry::Context::current);
         let span = self
             .tracer
             .span_builder(format!("wyrd.agent.run/{agent_id}"))
@@ -95,7 +140,7 @@ impl Observer for OtelObserver {
                 opentelemetry::KeyValue::new("wyrd.run_id", run_id.to_owned()),
                 opentelemetry::KeyValue::new("wyrd.agent.id", agent_id.to_owned()),
             ])
-            .start(&self.tracer);
+            .start_with_context(&self.tracer, &parent_cx);
         self.insert_span(run_id.to_owned(), span);
     }
 
@@ -107,6 +152,8 @@ impl Observer for OtelObserver {
         provider: &str,
         model: &str,
     ) {
+        // Agent span (keyed by run_id) is the parent of model call spans.
+        let parent_cx = self.make_parent_context(run_id);
         let span = self
             .tracer
             .span_builder(format!("wyrd.model.call/{provider}"))
@@ -118,7 +165,7 @@ impl Observer for OtelObserver {
                 opentelemetry::KeyValue::new("gen_ai.system", provider.to_owned()),
                 opentelemetry::KeyValue::new("gen_ai.request.model", model.to_owned()),
             ])
-            .start(&self.tracer);
+            .start_with_context(&self.tracer, &parent_cx);
         self.insert_span(format!("{run_id}.model.{iteration}"), span);
     }
 
@@ -150,6 +197,8 @@ impl Observer for OtelObserver {
         call_id: &str,
         tool_name: &str,
     ) {
+        // Agent span (keyed by run_id) is the parent of tool call spans.
+        let parent_cx = self.make_parent_context(run_id);
         let span = self
             .tracer
             .span_builder(format!("wyrd.tool.call/{tool_name}"))
@@ -161,7 +210,7 @@ impl Observer for OtelObserver {
                 opentelemetry::KeyValue::new("wyrd.call_id", call_id.to_owned()),
                 opentelemetry::KeyValue::new("tool.name", tool_name.to_owned()),
             ])
-            .start(&self.tracer);
+            .start_with_context(&self.tracer, &parent_cx);
         self.insert_span(format!("{run_id}.tool.{call_id}"), span);
     }
 

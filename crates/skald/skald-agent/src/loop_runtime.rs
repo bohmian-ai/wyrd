@@ -160,6 +160,7 @@ pub(crate) async fn run_prompt(
     providers: &ProviderRegistry,
     prompt: &Prompt,
     vars: &[(&str, &str)],
+    parent_run_id: Option<&str>,
 ) -> AgentResult<AgentRun> {
     let providers = this.effective_providers(providers);
     let run_id = ulid::Ulid::new().to_string();
@@ -183,7 +184,7 @@ pub(crate) async fn run_prompt(
                 .await
                 .map_err(|source| AgentError::JournalAppendFailed { source })?;
             observer
-                .on_agent_start(&run_id, None, &this.id, "", None)
+                .on_agent_start(&run_id, parent_run_id, &this.id, "", None)
                 .await;
 
             let rendered = prompt

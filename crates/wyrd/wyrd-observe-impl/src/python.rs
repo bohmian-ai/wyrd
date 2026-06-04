@@ -16,11 +16,14 @@ use skald_agent::observer::Observer;
 /// via `tokio::task::spawn_blocking`. This prevents Python attachment from
 /// blocking a Tokio async worker thread when parallel workflow steps fire
 /// observer events simultaneously.
-pub struct PythonObserver(Arc<Py<PyAny>>);
+///
+/// `Py<PyAny>` is already reference-counted and `Clone + Send` — no additional
+/// `Arc` wrapper is needed or correct.
+pub struct PythonObserver(Py<PyAny>);
 
 // PythonObserver implements all Observer methods by firing spawn_blocking.
 // Each method follows the same pattern:
-//   1. Clone self.0 (Arc<Py<PyAny>> is Clone + Send)
+//   1. Clone self.0 (Py<PyAny> is Clone + Send — reference-counted by PyO3)
 //   2. Own all &str args as String
 //   3. spawn_blocking -> Python::attach -> call_method1
 //   4. .await.ok() - observer failures never propagate
@@ -39,7 +42,7 @@ impl Observer for PythonObserver {
         let agent_id = agent_id.to_owned();
         let input = input.to_owned();
         let session_id = session_id.map(str::to_owned);
-        let inner = Arc::clone(&self.0);
+        let inner = self.0.clone();
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
                 let _ = inner.call_method1(
@@ -56,7 +59,7 @@ impl Observer for PythonObserver {
     async fn on_iteration(&self, run_id: &str, agent_id: &str, index: u32) {
         let run_id = run_id.to_owned();
         let agent_id = agent_id.to_owned();
-        let inner = Arc::clone(&self.0);
+        let inner = self.0.clone();
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
                 let _ = inner.call_method1(py, "on_iteration", (run_id, agent_id, index));
@@ -78,7 +81,7 @@ impl Observer for PythonObserver {
         let agent_id = agent_id.to_owned();
         let provider = provider.to_owned();
         let model = model.to_owned();
-        let inner = Arc::clone(&self.0);
+        let inner = self.0.clone();
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
                 let _ = inner.call_method1(
@@ -103,7 +106,7 @@ impl Observer for PythonObserver {
         let run_id = run_id.to_owned();
         let agent_id = agent_id.to_owned();
         let finish_reason = finish_reason.to_owned();
-        let inner = Arc::clone(&self.0);
+        let inner = self.0.clone();
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
                 let _ = inner.call_method1(
@@ -129,7 +132,7 @@ impl Observer for PythonObserver {
         let agent_id = agent_id.to_owned();
         let call_id = call_id.to_owned();
         let tool_name = tool_name.to_owned();
-        let inner = Arc::clone(&self.0);
+        let inner = self.0.clone();
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
                 let _ = inner.call_method1(
@@ -154,7 +157,7 @@ impl Observer for PythonObserver {
         let run_id = run_id.to_owned();
         let agent_id = agent_id.to_owned();
         let call_id = call_id.to_owned();
-        let inner = Arc::clone(&self.0);
+        let inner = self.0.clone();
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
                 let _ = inner.call_method1(
@@ -180,7 +183,7 @@ impl Observer for PythonObserver {
         let agent_id = agent_id.to_owned();
         let finish_reason = finish_reason.to_owned();
         let duration_ms = duration.as_millis() as u64;
-        let inner = Arc::clone(&self.0);
+        let inner = self.0.clone();
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
                 let _ = inner.call_method1(
@@ -199,7 +202,7 @@ impl Observer for PythonObserver {
         let agent_id = agent_id.to_owned();
         let code = code.to_owned();
         let message = message.to_owned();
-        let inner = Arc::clone(&self.0);
+        let inner = self.0.clone();
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
                 let _ = inner.call_method1(py, "on_agent_error", (run_id, agent_id, code, message));
@@ -212,7 +215,7 @@ impl Observer for PythonObserver {
     async fn on_workflow_start(&self, run_id: &str, workflow_id: &str, step_count: usize) {
         let run_id = run_id.to_owned();
         let workflow_id = workflow_id.to_owned();
-        let inner = Arc::clone(&self.0);
+        let inner = self.0.clone();
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
                 let _ =
@@ -227,7 +230,7 @@ impl Observer for PythonObserver {
         let run_id = run_id.to_owned();
         let workflow_id = workflow_id.to_owned();
         let duration_ms = duration.as_millis() as u64;
-        let inner = Arc::clone(&self.0);
+        let inner = self.0.clone();
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
                 let _ = inner.call_method1(
@@ -252,7 +255,7 @@ impl Observer for PythonObserver {
 /// `wyrd_observe::set_global` semantics).
 #[pyfunction]
 pub fn set_observer(observer: Py<PyAny>) {
-    wyrd_observe::set_global(Arc::new(PythonObserver(Arc::new(observer))));
+    wyrd_observe::set_global(Arc::new(PythonObserver(observer)));
 }
 
 /// Initialize the Rust observer bridge.

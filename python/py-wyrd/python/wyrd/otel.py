@@ -111,10 +111,18 @@ class OtelObserver(Observer):
             return self._spans.pop(key, None)
 
     def on_agent_start(self, run_id, parent_run_id, agent_id, input, session_id) -> None:
+        from opentelemetry import trace
         from opentelemetry.trace import SpanKind
+
+        # When this agent is a workflow step, the workflow span is the parent.
+        # Workflow spans are stored with key "wf.{parent_run_id}".
+        # When parent_run_id is None (standalone agent run), context=None → new trace root.
+        parent_span = self._get_span(f"wf.{parent_run_id}") if parent_run_id else None
+        parent_ctx = trace.set_span_in_context(parent_span) if parent_span is not None else None
 
         span = self._tracer.start_span(
             f"wyrd.agent.run/{agent_id}",
+            context=parent_ctx,
             kind=SpanKind.INTERNAL,
             attributes={
                 "wyrd.run_id": run_id,
@@ -124,10 +132,16 @@ class OtelObserver(Observer):
         self._set_span(run_id, span)
 
     def on_model_call(self, run_id, agent_id, iteration, provider, model) -> None:
+        from opentelemetry import trace
         from opentelemetry.trace import SpanKind
+
+        # Agent span (keyed by run_id) is the parent of model call spans.
+        agent_span = self._get_span(run_id)
+        parent_ctx = trace.set_span_in_context(agent_span) if agent_span is not None else None
 
         span = self._tracer.start_span(
             f"wyrd.model.call/{provider}",
+            context=parent_ctx,
             kind=SpanKind.CLIENT,
             attributes={
                 "wyrd.run_id": run_id,
@@ -146,10 +160,16 @@ class OtelObserver(Observer):
             span.end()
 
     def on_tool_call(self, run_id, agent_id, iteration, call_id, tool_name) -> None:
+        from opentelemetry import trace
         from opentelemetry.trace import SpanKind
+
+        # Agent span (keyed by run_id) is the parent of tool call spans.
+        agent_span = self._get_span(run_id)
+        parent_ctx = trace.set_span_in_context(agent_span) if agent_span is not None else None
 
         span = self._tracer.start_span(
             f"wyrd.tool.call/{tool_name}",
+            context=parent_ctx,
             kind=SpanKind.INTERNAL,
             attributes={
                 "wyrd.run_id": run_id,

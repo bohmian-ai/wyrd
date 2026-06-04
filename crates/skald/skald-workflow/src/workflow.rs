@@ -2,8 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use skald_agent::Agent;
+use skald_agent::observer_provider::current_observer;
 use skald_prompt::Prompt as RuntimePrompt;
 use skald_runtime::ProviderRegistry;
 use skald_spec::{MessageNum, Prompt, ProviderName, ProviderRequest, ProviderResponse};
@@ -85,12 +87,23 @@ impl DagExecutor {
     /// Returns `WorkflowError` when no ready tasks remain, agent execution
     /// fails, task locks fail, or a spawned task cannot return an outcome.
     pub async fn run(self: &Arc<Self>, context: Context) -> WorkflowResult<WorkflowRun> {
+        let workflow_run_id = ulid::Ulid::new().to_string();
+        let observer = current_observer();
+        let workflow_started_at = Instant::now();
+        let step_count = self.task_list.len();
+        observer
+            .on_workflow_start(&workflow_run_id, &self.id, step_count)
+            .await;
+
         let context = Arc::new(RwLock::new(context));
         let events = Arc::new(Mutex::new(Vec::new()));
         loop {
             if self.task_list.is_complete()? {
                 let final_events = finish_events(events)?;
                 let _final_context = finish_context(context).await;
+                observer
+                    .on_workflow_finish(&workflow_run_id, &self.id, workflow_started_at.elapsed())
+                    .await;
                 return self.collect_run(final_events);
             }
 
@@ -163,7 +176,10 @@ impl DagExecutor {
 
         let prompt = RuntimePrompt::from_native(prompt);
         for attempt in 0..=max_retries {
-            let response = match agent.run_prompt(agent.effective_providers(&self.providers), &prompt, &[]).await {
+            let response = match agent
+                .run_prompt(agent.effective_providers(&self.providers), &prompt, &[])
+                .await
+            {
                 Ok(run) => run
                     .final_response
                     .ok_or_else(|| WorkflowError::AgentMissingFinalResponse(task_id.to_owned()))?,
@@ -223,7 +239,11 @@ impl DagExecutor {
                 .await?;
             let runtime_prompt = RuntimePrompt::from_native(prompt_for_run);
             let response = match agent
-                .run_prompt(agent.effective_providers(&self.providers), &runtime_prompt, &[])
+                .run_prompt(
+                    agent.effective_providers(&self.providers),
+                    &runtime_prompt,
+                    &[],
+                )
                 .await
             {
                 Ok(run) => run

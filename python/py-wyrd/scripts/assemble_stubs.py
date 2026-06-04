@@ -137,6 +137,12 @@ def assemble_root_stub() -> None:
     final_content.append("")
     master_all.append("_init")
 
+    final_content.append("def set_observer(observer: object) -> None:")
+    final_content.append('    """Install a Python observer as the process-wide global observer."""')
+    final_content.append("    ...")
+    final_content.append("")
+    master_all.append("set_observer")
+
     final_content.append("### GLOBAL EXPORTS ###")
     final_content.append("__all__ = [")
     for item in sorted(set(master_all)):

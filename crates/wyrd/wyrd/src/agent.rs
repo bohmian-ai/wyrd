@@ -21,4 +21,7 @@ pub use skald_prompt::{
 pub use skald_runtime::ProviderRegistry;
 pub use skald_tool::{AgentTool, ToolDef, ToolError};
 pub use skald_workflow::{StepEvent, StepOutcome, TaskStatus as StepStatus, Workflow, WorkflowRun};
+#[cfg(feature = "otel")]
+pub use wyrd_observe::OtelObserver;
+pub use wyrd_observe::{CompositeObserver, set_global, with_observer};
 pub use wyrd_spec::{AgentCard, WorkflowCard};

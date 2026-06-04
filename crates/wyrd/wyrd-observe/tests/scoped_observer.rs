@@ -14,7 +14,7 @@ async fn with_observer_overrides_in_current_task() {
 
     wyrd_observe::with_observer(scoped.clone(), async {
         wyrd_observe::current()
-            .on_agent_start("agent-id", "run-id", None)
+            .on_agent_start("run-id", None, "agent-id", "input", None)
             .await;
     })
     .await;
@@ -31,7 +31,7 @@ async fn with_observer_restores_on_exit() {
 
     wyrd_observe::with_observer(scoped.clone(), async {}).await;
     wyrd_observe::current()
-        .on_agent_start("agent-id", "run-id", None)
+        .on_agent_start("run-id", None, "agent-id", "input", None)
         .await;
 
     assert_eq!(scoped.count(), 0);
@@ -47,7 +47,7 @@ async fn with_observer_does_not_propagate_to_detached_spawn() {
     wyrd_observe::with_observer(scoped.clone(), async {
         tokio::spawn(async {
             wyrd_observe::current()
-                .on_agent_start("agent-id", "run-id", None)
+                .on_agent_start("run-id", None, "agent-id", "input", None)
                 .await;
         })
         .await
@@ -96,7 +96,14 @@ impl RecordingObserver {
 
 #[async_trait]
 impl Observer for RecordingObserver {
-    async fn on_agent_start(&self, agent_id: &str, input: &str, session_id: Option<&str>) {
+    async fn on_agent_start(
+        &self,
+        _run_id: &str,
+        _parent_run_id: Option<&str>,
+        agent_id: &str,
+        input: &str,
+        session_id: Option<&str>,
+    ) {
         self.lock()
             .push(format!("{agent_id}:{input}:{}", session_id.unwrap_or("")));
     }

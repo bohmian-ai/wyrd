@@ -12,8 +12,14 @@ description = "Public Wyrd Rust umbrella crate; sanctioned re-exports for downst
 [lib]
 path = "src/lib.rs"
 
+[[example]]
+name = "tracing_stdout"
+path = "examples/tracing_stdout.rs"
+required-features = ["otel"]
+
 [features]
 default = []
+otel = ["wyrd-observe/otel"]
 
 [dependencies]
 skald-agent = { workspace = true }
@@ -27,5 +33,8 @@ wyrd-spec = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-stdout = { version = "0.27", features = ["trace"] }
 skald-spec = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

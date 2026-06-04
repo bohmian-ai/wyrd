@@ -48,3 +48,4 @@ wyrd-utils = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 serde_json = { workspace = true }
 skald-providers = { workspace = true }
+wyrd-observe = { workspace = true }

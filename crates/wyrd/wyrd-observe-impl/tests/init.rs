@@ -15,7 +15,7 @@ async fn wyrd_observe_impl_init_idempotent() {
         wyrd_observe_impl::init();
     }
     skald_agent::current_observer()
-        .on_agent_start("agent-id", "run-id", None)
+        .on_agent_start("run-id", None, "agent-id", "input", None)
         .await;
 
     assert_eq!(global.count(), 1);
@@ -28,7 +28,7 @@ async fn wyrd_observe_impl_init_resolves_through_provider() {
 
     wyrd_observe_impl::init();
     skald_agent::current_observer()
-        .on_agent_start("agent-id", "run-id", None)
+        .on_agent_start("run-id", None, "agent-id", "input", None)
         .await;
 
     assert_eq!(global.count(), 1);
@@ -71,7 +71,14 @@ impl RecordingObserver {
 
 #[async_trait]
 impl Observer for RecordingObserver {
-    async fn on_agent_start(&self, agent_id: &str, input: &str, session_id: Option<&str>) {
+    async fn on_agent_start(
+        &self,
+        _run_id: &str,
+        _parent_run_id: Option<&str>,
+        agent_id: &str,
+        input: &str,
+        session_id: Option<&str>,
+    ) {
         self.lock()
             .push(format!("{agent_id}:{input}:{}", session_id.unwrap_or("")));
     }

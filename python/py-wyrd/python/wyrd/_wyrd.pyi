@@ -147,6 +147,10 @@ def _init() -> None:
     """Initialize the native Wyrd extension."""
     ...
 
+def set_observer(observer: object) -> None:
+    """Install a Python observer as the process-wide global observer."""
+    ...
+
 ### GLOBAL EXPORTS ###
 __all__ = [
     "AgentError",
@@ -154,4 +158,5 @@ __all__ = [
     "ToolError",
     "WyrdError",
     "_init",
+    "set_observer",
 ]

@@ -197,16 +197,24 @@ impl RecordingObserver {
 
 #[async_trait]
 impl Observer for RecordingObserver {
-    async fn on_agent_start(&self, agent_id: &str, _input: &str, _session_id: Option<&str>) {
+    async fn on_agent_start(
+        &self,
+        _run_id: &str,
+        _parent_run_id: Option<&str>,
+        agent_id: &str,
+        _input: &str,
+        _session_id: Option<&str>,
+    ) {
         self.lock().push(format!("start:{agent_id}"));
     }
 
-    async fn on_iteration(&self, agent_id: &str, index: u32) {
+    async fn on_iteration(&self, _run_id: &str, agent_id: &str, index: u32) {
         self.lock().push(format!("iteration:{agent_id}:{index}"));
     }
 
     async fn on_agent_finish(
         &self,
+        _run_id: &str,
         agent_id: &str,
         finish_reason: &str,
         iterations: u32,

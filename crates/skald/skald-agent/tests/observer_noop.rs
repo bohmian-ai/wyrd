@@ -45,7 +45,14 @@ impl RecordingObserver {
 
 #[async_trait]
 impl Observer for RecordingObserver {
-    async fn on_agent_start(&self, _agent_id: &str, _input: &str, _session_id: Option<&str>) {
+    async fn on_agent_start(
+        &self,
+        _run_id: &str,
+        _parent_run_id: Option<&str>,
+        _agent_id: &str,
+        _input: &str,
+        _session_id: Option<&str>,
+    ) {
         match self.count.lock() {
             Ok(mut guard) => *guard += 1,
             Err(poisoned) => *poisoned.into_inner() += 1,

@@ -2,7 +2,7 @@
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
 #### begin imports ####
 from . import data, model, prompt
-from ._wyrd import AgentError, SessionError, ToolError, WyrdError
+from ._wyrd import AgentError, SessionError, ToolError, WyrdError, set_observer
 from .agent import (
     Agent,
     AgentRun,
@@ -22,6 +22,8 @@ from .agent import (
 )
 from .data import DataCard, Split
 from .model import ModelCard, ModelSignature, SampleInput
+from .observer import Observer
+from .otel import OtelObserver, WyrdInstrumentor
 from .prompt import (
     AnthropicSettings,
     GeminiSettings,
@@ -52,6 +54,8 @@ __all__ = [
     "NoSession",
     "OpenAIResponsesSettings",
     "OpenAISettings",
+    "Observer",
+    "OtelObserver",
     "Prompt",
     "PromptCard",
     "PromptCardMetadata",
@@ -71,10 +75,12 @@ __all__ = [
     "ToolError",
     "Workflow",
     "WorkflowRun",
+    "WyrdInstrumentor",
     "WyrdError",
     "data",
     "local_registry",
     "model",
     "prompt",
+    "set_observer",
     "tool",
 ]

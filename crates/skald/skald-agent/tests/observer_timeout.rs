@@ -434,7 +434,14 @@ impl RecordingObserver {
 
 #[async_trait]
 impl Observer for RecordingObserver {
-    async fn on_agent_start(&self, agent_id: &str, input: &str, session_id: Option<&str>) {
+    async fn on_agent_start(
+        &self,
+        _run_id: &str,
+        _parent_run_id: Option<&str>,
+        agent_id: &str,
+        input: &str,
+        session_id: Option<&str>,
+    ) {
         self.push(ObserverEvent::AgentStart {
             agent_id: agent_id.to_owned(),
             input: input.to_owned(),
@@ -442,11 +449,18 @@ impl Observer for RecordingObserver {
         });
     }
 
-    async fn on_iteration(&self, _agent_id: &str, index: u32) {
+    async fn on_iteration(&self, _run_id: &str, _agent_id: &str, index: u32) {
         self.push(ObserverEvent::Iteration { index });
     }
 
-    async fn on_model_call(&self, _agent_id: &str, iteration: u32, provider: &str, model: &str) {
+    async fn on_model_call(
+        &self,
+        _run_id: &str,
+        _agent_id: &str,
+        iteration: u32,
+        provider: &str,
+        model: &str,
+    ) {
         self.push(ObserverEvent::ModelCall {
             iteration,
             provider: provider.to_owned(),
@@ -456,6 +470,7 @@ impl Observer for RecordingObserver {
 
     async fn on_model_result(
         &self,
+        _run_id: &str,
         _agent_id: &str,
         iteration: u32,
         finish_reason: &str,
@@ -468,7 +483,14 @@ impl Observer for RecordingObserver {
         });
     }
 
-    async fn on_tool_call(&self, _agent_id: &str, iteration: u32, call_id: &str, tool_name: &str) {
+    async fn on_tool_call(
+        &self,
+        _run_id: &str,
+        _agent_id: &str,
+        iteration: u32,
+        call_id: &str,
+        tool_name: &str,
+    ) {
         self.push(ObserverEvent::ToolCall {
             iteration,
             call_id: call_id.to_owned(),
@@ -476,7 +498,14 @@ impl Observer for RecordingObserver {
         });
     }
 
-    async fn on_tool_result(&self, _agent_id: &str, iteration: u32, call_id: &str, ok: bool) {
+    async fn on_tool_result(
+        &self,
+        _run_id: &str,
+        _agent_id: &str,
+        iteration: u32,
+        call_id: &str,
+        ok: bool,
+    ) {
         self.push(ObserverEvent::ToolResult {
             iteration,
             call_id: call_id.to_owned(),
@@ -486,6 +515,7 @@ impl Observer for RecordingObserver {
 
     async fn on_agent_finish(
         &self,
+        _run_id: &str,
         agent_id: &str,
         finish_reason: &str,
         iterations: u32,
@@ -498,7 +528,7 @@ impl Observer for RecordingObserver {
         });
     }
 
-    async fn on_agent_error(&self, agent_id: &str, code: &str, message: &str) {
+    async fn on_agent_error(&self, _run_id: &str, agent_id: &str, code: &str, message: &str) {
         self.push(ObserverEvent::AgentError {
             agent_id: agent_id.to_owned(),
             code: code.to_owned(),

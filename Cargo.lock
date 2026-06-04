@@ -1903,6 +1903,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry-stdout"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc8a298402aa5c260be90d10dc54b5a7d4e1025c354848f8e2c976d761351049"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures-util",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "ordered-float",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "opentelemetry_sdk"
 version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1921,6 +1938,15 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+]
+
+[[package]]
+name = "ordered-float"
+version = "4.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
@@ -2850,6 +2876,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+ "wyrd-observe",
  "wyrd-runtime",
  "wyrd-spec",
  "wyrd-utils",
@@ -2980,6 +3007,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "ulid",
  "url",
  "wyrd-runtime",
  "wyrd-spec",
@@ -4439,6 +4467,9 @@ name = "wyrd"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "opentelemetry",
+ "opentelemetry-stdout",
+ "opentelemetry_sdk",
  "skald-agent",
  "skald-prompt",
  "skald-runtime",
@@ -4571,6 +4602,8 @@ name = "wyrd-observe"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "serde",
  "serde_json",
  "sha2",

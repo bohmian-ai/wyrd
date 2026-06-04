@@ -206,10 +206,7 @@ fn openai_message(role: &str, text: String) -> OpenAiChatMessage {
     OpenAiChatMessage {
         role: role.to_owned(),
         content: Some(OpenAiMessageContent::Text(text)),
-        name: None,
-        tool_calls: None,
-        tool_call_id: None,
-        refusal: None,
+        ..Default::default()
     }
 }
 
@@ -1257,10 +1254,7 @@ fn append_native_json_content(
             request.messages.push(OpenAiChatMessage {
                 role: role.to_owned(),
                 content: Some(OpenAiMessageContent::Parts(parts)),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                refusal: None,
+                ..Default::default()
             });
         }
         ProviderRequest::OpenAiResponses(request) => {

@@ -4035,22 +4035,8 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-huggingface = [
-    { name = "datasets" },
-]
-numpy = [
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-]
-pandas = [
-    { name = "pandas" },
-]
-polars = [
-    { name = "polars" },
-]
-torch = [
-    { name = "safetensors" },
-    { name = "torch" },
+otel = [
+    { name = "opentelemetry-api" },
 ]
 
 [package.dev-dependencies]
@@ -4084,15 +4070,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "datasets", marker = "extra == 'huggingface'", specifier = ">=2.20.0" },
-    { name = "numpy", marker = "extra == 'numpy'", specifier = ">=1.26" },
-    { name = "pandas", marker = "extra == 'pandas'", specifier = ">=2.2,<3" },
-    { name = "polars", marker = "extra == 'polars'", specifier = ">=1.10.0" },
+    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.27" },
     { name = "pyarrow", specifier = ">=18.0.0" },
-    { name = "safetensors", marker = "extra == 'torch'", specifier = ">=0.4.0" },
-    { name = "torch", marker = "extra == 'torch'", specifier = ">=2.4.0" },
 ]
-provides-extras = ["pandas", "polars", "numpy", "torch", "huggingface"]
+provides-extras = ["otel"]
 
 [package.metadata.requires-dev]
 dev = [

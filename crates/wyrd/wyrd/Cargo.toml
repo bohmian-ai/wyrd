@@ -18,6 +18,10 @@ path = "examples/tracing_stdout.rs"
 required-features = ["otel"]
 
 [[example]]
+name = "agent_openai"
+path = "examples/agent_openai.rs"
+
+[[example]]
 name = "workflow_openai"
 path = "examples/workflow_openai.rs"
 

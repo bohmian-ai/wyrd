@@ -112,10 +112,7 @@ pub fn openai_chat(
         messages.push(skald_spec::OpenAiChatMessage {
             role: "system".to_owned(),
             content: Some(OpenAiMessageContent::Text(system)),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-            refusal: None,
+            ..Default::default()
         });
     }
     messages.extend(options.messages.into_iter().map(openai_user_message));
@@ -303,10 +300,7 @@ fn openai_user_message(content: String) -> skald_spec::OpenAiChatMessage {
     skald_spec::OpenAiChatMessage {
         role: "user".to_owned(),
         content: Some(OpenAiMessageContent::Text(content)),
-        name: None,
-        tool_calls: None,
-        tool_call_id: None,
-        refusal: None,
+        ..Default::default()
     }
 }
 

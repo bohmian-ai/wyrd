@@ -142,10 +142,7 @@ pub(crate) fn session_turn_to_conversation_turn(
                     MessageNum::OpenAi(OpenAiChatMessage {
                         role: "assistant".to_owned(),
                         content: Some(OpenAiMessageContent::Text(turn.content)),
-                        name: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        refusal: None,
+                        ..Default::default()
                     })
                 }
             };
@@ -177,10 +174,7 @@ impl From<SessionTurn> for ConversationTurn {
                 message: MessageNum::OpenAi(OpenAiChatMessage {
                     role: "assistant".to_owned(),
                     content: Some(OpenAiMessageContent::Text(turn.content)),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    refusal: None,
+                    ..Default::default()
                 }),
             },
             Role::Tool => Self::ToolResult {

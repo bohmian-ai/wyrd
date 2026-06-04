@@ -17,10 +17,7 @@ pub fn system_messages(prompt: &str, provider: &ProviderName) -> AgentResult<Vec
         ProviderName::OpenAi => Ok(vec![MessageNum::OpenAi(OpenAiChatMessage {
             role: "system".to_owned(),
             content: Some(OpenAiMessageContent::Text(prompt.to_owned())),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-            refusal: None,
+            ..Default::default()
         })]),
         ProviderName::Anthropic => Ok(vec![MessageNum::Anthropic(AnthropicMessage {
             role: "system".to_owned(),

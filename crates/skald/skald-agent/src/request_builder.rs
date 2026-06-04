@@ -378,10 +378,7 @@ fn openai_message(role: &str, content: &str) -> OpenAiChatMessage {
     OpenAiChatMessage {
         role: role.to_owned(),
         content: Some(OpenAiMessageContent::Text(content.to_owned())),
-        name: None,
-        tool_calls: None,
-        tool_call_id: None,
-        refusal: None,
+        ..Default::default()
     }
 }
 

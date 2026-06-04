@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import functools
 import inspect
+import types
+import typing
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
@@ -13,6 +15,14 @@ from .._wyrd.tool import (
     _push_tool_registry_scope,
     _register_tool,
 )
+
+_PRIMITIVES: dict[Any, dict] = {
+    str: {"type": "string"},
+    int: {"type": "integer"},
+    float: {"type": "number"},
+    bool: {"type": "boolean"},
+    bytes: {"type": "string", "contentEncoding": "base64"},
+}
 
 
 class _ToolCallable:
@@ -69,23 +79,86 @@ def local_registry():
         _pop_tool_registry_scope()
 
 
-def _schema_from_signature(fn: Callable) -> dict:
-    from pydantic import TypeAdapter
+def _annotation_to_schema(annotation: Any) -> dict:
+    """Convert a Python type annotation to a JSON Schema dict.
 
-    signature = inspect.signature(fn)
-    hints = getattr(fn, "__annotations__", {}) or {}
+    Handles all stdlib typing constructs without requiring pydantic.
+    Falls back to pydantic.TypeAdapter for complex types (Pydantic models,
+    dataclasses) when pydantic is installed; returns {} otherwise.
+    """
+    if annotation is None or annotation is type(None):
+        return {"type": "null"}
+
+    if annotation is Any or annotation is inspect.Parameter.empty:
+        return {}
+
+    if annotation in _PRIMITIVES:
+        return _PRIMITIVES[annotation]
+
+    # Python 3.10+ union syntax: X | Y
+    if isinstance(annotation, types.UnionType):
+        args = annotation.__args__
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1 and len(args) == 2:
+            return _annotation_to_schema(non_none[0])
+        return {"anyOf": [_annotation_to_schema(a) for a in args]}
+
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+
+    # typing.Union / typing.Optional
+    if origin is typing.Union:
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1:
+            return _annotation_to_schema(non_none[0])
+        return {"anyOf": [_annotation_to_schema(a) for a in args]}
+
+    # typing.Literal
+    if origin is typing.Literal:
+        return {"enum": list(args)}
+
+    # list[T]
+    if origin is list:
+        return {"type": "array", "items": _annotation_to_schema(args[0])} if args else {"type": "array"}
+
+    # dict[K, V]
+    if origin is dict:
+        schema: dict = {"type": "object"}
+        if len(args) == 2:
+            schema["additionalProperties"] = _annotation_to_schema(args[1])
+        return schema
+
+    # tuple[T, ...]
+    if origin is tuple:
+        return (
+            {"type": "array", "prefixItems": [_annotation_to_schema(a) for a in args]}
+            if args
+            else {"type": "array"}
+        )
+
+    # Pydantic fallback for complex types (models, dataclasses, etc.)
+    try:
+        from pydantic import TypeAdapter
+
+        return TypeAdapter(annotation).json_schema()
+    except Exception:
+        return {}
+
+
+def _schema_from_signature(fn: Callable) -> dict:
+    sig = inspect.signature(fn)
+    hints = typing.get_type_hints(fn) if fn.__annotations__ else {}
     properties: dict[str, Any] = {}
     required: list[str] = []
-    for name, parameter in signature.parameters.items():
-        if name in {"self", "cls"}:
+    for param_name, parameter in sig.parameters.items():
+        if param_name in {"self", "cls"}:
             continue
-        annotation = hints.get(name, Any)
-        schema = TypeAdapter(annotation).json_schema()
-        if parameter.default is inspect._empty:
-            required.append(name)
+        schema = _annotation_to_schema(hints.get(param_name, Any))
+        if parameter.default is inspect.Parameter.empty:
+            required.append(param_name)
         else:
-            schema["default"] = parameter.default
-        properties[name] = schema
+            schema = {**schema, "default": parameter.default}
+        properties[param_name] = schema
     out: dict[str, Any] = {"type": "object", "properties": properties}
     if required:
         out["required"] = required
@@ -93,10 +166,8 @@ def _schema_from_signature(fn: Callable) -> dict:
 
 
 def _schema_from_return(fn: Callable) -> dict:
-    from pydantic import TypeAdapter
-
-    hints = getattr(fn, "__annotations__", {}) or {}
-    return TypeAdapter(hints.get("return", Any)).json_schema()
+    hints = typing.get_type_hints(fn) if fn.__annotations__ else {}
+    return _annotation_to_schema(hints.get("return", Any))
 
 
 __all__ = ["_ToolCallable", "local_registry", "tool"]

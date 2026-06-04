@@ -31,10 +31,75 @@ pub struct RecordId(pub uuid::Uuid);
 pub struct WorkflowUid(pub uuid::Uuid);
 
 /// Stable user-facing entity identifier for the eval subject or observation subject.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+///
+/// Entity UIDs must be non-empty and no longer than 512 characters.
+/// Deserialization goes through [`EntityUid::new`] so wire payloads cannot bypass
+/// validation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "server", schema(value_type = String))]
 #[serde(transparent)]
-pub struct EntityUid(pub String);
+pub struct EntityUid(String);
+
+impl EntityUid {
+    /// Constructs a validated entity uid.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when the value is empty or longer than
+    /// 512 characters.
+    pub fn new(value: impl Into<String>) -> Result<Self, WyrdError> {
+        let value = value.into();
+        if value.is_empty() || value.len() > 512 {
+            return Err(WyrdError::Validation {
+                message: format!("entity_uid length must be 1..=512, got {}", value.len()),
+                details: serde_json::Value::Null,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// Borrows the validated entity uid as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for EntityUid {
+    type Err = WyrdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for EntityUid {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl schemars::JsonSchema for EntityUid {
+    fn schema_name() -> String {
+        "EntityUid".to_string()
+    }
+
+    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, SchemaObject, SingleOrVec, StringValidation};
+
+        SchemaObject {
+            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
+            string: Some(Box::new(StringValidation {
+                max_length: Some(512),
+                min_length: Some(1),
+                pattern: None,
+            })),
+            ..Default::default()
+        }
+        .into()
+    }
+}
 
 /// Sixteen-byte OpenTelemetry trace identifier.
 ///
@@ -153,6 +218,20 @@ impl schemars::JsonSchema for TraceId {
     }
 }
 
+impl std::fmt::Display for TraceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+impl FromStr for TraceId {
+    type Err = WyrdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_hex(s)
+    }
+}
+
 /// Eight-byte OpenTelemetry span identifier.
 ///
 /// Wire format is a 16-character lower-case hex string. Deserialization also
@@ -267,6 +346,20 @@ impl schemars::JsonSchema for SpanId {
             ..Default::default()
         }
         .into()
+    }
+}
+
+impl std::fmt::Display for SpanId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+impl FromStr for SpanId {
+    type Err = WyrdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_hex(s)
     }
 }
 

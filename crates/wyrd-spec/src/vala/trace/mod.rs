@@ -25,6 +25,16 @@
 //! Trace and span ids live in [`crate::vala::ids`] (commit 02 of the
 //! trace-primitive plan promotes them from `vala::eval::ids`).
 
+use chrono::{DateTime, Utc};
+
+/// Returns `(end - start)` floored to whole milliseconds.
+///
+/// Sub-millisecond durations return `0`; OLAP predicates on `duration_ms > 0`
+/// will not match sub-millisecond spans.
+pub(crate) fn duration_ms_from_timestamps(start: DateTime<Utc>, end: DateTime<Utc>) -> u64 {
+    (end - start).num_milliseconds().max(0) as u64
+}
+
 pub mod attribute_value;
 pub mod attributes;
 pub mod gen_ai_eval_result;

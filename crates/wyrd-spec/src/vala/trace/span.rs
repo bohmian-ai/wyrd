@@ -102,6 +102,15 @@ impl SpanRecord {
                 details: serde_json::Value::Null,
             });
         }
+        if self.attributes.len() > 256 {
+            return Err(WyrdError::Validation {
+                message: format!(
+                    "span.attributes count must be <= 256, got {}",
+                    self.attributes.len()
+                ),
+                details: serde_json::Value::Null,
+            });
+        }
         if self.end_time < self.start_time {
             return Err(WyrdError::Validation {
                 message: format!(
@@ -112,7 +121,7 @@ impl SpanRecord {
             });
         }
 
-        let derived = (self.end_time - self.start_time).num_milliseconds().max(0) as u64;
+        let derived = super::duration_ms_from_timestamps(self.start_time, self.end_time);
         if self.duration_ms != derived {
             return Err(WyrdError::Validation {
                 message: format!(

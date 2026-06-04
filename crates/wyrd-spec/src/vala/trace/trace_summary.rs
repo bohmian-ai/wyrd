@@ -114,7 +114,7 @@ impl TraceSummaryRecord {
                 details: serde_json::Value::Null,
             });
         }
-        let derived = (self.end_time - self.start_time).num_milliseconds().max(0) as u64;
+        let derived = super::duration_ms_from_timestamps(self.start_time, self.end_time);
         if self.duration_ms != derived {
             return Err(WyrdError::Validation {
                 message: format!(

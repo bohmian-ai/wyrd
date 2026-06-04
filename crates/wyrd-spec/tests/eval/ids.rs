@@ -218,7 +218,7 @@ fn id_uuid_types_serde_round_trip() {
 
 #[test]
 fn entity_uid_serde_round_trip() {
-    let entity = EntityUid("customer-123".to_string());
+    let entity = EntityUid::new("customer-123").expect("valid entity uid");
     let json = serde_json::to_string(&entity).expect("entity uid serializes");
     assert_eq!(json, "\"customer-123\"");
     let round_trip: EntityUid = serde_json::from_str(&json).expect("entity uid deserializes");

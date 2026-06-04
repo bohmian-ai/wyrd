@@ -141,6 +141,11 @@ pub const GEN_AI_INPUT_MESSAGES: &str = "gen_ai.input.messages";
 /// Opt-in captured GenAI output messages.
 pub const GEN_AI_OUTPUT_MESSAGES: &str = "gen_ai.output.messages";
 /// Opt-in captured GenAI system instructions.
+///
+/// Single-segment suffix is intentional per the Wyrd GenAI semconv extension.
+/// The upstream OTel GenAI semconv does not yet define a canonical key for
+/// system instructions; track <https://github.com/open-telemetry/semantic-conventions>
+/// and rename if the spec stabilizes on a different key.
 pub const GEN_AI_SYSTEM_INSTRUCTIONS: &str = "gen_ai.system_instructions";
 
 /// Retrieved documents used by a GenAI call.

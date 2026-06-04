@@ -263,12 +263,44 @@ impl GenAiSpanRecord {
             });
         }
 
-        let derived = (self.end_time - self.start_time).num_milliseconds().max(0) as u64;
+        let derived = super::duration_ms_from_timestamps(self.start_time, self.end_time);
         if self.duration_ms != derived {
             return Err(WyrdError::Validation {
                 message: format!(
                     "gen_ai_span.duration_ms {} != end_time - start_time = {}",
                     self.duration_ms, derived
+                ),
+                details: serde_json::Value::Null,
+            });
+        }
+
+        const MAX_BLOB_BYTES: usize = 1_048_576;
+        for (field, value) in [
+            ("input_messages", &self.input_messages),
+            ("output_messages", &self.output_messages),
+            ("system_instructions", &self.system_instructions),
+            ("tool_definitions", &self.tool_definitions),
+            ("tool_call_arguments", &self.tool_call_arguments),
+            ("tool_call_result", &self.tool_call_result),
+            ("retrieval_documents", &self.retrieval_documents),
+        ] {
+            if let Some(v) = value {
+                let size = serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0);
+                if size > MAX_BLOB_BYTES {
+                    return Err(WyrdError::Validation {
+                        message: format!(
+                            "gen_ai_span.{field} exceeds {MAX_BLOB_BYTES} bytes, got {size}"
+                        ),
+                        details: serde_json::Value::Null,
+                    });
+                }
+            }
+        }
+        if self.extra.len() > 128 {
+            return Err(WyrdError::Validation {
+                message: format!(
+                    "gen_ai_span.extra count must be <= 128, got {}",
+                    self.extra.len()
                 ),
                 details: serde_json::Value::Null,
             });

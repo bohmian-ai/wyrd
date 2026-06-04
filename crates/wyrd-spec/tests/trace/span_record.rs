@@ -380,3 +380,23 @@ fn span_record_dropped_counts_round_trip_nonzero() {
     assert_eq!(back.dropped_events_count, 7);
     assert_eq!(back.dropped_links_count, 11);
 }
+
+#[test]
+fn span_record_validate_rejects_attributes_over_256() {
+    let mut s = span();
+    for i in 0..=256 {
+        s.attributes
+            .insert(format!("key_{i}"), serde_json::Value::Bool(true));
+    }
+    assert!(s.validate().is_err());
+}
+
+#[test]
+fn span_record_validate_accepts_attributes_at_256() {
+    let mut s = span();
+    for i in 0..256 {
+        s.attributes
+            .insert(format!("key_{i}"), serde_json::Value::Bool(true));
+    }
+    assert!(s.validate().is_ok());
+}

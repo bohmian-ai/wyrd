@@ -1,4 +1,4 @@
-use wyrd_spec::vala::ids::{DataTenantId, SpanId, TraceId};
+use wyrd_spec::vala::ids::{DataTenantId, EntityUid, SpanId, TraceId};
 
 #[test]
 fn trace_id_from_hex_accepts_canonical() {
@@ -245,5 +245,91 @@ fn vala_eval_ids_dataclass_ids_still_resolve() {
     let _: wyrd_spec::vala::eval::ids::WorkflowUid =
         wyrd_spec::vala::eval::ids::WorkflowUid(uuid::Uuid::nil());
     let _: wyrd_spec::vala::eval::ids::EntityUid =
-        wyrd_spec::vala::eval::ids::EntityUid("u".into());
+        wyrd_spec::vala::eval::ids::EntityUid::new("u").expect("valid entity uid");
+}
+
+#[test]
+fn trace_id_display_matches_to_hex() {
+    let id = TraceId::from_hex("0123456789abcdef0123456789abcdef").expect("valid trace id");
+    assert_eq!(format!("{id}"), "0123456789abcdef0123456789abcdef");
+}
+
+#[test]
+fn trace_id_from_str_parses_valid_hex() {
+    let id: TraceId = "0123456789abcdef0123456789abcdef"
+        .parse()
+        .expect("valid trace id");
+    assert_eq!(id.to_hex(), "0123456789abcdef0123456789abcdef");
+}
+
+#[test]
+fn trace_id_from_str_rejects_invalid() {
+    let result = "not-a-trace-id".parse::<TraceId>();
+    assert!(result.is_err());
+}
+
+#[test]
+fn span_id_display_matches_to_hex() {
+    let id = SpanId::from_hex("0123456789abcdef").expect("valid span id");
+    assert_eq!(format!("{id}"), "0123456789abcdef");
+}
+
+#[test]
+fn span_id_from_str_parses_valid_hex() {
+    let id: SpanId = "0123456789abcdef".parse().expect("valid span id");
+    assert_eq!(id.to_hex(), "0123456789abcdef");
+}
+
+#[test]
+fn span_id_from_str_rejects_invalid() {
+    let result = "not-a-span-id".parse::<SpanId>();
+    assert!(result.is_err());
+}
+
+#[test]
+fn data_tenant_id_from_str_parses_valid_id() {
+    let id: DataTenantId = "acme-prod".parse().expect("valid tenant id");
+    assert_eq!(id.as_str(), "acme-prod");
+}
+
+#[test]
+fn data_tenant_id_from_str_rejects_invalid_id() {
+    let result = "Acme".parse::<DataTenantId>();
+    assert!(result.is_err());
+}
+
+#[test]
+fn entity_uid_new_accepts_valid() {
+    let uid = EntityUid::new("agent-42").expect("valid entity uid");
+    assert_eq!(uid.as_str(), "agent-42");
+}
+
+#[test]
+fn entity_uid_new_rejects_empty() {
+    assert!(EntityUid::new("").is_err());
+}
+
+#[test]
+fn entity_uid_new_rejects_overlong() {
+    assert!(EntityUid::new("a".repeat(513)).is_err());
+}
+
+#[test]
+fn entity_uid_accepts_max_length() {
+    EntityUid::new("a".repeat(512)).expect("512 chars is valid");
+}
+
+#[test]
+fn entity_uid_serde_round_trip() {
+    let uid = EntityUid::new("agent-42").expect("valid entity uid");
+    let json = serde_json::to_string(&uid).expect("serializes");
+    assert_eq!(json, "\"agent-42\"");
+    let back: EntityUid = serde_json::from_str(&json).expect("deserializes");
+    assert_eq!(uid, back);
+}
+
+#[test]
+fn entity_uid_deserialize_rejects_empty() {
+    let result: Result<EntityUid, _> = serde_json::from_str("\"\"");
+    assert!(result.is_err());
 }

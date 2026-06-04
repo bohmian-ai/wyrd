@@ -50,6 +50,11 @@ impl<'de> Deserialize<'de> for AttributeValue {
         D: Deserializer<'de>,
     {
         let value = serde_json::Value::deserialize(deserializer)?;
+        if value.is_null() {
+            return Err(serde::de::Error::custom(
+                "attribute_value cannot be null; omit the key instead",
+            ));
+        }
         Ok(Self::from_json(&value))
     }
 }

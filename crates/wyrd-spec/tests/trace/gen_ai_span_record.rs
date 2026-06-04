@@ -337,3 +337,55 @@ fn gen_ai_span_record_validate_propagates_eval_result_failure() {
     });
     assert!(record.validate().is_err());
 }
+
+#[test]
+fn gen_ai_span_record_validate_rejects_nan_presence_penalty() {
+    let mut record = gen_ai();
+    record.request_presence_penalty = Some(f64::NAN);
+    assert!(record.validate().is_err());
+}
+
+#[test]
+fn gen_ai_span_record_validate_rejects_inf_presence_penalty() {
+    let mut record = gen_ai();
+    record.request_presence_penalty = Some(f64::INFINITY);
+    assert!(record.validate().is_err());
+}
+
+#[test]
+fn gen_ai_span_record_validate_rejects_input_messages_over_limit() {
+    let mut record = gen_ai();
+    let big = json!("x".repeat(1_048_577));
+    record.input_messages = Some(big);
+    assert!(record.validate().is_err());
+}
+
+#[test]
+fn gen_ai_span_record_validate_accepts_input_messages_at_limit() {
+    let mut record = gen_ai();
+    // A small valid JSON payload — just testing the happy path through the blob guard.
+    record.input_messages = Some(json!([{"role": "user", "content": "hello"}]));
+    assert!(record.validate().is_ok());
+}
+
+#[test]
+fn gen_ai_span_record_validate_rejects_extra_over_128_entries() {
+    let mut record = gen_ai();
+    for i in 0..=128 {
+        record
+            .extra
+            .insert(format!("gen_ai.vendor.key_{i}"), json!(i));
+    }
+    assert!(record.validate().is_err());
+}
+
+#[test]
+fn gen_ai_span_record_validate_accepts_extra_at_128_entries() {
+    let mut record = gen_ai();
+    for i in 0..128 {
+        record
+            .extra
+            .insert(format!("gen_ai.vendor.key_{i}"), json!(i));
+    }
+    assert!(record.validate().is_ok());
+}

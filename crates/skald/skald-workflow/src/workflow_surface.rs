@@ -128,6 +128,7 @@ impl Workflow {
     ///
     /// # Errors
     /// Returns DAG validation errors when the resulting graph is invalid.
+    #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, agent: Agent) -> WorkflowResult<Self> {
         self.append_agent_step(agent, Vec::new())?;
         self.spec.validate_dag()?;
@@ -466,6 +467,7 @@ impl WorkflowBuilder {
     ///
     /// # Errors
     /// Returns when the resulting workflow cannot be appended to.
+    #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, agent: Agent) -> WorkflowResult<Self> {
         self.wf.append_agent_step(agent, Vec::new())?;
         Ok(self)

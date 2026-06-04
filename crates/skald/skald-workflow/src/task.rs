@@ -32,7 +32,13 @@ impl SchemaResolver for NoRemoteResolver {
 /// Lifecycle status of a task during execution.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "wyrd.agent", name = "StepStatus", eq, eq_int)
+    pyo3::pyclass(
+        module = "wyrd.agent",
+        name = "StepStatus",
+        eq,
+        eq_int,
+        skip_from_py_object
+    )
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {

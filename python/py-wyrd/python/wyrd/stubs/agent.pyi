@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from .error import WyrdError
 from .header import JsonDict, PathLike
@@ -11,28 +11,97 @@ from .prompt import Prompt
 
 #### end of imports ####
 
-class SessionMemory(Protocol):
-    """Session memory object consumed by `Agent` runs."""
+class Role:
+    """Session turn role.
 
-    def recent(self, session_id: str, limit: int) -> Sequence[object]:
+    Values identify whether a turn came from the user, assistant, or tool.
+    """
+
+    User: Role
+    Assistant: Role
+    Tool: Role
+
+class SessionTurn:
+    """One session memory turn.
+
+    Session turns are passed between Python session memory objects and Agent runs.
+    """
+
+    def __init__(
+        self,
+        role: Role,
+        content: str,
+        *,
+        tool_call_id: str | None = ...,
+    ) -> None:
+        """Create a session turn.
+
+        Args:
+            role (Role): Role for the turn.
+            content (str): Turn content.
+            tool_call_id (str | None): Optional tool call id for tool turns.
+        """
+        ...
+
+    @property
+    def role(self) -> Role:
+        """Return the turn role."""
+        ...
+
+    @property
+    def content(self) -> str:
+        """Return the turn content."""
+        ...
+
+    @property
+    def tool_call_id(self) -> str | None:
+        """Return the optional tool call id."""
+        ...
+
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-compatible session turn mapping."""
+        ...
+
+@runtime_checkable
+class SessionMemory(Protocol):
+    """Protocol for Python session memory objects.
+
+    Implement this protocol to provide recent and append behavior to Agent runs.
+    """
+
+    def recent(self, session_id: str, limit: int) -> Sequence[SessionTurn | JsonDict]:
         """Return recent session turns.
 
         Args:
             session_id (str): Session id for the run.
-            limit (int): Maximum turns requested.
+            limit (int): Maximum recent turns requested.
 
         Returns:
-            Sequence[object]: Session turns as `SessionTurn` or mappings.
+            Sequence[SessionTurn | JsonDict]: Recent turns.
         """
         ...
 
-    def append(self, session_id: str, turn: object) -> None:
+    def append(self, session_id: str, turn: SessionTurn) -> None:
         """Append one session turn.
 
         Args:
             session_id (str): Session id for the run.
-            turn (object): Session turn to store.
+            turn (SessionTurn): Turn to append.
         """
+        ...
+
+class NoSession:
+    """No-op session memory implementation.
+
+    Use this when an Agent should not persist session turns.
+    """
+
+    def recent(self, session_id: str, limit: int) -> list[SessionTurn]:
+        """Return an empty recent-turn list."""
+        ...
+
+    def append(self, session_id: str, turn: SessionTurn) -> None:
+        """Ignore one session turn."""
         ...
 
 if True:
@@ -433,9 +502,7 @@ class Workflow:
         """
         ...
 
-    def add_after(
-        self, agent: Agent, after: Agent | str | Sequence[Agent | str]
-    ) -> Workflow:
+    def add_after(self, agent: Agent, after: Agent | str | Sequence[Agent | str]) -> Workflow:
         """Append `agent` as a new step depending on the supplied predecessors.
 
         Args:
@@ -550,8 +617,11 @@ __all__ = [
     "Agent",
     "AgentRun",
     "FinishReason",
+    "NoSession",
+    "Role",
     "RunConfig",
     "SessionMemory",
+    "SessionTurn",
     "StepEvent",
     "StepOutcome",
     "StepStatus",

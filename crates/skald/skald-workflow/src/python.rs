@@ -3,7 +3,7 @@
 #![cfg(feature = "python")]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
@@ -81,16 +81,16 @@ fn extract_agents(py: Python<'_>, agents: Vec<Py<PyAny>>) -> PyResult<Vec<Agent>
 }
 
 fn coerce_after<'py>(py: Python<'py>, after: &Bound<'py, PyAny>) -> PyResult<Vec<String>> {
-    if let Ok(text) = after.downcast::<PyString>() {
+    if let Ok(text) = after.cast::<PyString>() {
         return Ok(vec![text.to_str()?.to_owned()]);
     }
     if let Ok(py_agent) = after.extract::<Py<Agent>>() {
         return Ok(vec![step_id_from_agent(&py_agent.borrow(py))]);
     }
-    if let Ok(list) = after.downcast::<PyList>() {
+    if let Ok(list) = after.cast::<PyList>() {
         let mut out = Vec::with_capacity(list.len());
         for item in list.iter() {
-            if let Ok(text) = item.downcast::<PyString>() {
+            if let Ok(text) = item.cast::<PyString>() {
                 out.push(text.to_str()?.to_owned());
             } else if let Ok(py_agent) = item.extract::<Py<Agent>>() {
                 out.push(step_id_from_agent(&py_agent.borrow(py)));
@@ -297,7 +297,7 @@ impl Workflow {
     /// Raises:
     ///     WyrdError: When identity, IO, or codec fails.
     #[pyo3(name = "save")]
-    pub fn py_save(&self, path: String) -> PyResult<()> {
+    pub fn py_save(&self, path: PathBuf) -> PyResult<()> {
         self.save(path).map_err(wyrd_error_to_py)
     }
 
@@ -313,7 +313,7 @@ impl Workflow {
     ///     WyrdError: When IO, codec, or resolution fails.
     #[staticmethod]
     #[pyo3(name = "load")]
-    pub fn py_load(path: String) -> PyResult<Self> {
+    pub fn py_load(path: PathBuf) -> PyResult<Self> {
         let tool_resolver = skald_tool::default_registry();
         let prompt_resolver = skald_agent::default_prompt_resolver();
         Workflow::load(path, tool_resolver, prompt_resolver).map_err(wyrd_error_to_py)

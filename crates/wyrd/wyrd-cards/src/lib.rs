@@ -8,15 +8,16 @@ pub mod artifact;
 pub mod card;
 /// DataCard implementation module.
 pub mod data;
+/// Typed envelope holder modules.
+pub mod envelope;
 /// ModelCard implementation module.
 pub mod model;
 /// PromptCard implementation module.
 pub mod prompt;
-
 #[cfg(feature = "python")]
 use {pyo3::prelude::*, pyo3::types::PyModule};
 
-/// Register card Python objects under `wyrd._native.cards`.
+/// Register card Python objects under `wyrd.cards`.
 #[cfg(feature = "python")]
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let cards = PyModule::new(py, "cards")?;
@@ -45,10 +46,10 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     cards.add_submodule(&model)?;
     cards.add_submodule(&prompt)?;
     parent.add_submodule(&cards)?;
-    register_submodule(py, "wyrd._native.cards", &cards)?;
-    register_submodule(py, "wyrd._native.cards.data", &data)?;
-    register_submodule(py, "wyrd._native.cards.model", &model)?;
-    register_submodule(py, "wyrd._native.cards.prompt", &prompt)?;
+    register_submodule(py, "wyrd.cards", &cards)?;
+    register_submodule(py, "wyrd.cards.data", &data)?;
+    register_submodule(py, "wyrd.cards.model", &model)?;
+    register_submodule(py, "wyrd.cards.prompt", &prompt)?;
     Ok(())
 }
 

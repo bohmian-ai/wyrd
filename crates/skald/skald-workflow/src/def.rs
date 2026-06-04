@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
-use skald_agent::AgentDef;
+use skald_agent::RunConfig;
 use skald_spec::Prompt;
 
 use crate::error::{WorkflowError, WorkflowResult};
@@ -16,7 +16,7 @@ pub struct WorkflowDef {
     /// Human-readable workflow name.
     pub name: String,
     /// Declared agents that later bind to live providers.
-    pub agents: Vec<AgentDef>,
+    pub agents: Vec<WorkflowAgent>,
     /// Tasks in declaration order.
     pub tasks: Vec<TaskDef>,
 }
@@ -36,6 +36,18 @@ pub struct TaskDef {
     /// Maximum execution retries on validation or provider failure.
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+}
+
+/// Workflow-local declaration for an agent runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowAgent {
+    /// Stable agent id referenced by tasks.
+    pub id: String,
+    /// Resolved native prompt carried by the runtime agent.
+    pub prompt: Prompt,
+    /// Agent loop configuration.
+    #[serde(default)]
+    pub run_config: RunConfig,
 }
 
 /// Default maximum retry count for a task.

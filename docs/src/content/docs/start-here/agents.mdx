@@ -17,8 +17,8 @@ Use public package surfaces in examples, tests, and generated docs:
 from wyrd.data import DataCard, DataInterface, PandasInterface
 ```
 
-Do not import `wyrd._native`. That module is an implementation detail behind
-the public Python package.
+Do not import private native-extension modules directly. They are implementation
+details behind the public Python package.
 
 ## Copyable workflow
 
@@ -45,7 +45,7 @@ same workflow is explained step by step in the
 
 ## Never do this
 
-- Do not import `wyrd._native`.
+- Do not import private native-extension modules directly.
 - Do not invent private card shapes.
 - Do not write `tags`; Wyrd's public metadata contract uses `labels` and `annotations`.
 - Do not add or call card instance `register()` methods. Registry and client surfaces own durable registration.

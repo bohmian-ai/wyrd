@@ -1,63 +1,55 @@
-//! Live Skald agent runtime: identity, single-provider binding, a bounded
-//! tool-dispatch loop, and an observability hook.
+//! Agentic runtime for bounded Skald loops, tool execution, callbacks, session
+//! memory, journals, and observers.
 //!
-//! This crate sits above [`skald_runtime`] and below the Wyrd API holders that
-//! will project skald agents into the public card surface. The runtime is
-//! provider-native end to end: every request is a
-//! [`skald_spec::ProviderRequest`] built for the agent's chosen provider, and
-//! every response is read via [`skald_spec::ResponseAdapter`].
+//! Users enter through [`Agent`]: `Agent::new(prompt).with_tool(tool).run("draft
+//! the doc").await?`. `Agent::new` takes an already-resolved
+//! [`skald_prompt::Prompt`] and is infallible; execution errors surface from
+//! [`Agent::run`].
 //!
-//! ## Independence
-//!
-//! `skald-agent` depends on `skald-spec`, `skald-runtime`, `skald-tool`, and
-//! neutral infrastructure only. There is no dependency on Wyrd or Vala crates.
-//! Observability is injected through the [`Observer`] trait;
-//! skald never reaches up for a telemetry client.
-//!
-//! ## Live binding
-//!
-//! [`AgentDef`] is the serializable form; [`Agent::from_def`] is the only
-//! place a live provider client is bound. There is no undefined placeholder and
-//! no post-deserialize rebuild step.
-//!
-//! ## Bounded loop
-//!
-//! [`Agent::run`] runs a bounded tool-dispatch loop with a configurable
-//! [`RunConfig::max_iterations`] cap. Each iteration sends a native
-//! [`skald_spec::ProviderRequest`], reads the [`skald_spec::ProviderResponse`]
-//! via [`skald_spec::ResponseAdapter`], and either terminates when there are no
-//! tool calls or dispatches each tool through the registered [`AgentTool`]
-//! implementations and continues.
-//!
-//! ## Errors
-//!
-//! All public failures surface as [`AgentError`] with stable `SKALD_AGENT_*`
-//! codes for boundary mapping.
+//! Adjacent crates own adjacent surfaces: [`wyrd_spec::AgentCard`] is the
+//! durable on-disk envelope, [`skald_tool::AgentTool`] and [`AgentDelegateTool`]
+//! provide callable tools and delegation, and `wyrd-observe` auto-attaches
+//! observers when configured by the Wyrd runtime.
 
 #![deny(missing_docs)]
 #![allow(clippy::module_name_repetitions)]
 
 pub mod agent;
-pub mod builder;
-pub mod def;
+pub mod callbacks;
+pub mod conversation;
+pub mod delegate;
+pub mod delegation;
 pub mod error;
+pub mod journal;
 pub mod loop_runtime;
-pub mod messages;
 pub mod observer;
+pub mod observer_provider;
+#[cfg(feature = "python")]
+pub mod py_error;
+#[cfg(feature = "python")]
+pub mod python;
 pub mod registry;
 pub mod request_builder;
 pub mod run;
-pub mod tool;
+pub mod session;
 
-pub use agent::Agent;
-pub use builder::AgentBuilder;
-pub use def::AgentDef;
+pub use agent::{
+    Agent, AgentCallbacks, AgentWire, LocalPromptResolver, PromptResolver,
+    agent_run_config_spec_from_run_config, clear_prompt_card_registry, default_prompt_resolver,
+    derive_cascade_children, register_prompt_card, run_config_from_agent_run_config_spec,
+};
+pub use callbacks::{
+    AfterAgentFn, AfterModelFn, AfterToolFn, AgentContext, BeforeAgentFn, BeforeModelFn,
+    BeforeToolFn, CallbackOutcome,
+};
+pub use conversation::{Conversation, ConversationTurn};
+pub use delegate::AgentDelegateTool;
 pub use error::{AgentError, AgentResult};
+pub use journal::{Journal, JournalError, JournalEvent, NoopJournal};
 pub use observer::{NoopObserver, Observer};
+pub use observer_provider::{ObserverProvider, current_observer, set_observer_provider};
+#[cfg(feature = "python")]
+pub use python::python_register;
 pub use registry::system_messages;
-pub use run::{AgentRun, RunConfig};
-pub use tool::{AgentTool, AgentToolError, ToolRegistry};
-
-// Re-export `FinishReason` so callers do not depend on `skald-spec` directly
-// just to inspect agent termination cause.
-pub use skald_spec::FinishReason;
+pub use run::{AgentRun, FinishReason, RunConfig, RunError};
+pub use session::{NoSession, Role, SessionError, SessionId, SessionMemory, SessionTurn};

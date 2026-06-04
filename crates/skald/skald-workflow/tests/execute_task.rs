@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use skald_agent::{AgentDef, NoopObserver, Observer, RunConfig, ToolRegistry};
+use skald_agent::RunConfig;
 use skald_providers::ProviderError;
 use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::wire::openai_chat::{
@@ -9,6 +9,7 @@ use skald_spec::wire::openai_chat::{
     OpenAiMessageContent,
 };
 use skald_spec::{Prompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType};
+use skald_workflow::WorkflowAgent;
 use skald_workflow::{Context, TaskDef, TaskStatus, Workflow, WorkflowDef};
 
 fn text_prompt() -> Prompt {
@@ -81,12 +82,9 @@ async fn build_workflow(prompt: Prompt, mock: MockProvider, max_retries: u32) ->
     let def = WorkflowDef {
         id: "wf".to_owned(),
         name: "test".to_owned(),
-        agents: vec![AgentDef {
+        agents: vec![WorkflowAgent {
             id: "a".to_owned(),
-            provider: ProviderName::OpenAi,
-            system_prompt: None,
-            model: None,
-            tool_names: Vec::new(),
+            prompt: prompt.clone(),
             run_config: RunConfig::default(),
         }],
         tasks: vec![TaskDef {
@@ -99,14 +97,9 @@ async fn build_workflow(prompt: Prompt, mock: MockProvider, max_retries: u32) ->
     };
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(mock));
-    Workflow::from_def(
-        def,
-        &providers,
-        &ToolRegistry::new(),
-        Arc::new(NoopObserver) as Arc<dyn Observer>,
-    )
-    .await
-    .expect("workflow builds")
+    Workflow::build(def, &providers)
+        .await
+        .expect("workflow builds")
 }
 
 #[tokio::test]

@@ -92,7 +92,7 @@ impl Task {
     ///
     /// Returns `WorkflowError` when the task prompt cannot drive the agent
     /// loop or when its JSON schema response validator fails to compile.
-    pub fn from_def(def: TaskDef) -> WorkflowResult<Self> {
+    pub fn build(def: TaskDef) -> WorkflowResult<Self> {
         skald_agent::request_builder::validate_prompt_loop_request(&def.id, &def.prompt.request)?;
         let output_validator = compile_validator(&def.id, &def.prompt.response_type)?;
         Ok(Self {

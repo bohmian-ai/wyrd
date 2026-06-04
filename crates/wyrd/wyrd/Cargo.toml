@@ -16,8 +16,15 @@ path = "src/lib.rs"
 default = []
 
 [dependencies]
-skald-spec = { workspace = true }
 skald-agent = { workspace = true }
-skald-workflow = { workspace = true }
+skald-prompt = { workspace = true }
+skald-runtime = { workspace = true }
+skald-tool = { workspace = true }
+wyrd-observe = { workspace = true }
+wyrd-observe-impl = { workspace = true }
 wyrd-spec = { workspace = true }
-wyrd-cards = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+skald-spec = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

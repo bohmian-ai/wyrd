@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use skald_agent::{AgentDef, NoopObserver, Observer, RunConfig, ToolRegistry};
+use skald_agent::RunConfig;
 use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse,
     OpenAiMessageContent,
 };
 use skald_spec::{Prompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType};
+use skald_workflow::WorkflowAgent;
 use skald_workflow::{
     Context, TaskDef, TaskList, TaskStatus, Workflow, WorkflowDef, WorkflowError,
     default_max_retries,
@@ -66,13 +67,10 @@ fn openai_response(content: &str) -> ProviderResponse {
     })
 }
 
-fn agent_def() -> AgentDef {
-    AgentDef {
+fn agent_def() -> WorkflowAgent {
+    WorkflowAgent {
         id: "agent".to_owned(),
-        provider: ProviderName::OpenAi,
-        system_prompt: None,
-        model: None,
-        tool_names: Vec::new(),
+        prompt: openai_prompt("agent"),
         run_config: RunConfig::default(),
     }
 }
@@ -104,28 +102,16 @@ async fn build_workflow(def: WorkflowDef, responses: usize) -> Arc<Workflow> {
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(mock));
     Arc::new(
-        Workflow::from_def(
-            def,
-            &providers,
-            &ToolRegistry::new(),
-            Arc::new(NoopObserver) as Arc<dyn Observer>,
-        )
-        .await
-        .expect("workflow builds"),
+        Workflow::build(def, &providers)
+            .await
+            .expect("workflow builds"),
     )
 }
 
-async fn from_def_error(def: WorkflowDef) -> WorkflowError {
+async fn build_error(def: WorkflowDef) -> WorkflowError {
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(MockProvider::new(ProviderName::OpenAi)));
-    match Workflow::from_def(
-        def,
-        &providers,
-        &ToolRegistry::new(),
-        Arc::new(NoopObserver) as Arc<dyn Observer>,
-    )
-    .await
-    {
+    match Workflow::build(def, &providers).await {
         Ok(_) => panic!("workflow unexpectedly built"),
         Err(err) => err,
     }
@@ -182,7 +168,7 @@ async fn diamond_dag_places_siblings_in_one_level() {
 }
 
 #[tokio::test]
-async fn workflow_from_def_accepts_dependencies_declared_later() {
+async fn workflow_build_accepts_dependencies_declared_later() {
     let workflow = build_workflow(
         workflow_def(vec![
             task_def("c", vec!["b"]),
@@ -204,8 +190,8 @@ async fn workflow_from_def_accepts_dependencies_declared_later() {
 }
 
 #[tokio::test]
-async fn workflow_from_def_rejects_duplicate_id() {
-    let err = from_def_error(workflow_def(vec![
+async fn workflow_build_rejects_duplicate_id() {
+    let err = build_error(workflow_def(vec![
         task_def("a", vec![]),
         task_def("a", vec![]),
     ]))
@@ -214,14 +200,14 @@ async fn workflow_from_def_rejects_duplicate_id() {
 }
 
 #[tokio::test]
-async fn workflow_from_def_rejects_self_dependency() {
-    let err = from_def_error(workflow_def(vec![task_def("a", vec!["a"])])).await;
+async fn workflow_build_rejects_self_dependency() {
+    let err = build_error(workflow_def(vec![task_def("a", vec!["a"])])).await;
     assert_eq!(err.code(), "SKALD_WORKFLOW_422_SELF_DEP");
 }
 
 #[tokio::test]
-async fn workflow_from_def_rejects_missing_dependency() {
-    let err = from_def_error(workflow_def(vec![task_def("a", vec!["missing"])])).await;
+async fn workflow_build_rejects_missing_dependency() {
+    let err = build_error(workflow_def(vec![task_def("a", vec!["missing"])])).await;
     assert_eq!(err.code(), "SKALD_WORKFLOW_422_DEP_MISSING");
 }
 

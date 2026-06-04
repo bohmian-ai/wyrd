@@ -85,3 +85,36 @@ fn run_id_bucket_zero_buckets_returns_zero() {
 
     assert_eq!(id.hash_bucket(0), 0);
 }
+
+#[test]
+fn one_of_tool_call_successive_calls_alternate() {
+    let run_id = RunId::from_string("tool-run".to_owned());
+    let policy = SamplingPolicy::one_of(2).expect("2 is non-zero");
+
+    let first = policy.should_sample_tool_call(&run_id, "search");
+    let second = policy.should_sample_tool_call(&run_id, "search");
+
+    // OneOf(2) must alternate: the two results must differ.
+    assert_ne!(
+        first, second,
+        "OneOf(2) must alternate between consecutive tool-call checks"
+    );
+}
+
+#[test]
+fn one_of_tool_call_write_tool_always_sampled() {
+    let run_id = RunId::from_string("tool-run".to_owned());
+    // Divisor large enough that non-write tools would almost never be sampled.
+    let policy = SamplingPolicy::one_of(1_000_000).expect("non-zero");
+
+    for _ in 0..5 {
+        assert!(
+            policy.should_sample_tool_call(&run_id, "file_write"),
+            "write tool must always be sampled regardless of OneOf divisor"
+        );
+        assert!(
+            policy.should_sample_tool_call(&run_id, "execute_code"),
+            "execute_code must always be sampled regardless of OneOf divisor"
+        );
+    }
+}

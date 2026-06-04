@@ -72,7 +72,8 @@ pub async fn dispatch_stream(
 
 fn request_model(request: &ProviderRequest) -> Option<&str> {
     match request {
-        ProviderRequest::OpenAiChatCompletion(request) => Some(&request.model),
+        ProviderRequest::OpenAiChatCompletion(request)
+        | ProviderRequest::OpenAiChatCompatible { request, .. } => Some(&request.model),
         ProviderRequest::OpenAiResponses(request) => Some(&request.model),
         ProviderRequest::OpenAiEmbeddings(request) => Some(&request.model),
         ProviderRequest::AnthropicMessage(request) => Some(&request.model),

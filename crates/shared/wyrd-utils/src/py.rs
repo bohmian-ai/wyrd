@@ -5,17 +5,20 @@ use pyo3::create_exception;
 use pyo3::exceptions::{PyAttributeError, PyException, PyModuleNotFoundError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{
-    PyAny, PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyModule, PyString, PyTuple,
+    PyAny, PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyModule, PyString, PyTuple, PyType,
 };
 use serde_json::Value;
 use wyrd_spec::error::WyrdError as SpecWyrdError;
 
 create_exception!(
-    wyrd._native,
+    wyrd._wyrd,
     WyrdError,
     PyException,
     "Base Python exception for structured Wyrd errors."
 );
+create_exception!(wyrd._wyrd, AgentError, WyrdError, "Agent Wyrd error.");
+create_exception!(wyrd._wyrd, ToolError, WyrdError, "Tool Wyrd error.");
+create_exception!(wyrd._wyrd, SessionError, WyrdError, "Session Wyrd error.");
 
 /// Convert a JSON value to a Python object.
 ///
@@ -105,6 +108,10 @@ pub fn pyobject_to_json(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         }
         return Ok(Value::Object(map));
     }
+    // Pydantic models and other dataclass-like objects with a `model_dump` method.
+    if let Ok(dumped) = obj.call_method0("model_dump") {
+        return pyobject_to_json(&dumped);
+    }
     Ok(Value::String(obj.str()?.extract::<String>()?))
 }
 
@@ -152,7 +159,11 @@ pub fn module_version(py: Python<'_>, name: &str) -> PyResult<Option<String>> {
 /// # Errors
 /// Returns a Python error when module registration fails.
 pub fn register_wyrd_error_exception(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add("WyrdError", module.py().get_type::<WyrdError>())
+    let py = module.py();
+    module.add("WyrdError", py.get_type::<WyrdError>())?;
+    module.add("AgentError", py.get_type::<AgentError>())?;
+    module.add("ToolError", py.get_type::<ToolError>())?;
+    module.add("SessionError", py.get_type::<SessionError>())
 }
 
 /// Convert a public Wyrd error into a structured Python Wyrd error.
@@ -166,6 +177,68 @@ pub fn wyrd_error_to_py_err(error: SpecWyrdError) -> PyErr {
     })
 }
 
+/// Convert a public Wyrd error into a structured Python Wyrd error object.
+///
+/// # Errors
+/// Returns a Python error when exception construction fails.
+pub fn wyrd_error_to_py_object(py: Python<'_>, error: SpecWyrdError) -> PyResult<Py<PyAny>> {
+    let exception = build_wyrd_py_exception(py, error)?;
+    Ok(exception.into_any().unbind())
+}
+
+/// Convert a Python exception into a structured Wyrd error.
+pub fn py_err_to_wyrd_error(py: Python<'_>, error: PyErr) -> SpecWyrdError {
+    let value = error.value(py);
+    if let Ok(code) = value
+        .getattr("code")
+        .and_then(|code| code.extract::<String>())
+    {
+        let message = value
+            .getattr("message")
+            .and_then(|message| message.extract::<String>())
+            .unwrap_or_else(|_| error.to_string());
+        return wyrd_error_from_python_code(code, message);
+    }
+    if let Ok(args_obj) = value.getattr("args") {
+        if let Ok(args) = args_obj.cast::<PyTuple>() {
+            if args.len() >= 2 {
+                if let (Ok(code), Ok(message)) = (
+                    args.get_item(0).and_then(|item| item.extract::<String>()),
+                    args.get_item(1).and_then(|item| item.extract::<String>()),
+                ) {
+                    return wyrd_error_from_python_code(code, message);
+                }
+            }
+        }
+    }
+    let type_name = error
+        .get_type(py)
+        .name()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|_| "PyException".to_owned());
+    let detail = error.to_string();
+    SpecWyrdError::AgentValidation {
+        message: detail.clone(),
+        details: serde_json::json!({
+            "python_exception": type_name,
+            "detail": detail,
+        }),
+    }
+}
+
+fn wyrd_error_from_python_code(code: String, message: String) -> SpecWyrdError {
+    match code.as_str() {
+        "WYRD_AGENT_499_CALLBACK_ABORTED" => SpecWyrdError::AgentCallbackAborted {
+            message,
+            details: serde_json::json!({ "python_error_code": code }),
+        },
+        _ => SpecWyrdError::AgentValidation {
+            message,
+            details: serde_json::json!({ "python_error_code": code }),
+        },
+    }
+}
+
 fn py_iterable_to_json<'py>(iter: impl Iterator<Item = Bound<'py, PyAny>>) -> PyResult<Value> {
     let mut values = Vec::new();
     for item in iter {
@@ -175,6 +248,10 @@ fn py_iterable_to_json<'py>(iter: impl Iterator<Item = Bound<'py, PyAny>>) -> Py
 }
 
 fn build_wyrd_py_err(py: Python<'_>, error: SpecWyrdError) -> PyResult<PyErr> {
+    Ok(PyErr::from_value(build_wyrd_py_exception(py, error)?))
+}
+
+fn build_wyrd_py_exception(py: Python<'_>, error: SpecWyrdError) -> PyResult<Bound<'_, PyAny>> {
     let display = error.to_string();
     let problem = error.as_problem_json();
     let code = problem_string(&problem, "code", error.code()).to_owned();
@@ -192,7 +269,7 @@ fn build_wyrd_py_err(py: Python<'_>, error: SpecWyrdError) -> PyResult<PyErr> {
         .to_owned();
     let details = problem.get("details").cloned().unwrap_or(Value::Null);
 
-    let exception = py.get_type::<WyrdError>().call1((message.clone(),))?;
+    let exception = exception_type_for_code(py, &code).call1((message.clone(),))?;
     exception.setattr("code", code)?;
     exception.setattr("message", message)?;
     exception.setattr("details", json_to_pyobject(py, &details)?.bind(py))?;
@@ -201,9 +278,21 @@ fn build_wyrd_py_err(py: Python<'_>, error: SpecWyrdError) -> PyResult<PyErr> {
     exception.setattr("title", title)?;
     exception.setattr("type", problem_type)?;
     exception.setattr("problem", json_to_pyobject(py, &problem)?.bind(py))?;
-    Ok(PyErr::from_value(exception))
+    Ok(exception)
 }
 
 fn problem_string<'a>(problem: &'a Value, key: &str, fallback: &'a str) -> &'a str {
     problem.get(key).and_then(Value::as_str).unwrap_or(fallback)
+}
+
+fn exception_type_for_code<'py>(py: Python<'py>, code: &str) -> Bound<'py, PyType> {
+    if code.starts_with("WYRD_AGENT_") || code.starts_with("SKALD_AGENT_") {
+        py.get_type::<AgentError>()
+    } else if code.starts_with("WYRD_TOOL_") || code.starts_with("SKALD_TOOL_") {
+        py.get_type::<ToolError>()
+    } else if code.starts_with("WYRD_SESSION_") || code.starts_with("SKALD_SESSION_") {
+        py.get_type::<SessionError>()
+    } else {
+        py.get_type::<WyrdError>()
+    }
 }

@@ -3,7 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use skald_agent::{Agent, Observer, ToolRegistry};
+use skald_agent::Agent;
+use skald_prompt::Prompt as RuntimePrompt;
 use skald_runtime::ProviderRegistry;
 use skald_spec::{MessageNum, Prompt, ProviderName, ProviderRequest, ProviderResponse};
 use tokio::sync::RwLock;
@@ -11,7 +12,6 @@ use tokio::sync::RwLock;
 use crate::context::Context;
 use crate::def::WorkflowDef;
 use crate::error::{WorkflowError, WorkflowResult};
-use crate::observer_ext::emit_task_event;
 use crate::run::{TaskEvent, TaskOutcome, WorkflowRun, now_ms};
 use crate::schedule::execution_plan;
 use crate::task::TaskStatus;
@@ -23,9 +23,9 @@ pub struct Workflow {
     pub id: String,
     /// Human-readable workflow name.
     pub name: String,
+    providers: ProviderRegistry,
     agents: HashMap<String, Arc<Agent>>,
     task_list: TaskList,
-    observer: Arc<dyn Observer>,
 }
 
 impl Workflow {
@@ -35,18 +35,15 @@ impl Workflow {
     ///
     /// Returns `WorkflowError` when graph validation fails, agent binding fails,
     /// a task references an unknown agent, or task construction fails.
-    pub async fn from_def(
-        def: WorkflowDef,
-        providers: &ProviderRegistry,
-        tools: &ToolRegistry,
-        observer: Arc<dyn Observer>,
-    ) -> WorkflowResult<Self> {
+    pub async fn build(def: WorkflowDef, providers: &ProviderRegistry) -> WorkflowResult<Self> {
         def.validate_graph()?;
 
         let mut agents = HashMap::with_capacity(def.agents.len());
         for agent_def in def.agents {
             let id = agent_def.id.clone();
-            let agent = Agent::from_def(agent_def, providers, tools, Arc::clone(&observer)).await?;
+            let agent = Agent::new(RuntimePrompt::from_native(agent_def.prompt))
+                .with_id(agent_def.id)
+                .with_run_config(agent_def.run_config);
             agents.insert(id, Arc::new(agent));
         }
 
@@ -61,9 +58,9 @@ impl Workflow {
         Ok(Self {
             id: def.id,
             name: def.name,
+            providers: providers.clone(),
             agents,
             task_list,
-            observer,
         })
     }
 
@@ -164,9 +161,12 @@ impl Workflow {
             .get(&agent_id)
             .ok_or_else(|| WorkflowError::AgentNotFound(agent_id.clone()))?;
 
+        let prompt = RuntimePrompt::from_native(prompt);
         for attempt in 0..=max_retries {
-            let response = match agent.run_prompt(&prompt, &[]).await {
-                Ok(run) => run.output,
+            let response = match agent.run_prompt(&self.providers, &prompt, &[]).await {
+                Ok(run) => run
+                    .final_response
+                    .ok_or_else(|| WorkflowError::AgentMissingFinalResponse(task_id.to_owned()))?,
                 Err(_err) if attempt == max_retries => {
                     return Err(WorkflowError::MaxRetriesExceeded(task_id.to_owned()));
                 }
@@ -214,10 +214,21 @@ impl Workflow {
         for attempt in 0..=max_retries {
             let started_at = now_ms();
             let prompt_for_run = self
-                .prompt_with_handoff(&prompt, &dependencies, &agent.provider_name, &context)
+                .prompt_with_handoff(
+                    &prompt,
+                    &dependencies,
+                    &agent.prompt.native().request.provider(),
+                    &context,
+                )
                 .await?;
-            let response = match agent.run_prompt(&prompt_for_run, &[]).await {
-                Ok(run) => run.output,
+            let runtime_prompt = RuntimePrompt::from_native(prompt_for_run);
+            let response = match agent
+                .run_prompt(&self.providers, &runtime_prompt, &[])
+                .await
+            {
+                Ok(run) => run
+                    .final_response
+                    .ok_or_else(|| WorkflowError::AgentMissingFinalResponse(task_id.clone()))?,
                 Err(_err) if attempt == max_retries => {
                     let error = WorkflowError::MaxRetriesExceeded(task_id.clone());
                     self.record_failure(&task, &task_id, attempt, started_at, events, &error)?;
@@ -238,7 +249,7 @@ impl Workflow {
                 Ok(()) => {
                     let task_messages = crate::handoff::extract_messages_for_handoff(
                         &response,
-                        &agent.provider_name,
+                        &agent.prompt.native().request.provider(),
                     )?;
                     {
                         let mut guard = task.write().map_err(|_| WorkflowError::Lock)?;
@@ -384,7 +395,7 @@ impl Workflow {
             .agents
             .get(&agent_id)
             .ok_or_else(|| WorkflowError::AgentNotFound(agent_id.clone()))?;
-        Ok(agent.provider_name.clone())
+        Ok(agent.prompt.native().request.provider())
     }
 
     fn record_completion(
@@ -402,7 +413,6 @@ impl Workflow {
             attempt: attempt + 1,
             error: None,
         };
-        emit_task_event(self.observer.as_ref(), &event);
         push_event(events, event)
     }
 
@@ -427,7 +437,6 @@ impl Workflow {
             attempt: attempt + 1,
             error: Some(err.code().to_owned()),
         };
-        emit_task_event(self.observer.as_ref(), &event);
         push_event(events, event)
     }
 
@@ -452,7 +461,6 @@ impl Workflow {
             attempt: attempt + 1,
             error: Some(err.code().to_owned()),
         };
-        emit_task_event(self.observer.as_ref(), &event);
         push_event(events, event)
     }
 

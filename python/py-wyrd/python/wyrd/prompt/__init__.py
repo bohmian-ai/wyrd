@@ -1,6 +1,6 @@
-"""Public Prompt re-exports."""
+"""Public Prompt package."""
 
-from ._wyrd.cards.prompt import (
+from .._wyrd.cards.prompt import (
     AnthropicSettings,
     GeminiSettings,
     MediaRef,
@@ -16,11 +16,11 @@ from ._wyrd.cards.prompt import (
 )
 
 __all__ = [
+    "AnthropicSettings",
+    "GeminiSettings",
     "MediaRef",
     "OpenAIResponsesSettings",
     "OpenAISettings",
-    "AnthropicSettings",
-    "GeminiSettings",
     "Prompt",
     "PromptCard",
     "PromptCardMetadata",

@@ -1,5 +1,4 @@
 import pytest
-
 from wyrd import Agent, Prompt, Role, SessionTurn
 from wyrd.providers import mock_registry
 

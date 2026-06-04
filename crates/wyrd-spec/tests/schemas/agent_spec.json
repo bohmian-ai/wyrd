@@ -8,7 +8,7 @@
   ],
   "properties": {
     "prompt": {
-      "description": "Prompt reference preserved on disk and resolved by `wyrd-cards`.",
+      "description": "Prompt reference preserved on disk and resolved by `skald-agent`.",
       "allOf": [
         {
           "$ref": "#/definitions/PromptRef"
@@ -3885,6 +3885,32 @@
               "$ref": "#/definitions/OpenAiChatRequest"
             }
           ]
+        },
+        {
+          "description": "Custom provider that accepts OpenAI Chat Completions request semantics.",
+          "type": "object",
+          "required": [
+            "provider",
+            "request"
+          ],
+          "properties": {
+            "provider": {
+              "description": "Provider dispatch target.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ProviderName"
+                }
+              ]
+            },
+            "request": {
+              "description": "OpenAI Chat-shaped request body.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OpenAiChatRequest"
+                }
+              ]
+            }
+          }
         },
         {
           "description": "OpenAI Responses API request.",

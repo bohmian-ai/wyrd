@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import enum
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 
 class CallbackOutcome(enum.Enum):
@@ -11,7 +12,7 @@ class CallbackOutcome(enum.Enum):
     Skip = "skip"
 
     @staticmethod
-    def replace_with(value: Any) -> "_ReplaceWith":
+    def replace_with(value: Any) -> _ReplaceWith:
         return _ReplaceWith(value)
 
 

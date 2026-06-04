@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 import wyrd
 from wyrd import Agent, CallbackOutcome, FinishReason, Prompt, RunConfig, tool
 from wyrd.providers import mock_registry
@@ -137,6 +136,4 @@ def test_journey_module_paths() -> None:
     with pytest.raises(ImportError):
         from wyrd import AgentCard  # noqa: F401
 
-    assert not hasattr(wyrd, "_wyrd") or "AgentCard" not in dir(
-        getattr(wyrd, "_wyrd", object())
-    )
+    assert not hasattr(wyrd, "_wyrd") or "AgentCard" not in dir(getattr(wyrd, "_wyrd", object()))

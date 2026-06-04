@@ -4,7 +4,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from .header import PathLike
 from .prompt import Prompt
+
 #### end of imports ####
 
 class Agent:
@@ -31,7 +33,6 @@ class Agent:
         labels: Mapping[str, str] | None = ...,
         annotations: Mapping[str, str] | None = ...,
     ) -> None: ...
-
     @property
     def name(self) -> str | None: ...
     @property

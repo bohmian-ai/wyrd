@@ -1,5 +1,4 @@
 import pytest
-
 from wyrd import Agent, Prompt, WyrdError, tool
 
 

@@ -88,7 +88,6 @@ class Agent:
         labels: Mapping[str, str] | None = ...,
         annotations: Mapping[str, str] | None = ...,
     ) -> None: ...
-
     @property
     def name(self) -> str | None: ...
     @property

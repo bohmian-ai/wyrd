@@ -1,5 +1,4 @@
 import pytest
-
 from wyrd import Agent, Prompt
 
 
@@ -10,8 +9,8 @@ def test_agent_constructs_from_prompt() -> None:
 
     assert agent.name == "planner-agent"
     assert agent.version == "0.3.0"
-    assert getattr(agent, "provider") == "openai"
-    assert getattr(agent, "model") == "gpt-4o-mini"
+    assert agent.provider == "openai"
+    assert agent.model == "gpt-4o-mini"
 
 
 def test_agent_rejects_banned_kwargs_but_not_providers() -> None:

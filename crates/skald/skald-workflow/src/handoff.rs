@@ -74,10 +74,7 @@ pub fn extract_messages_for_handoff(
             Ok(vec![MessageNum::OpenAi(OpenAiChatMessage {
                 role: "assistant".to_owned(),
                 content: Some(OpenAiMessageContent::Text(text)),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                refusal: None,
+                ..Default::default()
             })])
         }
         (ProviderResponse::AnthropicMessage(_), ProviderName::Anthropic) => {

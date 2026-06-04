@@ -10,15 +10,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prompt = openai_chat(
         "gpt-5.4-nano-2026-03-17",
         OpenAiChatOptions {
-            system: Some("You are a helpful assistant.".to_owned()),
-            messages: vec!["Say hello in one sentence.".to_owned()],
+            system: Some("You are a helpful assistant. Answer in one sentence.".to_owned()),
+            messages: vec!["What is {{topic}}?".to_owned()],
             ..OpenAiChatOptions::default()
         },
     )?;
 
     let agent = Agent::new(prompt);
     let providers = skald_runtime::default_registry();
-    let run = agent.run_with(providers.as_ref(), None, "hello").await?;
+    let run = agent
+        .run_prompt(providers.as_ref(), &agent.prompt, &[("topic", "the Rust borrow checker")], None)
+        .await?;
 
     println!("finish: {:?}", run.finish_reason);
     println!("output: {}", run.output);

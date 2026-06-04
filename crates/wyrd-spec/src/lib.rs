@@ -27,6 +27,11 @@ pub mod version;
 
 pub use authz::{Principal, Role, Scope};
 pub use card::agent::{AgentCard, AgentCardError, AgentRunConfigSpec, AgentSpec};
+pub use card::workflow::{
+    WorkflowAction, WorkflowCard, WorkflowCardError, WorkflowRetryPolicy, WorkflowSpec,
+    WorkflowStep, WorkflowValidationError,
+};
+pub use reference::AgentRef;
 pub use card::data::{
     ArrowFormat, ArrowMeta, ColValue, ColorMode, CustomDataMeta, DataInterface, DataSchema,
     DataSpec, DataSplit, DataStats, HuggingfaceMeta, ImageFormat, ImageMeta, Inequality,

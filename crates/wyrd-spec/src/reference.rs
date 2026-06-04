@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::card::agent::AgentSpec;
 use crate::envelope::CardKind;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::version::VersionBlock;
@@ -41,6 +42,29 @@ impl From<skald_spec::Prompt> for PromptRef {
 }
 
 impl From<CardRef> for PromptRef {
+    fn from(card_ref: CardRef) -> Self {
+        Self::Card(card_ref)
+    }
+}
+
+/// Reference to a workflow step's agent, either inline or by Agent Card reference.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum AgentRef {
+    /// Inline agent spec body.
+    Inline(Box<AgentSpec>),
+    /// Reference to a registered Agent Card.
+    Card(CardRef),
+}
+
+impl From<AgentSpec> for AgentRef {
+    fn from(spec: AgentSpec) -> Self {
+        Self::Inline(Box::new(spec))
+    }
+}
+
+impl From<CardRef> for AgentRef {
     fn from(card_ref: CardRef) -> Self {
         Self::Card(card_ref)
     }

@@ -14,7 +14,7 @@ use skald_spec::{
     MessageNum, Prompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
 };
 use skald_workflow::WorkflowAgent;
-use skald_workflow::{Context, TaskDef, Workflow, WorkflowDef, extract_messages_for_handoff};
+use skald_workflow::{Context, DagExecutor, TaskDef, WorkflowDef, extract_messages_for_handoff};
 
 fn openai_prompt() -> Prompt {
     Prompt {
@@ -155,7 +155,7 @@ async fn same_provider_handoff_is_passthrough() {
     };
 
     let workflow = Arc::new(
-        Workflow::build(def, &providers)
+        DagExecutor::build(def, &providers)
             .await
             .expect("workflow builds"),
     );
@@ -219,7 +219,7 @@ async fn cross_provider_handoff_uses_message_conversion() {
     };
 
     let workflow = Arc::new(
-        Workflow::build(def, &providers)
+        DagExecutor::build(def, &providers)
             .await
             .expect("workflow builds"),
     );

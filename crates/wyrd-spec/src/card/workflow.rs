@@ -236,9 +236,10 @@ impl WorkflowCard {
         }
 
         let Spec::Workflow(spec) = card.spec else {
-            return Err(
-                WorkflowCardError::validation("Workflow Card spec must be a Workflow spec").into(),
-            );
+            return Err(WorkflowCardError::validation(
+                "Workflow Card spec must be a Workflow spec",
+            )
+            .into());
         };
 
         let cascade_children = derive_cascade_children(&spec);
@@ -460,8 +461,7 @@ fn card_name(field: &str, value: &str) -> Result<CardName, WyrdError> {
 
 fn version_block(field: &str, value: &str) -> Result<VersionBlock, WyrdError> {
     VersionBlock::parse(value).map_err(|error| {
-        WorkflowCardError::validation(format!("{field} must be a semantic version: {error}"))
-            .into()
+        WorkflowCardError::validation(format!("{field} must be a semantic version: {error}")).into()
     })
 }
 

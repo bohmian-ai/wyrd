@@ -7,7 +7,11 @@ use skald_spec::ProviderResponse;
 
 use crate::task::TaskStatus;
 
-/// Outcome returned by [`crate::Workflow::run`].
+/// Outcome returned by [`crate::DagExecutor::run`] and [`crate::Workflow::run`].
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "wyrd.agent", name = "WorkflowRun", skip_from_py_object)
+)]
 #[derive(Debug, Clone)]
 pub struct WorkflowRun {
     /// Final outcome per task, keyed by task id.
@@ -26,6 +30,10 @@ impl WorkflowRun {
 }
 
 /// Per-task final outcome captured after workflow execution.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "wyrd.agent", name = "StepOutcome", skip_from_py_object)
+)]
 #[derive(Debug, Clone)]
 pub struct TaskOutcome {
     /// Final task status.
@@ -37,6 +45,10 @@ pub struct TaskOutcome {
 }
 
 /// One observable task transition during a workflow run.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "wyrd.agent", name = "StepEvent", skip_from_py_object)
+)]
 #[derive(Debug, Clone)]
 pub struct TaskEvent {
     /// Task id.
@@ -52,6 +64,14 @@ pub struct TaskEvent {
     /// Stable error code for failed attempts.
     pub error: Option<String>,
 }
+
+/// Public alias for [`TaskOutcome`]; the user-facing surface refers to a workflow
+/// node as a "step" rather than a "task".
+pub type StepOutcome = TaskOutcome;
+
+/// Public alias for [`TaskEvent`]; the user-facing surface refers to a workflow
+/// node as a "step" rather than a "task".
+pub type StepEvent = TaskEvent;
 
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()

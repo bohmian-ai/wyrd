@@ -27,11 +27,6 @@ pub mod version;
 
 pub use authz::{Principal, Role, Scope};
 pub use card::agent::{AgentCard, AgentCardError, AgentRunConfigSpec, AgentSpec};
-pub use card::workflow::{
-    WorkflowAction, WorkflowCard, WorkflowCardError, WorkflowRetryPolicy, WorkflowSpec,
-    WorkflowStep, WorkflowValidationError,
-};
-pub use reference::AgentRef;
 pub use card::data::{
     ArrowFormat, ArrowMeta, ColValue, ColorMode, CustomDataMeta, DataInterface, DataSchema,
     DataSpec, DataSplit, DataStats, HuggingfaceMeta, ImageFormat, ImageMeta, Inequality,
@@ -44,9 +39,14 @@ pub use card::prompt::{
     CardLoadFormat, ParameterName, PromptRef, PromptSpec, extract_text_placeholders,
     parse_card_bytes, parse_spec_bytes, serialize_card, serialize_spec_bytes,
 };
+pub use card::workflow::{
+    WorkflowAction, WorkflowCard, WorkflowCardError, WorkflowRetryPolicy, WorkflowSpec,
+    WorkflowStep, WorkflowValidationError,
+};
 pub use ids::{ColumnName, QueryName, RoleName, SplitName};
 pub use metadata::{
     AnnotationKey, AnnotationValue, Annotations, CardMetadata, LabelKey, LabelValue, Labels,
     MetadataError,
 };
+pub use reference::AgentRef;
 pub use skald_spec::{MessageNum, Prompt, ProviderRequest, ProviderResponse, ResponseType};

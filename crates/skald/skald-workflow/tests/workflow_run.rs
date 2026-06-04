@@ -8,7 +8,7 @@ use skald_spec::wire::openai_chat::{
 };
 use skald_spec::{Prompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType};
 use skald_workflow::WorkflowAgent;
-use skald_workflow::{Context, TaskDef, TaskStatus, Workflow, WorkflowDef};
+use skald_workflow::{Context, DagExecutor, TaskDef, TaskStatus, WorkflowDef};
 
 fn prompt() -> Prompt {
     Prompt {
@@ -96,7 +96,7 @@ async fn workflow_run_carries_outcomes_events_last_task() {
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(mock));
     let workflow = Arc::new(
-        Workflow::build(def, &providers)
+        DagExecutor::build(def, &providers)
             .await
             .expect("workflow builds"),
     );

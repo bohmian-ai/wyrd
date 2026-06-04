@@ -30,6 +30,10 @@ impl SchemaResolver for NoRemoteResolver {
 }
 
 /// Lifecycle status of a task during execution.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "wyrd.agent", name = "StepStatus", eq, eq_int)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
     /// Not yet eligible to run, or eligible but not started.

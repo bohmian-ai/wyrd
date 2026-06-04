@@ -61,6 +61,12 @@ pub enum WorkflowError {
     /// Failure inside an agent propagated up.
     #[error(transparent)]
     Agent(#[from] AgentError),
+    /// Workflow spec validation surfaced through the user-facing surface.
+    #[error(transparent)]
+    Spec(#[from] wyrd_spec::card::workflow::WorkflowValidationError),
+    /// Generic boundary failure raised by the workflow user surface.
+    #[error("{0}")]
+    Other(String),
 }
 
 impl WorkflowError {
@@ -80,6 +86,18 @@ impl WorkflowError {
             Self::Cycle(_) => "SKALD_WORKFLOW_422_CYCLE",
             Self::Lock => "SKALD_WORKFLOW_500_LOCK",
             Self::Agent(source) => source.code(),
+            Self::Spec(error) => match error {
+                wyrd_spec::card::workflow::WorkflowValidationError::DuplicateStep => {
+                    "WYRD_WORKFLOW_422_DUPLICATE_STEP_ID"
+                }
+                wyrd_spec::card::workflow::WorkflowValidationError::MissingDependency => {
+                    "WYRD_WORKFLOW_422_MISSING_DEPENDENCY"
+                }
+                wyrd_spec::card::workflow::WorkflowValidationError::Cycle => {
+                    "WYRD_WORKFLOW_422_CYCLE"
+                }
+            },
+            Self::Other(_) => "SKALD_WORKFLOW_500_INTERNAL",
         }
     }
 }

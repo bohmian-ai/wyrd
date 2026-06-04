@@ -10,7 +10,7 @@ use skald_spec::wire::openai_chat::{
 use skald_spec::{Prompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType};
 use skald_workflow::WorkflowAgent;
 use skald_workflow::{
-    Context, TaskDef, TaskList, TaskStatus, Workflow, WorkflowDef, WorkflowError,
+    Context, DagExecutor, TaskDef, TaskList, TaskStatus, WorkflowDef, WorkflowError,
     default_max_retries,
 };
 
@@ -94,7 +94,7 @@ fn workflow_def(tasks: Vec<TaskDef>) -> WorkflowDef {
     }
 }
 
-async fn build_workflow(def: WorkflowDef, responses: usize) -> Arc<Workflow> {
+async fn build_workflow(def: WorkflowDef, responses: usize) -> Arc<DagExecutor> {
     let mock = MockProvider::new(ProviderName::OpenAi);
     for index in 0..responses {
         mock.push_response(openai_response(&format!("ok-{index}")));
@@ -102,7 +102,7 @@ async fn build_workflow(def: WorkflowDef, responses: usize) -> Arc<Workflow> {
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(mock));
     Arc::new(
-        Workflow::build(def, &providers)
+        DagExecutor::build(def, &providers)
             .await
             .expect("workflow builds"),
     )
@@ -111,7 +111,7 @@ async fn build_workflow(def: WorkflowDef, responses: usize) -> Arc<Workflow> {
 async fn build_error(def: WorkflowDef) -> WorkflowError {
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(MockProvider::new(ProviderName::OpenAi)));
-    match Workflow::build(def, &providers).await {
+    match DagExecutor::build(def, &providers).await {
         Ok(_) => panic!("workflow unexpectedly built"),
         Err(err) => err,
     }

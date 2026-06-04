@@ -674,7 +674,9 @@ impl Agent {
         }
     }
 
-    fn to_spec(&self) -> AgentSpec {
+    /// Project this agent into its pure durable [`AgentSpec`] body.
+    #[must_use]
+    pub fn to_spec(&self) -> AgentSpec {
         AgentSpec {
             prompt: self.prompt_ref.clone(),
             tool_names: self.tool_names.clone(),

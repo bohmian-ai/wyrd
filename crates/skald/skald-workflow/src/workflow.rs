@@ -18,7 +18,7 @@ use crate::task::TaskStatus;
 use crate::tasklist::{SharedTask, TaskList};
 
 /// Live workflow built from a validated [`WorkflowDef`].
-pub struct Workflow {
+pub struct DagExecutor {
     /// Stable workflow id.
     pub id: String,
     /// Human-readable workflow name.
@@ -28,7 +28,7 @@ pub struct Workflow {
     task_list: TaskList,
 }
 
-impl Workflow {
+impl DagExecutor {
     /// Build a live workflow from its declarative definition.
     ///
     /// # Errors

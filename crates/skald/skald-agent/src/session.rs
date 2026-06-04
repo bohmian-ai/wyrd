@@ -3,7 +3,10 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use skald_spec::wire::openai_chat::OpenAiMessageContent;
-use skald_spec::{MessageNum, OpenAiChatMessage};
+use skald_spec::{
+    AnthropicContentBlock, AnthropicMessage, GoogleContent, GooglePart, MessageNum,
+    OpenAiChatMessage, ProviderName,
+};
 
 use crate::conversation::ConversationTurn;
 
@@ -104,7 +107,66 @@ pub enum SessionError {
     AppendFailed(String),
 }
 
+/// Convert a session turn to a conversation turn using the given provider to
+/// produce the correct wire format for `Role::Assistant`.
+///
+/// Use this in preference to the `From` impl when the provider is known (e.g.
+/// inside `seed_session_recent`). The `From` impl falls back to the OpenAI wire
+/// format for `Role::Assistant` and is only safe for OpenAI-backed agents.
+pub(crate) fn session_turn_to_conversation_turn(
+    turn: SessionTurn,
+    provider: ProviderName,
+) -> ConversationTurn {
+    match turn.role {
+        Role::System => ConversationTurn::System {
+            content: turn.content,
+        },
+        Role::User => ConversationTurn::User {
+            content: turn.content,
+        },
+        Role::Assistant => {
+            let message = match provider {
+                ProviderName::Anthropic => MessageNum::Anthropic(AnthropicMessage {
+                    role: "assistant".to_owned(),
+                    content: vec![AnthropicContentBlock::Text {
+                        text: turn.content,
+                        cache_control: None,
+                        citations: None,
+                    }],
+                }),
+                ProviderName::Google | ProviderName::Vertex => {
+                    MessageNum::Gemini(GoogleContent {
+                        role: "model".to_owned(),
+                        parts: vec![GooglePart::Text { text: turn.content }],
+                    })
+                }
+                ProviderName::OpenAi | ProviderName::Custom(_) => {
+                    MessageNum::OpenAi(OpenAiChatMessage {
+                        role: "assistant".to_owned(),
+                        content: Some(OpenAiMessageContent::Text(turn.content)),
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        refusal: None,
+                    })
+                }
+            };
+            ConversationTurn::Assistant { message }
+        }
+        Role::Tool => ConversationTurn::ToolResult {
+            call_id: turn.call_id.unwrap_or_default(),
+            ok: true,
+            content: serde_json::Value::String(turn.content),
+        },
+    }
+}
+
 impl From<SessionTurn> for ConversationTurn {
+    /// Converts a session turn to a conversation turn.
+    ///
+    /// For `Role::Assistant` this always produces `MessageNum::OpenAi`. Use
+    /// [`session_turn_to_conversation_turn`] when the provider is known to get
+    /// the correct wire format for Anthropic or Gemini agents.
     fn from(turn: SessionTurn) -> Self {
         match turn.role {
             Role::System => Self::System {

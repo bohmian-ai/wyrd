@@ -105,6 +105,10 @@ pub fn pyobject_to_json(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         }
         return Ok(Value::Object(map));
     }
+    // Pydantic models and other dataclass-like objects with a `model_dump` method.
+    if let Ok(dumped) = obj.call_method0("model_dump") {
+        return pyobject_to_json(&dumped);
+    }
     Ok(Value::String(obj.str()?.extract::<String>()?))
 }
 

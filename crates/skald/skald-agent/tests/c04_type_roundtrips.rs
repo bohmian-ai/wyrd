@@ -329,3 +329,22 @@ fn error_codes_map_to_wyrd_error() {
     };
     assert_eq!(journal.code(), "SKALD_AGENT_500_JOURNAL");
 }
+
+#[test]
+fn session_turn_tool_role_none_call_id_produces_empty_string() {
+    let turn = ConversationTurn::from(SessionTurn {
+        role: Role::Tool,
+        content: "result".to_owned(),
+        call_id: None,
+    });
+    match turn {
+        ConversationTurn::ToolResult { call_id, .. } => {
+            assert!(
+                call_id.is_empty(),
+                "None call_id maps to empty string; providers that validate tool call ids will \
+                 receive a malformed message — callers must ensure call_id is always Some"
+            );
+        }
+        other => panic!("expected ToolResult, got {other:?}"),
+    }
+}

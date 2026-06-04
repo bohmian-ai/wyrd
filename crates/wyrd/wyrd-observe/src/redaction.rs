@@ -53,6 +53,18 @@ impl RedactionPolicy {
         RawValue::from_string(value.to_string()).unwrap_or_else(|_| placeholder_raw())
     }
 
+    /// Apply recursive field-name redaction to a `serde_json::Value` payload.
+    #[must_use]
+    pub fn redact_value(&self, mut args: Value) -> Value {
+        let blocked_lower: Vec<String> = self
+            .blocked_arg_fields
+            .iter()
+            .map(|field| field.to_lowercase())
+            .collect();
+        redact_in_place(&mut args, &blocked_lower);
+        args
+    }
+
     /// Redact or truncate provider response text before observation.
     #[must_use]
     pub fn redact_response_text(&self, text: &str) -> String {

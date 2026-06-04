@@ -81,6 +81,11 @@ pub fn default_prompt_resolver() -> &'static LocalPromptResolver {
 ///
 /// # Errors
 /// Returns validation errors when the reference is not a Prompt Card reference.
+/// Register a prompt under a `CardRef` for resolution by `Agent::try_from_ref`.
+///
+/// This registry is process-global and is not tenant-isolated. It is intended
+/// for single-process, single-tenant use only. In multi-tenant or multi-user
+/// processes, callers are responsible for ensuring no cross-tenant interference.
 pub fn register_prompt_card(card_ref: &CardRef, prompt: Prompt) -> Result<(), WyrdError> {
     if card_ref.kind != CardKind::Prompt {
         return Err(
@@ -96,7 +101,9 @@ pub fn register_prompt_card(card_ref: &CardRef, prompt: Prompt) -> Result<(), Wy
     Ok(())
 }
 
-/// Remove all process-local Agent prompt resolver entries.
+/// Remove all entries from the process-global Agent prompt resolver registry.
+///
+/// See [`register_prompt_card`] for isolation constraints.
 pub fn clear_prompt_card_registry() {
     if let Ok(mut registry) = prompt_registry().write() {
         registry.clear();
@@ -283,7 +290,7 @@ impl Agent {
         self
     }
 
-    /// Return a copy with one runtime-local tool appended.
+    /// Alias for [`with_tool`](Self::with_tool).
     #[must_use]
     pub fn add_tool(self, tool: Arc<dyn AgentTool>) -> Self {
         self.with_tool(tool)
@@ -304,7 +311,7 @@ impl Agent {
         self
     }
 
-    /// Return a copy with the full runtime-local tool cache replaced.
+    /// Alias for [`with_tools`](Self::with_tools).
     #[must_use]
     pub fn set_tools(self, tools: Vec<Arc<dyn AgentTool>>) -> Self {
         self.with_tools(tools)

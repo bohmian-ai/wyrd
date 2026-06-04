@@ -24,7 +24,7 @@ use crate::observer::Observer;
 use crate::observer_provider::current_observer;
 use crate::request_builder::{assistant_message, extract_messages, request_from_conversation};
 use crate::run::{AgentRun, FinishReason};
-use crate::session::{Role, SessionId, SessionTurn};
+use crate::session::{Role, SessionId, SessionTurn, session_turn_to_conversation_turn};
 
 #[derive(Debug, Clone)]
 struct ToolCall {
@@ -40,7 +40,7 @@ pub(crate) async fn run(
     session_id: Option<SessionId>,
     input: &str,
 ) -> AgentResult<AgentRun> {
-    let observer = capture_observer();
+    let observer = current_observer();
     let started_at = Instant::now();
     let span = debug_span!(
         "skald_agent.run",
@@ -50,11 +50,18 @@ pub(crate) async fn run(
         entry = "input",
     );
     async move {
+        const MAX_JOURNAL_INPUT_CHARS: usize = 4096;
+
         let body = async {
+            let journal_input = if input.len() > MAX_JOURNAL_INPUT_CHARS {
+                format!("{}… [truncated]", &input[..MAX_JOURNAL_INPUT_CHARS])
+            } else {
+                input.to_owned()
+            };
             this.journal
                 .append(JournalEvent::AgentStart {
                     agent_id: this.id.clone(),
-                    input: input.to_owned(),
+                    input: journal_input,
                     session_id: session_id.as_ref().map(|id| id.as_str().to_owned()),
                 })
                 .await
@@ -130,7 +137,9 @@ pub(crate) async fn run(
             None => body.await,
         };
 
-        append_terminal_journal_event(this, &result).await?;
+        if let Err(e) = append_terminal_journal_event(this, &result).await {
+            tracing::warn!("failed to append terminal journal event: {e}");
+        }
         append_terminal_observer_event(&*observer, this, &result, started_at.elapsed()).await;
         result
     }
@@ -145,7 +154,7 @@ pub(crate) async fn run_prompt(
     prompt: &Prompt,
     vars: &[(&str, &str)],
 ) -> AgentResult<AgentRun> {
-    let observer = capture_observer();
+    let observer = current_observer();
     let started_at = Instant::now();
     let span = debug_span!(
         "skald_agent.run_prompt",
@@ -202,16 +211,14 @@ pub(crate) async fn run_prompt(
             None => result.await,
         };
 
-        append_terminal_journal_event(this, &result).await?;
+        if let Err(e) = append_terminal_journal_event(this, &result).await {
+            tracing::warn!("failed to append terminal journal event: {e}");
+        }
         append_terminal_observer_event(&*observer, this, &result, started_at.elapsed()).await;
         result
     }
     .instrument(span)
     .await
-}
-
-fn capture_observer() -> Arc<dyn Observer> {
-    current_observer()
 }
 
 async fn run_loop(
@@ -385,7 +392,7 @@ async fn run_loop(
                             iteration,
                             call_id: call.id.clone(),
                             tool_name: call.name.clone(),
-                            args: call.args.clone(),
+                            args: redact_tool_args(call.args.clone()),
                         })
                         .await
                         .map_err(|source| AgentError::JournalAppendFailed { source })?;
@@ -514,8 +521,9 @@ impl Agent {
             session_id: session_id.as_str().to_owned(),
             source,
         })?;
+        let provider = self.prompt.native().request.provider();
         for turn in recent {
-            conversation.push(ConversationTurn::from(turn));
+            conversation.push(session_turn_to_conversation_turn(turn, provider.clone()));
         }
         Ok(())
     }
@@ -755,5 +763,33 @@ fn response_finish_reason(response: &ProviderResponse) -> String {
             .map(|reason| format!("{reason:?}").to_lowercase())
             .unwrap_or_else(|| "other".to_owned()),
         _ => format!("{:?}", response.adapter().finish_reason()).to_lowercase(),
+    }
+}
+
+const REDACTED: &str = "<REDACTED>";
+const SENSITIVE_FIELDS: &[&str] = &["password", "api_key", "secret", "token", "authorization"];
+
+fn redact_tool_args(mut value: serde_json::Value) -> serde_json::Value {
+    redact_in_place(&mut value);
+    value
+}
+
+fn redact_in_place(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                if SENSITIVE_FIELDS.contains(&key.to_lowercase().as_str()) {
+                    *val = serde_json::Value::String(REDACTED.to_owned());
+                } else {
+                    redact_in_place(val);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_in_place(item);
+            }
+        }
+        _ => {}
     }
 }

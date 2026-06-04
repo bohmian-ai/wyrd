@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyModule, PyString};
@@ -474,7 +473,7 @@ pub fn agent_run_to_py(py: Python<'_>, run: AgentRun) -> PyResult<Py<PyAny>> {
     )?;
     kwargs.set_item(
         "conversation",
-        wyrd_utils_like_json_to_py(
+        wyrd_utils::py::json_to_pyobject(
             py,
             &serde_json::to_value(&run.conversation)
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
@@ -497,6 +496,7 @@ pub fn wrap_before_agent(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<BeforeAgent
             },
             extract_string_replacement,
         )
+        .unwrap_or_else(|e| panic!("{e}"))
     }))
 }
 
@@ -511,12 +511,13 @@ pub fn wrap_after_agent(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterAgentFn
             |py| {
                 let args = (
                     ctx_to_py(py, ctx)?,
-                    wyrd_utils_like_json_to_py(py, &serde_json::to_value(run).unwrap_or_default())?,
+                    wyrd_utils::py::json_to_pyobject(py, &serde_json::to_value(run).unwrap_or_default())?,
                 );
                 cb.bind(py).call1(args)
             },
             extract_agent_run_replacement,
         )
+        .unwrap_or_else(|e| panic!("{e}"))
     }))
 }
 
@@ -531,7 +532,7 @@ pub fn wrap_before_model(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<BeforeModel
             |py| {
                 let args = (
                     ctx_to_py(py, ctx)?,
-                    wyrd_utils_like_json_to_py(
+                    wyrd_utils::py::json_to_pyobject(
                         py,
                         &serde_json::to_value(request).unwrap_or_default(),
                     )?,
@@ -540,6 +541,7 @@ pub fn wrap_before_model(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<BeforeModel
             },
             extract_provider_request_replacement,
         )
+        .unwrap_or_else(|e| panic!("{e}"))
     }))
 }
 
@@ -554,7 +556,7 @@ pub fn wrap_after_model(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterModelFn
             |py| {
                 let args = (
                     ctx_to_py(py, ctx)?,
-                    wyrd_utils_like_json_to_py(
+                    wyrd_utils::py::json_to_pyobject(
                         py,
                         &serde_json::to_value(response).unwrap_or_default(),
                     )?,
@@ -563,6 +565,7 @@ pub fn wrap_after_model(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterModelFn
             },
             extract_provider_response_replacement,
         )
+        .unwrap_or_else(|e| panic!("{e}"))
     }))
 }
 
@@ -578,12 +581,13 @@ pub fn wrap_before_tool(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<BeforeToolFn
                 let py_args = (
                     ctx_to_py(py, ctx)?,
                     tool.name(),
-                    wyrd_utils_like_json_to_py(py, args)?,
+                    wyrd_utils::py::json_to_pyobject(py, args)?,
                 );
                 cb.bind(py).call1(py_args)
             },
             extract_json_replacement,
         )
+        .unwrap_or_else(|e| panic!("{e}"))
     }))
 }
 
@@ -605,12 +609,13 @@ pub fn wrap_after_tool(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterToolFn> 
                 let py_args = (
                     ctx_to_py(py, ctx)?,
                     tool.name(),
-                    wyrd_utils_like_json_to_py(py, &value)?,
+                    wyrd_utils::py::json_to_pyobject(py, &value)?,
                 );
                 cb.bind(py).call1(py_args)
             },
             extract_tool_result_replacement,
         )
+        .unwrap_or_else(|e| panic!("{e}"))
     }))
 }
 
@@ -786,7 +791,7 @@ fn invoke_callback<T>(
     cb: &Py<PyAny>,
     call: impl for<'py> FnOnce(Python<'py>) -> PyResult<Bound<'py, PyAny>>,
     replacement: fn(&Bound<'_, PyAny>) -> PyResult<T>,
-) -> CallbackOutcome<T> {
+) -> PyResult<CallbackOutcome<T>> {
     Python::attach(|py| {
         if let Err(error) = cb
             .bind(py)
@@ -794,10 +799,10 @@ fn invoke_callback<T>(
             .then_some(())
             .ok_or_else(|| PyTypeError::new_err("agent callback must be callable"))
         {
-            panic!("{error}");
+            return Err(error);
         }
-        let result = call(py).unwrap_or_else(|error| panic!("{error}"));
-        callback_outcome(&result, replacement).unwrap_or_else(|error| panic!("{error}"))
+        let result = call(py)?;
+        callback_outcome(&result, replacement)
     })
 }
 
@@ -837,7 +842,7 @@ fn ctx_to_py(py: Python<'_>, ctx: &AgentContext) -> PyResult<Py<PyAny>> {
     dict.set_item("iteration", ctx.iteration)?;
     dict.set_item(
         "conversation",
-        wyrd_utils_like_json_to_py(
+        wyrd_utils::py::json_to_pyobject(
             py,
             &serde_json::to_value(ctx.conversation.as_ref())
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
@@ -904,7 +909,7 @@ fn session_turn_from_py(value: &Bound<'_, PyAny>) -> PyResult<SessionTurn> {
     if let Ok(turn) = value.extract::<PyRef<'_, SessionTurn>>() {
         return Ok(turn.clone());
     }
-    let json = wyrd_utils_like_py_to_json(value)?;
+    let json = wyrd_utils::py::pyobject_to_json(value)?;
     serde_json::from_value(json).map_err(|error| PyTypeError::new_err(error.to_string()))
 }
 
@@ -916,7 +921,7 @@ fn session_turns_from_py(value: &Bound<'_, PyAny>) -> PyResult<Vec<SessionTurn>>
         }
         return Ok(turns);
     }
-    let json = wyrd_utils_like_py_to_json(value)?;
+    let json = wyrd_utils::py::pyobject_to_json(value)?;
     serde_json::from_value(json).map_err(|error| PyTypeError::new_err(error.to_string()))
 }
 
@@ -928,27 +933,27 @@ fn extract_provider_request_replacement(value: &Bound<'_, PyAny>) -> PyResult<Pr
     if let Ok(request) = value.extract::<PyRef<'_, PyProviderRequest>>() {
         return Ok(request.native().clone());
     }
-    serde_json::from_value(wyrd_utils_like_py_to_json(value)?)
+    serde_json::from_value(wyrd_utils::py::pyobject_to_json(value)?)
         .map_err(|error| PyTypeError::new_err(error.to_string()))
 }
 
 fn extract_provider_response_replacement(value: &Bound<'_, PyAny>) -> PyResult<ProviderResponse> {
-    serde_json::from_value(wyrd_utils_like_py_to_json(value)?)
+    serde_json::from_value(wyrd_utils::py::pyobject_to_json(value)?)
         .map_err(|error| PyTypeError::new_err(error.to_string()))
 }
 
 fn extract_json_replacement(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
-    wyrd_utils_like_py_to_json(value)
+    wyrd_utils::py::pyobject_to_json(value)
 }
 
 fn extract_tool_result_replacement(
     value: &Bound<'_, PyAny>,
 ) -> PyResult<Result<serde_json::Value, skald_tool::ToolError>> {
-    Ok(Ok(wyrd_utils_like_py_to_json(value)?))
+    Ok(Ok(wyrd_utils::py::pyobject_to_json(value)?))
 }
 
 fn extract_agent_run_replacement(value: &Bound<'_, PyAny>) -> PyResult<AgentRun> {
-    serde_json::from_value(wyrd_utils_like_py_to_json(value)?)
+    serde_json::from_value(wyrd_utils::py::pyobject_to_json(value)?)
         .map_err(|error| PyTypeError::new_err(error.to_string()))
 }
 
@@ -963,79 +968,3 @@ fn finish_reason_str(reason: crate::FinishReason) -> &'static str {
     }
 }
 
-fn wyrd_utils_like_json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
-    match value {
-        serde_json::Value::Null => Ok(py.None()),
-        serde_json::Value::Bool(value) => value.into_py_any(py),
-        serde_json::Value::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                value.into_py_any(py)
-            } else if let Some(value) = value.as_u64() {
-                value.into_py_any(py)
-            } else if let Some(value) = value.as_f64() {
-                value.into_py_any(py)
-            } else {
-                Err(PyRuntimeError::new_err("invalid JSON number"))
-            }
-        }
-        serde_json::Value::String(value) => value.into_py_any(py),
-        serde_json::Value::Array(values) => {
-            let list = pyo3::types::PyList::empty(py);
-            for value in values {
-                list.append(wyrd_utils_like_json_to_py(py, value)?)?;
-            }
-            Ok(list.into_any().unbind())
-        }
-        serde_json::Value::Object(values) => {
-            let dict = PyDict::new(py);
-            for (key, value) in values {
-                dict.set_item(key, wyrd_utils_like_json_to_py(py, value)?)?;
-            }
-            Ok(dict.into_any().unbind())
-        }
-    }
-}
-
-fn wyrd_utils_like_py_to_json(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
-    if obj.is_none() {
-        return Ok(serde_json::Value::Null);
-    }
-    if let Ok(value) = obj.extract::<bool>() {
-        return Ok(serde_json::Value::Bool(value));
-    }
-    if let Ok(value) = obj.extract::<i64>() {
-        return Ok(serde_json::Value::Number(value.into()));
-    }
-    if let Ok(value) = obj.extract::<u64>() {
-        return Ok(serde_json::Value::Number(value.into()));
-    }
-    if let Ok(value) = obj.extract::<f64>() {
-        return serde_json::Number::from_f64(value)
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| PyTypeError::new_err("cannot convert non-finite float to JSON"));
-    }
-    if let Ok(value) = obj.extract::<String>() {
-        return Ok(serde_json::Value::String(value));
-    }
-    if let Ok(json) = obj.call_method0("model_dump") {
-        return wyrd_utils_like_py_to_json(&json);
-    }
-    if let Ok(list) = obj.cast::<PyList>() {
-        let mut out = Vec::with_capacity(list.len());
-        for value in list.iter() {
-            out.push(wyrd_utils_like_py_to_json(&value)?);
-        }
-        return Ok(serde_json::Value::Array(out));
-    }
-    if let Ok(dict) = obj.cast::<PyDict>() {
-        let mut map = serde_json::Map::new();
-        for (key, value) in dict {
-            map.insert(
-                key.extract::<String>()?,
-                wyrd_utils_like_py_to_json(&value)?,
-            );
-        }
-        return Ok(serde_json::Value::Object(map));
-    }
-    Ok(serde_json::Value::Null)
-}

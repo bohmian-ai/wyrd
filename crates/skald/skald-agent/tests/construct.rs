@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard, OnceLock};
 
 use skald_agent::{
     Agent, RunConfig, clear_prompt_card_registry, default_prompt_resolver, register_prompt_card,
@@ -17,6 +17,13 @@ use skald_tool::{ToolDef, ToolRegistry};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::reference::{CardRef, PromptRef};
 use wyrd_spec::{AgentCard, AgentRunConfigSpec};
+
+fn registry_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 fn temp_path(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -115,6 +122,7 @@ fn agent_try_from_ref_inline_succeeds_against_noop_resolver() {
 
 #[test]
 fn agent_try_from_ref_card_succeeds_with_test_resolver() {
+    let _guard = registry_lock();
     clear_prompt_card_registry();
     let card_ref = prompt_card_ref("planner-prompt");
     register_prompt_card(&card_ref, Prompt::from_native(prompt())).expect("prompt registers");
@@ -127,6 +135,7 @@ fn agent_try_from_ref_card_succeeds_with_test_resolver() {
 
 #[test]
 fn agent_try_from_ref_missing_card_errors() {
+    let _guard = registry_lock();
     clear_prompt_card_registry();
     let card_ref = prompt_card_ref("no-such");
 
@@ -138,6 +147,7 @@ fn agent_try_from_ref_missing_card_errors() {
 
 #[test]
 fn agent_with_chain_matches_locked_fixture() {
+    let _guard = registry_lock();
     clear_prompt_card_registry();
     let card_ref = prompt_card_ref("planner-prompt");
     register_prompt_card(&card_ref, Prompt::from_native(prompt())).expect("prompt registers");
@@ -242,6 +252,7 @@ fn local_save_load_allows_tools_but_registrable_rejects_them() {
 
 #[test]
 fn card_prompt_resolution_derives_cascade_and_missing_prompt_code() {
+    let _guard = registry_lock();
     clear_prompt_card_registry();
     let card_ref = prompt_card_ref("planner-prompt");
     let err = Agent::try_from_ref(PromptRef::from(card_ref.clone()), default_prompt_resolver())
@@ -286,6 +297,7 @@ fn unknown_runtime_local_tool_uses_wyrd_code() {
 
 #[test]
 fn fixture_loads_with_single_version_field() {
+    let _guard = registry_lock();
     clear_prompt_card_registry();
     let fixture = include_str!("fixtures/agent_planner_v0.3.yaml");
     assert!(fixture.contains("apiVersion: wyrd/v1"));
@@ -326,6 +338,34 @@ fn run_config_spec_converts_to_engine_config() {
     assert_eq!(config.tool_concurrency_cap, Some(1));
     assert_eq!(config.session_recent_limit, Some(2));
     assert_eq!(config.timeout, Some(std::time::Duration::from_millis(50)));
+}
+
+#[test]
+fn clear_prompt_card_registry_removes_previously_registered_entry() {
+    let _guard = registry_lock();
+    let card_ref = prompt_card_ref("ephemeral-prompt");
+    register_prompt_card(&card_ref, Prompt::from_native(prompt())).expect("registers ok");
+
+    // Confirm it resolves before the clear.
+    Agent::try_from_ref(PromptRef::from(card_ref.clone()), default_prompt_resolver())
+        .expect("registered prompt resolves");
+
+    clear_prompt_card_registry();
+
+    let err = Agent::try_from_ref(PromptRef::from(card_ref), default_prompt_resolver())
+        .expect_err("cleared entry must not resolve");
+    assert_eq!(err.code(), "WYRD_AGENT_404_PROMPT_CARD");
+}
+
+#[test]
+fn register_prompt_card_rejects_non_prompt_kind_card_ref() {
+    let _guard = registry_lock();
+    let mut card_ref = prompt_card_ref("some-agent");
+    card_ref.kind = CardKind::Agent;
+
+    let err = register_prompt_card(&card_ref, Prompt::from_native(prompt()))
+        .expect_err("non-Prompt kind must fail");
+    assert!(err.to_string().contains("Prompt Card refs"));
 }
 
 #[tokio::test]

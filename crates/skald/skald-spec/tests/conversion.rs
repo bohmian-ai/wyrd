@@ -6,7 +6,9 @@ use skald_spec::wire::anthropic_messages::{
 };
 use skald_spec::wire::google_generate::GooglePart;
 use skald_spec::wire::openai_chat::{OpenAiMessageContent, OpenAiToolCall};
-use skald_spec::{MessageConversion, MessageNum, ProviderName, SkaldError, convert_message_dyn};
+use skald_spec::{
+    MessageNum, ProviderMessageConversion, ProviderName, SkaldError, convert_message_dyn,
+};
 
 #[test]
 fn openai_to_anthropic_message_converts_text_and_tool_call() {

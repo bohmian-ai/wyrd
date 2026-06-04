@@ -1,35 +1,64 @@
-//! Pluggable observability hook for the agent loop.
-//!
-//! Skald defines this trait; consumers implement it. Skald itself never
-//! depends on higher-level observability clients.
+//! Agent run observer trait and no-op default.
 
-use serde_json::value::RawValue;
-use skald_spec::FinishReason;
+use std::time::Duration;
 
-/// Receives lifecycle events from the bounded tool loop.
+use async_trait::async_trait;
+
+/// Best-effort observer for live agent run events.
 ///
-/// Exactly one of `on_agent_finish` / `on_agent_error` fires per
-/// `Agent::run` / `Agent::run_prompt` invocation, after `on_agent_start`.
-/// Consumers can rely on this to close their run record exactly once.
+/// Observer events mirror [`crate::JournalEvent`] data, but observer methods
+/// return `()` so observability failures do not alter agent execution.
+#[async_trait]
 pub trait Observer: Send + Sync {
-    /// Called once per `Agent::run` / `Agent::run_prompt`, before the
-    /// first iteration.
-    fn on_agent_start(&self, _agent_id: &str, _iteration_cap: u32) {}
-    /// Called at the top of each iteration (1-based).
-    fn on_iteration(&self, _agent_id: &str, _iteration: u32) {}
-    /// Called immediately before dispatching one tool call.
-    fn on_tool_call(&self, _agent_id: &str, _tool: &str, _args: &RawValue) {}
-    /// Called immediately after a tool call returns or fails.
-    fn on_tool_result(&self, _agent_id: &str, _tool: &str, _ok: bool) {}
-    /// Called once when the loop terminates normally (no more tool calls).
-    fn on_agent_finish(&self, _agent_id: &str, _finish: FinishReason, _iterations: u32) {}
-    /// Called once when the loop terminates via an error before returning the
-    /// error to the caller. `code` is the stable `SKALD_AGENT_*` identifier.
-    fn on_agent_error(&self, _agent_id: &str, _code: &'static str, _detail: &str) {}
+    /// Agent run started.
+    async fn on_agent_start(&self, _agent_id: &str, _input: &str, _session_id: Option<&str>) {}
+
+    /// Loop iteration started.
+    async fn on_iteration(&self, _agent_id: &str, _index: u32) {}
+
+    /// Provider model call started.
+    async fn on_model_call(&self, _agent_id: &str, _iteration: u32, _provider: &str, _model: &str) {
+    }
+
+    /// Provider model call completed.
+    async fn on_model_result(
+        &self,
+        _agent_id: &str,
+        _iteration: u32,
+        _finish_reason: &str,
+        _synthetic: bool,
+    ) {
+    }
+
+    /// Tool invocation started.
+    async fn on_tool_call(
+        &self,
+        _agent_id: &str,
+        _iteration: u32,
+        _call_id: &str,
+        _tool_name: &str,
+    ) {
+    }
+
+    /// Tool invocation completed.
+    async fn on_tool_result(&self, _agent_id: &str, _iteration: u32, _call_id: &str, _ok: bool) {}
+
+    /// Agent run finished.
+    async fn on_agent_finish(
+        &self,
+        _agent_id: &str,
+        _finish_reason: &str,
+        _iterations: u32,
+        _duration: Duration,
+    ) {
+    }
+
+    /// Agent run failed.
+    async fn on_agent_error(&self, _agent_id: &str, _code: &str, _message: &str) {}
 }
 
-/// Default no-op observer; selected when no consumer wires one in.
-#[derive(Debug, Default, Clone, Copy)]
+/// Observer implementation that drops every event.
 pub struct NoopObserver;
 
+#[async_trait]
 impl Observer for NoopObserver {}

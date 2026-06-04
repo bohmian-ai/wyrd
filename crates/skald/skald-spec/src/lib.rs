@@ -17,12 +17,12 @@ pub mod wire;
 
 pub use adapter::{ResponseAdapter, ToolCallView, UsageView};
 pub use authoring::{DraftMessages, PromptDraft};
-pub use convert::{MessageConversion, convert_message_dyn};
+pub use convert::{ProviderMessageConversion, convert_message_dyn};
 pub use error::{SkaldError, SkaldResult};
 pub use media::{MediaKind, MediaRef, MediaSource};
 pub use message::MessageNum;
 pub use prompt::{Prompt, ProviderSettingsRef, ResponseType};
-pub use request::{ProviderName, ProviderRequest};
+pub use request::{ProviderName, ProviderRequest, ToolDescriptor};
 pub use response::ProviderResponse;
 pub use wire::anthropic_citation::AnthropicCitationV1;
 pub use wire::anthropic_messages::{

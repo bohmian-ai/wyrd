@@ -1,13 +1,18 @@
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
 use serde_json::value::RawValue;
+use serde_json::{Map, Value};
 
 use crate::wire::anthropic_messages::AnthropicMessagesRequest;
+use crate::wire::anthropic_messages::AnthropicTool;
 use crate::wire::google_embeddings::GoogleBatchEmbedRequest;
-use crate::wire::google_generate::GoogleGenerateContentRequest;
+use crate::wire::google_generate::{
+    GoogleFunctionDeclaration, GoogleGenerateContentRequest, GoogleTool,
+};
 use crate::wire::openai_chat::OpenAiChatRequest;
+use crate::wire::openai_chat::{OpenAiFunction, OpenAiTool};
 use crate::wire::openai_embeddings::OpenAiEmbeddingsRequest;
 use crate::wire::openai_responses::OpenAiResponsesRequest;
+use crate::wire::openai_responses::OpenAiResponsesTool;
 use crate::wire::vertex_generate::VertexGenerateContentRequest;
 use crate::wire::vertex_predict::VertexPredictRequest;
 
@@ -19,6 +24,13 @@ use crate::wire::vertex_predict::VertexPredictRequest;
 pub enum ProviderRequest {
     /// OpenAI Chat Completions request.
     OpenAiChatCompletion(OpenAiChatRequest),
+    /// Custom provider that accepts OpenAI Chat Completions request semantics.
+    OpenAiChatCompatible {
+        /// Provider dispatch target.
+        provider: ProviderName,
+        /// OpenAI Chat-shaped request body.
+        request: OpenAiChatRequest,
+    },
     /// OpenAI Responses API request.
     OpenAiResponses(OpenAiResponsesRequest),
     /// OpenAI Embeddings request.
@@ -54,6 +66,12 @@ impl<'de> Deserialize<'de> for ProviderRequest {
             return Ok(Self::RawV1 {
                 provider: raw.provider,
                 body: raw.body,
+            });
+        }
+        if let Ok(request) = serde_json::from_value::<OpenAiChatCompatibleRequest>(value.clone()) {
+            return Ok(Self::OpenAiChatCompatible {
+                provider: request.provider,
+                request: request.request,
             });
         }
 
@@ -105,10 +123,26 @@ struct RawProviderRequest {
     body: Box<RawValue>,
 }
 
+#[derive(Deserialize)]
+struct OpenAiChatCompatibleRequest {
+    provider: ProviderName,
+    request: OpenAiChatRequest,
+}
+
 impl PartialEq for ProviderRequest {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::OpenAiChatCompletion(left), Self::OpenAiChatCompletion(right)) => left == right,
+            (
+                Self::OpenAiChatCompatible {
+                    provider: left_provider,
+                    request: left_request,
+                },
+                Self::OpenAiChatCompatible {
+                    provider: right_provider,
+                    request: right_request,
+                },
+            ) => left_provider == right_provider && left_request == right_request,
             (Self::OpenAiResponses(left), Self::OpenAiResponses(right)) => left == right,
             (Self::OpenAiEmbeddings(left), Self::OpenAiEmbeddings(right)) => left == right,
             (Self::AnthropicMessage(left), Self::AnthropicMessage(right)) => left == right,
@@ -150,6 +184,18 @@ pub enum ProviderName {
     Custom(String),
 }
 
+/// Provider-tool descriptor projected into native request tool fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct ToolDescriptor {
+    /// Provider-visible function name.
+    pub name: String,
+    /// Provider-visible function description.
+    pub description: String,
+    /// JSON Schema for function arguments.
+    pub parameters: Value,
+}
+
 impl ProviderRequest {
     /// Returns the durable provider dispatch target for every request variant.
     pub fn provider(&self) -> ProviderName {
@@ -157,10 +203,101 @@ impl ProviderRequest {
             Self::OpenAiChatCompletion(_)
             | Self::OpenAiResponses(_)
             | Self::OpenAiEmbeddings(_) => ProviderName::OpenAi,
+            Self::OpenAiChatCompatible { provider, .. } => provider.clone(),
             Self::AnthropicMessage(_) => ProviderName::Anthropic,
             Self::GeminiGenerateContent(_) | Self::GoogleBatchEmbed(_) => ProviderName::Google,
             Self::Vertex(_) | Self::VertexPredict(_) => ProviderName::Vertex,
             Self::RawV1 { provider, .. } => provider.clone(),
         }
+    }
+
+    /// Return a copy of the native request with provider-specific tool fields populated.
+    pub fn with_tools(mut self, tools: Vec<ToolDescriptor>) -> Self {
+        if tools.is_empty() {
+            return self;
+        }
+
+        match &mut self {
+            Self::OpenAiChatCompletion(request) => {
+                request.tools = Some(tools.iter().map(openai_chat_tool).collect());
+            }
+            Self::OpenAiChatCompatible { request, .. } => {
+                request.tools = Some(tools.iter().map(openai_chat_tool).collect());
+            }
+            Self::OpenAiResponses(request) => {
+                request.tools = Some(tools.iter().map(openai_responses_tool).collect());
+            }
+            Self::AnthropicMessage(request) => {
+                request.tools = Some(tools.iter().map(anthropic_tool).collect());
+            }
+            Self::GeminiGenerateContent(request) => {
+                request.tools = Some(vec![google_tool(&tools)]);
+            }
+            Self::Vertex(request) => {
+                request.0.tools = Some(vec![google_tool(&tools)]);
+            }
+            Self::OpenAiEmbeddings(_)
+            | Self::GoogleBatchEmbed(_)
+            | Self::VertexPredict(_)
+            | Self::RawV1 { .. } => {}
+        }
+
+        self
+    }
+}
+
+fn schema_object(value: &Value) -> Option<Map<String, Value>> {
+    value.as_object().cloned()
+}
+
+fn openai_chat_tool(tool: &ToolDescriptor) -> OpenAiTool {
+    OpenAiTool::Function {
+        function: OpenAiFunction {
+            name: tool.name.clone(),
+            description: Some(tool.description.clone()),
+            parameters: schema_object(&tool.parameters),
+            strict: None,
+        },
+    }
+}
+
+fn openai_responses_tool(tool: &ToolDescriptor) -> OpenAiResponsesTool {
+    OpenAiResponsesTool::Function {
+        name: tool.name.clone(),
+        description: Some(tool.description.clone()),
+        parameters: schema_object(&tool.parameters),
+        strict: None,
+    }
+}
+
+fn anthropic_tool(tool: &ToolDescriptor) -> AnthropicTool {
+    AnthropicTool {
+        name: tool.name.clone(),
+        description: Some(tool.description.clone()),
+        input_schema: tool.parameters.clone(),
+        cache_control: None,
+        kind: None,
+        display_width_px: None,
+        display_height_px: None,
+        display_number: None,
+    }
+}
+
+fn google_tool(tools: &[ToolDescriptor]) -> GoogleTool {
+    GoogleTool {
+        function_declarations: Some(
+            tools
+                .iter()
+                .map(|tool| GoogleFunctionDeclaration {
+                    name: tool.name.clone(),
+                    description: Some(tool.description.clone()),
+                    parameters: tool.parameters.clone(),
+                })
+                .collect(),
+        ),
+        google_search: None,
+        google_search_retrieval: None,
+        code_execution: None,
+        url_context: None,
     }
 }

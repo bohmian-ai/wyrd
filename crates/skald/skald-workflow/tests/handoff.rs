@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use skald_agent::{AgentDef, NoopObserver, RunConfig, ToolRegistry};
+use skald_agent::RunConfig;
 use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::wire::anthropic_messages::{
     AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest, AnthropicMessagesResponse,
@@ -13,6 +13,7 @@ use skald_spec::wire::openai_chat::{
 use skald_spec::{
     MessageNum, Prompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
 };
+use skald_workflow::WorkflowAgent;
 use skald_workflow::{Context, TaskDef, Workflow, WorkflowDef, extract_messages_for_handoff};
 
 fn openai_prompt() -> Prompt {
@@ -109,13 +110,15 @@ fn anthropic_text(text: &str) -> ProviderResponse {
     })
 }
 
-fn agent(id: &str, provider: ProviderName) -> AgentDef {
-    AgentDef {
+fn agent(id: &str, provider: ProviderName) -> WorkflowAgent {
+    let prompt = match provider {
+        ProviderName::OpenAi => openai_prompt(),
+        ProviderName::Anthropic => anthropic_prompt(),
+        other => panic!("unsupported test provider: {other:?}"),
+    };
+    WorkflowAgent {
         id: id.to_owned(),
-        provider,
-        system_prompt: None,
-        model: None,
-        tool_names: Vec::new(),
+        prompt,
         run_config: RunConfig::default(),
     }
 }
@@ -152,14 +155,9 @@ async fn same_provider_handoff_is_passthrough() {
     };
 
     let workflow = Arc::new(
-        Workflow::from_def(
-            def,
-            &providers,
-            &ToolRegistry::new(),
-            Arc::new(NoopObserver),
-        )
-        .await
-        .expect("workflow builds"),
+        Workflow::build(def, &providers)
+            .await
+            .expect("workflow builds"),
     );
     let run = workflow.run(Context::new()).await.expect("workflow runs");
 
@@ -221,14 +219,9 @@ async fn cross_provider_handoff_uses_message_conversion() {
     };
 
     let workflow = Arc::new(
-        Workflow::from_def(
-            def,
-            &providers,
-            &ToolRegistry::new(),
-            Arc::new(NoopObserver),
-        )
-        .await
-        .expect("workflow builds"),
+        Workflow::build(def, &providers)
+            .await
+            .expect("workflow builds"),
     );
 
     workflow.run(Context::new()).await.expect("workflow runs");

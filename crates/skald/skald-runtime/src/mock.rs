@@ -5,6 +5,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use skald_providers::{ProviderError, ProviderStream};
+use skald_spec::wire::openai_chat::{
+    OpenAiChatChoice, OpenAiChatMessage, OpenAiChatResponse, OpenAiMessageContent, OpenAiUsage,
+};
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 
 use crate::provider::Provider;
@@ -30,6 +33,7 @@ pub struct MockProvider {
     name: ProviderName,
     responses: Arc<Mutex<VecDeque<MockExchange>>>,
     streams: Arc<Mutex<VecDeque<Result<ProviderStream, ProviderError>>>>,
+    echo: bool,
 }
 
 impl MockProvider {
@@ -39,6 +43,15 @@ impl MockProvider {
             name,
             responses: Arc::new(Mutex::new(VecDeque::new())),
             streams: Arc::new(Mutex::new(VecDeque::new())),
+            echo: false,
+        }
+    }
+
+    /// Creates a mock provider that echoes the last user message.
+    pub fn echo() -> Self {
+        Self {
+            echo: true,
+            ..Self::new(ProviderName::Custom("mock".to_owned()))
         }
     }
 
@@ -123,10 +136,17 @@ impl MockExpectation {
 #[async_trait]
 impl Provider for MockProvider {
     async fn send(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
-        let exchange = self
-            .response_queue()
-            .pop_front()
-            .ok_or_else(|| ProviderError::bad_request("mock", "mock response queue is empty"))?;
+        let exchange = self.response_queue().pop_front();
+        let Some(exchange) = exchange else {
+            return if self.echo {
+                Ok(openai_text_response(&last_user_text(&request)))
+            } else {
+                Err(ProviderError::bad_request(
+                    "mock",
+                    "mock response queue is empty",
+                ))
+            };
+        };
 
         if let Some(expected) = &exchange.expected {
             let expected = serde_json::to_value(expected)
@@ -153,4 +173,65 @@ impl Provider for MockProvider {
     fn name(&self) -> ProviderName {
         self.name.clone()
     }
+}
+
+fn last_user_text(request: &ProviderRequest) -> String {
+    let messages = match request {
+        ProviderRequest::OpenAiChatCompletion(request) => &request.messages,
+        ProviderRequest::OpenAiChatCompatible { request, .. } => &request.messages,
+        _ => return String::new(),
+    };
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .and_then(|message| message.content.as_ref())
+        .map(openai_content_text)
+        .unwrap_or_default()
+}
+
+fn openai_content_text(content: &OpenAiMessageContent) -> String {
+    match content {
+        OpenAiMessageContent::Text(text) => text.clone(),
+        OpenAiMessageContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                skald_spec::wire::openai_chat::OpenAiContentPart::Text { text } => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+fn openai_text_response(text: &str) -> ProviderResponse {
+    ProviderResponse::OpenAiChatCompletion(OpenAiChatResponse {
+        id: "mock_response".to_owned(),
+        object: "chat.completion".to_owned(),
+        created: 0,
+        model: "mock-model".to_owned(),
+        choices: vec![OpenAiChatChoice {
+            index: 0,
+            message: OpenAiChatMessage {
+                role: "assistant".to_owned(),
+                content: Some(OpenAiMessageContent::Text(text.to_owned())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                refusal: None,
+            },
+            finish_reason: Some("stop".to_owned()),
+            logprobs: None,
+        }],
+        usage: Some(OpenAiUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        }),
+        system_fingerprint: None,
+        service_tier: None,
+    })
 }

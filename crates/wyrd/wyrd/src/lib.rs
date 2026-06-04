@@ -1,8 +1,8 @@
 //! Public Wyrd Rust umbrella.
 //!
 //! Downstream Rust consumers depend on this crate and import from
-//! `wyrd::agent` or `wyrd::workflow`. The skald-* sub-package crates are
-//! internal layering; external code should not import them directly.
+//! `wyrd::agent`. The skald-* sub-package crates are internal layering;
+//! external code should not import them directly.
 //!
 //! # Stability
 //!
@@ -13,10 +13,25 @@
 #![deny(missing_docs)]
 #![allow(clippy::module_name_repetitions)]
 
+/// Initialize Wyrd subsystems.
+///
+/// This is idempotent. Rust users may call it manually when they want Skald
+/// agent runs to resolve observers through Wyrd observer state.
+pub fn init() {
+    wyrd_observe_impl::init();
+    skald_runtime::refresh_default_registry_from_env();
+}
+
 /// Agent runtime: identity, single-provider binding, bounded tool loop,
 /// observer hook, and `SKALD_AGENT_*` error catalog.
 pub mod agent;
 
-/// Workflow engine: DAG scheduling, single-task path, retries, cross-provider
-/// handoff, and `SKALD_WORKFLOW_*` error catalog.
-pub mod workflow;
+pub use skald_agent::Agent;
+pub use wyrd_spec::AgentCard;
+
+/// Negative public-surface pins.
+///
+/// ```compile_fail
+/// use wyrd::Workflow;
+/// ```
+pub mod __doc_neg_pins {}

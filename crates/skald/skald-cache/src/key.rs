@@ -59,17 +59,12 @@ impl CacheKey {
     /// Derives a cache key from provider-native cache directives when present.
     pub fn from_request(request: &ProviderRequest) -> SkaldCacheResult<Option<Self>> {
         match request {
-            ProviderRequest::OpenAiChatCompletion(request) => Ok(request
-                .settings
-                .prompt_cache_key
-                .as_deref()
-                .map(|prompt_cache_key| Self {
-                    provider: ProviderName::OpenAi,
-                    model: request.model.clone(),
-                    // OpenAI exposes the cache resource id directly. Keep that
-                    // id scoped by provider and model in the local key.
-                    request_prefix_hash: hash_bytes(prompt_cache_key.as_bytes()),
-                })),
+            ProviderRequest::OpenAiChatCompletion(request) => {
+                openai_cache_key(ProviderName::OpenAi, request)
+            }
+            ProviderRequest::OpenAiChatCompatible { provider, request } => {
+                openai_cache_key(provider.clone(), request)
+            }
             ProviderRequest::AnthropicMessage(request) => {
                 if !anthropic_has_cache_control(request) {
                     return Ok(None);
@@ -94,6 +89,23 @@ impl CacheKey {
             _ => Ok(None),
         }
     }
+}
+
+fn openai_cache_key(
+    provider: ProviderName,
+    request: &skald_spec::OpenAiChatRequest,
+) -> SkaldCacheResult<Option<CacheKey>> {
+    Ok(request
+        .settings
+        .prompt_cache_key
+        .as_deref()
+        .map(|prompt_cache_key| CacheKey {
+            provider,
+            model: request.model.clone(),
+            // OpenAI exposes the cache resource id directly. Keep that id
+            // scoped by provider and model in the local key.
+            request_prefix_hash: hash_bytes(prompt_cache_key.as_bytes()),
+        }))
 }
 
 /// Serializes the cache-controlled prefix of an Anthropic request for hashing.

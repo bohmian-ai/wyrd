@@ -1,4 +1,4 @@
-//! Helpers that bridge serde forms in [`crate::AgentDef`] to native values.
+//! Helpers that bridge serde forms in data contracts to native message envelopes.
 
 use skald_spec::wire::anthropic_messages::{AnthropicContentBlock, AnthropicMessage};
 use skald_spec::wire::google_generate::{GoogleContent, GooglePart};
@@ -38,10 +38,26 @@ pub fn system_messages(prompt: &str, provider: &ProviderName) -> AgentResult<Vec
                 }],
             })])
         }
-        ProviderName::Custom(_) => Err(AgentError::SystemPrompt {
-            provider: provider.clone(),
-            detail: "custom providers must author the system content into the Prompt directly"
+        ProviderName::Custom(provider) => Err(AgentError::Prompt {
+            agent: provider.clone(),
+            detail: "custom providers must author the system content into the prompt directly"
                 .to_owned(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use skald_spec::ProviderName;
+
+    use super::system_messages;
+
+    #[test]
+    fn system_messages_custom_provider_errors() {
+        let provider = ProviderName::Custom("llama".to_owned());
+
+        let err = system_messages("be helpful", &provider).expect_err("custom providers must fail");
+
+        assert_eq!(err.code(), "SKALD_AGENT_422_PROMPT");
     }
 }

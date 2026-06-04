@@ -1,4 +1,4 @@
-"""Assemble hand-authored Wyrd stub sources into the native extension stub."""
+"""Assemble hand-authored Wyrd stub sources into public package stubs."""
 
 from __future__ import annotations
 
@@ -6,18 +6,19 @@ import re
 from pathlib import Path
 
 STUB_DIR = Path("python/wyrd/stubs")
-OUTPUT_FILE = Path("python/wyrd/_native.pyi")
-PUBLIC_MODEL_FILE = Path("python/wyrd/model.pyi")
-PUBLIC_PROMPT_FILE = Path("python/wyrd/prompt.pyi")
-PUBLIC_INIT_FILE = Path("python/wyrd/__init__.pyi")
+PACKAGE_DIR = Path("python/wyrd")
+ROOT_OUTPUT_FILE = PACKAGE_DIR / "_wyrd.pyi"
 
-STUB_FILES = [
-    "header.pyi",
-    "error.pyi",
-    "data.pyi",
-    "model.pyi",
-    "prompt.pyi",
-]
+PUBLIC_MODULE_STUBS = {
+    "agent.pyi": PACKAGE_DIR / "agent" / "__init__.pyi",
+    "data.pyi": PACKAGE_DIR / "data" / "__init__.pyi",
+    "model.pyi": PACKAGE_DIR / "model" / "__init__.pyi",
+    "prompt.pyi": PACKAGE_DIR / "prompt" / "__init__.pyi",
+    "session.pyi": PACKAGE_DIR / "session" / "__init__.pyi",
+}
+
+ROOT_STUB_FILES = ["header.pyi", "error.pyi"]
+PACKAGE_STUB_FILE = "package.pyi"
 
 
 def validate_source_stub(filename: str, raw_text: str) -> None:
@@ -35,47 +36,110 @@ def strip_imports_section(content: str) -> str:
     return re.sub(pattern, "", content, flags=re.DOTALL)
 
 
-def extract_all(raw_text: str) -> list[str]:
-    """Return the literal names from a stub-level __all__ block."""
+def remove_all_block(content: str) -> tuple[str, list[str]]:
+    """Remove and return a source stub `__all__` block."""
     all_pattern = r"__all__\s*=\s*\[(.*?)\]"
-    match = re.search(all_pattern, raw_text, flags=re.DOTALL)
+    match = re.search(all_pattern, content, flags=re.DOTALL)
     if not match:
-        return []
+        return content, []
     items = re.findall(r'"([^"]+)"|\'([^\']+)\'', match.group(1))
-    return [a or b for a, b in items]
+    return re.sub(all_pattern, "", content, flags=re.DOTALL), [a or b for a, b in items]
 
 
-def assemble() -> None:
-    """Write the assembled native extension stub."""
+def validate_no_duplicate_classes(path: Path, content: str) -> None:
+    """Fail when one generated stub defines the same class name twice."""
+    seen: dict[str, int] = {}
+    duplicates: list[str] = []
+    for line_no, line in enumerate(content.splitlines(), start=1):
+        match = re.match(r"\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b", line)
+        if not match:
+            continue
+        name = match.group(1)
+        if name in seen:
+            duplicates.append(f"{name} at lines {seen[name]} and {line_no}")
+        else:
+            seen[name] = line_no
+    if duplicates:
+        joined = "; ".join(duplicates)
+        raise SystemExit(f"{path}: duplicate class declarations: {joined}")
+
+
+def write_stub(path: Path, lines: list[str]) -> None:
+    """Write a generated stub after duplicate-class validation."""
+    content = "\n".join(lines).strip() + "\n"
+    validate_no_duplicate_classes(path, content)
+    path.write_text(content, encoding="utf-8")
+
+
+def source_text(filename: str) -> str:
+    """Read and validate one hand-authored source stub."""
+    path = STUB_DIR / filename
+    raw_text = path.read_text(encoding="utf-8")
+    validate_source_stub(filename, raw_text)
+    return raw_text
+
+
+def rewrite_public_imports(filename: str, content: str) -> str:
+    """Rewrite source-stub imports for generated package-local stubs."""
+    replacements = {
+        "agent.pyi": {
+            "from collections.abc import Callable, Mapping, Sequence": (
+                "from collections.abc import Callable, Mapping, Sequence"
+            ),
+            "from .error import WyrdError\nfrom .header import JsonDict, PathLike": (
+                "from .._wyrd import JsonDict, PathLike, WyrdError"
+            ),
+            "from .prompt import Prompt": "from ..prompt import Prompt",
+        },
+        "data.pyi": {
+            "from .error import WyrdError\nfrom .header import CardRefLike, JsonDict, PathLike, StringMap": (
+                "from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError"
+            ),
+        },
+        "model.pyi": {
+            "from .data import FieldSpec\nfrom .error import WyrdError\nfrom .header import CardRefLike, JsonDict, PathLike, StringMap": (
+                "from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError\n"
+                "from ..data import FieldSpec"
+            ),
+        },
+        "prompt.pyi": {
+            "from .error import WyrdError\nfrom .header import JsonDict, PathLike": (
+                "from .._wyrd import JsonDict, PathLike, WyrdError"
+            ),
+        },
+        "session.pyi": {
+            "from .header import JsonDict": "from .._wyrd import JsonDict",
+        },
+    }
+    for before, after in replacements.get(filename, {}).items():
+        content = content.replace(before, after)
+    return content
+
+
+def assemble_root_stub() -> None:
+    """Write the root native extension stub."""
     final_content = [
         "# AUTO-GENERATED STUB FILE. DO NOT EDIT.",
-        "# ruff: noqa: F811",
         "# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value",
     ]
     master_all: list[str] = []
-    all_pattern = r"__all__\s*=\s*\[(.*?)\]"
 
-    for filename in STUB_FILES:
-        file_path = STUB_DIR / filename
-        if not file_path.exists():
-            continue
-
-        raw_text = file_path.read_text(encoding="utf-8")
-        validate_source_stub(filename, raw_text)
+    for filename in ROOT_STUB_FILES:
+        raw_text = source_text(filename)
         if filename != "header.pyi":
             raw_text = strip_imports_section(raw_text)
-
-        match = re.search(all_pattern, raw_text, flags=re.DOTALL)
-        if match:
-            items = re.findall(r'"([^"]+)"|\'([^\']+)\'', match.group(1))
-            master_all.extend(a or b for a, b in items)
-            text_to_append = re.sub(all_pattern, "", raw_text, flags=re.DOTALL)
-        else:
-            text_to_append = raw_text
+        text_to_append, all_items = remove_all_block(raw_text)
+        master_all.extend(all_items)
 
         final_content.append(f"### {filename} ###")
         final_content.append(text_to_append.strip())
         final_content.append("")
+
+    final_content.append("def _init() -> None:")
+    final_content.append('    """Initialize the native Wyrd extension."""')
+    final_content.append("    ...")
+    final_content.append("")
+    master_all.append("_init")
 
     final_content.append("### GLOBAL EXPORTS ###")
     final_content.append("__all__ = [")
@@ -83,109 +147,41 @@ def assemble() -> None:
         final_content.append(f'    "{item}",')
     final_content.append("]")
 
-    OUTPUT_FILE.write_text("\n".join(final_content) + "\n", encoding="utf-8")
-    write_public_model_stub()
-    write_public_prompt_stub()
-    write_public_init_stub()
-    print(f"Compiled {len(master_all)} exports into {OUTPUT_FILE}")
+    write_stub(ROOT_OUTPUT_FILE, final_content)
+    print(f"Compiled {len(master_all)} root exports into {ROOT_OUTPUT_FILE}")
 
 
-def write_public_model_stub() -> None:
-    """Write the public wyrd.model re-export stub."""
-    exports = extract_all((STUB_DIR / "model.pyi").read_text(encoding="utf-8"))
-    lines = [
-        "from typing import TYPE_CHECKING",
-        "",
-        "if TYPE_CHECKING:",
-        "    from ._native import (",
-    ]
-    lines.extend(f"        {name}," for name in exports)
-    lines.extend(
-        [
-            "    )",
-            "else:",
-            "    from ._native.cards.model import (",
+def assemble_public_module_stubs() -> None:
+    """Write package-local stubs for public Wyrd modules."""
+    for filename, output_path in PUBLIC_MODULE_STUBS.items():
+        raw_text = rewrite_public_imports(filename, source_text(filename))
+        lines = [
+            "# AUTO-GENERATED STUB FILE. DO NOT EDIT.",
+            "# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value",
+            raw_text.strip(),
         ]
-    )
-    lines.extend(f"        {name}," for name in exports)
-    lines.extend(["    )", "", "__all__ = ["])
-    lines.extend(f'    "{name}",' for name in exports)
-    lines.append("]")
-    PUBLIC_MODEL_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        write_stub(output_path, lines)
+        print(f"Compiled {filename} into {output_path}")
 
 
-def write_public_prompt_stub() -> None:
-    """Write the public wyrd.prompt re-export stub."""
-    exports = extract_all((STUB_DIR / "prompt.pyi").read_text(encoding="utf-8"))
+def assemble_package_stub() -> None:
+    """Write the root public package stub."""
+    raw_text = source_text(PACKAGE_STUB_FILE)
     lines = [
-        "from typing import TYPE_CHECKING",
-        "",
-        "if TYPE_CHECKING:",
-        "    from ._native import (",
+        "# AUTO-GENERATED STUB FILE. DO NOT EDIT.",
+        "# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value",
+        raw_text.strip(),
     ]
-    lines.extend(f"        {name}," for name in exports)
-    lines.extend(
-        [
-            "    )",
-            "else:",
-            "    from ._native.cards.prompt import (",
-        ]
-    )
-    lines.extend(f"        {name}," for name in exports)
-    lines.extend(["    )", "", "__all__ = ["])
-    lines.extend(f'    "{name}",' for name in exports)
-    lines.append("]")
-    PUBLIC_PROMPT_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    output_path = PACKAGE_DIR / "__init__.pyi"
+    write_stub(output_path, lines)
+    print(f"Compiled {PACKAGE_STUB_FILE} into {output_path}")
 
 
-def write_public_init_stub() -> None:
-    """Write the package root re-export stub."""
-    lines = [
-        "from . import data as data",
-        "from . import model as model",
-        "from . import prompt as prompt",
-        "from .data import DataCard as DataCard",
-        "from .data import Split as Split",
-        "from .data import WyrdError as WyrdError",
-        "from .model import ModelCard as ModelCard",
-        "from .model import ModelSignature as ModelSignature",
-        "from .model import SampleInput as SampleInput",
-        "from .prompt import AnthropicSettings as AnthropicSettings",
-        "from .prompt import GeminiSettings as GeminiSettings",
-        "from .prompt import MediaRef as MediaRef",
-        "from .prompt import OpenAIResponsesSettings as OpenAIResponsesSettings",
-        "from .prompt import OpenAISettings as OpenAISettings",
-        "from .prompt import Prompt as Prompt",
-        "from .prompt import PromptCard as PromptCard",
-        "from .prompt import PromptCardMetadata as PromptCardMetadata",
-        "from .prompt import PromptRef as PromptRef",
-        "from .prompt import ProviderRequest as ProviderRequest",
-        "from .prompt import ResponseFormat as ResponseFormat",
-        "",
-        "__all__ = [",
-        '    "AnthropicSettings",',
-        '    "DataCard",',
-        '    "GeminiSettings",',
-        '    "MediaRef",',
-        '    "ModelCard",',
-        '    "ModelSignature",',
-        '    "OpenAIResponsesSettings",',
-        '    "OpenAISettings",',
-        '    "Prompt",',
-        '    "PromptCard",',
-        '    "PromptCardMetadata",',
-        '    "PromptRef",',
-        '    "ProviderRequest",',
-        '    "ResponseFormat",',
-        '    "SampleInput",',
-        '    "Split",',
-        '    "WyrdError",',
-        '    "data",',
-        '    "model",',
-        '    "prompt",',
-        "]",
-    ]
-    PUBLIC_INIT_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+def assemble() -> None:
+    """Write all generated public stubs."""
+    assemble_root_stub()
+    assemble_package_stub()
+    assemble_public_module_stubs()
 
 
 if __name__ == "__main__":

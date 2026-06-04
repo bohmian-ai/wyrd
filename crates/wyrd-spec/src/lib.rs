@@ -27,6 +27,7 @@ pub mod vala;
 pub mod version;
 
 pub use authz::{Principal, Role, Scope};
+pub use card::agent::{AgentCard, AgentCardError, AgentRunConfigSpec, AgentSpec};
 pub use card::data::{
     ArrowFormat, ArrowMeta, ColValue, ColorMode, CustomDataMeta, DataInterface, DataSchema,
     DataSpec, DataSplit, DataStats, HuggingfaceMeta, ImageFormat, ImageMeta, Inequality,
@@ -41,6 +42,7 @@ pub use card::prompt::{
 };
 pub use ids::{ColumnName, QueryName, RoleName, SplitName};
 pub use metadata::{
-    AnnotationKey, AnnotationValue, Annotations, LabelKey, LabelValue, Labels, MetadataError,
+    AnnotationKey, AnnotationValue, Annotations, CardMetadata, LabelKey, LabelValue, Labels,
+    MetadataError,
 };
 pub use skald_spec::{MessageNum, Prompt, ProviderRequest, ProviderResponse, ResponseType};

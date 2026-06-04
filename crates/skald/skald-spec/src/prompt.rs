@@ -151,7 +151,8 @@ impl Prompt {
     /// Borrow native generation settings for the request's active provider.
     pub fn settings_ref(&self) -> Option<ProviderSettingsRef<'_>> {
         match &self.request {
-            ProviderRequest::OpenAiChatCompletion(request) => {
+            ProviderRequest::OpenAiChatCompletion(request)
+            | ProviderRequest::OpenAiChatCompatible { request, .. } => {
                 Some(ProviderSettingsRef::OpenAiChat(&request.settings))
             }
             ProviderRequest::OpenAiResponses(request) => {
@@ -224,7 +225,8 @@ impl Prompt {
     pub fn bind_media_mut(&mut self, name: &str, media: &MediaRef) -> SkaldResult<()> {
         self.normalize_media_placeholders_mut()?;
         match &mut self.request {
-            ProviderRequest::OpenAiChatCompletion(request) => {
+            ProviderRequest::OpenAiChatCompletion(request)
+            | ProviderRequest::OpenAiChatCompatible { request, .. } => {
                 bind_media_openai_chat(request, name, media)?;
             }
             ProviderRequest::OpenAiResponses(request) => {
@@ -302,6 +304,7 @@ fn deserialize_request_like(
         ProviderRequest::OpenAiChatCompletion(_) => {
             ProviderRequest::OpenAiChatCompletion(serde_json::from_value(value)?)
         }
+        ProviderRequest::OpenAiChatCompatible { .. } => serde_json::from_value(value)?,
         ProviderRequest::OpenAiResponses(_) => {
             ProviderRequest::OpenAiResponses(serde_json::from_value(value)?)
         }
@@ -355,7 +358,8 @@ fn placeholder_token(name: &str) -> String {
 
 fn scan_system_for_media(request: &ProviderRequest) -> SkaldResult<()> {
     match request {
-        ProviderRequest::OpenAiChatCompletion(request) => {
+        ProviderRequest::OpenAiChatCompletion(request)
+        | ProviderRequest::OpenAiChatCompatible { request, .. } => {
             for message in &request.messages {
                 if message.role == "system" {
                     scan_openai_chat_content(message.content.as_ref())?;
@@ -432,7 +436,10 @@ fn scan_text_for_system_media(text: &str) -> SkaldResult<()> {
 fn split_request_text_parts(request: &mut ProviderRequest) -> Vec<String> {
     let mut names = Vec::new();
     match request {
-        ProviderRequest::OpenAiChatCompletion(request) => split_openai_chat(request, &mut names),
+        ProviderRequest::OpenAiChatCompletion(request)
+        | ProviderRequest::OpenAiChatCompatible { request, .. } => {
+            split_openai_chat(request, &mut names);
+        }
         ProviderRequest::OpenAiResponses(request) => split_openai_responses(request, &mut names),
         ProviderRequest::AnthropicMessage(request) => split_anthropic(request, &mut names),
         ProviderRequest::GeminiGenerateContent(request) => split_google(request, &mut names),

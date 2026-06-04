@@ -6,7 +6,7 @@ from __future__ import annotations
 import datetime
 import os
 import pathlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol, TypeAlias, overload
 
 PathLike: TypeAlias = str | os.PathLike[str] | pathlib.Path
@@ -14,7 +14,16 @@ JsonDict: TypeAlias = dict[str, Any]
 StringMap: TypeAlias = Mapping[str, str]
 
 class CardRefLike(Protocol):
-    """Object that can be represented as a Wyrd card reference."""
+    """Object that can be represented as a Wyrd card reference.
+
+    Implement this protocol when a Python object can provide a JSON-compatible
+    CardRef mapping to a Wyrd boundary.
+    """
 
     def to_dict(self) -> JsonDict:
-        """Return a JSON-compatible card reference dictionary."""
+        """Return a JSON-compatible card reference dictionary.
+
+        Returns:
+            JsonDict: Serialized card reference.
+        """
+        ...

@@ -51,9 +51,10 @@ impl Observer for CompositeObserver {
         iteration: u32,
         provider: &str,
         model: &str,
+        request: &skald_spec::ProviderRequest,
     ) {
         for obs in &self.0 {
-            obs.on_model_call(run_id, agent_id, iteration, provider, model)
+            obs.on_model_call(run_id, agent_id, iteration, provider, model, request)
                 .await;
         }
     }
@@ -65,10 +66,18 @@ impl Observer for CompositeObserver {
         iteration: u32,
         finish_reason: &str,
         synthetic: bool,
+        response: &skald_spec::ProviderResponse,
     ) {
         for obs in &self.0 {
-            obs.on_model_result(run_id, agent_id, iteration, finish_reason, synthetic)
-                .await;
+            obs.on_model_result(
+                run_id,
+                agent_id,
+                iteration,
+                finish_reason,
+                synthetic,
+                response,
+            )
+            .await;
         }
     }
 

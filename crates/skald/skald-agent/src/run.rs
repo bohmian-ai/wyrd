@@ -1,5 +1,7 @@
 //! Runtime configuration and per-run output for the bounded tool loop.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use skald_spec::ProviderResponse;
 use wyrd_spec::error::WyrdError;
@@ -169,7 +171,8 @@ pub struct AgentRun {
     /// Convenience projection of the final assistant text.
     pub output: String,
     /// Final native provider response, when the run reached one.
-    pub final_response: Option<ProviderResponse>,
+    #[serde(skip)]
+    pub final_response: Option<Arc<ProviderResponse>>,
     /// Number of loop iterations executed (1-based).
     pub iterations: u32,
     /// Why the loop terminated.
@@ -298,6 +301,26 @@ impl AgentRun {
     #[getter]
     pub fn parsed(&self, py: pyo3::Python<'_>) -> Option<pyo3::Py<pyo3::PyAny>> {
         self.parsed.as_ref().map(|p| p.clone_ref(py))
+    }
+
+    /// Return the final provider response as a typed wrapper, if the run reached one.
+    ///
+    /// Returns:
+    ///     ProviderResponse | None: Typed provider response wrapper.
+    #[getter]
+    pub fn provider_response(
+        &self,
+        py: pyo3::Python<'_>,
+    ) -> pyo3::PyResult<Option<pyo3::Py<pyo3::PyAny>>> {
+        let Some(arc) = self.final_response.as_ref() else {
+            return Ok(None);
+        };
+        let py_response = pyo3::Py::new(
+            py,
+            skald_prompt::wire_py::PyProviderResponse::from_arc(Arc::clone(arc)),
+        )?
+        .into_any();
+        Ok(Some(py_response))
     }
 
     /// Return a concise Python representation.

@@ -1,6 +1,8 @@
 #### begin imports ####
 from __future__ import annotations
 
+from wyrd.stubs.prompt import ProviderRequest, ProviderResponse
+
 #### end of imports ####
 
 class Observer:
@@ -60,6 +62,7 @@ class Observer:
         iteration: int,
         provider: str,
         model: str,
+        request: ProviderRequest,
     ) -> None:
         """Provider model call started.
 
@@ -72,6 +75,7 @@ class Observer:
             iteration (int): Loop iteration index.
             provider (str): Provider name (e.g. "openai", "anthropic").
             model (str): Model name.
+            request (ProviderRequest): Typed provider request wrapper.
         """
         ...
 
@@ -82,6 +86,7 @@ class Observer:
         iteration: int,
         finish_reason: str,
         synthetic: bool,
+        response: ProviderResponse,
     ) -> None:
         """Provider model call completed.
 
@@ -95,6 +100,7 @@ class Observer:
             iteration (int): Loop iteration index.
             finish_reason (str): Provider finish reason string.
             synthetic (bool): True when the response was synthesized by a callback.
+            response (ProviderResponse): Typed provider response wrapper.
         """
         ...
 

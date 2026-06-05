@@ -78,18 +78,25 @@ impl Observer for PythonObserver {
         iteration: u32,
         provider: &str,
         model: &str,
+        request: &skald_spec::ProviderRequest,
     ) {
         let run_id = run_id.to_owned();
         let agent_id = agent_id.to_owned();
         let provider = provider.to_owned();
         let model = model.to_owned();
+        let request = request.clone();
         let inner = Arc::clone(&self.0);
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
+                let py_request =
+                    match Py::new(py, skald_prompt::PyProviderRequest::from_native(request)) {
+                        Ok(r) => r.into_any(),
+                        Err(_) => return,
+                    };
                 let _ = inner.call_method1(
                     py,
                     "on_model_call",
-                    (run_id, agent_id, iteration, provider, model),
+                    (run_id, agent_id, iteration, provider, model, py_request),
                 );
             });
         })
@@ -104,17 +111,33 @@ impl Observer for PythonObserver {
         iteration: u32,
         finish_reason: &str,
         synthetic: bool,
+        response: &skald_spec::ProviderResponse,
     ) {
         let run_id = run_id.to_owned();
         let agent_id = agent_id.to_owned();
         let finish_reason = finish_reason.to_owned();
+        let response = response.clone();
         let inner = Arc::clone(&self.0);
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
+                let py_response = match Py::new(
+                    py,
+                    skald_prompt::wire_py::PyProviderResponse::from_native(response),
+                ) {
+                    Ok(r) => r.into_any(),
+                    Err(_) => return,
+                };
                 let _ = inner.call_method1(
                     py,
                     "on_model_result",
-                    (run_id, agent_id, iteration, finish_reason, synthetic),
+                    (
+                        run_id,
+                        agent_id,
+                        iteration,
+                        finish_reason,
+                        synthetic,
+                        py_response,
+                    ),
                 );
             });
         })

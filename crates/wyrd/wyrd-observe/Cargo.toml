@@ -18,6 +18,7 @@ otel = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 
 [dependencies]
 skald-agent = { workspace = true }
+skald-spec = { workspace = true }
 vala-client = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-utils = { workspace = true }

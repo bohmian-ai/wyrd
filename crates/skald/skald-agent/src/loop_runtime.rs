@@ -280,6 +280,7 @@ async fn run_loop(
             "before_model",
         )? {
             ChainResult::Abort(error) => {
+                let synthetic_resp = synthetic_null_response();
                 append_model_journal_call_result(
                     this,
                     iteration,
@@ -288,6 +289,7 @@ async fn run_loop(
                     true,
                     run_id,
                     &*observer,
+                    &synthetic_resp,
                 )
                 .await?;
                 return Ok(AgentRun {
@@ -317,10 +319,12 @@ async fn run_loop(
                     false,
                     run_id,
                     &*observer,
+                    response,
                 )
                 .await?;
             }
             Err(error) => {
+                let synthetic_resp = synthetic_null_response();
                 append_model_journal_result(
                     this,
                     iteration,
@@ -328,6 +332,7 @@ async fn run_loop(
                     true,
                     run_id,
                     &*observer,
+                    &synthetic_resp,
                 )
                 .await?;
             }
@@ -371,7 +376,7 @@ async fn run_loop(
             let structured_output = parse_structured_output(this, &output)?;
             let run = AgentRun {
                 output,
-                final_response: Some(response),
+                final_response: Some(std::sync::Arc::new(response)),
                 iterations: iteration + 1,
                 finish_reason: FinishReason::ModelStopped,
                 conversation,
@@ -639,9 +644,19 @@ async fn append_model_journal_call_result(
     synthetic: bool,
     run_id: &str,
     observer: &dyn Observer,
+    response: &ProviderResponse,
 ) -> AgentResult<()> {
     append_model_journal_call(this, iteration, request, run_id, observer).await?;
-    append_model_journal_result(this, iteration, finish_reason, synthetic, run_id, observer).await
+    append_model_journal_result(
+        this,
+        iteration,
+        finish_reason,
+        synthetic,
+        run_id,
+        observer,
+        response,
+    )
+    .await
 }
 
 async fn append_model_journal_call(
@@ -663,7 +678,14 @@ async fn append_model_journal_call(
         .await
         .map_err(|source| AgentError::JournalAppendFailed { source })?;
     observer
-        .on_model_call(run_id, &this.id, iteration, &provider, &request_model)
+        .on_model_call(
+            run_id,
+            &this.id,
+            iteration,
+            &provider,
+            &request_model,
+            request,
+        )
         .await;
     Ok(())
 }
@@ -675,6 +697,7 @@ async fn append_model_journal_result(
     synthetic: bool,
     run_id: &str,
     observer: &dyn Observer,
+    response: &ProviderResponse,
 ) -> AgentResult<()> {
     this.journal
         .append(JournalEvent::ModelResult {
@@ -685,7 +708,14 @@ async fn append_model_journal_result(
         .await
         .map_err(|source| AgentError::JournalAppendFailed { source })?;
     observer
-        .on_model_result(run_id, &this.id, iteration, &finish_reason, synthetic)
+        .on_model_result(
+            run_id,
+            &this.id,
+            iteration,
+            &finish_reason,
+            synthetic,
+            response,
+        )
         .await;
     Ok(())
 }
@@ -858,4 +888,10 @@ fn redact_in_place(value: &mut serde_json::Value) {
         }
         _ => {}
     }
+}
+
+fn synthetic_null_response() -> ProviderResponse {
+    ProviderResponse::RawV1(
+        serde_json::value::RawValue::from_string("null".to_owned()).expect("'null' is valid JSON"),
+    )
 }

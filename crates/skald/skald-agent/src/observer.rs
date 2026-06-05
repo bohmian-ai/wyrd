@@ -45,6 +45,7 @@ pub trait Observer: Send + Sync {
         _iteration: u32,
         _provider: &str,
         _model: &str,
+        _request: &skald_spec::ProviderRequest,
     ) {
     }
 
@@ -56,6 +57,7 @@ pub trait Observer: Send + Sync {
         _iteration: u32,
         _finish_reason: &str,
         _synthetic: bool,
+        _response: &skald_spec::ProviderResponse,
     ) {
     }
 

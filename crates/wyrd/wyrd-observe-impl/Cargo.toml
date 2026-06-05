@@ -14,10 +14,12 @@ path = "src/lib.rs"
 
 [features]
 default = []
-python = ["dep:pyo3", "dep:tokio"]
+python = ["dep:pyo3", "dep:tokio", "dep:skald-prompt", "skald-prompt/python"]
 
 [dependencies]
 skald-agent = { workspace = true }
+skald-prompt = { workspace = true, optional = true }
+skald-spec = { workspace = true }
 wyrd-observe = { workspace = true }
 async-trait = { workspace = true }
 pyo3 = { workspace = true, optional = true }

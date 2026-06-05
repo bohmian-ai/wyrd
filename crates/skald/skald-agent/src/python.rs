@@ -542,14 +542,12 @@ pub fn wrap_before_model(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<BeforeModel
         invoke_callback(
             &cb,
             |py| {
-                let args = (
-                    ctx_to_py(py, ctx)?,
-                    wyrd_utils::py::json_to_pyobject(
-                        py,
-                        &serde_json::to_value(request).unwrap_or_default(),
-                    )?,
-                );
-                cb.bind(py).call1(args)
+                let py_request = Py::new(
+                    py,
+                    skald_prompt::PyProviderRequest::from_native(request.clone()),
+                )?
+                .into_any();
+                cb.bind(py).call1((ctx_to_py(py, ctx)?, py_request))
             },
             extract_provider_request_replacement,
         )
@@ -565,14 +563,12 @@ pub fn wrap_after_model(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterModelFn
         invoke_callback(
             &cb,
             |py| {
-                let args = (
-                    ctx_to_py(py, ctx)?,
-                    wyrd_utils::py::json_to_pyobject(
-                        py,
-                        &serde_json::to_value(response).unwrap_or_default(),
-                    )?,
-                );
-                cb.bind(py).call1(args)
+                let py_response = Py::new(
+                    py,
+                    skald_prompt::wire_py::PyProviderResponse::from_native(response.clone()),
+                )?
+                .into_any();
+                cb.bind(py).call1((ctx_to_py(py, ctx)?, py_response))
             },
             extract_provider_response_replacement,
         )
@@ -896,6 +892,9 @@ fn extract_provider_request_replacement(value: &Bound<'_, PyAny>) -> PyResult<Pr
 }
 
 fn extract_provider_response_replacement(value: &Bound<'_, PyAny>) -> PyResult<ProviderResponse> {
+    if let Ok(py_resp) = value.extract::<PyRef<'_, skald_prompt::wire_py::PyProviderResponse>>() {
+        return Ok(py_resp.native().clone());
+    }
     serde_json::from_value(wyrd_utils::py::pyobject_to_json(value)?)
         .map_err(|error| PyTypeError::new_err(error.to_string()))
 }
@@ -927,10 +926,12 @@ fn output_cls_from_py(value: Option<&Bound<'_, PyAny>>) -> AgentPyResult<Option<
         return Ok(None);
     };
     if !value.is_callable() {
-        return Err(AgentPyError::from(crate::error::AgentError::InvalidArgument {
-            name: "output_type".to_owned(),
-            detail: "must be a callable class (e.g. a pydantic.BaseModel subclass)".to_owned(),
-        }));
+        return Err(AgentPyError::from(
+            crate::error::AgentError::InvalidArgument {
+                name: "output_type".to_owned(),
+                detail: "must be a callable class (e.g. a pydantic.BaseModel subclass)".to_owned(),
+            },
+        ));
     }
     Ok(Some(value.clone().unbind()))
 }

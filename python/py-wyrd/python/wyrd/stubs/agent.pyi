@@ -7,7 +7,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from .error import WyrdError
 from .header import JsonDict, PathLike
-from .prompt import Prompt
+from .prompt import Prompt, ProviderResponse
 
 #### end of imports ####
 
@@ -187,6 +187,11 @@ if True:
         @property
         def parsed(self) -> Any:
             """Return the typed model instance when output_type was a class, or None."""
+            ...
+
+        @property
+        def provider_response(self) -> ProviderResponse | None:
+            """Return the final provider response as a typed wrapper, if the run reached one."""
             ...
 
 class Agent:

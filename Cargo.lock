@@ -4611,6 +4611,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "skald-agent",
+ "skald-spec",
  "tokio",
  "tracing",
  "vala-client",
@@ -4625,6 +4626,8 @@ dependencies = [
  "async-trait",
  "pyo3",
  "skald-agent",
+ "skald-prompt",
+ "skald-spec",
  "tokio",
  "wyrd-observe",
 ]

@@ -7,6 +7,7 @@ use skald_spec::wire::anthropic_messages::{
 use skald_spec::wire::google_generate::{GoogleContent, GoogleFunctionResponse, GooglePart};
 use skald_spec::wire::openai_chat::{OpenAiChatMessage, OpenAiMessageContent};
 use skald_spec::wire::openai_responses::{OpenAiResponseContentPart, OpenAiResponseItem};
+use std::sync::Arc;
 
 use crate::error::{PromptBuilderError, PromptBuilderResult};
 use crate::messages::{anthropic_text_block, anthropic_tool_result_block, google_text_part};
@@ -35,13 +36,22 @@ impl PartialEq for Prompt {
 }
 
 /// Opaque Python wrapper around a rendered native provider request.
+///
+/// Holds the request behind an `Arc` so that nested pyclasses (`PyOpenAiChatRequest`,
+/// `PyOpenAiChatMessage`, etc.) can share the same allocation with zero copies.
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "wyrd.prompt", name = "ProviderRequest", skip_from_py_object)
 )]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct PyProviderRequest {
-    inner: ProviderRequest,
+    inner: Arc<ProviderRequest>,
+}
+
+impl PartialEq for PyProviderRequest {
+    fn eq(&self, other: &Self) -> bool {
+        *self.inner == *other.inner
+    }
 }
 
 impl Prompt {
@@ -209,19 +219,31 @@ impl Prompt {
 }
 
 impl PyProviderRequest {
-    /// Wrap a native provider request for Python inspection.
-    pub const fn from_native(inner: ProviderRequest) -> Self {
+    /// Wrap a native provider request, taking ownership.
+    pub fn from_native(inner: ProviderRequest) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Wrap a shared Arc to an existing provider request.
+    pub fn from_arc(inner: Arc<ProviderRequest>) -> Self {
         Self { inner }
     }
 
     /// Borrow the wrapped provider request.
-    pub const fn native(&self) -> &ProviderRequest {
+    pub fn native(&self) -> &ProviderRequest {
         &self.inner
     }
 
     /// Consume the wrapper and return the native provider request.
     pub fn into_native(self) -> ProviderRequest {
-        self.inner
+        Arc::try_unwrap(self.inner).unwrap_or_else(|arc| (*arc).clone())
+    }
+
+    /// Clone the inner Arc without cloning the request value.
+    pub(crate) fn inner_arc(&self) -> Arc<ProviderRequest> {
+        Arc::clone(&self.inner)
     }
 }
 
@@ -263,7 +285,7 @@ fn unsupported_role(request: &ProviderRequest, role: &str) -> PromptBuilderResul
     })
 }
 
-fn provider_name_to_string(provider: &skald_spec::ProviderName) -> String {
+pub(crate) fn provider_name_to_string(provider: &skald_spec::ProviderName) -> String {
     match provider {
         skald_spec::ProviderName::OpenAi => "openai".to_owned(),
         skald_spec::ProviderName::Anthropic => "anthropic".to_owned(),
@@ -272,6 +294,28 @@ fn provider_name_to_string(provider: &skald_spec::ProviderName) -> String {
         skald_spec::ProviderName::Custom(value) => value.clone(),
     }
 }
+
+#[cfg(feature = "python")]
+pub(crate) fn wrong_provider(
+    expected: &str,
+    actual: skald_spec::ProviderName,
+) -> crate::error::PromptBuilderError {
+    crate::error::PromptBuilderError::WrongProvider {
+        expected: expected.to_owned(),
+        actual: provider_name_to_string(&actual),
+    }
+}
+
+#[cfg(feature = "python")]
+pub(crate) fn wrong_variant(expected: &str, actual: &str) -> crate::error::PromptBuilderError {
+    crate::error::PromptBuilderError::WrongVariant {
+        expected: expected.to_owned(),
+        actual: actual.to_owned(),
+    }
+}
+
+#[cfg(feature = "python")]
+use crate::wire_py;
 
 #[cfg(feature = "python")]
 use {
@@ -1038,13 +1082,15 @@ impl Prompt {
 #[pyo3::pymethods]
 impl PyProviderRequest {
     /// Return the native provider request as a Python dictionary.
+    /// Escape hatch for `RawV1` and any provider variant without a typed projection.
     pub fn model_dump(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
-        py_value(py, &self.inner)
+        py_value(py, self.inner.as_ref())
     }
 
     /// Return the native provider request as a JSON string.
+    /// Escape hatch for `RawV1` and any provider variant without a typed projection.
     pub fn model_dump_json(&self) -> CardPyResult<String> {
-        Ok(serde_json::to_string(&self.inner)?)
+        Ok(serde_json::to_string(self.inner.as_ref())?)
     }
 
     /// Return the provider name for the rendered request.
@@ -1053,17 +1099,73 @@ impl PyProviderRequest {
         provider_name_to_string(&self.inner.provider())
     }
 
+    /// Return a typed OpenAI Chat Completions request accessor.
+    /// Raises WyrdError when the provider is not openai chat.
+    pub fn openai(&self) -> CardPyResult<wire_py::PyOpenAiChatRequest> {
+        match self.inner.as_ref() {
+            skald_spec::ProviderRequest::OpenAiChatCompletion(_)
+            | skald_spec::ProviderRequest::OpenAiChatCompatible { .. } => {
+                Ok(wire_py::PyOpenAiChatRequest::new(Arc::clone(&self.inner)))
+            }
+            other => Err(wrong_provider("openai", other.provider()).into()),
+        }
+    }
+
+    /// Return a typed OpenAI Responses API request accessor.
+    /// Raises WyrdError when the provider is not openai responses.
+    pub fn openai_responses(&self) -> CardPyResult<wire_py::PyOpenAiResponsesRequest> {
+        match self.inner.as_ref() {
+            skald_spec::ProviderRequest::OpenAiResponses(_) => Ok(
+                wire_py::PyOpenAiResponsesRequest::new(Arc::clone(&self.inner)),
+            ),
+            other => Err(wrong_provider("openai_responses", other.provider()).into()),
+        }
+    }
+
+    /// Return a typed Anthropic Messages request accessor.
+    /// Raises WyrdError when the provider is not anthropic.
+    pub fn anthropic(&self) -> CardPyResult<wire_py::PyAnthropicMessagesRequest> {
+        match self.inner.as_ref() {
+            skald_spec::ProviderRequest::AnthropicMessage(_) => Ok(
+                wire_py::PyAnthropicMessagesRequest::new(Arc::clone(&self.inner)),
+            ),
+            other => Err(wrong_provider("anthropic", other.provider()).into()),
+        }
+    }
+
+    /// Return a typed Google Gemini request accessor.
+    /// Raises WyrdError when the provider is not google/gemini.
+    pub fn gemini(&self) -> CardPyResult<wire_py::PyGeminiRequest> {
+        match self.inner.as_ref() {
+            skald_spec::ProviderRequest::GeminiGenerateContent(_) => {
+                Ok(wire_py::PyGeminiRequest::new(Arc::clone(&self.inner)))
+            }
+            other => Err(wrong_provider("gemini", other.provider()).into()),
+        }
+    }
+
+    /// Return a typed Vertex AI request accessor.
+    /// Raises WyrdError when the provider is not vertex.
+    pub fn vertex(&self) -> CardPyResult<wire_py::PyVertexRequest> {
+        match self.inner.as_ref() {
+            skald_spec::ProviderRequest::Vertex(_) => {
+                Ok(wire_py::PyVertexRequest::new(Arc::clone(&self.inner)))
+            }
+            other => Err(wrong_provider("vertex", other.provider()).into()),
+        }
+    }
+
     /// Return native request messages or content turns as Python objects.
     #[getter]
     pub fn messages(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
-        wyrd_utils::py::json_to_pyobject(py, &request_messages_value(&self.inner))
+        wyrd_utils::py::json_to_pyobject(py, &request_messages_value(self.inner.as_ref()))
             .map_err(Into::into)
     }
 
     /// Return the last native request message or content turn.
     #[getter]
     pub fn message(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
-        let messages = request_messages_value(&self.inner);
+        let messages = request_messages_value(self.inner.as_ref());
         let value = messages
             .as_array()
             .and_then(|values| values.last())
@@ -1075,7 +1177,8 @@ impl PyProviderRequest {
     /// Return native system instructions when the provider has that field.
     #[getter]
     pub fn system(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
-        wyrd_utils::py::json_to_pyobject(py, &request_system_value(&self.inner)).map_err(Into::into)
+        wyrd_utils::py::json_to_pyobject(py, &request_system_value(self.inner.as_ref()))
+            .map_err(Into::into)
     }
 
     /// Return a concise Python representation.
@@ -1085,7 +1188,7 @@ impl PyProviderRequest {
 
     /// Return a pretty JSON string for interactive inspection.
     pub fn __str__(&self) -> String {
-        wyrd_utils::json::pretty_json_string(&self.inner)
+        wyrd_utils::json::pretty_json_string(self.inner.as_ref())
     }
 }
 
@@ -1169,7 +1272,7 @@ fn require_binding_args(owned: &[(String, String)]) -> CardPyResult<()> {
 #[cfg(feature = "python")]
 fn provider_request_from_py(value: &Bound<'_, PyAny>) -> CardPyResult<ProviderRequest> {
     if let Ok(request) = value.extract::<PyRef<'_, PyProviderRequest>>() {
-        return Ok(request.inner.clone());
+        return Ok((*request.inner).clone());
     }
     Ok(serde_json::from_value(wyrd_utils::py::pyobject_to_json(
         value,
@@ -1400,10 +1503,7 @@ fn py_annotation_to_schema<'py>(
             if args.try_iter().is_ok() {
                 let none_type = py.None().bind(py).get_type().into_any();
                 if let Ok(iter) = args.try_iter() {
-                    let non_none: Vec<_> = iter
-                        .flatten()
-                        .filter(|a| !a.is(&none_type))
-                        .collect();
+                    let non_none: Vec<_> = iter.flatten().filter(|a| !a.is(&none_type)).collect();
                     if !non_none.is_empty() {
                         return py_annotation_to_schema(py, &non_none[0]);
                     }

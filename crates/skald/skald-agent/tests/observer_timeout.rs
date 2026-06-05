@@ -460,6 +460,7 @@ impl Observer for RecordingObserver {
         iteration: u32,
         provider: &str,
         model: &str,
+        _request: &skald_spec::ProviderRequest,
     ) {
         self.push(ObserverEvent::ModelCall {
             iteration,
@@ -475,6 +476,7 @@ impl Observer for RecordingObserver {
         iteration: u32,
         finish_reason: &str,
         synthetic: bool,
+        _response: &skald_spec::ProviderResponse,
     ) {
         self.push(ObserverEvent::ModelResult {
             iteration,

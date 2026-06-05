@@ -14,6 +14,19 @@ fn noop_observer() -> OtelObserver {
     OtelObserver::new()
 }
 
+fn null_request() -> skald_spec::ProviderRequest {
+    skald_spec::ProviderRequest::RawV1 {
+        provider: skald_spec::ProviderName::Custom("test".to_owned()),
+        body: serde_json::value::RawValue::from_string("null".to_owned()).unwrap(),
+    }
+}
+
+fn null_response() -> skald_spec::ProviderResponse {
+    skald_spec::ProviderResponse::RawV1(
+        serde_json::value::RawValue::from_string("null".to_owned()).unwrap(),
+    )
+}
+
 #[tokio::test]
 async fn otel_observer_concurrent_workflow_steps_no_deadlock() {
     // Mirrors the real workflow dispatch path: one observer shared across
@@ -29,13 +42,13 @@ async fn otel_observer_concurrent_workflow_steps_no_deadlock() {
             let wf_run_id = "wf-concurrent";
             obs.on_agent_start(&run_id, Some(wf_run_id), "agent", "input", None)
                 .await;
-            obs.on_model_call(&run_id, "agent", 0, "openai", "gpt-4o")
+            obs.on_model_call(&run_id, "agent", 0, "openai", "gpt-4o", &null_request())
                 .await;
             obs.on_tool_call(&run_id, "agent", 0, &format!("call-{i}"), "search")
                 .await;
             obs.on_tool_result(&run_id, "agent", 0, &format!("call-{i}"), true)
                 .await;
-            obs.on_model_result(&run_id, "agent", 0, "stop", false)
+            obs.on_model_result(&run_id, "agent", 0, "stop", false, &null_response())
                 .await;
             obs.on_agent_finish(
                 &run_id,
@@ -58,7 +71,7 @@ async fn otel_observer_orphaned_events_do_not_panic() {
     // on_model_result / on_tool_result with no preceding start must be silent no-ops.
     // This can happen if an observer is installed after a run is already in progress.
     let obs = noop_observer();
-    obs.on_model_result("ghost", "agent", 0, "stop", false)
+    obs.on_model_result("ghost", "agent", 0, "stop", false, &null_response())
         .await;
     obs.on_tool_result("ghost", "agent", 0, "call-x", false)
         .await;

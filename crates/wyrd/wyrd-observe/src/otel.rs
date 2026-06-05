@@ -151,6 +151,7 @@ impl Observer for OtelObserver {
         iteration: u32,
         provider: &str,
         model: &str,
+        _request: &skald_spec::ProviderRequest,
     ) {
         // Agent span (keyed by run_id) is the parent of model call spans.
         let parent_cx = self.make_parent_context(run_id);
@@ -176,6 +177,7 @@ impl Observer for OtelObserver {
         iteration: u32,
         finish_reason: &str,
         _synthetic: bool,
+        _response: &skald_spec::ProviderResponse,
     ) {
         let key = format!("{run_id}.model.{iteration}");
         if let Some(mutex) = self.remove_span(&key) {

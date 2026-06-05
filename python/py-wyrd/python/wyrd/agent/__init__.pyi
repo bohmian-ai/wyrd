@@ -185,6 +185,11 @@ if True:
             """Return parsed JSON output when the prompt declared an output schema."""
             ...
 
+        @property
+        def parsed(self) -> Any:
+            """Return the typed model instance when output_type was a class, or None."""
+            ...
+
 class Agent:
     """Declarative and runnable Wyrd Agent."""
 
@@ -209,6 +214,7 @@ class Agent:
         annotations: Mapping[str, str] | None = ...,
         provider_base_url: str | None = ...,
         provider_api_key: str | None = ...,
+        output_type: type | None = ...,
     ) -> None:
         """Create an Agent.
 
@@ -234,6 +240,10 @@ class Agent:
                 process-global default registry is used.
             provider_api_key (str | None): API key for the overridden endpoint. When omitted
                 the standard environment variable for the prompt's provider is used.
+            output_type (type | None): Optional Python class for parsing AgentRun.parsed.
+                Must be callable and accept keyword arguments matching the structured output
+                fields (typically a pydantic.BaseModel subclass). Does NOT inject a
+                response_format schema — use Prompt(output=...) for schema enforcement.
         """
         ...
 
@@ -325,12 +335,20 @@ class Agent:
         """Validate whether this local Agent can be durably registered."""
         ...
 
-    def run(self, input: str | Mapping[str, Any], *, session_id: str | None = ...) -> AgentRun:
+    def run(
+        self,
+        input: str | Mapping[str, Any],
+        *,
+        session_id: str | None = ...,
+        output_type: type | None = ...,
+    ) -> AgentRun:
         """Run the bounded tool loop.
 
         Args:
             input (str | Mapping[str, Any]): User input for the run.
             session_id (str | None): Optional session id.
+            output_type (type | None): Per-call class override for AgentRun.parsed.
+                Overrides Agent(output_type=...) and Prompt(output=...) for this call only.
 
         Returns:
             AgentRun: Completed run result.

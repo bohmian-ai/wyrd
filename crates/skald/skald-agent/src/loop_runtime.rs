@@ -111,6 +111,8 @@ pub(crate) async fn run(
                         error: Some(error),
                         errors: Vec::new(),
                         structured_output: None,
+                        #[cfg(feature = "python")]
+                        parsed: None,
                     });
                 }
                 ChainResult::Replaced(input) => replace_seed_user_turn(&mut conversation, input),
@@ -297,6 +299,8 @@ async fn run_loop(
                     error: Some(error),
                     errors: Vec::new(),
                     structured_output: None,
+                    #[cfg(feature = "python")]
+                    parsed: None,
                 });
             }
             ChainResult::Replaced(replacement) => replacement,
@@ -374,6 +378,8 @@ async fn run_loop(
                 error: None,
                 errors: Vec::new(),
                 structured_output,
+                #[cfg(feature = "python")]
+                parsed: None,
             };
             return match apply_chain_with_panic_catch(
                 &this.callbacks.after_agent,

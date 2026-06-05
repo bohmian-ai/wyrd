@@ -185,6 +185,14 @@ pub struct AgentRun {
     /// Parsed JSON object for prompts that declared a structured output schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_output: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Typed model instance when the prompt declared an output class.
+    ///
+    /// Populated by `instantiate_parsed` in `py_run` after a successful
+    /// structured-output run. None for text prompts, YAML prompts with no
+    /// class bound at the Agent level, or when no class was passed.
+    #[serde(skip)]
+    #[cfg(feature = "python")]
+    pub parsed: Option<pyo3::Py<pyo3::PyAny>>,
 }
 
 #[cfg(feature = "python")]
@@ -281,6 +289,15 @@ impl AgentRun {
         };
         let value = serde_json::Value::Object(map.clone());
         wyrd_utils::py::json_to_pyobject(py, &value).map(Some)
+    }
+
+    /// Return the typed model instance when the prompt declared an output class.
+    ///
+    /// Returns:
+    ///     Any | None: Typed model instance, or None when no class was declared.
+    #[getter]
+    pub fn parsed(&self, py: pyo3::Python<'_>) -> Option<pyo3::Py<pyo3::PyAny>> {
+        self.parsed.as_ref().map(|p| p.clone_ref(py))
     }
 
     /// Return a concise Python representation.

@@ -187,6 +187,13 @@ pub struct Agent {
     /// Per-agent provider registry override. When set, overrides the global
     /// default registry for this agent's runs only. Not serialized.
     pub(crate) provider_override: Option<Arc<skald_runtime::ProviderRegistry>>,
+    /// Python class retained for structured-output instantiation.
+    ///
+    /// Set via `Agent(output_type=...)` or `agent.run(output_type=...)`.
+    /// Overrides `Prompt.py_output_cls` when both are set.
+    /// Only present under the `python` feature.
+    #[cfg(feature = "python")]
+    pub(crate) py_output_cls: Option<pyo3::Py<pyo3::PyAny>>,
 }
 
 impl fmt::Debug for Agent {
@@ -700,6 +707,8 @@ impl Agent {
             journal: Arc::new(NoopJournal),
             callbacks: AgentCallbacks::default(),
             provider_override: None,
+            #[cfg(feature = "python")]
+            py_output_cls: None,
         }
     }
 

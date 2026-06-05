@@ -16,9 +16,22 @@ use crate::messages::{anthropic_text_block, anthropic_tool_result_block, google_
     feature = "python",
     pyo3::pyclass(module = "wyrd.prompt", name = "Prompt", skip_from_py_object)
 )]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Prompt {
     pub(crate) inner: skald_spec::Prompt,
+    /// Python class retained for structured-output instantiation.
+    ///
+    /// Set when `Prompt(output=SomeModel)` receives a class. For YAML/card
+    /// prompts this is always `None` — the class is bound at the Agent level.
+    /// Only present under the `python` feature.
+    #[cfg(feature = "python")]
+    pub(crate) py_output_cls: Option<pyo3::Py<pyo3::PyAny>>,
+}
+
+impl PartialEq for Prompt {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
 }
 
 /// Opaque Python wrapper around a rendered native provider request.
@@ -43,8 +56,18 @@ impl Prompt {
     }
 
     /// Wrap a native prompt.
-    pub const fn from_native(inner: skald_spec::Prompt) -> Self {
-        Self { inner }
+    pub fn from_native(inner: skald_spec::Prompt) -> Self {
+        Self {
+            inner,
+            #[cfg(feature = "python")]
+            py_output_cls: None,
+        }
+    }
+
+    /// Return the retained Python output class, if one was passed at construction.
+    #[cfg(feature = "python")]
+    pub fn output_cls(&self) -> Option<&pyo3::Py<pyo3::PyAny>> {
+        self.py_output_cls.as_ref()
     }
 
     /// Render declared prompt variables into a native provider request.
@@ -293,7 +316,7 @@ impl Prompt {
     ) -> CardPyResult<Self> {
         let provider = provider_name_from_py(provider)?;
         let response_format = response_format_from_py(response_format)?;
-        let output = output_from_py(output)?;
+        let (output, py_output_cls) = output_from_py(output)?;
         let explicit_variables = variables.clone();
         let variables = variables.unwrap_or_default();
         let append_messages = !matches!(provider, skald_spec::ProviderName::Custom(_));
@@ -396,7 +419,9 @@ impl Prompt {
         if append_messages {
             prompt = append_py_messages(prompt, messages)?;
         }
-        assign_variables(prompt, explicit_variables)
+        let mut prompt = assign_variables(prompt, explicit_variables)?;
+        prompt.py_output_cls = py_output_cls;
+        Ok(prompt)
     }
 
     /// Build an `OpenAI` Chat prompt from native constructor arguments.
@@ -415,20 +440,23 @@ impl Prompt {
         version: Option<String>,
     ) -> CardPyResult<Self> {
         let explicit_variables = variables.clone();
+        let (output, py_output_cls) = output_from_py(output)?;
         let prompt = crate::builder::openai_chat(
             model,
             OpenAiChatOptions {
                 system,
                 messages: strings_from_py(messages)?,
                 response_format: response_format_from_py(response_format)?,
-                output: output_from_py(output)?,
+                output,
                 prompt_cache_key: cache_prompt_key(cache)?,
                 settings: resolve_openai_chat_settings(model_settings)?,
                 variables: variables.unwrap_or_default(),
                 version,
             },
         )?;
-        assign_variables(prompt, explicit_variables)
+        let mut prompt = assign_variables(prompt, explicit_variables)?;
+        prompt.py_output_cls = py_output_cls;
+        Ok(prompt)
     }
 
     /// Build an `OpenAI` Responses prompt from native constructor arguments.
@@ -446,19 +474,22 @@ impl Prompt {
         version: Option<String>,
     ) -> CardPyResult<Self> {
         let explicit_variables = variables.clone();
+        let (output, py_output_cls) = output_from_py(output)?;
         let prompt = crate::builder::openai_responses(
             model,
             OpenAiResponsesOptions {
                 instructions,
                 messages: strings_from_py(messages)?,
                 response_format: response_format_from_py(response_format)?,
-                output: output_from_py(output)?,
+                output,
                 settings: resolve_openai_responses_settings(model_settings)?,
                 variables: variables.unwrap_or_default(),
                 version,
             },
         )?;
-        assign_variables(prompt, explicit_variables)
+        let mut prompt = assign_variables(prompt, explicit_variables)?;
+        prompt.py_output_cls = py_output_cls;
+        Ok(prompt)
     }
 
     /// Build an Anthropic Messages prompt from native constructor arguments.
@@ -476,19 +507,22 @@ impl Prompt {
         version: Option<String>,
     ) -> CardPyResult<Self> {
         let explicit_variables = variables.clone();
+        let (output, py_output_cls) = output_from_py(output)?;
         let prompt = crate::builder::anthropic(
             model,
             AnthropicOptions {
                 system,
                 messages: strings_from_py(messages)?,
                 response_format: response_format_from_py(response_format)?,
-                output: output_from_py(output)?,
+                output,
                 settings: resolve_anthropic_settings(model_settings)?,
                 variables: variables.unwrap_or_default(),
                 version,
             },
         )?;
-        assign_variables(prompt, explicit_variables)
+        let mut prompt = assign_variables(prompt, explicit_variables)?;
+        prompt.py_output_cls = py_output_cls;
+        Ok(prompt)
     }
 
     /// Build a Google Gemini `GenerateContent` prompt from native constructor arguments.
@@ -506,17 +540,20 @@ impl Prompt {
         version: Option<String>,
     ) -> CardPyResult<Self> {
         let explicit_variables = variables.clone();
+        let (output, py_output_cls) = output_from_py(output)?;
         let options = GeminiOptions {
             system,
             messages: strings_from_py(messages)?,
             response_format: response_format_from_py(response_format)?,
-            output: output_from_py(output)?,
+            output,
             settings: resolve_google_settings(model_settings)?,
             variables: variables.unwrap_or_default(),
             version,
         };
         let prompt = crate::builder::gemini(model, options)?;
-        assign_variables(prompt, explicit_variables)
+        let mut prompt = assign_variables(prompt, explicit_variables)?;
+        prompt.py_output_cls = py_output_cls;
+        Ok(prompt)
     }
 
     /// Build a Vertex `GenerateContent` prompt from native constructor arguments.
@@ -534,17 +571,20 @@ impl Prompt {
         version: Option<String>,
     ) -> CardPyResult<Self> {
         let explicit_variables = variables.clone();
+        let (output, py_output_cls) = output_from_py(output)?;
         let options = GeminiOptions {
             system,
             messages: strings_from_py(messages)?,
             response_format: response_format_from_py(response_format)?,
-            output: output_from_py(output)?,
+            output,
             settings: resolve_google_settings(model_settings)?,
             variables: variables.unwrap_or_default(),
             version,
         };
         let prompt = crate::builder::vertex(model, options)?;
-        assign_variables(prompt, explicit_variables)
+        let mut prompt = assign_variables(prompt, explicit_variables)?;
+        prompt.py_output_cls = py_output_cls;
+        Ok(prompt)
     }
 
     /// Build a raw JSON passthrough prompt with a required provider target.
@@ -1224,30 +1264,203 @@ fn response_format_from_py(
 }
 
 #[cfg(feature = "python")]
-fn output_from_py(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Option<ResponseFormat>> {
-    let Some(value) = value.filter(|value| !value.is_none()) else {
-        return Ok(None);
+fn output_from_py(
+    value: Option<&Bound<'_, PyAny>>,
+) -> CardPyResult<(Option<ResponseFormat>, Option<pyo3::Py<pyo3::PyAny>>)> {
+    let Some(value) = value.filter(|v| !v.is_none()) else {
+        return Ok((None, None));
     };
 
+    // Already a ResponseFormat pyclass — pass through, no class to retain.
     if let Ok(format) = value.extract::<PyRef<'_, ResponseFormat>>() {
-        return Ok(Some(format.clone()));
+        return Ok((Some(format.clone()), None));
     }
 
     let py = value.py();
-    let helper = py
-        .import("wyrd._schema")?
-        .getattr("output_to_json_schema")?;
-    let result = helper.call1((value,))?;
-    let tuple = result.cast::<PyTuple>()?;
-    if tuple.len() != 2 {
-        return Err(PromptBuilderError::Validation(
-            "output_to_json_schema must return (name, schema)".to_owned(),
-        )
-        .into());
+
+    // Pydantic BaseModel subclass — call model_json_schema() and retain the class.
+    if is_pydantic_model(py, value)? {
+        let mut schema = crate::coerce::schema_from_py(value)
+            .map_err(|e| PromptBuilderError::Validation(e.to_string()))?;
+        normalize_output_schema(&mut schema);
+        let name = value
+            .getattr("__name__")
+            .and_then(|n| n.extract::<String>())
+            .unwrap_or_else(|_| "structured_output".to_owned());
+        let fmt = ResponseFormat::json_schema(name, schema)?;
+        return Ok((Some(fmt), Some(value.clone().unbind())));
     }
-    let name = tuple.get_item(0)?.extract::<String>()?;
-    let schema = crate::coerce::schema_from_py(&tuple.get_item(1)?)?;
-    Ok(Some(ResponseFormat::json_schema(name, schema)?))
+
+    // dict input — raw JSON Schema or dict[str, type].
+    if let Ok(dict) = value.cast::<PyDict>() {
+        let mut schema = if is_raw_json_schema(dict) {
+            crate::coerce::schema_from_py(value)
+                .map_err(|e| PromptBuilderError::Validation(e.to_string()))?
+        } else {
+            annotation_dict_to_schema(py, dict)?
+        };
+        normalize_output_schema(&mut schema);
+        return Ok((
+            Some(ResponseFormat::json_schema("structured_output", schema)?),
+            None,
+        ));
+    }
+
+    Err(PromptBuilderError::Validation(
+        "output must be a dict[str, type], pydantic.BaseModel subclass, or ResponseFormat".into(),
+    )
+    .into())
+}
+
+#[cfg(feature = "python")]
+fn is_pydantic_model<'py>(py: pyo3::Python<'py>, obj: &Bound<'py, PyAny>) -> CardPyResult<bool> {
+    let Ok(pydantic) = py.import("pydantic") else {
+        return Ok(false);
+    };
+    let Ok(basemodel) = pydantic.getattr("BaseModel") else {
+        return Ok(false);
+    };
+    let Ok(builtins) = py.import("builtins") else {
+        return Ok(false);
+    };
+    let Ok(is_subclass) = builtins.getattr("issubclass") else {
+        return Ok(false);
+    };
+    Ok(is_subclass
+        .call1((obj, basemodel))
+        .and_then(|r| r.extract::<bool>())
+        .unwrap_or(false))
+}
+
+#[cfg(feature = "python")]
+fn is_raw_json_schema(dict: &Bound<'_, pyo3::types::PyDict>) -> bool {
+    dict.get_item("type").ok().flatten().is_some()
+        || dict.get_item("properties").ok().flatten().is_some()
+        || dict.get_item("$schema").ok().flatten().is_some()
+}
+
+#[cfg(feature = "python")]
+fn normalize_output_schema(schema: &mut serde_json::Value) {
+    if let Some(obj) = schema.as_object_mut() {
+        obj.entry("additionalProperties")
+            .or_insert(serde_json::Value::Bool(false));
+    }
+}
+
+#[cfg(feature = "python")]
+fn annotation_dict_to_schema<'py>(
+    py: pyo3::Python<'py>,
+    dict: &Bound<'py, pyo3::types::PyDict>,
+) -> CardPyResult<serde_json::Value> {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for (k, v) in dict.iter() {
+        let key = k.extract::<String>().map_err(|_| {
+            PromptBuilderError::Validation("output schema keys must be strings".into())
+        })?;
+        let schema = py_annotation_to_schema(py, &v)?;
+        properties.insert(key.clone(), schema);
+        required.push(serde_json::Value::String(key));
+    }
+    Ok(serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
+    }))
+}
+
+#[cfg(feature = "python")]
+fn py_annotation_to_schema<'py>(
+    py: pyo3::Python<'py>,
+    ann: &Bound<'py, PyAny>,
+) -> CardPyResult<serde_json::Value> {
+    let builtins = py
+        .import("builtins")
+        .map_err(|e| PromptBuilderError::Validation(e.to_string()))?;
+
+    let primitives: &[(&str, &str)] = &[
+        ("str", "string"),
+        ("int", "integer"),
+        ("float", "number"),
+        ("bool", "boolean"),
+    ];
+    for (builtin_name, json_type) in primitives {
+        if let Ok(bt) = builtins.getattr(*builtin_name) {
+            if ann.is(&bt) {
+                return Ok(serde_json::json!({"type": json_type}));
+            }
+        }
+    }
+
+    // Python 3.10+ `T | None` — types.UnionType has __args__ but no __origin__.
+    // Must be checked before the __origin__ branch so `str | None` is handled correctly.
+    if ann.getattr("__origin__").is_err() {
+        if let Ok(args) = ann.getattr("__args__") {
+            if args.try_iter().is_ok() {
+                let none_type = py.None().bind(py).get_type().into_any();
+                if let Ok(iter) = args.try_iter() {
+                    let non_none: Vec<_> = iter
+                        .flatten()
+                        .filter(|a| !a.is(&none_type))
+                        .collect();
+                    if !non_none.is_empty() {
+                        return py_annotation_to_schema(py, &non_none[0]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Generic aliases — inspect __origin__ and __args__.
+    if let Ok(origin) = ann.getattr("__origin__") {
+        // list[T]
+        if let Ok(list_t) = builtins.getattr("list") {
+            if origin.is(&list_t) {
+                let items = if let Ok(args) = ann.getattr("__args__") {
+                    if let Ok(item) = args.get_item(0) {
+                        py_annotation_to_schema(py, &item)?
+                    } else {
+                        serde_json::json!({})
+                    }
+                } else {
+                    serde_json::json!({})
+                };
+                return Ok(serde_json::json!({"type": "array", "items": items}));
+            }
+        }
+        // dict[K, V]
+        if let Ok(dict_t) = builtins.getattr("dict") {
+            if origin.is(&dict_t) {
+                return Ok(serde_json::json!({"type": "object"}));
+            }
+        }
+        // Optional[T] / Union[T, None]
+        if let Ok(args) = ann.getattr("__args__") {
+            let none_type = py.None().bind(py).get_type().into_any();
+            if let Ok(iter) = args.try_iter() {
+                for arg in iter.flatten() {
+                    if !arg.is(&none_type) {
+                        return py_annotation_to_schema(py, &arg);
+                    }
+                }
+            }
+        }
+    }
+
+    // Nested Pydantic BaseModel — inline its schema recursively.
+    if is_pydantic_model(py, ann)? {
+        let mut schema = crate::coerce::schema_from_py(ann)
+            .map_err(|e| PromptBuilderError::Validation(e.to_string()))?;
+        normalize_output_schema(&mut schema);
+        return Ok(schema);
+    }
+
+    Err(PromptBuilderError::Validation(format!(
+        "unsupported output annotation: {ann} — supported types are str, int, float, \
+         bool, list[T], dict[K,V], Optional[T], and pydantic.BaseModel subclasses"
+    ))
+    .into())
 }
 
 #[cfg(feature = "python")]
@@ -1377,4 +1590,27 @@ where
         py,
         &serde_json::to_value(value)?,
     )?)
+}
+
+#[cfg(test)]
+mod output_schema_tests {
+    use super::normalize_output_schema;
+
+    #[test]
+    fn normalize_adds_additional_properties_when_absent() {
+        let mut schema = serde_json::json!({"type": "object", "properties": {}});
+        normalize_output_schema(&mut schema);
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn normalize_does_not_overwrite_existing_additional_properties() {
+        let mut schema =
+            serde_json::json!({"type": "object", "additionalProperties": {"type": "string"}});
+        normalize_output_schema(&mut schema);
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!({"type": "string"})
+        );
+    }
 }

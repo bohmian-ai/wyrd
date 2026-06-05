@@ -77,4 +77,6 @@ def test_output_invalid_class_raises() -> None:
     assert exc.value.code in {
         "WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA",
         "WYRD_PROMPT_422_PYDANTIC_REQUIRED",
+        "SKALD_PROMPT_422_VALIDATION",
+        "WYRD_PROMPT_400_DRAFT_INVALID",
     }

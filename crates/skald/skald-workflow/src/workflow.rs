@@ -121,12 +121,8 @@ impl DagExecutor {
                 let parent_run_id = workflow_run_id.clone();
                 let task_observer = Arc::clone(&observer);
                 handles.push(tokio::spawn(async move {
-                    let task = workflow.run_one_with_retries(
-                        task,
-                        &events,
-                        context,
-                        &parent_run_id,
-                    );
+                    let task =
+                        workflow.run_one_with_retries(task, &events, context, &parent_run_id);
                     wyrd_observe::with_observer(task_observer, task).await
                 }));
             }
@@ -307,7 +303,7 @@ impl DagExecutor {
                     {
                         let mut guard = task.write().map_err(|_| WorkflowError::Lock)?;
                         guard.status = TaskStatus::Completed;
-                    guard.result = Some(response.as_ref().clone());
+                        guard.result = Some(response.as_ref().clone());
                     }
                     {
                         let mut ctx_guard = context.write().await;

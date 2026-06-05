@@ -1,37 +1,26 @@
 apiVersion: wyrd/v1
-metadata:
-  space: default
-  name: research
-  version: "0.1.0"
 kind: Workflow
+metadata:
+  name: research
+  version: 0.1.0
 spec:
-  id: research
   steps:
-    - id: planner
-      action:
+  - id: planner
+    action:
+      type: agent
+      target:
         kind: Agent
-        spec:
-          prompt:
-            provider: mock
-            model: gpt-4o-mini
-            messages:
-              - role: user
-                content: "Plan research on: {{topic}}"
-            variables: [topic]
-            response_type:
-              type: text
-      depends_on: []
-    - id: writer
-      action:
+        name: planner
+        version: 0.1.0
+  - id: writer
+    action:
+      type: agent
+      target:
         kind: Agent
-        spec:
-          prompt:
-            provider: mock
-            model: gpt-4o-mini
-            messages:
-              - role: user
-                content: "Write a brief from: {{summary}}"
-            variables: [summary]
-            response_type:
-              type: text
-      depends_on: [planner]
+        name: writer
+        version: 0.1.0
+    depends_on:
+    - planner
+relationships:
+  outbound: []
+status: null

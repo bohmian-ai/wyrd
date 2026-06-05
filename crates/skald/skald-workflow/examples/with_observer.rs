@@ -10,6 +10,9 @@ use skald_spec::{ProviderRequest, ProviderResponse};
 use skald_workflow::{Workflow, WorkflowInput};
 use wyrd_observe::OtelObserver;
 
+mod common;
+use common::{mock_registry, plan_prompt, write_prompt};
+
 #[derive(Default)]
 struct TokenCounter {
     calls: AtomicU64,
@@ -56,22 +59,29 @@ impl Observer for TokenCounter {
 
 fn main() -> anyhow::Result<()> {
     let counter = Arc::new(TokenCounter::default());
-    let wf = Workflow::load(
-        "examples/workflows/research.yaml",
-        skald_tool::default_registry(),
-        skald_agent::default_prompt_resolver(),
-    )?
-    .with_observers(vec![
+    let planner = skald_agent::Agent::new(plan_prompt()).name("planner");
+    let writer = skald_agent::Agent::new(write_prompt()).name("writer");
+    let wf = Workflow::sequential("research", vec![planner, writer])?.with_observers(vec![
         Arc::new(OtelObserver::new()) as Arc<dyn Observer>,
         Arc::clone(&counter) as Arc<dyn Observer>,
     ]);
-    let run = wyrd_runtime::runtime().block_on(wf.run(WorkflowInput::from(HashMap::from([(
-        "topic".to_owned(),
-        "the Rust borrow checker".to_owned(),
-    )]))))?;
+    let providers = mock_registry(&[
+        r#"{"summary":"mock summary","steps":["read","write"]}"#,
+        "Final observed brief",
+    ]);
+    let run = wyrd_runtime::runtime().block_on(wf.run_with(
+        &providers,
+        WorkflowInput::from(HashMap::from([(
+            "topic".to_owned(),
+            "the Rust borrow checker".to_owned(),
+        )])),
+    ))?;
     println!("model calls: {}", counter.calls.load(Ordering::Relaxed));
     println!("tokens in:   {}", counter.tokens_in.load(Ordering::Relaxed));
-    println!("tokens out:  {}", counter.tokens_out.load(Ordering::Relaxed));
+    println!(
+        "tokens out:  {}",
+        counter.tokens_out.load(Ordering::Relaxed)
+    );
     println!("final:       {:?}", run.final_output);
     Ok(())
 }

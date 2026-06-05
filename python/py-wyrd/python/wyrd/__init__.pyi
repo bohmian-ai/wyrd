@@ -35,6 +35,7 @@ from .prompt import (
     PromptCardMetadata,
     PromptRef,
     ProviderRequest,
+    ProviderResponse,
     ResponseFormat,
 )
 
@@ -61,6 +62,7 @@ __all__ = [
     "PromptCardMetadata",
     "PromptRef",
     "ProviderRequest",
+    "ProviderResponse",
     "ResponseFormat",
     "Role",
     "RunConfig",

@@ -160,7 +160,7 @@ impl From<SessionTurn> for ConversationTurn {
     /// Converts a session turn to a conversation turn.
     ///
     /// For `Role::Assistant` this always produces `MessageNum::OpenAi`. Use
-    /// [`session_turn_to_conversation_turn`] when the provider is known to get
+    /// `session_turn_to_conversation_turn` when the provider is known to get
     /// the correct wire format for Anthropic or Gemini agents.
     fn from(turn: SessionTurn) -> Self {
         match turn.role {

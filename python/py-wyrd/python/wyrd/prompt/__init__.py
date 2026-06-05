@@ -11,6 +11,7 @@ from .._wyrd.cards.prompt import (
     PromptCardMetadata,
     PromptRef,
     ProviderRequest,
+    ProviderResponse,
     ResponseFormat,
     WyrdError,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "PromptCardMetadata",
     "PromptRef",
     "ProviderRequest",
+    "ProviderResponse",
     "ResponseFormat",
     "WyrdError",
 ]

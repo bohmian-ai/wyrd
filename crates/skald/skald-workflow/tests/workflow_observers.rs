@@ -63,7 +63,10 @@ struct EventLog {
 
 impl EventLog {
     fn push(&self, event: impl Into<String>) {
-        self.events.lock().expect("event log lock").push(event.into());
+        self.events
+            .lock()
+            .expect("event log lock")
+            .push(event.into());
     }
 
     fn events(&self) -> Vec<String> {
@@ -81,7 +84,10 @@ impl Observer for EventLog {
         _input: &str,
         _session_id: Option<&str>,
     ) {
-        self.push(format!("agent_start:{agent_id}:parent={}", parent_run_id.is_some()));
+        self.push(format!(
+            "agent_start:{agent_id}:parent={}",
+            parent_run_id.is_some()
+        ));
     }
 
     async fn on_model_call(
@@ -168,8 +174,8 @@ fn agent(name: &str) -> Agent {
                 messages: vec![format!("run {name}")],
                 ..OpenAiChatOptions::default()
             },
-    )
-    .expect("static prompt is valid"),
+        )
+        .expect("static prompt is valid"),
     )
     .name(name)
     .with_id(name)
@@ -180,8 +186,7 @@ fn workflow() -> Workflow {
 }
 
 fn workflow_named(name: &str) -> Workflow {
-    Workflow::sequential(name, [agent("planner"), agent("writer")])
-        .expect("workflow is valid")
+    Workflow::sequential(name, [agent("planner"), agent("writer")]).expect("workflow is valid")
 }
 
 fn openai_text_response(text: &str) -> ProviderResponse {
@@ -243,7 +248,10 @@ async fn workflow_with_multiple_observers_dispatches_in_order() {
 
     wf.run_with(&providers, "topic").await.unwrap();
 
-    assert_eq!(*sink.lock().expect("ordered observer lock"), ["a", "b", "c"]);
+    assert_eq!(
+        *sink.lock().expect("ordered observer lock"),
+        ["a", "b", "c"]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -257,7 +265,10 @@ async fn workflow_observers_override_global() {
     let providers = registry(vec!["plan", "write", "solo"]);
 
     wf.run_with(&providers, "topic").await.unwrap();
-    agent("solo").run_with(&providers, None, "topic").await.unwrap();
+    agent("solo")
+        .run_with(&providers, None, "topic")
+        .await
+        .unwrap();
 
     assert!(
         scoped
@@ -271,7 +282,12 @@ async fn workflow_observers_override_global() {
             .iter()
             .any(|event| event == "workflow_start:scoped-research")
     );
-    assert!(global.events().iter().any(|event| event == "agent_start:solo:parent=false"));
+    assert!(
+        global
+            .events()
+            .iter()
+            .any(|event| event == "agent_start:solo:parent=false")
+    );
 }
 
 #[test]

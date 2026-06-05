@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Resource",
+  "description": "OTel-canonical resource projection.\n\nFields:\n\n- `service_name` -- required OTel `service.name` semantic-convention attribute. Empty values are rejected; non-empty values are capped at 256 characters. - `service_namespace` -- optional OTel `service.namespace`. - `service_version` -- optional OTel `service.version`. - `service_instance_id` -- optional OTel `service.instance.id`. - `attributes` -- every other OTel resource attribute the producer emitted, such as `host.name`, `k8s.pod.uid`, `telemetry.sdk.name`, or `process.pid`.",
+  "type": "object",
+  "required": [
+    "service_name"
+  ],
+  "properties": {
+    "attributes": {
+      "description": "Remaining OTel resource attributes, such as `host.*`, `k8s.*`, and `cloud.*`.",
+      "default": {},
+      "type": "object",
+      "additionalProperties": true
+    },
+    "service_instance_id": {
+      "description": "`service.instance.id`, when emitted by the producer.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "service_name": {
+      "description": "`service.name`, required by OTel semantic conventions.",
+      "type": "string"
+    },
+    "service_namespace": {
+      "description": "`service.namespace`, when emitted by the producer.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "service_version": {
+      "description": "`service.version`, when emitted by the producer.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

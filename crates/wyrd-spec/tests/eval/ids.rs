@@ -218,7 +218,7 @@ fn id_uuid_types_serde_round_trip() {
 
 #[test]
 fn entity_uid_serde_round_trip() {
-    let entity = EntityUid("customer-123".to_string());
+    let entity = EntityUid::new("customer-123").expect("valid entity uid");
     let json = serde_json::to_string(&entity).expect("entity uid serializes");
     assert_eq!(json, "\"customer-123\"");
     let round_trip: EntityUid = serde_json::from_str(&json).expect("entity uid deserializes");
@@ -226,17 +226,17 @@ fn entity_uid_serde_round_trip() {
 }
 
 #[test]
-fn trace_id_serde_byte_array() {
-    let trace = TraceId([0; 16]);
+fn trace_id_deserializes_legacy_byte_array_and_serializes_hex() {
+    let trace: TraceId = serde_json::from_str("[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]")
+        .expect("legacy byte array deserializes");
     let json = serde_json::to_string(&trace).expect("trace id serializes");
-    let value: serde_json::Value = serde_json::from_str(&json).expect("trace id json parses");
-    assert_eq!(value.as_array().map(std::vec::Vec::len), Some(16));
+    assert_eq!(json, "\"0102030405060708090a0b0c0d0e0f10\"");
 }
 
 #[test]
-fn span_id_serde_byte_array() {
-    let span = SpanId([0; 8]);
+fn span_id_deserializes_legacy_byte_array_and_serializes_hex() {
+    let span: SpanId =
+        serde_json::from_str("[1,2,3,4,5,6,7,8]").expect("legacy byte array deserializes");
     let json = serde_json::to_string(&span).expect("span id serializes");
-    let value: serde_json::Value = serde_json::from_str(&json).expect("span id json parses");
-    assert_eq!(value.as_array().map(std::vec::Vec::len), Some(8));
+    assert_eq!(json, "\"0102030405060708\"");
 }

@@ -1,4 +1,11 @@
 //! Eval-scoped identifier and path types.
+//!
+//! Vala-wide ids live in [`crate::vala::ids`] and are re-exported here so
+//! existing `wyrd_spec::vala::eval::ids::*` imports continue to resolve.
+
+pub use crate::vala::ids::{
+    DataTenantId, EntityUid, RecordId, SessionId, SpanId, TraceId, WorkflowUid,
+};
 
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -136,42 +143,6 @@ impl schemars::JsonSchema for ScenarioId {
         .into()
     }
 }
-
-/// Session-scoped identifier grouping related eval records.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(transparent)]
-pub struct SessionId(pub uuid::Uuid);
-
-/// Identifier for a single eval record.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(transparent)]
-pub struct RecordId(pub uuid::Uuid);
-
-/// Identifier for one workflow execution against one target and input row.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(transparent)]
-pub struct WorkflowUid(pub uuid::Uuid);
-
-/// Stable user-facing entity identifier for the eval subject.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(transparent)]
-pub struct EntityUid(pub String);
-
-/// Sixteen-byte OpenTelemetry trace identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(transparent)]
-pub struct TraceId(pub [u8; 16]);
-
-/// Eight-byte OpenTelemetry span identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(transparent)]
-pub struct SpanId(pub [u8; 8]);
 
 /// Validated JSONPath expression used to address workflow and scenario fields.
 ///

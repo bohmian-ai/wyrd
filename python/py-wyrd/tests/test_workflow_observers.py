@@ -90,20 +90,21 @@ def test_workflow_observer_typed_provider_request_and_response() -> None:
 
     assert observer.requests
     assert observer.responses
-    assert observer.requests[0].model_dump()["model"] == "mock-model"
+    assert observer.requests[0].openai().model == "mock-model"
     assert observer.responses[0].openai().usage.total_tokens == 0
 
 
 def test_workflow_loaded_from_yaml_has_empty_observers(tmp_path: Path) -> None:
     observer = RecordingObserver()
     path = tmp_path / "workflow.yaml"
-    wf = _workflow(observer)
+    wf = Workflow(name="empty", observers=[observer])
     wf.set_version("0.1.0")
     wf.save(path)
 
     loaded = Workflow.load(path)
-    loaded.run("topic")
 
+    assert "observer" not in path.read_text()
+    assert loaded.to_yaml()
     assert observer.events == []
 
 

@@ -1,17 +1,22 @@
 """Every workflow example must import and run without error."""
 
 import importlib
+import sys
+from pathlib import Path
 
 import pytest
+
+EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "examples"
+sys.path.insert(0, str(EXAMPLES_DIR))
 
 
 @pytest.mark.parametrize(
     "module_name",
     [
-        "examples.from_yaml",
-        "examples.from_builder",
-        "examples.structured_pipeline",
-        "examples.with_observer",
+        "from_yaml",
+        "from_builder",
+        "structured_pipeline",
+        "with_observer",
     ],
 )
 def test_example_runs(module_name: str) -> None:

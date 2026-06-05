@@ -18,7 +18,7 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-from wyrd import Agent, WyrdInstrumentor
+from wyrd import Agent, OtelObserver, Workflow
 from wyrd.prompt import Prompt
 
 
@@ -32,7 +32,6 @@ def configure_otel() -> None:
 
 def main() -> None:
     configure_otel()
-    WyrdInstrumentor().instrument()
 
     agent = Agent(
         name="greeter",
@@ -45,8 +44,9 @@ def main() -> None:
         ),
     )
 
-    result = agent.run({"name": "world"})
-    print(result.output)
+    workflow = Workflow.sequential("jaeger-greeting", agent, observers=[OtelObserver()])
+    result = workflow.run({"name": "world"})
+    print(result.final_output)
     print("View trace at http://localhost:16686")
 
 

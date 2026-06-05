@@ -13,6 +13,7 @@ PUBLIC_MODULE_STUBS = {
     "agent.pyi": PACKAGE_DIR / "agent" / "__init__.pyi",
     "data.pyi": PACKAGE_DIR / "data" / "__init__.pyi",
     "model.pyi": PACKAGE_DIR / "model" / "__init__.pyi",
+    "observer.pyi": PACKAGE_DIR / "observer.pyi",
     "prompt.pyi": PACKAGE_DIR / "prompt" / "__init__.pyi",
 }
 
@@ -89,6 +90,12 @@ def rewrite_public_imports(filename: str, content: str) -> str:
                 "from .._wyrd import JsonDict, PathLike, WyrdError"
             ),
             "from .prompt import Prompt": "from ..prompt import Prompt",
+            "from .observer import Observer": "from ..observer import Observer",
+        },
+        "observer.pyi": {
+            "from wyrd.stubs.prompt import ProviderRequest, ProviderResponse": (
+                "from .prompt import ProviderRequest, ProviderResponse"
+            ),
         },
         "data.pyi": {
             "from .error import WyrdError\nfrom .header import CardRefLike, JsonDict, PathLike, StringMap": (
@@ -136,12 +143,6 @@ def assemble_root_stub() -> None:
     final_content.append("    ...")
     final_content.append("")
     master_all.append("_init")
-
-    final_content.append("def set_observer(observer: object) -> None:")
-    final_content.append('    """Install a Python observer as the process-wide global observer."""')
-    final_content.append("    ...")
-    final_content.append("")
-    master_all.append("set_observer")
 
     final_content.append("### GLOBAL EXPORTS ###")
     final_content.append("__all__ = [")

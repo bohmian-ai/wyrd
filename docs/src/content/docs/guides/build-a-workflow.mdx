@@ -1,0 +1,229 @@
+---
+title: Build an Agent Workflow
+description: Author a workflow from Python, YAML, or Rust, then run and instrument it.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+# Build an Agent Workflow
+
+A workflow is a DAG of agent invocations. Use `Workflow.sequential` for simple
+pipelines, `Workflow.parallel` when steps can run concurrently, or `add` /
+`add_after` for custom shapes.
+
+## Author
+
+<Tabs>
+  <TabItem label="Python">
+
+```python
+from wyrd import Agent, Prompt, Workflow, tool
+
+@tool
+def web_search(query: str) -> str:
+    """Search the web."""
+    return f"results for {query}"
+
+planner = Agent(
+    name="planner",
+    prompt=Prompt(
+        provider="openai",
+        model="gpt-4o",
+        system="You plan research projects.",
+        messages=["Plan research on: ${topic}"],
+        output={"summary": str, "steps": list[str]},
+    ),
+    tools=[web_search],
+)
+writer = Agent(
+    name="writer",
+    prompt=Prompt(
+        provider="openai",
+        model="gpt-4o",
+        system="Write a brief from research notes.",
+        messages=["Draft a brief on: ${summary}"],
+    ),
+)
+
+wf = Workflow.sequential("research", planner, writer)
+```
+
+  </TabItem>
+  <TabItem label="YAML">
+
+```yaml
+apiVersion: wyrd/v1
+metadata:
+  space: default
+  name: research
+  version: "0.1.0"
+kind: Workflow
+spec:
+  id: research
+  steps:
+    - id: planner
+      action:
+        kind: Agent
+        spec:
+          prompt:
+            provider: openai
+            model: gpt-4o
+            system: "You plan research projects."
+            messages:
+              - role: user
+                content: "Plan research on: {{topic}}"
+            variables: [topic]
+      depends_on: []
+    - id: writer
+      action:
+        kind: Agent
+        spec:
+          prompt:
+            provider: openai
+            model: gpt-4o
+            system: "Write a brief from research notes."
+            messages:
+              - role: user
+                content: "Draft a brief on: {{summary}}"
+            variables: [summary]
+      depends_on: [planner]
+```
+
+```python
+from wyrd import Workflow
+wf = Workflow.load("research.yaml")
+```
+
+  </TabItem>
+  <TabItem label="Rust">
+
+```rust
+use skald_agent::Agent;
+use skald_workflow::Workflow;
+
+let planner = Agent::new(plan_prompt()).name("planner");
+let writer = Agent::new(write_prompt()).name("writer");
+let wf = Workflow::sequential("research", vec![planner, writer])?;
+wf.save("research.yaml")?;
+```
+
+  </TabItem>
+</Tabs>
+
+## Run
+
+```python
+run = wf.run({"topic": "the Rust borrow checker"})
+print(run.parameters)
+print(run.final_output)
+```
+
+String input is available as `${input}`. Mapping input exposes each key as a
+template variable. Structured output from upstream steps accumulates in
+`WorkflowRun.parameters` and can feed downstream prompts.
+
+## Save And Load
+
+```python
+wf.save("research.yaml")
+loaded = Workflow.load("research.yaml")
+assert Workflow.from_yaml(wf.to_yaml()).to_yaml() == wf.to_yaml()
+```
+
+Observers are not serialized. Reattach them after `load`.
+
+## Custom DAG
+
+```python
+wf = Workflow(name="pipeline")
+wf.add(research_agent)
+wf.add_after(analysis_agent, after=research_agent)
+wf.add_after(summary_agent, after=research_agent)
+wf.add_after(final_agent, after=[analysis_agent, summary_agent])
+```
+
+## Observe
+
+<Tabs>
+  <TabItem label="Python">
+
+```python
+import threading
+from wyrd import Observer, OtelObserver, Workflow
+
+class TokenCounter(Observer):
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.tokens_in = 0
+        self.tokens_out = 0
+
+    def on_model_result(self, run_id, agent_id, iteration,
+                        finish_reason, synthetic, response):
+        if synthetic:
+            return
+        try:
+            usage = response.openai().usage
+        except Exception:
+            return
+        if usage:
+            with self._lock:
+                self.tokens_in += usage.prompt_tokens
+                self.tokens_out += usage.completion_tokens
+
+counter = TokenCounter()
+wf = Workflow.sequential("research", planner, writer,
+                         observers=[OtelObserver(), counter])
+run = wf.run({"topic": "the Rust borrow checker"})
+print(counter.tokens_in, counter.tokens_out, run.final_output)
+```
+
+  </TabItem>
+  <TabItem label="Rust">
+
+```rust
+use std::sync::Arc;
+
+use skald_agent::Observer;
+use skald_workflow::{Workflow, WorkflowInput};
+use wyrd_observe::OtelObserver;
+
+let counter = Arc::new(TokenCounter::default());
+let wf = Workflow::sequential("research", vec![planner, writer])?
+    .with_observers(vec![
+        Arc::new(OtelObserver::new()) as Arc<dyn Observer>,
+        Arc::clone(&counter) as Arc<dyn Observer>,
+    ]);
+let run = wyrd_runtime::runtime().block_on(wf.run(WorkflowInput::from("topic")))?;
+```
+
+  </TabItem>
+</Tabs>
+
+There is no global Python install path, no `observer=` parameter on `run`, and
+no `Agent(observers=...)`. Wrap a solo agent in a one-step workflow to observe
+it.
+
+`on_model_call` receives `ProviderRequest`; `on_model_result` receives
+`ProviderResponse`. Use typed accessors such as `request.openai()` and
+`response.openai()` instead of raw JSON decoding.
+
+## Typed Callback Wire
+
+```python
+from wyrd import Agent, Prompt, ProviderRequest, ProviderResponse
+
+def log_prompt(request: ProviderRequest) -> None:
+    print(request.openai().model)
+
+def log_response(response: ProviderResponse) -> None:
+    usage = response.openai().usage
+    if usage:
+        print(usage.total_tokens)
+
+agent = Agent(
+    name="researcher",
+    prompt=Prompt(provider="openai", model="gpt-4o", messages=["Research: ${topic}"]),
+    before_model_callback=log_prompt,
+    after_model_callback=log_response,
+)
+```

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use serde_json::{Map, Value};
-use skald_agent::Agent;
+use skald_agent::{Agent, Observer};
 use wyrd_spec::card::workflow::{
     WorkflowAction, WorkflowCard, WorkflowCardError, WorkflowSpec, WorkflowStep,
 };
@@ -104,6 +104,8 @@ pub struct Workflow {
     pub(crate) spec: WorkflowSpec,
     pub(crate) cascade_children: Vec<CardRef>,
     pub(crate) resolved_agents: HashMap<String, Arc<Agent>>,
+    /// Runtime-only observers attached to this workflow instance.
+    pub(crate) observers: Vec<Arc<dyn Observer>>,
 }
 
 impl std::fmt::Debug for Workflow {
@@ -134,6 +136,7 @@ impl Workflow {
             spec: WorkflowSpec::default(),
             cascade_children: Vec::new(),
             resolved_agents: HashMap::new(),
+            observers: Vec::new(),
         }
     }
 
@@ -164,6 +167,22 @@ impl Workflow {
         }
         wf.spec.validate_dag()?;
         Ok(wf)
+    }
+
+    /// Return a copy with runtime observers attached.
+    ///
+    /// Observers are runtime-only state. They are not serialized into the
+    /// workflow card and must be reattached after loading from YAML.
+    #[must_use]
+    pub fn with_observers(mut self, observers: Vec<Arc<dyn Observer>>) -> Self {
+        self.observers = observers;
+        self
+    }
+
+    /// Borrow the runtime observers attached to this workflow.
+    #[must_use]
+    pub fn observers(&self) -> &[Arc<dyn Observer>] {
+        &self.observers
     }
 
     /// Open a fluent builder for explicit DAG construction.
@@ -330,6 +349,7 @@ impl Workflow {
             spec: card.spec,
             cascade_children: card.cascade_children,
             resolved_agents: resolved,
+            observers: Vec::new(),
         })
     }
 
@@ -413,10 +433,29 @@ impl Workflow {
         providers: &skald_runtime::ProviderRegistry,
         input: impl Into<WorkflowInput>,
     ) -> WorkflowResult<WorkflowRun> {
+        wyrd_observe_impl::init();
+        let input = input.into();
+        let inner = self.run_with_inner(providers, input);
+        match self.observers.as_slice() {
+            [] => inner.await,
+            [one] => wyrd_observe::with_observer(Arc::clone(one), inner).await,
+            many => {
+                let composite: Arc<dyn Observer> =
+                    Arc::new(wyrd_observe::CompositeObserver::new(many.to_vec()));
+                wyrd_observe::with_observer(composite, inner).await
+            }
+        }
+    }
+
+    async fn run_with_inner(
+        &self,
+        providers: &skald_runtime::ProviderRegistry,
+        input: WorkflowInput,
+    ) -> WorkflowResult<WorkflowRun> {
         let def = self.to_workflow_def()?;
         let executor = DagExecutor::build(def, providers).await?;
         let mut ctx = Context::new();
-        ctx.input = input.into().into_context_input();
+        ctx.input = input.into_context_input();
         Arc::new(executor).run(ctx).await
     }
 

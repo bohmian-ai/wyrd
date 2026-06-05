@@ -1,4 +1,4 @@
-//! Python bridge: PythonObserver + set_observer.
+//! Python bridge for PythonObserver.
 
 #![cfg(feature = "python")]
 
@@ -22,6 +22,14 @@ use skald_agent::observer::Observer;
 /// cheaply move the handle into `spawn_blocking` closures without acquiring
 /// the GIL twice.
 pub struct PythonObserver(Arc<Py<PyAny>>);
+
+impl PythonObserver {
+    /// Wrap a Python observer instance for Rust observer dispatch.
+    #[must_use]
+    pub fn new(observer: Py<PyAny>) -> Self {
+        Self(Arc::new(observer))
+    }
+}
 
 // PythonObserver implements all Observer methods by firing spawn_blocking.
 // Each method follows the same pattern:
@@ -270,32 +278,18 @@ impl Observer for PythonObserver {
     }
 }
 
-/// Install a Python observer object as the process-wide global observer.
-///
-/// The observer must be a subclass of `wyrd.Observer`. It is wrapped in a
-/// `PythonObserver` bridge that dispatches Rust observer events to the Python
-/// object via `spawn_blocking + Python::attach`.
-///
-/// Subsequent calls are silent no-ops (first caller wins, matching
-/// `wyrd_observe::set_global` semantics).
-#[pyfunction]
-pub fn set_observer(observer: Py<PyAny>) {
-    wyrd_observe::set_global(Arc::new(PythonObserver(Arc::new(observer))));
-}
-
 /// Initialize the Rust observer bridge.
 #[pyfunction]
 pub fn _init() {
     crate::init();
 }
 
-/// Register `_init` and `set_observer` on `wyrd._wyrd`.
+/// Register `_init` on `wyrd._wyrd`.
 ///
 /// # Errors
 ///
 /// Returns PyO3 registration errors.
 pub fn python_register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_init, module)?)?;
-    module.add_function(wrap_pyfunction!(set_observer, module)?)?;
     Ok(())
 }

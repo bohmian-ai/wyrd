@@ -10,7 +10,7 @@ use skald_agent::{Observer, ObserverProvider};
 /// Python initialization hook.
 pub mod python;
 #[cfg(feature = "python")]
-pub use python::python_register;
+pub use python::{PythonObserver, python_register};
 
 /// Observer provider installed into `skald-agent`.
 pub struct WyrdObserverProvider;

@@ -30,7 +30,7 @@
 //! ## Errors
 //!
 //! All public failures surface as [`WorkflowError`] with stable
-//! `SKALD_WORKFLOW_*` codes.
+//! stable Wyrd workflow error codes.
 
 #![deny(missing_docs)]
 #![allow(clippy::module_name_repetitions)]

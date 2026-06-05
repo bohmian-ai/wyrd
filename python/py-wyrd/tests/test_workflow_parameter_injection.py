@@ -79,4 +79,4 @@ def test_workflow_missing_parameter_raises() -> None:
     with pytest.raises(WyrdError) as exc:
         wf.run("topic")
 
-    assert exc.value.code == "SKALD_WORKFLOW_422_MISSING_PARAMETER"
+    assert exc.value.code == "WYRD_WORKFLOW_422_MISSING_PARAMETER"

@@ -61,6 +61,7 @@ impl WyrdErrorVariant {
             Self::AgentTimeout => "WYRD_AGENT_504_TIMEOUT".to_owned(),
             Self::SessionRecentFailed => "WYRD_SESSION_500_RECENT".to_owned(),
             Self::SessionAppendFailed => "WYRD_SESSION_500_APPEND".to_owned(),
+            Self::Workflow(code) if code.starts_with("WYRD_") => code.clone(),
             Self::Workflow(code) => code
                 .strip_prefix("SKALD_")
                 .map_or_else(|| format!("WYRD_{code}"), |suffix| format!("WYRD_{suffix}")),
@@ -94,17 +95,17 @@ pub fn map_skald_code(code: &str) -> Option<WyrdErrorVariant> {
         "SKALD_SESSION_500_APPEND" => Some(WyrdErrorVariant::SessionAppendFailed),
         "SKALD_WORKFLOW_404_TASK"
         | "SKALD_WORKFLOW_404_AGENT"
-        | "SKALD_WORKFLOW_422_DEP_MISSING"
-        | "SKALD_WORKFLOW_409_TASK_EXISTS"
-        | "SKALD_WORKFLOW_422_SELF_DEP"
-        | "SKALD_WORKFLOW_422_CYCLE"
+        | "WYRD_WORKFLOW_422_MISSING_DEPENDENCY"
+        | "WYRD_WORKFLOW_422_DUPLICATE_STEP_ID"
+        | "WYRD_WORKFLOW_422_CYCLE"
         | "SKALD_WORKFLOW_422_OUTPUT_SCHEMA"
         | "SKALD_WORKFLOW_500_MAX_RETRIES"
         | "SKALD_WORKFLOW_500_AGENT_RESPONSE_MISSING"
         | "SKALD_WORKFLOW_500_INTERNAL"
         | "SKALD_WORKFLOW_500_STALLED"
         | "SKALD_WORKFLOW_500_LOCK"
-        | "SKALD_WORKFLOW_501_UNSUPPORTED_HANDOFF" => {
+        | "SKALD_WORKFLOW_501_UNSUPPORTED_HANDOFF"
+        | "WYRD_WORKFLOW_422_MISSING_PARAMETER" => {
             Some(WyrdErrorVariant::Workflow(code.to_owned()))
         }
         _ => None,
@@ -195,10 +196,9 @@ mod tests {
     const WORKFLOW_CODES: &[&str] = &[
         "SKALD_WORKFLOW_404_TASK",
         "SKALD_WORKFLOW_404_AGENT",
-        "SKALD_WORKFLOW_409_TASK_EXISTS",
-        "SKALD_WORKFLOW_422_DEP_MISSING",
-        "SKALD_WORKFLOW_422_SELF_DEP",
-        "SKALD_WORKFLOW_422_CYCLE",
+        "WYRD_WORKFLOW_422_DUPLICATE_STEP_ID",
+        "WYRD_WORKFLOW_422_MISSING_DEPENDENCY",
+        "WYRD_WORKFLOW_422_CYCLE",
         "SKALD_WORKFLOW_422_OUTPUT_SCHEMA",
         "SKALD_WORKFLOW_500_AGENT_RESPONSE_MISSING",
         "SKALD_WORKFLOW_500_INTERNAL",
@@ -206,6 +206,7 @@ mod tests {
         "SKALD_WORKFLOW_500_MAX_RETRIES",
         "SKALD_WORKFLOW_500_STALLED",
         "SKALD_WORKFLOW_501_UNSUPPORTED_HANDOFF",
+        "WYRD_WORKFLOW_422_MISSING_PARAMETER",
     ];
 
     #[test]

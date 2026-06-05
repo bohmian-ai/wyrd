@@ -1,7 +1,7 @@
 """Public Python package for Wyrd."""
 
 from . import data, model, prompt
-from ._wyrd import AgentError, SessionError, ToolError, WyrdError, _init, set_observer
+from ._wyrd import AgentError, SessionError, ToolError, WyrdError, _init
 from .agent import (
     Agent,
     AgentRun,
@@ -22,7 +22,7 @@ from .agent import (
 from .data import DataCard, Split
 from .model import ModelCard, ModelSignature, SampleInput
 from .observer import Observer
-from .otel import OtelObserver, WyrdInstrumentor
+from .otel import OtelObserver
 from .prompt import (
     AnthropicSettings,
     GeminiSettings,
@@ -74,12 +74,10 @@ __all__ = [
     "ToolError",
     "Workflow",
     "WorkflowRun",
-    "WyrdInstrumentor",
     "WyrdError",
     "data",
     "local_registry",
     "model",
     "prompt",
-    "set_observer",
     "tool",
 ]

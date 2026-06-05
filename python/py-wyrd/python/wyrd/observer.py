@@ -51,11 +51,12 @@ class Observer:
         iteration: int,
         provider: str,
         model: str,
+        request: object,
     ) -> None:
         """Provider model call started.
 
         Use this hook to open a provider/model span or count outbound model
-        requests. It fires immediately before the provider request is executed.
+        requests. It receives a typed ProviderRequest wrapper.
         """
 
     def on_model_result(
@@ -65,12 +66,12 @@ class Observer:
         iteration: int,
         finish_reason: str,
         synthetic: bool,
+        response: object,
     ) -> None:
         """Provider model call completed.
 
         Use this hook to close the model span opened by on_model_call or record
-        the provider finish reason. When synthetic is True, the result came from
-        runtime synthesis rather than a normal provider response.
+        the provider finish reason. It receives a typed ProviderResponse wrapper.
         """
 
     def on_tool_call(

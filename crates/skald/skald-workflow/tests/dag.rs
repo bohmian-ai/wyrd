@@ -200,19 +200,19 @@ async fn workflow_build_rejects_duplicate_id() {
         task_def("a", vec![]),
     ]))
     .await;
-    assert_eq!(err.code(), "SKALD_WORKFLOW_409_TASK_EXISTS");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_DUPLICATE_STEP_ID");
 }
 
 #[tokio::test]
 async fn workflow_build_rejects_self_dependency() {
     let err = build_error(workflow_def(vec![task_def("a", vec!["a"])])).await;
-    assert_eq!(err.code(), "SKALD_WORKFLOW_422_SELF_DEP");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_MISSING_DEPENDENCY");
 }
 
 #[tokio::test]
 async fn workflow_build_rejects_missing_dependency() {
     let err = build_error(workflow_def(vec![task_def("a", vec!["missing"])])).await;
-    assert_eq!(err.code(), "SKALD_WORKFLOW_422_DEP_MISSING");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_MISSING_DEPENDENCY");
 }
 
 #[test]
@@ -224,7 +224,7 @@ fn workflow_def_validate_graph_rejects_cycle() {
     ])
     .validate_graph()
     .expect_err("cycle fails");
-    assert_eq!(err.code(), "SKALD_WORKFLOW_422_CYCLE");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_CYCLE");
 }
 
 #[test]
@@ -236,7 +236,7 @@ fn tasklist_add_task_rejects_duplicate_id() {
     let err = tasks
         .add_task(task_def("a", vec![]))
         .expect_err("duplicate task fails");
-    assert_eq!(err.code(), "SKALD_WORKFLOW_409_TASK_EXISTS");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_DUPLICATE_STEP_ID");
 }
 
 #[test]
@@ -245,7 +245,7 @@ fn tasklist_add_task_rejects_self_dependency() {
     let err = tasks
         .add_task(task_def("a", vec!["a"]))
         .expect_err("self dependency fails");
-    assert_eq!(err.code(), "SKALD_WORKFLOW_422_SELF_DEP");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_MISSING_DEPENDENCY");
 }
 
 #[test]
@@ -254,7 +254,7 @@ fn tasklist_add_task_rejects_missing_dependency() {
     let err = tasks
         .add_task(task_def("a", vec!["missing"]))
         .expect_err("missing dependency fails");
-    assert_eq!(err.code(), "SKALD_WORKFLOW_422_DEP_MISSING");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_MISSING_DEPENDENCY");
 }
 
 #[tokio::test]

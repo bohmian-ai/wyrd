@@ -14,11 +14,13 @@ path = "src/lib.rs"
 
 [features]
 default = []
+otel = ["wyrd-observe/otel"]
 python = [
     "dep:pyo3",
     "dep:wyrd-runtime",
     "dep:wyrd-utils",
     "skald-agent/python",
+    "wyrd-observe-impl/python",
     "wyrd-utils/python",
 ]
 
@@ -29,6 +31,8 @@ skald-runtime = { workspace = true }
 skald-agent = { workspace = true }
 skald-tool = { workspace = true }
 wyrd-spec = { workspace = true }
+wyrd-observe = { workspace = true }
+wyrd-observe-impl = { workspace = true }
 wyrd-runtime = { workspace = true, optional = true }
 wyrd-utils = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }

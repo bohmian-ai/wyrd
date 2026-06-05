@@ -248,45 +248,7 @@ class OtelObserver(Observer):
         """
         ...
 
-class WyrdInstrumentor:
-    """Wires a Wyrd observer into the agent runtime.
-
-    Defaults to OtelObserver when called with no arguments.
-    """
-
-    def instrument(
-        self,
-        *,
-        observer: Observer | None = ...,
-        observers: list[Observer] | None = ...,
-    ) -> None:
-        """Install observer(s) into the Wyrd runtime.
-
-        Args:
-            observer (Observer | None): Optional single observer.
-            observers (list[Observer] | None): Optional list of observers.
-
-        When both are omitted, installs OtelObserver using the global OTel provider.
-        """
-        ...
-
-    def uninstrument(self) -> None:
-        """No-op. The global observer cannot be uninstalled after first install."""
-        ...
-
-def set_observer(observer: Observer) -> None:
-    """Install a Python observer as the process-wide global observer.
-
-    The first call wins. Subsequent calls are silent no-ops.
-
-    Args:
-        observer (Observer): Observer instance to install.
-    """
-    ...
-
 __all__ = [
     "Observer",
     "OtelObserver",
-    "WyrdInstrumentor",
-    "set_observer",
 ]

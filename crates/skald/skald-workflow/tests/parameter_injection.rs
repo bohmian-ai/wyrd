@@ -253,7 +253,7 @@ async fn workflow_missing_parameter_surfaces_code() {
 
     let err = wf.run_with(&providers, "topic").await.unwrap_err();
 
-    assert_eq!(err.code(), "SKALD_WORKFLOW_422_MISSING_PARAMETER");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_MISSING_PARAMETER");
 }
 
 #[tokio::test(flavor = "multi_thread")]

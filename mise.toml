@@ -332,6 +332,10 @@ dir = "python/py-wyrd"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/workflow_gateway.py"
 
+[tasks."check:examples"]
+description = "Build all example binaries"
+run = "cargo build -p skald-workflow --examples --all-features"
+
 [tasks."dev:backend"]
 description = "Build and run wyrd-server on :8080"
 run = [
@@ -468,7 +472,7 @@ diff -u "$BEFORE" "$AFTER" \
 
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
-depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:error-coverage", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:docs"]
+depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:error-coverage", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
 
 [tasks."dev:pg:nuke"]
 description = "Wipe embedded pg cache"

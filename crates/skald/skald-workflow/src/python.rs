@@ -4,11 +4,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyModule, PyString};
-use skald_agent::Agent;
+use skald_agent::{Agent, Observer};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, Labels};
 
@@ -120,6 +121,28 @@ fn extract_agents(py: Python<'_>, agents: Vec<Py<PyAny>>) -> PyResult<Vec<Agent>
     Ok(out)
 }
 
+fn extract_observers(
+    py: Python<'_>,
+    observers: Option<Vec<Py<PyAny>>>,
+) -> PyResult<Vec<Arc<dyn Observer>>> {
+    let Some(observers) = observers else {
+        return Ok(Vec::new());
+    };
+    let observer_cls = py.import("wyrd.observer")?.getattr("Observer")?;
+    let mut out: Vec<Arc<dyn Observer>> = Vec::with_capacity(observers.len());
+    for observer in observers {
+        let bound = observer.bind(py);
+        if !bound.is_instance(&observer_cls)? {
+            let type_name = bound.get_type().name()?;
+            return Err(PyTypeError::new_err(format!(
+                "expected Observer subclass, got {type_name}"
+            )));
+        }
+        out.push(Arc::new(wyrd_observe_impl::PythonObserver::new(observer)) as Arc<dyn Observer>);
+    }
+    Ok(out)
+}
+
 fn coerce_after<'py>(py: Python<'py>, after: &Bound<'py, PyAny>) -> PyResult<Vec<String>> {
     if let Ok(text) = after.cast::<PyString>() {
         return Ok(vec![text.to_str()?.to_owned()]);
@@ -175,16 +198,20 @@ impl Workflow {
         space = None,
         labels = None,
         annotations = None,
+        observers = None,
     ))]
     pub fn __new__(
+        py: Python<'_>,
         name: String,
         version: Option<String>,
         space: Option<String>,
         labels: Option<HashMap<String, String>>,
         annotations: Option<HashMap<String, String>>,
+        observers: Option<Vec<Py<PyAny>>>,
     ) -> PyResult<Self> {
         let labels = coerce_labels(labels)?;
         let annotations = coerce_annotations(annotations)?;
+        let observers = extract_observers(py, observers)?;
         let mut wf = Workflow::new(name);
         if let Some(version) = version {
             wf = wf.with_version(version);
@@ -194,6 +221,7 @@ impl Workflow {
         }
         wf.meta.labels = labels;
         wf.meta.annotations = annotations;
+        wf = wf.with_observers(observers);
         Ok(wf)
     }
 
@@ -202,6 +230,7 @@ impl Workflow {
     /// Args:
     ///     name (str): Workflow name.
     ///     *agents (Agent): One or more Agent values to chain.
+    ///     observers (list[Observer] | None): Optional runtime observers.
     ///
     /// Returns:
     ///     Workflow: Workflow with each agent depending on the previous one.
@@ -209,10 +238,18 @@ impl Workflow {
     /// Raises:
     ///     WyrdError: When the resulting DAG is invalid.
     #[staticmethod]
-    #[pyo3(name = "sequential", signature = (name, *agents))]
-    pub fn py_sequential(py: Python<'_>, name: String, agents: Vec<Py<PyAny>>) -> PyResult<Self> {
+    #[pyo3(name = "sequential", signature = (name, *agents, observers = None))]
+    pub fn py_sequential(
+        py: Python<'_>,
+        name: String,
+        agents: Vec<Py<PyAny>>,
+        observers: Option<Vec<Py<PyAny>>>,
+    ) -> PyResult<Self> {
         let agents = extract_agents(py, agents)?;
-        Workflow::sequential(name, agents).map_err(workflow_error_to_py)
+        let observers = extract_observers(py, observers)?;
+        Workflow::sequential(name, agents)
+            .map(|workflow| workflow.with_observers(observers))
+            .map_err(workflow_error_to_py)
     }
 
     /// Build a workflow whose steps run in parallel with no dependencies.
@@ -220,6 +257,7 @@ impl Workflow {
     /// Args:
     ///     name (str): Workflow name.
     ///     *agents (Agent): One or more Agent values to run in parallel.
+    ///     observers (list[Observer] | None): Optional runtime observers.
     ///
     /// Returns:
     ///     Workflow: Workflow with each agent as an independent root step.
@@ -227,10 +265,18 @@ impl Workflow {
     /// Raises:
     ///     WyrdError: When the resulting DAG is invalid.
     #[staticmethod]
-    #[pyo3(name = "parallel", signature = (name, *agents))]
-    pub fn py_parallel(py: Python<'_>, name: String, agents: Vec<Py<PyAny>>) -> PyResult<Self> {
+    #[pyo3(name = "parallel", signature = (name, *agents, observers = None))]
+    pub fn py_parallel(
+        py: Python<'_>,
+        name: String,
+        agents: Vec<Py<PyAny>>,
+        observers: Option<Vec<Py<PyAny>>>,
+    ) -> PyResult<Self> {
         let agents = extract_agents(py, agents)?;
-        Workflow::parallel(name, agents).map_err(workflow_error_to_py)
+        let observers = extract_observers(py, observers)?;
+        Workflow::parallel(name, agents)
+            .map(|workflow| workflow.with_observers(observers))
+            .map_err(workflow_error_to_py)
     }
 
     /// Append `agent` as a new step with no dependencies.

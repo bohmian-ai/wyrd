@@ -7,6 +7,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from .error import WyrdError
 from .header import JsonDict, PathLike
+from .observer import Observer
 from .prompt import Prompt, ProviderResponse
 
 #### end of imports ####
@@ -489,6 +490,7 @@ class Workflow:
         space: str | None = ...,
         labels: Mapping[str, str] | None = ...,
         annotations: Mapping[str, str] | None = ...,
+        observers: Sequence[Observer] | None = ...,
     ) -> None:
         """Build an empty Workflow with the given name and optional metadata.
 
@@ -498,16 +500,22 @@ class Workflow:
             space (str | None): Optional logical space.
             labels (Mapping[str, str] | None): Optional queryable labels.
             annotations (Mapping[str, str] | None): Optional free-form annotations.
+            observers (Sequence[Observer] | None): Runtime observers for workflow runs.
         """
         ...
 
     @staticmethod
-    def sequential(name: str, *agents: Agent) -> Workflow:
+    def sequential(
+        name: str,
+        *agents: Agent,
+        observers: Sequence[Observer] | None = ...,
+    ) -> Workflow:
         """Build a workflow whose steps run sequentially.
 
         Args:
             name (str): Workflow name.
             *agents (Agent): One or more Agent values to chain.
+            observers (Sequence[Observer] | None): Runtime observers for workflow runs.
 
         Returns:
             Workflow: Workflow with each agent depending on the previous one.
@@ -518,12 +526,17 @@ class Workflow:
         ...
 
     @staticmethod
-    def parallel(name: str, *agents: Agent) -> Workflow:
+    def parallel(
+        name: str,
+        *agents: Agent,
+        observers: Sequence[Observer] | None = ...,
+    ) -> Workflow:
         """Build a workflow whose steps run in parallel with no dependencies.
 
         Args:
             name (str): Workflow name.
             *agents (Agent): One or more Agent values to run in parallel.
+            observers (Sequence[Observer] | None): Runtime observers for workflow runs.
 
         Returns:
             Workflow: Workflow with each agent as an independent root step.

@@ -3009,6 +3009,8 @@ dependencies = [
  "tracing",
  "ulid",
  "url",
+ "wyrd-observe",
+ "wyrd-observe-impl",
  "wyrd-runtime",
  "wyrd-spec",
  "wyrd-utils",

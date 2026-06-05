@@ -119,10 +119,15 @@ impl DagExecutor {
                 let events = Arc::clone(&events);
                 let context = Arc::clone(&context);
                 let parent_run_id = workflow_run_id.clone();
+                let task_observer = Arc::clone(&observer);
                 handles.push(tokio::spawn(async move {
-                    workflow
-                        .run_one_with_retries(task, &events, context, &parent_run_id)
-                        .await
+                    let task = workflow.run_one_with_retries(
+                        task,
+                        &events,
+                        context,
+                        &parent_run_id,
+                    );
+                    wyrd_observe::with_observer(task_observer, task).await
                 }));
             }
 
@@ -204,7 +209,7 @@ impl DagExecutor {
                 guard.validate_response(&response)
             };
             match validation {
-                Ok(()) => return Ok(response),
+                Ok(()) => return Ok(response.as_ref().clone()),
                 Err(err) if attempt == max_retries => return Err(err),
                 Err(_err) => {}
             }
@@ -302,7 +307,7 @@ impl DagExecutor {
                     {
                         let mut guard = task.write().map_err(|_| WorkflowError::Lock)?;
                         guard.status = TaskStatus::Completed;
-                        guard.result = Some(response);
+                    guard.result = Some(response.as_ref().clone());
                     }
                     {
                         let mut ctx_guard = context.write().await;

@@ -12,6 +12,9 @@ import pathlib
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol, TypeAlias, overload
 
+from wyrd.observer import Observer
+from wyrd.otel import OtelObserver
+
 PathLike: TypeAlias = str | os.PathLike[str] | pathlib.Path
 JsonDict: TypeAlias = dict[str, Any]
 StringMap: TypeAlias = Mapping[str, str]
@@ -147,10 +150,6 @@ def _init() -> None:
     """Initialize the native Wyrd extension."""
     ...
 
-def set_observer(observer: object) -> None:
-    """Install a Python observer as the process-wide global observer."""
-    ...
-
 ### GLOBAL EXPORTS ###
 __all__ = [
     "AgentError",
@@ -158,5 +157,4 @@ __all__ = [
     "ToolError",
     "WyrdError",
     "_init",
-    "set_observer",
 ]

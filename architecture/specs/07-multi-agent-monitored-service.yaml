@@ -12,6 +12,10 @@
 #
 # Card inventory (16 cards):
 #
+#   SOURCES (2)                          # Wyrd reads; never pushes.
+#     - Source   ops-copilot-run-archive   # parquet of agent runs (vala archive)
+#     - Source   ops-copilot-latency-stats # parquet of service latency samples
+#
 #   PROMPTS (3)
 #     - Prompt   triage-prompt
 #     - Prompt   runbook-prompt
@@ -26,7 +30,7 @@
 #     - Policy   runbook-runtime-policy            # per-agent gates
 #     - Policy   ops-copilot-service-policy        # service-wide gates
 #
-#   OBSERVATION (5)
+#   OBSERVATION (4)
 #     - Eval     triage-eval                       # judge eval, targets triage agent
 #     - Eval     runbook-eval                      # judge eval, targets runbook agent
 #     - Drift    triage-output-quality-drift       # PSI, targets triage agent
@@ -37,29 +41,23 @@
 #     - Operator pageroncall-operator
 #     - Trigger  latency-drift-page-trigger        # drift → operator
 #
-#   COMPOSITION + SINK (2)
-#     - Service  ddog-sink-prod                    # observability sink
-#     - Service  ops-copilot-svc                   # the composing Service
+#   COMPOSITION (1)
+#     - Service  ops-copilot-svc                   # composes Agents + Policies
 #
 # Design choices worth noticing while reading:
 #
-#   1. Drifts and Evals all declare their OWN target_refs. They sit OUTSIDE the
-#      Service composition. The Service knows nothing about them. They link
-#      themselves to the Agents/Service via target_refs.
+#   1. Wyrd reads; it does not push. The team's runtime emits metrics, traces,
+#      and run records via their own SDKs (Datadog, OTel, whatever). Wyrd uses
+#      `Source` cards to point Drifts/Evals/Audits at that history when they
+#      need to query it. There is no "sink" Service.
 #
-#   2. ObservationHooks lives on Eval today (per current spec) but NOT on
-#      ServiceSpec, AgentSpec, or DriftSpec. The service-wide fanout to
-#      ddog-sink-prod is therefore expressed two ways:
-#         a) Eval.observation_hooks (works today, lives in spec).
-#         b) Drift/Service-level fanout (PROPOSED, commented in this file).
-#      Open issue: lift observation_hooks to a foundation on every run-
-#      producing spec.
+#   2. Drifts and Evals declare their OWN target_refs and their OWN source_refs.
+#      They sit OUTSIDE the Service composition. The Service knows nothing
+#      about them. They link themselves to the Agents/Service via target_refs.
 #
 #   3. Per-agent Policy binding has no first-class field on ServiceComponent
-#      today. The workaround is to list each Policy as its own component and
-#      scope the rule expressions by `agent.name`. The PROPOSED alternative is
-#      a `policy_refs:` field on ServiceComponent — shown commented out where
-#      it would live.
+#      today (open question #1). The workaround is to list each Policy as its
+#      own component and scope the rule expressions by `agent.name`.
 #
 #   4. Service-wide Policy is composed as a Service component without an
 #      `agent.name` gate; the runtime applies it to every invocation.
@@ -70,8 +68,43 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
+# SOURCES
+# -----------------------------------------------------------------------------
+apiVersion: wyrd/v1
+kind: Source
+metadata:
+  name: ops-copilot-run-archive
+  version: "1.0.0"
+  space: prod
+spec:
+  kind: object_store
+  uri: s3://acme-vala/ops-copilot/runs/
+  format: parquet
+  credential_ref: { provider: aws_secrets_manager, name: prod/vala/reader }
+  defaults:
+    partition_keys:
+      type: list
+      value:
+        - { type: str, value: dt }
+        - { type: str, value: agent }
+
+---
+apiVersion: wyrd/v1
+kind: Source
+metadata:
+  name: ops-copilot-latency-stats
+  version: "1.0.0"
+  space: prod
+spec:
+  kind: object_store
+  uri: s3://acme-vala/ops-copilot/latency/
+  format: parquet
+  credential_ref: { provider: aws_secrets_manager, name: prod/vala/reader }
+
+# -----------------------------------------------------------------------------
 # PROMPTS
 # -----------------------------------------------------------------------------
+---
 apiVersion: wyrd/v1
 kind: Prompt
 metadata:
@@ -176,7 +209,7 @@ spec:
 #
 # Per-agent policies scope by `agent.name` in expressions today, because
 # ServiceComponent does not yet carry policy_refs. Once that binding lands,
-# expressions drop the agent.name scoping.
+# expressions drop the agent.name scoping. (Open question #1.)
 # -----------------------------------------------------------------------------
 ---
 apiVersion: wyrd/v1
@@ -252,9 +285,10 @@ spec:
 # -----------------------------------------------------------------------------
 # OBSERVATION — Evals and Drifts
 #
-# Each Eval/Drift declares its target via target_refs. Authors never edit the
-# Agent or Service to "register" the observation. The Service composes the
-# Agents; the Evals/Drifts attach independently.
+# Each Eval/Drift declares its target via target_refs and its history via
+# source_refs. Authors never edit the Agent or Service to "register" the
+# observation. The Service composes the Agents; the Evals/Drifts attach
+# independently.
 # -----------------------------------------------------------------------------
 ---
 apiVersion: wyrd/v1
@@ -272,6 +306,8 @@ spec:
     - { kind: Prompt, name: ops-copilot-judge-prompt, version: "1.0.0", space: prod }
   dataset_refs:
     - { kind: Data,   name: triage-eval-set,          version: "2026.06.01", space: prod }
+  source_refs:
+    - { kind: Source, name: ops-copilot-run-archive,  version: "1.0.0", space: prod }
   pass_gates:
     - { metric: correctness_mean, op: ">=", value: 4.0 }
     - { metric: safety_min,       op: ">=", value: 4.0 }
@@ -279,10 +315,6 @@ spec:
     type: Judge
     config:
       rubric: [correctness, completeness, safety]
-  observation_hooks:
-    route_refs:
-      - { kind: Service, name: ddog-sink-prod, version: "1.0.0", space: prod }
-    events: [eval.run.finished, eval.gate.failed]
 
 ---
 apiVersion: wyrd/v1
@@ -300,16 +332,14 @@ spec:
     - { kind: Prompt, name: ops-copilot-judge-prompt, version: "1.0.0", space: prod }
   dataset_refs:
     - { kind: Data,   name: runbook-eval-set,         version: "2026.06.01", space: prod }
+  source_refs:
+    - { kind: Source, name: ops-copilot-run-archive,  version: "1.0.0", space: prod }
   pass_gates:
     - { metric: correctness_mean, op: ">=", value: 4.2 }
   profile:
     type: Judge
     config:
       rubric: [correctness, safety]
-  observation_hooks:
-    route_refs:
-      - { kind: Service, name: ddog-sink-prod, version: "1.0.0", space: prod }
-    events: [eval.run.finished, eval.gate.failed]
 
 ---
 # Per-agent drift: PSI on triage severity distribution.
@@ -326,6 +356,8 @@ spec:
     - { kind: Agent, name: incident-triage-agent, version: "1.0.0", space: prod }
   baseline_ref:
     { kind: Data,  name: triage-baseline-distribution, version: "2026.05.01", space: prod }
+  source_refs:
+    - { kind: Source, name: ops-copilot-run-archive,   version: "1.0.0", space: prod }
   features: [predicted_severity]
   profile:
     type: Psi
@@ -334,10 +366,6 @@ spec:
       alert_threshold: 0.2
   thresholds:
     psi: 0.2
-  # PROPOSED: observation_hooks foundation on DriftSpec (commented).
-  # observation_hooks:
-  #   route_refs: [{ kind: Service, name: ddog-sink-prod, version: "1.0.0", space: prod }]
-  #   events: [drift.alert.fired, drift.score.computed]
 
 ---
 apiVersion: wyrd/v1
@@ -353,6 +381,8 @@ spec:
     - { kind: Agent, name: runbook-executor-agent, version: "1.0.0", space: prod }
   baseline_ref:
     { kind: Data,  name: runbook-success-baseline, version: "2026.05.01", space: prod }
+  source_refs:
+    - { kind: Source, name: ops-copilot-run-archive, version: "1.0.0", space: prod }
   features: [step_success_rate]
   profile:
     type: Spc
@@ -377,6 +407,8 @@ spec:
     - { kind: Service, name: ops-copilot-svc, version: "1.0.0", space: prod }
   baseline_ref:
     { kind: Data, name: ops-copilot-latency-baseline, version: "2026.05.01", space: prod }
+  source_refs:
+    - { kind: Source, name: ops-copilot-latency-stats, version: "1.0.0", space: prod }
   features: [p95_latency_ms]
   profile:
     type: Spc
@@ -421,40 +453,10 @@ spec:
   cooldown_seconds: 600
 
 # -----------------------------------------------------------------------------
-# OBSERVABILITY SINK
-# -----------------------------------------------------------------------------
----
-apiVersion: wyrd/v1
-kind: Service
-metadata:
-  name: ddog-sink-prod
-  version: "1.0.0"
-  space: prod
-  labels:
-    role:   observability-sink
-    vendor: datadog
-spec:
-  description: Datadog sink for ops-copilot observations.
-  service_type: observability
-  runtime:
-    kind: api
-    framework: datadog
-    strict: true
-    config:
-      site:    { type: str, value: datadoghq.com }
-      env:     { type: str, value: prod }
-      service: { type: str, value: ops-copilot }
-  credential_refs:
-    - { provider: aws_secrets_manager, name: prod/datadog/api_key }
-
-# -----------------------------------------------------------------------------
 # COMPOSING SERVICE
 #
 # Today: per-agent policies are listed as flat components and scoped by
-#        `agent.name` in their rule expressions.
-#
-# Proposed (commented): ServiceComponent gains an optional `policy_refs`
-# binding so per-agent gates apply only when that agent is invoked.
+#        `agent.name` in their rule expressions. (Open question #1.)
 # -----------------------------------------------------------------------------
 ---
 apiVersion: wyrd/v1
@@ -470,25 +472,16 @@ spec:
     # Agents
     - alias: triage
       ref: { kind: Agent, name: incident-triage-agent, version: "1.0.0", space: prod }
-      # PROPOSED — per-component policy binding (commented; pending lock):
-      # policy_refs:
-      #   - { kind: Policy, name: triage-runtime-policy, version: "1.0.0", space: prod }
     - alias: executor
       ref: { kind: Agent, name: runbook-executor-agent, version: "1.0.0", space: prod }
-      # policy_refs:
-      #   - { kind: Policy, name: runbook-runtime-policy, version: "1.0.0", space: prod }
 
-    # Policies — flat list today; per-agent binding pending lock.
+    # Policies — flat list today; per-agent binding pending decision.
     - alias: triage_policy
       ref: { kind: Policy, name: triage-runtime-policy,    version: "1.0.0", space: prod }
     - alias: executor_policy
       ref: { kind: Policy, name: runbook-runtime-policy,   version: "1.0.0", space: prod }
     - alias: service_policy
       ref: { kind: Policy, name: ops-copilot-service-policy, version: "1.0.0", space: prod }
-
-    # Observability sink (referenced by Evals via observation_hooks).
-    - alias: ddog
-      ref: { kind: Service, name: ddog-sink-prod, version: "1.0.0", space: prod }
 
   entry_point: acme.opscopilot.service:app
   deployment:
@@ -500,16 +493,3 @@ spec:
     strict: true
     policy:
       runtime_hooks: true
-
-  # PROPOSED — observation_hooks lifted to a foundation on ServiceSpec
-  # (commented; pending lock). Today, fanout is expressed by each Eval/Drift
-  # declaring its own observation_hooks. Once lifted, this lets the Service
-  # fan out service-level events (start/finish/tool.failed) too.
-  #
-  # observation_hooks:
-  #   route_refs:
-  #     - { kind: Service, name: ddog-sink-prod, version: "1.0.0", space: prod }
-  #   events:
-  #     - service.run.started
-  #     - service.run.finished
-  #     - service.tool.failed

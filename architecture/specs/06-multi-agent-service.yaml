@@ -1,15 +1,19 @@
 # =============================================================================
-# Example 6 — Multi-agent service with policy, audit, skills, and MCP
+# Example 6 — Multi-agent service with policy, audit, and MCP
 #
 # Scenario: An internal "engineering copilot" exposes two specialized agents
 # (a code-review agent and a release-notes agent) behind one service. They
-# share a reusable Skill ("conventional commits"), pull external tools through
-# a registered MCP server (GitHub), are governed by a single PolicyCard, and
-# the whole bundle is covered by an AuditCard.
+# pull external tools through a registered MCP server (GitHub), are governed
+# by a single PolicyCard, and the whole bundle is covered by an AuditCard.
 #
-# Card inventory:
-#   - Skill    conventional-commits           # reusable instruction set
-#   - Mcp      github-mcp                     # MCP server catalog
+# Note: there is no `Tool` or `Skill` CardKind in v1.
+#   - Reusable instructions (e.g. Conventional Commits) live inline in the
+#     Prompt that needs them, or as a dedicated Prompt with variables.
+#   - Tool resolution is by name from the runtime tool registry; MCP servers
+#     auto-register their advertised tools.
+#
+# Card inventory (7 cards):
+#   - Mcp      github-mcp                     # MCP server registration
 #   - Prompt   code-review-prompt
 #   - Prompt   release-notes-prompt
 #   - Agent    code-review-agent
@@ -19,29 +23,6 @@
 #   - Audit    eng-copilot-audit
 # =============================================================================
 
-apiVersion: wyrd/v1
-kind: Skill
-metadata:
-  name: conventional-commits
-  version: "1.1.0"
-  space: prod
-  labels:
-    domain: git
-spec:
-  description: Reusable instructions for producing Conventional Commits 1.0.0 messages.
-  prompt_refs: []
-  tool_refs: []
-  output_schema:
-    type: object
-    required: [type, scope, subject]
-    properties:
-      type:    { type: string, enum: [feat, fix, docs, refactor, test, chore] }
-      scope:   { type: string }
-      subject: { type: string, maxLength: 72 }
-      body:    { type: string }
-      breaking: { type: boolean }
-
----
 apiVersion: wyrd/v1
 kind: Mcp
 metadata:
@@ -53,6 +34,8 @@ spec:
   server_name: github
   transport: stdio
   scopes: [repo:read, pull_requests:write, issues:read]
+  credential_refs:
+    - { provider: aws_secrets_manager, name: prod/github/pat }
   details:
     command:
       type: list
@@ -60,10 +43,6 @@ spec:
         - { type: str, value: "npx" }
         - { type: str, value: "-y" }
         - { type: str, value: "@modelcontextprotocol/server-github" }
-    env:
-      type: object
-      value:
-        GITHUB_PERSONAL_ACCESS_TOKEN: { type: str, value: "${secrets.github_pat}" }
 
 ---
 apiVersion: wyrd/v1
@@ -79,7 +58,9 @@ spec:
     - role: system
       content: |
         You review pull requests. Comment on correctness, readability, and
-        risk. Be specific. Cite file:line.
+        risk. Be specific. Cite file:line. Format commit message suggestions
+        using Conventional Commits 1.0.0 (type(scope): subject, body,
+        BREAKING CHANGE: footer where applicable).
     - role: user
       content: |
         Diff:
@@ -122,8 +103,8 @@ spec:
     name: code-review-prompt
     version: "1.0.0"
     space: prod
-  # Tool names resolve from the runtime tool registry. The github-mcp server
-  # surfaces tools like `gh_pr_get`, `gh_pr_comment`.
+  # Tool names resolve from the runtime tool registry. github-mcp auto-
+  # registers tools like `gh_pr_get`, `gh_pr_comment`.
   tool_names: [gh_pr_get, gh_pr_comment]
   run_config:
     max_iterations: 8
@@ -187,12 +168,8 @@ spec:
       ref: { kind: Agent,  name: release-notes-agent,  version: "1.0.0", space: prod }
     - alias: github
       ref: { kind: Mcp,    name: github-mcp,           version: "1.0.0", space: prod }
-    - alias: skill_cc
-      ref: { kind: Skill,  name: conventional-commits, version: "1.1.0", space: prod }
     - alias: policy
       ref: { kind: Policy, name: eng-copilot-runtime-policy, version: "1.0.0", space: prod }
-    - alias: ddog
-      ref: { kind: Service, name: ddog-sink-prod,      version: "1.0.0", space: prod }
   entry_point: acme.engcopilot.service:app
   deployment:
     image:    { type: str, value: registry.acme.com/eng-copilot:1.0.0 }

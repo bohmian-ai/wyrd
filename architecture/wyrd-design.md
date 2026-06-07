@@ -34,17 +34,29 @@ Downstream artifacts are brought up to this version in a sync pass.
 10. **Every cross-card pointer is a `CardRef`.** No string-typed parents or
     path-typed lookups in the protocol. Path hints belong on
     `ServiceComponent.source` only, where they're an authoring convenience.
+11. **Sub-agency is a relationship, not a noun.** An Agent invoking another
+    Agent is the sub-agent call. The callee is an `AgentCard`. The caller's
+    prompt / runtime expresses the invocation. No `SubAgent` kind.
+12. **Tools are runtime names, not cards.** `AgentSpec.tool_names: Vec<String>`
+    resolves through the runtime tool registry. MCP servers auto-register
+    their tools by name; host tools register themselves. No `Tool` kind.
+13. **No event vocabulary on the wire.** "Observation" comes from Drift/Eval/
+    Audit; "trigger firing" comes from the `TriggerSource` enum. Free-form
+    event-name strings are doctrine drift.
+14. **Harness-host config does not belong on Cards.** Permission modes,
+    sandboxes, isolation, effort, and per-CLI compatibility are properties of
+    the host that runs the Agent, not of the Agent contract.
 
 ---
 
 ## Kind catalog
 
-19 native kinds + `External { name, schema_hash }` for forward-compat.
+16 native kinds + `External { name, schema_hash }` for forward-compat.
 
 | Domain        | Kinds |
 |---------------|-------|
 | Data plane    | Data, Model, Artifact, Experiment |
-| Agent plane   | Prompt, Tool, Agent, Workflow, SubAgent, Skill, Mcp |
+| Agent plane   | Prompt, Agent, Workflow, Mcp |
 | Composition   | Service |
 | Governance    | Policy, Audit |
 | Observability | Drift, Eval, Source |
@@ -118,28 +130,10 @@ spec:
   # Flattened Skald Prompt: provider, model, messages, variables, response_format, ...
 ```
 
-### Tool
-LLM-visible tool descriptor.
-```yaml
-spec:
-  name: string
-  description: string
-  tool_type: string              # script | api | mcp | builtin
-  args_schema: json
-  output_schema?: json
-  script_config: { string: NonSecretValue }
-  api_config: { string: NonSecretValue }
-  credential_refs: [CredentialRef]
-  mcp_server_name?: string
-  allowed_tools: [string]
-  requires_approval: bool
-  hook_events: [string]
-  hook_matcher: { string: NonSecretValue }
-  details: { string: NonSecretValue }
-```
-
 ### Agent
-Agent contract: prompt + tools + run config.
+Agent contract: prompt + tools + run config. Tool names resolve through the
+runtime tool registry (host tools + MCP server registrations). Approval,
+per-tool blocks, and hook gates live on `Policy`, not here.
 ```yaml
 spec:
   prompt: PromptRef              # CardRef or inline prompt
@@ -159,46 +153,16 @@ spec:
   details: { string: NonSecretValue }
 ```
 
-### SubAgent
-Headless sub-agent definition for harness consumption.
-```yaml
-spec:
-  description?: string
-  prompt?: string
-  model?: string
-  tool_refs: [CardRef]
-  disallowed_tools: [string]
-  skill_refs: [CardRef]          # → Skill
-  max_turns?: u32
-  permission_mode?: string
-  memory: { string: NonSecretValue }
-  background: bool
-  effort?: string
-  isolation?: string
-  compatible_clis: [string]
-```
-
-### Skill
-Reusable instruction + tool bundle.
-```yaml
-spec:
-  description?: string
-  prompt_refs: [CardRef]
-  tool_refs: [CardRef]
-  input_schema?: json
-  output_schema?: json
-  details: { string: NonSecretValue }
-```
-
 ### Mcp
-MCP server registration.
+MCP server registration. The server enumerates its own tools at runtime; we do
+not shadow them as cards.
 ```yaml
 spec:
   description?: string
   server_name: string
   transport?: string             # stdio | http | sse
-  tool_refs: [CardRef]
   scopes: [string]
+  credential_refs: [CredentialRef]
   details: { string: NonSecretValue }
 ```
 
@@ -329,6 +293,10 @@ Shared types embedded into specs. Owned by `wyrd-spec`.
 Foundations explicitly **removed** from v1 protocol surface:
 - `ObservationHooks` — Wyrd doesn't push. Triggers + Operators carry reaction
   routing; Sources carry read-side history.
+- Free-form event-name strings (`events: Vec<String>`, `hook_events:
+  Vec<String>`) — observations are typed by source CardRef + kind. If hook
+  phases ever land on `Policy`, they're a closed enum (`PreInvoke |
+  PostInvoke | OnError`), not strings.
 
 ---
 
@@ -338,8 +306,9 @@ Foundations explicitly **removed** from v1 protocol surface:
 |---------|--------------------------------------|--------------------------------|
 | Data    | `artifact_refs`, `splits`            | `Drift.baseline_ref`, `Eval.dataset_refs`, `Experiment.target_refs` |
 | Model   | `artifact_refs`                      | `Drift.target_refs`, `Eval.target_refs`, `Service.components.ref`, `Experiment.target_refs` |
-| Agent   | `prompt`, `tool_names`               | `Drift.target_refs`, `Eval.target_refs`, `Service.components.ref` |
+| Agent   | `prompt`, `tool_names`               | `Drift.target_refs`, `Eval.target_refs`, `Service.components.ref`, Agent prompts (sub-agent calls) |
 | Workflow| `steps.*.target`                     | `Service.components.ref`, `Operator.workflow_ref` |
+| Mcp     | `credential_refs`                    | `Service.components.ref` |
 | Drift   | `target_refs`, `baseline_ref`, `source_refs` | `Trigger.source.card` |
 | Eval    | `target_refs`, `judge_refs`, `dataset_refs`, `source_refs` | `Trigger.source.card` |
 | Audit   | `subject_refs`, `policy_refs`, `evidence_refs`, `source_refs` | — |
@@ -348,6 +317,9 @@ Foundations explicitly **removed** from v1 protocol surface:
 | Trigger | `source.card`, `target`              | — |
 | Operator| `adapter`, `pre_invoke`, `post_invoke` | `Trigger.target` |
 | Source  | `credential_ref`                     | `Drift.source_refs`, `Eval.source_refs`, `Audit.source_refs` |
+
+`Service.components` accepts: Agent, Prompt, Model, Workflow, Mcp, Policy. No
+other kinds are runtime-aliased into a Service.
 
 ---
 
@@ -393,14 +365,15 @@ services/ops-copilot/
    expressions scope by `agent.name`. Decision pending a real use case.
 2. Source vendor read adapters (Datadog metrics, PromQL, Tempo, Loki).
    v1 ships `object_store` only.
-3. Closed event-name taxonomy for internal `vala` observations.
-4. Format negotiation for `object_store` Source — schema-on-read vs registered
+3. Format negotiation for `object_store` Source — schema-on-read vs registered
    schema reference.
-5. Time-window semantics for how Drift/Eval cards describe the read range
+4. Time-window semantics for how Drift/Eval cards describe the read range
    over `source_refs`.
-6. Service-level Drift target semantics — what "drift on a Service" computes
+5. Service-level Drift target semantics — what "drift on a Service" computes
    when Wyrd reads internal traces vs external Sources.
-7. Default Source binding at the Service or Agent level to avoid repeating
+6. Default Source binding at the Service or Agent level to avoid repeating
    `source_refs` on every Drift/Eval.
-8. Audit `source_refs` vs `evidence_refs` boundary — Source is queryable
+7. Audit `source_refs` vs `evidence_refs` boundary — Source is queryable
    history; `evidence_refs` are concrete card pointers.
+8. Whether tool hook phases need a closed enum on `Policy.rules` or can stay
+   off the wire entirely (no consumer today).

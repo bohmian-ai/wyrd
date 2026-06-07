@@ -1,0 +1,1830 @@
+# =============================================================================
+# Wyrd Protocol — OpenAPI 3.1 source-of-truth contract
+#
+# This document is the machine-readable companion to `wyrd-protocol.md`.
+# It captures the CURRENT-STATE wire contract (envelope + foundations + 18
+# native kind specs + resource operations + errors) so that conflicts
+# between the Markdown protocol, the Rust reference implementation, and the
+# worked YAML examples can be surfaced by diff.
+#
+# It is NOT yet the published v1 contract. Annotations:
+#
+#   x-wyrd-open-issue: <ID>     # cross-reference to wyrd-protocol.md §App.A
+#   x-wyrd-source:     <path>   # owning Rust source file
+#   x-wyrd-note:       <string> # editorial note for iteration
+#
+# Iteration policy: when an open issue is resolved, update this file AND
+# wyrd-protocol.md in the same commit. When the protocol locks v1, this file
+# is published as the canonical OpenAPI under the docs site.
+#
+# Cross-references:
+#   - Protocol prose:           architecture/wyrd-protocol.md
+#   - Worked YAML examples:     architecture/specs/*.yaml
+#   - Rust reference types:     crates/wyrd-spec/src/
+# =============================================================================
+
+openapi: 3.1.0
+
+info:
+  title: Wyrd Protocol
+  summary: The protocol for the AI control plane.
+  description: |
+    Wyrd is the protocol for the AI control plane — declared intent for AI
+    work, governed and observable.
+
+    This OpenAPI document is the **source-of-truth contract**. It defines:
+      - the universal Card envelope and metadata,
+      - the shared foundations (Governance, ObservationHooks, FrameworkAdapterRef,
+        CredentialRef, value types),
+      - the 18 native Card kind specs,
+      - the resource operations (CRUD, watch, lineage, observation stream),
+      - the standard error catalog (RFC 7807 problem details with the Wyrd code
+        catalog).
+
+    Companion documents: architecture/wyrd-protocol.md (prose),
+    architecture/specs/*.yaml (worked examples).
+  version: "1.0.0-draft.1"
+  contact:
+    name: Wyrd
+    url: https://wyrd.io
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+
+externalDocs:
+  description: Wyrd protocol prose specification
+  url: ./wyrd-protocol.md
+
+servers:
+  - url: https://{host}/v1
+    description: Wyrd-compatible control plane
+    variables:
+      host:
+        default: localhost:8080
+
+tags:
+  - name: cards
+    description: Resource operations on Cards.
+  - name: lineage
+    description: Derived relationship and lineage queries.
+  - name: observations
+    description: Observation stream operations.
+  - name: discovery
+    description: Capability descriptor and kind catalog.
+
+# =============================================================================
+# Paths — resource operations from Part IV of the protocol prose.
+# =============================================================================
+
+paths:
+
+  /protocol:
+    get:
+      tags: [discovery]
+      operationId: getProtocolDescriptor
+      summary: Retrieve the capability descriptor.
+      responses:
+        "200":
+          description: Capability descriptor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CapabilityDescriptor"
+
+  /kinds/{kind}/schema:
+    get:
+      tags: [discovery]
+      operationId: getKindSchema
+      summary: Retrieve the JSON Schema for a Card kind.
+      parameters:
+        - $ref: "#/components/parameters/KindPath"
+      responses:
+        "200":
+          description: JSON Schema for the kind's spec.
+          content:
+            application/schema+json:
+              schema: { type: object, additionalProperties: true }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /cards:
+    post:
+      tags: [cards]
+      operationId: createCard
+      summary: Register a new Card.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/Card" } }
+          application/yaml: { schema: { $ref: "#/components/schemas/Card" } }
+      responses:
+        "201":
+          description: Card registered.
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Card" } }
+        "400": { $ref: "#/components/responses/Validation" }
+        "403": { $ref: "#/components/responses/PermissionDenied" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    get:
+      tags: [cards]
+      operationId: listCards
+      summary: List Cards with filters.
+      parameters:
+        - $ref: "#/components/parameters/SpaceQuery"
+        - $ref: "#/components/parameters/KindQuery"
+        - $ref: "#/components/parameters/LabelSelector"
+        - $ref: "#/components/parameters/NamePrefix"
+        - $ref: "#/components/parameters/RefersTo"
+        - $ref: "#/components/parameters/PageCursor"
+      responses:
+        "200":
+          description: Cards page.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CardPage" }
+
+  /cards:bulk:
+    post:
+      tags: [cards]
+      operationId: createCardsBulk
+      summary: Register multiple Cards. Atomic-per-Card; cross-Card refs resolve.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cards]
+              properties:
+                cards:
+                  type: array
+                  items: { $ref: "#/components/schemas/Card" }
+      responses:
+        "200":
+          description: Per-Card outcomes.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BulkCardResult" }
+
+  /cards:dryRun:
+    post:
+      tags: [cards]
+      operationId: dryRunCard
+      summary: Validate a Card without registering.
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/Card" } }
+      responses:
+        "200":
+          description: Validation result.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DryRunResult" }
+
+  /cards:watch:
+    get:
+      tags: [cards]
+      operationId: watchCards
+      summary: Subscribe to Card create/update/delete events (SSE).
+      parameters:
+        - $ref: "#/components/parameters/SpaceQuery"
+        - $ref: "#/components/parameters/KindQuery"
+        - $ref: "#/components/parameters/LabelSelector"
+        - $ref: "#/components/parameters/WatchCursor"
+      responses:
+        "200":
+          description: Event stream.
+          content:
+            text/event-stream:
+              schema: { $ref: "#/components/schemas/CardEvent" }
+
+  /spaces/{space}/cards/{kind}/{name}/{version}:
+    parameters:
+      - $ref: "#/components/parameters/SpacePath"
+      - $ref: "#/components/parameters/KindPath"
+      - $ref: "#/components/parameters/NamePath"
+      - $ref: "#/components/parameters/VersionPath"
+    get:
+      tags: [cards]
+      operationId: getCard
+      summary: Retrieve a Card.
+      responses:
+        "200":
+          description: Card.
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Card" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [cards]
+      operationId: updateCard
+      summary: Update a Card (extension; see x-wyrd-open-issue).
+      x-wyrd-note: |
+        Card versions are immutable by default (protocol §I.3.2).
+        Servers MAY support spec-edit on draft-phase Cards.
+      parameters:
+        - in: header
+          name: If-Match
+          schema: { type: string }
+          required: true
+          description: spec_hash precondition for optimistic concurrency.
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: Updated Card.
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Card" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    delete:
+      tags: [cards]
+      operationId: deleteCard
+      summary: Delete a Card (soft or hard; implementation-defined).
+      responses:
+        "204":
+          description: Deleted.
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /lineage/neighbors:
+    get:
+      tags: [lineage]
+      operationId: lineageNeighbors
+      summary: Inbound and outbound relationships for a Card.
+      parameters:
+        - in: query
+          name: ref
+          required: true
+          schema: { type: string }
+          description: CardRef display string.
+      responses:
+        "200":
+          description: Neighbors.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LineageNeighbors" }
+
+  /lineage/between:
+    get:
+      tags: [lineage]
+      operationId: lineageBetween
+      summary: Paths between two Cards.
+      parameters:
+        - in: query
+          name: from
+          required: true
+          schema: { type: string }
+        - in: query
+          name: to
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Paths.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LineagePaths" }
+
+  /observations:watch:
+    get:
+      tags: [observations]
+      operationId: watchObservations
+      summary: Subscribe to observations (SSE).
+      parameters:
+        - in: query
+          name: kinds
+          schema: { type: array, items: { type: string } }
+          explode: true
+        - in: query
+          name: events
+          schema: { type: array, items: { type: string } }
+          explode: true
+        - in: query
+          name: trace_id
+          schema: { type: string }
+        - $ref: "#/components/parameters/WatchCursor"
+      responses:
+        "200":
+          description: Observation stream.
+          content:
+            text/event-stream:
+              schema: { $ref: "#/components/schemas/Observation" }
+
+# =============================================================================
+# Components
+# =============================================================================
+
+components:
+
+  # ---------------------------------------------------------------------------
+  # Reusable parameters
+  # ---------------------------------------------------------------------------
+  parameters:
+    SpacePath:
+      in: path
+      name: space
+      required: true
+      schema: { $ref: "#/components/schemas/SpaceName" }
+    KindPath:
+      in: path
+      name: kind
+      required: true
+      schema: { $ref: "#/components/schemas/CardKindName" }
+    NamePath:
+      in: path
+      name: name
+      required: true
+      schema: { $ref: "#/components/schemas/CardName" }
+    VersionPath:
+      in: path
+      name: version
+      required: true
+      schema: { $ref: "#/components/schemas/VersionBlock" }
+    SpaceQuery:
+      in: query
+      name: space
+      schema: { $ref: "#/components/schemas/SpaceName" }
+    KindQuery:
+      in: query
+      name: kind
+      schema:
+        type: array
+        items: { $ref: "#/components/schemas/CardKindName" }
+      explode: true
+    LabelSelector:
+      in: query
+      name: labels
+      schema:
+        type: array
+        items: { type: string, example: "team=ml" }
+      explode: true
+    NamePrefix:
+      in: query
+      name: name_prefix
+      schema: { type: string }
+    RefersTo:
+      in: query
+      name: refers_to
+      schema: { type: string, description: "CardRef display string" }
+    PageCursor:
+      in: query
+      name: cursor
+      schema: { type: string }
+    WatchCursor:
+      in: query
+      name: cursor
+      schema: { type: string }
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      schema: { $ref: "#/components/schemas/IdempotencyKey" }
+
+  # ---------------------------------------------------------------------------
+  # Reusable responses
+  # ---------------------------------------------------------------------------
+  responses:
+    Validation:
+      description: Validation failed (WYRD_SPEC_400_VALIDATION).
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    NotFound:
+      description: Resource not found (WYRD_SPEC_404_NOT_FOUND).
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Conflict:
+      description: Conflict (WYRD_SPEC_409_CONFLICT).
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    PermissionDenied:
+      description: Permission denied (WYRD_SPEC_403_PERMISSION_DENIED).
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+    mtls:
+      type: mutualTLS
+
+  # ---------------------------------------------------------------------------
+  # Schemas
+  # ---------------------------------------------------------------------------
+  schemas:
+
+    # =======================================================================
+    # I. Envelope
+    # =======================================================================
+
+    Card:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/envelope.rs
+      required: [apiVersion, kind, metadata, spec]
+      properties:
+        apiVersion:
+          type: string
+          const: wyrd/v1
+        kind:
+          $ref: "#/components/schemas/CardKind"
+        metadata:
+          $ref: "#/components/schemas/Metadata"
+        spec:
+          description: |
+            Kind-specific spec. Authors and clients send the spec for the
+            kind declared in `kind`. Servers validate the spec matches kind.
+          oneOf:
+            - $ref: "#/components/schemas/DataSpec"
+            - $ref: "#/components/schemas/ModelSpec"
+            - $ref: "#/components/schemas/ExperimentSpec"
+            - $ref: "#/components/schemas/PromptSpec"
+            - $ref: "#/components/schemas/ToolSpec"
+            - $ref: "#/components/schemas/AgentSpec"
+            - $ref: "#/components/schemas/WorkflowSpec"
+            - $ref: "#/components/schemas/EvalSpec"
+            - $ref: "#/components/schemas/DriftSpec"
+            - $ref: "#/components/schemas/ServiceSpec"
+            - $ref: "#/components/schemas/PolicySpec"
+            - $ref: "#/components/schemas/McpSpec"
+            - $ref: "#/components/schemas/SkillSpec"
+            - $ref: "#/components/schemas/SubAgentSpec"
+            - $ref: "#/components/schemas/AuditSpec"
+            - $ref: "#/components/schemas/ArtifactSpec"
+            - $ref: "#/components/schemas/TriggerSpec"
+            - $ref: "#/components/schemas/OperatorSpec"
+            - { type: object, additionalProperties: true,
+                description: "External kind spec (opaque)" }
+        relationships:
+          $ref: "#/components/schemas/Relationships"
+          description: Server-derived. Authors MUST NOT write.
+        status:
+          $ref: "#/components/schemas/Status"
+          description: Server-managed. Authors MUST NOT write.
+
+    Metadata:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/envelope.rs
+      required: [name, version]
+      properties:
+        name:        { $ref: "#/components/schemas/CardName" }
+        version:     { $ref: "#/components/schemas/VersionBlock" }
+        space:       { $ref: "#/components/schemas/SpaceName" }
+        uid:         { $ref: "#/components/schemas/CardUid" }
+        labels:
+          type: object
+          additionalProperties: { type: string }
+        annotations:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            Free-form. Keys under `wyrd.io/*` are reserved. User/vendor keys
+            MUST use a DNS-style prefix.
+        spec_hash:     { type: string, description: "Server-derived" }
+        artifact_hash: { type: string, description: "Server-derived (ArtifactCards)" }
+
+    CardKind:
+      oneOf:
+        - $ref: "#/components/schemas/CardKindName"
+        - type: object
+          description: External Card kind with schema hash.
+          required: [kind, schema_hash]
+          properties:
+            kind:
+              type: string
+              pattern: "^[A-Za-z][A-Za-z0-9_.-]*$"
+            schema_hash:
+              type: string
+              pattern: "^[0-9a-f]{64}$"
+
+    CardKindName:
+      type: string
+      description: One of the 18 native Card kinds.
+      enum:
+        - Data
+        - Model
+        - Experiment
+        - Prompt
+        - Tool
+        - Agent
+        - Workflow
+        - Eval
+        - Drift
+        - Service
+        - Policy
+        - Mcp
+        - Skill
+        - SubAgent
+        - Audit
+        - Artifact
+        - Trigger
+        - Operator
+
+    Relationships:
+      type: object
+      x-wyrd-open-issue: A1
+      description: Server-derived display strings; lacks edge-type.
+      properties:
+        outbound: { type: array, items: { type: string } }
+        inbound:  { type: array, items: { type: string } }
+
+    Status:
+      type: object
+      x-wyrd-open-issue: A2
+      description: Server-managed lifecycle.
+      properties:
+        phase:
+          type: string
+          description: |
+            Free string today; proposed closed enum
+            { draft, active, deprecated, archived }.
+        message:    { type: string }
+        updated_at: { type: string, format: date-time }
+
+    # =======================================================================
+    # I. Identifiers
+    # =======================================================================
+
+    SpaceName:
+      type: string
+      x-wyrd-source: crates/wyrd-spec/src/ids.rs
+      description: "Validated `[a-z][a-z0-9_-]{2,63}`."
+      pattern: "^[a-z][a-z0-9_-]{2,63}$"
+
+    CardName:
+      type: string
+      x-wyrd-source: crates/wyrd-spec/src/ids.rs
+      pattern: "^[a-z][a-z0-9_-]{2,63}$"
+
+    CardUid:
+      type: string
+      x-wyrd-source: crates/wyrd-spec/src/ids.rs
+      description: UUIDv7.
+      format: uuid
+
+    VersionBlock:
+      type: string
+      x-wyrd-source: crates/wyrd-spec/src/version.rs
+      description: Strict semver MAJOR.MINOR.PATCH; pre-release/build reserved.
+      pattern: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+
+    ColumnName:
+      type: string
+      pattern: "^[a-z][a-z0-9_-]{0,63}$"
+
+    SplitName:
+      type: string
+      pattern: "^[a-z][a-z0-9_-]{0,63}$"
+
+    QueryName:
+      type: string
+      pattern: "^[a-z][a-z0-9_-]{0,63}$"
+
+    IdempotencyKey:
+      type: string
+      description: "8–256 chars, no whitespace."
+      minLength: 8
+      maxLength: 256
+
+    # =======================================================================
+    # I. References
+    # =======================================================================
+
+    CardRef:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/reference.rs
+      required: [kind, name, version]
+      properties:
+        kind:    { $ref: "#/components/schemas/CardKindName" }
+        name:    { $ref: "#/components/schemas/CardName" }
+        version: { $ref: "#/components/schemas/VersionBlock" }
+        space:   { $ref: "#/components/schemas/SpaceName" }
+        uid:     { $ref: "#/components/schemas/CardUid" }
+
+    PromptRef:
+      description: "Inline prompt or CardRef→Prompt (untagged union)."
+      oneOf:
+        - $ref: "#/components/schemas/NativePrompt"
+        - $ref: "#/components/schemas/CardRef"
+
+    AgentRef:
+      description: "Inline AgentSpec or CardRef→Agent (untagged union)."
+      oneOf:
+        - $ref: "#/components/schemas/AgentSpec"
+        - $ref: "#/components/schemas/CardRef"
+
+    # =======================================================================
+    # I.6 Foundations
+    # =======================================================================
+
+    Governance:
+      type: object
+      x-wyrd-open-issue: A3
+      x-wyrd-source: crates/wyrd-spec/src/card/common.rs
+      x-wyrd-note: |
+        Currently appears on Eval, Workflow, SubAgent. Proposed: promote to
+        envelope-adjacent (apply on every Card spec).
+      properties:
+        policy_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        audit_ref: { $ref: "#/components/schemas/CardRef" }
+        approval_requirements:
+          type: array
+          items: { type: string }
+        metadata:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    ObservationHooks:
+      type: object
+      x-wyrd-open-issue: A4
+      x-wyrd-source: crates/wyrd-spec/src/card/common.rs
+      x-wyrd-note: |
+        Currently appears on Eval, Workflow, SubAgent. Missing on Service,
+        Model, Agent, Drift. Event vocabulary is open (see A5).
+      properties:
+        route_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+          x-wyrd-open-issue: A8
+          description: |
+            Should constrain to Service with `service_type: observability`.
+        events:
+          type: array
+          items: { type: string }
+          x-wyrd-open-issue: A5
+          description: Closed taxonomy pending lock.
+
+    FrameworkAdapterRef:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/artifact.rs
+      required: [name, version]
+      properties:
+        name:    { type: string, description: "e.g. sklearn | mlflow | datadog" }
+        version: { type: string }
+        config:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    CredentialRef:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/common.rs
+      required: [provider, name]
+      properties:
+        provider: { type: string, description: "aws_secrets_manager | vault | …" }
+        name:     { type: string, description: "Key or logical name in that provider" }
+
+    NonSecretValue:
+      x-wyrd-open-issue: A6
+      x-wyrd-source: crates/wyrd-spec/src/card/common.rs
+      description: |
+        Tagged union of non-secret JSON-like config values. Pending unification
+        with ParameterValue.
+      oneOf:
+        - { type: object, required: [type, value], properties: { type: { const: str    }, value: { type: string  } } }
+        - { type: object, required: [type, value], properties: { type: { const: number }, value: { type: number  } } }
+        - { type: object, required: [type, value], properties: { type: { const: bool   }, value: { type: boolean } } }
+        - { type: object, required: [type, value], properties: { type: { const: list   }, value: { type: array, items: { $ref: "#/components/schemas/NonSecretValue" } } } }
+        - { type: object, required: [type, value], properties: { type: { const: object }, value: { type: object, additionalProperties: { $ref: "#/components/schemas/NonSecretValue" } } } }
+
+    ParameterValue:
+      x-wyrd-open-issue: A6
+      x-wyrd-source: crates/wyrd-spec/src/card/common.rs
+      description: |
+        Typed scalar used for run/experiment/workflow inputs. Pending
+        unification with NonSecretValue.
+      oneOf:
+        - { type: object, required: [type, value], properties: { type: { const: int   }, value: { type: integer } } }
+        - { type: object, required: [type, value], properties: { type: { const: float }, value: { type: number  } } }
+        - { type: object, required: [type, value], properties: { type: { const: str   }, value: { type: string  } } }
+        - { type: object, required: [type, value], properties: { type: { const: bool  }, value: { type: boolean } } }
+        - { type: object, required: [type, value], properties: { type: { const: json  }, value: {} } }
+
+    MetricEntry:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/common.rs
+      required: [name, value]
+      properties:
+        name:       { type: string }
+        value:      { type: number }
+        step:       { type: integer }
+        timestamp:  { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        is_eval:    { type: boolean, default: false }
+
+    AgentInterface:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/common.rs
+      required: [name, mode]
+      properties:
+        name:       { type: string }
+        mode:       { type: string, description: "text | json | audio | tool" }
+        schema_ref: { $ref: "#/components/schemas/CardRef" }
+        metadata:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    ProtocolProfile:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/common.rs
+      required: [protocol]
+      properties:
+        protocol: { type: string, description: "a2a | ag_ui | a2ui | mcp | http" }
+        version:  { type: string }
+        metadata:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    # =======================================================================
+    # II. Per-kind specs (current state)
+    # =======================================================================
+
+    # --- II.1 Data --------------------------------------------------------
+    DataSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/data.rs
+      required: [interface, schema, stats]
+      properties:
+        interface: { $ref: "#/components/schemas/DataInterface" }
+        schema:    { $ref: "#/components/schemas/DataSchema" }
+        artifact_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        splits:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/DataSplit" }
+        target_columns:
+          type: array
+          items: { $ref: "#/components/schemas/ColumnName" }
+        sql:   { $ref: "#/components/schemas/SqlLogic" }
+        stats: { $ref: "#/components/schemas/DataStats" }
+
+    DataInterface:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [Pandas, Polars, Arrow, Parquet, Numpy, Torch, Sql, Jsonl, Image, Text, Huggingface, Custom]
+        meta:
+          type: object
+          additionalProperties: true
+          description: Interface-specific meta. See source for exact per-variant shape.
+
+    DataSchema:
+      type: object
+      properties:
+        columns:
+          type: array
+          items: { $ref: "#/components/schemas/FieldSpec" }
+
+    FieldSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/field.rs
+      required: [name, dtype]
+      properties:
+        name:     { $ref: "#/components/schemas/ColumnName" }
+        dtype:    { type: string, description: "Wyrd dtype (e.g. int32, float64, string, bool)" }
+        nullable: { type: boolean, default: true }
+        dims:
+          type: array
+          items: { type: integer }
+
+    DataSplit:
+      type: object
+      required: [label, strategy]
+      properties:
+        label:    { $ref: "#/components/schemas/SplitName" }
+        strategy:
+          oneOf:
+            - { type: object, required: [kind, meta], properties: { kind: { const: row_fraction }, meta: { type: object } } }
+            - { type: object, required: [kind, meta], properties: { kind: { const: materialized }, meta: { type: object, properties: { artifact_ref: { $ref: "#/components/schemas/CardRef" } } } } }
+            - { type: object, required: [kind, meta], properties: { kind: { const: predicate    }, meta: { type: object } } }
+            - { type: object, additionalProperties: true }
+
+    SqlLogic:
+      type: object
+      additionalProperties: true
+      x-wyrd-note: "Detailed shape captured in card/data.rs; modeled as opaque here."
+
+    DataStats:
+      type: object
+      required: [kind]
+      properties:
+        kind: { type: string, enum: [local, durable, none] }
+        meta:
+          type: object
+          additionalProperties: true
+
+    # --- II.2 Artifact ---------------------------------------------------
+    ArtifactSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/artifact.rs
+      required: [artifact_kind]
+      properties:
+        artifact_kind:
+          type: string
+          x-wyrd-open-issue: A19
+          description: |
+            Currently free string. Proposed closed taxonomy
+            { sklearn_pickle | torch_state_dict | onnx | huggingface_snapshot |
+              parquet | dataset_index | external_model | external_dataset | binary }.
+        artifact_uris:
+          type: array
+          items: { type: string, format: uri }
+        content_type: { type: string }
+        size_bytes:   { type: integer, format: int64, minimum: 0 }
+        integrity:    { type: string, description: "e.g. sha256:<hex64>" }
+        schema_ref:   { $ref: "#/components/schemas/CardRef" }
+        framework_adapter: { $ref: "#/components/schemas/FrameworkAdapterRef" }
+        external_uri: { type: string, description: "Upstream-registry URI; e.g. models:/foo/Production" }
+        metadata:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    # --- II.3 Prompt -----------------------------------------------------
+    PromptSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/prompt/spec.rs
+      description: |
+        Flattened native skald Prompt. Two input forms:
+          - Declarative (`provider` present, `request` absent): compiled from
+            PromptDraft on load.
+          - Native (`request` present): stored Prompt shape directly.
+      properties:
+        provider: { type: string, description: "Declarative form" }
+        model:    { type: string }
+        messages:
+          type: array
+          items:
+            type: object
+            required: [role, content]
+            properties:
+              role:    { type: string, enum: [system, user, assistant, tool] }
+              content: { type: string }
+        variables:
+          type: array
+          items: { type: string }
+        response_format:
+          oneOf:
+            - { type: string, enum: [text] }
+            - { type: object, required: [kind, schema], properties: { kind: { const: json_schema }, schema: { type: object, additionalProperties: true } } }
+        request:
+          type: object
+          additionalProperties: true
+          description: "Native form; provider-specific request shape."
+      additionalProperties: true
+
+    NativePrompt:
+      type: object
+      additionalProperties: true
+      description: Native skald Prompt shape used inline by PromptRef.
+
+    # --- II.4 Model ------------------------------------------------------
+    ModelSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/model.rs
+      required: [interface, task_type, signature]
+      properties:
+        interface: { $ref: "#/components/schemas/ModelInterface" }
+        task_type: { $ref: "#/components/schemas/TaskType" }
+        signature: { $ref: "#/components/schemas/ModelSignature" }
+        sample_input:
+          type: object
+          additionalProperties: true
+        artifact_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+
+    ModelInterface:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [Sklearn, Xgboost, Lightgbm, Catboost, Torch, Lightning, Tensorflow, Huggingface, Custom]
+        meta:
+          type: object
+          additionalProperties: true
+
+    TaskType:
+      type: string
+      description: "Closed Wyrd ML task taxonomy."
+      enum:
+        - BinaryClassification
+        - MultiClassClassification
+        - Regression
+        - Ranking
+        - Clustering
+        - Generation
+        - Embedding
+        - Other
+
+    ModelSignature:
+      type: object
+      required: [inputs, outputs]
+      properties:
+        inputs:
+          type: array
+          items: { $ref: "#/components/schemas/FieldSpec" }
+        outputs:
+          type: array
+          items: { $ref: "#/components/schemas/FieldSpec" }
+
+    # --- II.5 Tool -------------------------------------------------------
+    ToolSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/tool.rs
+      required: [name, description, tool_type, args_schema]
+      properties:
+        name:        { type: string, pattern: "^[a-z][a-z0-9_]*$" }
+        description: { type: string }
+        tool_type:
+          x-wyrd-open-issue: A10
+          type: string
+          description: |
+            Free string today; proposed closed enum
+            { Script | Api | Mcp | Builtin | Workflow | Agent }.
+        args_schema:    { type: object, additionalProperties: true, description: "JSON Schema" }
+        output_schema:  { type: object, additionalProperties: true, description: "JSON Schema" }
+        script_config:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+        api_config:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+        credential_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CredentialRef" }
+        mcp_server_name:
+          x-wyrd-open-issue: A11
+          type: string
+          description: "Free string today; proposed mcp_ref: CardRef→Mcp."
+        allowed_tools:
+          type: array
+          items: { type: string }
+        requires_approval: { type: boolean, default: false }
+        hook_events:
+          type: array
+          items: { type: string }
+        hook_matcher:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+        details:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    # --- II.6 Agent ------------------------------------------------------
+    AgentSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/agent.rs
+      required: [prompt]
+      properties:
+        prompt: { $ref: "#/components/schemas/PromptRef" }
+        tool_names:
+          type: array
+          items: { type: string }
+          x-wyrd-open-issue: A12
+          x-wyrd-note: Proposed tool_refs:Vec<CardRef→Tool|Mcp>.
+        run_config:
+          $ref: "#/components/schemas/AgentRunConfigSpec"
+      x-wyrd-open-issue: [A3, A4]
+      x-wyrd-note: |
+        AgentSpec lacks governance and observation_hooks today.
+
+    AgentRunConfigSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/agent.rs
+      properties:
+        max_iterations:       { type: integer, minimum: 1 }
+        tool_concurrency_cap: { type: integer, minimum: 1 }
+        session_recent_limit: { type: integer, minimum: 0 }
+        timeout_ms:           { type: integer, minimum: 1 }
+
+    # --- II.7 SubAgent ---------------------------------------------------
+    SubAgentSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/subagent.rs
+      properties:
+        description: { type: string }
+        prompt:      { type: string }
+        model:       { type: string }
+        tool_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        disallowed_tools:
+          type: array
+          items: { type: string }
+        skill_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        max_turns:       { type: integer, minimum: 1 }
+        permission_mode: { type: string }
+        memory:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+        background: { type: boolean, default: false }
+        effort:     { type: string }
+        isolation:  { type: string }
+        compatible_clis:
+          type: array
+          items: { type: string }
+        mcp_servers:
+          type: array
+          items: { type: string }
+        sandbox_mode: { type: string }
+        temperature:  { type: number, minimum: 0, maximum: 2 }
+        governance:        { $ref: "#/components/schemas/Governance" }
+        observation_hooks: { $ref: "#/components/schemas/ObservationHooks" }
+        details:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    # --- II.8 Workflow ---------------------------------------------------
+    WorkflowSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/workflow.rs
+      properties:
+        description: { type: string }
+        inputs:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/ParameterValue" }
+        steps:
+          type: array
+          items: { $ref: "#/components/schemas/WorkflowStep" }
+        outputs:
+          type: object
+          additionalProperties: true
+        governance:        { $ref: "#/components/schemas/Governance" }
+        observation_hooks: { $ref: "#/components/schemas/ObservationHooks" }
+        details:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    WorkflowStep:
+      type: object
+      required: [id, action]
+      properties:
+        id:     { type: string }
+        action: { $ref: "#/components/schemas/WorkflowAction" }
+        depends_on:
+          type: array
+          items: { type: string }
+        inputs:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/ParameterValue" }
+        condition:       { type: string }
+        timeout_seconds: { type: integer, minimum: 1 }
+        retry:           { $ref: "#/components/schemas/WorkflowRetryPolicy" }
+        display:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    WorkflowAction:
+      type: object
+      required: [type, target]
+      properties:
+        type:
+          type: string
+          enum: [skill, agent, mcp, tool, prompt]
+        target:
+          oneOf:
+            - $ref: "#/components/schemas/CardRef"
+            - $ref: "#/components/schemas/AgentRef"
+
+    WorkflowRetryPolicy:
+      type: object
+      required: [max_retries]
+      properties:
+        max_retries:        { type: integer, minimum: 0 }
+        initial_backoff_ms: { type: integer, minimum: 0 }
+
+    # --- II.9 Operator ---------------------------------------------------
+    OperatorSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/operator.rs
+      required: [adapter]
+      properties:
+        adapter: { $ref: "#/components/schemas/FrameworkAdapterRef" }
+        inputs:
+          type: array
+          items:
+            type: object
+            required: [name, schema_ref]
+            properties:
+              name:       { type: string }
+              schema_ref: { type: string }
+        pre_invoke:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        post_invoke:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        budget:
+          type: object
+          properties:
+            max_wall_seconds: { type: integer, minimum: 1 }
+            max_memory_mb:    { type: integer, minimum: 1 }
+            max_tool_calls:   { type: integer, minimum: 1 }
+
+    # --- II.10 Service ---------------------------------------------------
+    ServiceSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/service.rs
+      x-wyrd-open-issue: [A14, A15, A3, A4]
+      x-wyrd-note: |
+        Today: untyped components vector; service_type is free string;
+        governance/observation_hooks absent.
+      properties:
+        description: { type: string }
+        service_type:
+          type: string
+          x-wyrd-open-issue: A14
+          description: |
+            Free string today; proposed closed enum
+            { Api | Mcp | Agent | Workflow | Observability | Batch }.
+        components:
+          type: array
+          x-wyrd-open-issue: A15
+          x-wyrd-note: |
+            Mixed-concerns untyped list. Proposed: split into typed slots
+            uses/monitored_by/governed_by/audited_by/routes_to.
+          items: { $ref: "#/components/schemas/ServiceComponent" }
+        entry_point:
+          type: string
+          x-wyrd-open-issue: A26
+          description: |
+            Currently a Python symbol (pkg.module:obj). Proposed typed
+            EntryPoint { language, locator }.
+        deployment:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+        runtime: { $ref: "#/components/schemas/ServiceRuntime" }
+        service_config:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+        credential_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CredentialRef" }
+        content_hash: { type: string }
+        lock_hash:    { type: string }
+        metadata:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    ServiceComponent:
+      type: object
+      required: [alias, ref]
+      properties:
+        alias:
+          type: string
+          x-wyrd-open-issue: A27
+          description: Service-local. Surfaces MUST NOT present as CardName.
+        ref:    { $ref: "#/components/schemas/CardRef" }
+        source: { $ref: "#/components/schemas/ComponentSource" }
+        config:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+        credential_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CredentialRef" }
+
+    ComponentSource:
+      type: object
+      required: [path, kind]
+      properties:
+        path: { type: string }
+        kind: { type: string }
+
+    ServiceRuntime:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [api, mcp, agent, workflow]
+        framework: { type: string }
+        mode:
+          type: string
+          enum: [in_process]
+        strict: { type: boolean }
+        config:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+        policy:
+          type: object
+          properties:
+            runtime_hooks: { type: boolean, default: false }
+
+    # --- II.11 Skill -----------------------------------------------------
+    SkillSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/skill.rs
+      properties:
+        description: { type: string }
+        prompt_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        tool_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        input_schema:
+          type: object
+          additionalProperties: true
+        output_schema:
+          type: object
+          additionalProperties: true
+        details:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    # --- II.12 Mcp -------------------------------------------------------
+    McpSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/mcp.rs
+      required: [server_name]
+      properties:
+        description: { type: string }
+        server_name: { type: string }
+        transport:
+          type: string
+          description: "stdio | http+sse | http+streamable | …"
+        tool_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        scopes:
+          type: array
+          items: { type: string }
+        details:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    # --- II.13 Policy ----------------------------------------------------
+    PolicySpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/policy.rs
+      properties:
+        description: { type: string }
+        rules:
+          type: array
+          items: { $ref: "#/components/schemas/PolicyRule" }
+        enforcement:
+          x-wyrd-open-issue: A16
+          type: string
+          description: |
+            Free string today; proposed closed enum tied to control-point
+            taxonomy { registration | install | promote | access |
+            pre_invoke | post_invoke | artifact_use | both }.
+        selector:
+          x-wyrd-open-issue: A17
+          x-wyrd-note: "Proposed. Not present in code yet."
+          type: object
+          properties:
+            space:  { $ref: "#/components/schemas/SpaceName" }
+            kind:   { $ref: "#/components/schemas/CardKindName" }
+            labels:
+              type: object
+              additionalProperties: { type: string }
+        details:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    PolicyRule:
+      type: object
+      required: [name, expression, action]
+      properties:
+        name:       { type: string }
+        expression: { type: string }
+        action:
+          type: string
+          enum: [allow, warn, block, approval_required]
+        metadata:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    # --- II.14 Audit -----------------------------------------------------
+    AuditSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/audit.rs
+      x-wyrd-open-issue: A18
+      properties:
+        description: { type: string }
+        subject_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+          x-wyrd-note: Proposed constraint { Service | Agent | Workflow | Model | Data | Operator }.
+        policy_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+          x-wyrd-note: Proposed constraint to Policy.
+        evidence_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+          x-wyrd-note: Proposed constraint { Eval | Drift | Artifact | Experiment }.
+        details:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    # --- II.15 Drift -----------------------------------------------------
+    DriftSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/drift.rs
+      x-wyrd-open-issue: [A3, A4, A28]
+      required: [method]
+      properties:
+        description: { type: string }
+        method:
+          type: string
+          enum: [Spc, Psi, Custom, Agent, External]
+        profile: { $ref: "#/components/schemas/DriftProfile" }
+        baseline_ref: { $ref: "#/components/schemas/CardRef" }
+        target_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+          description: |
+            Monitor declares its targets. The monitored Card does NOT declare
+            its monitors (locked direction; protocol §III.3).
+        features:
+          type: array
+          items: { type: string }
+        thresholds:
+          type: object
+          additionalProperties: { type: number }
+        details:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    DriftProfile:
+      type: object
+      required: [type, config]
+      properties:
+        type:   { type: string, enum: [Spc, Psi, Custom, Agent] }
+        config:
+          oneOf:
+            - { $ref: "#/components/schemas/SpcProfile" }
+            - { $ref: "#/components/schemas/PsiProfile" }
+            - { $ref: "#/components/schemas/CustomProfile" }
+            - { $ref: "#/components/schemas/AgentEvalProfile" }
+
+    SpcProfile:
+      type: object
+      properties:
+        sample_size:     { type: integer, minimum: 1 }
+        feature_map:
+          type: object
+          additionalProperties: { type: string }
+        alert_threshold: { type: number }
+
+    PsiProfile:
+      type: object
+      properties:
+        categorical_features:
+          type: array
+          items: { type: string }
+        binning_strategy: { type: string }
+        alert_threshold:  { type: number }
+
+    CustomProfile:
+      type: object
+      required: [metric]
+      properties:
+        metric:          { type: string }
+        sample_size:     { type: integer, minimum: 1 }
+        alert_threshold: { type: number }
+
+    AgentEvalProfile:
+      type: object
+      required: [task]
+      properties:
+        task:            { type: string }
+        sample_ratio:    { type: number, minimum: 0, maximum: 1 }
+        alert_threshold: { type: number }
+
+    # --- II.16 Eval ------------------------------------------------------
+    EvalSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/eval.rs
+      x-wyrd-open-issue: [A20, A21, A28]
+      properties:
+        description: { type: string }
+        eval_type:
+          type: string
+          enum: [Assertion, Judge, Benchmark, Agentic, Custom]
+        target_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        judge_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        assertions:
+          type: array
+          items: { $ref: "#/components/schemas/EvalAssertion" }
+        pass_gates:
+          type: array
+          items: { $ref: "#/components/schemas/EvalPassGate" }
+        dataset_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        profile:
+          $ref: "#/components/schemas/EvalProfile"
+        default_parameters:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/ParameterValue" }
+        governance:        { $ref: "#/components/schemas/Governance" }
+        observation_hooks: { $ref: "#/components/schemas/ObservationHooks" }
+        details:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    EvalProfile:
+      type: object
+      required: [type, config]
+      properties:
+        type:   { type: string, enum: [Assertion, Judge, Benchmark, Agentic, Custom] }
+        config:
+          oneOf:
+            - { $ref: "#/components/schemas/AssertionEvalProfile" }
+            - { $ref: "#/components/schemas/JudgeEvalProfile" }
+            - { $ref: "#/components/schemas/BenchmarkEvalProfile" }
+            - { $ref: "#/components/schemas/AgenticEvalProfile" }
+            - { $ref: "#/components/schemas/CustomEvalProfile" }
+
+    AssertionEvalProfile:
+      type: object
+      properties:
+        rules:
+          type: array
+          items: { type: string }
+        input_schema:
+          type: object
+          additionalProperties: true
+        output_schema:
+          type: object
+          additionalProperties: true
+
+    JudgeEvalProfile:
+      type: object
+      properties:
+        prompt_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        rubric:
+          type: array
+          items: { $ref: "#/components/schemas/EvalRubricItem" }
+        config:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    BenchmarkEvalProfile:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        dataset_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        metrics:
+          type: array
+          items: { type: string }
+
+    AgenticEvalProfile:
+      type: object
+      properties:
+        scenarios:
+          type: array
+          items: { $ref: "#/components/schemas/EvalScenario" }
+        required_tools:
+          type: array
+          items: { type: string }
+        max_steps: { type: integer, minimum: 1 }
+
+    CustomEvalProfile:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        config:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    EvalAssertion:
+      type: object
+      required: [name, rule]
+      properties:
+        name: { type: string }
+        rule: { type: string }
+        metadata:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    EvalPassGate:
+      type: object
+      required: [name, operator, threshold]
+      properties:
+        name:      { type: string }
+        operator:  { type: string, description: "e.g. >= | > | <= | <" }
+        threshold: { type: number }
+
+    EvalRubricItem:
+      type: object
+      required: [name, description]
+      properties:
+        name:        { type: string }
+        description: { type: string }
+        weight:      { type: number, minimum: 0 }
+
+    EvalScenario:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        inputs:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/ParameterValue" }
+        expectations:
+          type: array
+          items: { type: string }
+
+    # --- II.17 Trigger ---------------------------------------------------
+    TriggerSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/trigger.rs
+      required: [source, target]
+      properties:
+        source: { $ref: "#/components/schemas/TriggerSource" }
+        target:
+          $ref: "#/components/schemas/CardRef"
+          x-wyrd-open-issue: A22
+          x-wyrd-note: "Code constrains to Operator. Proposed: Operator | Workflow | Eval."
+        cooldown_seconds: { type: integer, minimum: 0 }
+        config:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    TriggerSource:
+      type: object
+      required: [kind]
+      x-wyrd-open-issue: A23
+      x-wyrd-note: |
+        Today: { drift_observation | eval_observation | schedule }.
+        Proposed: add service_observation, policy_observation,
+        external_signal, run_finished.
+      oneOf:
+        - type: object
+          required: [kind, card]
+          properties:
+            kind: { const: drift_observation }
+            card: { $ref: "#/components/schemas/CardRef" }
+        - type: object
+          required: [kind, card]
+          properties:
+            kind: { const: eval_observation }
+            card: { $ref: "#/components/schemas/CardRef" }
+        - type: object
+          required: [kind, cron]
+          properties:
+            kind: { const: schedule }
+            cron: { type: string }
+
+    # --- II.18 Experiment -------------------------------------------------
+    ExperimentSpec:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/card/experiment.rs
+      properties:
+        experiment_type: { type: string }
+        description:     { type: string }
+        target_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        default_parameters:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/ParameterValue" }
+        run_refs:
+          type: array
+          items: { $ref: "#/components/schemas/RunRef" }
+        summary_metrics:
+          type: array
+          items: { $ref: "#/components/schemas/MetricEntry" }
+        best_run_ref: { $ref: "#/components/schemas/RunRef" }
+        artifact_refs:
+          type: array
+          items: { $ref: "#/components/schemas/CardRef" }
+        details:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    RunRef:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/run.rs
+      required: [run_id]
+      properties:
+        run_id:    { type: string, format: uuid }
+        run_kind:  { type: string }
+        card_ref:  { $ref: "#/components/schemas/CardRef" }
+
+    # =======================================================================
+    # IV / V. Operation envelopes
+    # =======================================================================
+
+    CardPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Card" }
+        next_cursor: { type: string }
+
+    BulkCardResult:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            type: object
+            required: [outcome]
+            properties:
+              outcome:
+                type: string
+                enum: [accepted, conflict, validation_rejected, policy_blocked]
+              card:    { $ref: "#/components/schemas/Card" }
+              problem: { $ref: "#/components/schemas/Problem" }
+
+    DryRunResult:
+      type: object
+      required: [ok]
+      properties:
+        ok:       { type: boolean }
+        problems:
+          type: array
+          items: { $ref: "#/components/schemas/Problem" }
+        derived_relationships:
+          $ref: "#/components/schemas/Relationships"
+
+    CardEvent:
+      type: object
+      required: [type, card]
+      properties:
+        type:
+          type: string
+          enum: [created, updated, deleted]
+        card:   { $ref: "#/components/schemas/Card" }
+        cursor: { type: string }
+
+    LineageNeighbors:
+      type: object
+      properties:
+        inbound:
+          type: array
+          items: { type: string }
+        outbound:
+          type: array
+          items: { type: string }
+
+    LineagePaths:
+      type: object
+      properties:
+        paths:
+          type: array
+          items:
+            type: array
+            items: { type: string }
+
+    CapabilityDescriptor:
+      type: object
+      required: [protocol, api_version, capabilities]
+      properties:
+        protocol:       { const: wyrd }
+        api_version:    { const: wyrd/v1 }
+        server_version: { type: string }
+        capabilities:
+          type: object
+          required: [kinds, operations, transports]
+          properties:
+            kinds:
+              type: array
+              items: { $ref: "#/components/schemas/CardKindName" }
+            external_kinds:
+              type: array
+              items: { type: string }
+            operations:
+              type: array
+              items: { type: string, example: "cards.create" }
+            extensions:
+              type: array
+              items: { type: string, description: "DNS-prefixed extension key" }
+            transports:
+              type: array
+              items:
+                type: string
+                enum: [http+json, mcp, a2a-bridge, grpc]
+        authn:
+          type: object
+          properties:
+            schemes:
+              type: array
+              items:
+                type: string
+                enum: [bearer, mtls]
+        deprecations:
+          type: array
+          items:
+            type: object
+            required: [path, since, removal]
+            properties:
+              path:    { type: string, description: "JSON-pointer or operation/scope id" }
+              since:   { type: string }
+              removal: { type: string }
+
+    # =======================================================================
+    # VI. Observation envelope (candidate; OPEN-A24)
+    # =======================================================================
+
+    Observation:
+      type: object
+      x-wyrd-open-issue: A24
+      required: [schema, observation_id, emitted_at, emitter, event]
+      properties:
+        schema:         { const: wyrd/v1 }
+        observation_id: { type: string, description: "ULID" }
+        emitted_at:     { type: string, format: date-time }
+        emitter:
+          type: object
+          required: [kind, ref]
+          properties:
+            kind:        { $ref: "#/components/schemas/CardKindName" }
+            ref:         { $ref: "#/components/schemas/CardRef" }
+            service_ref: { $ref: "#/components/schemas/CardRef" }
+        run:
+          type: object
+          properties:
+            run_id:        { type: string }
+            parent_run_id: { type: string }
+        event:
+          type: string
+          x-wyrd-open-issue: A5
+        payload:
+          type: object
+          additionalProperties: true
+        trace:
+          type: object
+          required: [trace_id, span_id]
+          properties:
+            trace_id:       { type: string, pattern: "^[0-9a-f]{32}$" }
+            span_id:        { type: string, pattern: "^[0-9a-f]{16}$" }
+            parent_span_id: { type: string, pattern: "^[0-9a-f]{16}$" }
+        attributes:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
+
+    # =======================================================================
+    # Errors (RFC 7807 + Wyrd catalog)
+    # =======================================================================
+
+    Problem:
+      type: object
+      x-wyrd-source: crates/wyrd-spec/src/error.rs
+      required: [type, title, status, code, detail]
+      properties:
+        type:        { type: string, format: uri, example: "https://wyrd.io/errors/WYRD_SPEC_400_VALIDATION" }
+        title:       { type: string }
+        status:      { type: integer }
+        code:
+          type: string
+          description: Wyrd error code.
+          enum:
+            - WYRD_SPEC_400_VALIDATION
+            - WYRD_SPEC_403_PERMISSION_DENIED
+            - WYRD_SPEC_404_NOT_FOUND
+            - WYRD_SPEC_409_CONFLICT
+            - WYRD_SPEC_500_INTERNAL
+            - WYRD_SPEC_502_UPSTREAM_FAILURE
+        detail:      { type: string }
+        trace_id:    { type: string, pattern: "^[0-9a-f]{32}$" }
+        remediation: { type: string }
+        details:
+          type: object
+          additionalProperties: true
+
+security:
+  - bearer: []
+
+# =============================================================================
+# Notes for iteration
+# =============================================================================
+# - When you spot a divergence between this file and the Rust code, file it
+#   here as an x-wyrd-open-issue and update wyrd-protocol.md §App.A.
+# - When you spot a divergence between this file and a worked example under
+#   architecture/specs/, the worked example is wrong (or this file needs
+#   tightening). Fix in the same commit.
+# - When an open issue is resolved, remove the x-wyrd-open-issue marker
+#   AND update wyrd-protocol.md §App.A and the relevant Rust source.

@@ -81,16 +81,20 @@ Downstream artifacts are brought up to this version in a sync pass.
       ingest, signed with the per-card governance token; never propagated
       between services and never read by Policy CEL.
 
-    A deployed Service card auto-provisions a service account at registration
-    (named in `spec.service_account`) and receives a card-bound API key
-    returned once in the response. The pipeline injects `WYRD_API_KEY` into
-    the pod; the SDK exchanges it once at startup for a short-lived JWT
-    carrying the card's `card_ref` claim. On cross-service calls the SDK adds
-    `Wyrd-Caller-Identity: Bearer <jwt>` — the application's `Authorization`
-    header is never touched. The mesh's ext_authz filter (or the SDK
-    middleware) authenticates itself to `/v1/authz/check` with its own
-    card-scoped JWT and forwards the caller's JWT plus the original
-    method/path as headers; the body is empty. Both identities are
+    A deployed Service card runs under a Wyrd-owned service account derived
+    deterministically from its `card_ref`. `wyrd apply` registers the card and
+    creates the SA (idempotent on re-apply); no secret is returned. Credentials
+    are issued out-of-band by an admin-authenticated `wyrd auth issue-key
+    <card_ref>` call, which mints a card-bound API key and returns it to the
+    caller. The caller uploads the key to the deploy environment's secret store
+    (Vault, AWS Secrets Manager, GCP Secret Manager); deploy-time secret
+    injection puts it into the pod as `WYRD_API_KEY`. The SDK exchanges it once
+    at startup for a short-lived JWT carrying the card's `card_ref` claim. On
+    cross-service calls the SDK adds `Wyrd-Caller-Identity: Bearer <jwt>` — the
+    application's `Authorization` header is never touched. The mesh's ext_authz
+    filter (or the SDK middleware) authenticates itself to `/v1/authz/check`
+    with its own card-scoped JWT and forwards the caller's JWT plus the
+    original method/path as headers; the body is empty. Both identities are
     server-verified from signed claims.
 19. **Light-card reference slots accept `ref | path | inline`.** Wherever a
     card spec references a light card (Prompt, Agent, Workflow, Mcp, Policy,
@@ -232,14 +236,13 @@ directory, not Service components.
 spec:
   description?: string
   components: [ServiceComponent] # { alias, ref | path | inline }
-  entry_point?: string
-  service_config: { string: NonSecretValue }
-  service_account: string        # SA name. Wyrd auto-provisions the SA at registration and
-                                 # issues a card-bound API key returned ONCE in the response.
-                                 # The SDK exchanges this key at startup for the JWT that
-                                 # carries the card's `card_ref` claim (see Runtime identity).
-  metadata: { string: NonSecretValue }
+  entry_point?: string           # SDK AppState bootstrap module (e.g. `acme.copilot.app:app`).
+                                 # Importing it materializes the service's locked card snapshot
+                                 # at runtime. Wyrd doesn't import this; the deploy image does.
 ```
+
+Identity is derived from the Service's `card_ref` and bound on first deploy
+contact — no `service_account` field on the spec. See "Runtime identity".
 
 ### Policy
 Declarative governance rules. CEL-evaluated. Three lifecycle phases share one
@@ -279,24 +282,35 @@ Closed enums:
 
 ### Runtime identity
 
-A deployed Service card runs as the service account named in
-`spec.service_account`. At registration, Wyrd idempotently creates the SA
-(least-privilege default role) and issues an API key bound to the card,
-returned ONCE in the registration response. The CI/CD pipeline writes the key
-directly to the shop's secret store — no human paste.
+A deployed Service card runs under a Wyrd-owned service account derived
+deterministically from the card's `card_ref`. `wyrd apply` registers the card
+and creates the SA (idempotent on re-apply); no secret is returned. The
+declarative and credential operations are separated, matching the kubectl
+pattern (`apply` then `create token`):
+
+| Operation | Wyrd command | What it does |
+|---|---|---|
+| Register card + create SA | `wyrd apply -f service.yaml` | Idempotent. Writes card, creates SA. No secret. |
+| Mint a card-bound API key | `wyrd auth issue-key <card_ref>` | Admin-authenticated. Returns the key to the caller. Caller uploads to the deploy environment's secret store. Re-issuable for rotation. |
+
+Deploy-time secret injection (Vault Agent, External Secrets Operator, AWS
+Secrets Manager CSI driver, etc.) puts the API key into the pod as
+`WYRD_API_KEY`. The SDK exchanges it ONCE at startup at `POST /auth/token` for a
+short-lived JWT (~15m) carrying the `card_ref` claim, and auto-refreshes before
+expiry.
 
 Env vars in deployed services:
 
 | Env var | Required? | Source | Used for |
 |---|---|---|---|
-| `WYRD_API_KEY` | REQUIRED | CI writes from registration response | Exchanged ONCE at startup at `POST /auth/token` for short-lived JWT (~15m). SDK auto-refreshes. JWT carries `card_ref` claim. |
+| `WYRD_API_KEY` | REQUIRED | Deploy environment's secret store (key minted by `wyrd auth issue-key <card_ref>`) | Exchanged ONCE at startup at `POST /auth/token` for short-lived JWT. SDK auto-refreshes. JWT carries `card_ref` claim. |
 | `WYRD_API_URL` | REQUIRED | Static config | Wyrd server base URL. |
 | `WYRD_GOV_TOKEN` | OPTIONAL | CI writes from `wyrd gov-token issue` response | Only if the app calls `wyrd.observe(...)`. |
 
-The API key is exchanged at startup — never on the wire. The JWT — not the
-API key — is what travels on cross-service calls in the dedicated
-`Wyrd-Caller-Identity: Bearer <jwt>` header. The application's own
-`Authorization` header is never touched by the SDK.
+The API key is exchanged at startup — never on the wire. The JWT — not the API
+key — is what travels on cross-service
+calls in the dedicated `Wyrd-Caller-Identity: Bearer <jwt>` header. The
+application's own `Authorization` header is never touched by the SDK.
 
 ```
 POST /charge HTTP/1.1

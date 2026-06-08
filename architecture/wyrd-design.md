@@ -219,7 +219,6 @@ directory, not Service components.
 ```yaml
 spec:
   description?: string
-  service_type?: string          # agent | workflow | api | mcp | observability-only sources etc.
   components: [ServiceComponent] # { alias, ref, source?, config, credential_refs }
   entry_point?: string
   deployment: { string: NonSecretValue }

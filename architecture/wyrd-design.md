@@ -18,15 +18,15 @@ Downstream artifacts are brought up to this version in a sync pass.
    deployment unit is a directory of card YAMLs applied together.
 2. **One fact, one owning Kind.** If a field could live in two places, the
    doctrine has a gap. Surface it.
-3. **Monitors declare subjects.** Drift, Eval, Audit reference what they
-   observe. Subjects do not list their observers. Drift and Eval declare a
-   single `subject_ref`; Audit may declare many.
+3. **Monitors declare subjects.** Drift and Eval reference what they
+   observe. Subjects do not list their observers. Each declares a single
+   `subject_ref`.
 4. **Reactions are Operators. Wiring is Triggers.** Drift/Eval/Policy never
    inline reaction logic.
 5. **Service composes for deployment, not observation.** Drift/Eval/Trigger/
    Operator/Audit/Source are peer cards, not Service components.
 6. **Enforcement is composed at the surface that enforces it.** Service
-   composes Policy for runtime gates. Audit references Policy as evidence.
+   composes Policy for runtime gates.
 7. **Wyrd reads. It does not push.** Application code emits to its own
    observability stack with its own SDKs. Wyrd records internal observations
    in `vala`; external data is queried through `Source` cards.
@@ -41,8 +41,8 @@ Downstream artifacts are brought up to this version in a sync pass.
 12. **Tools are runtime names, not cards.** `AgentSpec.tool_names: Vec<String>`
     resolves through the runtime tool registry. MCP servers auto-register
     their tools by name; host tools register themselves. No `Tool` kind.
-13. **No event vocabulary on the wire.** "Observation" comes from Drift/Eval/
-    Audit; "trigger firing" comes from the `TriggerSource` enum. Free-form
+13. **No event vocabulary on the wire.** "Observation" comes from Drift/Eval;
+    "trigger firing" comes from the `TriggerSource` enum. Free-form
     event-name strings are doctrine drift.
 14. **Harness-host config does not belong on Cards.** Permission modes,
     sandboxes, isolation, effort, and per-CLI compatibility are properties of
@@ -399,16 +399,8 @@ self-assert its identity — no env var, no body field, no header carries
 identity data the pod authored.
 
 ### Audit
-Governance attestation; references the policies and subjects in scope.
-```yaml
-spec:
-  description?: string
-  subject_refs: [CardRef]
-  policy_refs: [CardRef]
-  evidence_refs: [CardRef]
-  source_refs: [CardRef]         # → Source — durable evidence stream
-  details: { string: NonSecretValue }
-```
+Immutable case file. Records the result of an investigation against the
+provenance graph; never user-declared scope. Detailed spec under design.
 
 ### Drift
 Observation producer for a single subject. Envelope is orthogonal: subject +
@@ -726,12 +718,12 @@ ergonomic they expect from JSON-Schema `$ref` / OpenAPI external-file imports.
 | Mcp     | `server_name`, `transport`, `scopes` | `Service.components.ref` |
 | Drift   | `subject_ref`, `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `Trigger.source.drift_ref`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
 | Eval    | `subject_ref`, `dataset_ref`, `source_ref`, `tasks[].Judge.prompt` (PromptRef) | `Drift.signal.eval_ref`, `Trigger.source.eval_ref` |
-| Audit   | `subject_refs`, `policy_refs`, `evidence_refs`, `source_refs` | — |
+| Audit   | — (under redesign)                   | — |
 | Service | `components[].ref`                   | `Drift.subject_ref` (service-level), `Eval.subject_ref` |
-| Policy  | `rules`                              | `Service.components.ref`, `Audit.policy_refs`, `Operator.pre_invoke`, `Operator.post_invoke` |
+| Policy  | `rules`                              | `Service.components.ref`, `Operator.pre_invoke`, `Operator.post_invoke` |
 | Trigger | `schedule`, `source.drift_ref` \| `source.eval_ref`, `operator_ref` | — |
 | Operator| `action` (`workflow_ref` \| typed `channel` shape \| `auth.env`), `pre_invoke`, `post_invoke` | `Trigger.operator_ref` |
-| Source  | `kind`, `uri`, `format`              | `Drift.signal.source_ref` (External variant), `Eval.source_ref`, `Audit.source_refs` |
+| Source  | `kind`, `uri`, `format`              | `Drift.signal.source_ref` (External variant), `Eval.source_ref` |
 
 `Service.components` accepts: Agent, Prompt, Model, Workflow, Mcp, Policy. No
 other kinds are runtime-aliased into a Service.
@@ -766,7 +758,7 @@ services/ops-copilot/
 │   ├── runbook-drift.yaml
 │   └── service-latency-drift.yaml
 ├── audits/
-│   └── service-quarterly.yaml   # source_refs → audit-log
+│   └── service-quarterly.yaml   # case file capturing a periodic service review
 └── reactions/
     ├── pageroncall-operator.yaml
     └── latency-page-trigger.yaml
@@ -789,14 +781,9 @@ services/ops-copilot/
    singular.
 6. Default Source binding at the Service or Agent level to avoid repeating
    `source_ref` on every Drift/Eval.
-7. Audit `source_refs` vs `evidence_refs` boundary — Source is queryable
-   history; `evidence_refs` are concrete card pointers.
-8. Whether tool hook phases need a closed enum on `Policy.rules` or can stay
+7. Whether tool hook phases need a closed enum on `Policy.rules` or can stay
    off the wire entirely (no consumer today).
-9. Whether `Audit.subject_refs` stays plural. An audit may genuinely cover a
-   Service plus its component Agents; collapse to singular if real audits
-   don't span multiple cards in practice.
-10. **Closed.** `Eval` does not carry its own `signal` decomposition. Eval IS
+8. **Closed.** `Eval` does not carry its own `signal` decomposition. Eval IS
     the signal — its per-task pass/fail aggregates into a score stream
     consumed downstream by `Drift` with `DriftSignal::EvalScore`. The input
     edges (`dataset_ref` vs `source_ref`) are two optional `CardRef`s, not a

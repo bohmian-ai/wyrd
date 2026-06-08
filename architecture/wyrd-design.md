@@ -219,11 +219,10 @@ directory, not Service components.
 ```yaml
 spec:
   description?: string
-  components: [ServiceComponent] # { alias, ref, source?, config, credential_refs }
+  components: [ServiceComponent] # { alias, ref, source?, config }
   entry_point?: string
   runtime?: ServiceRuntime       # { framework?, mode?, strict?, config, policy }
   service_config: { string: NonSecretValue }
-  credential_refs: [CredentialRef]
   service_account: string        # SA name. Wyrd auto-provisions the SA at registration and
                                  # issues a card-bound API key returned ONCE in the response.
                                  # The SDK exchanges this key at startup for the JWT that

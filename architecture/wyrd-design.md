@@ -221,7 +221,6 @@ spec:
   server_name: string
   transport?: string             # stdio | http | sse
   scopes: [string]
-  credential_refs: [CredentialRef]
   details: { string: NonSecretValue }
 ```
 
@@ -508,7 +507,6 @@ spec:
   kind: object_store             # v1: object_store only
   uri: string                    # s3:// | gs:// | az:// | file://
   format: parquet | jsonl | arrow_ipc | csv
-  credential_ref?: CredentialRef
   defaults: { string: NonSecretValue }
 ```
 
@@ -571,17 +569,24 @@ protocol-versioned additions):
 
 | Channel     | Carries                                                                       |
 |-------------|-------------------------------------------------------------------------------|
-| `PagerDuty` | `routing_key_ref: CredentialRef`, `severity`, `summary`, `dedup_key?: string` |
-| `Slack`     | `webhook_url_ref: CredentialRef`, `text: string`                              |
+| `PagerDuty` | `severity`, `summary`, `dedup_key?: string`                                   |
+| `Slack`     | `text: string`                                                                |
 
 `HttpMethod`: closed enum — `Get | Post | Put | Patch | Delete`.
 
 `HttpAuth` (closed tagged union):
 - `None`
-- `Bearer { credential_ref: CredentialRef }`
-- `Basic { credential_ref: CredentialRef }`
-- `Header { name: string, credential_ref: CredentialRef }` (covers `X-API-Key`,
+- `Bearer { env: string }` — `env` names a server-side env var holding the token
+- `Basic { env: string }` — env var holds `user:password`
+- `Header { name: string, env: string }` (covers `X-API-Key`,
   `Authorization: token <foo>`)
+
+Wyrd-the-server resolves `env` by reading the process environment at fire time;
+missing env vars fail the action closed. Cards never carry secret material.
+Notify channels (Slack/PagerDuty) and Source (S3/GCS/Azure) resolve their
+credentials from the server's own configuration — webhook URLs, routing keys,
+and object-store credentials live in the server's env or its operator config,
+not in the card.
 
 `HttpBody`: structured JSON (`JsonValue`). Any string leaf may contain
 `{{...}}` placeholders the server interpolates at fire time. Same templating
@@ -704,15 +709,15 @@ ergonomic they expect from JSON-Schema `$ref` / OpenAPI external-file imports.
 | Model   | `artifact_refs`                      | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, `Experiment.target_refs` |
 | Agent   | `prompt`, `tool_names`               | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, Agent prompts (sub-agent calls) |
 | Workflow| `steps.*.target`                     | `Eval.subject_ref`, `Service.components.ref`, `Operator.action.workflow_ref` |
-| Mcp     | `credential_refs`                    | `Service.components.ref` |
+| Mcp     | `server_name`, `transport`, `scopes` | `Service.components.ref` |
 | Drift   | `subject_ref`, `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `Trigger.source.drift_ref`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
 | Eval    | `subject_ref`, `dataset_ref`, `source_ref`, `tasks[].Judge.prompt` (PromptRef) | `Drift.signal.eval_ref`, `Trigger.source.eval_ref` |
 | Audit   | `subject_refs`, `policy_refs`, `evidence_refs`, `source_refs` | — |
 | Service | `components[].ref`                   | `Drift.subject_ref` (service-level), `Eval.subject_ref` |
 | Policy  | `rules`                              | `Service.components.ref`, `Audit.policy_refs`, `Operator.pre_invoke`, `Operator.post_invoke` |
 | Trigger | `schedule`, `source.drift_ref` \| `source.eval_ref`, `operator_ref` | — |
-| Operator| `action` (`workflow_ref` \| `channel.*_ref` \| `auth.credential_ref`), `pre_invoke`, `post_invoke` | `Trigger.operator_ref` |
-| Source  | `credential_ref`                     | `Drift.signal.source_ref` (External variant), `Eval.source_ref`, `Audit.source_refs` |
+| Operator| `action` (`workflow_ref` \| typed `channel` shape \| `auth.env`), `pre_invoke`, `post_invoke` | `Trigger.operator_ref` |
+| Source  | `kind`, `uri`, `format`              | `Drift.signal.source_ref` (External variant), `Eval.source_ref`, `Audit.source_refs` |
 
 `Service.components` accepts: Agent, Prompt, Model, Workflow, Mcp, Policy. No
 other kinds are runtime-aliased into a Service.

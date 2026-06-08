@@ -481,8 +481,44 @@ identity (same posture as `ServiceIdentity`, doctrine #15).
 | `Human`   | `sub: string` (verified subject claim) |
 | `Agent`   | `card_ref: CardRef` (→ Agent)     |
 
+`ProvenanceQuery` is the structured, replayable question that produced the
+lineage. Parametric, not a DSL — Wyrd has no graph DB and no query engine
+to drive a DSL through, and the query is stored on every Audit card so it
+must replay verbatim forever.
+
+```yaml
+ProvenanceQuery:
+  roots: [CardRef]              # 1+ subjects, version-locked (doctrine #8)
+  direction: TraversalDirection # Upstream | Downstream | Both
+  depth?: u32                   # default 8, server-capped (e.g. 32)
+```
+
+`TraversalDirection` walks the `card_edges` derived index:
+
+| Variant      | Walks                                  | Means |
+|--------------|----------------------------------------|-------|
+| `Upstream`   | `card_edges WHERE source ∈ frontier`   | What produced X / what X consumes. |
+| `Downstream` | `card_edges WHERE target ∈ frontier`   | What consumes X / what depends on X. |
+| `Both`       | union                                  | Full neighborhood. |
+
+The query carries no `kinds` or `space` filter. Both were removed by
+design:
+
+- **No `kinds`.** Filtering would silently narrow the pinned subgraph,
+  giving future readers a forensic false signal that the investigator
+  considered only those kinds. Display filtering is a UI concern; the
+  audit pins the whole neighborhood.
+- **No `space`.** Visibility is already RBAC-enforced server-side. A
+  `space` filter at query time would hide cross-space references — which
+  in an investigation are often the finding (e.g. a prod Service
+  referencing a staging Model).
+
+`roots` is a list because multi-version subjects are the common case for
+incident windows: a Service that bumped from `1.0.0` to `1.1.0` mid-window
+has two distinct version-locked roots, and an investigator pinning the
+window needs both in one Audit.
+
 **Under design (wire shape deferred):**
-- `ProvenanceQuery` — the structured question (root refs, direction, depth, filters).
 - `LineageSubgraph` — the frozen graph (nodes as `CardRef`, edges typed by relation).
 - `ObservationCriteria` — the re-fetch filter against vala (subjects, time range, signal/method, projection).
 - `digest` algorithm — canonical-form rules + hash (BLAKE3 vs SHA-256).

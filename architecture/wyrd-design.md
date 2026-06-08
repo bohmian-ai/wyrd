@@ -33,8 +33,8 @@ Downstream artifacts are brought up to this version in a sync pass.
 8. **Lineage is server-derived from `*_refs`.** Never authored. Never edited.
 9. **Status is server-managed.** Authors never write `status:`.
 10. **Every cross-card pointer is a `CardRef`.** No string-typed parents or
-    path-typed lookups in the protocol. Path hints belong on
-    `ServiceComponent.source` only, where they're an authoring convenience.
+    path-typed lookups in the protocol. Co-location is expressed by the
+    deployment directory, not by a path field on any card.
 11. **Sub-agency is a relationship, not a noun.** An Agent invoking another
     Agent is the sub-agent call. The callee is an `AgentCard`. The caller's
     prompt / runtime expresses the invocation. No `SubAgent` kind.
@@ -219,7 +219,7 @@ directory, not Service components.
 ```yaml
 spec:
   description?: string
-  components: [ServiceComponent] # { alias, ref, source?, config }
+  components: [ServiceComponent] # { alias, ref }
   entry_point?: string
   service_config: { string: NonSecretValue }
   service_account: string        # SA name. Wyrd auto-provisions the SA at registration and

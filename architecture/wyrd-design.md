@@ -518,10 +518,74 @@ incident windows: a Service that bumped from `1.0.0` to `1.1.0` mid-window
 has two distinct version-locked roots, and an investigator pinning the
 window needs both in one Audit.
 
+`LineageSubgraph` is the frozen graph that `ProvenanceQuery` produces.
+Nodes are cards (by reference, not inlined); edges are the typed
+`card_ref` fields inside each card's spec that point at other cards. The
+subgraph is the explicit topology at `snapshot_at` — readers don't
+re-derive it from card specs.
+
+```yaml
+LineageSubgraph:
+  nodes: [LineageNode]
+  edges: [LineageEdge]
+
+LineageNode:
+  card_ref: CardRef           # version-locked identity (doctrine #8)
+  kind: CardKind              # redundant with card_ref; lets readers filter without parsing
+  attributes_digest: string   # JCS canonicalization (RFC 8785) + SHA-256 of the card
+
+LineageEdge:
+  source: CardRef             # the card that authored the reference
+  target: CardRef             # the card being referenced
+  edge_kind: EdgeKind         # semantic relation (closed enum)
+  via: string                 # dot-notation path inside source spec, e.g. "spec.components[0].ref"
+```
+
+`EdgeKind` is a closed enum, derived directly from the typed `card_ref`
+fields in the locked spec model. A new card kind that introduces new
+typed refs is a versioned breaking change that adds variants.
+
+| Variant     | Source-card fields                                                |
+|-------------|-------------------------------------------------------------------|
+| `Subject`   | `Drift.subject_ref`, `Eval.subject_ref`                           |
+| `Component` | `Service.components[].ref`, `Workflow.steps[].target`             |
+| `Artifact`  | `Data.artifact_refs[]`, `Model.artifact_refs[]`                   |
+| `Prompt`    | `Agent.prompt`, `Eval.tasks[].Judge.prompt`                       |
+| `Dataset`   | `Eval.dataset_ref`                                                |
+| `Source`    | `Eval.source_ref`, `Drift.signal.External.source_ref`             |
+| `Baseline`  | `Drift.signal.Distribution.baseline_ref`                          |
+| `Trigger`   | `Trigger.source.drift_ref \| eval_ref`                            |
+| `Operator`  | `Trigger.operator_ref`                                            |
+| `Workflow`  | `Operator.action.workflow_ref`                                    |
+| `Hook`      | `Operator.pre_invoke`, `Operator.post_invoke`                     |
+
+**Integrity.** Both `LineageNode.attributes_digest` and the Audit card's
+own `digest` use the same recipe: **JCS canonicalization (RFC 8785) +
+SHA-256**. JCS pins key ordering, number formatting, and whitespace so
+two valid JSON serializations of the same record hash identically.
+SHA-256 is FIPS 140-3 approved — the boring, auditor-friendly choice
+that needs no defense in a SOC 2, SR 11-7, or AI Act review.
+
+**`via` syntax.** Dot notation (`spec.components[0].ref`), not RFC 6901
+JSON Pointer. Reasoning:
+
+- Reads like the YAML the author wrote and the agent already sees.
+- Grammar is tiny: `<key>`, `<key>.<key>`, `<key>[<index>]`. No quoting.
+- Card spec field names are controlled snake_case identifiers — no
+  ambiguity risk from user-supplied keys at any structural position
+  where a `via` can point.
+- LLM training-data weight strongly favours dot notation; agents reading
+  audits parse it natively.
+
+**Why edges aren't redundant with nodes.** Nodes carry `card_ref` only —
+not the spec content. Without an explicit edge list a reader would have
+to fetch every card from the registry and re-parse its spec to rebuild
+the graph; that ties replay to live spec-parsing logic that drifts
+across API versions. The edge list is the connectivity finding itself,
+recorded once at snapshot time.
+
 **Under design (wire shape deferred):**
-- `LineageSubgraph` — the frozen graph (nodes as `CardRef`, edges typed by relation).
 - `ObservationCriteria` — the re-fetch filter against vala (subjects, time range, signal/method, projection).
-- `digest` algorithm — canonical-form rules + hash (BLAKE3 vs SHA-256).
 - Multi-party `attestations` — deferred to v1.1; `details` may carry informally in v1.
 
 ### Drift

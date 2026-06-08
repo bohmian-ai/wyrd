@@ -92,6 +92,19 @@ Downstream artifacts are brought up to this version in a sync pass.
     card-scoped JWT and forwards the caller's JWT plus the original
     method/path as headers; the body is empty. Both identities are
     server-verified from signed claims.
+19. **Light-card reference slots accept `ref | path | inline`.** Wherever a
+    card spec references a light card (Prompt, Agent, Workflow, Mcp, Policy,
+    Eval, Trigger, Operator, Source, Audit, Service), the slot is a
+    three-variant tagged-by-key union, mutually exclusive:
+    - `ref:`    — `CardRef` to a registered card. Stable identity.
+    - `path:`   — client-side authoring sugar. Loader splices the file's
+                  spec body inline before send. Never on the wire. Never
+                  auto-registered.
+    - `inline:` — spec body embedded in the parent, prefixed with `kind:`.
+                  No card identity; not addressable from outside the parent.
+
+    Heavy cards (Model, Data, Experiment) accept `ref:` only — identity is
+    required for lineage. See §"Light-card reference forms" for loader rules.
 
 ---
 
@@ -219,7 +232,7 @@ directory, not Service components.
 ```yaml
 spec:
   description?: string
-  components: [ServiceComponent] # { alias, ref }
+  components: [ServiceComponent] # { alias, ref | path | inline }
   entry_point?: string
   service_config: { string: NonSecretValue }
   service_account: string        # SA name. Wyrd auto-provisions the SA at registration and
@@ -590,7 +603,7 @@ Shared types embedded into specs. Owned by `wyrd-spec`.
 | Foundation          | Purpose |
 |---------------------|---------|
 | `CardRef`           | `{ kind, name, version, space?, uid? }` — the only authored pointer between Cards |
-| `PromptRef`         | Two-variant tagged union: `Card(CardRef → Prompt)` \| `Inline(PromptSpec)`. Inline has no card identity and cannot be referenced from outside its parent. Used by `Agent.prompt` and `EvalTask::Judge.prompt`. |
+| `LightRef`          | Three-variant tagged-by-key union for any light-card slot: `ref: CardRef` \| `inline: <Spec>` \| `path: string` (authoring sugar; resolves to inline before send). The slot's parent field determines which `<Spec>` is valid inline. Heavy-card references stay `CardRef`-only. |
 | `Governance`        | Compliance metadata: approvals, residency, retention |
 | `FrameworkAdapterRef` | `{ name, version?, config }` — runtime adapter binding (MLflow, Skald, LangGraph, etc.) |
 | `CredentialRef`     | `{ provider, name }` — provider+name lookup at runtime |
@@ -715,58 +728,79 @@ apply -f eval-suite.yaml` registers all of them in dependency order. The Agent
 under test, the Source it reads from, and the Eval that judges it can all
 ship in one file.
 
-### `PromptRef` authoring forms
+### Light-card reference forms
 
-The typed contract has two variants. The **authoring layer** adds a third
-load-time form (`path`) for splitting prompts into separate files.
+A light-card reference slot accepts exactly one of three keys: `ref`, `path`,
+or `inline`. The key IS the discriminator; there is no separate `kind:` tag
+for the variant. The three forms in isolation:
 
 ```yaml
-# 1. Card reference — points at a registered Prompt.
-prompt:
-  kind: ref
-  ref: { kind: Prompt, name: helpfulness-judge, version: "1.0.0", space: prod }
+# 1. ref — points at a registered card.
+ref: { kind: Policy, name: pii-redaction, version: "1.0.0", space: prod }
 
-# 2. Inline — full PromptSpec embedded in the parent.
-prompt:
-  kind: inline
-  provider: anthropic
-  model: claude-opus-4-7
-  messages: [ ... ]
-  variables: [input, output]
-  response_format: json
+# 2. path — authoring sugar. Loader splices the file's spec body inline.
+#    File begins with `kind:` then spec fields; no `apiVersion` or `metadata`.
+path: ./policies/pii-redaction.yaml
 
-# 3. Path — loader-time directive (NOT a wire variant; resolved client-side).
-prompt:
-  kind: path
-  value: "./prompts/helpfulness-judge.yaml"
+# 3. inline — full spec body embedded in the parent. No card identity.
+inline:
+  kind: Policy
+  rules:
+    - name: redact-ssn
+      expression: "message.contains_pii('ssn')"
+      action: gate
+  scope: service_local
 ```
+
+In context — `Service.components[]` mixing all three plus a heavy-card ref:
+
+```yaml
+components:
+  - alias: agent
+    ref:  { kind: Agent, name: support-triage,   version: "1.0.0", space: prod }
+  - alias: model
+    ref:  { kind: Model, name: churn-classifier, version: "1.4.2", space: prod }  # heavy — ref only
+  - alias: prompt
+    path: ./prompts/triage-system.yaml
+  - alias: pii-policy
+    inline:
+      kind: Policy
+      rules:
+        - name: redact-ssn
+          expression: "message.contains_pii('ssn')"
+          action: gate
+      scope: service_local
+```
+
+Same three-key shape applies anywhere a light card is referenced —
+`Service.components[].ref`, `Trigger.target`, `Workflow.steps[].target`,
+`Agent.prompt`, `EvalTask::Judge.prompt`, etc.
 
 ### Path resolution rules (loader contract)
 
-`path:` is **client-side authoring sugar**, not a `PromptRef` wire variant.
-The loader splices the referenced file's content into the parent at read
-time; the payload that leaves the client contains only `ref` or `inline`. The
-server, registry, and `vala` never see a `path:` value.
+`path:` is **client-side authoring sugar**, not a wire variant. The loader
+splices the referenced file's spec body into the parent at read time; the
+payload that leaves the client contains only `ref` or `inline`. The server,
+registry, and `vala` never see a `path:` value.
 
-- Resolved **relative to the file containing the `kind: path` reference** —
-  not CWD, not apply-root.
+- Resolved **relative to the file containing the `path:` reference** — not
+  CWD, not apply-root.
 - Absolute paths are allowed but discouraged (breaks portability across
   machines and CI).
-- The referenced file is a **bare spec body** (no `apiVersion` / `kind` /
-  `metadata` wrapper) — a fragment, not a card document. Card documents go
-  in their own multi-doc YAML entries and get registered separately.
+- The referenced file is a **bare spec body** — `kind:` plus spec fields,
+  no `apiVersion` or `metadata` envelope. The `kind:` makes the file
+  self-describing and parses identically to an inline body.
 - Path imports are **never auto-registered as cards**. The result is inline.
-  If you want a registered, reusable `Prompt`, write a full card document
-  (with `apiVersion` + `kind` + `metadata`) and apply it; then reference by
-  `CardRef`.
+  If you want a registered, reusable card, write a full card document (with
+  `apiVersion` + `kind` + `metadata`) and apply it; then reference by `ref:`.
 - Transitive: a `path:`-loaded fragment may itself contain `path:` refs.
   Loader resolves transitively with a hard depth limit (≤8) to catch cycles.
-- `path`, `inline`, and `ref` are mutually exclusive on a single `PromptRef`.
+- `ref`, `path`, and `inline` are mutually exclusive on any single slot.
   Any combination is a validation error.
 
-This keeps the wire contract tight (two-variant `PromptRef`), prevents
-filesystem-on-server, and gives authors the file-splitting ergonomic they
-expect from JSON-Schema `$ref` / OpenAPI external-file imports.
+This keeps the wire contract tight (two-variant `LightRef` post-loader),
+prevents filesystem-on-server, and gives authors the file-splitting
+ergonomic they expect from JSON-Schema `$ref` / OpenAPI external-file imports.
 
 ---
 
@@ -857,9 +891,3 @@ services/ops-copilot/
     edges (`dataset_ref` vs `source_ref`) are two optional `CardRef`s, not a
     tagged enum: presence is the mode (offline driver, online sink, both, or
     neither → vala default archive).
-11. Whether `AgentRef = CardRef | Inline` should land in v1. The Rule 17
-    pattern permits it; no current field has a clean use case that doesn't
-    cross a doctrine boundary (`subject_ref`, `Service.components.ref`,
-    `Workflow.steps.target` all need stable identity). Likely first home:
-    one-off `Workflow.steps[].target` for ephemeral agent steps. Deferred
-    until a concrete request surfaces.

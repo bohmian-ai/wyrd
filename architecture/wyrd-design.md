@@ -221,8 +221,7 @@ spec:
   description?: string
   components: [ServiceComponent] # { alias, ref, source?, config, credential_refs }
   entry_point?: string
-  deployment: { string: NonSecretValue }
-  runtime?: ServiceRuntime       # { kind, framework?, mode?, strict?, config, policy }
+  runtime?: ServiceRuntime       # { framework?, mode?, strict?, config, policy }
   service_config: { string: NonSecretValue }
   credential_refs: [CredentialRef]
   service_account: string        # SA name. Wyrd auto-provisions the SA at registration and

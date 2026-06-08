@@ -226,8 +226,6 @@ spec:
                                  # issues a card-bound API key returned ONCE in the response.
                                  # The SDK exchanges this key at startup for the JWT that
                                  # carries the card's `card_ref` claim (see Runtime identity).
-  content_hash?: string
-  lock_hash?: string
   metadata: { string: NonSecretValue }
 ```
 

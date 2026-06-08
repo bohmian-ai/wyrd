@@ -52,6 +52,22 @@ Downstream artifacts are brought up to this version in a sync pass.
     scheduling and they do not carry dispatch. Scheduling lives on
     `TriggerSource::Schedule`. Dispatch lives on `Operator`. There is no
     `Alert` kind — alerting is an Operator with a notification adapter.
+16. **Heavy cards anchor lineage; light cards are spec-only.** Model, Data, and
+    Experiment carry durable artifact bytes and MUST be pre-registered before
+    anything else can point at them — they're the lineage anchors. Every other
+    kind (Prompt, Agent, Eval, Policy, Trigger, Operator, Source, Mcp,
+    Workflow, Audit, Service) is spec-only: `wyrd apply -f file.yaml` reads
+    and registers in one move. No separate storage step, no programmatic
+    registration prerequisite.
+17. **Light cards may inline in place of a `CardRef`.** Wherever a `CardRef`
+    points at a light card and the inline target has no need for cross-spec
+    identity, the parent spec MAY embed the full definition instead. Today
+    `Agent.prompt` and `EvalTask::Judge.prompt` accept `PromptRef = CardRef |
+    Inline`. Inline definitions have no card identity, are not registered
+    standalone, and cannot be referenced from outside their parent. To reuse,
+    register as a card and reference by `CardRef`. Heavy refs (`subject_ref`,
+    `dataset_ref`, `Service.components.ref`, `Workflow.steps.target`) stay
+    `CardRef`-only — identity is the point.
 
 ---
 
@@ -142,7 +158,7 @@ runtime tool registry (host tools + MCP server registrations). Approval,
 per-tool blocks, and hook gates live on `Policy`, not here.
 ```yaml
 spec:
-  prompt: PromptRef              # CardRef or inline prompt
+  prompt: PromptRef              # CardRef (→ Prompt) or inline PromptSpec
   tool_names: [string]
   run_config: AgentRunConfigSpec # max_iterations, tool_concurrency_cap, session_recent_limit, timeout_ms
 ```
@@ -291,7 +307,7 @@ variant carries `id: string`, optional `depends_on: [string]` (DAG edges), and
 | Variant          | Variant-specific carries                                                                          | Use |
 |------------------|---------------------------------------------------------------------------------------------------|-----|
 | `Assertion`      | `context_path?: string`, `operator: ComparisonOperator`, `expected: ParameterValue`, `description?: string` | Deterministic check on a dot-path into a record |
-| `Judge`          | `prompt_ref: CardRef` (→ Prompt), `operator: ComparisonOperator`, `threshold: ParameterValue`     | LLM judge: one Prompt per task, judge score compared to threshold |
+| `Judge`          | `prompt: PromptRef` (`CardRef` → Prompt OR inline `PromptSpec`), `operator: ComparisonOperator`, `threshold: ParameterValue` | LLM judge: one Prompt per task, judge score compared to threshold |
 | `TraceAssertion` | `span_property: string`, `operator: ComparisonOperator`, `expected: ParameterValue`               | OTel span property (tokens, duration_ms, retry_count, …) read via `source_ref` |
 | `AgentAssertion` | `check: AgentCheckKind`, `expected: ParameterValue`                                               | Tool-call / response-shape check (`tool_called` \| `tool_args` \| `response_format` \| `step_count`) read via `source_ref` |
 
@@ -358,6 +374,7 @@ Shared types embedded into specs. Owned by `wyrd-spec`.
 | Foundation          | Purpose |
 |---------------------|---------|
 | `CardRef`           | `{ kind, name, version, space?, uid? }` — the only authored pointer between Cards |
+| `PromptRef`         | Two-variant tagged union: `Card(CardRef → Prompt)` \| `Inline(PromptSpec)`. Inline has no card identity and cannot be referenced from outside its parent. Used by `Agent.prompt` and `EvalTask::Judge.prompt`. |
 | `Governance`        | Compliance metadata: approvals, residency, retention |
 | `FrameworkAdapterRef` | `{ name, version?, config }` — runtime adapter binding (MLflow, Skald, LangGraph, etc.) |
 | `CredentialRef`     | `{ provider, name }` — provider+name lookup at runtime |
@@ -418,6 +435,85 @@ Foundations explicitly **removed** from v1 protocol surface:
 
 ---
 
+## Spec-file authoring
+
+Two complementary mechanisms — `wyrd apply -f file.yaml` reads + registers in
+one move, and a `PromptRef` may be inlined where its own identity isn't
+needed. Together they support the single-file Scouter/opsml-style workflow
+without breaking Rule 1 ("cards are independent registry entries").
+
+### Pre-registration matrix (Rule 16)
+
+| Kind | Must pre-register? | Why |
+|------|---------------------|-----|
+| `Model`        | **Yes** | Carries weight artifacts; lineage anchor. |
+| `Data`         | **Yes** (unless used purely as inline eval scenarios, which v1 does not support — `dataset_ref` is `CardRef`-only) | Carries dataset bytes; lineage anchor. |
+| `Experiment`   | **Yes** | Carries run history. |
+| `Artifact`     | **Yes** (typically derived from heavy cards) | Pointer to durable bytes. |
+| `Prompt`       | Optional | Light. Inlineable as `PromptRef` inside `Agent.prompt` / `EvalTask::Judge.prompt`. |
+| `Agent`        | Optional | Light. Spec-only; `apply` registers it. No v1 field accepts inline `AgentRef` (see Q11). |
+| `Eval`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Workflow`, `Audit`, `Service` | Optional | Light. Spec-only; `apply` registers each card as it's read. |
+
+A single YAML file may contain many `---`-separated card documents — `wyrd
+apply -f eval-suite.yaml` registers all of them in dependency order. The Agent
+under test, the Source it reads from, and the Eval that judges it can all
+ship in one file.
+
+### `PromptRef` authoring forms
+
+The typed contract has two variants. The **authoring layer** adds a third
+load-time form (`path`) for splitting prompts into separate files.
+
+```yaml
+# 1. Card reference — points at a registered Prompt.
+prompt:
+  kind: ref
+  ref: { kind: Prompt, name: helpfulness-judge, version: "1.0.0", space: prod }
+
+# 2. Inline — full PromptSpec embedded in the parent.
+prompt:
+  kind: inline
+  provider: anthropic
+  model: claude-opus-4-7
+  messages: [ ... ]
+  variables: [input, output]
+  response_format: json
+
+# 3. Path — loader-time directive (NOT a wire variant; resolved client-side).
+prompt:
+  kind: path
+  value: "./prompts/helpfulness-judge.yaml"
+```
+
+### Path resolution rules (loader contract)
+
+`path:` is **client-side authoring sugar**, not a `PromptRef` wire variant.
+The loader splices the referenced file's content into the parent at read
+time; the payload that leaves the client contains only `ref` or `inline`. The
+server, registry, and `vala` never see a `path:` value.
+
+- Resolved **relative to the file containing the `kind: path` reference** —
+  not CWD, not apply-root.
+- Absolute paths are allowed but discouraged (breaks portability across
+  machines and CI).
+- The referenced file is a **bare spec body** (no `apiVersion` / `kind` /
+  `metadata` wrapper) — a fragment, not a card document. Card documents go
+  in their own multi-doc YAML entries and get registered separately.
+- Path imports are **never auto-registered as cards**. The result is inline.
+  If you want a registered, reusable `Prompt`, write a full card document
+  (with `apiVersion` + `kind` + `metadata`) and apply it; then reference by
+  `CardRef`.
+- Transitive: a `path:`-loaded fragment may itself contain `path:` refs.
+  Loader resolves transitively with a hard depth limit (≤8) to catch cycles.
+- `path`, `inline`, and `ref` are mutually exclusive on a single `PromptRef`.
+  Any combination is a validation error.
+
+This keeps the wire contract tight (two-variant `PromptRef`), prevents
+filesystem-on-server, and gives authors the file-splitting ergonomic they
+expect from JSON-Schema `$ref` / OpenAPI external-file imports.
+
+---
+
 ## Reference-direction quick reference
 
 | Card    | Refs that authored on it             | Refs that point at it          |
@@ -428,7 +524,7 @@ Foundations explicitly **removed** from v1 protocol surface:
 | Workflow| `steps.*.target`                     | `Eval.subject_ref`, `Service.components.ref`, `Operator.workflow_ref` |
 | Mcp     | `credential_refs`                    | `Service.components.ref` |
 | Drift   | `subject_ref`, `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `Trigger.source.card`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
-| Eval    | `subject_ref`, `dataset_ref`, `source_ref`, `tasks[].Judge.prompt_ref` | `Trigger.source.card`, `Drift.signal.eval_ref` |
+| Eval    | `subject_ref`, `dataset_ref`, `source_ref`, `tasks[].Judge.prompt` (PromptRef) | `Trigger.source.card`, `Drift.signal.eval_ref` |
 | Audit   | `subject_refs`, `policy_refs`, `evidence_refs`, `source_refs` | — |
 | Service | `components[].ref`                   | `Drift.subject_ref` (service-level), `Eval.subject_ref`, `Trigger.source.card` (via observations) |
 | Policy  | `rules`                              | `Service.components.ref`, `Audit.policy_refs`, `Operator.pre_invoke`, `Operator.post_invoke` |
@@ -505,3 +601,9 @@ services/ops-copilot/
     edges (`dataset_ref` vs `source_ref`) are two optional `CardRef`s, not a
     tagged enum: presence is the mode (offline driver, online sink, both, or
     neither → vala default archive).
+11. Whether `AgentRef = CardRef | Inline` should land in v1. The Rule 17
+    pattern permits it; no current field has a clean use case that doesn't
+    cross a doctrine boundary (`subject_ref`, `Service.components.ref`,
+    `Workflow.steps.target` all need stable identity). Likely first home:
+    one-off `Workflow.steps[].target` for ephemeral agent steps. Deferred
+    until a concrete request surfaces.

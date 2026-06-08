@@ -50,8 +50,8 @@ Downstream artifacts are brought up to this version in a sync pass.
 15. **Monitors are pure observation producers.** Drift and Eval describe what
     is observed and what counts as an observation. They do not carry
     scheduling and they do not carry dispatch. Scheduling lives on
-    `TriggerSource::Schedule`. Dispatch lives on `Operator`. There is no
-    `Alert` kind — alerting is an Operator with a notification adapter.
+    `Trigger.schedule`. Dispatch lives on `Operator`. There is no `Alert`
+    kind — alerting is an Operator with a notification adapter.
 16. **Heavy cards anchor lineage; light cards are spec-only.** Model, Data, and
     Experiment carry durable artifact bytes and MUST be pre-registered before
     anything else can point at them — they're the lineage anchors. Every other
@@ -345,33 +345,37 @@ spec:
 ```
 
 ### Trigger
-Pure wiring card. Connects exactly one source (a Drift observation stream or a
-cron schedule) to exactly one Operator. No conditional logic, no filtering,
-no dispatch — Drift owns the fire condition; Operator owns the reaction;
-Trigger is the wire between them.
+Fires an Operator. A Trigger declares when (`schedule`), what to evaluate
+(`source`, optional), and what to fire (`operator_ref`). On each schedule
+tick, the server evaluates the source if present; if its condition matches
+(or no source is declared), the operator fires.
 ```yaml
 spec:
   description?: string
-  source: TriggerSource          # closed tagged union — see below
-  operator_ref: CardRef          # → Operator (the only valid target kind)
+  schedule: { cron: string, tz?: string }   # required — IANA tz name, default UTC
+  source?: TriggerSource                     # closed tagged union — see below
+  operator_ref: CardRef                      # → Operator (the only valid target kind)
 ```
 
 `TriggerSource` is a closed tagged union (snake_case `kind` discriminator):
 
-| Variant            | Variant-specific carries                                       | Fires when |
-|--------------------|----------------------------------------------------------------|------------|
-| `DriftObservation` | `drift_ref: CardRef` (→ Drift), `cooldown_seconds?: u32`       | The referenced Drift emits an observation. `cooldown_seconds` debounces repeat firings on the same Drift. |
-| `Schedule`         | `cron: string`, `tz?: string` (IANA tz database name, default `UTC`) | Cron schedule elapses. No cooldown — cron is the cadence. |
+| Variant | Variant-specific carries        | Server does on each schedule tick                                              |
+|---------|---------------------------------|--------------------------------------------------------------------------------|
+| `Drift` | `drift_ref: CardRef` (→ Drift)  | Evaluates the Drift. Condition match → fire `operator_ref`. Else record metric. |
+| `Eval`  | `eval_ref: CardRef` (→ Eval)    | Runs the Eval. Any task failure → fire `operator_ref`. Else record scores.     |
 
-Eval does not appear as a source variant — the Eval→Drift bridge runs through
-`DriftSignal::EvalScore`, so any "fire on eval result" wiring is authored as
-`Drift(EvalScore) → Trigger(DriftObservation) → Operator`. One fire-vocabulary
-in the protocol (Rule 15).
+If `source` is omitted, the operator fires unconditionally on every schedule
+tick (cron-driven webhook or workflow dispatch with no monitor gate).
 
-External pushes are deliberately not a variant — Rule 7 ("Wyrd reads, it does
-not push") means external signals enter through a `Source`, are read by a
-`Drift` with `DriftSignal::External { source_ref }`, and then fire through
-`DriftObservation`.
+vala chooses the evaluation strategy (windowed PSI/SPC compute, per-record
+aggregation, threshold-on-latest) based on the (signal, condition) pair of
+the referenced card. The card schema does not declare strategy — it's
+implementation.
+
+External pushes are deliberately not a Trigger source — Rule 7 ("Wyrd reads,
+it does not push") means external signals enter through a `Source`, are read
+by a `Drift` with `DriftSignal::External { source_ref }`, and fire through
+`source.Drift` like any other drift.
 
 ### Operator
 Reaction primitive; performs the action when a Trigger fires.
@@ -451,22 +455,36 @@ Foundations explicitly **removed** from v1 protocol surface:
   on Drift or Eval — scheduling is `TriggerSource::Schedule`; dispatch is
   `Operator`; sampling cadence is a runtime knob. No scheduling, sampling,
   or notification leaks onto observation cards.
-- `TriggerSource::EvalObservation` — collapsed into the Eval→Drift bridge.
-  Author "fire on eval" as `Drift(EvalScore) → Trigger(DriftObservation) →
-  Operator`. One fire-vocabulary across the protocol (Rule 15).
+- `TriggerSource::DriftObservation` (downstream wire: "fire when Drift emits")
+  — the variant assumed a hidden subsystem evaluating Drifts on an unstated
+  cadence. Replaced by upstream `TriggerSource::Drift { drift_ref }`: the
+  Trigger's own `schedule` drives the Drift evaluation, and the operator fires
+  on condition match. No hidden cadence; every monitor evaluation is the
+  visible firing of a Trigger.
+- `TriggerSource::Schedule { cron, tz? }` (cron as a source variant) — schedule
+  is intrinsic to every Trigger, not a variant alternative to a monitor. Moved
+  to top-level `Trigger.schedule`. `source` is now optional; absent `source`
+  means unconditional fire on schedule.
+- `TriggerSource::EvalObservation` (downstream wire: "fire when Eval emits")
+  — never landed. Eval invocation lives on Trigger as upstream
+  `TriggerSource::Eval { eval_ref }` (runs the Eval on schedule, fires the
+  operator on any task failure). For windowed/aggregate fire conditions over
+  eval scores (e.g., "alert when pass_rate < 0.95 over 24h"), author a Drift
+  with `DriftSignal::EvalScore { eval_ref }` and watch it via
+  `TriggerSource::Drift`.
 - `Trigger.config: BTreeMap<String, NonSecretValue>` — second-layer filtering
   on the wire is doctrine drift. Severity / threshold / shape decisions belong
   on `Drift.condition`; reaction behavior belongs on `Operator`. Trigger is
   pure wiring.
-- `Trigger.cooldown_seconds` at the top level — meaningless for `Schedule`
-  (cron is the cadence). Cooldown now lives inside the `DriftObservation`
-  variant where it applies.
+- `Trigger.cooldown_seconds` (top-level and variant-level) — the `schedule`
+  cadence IS the cooldown. Triggers fire at most once per schedule tick; a
+  second-layer debounce field is redundant.
 - `Trigger.target: CardRef` (untyped) — replaced by `operator_ref: CardRef`.
   Naming convention: a `CardRef` that points at exactly one kind is named
   `<kind>_ref`. Operator is the only valid Trigger target (Workflow lacks
-  Policy gates; Eval is observation, not reaction).
-- `TriggerSource.card` (generic field name on the `DriftObservation` variant)
-  — replaced by `drift_ref`. Same `<kind>_ref` convention as
+  Policy gates; Eval is invoked via `source.Eval`, not the target slot).
+- `TriggerSource.card` (generic field name on the prior drift variant) —
+  replaced by `drift_ref`. Same `<kind>_ref` convention as
   `Drift.signal.baseline_ref` / `eval_ref` / `source_ref`.
 
 ---
@@ -560,11 +578,11 @@ expect from JSON-Schema `$ref` / OpenAPI external-file imports.
 | Workflow| `steps.*.target`                     | `Eval.subject_ref`, `Service.components.ref`, `Operator.workflow_ref` |
 | Mcp     | `credential_refs`                    | `Service.components.ref` |
 | Drift   | `subject_ref`, `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `Trigger.source.drift_ref`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
-| Eval    | `subject_ref`, `dataset_ref`, `source_ref`, `tasks[].Judge.prompt` (PromptRef) | `Drift.signal.eval_ref` |
+| Eval    | `subject_ref`, `dataset_ref`, `source_ref`, `tasks[].Judge.prompt` (PromptRef) | `Drift.signal.eval_ref`, `Trigger.source.eval_ref` |
 | Audit   | `subject_refs`, `policy_refs`, `evidence_refs`, `source_refs` | — |
 | Service | `components[].ref`                   | `Drift.subject_ref` (service-level), `Eval.subject_ref` |
 | Policy  | `rules`                              | `Service.components.ref`, `Audit.policy_refs`, `Operator.pre_invoke`, `Operator.post_invoke` |
-| Trigger | `source.drift_ref`, `operator_ref`   | — |
+| Trigger | `schedule`, `source.drift_ref` \| `source.eval_ref`, `operator_ref` | — |
 | Operator| `adapter`, `pre_invoke`, `post_invoke` | `Trigger.operator_ref` |
 | Source  | `credential_ref`                     | `Drift.signal.source_ref` (External variant), `Eval.source_ref`, `Audit.source_refs` |
 

@@ -249,22 +249,73 @@ authoring; the card stores resolved bounds):
 | `Outside`       | `lower: f64`, `upper: f64`       | Sample < `lower` or > `upper` |
 
 ### Eval
-Behavioral assessment for a single subject; declares pass gates.
+Behavioral assessment workflow for a single subject. Envelope is orthogonal:
+**what** is judged (`subject_ref`), **how** (`tasks` DAG), **where to read its
+observations from** (`source_ref`), and an optional **offline driver**
+(`dataset_ref`). No scheduling, no dispatch, no fire condition — fire lives on
+`Drift` with `DriftSignal::EvalScore`. Lifted from Scouter's
+`AgentEvalProfile`; collapses the parallel `EvalType`+`EvalProfile` enums into
+a single typed task workflow.
 ```yaml
 spec:
   description?: string
-  eval_type: EvalType            # Assertion | Judge | Benchmark | Agentic | Custom
-  subject_ref: CardRef           # → Agent | Model | Workflow — singular
-  judge_refs: [CardRef]          # → Prompt | Agent
-  assertions: [EvalAssertion]
-  pass_gates: [EvalPassGate]
-  dataset_refs: [CardRef]        # → Data
-  source_refs: [CardRef]         # → Source — production runs/traces
-  profile?: EvalProfile
-  default_parameters: { string: ParameterValue }
+  subject_ref: CardRef           # → Agent | Workflow | Service | Model — WHAT is judged
+  tasks: [EvalTask]              # evaluation workflow — DAG via depends_on
+  dataset_ref?: CardRef          # → Data — offline scenario driver
+  source_ref?: CardRef           # → Source — WHERE Wyrd reads observations
   governance?: Governance
   details: { string: NonSecretValue }
 ```
+
+**Three modes the same shape supports** (no `eval_mode` discriminator; presence
+of refs is the mode):
+
+| `dataset_ref` | `source_ref` | Runtime behavior |
+|---------------|--------------|------------------|
+| set           | unset        | Offline batch. Engine invokes `subject_ref` against the Data card's scenario rows, captures traces inline. |
+| unset         | set          | Online / archived. Engine reads the user's sink, filters records by subject identity, samples records into the task workflow. |
+| set           | set          | Same tasks, both modes — Scouter's "define once, reuse everywhere." Offline gate and online monitor share one task definition. |
+| unset         | unset        | Online over `vala`'s default observation archive. |
+
+**Directional flow.** All three refs are `CardRef`s authored on `Eval`; nothing
+points back. At runtime: engine resolves `subject_ref` (identity filter),
+resolves `source_ref` (read location), opens the Source, queries records,
+feeds them into the `tasks` workflow, aggregates per-task pass/fail into a
+score stream consumed downstream by a `Drift` card with
+`DriftSignal::EvalScore`.
+
+`EvalTask` is a closed tagged union (lift of Scouter's four task types). Each
+variant carries `id: string`, optional `depends_on: [string]` (DAG edges), and
+`condition: bool` (conditional gate — short-circuit downstream when this fails):
+
+| Variant          | Variant-specific carries                                                                          | Use |
+|------------------|---------------------------------------------------------------------------------------------------|-----|
+| `Assertion`      | `context_path?: string`, `operator: ComparisonOperator`, `expected: ParameterValue`, `description?: string` | Deterministic check on a dot-path into a record |
+| `Judge`          | `prompt_ref: CardRef` (→ Prompt), `operator: ComparisonOperator`, `threshold: ParameterValue`     | LLM judge: one Prompt per task, judge score compared to threshold |
+| `TraceAssertion` | `span_property: string`, `operator: ComparisonOperator`, `expected: ParameterValue`               | OTel span property (tokens, duration_ms, retry_count, …) read via `source_ref` |
+| `AgentAssertion` | `check: AgentCheckKind`, `expected: ParameterValue`                                               | Tool-call / response-shape check (`tool_called` \| `tool_args` \| `response_format` \| `step_count`) read via `source_ref` |
+
+`ComparisonOperator` is a closed enum:
+`eq | neq | gt | gte | lt | lte | contains | matches | exists`.
+
+`EvalScenario` is the row shape carried by a `Data` card bound to
+`dataset_ref` (not an Eval field — scenarios and datasets are the same noun):
+```yaml
+- id: string
+  initial_query: string
+  predefined_turns?: [string]      # scripted multi-turn
+  simulated_user_persona?: string  # interactive driver
+  termination_signal?: string
+  max_turns?: u32
+  expected_outcome?: string
+  tasks?: [EvalTask]               # scenario-local tasks (passenger view: final response)
+  metadata?: { string: NonSecretValue }
+```
+
+Scenario-local `tasks` are the **passenger view** (judged against the agent's
+final response for that scenario); top-level `Eval.tasks` are the **mechanic
+view** (judged against intermediate sub-agent records / spans / tool calls).
+Both run in one pass — Scouter's scenario-vs-workflow split lifted intact.
 
 ### Source
 Read-side reference to external data system. **Wyrd reads, never writes.**
@@ -335,9 +386,35 @@ Foundations explicitly **removed** from v1 protocol surface:
 - `Eval.target_refs: Vec<CardRef>` (plural) — replaced by singular
   `subject_ref: CardRef`. One Eval covers one subject; author multiple Eval
   cards for multiple subjects.
-- Any `schedule` / `cron` / `alert_config` / dispatch fields on Drift or Eval
-  — scheduling is `TriggerSource::Schedule`; dispatch is `Operator`. No
-  scheduling or notification leaks onto observation cards.
+- `Eval.eval_type: EvalType` + parallel `Eval.profile: EvalProfile` enums
+  (`AssertionEvalProfile` / `JudgeEvalProfile` / `BenchmarkEvalProfile` /
+  `AgenticEvalProfile` / `CustomEvalProfile`) — same redundancy that
+  `DriftMethod`+`DriftProfile` had. The shape of an eval emerges from which
+  `EvalTask` variants appear in `tasks`; the discriminator was duplicated
+  information.
+- `Eval.judge_refs: Vec<CardRef>` (top-level) — folded into per-task
+  `prompt_ref` on the `EvalTask::Judge` variant. One judge per task is the
+  Scouter shape.
+- `Eval.assertions: Vec<EvalAssertion>` (top-level) — folded into `tasks` as
+  the `EvalTask::Assertion` variant.
+- `Eval.pass_gates: Vec<EvalPassGate>` — fire condition belongs on `Drift`,
+  not `Eval`. "Fire when pass_rate < 0.95" is a `Drift` card with
+  `DriftSignal::EvalScore { eval_ref }` + `DriftCondition::Below { limit }`.
+  One fire-vocabulary in the protocol, not two.
+- `Eval.dataset_refs: Vec<CardRef>` (plural) — replaced by singular
+  `dataset_ref: CardRef`. Scenarios and datasets are the same noun; one
+  scenario set per Eval. Inline `scenarios: Vec<EvalScenario>` is also
+  removed — the canonical record-set noun is `Data`, and the Data card
+  carries `EvalScenario` rows.
+- `Eval.source_refs: Vec<CardRef>` (plural) — replaced by singular
+  `source_ref: CardRef`. One sink declares where Wyrd reads observations
+  for the subject from.
+- `Eval.default_parameters: BTreeMap<String, ParameterValue>` — no v1 use
+  case; runtime parameters belong on the runtime, not the durable contract.
+- Any `schedule` / `cron` / `alert_config` / `sample_ratio` / dispatch fields
+  on Drift or Eval — scheduling is `TriggerSource::Schedule`; dispatch is
+  `Operator`; sampling cadence is a runtime knob. No scheduling, sampling,
+  or notification leaks onto observation cards.
 
 ---
 
@@ -345,19 +422,19 @@ Foundations explicitly **removed** from v1 protocol surface:
 
 | Card    | Refs that authored on it             | Refs that point at it          |
 |---------|--------------------------------------|--------------------------------|
-| Data    | `artifact_refs`, `splits`            | `Drift.signal.baseline_ref`, `Eval.dataset_refs`, `Experiment.target_refs` |
+| Data    | `artifact_refs`, `splits`            | `Drift.signal.baseline_ref`, `Eval.dataset_ref`, `Experiment.target_refs` |
 | Model   | `artifact_refs`                      | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, `Experiment.target_refs` |
 | Agent   | `prompt`, `tool_names`               | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, Agent prompts (sub-agent calls) |
 | Workflow| `steps.*.target`                     | `Eval.subject_ref`, `Service.components.ref`, `Operator.workflow_ref` |
 | Mcp     | `credential_refs`                    | `Service.components.ref` |
 | Drift   | `subject_ref`, `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `Trigger.source.card`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
-| Eval    | `subject_ref`, `judge_refs`, `dataset_refs`, `source_refs` | `Trigger.source.card`, `Drift.signal.eval_ref` |
+| Eval    | `subject_ref`, `dataset_ref`, `source_ref`, `tasks[].Judge.prompt_ref` | `Trigger.source.card`, `Drift.signal.eval_ref` |
 | Audit   | `subject_refs`, `policy_refs`, `evidence_refs`, `source_refs` | — |
 | Service | `components[].ref`                   | `Drift.subject_ref` (service-level), `Eval.subject_ref`, `Trigger.source.card` (via observations) |
 | Policy  | `rules`                              | `Service.components.ref`, `Audit.policy_refs`, `Operator.pre_invoke`, `Operator.post_invoke` |
 | Trigger | `source.card`, `target`              | — |
 | Operator| `adapter`, `pre_invoke`, `post_invoke` | `Trigger.target` |
-| Source  | `credential_ref`                     | `Drift.signal.source_ref` (External variant), `Eval.source_refs`, `Audit.source_refs` |
+| Source  | `credential_ref`                     | `Drift.signal.source_ref` (External variant), `Eval.source_ref`, `Audit.source_refs` |
 
 `Service.components` accepts: Agent, Prompt, Model, Workflow, Mcp, Policy. No
 other kinds are runtime-aliased into a Service.
@@ -386,7 +463,7 @@ services/ops-copilot/
 │   ├── runbook-policy.yaml
 │   └── service-policy.yaml
 ├── observability/
-│   ├── triage-eval.yaml         # source_refs → run-archive
+│   ├── triage-eval.yaml         # source_ref → run-archive
 │   ├── runbook-eval.yaml
 │   ├── triage-drift.yaml
 │   ├── runbook-drift.yaml
@@ -409,12 +486,12 @@ services/ops-copilot/
 3. Format negotiation for `object_store` Source — schema-on-read vs registered
    schema reference.
 4. Time-window semantics for how Drift/Eval cards describe the read range
-   over `source_refs`.
+   over `source_ref`.
 5. Service-level Drift subject semantics — what "drift on a Service" computes
    when Wyrd reads internal traces vs external Sources, given the subject is
    singular.
 6. Default Source binding at the Service or Agent level to avoid repeating
-   `source_refs` on every Drift/Eval.
+   `source_ref` on every Drift/Eval.
 7. Audit `source_refs` vs `evidence_refs` boundary — Source is queryable
    history; `evidence_refs` are concrete card pointers.
 8. Whether tool hook phases need a closed enum on `Policy.rules` or can stay
@@ -422,6 +499,9 @@ services/ops-copilot/
 9. Whether `Audit.subject_refs` stays plural. An audit may genuinely cover a
    Service plus its component Agents; collapse to singular if real audits
    don't span multiple cards in practice.
-10. Whether `Eval` should carry its own `signal` decomposition symmetric with
-    Drift (dataset vs production-trace input edges), or if `dataset_refs` +
-    `source_refs` already does the job.
+10. **Closed.** `Eval` does not carry its own `signal` decomposition. Eval IS
+    the signal — its per-task pass/fail aggregates into a score stream
+    consumed downstream by `Drift` with `DriftSignal::EvalScore`. The input
+    edges (`dataset_ref` vs `source_ref`) are two optional `CardRef`s, not a
+    tagged enum: presence is the mode (offline driver, online sink, both, or
+    neither → vala default archive).

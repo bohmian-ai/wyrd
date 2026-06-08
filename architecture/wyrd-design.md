@@ -296,11 +296,34 @@ API key — is what travels on cross-service calls in the dedicated
 POST /charge HTTP/1.1
 Host: billing-svc.acme.svc.cluster.local
 Wyrd-Caller-Identity: Bearer <Service-A's JWT>     ← SDK adds; carries caller's card_ref
+Wyrd-Request-Id:      <ULID>                       ← SDK adds; request correlator
 Authorization: Bearer <app's own JWT>              ← app's own auth; Wyrd never reads
 Content-Type: application/json
 
 { "amount": 100 }
 ```
+
+#### `Wyrd-Request-Id` — request correlator
+
+A Wyrd-owned, request-scoped opaque ID that joins every hop of a logical
+request. It is the sole correlator for policy ancestry and audit replay —
+Wyrd does not depend on `traceparent`, mesh tracing, or any external
+propagation contract.
+
+Contract:
+
+- Opaque ULID minted by Wyrd at first sighting (no inbound
+  `Wyrd-Request-Id` at `/v1/authz/check`).
+- Propagated unchanged by Wyrd SDK middleware and ext_authz on outbound
+  calls. Never mutated, never re-minted mid-request.
+- Every Wyrd-emitted observation carries it as a label.
+- Ancestry of any request (service1 → service2 → service3) is
+  reconstructable by joining observations on this ID; per-hop caller
+  identity comes from the verified `Wyrd-Caller-Identity` JWT at each
+  call.
+
+Storage tier, query API, and CEL surface (e.g. a `chain.*` binding) are
+implementation concerns deferred to the runtime stage.
 
 ### Runtime authz: `POST /v1/authz/check`
 
@@ -327,6 +350,7 @@ POST /v1/authz/check HTTP/1.1
 Host: wyrd.acme.com
 Authorization:         Bearer <middleware/sidecar's own JWT — its card identity>
 Wyrd-Caller-Identity:  Bearer <caller's JWT — forwarded from the original request>
+Wyrd-Request-Id:       <ULID — forwarded from inbound, or absent on first hop>
 X-Original-Method:     POST
 X-Original-Path:       /charge
 Content-Length: 0
@@ -337,15 +361,18 @@ Wyrd:
    `actor`, `scopes`).
 2. Verifies `Wyrd-Caller-Identity` JWT → builds `caller` from claims.
 3. Reads `X-Original-Method` / `X-Original-Path` → builds `request`.
-4. Assembles `InvokeContext { caller, callee, request, attrs }` (attrs are
+4. Reads `Wyrd-Request-Id` if present; mints a fresh ULID if absent and
+   echoes it back so the middleware/sidecar can inject it on the outbound
+   call.
+5. Assembles `InvokeContext { caller, callee, request, attrs }` (attrs are
    merged Classify-derived attributes from caller + callee cards).
-5. Evaluates CEL rules where `action == invoke` for the callee card
+6. Evaluates CEL rules where `action == invoke` for the callee card
    (org-global ∪ service-local, deny-overrides).
-6. Returns `200 OK` (Allow) or `403 Forbidden` with `PolicyDecision::Deny { reason }`.
-7. Asynchronously emits one `PolicyInvokeDecision` observation per check
-   (signed with Wyrd internal authority — no caller/callee gov-token
-   consumed). Every allow and every deny is audited automatically; no
-   developer wiring.
+7. Returns `200 OK` (Allow) or `403 Forbidden` with `PolicyDecision::Deny { reason }`.
+8. Asynchronously emits one `PolicyInvokeDecision` observation per check,
+   labeled with `Wyrd-Request-Id` (signed with Wyrd internal authority —
+   no caller/callee gov-token consumed). Every allow and every deny is
+   audited automatically; no developer wiring.
 
 Both identities are server-signed and verified from claims. The pod cannot
 self-assert its identity — no env var, no body field, no header carries

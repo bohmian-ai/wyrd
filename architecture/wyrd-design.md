@@ -68,6 +68,30 @@ Downstream artifacts are brought up to this version in a sync pass.
     register as a card and reference by `CardRef`. Heavy refs (`subject_ref`,
     `dataset_ref`, `Service.components.ref`, `Workflow.steps.target`) stay
     `CardRef`-only — identity is the point.
+18. **Auth, Policy, and Emit are three distinct planes.**
+    - **Auth** gates Wyrd API calls: `Scope` on the handler, stateless pubkey
+      verify of the access token. Answers "is this principal allowed to hit
+      this Wyrd route?"
+    - **Policy** gates card states (`classify` at register-time, `gate` at
+      deploy-time) and cross-service invokes (`invoke` at runtime). Runtime
+      invoke evaluation is centralized at `POST /v1/authz/check`, called
+      transparently by the service mesh's ext_authz filter or by the SDK
+      middleware in non-mesh shops.
+    - **Emit** is the data-plane channel from a deployed service to Wyrd's
+      ingest, signed with the per-card governance token; never propagated
+      between services and never read by Policy CEL.
+
+    A deployed Service card auto-provisions a service account at registration
+    (named in `spec.service_account`) and receives a card-bound API key
+    returned once in the response. The pipeline injects `WYRD_API_KEY` into
+    the pod; the SDK exchanges it once at startup for a short-lived JWT
+    carrying the card's `card_ref` claim. On cross-service calls the SDK adds
+    `Wyrd-Caller-Identity: Bearer <jwt>` — the application's `Authorization`
+    header is never touched. The mesh's ext_authz filter (or the SDK
+    middleware) authenticates itself to `/v1/authz/check` with its own
+    card-scoped JWT and forwards the caller's JWT plus the original
+    method/path as headers; the body is empty. Both identities are
+    server-verified from signed claims.
 
 ---
 
@@ -202,20 +226,130 @@ spec:
   runtime?: ServiceRuntime       # { kind, framework?, mode?, strict?, config, policy }
   service_config: { string: NonSecretValue }
   credential_refs: [CredentialRef]
+  service_account: string        # SA name. Wyrd auto-provisions the SA at registration and
+                                 # issues a card-bound API key returned ONCE in the response.
+                                 # The SDK exchanges this key at startup for the JWT that
+                                 # carries the card's `card_ref` claim (see Runtime identity).
   content_hash?: string
   lock_hash?: string
   metadata: { string: NonSecretValue }
 ```
 
 ### Policy
-Runtime / governance gate rules.
+Declarative governance rules. CEL-evaluated. Three lifecycle phases share one
+rule shape; the `action` field on each rule says when it fires:
+
+  - `classify` (register-time): rule derives attrs onto the card (e.g.
+                                `risk.tier = "high"`). Never blocks.
+  - `gate`     (deploy-time):   rule allows/denies governance-token issuance
+                                for the card. Blocks when Deny.
+  - `invoke`   (runtime, per cross-service call): evaluated by
+                                `POST /v1/authz/check`. Returns Allow/Deny to
+                                the mesh ext_authz filter or the SDK
+                                middleware. Developers never write enforcement
+                                code.
+
+Composition: `org_global ∪ service_local`, deny-overrides. Service-local can
+only tighten. CEL parse + evaluation is owned by the Stage-5 enterprise
+engine; `wyrd-spec` enforces only `CelExpression` transport invariants
+(non-empty, ≤4096 chars, no control chars).
+
 ```yaml
 spec:
   description?: string
-  rules: [PolicyRule]            # { name, expression, action, metadata }
-  enforcement?: string           # pre_invoke | post_invoke | both
+  rules: [PolicyRule]            # { name, expression: CelExpression, action: PolicyAction, metadata }
+  enforcement?: Enforcement       # active | inert. Default: active.
+  scope: PolicyScope              # org_global | service_local. Default: service_local.
+  target?: PolicyTarget           # selector for org_global; absent for service_local
   details: { string: NonSecretValue }
 ```
+
+Closed enums:
+- `PolicyAction = Classify | Gate | Invoke`
+- `Enforcement = Active | Inert`
+- `PolicyScope = OrgGlobal | ServiceLocal`
+- `PolicyTarget = { spaces: [SpaceName], kinds: [CardKind], actions: [PolicyAction] }`
+- `PolicyDecision = Allow | Deny { reason: string }`
+
+### Runtime identity
+
+A deployed Service card runs as the service account named in
+`spec.service_account`. At registration, Wyrd idempotently creates the SA
+(least-privilege default role) and issues an API key bound to the card,
+returned ONCE in the registration response. The CI/CD pipeline writes the key
+directly to the shop's secret store — no human paste.
+
+Env vars in deployed services:
+
+| Env var | Required? | Source | Used for |
+|---|---|---|---|
+| `WYRD_API_KEY` | REQUIRED | CI writes from registration response | Exchanged ONCE at startup at `POST /auth/token` for short-lived JWT (~15m). SDK auto-refreshes. JWT carries `card_ref` claim. |
+| `WYRD_API_URL` | REQUIRED | Static config | Wyrd server base URL. |
+| `WYRD_GOV_TOKEN` | OPTIONAL | CI writes from `wyrd gov-token issue` response | Only if the app calls `wyrd.observe(...)`. |
+
+The API key is exchanged at startup — never on the wire. The JWT — not the
+API key — is what travels on cross-service calls in the dedicated
+`Wyrd-Caller-Identity: Bearer <jwt>` header. The application's own
+`Authorization` header is never touched by the SDK.
+
+```
+POST /charge HTTP/1.1
+Host: billing-svc.acme.svc.cluster.local
+Wyrd-Caller-Identity: Bearer <Service-A's JWT>     ← SDK adds; carries caller's card_ref
+Authorization: Bearer <app's own JWT>              ← app's own auth; Wyrd never reads
+Content-Type: application/json
+
+{ "amount": 100 }
+```
+
+### Runtime authz: `POST /v1/authz/check`
+
+The single CEL evaluation surface for `PolicyAction::Invoke`. Two delivery
+paths, identical semantics:
+
+- **Service mesh (ext_authz).** The mesh's local Envoy/Istio sidecar
+  intercepts the inbound request transparently (iptables redirect, standard
+  k8s/Istio behavior), and the configured ext_authz filter calls Wyrd's
+  `/v1/authz/check`. The developer's application code makes a normal HTTP
+  call — it does not address Envoy explicitly. One-time platform-team filter
+  config covers every workload.
+- **SDK middleware (non-mesh).** Identical semantics in-process. One-line
+  developer install (`app.add_middleware(PolicyMiddleware)`). The middleware
+  reads `Wyrd-Caller-Identity` from the inbound request and calls the same
+  `/v1/authz/check` route.
+
+The check is **headers-only**. Body is empty. All inputs are headers, which
+matches how Envoy's ext_authz filter natively forwards data — zero
+translation logic on either end.
+
+```
+POST /v1/authz/check HTTP/1.1
+Host: wyrd.acme.com
+Authorization:         Bearer <middleware/sidecar's own JWT — its card identity>
+Wyrd-Caller-Identity:  Bearer <caller's JWT — forwarded from the original request>
+X-Original-Method:     POST
+X-Original-Path:       /charge
+Content-Length: 0
+```
+
+Wyrd:
+1. Verifies `Authorization` JWT → builds `callee` from claims (`card_ref`,
+   `actor`, `scopes`).
+2. Verifies `Wyrd-Caller-Identity` JWT → builds `caller` from claims.
+3. Reads `X-Original-Method` / `X-Original-Path` → builds `request`.
+4. Assembles `InvokeContext { caller, callee, request, attrs }` (attrs are
+   merged Classify-derived attributes from caller + callee cards).
+5. Evaluates CEL rules where `action == invoke` for the callee card
+   (org-global ∪ service-local, deny-overrides).
+6. Returns `200 OK` (Allow) or `403 Forbidden` with `PolicyDecision::Deny { reason }`.
+7. Asynchronously emits one `PolicyInvokeDecision` observation per check
+   (signed with Wyrd internal authority — no caller/callee gov-token
+   consumed). Every allow and every deny is audited automatically; no
+   developer wiring.
+
+Both identities are server-signed and verified from claims. The pod cannot
+self-assert its identity — no env var, no body field, no header carries
+identity data the pod authored.
 
 ### Audit
 Governance attestation; references the policies and subjects in scope.

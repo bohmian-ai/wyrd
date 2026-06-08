@@ -18,8 +18,9 @@ Downstream artifacts are brought up to this version in a sync pass.
    deployment unit is a directory of card YAMLs applied together.
 2. **One fact, one owning Kind.** If a field could live in two places, the
    doctrine has a gap. Surface it.
-3. **Monitors declare targets.** Drift, Eval, Audit reference what they
-   observe. Targets do not list their observers.
+3. **Monitors declare subjects.** Drift, Eval, Audit reference what they
+   observe. Subjects do not list their observers. Drift and Eval declare a
+   single `subject_ref`; Audit may declare many.
 4. **Reactions are Operators. Wiring is Triggers.** Drift/Eval/Policy never
    inline reaction logic.
 5. **Service composes for deployment, not observation.** Drift/Eval/Trigger/
@@ -46,6 +47,11 @@ Downstream artifacts are brought up to this version in a sync pass.
 14. **Harness-host config does not belong on Cards.** Permission modes,
     sandboxes, isolation, effort, and per-CLI compatibility are properties of
     the host that runs the Agent, not of the Agent contract.
+15. **Monitors are pure observation producers.** Drift and Eval describe what
+    is observed and what counts as an observation. They do not carry
+    scheduling and they do not carry dispatch. Scheduling lives on
+    `TriggerSource::Schedule`. Dispatch lives on `Operator`. There is no
+    `Alert` kind — alerting is an Operator with a notification adapter.
 
 ---
 
@@ -208,27 +214,47 @@ spec:
 ```
 
 ### Drift
-Distribution monitor; declares its targets.
+Observation producer for a single subject. Envelope is orthogonal: subject +
+signal + condition + math. No scheduling, no dispatch. Scheduling is a
+`Trigger`; dispatch is an `Operator`.
 ```yaml
 spec:
   description?: string
   method: DriftMethod            # Spc | Psi | Custom | Agent | External
-  profile?: DriftProfile
-  baseline_ref?: CardRef         # → Data
-  target_refs: [CardRef]         # → Model | Agent | Service | Data
-  source_refs: [CardRef]         # → Source — historical data to query
-  features: [string]
-  thresholds: { string: f64 }
+  subject_ref: CardRef           # → Model | Agent | Service | Data — singular
+  signal: DriftSignal            # how the measurement enters the monitor
+  condition: DriftCondition      # when a sample becomes an emittable observation
+  profile?: DriftProfile         # method-specific math config (PSI bins, SPC window, etc.)
   details: { string: NonSecretValue }
 ```
 
+`DriftSignal` is a closed enum:
+
+| Variant         | Carries                                          | Use |
+|-----------------|--------------------------------------------------|-----|
+| `Distribution`  | `baseline_ref: CardRef` (→ Data), `features: [string]` | PSI / SPC over a baseline dataset |
+| `Metric`        | `name: string`                                   | Named scalar from subject runtime (mae, p99_latency_ms, tokens_per_call, cost_per_run_usd) |
+| `EvalScore`     | `eval_ref: CardRef` (→ Eval)                     | Score stream from an Eval card — the typed Eval↔Drift bridge |
+| `External`      | `source_ref: CardRef` (→ Source)                 | Measurement from an external system (Prometheus, OTel) |
+
+`DriftCondition` is a closed enum — one comparator vocabulary, no separate
+"baselined" shape (baseline + delta resolves to `Outside { lower, upper }` at
+authoring; the card stores resolved bounds):
+
+| Variant         | Carries                          | Fires when |
+|-----------------|----------------------------------|------------|
+| `Statistical`   | —                                | The method's profile decides (PSI threshold, SPC sigma) |
+| `Above`         | `limit: f64`                     | Sample > `limit` |
+| `Below`         | `limit: f64`                     | Sample < `limit` |
+| `Outside`       | `lower: f64`, `upper: f64`       | Sample < `lower` or > `upper` |
+
 ### Eval
-Behavioral assessment; declares its targets and pass gates.
+Behavioral assessment for a single subject; declares pass gates.
 ```yaml
 spec:
   description?: string
   eval_type: EvalType            # Assertion | Judge | Benchmark | Agentic | Custom
-  target_refs: [CardRef]         # → Agent | Model | Workflow
+  subject_ref: CardRef           # → Agent | Model | Workflow — singular
   judge_refs: [CardRef]          # → Prompt | Agent
   assertions: [EvalAssertion]
   pass_gates: [EvalPassGate]
@@ -297,6 +323,21 @@ Foundations explicitly **removed** from v1 protocol surface:
   Vec<String>`) — observations are typed by source CardRef + kind. If hook
   phases ever land on `Policy`, they're a closed enum (`PreInvoke |
   PostInvoke | OnError`), not strings.
+- `Drift.target_refs: Vec<CardRef>` (plural, untyped intent) — replaced by
+  singular `subject_ref: CardRef`.
+- `Drift.baseline_ref` (top-level), `Drift.features` (top-level) — only
+  meaningful for distribution drift; folded into `DriftSignal::Distribution`.
+- `Drift.thresholds: BTreeMap<String, f64>` (untyped bag) — replaced by the
+  typed `DriftCondition` enum (`Statistical | Above | Below | Outside`).
+- `Drift.source_refs` (top-level) — read-side source for distribution/metric
+  monitoring arrives via `DriftSignal::External { source_ref }` or implicitly
+  through the subject's runtime emission.
+- `Eval.target_refs: Vec<CardRef>` (plural) — replaced by singular
+  `subject_ref: CardRef`. One Eval covers one subject; author multiple Eval
+  cards for multiple subjects.
+- Any `schedule` / `cron` / `alert_config` / dispatch fields on Drift or Eval
+  — scheduling is `TriggerSource::Schedule`; dispatch is `Operator`. No
+  scheduling or notification leaks onto observation cards.
 
 ---
 
@@ -304,19 +345,19 @@ Foundations explicitly **removed** from v1 protocol surface:
 
 | Card    | Refs that authored on it             | Refs that point at it          |
 |---------|--------------------------------------|--------------------------------|
-| Data    | `artifact_refs`, `splits`            | `Drift.baseline_ref`, `Eval.dataset_refs`, `Experiment.target_refs` |
-| Model   | `artifact_refs`                      | `Drift.target_refs`, `Eval.target_refs`, `Service.components.ref`, `Experiment.target_refs` |
-| Agent   | `prompt`, `tool_names`               | `Drift.target_refs`, `Eval.target_refs`, `Service.components.ref`, Agent prompts (sub-agent calls) |
-| Workflow| `steps.*.target`                     | `Service.components.ref`, `Operator.workflow_ref` |
+| Data    | `artifact_refs`, `splits`            | `Drift.signal.baseline_ref`, `Eval.dataset_refs`, `Experiment.target_refs` |
+| Model   | `artifact_refs`                      | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, `Experiment.target_refs` |
+| Agent   | `prompt`, `tool_names`               | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, Agent prompts (sub-agent calls) |
+| Workflow| `steps.*.target`                     | `Eval.subject_ref`, `Service.components.ref`, `Operator.workflow_ref` |
 | Mcp     | `credential_refs`                    | `Service.components.ref` |
-| Drift   | `target_refs`, `baseline_ref`, `source_refs` | `Trigger.source.card` |
-| Eval    | `target_refs`, `judge_refs`, `dataset_refs`, `source_refs` | `Trigger.source.card` |
+| Drift   | `subject_ref`, `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `Trigger.source.card`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
+| Eval    | `subject_ref`, `judge_refs`, `dataset_refs`, `source_refs` | `Trigger.source.card`, `Drift.signal.eval_ref` |
 | Audit   | `subject_refs`, `policy_refs`, `evidence_refs`, `source_refs` | — |
-| Service | `components[].ref`                   | `Drift.target_refs` (service-level), `Trigger.source.card` (via observations) |
+| Service | `components[].ref`                   | `Drift.subject_ref` (service-level), `Eval.subject_ref`, `Trigger.source.card` (via observations) |
 | Policy  | `rules`                              | `Service.components.ref`, `Audit.policy_refs`, `Operator.pre_invoke`, `Operator.post_invoke` |
 | Trigger | `source.card`, `target`              | — |
 | Operator| `adapter`, `pre_invoke`, `post_invoke` | `Trigger.target` |
-| Source  | `credential_ref`                     | `Drift.source_refs`, `Eval.source_refs`, `Audit.source_refs` |
+| Source  | `credential_ref`                     | `Drift.signal.source_ref` (External variant), `Eval.source_refs`, `Audit.source_refs` |
 
 `Service.components` accepts: Agent, Prompt, Model, Workflow, Mcp, Policy. No
 other kinds are runtime-aliased into a Service.
@@ -369,11 +410,18 @@ services/ops-copilot/
    schema reference.
 4. Time-window semantics for how Drift/Eval cards describe the read range
    over `source_refs`.
-5. Service-level Drift target semantics — what "drift on a Service" computes
-   when Wyrd reads internal traces vs external Sources.
+5. Service-level Drift subject semantics — what "drift on a Service" computes
+   when Wyrd reads internal traces vs external Sources, given the subject is
+   singular.
 6. Default Source binding at the Service or Agent level to avoid repeating
    `source_refs` on every Drift/Eval.
 7. Audit `source_refs` vs `evidence_refs` boundary — Source is queryable
    history; `evidence_refs` are concrete card pointers.
 8. Whether tool hook phases need a closed enum on `Policy.rules` or can stay
    off the wire entirely (no consumer today).
+9. Whether `Audit.subject_refs` stays plural. An audit may genuinely cover a
+   Service plus its component Agents; collapse to singular if real audits
+   don't span multiple cards in practice.
+10. Whether `Eval` should carry its own `signal` decomposition symmetric with
+    Drift (dataset vs production-trace input edges), or if `dataset_refs` +
+    `source_refs` already does the job.

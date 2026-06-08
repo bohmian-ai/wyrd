@@ -402,6 +402,26 @@ identity data the pod authored.
 Immutable case file. Records the result of an investigation against the
 provenance graph; never user-declared scope. Detailed spec under design.
 
+**Creation.** Audit cards are created on-demand only. An investigator —
+human or agent — runs a provenance query, decides what is worth pinning,
+and snapshots the result. Wyrd does not auto-create Audit cards in v1;
+teams that want auto-snapshots wire a `Trigger` + `Operator` using
+existing nouns.
+
+**Storage.** Light-card pattern (doctrine #16). The case file lives inline
+on the Audit card itself — no separate `Artifact`, no separate chain
+table. The card carries the investigation metadata, the query that
+produced the chain, the lineage subgraph at snapshot time (cards + edges
+by `card_ref`), and the criteria for re-fetching the relevant observations
+from vala. Size is bounded by lineage depth, not by observation count.
+
+**Replay.** The card's attributes are the source of truth. The lineage
+half is read inline from the card; the observation half is re-fetched by
+running the inline criteria against vala's observation store.
+`card_ref`s are version-locked (doctrine #8), so lineage anchors stay
+valid as long as the registry retains the cited cards. Observation
+retention in vala (years) covers the replay window.
+
 ### Drift
 Observation producer for a single subject. Envelope is orthogonal: subject +
 signal + condition + math. No scheduling, no dispatch. Scheduling is a

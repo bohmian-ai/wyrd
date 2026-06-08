@@ -400,7 +400,7 @@ identity data the pod authored.
 
 ### Audit
 Immutable case file. Records the result of an investigation against the
-provenance graph; never user-declared scope. Detailed spec under design.
+provenance graph; never user-declared scope.
 
 **Creation.** Audit cards are created on-demand only. An investigator —
 human or agent — runs a provenance query, decides what is worth pinning,
@@ -421,6 +421,72 @@ running the inline criteria against vala's observation store.
 `card_ref`s are version-locked (doctrine #8), so lineage anchors stay
 valid as long as the registry retains the cited cards. Observation
 retention in vala (years) covers the replay window.
+
+```yaml
+spec:
+  # Why this investigation exists
+  purpose: AuditPurpose              # Incident | Compliance | Review | Adhoc
+  description?: string               # free-form investigator notes
+
+  # What is under investigation (indexed for search/listing)
+  subject_refs: [CardRef]            # the cards this audit centers on
+
+  # What was asked
+  query: ProvenanceQuery             # structured, replayable
+
+  # What was found, frozen at snapshot time
+  lineage: LineageSubgraph           # cards + edges by card_ref (version-locked)
+  observation_criteria: ObservationCriteria  # how to re-fetch from vala
+
+  # What the investigator decided
+  status?: AuditStatus               # Open | Mitigated | Resolved | FalsePositive | Suppressed
+  findings?: string                  # narrative conclusion
+
+  # Provenance of the audit itself — server-authored, not user-asserted
+  investigator: Investigator         # Human(sub) | Agent(card_ref → Agent)
+  snapshot_at: Timestamp             # server-stamped
+  digest: string                     # canonical-form integrity hash
+
+  details: { string: NonSecretValue }
+```
+
+`AuditPurpose` is a closed enum:
+
+| Variant      | Use |
+|--------------|-----|
+| `Incident`   | Post-incident investigation. Why did the system behave this way? |
+| `Compliance` | Evidence pin for a regulatory regime (SOC 2, SR 11-7, AI Act, etc.). |
+| `Review`     | Routine review — quarterly, model-risk, change-board. |
+| `Adhoc`      | Investigator-initiated; no formal frame. |
+
+`AuditStatus` is a closed enum capturing disposition **at `snapshot_at`**,
+not forever. When disposition changes (Open → Mitigated → Resolved), the
+investigator writes a new Audit; the chain of Audits is the remediation
+timeline.
+
+| Variant         | Use |
+|-----------------|-----|
+| `Open`          | Confirmed concern, action pending. |
+| `Mitigated`     | Compensating control in place; root cause not fixed. |
+| `Resolved`      | Addressed — fixed, or review confirmed no issue. |
+| `FalsePositive` | Investigation showed no real concern. |
+| `Suppressed`    | Real concern; risk explicitly accepted. |
+
+`Investigator` is a closed enum identifying who ran the investigation. The
+server fills this from the calling principal; callers cannot self-assert
+identity (same posture as `ServiceIdentity`, doctrine #15).
+
+| Variant   | Carries                           |
+|-----------|-----------------------------------|
+| `Human`   | `sub: string` (verified subject claim) |
+| `Agent`   | `card_ref: CardRef` (→ Agent)     |
+
+**Under design (wire shape deferred):**
+- `ProvenanceQuery` — the structured question (root refs, direction, depth, filters).
+- `LineageSubgraph` — the frozen graph (nodes as `CardRef`, edges typed by relation).
+- `ObservationCriteria` — the re-fetch filter against vala (subjects, time range, signal/method, projection).
+- `digest` algorithm — canonical-form rules + hash (BLAKE3 vs SHA-256).
+- Multi-party `attestations` — deferred to v1.1; `details` may carry informally in v1.
 
 ### Drift
 Observation producer for a single subject. Envelope is orthogonal: subject +
@@ -738,7 +804,7 @@ ergonomic they expect from JSON-Schema `$ref` / OpenAPI external-file imports.
 | Mcp     | `server_name`, `transport`, `scopes` | `Service.components.ref` |
 | Drift   | `subject_ref`, `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `Trigger.source.drift_ref`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
 | Eval    | `subject_ref`, `dataset_ref`, `source_ref`, `tasks[].Judge.prompt` (PromptRef) | `Drift.signal.eval_ref`, `Trigger.source.eval_ref` |
-| Audit   | — (under redesign)                   | — |
+| Audit   | `subject_refs`, `query` (roots), `lineage` (nodes), `investigator` (Agent variant) | — |
 | Service | `components[].ref`                   | `Drift.subject_ref` (service-level), `Eval.subject_ref` |
 | Policy  | `rules`                              | `Service.components.ref`, `Operator.pre_invoke`, `Operator.post_invoke` |
 | Trigger | `schedule`, `source.drift_ref` \| `source.eval_ref`, `operator_ref` | — |

@@ -221,7 +221,6 @@ spec:
   description?: string
   components: [ServiceComponent] # { alias, ref, source?, config }
   entry_point?: string
-  runtime?: ServiceRuntime       # { framework?, mode?, strict?, config, policy }
   service_config: { string: NonSecretValue }
   service_account: string        # SA name. Wyrd auto-provisions the SA at registration and
                                  # issues a card-bound API key returned ONCE in the response.

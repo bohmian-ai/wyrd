@@ -378,15 +378,53 @@ by a `Drift` with `DriftSignal::External { source_ref }`, and fire through
 `source.Drift` like any other drift.
 
 ### Operator
-Reaction primitive; performs the action when a Trigger fires.
+Fires when a Trigger references it. Performs exactly one action — a Workflow
+dispatch, a typed notification, or a generic HTTP call — gated by optional
+Policy hooks before and after.
 ```yaml
 spec:
-  adapter: FrameworkAdapterRef
-  inputs: [OperatorInput]
-  pre_invoke: [CardRef]          # → Policy
-  post_invoke: [CardRef]         # → Policy
-  budget?: OperatorBudget
+  description?: string
+  action: OperatorAction          # closed tagged union — see below
+  pre_invoke?: [CardRef]          # → Policy, runs before action
+  post_invoke?: [CardRef]         # → Policy, runs on action result
+  budget?: { max_wall_seconds?: u32, max_tool_calls?: u32 }
 ```
+
+`OperatorAction` is a closed tagged union (snake_case `kind` discriminator):
+
+| Variant    | Variant-specific carries                                                              | Server does                                                                   |
+|------------|---------------------------------------------------------------------------------------|-------------------------------------------------------------------------------|
+| `Workflow` | `workflow_ref: CardRef` (→ Workflow)                                                  | Dispatches the Workflow with the firing context as entrypoint payload.        |
+| `Notify`   | `channel: NotifyChannel` (closed tagged union — typed vendor shape)                  | Sends the notification through the vendor-specific adapter the server owns.   |
+| `Http`     | `method`, `url`, `headers?`, `body?`, `auth?`, `timeout_seconds?`, `expect_status?` | Builds and sends the HTTP request; records response code and latency in vala. |
+
+`NotifyChannel` (v1 set; closed tagged union; additional channels are
+protocol-versioned additions):
+
+| Channel     | Carries                                                                       |
+|-------------|-------------------------------------------------------------------------------|
+| `PagerDuty` | `routing_key_ref: CredentialRef`, `severity`, `summary`, `dedup_key?: string` |
+| `Slack`     | `webhook_url_ref: CredentialRef`, `text: string`                              |
+
+`HttpMethod`: closed enum — `Get | Post | Put | Patch | Delete`.
+
+`HttpAuth` (closed tagged union):
+- `None`
+- `Bearer { credential_ref: CredentialRef }`
+- `Basic { credential_ref: CredentialRef }`
+- `Header { name: string, credential_ref: CredentialRef }` (covers `X-API-Key`,
+  `Authorization: token <foo>`)
+
+`HttpBody`: structured JSON (`JsonValue`). Any string leaf may contain
+`{{...}}` placeholders the server interpolates at fire time. Same templating
+applies to `Http.url` and to text fields in `NotifyChannel` variants.
+
+Templating context comes from the Trigger that fired the Operator:
+- `Trigger.source = Drift { drift_ref }`: `drift.{name, subject_ref.{kind, name, version}}`, `observation.{value, threshold, fired_at}`.
+- `Trigger.source = Eval { eval_ref }`: `eval.{name, subject_ref.*}`, `failures[]` (per-task failure entries).
+- `Trigger.source` absent: `schedule.fired_at` only.
+
+Exact field schema for each context lives in OpenAPI.
 
 ---
 
@@ -486,6 +524,15 @@ Foundations explicitly **removed** from v1 protocol surface:
 - `TriggerSource.card` (generic field name on the prior drift variant) —
   replaced by `drift_ref`. Same `<kind>_ref` convention as
   `Drift.signal.baseline_ref` / `eval_ref` / `source_ref`.
+- `Operator.adapter: FrameworkAdapterRef` — Workflow execution lives on
+  Workflow cards; Notify/Http are stock server primitives. No framework
+  binding on the reaction wire.
+- `Operator.inputs: Vec<OperatorInput>` (with free-string `schema_ref`) —
+  untyped wire vocabulary. Each `OperatorAction` variant declares its own
+  input shape via the templating context bound by the firing Trigger.
+- `OperatorInput` (foundation) — dropped with `inputs`.
+- `OperatorBudget.max_memory_mb` — host/sandbox concern (Rule 14). `Operator.budget`
+  retains `max_wall_seconds` and `max_tool_calls` only.
 
 ---
 
@@ -575,7 +622,7 @@ expect from JSON-Schema `$ref` / OpenAPI external-file imports.
 | Data    | `artifact_refs`, `splits`            | `Drift.signal.baseline_ref`, `Eval.dataset_ref`, `Experiment.target_refs` |
 | Model   | `artifact_refs`                      | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, `Experiment.target_refs` |
 | Agent   | `prompt`, `tool_names`               | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, Agent prompts (sub-agent calls) |
-| Workflow| `steps.*.target`                     | `Eval.subject_ref`, `Service.components.ref`, `Operator.workflow_ref` |
+| Workflow| `steps.*.target`                     | `Eval.subject_ref`, `Service.components.ref`, `Operator.action.workflow_ref` |
 | Mcp     | `credential_refs`                    | `Service.components.ref` |
 | Drift   | `subject_ref`, `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `Trigger.source.drift_ref`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
 | Eval    | `subject_ref`, `dataset_ref`, `source_ref`, `tasks[].Judge.prompt` (PromptRef) | `Drift.signal.eval_ref`, `Trigger.source.eval_ref` |
@@ -583,7 +630,7 @@ expect from JSON-Schema `$ref` / OpenAPI external-file imports.
 | Service | `components[].ref`                   | `Drift.subject_ref` (service-level), `Eval.subject_ref` |
 | Policy  | `rules`                              | `Service.components.ref`, `Audit.policy_refs`, `Operator.pre_invoke`, `Operator.post_invoke` |
 | Trigger | `schedule`, `source.drift_ref` \| `source.eval_ref`, `operator_ref` | — |
-| Operator| `adapter`, `pre_invoke`, `post_invoke` | `Trigger.operator_ref` |
+| Operator| `action` (`workflow_ref` \| `channel.*_ref` \| `auth.credential_ref`), `pre_invoke`, `post_invoke` | `Trigger.operator_ref` |
 | Source  | `credential_ref`                     | `Drift.signal.source_ref` (External variant), `Eval.source_ref`, `Audit.source_refs` |
 
 `Service.components` accepts: Agent, Prompt, Model, Workflow, Mcp, Policy. No

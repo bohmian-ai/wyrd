@@ -2,7 +2,7 @@
 
 from . import cards, data, model, prompt
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError, _init
-from .cards import CardRef, Kind
+from .cards import CardKind, CardRef
 from .agent import Agent, AgentRun, FinishReason, RunConfig, local_registry, tool
 from .data import DataCard, Split
 from .model import ModelCard, ModelSignature, SampleInput
@@ -28,11 +28,11 @@ __all__ = [
     "AgentError",
     "AgentRun",
     "AnthropicSettings",
+    "CardKind",
     "CardRef",
     "DataCard",
     "FinishReason",
     "GeminiSettings",
-    "Kind",
     "MediaRef",
     "ModelCard",
     "ModelSignature",

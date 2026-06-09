@@ -2,52 +2,48 @@
 
 #### end of imports ####
 
-class Kind:
-    """Native Wyrd card kind.
+class CardKind:
+    """Wyrd card kind.
 
     Use these constants when constructing CardRef values from Python.
     """
 
-    Data: Kind
-    Model: Kind
-    Experiment: Kind
-    Prompt: Kind
-    Tool: Kind
-    Agent: Kind
-    Workflow: Kind
-    Eval: Kind
-    Drift: Kind
-    Service: Kind
-    Policy: Kind
-    Mcp: Kind
-    Skill: Kind
-    SubAgent: Kind
-    Audit: Kind
-    Artifact: Kind
-    Trigger: Kind
-    Operator: Kind
+    Data: CardKind
+    Model: CardKind
+    Experiment: CardKind
+    Prompt: CardKind
+    Tool: CardKind
+    Agent: CardKind
+    Workflow: CardKind
+    Eval: CardKind
+    Drift: CardKind
+    Service: CardKind
+    Policy: CardKind
+    Mcp: CardKind
+    Skill: CardKind
+    SubAgent: CardKind
+    Audit: CardKind
+    Artifact: CardKind
+    Trigger: CardKind
+    Operator: CardKind
+    External: CardKind
 
     @property
     def name(self) -> str:
-        """Return the native Wyrd kind wire name."""
+        """Return the Wyrd kind wire name."""
         ...
 
 class CardRef:
     """Reference to a registered Wyrd Card.
 
     CardRef carries kind, name, version, optional space, and optional resolved
-    UID. Python callers may pass either a Kind constant or the native kind wire
-    string to the constructor.
+    UID. Python callers may pass either a CardKind constant or the native kind
+    wire string to the constructor.
     """
 
     @property
-    def kind(self) -> Kind:
-        """Native kind of the referenced card.
-
-        Raises:
-            WyrdError: If the card ref points at an external kind not
-                representable as ``wyrd.cards.Kind``.
-        """
+    def kind(self) -> CardKind:
+        """Card kind."""
         ...
 
     name: str
@@ -57,7 +53,7 @@ class CardRef:
 
     def __init__(
         self,
-        kind: Kind | str,
+        kind: CardKind | str,
         name: str,
         version: str,
         *,
@@ -67,15 +63,14 @@ class CardRef:
         """Create a Wyrd card reference.
 
         Args:
-            kind (Kind | str): Native Wyrd card kind. External kinds are not
-                constructable from Python.
+            kind (CardKind | str): Wyrd card kind.
             name (str): Referenced card name.
             version (str): Exact referenced card version.
             space (str | None): Optional card space.
             uid (str | None): Optional resolved card UID.
 
         Raises:
-            WyrdError: If kind is not native, or identity fields are invalid.
+            WyrdError: If kind is unknown, or identity fields are invalid.
         """
         ...
 
@@ -83,4 +78,4 @@ class CardRef:
         """Return a concise Python representation."""
         ...
 
-__all__ = ["CardRef", "Kind"]
+__all__ = ["CardKind", "CardRef"]

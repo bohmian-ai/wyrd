@@ -3,13 +3,13 @@
 import pytest
 
 from wyrd._wyrd import WyrdError
-from wyrd.cards import CardRef, Kind
+from wyrd.cards import CardKind, CardRef
 
 
 def test_constructs_minimal_card_ref() -> None:
     ref = CardRef(kind="Artifact", name="weights", version="1.0.0")
 
-    assert ref.kind == Kind.Artifact
+    assert ref.kind == CardKind.Artifact
     assert ref.name == "weights"
     assert ref.version == "1.0.0"
     assert ref.space is None
@@ -18,7 +18,7 @@ def test_constructs_minimal_card_ref() -> None:
 
 def test_constructs_full_card_ref() -> None:
     ref = CardRef(
-        kind=Kind.Model,
+        kind=CardKind.Model,
         name="churn-classifier",
         version="1.4.2",
         space="prod",
@@ -30,9 +30,9 @@ def test_constructs_full_card_ref() -> None:
 
 
 def test_equality_by_value() -> None:
-    a = CardRef(kind=Kind.Data, name="dataset", version="1.0.0")
-    b = CardRef(kind=Kind.Data, name="dataset", version="1.0.0")
-    c = CardRef(kind=Kind.Data, name="dataset", version="1.1.0")
+    a = CardRef(kind=CardKind.Data, name="dataset", version="1.0.0")
+    b = CardRef(kind=CardKind.Data, name="dataset", version="1.0.0")
+    c = CardRef(kind=CardKind.Data, name="dataset", version="1.1.0")
 
     assert a == b
     assert a != c
@@ -59,7 +59,7 @@ def test_rejects_unknown_kind() -> None:
 
 def test_rejects_invalid_version() -> None:
     with pytest.raises(WyrdError) as exc_info:
-        CardRef(kind=Kind.Model, name="card-x", version="not-a-version")
+        CardRef(kind=CardKind.Model, name="card-x", version="not-a-version")
 
     assert exc_info.value.code == "WYRD_SPEC_400_VALIDATION"
 
@@ -85,6 +85,7 @@ def test_rejects_invalid_version() -> None:
         "Artifact",
         "Trigger",
         "Operator",
+        "External",
     ],
 )
 def test_every_native_kind_is_accepted(kind: str) -> None:
@@ -96,27 +97,28 @@ def test_every_native_kind_is_accepted(kind: str) -> None:
 @pytest.mark.parametrize(
     ("kind", "name"),
     [
-        (Kind.Data, "Data"),
-        (Kind.Model, "Model"),
-        (Kind.Experiment, "Experiment"),
-        (Kind.Prompt, "Prompt"),
-        (Kind.Tool, "Tool"),
-        (Kind.Agent, "Agent"),
-        (Kind.Workflow, "Workflow"),
-        (Kind.Eval, "Eval"),
-        (Kind.Drift, "Drift"),
-        (Kind.Service, "Service"),
-        (Kind.Policy, "Policy"),
-        (Kind.Mcp, "Mcp"),
-        (Kind.Skill, "Skill"),
-        (Kind.SubAgent, "SubAgent"),
-        (Kind.Audit, "Audit"),
-        (Kind.Artifact, "Artifact"),
-        (Kind.Trigger, "Trigger"),
-        (Kind.Operator, "Operator"),
+        (CardKind.Data, "Data"),
+        (CardKind.Model, "Model"),
+        (CardKind.Experiment, "Experiment"),
+        (CardKind.Prompt, "Prompt"),
+        (CardKind.Tool, "Tool"),
+        (CardKind.Agent, "Agent"),
+        (CardKind.Workflow, "Workflow"),
+        (CardKind.Eval, "Eval"),
+        (CardKind.Drift, "Drift"),
+        (CardKind.Service, "Service"),
+        (CardKind.Policy, "Policy"),
+        (CardKind.Mcp, "Mcp"),
+        (CardKind.Skill, "Skill"),
+        (CardKind.SubAgent, "SubAgent"),
+        (CardKind.Audit, "Audit"),
+        (CardKind.Artifact, "Artifact"),
+        (CardKind.Trigger, "Trigger"),
+        (CardKind.Operator, "Operator"),
+        (CardKind.External, "External"),
     ],
 )
-def test_every_native_kind_enum_is_accepted(kind: Kind, name: str) -> None:
+def test_every_native_kind_enum_is_accepted(kind: CardKind, name: str) -> None:
     ref = CardRef(kind=kind, name="card-x", version="1.0.0")
 
     assert ref.kind == kind

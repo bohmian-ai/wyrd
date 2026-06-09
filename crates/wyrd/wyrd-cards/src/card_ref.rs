@@ -304,14 +304,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kind_from_external_card_kind_returns_validation_error() {
-        let external = CardKind::External {
-            name: "vendor.plugin".to_string(),
-            schema_hash: [0u8; 32],
-        };
-        let result = Kind::from_card_kind(&external);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("vendor.plugin"));
+    fn kind_from_external_card_kind_maps_to_external_variant() {
+        let result = Kind::from_card_kind(&CardKind::External);
+        assert_eq!(result, Kind::External);
     }
 }

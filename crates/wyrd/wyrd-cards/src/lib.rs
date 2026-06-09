@@ -4,7 +4,7 @@
 
 /// Compatibility re-exports for card holder types.
 pub mod card;
-/// Python-boundary card reference types: CardRef and Kind.
+/// Python-boundary card reference types: CardRef and CardKind.
 #[cfg(feature = "python")]
 pub mod card_ref;
 /// DataCard implementation module.

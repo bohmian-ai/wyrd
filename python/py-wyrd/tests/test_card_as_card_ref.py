@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from wyrd.cards import CardRef, Kind
+from wyrd.cards import CardKind, CardRef
 from wyrd.data import DataCard, FieldSpec, PandasInterface
 from wyrd.model import ModelCard, ModelCardMetadata, ModelSignature, SklearnInterface
 from wyrd.prompt import Prompt, PromptCard
@@ -19,7 +19,7 @@ def test_prompt_card_as_card_ref() -> None:
     ref = card.as_card_ref()
 
     assert isinstance(ref, CardRef)
-    assert ref.kind == Kind.Prompt
+    assert ref.kind == CardKind.Prompt
     assert ref.name == card.name
     assert ref.version == card.version
 
@@ -44,7 +44,7 @@ def test_model_card_as_card_ref() -> None:
     ref = card.as_card_ref()
 
     assert isinstance(ref, CardRef)
-    assert ref.kind == Kind.Model
+    assert ref.kind == CardKind.Model
     assert ref.name == card.name
     assert ref.version == card.version
 
@@ -59,6 +59,6 @@ def test_data_card_as_card_ref() -> None:
     ref = card.as_card_ref()
 
     assert isinstance(ref, CardRef)
-    assert ref.kind == Kind.Data
+    assert ref.kind == CardKind.Data
     assert ref.name == card.name
     assert ref.version == card.version

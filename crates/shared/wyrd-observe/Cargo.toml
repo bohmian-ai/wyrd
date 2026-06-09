@@ -24,7 +24,6 @@ python = [
 [dependencies]
 skald-spec = { workspace = true }
 skald-prompt = { workspace = true, optional = true }
-vala-client = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-utils = { workspace = true }
 async-trait = { workspace = true }

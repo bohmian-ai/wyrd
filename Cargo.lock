@@ -4615,7 +4615,6 @@ dependencies = [
  "skald-spec",
  "tokio",
  "tracing",
- "vala-client",
  "wyrd-spec",
  "wyrd-utils",
 ]

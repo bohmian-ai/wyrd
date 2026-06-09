@@ -5,6 +5,7 @@ from __future__ import annotations
 import pydantic
 import pytest
 from wyrd import Prompt
+from wyrd._wyrd import WyrdError
 
 
 def test_pydantic_model_extracts_schema_at_construction():
@@ -30,9 +31,7 @@ def test_pydantic_model_class_name_is_schema_name():
     class MyOutput(pydantic.BaseModel):
         value: int
 
-    prompt = Prompt(
-        messages=["go"], model="gpt-test", provider="openai", output=MyOutput
-    )
+    prompt = Prompt(messages=["go"], model="gpt-test", provider="openai", output=MyOutput)
     fmt = prompt.request.model_dump()["response_format"]
     assert fmt["json_schema"]["name"] == "MyOutput"
 
@@ -61,9 +60,7 @@ def test_raw_json_schema_passthrough():
         "properties": {"x": {"type": "string"}},
         "required": ["x"],
     }
-    prompt = Prompt(
-        messages=["go"], model="gpt-test", provider="openai", output=raw
-    )
+    prompt = Prompt(messages=["go"], model="gpt-test", provider="openai", output=raw)
     schema = prompt.request.model_dump()["response_format"]["json_schema"]["schema"]
     assert schema["properties"]["x"] == {"type": "string"}
     assert schema["additionalProperties"] is False
@@ -75,15 +72,13 @@ def test_additional_properties_not_overwritten():
         "properties": {"x": {"type": "string"}},
         "additionalProperties": True,
     }
-    prompt = Prompt(
-        messages=["go"], model="gpt-test", provider="openai", output=raw
-    )
+    prompt = Prompt(messages=["go"], model="gpt-test", provider="openai", output=raw)
     schema = prompt.request.model_dump()["response_format"]["json_schema"]["schema"]
     assert schema["additionalProperties"] is True
 
 
 def test_invalid_output_type_raises():
-    with pytest.raises(Exception):
+    with pytest.raises(WyrdError):
         Prompt(
             messages=["go"],
             model="gpt-test",
@@ -105,9 +100,7 @@ def test_rust_schema_extraction_does_not_use_output_to_json_schema():
     class Verified(pydantic.BaseModel):
         verified: bool
 
-    prompt = Prompt(
-        messages=["go"], model="gpt-test", provider="openai", output=Verified
-    )
+    prompt = Prompt(messages=["go"], model="gpt-test", provider="openai", output=Verified)
     schema = prompt.request.model_dump()["response_format"]["json_schema"]["schema"]
     assert schema["additionalProperties"] is False
     assert "verified" in schema["properties"]

@@ -58,9 +58,7 @@ def annotation_to_schema(annotation: Any) -> dict:
 
     if origin is list:
         return (
-            {"type": "array", "items": annotation_to_schema(args[0])}
-            if args
-            else {"type": "array"}
+            {"type": "array", "items": annotation_to_schema(args[0])} if args else {"type": "array"}
         )
 
     if origin is dict:

@@ -25,7 +25,9 @@ class RecordingObserver(Observer):
         self.events.append(f"model_call:{agent_id}:{provider}")
         self.requests.append(request)
 
-    def on_model_result(self, run_id, agent_id, iteration, finish_reason, synthetic, response) -> None:
+    def on_model_result(
+        self, run_id, agent_id, iteration, finish_reason, synthetic, response
+    ) -> None:
         self.events.append(f"model_result:{agent_id}:{synthetic}")
         self.responses.append(response)
 

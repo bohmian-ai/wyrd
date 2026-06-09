@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 from datasets import Dataset
+from wyrd.cards import CardKind, CardRef
 from wyrd.data import (
     ArrowInterface,
     DataCard,
@@ -26,7 +27,6 @@ from wyrd.data import (
     TorchInterface,
     WyrdError,
 )
-from wyrd.cards import CardKind, CardRef
 
 
 def _payload(card: DataCard) -> dict:

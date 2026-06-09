@@ -50,9 +50,7 @@ def test_structured_output_still_dict_when_parsed_present():
         summary: str
 
     agent = Agent(
-        prompt=Prompt(
-            messages=["go"], model="mock-model", provider="mock", output=Plan
-        ),
+        prompt=Prompt(messages=["go"], model="mock-model", provider="mock", output=Plan),
         after_model_callback=lambda ctx, r: _response('{"summary":"hello"}'),
     )
     run = agent.run("go")
@@ -62,9 +60,7 @@ def test_structured_output_still_dict_when_parsed_present():
 
 
 def test_parsed_is_none_for_text_prompt():
-    agent = Agent(
-        prompt=Prompt(messages=["go"], model="mock-model", provider="mock")
-    )
+    agent = Agent(prompt=Prompt(messages=["go"], model="mock-model", provider="mock"))
     run = agent.run("go")
     assert run.parsed is None
     assert run.structured_output is None

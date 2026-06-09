@@ -53,7 +53,7 @@ def _assert_card_json(path: Path, interface_kind: str) -> None:
     assert payload["apiVersion"] == "wyrd/v1"
     assert payload["kind"] == "Data"
     assert payload["spec"]["interface"]["kind"] == interface_kind
-    assert payload["spec"]["artifact_refs"] == []
+    assert payload["spec"]["card_refs"] == []
 
 
 def _assert_stats(card: DataCard) -> None:
@@ -603,13 +603,13 @@ def test_load_requires_a_local_path_when_artifacts_are_not_downloaded() -> None:
     assert exc.value.code == "WYRD_DATA_400_VALIDATION"
 
 
-def test_save_does_not_create_artifact_cards_or_artifact_refs(tmp_path: Path) -> None:
+def test_save_does_not_create_artifact_cards_or_card_refs(tmp_path: Path) -> None:
     card = DataCard(PandasInterface(data=pd.DataFrame({"x": [1]})))
 
     card.save(tmp_path)
 
     payload = json.loads((tmp_path / "card.json").read_text(encoding="utf-8"))
-    assert payload["spec"]["artifact_refs"] == []
+    assert payload["spec"]["card_refs"] == []
 
 
 def test_huggingface_pointer_only_save_writes_pointer_json(tmp_path: Path) -> None:

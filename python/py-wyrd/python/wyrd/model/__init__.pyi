@@ -631,7 +631,7 @@ class ModelCardMetadata:
     task_type: str
     signature: ModelSignature | JsonDict
     sample_input: SampleInput | JsonDict | None
-    artifact_refs: list[CardRefLike]
+    card_refs: list[CardRefLike]
 
     def __init__(
         self,
@@ -639,7 +639,7 @@ class ModelCardMetadata:
         task_type: str = ...,
         signature: ModelSignature | JsonDict | None = ...,
         sample_input: SampleInput | JsonDict | None = ...,
-        artifact_refs: Sequence[CardRefLike] | None = ...,
+        card_refs: Sequence[CardRefLike] | None = ...,
     ) -> None:
         """Create ModelCard holder metadata.
 
@@ -651,7 +651,7 @@ class ModelCardMetadata:
                 metadata.
             sample_input (SampleInput | JsonDict | None): Optional sample input
                 descriptor.
-            artifact_refs (Sequence[CardRefLike] | None): Existing durable
+            card_refs (Sequence[CardRefLike] | None): Existing durable
                 Artifact card references.
         """
         ...
@@ -798,7 +798,7 @@ class ModelCard:
 
         The held interface writes model bytes. Wyrd updates interface metadata
         and writes the ModelCard envelope; it does not create ArtifactCards or
-        mutate `artifact_refs`.
+        mutate `card_refs`.
 
         Args:
             path (PathLike): Local directory where Wyrd writes model bytes and

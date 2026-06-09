@@ -215,8 +215,8 @@ def test_artifact_card_input_requires_or_infers_interface_metadata(tmp_path) -> 
     card = DataCard(artifact)
     metadata = card.metadata.to_dict()
 
-    assert metadata["artifact_refs"][0]["kind"] == "Artifact"
-    assert metadata["artifact_refs"][0]["name"] == "existing-data"
+    assert metadata["card_refs"][0]["kind"] == "Artifact"
+    assert metadata["card_refs"][0]["name"] == "existing-data"
 
 
 def test_artifact_card_input_rejects_non_artifact_card_ref() -> None:

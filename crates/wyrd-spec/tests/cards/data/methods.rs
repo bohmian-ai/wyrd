@@ -69,7 +69,7 @@ fn data_spec_helpers_expose_interface_refs_stats_targets_and_splits() {
 
     assert_eq!(spec.interface_kind(), "Pandas");
     assert!(spec.is_tabular());
-    assert_eq!(spec.artifact_refs().collect::<Vec<_>>(), vec![&artifact]);
+    assert_eq!(spec.card_refs().collect::<Vec<_>>(), vec![&artifact]);
     assert_eq!(spec.target_columns().next().unwrap().as_str(), "target");
     assert_eq!(spec.stats().byte_count, 12);
     assert!(spec.split(&split("train")).is_some());

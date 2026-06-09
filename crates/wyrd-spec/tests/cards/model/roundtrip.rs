@@ -41,7 +41,7 @@ fn spec(interface: ModelInterface) -> ModelSpec {
         task_type: TaskType::Other,
         signature: signature(),
         sample_input: Some(SampleInput::new(SampleInputKind::Dict)),
-        artifact_refs: vec![model_ref("model")],
+        card_refs: vec![model_ref("model")],
     }
 }
 

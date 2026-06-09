@@ -39,7 +39,7 @@ fn valid_spec() -> ModelSpec {
         task_type: TaskType::Regression,
         signature: valid_signature(),
         sample_input: None,
-        artifact_refs: Vec::new(),
+        card_refs: Vec::new(),
     }
 }
 
@@ -427,7 +427,7 @@ fn model_helpers_are_stable() {
     assert!(spec.is_generation());
     assert_eq!(spec.signature.inputs().len(), 1);
     assert_eq!(spec.signature.outputs().len(), 1);
-    assert_eq!(spec.artifact_refs().count(), 0);
+    assert_eq!(spec.card_refs().count(), 0);
 }
 
 #[test]

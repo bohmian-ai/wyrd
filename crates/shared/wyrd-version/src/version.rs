@@ -40,10 +40,10 @@ impl WyrdVersion {
     /// produced them so downstream code can detect schema drift.
     #[must_use]
     pub fn current() -> Self {
-        // Resolved at compile time; cannot fail in practice. If the workspace
-        // version string ever becomes invalid semver the build itself fails.
-        Self::parse(env!("CARGO_PKG_VERSION"))
-            .expect("workspace CARGO_PKG_VERSION must be valid semver")
+        match Self::parse(env!("CARGO_PKG_VERSION")) {
+            Ok(version) => version,
+            Err(_) => Self(Version::new(0, 0, 0)),
+        }
     }
 
     #[must_use]

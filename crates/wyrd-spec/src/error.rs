@@ -295,6 +295,48 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// DriftCard validation failed.
+    #[error("[WYRD_DRIFT_400_VALIDATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_DRIFT_400_VALIDATION",
+        status = 400,
+        title = "DriftCard validation failed",
+        remediation = "Fix the DriftCard envelope, profile, condition, or signal fields."
+    )]
+    DriftValidation {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A DriftCard signal variant is not compatible with the requested method.
+    #[error("[WYRD_DRIFT_400_SIGNAL_METHOD_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_DRIFT_400_SIGNAL_METHOD_MISMATCH",
+        status = 400,
+        title = "DriftCard signal/method mismatch",
+        remediation = "Use a signal variant supported by the chosen DriftMethod (see DriftSpec docs)."
+    )]
+    DriftSignalMethodMismatch {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A DriftCard method that requires a profile was registered without one.
+    #[error("[WYRD_DRIFT_400_PROFILE_REQUIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_DRIFT_400_PROFILE_REQUIRED",
+        status = 400,
+        title = "DriftCard profile required",
+        remediation = "Attach the method-matching DriftProfile (PsiProfile, SpcProfile, or CustomProfile)."
+    )]
+    DriftProfileRequired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Python model input could not be classified as a supported ModelCard interface.
     #[error("[WYRD_MODEL_400_UNKNOWN_MODEL_TYPE] {message}")]
     #[wyrd_error(
@@ -1021,6 +1063,9 @@ impl WyrdError {
             | Self::DataTargetColumnUnknown { message, details }
             | Self::DataInvalidInterfaceOption { message, details }
             | Self::DataInterfaceMetadataRequired { message, details }
+            | Self::DriftValidation { message, details }
+            | Self::DriftSignalMethodMismatch { message, details }
+            | Self::DriftProfileRequired { message, details }
             | Self::ModelUnknownModelType { message, details }
             | Self::ModelValidation { message, details }
             | Self::ModelMissingSignature { message, details }

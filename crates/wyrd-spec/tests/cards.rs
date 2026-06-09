@@ -6,6 +6,8 @@ mod data_methods;
 mod data_roundtrip;
 #[path = "cards/data/validation.rs"]
 mod data_validation;
+#[path = "cards/drift_validation.rs"]
+mod drift_validation;
 #[path = "cards/envelope_roundtrip.rs"]
 mod envelope_roundtrip;
 #[path = "cards/eval.rs"]

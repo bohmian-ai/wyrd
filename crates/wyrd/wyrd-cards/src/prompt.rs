@@ -23,12 +23,12 @@ pub mod io;
 
 #[cfg(feature = "python")]
 use {
+    crate::card_ref::CardRefPy,
     pyo3::prelude::*,
     pyo3::pyclass::{PyTraverseError, PyVisit},
     pyo3::types::{PyAny, PyAnyMethods},
     std::path::PathBuf,
     wyrd_interfaces::error::WyrdPyError,
-    crate::card_ref::CardRefPy,
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
 };
 

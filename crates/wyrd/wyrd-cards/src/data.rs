@@ -20,6 +20,7 @@ use wyrd_spec::version::ApiVersion;
 
 #[cfg(feature = "python")]
 use {
+    crate::card_ref::CardRefPy,
     pyo3::prelude::*,
     pyo3::pyclass::{PyTraverseError, PyVisit},
     pyo3::types::{PyAny, PyDict, PyType, PyTypeMethods},
@@ -35,7 +36,6 @@ use {
     wyrd_interfaces::data::schema::PyDataSchema,
     wyrd_interfaces::data::stats::PyDataStats,
     wyrd_interfaces::error::WyrdPyError,
-    crate::card_ref::CardRefPy,
     wyrd_spec::envelope::Metadata as EnvelopeMetadata,
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
 };

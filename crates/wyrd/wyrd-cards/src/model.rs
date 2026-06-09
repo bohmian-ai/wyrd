@@ -19,13 +19,13 @@ use wyrd_spec::version::ApiVersion;
 
 #[cfg(feature = "python")]
 use {
+    crate::card_ref::CardRefPy,
     pyo3::prelude::*,
     pyo3::pyclass::{PyTraverseError, PyVisit},
     pyo3::types::{PyAny, PyDict, PyType, PyTypeMethods},
     std::path::PathBuf,
     wyrd_interfaces::data::dtype::{extract_pathbuf, is_path_like},
     wyrd_interfaces::error::WyrdPyError,
-    crate::card_ref::CardRefPy,
     wyrd_interfaces::model::interfaces::{
         CatboostInterface as ModelCatboostInterface,
         HuggingfaceInterface as ModelHuggingfaceInterface,

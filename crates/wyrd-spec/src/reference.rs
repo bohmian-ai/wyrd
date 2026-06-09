@@ -83,6 +83,29 @@ pub enum Kind {
 
 #[cfg(feature = "python")]
 impl Kind {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Data => "Data",
+            Self::Model => "Model",
+            Self::Experiment => "Experiment",
+            Self::Prompt => "Prompt",
+            Self::Tool => "Tool",
+            Self::Agent => "Agent",
+            Self::Workflow => "Workflow",
+            Self::Eval => "Eval",
+            Self::Drift => "Drift",
+            Self::Service => "Service",
+            Self::Policy => "Policy",
+            Self::Mcp => "Mcp",
+            Self::Skill => "Skill",
+            Self::SubAgent => "SubAgent",
+            Self::Audit => "Audit",
+            Self::Artifact => "Artifact",
+            Self::Trigger => "Trigger",
+            Self::Operator => "Operator",
+        }
+    }
+
     fn into_card_kind(self) -> CardKind {
         match self {
             Self::Data => CardKind::Data,
@@ -135,6 +158,20 @@ impl Kind {
                 }),
             }),
         }
+    }
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl Kind {
+    /// Native Wyrd kind wire name.
+    #[getter]
+    fn name(&self) -> &'static str {
+        self.wire_name()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Kind.{}", self.wire_name())
     }
 }
 

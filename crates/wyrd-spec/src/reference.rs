@@ -11,6 +11,7 @@ use pyo3::{
 };
 
 use crate::envelope::CardKind;
+#[cfg(feature = "python")]
 use crate::error::WyrdError;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::version::VersionBlock;
@@ -18,7 +19,7 @@ use crate::version::VersionBlock;
 /// Reference to a registered Card by kind, name, version, optional space, and optional UID.
 #[cfg_attr(
     feature = "python",
-    pyclass(module = "wyrd.cards", name = "CardRef", frozen, eq)
+    pyclass(module = "wyrd.cards", name = "CardRef", frozen, eq, from_py_object)
 )]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]

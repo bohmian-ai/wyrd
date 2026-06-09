@@ -26,7 +26,7 @@ from wyrd.data import (
     TorchInterface,
     WyrdError,
 )
-from wyrd.cards import CardRef
+from wyrd.cards import CardRef, Kind
 
 
 def _payload(card: DataCard) -> dict:
@@ -211,7 +211,7 @@ def test_datacard_to_card_body_returns_data_variant() -> None:
 
 
 def test_artifact_card_input_requires_or_infers_interface_metadata(tmp_path) -> None:
-    artifact = CardRef(kind="Artifact", name="existing-data", version="1.0.0")
+    artifact = CardRef(kind=Kind.Artifact, name="existing-data", version="1.0.0")
     card = DataCard(artifact)
     metadata = card.metadata.to_dict()
 
@@ -220,7 +220,7 @@ def test_artifact_card_input_requires_or_infers_interface_metadata(tmp_path) -> 
 
 
 def test_artifact_card_input_rejects_non_artifact_card_ref() -> None:
-    data_ref = CardRef(kind="Data", name="existing-data", version="1.0.0")
+    data_ref = CardRef(kind=Kind.Data, name="existing-data", version="1.0.0")
 
     with pytest.raises(WyrdError) as exc:
         DataCard(data_ref)

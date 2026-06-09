@@ -897,7 +897,7 @@ mod tests {
         DataInterface as RustDataInterface, DataSchema, DataStats, PandasMeta, ParquetCompression,
     };
     use wyrd_spec::card::field::FieldSpec;
-    use wyrd_spec::envelope::Spec;
+    use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::ids::ColumnName;
     use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue};
 
@@ -966,5 +966,34 @@ mod tests {
             serialized.contains(r#""annotations":{"acme.com/source":"warehouse.customer_churn"}"#)
         );
         assert!(!serialized.contains(r#""tags""#));
+    }
+
+    #[test]
+    fn as_card_ref_returns_data_kind() {
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            LabelKey::new("domain").expect("static label key is valid"),
+            LabelValue::new("churn").expect("static label value is valid"),
+        );
+        let card = DataCard {
+            space: "default".to_string(),
+            name: "data".to_string(),
+            version: "0.1.0".to_string(),
+            uid: "018f90f5-8e1b-7c4a-a834-4d2d4df6e9c2".to_string(),
+            labels,
+            annotations: BTreeMap::new(),
+            metadata: DataCardMetadata::default(),
+            created_at: DateTime::<Utc>::from_timestamp(0, 0)
+                .expect("unix epoch timestamp is valid"),
+            is_card: true,
+            #[cfg(feature = "python")]
+            interface: None,
+        };
+
+        let card_ref = card.as_card_ref().expect("identity is valid");
+
+        assert_eq!(card_ref.kind, CardKind::Data);
+        assert_eq!(card_ref.name.as_str(), "data");
+        assert_eq!(card_ref.version.as_str(), "0.1.0");
     }
 }

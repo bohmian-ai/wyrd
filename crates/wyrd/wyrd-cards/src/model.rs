@@ -1085,7 +1085,7 @@ mod tests {
         ModelInterface as RustModelInterface, ModelSignature as RustModelSignature, SklearnMeta,
         TaskType,
     };
-    use wyrd_spec::envelope::Spec;
+    use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::ids::ColumnName;
     use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue};
 
@@ -1122,6 +1122,16 @@ mod tests {
         assert!(serialized.contains(r#""kind":"Model""#));
         assert!(serialized.contains(r#""labels":{"domain":"churn"}"#));
         assert!(serialized.contains(r#""spec":{"interface":{"kind":"Sklearn""#));
+    }
+
+    #[test]
+    fn as_card_ref_returns_model_kind() {
+        let card = model_card();
+        let card_ref = card.as_card_ref().expect("identity is valid");
+
+        assert_eq!(card_ref.kind, CardKind::Model);
+        assert_eq!(card_ref.name.as_str(), "model");
+        assert_eq!(card_ref.version.as_str(), "0.1.0");
     }
 
     fn model_card() -> ModelCard {

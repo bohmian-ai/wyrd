@@ -140,8 +140,9 @@ run = """
 set -eu
 
 if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/wyrd-spec \
+    --glob '!crates/wyrd-spec/Cargo.toml' \
     --glob '!crates/wyrd-spec/src/reference.rs'; then
-  echo 'PyO3 scope violation detected in wyrd-spec (only reference.rs may opt in)'
+  echo 'PyO3 scope violation detected in wyrd-spec (only Cargo.toml and reference.rs may opt in)'
   exit 1
 fi
 

@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 from typing import Any
 
+from .cards import CardRef
 from .error import WyrdError
 from .header import JsonDict, PathLike
 
@@ -1457,7 +1458,6 @@ class PromptCard:
     content_hash: str
     parameters: list[str]
     is_fully_bound: bool
-    card_ref: str
     is_card: bool
 
     def __init__(
@@ -1557,6 +1557,17 @@ class PromptCard:
         Raises:
             WyrdError: If the prompt or holder identity cannot be converted
                 into a valid PromptCard envelope.
+        """
+        ...
+
+    def as_card_ref(self) -> CardRef:
+        """Return a CardRef pointing at this PromptCard.
+
+        Returns:
+            CardRef: Reference with kind `Kind.Prompt`.
+
+        Raises:
+            WyrdError: If holder identity fields are invalid.
         """
         ...
 

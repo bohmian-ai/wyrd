@@ -35,7 +35,7 @@ pub struct ExperimentSpec {
     pub best_run_ref: Option<RunRef>,
     /// Artifact references.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub artifact_refs: Vec<CardRef>,
+    pub card_refs: Vec<CardRef>,
     /// Free-form details.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub details: BTreeMap<String, NonSecretValue>,

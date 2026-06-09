@@ -1,15 +1,11 @@
 //! Universal Card envelope.
 
 use std::collections::BTreeMap;
-use std::fmt;
 
+use schemars::JsonSchema;
 use schemars::r#gen::SchemaGenerator;
-use schemars::schema::{
-    InstanceType, Metadata as SchemaMetadata, ObjectValidation, Schema, SchemaObject,
-    StringValidation, SubschemaValidation,
-};
-use schemars::{JsonSchema, Map as SchemaMap};
-use serde::de::{Error as DeError, MapAccess, Visitor};
+use schemars::schema::{InstanceType, Metadata as SchemaMetadata, Schema, SchemaObject};
+use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;
 
@@ -205,18 +201,13 @@ pub enum CardKind {
     /// Operator Card.
     // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-2
     Operator,
-    /// Unknown Card kind with schema hash.
-    External {
-        /// External kind name.
-        name: String,
-        /// 32-byte schema hash.
-        schema_hash: [u8; 32],
-    },
+    /// Unknown/external card kind.
+    External,
 }
 
 impl CardKind {
     /// Native v1 Card kind count.
-    pub const NATIVE_COUNT: usize = 18;
+    pub const NATIVE_COUNT: usize = 19;
 
     /// Return every native kind.
     #[must_use]
@@ -240,6 +231,7 @@ impl CardKind {
             Self::Artifact,
             Self::Trigger,
             Self::Operator,
+            Self::External,
         ]
     }
 
@@ -265,15 +257,14 @@ impl CardKind {
             Self::Artifact => "Artifact",
             Self::Trigger => "Trigger",
             Self::Operator => "Operator",
-            Self::External { .. } => return None,
+            Self::External => "External",
         })
     }
 
     /// Public wire name for this kind.
     #[must_use]
-    pub fn wire_name(&self) -> &str {
+    pub fn wire_name(&self) -> &'static str {
         match self {
-            Self::External { name, .. } => name,
             Self::Data => "Data",
             Self::Model => "Model",
             Self::Experiment => "Experiment",
@@ -292,96 +283,21 @@ impl CardKind {
             Self::Artifact => "Artifact",
             Self::Trigger => "Trigger",
             Self::Operator => "Operator",
+            Self::External => "External",
         }
     }
 }
 
 impl Serialize for CardKind {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if let Some(name) = self.native_name() {
-            return serializer.serialize_str(name);
-        }
-        match self {
-            Self::External { name, schema_hash } => {
-                #[derive(Serialize)]
-                struct External<'a> {
-                    kind: &'a str,
-                    schema_hash: String,
-                }
-                External {
-                    kind: name,
-                    schema_hash: hex::encode(schema_hash),
-                }
-                .serialize(serializer)
-            }
-            _ => unreachable!("native handled above"),
-        }
+        serializer.serialize_str(self.wire_name())
     }
 }
 
 impl<'de> Deserialize<'de> for CardKind {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct KindVisitor;
-
-        impl<'de> Visitor<'de> for KindVisitor {
-            type Value = CardKind;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a native kind string or external kind object")
-            }
-
-            fn visit_str<E: DeError>(self, value: &str) -> Result<Self::Value, E> {
-                native_from_str(value).ok_or_else(|| E::custom("unknown native card kind"))
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut name = None;
-                let mut hash = None;
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "kind" => name = Some(map.next_value::<String>()?),
-                        "schema_hash" => hash = Some(map.next_value::<String>()?),
-                        _ => {
-                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                let name = name.ok_or_else(|| A::Error::missing_field("kind"))?;
-                let hash = hash.ok_or_else(|| A::Error::missing_field("schema_hash"))?;
-                if let Some(native) = native_from_str(&name) {
-                    return Ok(native);
-                }
-                if name.is_empty()
-                    || !name.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
-                    })
-                    || !name
-                        .bytes()
-                        .next()
-                        .is_some_and(|byte| byte.is_ascii_alphabetic())
-                {
-                    return Err(A::Error::custom(
-                        "external kind must match [A-Za-z][A-Za-z0-9_.-]*",
-                    ));
-                }
-                if hash.len() != 64
-                    || !hash
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                {
-                    return Err(A::Error::custom(
-                        "schema_hash must be 64 lowercase hexadecimal characters",
-                    ));
-                }
-                let decoded = hex::decode(hash).map_err(A::Error::custom)?;
-                let schema_hash: [u8; 32] = decoded
-                    .try_into()
-                    .map_err(|_| A::Error::custom("schema_hash must decode to 32 bytes"))?;
-                Ok(CardKind::External { name, schema_hash })
-            }
-        }
-
-        deserializer.deserialize_any(KindVisitor)
+        let s = String::deserialize(deserializer)?;
+        native_from_str(&s).ok_or_else(|| D::Error::custom(format!("unknown card kind: {s}")))
     }
 }
 
@@ -405,6 +321,7 @@ fn native_from_str(value: &str) -> Option<CardKind> {
         "Artifact" => CardKind::Artifact,
         "Trigger" => CardKind::Trigger,
         "Operator" => CardKind::Operator,
+        "External" => CardKind::External,
         _ => return None,
     })
 }
@@ -415,80 +332,19 @@ impl JsonSchema for CardKind {
     }
 
     fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
-        let native_values = Self::native()
+        let enum_values = Self::native()
             .iter()
             .map(|kind| json!(kind.wire_name()))
             .collect();
 
-        let native_schema = SchemaObject {
-            metadata: Some(Box::new(SchemaMetadata {
-                title: Some("NativeCardKind".to_string()),
-                description: Some("Native Wyrd Card kind.".to_string()),
-                ..SchemaMetadata::default()
-            })),
-            instance_type: Some(InstanceType::String.into()),
-            enum_values: Some(native_values),
-            ..SchemaObject::default()
-        };
-
-        let mut properties = SchemaMap::new();
-        properties.insert(
-            "kind".to_string(),
-            SchemaObject {
-                instance_type: Some(InstanceType::String.into()),
-                string: Some(Box::new(StringValidation {
-                    min_length: Some(1),
-                    pattern: Some(r"^[A-Za-z][A-Za-z0-9_.-]*$".to_string()),
-                    ..StringValidation::default()
-                })),
-                ..SchemaObject::default()
-            }
-            .into(),
-        );
-        properties.insert(
-            "schema_hash".to_string(),
-            SchemaObject {
-                instance_type: Some(InstanceType::String.into()),
-                string: Some(Box::new(StringValidation {
-                    min_length: Some(64),
-                    max_length: Some(64),
-                    pattern: Some(r"^[0-9a-f]{64}$".to_string()),
-                })),
-                ..SchemaObject::default()
-            }
-            .into(),
-        );
-
-        let external_schema = SchemaObject {
-            metadata: Some(Box::new(SchemaMetadata {
-                title: Some("ExternalCardKind".to_string()),
-                description: Some("External Card kind with schema hash.".to_string()),
-                ..SchemaMetadata::default()
-            })),
-            instance_type: Some(InstanceType::Object.into()),
-            object: Some(Box::new(ObjectValidation {
-                required: ["kind".to_string(), "schema_hash".to_string()]
-                    .into_iter()
-                    .collect(),
-                properties,
-                additional_properties: Some(Box::new(Schema::Bool(false))),
-                ..ObjectValidation::default()
-            })),
-            ..SchemaObject::default()
-        };
-
         SchemaObject {
             metadata: Some(Box::new(SchemaMetadata {
                 title: Some(Self::schema_name()),
-                description: Some(
-                    "Native Wyrd Card kind string or external kind object.".to_string(),
-                ),
+                description: Some("Wyrd Card kind.".to_string()),
                 ..SchemaMetadata::default()
             })),
-            subschemas: Some(Box::new(SubschemaValidation {
-                one_of: Some(vec![native_schema.into(), external_schema.into()]),
-                ..SubschemaValidation::default()
-            })),
+            instance_type: Some(InstanceType::String.into()),
+            enum_values: Some(enum_values),
             ..SchemaObject::default()
         }
         .into()
@@ -610,6 +466,6 @@ fn spec_from_kind_value(kind: &CardKind, mut value: serde_json::Value) -> Result
         CardKind::Operator => serde_json::from_value(value)
             .map(Spec::Operator)
             .map_err(|e| e.to_string()),
-        CardKind::External { name, .. } => Err(format!("unsupported external card kind: {name}")),
+        CardKind::External => Err("unsupported external card kind".to_string()),
     }
 }

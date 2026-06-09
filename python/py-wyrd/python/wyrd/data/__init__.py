@@ -2,7 +2,6 @@
 
 from .._wyrd.cards.data import (
     ArrowInterface,
-    ArtifactCard,
     DataCard,
     DataCardMetadata,
     DataInterface,
@@ -25,7 +24,6 @@ from .._wyrd.cards.data import (
 
 __all__ = [
     "ArrowInterface",
-    "ArtifactCard",
     "DataCard",
     "DataCardMetadata",
     "DataInterface",

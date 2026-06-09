@@ -1,5 +1,5 @@
 #### begin imports ####
-from . import data, model, prompt
+from . import cards, data, model, prompt
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError
 from .agent import (
     Agent,
@@ -18,6 +18,7 @@ from .agent import (
     local_registry,
     tool,
 )
+from .cards import CardKind, CardRef
 from .data import DataCard, Split
 from .model import ModelCard, ModelSignature, SampleInput
 from .observer import Observer
@@ -44,6 +45,8 @@ __all__ = [
     "AgentError",
     "AgentRun",
     "AnthropicSettings",
+    "CardKind",
+    "CardRef",
     "DataCard",
     "FinishReason",
     "GeminiSettings",
@@ -76,6 +79,7 @@ __all__ = [
     "Workflow",
     "WorkflowRun",
     "WyrdError",
+    "cards",
     "data",
     "local_registry",
     "model",

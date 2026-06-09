@@ -10,16 +10,20 @@ use wyrd_interfaces::error::CardPyResult;
 use wyrd_spec::card::prompt::{PromptRef as NativePromptRef, PromptSpec};
 use wyrd_spec::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::{ApiVersion, VersionBlock};
+use wyrd_spec::version::ApiVersion;
+
+use crate::identity::{
+    card_name, optional_card_uid, optional_space_name, validation_error, version_block,
+};
 
 /// PromptCard filesystem IO helpers.
 pub mod io;
 
 #[cfg(feature = "python")]
 use {
+    crate::card_ref::CardRefPy,
     pyo3::prelude::*,
     pyo3::pyclass::{PyTraverseError, PyVisit},
     pyo3::types::{PyAny, PyAnyMethods},
@@ -578,19 +582,14 @@ impl PromptCard {
         Ok(self.to_prompt_spec_from_metadata()?.is_fully_bound())
     }
 
-    /// Return this holder's Wyrd `CardRef` as a compact string.
+    /// Convert this `PromptCard`'s identity into a Wyrd `CardRef`.
     ///
     /// # Errors
-    /// Returns a Wyrd error when identity fields are invalid.
-    #[getter]
-    pub fn card_ref(&self) -> CardPyResult<String> {
-        let card_ref = self.as_card_ref()?;
-        Ok(format!(
-            "{}/{}/{}",
-            card_ref.kind.wire_name(),
-            card_ref.name,
-            card_ref.version
-        ))
+    /// Returns a Wyrd validation error when identity fields fail newtype
+    /// invariants.
+    #[pyo3(name = "as_card_ref")]
+    pub fn as_card_ref_py(&self) -> CardPyResult<CardRefPy> {
+        self.as_card_ref().map(CardRefPy).map_err(Into::into)
     }
 
     /// Save this `PromptCard` envelope to a local JSON or YAML file.
@@ -770,61 +769,6 @@ fn default_prompt() -> skald_spec::Prompt {
     ) {
         Ok(prompt) => prompt,
         Err(error) => panic!("static placeholder prompt is valid: {error}"),
-    }
-}
-
-fn card_name(field: &str, value: &str) -> Result<CardName, WyrdError> {
-    CardName::new(value).map_err(|error| invalid_identity(field, value, error))
-}
-
-fn optional_space_name(value: &str) -> Result<Option<SpaceName>, WyrdError> {
-    if value.is_empty() {
-        Ok(None)
-    } else {
-        SpaceName::new(value)
-            .map(Some)
-            .map_err(|error| invalid_identity("space", value, error))
-    }
-}
-
-fn optional_card_uid(value: &str) -> Result<Option<CardUid>, WyrdError> {
-    if value.is_empty() {
-        Ok(None)
-    } else {
-        CardUid::new(value)
-            .map(Some)
-            .map_err(|error| invalid_identity("uid", value, error))
-    }
-}
-
-fn version_block(value: &str) -> Result<VersionBlock, WyrdError> {
-    VersionBlock::parse(value).map_err(|error| {
-        validation_error(
-            format!("invalid prompt card version: {value}"),
-            json!({
-                "field": "version",
-                "value": value,
-                "source": error.to_string(),
-            }),
-        )
-    })
-}
-
-fn invalid_identity(field: &str, value: &str, error: impl std::fmt::Display) -> WyrdError {
-    validation_error(
-        format!("invalid prompt card {field}: {value}"),
-        json!({
-            "field": field,
-            "value": value,
-            "source": error.to_string(),
-        }),
-    )
-}
-
-fn validation_error(message: impl Into<String>, details: serde_json::Value) -> WyrdError {
-    WyrdError::Validation {
-        message: message.into(),
-        details,
     }
 }
 

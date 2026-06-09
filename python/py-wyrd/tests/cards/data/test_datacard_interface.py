@@ -12,7 +12,6 @@ import torch
 from datasets import Dataset
 from wyrd.data import (
     ArrowInterface,
-    ArtifactCard,
     DataCard,
     DataInterface,
     HuggingfaceInterface,
@@ -27,6 +26,7 @@ from wyrd.data import (
     TorchInterface,
     WyrdError,
 )
+from wyrd.cards import CardKind, CardRef
 
 
 def _payload(card: DataCard) -> dict:
@@ -211,12 +211,23 @@ def test_datacard_to_card_body_returns_data_variant() -> None:
 
 
 def test_artifact_card_input_requires_or_infers_interface_metadata(tmp_path) -> None:
-    artifact = ArtifactCard(name="existing-data", version="1.0.0")
+    artifact = CardRef(kind=CardKind.Artifact, name="existing-data", version="1.0.0")
     card = DataCard(artifact)
     metadata = card.metadata.to_dict()
 
-    assert metadata["artifact_refs"][0]["kind"] == "Artifact"
-    assert metadata["artifact_refs"][0]["name"] == "existing-data"
+    assert metadata["card_refs"][0]["kind"] == "Artifact"
+    assert metadata["card_refs"][0]["name"] == "existing-data"
+
+
+def test_artifact_card_input_rejects_non_artifact_card_ref() -> None:
+    data_ref = CardRef(kind=CardKind.Data, name="existing-data", version="1.0.0")
+
+    with pytest.raises(WyrdError) as exc:
+        DataCard(data_ref)
+
+    assert exc.value.code == "WYRD_DATA_400_VALIDATION"
+    assert exc.value.details["expected_kind"] == "Artifact"
+    assert exc.value.details["actual_kind"] == "Data"
 
 
 def test_set_interface_replaces_spec_metadata_and_schema() -> None:

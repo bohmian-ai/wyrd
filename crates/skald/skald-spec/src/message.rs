@@ -12,7 +12,7 @@ use crate::wire::openai_chat::OpenAiChatMessage;
 #[non_exhaustive]
 pub enum MessageNum {
     /// OpenAI chat message.
-    OpenAi(OpenAiChatMessage),
+    OpenAi(Box<OpenAiChatMessage>),
     /// Anthropic message.
     Anthropic(AnthropicMessage),
     /// Google Gemini content turn.
@@ -38,7 +38,7 @@ impl<'de> Deserialize<'de> for MessageNum {
             return Ok(Self::Gemini(message));
         }
         if let Ok(message) = serde_json::from_value::<OpenAiChatMessage>(value.clone()) {
-            return Ok(Self::OpenAi(message));
+            return Ok(Self::OpenAi(Box::new(message)));
         }
 
         RawValue::from_string(value.to_string())

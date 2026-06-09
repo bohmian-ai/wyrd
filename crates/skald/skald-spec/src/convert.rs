@@ -288,13 +288,13 @@ pub fn convert_message_dyn(
             message.convert().map(MessageNum::Gemini)
         }
         (ProviderName::Anthropic, ProviderName::OpenAi, MessageNum::Anthropic(message)) => {
-            message.convert().map(MessageNum::OpenAi)
+            message.convert().map(|m| MessageNum::OpenAi(Box::new(m)))
         }
         (ProviderName::Anthropic, ProviderName::Google, MessageNum::Anthropic(message)) => {
             message.convert().map(MessageNum::Gemini)
         }
         (ProviderName::Google, ProviderName::OpenAi, MessageNum::Gemini(message)) => {
-            message.convert().map(MessageNum::OpenAi)
+            message.convert().map(|m| MessageNum::OpenAi(Box::new(m)))
         }
         (ProviderName::Google, ProviderName::Anthropic, MessageNum::Gemini(message)) => {
             message.convert().map(MessageNum::Anthropic)

@@ -240,11 +240,6 @@ impl PyProviderRequest {
     pub fn into_native(self) -> ProviderRequest {
         Arc::try_unwrap(self.inner).unwrap_or_else(|arc| (*arc).clone())
     }
-
-    /// Clone the inner Arc without cloning the request value.
-    pub(crate) fn inner_arc(&self) -> Arc<ProviderRequest> {
-        Arc::clone(&self.inner)
-    }
 }
 
 fn openai_message(role: &str, text: String) -> OpenAiChatMessage {
@@ -296,6 +291,7 @@ pub(crate) fn provider_name_to_string(provider: &skald_spec::ProviderName) -> St
 }
 
 #[cfg(feature = "python")]
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn wrong_provider(
     expected: &str,
     actual: skald_spec::ProviderName,
@@ -1099,8 +1095,8 @@ impl PyProviderRequest {
         provider_name_to_string(&self.inner.provider())
     }
 
-    /// Return a typed OpenAI Chat Completions request accessor.
-    /// Raises WyrdError when the provider is not openai chat.
+    /// Return a typed `OpenAI` Chat Completions request accessor.
+    /// Raises `WyrdError` when the provider is not openai chat.
     pub fn openai(&self) -> CardPyResult<wire_py::PyOpenAiChatRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::OpenAiChatCompletion(_)
@@ -1111,8 +1107,8 @@ impl PyProviderRequest {
         }
     }
 
-    /// Return a typed OpenAI Responses API request accessor.
-    /// Raises WyrdError when the provider is not openai responses.
+    /// Return a typed `OpenAI` Responses API request accessor.
+    /// Raises `WyrdError` when the provider is not openai responses.
     pub fn openai_responses(&self) -> CardPyResult<wire_py::PyOpenAiResponsesRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::OpenAiResponses(_) => Ok(
@@ -1123,7 +1119,7 @@ impl PyProviderRequest {
     }
 
     /// Return a typed Anthropic Messages request accessor.
-    /// Raises WyrdError when the provider is not anthropic.
+    /// Raises `WyrdError` when the provider is not anthropic.
     pub fn anthropic(&self) -> CardPyResult<wire_py::PyAnthropicMessagesRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::AnthropicMessage(_) => Ok(
@@ -1134,7 +1130,7 @@ impl PyProviderRequest {
     }
 
     /// Return a typed Google Gemini request accessor.
-    /// Raises WyrdError when the provider is not google/gemini.
+    /// Raises `WyrdError` when the provider is not google/gemini.
     pub fn gemini(&self) -> CardPyResult<wire_py::PyGeminiRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::GeminiGenerateContent(_) => {
@@ -1145,7 +1141,7 @@ impl PyProviderRequest {
     }
 
     /// Return a typed Vertex AI request accessor.
-    /// Raises WyrdError when the provider is not vertex.
+    /// Raises `WyrdError` when the provider is not vertex.
     pub fn vertex(&self) -> CardPyResult<wire_py::PyVertexRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::Vertex(_) => {

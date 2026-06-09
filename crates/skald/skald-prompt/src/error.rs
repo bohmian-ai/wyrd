@@ -76,8 +76,9 @@ impl PromptBuilderError {
             Self::Wyrd(error) => error.code(),
             Self::Skald(error) => error.code(),
             Self::Io { .. } => "SKALD_PROMPT_500_IO",
-            Self::WrongProvider { .. } => "WYRD_PROMPT_400_PROVIDER_MISMATCH",
-            Self::WrongVariant { .. } => "WYRD_PROMPT_400_PROVIDER_MISMATCH",
+            Self::WrongProvider { .. } | Self::WrongVariant { .. } => {
+                "WYRD_PROMPT_400_PROVIDER_MISMATCH"
+            }
         }
     }
 }
@@ -130,14 +131,8 @@ impl From<PromptBuilderError> for wyrd_interfaces::error::WyrdPyError {
                 }
                 .into()
             }
-            PromptBuilderError::WrongProvider { expected, actual } => {
-                wyrd_spec::error::WyrdError::PromptProviderMismatch {
-                    message,
-                    details: json!({ "expected": expected, "actual": actual }),
-                }
-                .into()
-            }
-            PromptBuilderError::WrongVariant { expected, actual } => {
+            PromptBuilderError::WrongProvider { expected, actual }
+            | PromptBuilderError::WrongVariant { expected, actual } => {
                 wyrd_spec::error::WyrdError::PromptProviderMismatch {
                     message,
                     details: json!({ "expected": expected, "actual": actual }),

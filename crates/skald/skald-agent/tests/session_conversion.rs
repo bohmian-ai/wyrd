@@ -13,7 +13,7 @@ use skald_spec::{
 use skald_tool::ToolError;
 
 fn openai_assistant_message(content: &str) -> MessageNum {
-    MessageNum::OpenAi(OpenAiChatMessage {
+    MessageNum::OpenAi(Box::new(OpenAiChatMessage {
         role: "assistant".to_owned(),
         content: Some(OpenAiMessageContent::Text(content.to_owned())),
         name: None,
@@ -22,7 +22,7 @@ fn openai_assistant_message(content: &str) -> MessageNum {
         refusal: None,
         annotations: Vec::new(),
         audio: None,
-    })
+    }))
 }
 
 #[test]

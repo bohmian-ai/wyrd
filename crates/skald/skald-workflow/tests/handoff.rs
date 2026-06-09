@@ -251,7 +251,7 @@ fn handoff_messages_rejects_raw_v1() {
 
 #[test]
 fn handoff_messages_same_provider_is_clone_passthrough() {
-    let messages = vec![MessageNum::OpenAi(OpenAiChatMessage {
+    let messages = vec![MessageNum::OpenAi(Box::new(OpenAiChatMessage {
         role: "user".to_owned(),
         content: Some(OpenAiMessageContent::Text("hi".to_owned())),
         name: None,
@@ -260,7 +260,7 @@ fn handoff_messages_same_provider_is_clone_passthrough() {
         refusal: None,
         annotations: Vec::new(),
         audio: None,
-    })];
+    }))];
 
     let out =
         skald_workflow::handoff_messages(&ProviderName::OpenAi, &ProviderName::OpenAi, &messages)
@@ -271,7 +271,7 @@ fn handoff_messages_same_provider_is_clone_passthrough() {
 
 #[test]
 fn handoff_messages_rejects_missing_conversion() {
-    let messages = vec![MessageNum::OpenAi(OpenAiChatMessage {
+    let messages = vec![MessageNum::OpenAi(Box::new(OpenAiChatMessage {
         role: "assistant".to_owned(),
         content: Some(OpenAiMessageContent::Text("hi".to_owned())),
         name: None,
@@ -280,7 +280,7 @@ fn handoff_messages_rejects_missing_conversion() {
         refusal: None,
         annotations: Vec::new(),
         audio: None,
-    })];
+    }))];
 
     let err = skald_workflow::handoff_messages(
         &ProviderName::OpenAi,

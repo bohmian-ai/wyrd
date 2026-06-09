@@ -18,12 +18,14 @@ fn openai_tool_call_and_result_round_trip_through_message_num() {
         tool_calls: Some(vec![call.clone()]),
         tool_call_id: None,
         refusal: None,
+        annotations: Vec::new(),
+        audio: None,
     };
     let result = openai_tool_result_message("call_1", "{\"forecast\":\"sunny\"}");
 
     assert_eq!(call.function.name, "lookup_weather");
-    assert_round_trips(MessageNum::OpenAi(assistant));
-    assert_round_trips(MessageNum::OpenAi(result));
+    assert_round_trips(MessageNum::OpenAi(Box::new(assistant)));
+    assert_round_trips(MessageNum::OpenAi(Box::new(result)));
 }
 
 #[test]

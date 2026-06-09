@@ -139,11 +139,11 @@ pub(crate) fn session_turn_to_conversation_turn(
                     parts: vec![GooglePart::Text { text: turn.content }],
                 }),
                 ProviderName::OpenAi | ProviderName::Custom(_) => {
-                    MessageNum::OpenAi(OpenAiChatMessage {
+                    MessageNum::OpenAi(Box::new(OpenAiChatMessage {
                         role: "assistant".to_owned(),
                         content: Some(OpenAiMessageContent::Text(turn.content)),
                         ..Default::default()
-                    })
+                    }))
                 }
             };
             ConversationTurn::Assistant { message }
@@ -171,11 +171,11 @@ impl From<SessionTurn> for ConversationTurn {
                 content: turn.content,
             },
             Role::Assistant => Self::Assistant {
-                message: MessageNum::OpenAi(OpenAiChatMessage {
+                message: MessageNum::OpenAi(Box::new(OpenAiChatMessage {
                     role: "assistant".to_owned(),
                     content: Some(OpenAiMessageContent::Text(turn.content)),
                     ..Default::default()
-                }),
+                })),
             },
             Role::Tool => Self::ToolResult {
                 call_id: turn.call_id.unwrap_or_default(),

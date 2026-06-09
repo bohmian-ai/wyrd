@@ -386,7 +386,7 @@ impl DagExecutor {
                 let messages = upstream
                     .iter()
                     .map(|msg| match msg {
-                        MessageNum::OpenAi(message) => Ok(message.clone()),
+                        MessageNum::OpenAi(message) => Ok((*message).clone()),
                         _ => Err(unsupported_handoff(&provider_of_message(msg), dst_provider)),
                     })
                     .collect::<WorkflowResult<Vec<_>>>()?;
@@ -396,7 +396,7 @@ impl DagExecutor {
                 let messages = upstream
                     .iter()
                     .map(|msg| match msg {
-                        MessageNum::OpenAi(message) => Ok(message.clone()),
+                        MessageNum::OpenAi(message) => Ok((*message).clone()),
                         _ => Err(unsupported_handoff(&provider_of_message(msg), dst_provider)),
                     })
                     .collect::<WorkflowResult<Vec<_>>>()?;

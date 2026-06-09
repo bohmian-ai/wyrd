@@ -72,11 +72,11 @@ pub fn extract_messages_for_handoff(
         (ProviderResponse::OpenAiChatCompletion(_), ProviderName::OpenAi)
         | (ProviderResponse::OpenAiResponses(_), ProviderName::OpenAi)
         | (ProviderResponse::OpenAiChatCompletion(_), ProviderName::Custom(_)) => {
-            Ok(vec![MessageNum::OpenAi(OpenAiChatMessage {
+            Ok(vec![MessageNum::OpenAi(Box::new(OpenAiChatMessage {
                 role: "assistant".to_owned(),
                 content: Some(OpenAiMessageContent::Text(text)),
                 ..Default::default()
-            })])
+            }))])
         }
         (ProviderResponse::AnthropicMessage(_), ProviderName::Anthropic) => {
             Ok(vec![MessageNum::Anthropic(AnthropicMessage {

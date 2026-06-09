@@ -2,7 +2,16 @@
 //!
 //! One clone per boundary crossing (callback/observer receives `PyProviderRequest` /
 //! `PyProviderResponse`). Every nested field access after that is zero-copy via the `Arc`.
-
+// PyO3 `__repr__` methods must take `&self` even when they return a static string.
+#![allow(clippy::unused_self)]
+// PyO3 bridge code uses match-let patterns that predate `let…else` and are clearer inline.
+#![allow(clippy::manual_let_else)]
+// Large bridge file: exhaustive single-remaining-variant matches are overly verbose.
+#![allow(clippy::match_wildcard_for_single_variants)]
+// `|v| v.len()` is clearer than `Vec::len` in closure context here.
+#![allow(clippy::redundant_closure_for_method_calls)]
+// CardPyResult return types are intentionally uniform even when infallible.
+#![allow(clippy::unnecessary_wraps)]
 #![allow(missing_docs)]
 
 use std::sync::Arc;
@@ -28,9 +37,9 @@ use skald_spec::wire::openai_chat::{
     OpenAiAudioFormat, OpenAiBuiltInVoice, OpenAiChatAudio, OpenAiChatChoice, OpenAiChatLogprobs,
     OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiChatToolChoice,
     OpenAiCompletionTokensDetails, OpenAiContentPart, OpenAiCustomChoice, OpenAiCustomTool,
-    OpenAiCustomToolFormat, OpenAiCustomVoice, OpenAiFilePart, OpenAiFunctionChoice, OpenAiGrammar,
-    OpenAiGrammarSyntax, OpenAiImageUrl, OpenAiInputAudio, OpenAiJsonSchema,
-    OpenAiMessageAnnotation, OpenAiMessageAudio, OpenAiMessageContent, OpenAiNamedCustomToolChoice,
+    OpenAiCustomToolFormat, OpenAiFilePart, OpenAiFunctionChoice, OpenAiGrammar,
+    OpenAiGrammarSyntax, OpenAiImageUrl, OpenAiInputAudio, OpenAiMessageAnnotation,
+    OpenAiMessageAudio, OpenAiMessageContent, OpenAiNamedCustomToolChoice,
     OpenAiNamedCustomToolChoiceKind, OpenAiNamedFunctionToolChoice,
     OpenAiNamedFunctionToolChoiceKind, OpenAiPredictionContent, OpenAiPredictionContentPart,
     OpenAiPredictionKind, OpenAiPredictionPayload, OpenAiPromptTokensDetails,
@@ -41,14 +50,12 @@ use skald_spec::wire::openai_chat::{
 use skald_spec::wire::openai_responses::{
     OpenAiReasoning, OpenAiReasoningSummary, OpenAiResponseContentPart, OpenAiResponseItem,
     OpenAiResponsesAllowedToolsChoice, OpenAiResponsesAllowedToolsKind,
-    OpenAiResponsesAllowedToolsMode, OpenAiResponsesApplyPatchToolChoice,
-    OpenAiResponsesApplyPatchToolKind, OpenAiResponsesCustomToolChoice,
+    OpenAiResponsesAllowedToolsMode, OpenAiResponsesCustomToolChoice,
     OpenAiResponsesCustomToolFormat, OpenAiResponsesFunctionToolChoice,
     OpenAiResponsesFunctionToolKind, OpenAiResponsesGrammar, OpenAiResponsesGrammarSyntax,
     OpenAiResponsesHostedToolChoice, OpenAiResponsesHostedToolKind,
     OpenAiResponsesInputTokensDetails, OpenAiResponsesMcpToolChoice, OpenAiResponsesMcpToolKind,
-    OpenAiResponsesOutputTokensDetails, OpenAiResponsesRequest, OpenAiResponsesResponse,
-    OpenAiResponsesSettings, OpenAiResponsesShellToolChoice, OpenAiResponsesShellToolKind,
+    OpenAiResponsesOutputTokensDetails, OpenAiResponsesRequest, OpenAiResponsesSettings,
     OpenAiResponsesText, OpenAiResponsesTool, OpenAiResponsesToolChoice,
     OpenAiResponsesToolChoiceMode, OpenAiResponsesUsage, OpenAiTextResponseFormat,
 };
@@ -77,9 +84,6 @@ impl PyProviderResponse {
     }
     pub fn native(&self) -> &ProviderResponse {
         &self.inner
-    }
-    pub(crate) fn inner_arc(&self) -> Arc<ProviderResponse> {
-        Arc::clone(&self.inner)
     }
 }
 
@@ -1039,18 +1043,18 @@ impl PyOpenAiGrammar {
             {
                 OpenAiTool::Custom { custom } => match custom.format.as_ref().expect("guarded") {
                     OpenAiCustomToolFormat::Grammar { grammar } => grammar,
-                    _ => unreachable!(),
+                    OpenAiCustomToolFormat::Text => unreachable!(),
                 },
-                _ => unreachable!(),
+                OpenAiTool::Function { .. } => unreachable!(),
             },
             ProviderRequest::OpenAiChatCompatible { request, .. } => {
                 match &request.tools.as_ref().expect("guarded")[self.tool_index] {
                     OpenAiTool::Custom { custom } => match custom.format.as_ref().expect("guarded")
                     {
                         OpenAiCustomToolFormat::Grammar { grammar } => grammar,
-                        _ => unreachable!(),
+                        OpenAiCustomToolFormat::Text => unreachable!(),
                     },
-                    _ => unreachable!(),
+                    OpenAiTool::Function { .. } => unreachable!(),
                 }
             }
             _ => unreachable!(),
@@ -1471,7 +1475,7 @@ impl PyOpenAiMessageContent {
     fn as_text(&self) -> CardPyResult<String> {
         match self.c() {
             OpenAiMessageContent::Text(s) => Ok(s.clone()),
-            _ => Err(wrong_variant("text", self.kind()).into()),
+            OpenAiMessageContent::Parts(_) => Err(wrong_variant("text", self.kind()).into()),
         }
     }
     fn as_parts(&self) -> CardPyResult<Vec<PyOpenAiContentPart>> {
@@ -1482,7 +1486,7 @@ impl PyOpenAiMessageContent {
                     part_index: i,
                 })
                 .collect()),
-            _ => Err(wrong_variant("parts", self.kind()).into()),
+            OpenAiMessageContent::Text(_) => Err(wrong_variant("parts", self.kind()).into()),
         }
     }
     fn __repr__(&self) -> String {
@@ -1499,7 +1503,7 @@ impl PyOpenAiContentPart {
     fn p(&self) -> &OpenAiContentPart {
         match self.src.msg().content.as_ref().expect("guarded") {
             OpenAiMessageContent::Parts(ps) => &ps[self.part_index],
-            _ => unreachable!("guarded by parent"),
+            OpenAiMessageContent::Text(_) => unreachable!("guarded by parent"),
         }
     }
 }
@@ -1564,7 +1568,7 @@ impl PyOpenAiImageUrl {
                 OpenAiContentPart::ImageUrl { image_url } => image_url,
                 _ => unreachable!(),
             },
-            _ => unreachable!(),
+            OpenAiMessageContent::Text(_) => unreachable!(),
         }
     }
 }
@@ -2296,6 +2300,7 @@ impl PyAnthropicSystemBlock {
 #[derive(Clone)]
 enum AnthropicCacheControlPath {
     SystemBlock(usize),
+    #[allow(dead_code)]
     Tool(usize),
 }
 
@@ -2318,7 +2323,7 @@ impl PyAnthropicCacheControl {
                             cache_control.as_ref().expect("guarded")
                         }
                     },
-                    _ => unreachable!(),
+                    AnthropicSystem::Text(_) => unreachable!(),
                 }
             }
             AnthropicCacheControlPath::Tool(i) => req.tools.as_ref().expect("guarded")[*i]
@@ -2527,7 +2532,7 @@ impl PyAnthropicToolResultContent {
     fn as_text(&self) -> CardPyResult<String> {
         match &self.value {
             AnthropicToolResultContent::Text(s) => Ok(s.clone()),
-            _ => Err(wrong_variant("text", self.kind()).into()),
+            AnthropicToolResultContent::Blocks(_) => Err(wrong_variant("text", self.kind()).into()),
         }
     }
     fn __repr__(&self) -> String {
@@ -3327,6 +3332,7 @@ pub struct PyGoogleToolConfig {
     inner: Arc<ProviderRequest>,
 }
 impl PyGoogleToolConfig {
+    #[allow(dead_code)]
     fn c(&self) -> &GoogleToolConfig {
         google_request(&self.inner)
             .tool_config
@@ -4041,6 +4047,7 @@ impl PyOpenAiResponsesCustomToolChoice {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesApplyPatchToolChoice")]
 pub struct PyOpenAiResponsesApplyPatchToolChoice {
+    #[allow(dead_code)]
     inner: Arc<ProviderRequest>,
 }
 #[pymethods]
@@ -4056,6 +4063,7 @@ impl PyOpenAiResponsesApplyPatchToolChoice {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesShellToolChoice")]
 pub struct PyOpenAiResponsesShellToolChoice {
+    #[allow(dead_code)]
     inner: Arc<ProviderRequest>,
 }
 #[pymethods]

@@ -536,7 +536,7 @@
           ]
         },
         "manifest_ref": {
-          "description": "Optional manifest ArtifactCard reference.",
+          "description": "Optional manifest Artifact card reference.",
           "anyOf": [
             {
               "$ref": "#/definitions/CardRef"
@@ -791,7 +791,7 @@
           "type": "string"
         },
         "manifest_ref": {
-          "description": "Optional manifest ArtifactCard reference.",
+          "description": "Optional manifest Artifact card reference.",
           "anyOf": [
             {
               "$ref": "#/definitions/CardRef"

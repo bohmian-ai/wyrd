@@ -138,7 +138,7 @@ Dataset declaration with typed interface and schema.
 spec:
   interface: DataInterface       # Pandas | Polars | Arrow | Parquet | Numpy | Torch | Sql | Jsonl | Image | Text | Huggingface | Custom
   schema: DataSchema
-  artifact_refs: [CardRef]       # → Artifact
+  card_refs: [CardRef]       # → Artifact
   splits: { SplitName: DataSplit }
   target_columns: [ColumnName]
   sql?: SqlLogic
@@ -153,7 +153,7 @@ spec:
   task_type: TaskType            # BinaryClassification | MultiClassClassification | Regression | Generation | Embedding | Custom
   signature: ModelSignature
   sample_input?: SampleInput
-  artifact_refs: [CardRef]       # → Artifact
+  card_refs: [CardRef]       # → Artifact
 ```
 
 ### Artifact
@@ -182,7 +182,7 @@ spec:
   run_refs: [RunRef]
   summary_metrics: [MetricEntry]
   best_run_ref?: RunRef
-  artifact_refs: [CardRef]
+  card_refs: [CardRef]
   details: { string: NonSecretValue }
 ```
 
@@ -549,7 +549,7 @@ typed refs is a versioned breaking change that adds variants.
 |-------------|-------------------------------------------------------------------|
 | `Subject`   | `Drift.subject_ref`, `Eval.subject_ref`                           |
 | `Component` | `Service.components[].ref`, `Workflow.steps[].target`             |
-| `Artifact`  | `Data.artifact_refs[]`, `Model.artifact_refs[]`                   |
+| `Artifact`  | `Data.card_refs[]`, `Model.card_refs[]`                   |
 | `Prompt`    | `Agent.prompt`, `Eval.tasks[].Judge.prompt`                       |
 | `Dataset`   | `Eval.dataset_ref`                                                |
 | `Source`    | `Eval.source_ref`, `Drift.signal.External.source_ref`             |
@@ -941,8 +941,8 @@ ergonomic they expect from JSON-Schema `$ref` / OpenAPI external-file imports.
 
 | Card    | Refs that authored on it             | Refs that point at it          |
 |---------|--------------------------------------|--------------------------------|
-| Data    | `artifact_refs`, `splits`            | `Drift.signal.baseline_ref`, `Eval.dataset_ref`, `Experiment.target_refs` |
-| Model   | `artifact_refs`                      | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, `Experiment.target_refs` |
+| Data    | `card_refs`, `splits`            | `Drift.signal.baseline_ref`, `Eval.dataset_ref`, `Experiment.target_refs` |
+| Model   | `card_refs`                      | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, `Experiment.target_refs` |
 | Agent   | `prompt`, `tool_names`               | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, Agent prompts (sub-agent calls) |
 | Workflow| `steps.*.target`                     | `Eval.subject_ref`, `Service.components.ref`, `Operator.action.workflow_ref` |
 | Mcp     | `server_name`, `transport`, `scopes` | `Service.components.ref` |

@@ -224,14 +224,14 @@ impl CardRef {
         let parsed_space =
             match space {
                 None => None,
-                Some(value) if value.is_empty() => None,
+                Some("") => None,
                 Some(value) => Some(SpaceName::new(value).map_err(|error| {
                     wyrd_error_to_py_err(invalid_identity("space", value, error))
                 })?),
             };
         let parsed_uid = match uid {
             None => None,
-            Some(value) if value.is_empty() => None,
+            Some("") => None,
             Some(value) => Some(
                 CardUid::new(value)
                     .map_err(|error| wyrd_error_to_py_err(invalid_identity("uid", value, error)))?,

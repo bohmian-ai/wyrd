@@ -36,12 +36,12 @@ spec:
       compression: zstd
   schema:
     columns:
-      - { name: customer_id,     dtype: string,   nullable: false }
-      - { name: tenure_months,   dtype: int32,    nullable: false }
-      - { name: monthly_charge,  dtype: float64,  nullable: false }
-      - { name: contract_type,   dtype: string,   nullable: false }
-      - { name: support_tickets, dtype: int32,    nullable: true  }
-      - { name: churned,         dtype: bool,     nullable: false }
+      - { name: customer_id, dtype: string, nullable: false }
+      - { name: tenure_months, dtype: int32, nullable: false }
+      - { name: monthly_charge, dtype: float64, nullable: false }
+      - { name: contract_type, dtype: string, nullable: false }
+      - { name: support_tickets, dtype: int32, nullable: true }
+      - { name: churned, dtype: bool, nullable: false }
   target_columns: [churned]
   splits:
     train:
@@ -93,16 +93,21 @@ spec:
   task_type: BinaryClassification
   signature:
     inputs:
-      - { name: tenure_months,   dtype: int32,    nullable: false }
-      - { name: monthly_charge,  dtype: float64,  nullable: false }
-      - { name: contract_type,   dtype: string,   nullable: false }
-      - { name: support_tickets, dtype: int32,    nullable: true  }
+      - { name: tenure_months, dtype: int32, nullable: false }
+      - { name: monthly_charge, dtype: float64, nullable: false }
+      - { name: contract_type, dtype: string, nullable: false }
+      - { name: support_tickets, dtype: int32, nullable: true }
     outputs:
       - { name: churn_probability, dtype: float64, nullable: false }
   sample_input:
     rows:
-      - { tenure_months: 12, monthly_charge: 65.30, contract_type: month-to-month, support_tickets: 3 }
-  artifact_refs:
+      - {
+          tenure_months: 12,
+          monthly_charge: 65.30,
+          contract_type: month-to-month,
+          support_tickets: 3,
+        }
+  card_refs:
     - { kind: Artifact, name: churn-clf-bytes, version: "1.4.2", space: prod }
 
 ---
@@ -128,11 +133,16 @@ spec:
     strict: true
     config:
       site: { type: str, value: datadoghq.com }
-      env:  { type: str, value: prod }
-      tags: { type: list, value: [
-        { type: str, value: "team:churn-ml" },
-        { type: str, value: "service:churn-prediction-svc" }
-      ]}
+      env: { type: str, value: prod }
+      tags:
+        {
+          type: list,
+          value:
+            [
+              { type: str, value: "team:churn-ml" },
+              { type: str, value: "service:churn-prediction-svc" },
+            ],
+        }
   credential_refs:
     - { provider: aws_secrets_manager, name: prod/datadog/api_key }
     - { provider: aws_secrets_manager, name: prod/datadog/app_key }
@@ -151,12 +161,13 @@ spec:
   service_type: api
   components:
     - alias: model
-      ref: { kind: Model, name: churn-classifier, version: "1.4.2", space: prod }
+      ref:
+        { kind: Model, name: churn-classifier, version: "1.4.2", space: prod }
     - alias: ddog
       ref: { kind: Service, name: ddog-sink, version: "1.0.0", space: prod }
   entry_point: acme.churn.service:app
   deployment:
-    image:    { type: str, value: registry.acme.com/churn-svc:1.4.2 }
+    image: { type: str, value: registry.acme.com/churn-svc:1.4.2 }
     replicas: { type: number, value: 3 }
   runtime:
     kind: api
@@ -186,10 +197,16 @@ spec:
       categorical_features: [contract_type]
       binning_strategy: quantile_10
       alert_threshold: 0.2
-  baseline_ref: { kind: Data,    name: churn-events,      version: "2026.06.01", space: prod }
+  baseline_ref:
+    { kind: Data, name: churn-events, version: "2026.06.01", space: prod }
   target_refs:
-    - { kind: Model,   name: churn-classifier,  version: "1.4.2",      space: prod }
-    - { kind: Service, name: churn-prediction-svc, version: "1.4.2",   space: prod }
+    - { kind: Model, name: churn-classifier, version: "1.4.2", space: prod }
+    - {
+        kind: Service,
+        name: churn-prediction-svc,
+        version: "1.4.2",
+        space: prod,
+      }
   features: [tenure_months, monthly_charge, contract_type, support_tickets]
   thresholds:
     psi: 0.2
@@ -206,16 +223,16 @@ spec:
     name: sklearn_train
     version: "1.5.x"
     config:
-      pipeline:  { type: str, value: acme.churn.pipelines:gb_v1 }
+      pipeline: { type: str, value: acme.churn.pipelines:gb_v1 }
       max_depth: { type: number, value: 6 }
   inputs:
-    - { name: dataset_ref,    schema_ref: wyrd.CardRef }
+    - { name: dataset_ref, schema_ref: wyrd.CardRef }
     - { name: baseline_model, schema_ref: wyrd.CardRef }
   pre_invoke: []
   post_invoke: []
   budget:
     max_wall_seconds: 7200
-    max_memory_mb:    16384
+    max_memory_mb: 16384
 
 ---
 apiVersion: wyrd/v1
@@ -227,7 +244,8 @@ metadata:
 spec:
   source:
     kind: drift_observation
-    card: { kind: Drift, name: churn-feature-drift, version: "1.0.0", space: prod }
+    card:
+      { kind: Drift, name: churn-feature-drift, version: "1.0.0", space: prod }
   target: { kind: Operator, name: churn-retrain, version: "1.0.0", space: prod }
   cooldown_seconds: 86400
   config:

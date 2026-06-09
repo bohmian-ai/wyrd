@@ -4,7 +4,7 @@
   "description": "Grouping and comparison context for related runs.",
   "type": "object",
   "properties": {
-    "artifact_refs": {
+    "card_refs": {
       "description": "Artifact references.",
       "type": "array",
       "items": {

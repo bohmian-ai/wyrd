@@ -61,7 +61,7 @@ pub struct ModelCardMetadata {
     /// Optional sample input descriptor.
     pub sample_input: Option<RustSampleInput>,
     /// Existing durable Artifact card references for this model card.
-    pub artifact_refs: Vec<CardRef>,
+    pub card_refs: Vec<CardRef>,
 }
 
 impl Default for ModelCardMetadata {
@@ -78,7 +78,7 @@ impl Default for ModelCardMetadata {
             task_type: TaskType::Other,
             signature: RustModelSignature::new(Vec::new(), Vec::new()),
             sample_input: None,
-            artifact_refs: Vec::new(),
+            card_refs: Vec::new(),
         }
     }
 }
@@ -234,21 +234,21 @@ impl ModelCardMetadata {
     /// Returns a Wyrd error when task type, signature, sample input, interface,
     /// or artifact reference values cannot be parsed into the Rust spec shape.
     #[new]
-    #[pyo3(signature = (*, interface=None, task_type="other", signature=None, sample_input=None, artifact_refs=None))]
+    #[pyo3(signature = (*, interface=None, task_type="other", signature=None, sample_input=None, card_refs=None))]
     pub fn __new__(
         py: Python<'_>,
         interface: Option<&Bound<'_, PyAny>>,
         task_type: &str,
         signature: Option<&Bound<'_, PyAny>>,
         sample_input: Option<&Bound<'_, PyAny>>,
-        artifact_refs: Option<&Bound<'_, PyAny>>,
+        card_refs: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<Self> {
         Ok(Self {
             interface: parse_metadata_interface(py, interface)?,
             task_type: parse_task_type(task_type)?,
             signature: parse_metadata_signature(signature)?,
             sample_input: parse_metadata_sample_input(sample_input)?,
-            artifact_refs: parse_metadata_artifact_refs(artifact_refs)?,
+            card_refs: parse_metadata_card_refs(card_refs)?,
         })
     }
 
@@ -646,7 +646,7 @@ impl ModelCard {
                     task_type: envelope.spec.task_type,
                     signature: envelope.spec.signature,
                     sample_input: envelope.spec.sample_input,
-                    artifact_refs: envelope.spec.artifact_refs,
+                    card_refs: envelope.spec.card_refs,
                 },
                 created_at: utc_now(),
                 is_card: true,
@@ -992,7 +992,7 @@ fn model_spec_from_metadata(
         task_type: metadata.task_type,
         signature: metadata.signature.clone(),
         sample_input: metadata.sample_input.clone(),
-        artifact_refs: metadata.artifact_refs.clone(),
+        card_refs: metadata.card_refs.clone(),
     }
 }
 
@@ -1058,7 +1058,7 @@ fn parse_metadata_sample_input(
 }
 
 #[cfg(feature = "python")]
-fn parse_metadata_artifact_refs(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Vec<CardRef>> {
+fn parse_metadata_card_refs(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Vec<CardRef>> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
@@ -1155,7 +1155,7 @@ mod tests {
                 task_type: TaskType::BinaryClassification,
                 signature: valid_signature(),
                 sample_input: None,
-                artifact_refs: Vec::new(),
+                card_refs: Vec::new(),
             },
             created_at: Utc::now(),
             is_card: true,

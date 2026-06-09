@@ -9,8 +9,8 @@
     "stats"
   ],
   "properties": {
-    "artifact_refs": {
-      "description": "Durable ArtifactCard references linked to this data card.",
+    "card_refs": {
+      "description": "Durable Artifact card references linked to this data card.",
       "default": [],
       "type": "array",
       "items": {
@@ -808,7 +808,7 @@
           ]
         },
         "manifest_ref": {
-          "description": "Optional manifest ArtifactCard reference.",
+          "description": "Optional manifest Artifact card reference.",
           "anyOf": [
             {
               "$ref": "#/definitions/CardRef"
@@ -1284,7 +1284,7 @@
           "type": "string"
         },
         "manifest_ref": {
-          "description": "Optional manifest ArtifactCard reference.",
+          "description": "Optional manifest Artifact card reference.",
           "anyOf": [
             {
               "$ref": "#/definitions/CardRef"

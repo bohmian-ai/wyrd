@@ -77,7 +77,6 @@ tags:
 # =============================================================================
 
 paths:
-
   /protocol:
     get:
       tags: [discovery]
@@ -319,7 +318,6 @@ paths:
 # =============================================================================
 
 components:
-
   # ---------------------------------------------------------------------------
   # Reusable parameters
   # ---------------------------------------------------------------------------
@@ -420,7 +418,6 @@ components:
   # Schemas
   # ---------------------------------------------------------------------------
   schemas:
-
     # =======================================================================
     # I. Envelope
     # =======================================================================
@@ -460,8 +457,11 @@ components:
             - $ref: "#/components/schemas/ArtifactSpec"
             - $ref: "#/components/schemas/TriggerSpec"
             - $ref: "#/components/schemas/OperatorSpec"
-            - { type: object, additionalProperties: true,
-                description: "External kind spec (opaque)" }
+            - {
+                type: object,
+                additionalProperties: true,
+                description: "External kind spec (opaque)",
+              }
         relationships:
           $ref: "#/components/schemas/Relationships"
           description: Server-derived. Authors MUST NOT write.
@@ -474,10 +474,10 @@ components:
       x-wyrd-source: crates/wyrd-spec/src/envelope.rs
       required: [name, version]
       properties:
-        name:        { $ref: "#/components/schemas/CardName" }
-        version:     { $ref: "#/components/schemas/VersionBlock" }
-        space:       { $ref: "#/components/schemas/SpaceName" }
-        uid:         { $ref: "#/components/schemas/CardUid" }
+        name: { $ref: "#/components/schemas/CardName" }
+        version: { $ref: "#/components/schemas/VersionBlock" }
+        space: { $ref: "#/components/schemas/SpaceName" }
+        uid: { $ref: "#/components/schemas/CardUid" }
         labels:
           type: object
           additionalProperties: { type: string }
@@ -487,8 +487,9 @@ components:
           description: |
             Free-form. Keys under `wyrd.io/*` are reserved. User/vendor keys
             MUST use a DNS-style prefix.
-        spec_hash:     { type: string, description: "Server-derived" }
-        artifact_hash: { type: string, description: "Server-derived (ArtifactCards)" }
+        spec_hash: { type: string, description: "Server-derived" }
+        artifact_hash:
+          { type: string, description: "Server-derived (ArtifactCards)" }
 
     CardKind:
       oneOf:
@@ -533,7 +534,7 @@ components:
       description: Server-derived display strings; lacks edge-type.
       properties:
         outbound: { type: array, items: { type: string } }
-        inbound:  { type: array, items: { type: string } }
+        inbound: { type: array, items: { type: string } }
 
     Status:
       type: object
@@ -545,7 +546,7 @@ components:
           description: |
             Free string today; proposed closed enum
             { draft, active, deprecated, archived }.
-        message:    { type: string }
+        message: { type: string }
         updated_at: { type: string, format: date-time }
 
     # =======================================================================
@@ -602,11 +603,11 @@ components:
       x-wyrd-source: crates/wyrd-spec/src/reference.rs
       required: [kind, name, version]
       properties:
-        kind:    { $ref: "#/components/schemas/CardKindName" }
-        name:    { $ref: "#/components/schemas/CardName" }
+        kind: { $ref: "#/components/schemas/CardKindName" }
+        name: { $ref: "#/components/schemas/CardName" }
         version: { $ref: "#/components/schemas/VersionBlock" }
-        space:   { $ref: "#/components/schemas/SpaceName" }
-        uid:     { $ref: "#/components/schemas/CardUid" }
+        space: { $ref: "#/components/schemas/SpaceName" }
+        uid: { $ref: "#/components/schemas/CardUid" }
 
     PromptRef:
       description: "Inline prompt or CardRef→Prompt (untagged union)."
@@ -668,7 +669,7 @@ components:
       x-wyrd-source: crates/wyrd-spec/src/card/artifact.rs
       required: [name, version]
       properties:
-        name:    { type: string, description: "e.g. sklearn | mlflow | datadog" }
+        name: { type: string, description: "e.g. sklearn | mlflow | datadog" }
         version: { type: string }
         config:
           type: object
@@ -679,8 +680,10 @@ components:
       x-wyrd-source: crates/wyrd-spec/src/card/common.rs
       required: [provider, name]
       properties:
-        provider: { type: string, description: "aws_secrets_manager | vault | …" }
-        name:     { type: string, description: "Key or logical name in that provider" }
+        provider:
+          { type: string, description: "aws_secrets_manager | vault | …" }
+        name:
+          { type: string, description: "Key or logical name in that provider" }
 
     NonSecretValue:
       x-wyrd-open-issue: A6
@@ -689,11 +692,48 @@ components:
         Tagged union of non-secret JSON-like config values. Pending unification
         with ParameterValue.
       oneOf:
-        - { type: object, required: [type, value], properties: { type: { const: str    }, value: { type: string  } } }
-        - { type: object, required: [type, value], properties: { type: { const: number }, value: { type: number  } } }
-        - { type: object, required: [type, value], properties: { type: { const: bool   }, value: { type: boolean } } }
-        - { type: object, required: [type, value], properties: { type: { const: list   }, value: { type: array, items: { $ref: "#/components/schemas/NonSecretValue" } } } }
-        - { type: object, required: [type, value], properties: { type: { const: object }, value: { type: object, additionalProperties: { $ref: "#/components/schemas/NonSecretValue" } } } }
+        - {
+            type: object,
+            required: [type, value],
+            properties: { type: { const: str }, value: { type: string } },
+          }
+        - {
+            type: object,
+            required: [type, value],
+            properties: { type: { const: number }, value: { type: number } },
+          }
+        - {
+            type: object,
+            required: [type, value],
+            properties: { type: { const: bool }, value: { type: boolean } },
+          }
+        - {
+            type: object,
+            required: [type, value],
+            properties:
+              {
+                type: { const: list },
+                value:
+                  {
+                    type: array,
+                    items: { $ref: "#/components/schemas/NonSecretValue" },
+                  },
+              },
+          }
+        - {
+            type: object,
+            required: [type, value],
+            properties:
+              {
+                type: { const: object },
+                value:
+                  {
+                    type: object,
+                    additionalProperties:
+                      { $ref: "#/components/schemas/NonSecretValue" },
+                  },
+              },
+          }
 
     ParameterValue:
       x-wyrd-open-issue: A6
@@ -702,31 +742,51 @@ components:
         Typed scalar used for run/experiment/workflow inputs. Pending
         unification with NonSecretValue.
       oneOf:
-        - { type: object, required: [type, value], properties: { type: { const: int   }, value: { type: integer } } }
-        - { type: object, required: [type, value], properties: { type: { const: float }, value: { type: number  } } }
-        - { type: object, required: [type, value], properties: { type: { const: str   }, value: { type: string  } } }
-        - { type: object, required: [type, value], properties: { type: { const: bool  }, value: { type: boolean } } }
-        - { type: object, required: [type, value], properties: { type: { const: json  }, value: {} } }
+        - {
+            type: object,
+            required: [type, value],
+            properties: { type: { const: int }, value: { type: integer } },
+          }
+        - {
+            type: object,
+            required: [type, value],
+            properties: { type: { const: float }, value: { type: number } },
+          }
+        - {
+            type: object,
+            required: [type, value],
+            properties: { type: { const: str }, value: { type: string } },
+          }
+        - {
+            type: object,
+            required: [type, value],
+            properties: { type: { const: bool }, value: { type: boolean } },
+          }
+        - {
+            type: object,
+            required: [type, value],
+            properties: { type: { const: json }, value: {} },
+          }
 
     MetricEntry:
       type: object
       x-wyrd-source: crates/wyrd-spec/src/card/common.rs
       required: [name, value]
       properties:
-        name:       { type: string }
-        value:      { type: number }
-        step:       { type: integer }
-        timestamp:  { type: string, format: date-time }
+        name: { type: string }
+        value: { type: number }
+        step: { type: integer }
+        timestamp: { type: string, format: date-time }
         created_at: { type: string, format: date-time }
-        is_eval:    { type: boolean, default: false }
+        is_eval: { type: boolean, default: false }
 
     AgentInterface:
       type: object
       x-wyrd-source: crates/wyrd-spec/src/card/common.rs
       required: [name, mode]
       properties:
-        name:       { type: string }
-        mode:       { type: string, description: "text | json | audio | tool" }
+        name: { type: string }
+        mode: { type: string, description: "text | json | audio | tool" }
         schema_ref: { $ref: "#/components/schemas/CardRef" }
         metadata:
           type: object
@@ -737,8 +797,9 @@ components:
       x-wyrd-source: crates/wyrd-spec/src/card/common.rs
       required: [protocol]
       properties:
-        protocol: { type: string, description: "a2a | ag_ui | a2ui | mcp | http" }
-        version:  { type: string }
+        protocol:
+          { type: string, description: "a2a | ag_ui | a2ui | mcp | http" }
+        version: { type: string }
         metadata:
           type: object
           additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
@@ -754,8 +815,8 @@ components:
       required: [interface, schema, stats]
       properties:
         interface: { $ref: "#/components/schemas/DataInterface" }
-        schema:    { $ref: "#/components/schemas/DataSchema" }
-        artifact_refs:
+        schema: { $ref: "#/components/schemas/DataSchema" }
+        card_refs:
           type: array
           items: { $ref: "#/components/schemas/CardRef" }
         splits:
@@ -764,7 +825,7 @@ components:
         target_columns:
           type: array
           items: { $ref: "#/components/schemas/ColumnName" }
-        sql:   { $ref: "#/components/schemas/SqlLogic" }
+        sql: { $ref: "#/components/schemas/SqlLogic" }
         stats: { $ref: "#/components/schemas/DataStats" }
 
     DataInterface:
@@ -773,7 +834,21 @@ components:
       properties:
         kind:
           type: string
-          enum: [Pandas, Polars, Arrow, Parquet, Numpy, Torch, Sql, Jsonl, Image, Text, Huggingface, Custom]
+          enum:
+            [
+              Pandas,
+              Polars,
+              Arrow,
+              Parquet,
+              Numpy,
+              Torch,
+              Sql,
+              Jsonl,
+              Image,
+              Text,
+              Huggingface,
+              Custom,
+            ]
         meta:
           type: object
           additionalProperties: true
@@ -791,8 +866,12 @@ components:
       x-wyrd-source: crates/wyrd-spec/src/card/field.rs
       required: [name, dtype]
       properties:
-        name:     { $ref: "#/components/schemas/ColumnName" }
-        dtype:    { type: string, description: "Wyrd dtype (e.g. int32, float64, string, bool)" }
+        name: { $ref: "#/components/schemas/ColumnName" }
+        dtype:
+          {
+            type: string,
+            description: "Wyrd dtype (e.g. int32, float64, string, bool)",
+          }
         nullable: { type: boolean, default: true }
         dims:
           type: array
@@ -802,12 +881,38 @@ components:
       type: object
       required: [label, strategy]
       properties:
-        label:    { $ref: "#/components/schemas/SplitName" }
+        label: { $ref: "#/components/schemas/SplitName" }
         strategy:
           oneOf:
-            - { type: object, required: [kind, meta], properties: { kind: { const: row_fraction }, meta: { type: object } } }
-            - { type: object, required: [kind, meta], properties: { kind: { const: materialized }, meta: { type: object, properties: { artifact_ref: { $ref: "#/components/schemas/CardRef" } } } } }
-            - { type: object, required: [kind, meta], properties: { kind: { const: predicate    }, meta: { type: object } } }
+            - {
+                type: object,
+                required: [kind, meta],
+                properties:
+                  { kind: { const: row_fraction }, meta: { type: object } },
+              }
+            - {
+                type: object,
+                required: [kind, meta],
+                properties:
+                  {
+                    kind: { const: materialized },
+                    meta:
+                      {
+                        type: object,
+                        properties:
+                          {
+                            artifact_ref:
+                              { $ref: "#/components/schemas/CardRef" },
+                          },
+                      },
+                  },
+              }
+            - {
+                type: object,
+                required: [kind, meta],
+                properties:
+                  { kind: { const: predicate }, meta: { type: object } },
+              }
             - { type: object, additionalProperties: true }
 
     SqlLogic:
@@ -841,11 +946,15 @@ components:
           type: array
           items: { type: string, format: uri }
         content_type: { type: string }
-        size_bytes:   { type: integer, format: int64, minimum: 0 }
-        integrity:    { type: string, description: "e.g. sha256:<hex64>" }
-        schema_ref:   { $ref: "#/components/schemas/CardRef" }
+        size_bytes: { type: integer, format: int64, minimum: 0 }
+        integrity: { type: string, description: "e.g. sha256:<hex64>" }
+        schema_ref: { $ref: "#/components/schemas/CardRef" }
         framework_adapter: { $ref: "#/components/schemas/FrameworkAdapterRef" }
-        external_uri: { type: string, description: "Upstream-registry URI; e.g. models:/foo/Production" }
+        external_uri:
+          {
+            type: string,
+            description: "Upstream-registry URI; e.g. models:/foo/Production",
+          }
         metadata:
           type: object
           additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
@@ -861,14 +970,14 @@ components:
           - Native (`request` present): stored Prompt shape directly.
       properties:
         provider: { type: string, description: "Declarative form" }
-        model:    { type: string }
+        model: { type: string }
         messages:
           type: array
           items:
             type: object
             required: [role, content]
             properties:
-              role:    { type: string, enum: [system, user, assistant, tool] }
+              role: { type: string, enum: [system, user, assistant, tool] }
               content: { type: string }
         variables:
           type: array
@@ -876,7 +985,15 @@ components:
         response_format:
           oneOf:
             - { type: string, enum: [text] }
-            - { type: object, required: [kind, schema], properties: { kind: { const: json_schema }, schema: { type: object, additionalProperties: true } } }
+            - {
+                type: object,
+                required: [kind, schema],
+                properties:
+                  {
+                    kind: { const: json_schema },
+                    schema: { type: object, additionalProperties: true },
+                  },
+              }
         request:
           type: object
           additionalProperties: true
@@ -900,7 +1017,7 @@ components:
         sample_input:
           type: object
           additionalProperties: true
-        artifact_refs:
+        card_refs:
           type: array
           items: { $ref: "#/components/schemas/CardRef" }
 
@@ -910,7 +1027,18 @@ components:
       properties:
         kind:
           type: string
-          enum: [Sklearn, Xgboost, Lightgbm, Catboost, Torch, Lightning, Tensorflow, Huggingface, Custom]
+          enum:
+            [
+              Sklearn,
+              Xgboost,
+              Lightgbm,
+              Catboost,
+              Torch,
+              Lightning,
+              Tensorflow,
+              Huggingface,
+              Custom,
+            ]
         meta:
           type: object
           additionalProperties: true
@@ -945,7 +1073,7 @@ components:
       x-wyrd-source: crates/wyrd-spec/src/card/tool.rs
       required: [name, description, tool_type, args_schema]
       properties:
-        name:        { type: string, pattern: "^[a-z][a-z0-9_]*$" }
+        name: { type: string, pattern: "^[a-z][a-z0-9_]*$" }
         description: { type: string }
         tool_type:
           x-wyrd-open-issue: A10
@@ -953,8 +1081,18 @@ components:
           description: |
             Free string today; proposed closed enum
             { Script | Api | Mcp | Builtin | Workflow | Agent }.
-        args_schema:    { type: object, additionalProperties: true, description: "JSON Schema" }
-        output_schema:  { type: object, additionalProperties: true, description: "JSON Schema" }
+        args_schema:
+          {
+            type: object,
+            additionalProperties: true,
+            description: "JSON Schema",
+          }
+        output_schema:
+          {
+            type: object,
+            additionalProperties: true,
+            description: "JSON Schema",
+          }
         script_config:
           type: object
           additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
@@ -1004,10 +1142,10 @@ components:
       type: object
       x-wyrd-source: crates/wyrd-spec/src/card/agent.rs
       properties:
-        max_iterations:       { type: integer, minimum: 1 }
+        max_iterations: { type: integer, minimum: 1 }
         tool_concurrency_cap: { type: integer, minimum: 1 }
         session_recent_limit: { type: integer, minimum: 0 }
-        timeout_ms:           { type: integer, minimum: 1 }
+        timeout_ms: { type: integer, minimum: 1 }
 
     # --- II.7 SubAgent ---------------------------------------------------
     SubAgentSpec:
@@ -1015,8 +1153,8 @@ components:
       x-wyrd-source: crates/wyrd-spec/src/card/subagent.rs
       properties:
         description: { type: string }
-        prompt:      { type: string }
-        model:       { type: string }
+        prompt: { type: string }
+        model: { type: string }
         tool_refs:
           type: array
           items: { $ref: "#/components/schemas/CardRef" }
@@ -1026,14 +1164,14 @@ components:
         skill_refs:
           type: array
           items: { $ref: "#/components/schemas/CardRef" }
-        max_turns:       { type: integer, minimum: 1 }
+        max_turns: { type: integer, minimum: 1 }
         permission_mode: { type: string }
         memory:
           type: object
           additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
         background: { type: boolean, default: false }
-        effort:     { type: string }
-        isolation:  { type: string }
+        effort: { type: string }
+        isolation: { type: string }
         compatible_clis:
           type: array
           items: { type: string }
@@ -1041,8 +1179,8 @@ components:
           type: array
           items: { type: string }
         sandbox_mode: { type: string }
-        temperature:  { type: number, minimum: 0, maximum: 2 }
-        governance:        { $ref: "#/components/schemas/Governance" }
+        temperature: { type: number, minimum: 0, maximum: 2 }
+        governance: { $ref: "#/components/schemas/Governance" }
         observation_hooks: { $ref: "#/components/schemas/ObservationHooks" }
         details:
           type: object
@@ -1063,7 +1201,7 @@ components:
         outputs:
           type: object
           additionalProperties: true
-        governance:        { $ref: "#/components/schemas/Governance" }
+        governance: { $ref: "#/components/schemas/Governance" }
         observation_hooks: { $ref: "#/components/schemas/ObservationHooks" }
         details:
           type: object
@@ -1073,7 +1211,7 @@ components:
       type: object
       required: [id, action]
       properties:
-        id:     { type: string }
+        id: { type: string }
         action: { $ref: "#/components/schemas/WorkflowAction" }
         depends_on:
           type: array
@@ -1081,9 +1219,9 @@ components:
         inputs:
           type: object
           additionalProperties: { $ref: "#/components/schemas/ParameterValue" }
-        condition:       { type: string }
+        condition: { type: string }
         timeout_seconds: { type: integer, minimum: 1 }
-        retry:           { $ref: "#/components/schemas/WorkflowRetryPolicy" }
+        retry: { $ref: "#/components/schemas/WorkflowRetryPolicy" }
         display:
           type: object
           additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
@@ -1104,7 +1242,7 @@ components:
       type: object
       required: [max_retries]
       properties:
-        max_retries:        { type: integer, minimum: 0 }
+        max_retries: { type: integer, minimum: 0 }
         initial_backoff_ms: { type: integer, minimum: 0 }
 
     # --- II.9 Operator ---------------------------------------------------
@@ -1120,7 +1258,7 @@ components:
             type: object
             required: [name, schema_ref]
             properties:
-              name:       { type: string }
+              name: { type: string }
               schema_ref: { type: string }
         pre_invoke:
           type: array
@@ -1132,8 +1270,8 @@ components:
           type: object
           properties:
             max_wall_seconds: { type: integer, minimum: 1 }
-            max_memory_mb:    { type: integer, minimum: 1 }
-            max_tool_calls:   { type: integer, minimum: 1 }
+            max_memory_mb: { type: integer, minimum: 1 }
+            max_tool_calls: { type: integer, minimum: 1 }
 
     # --- II.10 Service ---------------------------------------------------
     ServiceSpec:
@@ -1175,7 +1313,7 @@ components:
           type: array
           items: { $ref: "#/components/schemas/CredentialRef" }
         content_hash: { type: string }
-        lock_hash:    { type: string }
+        lock_hash: { type: string }
         metadata:
           type: object
           additionalProperties: { $ref: "#/components/schemas/NonSecretValue" }
@@ -1188,7 +1326,7 @@ components:
           type: string
           x-wyrd-open-issue: A27
           description: Service-local. Surfaces MUST NOT present as CardName.
-        ref:    { $ref: "#/components/schemas/CardRef" }
+        ref: { $ref: "#/components/schemas/CardRef" }
         source: { $ref: "#/components/schemas/ComponentSource" }
         config:
           type: object
@@ -1288,8 +1426,8 @@ components:
           x-wyrd-note: "Proposed. Not present in code yet."
           type: object
           properties:
-            space:  { $ref: "#/components/schemas/SpaceName" }
-            kind:   { $ref: "#/components/schemas/CardKindName" }
+            space: { $ref: "#/components/schemas/SpaceName" }
+            kind: { $ref: "#/components/schemas/CardKindName" }
             labels:
               type: object
               additionalProperties: { type: string }
@@ -1301,7 +1439,7 @@ components:
       type: object
       required: [name, expression, action]
       properties:
-        name:       { type: string }
+        name: { type: string }
         expression: { type: string }
         action:
           type: string
@@ -1366,7 +1504,7 @@ components:
       type: object
       required: [type, config]
       properties:
-        type:   { type: string, enum: [Spc, Psi, Custom, Agent] }
+        type: { type: string, enum: [Spc, Psi, Custom, Agent] }
         config:
           oneOf:
             - { $ref: "#/components/schemas/SpcProfile" }
@@ -1377,7 +1515,7 @@ components:
     SpcProfile:
       type: object
       properties:
-        sample_size:     { type: integer, minimum: 1 }
+        sample_size: { type: integer, minimum: 1 }
         feature_map:
           type: object
           additionalProperties: { type: string }
@@ -1390,22 +1528,22 @@ components:
           type: array
           items: { type: string }
         binning_strategy: { type: string }
-        alert_threshold:  { type: number }
+        alert_threshold: { type: number }
 
     CustomProfile:
       type: object
       required: [metric]
       properties:
-        metric:          { type: string }
-        sample_size:     { type: integer, minimum: 1 }
+        metric: { type: string }
+        sample_size: { type: integer, minimum: 1 }
         alert_threshold: { type: number }
 
     AgentEvalProfile:
       type: object
       required: [task]
       properties:
-        task:            { type: string }
-        sample_ratio:    { type: number, minimum: 0, maximum: 1 }
+        task: { type: string }
+        sample_ratio: { type: number, minimum: 0, maximum: 1 }
         alert_threshold: { type: number }
 
     # --- II.16 Eval ------------------------------------------------------
@@ -1438,7 +1576,7 @@ components:
         default_parameters:
           type: object
           additionalProperties: { $ref: "#/components/schemas/ParameterValue" }
-        governance:        { $ref: "#/components/schemas/Governance" }
+        governance: { $ref: "#/components/schemas/Governance" }
         observation_hooks: { $ref: "#/components/schemas/ObservationHooks" }
         details:
           type: object
@@ -1448,7 +1586,8 @@ components:
       type: object
       required: [type, config]
       properties:
-        type:   { type: string, enum: [Assertion, Judge, Benchmark, Agentic, Custom] }
+        type:
+          { type: string, enum: [Assertion, Judge, Benchmark, Agentic, Custom] }
         config:
           oneOf:
             - { $ref: "#/components/schemas/AssertionEvalProfile" }
@@ -1529,17 +1668,17 @@ components:
       type: object
       required: [name, operator, threshold]
       properties:
-        name:      { type: string }
-        operator:  { type: string, description: "e.g. >= | > | <= | <" }
+        name: { type: string }
+        operator: { type: string, description: "e.g. >= | > | <= | <" }
         threshold: { type: number }
 
     EvalRubricItem:
       type: object
       required: [name, description]
       properties:
-        name:        { type: string }
+        name: { type: string }
         description: { type: string }
-        weight:      { type: number, minimum: 0 }
+        weight: { type: number, minimum: 0 }
 
     EvalScenario:
       type: object
@@ -1600,7 +1739,7 @@ components:
       x-wyrd-source: crates/wyrd-spec/src/card/experiment.rs
       properties:
         experiment_type: { type: string }
-        description:     { type: string }
+        description: { type: string }
         target_refs:
           type: array
           items: { $ref: "#/components/schemas/CardRef" }
@@ -1614,7 +1753,7 @@ components:
           type: array
           items: { $ref: "#/components/schemas/MetricEntry" }
         best_run_ref: { $ref: "#/components/schemas/RunRef" }
-        artifact_refs:
+        card_refs:
           type: array
           items: { $ref: "#/components/schemas/CardRef" }
         details:
@@ -1626,9 +1765,9 @@ components:
       x-wyrd-source: crates/wyrd-spec/src/run.rs
       required: [run_id]
       properties:
-        run_id:    { type: string, format: uuid }
-        run_kind:  { type: string }
-        card_ref:  { $ref: "#/components/schemas/CardRef" }
+        run_id: { type: string, format: uuid }
+        run_kind: { type: string }
+        card_ref: { $ref: "#/components/schemas/CardRef" }
 
     # =======================================================================
     # IV / V. Operation envelopes
@@ -1656,14 +1795,14 @@ components:
               outcome:
                 type: string
                 enum: [accepted, conflict, validation_rejected, policy_blocked]
-              card:    { $ref: "#/components/schemas/Card" }
+              card: { $ref: "#/components/schemas/Card" }
               problem: { $ref: "#/components/schemas/Problem" }
 
     DryRunResult:
       type: object
       required: [ok]
       properties:
-        ok:       { type: boolean }
+        ok: { type: boolean }
         problems:
           type: array
           items: { $ref: "#/components/schemas/Problem" }
@@ -1677,7 +1816,7 @@ components:
         type:
           type: string
           enum: [created, updated, deleted]
-        card:   { $ref: "#/components/schemas/Card" }
+        card: { $ref: "#/components/schemas/Card" }
         cursor: { type: string }
 
     LineageNeighbors:
@@ -1703,8 +1842,8 @@ components:
       type: object
       required: [protocol, api_version, capabilities]
       properties:
-        protocol:       { const: wyrd }
-        api_version:    { const: wyrd/v1 }
+        protocol: { const: wyrd }
+        api_version: { const: wyrd/v1 }
         server_version: { type: string }
         capabilities:
           type: object
@@ -1741,8 +1880,12 @@ components:
             type: object
             required: [path, since, removal]
             properties:
-              path:    { type: string, description: "JSON-pointer or operation/scope id" }
-              since:   { type: string }
+              path:
+                {
+                  type: string,
+                  description: "JSON-pointer or operation/scope id",
+                }
+              since: { type: string }
               removal: { type: string }
 
     # =======================================================================
@@ -1754,20 +1897,20 @@ components:
       x-wyrd-open-issue: A24
       required: [schema, observation_id, emitted_at, emitter, event]
       properties:
-        schema:         { const: wyrd/v1 }
+        schema: { const: wyrd/v1 }
         observation_id: { type: string, description: "ULID" }
-        emitted_at:     { type: string, format: date-time }
+        emitted_at: { type: string, format: date-time }
         emitter:
           type: object
           required: [kind, ref]
           properties:
-            kind:        { $ref: "#/components/schemas/CardKindName" }
-            ref:         { $ref: "#/components/schemas/CardRef" }
+            kind: { $ref: "#/components/schemas/CardKindName" }
+            ref: { $ref: "#/components/schemas/CardRef" }
             service_ref: { $ref: "#/components/schemas/CardRef" }
         run:
           type: object
           properties:
-            run_id:        { type: string }
+            run_id: { type: string }
             parent_run_id: { type: string }
         event:
           type: string
@@ -1779,8 +1922,8 @@ components:
           type: object
           required: [trace_id, span_id]
           properties:
-            trace_id:       { type: string, pattern: "^[0-9a-f]{32}$" }
-            span_id:        { type: string, pattern: "^[0-9a-f]{16}$" }
+            trace_id: { type: string, pattern: "^[0-9a-f]{32}$" }
+            span_id: { type: string, pattern: "^[0-9a-f]{16}$" }
             parent_span_id: { type: string, pattern: "^[0-9a-f]{16}$" }
         attributes:
           type: object
@@ -1795,9 +1938,14 @@ components:
       x-wyrd-source: crates/wyrd-spec/src/error.rs
       required: [type, title, status, code, detail]
       properties:
-        type:        { type: string, format: uri, example: "https://wyrd.io/errors/WYRD_SPEC_400_VALIDATION" }
-        title:       { type: string }
-        status:      { type: integer }
+        type:
+          {
+            type: string,
+            format: uri,
+            example: "https://wyrd.io/errors/WYRD_SPEC_400_VALIDATION",
+          }
+        title: { type: string }
+        status: { type: integer }
         code:
           type: string
           description: Wyrd error code.
@@ -1808,8 +1956,8 @@ components:
             - WYRD_SPEC_409_CONFLICT
             - WYRD_SPEC_500_INTERNAL
             - WYRD_SPEC_502_UPSTREAM_FAILURE
-        detail:      { type: string }
-        trace_id:    { type: string, pattern: "^[0-9a-f]{32}$" }
+        detail: { type: string }
+        trace_id: { type: string, pattern: "^[0-9a-f]{32}$" }
         remediation: { type: string }
         details:
           type: object

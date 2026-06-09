@@ -52,8 +52,8 @@ pub struct DataCardMetadata {
     pub interface: RustDataInterface,
     /// Inferred or supplied data schema.
     pub schema: DataSchema,
-    /// Existing durable Artifact card references for this data card.
-    pub artifact_refs: Vec<CardRef>,
+    /// Existing durable card references for this data card.
+    pub card_refs: Vec<CardRef>,
     /// Declared split strategies by split label.
     pub splits: HashMap<SplitName, DataSplit>,
     /// Target columns for supervised workflows.
@@ -73,7 +73,7 @@ impl Default for DataCardMetadata {
                 extra: BTreeMap::new(),
             }),
             schema: DataSchema::empty(),
-            artifact_refs: Vec::new(),
+            card_refs: Vec::new(),
             splits: HashMap::new(),
             target_columns: Vec::new(),
             sql: None,
@@ -277,7 +277,7 @@ impl DataCard {
     ) -> CardPyResult<Self> {
         let py = data.py();
         let mut metadata = metadata.unwrap_or_default();
-        let (interface, artifact_ref) =
+        let (interface, card_ref) =
             DataCardInput::extract_bound(data, false)?.into_parts(py, &metadata)?;
 
         if let Some(handle) = interface.as_ref() {
@@ -285,8 +285,8 @@ impl DataCard {
             metadata.schema = infer_schema_from_handle(handle, py)?;
             metadata.sql = sql_logic_from_handle(handle, py)?;
         }
-        if let Some(artifact_ref) = artifact_ref {
-            metadata.artifact_refs.push(artifact_ref);
+        if let Some(card_ref) = card_ref {
+            metadata.card_refs.push(card_ref);
         }
 
         Ok(Self {
@@ -613,7 +613,7 @@ impl DataCard {
 
     fn attach_data(&mut self, py: Python<'_>, data: Option<&Bound<'_, PyAny>>) -> CardPyResult<()> {
         if let Some(data) = data {
-            let (interface, artifact_ref) =
+            let (interface, card_ref) =
                 DataCardInput::extract_bound(data, true)?.into_parts(py, &self.metadata)?;
             if let Some(handle) = interface {
                 self.metadata.interface = handle.to_spec_interface(py)?;
@@ -621,8 +621,8 @@ impl DataCard {
                 self.metadata.sql = sql_logic_from_handle(&handle, py)?;
                 self.interface = Some(handle.into_py_any(py)?);
             }
-            if let Some(artifact_ref) = artifact_ref {
-                self.metadata.artifact_refs.push(artifact_ref);
+            if let Some(card_ref) = card_ref {
+                self.metadata.card_refs.push(card_ref);
             }
             return Ok(());
         }
@@ -658,7 +658,7 @@ impl DataCard {
                 metadata: DataCardMetadata {
                     interface: envelope.spec.interface,
                     schema: envelope.spec.schema,
-                    artifact_refs: envelope.spec.artifact_refs,
+                    card_refs: envelope.spec.card_refs,
                     splits: envelope.spec.splits,
                     target_columns: envelope.spec.target_columns,
                     sql: envelope.spec.sql,
@@ -873,7 +873,7 @@ fn data_spec_from_metadata(metadata: &DataCardMetadata, interface: RustDataInter
     DataSpec {
         interface,
         schema: metadata.schema.clone(),
-        artifact_refs: metadata.artifact_refs.clone(),
+        card_refs: metadata.card_refs.clone(),
         splits: metadata.splits.clone(),
         target_columns: metadata.target_columns.clone(),
         sql: metadata.sql.clone(),
@@ -930,7 +930,7 @@ mod tests {
                     ColumnName::new("value").expect("static column name is valid"),
                     "int64",
                 )]),
-                artifact_refs: Vec::new(),
+                card_refs: Vec::new(),
                 splits: HashMap::new(),
                 target_columns: Vec::new(),
                 sql: None,

@@ -9,7 +9,7 @@
     "task_type"
   ],
   "properties": {
-    "artifact_refs": {
+    "card_refs": {
       "description": "Durable Artifact card references linked to this model card.",
       "default": [],
       "type": "array",

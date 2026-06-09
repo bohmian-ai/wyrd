@@ -51,7 +51,7 @@ def test_repr_contains_identity_fields() -> None:
 
 def test_rejects_unknown_kind() -> None:
     with pytest.raises(WyrdError) as exc_info:
-        CardRef(kind="NotAKind", name="x", version="1.0.0")
+        CardRef(kind="NotAKind", name="card-x", version="1.0.0")
 
     assert exc_info.value.code == "WYRD_SPEC_400_VALIDATION"
     assert "unknown card kind" in str(exc_info.value).lower()
@@ -59,7 +59,7 @@ def test_rejects_unknown_kind() -> None:
 
 def test_rejects_invalid_version() -> None:
     with pytest.raises(WyrdError) as exc_info:
-        CardRef(kind=Kind.Model, name="x", version="not-a-version")
+        CardRef(kind=Kind.Model, name="card-x", version="not-a-version")
 
     assert exc_info.value.code == "WYRD_SPEC_400_VALIDATION"
 
@@ -88,7 +88,7 @@ def test_rejects_invalid_version() -> None:
     ],
 )
 def test_every_native_kind_is_accepted(kind: str) -> None:
-    ref = CardRef(kind=kind, name="x", version="1.0.0")
+    ref = CardRef(kind=kind, name="card-x", version="1.0.0")
 
     assert ref.kind.name == kind
 
@@ -117,7 +117,7 @@ def test_every_native_kind_is_accepted(kind: str) -> None:
     ],
 )
 def test_every_native_kind_enum_is_accepted(kind: Kind, name: str) -> None:
-    ref = CardRef(kind=kind, name="x", version="1.0.0")
+    ref = CardRef(kind=kind, name="card-x", version="1.0.0")
 
     assert ref.kind == kind
     assert ref.kind.name == name

@@ -1,7 +1,7 @@
 # AUTO-GENERATED STUB FILE. DO NOT EDIT.
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
 #### begin imports ####
-from . import data, model, prompt
+from . import cards, data, model, prompt
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError
 from .agent import Agent, AgentRun, FinishReason, RunConfig, local_registry, tool
 from .data import DataCard, Split
@@ -52,6 +52,7 @@ __all__ = [
     "Split",
     "ToolError",
     "WyrdError",
+    "cards",
     "data",
     "local_registry",
     "model",

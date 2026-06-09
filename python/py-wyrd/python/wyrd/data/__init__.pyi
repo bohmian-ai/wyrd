@@ -5,6 +5,7 @@
 from collections.abc import Mapping, Sequence
 from typing import Any, overload
 
+from ..cards import CardRef
 from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError
 
 #### end of imports ####
@@ -506,38 +507,6 @@ class Split:
         """Return this split strategy as a JSON-compatible dictionary."""
         ...
 
-class ArtifactCard:
-    """Minimal Artifact card reference holder accepted by DataCard.
-
-    This PR1 holder exists so a DataCard can point at bytes that are already
-    durable without creating or uploading a new artifact during local save.
-    """
-
-    space: str
-    name: str
-    version: str
-    uid: str
-
-    def __init__(
-        self,
-        space: str | None = ...,
-        name: str | None = ...,
-        version: str | None = ...,
-        uid: str | None = ...,
-    ) -> None:
-        """Create an Artifact card reference holder.
-
-        Args:
-            space (str | None): Optional artifact space. Defaults to
-                `default`.
-            name (str | None): Optional artifact name. Defaults to `artifact`.
-            version (str | None): Optional semantic version. Defaults to
-                `0.1.0`.
-            uid (str | None): Optional artifact UID. Defaults to a generated
-                UID.
-        """
-        ...
-
 class DataCardMetadata:
     """Python holder metadata used to build a durable DataCard spec."""
 
@@ -633,6 +602,41 @@ class DataCard:
     @overload
     def __init__(
         self,
+        data: CardRef,
+        space: str | None = ...,
+        name: str | None = ...,
+        version: str | None = ...,
+        uid: str | None = ...,
+        labels: StringMap | None = ...,
+        annotations: StringMap | None = ...,
+        metadata: DataCardMetadata | None = ...,
+    ) -> None:
+        """Create a DataCard from an existing Artifact card reference.
+
+        Args:
+            data (CardRef): Reference with kind `Kind.Artifact` or
+                `kind="Artifact"`.
+            space (str | None): Optional card space. Defaults to `default`.
+            name (str | None): Optional card name. Defaults to `data`.
+            version (str | None): Optional semantic version. Defaults to
+                `0.1.0`.
+            uid (str | None): Optional card UID. Defaults to a generated UID.
+            labels (StringMap | None): Queryable user labels copied into the
+                card metadata.
+            annotations (StringMap | None): Free-form user annotations copied
+                into the card metadata.
+            metadata (DataCardMetadata | None): Existing holder metadata to
+                seed before artifact reference attachment.
+
+        Raises:
+            WyrdError: If the CardRef kind is not Artifact or holder metadata
+                is invalid.
+        """
+        ...
+
+    @overload
+    def __init__(
+        self,
         data: Any,
         space: str | None = ...,
         name: str | None = ...,
@@ -710,6 +714,17 @@ class DataCard:
         """Return this DataCard envelope as JSON without filesystem IO."""
         ...
 
+    def as_card_ref(self) -> CardRef:
+        """Return a CardRef pointing at this DataCard.
+
+        Returns:
+            CardRef: Reference with kind `Kind.Data`.
+
+        Raises:
+            WyrdError: If holder identity fields are invalid.
+        """
+        ...
+
     @staticmethod
     def model_validate_json(json_string: str, interface: Any = ...) -> DataCard:
         """Build a DataCard from serialized Wyrd card JSON.
@@ -718,13 +733,13 @@ class DataCard:
             json_string (str): Serialized DataCard envelope.
             interface (Any): Optional built-in interface, Python subclass
                 instance, Python subclass type reconstructed through
-                `from_metadata`, or ArtifactCard to attach after parsing.
+                `from_metadata`, or CardRef with kind Artifact to attach after
+                parsing.
         """
         ...
 
 __all__ = [
     "ArrowInterface",
-    "ArtifactCard",
     "DataCard",
     "DataCardMetadata",
     "DataInterface",

@@ -639,13 +639,24 @@ signal + condition + math. No scheduling, no dispatch. Scheduling is a
 ```yaml
 spec:
   description?: string
-  method: DriftMethod            # Spc | Psi | Custom | Agent | External
+  method: DriftMethod            # Spc | Psi | Custom | External
   subject_ref: CardRef           # → Model | Agent | Service | Data — singular
   signal: DriftSignal            # how the measurement enters the monitor
   condition: DriftCondition      # when a sample becomes an emittable observation
   profile?: DriftProfile         # method-specific math config (PSI bins, SPC window, etc.)
   details: { string: NonSecretValue }
 ```
+
+**`Agent` is deliberately absent from `DriftMethod` in v1.** Agent-behavior drift
+(tool-call distribution shifts, response-format drift, step-count anomalies) is
+real but underspecified: it has no settled signal vocabulary, no profile shape,
+and no canonical scoring algorithm. Adding the enum variant before that work
+lands would freeze a contract we cannot honor. The variant is re-added once a
+follow-up design dialogue locks `AgentDriftProfile`, its signal channels, and
+the scoring algorithm — tracked as Drift-7 in
+`wyrd-plan/plans/phase-4-vala/02-foundations/implementation_plan/03-drift-primitive/12-followups.md`.
+Eval-score drift on agents is addressable today via `DriftSignal::EvalScore` +
+`DriftMethod::Spc`.
 
 `DriftSignal` is a closed enum:
 

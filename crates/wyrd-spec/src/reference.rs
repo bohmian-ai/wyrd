@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "python")]
 use pyo3::{
     IntoPyObjectExt,
-    exceptions::{PyRuntimeError, PyValueError},
+    exceptions::PyRuntimeError,
     prelude::*,
-    types::{PyAny, PyDict, PyList},
+    types::{PyDict, PyList},
 };
 
 use crate::envelope::CardKind;
@@ -354,9 +354,9 @@ fn invalid_identity(field: &str, value: &str, error: impl std::fmt::Display) -> 
 fn wyrd_error_to_py_err(error: WyrdError) -> PyErr {
     Python::attach(|py| match build_wyrd_py_exception(py, &error) {
         Ok(exception) => PyErr::from_value(exception),
-        Err(source) => {
-            PyValueError::new_err(format!("{error}; failed to attach Wyrd metadata: {source}"))
-        }
+        Err(source) => PyRuntimeError::new_err(format!(
+            "failed to construct structured Wyrd Python error: {source}"
+        )),
     })
 }
 
@@ -382,7 +382,16 @@ fn build_wyrd_py_exception<'py>(py: Python<'py>, error: &WyrdError) -> PyResult<
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    let exception_type = py.import("wyrd._wyrd")?.getattr("WyrdError")?;
+    let exception_name = if code.starts_with("WYRD_AGENT_") || code.starts_with("SKALD_AGENT_") {
+        "AgentError"
+    } else if code.starts_with("WYRD_TOOL_") || code.starts_with("SKALD_TOOL_") {
+        "ToolError"
+    } else if code.starts_with("WYRD_SESSION_") || code.starts_with("SKALD_SESSION_") {
+        "SessionError"
+    } else {
+        "WyrdError"
+    };
+    let exception_type = py.import("wyrd._wyrd")?.getattr(exception_name)?;
     let exception = exception_type.call1((message.clone(),))?;
     exception.setattr("code", code)?;
     exception.setattr("message", message)?;
@@ -457,6 +466,19 @@ mod tests {
         let json = serde_json::to_string(&card_ref).expect("serialize");
         let parsed: CardRef = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(card_ref, parsed);
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn kind_from_external_card_kind_returns_validation_error() {
+        let external = CardKind::External {
+            name: "vendor.plugin".to_string(),
+            schema_hash: [0u8; 32],
+        };
+        let result = Kind::from_card_kind(&external);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("vendor.plugin"));
     }
 
     #[test]

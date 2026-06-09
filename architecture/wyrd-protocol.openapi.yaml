@@ -886,34 +886,60 @@ components:
           oneOf:
             - {
                 type: object,
-                required: [kind, meta],
+                required: [kind, value],
                 properties:
-                  { kind: { const: row_fraction }, meta: { type: object } },
+                  {
+                    kind: { const: Materialized },
+                    value: { $ref: "#/components/schemas/CardRef" },
+                  },
               }
             - {
                 type: object,
-                required: [kind, meta],
+                required: [kind, value],
                 properties:
                   {
-                    kind: { const: materialized },
-                    meta:
+                    kind: { const: Column },
+                    value:
                       {
                         type: object,
+                        required: [name, op, value],
                         properties:
                           {
-                            artifact_ref:
-                              { $ref: "#/components/schemas/CardRef" },
+                            name: { type: string },
+                            op: { type: string },
+                            value: { type: string },
                           },
                       },
                   },
               }
             - {
                 type: object,
-                required: [kind, meta],
+                required: [kind, value],
                 properties:
-                  { kind: { const: predicate }, meta: { type: object } },
+                  {
+                    kind: { const: IndexRange },
+                    value:
+                      {
+                        type: object,
+                        required: [start, stop],
+                        properties:
+                          {
+                            start: { type: integer, format: int64 },
+                            stop: { type: integer, format: int64 },
+                          },
+                      },
+                  },
               }
-            - { type: object, additionalProperties: true }
+            - {
+                type: object,
+                required: [kind, value],
+                properties:
+                  {
+                    kind: { const: Indices },
+                    value:
+                      { type: array, items: { type: integer, format: int64 } },
+                  },
+              }
 
     SqlLogic:
       type: object

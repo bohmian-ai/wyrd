@@ -456,7 +456,7 @@ spec:
 
 **Required fields:** `interface`, `schema`, `stats`.
 **Optional fields:** `card_refs`, `splits`, `target_columns`, `sql`.
-**CardRefs:** `card_refs → Artifact`; `splits[*].artifact_ref → Artifact`.
+**CardRefs:** `card_refs → Artifact`; `splits[*].strategy.value → Artifact` (Materialized splits only).
 **Validation:** schema columns MUST be unique; split keys MUST be unique.
 **Worked example:** `01-ml-prediction-service.yaml`, `03-rag-workflow-service.yaml`.
 **Runtime emissions:** none directly; runs are emitted by Cards that consume Data.

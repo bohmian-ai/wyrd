@@ -40,7 +40,16 @@ class CardRef:
     string to the constructor.
     """
 
-    kind: Kind
+    @property
+    def kind(self) -> Kind:
+        """Native kind of the referenced card.
+
+        Raises:
+            WyrdError: If the card ref points at an external kind not
+                representable as ``wyrd.cards.Kind``.
+        """
+        ...
+
     name: str
     version: str
     space: str | None

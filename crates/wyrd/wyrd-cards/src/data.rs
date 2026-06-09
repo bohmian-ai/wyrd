@@ -967,6 +967,44 @@ mod tests {
     }
 
     #[test]
+    fn as_card_ref_returns_err_for_empty_name() {
+        let card = DataCard {
+            space: "default".to_string(),
+            name: String::new(),
+            version: "0.1.0".to_string(),
+            uid: String::new(),
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            metadata: DataCardMetadata::default(),
+            created_at: DateTime::<Utc>::from_timestamp(0, 0)
+                .expect("unix epoch timestamp is valid"),
+            is_card: true,
+            #[cfg(feature = "python")]
+            interface: None,
+        };
+        assert!(card.as_card_ref().is_err());
+    }
+
+    #[test]
+    fn as_card_ref_returns_err_for_invalid_version() {
+        let card = DataCard {
+            space: "default".to_string(),
+            name: "my-dataset".to_string(),
+            version: "not-semver".to_string(),
+            uid: String::new(),
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            metadata: DataCardMetadata::default(),
+            created_at: DateTime::<Utc>::from_timestamp(0, 0)
+                .expect("unix epoch timestamp is valid"),
+            is_card: true,
+            #[cfg(feature = "python")]
+            interface: None,
+        };
+        assert!(card.as_card_ref().is_err());
+    }
+
+    #[test]
     fn as_card_ref_returns_data_kind() {
         let mut labels = BTreeMap::new();
         labels.insert(

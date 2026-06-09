@@ -3,6 +3,7 @@
 from collections.abc import Mapping, Sequence
 from typing import Any, overload
 
+from .cards import CardRef
 from .data import FieldSpec
 from .error import WyrdError
 from .header import CardRefLike, JsonDict, PathLike, StringMap
@@ -650,7 +651,7 @@ class ModelCardMetadata:
             sample_input (SampleInput | JsonDict | None): Optional sample input
                 descriptor.
             artifact_refs (Sequence[CardRefLike] | None): Existing durable
-                ArtifactCard references.
+                Artifact card references.
         """
         ...
 
@@ -820,6 +821,17 @@ class ModelCard:
 
     def model_dump_json(self) -> str:
         """Return this ModelCard envelope as JSON without filesystem IO."""
+        ...
+
+    def as_card_ref(self) -> CardRef:
+        """Return a CardRef pointing at this ModelCard.
+
+        Returns:
+            CardRef: Reference with kind `Kind.Model`.
+
+        Raises:
+            WyrdError: If holder identity fields are invalid.
+        """
         ...
 
     @staticmethod

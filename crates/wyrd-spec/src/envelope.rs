@@ -2,9 +2,9 @@
 
 use std::collections::BTreeMap;
 
+use schemars::JsonSchema;
 use schemars::r#gen::SchemaGenerator;
 use schemars::schema::{InstanceType, Metadata as SchemaMetadata, Schema, SchemaObject};
-use schemars::JsonSchema;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;

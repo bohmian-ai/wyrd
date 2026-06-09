@@ -28,7 +28,8 @@ fn x_bar_s_parity_with_hand_computation() {
     };
     let fname = FeatureName::new("x").expect("valid feature name");
 
-    let baseline = fit_spc_baseline(&batch, &profile, &[fname.clone()]).expect("baseline");
+    let baseline =
+        fit_spc_baseline(&batch, &profile, std::slice::from_ref(&fname)).expect("baseline");
 
     let fitted = baseline.features.get(&fname).expect("feature");
     let expected_stddev_adj = (2.0_f64).sqrt() / 0.8;

@@ -44,7 +44,8 @@ fn fit_adaptive_chunk_size_small_data() {
     let profile = spc_profile(0);
     let fname = feature("x");
 
-    let baseline = fit_spc_baseline(&batch, &profile, &[fname.clone()]).expect("baseline");
+    let baseline =
+        fit_spc_baseline(&batch, &profile, std::slice::from_ref(&fname)).expect("baseline");
 
     assert_eq!(baseline.chunk_size, 25);
     let fitted = baseline.features.get(&fname).expect("feature");
@@ -70,7 +71,8 @@ fn fit_from_int_column() {
     let profile = spc_profile(0);
     let fname = feature("x");
 
-    let baseline = fit_spc_baseline(&batch, &profile, &[fname.clone()]).expect("baseline");
+    let baseline =
+        fit_spc_baseline(&batch, &profile, std::slice::from_ref(&fname)).expect("baseline");
 
     let fitted = baseline.features.get(&fname).expect("feature");
     assert!(fitted.center > 0.0);
@@ -82,7 +84,8 @@ fn fit_includes_trailing_partial_chunk_for_center() {
     let profile = spc_profile(4);
     let fname = feature("x");
 
-    let baseline = fit_spc_baseline(&batch, &profile, &[fname.clone()]).expect("baseline");
+    let baseline =
+        fit_spc_baseline(&batch, &profile, std::slice::from_ref(&fname)).expect("baseline");
 
     let fitted = baseline.features.get(&fname).expect("feature");
     assert!((fitted.center - 52.0).abs() < 1e-12);

@@ -13,6 +13,10 @@ pub struct ColumnRef<'a> {
     pub array: &'a ArrayRef,
 }
 
+/// Column extraction failed because Arrow could not cast or downcast the array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnCastError;
+
 impl<'a> ColumnRef<'a> {
     pub fn data_type_string(&self) -> String {
         format!("{:?}", self.array.data_type())
@@ -20,11 +24,14 @@ impl<'a> ColumnRef<'a> {
 
     /// Cast and return all non-null `f64` values.
     ///
-    /// Returns `Err(())` if the column cannot be cast to `Float64`. Callers
-    /// translate this to the appropriate Wyrd error variant.
-    pub fn collect_f64_non_null(&self) -> Result<Vec<f64>, ()> {
-        let casted = cast(self.array, &DataType::Float64).map_err(|_| ())?;
-        let arr = casted.as_any().downcast_ref::<Float64Array>().ok_or(())?;
+    /// Returns [`ColumnCastError`] if the column cannot be cast to `Float64`.
+    /// Callers translate this to the appropriate Wyrd error variant.
+    pub fn collect_f64_non_null(&self) -> Result<Vec<f64>, ColumnCastError> {
+        let casted = cast(self.array, &DataType::Float64).map_err(|_| ColumnCastError)?;
+        let arr = casted
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or(ColumnCastError)?;
         let mut out = Vec::with_capacity(arr.len().saturating_sub(arr.null_count()));
         for i in 0..arr.len() {
             if arr.is_valid(i) {
@@ -36,10 +43,13 @@ impl<'a> ColumnRef<'a> {
 
     /// Cast and return all non-null string values.
     ///
-    /// Returns `Err(())` if the column cannot be cast to `Utf8`.
-    pub fn collect_string_non_null(&self) -> Result<Vec<String>, ()> {
-        let casted = cast(self.array, &DataType::Utf8).map_err(|_| ())?;
-        let arr = casted.as_any().downcast_ref::<StringArray>().ok_or(())?;
+    /// Returns [`ColumnCastError`] if the column cannot be cast to `Utf8`.
+    pub fn collect_string_non_null(&self) -> Result<Vec<String>, ColumnCastError> {
+        let casted = cast(self.array, &DataType::Utf8).map_err(|_| ColumnCastError)?;
+        let arr = casted
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or(ColumnCastError)?;
         let mut out = Vec::with_capacity(arr.len().saturating_sub(arr.null_count()));
         for i in 0..arr.len() {
             if arr.is_valid(i) {

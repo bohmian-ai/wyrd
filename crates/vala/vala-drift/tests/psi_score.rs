@@ -49,7 +49,8 @@ fn psi_identical_distributions_no_drift() {
     let target_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
     let profile = psi_profile_default();
     let fname = feature("x");
-    let baseline = fit_psi_baseline(&baseline_batch, &profile, &[fname.clone()]).expect("baseline");
+    let baseline = fit_psi_baseline(&baseline_batch, &profile, std::slice::from_ref(&fname))
+        .expect("baseline");
 
     let report = score_psi(&baseline, &target_batch, &profile).expect("report");
 
@@ -78,7 +79,8 @@ fn psi_target_too_small_is_inconclusive_with_nan_score_and_threshold() {
     let target_batch = numeric_batch("x", (0..50).map(|value| value as f64).collect());
     let profile = psi_profile_default();
     let fname = feature("x");
-    let baseline = fit_psi_baseline(&baseline_batch, &profile, &[fname.clone()]).expect("baseline");
+    let baseline = fit_psi_baseline(&baseline_batch, &profile, std::slice::from_ref(&fname))
+        .expect("baseline");
 
     let report = score_psi(&baseline, &target_batch, &profile).expect("report");
 
@@ -153,7 +155,8 @@ fn psi_new_categorical_values_count_in_denominator_only() {
         categorical_features: vec![fname.clone()],
         threshold: PsiThreshold::Fixed { value: 100.0 },
     };
-    let baseline = fit_psi_baseline(&baseline_batch, &profile, &[fname.clone()]).expect("baseline");
+    let baseline = fit_psi_baseline(&baseline_batch, &profile, std::slice::from_ref(&fname))
+        .expect("baseline");
 
     let report = score_psi(&baseline, &target_batch, &profile).expect("report");
 

@@ -151,7 +151,7 @@ fn target_numeric_proportions(
     let values =
         column
             .collect_f64_non_null()
-            .map_err(|()| DriftScoreError::FeatureTypeMismatch {
+            .map_err(|_| DriftScoreError::FeatureTypeMismatch {
                 feature: fitted.feature.as_str().to_string(),
             })?;
     let total = values.len() as u64;
@@ -193,7 +193,7 @@ fn target_categorical_proportions(
     let values =
         column
             .collect_string_non_null()
-            .map_err(|()| DriftScoreError::FeatureTypeMismatch {
+            .map_err(|_| DriftScoreError::FeatureTypeMismatch {
                 feature: fitted.feature.as_str().to_string(),
             })?;
     let total = values.len() as u64;
@@ -273,7 +273,7 @@ fn fit_numeric(
 
     let values = column
         .collect_f64_non_null()
-        .map_err(|()| DriftFitError::FeatureNotNumeric {
+        .map_err(|_| DriftFitError::FeatureNotNumeric {
             feature: column.name.to_string(),
             arrow_type: column.data_type_string(),
         })?;
@@ -326,7 +326,7 @@ fn fit_categorical(
     let values =
         column
             .collect_string_non_null()
-            .map_err(|()| DriftFitError::FeatureNotCategorical {
+            .map_err(|_| DriftFitError::FeatureNotCategorical {
                 feature: column.name.to_string(),
                 arrow_type: column.data_type_string(),
             })?;

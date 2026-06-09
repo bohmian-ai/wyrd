@@ -60,7 +60,7 @@ pub fn fit_spc_baseline(
         let values =
             column
                 .collect_f64_non_null()
-                .map_err(|()| DriftFitError::FeatureNotNumeric {
+                .map_err(|_| DriftFitError::FeatureNotNumeric {
                     feature: feature.as_str().to_string(),
                     arrow_type: column.data_type_string(),
                 })?;

@@ -581,7 +581,7 @@ impl PromptCard {
         Ok(self.to_prompt_spec_from_metadata()?.is_fully_bound())
     }
 
-    /// Convert this PromptCard's identity into a Wyrd CardRef.
+    /// Convert this `PromptCard`'s identity into a Wyrd `CardRef`.
     ///
     /// # Errors
     /// Returns a Wyrd validation error when identity fields fail newtype

@@ -404,7 +404,7 @@ impl DataCard {
         &self.uid
     }
 
-    /// Convert this DataCard's identity into a Wyrd CardRef.
+    /// Convert this `DataCard`'s identity into a Wyrd `CardRef`.
     ///
     /// # Errors
     /// Returns a Wyrd validation error when identity fields fail newtype

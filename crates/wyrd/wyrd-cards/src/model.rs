@@ -377,7 +377,7 @@ impl ModelCard {
         &self.uid
     }
 
-    /// Convert this ModelCard's identity into a Wyrd CardRef.
+    /// Convert this `ModelCard`'s identity into a Wyrd `CardRef`.
     ///
     /// # Errors
     /// Returns a Wyrd validation error when identity fields fail newtype

@@ -28,6 +28,7 @@ use {
     pyo3::types::{PyAny, PyAnyMethods},
     std::path::PathBuf,
     wyrd_interfaces::error::WyrdPyError,
+    crate::card_ref::CardRefPy,
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
 };
 
@@ -587,8 +588,8 @@ impl PromptCard {
     /// Returns a Wyrd validation error when identity fields fail newtype
     /// invariants.
     #[pyo3(name = "as_card_ref")]
-    pub fn as_card_ref_py(&self) -> CardPyResult<CardRef> {
-        self.as_card_ref().map_err(Into::into)
+    pub fn as_card_ref_py(&self) -> CardPyResult<CardRefPy> {
+        self.as_card_ref().map(CardRefPy).map_err(Into::into)
     }
 
     /// Save this `PromptCard` envelope to a local JSON or YAML file.

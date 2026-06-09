@@ -8,7 +8,7 @@ repository = { workspace = true }
 authors = { workspace = true }
 [features]
 default = []
-python = ["dep:pyo3", "chrono/clock", "wyrd-interfaces/python", "wyrd-utils/python", "skald-prompt/python", "wyrd-spec/python"]
+python = ["dep:pyo3", "chrono/clock", "wyrd-interfaces/python", "wyrd-utils/python", "skald-prompt/python"]
 
 [dependencies]
 skald-spec = { workspace = true }

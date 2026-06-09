@@ -25,6 +25,7 @@ use {
     std::path::PathBuf,
     wyrd_interfaces::data::dtype::{extract_pathbuf, is_path_like},
     wyrd_interfaces::error::WyrdPyError,
+    crate::card_ref::CardRefPy,
     wyrd_interfaces::model::interfaces::{
         CatboostInterface as ModelCatboostInterface,
         HuggingfaceInterface as ModelHuggingfaceInterface,
@@ -383,8 +384,8 @@ impl ModelCard {
     /// Returns a Wyrd validation error when identity fields fail newtype
     /// invariants.
     #[pyo3(name = "as_card_ref")]
-    pub fn as_card_ref_py(&self) -> CardPyResult<CardRef> {
-        self.as_card_ref().map_err(Into::into)
+    pub fn as_card_ref_py(&self) -> CardPyResult<CardRefPy> {
+        self.as_card_ref().map(CardRefPy).map_err(Into::into)
     }
 
     /// Set the `ModelCard` UID.

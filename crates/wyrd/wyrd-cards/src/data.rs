@@ -35,6 +35,7 @@ use {
     wyrd_interfaces::data::schema::PyDataSchema,
     wyrd_interfaces::data::stats::PyDataStats,
     wyrd_interfaces::error::WyrdPyError,
+    crate::card_ref::CardRefPy,
     wyrd_spec::envelope::Metadata as EnvelopeMetadata,
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
 };
@@ -410,8 +411,8 @@ impl DataCard {
     /// Returns a Wyrd validation error when identity fields fail newtype
     /// invariants.
     #[pyo3(name = "as_card_ref")]
-    pub fn as_card_ref_py(&self) -> CardPyResult<CardRef> {
-        self.as_card_ref().map_err(Into::into)
+    pub fn as_card_ref_py(&self) -> CardPyResult<CardRefPy> {
+        self.as_card_ref().map(CardRefPy).map_err(Into::into)
     }
 
     /// Set the `DataCard` UID.
@@ -687,8 +688,8 @@ enum DataCardInput {
 #[cfg(feature = "python")]
 impl DataCardInput {
     fn extract_bound(data: &Bound<'_, PyAny>, allow_interface_class: bool) -> CardPyResult<Self> {
-        if data.is_instance_of::<CardRef>() {
-            let card_ref = data.extract::<CardRef>()?;
+        if data.is_instance_of::<CardRefPy>() {
+            let card_ref = data.extract::<CardRefPy>()?.0;
             if card_ref.kind != CardKind::Artifact {
                 return Err(WyrdPyError::validation_with_details(
                     "DataCard Artifact input requires a CardRef with kind=Artifact",

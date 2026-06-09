@@ -1,0 +1,323 @@
+//! Python-boundary card reference types: `CardRef` and `Kind`.
+
+use pyo3::prelude::*;
+use pyo3::types::PyAny;
+use wyrd_spec::envelope::CardKind;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+use wyrd_spec::reference::CardRef;
+use wyrd_spec::version::VersionBlock;
+use wyrd_utils::py::wyrd_error_to_py_err;
+
+/// Native Wyrd card kind accepted by Python CardRef construction.
+#[pyclass(module = "wyrd.cards", name = "Kind", eq, eq_int, from_py_object)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Data Card.
+    Data,
+    /// Model Card.
+    Model,
+    /// Experiment Card.
+    Experiment,
+    /// Prompt Card.
+    Prompt,
+    /// Tool Card.
+    Tool,
+    /// Agent Card.
+    Agent,
+    /// Workflow Card.
+    Workflow,
+    /// Evaluation Card.
+    Eval,
+    /// Drift Card.
+    Drift,
+    /// Service Card.
+    Service,
+    /// Policy Card.
+    Policy,
+    /// MCP Card.
+    Mcp,
+    /// Skill Card.
+    Skill,
+    /// Sub-agent Card.
+    SubAgent,
+    /// Audit Card.
+    Audit,
+    /// Artifact Card.
+    Artifact,
+    /// Trigger Card.
+    Trigger,
+    /// Operator Card.
+    Operator,
+}
+
+impl Kind {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Data => "Data",
+            Self::Model => "Model",
+            Self::Experiment => "Experiment",
+            Self::Prompt => "Prompt",
+            Self::Tool => "Tool",
+            Self::Agent => "Agent",
+            Self::Workflow => "Workflow",
+            Self::Eval => "Eval",
+            Self::Drift => "Drift",
+            Self::Service => "Service",
+            Self::Policy => "Policy",
+            Self::Mcp => "Mcp",
+            Self::Skill => "Skill",
+            Self::SubAgent => "SubAgent",
+            Self::Audit => "Audit",
+            Self::Artifact => "Artifact",
+            Self::Trigger => "Trigger",
+            Self::Operator => "Operator",
+        }
+    }
+
+    fn into_card_kind(self) -> CardKind {
+        match self {
+            Self::Data => CardKind::Data,
+            Self::Model => CardKind::Model,
+            Self::Experiment => CardKind::Experiment,
+            Self::Prompt => CardKind::Prompt,
+            Self::Tool => CardKind::Tool,
+            Self::Agent => CardKind::Agent,
+            Self::Workflow => CardKind::Workflow,
+            Self::Eval => CardKind::Eval,
+            Self::Drift => CardKind::Drift,
+            Self::Service => CardKind::Service,
+            Self::Policy => CardKind::Policy,
+            Self::Mcp => CardKind::Mcp,
+            Self::Skill => CardKind::Skill,
+            Self::SubAgent => CardKind::SubAgent,
+            Self::Audit => CardKind::Audit,
+            Self::Artifact => CardKind::Artifact,
+            Self::Trigger => CardKind::Trigger,
+            Self::Operator => CardKind::Operator,
+        }
+    }
+
+    pub(crate) fn from_card_kind(kind: &CardKind) -> Result<Self, WyrdError> {
+        match kind {
+            CardKind::Data => Ok(Self::Data),
+            CardKind::Model => Ok(Self::Model),
+            CardKind::Experiment => Ok(Self::Experiment),
+            CardKind::Prompt => Ok(Self::Prompt),
+            CardKind::Tool => Ok(Self::Tool),
+            CardKind::Agent => Ok(Self::Agent),
+            CardKind::Workflow => Ok(Self::Workflow),
+            CardKind::Eval => Ok(Self::Eval),
+            CardKind::Drift => Ok(Self::Drift),
+            CardKind::Service => Ok(Self::Service),
+            CardKind::Policy => Ok(Self::Policy),
+            CardKind::Mcp => Ok(Self::Mcp),
+            CardKind::Skill => Ok(Self::Skill),
+            CardKind::SubAgent => Ok(Self::SubAgent),
+            CardKind::Audit => Ok(Self::Audit),
+            CardKind::Artifact => Ok(Self::Artifact),
+            CardKind::Trigger => Ok(Self::Trigger),
+            CardKind::Operator => Ok(Self::Operator),
+            CardKind::External { name, .. } => Err(WyrdError::Validation {
+                message: format!("external card kind is not exposed as wyrd.cards.Kind: {name}"),
+                details: serde_json::json!({
+                    "field": "kind",
+                    "value": name,
+                    "allowed": native_kind_names(),
+                }),
+            }),
+        }
+    }
+}
+
+#[pymethods]
+impl Kind {
+    /// Native Wyrd kind wire name.
+    #[getter]
+    fn name(&self) -> &'static str {
+        self.wire_name()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Kind.{}", self.wire_name())
+    }
+}
+
+/// Python wrapper for a Wyrd card reference.
+///
+/// Exposed to Python as `wyrd.cards.CardRef`. Wraps the pure-Rust `CardRef`
+/// contract type from `wyrd-spec`. Lives in `wyrd-cards` so the error
+/// conversion helpers from `wyrd-utils` are available without a circular dep.
+#[derive(Clone, PartialEq)]
+#[pyclass(module = "wyrd.cards", name = "CardRef", frozen, eq)]
+pub struct CardRefPy(pub CardRef);
+
+#[pymethods]
+impl CardRefPy {
+    /// Build a CardRef from its identity components.
+    ///
+    /// `kind` accepts the native wire name of a registered card kind
+    /// (one of `Data`, `Model`, `Experiment`, `Prompt`, `Tool`, `Agent`,
+    /// `Workflow`, `Eval`, `Drift`, `Service`, `Policy`, `Mcp`, `Skill`,
+    /// `SubAgent`, `Audit`, `Artifact`, `Trigger`, `Operator`). External
+    /// kinds are not constructable from Python in v1.
+    #[new]
+    #[pyo3(signature = (kind, name, version, *, space=None, uid=None))]
+    fn __new__(
+        kind: &Bound<'_, PyAny>,
+        name: &str,
+        version: &str,
+        space: Option<&str>,
+        uid: Option<&str>,
+    ) -> PyResult<Self> {
+        let parsed_kind = parse_kind_input(kind).map_err(wyrd_error_to_py_err)?;
+        let parsed_name = CardName::new(name)
+            .map_err(|error| wyrd_error_to_py_err(invalid_identity("name", name, error)))?;
+        let parsed_version = VersionBlock::parse(version)
+            .map_err(|error| wyrd_error_to_py_err(invalid_identity("version", version, error)))?;
+        let parsed_space = match space {
+            None => None,
+            Some("") => None,
+            Some(value) => Some(SpaceName::new(value).map_err(|error| {
+                wyrd_error_to_py_err(invalid_identity("space", value, error))
+            })?),
+        };
+        let parsed_uid = match uid {
+            None => None,
+            Some("") => None,
+            Some(value) => Some(
+                CardUid::new(value)
+                    .map_err(|error| wyrd_error_to_py_err(invalid_identity("uid", value, error)))?,
+            ),
+        };
+        Ok(Self(CardRef {
+            kind: parsed_kind,
+            name: parsed_name,
+            version: parsed_version,
+            space: parsed_space,
+            uid: parsed_uid,
+        }))
+    }
+
+    /// Native kind of the referenced card.
+    ///
+    /// # Raises
+    /// `WyrdError` if the card ref was deserialized with an external kind not
+    /// representable as `wyrd.cards.Kind`.
+    #[getter]
+    fn kind(&self) -> PyResult<Kind> {
+        Kind::from_card_kind(&self.0.kind).map_err(wyrd_error_to_py_err)
+    }
+
+    /// Referenced card name.
+    #[getter]
+    fn name(&self) -> String {
+        self.0.name.to_string()
+    }
+
+    /// Exact referenced card version.
+    #[getter]
+    fn version(&self) -> String {
+        self.0.version.to_string()
+    }
+
+    /// Optional space; `None` means current/default space.
+    #[getter]
+    fn space(&self) -> Option<String> {
+        self.0.space.as_ref().map(ToString::to_string)
+    }
+
+    /// Optional resolved UID.
+    #[getter]
+    fn uid(&self) -> Option<String> {
+        self.0.uid.as_ref().map(ToString::to_string)
+    }
+
+    fn __repr__(&self) -> String {
+        let space = self
+            .0
+            .space
+            .as_ref()
+            .map_or_else(|| "None".to_string(), |s| format!("'{s}'"));
+        let uid = self
+            .0
+            .uid
+            .as_ref()
+            .map_or_else(|| "None".to_string(), |u| format!("'{u}'"));
+        format!(
+            "CardRef(kind='{}', name='{}', version='{}', space={}, uid={})",
+            self.0.kind.wire_name(),
+            self.0.name,
+            self.0.version,
+            space,
+            uid,
+        )
+    }
+}
+
+fn parse_kind_input(value: &Bound<'_, PyAny>) -> Result<CardKind, WyrdError> {
+    if let Ok(kind) = value.extract::<Kind>() {
+        return Ok(kind.into_card_kind());
+    }
+    if let Ok(kind) = value.extract::<String>() {
+        return parse_native_kind(&kind);
+    }
+    Err(WyrdError::Validation {
+        message: "card ref kind must be a wyrd.cards.Kind or native kind string".to_string(),
+        details: serde_json::json!({
+            "field": "kind",
+            "allowed": native_kind_names(),
+        }),
+    })
+}
+
+fn parse_native_kind(value: &str) -> Result<CardKind, WyrdError> {
+    for native in CardKind::native() {
+        if native.wire_name() == value {
+            return Ok(native);
+        }
+    }
+    Err(WyrdError::Validation {
+        message: format!("unknown card kind: {value}"),
+        details: serde_json::json!({
+            "field": "kind",
+            "value": value,
+            "allowed": native_kind_names(),
+        }),
+    })
+}
+
+fn native_kind_names() -> Vec<&'static str> {
+    CardKind::native()
+        .iter()
+        .filter_map(CardKind::native_name)
+        .collect()
+}
+
+fn invalid_identity(field: &str, value: &str, error: impl std::fmt::Display) -> WyrdError {
+    WyrdError::Validation {
+        message: format!("invalid card ref {field}: {value}"),
+        details: serde_json::json!({
+            "field": field,
+            "value": value,
+            "source": error.to_string(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kind_from_external_card_kind_returns_validation_error() {
+        let external = CardKind::External {
+            name: "vendor.plugin".to_string(),
+            schema_hash: [0u8; 32],
+        };
+        let result = Kind::from_card_kind(&external);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("vendor.plugin"));
+    }
+}

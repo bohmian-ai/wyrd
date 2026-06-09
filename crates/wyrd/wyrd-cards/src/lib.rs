@@ -4,6 +4,9 @@
 
 /// Compatibility re-exports for card holder types.
 pub mod card;
+/// Python-boundary card reference types: CardRef and Kind.
+#[cfg(feature = "python")]
+pub mod card_ref;
 /// DataCard implementation module.
 pub mod data;
 /// Typed envelope holder modules.
@@ -24,8 +27,8 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let model = PyModule::new(py, "model")?;
     let prompt = PyModule::new(py, "prompt")?;
 
-    cards.add_class::<wyrd_spec::reference::CardRef>()?;
-    cards.add_class::<wyrd_spec::reference::Kind>()?;
+    cards.add_class::<card_ref::CardRefPy>()?;
+    cards.add_class::<card_ref::Kind>()?;
 
     wyrd_interfaces::error::register_exceptions(&data)?;
     wyrd_interfaces::data::register(&data)?;

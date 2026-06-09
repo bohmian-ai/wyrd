@@ -15,12 +15,10 @@ path = "src/lib.rs"
 default = []
 server = ["dep:utoipa"]
 wasm = []
-python = ["dep:pyo3"]
 
 [dependencies]
 chrono = { workspace = true }
 hex = { workspace = true }
-pyo3 = { workspace = true, optional = true }
 regex = { workspace = true }
 schemars = { workspace = true }
 semver = { workspace = true }

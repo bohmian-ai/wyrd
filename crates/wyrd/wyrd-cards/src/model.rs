@@ -11,7 +11,8 @@ use wyrd_spec::card::model::{
     CustomMeta as CustomModelMeta, ModelInterface as RustModelInterface,
     ModelSignature as RustModelSignature, ModelSpec, SampleInput as RustSampleInput, TaskType,
 };
-use wyrd_spec::envelope::Spec;
+use wyrd_spec::envelope::{CardKind, Spec};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::version::ApiVersion;
@@ -38,7 +39,7 @@ use {
     wyrd_spec::card::model::{
         HuggingFaceTask, HuggingfaceMeta, TensorflowMeta, TfSaveFormat, TorchMeta, TorchSaveFormat,
     },
-    wyrd_spec::envelope::{CardKind, Metadata as EnvelopeMetadata},
+    wyrd_spec::envelope::Metadata as EnvelopeMetadata,
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
     wyrd_utils::py::pyobject_to_json,
 };
@@ -59,7 +60,7 @@ pub struct ModelCardMetadata {
     pub signature: RustModelSignature,
     /// Optional sample input descriptor.
     pub sample_input: Option<RustSampleInput>,
-    /// Existing durable `ArtifactCard` references for this model card.
+    /// Existing durable Artifact card references for this model card.
     pub artifact_refs: Vec<CardRef>,
 }
 
@@ -86,8 +87,8 @@ impl Default for ModelCardMetadata {
 ///
 /// A `ModelCard` owns local identity, holder metadata, and an optional live
 /// Python model interface. It can save and load local filesystem
-/// materialization, but it never registers itself and never creates
-/// `ArtifactCards`.
+/// materialization, but it never registers itself and never creates Artifact
+/// cards.
 #[cfg_attr(
     feature = "python",
     pyclass(module = "wyrd.model", skip_from_py_object)
@@ -151,6 +152,24 @@ impl ModelCard {
     #[must_use]
     pub fn to_model_spec_from_metadata(&self) -> ModelSpec {
         model_spec_from_metadata(&self.metadata, self.metadata.interface.clone())
+    }
+
+    /// Convert this holder identity into a Model Card reference.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when identity fields are invalid.
+    pub fn as_card_ref(&self) -> Result<CardRef, WyrdError> {
+        use crate::identity::{
+            card_name, optional_card_uid, optional_space_name, version_block,
+        };
+
+        Ok(CardRef {
+            kind: CardKind::Model,
+            name: card_name("name", &self.name)?,
+            version: version_block(&self.version)?,
+            space: optional_space_name(&self.space)?,
+            uid: optional_card_uid(&self.uid)?,
+        })
     }
 
     fn to_card_envelope(&self) -> ModelCardEnvelope<'_> {
@@ -358,6 +377,16 @@ impl ModelCard {
     #[getter]
     pub fn uid(&self) -> &str {
         &self.uid
+    }
+
+    /// Convert this ModelCard's identity into a Wyrd CardRef.
+    ///
+    /// # Errors
+    /// Returns a Wyrd validation error when identity fields fail newtype
+    /// invariants.
+    #[pyo3(name = "as_card_ref")]
+    pub fn as_card_ref_py(&self) -> CardPyResult<CardRef> {
+        self.as_card_ref().map_err(Into::into)
     }
 
     /// Set the `ModelCard` UID.

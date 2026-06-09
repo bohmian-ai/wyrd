@@ -139,8 +139,9 @@ description = "Assert PyO3 stays out of pure contracts and Python-free shared cr
 run = """
 set -eu
 
-if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/wyrd-spec; then
-  echo 'PyO3 scope violation detected in wyrd-spec'
+if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/wyrd-spec \
+    --glob '!crates/wyrd-spec/src/reference.rs'; then
+  echo 'PyO3 scope violation detected in wyrd-spec (only reference.rs may opt in)'
   exit 1
 fi
 

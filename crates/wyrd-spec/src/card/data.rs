@@ -22,7 +22,7 @@ pub struct DataSpec {
     pub interface: DataInterface,
     /// Ordered schema fields for tabular interfaces.
     pub schema: DataSchema,
-    /// Durable ArtifactCard references linked to this data card.
+    /// Durable Artifact card references linked to this data card.
     #[serde(default)]
     pub artifact_refs: Vec<CardRef>,
     /// Declared split strategies by stable split label.
@@ -86,7 +86,7 @@ impl DataSpec {
         self.interface.requires_schema_columns()
     }
 
-    /// Iterate durable ArtifactCard references linked to this data card.
+    /// Iterate durable Artifact card references linked to this data card.
     pub fn artifact_refs(&self) -> impl Iterator<Item = &CardRef> {
         self.artifact_refs.iter()
     }
@@ -108,7 +108,7 @@ impl DataSpec {
         self.splits.get(label)
     }
 
-    /// Iterate materialized ArtifactCard refs declared by split strategies.
+    /// Iterate materialized Artifact card refs declared by split strategies.
     pub fn materialized_split_refs(&self) -> impl Iterator<Item = &CardRef> {
         self.splits.values().filter_map(DataSplit::artifact_ref)
     }
@@ -301,7 +301,7 @@ pub struct DataSplit {
 }
 
 impl DataSplit {
-    /// Build a split that points at a pre-materialized ArtifactCard.
+    /// Build a split that points at a pre-materialized Artifact card.
     #[must_use]
     pub fn materialized(label: SplitName, artifact_ref: CardRef) -> Self {
         Self {
@@ -337,7 +337,7 @@ impl DataSplit {
         }
     }
 
-    /// Return the ArtifactCard reference when this is a materialized split.
+    /// Return the Artifact card reference when this is a materialized split.
     #[must_use]
     pub fn artifact_ref(&self) -> Option<&CardRef> {
         self.strategy.materialized_artifact_ref()
@@ -378,7 +378,7 @@ pub enum SplitStrategy {
 }
 
 impl SplitStrategy {
-    /// Return the ArtifactCard reference carried by a materialized split.
+    /// Return the Artifact card reference carried by a materialized split.
     #[must_use]
     pub fn materialized_artifact_ref(&self) -> Option<&CardRef> {
         match self {
@@ -569,7 +569,7 @@ pub struct JsonlMeta {
 pub struct ImageMeta {
     /// Image file format family.
     pub format: ImageFormat,
-    /// Optional manifest ArtifactCard reference.
+    /// Optional manifest Artifact card reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_ref: Option<CardRef>,
     /// Image color mode.
@@ -583,7 +583,7 @@ pub struct TextMeta {
     /// Text encoding used by local files.
     #[serde(default = "default_text_encoding")]
     pub encoding: String,
-    /// Optional manifest ArtifactCard reference.
+    /// Optional manifest Artifact card reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_ref: Option<CardRef>,
 }

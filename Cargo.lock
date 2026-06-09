@@ -4612,6 +4612,7 @@ dependencies = [
  "chrono",
  "hex",
  "proptest",
+ "pyo3",
  "regex",
  "schemars",
  "semver",

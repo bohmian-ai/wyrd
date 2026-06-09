@@ -217,18 +217,18 @@ impl CardRef {
         uid: Option<&str>,
     ) -> PyResult<Self> {
         let parsed_kind = parse_kind_input(kind).map_err(wyrd_error_to_py_err)?;
-        let parsed_name =
-            CardName::new(name).map_err(|error| wyrd_error_to_py_err(invalid_identity("name", name, error)))?;
+        let parsed_name = CardName::new(name)
+            .map_err(|error| wyrd_error_to_py_err(invalid_identity("name", name, error)))?;
         let parsed_version = VersionBlock::parse(version)
             .map_err(|error| wyrd_error_to_py_err(invalid_identity("version", version, error)))?;
-        let parsed_space = match space {
-            None => None,
-            Some(value) if value.is_empty() => None,
-            Some(value) => Some(
-                SpaceName::new(value)
-                    .map_err(|error| wyrd_error_to_py_err(invalid_identity("space", value, error)))?,
-            ),
-        };
+        let parsed_space =
+            match space {
+                None => None,
+                Some(value) if value.is_empty() => None,
+                Some(value) => Some(SpaceName::new(value).map_err(|error| {
+                    wyrd_error_to_py_err(invalid_identity("space", value, error))
+                })?),
+            };
         let parsed_uid = match uid {
             None => None,
             Some(value) if value.is_empty() => None,
@@ -354,15 +354,14 @@ fn invalid_identity(field: &str, value: &str, error: impl std::fmt::Display) -> 
 fn wyrd_error_to_py_err(error: WyrdError) -> PyErr {
     Python::attach(|py| match build_wyrd_py_exception(py, &error) {
         Ok(exception) => PyErr::from_value(exception),
-        Err(source) => PyValueError::new_err(format!("{error}; failed to attach Wyrd metadata: {source}")),
+        Err(source) => {
+            PyValueError::new_err(format!("{error}; failed to attach Wyrd metadata: {source}"))
+        }
     })
 }
 
 #[cfg(feature = "python")]
-fn build_wyrd_py_exception<'py>(
-    py: Python<'py>,
-    error: &WyrdError,
-) -> PyResult<Bound<'py, PyAny>> {
+fn build_wyrd_py_exception<'py>(py: Python<'py>, error: &WyrdError) -> PyResult<Bound<'py, PyAny>> {
     let display = error.to_string();
     let problem = error.as_problem_json();
     let code = problem_string(&problem, "code", error.code()).to_owned();

@@ -159,9 +159,7 @@ impl ModelCard {
     /// # Errors
     /// Returns a Wyrd error when identity fields are invalid.
     pub fn as_card_ref(&self) -> Result<CardRef, WyrdError> {
-        use crate::identity::{
-            card_name, optional_card_uid, optional_space_name, version_block,
-        };
+        use crate::identity::{card_name, optional_card_uid, optional_space_name, version_block};
 
         Ok(CardRef {
             kind: CardKind::Model,

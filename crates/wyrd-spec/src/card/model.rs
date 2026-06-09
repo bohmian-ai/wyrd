@@ -31,7 +31,7 @@ pub struct ModelSpec {
     pub sample_input: Option<SampleInput>,
     /// Durable Artifact card references linked to this model card.
     #[serde(default)]
-    pub artifact_refs: Vec<CardRef>,
+    pub card_refs: Vec<CardRef>,
 }
 
 impl ModelSpec {
@@ -44,14 +44,14 @@ impl ModelSpec {
         task_type: TaskType,
         signature: ModelSignature,
         sample_input: Option<SampleInput>,
-        artifact_refs: Vec<CardRef>,
+        card_refs: Vec<CardRef>,
     ) -> Result<Self, ModelCardError> {
         let spec = Self {
             interface,
             task_type,
             signature,
             sample_input,
-            artifact_refs,
+            card_refs,
         };
         spec.validate()?;
         Ok(spec)
@@ -78,8 +78,8 @@ impl ModelSpec {
     }
 
     /// Iterate durable Artifact card references linked to this model card.
-    pub fn artifact_refs(&self) -> impl Iterator<Item = &CardRef> {
-        self.artifact_refs.iter()
+    pub fn card_refs(&self) -> impl Iterator<Item = &CardRef> {
+        self.card_refs.iter()
     }
 }
 

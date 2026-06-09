@@ -128,7 +128,7 @@ fn model_spec_is_generation_only_for_generation_task() {
 }
 
 #[test]
-fn model_spec_artifact_refs_iterates_declared_refs() {
+fn model_spec_card_refs_iterates_declared_refs() {
     let refs = vec![
         model_ref("model"),
         model_ref("tokenizer"),
@@ -144,13 +144,13 @@ fn model_spec_artifact_refs_iterates_declared_refs() {
     .unwrap();
 
     assert_eq!(
-        spec.artifact_refs().collect::<Vec<_>>(),
+        spec.card_refs().collect::<Vec<_>>(),
         refs.iter().collect::<Vec<_>>()
     );
 }
 
 #[test]
-fn model_spec_artifact_refs_empty_for_local_spec_without_refs() {
+fn model_spec_card_refs_empty_for_local_spec_without_refs() {
     let spec = ModelSpec::new(
         sklearn_interface(),
         TaskType::Regression,
@@ -159,7 +159,7 @@ fn model_spec_artifact_refs_empty_for_local_spec_without_refs() {
         Vec::new(),
     )
     .unwrap();
-    assert_eq!(spec.artifact_refs().count(), 0);
+    assert_eq!(spec.card_refs().count(), 0);
 }
 
 #[test]

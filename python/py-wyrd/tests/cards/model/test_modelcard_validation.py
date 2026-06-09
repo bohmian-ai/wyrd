@@ -156,7 +156,7 @@ def test_custom_json_without_explicit_interface_raises_stable_model_error_code()
             },
             "task_type": "Other",
             "signature": model_signature().to_dict(),
-            "artifact_refs": [],
+            "card_refs": [],
         },
         "relationships": [],
     }

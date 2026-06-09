@@ -5,6 +5,7 @@
 from collections.abc import Mapping, Sequence
 from typing import Any, overload
 
+from ..cards import CardRef
 from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError
 from ..data import FieldSpec
 
@@ -630,7 +631,7 @@ class ModelCardMetadata:
     task_type: str
     signature: ModelSignature | JsonDict
     sample_input: SampleInput | JsonDict | None
-    artifact_refs: list[CardRefLike]
+    card_refs: list[CardRefLike]
 
     def __init__(
         self,
@@ -638,7 +639,7 @@ class ModelCardMetadata:
         task_type: str = ...,
         signature: ModelSignature | JsonDict | None = ...,
         sample_input: SampleInput | JsonDict | None = ...,
-        artifact_refs: Sequence[CardRefLike] | None = ...,
+        card_refs: Sequence[CardRefLike] | None = ...,
     ) -> None:
         """Create ModelCard holder metadata.
 
@@ -650,8 +651,8 @@ class ModelCardMetadata:
                 metadata.
             sample_input (SampleInput | JsonDict | None): Optional sample input
                 descriptor.
-            artifact_refs (Sequence[CardRefLike] | None): Existing durable
-                ArtifactCard references.
+            card_refs (Sequence[CardRefLike] | None): Existing durable
+                Artifact card references.
         """
         ...
 
@@ -797,7 +798,7 @@ class ModelCard:
 
         The held interface writes model bytes. Wyrd updates interface metadata
         and writes the ModelCard envelope; it does not create ArtifactCards or
-        mutate `artifact_refs`.
+        mutate `card_refs`.
 
         Args:
             path (PathLike): Local directory where Wyrd writes model bytes and
@@ -821,6 +822,17 @@ class ModelCard:
 
     def model_dump_json(self) -> str:
         """Return this ModelCard envelope as JSON without filesystem IO."""
+        ...
+
+    def as_card_ref(self) -> CardRef:
+        """Return a CardRef pointing at this ModelCard.
+
+        Returns:
+            CardRef: Reference with kind `Kind.Model`.
+
+        Raises:
+            WyrdError: If holder identity fields are invalid.
+        """
         ...
 
     @staticmethod

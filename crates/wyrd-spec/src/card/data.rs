@@ -22,9 +22,9 @@ pub struct DataSpec {
     pub interface: DataInterface,
     /// Ordered schema fields for tabular interfaces.
     pub schema: DataSchema,
-    /// Durable ArtifactCard references linked to this data card.
+    /// Durable Artifact card references linked to this data card.
     #[serde(default)]
-    pub artifact_refs: Vec<CardRef>,
+    pub card_refs: Vec<CardRef>,
     /// Declared split strategies by stable split label.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub splits: HashMap<SplitName, DataSplit>,
@@ -47,7 +47,7 @@ impl DataSpec {
     pub fn new(
         interface: DataInterface,
         schema: DataSchema,
-        artifact_refs: Vec<CardRef>,
+        card_refs: Vec<CardRef>,
         splits: HashMap<SplitName, DataSplit>,
         target_columns: Vec<ColumnName>,
         sql: Option<SqlLogic>,
@@ -56,7 +56,7 @@ impl DataSpec {
         let spec = Self {
             interface,
             schema,
-            artifact_refs,
+            card_refs,
             splits,
             target_columns,
             sql,
@@ -86,9 +86,9 @@ impl DataSpec {
         self.interface.requires_schema_columns()
     }
 
-    /// Iterate durable ArtifactCard references linked to this data card.
-    pub fn artifact_refs(&self) -> impl Iterator<Item = &CardRef> {
-        self.artifact_refs.iter()
+    /// Iterate durable Artifact card references linked to this data card.
+    pub fn card_refs(&self) -> impl Iterator<Item = &CardRef> {
+        self.card_refs.iter()
     }
 
     /// Return the declared local/storage stats captured by the interface.
@@ -108,9 +108,9 @@ impl DataSpec {
         self.splits.get(label)
     }
 
-    /// Iterate materialized ArtifactCard refs declared by split strategies.
+    /// Iterate materialized Artifact card refs declared by split strategies.
     pub fn materialized_split_refs(&self) -> impl Iterator<Item = &CardRef> {
-        self.splits.values().filter_map(DataSplit::artifact_ref)
+        self.splits.values().filter_map(DataSplit::card_ref)
     }
 }
 
@@ -301,12 +301,12 @@ pub struct DataSplit {
 }
 
 impl DataSplit {
-    /// Build a split that points at a pre-materialized ArtifactCard.
+    /// Build a split that points at a pre-materialized Artifact card.
     #[must_use]
-    pub fn materialized(label: SplitName, artifact_ref: CardRef) -> Self {
+    pub fn materialized(label: SplitName, card_ref: CardRef) -> Self {
         Self {
             label,
-            strategy: SplitStrategy::Materialized(artifact_ref),
+            strategy: SplitStrategy::Materialized(card_ref),
         }
     }
 
@@ -337,10 +337,10 @@ impl DataSplit {
         }
     }
 
-    /// Return the ArtifactCard reference when this is a materialized split.
+    /// Return the Artifact card reference when this is a materialized split.
     #[must_use]
-    pub fn artifact_ref(&self) -> Option<&CardRef> {
-        self.strategy.materialized_artifact_ref()
+    pub fn card_ref(&self) -> Option<&CardRef> {
+        self.strategy.materialized_card_ref()
     }
 
     /// Return the referenced schema column when this is a column predicate split.
@@ -378,11 +378,11 @@ pub enum SplitStrategy {
 }
 
 impl SplitStrategy {
-    /// Return the ArtifactCard reference carried by a materialized split.
+    /// Return the Artifact card reference carried by a materialized split.
     #[must_use]
-    pub fn materialized_artifact_ref(&self) -> Option<&CardRef> {
+    pub fn materialized_card_ref(&self) -> Option<&CardRef> {
         match self {
-            Self::Materialized(artifact_ref) => Some(artifact_ref),
+            Self::Materialized(card_ref) => Some(card_ref),
             _ => None,
         }
     }
@@ -569,7 +569,7 @@ pub struct JsonlMeta {
 pub struct ImageMeta {
     /// Image file format family.
     pub format: ImageFormat,
-    /// Optional manifest ArtifactCard reference.
+    /// Optional manifest Artifact card reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_ref: Option<CardRef>,
     /// Image color mode.
@@ -583,7 +583,7 @@ pub struct TextMeta {
     /// Text encoding used by local files.
     #[serde(default = "default_text_encoding")]
     pub encoding: String,
-    /// Optional manifest ArtifactCard reference.
+    /// Optional manifest Artifact card reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_ref: Option<CardRef>,
 }

@@ -447,7 +447,7 @@ spec:
     meta: { ... }
   schema:
     columns: [ { name, dtype, nullable }, ... ]
-  artifact_refs: [<CardRef→Artifact>, ...]
+  card_refs: [<CardRef→Artifact>, ...]
   splits: { <SplitName>: { kind, meta } }
   target_columns: [<ColumnName>, ...]
   sql: { ... }                              # optional SQL bundle
@@ -455,8 +455,8 @@ spec:
 ```
 
 **Required fields:** `interface`, `schema`, `stats`.
-**Optional fields:** `artifact_refs`, `splits`, `target_columns`, `sql`.
-**CardRefs:** `artifact_refs → Artifact`; `splits[*].artifact_ref → Artifact`.
+**Optional fields:** `card_refs`, `splits`, `target_columns`, `sql`.
+**CardRefs:** `card_refs → Artifact`; `splits[*].strategy.value → Artifact` (Materialized splits only).
 **Validation:** schema columns MUST be unique; split keys MUST be unique.
 **Worked example:** `01-ml-prediction-service.yaml`, `03-rag-workflow-service.yaml`.
 **Runtime emissions:** none directly; runs are emitted by Cards that consume Data.
@@ -540,13 +540,13 @@ spec:
     inputs:  [ { name, dtype, nullable }, ... ]
     outputs: [ { name, dtype, nullable }, ... ]
   sample_input: { rows: [ ... ] }     # optional
-  artifact_refs: [<CardRef→Artifact>, ...]
+  card_refs: [<CardRef→Artifact>, ...]
 ```
 
 **Required fields:** `interface`, `task_type`, `signature.inputs`, `signature.outputs`.
-**CardRefs:** `artifact_refs → Artifact`.
+**CardRefs:** `card_refs → Artifact`.
 **Validation:** every input and output MUST have a `name` and a valid `dtype`;
-`artifact_refs` MUST be non-empty unless `interface.kind == Custom`.
+`card_refs` MUST be non-empty unless `interface.kind == Custom`.
 **Worked example:** `01-ml-prediction-service.yaml`, `04-external-mlflow.yaml`.
 **Runtime emissions:** `card.Model.predict.started | finished | failed` (proposed).
 **Open:** OPEN-A3, OPEN-A4, OPEN-A5 (Governance / ObservationHooks placement).
@@ -1526,7 +1526,7 @@ spec:
 # Model card
 spec:
   interface: { kind: Sklearn, meta: { sklearn_estimator: …, sklearn_version: … } }
-  artifact_refs:
+  card_refs:
     - { kind: Artifact, name: clf-bytes, version: "1.0.0" }
 ```
 

@@ -45,3 +45,40 @@ impl From<CardRef> for PromptRef {
         Self::Card(card_ref)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_ref() -> CardRef {
+        CardRef {
+            kind: CardKind::Artifact,
+            name: CardName::new("weights").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: Some(SpaceName::new("prod").expect("static space is valid")),
+            uid: None,
+        }
+    }
+
+    #[test]
+    fn card_ref_serde_roundtrips() {
+        let card_ref = sample_ref();
+        let json = serde_json::to_string(&card_ref).expect("serialize");
+        let parsed: CardRef = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(card_ref, parsed);
+    }
+
+    #[test]
+    fn card_ref_skips_none_fields() {
+        let card_ref = CardRef {
+            kind: CardKind::Model,
+            name: CardName::new("churn").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: None,
+            uid: None,
+        };
+        let json = serde_json::to_string(&card_ref).expect("serialize");
+        assert!(!json.contains("space"), "space=None must skip");
+        assert!(!json.contains("uid"), "uid=None must skip");
+    }
+}

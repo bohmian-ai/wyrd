@@ -17,19 +17,19 @@ server = ["dep:utoipa"]
 wasm = []
 
 [dependencies]
+chrono = { workspace = true }
+hex = { workspace = true }
+regex = { workspace = true }
+schemars = { workspace = true }
+semver = { workspace = true }
 skald-spec = { workspace = true, features = ["schemars"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-schemars = { workspace = true }
-utoipa = { workspace = true, optional = true }
 thiserror = { workspace = true }
-chrono = { workspace = true }
+utoipa = { workspace = true, optional = true }
 uuid = { workspace = true }
-semver = { workspace = true }
-hex = { workspace = true }
 sha2 = { workspace = true }
-regex = { workspace = true }
 wyrd-error-derive = { path = "../shared/wyrd-error-derive", version = "0.0.1" }
 
 [dev-dependencies]

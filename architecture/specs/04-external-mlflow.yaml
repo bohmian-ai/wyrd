@@ -25,12 +25,12 @@ metadata:
   version: "7.0.0"
   space: prod
   labels:
-    vendor:   mlflow
+    vendor: mlflow
     upstream: mlflow-prod
   annotations:
-    acme.com/mlflow-run-id:       run-9f3c2b18e2af40f08e1aa3c5d6e7f
-    acme.com/mlflow-experiment:   fraud-detection
-    acme.com/mlflow-stage:        Production
+    acme.com/mlflow-run-id: run-9f3c2b18e2af40f08e1aa3c5d6e7f
+    acme.com/mlflow-experiment: fraud-detection
+    acme.com/mlflow-stage: Production
 spec:
   artifact_kind: external_model
   # No artifact_uris because bytes stay in MLflow; only external_uri is set.
@@ -39,9 +39,9 @@ spec:
     name: mlflow
     version: "2.14.x"
     config:
-      tracking_uri:    { type: str, value: https://mlflow.acme.internal }
-      load_flavor:     { type: str, value: pyfunc }
-      stage:           { type: str, value: Production }
+      tracking_uri: { type: str, value: https://mlflow.acme.internal }
+      load_flavor: { type: str, value: pyfunc }
+      stage: { type: str, value: Production }
   metadata:
     runtime_signature:
       type: object
@@ -78,13 +78,13 @@ spec:
   task_type: BinaryClassification
   signature:
     inputs:
-      - { name: amount,            dtype: float64, nullable: false }
-      - { name: merchant_category, dtype: string,  nullable: false }
-      - { name: country,           dtype: string,  nullable: false }
-      - { name: time_of_day,       dtype: int32,   nullable: false }
+      - { name: amount, dtype: float64, nullable: false }
+      - { name: merchant_category, dtype: string, nullable: false }
+      - { name: country, dtype: string, nullable: false }
+      - { name: time_of_day, dtype: int32, nullable: false }
     outputs:
       - { name: fraud_score, dtype: float64, nullable: false }
-  artifact_refs:
+  card_refs:
     - { kind: Artifact, name: mlflow-fraud-v7, version: "7.0.0", space: prod }
 
 ---
@@ -101,15 +101,15 @@ spec:
       uri: s3://acme-data/fraud/baseline-2026-05/
   schema:
     columns:
-      - { name: amount,            dtype: float64, nullable: false }
-      - { name: merchant_category, dtype: string,  nullable: false }
-      - { name: country,           dtype: string,  nullable: false }
-      - { name: time_of_day,       dtype: int32,   nullable: false }
-      - { name: fraud_score,       dtype: float64, nullable: false }
+      - { name: amount, dtype: float64, nullable: false }
+      - { name: merchant_category, dtype: string, nullable: false }
+      - { name: country, dtype: string, nullable: false }
+      - { name: time_of_day, dtype: int32, nullable: false }
+      - { name: fraud_score, dtype: float64, nullable: false }
   stats:
     kind: local
     meta:
-      rows:  3_200_000
+      rows: 3_200_000
       bytes: 412_000_000
 
 ---
@@ -129,7 +129,8 @@ spec:
       alert_threshold: 3.0
       feature_map:
         fraud_score: numeric
-  baseline_ref: { kind: Data,  name: fraud-baseline, version: "2026.05.01", space: prod }
+  baseline_ref:
+    { kind: Data, name: fraud-baseline, version: "2026.05.01", space: prod }
   target_refs:
     - { kind: Model, name: fraud-detector, version: "7.0.0", space: prod }
   features: [fraud_score]
@@ -151,7 +152,7 @@ spec:
       ref: { kind: Model, name: fraud-detector, version: "7.0.0", space: prod }
   entry_point: acme.fraud.scoring:app
   deployment:
-    image:    { type: str, value: registry.acme.com/fraud-scoring:7.0.0 }
+    image: { type: str, value: registry.acme.com/fraud-scoring:7.0.0 }
     replicas: { type: number, value: 4 }
   runtime:
     kind: api

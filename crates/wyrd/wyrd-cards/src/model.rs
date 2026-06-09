@@ -11,13 +11,15 @@ use wyrd_spec::card::model::{
     CustomMeta as CustomModelMeta, ModelInterface as RustModelInterface,
     ModelSignature as RustModelSignature, ModelSpec, SampleInput as RustSampleInput, TaskType,
 };
-use wyrd_spec::envelope::Spec;
+use wyrd_spec::envelope::{CardKind, Spec};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::version::ApiVersion;
 
 #[cfg(feature = "python")]
 use {
+    crate::card_ref::CardRefPy,
     pyo3::prelude::*,
     pyo3::pyclass::{PyTraverseError, PyVisit},
     pyo3::types::{PyAny, PyDict, PyType, PyTypeMethods},
@@ -38,7 +40,7 @@ use {
     wyrd_spec::card::model::{
         HuggingFaceTask, HuggingfaceMeta, TensorflowMeta, TfSaveFormat, TorchMeta, TorchSaveFormat,
     },
-    wyrd_spec::envelope::{CardKind, Metadata as EnvelopeMetadata},
+    wyrd_spec::envelope::Metadata as EnvelopeMetadata,
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
     wyrd_utils::py::pyobject_to_json,
 };
@@ -59,8 +61,8 @@ pub struct ModelCardMetadata {
     pub signature: RustModelSignature,
     /// Optional sample input descriptor.
     pub sample_input: Option<RustSampleInput>,
-    /// Existing durable `ArtifactCard` references for this model card.
-    pub artifact_refs: Vec<CardRef>,
+    /// Existing durable Artifact card references for this model card.
+    pub card_refs: Vec<CardRef>,
 }
 
 impl Default for ModelCardMetadata {
@@ -77,7 +79,7 @@ impl Default for ModelCardMetadata {
             task_type: TaskType::Other,
             signature: RustModelSignature::new(Vec::new(), Vec::new()),
             sample_input: None,
-            artifact_refs: Vec::new(),
+            card_refs: Vec::new(),
         }
     }
 }
@@ -86,8 +88,8 @@ impl Default for ModelCardMetadata {
 ///
 /// A `ModelCard` owns local identity, holder metadata, and an optional live
 /// Python model interface. It can save and load local filesystem
-/// materialization, but it never registers itself and never creates
-/// `ArtifactCards`.
+/// materialization, but it never registers itself and never creates Artifact
+/// cards.
 #[cfg_attr(
     feature = "python",
     pyclass(module = "wyrd.model", skip_from_py_object)
@@ -151,6 +153,22 @@ impl ModelCard {
     #[must_use]
     pub fn to_model_spec_from_metadata(&self) -> ModelSpec {
         model_spec_from_metadata(&self.metadata, self.metadata.interface.clone())
+    }
+
+    /// Convert this holder identity into a Model Card reference.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when identity fields are invalid.
+    pub fn as_card_ref(&self) -> Result<CardRef, WyrdError> {
+        use crate::identity::{card_name, optional_card_uid, optional_space_name, version_block};
+
+        Ok(CardRef {
+            kind: CardKind::Model,
+            name: card_name("name", &self.name)?,
+            version: version_block(&self.version)?,
+            space: optional_space_name(&self.space)?,
+            uid: optional_card_uid(&self.uid)?,
+        })
     }
 
     fn to_card_envelope(&self) -> ModelCardEnvelope<'_> {
@@ -217,21 +235,21 @@ impl ModelCardMetadata {
     /// Returns a Wyrd error when task type, signature, sample input, interface,
     /// or artifact reference values cannot be parsed into the Rust spec shape.
     #[new]
-    #[pyo3(signature = (*, interface=None, task_type="other", signature=None, sample_input=None, artifact_refs=None))]
+    #[pyo3(signature = (*, interface=None, task_type="other", signature=None, sample_input=None, card_refs=None))]
     pub fn __new__(
         py: Python<'_>,
         interface: Option<&Bound<'_, PyAny>>,
         task_type: &str,
         signature: Option<&Bound<'_, PyAny>>,
         sample_input: Option<&Bound<'_, PyAny>>,
-        artifact_refs: Option<&Bound<'_, PyAny>>,
+        card_refs: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<Self> {
         Ok(Self {
             interface: parse_metadata_interface(py, interface)?,
             task_type: parse_task_type(task_type)?,
             signature: parse_metadata_signature(signature)?,
             sample_input: parse_metadata_sample_input(sample_input)?,
-            artifact_refs: parse_metadata_artifact_refs(artifact_refs)?,
+            card_refs: parse_metadata_card_refs(card_refs)?,
         })
     }
 
@@ -358,6 +376,16 @@ impl ModelCard {
     #[getter]
     pub fn uid(&self) -> &str {
         &self.uid
+    }
+
+    /// Convert this `ModelCard`'s identity into a Wyrd `CardRef`.
+    ///
+    /// # Errors
+    /// Returns a Wyrd validation error when identity fields fail newtype
+    /// invariants.
+    #[pyo3(name = "as_card_ref")]
+    pub fn as_card_ref_py(&self) -> CardPyResult<CardRefPy> {
+        self.as_card_ref().map(CardRefPy).map_err(Into::into)
     }
 
     /// Set the `ModelCard` UID.
@@ -619,7 +647,7 @@ impl ModelCard {
                     task_type: envelope.spec.task_type,
                     signature: envelope.spec.signature,
                     sample_input: envelope.spec.sample_input,
-                    artifact_refs: envelope.spec.artifact_refs,
+                    card_refs: envelope.spec.card_refs,
                 },
                 created_at: utc_now(),
                 is_card: true,
@@ -965,7 +993,7 @@ fn model_spec_from_metadata(
         task_type: metadata.task_type,
         signature: metadata.signature.clone(),
         sample_input: metadata.sample_input.clone(),
-        artifact_refs: metadata.artifact_refs.clone(),
+        card_refs: metadata.card_refs.clone(),
     }
 }
 
@@ -1031,7 +1059,7 @@ fn parse_metadata_sample_input(
 }
 
 #[cfg(feature = "python")]
-fn parse_metadata_artifact_refs(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Vec<CardRef>> {
+fn parse_metadata_card_refs(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Vec<CardRef>> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
@@ -1056,7 +1084,7 @@ mod tests {
         ModelInterface as RustModelInterface, ModelSignature as RustModelSignature, SklearnMeta,
         TaskType,
     };
-    use wyrd_spec::envelope::Spec;
+    use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::ids::ColumnName;
     use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue};
 
@@ -1095,6 +1123,16 @@ mod tests {
         assert!(serialized.contains(r#""spec":{"interface":{"kind":"Sklearn""#));
     }
 
+    #[test]
+    fn as_card_ref_returns_model_kind() {
+        let card = model_card();
+        let card_ref = card.as_card_ref().expect("identity is valid");
+
+        assert_eq!(card_ref.kind, CardKind::Model);
+        assert_eq!(card_ref.name.as_str(), "model");
+        assert_eq!(card_ref.version.as_str(), "0.1.0");
+    }
+
     fn model_card() -> ModelCard {
         let mut labels = BTreeMap::new();
         labels.insert(label_key("domain"), label_value("churn"));
@@ -1118,7 +1156,7 @@ mod tests {
                 task_type: TaskType::BinaryClassification,
                 signature: valid_signature(),
                 sample_input: None,
-                artifact_refs: Vec::new(),
+                card_refs: Vec::new(),
             },
             created_at: Utc::now(),
             is_card: true,

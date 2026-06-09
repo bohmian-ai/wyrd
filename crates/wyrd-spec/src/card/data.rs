@@ -24,7 +24,7 @@ pub struct DataSpec {
     pub schema: DataSchema,
     /// Durable Artifact card references linked to this data card.
     #[serde(default)]
-    pub artifact_refs: Vec<CardRef>,
+    pub card_refs: Vec<CardRef>,
     /// Declared split strategies by stable split label.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub splits: HashMap<SplitName, DataSplit>,
@@ -47,7 +47,7 @@ impl DataSpec {
     pub fn new(
         interface: DataInterface,
         schema: DataSchema,
-        artifact_refs: Vec<CardRef>,
+        card_refs: Vec<CardRef>,
         splits: HashMap<SplitName, DataSplit>,
         target_columns: Vec<ColumnName>,
         sql: Option<SqlLogic>,
@@ -56,7 +56,7 @@ impl DataSpec {
         let spec = Self {
             interface,
             schema,
-            artifact_refs,
+            card_refs,
             splits,
             target_columns,
             sql,
@@ -87,8 +87,8 @@ impl DataSpec {
     }
 
     /// Iterate durable Artifact card references linked to this data card.
-    pub fn artifact_refs(&self) -> impl Iterator<Item = &CardRef> {
-        self.artifact_refs.iter()
+    pub fn card_refs(&self) -> impl Iterator<Item = &CardRef> {
+        self.card_refs.iter()
     }
 
     /// Return the declared local/storage stats captured by the interface.
@@ -110,7 +110,7 @@ impl DataSpec {
 
     /// Iterate materialized Artifact card refs declared by split strategies.
     pub fn materialized_split_refs(&self) -> impl Iterator<Item = &CardRef> {
-        self.splits.values().filter_map(DataSplit::artifact_ref)
+        self.splits.values().filter_map(DataSplit::card_ref)
     }
 }
 
@@ -303,10 +303,10 @@ pub struct DataSplit {
 impl DataSplit {
     /// Build a split that points at a pre-materialized Artifact card.
     #[must_use]
-    pub fn materialized(label: SplitName, artifact_ref: CardRef) -> Self {
+    pub fn materialized(label: SplitName, card_ref: CardRef) -> Self {
         Self {
             label,
-            strategy: SplitStrategy::Materialized(artifact_ref),
+            strategy: SplitStrategy::Materialized(card_ref),
         }
     }
 
@@ -339,8 +339,8 @@ impl DataSplit {
 
     /// Return the Artifact card reference when this is a materialized split.
     #[must_use]
-    pub fn artifact_ref(&self) -> Option<&CardRef> {
-        self.strategy.materialized_artifact_ref()
+    pub fn card_ref(&self) -> Option<&CardRef> {
+        self.strategy.materialized_card_ref()
     }
 
     /// Return the referenced schema column when this is a column predicate split.
@@ -380,9 +380,9 @@ pub enum SplitStrategy {
 impl SplitStrategy {
     /// Return the Artifact card reference carried by a materialized split.
     #[must_use]
-    pub fn materialized_artifact_ref(&self) -> Option<&CardRef> {
+    pub fn materialized_card_ref(&self) -> Option<&CardRef> {
         match self {
-            Self::Materialized(artifact_ref) => Some(artifact_ref),
+            Self::Materialized(card_ref) => Some(card_ref),
             _ => None,
         }
     }

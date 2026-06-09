@@ -12,7 +12,7 @@ spec:
     name: langgraph
     version: "^0.2"
     config:
-      graph_artifact_ref:
+      graph_card_ref:
         type: object
         value:
           kind:

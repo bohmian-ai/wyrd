@@ -34,7 +34,7 @@ fn stats() -> DataStats {
     }
 }
 
-fn artifact_ref() -> CardRef {
+fn card_ref() -> CardRef {
     CardRef {
         kind: CardKind::Artifact,
         name: CardName::new("artifact").unwrap(),
@@ -53,9 +53,9 @@ fn interface() -> DataInterface {
 
 #[test]
 fn data_spec_helpers_expose_interface_refs_stats_targets_and_splits() {
-    let split_ref = artifact_ref();
+    let split_ref = card_ref();
     let train_split = DataSplit::materialized(split("train"), split_ref.clone());
-    let artifact = artifact_ref();
+    let artifact = card_ref();
     let spec = DataSpec::new(
         interface(),
         schema(),
@@ -108,8 +108,8 @@ fn data_schema_helpers_preserve_order() {
 
 #[test]
 fn split_helpers_expose_strategy_details() {
-    let materialized = DataSplit::materialized(split("train"), artifact_ref());
-    assert!(materialized.artifact_ref().is_some());
+    let materialized = DataSplit::materialized(split("train"), card_ref());
+    assert!(materialized.card_ref().is_some());
     assert_eq!(materialized.strategy.kind(), "Materialized");
 
     let column = DataSplit::column(

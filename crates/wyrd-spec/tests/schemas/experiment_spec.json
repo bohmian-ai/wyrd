@@ -4,13 +4,6 @@
   "description": "Grouping and comparison context for related runs.",
   "type": "object",
   "properties": {
-    "card_refs": {
-      "description": "Artifact references.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/CardRef"
-      }
-    },
     "best_run_ref": {
       "description": "Best run reference.",
       "anyOf": [
@@ -21,6 +14,13 @@
           "type": "null"
         }
       ]
+    },
+    "card_refs": {
+      "description": "Artifact references.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CardRef"
+      }
     },
     "default_parameters": {
       "description": "Default parameters applied to runs.",

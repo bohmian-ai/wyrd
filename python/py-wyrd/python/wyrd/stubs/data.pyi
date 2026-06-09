@@ -472,11 +472,11 @@ class Split:
         ...
 
     @staticmethod
-    def materialized(artifact_ref: Mapping[str, Any] | CardRefLike) -> Split:
+    def materialized(card_ref: Mapping[str, Any] | CardRefLike) -> Split:
         """Declare a split backed by an Artifact card reference.
 
         Args:
-            artifact_ref (Mapping[str, Any] | CardRefLike): Mapping or object
+            card_ref (Mapping[str, Any] | CardRefLike): Mapping or object
                 that serializes to a CardRef with `kind` set to `Artifact`.
         """
         ...

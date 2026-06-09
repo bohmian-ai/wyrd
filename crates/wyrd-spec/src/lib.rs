@@ -40,7 +40,7 @@ pub use card::prompt::{
     CardLoadFormat, ParameterName, PromptRef, PromptSpec, extract_text_placeholders,
     parse_card_bytes, parse_spec_bytes, serialize_card, serialize_spec_bytes,
 };
-pub use ids::{ColumnName, QueryName, RoleName, SplitName};
+pub use ids::{ColumnName, FeatureName, QueryName, RoleName, SplitName};
 pub use metadata::{
     AnnotationKey, AnnotationValue, Annotations, CardMetadata, LabelKey, LabelValue, Labels,
     MetadataError,

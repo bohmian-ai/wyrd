@@ -1,13 +1,13 @@
 //! PSI baseline fit and target scoring.
-//!
-//! Score body lands in Commit 6.
 
 pub mod binning;
 pub mod score;
 pub mod threshold;
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 
+use arrow_schema::DataType;
 use wyrd_spec::card::drift::{PsiBinningStrategy, PsiProfile};
 use wyrd_spec::ids::FeatureName;
 use wyrd_version::WyrdVersion;
@@ -15,7 +15,9 @@ use wyrd_version::WyrdVersion;
 use crate::error::{DriftFitError, DriftScoreError};
 use crate::feature::{ColumnRef, resolve_column};
 use crate::psi::binning::{assign_bin, compute_edges_equal_width, compute_edges_quantile};
-use crate::report::DriftReport;
+use crate::psi::score::{PSI_MIN_TARGET_SAMPLE, psi};
+use crate::psi::threshold::compute_psi_threshold;
+use crate::report::{DriftReport, DriftVerdict, FeatureDriftReport};
 
 /// PSI fitted baseline, one entry per feature.
 #[derive(Debug, Clone)]
@@ -72,13 +74,189 @@ pub fn fit_psi_baseline(
     })
 }
 
-/// Body lands in Commit 6.
 pub fn score_psi(
-    _baseline: &PsiBaseline,
-    _target: &arrow::record_batch::RecordBatch,
-    _profile: &PsiProfile,
+    baseline: &PsiBaseline,
+    target: &arrow::record_batch::RecordBatch,
+    profile: &PsiProfile,
 ) -> Result<DriftReport, DriftScoreError> {
-    unimplemented!("score_psi body lands in Commit 6")
+    use wyrd_spec::card::drift::DriftMethod;
+
+    let mut feature_reports = BTreeMap::new();
+    for (feature_name, fitted) in &baseline.features {
+        let column = resolve_column(target, feature_name).map_err(|_| {
+            DriftScoreError::FeatureMissingInTarget {
+                feature: feature_name.as_str().to_string(),
+            }
+        })?;
+        let (target_proportions, target_total) = match fitted.bin_type {
+            BinType::Numeric => target_numeric_proportions(fitted, &column)?,
+            BinType::Categorical => target_categorical_proportions(fitted, &column)?,
+        };
+
+        if target_total < PSI_MIN_TARGET_SAMPLE {
+            feature_reports.insert(
+                feature_name.clone(),
+                FeatureDriftReport {
+                    feature: feature_name.clone(),
+                    score: f64::NAN,
+                    threshold: f64::NAN,
+                    verdict: DriftVerdict::Inconclusive,
+                },
+            );
+            continue;
+        }
+
+        let baseline_proportions = fitted
+            .bins
+            .iter()
+            .map(|bin| bin.proportion)
+            .collect::<Vec<_>>();
+        let score = psi(&baseline_proportions, &target_proportions);
+        let threshold = compute_psi_threshold(&profile.threshold, fitted.bins.len(), target_total)?;
+        let verdict = if score > threshold {
+            DriftVerdict::Drift
+        } else {
+            DriftVerdict::NoDrift
+        };
+
+        feature_reports.insert(
+            feature_name.clone(),
+            FeatureDriftReport {
+                feature: feature_name.clone(),
+                score,
+                threshold,
+                verdict,
+            },
+        );
+    }
+
+    let verdict = DriftReport::aggregate_verdict(&feature_reports);
+    Ok(DriftReport {
+        method: DriftMethod::Psi,
+        features: feature_reports,
+        verdict,
+    })
+}
+
+fn target_numeric_proportions(
+    fitted: &FittedPsiFeature,
+    column: &ColumnRef<'_>,
+) -> Result<(Vec<f64>, u64), DriftScoreError> {
+    if !column.is_numeric() {
+        return Err(DriftScoreError::FeatureTypeMismatch {
+            feature: fitted.feature.as_str().to_string(),
+        });
+    }
+
+    let values =
+        column
+            .collect_f64_non_null()
+            .map_err(|()| DriftScoreError::FeatureTypeMismatch {
+                feature: fitted.feature.as_str().to_string(),
+            })?;
+    let total = values.len() as u64;
+    if total == 0 {
+        return Err(DriftScoreError::FeatureEmpty {
+            feature: fitted.feature.as_str().to_string(),
+        });
+    }
+
+    let edges = numeric_edges(fitted)?;
+    let mut counts = vec![0_u64; fitted.bins.len()];
+    for value in &values {
+        if !value.is_finite() {
+            return Err(DriftScoreError::PsiInternal {
+                message: "non-finite value in target column".to_string(),
+            });
+        }
+        let bin = assign_bin(*value, &edges);
+        counts[bin] += 1;
+    }
+
+    let proportions = counts
+        .iter()
+        .map(|count| *count as f64 / total as f64)
+        .collect();
+    Ok((proportions, total))
+}
+
+fn target_categorical_proportions(
+    fitted: &FittedPsiFeature,
+    column: &ColumnRef<'_>,
+) -> Result<(Vec<f64>, u64), DriftScoreError> {
+    if !is_categorical_dtype(column.array.data_type()) {
+        return Err(DriftScoreError::FeatureTypeMismatch {
+            feature: fitted.feature.as_str().to_string(),
+        });
+    }
+
+    let values =
+        column
+            .collect_string_non_null()
+            .map_err(|()| DriftScoreError::FeatureTypeMismatch {
+                feature: fitted.feature.as_str().to_string(),
+            })?;
+    let total = values.len() as u64;
+    if total == 0 {
+        return Err(DriftScoreError::FeatureEmpty {
+            feature: fitted.feature.as_str().to_string(),
+        });
+    }
+
+    let mut counts = vec![0_u64; fitted.bins.len()];
+    let mut index_by_category = HashMap::with_capacity(fitted.bins.len());
+    for (index, bin) in fitted.bins.iter().enumerate() {
+        if let Some(category) = &bin.categorical_value {
+            index_by_category.insert(category.as_str(), index);
+        }
+    }
+
+    for value in &values {
+        if let Some(index) = index_by_category.get(value.as_str()) {
+            counts[*index] += 1;
+        }
+    }
+
+    let proportions = counts
+        .iter()
+        .map(|count| *count as f64 / total as f64)
+        .collect();
+    Ok((proportions, total))
+}
+
+fn numeric_edges(fitted: &FittedPsiFeature) -> Result<Vec<f64>, DriftScoreError> {
+    let mut edges = Vec::with_capacity(fitted.bins.len() + 1);
+    let first = fitted
+        .bins
+        .first()
+        .ok_or_else(|| DriftScoreError::PsiInternal {
+            message: format!("feature {} has no fitted bins", fitted.feature.as_str()),
+        })?;
+    edges.push(first.lower.ok_or_else(|| DriftScoreError::PsiInternal {
+        message: format!(
+            "numeric feature {} has a first bin without lower edge",
+            fitted.feature.as_str()
+        ),
+    })?);
+
+    for bin in &fitted.bins {
+        edges.push(bin.upper.ok_or_else(|| DriftScoreError::PsiInternal {
+            message: format!(
+                "numeric feature {} has a bin without upper edge",
+                fitted.feature.as_str()
+            ),
+        })?);
+    }
+
+    Ok(edges)
+}
+
+fn is_categorical_dtype(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8 | DataType::LargeUtf8 => true,
+        DataType::Dictionary(_, value_type) => is_categorical_dtype(value_type),
+        _ => false,
+    }
 }
 
 fn fit_numeric(

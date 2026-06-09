@@ -4714,6 +4714,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-version"
+version = "0.0.1"
+dependencies = [
+ "schemars",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "yansi"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

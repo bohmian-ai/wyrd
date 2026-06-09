@@ -138,7 +138,9 @@ fn extract_observers(
                 "expected Observer subclass, got {type_name}"
             )));
         }
-        out.push(Arc::new(wyrd_observe_impl::PythonObserver::new(observer)) as Arc<dyn Observer>);
+        out.push(
+            Arc::new(wyrd_observe::python::PythonObserver::new(observer)) as Arc<dyn Observer>,
+        );
     }
     Ok(out)
 }

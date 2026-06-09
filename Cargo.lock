@@ -2198,7 +2198,7 @@ dependencies = [
  "skald-tool",
  "skald-workflow",
  "wyrd-cards",
- "wyrd-observe-impl",
+ "wyrd-observe",
  "wyrd-utils",
 ]
 
@@ -3010,7 +3010,6 @@ dependencies = [
  "ulid",
  "url",
  "wyrd-observe",
- "wyrd-observe-impl",
  "wyrd-runtime",
  "wyrd-spec",
  "wyrd-utils",
@@ -4483,7 +4482,6 @@ dependencies = [
  "skald-workflow",
  "tokio",
  "wyrd-observe",
- "wyrd-observe-impl",
  "wyrd-spec",
 ]
 
@@ -4609,29 +4607,17 @@ dependencies = [
  "async-trait",
  "opentelemetry",
  "opentelemetry_sdk",
+ "pyo3",
  "serde",
  "serde_json",
  "sha2",
- "skald-agent",
+ "skald-prompt",
  "skald-spec",
  "tokio",
  "tracing",
  "vala-client",
  "wyrd-spec",
  "wyrd-utils",
-]
-
-[[package]]
-name = "wyrd-observe-impl"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "pyo3",
- "skald-agent",
- "skald-prompt",
- "skald-spec",
- "tokio",
- "wyrd-observe",
 ]
 
 [[package]]

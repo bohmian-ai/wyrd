@@ -12,7 +12,7 @@ fn main() -> anyhow::Result<()> {
         skald_tool::default_registry(),
         skald_agent::default_prompt_resolver(),
     )?;
-    println!("workflow: {}", wf.name().unwrap_or("anonymous"));
-    println!("steps: {:?}", wf.steps());
+    println!("workflow: {}", wf.name_str().unwrap_or("anonymous"));
+    println!("steps: {:?}", wf.step_ids());
     Ok(())
 }

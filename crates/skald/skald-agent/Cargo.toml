@@ -30,6 +30,7 @@ skald-prompt = { workspace = true }
 skald-runtime = { workspace = true }
 skald-tool = { workspace = true }
 wyrd-spec = { workspace = true }
+wyrd-observe = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -48,4 +49,3 @@ wyrd-utils = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 serde_json = { workspace = true }
 skald-providers = { workspace = true }
-wyrd-observe = { workspace = true }

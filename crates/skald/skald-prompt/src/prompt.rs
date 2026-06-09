@@ -1378,7 +1378,7 @@ fn output_from_py(
     let py = value.py();
 
     // Pydantic BaseModel subclass — call model_json_schema() and retain the class.
-    if is_pydantic_model(py, value)? {
+    if is_pydantic_model(py, value) {
         let mut schema = crate::coerce::schema_from_py(value)
             .map_err(|e| PromptBuilderError::Validation(e.to_string()))?;
         normalize_output_schema(&mut schema);
@@ -1412,23 +1412,23 @@ fn output_from_py(
 }
 
 #[cfg(feature = "python")]
-fn is_pydantic_model<'py>(py: pyo3::Python<'py>, obj: &Bound<'py, PyAny>) -> CardPyResult<bool> {
+fn is_pydantic_model<'py>(py: pyo3::Python<'py>, obj: &Bound<'py, PyAny>) -> bool {
     let Ok(pydantic) = py.import("pydantic") else {
-        return Ok(false);
+        return false;
     };
     let Ok(basemodel) = pydantic.getattr("BaseModel") else {
-        return Ok(false);
+        return false;
     };
     let Ok(builtins) = py.import("builtins") else {
-        return Ok(false);
+        return false;
     };
     let Ok(is_subclass) = builtins.getattr("issubclass") else {
-        return Ok(false);
+        return false;
     };
-    Ok(is_subclass
+    is_subclass
         .call1((obj, basemodel))
         .and_then(|r| r.extract::<bool>())
-        .unwrap_or(false))
+        .unwrap_or(false)
 }
 
 #[cfg(feature = "python")]
@@ -1438,7 +1438,7 @@ fn is_raw_json_schema(dict: &Bound<'_, pyo3::types::PyDict>) -> bool {
         || dict.get_item("$schema").ok().flatten().is_some()
 }
 
-#[cfg(feature = "python")]
+#[cfg(any(test, feature = "python"))]
 fn normalize_output_schema(schema: &mut serde_json::Value) {
     if let Some(obj) = schema.as_object_mut() {
         obj.entry("additionalProperties")
@@ -1545,7 +1545,7 @@ fn py_annotation_to_schema<'py>(
     }
 
     // Nested Pydantic BaseModel — inline its schema recursively.
-    if is_pydantic_model(py, ann)? {
+    if is_pydantic_model(py, ann) {
         let mut schema = crate::coerce::schema_from_py(ann)
             .map_err(|e| PromptBuilderError::Validation(e.to_string()))?;
         normalize_output_schema(&mut schema);

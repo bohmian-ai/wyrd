@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use async_trait::async_trait;
-use skald_agent::observer::Observer;
+use wyrd_observe::Observer;
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static GLOBAL_RECORDER: OnceLock<Arc<RecordingObserver>> = OnceLock::new();

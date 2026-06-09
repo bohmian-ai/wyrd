@@ -5,12 +5,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde_json::Value;
-use skald_agent::observer_provider::current_observer;
 use skald_agent::{Agent, AgentError};
 use skald_prompt::Prompt as RuntimePrompt;
 use skald_runtime::ProviderRegistry;
 use skald_spec::{MessageNum, Prompt, ProviderName, ProviderRequest, ProviderResponse};
 use tokio::sync::RwLock;
+use wyrd_observe::current;
 
 use crate::context::Context;
 use crate::def::WorkflowDef;
@@ -89,7 +89,7 @@ impl DagExecutor {
     /// fails, task locks fail, or a spawned task cannot return an outcome.
     pub async fn run(self: &Arc<Self>, context: Context) -> WorkflowResult<WorkflowRun> {
         let workflow_run_id = ulid::Ulid::new().to_string();
-        let observer = current_observer();
+        let observer = current();
         let workflow_started_at = Instant::now();
         let step_count = self.task_list.len();
         observer
@@ -195,7 +195,7 @@ impl DagExecutor {
                     .final_response
                     .ok_or_else(|| WorkflowError::AgentMissingFinalResponse(task_id.to_owned()))?,
                 Err(err) if attempt == max_retries => {
-                    return Err(terminal_agent_error(&task_id, &native_prompt, err));
+                    return Err(terminal_agent_error(task_id, &native_prompt, err));
                 }
                 Err(_err) => continue,
             };
@@ -386,7 +386,7 @@ impl DagExecutor {
                 let messages = upstream
                     .iter()
                     .map(|msg| match msg {
-                        MessageNum::OpenAi(message) => Ok((*message).clone()),
+                        MessageNum::OpenAi(message) => Ok((**message).clone()),
                         _ => Err(unsupported_handoff(&provider_of_message(msg), dst_provider)),
                     })
                     .collect::<WorkflowResult<Vec<_>>>()?;
@@ -396,7 +396,7 @@ impl DagExecutor {
                 let messages = upstream
                     .iter()
                     .map(|msg| match msg {
-                        MessageNum::OpenAi(message) => Ok((*message).clone()),
+                        MessageNum::OpenAi(message) => Ok((**message).clone()),
                         _ => Err(unsupported_handoff(&provider_of_message(msg), dst_provider)),
                     })
                     .collect::<WorkflowResult<Vec<_>>>()?;

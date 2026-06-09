@@ -5,10 +5,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::Observer;
 use async_trait::async_trait;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use skald_agent::observer::Observer;
 
 /// Wraps a Python object that subclasses `wyrd.Observer`.
 ///

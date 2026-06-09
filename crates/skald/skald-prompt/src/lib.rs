@@ -47,6 +47,7 @@ use pyo3::{prelude::*, types::PyModule};
 
 /// Register prompt Python classes on a `wyrd.prompt` module.
 #[cfg(feature = "python")]
+#[allow(clippy::too_many_lines)]
 pub fn register_prompt(module: &Bound<'_, PyModule>) -> PyResult<()> {
     wyrd_interfaces::error::register_exceptions(module)?;
     module.add_class::<Prompt>()?;

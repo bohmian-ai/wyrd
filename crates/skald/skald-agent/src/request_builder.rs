@@ -176,7 +176,7 @@ pub fn rebuild_request_messages(
             req.messages.clear();
             for msg in new_messages {
                 match msg {
-                    MessageNum::OpenAi(message) => req.messages.push((*message).clone()),
+                    MessageNum::OpenAi(message) => req.messages.push((**message).clone()),
                     _ => return Err(mismatch(ProviderName::OpenAi)),
                 }
             }

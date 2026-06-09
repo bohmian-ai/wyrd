@@ -20,11 +20,10 @@ use crate::callbacks::{
 use crate::conversation::{Conversation, ConversationTurn};
 use crate::error::{AgentError, AgentResult};
 use crate::journal::JournalEvent;
-use crate::observer::Observer;
-use crate::observer_provider::current_observer;
 use crate::request_builder::{assistant_message, extract_messages, request_from_conversation};
 use crate::run::{AgentRun, FinishReason};
 use crate::session::{Role, SessionId, SessionTurn, session_turn_to_conversation_turn};
+use wyrd_observe::{Observer, current};
 
 #[derive(Debug, Clone)]
 struct ToolCall {
@@ -42,7 +41,7 @@ pub(crate) async fn run(
 ) -> AgentResult<AgentRun> {
     let providers = this.effective_providers(providers);
     let run_id = ulid::Ulid::new().to_string();
-    let observer = current_observer();
+    let observer = current();
     let started_at = Instant::now();
     let span = debug_span!(
         "skald_agent.run",
@@ -167,7 +166,7 @@ pub(crate) async fn run_prompt(
 ) -> AgentResult<AgentRun> {
     let providers = this.effective_providers(providers);
     let run_id = ulid::Ulid::new().to_string();
-    let observer = current_observer();
+    let observer = current();
     let started_at = Instant::now();
     let span = debug_span!(
         "skald_agent.run_prompt",
@@ -636,6 +635,7 @@ async fn append_terminal_observer_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn append_model_journal_call_result(
     this: &Agent,
     iteration: u32,

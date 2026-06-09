@@ -433,7 +433,7 @@ impl Workflow {
         providers: &skald_runtime::ProviderRegistry,
         input: impl Into<WorkflowInput>,
     ) -> WorkflowResult<WorkflowRun> {
-        wyrd_observe_impl::init();
+        wyrd_observe::init();
         let input = input.into();
         let inner = self.run_with_inner(providers, input);
         match self.observers.as_slice() {

@@ -11,10 +11,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use crate::Observer;
 use async_trait::async_trait;
 use opentelemetry::global::{self, BoxedSpan, BoxedTracer};
 use opentelemetry::trace::{Span, SpanContext, SpanKind, Status, TraceContextExt, Tracer};
-use skald_agent::observer::Observer;
 
 /// Span store - keyed by run_id (and run_id + suffix for sub-spans).
 /// RwLock guards structural mutations; Mutex guards individual span mutation

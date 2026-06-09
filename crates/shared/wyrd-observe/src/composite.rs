@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::Observer;
 use async_trait::async_trait;
-use skald_agent::observer::Observer;
 
 /// Fans out every observer event to each registered downstream observer
 /// in order. Events are dispatched sequentially - a slow observer blocks

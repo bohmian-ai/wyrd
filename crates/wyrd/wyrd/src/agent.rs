@@ -8,7 +8,6 @@
 //! with resolved prompt state. `Workflow` lives in the same module because a
 //! Wyrd workflow is composition of agents.
 
-pub use skald_agent::observer::{NoopObserver, Observer};
 pub use skald_agent::{
     Agent, AgentCallbacks, AgentContext, AgentDelegateTool, AgentRun, AgentWire, CallbackOutcome,
     Conversation, ConversationTurn, FinishReason, Journal, JournalEvent, LocalPromptResolver,
@@ -24,4 +23,5 @@ pub use skald_workflow::{StepEvent, StepOutcome, TaskStatus as StepStatus, Workf
 #[cfg(feature = "otel")]
 pub use wyrd_observe::OtelObserver;
 pub use wyrd_observe::{CompositeObserver, set_global, with_observer};
+pub use wyrd_observe::{NoopObserver, Observer};
 pub use wyrd_spec::{AgentCard, WorkflowCard};

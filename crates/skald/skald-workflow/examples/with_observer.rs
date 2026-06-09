@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use skald_agent::Observer;
 use skald_spec::{ProviderRequest, ProviderResponse};
 use skald_workflow::{Workflow, WorkflowInput};
+use wyrd_observe::Observer;
 use wyrd_observe::OtelObserver;
 
 mod common;
@@ -49,15 +49,16 @@ impl Observer for TokenCounter {
         if let ProviderResponse::OpenAiChatCompletion(response) = response {
             if let Some(usage) = &response.usage {
                 self.tokens_in
-                    .fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
+                    .fetch_add(usage.prompt_tokens, Ordering::Relaxed);
                 self.tokens_out
-                    .fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
+                    .fetch_add(usage.completion_tokens, Ordering::Relaxed);
             }
         }
     }
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let counter = Arc::new(TokenCounter::default());
     let planner = skald_agent::Agent::new(plan_prompt()).name("planner");
     let writer = skald_agent::Agent::new(write_prompt()).name("writer");
@@ -69,13 +70,15 @@ fn main() -> anyhow::Result<()> {
         r#"{"summary":"mock summary","steps":["read","write"]}"#,
         "Final observed brief",
     ]);
-    let run = wyrd_runtime::runtime().block_on(wf.run_with(
-        &providers,
-        WorkflowInput::from(HashMap::from([(
-            "topic".to_owned(),
-            "the Rust borrow checker".to_owned(),
-        )])),
-    ))?;
+    let run = wf
+        .run_with(
+            &providers,
+            WorkflowInput::from(HashMap::from([(
+                "topic".to_owned(),
+                "the Rust borrow checker".to_owned(),
+            )])),
+        )
+        .await?;
     println!("model calls: {}", counter.calls.load(Ordering::Relaxed));
     println!("tokens in:   {}", counter.tokens_in.load(Ordering::Relaxed));
     println!(

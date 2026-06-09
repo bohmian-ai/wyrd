@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use skald_agent::observer::{NoopObserver, Observer};
+use crate::{NoopObserver, Observer};
 
 use crate::scoped::SCOPED_OBSERVER;
 

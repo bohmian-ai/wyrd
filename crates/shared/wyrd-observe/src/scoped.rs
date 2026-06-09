@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use skald_agent::observer::Observer;
+use crate::Observer;
 
 tokio::task_local! {
     pub(crate) static SCOPED_OBSERVER: Arc<dyn Observer>;

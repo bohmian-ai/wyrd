@@ -5,8 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use skald_agent::Observer;
-use wyrd_observe::OtelObserver;
+use wyrd_observe::{Observer, OtelObserver};
 
 fn noop_observer() -> OtelObserver {
     // Uses the global no-op provider. Spans are discarded but span store

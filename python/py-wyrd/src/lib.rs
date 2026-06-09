@@ -47,7 +47,7 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&providers)?;
     register_submodule(py, "wyrd._wyrd.providers", &providers)?;
 
-    wyrd_observe_impl::python_register(m)?;
+    wyrd_observe::python::python_register(m)?;
     Ok(())
 }
 

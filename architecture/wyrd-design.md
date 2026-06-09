@@ -584,8 +584,52 @@ the graph; that ties replay to live spec-parsing logic that drifts
 across API versions. The edge list is the connectivity finding itself,
 recorded once at snapshot time.
 
+`ObservationCriteria` is the structured, replayable filter that the audit
+hands to vala on creation **and on every replay** to re-materialize the
+runtime evidence behind the lineage. Parametric, not a DSL — same posture
+as `ProvenanceQuery`. Two required fields fix the floor (what + when);
+four optional fields narrow.
+
+```yaml
+ObservationCriteria:
+  subject_refs: [CardRef]                      # what observations are about (version-locked, doctrine #8)
+  time_range: TimeRange                        # closed [from, to] — bounds the case file
+
+  signals?: [Signal]                           # closed-enum filter; absent = all signals
+  actors?: [ActorRef]                          # filter on emit_actor (ServiceIdentity / Human); absent = all
+  request_ids?: [WyrdRequestId]                # pin to specific runtime hops; absent = no pin
+  labels?: { string: string }                  # attribute equality filter (tenant, region, etc.)
+```
+
+The required pair gives every audit a deterministic minimum: **the
+lifecycle axis** (`subject_refs`, doctrine #8) and **the time axis**
+(`time_range`). Everything else narrows.
+
+| Field         | Why it's optional                                                  |
+|---------------|--------------------------------------------------------------------|
+| `signals`     | Lets the audit pin to e.g. `Drift` only, or `EvalScore` only.      |
+| `actors`      | Lets the audit pin to one service identity's emissions.            |
+| `request_ids` | Lets the audit pin to specific runtime hops (doctrine #15) when the investigator already knows them. |
+| `labels`      | Open-shape narrowing the registry doesn't model — tenant, region, deployment slice. |
+
+Excluded fields, with reasoning matching `ProvenanceQuery`:
+
+- **No `space`.** Already pinned by version-locked `subject_refs`.
+- **No `kinds`.** Implied by `subject_refs[i].kind`; an explicit filter
+  would silently narrow replay and give future readers a forensic false
+  signal.
+- **No `limit` / `cursor`.** Replay must return the deterministic full
+  set; pagination is a render-side concern at the API boundary.
+
+**Replay determinism.** The same `ObservationCriteria` against the same
+vala store at the same logical time returns the same observation set —
+the property the audit's `digest` depends on. Vala's append-only,
+time-bounded retention (years) covers the window. If a referenced subject
+is purged from the registry, the criteria still validates structurally
+and vala returns whatever observations remain; the audit's `digest`
+captures what *was* materialized at `snapshot_at`.
+
 **Under design (wire shape deferred):**
-- `ObservationCriteria` — the re-fetch filter against vala (subjects, time range, signal/method, projection).
 - Multi-party `attestations` — deferred to v1.1; `details` may carry informally in v1.
 
 ### Drift

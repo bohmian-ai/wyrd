@@ -74,4 +74,7 @@ pub enum DriftScoreError {
 
     #[error("SPC score internal error: {message}")]
     SpcInternal { message: String },
+
+    #[error("Custom score internal error: {message}")]
+    CustomInternal { message: String },
 }

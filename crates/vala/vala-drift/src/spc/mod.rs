@@ -1,6 +1,4 @@
 //! SPC baseline fit and target scoring.
-//!
-//! Fit body lands in Commit 7. Score body lands in Commit 8.
 
 pub mod control_limits;
 pub mod weco;
@@ -109,9 +107,104 @@ pub fn fit_spc_baseline(
 }
 
 pub fn score_spc(
-    _baseline: &SpcBaseline,
-    _target: &arrow::record_batch::RecordBatch,
-    _profile: &SpcProfile,
+    baseline: &SpcBaseline,
+    target: &arrow::record_batch::RecordBatch,
+    profile: &SpcProfile,
 ) -> Result<DriftReport, DriftScoreError> {
-    unimplemented!("score_spc body lands in Commit 8")
+    use crate::feature::resolve_column;
+    use crate::report::{DriftVerdict, FeatureDriftReport};
+    use crate::spc::control_limits::ControlLimits;
+    use crate::spc::weco::{assign_zone, evaluate, parse_rule};
+    use wyrd_spec::card::drift::DriftMethod;
+
+    let rule = parse_rule(&profile.weco_rule.rule_string)?;
+    let chunk_size = baseline.chunk_size as usize;
+    let mut feature_reports = BTreeMap::new();
+
+    for (feature_name, fitted) in &baseline.features {
+        let column = resolve_column(target, feature_name).map_err(|_| {
+            DriftScoreError::FeatureMissingInTarget {
+                feature: feature_name.as_str().to_string(),
+            }
+        })?;
+        if !column.is_numeric() {
+            return Err(DriftScoreError::FeatureTypeMismatch {
+                feature: feature_name.as_str().to_string(),
+            });
+        }
+        let values =
+            column
+                .collect_f64_non_null()
+                .map_err(|_| DriftScoreError::FeatureTypeMismatch {
+                    feature: feature_name.as_str().to_string(),
+                })?;
+        if values.is_empty() {
+            return Err(DriftScoreError::FeatureEmpty {
+                feature: feature_name.as_str().to_string(),
+            });
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(DriftScoreError::SpcInternal {
+                message: "non-finite value in target column".into(),
+            });
+        }
+        if values.len() < chunk_size {
+            return Err(DriftScoreError::TargetTooSmall {
+                feature: feature_name.as_str().to_string(),
+                rows: values.len(),
+                chunk_size,
+            });
+        }
+
+        let chunk_means = sample_chunk_means(&values, chunk_size)?;
+        let limits = ControlLimits {
+            center: fitted.center,
+            one_lcl: fitted.one_lcl,
+            one_ucl: fitted.one_ucl,
+            two_lcl: fitted.two_lcl,
+            two_ucl: fitted.two_ucl,
+            three_lcl: fitted.three_lcl,
+            three_ucl: fitted.three_ucl,
+        };
+        let drift_array: Vec<i8> = chunk_means
+            .iter()
+            .map(|value| assign_zone(*value, &limits))
+            .collect();
+        let violations = evaluate(&drift_array, &rule, profile.alert_threshold);
+        let score = violations.len() as f64;
+        let verdict = if score > 0.0 {
+            DriftVerdict::Drift
+        } else {
+            DriftVerdict::NoDrift
+        };
+        feature_reports.insert(
+            feature_name.clone(),
+            FeatureDriftReport {
+                feature: feature_name.clone(),
+                score,
+                threshold: 0.0,
+                verdict,
+            },
+        );
+    }
+
+    let verdict = DriftReport::aggregate_verdict(&feature_reports);
+    Ok(DriftReport {
+        method: DriftMethod::Spc,
+        features: feature_reports,
+        verdict,
+    })
+}
+
+fn sample_chunk_means(values: &[f64], chunk_size: usize) -> Result<Vec<f64>, DriftScoreError> {
+    if chunk_size == 0 {
+        return Err(DriftScoreError::SpcInternal {
+            message: "chunk_size must be greater than zero".into(),
+        });
+    }
+
+    Ok(values
+        .chunks(chunk_size)
+        .map(|chunk| chunk.iter().sum::<f64>() / chunk.len() as f64)
+        .collect())
 }

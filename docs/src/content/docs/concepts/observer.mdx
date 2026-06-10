@@ -3,10 +3,17 @@ title: Observer — lifecycle instrumentation
 description: How to instrument Wyrd agent and workflow runs.
 ---
 
+import { Aside } from '@astrojs/starlight/components';
+
 # Observer
 
 `Observer` is a Python base class you subclass to receive lifecycle events from
 workflow runs. All methods have no-op defaults.
+
+<Aside type="note">
+For a step-by-step setup, see [Instrument with Observers](/guides/instrument-with-observers/)
+and [Instrument with OTel](/guides/instrument-with-otel/). This page covers the lifecycle reference.
+</Aside>
 
 Install observers only on workflows:
 
@@ -22,6 +29,18 @@ wf.run({"topic": "Rust"})
 ```
 
 There is no global Python install path and no per-run observer parameter.
+
+## Why Workflow Level
+
+The Workflow owns the run id, DAG scheduling, step dependencies, fan-out, fan-in,
+and final result. Observers attach there so every child Agent event belongs to
+one workflow event stream.
+
+An Agent owns only its local model loop: prompt rendering, tool calls,
+callbacks, session memory, and finish reason. Agent-level observers would split
+multi-step runs into separate streams without one owner for parent-child order,
+dependency timing, or final workflow status. Wrap a solo Agent in a one-step
+Workflow when it needs lifecycle events.
 
 ## Callbacks Vs Observers
 

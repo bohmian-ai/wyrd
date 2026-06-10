@@ -22,8 +22,6 @@ pub mod delegation;
 pub mod error;
 pub mod journal;
 pub mod loop_runtime;
-pub mod observer;
-pub mod observer_provider;
 #[cfg(feature = "python")]
 pub mod py_error;
 #[cfg(feature = "python")]
@@ -46,10 +44,9 @@ pub use conversation::{Conversation, ConversationTurn};
 pub use delegate::AgentDelegateTool;
 pub use error::{AgentError, AgentResult};
 pub use journal::{Journal, JournalError, JournalEvent, NoopJournal};
-pub use observer::{NoopObserver, Observer};
-pub use observer_provider::{ObserverProvider, current_observer, set_observer_provider};
 #[cfg(feature = "python")]
 pub use python::python_register;
 pub use registry::system_messages;
 pub use run::{AgentRun, FinishReason, RunConfig, RunError};
 pub use session::{NoSession, Role, SessionError, SessionId, SessionMemory, SessionTurn};
+pub use wyrd_observe::{NoopObserver, Observer};

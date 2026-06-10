@@ -27,7 +27,7 @@ Skald does not depend on `wyrd-*` or `vala-*`.
   `SKALD_AGENT_*` error catalog.
 - `skald-workflow`: workflow runtime. It owns `Workflow`, `WorkflowDef`,
   `Task`/`TaskDef`, `Context`, the DAG executor, `execute_task`,
-  `MessageConversion`-routed handoff, and the `SKALD_WORKFLOW_*` error catalog.
+  `MessageConversion`-routed handoff, and stable Wyrd workflow error codes.
 - `skald-prompt`: Python authoring boundary. It builds native prompt/request
   values and exposes the `wyrd.prompt.Prompt` Python class.
 

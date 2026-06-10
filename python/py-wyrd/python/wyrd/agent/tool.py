@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import functools
 import inspect
+import typing
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
+from .._schema import annotation_to_schema as _annotation_to_schema
 from .._wyrd.tool import (
     _pop_tool_registry_scope,
     _push_tool_registry_scope,
@@ -70,22 +72,19 @@ def local_registry():
 
 
 def _schema_from_signature(fn: Callable) -> dict:
-    from pydantic import TypeAdapter
-
-    signature = inspect.signature(fn)
-    hints = getattr(fn, "__annotations__", {}) or {}
+    sig = inspect.signature(fn)
+    hints = typing.get_type_hints(fn) if fn.__annotations__ else {}
     properties: dict[str, Any] = {}
     required: list[str] = []
-    for name, parameter in signature.parameters.items():
-        if name in {"self", "cls"}:
+    for param_name, parameter in sig.parameters.items():
+        if param_name in {"self", "cls"}:
             continue
-        annotation = hints.get(name, Any)
-        schema = TypeAdapter(annotation).json_schema()
-        if parameter.default is inspect._empty:
-            required.append(name)
+        schema = _annotation_to_schema(hints.get(param_name, Any))
+        if parameter.default is inspect.Parameter.empty:
+            required.append(param_name)
         else:
-            schema["default"] = parameter.default
-        properties[name] = schema
+            schema = {**schema, "default": parameter.default}
+        properties[param_name] = schema
     out: dict[str, Any] = {"type": "object", "properties": properties}
     if required:
         out["required"] = required
@@ -93,10 +92,8 @@ def _schema_from_signature(fn: Callable) -> dict:
 
 
 def _schema_from_return(fn: Callable) -> dict:
-    from pydantic import TypeAdapter
-
-    hints = getattr(fn, "__annotations__", {}) or {}
-    return TypeAdapter(hints.get("return", Any)).json_schema()
+    hints = typing.get_type_hints(fn) if fn.__annotations__ else {}
+    return _annotation_to_schema(hints.get("return", Any))
 
 
 __all__ = ["_ToolCallable", "local_registry", "tool"]

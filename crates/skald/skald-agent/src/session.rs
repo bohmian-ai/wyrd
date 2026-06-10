@@ -139,14 +139,11 @@ pub(crate) fn session_turn_to_conversation_turn(
                     parts: vec![GooglePart::Text { text: turn.content }],
                 }),
                 ProviderName::OpenAi | ProviderName::Custom(_) => {
-                    MessageNum::OpenAi(OpenAiChatMessage {
+                    MessageNum::OpenAi(Box::new(OpenAiChatMessage {
                         role: "assistant".to_owned(),
                         content: Some(OpenAiMessageContent::Text(turn.content)),
-                        name: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        refusal: None,
-                    })
+                        ..Default::default()
+                    }))
                 }
             };
             ConversationTurn::Assistant { message }
@@ -163,7 +160,7 @@ impl From<SessionTurn> for ConversationTurn {
     /// Converts a session turn to a conversation turn.
     ///
     /// For `Role::Assistant` this always produces `MessageNum::OpenAi`. Use
-    /// [`session_turn_to_conversation_turn`] when the provider is known to get
+    /// `session_turn_to_conversation_turn` when the provider is known to get
     /// the correct wire format for Anthropic or Gemini agents.
     fn from(turn: SessionTurn) -> Self {
         match turn.role {
@@ -174,14 +171,11 @@ impl From<SessionTurn> for ConversationTurn {
                 content: turn.content,
             },
             Role::Assistant => Self::Assistant {
-                message: MessageNum::OpenAi(OpenAiChatMessage {
+                message: MessageNum::OpenAi(Box::new(OpenAiChatMessage {
                     role: "assistant".to_owned(),
                     content: Some(OpenAiMessageContent::Text(turn.content)),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    refusal: None,
-                }),
+                    ..Default::default()
+                })),
             },
             Role::Tool => Self::ToolResult {
                 call_id: turn.call_id.unwrap_or_default(),

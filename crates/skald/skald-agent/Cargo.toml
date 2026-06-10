@@ -30,6 +30,7 @@ skald-prompt = { workspace = true }
 skald-runtime = { workspace = true }
 skald-tool = { workspace = true }
 wyrd-spec = { workspace = true }
+wyrd-observe = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

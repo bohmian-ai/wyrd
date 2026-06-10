@@ -1,7 +1,6 @@
 """Boundary tests for the wyrd.cards.CardRef pyclass."""
 
 import pytest
-
 from wyrd._wyrd import WyrdError
 from wyrd.cards import CardKind, CardRef
 

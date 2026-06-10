@@ -43,6 +43,17 @@ export default defineConfig({
           ],
         },
         {
+          label: "Build",
+          collapsed: false,
+          items: [
+            { label: "Build a Prompt", link: "/guides/build-a-prompt/" },
+            { label: "Build an Agent", link: "/guides/build-an-agent/" },
+            { label: "Build a Workflow", link: "/guides/build-a-workflow/" },
+            { label: "Instrument with Observers", link: "/guides/instrument-with-observers/" },
+            { label: "Instrument with OTel", link: "/guides/instrument-with-otel/" },
+          ],
+        },
+        {
           label: "Concepts",
           collapsed: true,
           items: [

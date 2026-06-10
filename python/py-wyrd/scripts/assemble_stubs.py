@@ -14,8 +14,8 @@ PUBLIC_MODULE_STUBS = {
     "cards.pyi": PACKAGE_DIR / "cards" / "__init__.pyi",
     "data.pyi": PACKAGE_DIR / "data" / "__init__.pyi",
     "model.pyi": PACKAGE_DIR / "model" / "__init__.pyi",
+    "observer.pyi": PACKAGE_DIR / "observer.pyi",
     "prompt.pyi": PACKAGE_DIR / "prompt" / "__init__.pyi",
-    "session.pyi": PACKAGE_DIR / "session" / "__init__.pyi",
 }
 
 ROOT_STUB_FILES = ["header.pyi", "error.pyi"]
@@ -91,6 +91,12 @@ def rewrite_public_imports(filename: str, content: str) -> str:
                 "from .._wyrd import JsonDict, PathLike, WyrdError"
             ),
             "from .prompt import Prompt": "from ..prompt import Prompt",
+            "from .observer import Observer": "from ..observer import Observer",
+        },
+        "observer.pyi": {
+            "from wyrd.stubs.prompt import ProviderRequest, ProviderResponse": (
+                "from .prompt import ProviderRequest, ProviderResponse"
+            ),
         },
         "data.pyi": {
             "from .cards import CardRef": "from ..cards import CardRef",
@@ -110,9 +116,6 @@ def rewrite_public_imports(filename: str, content: str) -> str:
             "from .error import WyrdError\nfrom .header import JsonDict, PathLike": (
                 "from .._wyrd import JsonDict, PathLike, WyrdError"
             ),
-        },
-        "session.pyi": {
-            "from .header import JsonDict": "from .._wyrd import JsonDict",
         },
     }
     for before, after in replacements.get(filename, {}).items():

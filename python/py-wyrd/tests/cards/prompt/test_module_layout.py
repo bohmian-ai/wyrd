@@ -15,6 +15,10 @@ def test_importing_wyrd_runtime_fails() -> None:
         importlib.import_module("wyrd" + ".runtime")
 
 
-def test_top_level_runtime_agent_workflow_task_and_embedder_are_absent() -> None:
-    for name in ("SkaldRuntime", "Workflow", "Task", "Embedder"):
+def test_top_level_runtime_task_and_embedder_are_absent() -> None:
+    for name in ("SkaldRuntime", "Task", "Embedder"):
         assert not hasattr(wyrd, name), name
+
+
+def test_top_level_workflow_is_exposed() -> None:
+    assert wyrd.Workflow is wyrd.agent.Workflow

@@ -1,0 +1,97 @@
+---
+title: Workflow
+description: Reference for the Wyrd Workflow card and workflow run surface.
+---
+
+# Workflow
+
+A `Workflow` is a DAG of steps. In S13 the primary authoring surface is
+agent steps: `Workflow.sequential`, `Workflow.parallel`, and fluent
+`add` / `add_after`.
+
+## Envelope
+
+```yaml
+apiVersion: wyrd/v1
+metadata:
+  space: default
+  name: research
+  version: "0.1.0"
+kind: Workflow
+spec:
+  id: research
+  steps:
+    - id: planner
+      action:
+        kind: Agent
+        spec: { ... }
+      depends_on: []
+```
+
+## Spec
+
+`WorkflowSpec` fields:
+
+| Field | Meaning |
+|---|---|
+| `id` | Stable workflow id. |
+| `steps` | Ordered `WorkflowStep` list. |
+
+`WorkflowStep` contains `id`, `action`, `depends_on`, and optional retry/display
+metadata. `WorkflowAction::Agent(AgentRef)` is the shipped S13 action.
+Other action kinds are reserved.
+
+`AgentRef` is either `Inline(AgentSpec)` or `Card(CardRef)`. Python authoring
+through `Workflow.add` and `Workflow.sequential` uses inline resolved agents
+for local runs and cascade metadata for named child cards.
+
+## Python
+
+```python
+from wyrd import Workflow
+
+wf = Workflow.sequential("research", planner, writer)
+run = wf.run({"topic": "Rust"})
+print(run.final_output)
+```
+
+`Workflow.run(input) -> WorkflowRun` accepts a string exposed as `${input}` or
+a mapping whose keys become template variables. Downstream steps can bind
+structured output from upstream steps.
+
+## WorkflowRun
+
+`WorkflowRun` exposes:
+
+| Field | Type |
+|---|---|
+| `outcomes` | `Mapping[str, StepOutcome]` keyed by step id. |
+| `events` | `Sequence[StepEvent]`. |
+| `final_step_id` | `str | None`. |
+| `parameters` | `dict[str, Any]` accumulated from structured outputs. |
+| `final_output` | `str | None` terminal assistant text. |
+
+## Observers
+
+Observers attach at construction: `Workflow(..., observers=[obs])`,
+`Workflow.sequential(..., observers=[obs])`, or
+`Workflow.parallel(..., observers=[obs])`. They are runtime-only and are not
+serialized by `to_yaml` or `save`; loaded workflows have an empty observer list.
+
+## Save And Load
+
+Use `wf.save(path)`, `Workflow.load(path)`, `wf.to_yaml()`, and
+`Workflow.from_yaml(yaml)`. Save/load are local filesystem operations.
+
+## Cascade Registration
+
+Named child agents produce cascade entries on the workflow card. See
+[Cascade Registration](/concepts/cascade-registration/) for the registry
+contract.
+
+## Errors
+
+Common codes: `WYRD_WORKFLOW_422_CYCLE`,
+`WYRD_WORKFLOW_422_MISSING_DEPENDENCY`,
+`WYRD_WORKFLOW_422_DUPLICATE_STEP_ID`,
+`WYRD_WORKFLOW_422_MISSING_PARAMETER`, and `WYRD_CARD_400_BAD_EXTENSION`.

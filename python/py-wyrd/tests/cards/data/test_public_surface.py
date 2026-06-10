@@ -59,8 +59,9 @@ def test_opsml_style_python_package_layout() -> None:
     assert {path.name for path in PACKAGE_ROOT.glob("*.pyi")} == {
         "__init__.pyi",
         "_wyrd.pyi",
+        "observer.pyi",
     }
-    for name in ("agent", "cards", "data", "model", "prompt", "session"):
+    for name in ("agent", "cards", "data", "model", "prompt"):
         assert (PACKAGE_ROOT / name / "__init__.py").is_file()
         assert (PACKAGE_ROOT / name / "__init__.pyi").is_file()
         assert not (PACKAGE_ROOT / f"{name}.py").exists()

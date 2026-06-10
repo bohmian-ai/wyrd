@@ -7,6 +7,7 @@ use skald_spec::wire::anthropic_messages::{
 use skald_spec::wire::google_generate::{GoogleContent, GoogleFunctionResponse, GooglePart};
 use skald_spec::wire::openai_chat::{OpenAiChatMessage, OpenAiMessageContent};
 use skald_spec::wire::openai_responses::{OpenAiResponseContentPart, OpenAiResponseItem};
+use std::sync::Arc;
 
 use crate::error::{PromptBuilderError, PromptBuilderResult};
 use crate::messages::{anthropic_text_block, anthropic_tool_result_block, google_text_part};
@@ -16,19 +17,41 @@ use crate::messages::{anthropic_text_block, anthropic_tool_result_block, google_
     feature = "python",
     pyo3::pyclass(module = "wyrd.prompt", name = "Prompt", skip_from_py_object)
 )]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Prompt {
     pub(crate) inner: skald_spec::Prompt,
+    /// Python class retained for structured-output instantiation.
+    ///
+    /// Set when `Prompt(output=SomeModel)` receives a class. For YAML/card
+    /// prompts this is always `None` — the class is bound at the Agent level.
+    /// Only present under the `python` feature.
+    #[cfg(feature = "python")]
+    pub(crate) py_output_cls: Option<pyo3::Py<pyo3::PyAny>>,
+}
+
+impl PartialEq for Prompt {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
 }
 
 /// Opaque Python wrapper around a rendered native provider request.
+///
+/// Holds the request behind an `Arc` so that nested pyclasses (`PyOpenAiChatRequest`,
+/// `PyOpenAiChatMessage`, etc.) can share the same allocation with zero copies.
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "wyrd.prompt", name = "ProviderRequest", skip_from_py_object)
 )]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct PyProviderRequest {
-    inner: ProviderRequest,
+    inner: Arc<ProviderRequest>,
+}
+
+impl PartialEq for PyProviderRequest {
+    fn eq(&self, other: &Self) -> bool {
+        *self.inner == *other.inner
+    }
 }
 
 impl Prompt {
@@ -43,8 +66,18 @@ impl Prompt {
     }
 
     /// Wrap a native prompt.
-    pub const fn from_native(inner: skald_spec::Prompt) -> Self {
-        Self { inner }
+    pub fn from_native(inner: skald_spec::Prompt) -> Self {
+        Self {
+            inner,
+            #[cfg(feature = "python")]
+            py_output_cls: None,
+        }
+    }
+
+    /// Return the retained Python output class, if one was passed at construction.
+    #[cfg(feature = "python")]
+    pub fn output_cls(&self) -> Option<&pyo3::Py<pyo3::PyAny>> {
+        self.py_output_cls.as_ref()
     }
 
     /// Render declared prompt variables into a native provider request.
@@ -186,19 +219,26 @@ impl Prompt {
 }
 
 impl PyProviderRequest {
-    /// Wrap a native provider request for Python inspection.
-    pub const fn from_native(inner: ProviderRequest) -> Self {
+    /// Wrap a native provider request, taking ownership.
+    pub fn from_native(inner: ProviderRequest) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Wrap a shared Arc to an existing provider request.
+    pub fn from_arc(inner: Arc<ProviderRequest>) -> Self {
         Self { inner }
     }
 
     /// Borrow the wrapped provider request.
-    pub const fn native(&self) -> &ProviderRequest {
+    pub fn native(&self) -> &ProviderRequest {
         &self.inner
     }
 
     /// Consume the wrapper and return the native provider request.
     pub fn into_native(self) -> ProviderRequest {
-        self.inner
+        Arc::try_unwrap(self.inner).unwrap_or_else(|arc| (*arc).clone())
     }
 }
 
@@ -206,10 +246,7 @@ fn openai_message(role: &str, text: String) -> OpenAiChatMessage {
     OpenAiChatMessage {
         role: role.to_owned(),
         content: Some(OpenAiMessageContent::Text(text)),
-        name: None,
-        tool_calls: None,
-        tool_call_id: None,
-        refusal: None,
+        ..Default::default()
     }
 }
 
@@ -243,7 +280,7 @@ fn unsupported_role(request: &ProviderRequest, role: &str) -> PromptBuilderResul
     })
 }
 
-fn provider_name_to_string(provider: &skald_spec::ProviderName) -> String {
+pub(crate) fn provider_name_to_string(provider: &skald_spec::ProviderName) -> String {
     match provider {
         skald_spec::ProviderName::OpenAi => "openai".to_owned(),
         skald_spec::ProviderName::Anthropic => "anthropic".to_owned(),
@@ -252,6 +289,29 @@ fn provider_name_to_string(provider: &skald_spec::ProviderName) -> String {
         skald_spec::ProviderName::Custom(value) => value.clone(),
     }
 }
+
+#[cfg(feature = "python")]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn wrong_provider(
+    expected: &str,
+    actual: skald_spec::ProviderName,
+) -> crate::error::PromptBuilderError {
+    crate::error::PromptBuilderError::WrongProvider {
+        expected: expected.to_owned(),
+        actual: provider_name_to_string(&actual),
+    }
+}
+
+#[cfg(feature = "python")]
+pub(crate) fn wrong_variant(expected: &str, actual: &str) -> crate::error::PromptBuilderError {
+    crate::error::PromptBuilderError::WrongVariant {
+        expected: expected.to_owned(),
+        actual: actual.to_owned(),
+    }
+}
+
+#[cfg(feature = "python")]
+use crate::wire_py;
 
 #[cfg(feature = "python")]
 use {
@@ -278,7 +338,7 @@ use {
 impl Prompt {
     /// Build a vendor-native prompt from provider and message inputs.
     #[new]
-    #[pyo3(signature = (messages, model, *, provider, system=None, response_format=None, operation=None, cache=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (messages, model, *, provider, system=None, response_format=None, output=None, operation=None, cache=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_lines)]
     pub fn __new__(
@@ -287,6 +347,7 @@ impl Prompt {
         provider: &Bound<'_, PyAny>,
         system: Option<String>,
         response_format: Option<&Bound<'_, PyAny>>,
+        output: Option<&Bound<'_, PyAny>>,
         operation: Option<&str>,
         cache: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
@@ -295,7 +356,8 @@ impl Prompt {
     ) -> CardPyResult<Self> {
         let provider = provider_name_from_py(provider)?;
         let response_format = response_format_from_py(response_format)?;
-        let auto_variables = variables.is_none();
+        let (output, py_output_cls) = output_from_py(output)?;
+        let explicit_variables = variables.clone();
         let variables = variables.unwrap_or_default();
         let append_messages = !matches!(provider, skald_spec::ProviderName::Custom(_));
         let mut prompt = match provider {
@@ -308,6 +370,7 @@ impl Prompt {
                     OpenAiResponsesOptions {
                         instructions: system,
                         response_format,
+                        output,
                         settings: resolve_openai_responses_settings(model_settings)?,
                         variables,
                         version,
@@ -320,6 +383,7 @@ impl Prompt {
                 OpenAiChatOptions {
                     system,
                     response_format,
+                    output,
                     prompt_cache_key: cache_prompt_key(cache)?,
                     settings: resolve_openai_chat_settings(model_settings)?,
                     variables,
@@ -332,6 +396,7 @@ impl Prompt {
                 AnthropicOptions {
                     system,
                     response_format,
+                    output,
                     settings: resolve_anthropic_settings(model_settings)?,
                     variables,
                     version,
@@ -342,6 +407,7 @@ impl Prompt {
                 let options = GeminiOptions {
                     system,
                     response_format,
+                    output,
                     settings: resolve_google_settings(model_settings)?,
                     variables,
                     version,
@@ -353,6 +419,7 @@ impl Prompt {
                 let options = GeminiOptions {
                     system,
                     response_format,
+                    output,
                     settings: resolve_google_settings(model_settings)?,
                     variables,
                     version,
@@ -367,6 +434,7 @@ impl Prompt {
                         system,
                         messages: strings_from_py(Some(messages))?,
                         response_format,
+                        output,
                         settings: resolve_openai_chat_settings(model_settings)?,
                         variables,
                         version,
@@ -391,148 +459,172 @@ impl Prompt {
         if append_messages {
             prompt = append_py_messages(prompt, messages)?;
         }
-        if auto_variables {
-            prompt.inner.variables = extract_prompt_variables(&prompt)?;
-        }
+        let mut prompt = assign_variables(prompt, explicit_variables)?;
+        prompt.py_output_cls = py_output_cls;
         Ok(prompt)
     }
 
     /// Build an `OpenAI` Chat prompt from native constructor arguments.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, cache=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, cache=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn openai_chat(
         model: String,
         system: Option<String>,
         messages: Option<&Bound<'_, PyAny>>,
         response_format: Option<&Bound<'_, PyAny>>,
+        output: Option<&Bound<'_, PyAny>>,
         cache: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
-        let auto_variables = variables.is_none();
+        let explicit_variables = variables.clone();
+        let (output, py_output_cls) = output_from_py(output)?;
         let prompt = crate::builder::openai_chat(
             model,
             OpenAiChatOptions {
                 system,
                 messages: strings_from_py(messages)?,
                 response_format: response_format_from_py(response_format)?,
+                output,
                 prompt_cache_key: cache_prompt_key(cache)?,
                 settings: resolve_openai_chat_settings(model_settings)?,
                 variables: variables.unwrap_or_default(),
                 version,
             },
         )?;
-        auto_assign_variables(prompt, auto_variables)
+        let mut prompt = assign_variables(prompt, explicit_variables)?;
+        prompt.py_output_cls = py_output_cls;
+        Ok(prompt)
     }
 
     /// Build an `OpenAI` Responses prompt from native constructor arguments.
     #[staticmethod]
-    #[pyo3(signature = (model, *, instructions=None, messages=None, response_format=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, instructions=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn openai_responses(
         model: String,
         instructions: Option<String>,
         messages: Option<&Bound<'_, PyAny>>,
         response_format: Option<&Bound<'_, PyAny>>,
+        output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
-        let auto_variables = variables.is_none();
+        let explicit_variables = variables.clone();
+        let (output, py_output_cls) = output_from_py(output)?;
         let prompt = crate::builder::openai_responses(
             model,
             OpenAiResponsesOptions {
                 instructions,
                 messages: strings_from_py(messages)?,
                 response_format: response_format_from_py(response_format)?,
+                output,
                 settings: resolve_openai_responses_settings(model_settings)?,
                 variables: variables.unwrap_or_default(),
                 version,
             },
         )?;
-        auto_assign_variables(prompt, auto_variables)
+        let mut prompt = assign_variables(prompt, explicit_variables)?;
+        prompt.py_output_cls = py_output_cls;
+        Ok(prompt)
     }
 
     /// Build an Anthropic Messages prompt from native constructor arguments.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn anthropic(
         model: String,
         system: Option<String>,
         messages: Option<&Bound<'_, PyAny>>,
         response_format: Option<&Bound<'_, PyAny>>,
+        output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
-        let auto_variables = variables.is_none();
+        let explicit_variables = variables.clone();
+        let (output, py_output_cls) = output_from_py(output)?;
         let prompt = crate::builder::anthropic(
             model,
             AnthropicOptions {
                 system,
                 messages: strings_from_py(messages)?,
                 response_format: response_format_from_py(response_format)?,
+                output,
                 settings: resolve_anthropic_settings(model_settings)?,
                 variables: variables.unwrap_or_default(),
                 version,
             },
         )?;
-        auto_assign_variables(prompt, auto_variables)
+        let mut prompt = assign_variables(prompt, explicit_variables)?;
+        prompt.py_output_cls = py_output_cls;
+        Ok(prompt)
     }
 
     /// Build a Google Gemini `GenerateContent` prompt from native constructor arguments.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn gemini(
         model: String,
         system: Option<String>,
         messages: Option<&Bound<'_, PyAny>>,
         response_format: Option<&Bound<'_, PyAny>>,
+        output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
-        let auto_variables = variables.is_none();
+        let explicit_variables = variables.clone();
+        let (output, py_output_cls) = output_from_py(output)?;
         let options = GeminiOptions {
             system,
             messages: strings_from_py(messages)?,
             response_format: response_format_from_py(response_format)?,
+            output,
             settings: resolve_google_settings(model_settings)?,
             variables: variables.unwrap_or_default(),
             version,
         };
         let prompt = crate::builder::gemini(model, options)?;
-        auto_assign_variables(prompt, auto_variables)
+        let mut prompt = assign_variables(prompt, explicit_variables)?;
+        prompt.py_output_cls = py_output_cls;
+        Ok(prompt)
     }
 
     /// Build a Vertex `GenerateContent` prompt from native constructor arguments.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn vertex(
         model: String,
         system: Option<String>,
         messages: Option<&Bound<'_, PyAny>>,
         response_format: Option<&Bound<'_, PyAny>>,
+        output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
     ) -> CardPyResult<Self> {
-        let auto_variables = variables.is_none();
+        let explicit_variables = variables.clone();
+        let (output, py_output_cls) = output_from_py(output)?;
         let options = GeminiOptions {
             system,
             messages: strings_from_py(messages)?,
             response_format: response_format_from_py(response_format)?,
+            output,
             settings: resolve_google_settings(model_settings)?,
             variables: variables.unwrap_or_default(),
             version,
         };
         let prompt = crate::builder::vertex(model, options)?;
-        auto_assign_variables(prompt, auto_variables)
+        let mut prompt = assign_variables(prompt, explicit_variables)?;
+        prompt.py_output_cls = py_output_cls;
+        Ok(prompt)
     }
 
     /// Build a raw JSON passthrough prompt with a required provider target.
@@ -986,13 +1078,15 @@ impl Prompt {
 #[pyo3::pymethods]
 impl PyProviderRequest {
     /// Return the native provider request as a Python dictionary.
+    /// Escape hatch for `RawV1` and any provider variant without a typed projection.
     pub fn model_dump(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
-        py_value(py, &self.inner)
+        py_value(py, self.inner.as_ref())
     }
 
     /// Return the native provider request as a JSON string.
+    /// Escape hatch for `RawV1` and any provider variant without a typed projection.
     pub fn model_dump_json(&self) -> CardPyResult<String> {
-        Ok(serde_json::to_string(&self.inner)?)
+        Ok(serde_json::to_string(self.inner.as_ref())?)
     }
 
     /// Return the provider name for the rendered request.
@@ -1001,17 +1095,73 @@ impl PyProviderRequest {
         provider_name_to_string(&self.inner.provider())
     }
 
+    /// Return a typed `OpenAI` Chat Completions request accessor.
+    /// Raises `WyrdError` when the provider is not openai chat.
+    pub fn openai(&self) -> CardPyResult<wire_py::PyOpenAiChatRequest> {
+        match self.inner.as_ref() {
+            skald_spec::ProviderRequest::OpenAiChatCompletion(_)
+            | skald_spec::ProviderRequest::OpenAiChatCompatible { .. } => {
+                Ok(wire_py::PyOpenAiChatRequest::new(Arc::clone(&self.inner)))
+            }
+            other => Err(wrong_provider("openai", other.provider()).into()),
+        }
+    }
+
+    /// Return a typed `OpenAI` Responses API request accessor.
+    /// Raises `WyrdError` when the provider is not openai responses.
+    pub fn openai_responses(&self) -> CardPyResult<wire_py::PyOpenAiResponsesRequest> {
+        match self.inner.as_ref() {
+            skald_spec::ProviderRequest::OpenAiResponses(_) => Ok(
+                wire_py::PyOpenAiResponsesRequest::new(Arc::clone(&self.inner)),
+            ),
+            other => Err(wrong_provider("openai_responses", other.provider()).into()),
+        }
+    }
+
+    /// Return a typed Anthropic Messages request accessor.
+    /// Raises `WyrdError` when the provider is not anthropic.
+    pub fn anthropic(&self) -> CardPyResult<wire_py::PyAnthropicMessagesRequest> {
+        match self.inner.as_ref() {
+            skald_spec::ProviderRequest::AnthropicMessage(_) => Ok(
+                wire_py::PyAnthropicMessagesRequest::new(Arc::clone(&self.inner)),
+            ),
+            other => Err(wrong_provider("anthropic", other.provider()).into()),
+        }
+    }
+
+    /// Return a typed Google Gemini request accessor.
+    /// Raises `WyrdError` when the provider is not google/gemini.
+    pub fn gemini(&self) -> CardPyResult<wire_py::PyGeminiRequest> {
+        match self.inner.as_ref() {
+            skald_spec::ProviderRequest::GeminiGenerateContent(_) => {
+                Ok(wire_py::PyGeminiRequest::new(Arc::clone(&self.inner)))
+            }
+            other => Err(wrong_provider("gemini", other.provider()).into()),
+        }
+    }
+
+    /// Return a typed Vertex AI request accessor.
+    /// Raises `WyrdError` when the provider is not vertex.
+    pub fn vertex(&self) -> CardPyResult<wire_py::PyVertexRequest> {
+        match self.inner.as_ref() {
+            skald_spec::ProviderRequest::Vertex(_) => {
+                Ok(wire_py::PyVertexRequest::new(Arc::clone(&self.inner)))
+            }
+            other => Err(wrong_provider("vertex", other.provider()).into()),
+        }
+    }
+
     /// Return native request messages or content turns as Python objects.
     #[getter]
     pub fn messages(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
-        wyrd_utils::py::json_to_pyobject(py, &request_messages_value(&self.inner))
+        wyrd_utils::py::json_to_pyobject(py, &request_messages_value(self.inner.as_ref()))
             .map_err(Into::into)
     }
 
     /// Return the last native request message or content turn.
     #[getter]
     pub fn message(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
-        let messages = request_messages_value(&self.inner);
+        let messages = request_messages_value(self.inner.as_ref());
         let value = messages
             .as_array()
             .and_then(|values| values.last())
@@ -1023,7 +1173,8 @@ impl PyProviderRequest {
     /// Return native system instructions when the provider has that field.
     #[getter]
     pub fn system(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
-        wyrd_utils::py::json_to_pyobject(py, &request_system_value(&self.inner)).map_err(Into::into)
+        wyrd_utils::py::json_to_pyobject(py, &request_system_value(self.inner.as_ref()))
+            .map_err(Into::into)
     }
 
     /// Return a concise Python representation.
@@ -1033,15 +1184,19 @@ impl PyProviderRequest {
 
     /// Return a pretty JSON string for interactive inspection.
     pub fn __str__(&self) -> String {
-        wyrd_utils::json::pretty_json_string(&self.inner)
+        wyrd_utils::json::pretty_json_string(self.inner.as_ref())
     }
 }
 
 #[cfg(feature = "python")]
-fn auto_assign_variables(mut prompt: Prompt, auto_variables: bool) -> CardPyResult<Prompt> {
-    if auto_variables {
-        prompt.inner.variables = extract_prompt_variables(&prompt)?;
-    }
+fn assign_variables(
+    mut prompt: Prompt,
+    explicit_variables: Option<Vec<String>>,
+) -> CardPyResult<Prompt> {
+    prompt.inner.variables = match explicit_variables {
+        Some(variables) => variables,
+        None => extract_prompt_variables(&prompt)?,
+    };
     Ok(prompt)
 }
 
@@ -1113,7 +1268,7 @@ fn require_binding_args(owned: &[(String, String)]) -> CardPyResult<()> {
 #[cfg(feature = "python")]
 fn provider_request_from_py(value: &Bound<'_, PyAny>) -> CardPyResult<ProviderRequest> {
     if let Ok(request) = value.extract::<PyRef<'_, PyProviderRequest>>() {
-        return Ok(request.inner.clone());
+        return Ok((*request.inner).clone());
     }
     Ok(serde_json::from_value(wyrd_utils::py::pyobject_to_json(
         value,
@@ -1208,6 +1363,203 @@ fn response_format_from_py(
 }
 
 #[cfg(feature = "python")]
+fn output_from_py(
+    value: Option<&Bound<'_, PyAny>>,
+) -> CardPyResult<(Option<ResponseFormat>, Option<pyo3::Py<pyo3::PyAny>>)> {
+    let Some(value) = value.filter(|v| !v.is_none()) else {
+        return Ok((None, None));
+    };
+
+    // Already a ResponseFormat pyclass — pass through, no class to retain.
+    if let Ok(format) = value.extract::<PyRef<'_, ResponseFormat>>() {
+        return Ok((Some(format.clone()), None));
+    }
+
+    let py = value.py();
+
+    // Pydantic BaseModel subclass — call model_json_schema() and retain the class.
+    if is_pydantic_model(py, value) {
+        let mut schema = crate::coerce::schema_from_py(value)
+            .map_err(|e| PromptBuilderError::Validation(e.to_string()))?;
+        normalize_output_schema(&mut schema);
+        let name = value
+            .getattr("__name__")
+            .and_then(|n| n.extract::<String>())
+            .unwrap_or_else(|_| "structured_output".to_owned());
+        let fmt = ResponseFormat::json_schema(name, schema)?;
+        return Ok((Some(fmt), Some(value.clone().unbind())));
+    }
+
+    // dict input — raw JSON Schema or dict[str, type].
+    if let Ok(dict) = value.cast::<PyDict>() {
+        let mut schema = if is_raw_json_schema(dict) {
+            crate::coerce::schema_from_py(value)
+                .map_err(|e| PromptBuilderError::Validation(e.to_string()))?
+        } else {
+            annotation_dict_to_schema(py, dict)?
+        };
+        normalize_output_schema(&mut schema);
+        return Ok((
+            Some(ResponseFormat::json_schema("structured_output", schema)?),
+            None,
+        ));
+    }
+
+    Err(PromptBuilderError::Validation(
+        "output must be a dict[str, type], pydantic.BaseModel subclass, or ResponseFormat".into(),
+    )
+    .into())
+}
+
+#[cfg(feature = "python")]
+fn is_pydantic_model<'py>(py: pyo3::Python<'py>, obj: &Bound<'py, PyAny>) -> bool {
+    let Ok(pydantic) = py.import("pydantic") else {
+        return false;
+    };
+    let Ok(basemodel) = pydantic.getattr("BaseModel") else {
+        return false;
+    };
+    let Ok(builtins) = py.import("builtins") else {
+        return false;
+    };
+    let Ok(is_subclass) = builtins.getattr("issubclass") else {
+        return false;
+    };
+    is_subclass
+        .call1((obj, basemodel))
+        .and_then(|r| r.extract::<bool>())
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "python")]
+fn is_raw_json_schema(dict: &Bound<'_, pyo3::types::PyDict>) -> bool {
+    dict.get_item("type").ok().flatten().is_some()
+        || dict.get_item("properties").ok().flatten().is_some()
+        || dict.get_item("$schema").ok().flatten().is_some()
+}
+
+#[cfg(any(test, feature = "python"))]
+fn normalize_output_schema(schema: &mut serde_json::Value) {
+    if let Some(obj) = schema.as_object_mut() {
+        obj.entry("additionalProperties")
+            .or_insert(serde_json::Value::Bool(false));
+    }
+}
+
+#[cfg(feature = "python")]
+fn annotation_dict_to_schema<'py>(
+    py: pyo3::Python<'py>,
+    dict: &Bound<'py, pyo3::types::PyDict>,
+) -> CardPyResult<serde_json::Value> {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for (k, v) in dict.iter() {
+        let key = k.extract::<String>().map_err(|_| {
+            PromptBuilderError::Validation("output schema keys must be strings".into())
+        })?;
+        let schema = py_annotation_to_schema(py, &v)?;
+        properties.insert(key.clone(), schema);
+        required.push(serde_json::Value::String(key));
+    }
+    Ok(serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
+    }))
+}
+
+#[cfg(feature = "python")]
+fn py_annotation_to_schema<'py>(
+    py: pyo3::Python<'py>,
+    ann: &Bound<'py, PyAny>,
+) -> CardPyResult<serde_json::Value> {
+    let builtins = py
+        .import("builtins")
+        .map_err(|e| PromptBuilderError::Validation(e.to_string()))?;
+
+    let primitives: &[(&str, &str)] = &[
+        ("str", "string"),
+        ("int", "integer"),
+        ("float", "number"),
+        ("bool", "boolean"),
+    ];
+    for (builtin_name, json_type) in primitives {
+        if let Ok(bt) = builtins.getattr(*builtin_name) {
+            if ann.is(&bt) {
+                return Ok(serde_json::json!({"type": json_type}));
+            }
+        }
+    }
+
+    // Python 3.10+ `T | None` — types.UnionType has __args__ but no __origin__.
+    // Must be checked before the __origin__ branch so `str | None` is handled correctly.
+    if ann.getattr("__origin__").is_err() {
+        if let Ok(args) = ann.getattr("__args__") {
+            if args.try_iter().is_ok() {
+                let none_type = py.None().bind(py).get_type().into_any();
+                if let Ok(iter) = args.try_iter() {
+                    let non_none: Vec<_> = iter.flatten().filter(|a| !a.is(&none_type)).collect();
+                    if !non_none.is_empty() {
+                        return py_annotation_to_schema(py, &non_none[0]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Generic aliases — inspect __origin__ and __args__.
+    if let Ok(origin) = ann.getattr("__origin__") {
+        // list[T]
+        if let Ok(list_t) = builtins.getattr("list") {
+            if origin.is(&list_t) {
+                let items = if let Ok(args) = ann.getattr("__args__") {
+                    if let Ok(item) = args.get_item(0) {
+                        py_annotation_to_schema(py, &item)?
+                    } else {
+                        serde_json::json!({})
+                    }
+                } else {
+                    serde_json::json!({})
+                };
+                return Ok(serde_json::json!({"type": "array", "items": items}));
+            }
+        }
+        // dict[K, V]
+        if let Ok(dict_t) = builtins.getattr("dict") {
+            if origin.is(&dict_t) {
+                return Ok(serde_json::json!({"type": "object"}));
+            }
+        }
+        // Optional[T] / Union[T, None]
+        if let Ok(args) = ann.getattr("__args__") {
+            let none_type = py.None().bind(py).get_type().into_any();
+            if let Ok(iter) = args.try_iter() {
+                for arg in iter.flatten() {
+                    if !arg.is(&none_type) {
+                        return py_annotation_to_schema(py, &arg);
+                    }
+                }
+            }
+        }
+    }
+
+    // Nested Pydantic BaseModel — inline its schema recursively.
+    if is_pydantic_model(py, ann) {
+        let mut schema = crate::coerce::schema_from_py(ann)
+            .map_err(|e| PromptBuilderError::Validation(e.to_string()))?;
+        normalize_output_schema(&mut schema);
+        return Ok(schema);
+    }
+
+    Err(PromptBuilderError::Validation(format!(
+        "unsupported output annotation: {ann} — supported types are str, int, float, \
+         bool, list[T], dict[K,V], Optional[T], and pydantic.BaseModel subclasses"
+    ))
+    .into())
+}
+
+#[cfg(feature = "python")]
 fn cache_prompt_key(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Option<String>> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(None);
@@ -1257,10 +1609,7 @@ fn append_native_json_content(
             request.messages.push(OpenAiChatMessage {
                 role: role.to_owned(),
                 content: Some(OpenAiMessageContent::Parts(parts)),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                refusal: None,
+                ..Default::default()
             });
         }
         ProviderRequest::OpenAiResponses(request) => {
@@ -1337,4 +1686,27 @@ where
         py,
         &serde_json::to_value(value)?,
     )?)
+}
+
+#[cfg(test)]
+mod output_schema_tests {
+    use super::normalize_output_schema;
+
+    #[test]
+    fn normalize_adds_additional_properties_when_absent() {
+        let mut schema = serde_json::json!({"type": "object", "properties": {}});
+        normalize_output_schema(&mut schema);
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn normalize_does_not_overwrite_existing_additional_properties() {
+        let mut schema =
+            serde_json::json!({"type": "object", "additionalProperties": {"type": "string"}});
+        normalize_output_schema(&mut schema);
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!({"type": "string"})
+        );
+    }
 }

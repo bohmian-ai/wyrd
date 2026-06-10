@@ -43,6 +43,15 @@ impl Agent {
     ///     session (SessionMemory | None): Optional session memory object with recent and append methods.
     ///     labels (dict[str, str] | None): Optional envelope labels.
     ///     annotations (dict[str, str] | None): Optional envelope annotations.
+    ///     provider_base_url (str | None): Override the provider endpoint for this agent only.
+    ///         Useful for routing through an AI gateway (e.g. LiteLLM). Falls back to the
+    ///         standard environment variable when `provider_api_key` is not supplied.
+    ///     provider_api_key (str | None): API key for the overridden provider endpoint.
+    ///         When omitted, the standard environment variable for the prompt's provider is used.
+    ///     output_type (type | None): Optional Python class for parsing AgentRun.parsed.
+    ///         Must be callable and accept keyword arguments matching the structured output
+    ///         fields (typically a pydantic.BaseModel subclass). Does NOT inject a schema into
+    ///         the provider request — use Prompt(output=...) for schema enforcement.
     ///
     /// Returns:
     ///     Agent: New Agent ready to run.
@@ -67,7 +76,10 @@ impl Agent {
         after_tool_callback = None,
         session = None,
         labels = None,
-        annotations = None
+        annotations = None,
+        provider_base_url = None,
+        provider_api_key = None,
+        output_type = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn __new__(
@@ -88,6 +100,9 @@ impl Agent {
         session: Option<Py<PyAny>>,
         labels: Option<HashMap<String, String>>,
         annotations: Option<HashMap<String, String>>,
+        provider_base_url: Option<String>,
+        provider_api_key: Option<String>,
+        output_type: Option<&Bound<'_, PyAny>>,
     ) -> AgentPyResult<Self> {
         let mut agent = agent_from_prompt_py(prompt)?;
 
@@ -138,6 +153,19 @@ impl Agent {
         if let Some(callback) = after_tool_callback {
             agent = agent.after_tool(wrap_after_tool(py, callback)?);
         }
+
+        if let Some(base_url) = provider_base_url {
+            let provider_name = agent.prompt.native().request.provider();
+            let registry = skald_runtime::ProviderRegistry::for_provider(
+                &provider_name,
+                base_url,
+                provider_api_key,
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            agent = agent.with_provider_registry(Arc::new(registry));
+        }
+
+        agent.py_output_cls = output_cls_from_py(output_type)?;
 
         Ok(agent)
     }
@@ -245,19 +273,34 @@ impl Agent {
 
     /// Run the bounded tool loop and return an AgentRun value.
     #[pyo3(name = "run")]
-    #[pyo3(signature = (input, *, session_id=None))]
+    #[pyo3(signature = (input, *, session_id=None, output_type=None))]
     pub fn py_run(
         &self,
         py: Python<'_>,
         input: &Bound<'_, PyAny>,
         session_id: Option<String>,
+        output_type: Option<&Bound<'_, PyAny>>,
     ) -> AgentPyResult<Py<PyAny>> {
-        let input = input_to_string(input)?;
+        let input_str = input_to_string(input)?;
         let providers = skald_runtime::default_registry();
         let session_id = session_id.map(SessionId::new);
-        let run = py.detach(|| {
-            wyrd_runtime::runtime().block_on(self.run_with(providers.as_ref(), session_id, &input))
+        let mut run = py.detach(|| {
+            wyrd_runtime::runtime().block_on(self.run_with(
+                providers.as_ref(),
+                session_id,
+                &input_str,
+            ))
         })?;
+
+        // Resolution order: run(output_type=) > Agent.py_output_cls > Prompt.py_output_cls
+        let call_cls = output_cls_from_py(output_type)?;
+        let effective_cls = call_cls
+            .or_else(|| self.py_output_cls.as_ref().map(|c| c.clone_ref(py)))
+            .or_else(|| self.prompt.output_cls().map(|c| c.clone_ref(py)));
+        if let (Some(cls), Some(map)) = (effective_cls, run.structured_output.as_ref()) {
+            run.parsed = Some(instantiate_parsed(py, &cls, &run.output, map)?);
+        }
+
         Ok(Py::new(py, run)?.into_any())
     }
 
@@ -499,14 +542,12 @@ pub fn wrap_before_model(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<BeforeModel
         invoke_callback(
             &cb,
             |py| {
-                let args = (
-                    ctx_to_py(py, ctx)?,
-                    wyrd_utils::py::json_to_pyobject(
-                        py,
-                        &serde_json::to_value(request).unwrap_or_default(),
-                    )?,
-                );
-                cb.bind(py).call1(args)
+                let py_request = Py::new(
+                    py,
+                    skald_prompt::PyProviderRequest::from_native(request.clone()),
+                )?
+                .into_any();
+                cb.bind(py).call1((ctx_to_py(py, ctx)?, py_request))
             },
             extract_provider_request_replacement,
         )
@@ -522,14 +563,12 @@ pub fn wrap_after_model(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterModelFn
         invoke_callback(
             &cb,
             |py| {
-                let args = (
-                    ctx_to_py(py, ctx)?,
-                    wyrd_utils::py::json_to_pyobject(
-                        py,
-                        &serde_json::to_value(response).unwrap_or_default(),
-                    )?,
-                );
-                cb.bind(py).call1(args)
+                let py_response = Py::new(
+                    py,
+                    skald_prompt::wire_py::PyProviderResponse::from_native(response.clone()),
+                )?
+                .into_any();
+                cb.bind(py).call1((ctx_to_py(py, ctx)?, py_response))
             },
             extract_provider_response_replacement,
         )
@@ -853,6 +892,9 @@ fn extract_provider_request_replacement(value: &Bound<'_, PyAny>) -> PyResult<Pr
 }
 
 fn extract_provider_response_replacement(value: &Bound<'_, PyAny>) -> PyResult<ProviderResponse> {
+    if let Ok(py_resp) = value.extract::<PyRef<'_, skald_prompt::wire_py::PyProviderResponse>>() {
+        return Ok(py_resp.native().clone());
+    }
     serde_json::from_value(wyrd_utils::py::pyobject_to_json(value)?)
         .map_err(|error| PyTypeError::new_err(error.to_string()))
 }
@@ -870,4 +912,77 @@ fn extract_tool_result_replacement(
 fn extract_agent_run_replacement(value: &Bound<'_, PyAny>) -> PyResult<AgentRun> {
     serde_json::from_value(wyrd_utils::py::pyobject_to_json(value)?)
         .map_err(|error| PyTypeError::new_err(error.to_string()))
+}
+
+/// Extract and retain a Python class reference from an `output_type=` kwarg.
+///
+/// Accepts a Pydantic BaseModel subclass or any callable. Returns None when
+/// the value is None or py-None. Returns an error when the value is not callable.
+///
+/// Does NOT extract a schema from the class. Schema must already be set on
+/// the Prompt via `Prompt(output=...)` or in the YAML card spec.
+fn output_cls_from_py(value: Option<&Bound<'_, PyAny>>) -> AgentPyResult<Option<Py<PyAny>>> {
+    let Some(value) = value.filter(|v| !v.is_none()) else {
+        return Ok(None);
+    };
+    if !value.is_callable() {
+        return Err(AgentPyError::from(
+            crate::error::AgentError::InvalidArgument {
+                name: "output_type".to_owned(),
+                detail: "must be a callable class (e.g. a pydantic.BaseModel subclass)".to_owned(),
+            },
+        ));
+    }
+    Ok(Some(value.clone().unbind()))
+}
+
+/// Instantiate a typed model from the agent's raw output text and structured map.
+///
+/// Pydantic path: calls `cls.model_validate_json(output_text)`.
+/// Generic callable path: calls `cls(**structured_output_dict)`.
+///
+/// Returns `AgentPyError` on instantiation failure, surfaced as
+/// `SKALD_AGENT_422_STRUCTURED_DECODE`.
+fn instantiate_parsed<'py>(
+    py: Python<'py>,
+    cls: &Py<PyAny>,
+    output_text: &str,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> AgentPyResult<Py<PyAny>> {
+    let bound = cls.bind(py);
+
+    if bound.hasattr("model_validate_json").unwrap_or(false) {
+        return bound
+            .call_method1("model_validate_json", (output_text,))
+            .map(|r| r.unbind())
+            .map_err(|e| {
+                AgentPyError::from(crate::error::AgentError::StructuredOutputDecode {
+                    agent: "<python>".to_owned(),
+                    detail: e.to_string(),
+                })
+            });
+    }
+
+    let val = serde_json::Value::Object(map.clone());
+    let py_val = wyrd_utils::py::json_to_pyobject(py, &val).map_err(|e| {
+        AgentPyError::from(crate::error::AgentError::StructuredOutputDecode {
+            agent: "<python>".to_owned(),
+            detail: e.to_string(),
+        })
+    })?;
+    let kwargs = py_val.cast_bound::<PyDict>(py).map_err(|e| {
+        AgentPyError::from(crate::error::AgentError::StructuredOutputDecode {
+            agent: "<python>".to_owned(),
+            detail: e.to_string(),
+        })
+    })?;
+    bound
+        .call((), Some(kwargs))
+        .map(|r| r.unbind())
+        .map_err(|e| {
+            AgentPyError::from(crate::error::AgentError::StructuredOutputDecode {
+                agent: "<python>".to_owned(),
+                detail: e.to_string(),
+            })
+        })
 }

@@ -71,6 +71,65 @@ fn openai_responses_emits_native_text_format() {
 }
 
 #[test]
+fn output_wins_over_response_format_for_openai_chat() {
+    let output_schema = json!({
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
+        "required": ["summary"],
+        "additionalProperties": false
+    });
+    let prompt = openai_chat(
+        "gpt-4o",
+        OpenAiChatOptions {
+            messages: vec!["summarize".to_owned()],
+            response_format: Some(ResponseFormat::json_object()),
+            output: Some(ResponseFormat::json_schema("summary", output_schema.clone()).unwrap()),
+            ..OpenAiChatOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        prompt.native().response_type,
+        ResponseType::JsonSchema {
+            name: "summary".to_owned(),
+            schema: output_schema
+        }
+    );
+    let ProviderRequest::OpenAiChatCompletion(request) = &prompt.native().request else {
+        panic!("expected OpenAI chat request");
+    };
+    assert!(matches!(
+        request.response_format,
+        Some(OpenAiResponseFormat::JsonSchema { .. })
+    ));
+}
+
+#[test]
+fn anthropic_output_emits_output_config() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
+        "required": ["summary"],
+        "additionalProperties": false
+    });
+    let prompt = anthropic(
+        "claude-sonnet-4",
+        AnthropicOptions {
+            messages: vec!["summarize".to_owned()],
+            output: Some(ResponseFormat::json_schema("summary", schema).unwrap()),
+            ..AnthropicOptions::default()
+        },
+    )
+    .unwrap();
+
+    let ProviderRequest::AnthropicMessage(request) = &prompt.native().request else {
+        panic!("expected Anthropic request");
+    };
+    assert!(request.output_config.is_some());
+}
+
+#[test]
 fn role_helpers_append_native_messages_without_neutral_storage() {
     let prompt = anthropic(
         "claude-sonnet-4",

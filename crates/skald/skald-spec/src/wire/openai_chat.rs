@@ -398,9 +398,8 @@ pub struct OpenAiCustomChoice {
 }
 
 /// One chat message on the wire.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
 pub struct OpenAiChatMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -413,6 +412,41 @@ pub struct OpenAiChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
+    /// URL citations from web search, when present.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<OpenAiMessageAnnotation>,
+    /// Audio output, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<OpenAiMessageAudio>,
+}
+
+/// A URL citation annotation returned by web search.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct OpenAiMessageAnnotation {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub url_citation: OpenAiUrlCitation,
+}
+
+/// Citation metadata for a web search result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct OpenAiUrlCitation {
+    pub url: String,
+    pub title: String,
+    pub start_index: u32,
+    pub end_index: u32,
+}
+
+/// Audio output returned by the model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct OpenAiMessageAudio {
+    pub id: String,
+    pub expires_at: u64,
+    pub data: String,
+    pub transcript: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -14,11 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-pandas = ["pandas>=2.2,<3"]
-polars = ["polars>=1.10.0"]
-numpy = ["numpy>=1.26"]
-torch = ["torch>=2.4.0", "safetensors>=0.4.0"]
-huggingface = ["datasets>=2.20.0"]
+otel = ["opentelemetry-api>=1.27"]
 
 [dependency-groups]
 dev = [
@@ -27,6 +23,8 @@ dev = [
     "lightgbm>=4.5.0",
     "maturin>=1.7,<2",
     "numpy>=1.26",
+    "opentelemetry-api>=1.27",
+    "opentelemetry-sdk>=1.27",
     "pandas>=2.2,<3",
     "polars>=1.10.0",
     "pydantic>=2.0.0,<3.0.0",

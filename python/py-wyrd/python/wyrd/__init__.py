@@ -2,10 +2,28 @@
 
 from . import cards, data, model, prompt
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError, _init
+from .agent import (
+    Agent,
+    AgentRun,
+    FinishReason,
+    NoSession,
+    Role,
+    RunConfig,
+    SessionMemory,
+    SessionTurn,
+    StepEvent,
+    StepOutcome,
+    StepStatus,
+    Workflow,
+    WorkflowRun,
+    local_registry,
+    tool,
+)
 from .cards import CardKind, CardRef
-from .agent import Agent, AgentRun, FinishReason, RunConfig, local_registry, tool
 from .data import DataCard, Split
 from .model import ModelCard, ModelSignature, SampleInput
+from .observer import Observer
+from .otel import OtelObserver
 from .prompt import (
     AnthropicSettings,
     GeminiSettings,
@@ -17,9 +35,9 @@ from .prompt import (
     PromptCardMetadata,
     PromptRef,
     ProviderRequest,
+    ProviderResponse,
     ResponseFormat,
 )
-from .session import NoSession, Role, SessionMemory, SessionTurn
 
 _init()
 
@@ -39,11 +57,14 @@ __all__ = [
     "NoSession",
     "OpenAIResponsesSettings",
     "OpenAISettings",
+    "Observer",
+    "OtelObserver",
     "Prompt",
     "PromptCard",
     "PromptCardMetadata",
     "PromptRef",
     "ProviderRequest",
+    "ProviderResponse",
     "ResponseFormat",
     "Role",
     "RunConfig",
@@ -52,7 +73,12 @@ __all__ = [
     "SessionMemory",
     "SessionTurn",
     "Split",
+    "StepEvent",
+    "StepOutcome",
+    "StepStatus",
     "ToolError",
+    "Workflow",
+    "WorkflowRun",
     "WyrdError",
     "cards",
     "data",

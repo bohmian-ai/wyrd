@@ -184,6 +184,16 @@ pub struct Agent {
     pub(crate) journal: Arc<dyn Journal>,
     /// Runtime callback chains.
     pub(crate) callbacks: AgentCallbacks,
+    /// Per-agent provider registry override. When set, overrides the global
+    /// default registry for this agent's runs only. Not serialized.
+    pub(crate) provider_override: Option<Arc<skald_runtime::ProviderRegistry>>,
+    /// Python class retained for structured-output instantiation.
+    ///
+    /// Set via `Agent(output_type=...)` or `agent.run(output_type=...)`.
+    /// Overrides `Prompt.py_output_cls` when both are set.
+    /// Only present under the `python` feature.
+    #[cfg(feature = "python")]
+    pub(crate) py_output_cls: Option<pyo3::Py<pyo3::PyAny>>,
 }
 
 impl fmt::Debug for Agent {
@@ -268,6 +278,30 @@ impl Agent {
         self.prompt = Arc::new(resolve_prompt_ref(&prompt_ref, resolver)?);
         self.prompt_ref = prompt_ref;
         Ok(self)
+    }
+
+    /// Return a copy with a per-agent provider registry override.
+    ///
+    /// When set, this registry is used instead of the process-global default
+    /// for every run driven by this agent. The override is purely runtime
+    /// state — it is not serialized into the `AgentCard` or `AgentSpec`.
+    #[must_use]
+    pub fn with_provider_registry(
+        mut self,
+        registry: Arc<skald_runtime::ProviderRegistry>,
+    ) -> Self {
+        self.provider_override = Some(registry);
+        self
+    }
+
+    /// Return the effective provider registry for this agent.
+    ///
+    /// Returns the per-agent override when set, otherwise `fallback`.
+    pub fn effective_providers<'a>(
+        &'a self,
+        fallback: &'a skald_runtime::ProviderRegistry,
+    ) -> &'a skald_runtime::ProviderRegistry {
+        self.provider_override.as_deref().unwrap_or(fallback)
     }
 
     /// Return a copy with one runtime-local tool appended.
@@ -651,8 +685,9 @@ impl Agent {
         providers: &skald_runtime::ProviderRegistry,
         prompt: &Prompt,
         vars: &[(&str, &str)],
+        parent_run_id: Option<&str>,
     ) -> AgentResult<crate::run::AgentRun> {
-        crate::loop_runtime::run_prompt(self, providers, prompt, vars).await
+        crate::loop_runtime::run_prompt(self, providers, prompt, vars, parent_run_id).await
     }
 
     fn from_resolved_parts(id: String, prompt_ref: PromptRef, prompt: Prompt) -> Self {
@@ -671,10 +706,15 @@ impl Agent {
             session: Arc::new(NoSession),
             journal: Arc::new(NoopJournal),
             callbacks: AgentCallbacks::default(),
+            provider_override: None,
+            #[cfg(feature = "python")]
+            py_output_cls: None,
         }
     }
 
-    fn to_spec(&self) -> AgentSpec {
+    /// Project this agent into its pure durable [`AgentSpec`] body.
+    #[must_use]
+    pub fn to_spec(&self) -> AgentSpec {
         AgentSpec {
             prompt: self.prompt_ref.clone(),
             tool_names: self.tool_names.clone(),

@@ -302,7 +302,7 @@ pub fn provider_response_variants() -> Vec<ProviderResponse> {
 
 pub fn message_variants() -> Vec<MessageNum> {
     vec![
-        MessageNum::OpenAi(openai_message()),
+        MessageNum::OpenAi(Box::new(openai_message())),
         MessageNum::Anthropic(anthropic_message()),
         MessageNum::Gemini(google_message()),
     ]

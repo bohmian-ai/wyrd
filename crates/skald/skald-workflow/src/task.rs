@@ -30,6 +30,16 @@ impl SchemaResolver for NoRemoteResolver {
 }
 
 /// Lifecycle status of a task during execution.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "wyrd.agent",
+        name = "StepStatus",
+        eq,
+        eq_int,
+        skip_from_py_object
+    )
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
     /// Not yet eligible to run, or eligible but not started.
@@ -165,7 +175,7 @@ fn compile_validator(
     }
 }
 
-fn response_schema_name(response_type: &ResponseType) -> String {
+pub(crate) fn response_schema_name(response_type: &ResponseType) -> String {
     match response_type {
         ResponseType::JsonSchema { name, .. } => name.clone(),
         ResponseType::Text => String::new(),

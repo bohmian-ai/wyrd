@@ -107,7 +107,7 @@ fn render_escapes_json_special_characters_and_blocks_injection() {
 }
 
 #[test]
-fn dollar_syntax_is_not_matched() {
+fn dollar_syntax_is_bound() {
     let mut request = common::google_request();
     if let skald_spec::wire::google_generate::GooglePart::Text { text } =
         &mut request.contents[0].parts[0]
@@ -121,7 +121,7 @@ fn dollar_syntax_is_not_matched() {
     .render(&[("name", "Ada")])
     .unwrap();
     let value: Value = serde_json::to_value(rendered).unwrap();
-    assert!(value.to_string().contains(&format!("${{{}}}", "name")));
+    assert!(value.to_string().contains("Hello Ada"));
 }
 
 #[test]

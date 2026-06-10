@@ -2,7 +2,6 @@
 
 import numpy as np
 import pandas as pd
-
 from wyrd.cards import CardKind, CardRef
 from wyrd.data import DataCard, FieldSpec, PandasInterface
 from wyrd.model import ModelCard, ModelCardMetadata, ModelSignature, SklearnInterface

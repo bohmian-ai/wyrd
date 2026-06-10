@@ -2,7 +2,7 @@
 //!
 //! - [`EvalExecError`] is crate-local and uses plain `thiserror`. The
 //!   executors, stores, scenario loader, and operator dispatcher raise this.
-//!   It is never serialized and never crosses an HTTP / Python / MCP boundary.
+//!   It is never serialized and never crosses an external boundary.
 //! - [`EvalError`] is the public-facing enum. Variants carry
 //!   `#[wyrd_error(code = "WYRD_EVAL_<STATUS>_<SLUG>", status, title,
 //!   remediation)]` so the `WyrdError` derive supplies stable metadata.
@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use wyrd_error_derive::WyrdError;
+use wyrd_spec::vala::eval::ids::TaskId;
 
 /// Errors raised inside the engine: executor dispatch, store lookups, scenario
 /// loading, JsonPath evaluation, and operator mismatch.
@@ -84,6 +85,14 @@ pub enum EvalExecError {
     /// A `JsonPath` evaluation produced no matches or surfaced a parser error.
     #[error("JsonPath {path} failed: {reason}")]
     JsonPathFailure { path: String, reason: String },
+
+    /// The task registry saw the same task id twice while indexing a plan.
+    #[error("duplicate eval task id {task:?}")]
+    DuplicateTaskId { task: TaskId },
+
+    /// The task registry saw a dependency absent from the indexed task set.
+    #[error("task {task:?} depends on unknown task {dep:?}")]
+    UnknownDependency { task: TaskId, dep: TaskId },
 }
 
 /// Public-facing eval error.
@@ -348,6 +357,17 @@ impl From<EvalExecError> for EvalError {
                 details: serde_json::json!({
                     "path": path,
                     "reason": reason,
+                }),
+            },
+            EvalExecError::DuplicateTaskId { task } => Self::TaskNotFound {
+                message,
+                details: serde_json::json!({ "task_id": task.as_str() }),
+            },
+            EvalExecError::UnknownDependency { task, dep } => Self::DependencyMissing {
+                message,
+                details: serde_json::json!({
+                    "task_id": task.as_str(),
+                    "depends_on": dep.as_str(),
                 }),
             },
         }

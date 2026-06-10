@@ -32,5 +32,6 @@ wyrd-spec = { workspace = true }
 wyrd-utils = { workspace = true }
 
 [dev-dependencies]
+chrono = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "test-util"] }

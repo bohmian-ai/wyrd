@@ -21,9 +21,11 @@
 //!
 //! - `operators` - runtime semantics for the 56-variant `ComparisonOperator`
 //!   catalog.
-//! - `context` / `store` - `ExecutionContext`, `TaskRegistry`,
-//!   `AssertionResultStore`, `LlmResponseStore`.
-//! - `task` - the four executors (`assertion`, `llm_judge`, `trace`, `agent`)
+//! - `context` - `ExecutionContext`, `ContextSnapshot`, `TaskOutput`,
+//!   `RunIdentity`. Per-stage state is rebuilt at each stage barrier via
+//!   `ContextSnapshot::extend` (Arc bumps, no JSON cloning).
+//! - `store` - immutable `TaskRegistry`, `EvalTaskKind`, `JudgeOutcome`.
+//! - `tasks` - the four executors (`assertion`, `judge`, `trace`, `agent`)
 //!   plus `media` bindings.
 //! - `scenario` - loader plus mechanic/passenger pass.
 //! - `results` - task -> scenario -> subject -> run aggregation,
@@ -45,15 +47,22 @@
 pub mod compare;
 pub mod context;
 pub mod error;
+pub mod executor;
 pub mod judge;
 pub mod operators;
 pub mod results;
 pub mod scenario;
 pub mod store;
-pub mod task;
+pub mod tasks;
 pub mod trace_source;
 
-pub use context::ExecutionContext;
+pub use context::{
+    ContextSnapshot, ExecutionContext, RunIdentity, TaskOutput, extract_jsonpath_from,
+    extract_required_jsonpath_from,
+};
 pub use error::{EvalError, EvalExecError};
+pub use executor::{
+    EvalReport, Executors, RunLedger, SkipReason, TaskExecutor, TaskRunOutcome, execute_plan,
+};
 pub use operators::{OperatorVerdict, evaluate_operator};
-pub use store::{AssertionResultStore, EvalTaskKind, JudgeOutcome, LlmResponseStore, TaskRegistry};
+pub use store::{EvalTaskKind, JudgeOutcome, TaskRegistry};

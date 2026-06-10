@@ -1,16 +1,16 @@
-//! Per-scenario accumulating stores for task results and judge outputs.
+//! Per-`ExecutionPlan` task registry plus the engine-local [`JudgeOutcome`]
+//! shape.
 //!
-//! **Cross-scenario isolation rule.** Stores are owned by a single
-//! [`crate::context::ExecutionContext`] for one scenario's execution. Keys are
-//! `(TaskId, RecordId)` with no scenario discriminator, which is correct only
-//! because callers instantiate fresh stores per scenario.
+//! Built once per plan, immutable thereafter. Per-run state (skip ledger,
+//! task outputs) lives on [`crate::executor::RunLedger`] and
+//! [`crate::context::ContextSnapshot`]; the registry only answers "what task
+//! has this id and what kind is it".
 
 use std::collections::{BTreeSet, HashMap};
 
 use serde_json::Value;
-use wyrd_spec::vala::eval::ids::{RecordId, TaskId};
+use wyrd_spec::vala::eval::ids::TaskId;
 use wyrd_spec::vala::eval::plan::ExecutionPlan;
-use wyrd_spec::vala::eval::result::AssertionResult;
 use wyrd_spec::vala::eval::task::EvalTask;
 
 use crate::error::EvalExecError;
@@ -42,6 +42,11 @@ impl EvalTaskKind {
 }
 
 /// Per-`ExecutionPlan` registry: tasks indexed by id and by kind.
+///
+/// Built once per plan, immutable thereafter. The stage driver consults this
+/// on every task dispatch and every dependency check. Per-run state lives
+/// elsewhere: skip ledger and per-task outputs are owned by
+/// [`crate::executor::RunLedger`] and [`crate::context::ContextSnapshot`].
 #[derive(Debug, Clone)]
 pub struct TaskRegistry {
     tasks: HashMap<TaskId, EvalTask>,
@@ -55,7 +60,7 @@ impl TaskRegistry {
     /// # Errors
     /// Returns [`EvalExecError::DuplicateTaskId`] if the same id appears
     /// twice, or [`EvalExecError::UnknownDependency`] if a task references an
-    /// absent dependency.
+    /// absent dependency or the plan and spec task sets disagree.
     pub fn from_plan<I>(plan: &ExecutionPlan, tasks: I) -> Result<Self, EvalExecError>
     where
         I: IntoIterator<Item = (TaskId, EvalTask)>,
@@ -153,73 +158,11 @@ impl TaskRegistry {
     }
 }
 
-/// Accumulating store for [`AssertionResult`] rows keyed by
-/// `(TaskId, RecordId)`.
-#[derive(Debug, Default, Clone)]
-pub struct AssertionResultStore {
-    results: HashMap<(TaskId, RecordId), AssertionResult>,
-}
-
-impl AssertionResultStore {
-    /// Fresh empty store.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            results: HashMap::new(),
-        }
-    }
-
-    /// Record one assertion result.
-    pub fn record(&mut self, task: TaskId, record: RecordId, result: AssertionResult) {
-        self.results.insert((task, record), result);
-    }
-
-    /// Borrow a previously recorded result.
-    #[must_use]
-    pub fn get(&self, task: &TaskId, record: &RecordId) -> Option<&AssertionResult> {
-        self.results.get(&(task.clone(), record.clone()))
-    }
-
-    /// Drain every result associated with `record`, in `TaskId` order.
-    pub fn take_for_record(&mut self, record: &RecordId) -> Vec<AssertionResult> {
-        let mut keys: Vec<(TaskId, RecordId)> = self
-            .results
-            .keys()
-            .filter(|(_, recorded)| recorded == record)
-            .cloned()
-            .collect();
-        keys.sort_by(|(left, _), (right, _)| left.cmp(right));
-
-        let mut drained = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some(value) = self.results.remove(&key) {
-                drained.push(value);
-            }
-        }
-        drained
-    }
-
-    /// Iterate every `(task, record) -> result` triple currently stored.
-    pub fn iter(&self) -> impl Iterator<Item = (&TaskId, &RecordId, &AssertionResult)> {
-        self.results
-            .iter()
-            .map(|((task, record), value)| (task, record, value))
-    }
-
-    /// Number of recorded results.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.results.len()
-    }
-
-    /// True iff no results are recorded.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.results.is_empty()
-    }
-}
-
 /// One judge invocation's raw and parsed payload.
+///
+/// The judge executor (commit 9) produces this; the engine retains it on the
+/// snapshot's `task_outputs` so downstream tasks can JSONPath into
+/// `$.task.<judge_id>.parsed`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JudgeOutcome {
     /// Raw provider response payload as the judge invoker returned it.
@@ -228,57 +171,11 @@ pub struct JudgeOutcome {
     pub parsed: Value,
 }
 
-/// Accumulating store for judge outputs keyed by `(TaskId, RecordId)`.
-#[derive(Debug, Default, Clone)]
-pub struct LlmResponseStore {
-    responses: HashMap<(TaskId, RecordId), JudgeOutcome>,
-}
-
-impl LlmResponseStore {
-    /// Fresh empty store.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            responses: HashMap::new(),
-        }
-    }
-
-    /// Record one judge outcome.
-    pub fn record(&mut self, task: TaskId, record: RecordId, outcome: JudgeOutcome) {
-        self.responses.insert((task, record), outcome);
-    }
-
-    /// Borrow a stored outcome.
-    #[must_use]
-    pub fn get(&self, task: &TaskId, record: &RecordId) -> Option<&JudgeOutcome> {
-        self.responses.get(&(task.clone(), record.clone()))
-    }
-
-    /// Remove and return a stored outcome.
-    pub fn take(&mut self, task: &TaskId, record: &RecordId) -> Option<JudgeOutcome> {
-        self.responses.remove(&(task.clone(), record.clone()))
-    }
-
-    /// Number of recorded outcomes.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.responses.len()
-    }
-
-    /// True iff no outcomes are recorded.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.responses.is_empty()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use serde_json::json;
     use std::collections::BTreeMap;
-    use uuid::Uuid;
     use wyrd_spec::vala::eval::assertion::AssertionTask;
     use wyrd_spec::vala::eval::operator::ComparisonOperator;
     use wyrd_spec::vala::eval::plan::validate_dag;
@@ -307,23 +204,6 @@ mod tests {
         let plan = validate_dag(&map).expect("test fixture is a valid DAG");
         let pairs = map.into_iter().collect();
         (plan, pairs)
-    }
-
-    fn result_for(id: &str, stage: u32) -> AssertionResult {
-        AssertionResult {
-            task_id: task_id(id),
-            passed: true,
-            actual: Some(json!(1)),
-            expected: json!(1),
-            operator: ComparisonOperator::Equals,
-            message: None,
-            stage,
-            started_at: chrono::Utc
-                .with_ymd_and_hms(2026, 6, 10, 0, 0, 0)
-                .single()
-                .expect("static timestamp is valid"),
-            duration_ms: 1,
-        }
     }
 
     #[test]
@@ -372,90 +252,12 @@ mod tests {
     }
 
     #[test]
-    fn assertion_store_round_trip_drains_per_record() {
-        let mut store = AssertionResultStore::new();
-        let record_a = RecordId(Uuid::from_u128(1));
-        let record_b = RecordId(Uuid::from_u128(2));
-
-        store.record(task_id("alpha"), record_a.clone(), result_for("alpha", 0));
-        store.record(task_id("beta"), record_a.clone(), result_for("beta", 1));
-        store.record(task_id("alpha"), record_b.clone(), result_for("alpha", 0));
-
-        assert_eq!(store.len(), 3);
-        assert_eq!(
-            store
-                .get(&task_id("alpha"), &record_a)
-                .map(|result| result.stage),
-            Some(0)
-        );
-
-        let drained = store.take_for_record(&record_a);
-        assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].task_id, task_id("alpha"));
-        assert_eq!(drained[1].task_id, task_id("beta"));
-        assert_eq!(store.len(), 1);
-        assert!(store.get(&task_id("alpha"), &record_b).is_some());
-    }
-
-    #[test]
-    fn llm_response_store_round_trip() {
-        let mut store = LlmResponseStore::new();
-        let record = RecordId(Uuid::from_u128(7));
+    fn judge_outcome_round_trip_is_value_type() {
         let outcome = JudgeOutcome {
             raw: json!({"choices": [{"verdict": "pass"}]}),
             parsed: json!({"verdict": "pass"}),
         };
-
-        store.record(task_id("judge"), record.clone(), outcome.clone());
-        assert_eq!(store.len(), 1);
-        assert_eq!(store.get(&task_id("judge"), &record), Some(&outcome));
-
-        let taken = store
-            .take(&task_id("judge"), &record)
-            .expect("fixture outcome is present");
-        assert_eq!(taken, outcome);
-        assert!(store.is_empty());
-        assert!(store.get(&task_id("judge"), &record).is_none());
-    }
-
-    #[test]
-    fn cross_scenario_key_collision_is_silent_without_reset() {
-        let mut store = AssertionResultStore::new();
-        let task = task_id("greeting_present");
-        let record = RecordId(Uuid::from_u128(42));
-
-        let pass = AssertionResult {
-            passed: true,
-            ..result_for("greeting_present", 0)
-        };
-        store.record(task.clone(), record.clone(), pass.clone());
-        assert_eq!(
-            store.get(&task, &record).map(|result| result.passed),
-            Some(true)
-        );
-
-        let fail = AssertionResult {
-            passed: false,
-            ..result_for("greeting_present", 0)
-        };
-        store.record(task.clone(), record.clone(), fail.clone());
-        assert_eq!(
-            store.get(&task, &record).map(|result| result.passed),
-            Some(false)
-        );
-        assert_eq!(store.len(), 1);
-
-        let mut store_a = AssertionResultStore::new();
-        let mut store_b = AssertionResultStore::new();
-        store_a.record(task.clone(), record.clone(), pass);
-        store_b.record(task.clone(), record.clone(), fail);
-        assert_eq!(
-            store_a.get(&task, &record).map(|result| result.passed),
-            Some(true)
-        );
-        assert_eq!(
-            store_b.get(&task, &record).map(|result| result.passed),
-            Some(false)
-        );
+        let cloned = outcome.clone();
+        assert_eq!(outcome, cloned);
     }
 }

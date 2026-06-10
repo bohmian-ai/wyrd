@@ -86,6 +86,25 @@ pub enum EvalExecError {
     #[error("JsonPath {path} failed: {reason}")]
     JsonPathFailure { path: String, reason: String },
 
+    /// A task's condition referenced a JSONPath that did not resolve against
+    /// the current execution context.
+    #[error("task {task_id:?}: condition path {path:?} did not resolve")]
+    ConditionPathMissing { task_id: TaskId, path: String },
+
+    /// A task asked to extract a JSONPath that did not resolve against the
+    /// current execution context.
+    #[error("task {task_id:?}: extract path {path:?} did not resolve")]
+    ExtractPathMissing { task_id: TaskId, path: String },
+
+    /// Operator dispatch rejected the observed/expected pair for type-shape
+    /// reasons that the typed catalog cannot encode at parse time.
+    #[error("task {task_id:?}: operator {operator:?} cannot compare {reason}")]
+    OperatorTypeMismatch {
+        task_id: TaskId,
+        operator: String,
+        reason: String,
+    },
+
     /// The task registry saw the same task id twice while indexing a plan.
     #[error("duplicate eval task id {task:?}")]
     DuplicateTaskId { task: TaskId },
@@ -356,6 +375,34 @@ impl From<EvalExecError> for EvalError {
                 message,
                 details: serde_json::json!({
                     "path": path,
+                    "reason": reason,
+                }),
+            },
+            EvalExecError::ConditionPathMissing { task_id, path } => Self::JsonPathFailure {
+                message,
+                details: serde_json::json!({
+                    "task_id": task_id.as_str(),
+                    "path": path,
+                    "reason": "condition path did not resolve",
+                }),
+            },
+            EvalExecError::ExtractPathMissing { task_id, path } => Self::JsonPathFailure {
+                message,
+                details: serde_json::json!({
+                    "task_id": task_id.as_str(),
+                    "path": path,
+                    "reason": "extract path did not resolve",
+                }),
+            },
+            EvalExecError::OperatorTypeMismatch {
+                task_id,
+                operator,
+                reason,
+            } => Self::OperatorMismatch {
+                message,
+                details: serde_json::json!({
+                    "task_id": task_id.as_str(),
+                    "operator": operator,
                     "reason": reason,
                 }),
             },

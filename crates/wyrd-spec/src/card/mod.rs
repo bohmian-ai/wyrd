@@ -21,7 +21,7 @@ pub mod tool;
 pub mod trigger;
 pub mod workflow;
 
-pub use crate::ids::{ColumnName, QueryName, SplitName};
+pub use crate::ids::{ColumnName, FeatureName, QueryName, SplitName};
 pub use common::{
     AgentInterface, CredentialRef, Governance, MetricEntry, NonSecretValue, ObservationHooks,
     ParameterValue, ProtocolProfile,

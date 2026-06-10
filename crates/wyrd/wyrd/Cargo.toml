@@ -12,31 +12,6 @@ description = "Public Wyrd Rust umbrella crate; sanctioned re-exports for downst
 [lib]
 path = "src/lib.rs"
 
-[[example]]
-name = "tracing_stdout"
-path = "examples/tracing_stdout.rs"
-required-features = ["otel"]
-
-[[example]]
-name = "agent_openai"
-path = "examples/agent_openai.rs"
-
-[[example]]
-name = "workflow_openai"
-path = "examples/workflow_openai.rs"
-
-[[example]]
-name = "workflow_anthropic"
-path = "examples/workflow_anthropic.rs"
-
-[[example]]
-name = "workflow_gemini"
-path = "examples/workflow_gemini.rs"
-
-[[example]]
-name = "workflow_gateway"
-path = "examples/workflow_gateway.rs"
-
 [features]
 default = []
 otel = ["wyrd-observe/otel"]

@@ -20,7 +20,7 @@ A Workflow is a directed acyclic graph of Agent invocations. Use `Workflow.seque
   </TabItem>
   <TabItem label="YAML">
 
-<CodeFromFile file="../../../crates/skald/skald-workflow/examples/workflows/research.yaml" lang="yaml" />
+<CodeFromFile file="../../../examples/rust/workflows/research.yaml" lang="yaml" />
 
 ```python
 from wyrd import Workflow
@@ -30,7 +30,7 @@ wf = Workflow.load("research.yaml")
   </TabItem>
   <TabItem label="Rust">
 
-<CodeFromFile file="../../../crates/skald/skald-workflow/examples/from_builder.rs" lang="rust" />
+<CodeFromFile file="../../../examples/rust/workflow_from_builder.rs" lang="rust" />
 
   </TabItem>
 </Tabs>
@@ -77,7 +77,7 @@ Use `parallel` when steps do not depend on each other. Use `add_after` to fan ba
   </TabItem>
   <TabItem label="Rust">
 
-<CodeFromFile file="../../../crates/skald/skald-workflow/examples/parallel.rs" lang="rust" />
+<CodeFromFile file="../../../examples/rust/workflow_parallel.rs" lang="rust" />
 
   </TabItem>
 </Tabs>
@@ -94,7 +94,7 @@ Observers attach to workflows. See [Instrument with Observers](/guides/instrumen
   </TabItem>
   <TabItem label="Rust">
 
-<CodeFromFile file="../../../crates/skald/skald-workflow/examples/with_observer.rs" lang="rust" />
+<CodeFromFile file="../../../examples/rust/workflow_with_observer.rs" lang="rust" />
 
   </TabItem>
 </Tabs>

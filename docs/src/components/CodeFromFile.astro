@@ -4,7 +4,7 @@ import { Code } from '@astrojs/starlight/components';
 interface Props {
   /**
    * Path to the example file, relative to this component.
-   * Example: "../../../crates/skald/skald-workflow/examples/with_observer.rs"
+   * Example: "../../../examples/rust/workflow_with_observer.rs"
    */
   file: string;
   /** Language id for syntax highlighting, e.g. "rust", "python", "yaml". */
@@ -21,6 +21,7 @@ const files = import.meta.glob(
   [
     '../../../crates/**/*.rs',
     '../../../crates/**/*.yaml',
+    '../../../examples/**/*.rs',
     '../../../examples/**/*.py',
     '../../../examples/**/*.yaml',
     '../../../python/**/*.py',

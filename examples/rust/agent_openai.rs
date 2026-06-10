@@ -1,4 +1,4 @@
-//! Single-agent OpenAI example; run with `cargo run -p wyrd --example agent_openai --all-features`.
+//! Single-agent OpenAI example; run with `cargo run -p wyrd-rust-examples --bin agent_openai`.
 
 use wyrd::Agent;
 use wyrd::agent::{OpenAiChatOptions, openai_chat};

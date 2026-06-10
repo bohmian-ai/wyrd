@@ -1,9 +1,9 @@
-//! Gemini sequential workflow example; run with `cargo run -p wyrd --example workflow_gemini --all-features`.
+//! Anthropic sequential workflow example; run with `cargo run -p wyrd-rust-examples --bin workflow_anthropic`.
 
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use wyrd::agent::{GeminiOptions, ToolDef, ToolError, gemini};
+use wyrd::agent::{AnthropicOptions, ToolDef, ToolError, anthropic};
 use wyrd::{Agent, Workflow};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -39,29 +39,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         web_search,
     );
 
-    let researcher_prompt = gemini(
-        "gemini-2.0-flash",
-        GeminiOptions {
+    let researcher_prompt = anthropic(
+        "claude-3-5-haiku-20241022",
+        AnthropicOptions {
             system: Some(
                 "You are a concise researcher. Use the web_search tool to find 3 key facts about the topic, then summarise them."
                     .to_owned(),
             ),
             messages: vec!["Research: {{topic}}".to_owned()],
             variables: vec!["topic".to_owned()],
-            ..GeminiOptions::default()
+            ..AnthropicOptions::default()
         },
     )?;
 
-    let writer_prompt = gemini(
-        "gemini-2.0-flash",
-        GeminiOptions {
+    let writer_prompt = anthropic(
+        "claude-3-5-haiku-20241022",
+        AnthropicOptions {
             system: Some(
                 "You are a concise writer. Turn the research notes into a two-sentence summary."
                     .to_owned(),
             ),
             messages: vec!["Write a summary from: {{research}}".to_owned()],
             variables: vec!["research".to_owned()],
-            ..GeminiOptions::default()
+            ..AnthropicOptions::default()
         },
     )?;
 

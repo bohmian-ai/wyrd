@@ -1,6 +1,6 @@
 //! OTel tracing example - outputs spans to stdout (no infra required).
 //!
-//! Run with: cargo run -p wyrd --example tracing_stdout --features otel
+//! Run with: cargo run -p wyrd-rust-examples --bin tracing_stdout
 
 fn main() {
     use opentelemetry::global;

@@ -1,4 +1,4 @@
-//! OpenAI sequential workflow example; run with `cargo run -p wyrd --example workflow_openai --all-features`.
+//! OpenAI sequential workflow example; run with `cargo run -p wyrd-rust-examples --bin workflow_openai`.
 
 use std::sync::Arc;
 

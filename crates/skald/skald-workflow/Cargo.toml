@@ -49,10 +49,6 @@ anyhow = "1"
 url = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 
-[[example]]
-name = "with_observer"
-required-features = ["otel"]
-
 [dev-dependencies]
 skald-providers = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

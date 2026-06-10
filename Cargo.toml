@@ -6,6 +6,7 @@ members = [
     "crates/skald/*",
     "crates/shared/*",
     "crates/wyrd-spec",
+    "examples/rust",
     "python/py-wyrd",
 ]
 default-members = [

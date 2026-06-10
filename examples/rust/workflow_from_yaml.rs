@@ -4,7 +4,6 @@ use skald_workflow::Workflow;
 
 fn main() -> anyhow::Result<()> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("examples")
         .join("workflows")
         .join("research.yaml");
     let wf = Workflow::load(

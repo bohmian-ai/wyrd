@@ -4631,6 +4631,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-rust-examples"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "opentelemetry",
+ "opentelemetry-stdout",
+ "opentelemetry_sdk",
+ "schemars",
+ "serde",
+ "serde_json",
+ "skald-agent",
+ "skald-prompt",
+ "skald-runtime",
+ "skald-spec",
+ "skald-tool",
+ "skald-workflow",
+ "tokio",
+ "wyrd",
+ "wyrd-observe",
+]
+
+[[package]]
 name = "wyrd-server"
 version = "0.0.1"
 dependencies = [

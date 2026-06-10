@@ -1,3 +1,5 @@
+//! Build an Agent card from a Prompt and save it as local YAML.
+
 use std::path::PathBuf;
 
 use skald_agent::Agent;

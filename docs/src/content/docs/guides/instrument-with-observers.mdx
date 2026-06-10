@@ -43,7 +43,7 @@ An Agent owns its local model loop: prompt rendering, tool calls, callbacks, ses
   </TabItem>
   <TabItem label="Rust">
 
-<CodeFromFile file="../../../crates/skald/skald-workflow/examples/with_observer.rs" lang="rust" />
+<CodeFromFile file="../../../examples/rust/workflow_with_observer.rs" lang="rust" />
 
 `TokenCounter` implements the async observer trait and uses atomics because hooks run from async workflow execution.
 

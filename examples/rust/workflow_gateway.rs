@@ -1,4 +1,4 @@
-//! OpenAI gateway workflow example; run with `cargo run -p wyrd --example workflow_gateway --all-features`.
+//! OpenAI gateway workflow example; run with `cargo run -p wyrd-rust-examples --bin workflow_gateway`.
 
 use std::sync::Arc;
 

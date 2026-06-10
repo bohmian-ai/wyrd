@@ -1,7 +1,7 @@
 //! Two-step structured-output workflow against the live OpenAI API.
 //!
 //! Run with:
-//! `cargo run -p wyrd --example workflow_structured_output --all-features`.
+//! `cargo run -p wyrd-rust-examples --bin workflow_structured_output`.
 
 use serde_json::json;
 use wyrd::agent::{Agent, OpenAiChatOptions, Workflow, openai_chat};

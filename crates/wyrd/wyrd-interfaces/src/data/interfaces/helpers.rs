@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyTuple};
@@ -277,9 +278,9 @@ macro_rules! impl_clone_for_handle {
     ($type:ty { $($field:ident),+ $(,)? }) => {
         impl $type {
             #[allow(dead_code)]
-            pub(super) fn clone_for_handle(&self, py: Python<'_>) -> Self {
+            pub(super) fn clone_for_handle(&self, _py: Python<'_>) -> Self {
                 Self {
-                    data: self.data.as_ref().map(|data| data.clone_ref(py)),
+                    data: self.data.as_ref().map(Arc::clone),
                     $($field: self.$field.clone()),+
                 }
             }

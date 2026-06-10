@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyType};
@@ -30,8 +31,8 @@ impl SklearnInterface {
         save_joblib_model(
             py,
             path,
-            self.model.as_ref(),
-            self.preprocessor.as_ref(),
+            self.model.as_deref(),
+            self.preprocessor.as_deref(),
             required::SKLEARN,
             "SklearnInterface",
         )
@@ -75,8 +76,8 @@ impl XgboostInterface {
         save_joblib_model(
             py,
             path,
-            self.model.as_ref(),
-            self.preprocessor.as_ref(),
+            self.model.as_deref(),
+            self.preprocessor.as_deref(),
             required::XGBOOST,
             "XgboostInterface",
         )
@@ -120,8 +121,8 @@ impl LightgbmInterface {
         save_joblib_model(
             py,
             path,
-            self.model.as_ref(),
-            self.preprocessor.as_ref(),
+            self.model.as_deref(),
+            self.preprocessor.as_deref(),
             required::LIGHTGBM,
             "LightgbmInterface",
         )
@@ -165,8 +166,8 @@ impl CatboostInterface {
         save_joblib_model(
             py,
             path,
-            self.model.as_ref(),
-            self.preprocessor.as_ref(),
+            self.model.as_deref(),
+            self.preprocessor.as_deref(),
             required::CATBOOST,
             "CatboostInterface",
         )
@@ -207,7 +208,7 @@ impl TorchInterface {
         save_kwargs: Option<&Bound<'_, PyDict>>,
     ) -> CardPyResult<()> {
         let _ = save_kwargs;
-        let model = require_model(self.model.as_ref(), "TorchInterface")?;
+        let model = require_model(self.model.as_deref(), "TorchInterface")?;
         fs::create_dir_all(path)?;
         match self.save_format {
             TorchSaveFormat::Safetensors => {
@@ -223,7 +224,7 @@ impl TorchInterface {
                     .call_method1("save", (state_dict, &path.join("model.pt")))?;
             }
         }
-        save_preprocessor_joblib(py, path, self.preprocessor.as_ref(), "torch")
+        save_preprocessor_joblib(py, path, self.preprocessor.as_deref(), "torch")
     }
 
     /// Load a torch model from the local artifact layout.
@@ -242,7 +243,7 @@ impl TorchInterface {
         match self.save_format {
             TorchSaveFormat::Safetensors => {
                 ensure_extras_pair(py, required::TORCH_SAFETENSORS)?;
-                let model = self.model.as_ref().ok_or_else(|| {
+                let model = self.model.as_deref().ok_or_else(|| {
                     WyrdPyError::model_validation(
                         "TorchInterface.load with safetensors requires an attached torch module instance",
                     )
@@ -264,7 +265,7 @@ impl TorchInterface {
                     (&path.join("model.pt"),),
                     Some(&kwargs),
                 )?;
-                self.model = Some(model.unbind());
+                self.model = Some(Arc::new(model.unbind()));
             }
         }
         self.preprocessor = load_preprocessor_joblib(py, path, "torch")?;
@@ -285,11 +286,11 @@ impl LightningInterface {
         save_kwargs: Option<&Bound<'_, PyDict>>,
     ) -> CardPyResult<()> {
         let _ = save_kwargs;
-        let model = require_model(self.model.as_ref(), "LightningInterface")?;
+        let model = require_model(self.model.as_deref(), "LightningInterface")?;
         ensure_extras_pair(py, required::LIGHTNING)?;
         fs::create_dir_all(path)?;
         let checkpoint_path = path.join("model.ckpt");
-        if let Some(trainer) = self.trainer.as_ref() {
+        if let Some(trainer) = self.trainer.as_deref() {
             trainer
                 .bind(py)
                 .call_method1("save_checkpoint", (&checkpoint_path,))?;
@@ -300,7 +301,7 @@ impl LightningInterface {
             py.import("torch")?
                 .call_method1("save", (checkpoint, &checkpoint_path))?;
         }
-        save_preprocessor_joblib(py, path, self.preprocessor.as_ref(), "lightning")
+        save_preprocessor_joblib(py, path, self.preprocessor.as_deref(), "lightning")
     }
 
     /// Load a Lightning module checkpoint from the local artifact layout.
@@ -317,7 +318,7 @@ impl LightningInterface {
         let _ = load_kwargs;
         ensure_extras_pair(py, required::LIGHTNING)?;
         let checkpoint_path = path.join("model.ckpt");
-        let model = self.model.as_ref().ok_or_else(|| {
+        let model = self.model.as_deref().ok_or_else(|| {
             WyrdPyError::model_validation(
                 "LightningInterface.load requires an attached LightningModule class or instance",
             )
@@ -325,7 +326,7 @@ impl LightningInterface {
         let bound = model.bind(py);
         if bound.cast::<PyType>().is_ok() {
             let loaded = bound.call_method1("load_from_checkpoint", (&checkpoint_path,))?;
-            self.model = Some(loaded.unbind());
+            self.model = Some(Arc::new(loaded.unbind()));
         } else {
             let kwargs = PyDict::new(py);
             kwargs.set_item("map_location", "cpu")?;
@@ -353,7 +354,7 @@ impl TensorflowInterface {
         save_kwargs: Option<&Bound<'_, PyDict>>,
     ) -> CardPyResult<()> {
         let _ = save_kwargs;
-        let model = require_model(self.model.as_ref(), "TensorflowInterface")?;
+        let model = require_model(self.model.as_deref(), "TensorflowInterface")?;
         ensure_extras_pair(py, required::TENSORFLOW)?;
         fs::create_dir_all(path)?;
         match self.save_format {
@@ -368,7 +369,7 @@ impl TensorflowInterface {
                     .call_method1("export", (&path.join("savedmodel"),))?;
             }
         }
-        save_preprocessor_joblib(py, path, self.preprocessor.as_ref(), "tensorflow")
+        save_preprocessor_joblib(py, path, self.preprocessor.as_deref(), "tensorflow")
     }
 
     /// Load a TensorFlow/Keras model from the local artifact layout.
@@ -394,7 +395,7 @@ impl TensorflowInterface {
                 .getattr("saved_model")?
                 .call_method1("load", (&path.join("savedmodel"),))?,
         };
-        self.model = Some(model.unbind());
+        self.model = Some(Arc::new(model.unbind()));
         self.preprocessor = load_preprocessor_joblib(py, path, "tensorflow")?;
         Ok(())
     }
@@ -413,14 +414,14 @@ impl HuggingfaceInterface {
         save_kwargs: Option<&Bound<'_, PyDict>>,
     ) -> CardPyResult<()> {
         let _ = save_kwargs;
-        let model = require_model(self.model.as_ref(), "HuggingfaceInterface")?;
+        let model = require_model(self.model.as_deref(), "HuggingfaceInterface")?;
         ensure_extras_pair(py, required::HUGGINGFACE)?;
         let model_dir = path.join("model");
         fs::create_dir_all(&model_dir)?;
         model
             .bind(py)
             .call_method1("save_pretrained", (&model_dir,))?;
-        if let Some(processor) = self.processor.as_ref() {
+        if let Some(processor) = self.processor.as_deref() {
             processor
                 .bind(py)
                 .call_method1("save_pretrained", (&model_dir,))?;
@@ -453,7 +454,7 @@ impl HuggingfaceInterface {
             })?
             .call_method1("from_pretrained", (&model_dir,))?;
         self.model_subtype = Some(qualname_of(py, &model)?);
-        self.model = Some(model.unbind());
+        self.model = Some(Arc::new(model.unbind()));
         self.processor = load_huggingface_processor(&transformers, &model_dir);
         Ok(())
     }
@@ -484,8 +485,8 @@ fn save_joblib_model(
 fn load_joblib_model(
     py: Python<'_>,
     path: &Path,
-    model: &mut Option<Py<PyAny>>,
-    preprocessor: &mut Option<Py<PyAny>>,
+    model: &mut Option<Arc<Py<PyAny>>>,
+    preprocessor: &mut Option<Arc<Py<PyAny>>>,
     required: (&str, &[&str]),
 ) -> CardPyResult<()> {
     ensure_extras_pair(py, required)?;
@@ -496,7 +497,7 @@ fn load_joblib_model(
             "joblib model artifact loaded as None",
         ));
     }
-    *model = Some(loaded.unbind());
+    *model = Some(Arc::new(loaded.unbind()));
     *preprocessor = load_preprocessor_joblib(py, path, required.0)?;
     Ok(())
 }
@@ -521,17 +522,17 @@ fn load_preprocessor_joblib(
     py: Python<'_>,
     path: &Path,
     extras: &str,
-) -> CardPyResult<Option<Py<PyAny>>> {
+) -> CardPyResult<Option<Arc<Py<PyAny>>>> {
     let preprocessor_path = path.join("preprocessor.joblib");
     if !preprocessor_path.exists() {
         return Ok(None);
     }
     ensure_extras(py, extras, &["joblib"])?;
-    Ok(Some(
+    Ok(Some(Arc::new(
         py.import("joblib")?
             .call_method1("load", (&preprocessor_path,))?
             .unbind(),
-    ))
+    )))
 }
 
 fn require_model<'a>(
@@ -550,15 +551,15 @@ fn ensure_extras_pair(py: Python<'_>, required: (&str, &[&str])) -> CardPyResult
 fn load_huggingface_processor(
     transformers: &Bound<'_, PyAny>,
     model_dir: &Path,
-) -> Option<Py<PyAny>> {
+) -> Option<Arc<Py<PyAny>>> {
     if let Ok(auto_processor) = transformers.getattr("AutoProcessor") {
         if let Ok(processor) = auto_processor.call_method1("from_pretrained", (model_dir,)) {
-            return Some(processor.unbind());
+            return Some(Arc::new(processor.unbind()));
         }
     }
     if let Ok(auto_tokenizer) = transformers.getattr("AutoTokenizer") {
         if let Ok(tokenizer) = auto_tokenizer.call_method1("from_pretrained", (model_dir,)) {
-            return Some(tokenizer.unbind());
+            return Some(Arc::new(tokenizer.unbind()));
         }
     }
     None

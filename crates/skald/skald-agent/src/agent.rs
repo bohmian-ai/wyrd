@@ -193,7 +193,7 @@ pub struct Agent {
     /// Overrides `Prompt.py_output_cls` when both are set.
     /// Only present under the `python` feature.
     #[cfg(feature = "python")]
-    pub(crate) py_output_cls: Option<pyo3::Py<pyo3::PyAny>>,
+    pub(crate) py_output_cls: Option<Arc<pyo3::Py<pyo3::PyAny>>>,
 }
 
 impl fmt::Debug for Agent {

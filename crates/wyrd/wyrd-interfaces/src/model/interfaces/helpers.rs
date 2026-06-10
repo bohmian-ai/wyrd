@@ -3,6 +3,7 @@ use crate::error::{CardPyResult, WyrdPyError};
 #[cfg(feature = "python")]
 use {
     pyo3::prelude::*,
+    std::sync::Arc,
     wyrd_spec::card::model::{
         CatboostMeta, HuggingfaceMeta, LightgbmMeta, LightningMeta, SklearnMeta, TensorflowMeta,
         TorchMeta, XgboostMeta,
@@ -66,10 +67,10 @@ pub(crate) mod required {
 macro_rules! clone_for_handle {
     ($type:ty, { $($py_field:ident),* $(,)? }, { $($field:ident),* $(,)? }) => {
         impl $type {
-            pub(super) fn clone_for_handle(&self, py: Python<'_>) -> Self {
+            pub(super) fn clone_for_handle(&self, _py: Python<'_>) -> Self {
                 Self {
                     $(
-                        $py_field: self.$py_field.as_ref().map(|value| value.clone_ref(py)),
+                        $py_field: self.$py_field.as_ref().map(Arc::clone),
                     )*
                     $(
                         $field: self.$field.clone(),

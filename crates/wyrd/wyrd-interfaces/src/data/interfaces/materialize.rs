@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -93,7 +94,7 @@ impl PandasInterface {
         let kwargs = pyarrow_engine_kwargs(py)?;
         let pandas = py.import("pandas")?;
         let loaded = pandas.call_method("read_parquet", (&absolute_path,), Some(&kwargs))?;
-        self.data = Some(loaded.unbind());
+        self.data = Some(Arc::new(loaded.unbind()));
         Ok(())
     }
 }
@@ -159,11 +160,11 @@ impl PolarsInterface {
         let absolute_path = RustDataInterface::Polars(self.to_rust(py)?).artifact_path(path)?;
         require_local_file(&absolute_path)?;
         let polars = py.import("polars")?;
-        self.data = Some(
+        self.data = Some(Arc::new(
             polars
                 .call_method1("read_parquet", (&absolute_path,))?
                 .unbind(),
-        );
+        ));
         Ok(())
     }
 }
@@ -244,7 +245,7 @@ impl ArrowInterface {
         let format = meta.format;
         let absolute_path = RustDataInterface::Arrow(meta).artifact_path(path)?;
         require_local_file(&absolute_path)?;
-        self.data = Some(match format {
+        self.data = Some(Arc::new(match format {
             ArrowFormat::Parquet => py
                 .import("pyarrow.parquet")?
                 .call_method1("read_table", (&absolute_path,))?
@@ -254,7 +255,7 @@ impl ArrowInterface {
                 let reader = ipc.call_method1("open_file", (&absolute_path,))?;
                 reader.call_method0("read_all")?.unbind()
             }
-        });
+        }));
         Ok(())
     }
 }
@@ -326,11 +327,11 @@ impl ParquetInterface {
     ) -> CardPyResult<()> {
         let absolute_path = RustDataInterface::Parquet(self.to_rust(py)?).artifact_path(path)?;
         require_local_file(&absolute_path)?;
-        self.data = Some(
+        self.data = Some(Arc::new(
             py.import("pyarrow.parquet")?
                 .call_method1("read_table", (&absolute_path,))?
                 .unbind(),
-        );
+        ));
         Ok(())
     }
 }
@@ -408,7 +409,7 @@ impl NumpyInterface {
         require_local_file(&absolute_path)?;
         let numpy = py.import("numpy")?;
         let kwargs = numpy_no_pickle_kwargs(py)?;
-        self.data = Some(match format {
+        self.data = Some(Arc::new(match format {
             NumpyFormat::Npy => numpy
                 .call_method("load", (&absolute_path,), Some(&kwargs))?
                 .unbind(),
@@ -416,7 +417,7 @@ impl NumpyInterface {
                 let loaded = numpy.call_method("load", (&absolute_path,), Some(&kwargs))?;
                 loaded.get_item("value")?.unbind()
             }
-        });
+        }));
         Ok(())
     }
 }
@@ -495,7 +496,7 @@ impl TorchInterface {
         let save_format = meta.save_format;
         let absolute_path = RustDataInterface::Torch(meta).artifact_path(path)?;
         require_local_file(&absolute_path)?;
-        self.data = Some(match save_format {
+        self.data = Some(Arc::new(match save_format {
             TorchSaveFormat::Safetensors => py
                 .import("safetensors.torch")?
                 .call_method1("load_file", (&absolute_path,))?
@@ -507,7 +508,7 @@ impl TorchInterface {
                     .call_method("load", (&absolute_path,), Some(&kwargs))?
                     .unbind()
             }
-        });
+        }));
         Ok(())
     }
 }
@@ -536,7 +537,7 @@ impl SqlInterface {
         path: &Path,
         _save_kwargs: Option<&Bound<'_, PyDict>>,
     ) -> CardPyResult<DataStats> {
-        let query_bundle = sql_logic_from_data(py, self.data.as_ref())?;
+        let query_bundle = sql_logic_from_data(py, self.data.as_deref())?;
         let absolute_path = RustDataInterface::Sql(self.to_rust(py)?).artifact_path(path)?;
         write_json_sorted(&absolute_path, &query_bundle)?;
         let schema = DataSchema::empty();
@@ -563,7 +564,9 @@ impl SqlInterface {
     ) -> CardPyResult<()> {
         let absolute_path = RustDataInterface::Sql(self.to_rust(py)?).artifact_path(path)?;
         require_local_file(&absolute_path)?;
-        self.data = Some(serde_json_file_to_py(py, &absolute_path)?.unbind());
+        self.data = Some(Arc::new(
+            serde_json_file_to_py(py, &absolute_path)?.unbind(),
+        ));
         Ok(())
     }
 }
@@ -630,7 +633,7 @@ impl JsonlInterface {
         let compression = meta.compression;
         let absolute_path = RustDataInterface::Jsonl(meta).artifact_path(path)?;
         require_local_file(&absolute_path)?;
-        self.data = Some(
+        self.data = Some(Arc::new(
             read_jsonl_to_py(
                 py,
                 &absolute_path,
@@ -638,7 +641,7 @@ impl JsonlInterface {
                 load_kwargs,
             )?
             .unbind(),
-        );
+        ));
         Ok(())
     }
 }
@@ -707,7 +710,7 @@ impl ImageInterface {
     ) -> CardPyResult<()> {
         let absolute_path = RustDataInterface::Image(self.to_rust(py)?).artifact_path(path)?;
         require_local_file(&absolute_path)?;
-        self.data = Some(manifest_json_to_py(py, &absolute_path)?.unbind());
+        self.data = Some(Arc::new(manifest_json_to_py(py, &absolute_path)?.unbind()));
         Ok(())
     }
 }
@@ -776,7 +779,7 @@ impl TextInterface {
     ) -> CardPyResult<()> {
         let absolute_path = RustDataInterface::Text(self.to_rust(py)?).artifact_path(path)?;
         require_local_file(&absolute_path)?;
-        self.data = Some(manifest_json_to_py(py, &absolute_path)?.unbind());
+        self.data = Some(Arc::new(manifest_json_to_py(py, &absolute_path)?.unbind()));
         Ok(())
     }
 }
@@ -861,7 +864,7 @@ impl HuggingfaceInterface {
         let datasets = py.import("datasets")?;
         let pointer_path = path.join("data/dataset_pointer.json");
         let dataset_dir = path.join("data/dataset");
-        self.data = Some(if pointer_path.exists() {
+        self.data = Some(Arc::new(if pointer_path.exists() {
             let allow_remote = bool_kwarg(load_kwargs, "allow_remote")?;
             if !allow_remote {
                 return Err(WyrdPyError::validation(
@@ -878,7 +881,7 @@ impl HuggingfaceInterface {
             datasets
                 .call_method1("load_from_disk", (&dataset_dir,))?
                 .unbind()
-        });
+        }));
         Ok(())
     }
 }

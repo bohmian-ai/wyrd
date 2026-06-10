@@ -97,7 +97,7 @@ arrow = "55"
 arrow-array = "55"
 arrow-schema = "55"
 statrs = "0.18"
-pyo3 = { version = "0.28", features = ["abi3-py310", "chrono", "py-clone"] }
+pyo3 = { version = "0.28", features = ["abi3-py310", "chrono"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

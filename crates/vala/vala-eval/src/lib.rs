@@ -68,3 +68,4 @@ pub use judge::{JudgeError, JudgeInvoker, MockJudgeInvoker};
 pub use operators::{OperatorVerdict, evaluate_operator};
 pub use store::{EvalTaskKind, JudgeOutcome, TaskRegistry};
 pub use tasks::{EvalMediaBinding, MediaBindings};
+pub use trace_source::{InMemoryTraceSource, MockTraceSource, TraceSource, TraceUnavailable};

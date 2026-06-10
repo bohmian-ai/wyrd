@@ -59,6 +59,14 @@ pub enum EvalExecError {
     #[error("trace {trace_id} unavailable: {reason}")]
     TraceUnavailable { trace_id: String, reason: String },
 
+    /// `TraceSource` returned `TraceUnavailable` for this task's record.
+    #[error("trace_assertion task {task_id:?}: trace unavailable: {reason}")]
+    TraceUnavailableForTask { task_id: TaskId, reason: String },
+
+    /// A trace task ran without a trace id on the current snapshot.
+    #[error("trace_assertion task {task_id:?}: no trace_id on record")]
+    TraceIdMissing { task_id: TaskId },
+
     /// An `LlmJudge` task declared a media variable that the record did not
     /// supply.
     #[error("media binding {binding} missing for judge invocation")]
@@ -354,6 +362,20 @@ impl From<EvalExecError> for EvalError {
                 details: serde_json::json!({
                     "trace_id": trace_id,
                     "reason": reason,
+                }),
+            },
+            EvalExecError::TraceUnavailableForTask { task_id, reason } => Self::TraceUnavailable {
+                message,
+                details: serde_json::json!({
+                    "task_id": task_id.as_str(),
+                    "reason": reason,
+                }),
+            },
+            EvalExecError::TraceIdMissing { task_id } => Self::TraceUnavailable {
+                message,
+                details: serde_json::json!({
+                    "task_id": task_id.as_str(),
+                    "reason": "trace_id missing on record",
                 }),
             },
             EvalExecError::MediaBindingMissing { binding } => Self::MediaBindingMissing {

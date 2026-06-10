@@ -22,6 +22,7 @@ use jsonpath_rust::JsonPathValue;
 use serde_json::{Map, Value};
 use wyrd_spec::vala::eval::ids::{JsonPath, RecordId, RunId, ScenarioId, TaskId};
 use wyrd_spec::vala::eval::result::AssertionResult;
+use wyrd_spec::vala::ids::TraceId;
 
 use crate::error::EvalExecError;
 use crate::store::JudgeOutcome;
@@ -82,6 +83,8 @@ impl TaskOutput {
 pub struct ContextSnapshot {
     /// Typed identity of the enclosing run / record / scenario.
     pub identity: RecordIdentity,
+    /// Per-record trace id used by trace assertion tasks.
+    pub trace_id: Option<TraceId>,
     /// The immutable observation document.
     pub base_context: Arc<Value>,
     /// Per-task outputs accumulated by prior stages.
@@ -98,6 +101,7 @@ impl ContextSnapshot {
     pub fn new(base_context: Arc<Value>, identity: RecordIdentity) -> Self {
         Self {
             identity,
+            trace_id: None,
             base_context,
             task_outputs: Arc::new(HashMap::new()),
             media: Arc::new(MediaBindings::new()),
@@ -111,6 +115,15 @@ impl ContextSnapshot {
         Self {
             media: Arc::new(media),
             required_media: Arc::new(required_media),
+            ..self
+        }
+    }
+
+    /// Attach the per-record trace id used by trace assertions.
+    #[must_use]
+    pub fn with_trace_id(self, trace_id: TraceId) -> Self {
+        Self {
+            trace_id: Some(trace_id),
             ..self
         }
     }
@@ -133,6 +146,7 @@ impl ContextSnapshot {
         }
         Self {
             identity: self.identity.clone(),
+            trace_id: self.trace_id,
             base_context: Arc::clone(&self.base_context),
             task_outputs: Arc::new(next),
             media: Arc::clone(&self.media),
@@ -245,6 +259,13 @@ impl ExecutionContext {
             .as_ref()
             .clone()
             .with_media(media, required_media);
+        Self::from_snapshot(Arc::new(snapshot))
+    }
+
+    /// Return a context with the per-record trace id attached.
+    #[must_use]
+    pub fn with_trace_id(self, trace_id: TraceId) -> Self {
+        let snapshot = self.snapshot.as_ref().clone().with_trace_id(trace_id);
         Self::from_snapshot(Arc::new(snapshot))
     }
 

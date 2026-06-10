@@ -15,7 +15,7 @@ use vala_eval::store::{JudgeOutcome, TaskRegistry};
 use vala_eval::tasks::{
     AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, TraceTaskExecutor,
 };
-use vala_eval::{JudgeError, MockJudgeInvoker};
+use vala_eval::{InMemoryTraceSource, JudgeError, MockJudgeInvoker};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::CardName;
 use wyrd_spec::reference::CardRef;
@@ -98,7 +98,10 @@ fn executors() -> Executors {
     Executors {
         assertion: Arc::new(AssertionTaskExecutor::new()),
         judge: Arc::new(JudgeTaskExecutor::new(mock)),
-        trace: Arc::new(TraceTaskExecutor::new()),
+        trace: Arc::new(TraceTaskExecutor::new(
+            Arc::new(InMemoryTraceSource::new()),
+            Duration::from_millis(250),
+        )),
         agent: Arc::new(AgentTaskExecutor::new()),
     }
 }
@@ -107,7 +110,10 @@ fn executors_with_judge(judge: Arc<dyn TaskExecutor>) -> Executors {
     Executors {
         assertion: Arc::new(AssertionTaskExecutor::new()),
         judge,
-        trace: Arc::new(TraceTaskExecutor::new()),
+        trace: Arc::new(TraceTaskExecutor::new(
+            Arc::new(InMemoryTraceSource::new()),
+            Duration::from_millis(250),
+        )),
         agent: Arc::new(AgentTaskExecutor::new()),
     }
 }

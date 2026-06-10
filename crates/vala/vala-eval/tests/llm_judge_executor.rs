@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -9,7 +10,7 @@ use vala_eval::store::TaskRegistry;
 use vala_eval::tasks::{
     AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, TraceTaskExecutor,
 };
-use vala_eval::{JudgeError, MockJudgeInvoker};
+use vala_eval::{InMemoryTraceSource, JudgeError, MockJudgeInvoker};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::CardName;
 use wyrd_spec::reference::CardRef;
@@ -94,7 +95,10 @@ fn executors(mock: Arc<MockJudgeInvoker>) -> Executors {
     Executors {
         assertion: Arc::new(AssertionTaskExecutor::new()),
         judge: Arc::new(JudgeTaskExecutor::new(mock)),
-        trace: Arc::new(TraceTaskExecutor::new()),
+        trace: Arc::new(TraceTaskExecutor::new(
+            Arc::new(InMemoryTraceSource::new()),
+            Duration::from_millis(250),
+        )),
         agent: Arc::new(AgentTaskExecutor::new()),
     }
 }

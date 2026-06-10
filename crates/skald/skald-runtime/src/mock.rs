@@ -216,10 +216,7 @@ fn openai_text_response(text: &str) -> ProviderResponse {
             message: OpenAiChatMessage {
                 role: "assistant".to_owned(),
                 content: Some(OpenAiMessageContent::Text(text.to_owned())),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                refusal: None,
+                ..Default::default()
             },
             finish_reason: Some("stop".to_owned()),
             logprobs: None,

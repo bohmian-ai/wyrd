@@ -24,7 +24,7 @@ fn query(name: &str) -> QueryName {
     QueryName::new(name).unwrap()
 }
 
-fn artifact_ref(name: &str) -> CardRef {
+fn card_ref(name: &str) -> CardRef {
     CardRef {
         kind: CardKind::Artifact,
         name: CardName::new(name).unwrap(),
@@ -109,12 +109,12 @@ fn interfaces() -> Vec<DataInterface> {
         }),
         DataInterface::Image(ImageMeta {
             format: ImageFormat::Mixed,
-            manifest_ref: Some(artifact_ref("imagemanifest")),
+            manifest_ref: Some(card_ref("imagemanifest")),
             color_mode: ColorMode::Rgb,
         }),
         DataInterface::Text(TextMeta {
             encoding: "utf-8".to_string(),
-            manifest_ref: Some(artifact_ref("textmanifest")),
+            manifest_ref: Some(card_ref("textmanifest")),
         }),
         DataInterface::Huggingface(HuggingfaceMeta {
             dataset_id: "acme/data".to_string(),
@@ -147,7 +147,7 @@ fn every_interface_variant_round_trips_json_and_yaml() {
 #[test]
 fn every_split_strategy_variant_round_trips_json_and_yaml() {
     let splits = vec![
-        DataSplit::materialized(split("materialized"), artifact_ref("splitartifact")),
+        DataSplit::materialized(split("materialized"), card_ref("splitartifact")),
         DataSplit::column(
             split("column"),
             col("feature"),
@@ -172,7 +172,7 @@ fn every_split_strategy_variant_round_trips_json_and_yaml() {
 #[test]
 fn split_strategy_kind_strings_are_stable() {
     assert_eq!(
-        SplitStrategy::Materialized(artifact_ref("artifact")).kind(),
+        SplitStrategy::Materialized(card_ref("artifact")).kind(),
         "Materialized"
     );
     assert_eq!(

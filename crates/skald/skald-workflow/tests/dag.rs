@@ -10,7 +10,7 @@ use skald_spec::wire::openai_chat::{
 use skald_spec::{Prompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType};
 use skald_workflow::WorkflowAgent;
 use skald_workflow::{
-    Context, TaskDef, TaskList, TaskStatus, Workflow, WorkflowDef, WorkflowError,
+    Context, DagExecutor, TaskDef, TaskList, TaskStatus, WorkflowDef, WorkflowError,
     default_max_retries,
 };
 
@@ -25,6 +25,8 @@ fn openai_prompt(text: &str) -> Prompt {
                 tool_calls: None,
                 tool_call_id: None,
                 refusal: None,
+                annotations: Vec::new(),
+                audio: None,
             }],
             response_format: None,
             stream: None,
@@ -57,6 +59,8 @@ fn openai_response(content: &str) -> ProviderResponse {
                 tool_calls: None,
                 tool_call_id: None,
                 refusal: None,
+                annotations: Vec::new(),
+                audio: None,
             },
             finish_reason: Some("stop".to_owned()),
             logprobs: None,
@@ -94,7 +98,7 @@ fn workflow_def(tasks: Vec<TaskDef>) -> WorkflowDef {
     }
 }
 
-async fn build_workflow(def: WorkflowDef, responses: usize) -> Arc<Workflow> {
+async fn build_workflow(def: WorkflowDef, responses: usize) -> Arc<DagExecutor> {
     let mock = MockProvider::new(ProviderName::OpenAi);
     for index in 0..responses {
         mock.push_response(openai_response(&format!("ok-{index}")));
@@ -102,7 +106,7 @@ async fn build_workflow(def: WorkflowDef, responses: usize) -> Arc<Workflow> {
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(mock));
     Arc::new(
-        Workflow::build(def, &providers)
+        DagExecutor::build(def, &providers)
             .await
             .expect("workflow builds"),
     )
@@ -111,7 +115,7 @@ async fn build_workflow(def: WorkflowDef, responses: usize) -> Arc<Workflow> {
 async fn build_error(def: WorkflowDef) -> WorkflowError {
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(MockProvider::new(ProviderName::OpenAi)));
-    match Workflow::build(def, &providers).await {
+    match DagExecutor::build(def, &providers).await {
         Ok(_) => panic!("workflow unexpectedly built"),
         Err(err) => err,
     }
@@ -196,19 +200,19 @@ async fn workflow_build_rejects_duplicate_id() {
         task_def("a", vec![]),
     ]))
     .await;
-    assert_eq!(err.code(), "SKALD_WORKFLOW_409_TASK_EXISTS");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_DUPLICATE_STEP_ID");
 }
 
 #[tokio::test]
 async fn workflow_build_rejects_self_dependency() {
     let err = build_error(workflow_def(vec![task_def("a", vec!["a"])])).await;
-    assert_eq!(err.code(), "SKALD_WORKFLOW_422_SELF_DEP");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_MISSING_DEPENDENCY");
 }
 
 #[tokio::test]
 async fn workflow_build_rejects_missing_dependency() {
     let err = build_error(workflow_def(vec![task_def("a", vec!["missing"])])).await;
-    assert_eq!(err.code(), "SKALD_WORKFLOW_422_DEP_MISSING");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_MISSING_DEPENDENCY");
 }
 
 #[test]
@@ -220,7 +224,7 @@ fn workflow_def_validate_graph_rejects_cycle() {
     ])
     .validate_graph()
     .expect_err("cycle fails");
-    assert_eq!(err.code(), "SKALD_WORKFLOW_422_CYCLE");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_CYCLE");
 }
 
 #[test]
@@ -232,7 +236,7 @@ fn tasklist_add_task_rejects_duplicate_id() {
     let err = tasks
         .add_task(task_def("a", vec![]))
         .expect_err("duplicate task fails");
-    assert_eq!(err.code(), "SKALD_WORKFLOW_409_TASK_EXISTS");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_DUPLICATE_STEP_ID");
 }
 
 #[test]
@@ -241,7 +245,7 @@ fn tasklist_add_task_rejects_self_dependency() {
     let err = tasks
         .add_task(task_def("a", vec!["a"]))
         .expect_err("self dependency fails");
-    assert_eq!(err.code(), "SKALD_WORKFLOW_422_SELF_DEP");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_MISSING_DEPENDENCY");
 }
 
 #[test]
@@ -250,7 +254,7 @@ fn tasklist_add_task_rejects_missing_dependency() {
     let err = tasks
         .add_task(task_def("a", vec!["missing"]))
         .expect_err("missing dependency fails");
-    assert_eq!(err.code(), "SKALD_WORKFLOW_422_DEP_MISSING");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_MISSING_DEPENDENCY");
 }
 
 #[tokio::test]

@@ -7,7 +7,7 @@ use futures::StreamExt;
 use futures::stream;
 use skald_prompt::Prompt;
 use skald_runtime::{ProviderRegistry, dispatch};
-use skald_spec::{ProviderName, ProviderRequest, ProviderResponse, ToolDescriptor};
+use skald_spec::{ProviderName, ProviderRequest, ProviderResponse, ResponseType, ToolDescriptor};
 use skald_tool::AgentTool;
 use tracing::{Instrument, debug_span};
 
@@ -20,11 +20,10 @@ use crate::callbacks::{
 use crate::conversation::{Conversation, ConversationTurn};
 use crate::error::{AgentError, AgentResult};
 use crate::journal::JournalEvent;
-use crate::observer::Observer;
-use crate::observer_provider::current_observer;
 use crate::request_builder::{assistant_message, extract_messages, request_from_conversation};
 use crate::run::{AgentRun, FinishReason};
 use crate::session::{Role, SessionId, SessionTurn, session_turn_to_conversation_turn};
+use wyrd_observe::{Observer, current};
 
 #[derive(Debug, Clone)]
 struct ToolCall {
@@ -40,7 +39,9 @@ pub(crate) async fn run(
     session_id: Option<SessionId>,
     input: &str,
 ) -> AgentResult<AgentRun> {
-    let observer = current_observer();
+    let providers = this.effective_providers(providers);
+    let run_id = ulid::Ulid::new().to_string();
+    let observer = current();
     let started_at = Instant::now();
     let span = debug_span!(
         "skald_agent.run",
@@ -68,6 +69,8 @@ pub(crate) async fn run(
                 .map_err(|source| AgentError::JournalAppendFailed { source })?;
             observer
                 .on_agent_start(
+                    &run_id,
+                    None,
                     &this.id,
                     input,
                     session_id.as_ref().map(crate::session::SessionId::as_str),
@@ -106,6 +109,9 @@ pub(crate) async fn run(
                         conversation,
                         error: Some(error),
                         errors: Vec::new(),
+                        structured_output: None,
+                        #[cfg(feature = "python")]
+                        parsed: None,
                     });
                 }
                 ChainResult::Replaced(input) => replace_seed_user_turn(&mut conversation, input),
@@ -121,6 +127,7 @@ pub(crate) async fn run(
             run_loop(
                 this,
                 providers,
+                &run_id,
                 rendered,
                 seed_messages,
                 conversation,
@@ -141,7 +148,8 @@ pub(crate) async fn run(
         if let Err(e) = append_terminal_journal_event(this, &result).await {
             tracing::warn!("failed to append terminal journal event: {e}");
         }
-        append_terminal_observer_event(&*observer, this, &result, started_at.elapsed()).await;
+        append_terminal_observer_event(&run_id, &*observer, this, &result, started_at.elapsed())
+            .await;
         result
     }
     .instrument(span)
@@ -154,8 +162,11 @@ pub(crate) async fn run_prompt(
     providers: &ProviderRegistry,
     prompt: &Prompt,
     vars: &[(&str, &str)],
+    parent_run_id: Option<&str>,
 ) -> AgentResult<AgentRun> {
-    let observer = current_observer();
+    let providers = this.effective_providers(providers);
+    let run_id = ulid::Ulid::new().to_string();
+    let observer = current();
     let started_at = Instant::now();
     let span = debug_span!(
         "skald_agent.run_prompt",
@@ -174,7 +185,9 @@ pub(crate) async fn run_prompt(
                 })
                 .await
                 .map_err(|source| AgentError::JournalAppendFailed { source })?;
-            observer.on_agent_start(&this.id, "", None).await;
+            observer
+                .on_agent_start(&run_id, parent_run_id, &this.id, "", None)
+                .await;
 
             let rendered = prompt
                 .render_native(vars)
@@ -195,6 +208,7 @@ pub(crate) async fn run_prompt(
             run_loop(
                 this,
                 providers,
+                &run_id,
                 rendered,
                 seed_messages,
                 Conversation::new(),
@@ -215,16 +229,19 @@ pub(crate) async fn run_prompt(
         if let Err(e) = append_terminal_journal_event(this, &result).await {
             tracing::warn!("failed to append terminal journal event: {e}");
         }
-        append_terminal_observer_event(&*observer, this, &result, started_at.elapsed()).await;
+        append_terminal_observer_event(&run_id, &*observer, this, &result, started_at.elapsed())
+            .await;
         result
     }
     .instrument(span)
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     this: &Agent,
     providers: &ProviderRegistry,
+    run_id: &str,
     template: ProviderRequest,
     seed_messages: Vec<skald_spec::MessageNum>,
     mut conversation: Conversation,
@@ -246,7 +263,7 @@ async fn run_loop(
             .append(JournalEvent::Iteration { index: iteration })
             .await
             .map_err(|source| AgentError::JournalAppendFailed { source })?;
-        observer.on_iteration(&this.id, iteration).await;
+        observer.on_iteration(run_id, &this.id, iteration).await;
 
         let ctx = agent_context_with_session(this, session_id, iteration, &conversation);
         let mut request =
@@ -262,13 +279,16 @@ async fn run_loop(
             "before_model",
         )? {
             ChainResult::Abort(error) => {
+                let synthetic_resp = synthetic_null_response();
                 append_model_journal_call_result(
                     this,
                     iteration,
                     &request,
                     "callback_aborted".to_owned(),
                     true,
+                    run_id,
                     &*observer,
+                    &synthetic_resp,
                 )
                 .await?;
                 return Ok(AgentRun {
@@ -279,12 +299,15 @@ async fn run_loop(
                     conversation,
                     error: Some(error),
                     errors: Vec::new(),
+                    structured_output: None,
+                    #[cfg(feature = "python")]
+                    parsed: None,
                 });
             }
             ChainResult::Replaced(replacement) => replacement,
         };
 
-        append_model_journal_call(this, iteration, &request, &*observer).await?;
+        append_model_journal_call(this, iteration, &request, run_id, &*observer).await?;
         let response = dispatch(providers, request).await;
         match &response {
             Ok(response) => {
@@ -293,17 +316,22 @@ async fn run_loop(
                     iteration,
                     response_finish_reason(response),
                     false,
+                    run_id,
                     &*observer,
+                    response,
                 )
                 .await?;
             }
             Err(error) => {
+                let synthetic_resp = synthetic_null_response();
                 append_model_journal_result(
                     this,
                     iteration,
                     format!("provider_error:{error}"),
                     true,
+                    run_id,
                     &*observer,
+                    &synthetic_resp,
                 )
                 .await?;
             }
@@ -344,14 +372,18 @@ async fn run_loop(
                 .text()
                 .map(std::borrow::Cow::into_owned)
                 .unwrap_or_default();
+            let structured_output = parse_structured_output(this, &output)?;
             let run = AgentRun {
                 output,
-                final_response: Some(response),
+                final_response: Some(std::sync::Arc::new(response)),
                 iterations: iteration + 1,
                 finish_reason: FinishReason::ModelStopped,
                 conversation,
                 error: None,
                 errors: Vec::new(),
+                structured_output,
+                #[cfg(feature = "python")]
+                parsed: None,
             };
             return match apply_chain_with_panic_catch(
                 &this.callbacks.after_agent,
@@ -402,7 +434,7 @@ async fn run_loop(
                         .await
                         .map_err(|source| AgentError::JournalAppendFailed { source })?;
                     observer
-                        .on_tool_call(&ctx.agent_id, iteration, &call.id, &call.name)
+                        .on_tool_call(run_id, &ctx.agent_id, iteration, &call.id, &call.name)
                         .await;
                     let args = match apply_chain_with_panic_catch_tool(
                         &before_tool,
@@ -423,7 +455,7 @@ async fn run_loop(
                                 .await
                                 .map_err(|source| AgentError::JournalAppendFailed { source })?;
                             observer
-                                .on_tool_result(&ctx.agent_id, iteration, &call.id, true)
+                                .on_tool_result(run_id, &ctx.agent_id, iteration, &call.id, true)
                                 .await;
                             return Ok((
                                 idx,
@@ -472,7 +504,7 @@ async fn run_loop(
                         .await
                         .map_err(|source| AgentError::JournalAppendFailed { source })?;
                     observer
-                        .on_tool_result(&ctx.agent_id, iteration, &call.id, ok)
+                        .on_tool_result(run_id, &ctx.agent_id, iteration, &call.id, ok)
                         .await;
                     if ok {
                         if let Some(session_id) = session_id.as_ref() {
@@ -577,6 +609,7 @@ async fn append_terminal_journal_event(
 }
 
 async fn append_terminal_observer_event(
+    run_id: &str,
     observer: &dyn Observer,
     this: &Agent,
     result: &AgentResult<AgentRun>,
@@ -586,6 +619,7 @@ async fn append_terminal_observer_event(
         Ok(run) => {
             observer
                 .on_agent_finish(
+                    run_id,
                     &this.id,
                     &format!("{:?}", run.finish_reason).to_lowercase(),
                     run.iterations,
@@ -595,28 +629,41 @@ async fn append_terminal_observer_event(
         }
         Err(error) => {
             observer
-                .on_agent_error(&this.id, error.code(), &error.to_string())
+                .on_agent_error(run_id, &this.id, error.code(), &error.to_string())
                 .await;
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn append_model_journal_call_result(
     this: &Agent,
     iteration: u32,
     request: &ProviderRequest,
     finish_reason: String,
     synthetic: bool,
+    run_id: &str,
     observer: &dyn Observer,
+    response: &ProviderResponse,
 ) -> AgentResult<()> {
-    append_model_journal_call(this, iteration, request, observer).await?;
-    append_model_journal_result(this, iteration, finish_reason, synthetic, observer).await
+    append_model_journal_call(this, iteration, request, run_id, observer).await?;
+    append_model_journal_result(
+        this,
+        iteration,
+        finish_reason,
+        synthetic,
+        run_id,
+        observer,
+        response,
+    )
+    .await
 }
 
 async fn append_model_journal_call(
     this: &Agent,
     iteration: u32,
     request: &ProviderRequest,
+    run_id: &str,
     observer: &dyn Observer,
 ) -> AgentResult<()> {
     let request_provider = request.provider();
@@ -631,7 +678,14 @@ async fn append_model_journal_call(
         .await
         .map_err(|source| AgentError::JournalAppendFailed { source })?;
     observer
-        .on_model_call(&this.id, iteration, &provider, &request_model)
+        .on_model_call(
+            run_id,
+            &this.id,
+            iteration,
+            &provider,
+            &request_model,
+            request,
+        )
         .await;
     Ok(())
 }
@@ -641,7 +695,9 @@ async fn append_model_journal_result(
     iteration: u32,
     finish_reason: String,
     synthetic: bool,
+    run_id: &str,
     observer: &dyn Observer,
+    response: &ProviderResponse,
 ) -> AgentResult<()> {
     this.journal
         .append(JournalEvent::ModelResult {
@@ -652,7 +708,14 @@ async fn append_model_journal_result(
         .await
         .map_err(|source| AgentError::JournalAppendFailed { source })?;
     observer
-        .on_model_result(&this.id, iteration, &finish_reason, synthetic)
+        .on_model_result(
+            run_id,
+            &this.id,
+            iteration,
+            &finish_reason,
+            synthetic,
+            response,
+        )
         .await;
     Ok(())
 }
@@ -774,6 +837,31 @@ fn response_finish_reason(response: &ProviderResponse) -> String {
     }
 }
 
+fn parse_structured_output(
+    this: &Agent,
+    output: &str,
+) -> AgentResult<Option<serde_json::Map<String, serde_json::Value>>> {
+    match &this.prompt.native().response_type {
+        ResponseType::Text => Ok(None),
+        ResponseType::JsonSchema { .. } => {
+            let value: serde_json::Value =
+                serde_json::from_str(output.trim()).map_err(|error| {
+                    AgentError::StructuredOutputDecode {
+                        agent: this.id.clone(),
+                        detail: error.to_string(),
+                    }
+                })?;
+            let serde_json::Value::Object(map) = value else {
+                return Err(AgentError::StructuredOutputDecode {
+                    agent: this.id.clone(),
+                    detail: "structured output must be a JSON object".to_owned(),
+                });
+            };
+            Ok(Some(map))
+        }
+    }
+}
+
 const REDACTED: &str = "<REDACTED>";
 const SENSITIVE_FIELDS: &[&str] = &["password", "api_key", "secret", "token", "authorization"];
 
@@ -800,4 +888,10 @@ fn redact_in_place(value: &mut serde_json::Value) {
         }
         _ => {}
     }
+}
+
+fn synthetic_null_response() -> ProviderResponse {
+    ProviderResponse::RawV1(
+        serde_json::value::RawValue::from_string("null".to_owned()).expect("'null' is valid JSON"),
+    )
 }

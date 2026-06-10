@@ -1,0 +1,77 @@
+[package]
+name = "wyrd-rust-examples"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "Runnable Wyrd Rust examples."
+
+[[bin]]
+name = "agent_openai"
+path = "agent_openai.rs"
+
+[[bin]]
+name = "agent_smoke"
+path = "agent_smoke.rs"
+
+[[bin]]
+name = "tracing_stdout"
+path = "tracing_stdout.rs"
+
+[[bin]]
+name = "workflow_anthropic"
+path = "workflow_anthropic.rs"
+
+[[bin]]
+name = "workflow_from_builder"
+path = "workflow_from_builder.rs"
+
+[[bin]]
+name = "workflow_from_yaml"
+path = "workflow_from_yaml.rs"
+
+[[bin]]
+name = "workflow_gateway"
+path = "workflow_gateway.rs"
+
+[[bin]]
+name = "workflow_gemini"
+path = "workflow_gemini.rs"
+
+[[bin]]
+name = "workflow_openai"
+path = "workflow_openai.rs"
+
+[[bin]]
+name = "workflow_parallel"
+path = "workflow_parallel.rs"
+
+[[bin]]
+name = "workflow_structured_output"
+path = "workflow_structured_output.rs"
+
+[[bin]]
+name = "workflow_with_observer"
+path = "workflow_with_observer.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-stdout = { version = "0.27", features = ["trace"] }
+opentelemetry_sdk = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+skald-agent = { workspace = true }
+skald-prompt = { workspace = true }
+skald-runtime = { workspace = true }
+skald-spec = { workspace = true }
+skald-tool = { workspace = true }
+skald-workflow = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wyrd = { path = "../../crates/wyrd/wyrd", features = ["otel"] }
+wyrd-observe = { workspace = true, features = ["otel"] }

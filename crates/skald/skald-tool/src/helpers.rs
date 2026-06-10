@@ -30,10 +30,8 @@ pub fn openai_tool_result_message(
     OpenAiChatMessage {
         role: "tool".to_owned(),
         content: Some(OpenAiMessageContent::Text(content.into())),
-        name: None,
-        tool_calls: None,
         tool_call_id: Some(tool_call_id.into()),
-        refusal: None,
+        ..Default::default()
     }
 }
 

@@ -34,6 +34,8 @@ fn openai_to_anthropic_message_converts_tool_result() {
         tool_calls: None,
         tool_call_id: Some("call_1".to_string()),
         refusal: None,
+        annotations: Vec::new(),
+        audio: None,
     };
     let converted: skald_spec::wire::anthropic_messages::AnthropicMessage =
         message.convert().unwrap();
@@ -115,7 +117,7 @@ fn same_provider_conversion_is_identity() {
     for (provider, message) in [
         (
             ProviderName::OpenAi,
-            MessageNum::OpenAi(common::openai_message()),
+            MessageNum::OpenAi(Box::new(common::openai_message())),
         ),
         (
             ProviderName::Anthropic,
@@ -138,7 +140,7 @@ fn unsupported_conversion_pair_returns_skald_spec_501() {
     let err = convert_message_dyn(
         ProviderName::OpenAi,
         ProviderName::Vertex,
-        &MessageNum::OpenAi(common::openai_message()),
+        &MessageNum::OpenAi(Box::new(common::openai_message())),
     )
     .unwrap_err();
     assert!(matches!(err, SkaldError::UnsupportedConversion { .. }));

@@ -11,7 +11,8 @@ use wyrd_spec::card::data::{
     CustomDataMeta, DataInterface as RustDataInterface, DataSchema, DataSpec, DataSplit, DataStats,
     SqlLogic,
 };
-use wyrd_spec::envelope::Spec;
+use wyrd_spec::envelope::{CardKind, Spec};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{ColumnName, SplitName};
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
@@ -19,7 +20,7 @@ use wyrd_spec::version::ApiVersion;
 
 #[cfg(feature = "python")]
 use {
-    crate::artifact::ArtifactCard,
+    crate::card_ref::CardRefPy,
     pyo3::prelude::*,
     pyo3::pyclass::{PyTraverseError, PyVisit},
     pyo3::types::{PyAny, PyDict, PyType, PyTypeMethods},
@@ -35,7 +36,7 @@ use {
     wyrd_interfaces::data::schema::PyDataSchema,
     wyrd_interfaces::data::stats::PyDataStats,
     wyrd_interfaces::error::WyrdPyError,
-    wyrd_spec::envelope::{CardKind, Metadata as EnvelopeMetadata},
+    wyrd_spec::envelope::Metadata as EnvelopeMetadata,
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
 };
 
@@ -52,8 +53,8 @@ pub struct DataCardMetadata {
     pub interface: RustDataInterface,
     /// Inferred or supplied data schema.
     pub schema: DataSchema,
-    /// Existing durable `ArtifactCard` references for this data card.
-    pub artifact_refs: Vec<CardRef>,
+    /// Existing durable card references for this data card.
+    pub card_refs: Vec<CardRef>,
     /// Declared split strategies by split label.
     pub splits: HashMap<SplitName, DataSplit>,
     /// Target columns for supervised workflows.
@@ -73,7 +74,7 @@ impl Default for DataCardMetadata {
                 extra: BTreeMap::new(),
             }),
             schema: DataSchema::empty(),
-            artifact_refs: Vec::new(),
+            card_refs: Vec::new(),
             splits: HashMap::new(),
             target_columns: Vec::new(),
             sql: None,
@@ -91,7 +92,7 @@ impl Default for DataCardMetadata {
 ///
 /// A `DataCard` owns local identity, holder metadata, and an optional live Python
 /// data interface. It can save and load local filesystem materialization, but
-/// it never registers itself and never creates `ArtifactCards`.
+/// it never registers itself and never creates Artifact cards.
 #[cfg_attr(feature = "python", pyclass(module = "wyrd.data", skip_from_py_object))]
 #[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Serialize, Deserialize)]
@@ -157,6 +158,22 @@ impl DataCard {
     /// durable-contract invariants must be checked.
     pub fn to_data_spec_from_metadata(&self) -> DataSpec {
         data_spec_from_metadata(&self.metadata, self.metadata.interface.clone())
+    }
+
+    /// Convert this holder identity into a Data Card reference.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when identity fields are invalid.
+    pub fn as_card_ref(&self) -> Result<CardRef, WyrdError> {
+        use crate::identity::{card_name, optional_card_uid, optional_space_name, version_block};
+
+        Ok(CardRef {
+            kind: CardKind::Data,
+            name: card_name("name", &self.name)?,
+            version: version_block(&self.version)?,
+            space: optional_space_name(&self.space)?,
+            uid: optional_card_uid(&self.uid)?,
+        })
     }
 
     fn to_card_envelope(&self) -> DataCardEnvelope<'_> {
@@ -230,11 +247,11 @@ impl DataCardMetadata {
 #[cfg(feature = "python")]
 #[pymethods]
 impl DataCard {
-    /// Create a local `DataCard` from raw data, a data interface, or an `ArtifactCard`.
+    /// Create a local `DataCard` from raw data, a data interface, or an Artifact card reference.
     ///
     /// # Arguments
     /// * `data` - Raw framework data, a `DataInterface`, a Python subclass of
-    ///   `DataInterface`, or an existing `ArtifactCard`.
+    ///   `DataInterface`, or a `CardRef` with kind `Artifact`.
     /// * `space` - Optional card space. Defaults to `default`.
     /// * `name` - Optional card name. Defaults to `data`.
     /// * `version` - Optional semantic version. Defaults to `0.1.0`.
@@ -261,7 +278,7 @@ impl DataCard {
     ) -> CardPyResult<Self> {
         let py = data.py();
         let mut metadata = metadata.unwrap_or_default();
-        let (interface, artifact_ref) =
+        let (interface, card_ref) =
             DataCardInput::extract_bound(data, false)?.into_parts(py, &metadata)?;
 
         if let Some(handle) = interface.as_ref() {
@@ -269,8 +286,8 @@ impl DataCard {
             metadata.schema = infer_schema_from_handle(handle, py)?;
             metadata.sql = sql_logic_from_handle(handle, py)?;
         }
-        if let Some(artifact_ref) = artifact_ref {
-            metadata.artifact_refs.push(artifact_ref);
+        if let Some(card_ref) = card_ref {
+            metadata.card_refs.push(card_ref);
         }
 
         Ok(Self {
@@ -388,6 +405,16 @@ impl DataCard {
         &self.uid
     }
 
+    /// Convert this `DataCard`'s identity into a Wyrd `CardRef`.
+    ///
+    /// # Errors
+    /// Returns a Wyrd validation error when identity fields fail newtype
+    /// invariants.
+    #[pyo3(name = "as_card_ref")]
+    pub fn as_card_ref_py(&self) -> CardPyResult<CardRefPy> {
+        self.as_card_ref().map(CardRefPy).map_err(Into::into)
+    }
+
     /// Set the `DataCard` UID.
     #[setter]
     pub fn set_uid(&mut self, value: String) {
@@ -456,7 +483,7 @@ impl DataCard {
     ///
     /// This method only performs local filesystem materialization. It updates
     /// interface metadata and byte stats, then writes `card.json`. It does not
-    /// create `ArtifactCards`, upload bytes, or register anything.
+    /// create Artifact cards, upload bytes, or register anything.
     ///
     /// # Errors
     /// Returns a Wyrd error when no interface is attached, interface save
@@ -587,7 +614,7 @@ impl DataCard {
 
     fn attach_data(&mut self, py: Python<'_>, data: Option<&Bound<'_, PyAny>>) -> CardPyResult<()> {
         if let Some(data) = data {
-            let (interface, artifact_ref) =
+            let (interface, card_ref) =
                 DataCardInput::extract_bound(data, true)?.into_parts(py, &self.metadata)?;
             if let Some(handle) = interface {
                 self.metadata.interface = handle.to_spec_interface(py)?;
@@ -595,8 +622,8 @@ impl DataCard {
                 self.metadata.sql = sql_logic_from_handle(&handle, py)?;
                 self.interface = Some(handle.into_py_any(py)?);
             }
-            if let Some(artifact_ref) = artifact_ref {
-                self.metadata.artifact_refs.push(artifact_ref);
+            if let Some(card_ref) = card_ref {
+                self.metadata.card_refs.push(card_ref);
             }
             return Ok(());
         }
@@ -632,7 +659,7 @@ impl DataCard {
                 metadata: DataCardMetadata {
                     interface: envelope.spec.interface,
                     schema: envelope.spec.schema,
-                    artifact_refs: envelope.spec.artifact_refs,
+                    card_refs: envelope.spec.card_refs,
                     splits: envelope.spec.splits,
                     target_columns: envelope.spec.target_columns,
                     sql: envelope.spec.sql,
@@ -655,15 +682,25 @@ enum DataCardInput {
     Raw(Py<PyAny>),
     Interface(DataInterfaceHandle),
     InterfaceClass(Py<PyAny>),
-    Artifact(ArtifactCard),
+    Artifact(CardRef),
 }
 
 #[cfg(feature = "python")]
 impl DataCardInput {
     fn extract_bound(data: &Bound<'_, PyAny>, allow_interface_class: bool) -> CardPyResult<Self> {
-        if data.is_instance_of::<ArtifactCard>() {
-            let artifact = data.extract::<PyRef<'_, ArtifactCard>>()?;
-            return Ok(Self::Artifact(artifact.clone()));
+        if data.is_instance_of::<CardRefPy>() {
+            let card_ref = data.extract::<CardRefPy>()?.0;
+            if card_ref.kind != CardKind::Artifact {
+                return Err(WyrdPyError::validation_with_details(
+                    "DataCard Artifact input requires a CardRef with kind=Artifact",
+                    json!({
+                        "field": "data",
+                        "expected_kind": "Artifact",
+                        "actual_kind": card_ref.kind.wire_name(),
+                    }),
+                ));
+            }
+            return Ok(Self::Artifact(card_ref));
         }
 
         if data.is_instance_of::<DataInterface>() {
@@ -701,7 +738,7 @@ impl DataCardInput {
                     .call_method1("from_metadata", (metadata.clone(),))?;
                 Ok((Some(DataInterfaceHandle::from_interface(&interface)?), None))
             }
-            Self::Artifact(artifact) => Ok((None, Some(artifact.as_card_ref()?))),
+            Self::Artifact(card_ref) => Ok((None, Some(card_ref))),
         }
     }
 }
@@ -837,7 +874,7 @@ fn data_spec_from_metadata(metadata: &DataCardMetadata, interface: RustDataInter
     DataSpec {
         interface,
         schema: metadata.schema.clone(),
-        artifact_refs: metadata.artifact_refs.clone(),
+        card_refs: metadata.card_refs.clone(),
         splits: metadata.splits.clone(),
         target_columns: metadata.target_columns.clone(),
         sql: metadata.sql.clone(),
@@ -859,7 +896,7 @@ mod tests {
         DataInterface as RustDataInterface, DataSchema, DataStats, PandasMeta, ParquetCompression,
     };
     use wyrd_spec::card::field::FieldSpec;
-    use wyrd_spec::envelope::Spec;
+    use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::ids::ColumnName;
     use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue};
 
@@ -894,7 +931,7 @@ mod tests {
                     ColumnName::new("value").expect("static column name is valid"),
                     "int64",
                 )]),
-                artifact_refs: Vec::new(),
+                card_refs: Vec::new(),
                 splits: HashMap::new(),
                 target_columns: Vec::new(),
                 sql: None,
@@ -928,5 +965,72 @@ mod tests {
             serialized.contains(r#""annotations":{"acme.com/source":"warehouse.customer_churn"}"#)
         );
         assert!(!serialized.contains(r#""tags""#));
+    }
+
+    #[test]
+    fn as_card_ref_returns_err_for_empty_name() {
+        let card = DataCard {
+            space: "default".to_string(),
+            name: String::new(),
+            version: "0.1.0".to_string(),
+            uid: String::new(),
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            metadata: DataCardMetadata::default(),
+            created_at: DateTime::<Utc>::from_timestamp(0, 0)
+                .expect("unix epoch timestamp is valid"),
+            is_card: true,
+            #[cfg(feature = "python")]
+            interface: None,
+        };
+        assert!(card.as_card_ref().is_err());
+    }
+
+    #[test]
+    fn as_card_ref_returns_err_for_invalid_version() {
+        let card = DataCard {
+            space: "default".to_string(),
+            name: "my-dataset".to_string(),
+            version: "not-semver".to_string(),
+            uid: String::new(),
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            metadata: DataCardMetadata::default(),
+            created_at: DateTime::<Utc>::from_timestamp(0, 0)
+                .expect("unix epoch timestamp is valid"),
+            is_card: true,
+            #[cfg(feature = "python")]
+            interface: None,
+        };
+        assert!(card.as_card_ref().is_err());
+    }
+
+    #[test]
+    fn as_card_ref_returns_data_kind() {
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            LabelKey::new("domain").expect("static label key is valid"),
+            LabelValue::new("churn").expect("static label value is valid"),
+        );
+        let card = DataCard {
+            space: "default".to_string(),
+            name: "data".to_string(),
+            version: "0.1.0".to_string(),
+            uid: "018f90f5-8e1b-7c4a-a834-4d2d4df6e9c2".to_string(),
+            labels,
+            annotations: BTreeMap::new(),
+            metadata: DataCardMetadata::default(),
+            created_at: DateTime::<Utc>::from_timestamp(0, 0)
+                .expect("unix epoch timestamp is valid"),
+            is_card: true,
+            #[cfg(feature = "python")]
+            interface: None,
+        };
+
+        let card_ref = card.as_card_ref().expect("identity is valid");
+
+        assert_eq!(card_ref.kind, CardKind::Data);
+        assert_eq!(card_ref.name.as_str(), "data");
+        assert_eq!(card_ref.version.as_str(), "0.1.0");
     }
 }

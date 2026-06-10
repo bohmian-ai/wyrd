@@ -1,0 +1,26 @@
+apiVersion: wyrd/v1
+kind: Workflow
+metadata:
+  name: research
+  version: 0.1.0
+spec:
+  steps:
+  - id: planner
+    action:
+      type: agent
+      target:
+        kind: Agent
+        name: planner
+        version: 0.1.0
+  - id: writer
+    action:
+      type: agent
+      target:
+        kind: Agent
+        name: writer
+        version: 0.1.0
+    depends_on:
+    - planner
+relationships:
+  outbound: []
+status: null

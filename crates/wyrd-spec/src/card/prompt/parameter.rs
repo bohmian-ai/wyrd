@@ -51,12 +51,17 @@ pub fn is_valid_parameter_name(value: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-/// Returns the compiled `{{name}}` placeholder regex used by PromptCard validation.
+/// Returns the compiled text placeholder regex used by PromptCard validation.
+///
+/// Accepts both `${name}` and `{{name}}`. The `${media:name}` form remains
+/// reserved for media binding and is not matched here.
 pub fn text_placeholder_regex() -> &'static Regex {
     static PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
-    PLACEHOLDER_RE.get_or_init(|| match Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}") {
-        Ok(regex) => regex,
-        Err(error) => panic!("PromptCard placeholder regex is static and valid: {error}"),
+    PLACEHOLDER_RE.get_or_init(|| {
+        match Regex::new(r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}|\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}") {
+            Ok(regex) => regex,
+            Err(error) => panic!("PromptCard placeholder regex is static and valid: {error}"),
+        }
     })
 }
 
@@ -71,7 +76,7 @@ pub fn media_placeholder_regex() -> &'static Regex {
     )
 }
 
-/// Extracts declared-style `{{name}}` placeholders from the native request JSON.
+/// Extracts declared-style text placeholders from the native request JSON.
 ///
 /// Results are deterministic: first-seen order is preserved and repeated names
 /// appear once.
@@ -96,7 +101,10 @@ fn extract_with_regex(spec: &PromptSpec, regex: &Regex) -> Result<Vec<String>, W
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for capture in regex.captures_iter(&json) {
-        let name = capture[1].to_owned();
+        let Some(name_match) = capture.get(1).or_else(|| capture.get(2)) else {
+            continue;
+        };
+        let name = name_match.as_str().to_owned();
         if seen.insert(name.clone()) {
             out.push(name);
         }

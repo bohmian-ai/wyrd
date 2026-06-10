@@ -41,6 +41,16 @@ pub enum WorkflowError {
         /// Validator, parse, or missing-output detail.
         received: String,
     },
+    /// A step prompt referenced a variable absent from input and upstream output.
+    #[error(
+        "step '{step_id}' references variable '{name}' not present in workflow input or upstream output"
+    )]
+    MissingParameter {
+        /// Step id whose prompt references the variable.
+        step_id: String,
+        /// Variable name that failed to resolve.
+        name: String,
+    },
     /// No ready tasks remain but the workflow is not complete.
     #[error("workflow stalled; pending: {0:?}")]
     Stalled(Vec<String>),
@@ -61,6 +71,12 @@ pub enum WorkflowError {
     /// Failure inside an agent propagated up.
     #[error(transparent)]
     Agent(#[from] AgentError),
+    /// Workflow spec validation surfaced through the user-facing surface.
+    #[error(transparent)]
+    Spec(#[from] wyrd_spec::card::workflow::WorkflowValidationError),
+    /// Generic boundary failure raised by the workflow user surface.
+    #[error("{0}")]
+    Other(String),
 }
 
 impl WorkflowError {
@@ -69,17 +85,30 @@ impl WorkflowError {
         match self {
             Self::TaskNotFound(_) => "SKALD_WORKFLOW_404_TASK",
             Self::AgentNotFound(_) => "SKALD_WORKFLOW_404_AGENT",
-            Self::DependencyNotFound(_) => "SKALD_WORKFLOW_422_DEP_MISSING",
-            Self::TaskAlreadyExists(_) => "SKALD_WORKFLOW_409_TASK_EXISTS",
-            Self::TaskDependsOnItself(_) => "SKALD_WORKFLOW_422_SELF_DEP",
+            Self::DependencyNotFound(_) => "WYRD_WORKFLOW_422_MISSING_DEPENDENCY",
+            Self::TaskAlreadyExists(_) => "WYRD_WORKFLOW_422_DUPLICATE_STEP_ID",
+            Self::TaskDependsOnItself(_) => "WYRD_WORKFLOW_422_MISSING_DEPENDENCY",
             Self::MaxRetriesExceeded(_) => "SKALD_WORKFLOW_500_MAX_RETRIES",
             Self::AgentMissingFinalResponse(_) => "SKALD_WORKFLOW_500_AGENT_RESPONSE_MISSING",
             Self::ResponseValidationFailed { .. } => "SKALD_WORKFLOW_422_OUTPUT_SCHEMA",
+            Self::MissingParameter { .. } => "WYRD_WORKFLOW_422_MISSING_PARAMETER",
             Self::Stalled(_) => "SKALD_WORKFLOW_500_STALLED",
             Self::UnsupportedHandoff { .. } => "SKALD_WORKFLOW_501_UNSUPPORTED_HANDOFF",
-            Self::Cycle(_) => "SKALD_WORKFLOW_422_CYCLE",
+            Self::Cycle(_) => "WYRD_WORKFLOW_422_CYCLE",
             Self::Lock => "SKALD_WORKFLOW_500_LOCK",
             Self::Agent(source) => source.code(),
+            Self::Spec(error) => match error {
+                wyrd_spec::card::workflow::WorkflowValidationError::DuplicateStep => {
+                    "WYRD_WORKFLOW_422_DUPLICATE_STEP_ID"
+                }
+                wyrd_spec::card::workflow::WorkflowValidationError::MissingDependency => {
+                    "WYRD_WORKFLOW_422_MISSING_DEPENDENCY"
+                }
+                wyrd_spec::card::workflow::WorkflowValidationError::Cycle => {
+                    "WYRD_WORKFLOW_422_CYCLE"
+                }
+            },
+            Self::Other(_) => "SKALD_WORKFLOW_500_INTERNAL",
         }
     }
 }

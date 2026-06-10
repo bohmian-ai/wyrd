@@ -75,7 +75,7 @@ pub fn extract_messages(agent: &str, request: &ProviderRequest) -> AgentResult<V
             .messages
             .iter()
             .cloned()
-            .map(MessageNum::OpenAi)
+            .map(|m| MessageNum::OpenAi(Box::new(m)))
             .collect()),
         (PromptLoopSupport::Anthropic, ProviderRequest::AnthropicMessage(req)) => Ok(req
             .messages
@@ -126,7 +126,7 @@ pub fn assistant_message(agent: &str, response: &ProviderResponse) -> AgentResul
                     provider: skald_spec::ProviderName::OpenAi,
                     detail: format!("agent '{agent}' received OpenAI response with no choices"),
                 })?;
-            Ok(MessageNum::OpenAi(choice.message.clone()))
+            Ok(MessageNum::OpenAi(Box::new(choice.message.clone())))
         }
         ProviderResponse::AnthropicMessage(response) => {
             Ok(MessageNum::Anthropic(AnthropicMessage {
@@ -176,7 +176,7 @@ pub fn rebuild_request_messages(
             req.messages.clear();
             for msg in new_messages {
                 match msg {
-                    MessageNum::OpenAi(message) => req.messages.push(message.clone()),
+                    MessageNum::OpenAi(message) => req.messages.push((**message).clone()),
                     _ => return Err(mismatch(ProviderName::OpenAi)),
                 }
             }
@@ -296,7 +296,9 @@ fn validate_message_provider(
 
 fn system_message(provider: PromptLoopSupport, content: &str) -> MessageNum {
     match provider {
-        PromptLoopSupport::OpenAiChat => MessageNum::OpenAi(openai_message("system", content)),
+        PromptLoopSupport::OpenAiChat => {
+            MessageNum::OpenAi(Box::new(openai_message("system", content)))
+        }
         PromptLoopSupport::Anthropic => MessageNum::Anthropic(AnthropicMessage {
             role: "system".to_owned(),
             content: vec![AnthropicContentBlock::Text {
@@ -318,7 +320,9 @@ fn system_message(provider: PromptLoopSupport, content: &str) -> MessageNum {
 
 fn user_message(provider: PromptLoopSupport, content: &str) -> MessageNum {
     match provider {
-        PromptLoopSupport::OpenAiChat => MessageNum::OpenAi(openai_message("user", content)),
+        PromptLoopSupport::OpenAiChat => {
+            MessageNum::OpenAi(Box::new(openai_message("user", content)))
+        }
         PromptLoopSupport::Anthropic => MessageNum::Anthropic(AnthropicMessage {
             role: "user".to_owned(),
             content: vec![AnthropicContentBlock::Text {
@@ -349,7 +353,7 @@ fn tool_result_message(
         PromptLoopSupport::OpenAiChat => {
             let mut message = openai_message("tool", &content_text);
             message.tool_call_id = Some(call_id.to_owned());
-            MessageNum::OpenAi(message)
+            MessageNum::OpenAi(Box::new(message))
         }
         PromptLoopSupport::Anthropic => MessageNum::Anthropic(AnthropicMessage {
             role: "user".to_owned(),
@@ -378,10 +382,7 @@ fn openai_message(role: &str, content: &str) -> OpenAiChatMessage {
     OpenAiChatMessage {
         role: role.to_owned(),
         content: Some(OpenAiMessageContent::Text(content.to_owned())),
-        name: None,
-        tool_calls: None,
-        tool_call_id: None,
-        refusal: None,
+        ..Default::default()
     }
 }
 
@@ -408,6 +409,7 @@ mod tests {
             stream: None,
             tools: None,
             tool_choice: None,
+            output_config: None,
             settings: AnthropicMessagesSettings::default(),
         })
     }
@@ -458,6 +460,8 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             refusal: None,
+            annotations: Vec::new(),
+            audio: None,
         }
     }
 
@@ -544,7 +548,10 @@ mod tests {
     #[test]
     fn rebuild_request_messages_rejects_mismatched_variant() {
         let template = anthropic_request(vec![]);
-        let new_messages = vec![MessageNum::OpenAi(openai_message("user", "wrong provider"))];
+        let new_messages = vec![MessageNum::OpenAi(Box::new(openai_message(
+            "user",
+            "wrong provider",
+        )))];
 
         let err = rebuild_request_messages(template, &new_messages)
             .expect_err("variant mismatch must fail");

@@ -116,10 +116,8 @@ impl ProviderMessageConversion<OpenAiChatMessage> for AnthropicMessage {
             return Ok(OpenAiChatMessage {
                 role: "tool".to_string(),
                 content: Some(OpenAiMessageContent::Text(content)),
-                name: None,
-                tool_calls: None,
                 tool_call_id: Some(tool_use_id),
-                refusal: None,
+                ..Default::default()
             });
         }
 
@@ -128,14 +126,12 @@ impl ProviderMessageConversion<OpenAiChatMessage> for AnthropicMessage {
             content: Some(OpenAiMessageContent::Parts(anthropic_content_to_openai(
                 &self.content,
             ))),
-            name: None,
             tool_calls: if tool_calls.is_empty() {
                 None
             } else {
                 Some(tool_calls)
             },
-            tool_call_id: None,
-            refusal: None,
+            ..Default::default()
         })
     }
 }
@@ -205,10 +201,8 @@ impl ProviderMessageConversion<OpenAiChatMessage> for GoogleContent {
             return Ok(OpenAiChatMessage {
                 role: "tool".to_string(),
                 content: Some(OpenAiMessageContent::Text(response.to_string())),
-                name: None,
-                tool_calls: None,
                 tool_call_id: Some(name),
-                refusal: None,
+                ..Default::default()
             });
         }
 
@@ -217,14 +211,12 @@ impl ProviderMessageConversion<OpenAiChatMessage> for GoogleContent {
             content: Some(OpenAiMessageContent::Parts(google_content_to_openai(
                 &self.parts,
             ))),
-            name: None,
             tool_calls: if tool_calls.is_empty() {
                 None
             } else {
                 Some(tool_calls)
             },
-            tool_call_id: None,
-            refusal: None,
+            ..Default::default()
         })
     }
 }
@@ -296,13 +288,13 @@ pub fn convert_message_dyn(
             message.convert().map(MessageNum::Gemini)
         }
         (ProviderName::Anthropic, ProviderName::OpenAi, MessageNum::Anthropic(message)) => {
-            message.convert().map(MessageNum::OpenAi)
+            message.convert().map(|m| MessageNum::OpenAi(Box::new(m)))
         }
         (ProviderName::Anthropic, ProviderName::Google, MessageNum::Anthropic(message)) => {
             message.convert().map(MessageNum::Gemini)
         }
         (ProviderName::Google, ProviderName::OpenAi, MessageNum::Gemini(message)) => {
-            message.convert().map(MessageNum::OpenAi)
+            message.convert().map(|m| MessageNum::OpenAi(Box::new(m)))
         }
         (ProviderName::Google, ProviderName::Anthropic, MessageNum::Gemini(message)) => {
             message.convert().map(MessageNum::Anthropic)

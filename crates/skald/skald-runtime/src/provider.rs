@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use skald_providers::{
     AnthropicClient, GoogleClient, OpenAiClient, ProviderClient, ProviderError, ProviderStream,
     VertexClient,
+    auth::{AnthropicAuth, OpenAiAuth},
 };
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 
@@ -119,6 +120,59 @@ impl ProviderRegistry {
     /// Returns true when no providers are registered.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// Fluent builder: register one provider and return `self`.
+    #[must_use]
+    pub fn with(mut self, client: Arc<dyn Provider>) -> Self {
+        self.register(client);
+        self
+    }
+
+    /// Build a single-provider registry for `name` pointed at `base_url`.
+    ///
+    /// For OpenAI and Anthropic the API key falls back to the relevant
+    /// environment variable when `api_key` is `None`. Google and Vertex
+    /// require an OpenAI-compatible gateway (use `ProviderName::OpenAi`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError` when the API key is missing from both the
+    /// argument and the environment, or when client construction fails.
+    pub fn for_provider(
+        name: &skald_spec::ProviderName,
+        base_url: impl Into<String>,
+        api_key: Option<impl Into<String>>,
+    ) -> Result<Self, ProviderError> {
+        let base_url = base_url.into();
+        let api_key = api_key.map(Into::into);
+        match name {
+            skald_spec::ProviderName::OpenAi => {
+                let auth = match api_key {
+                    Some(key) => OpenAiAuth::new(key).with_base_url(base_url),
+                    None => OpenAiAuth::from_env()?.with_base_url(base_url),
+                };
+                Ok(Self::new().with(Arc::new(OpenAiClient::new(auth)?)))
+            }
+            skald_spec::ProviderName::Anthropic => {
+                let auth = match api_key {
+                    Some(key) => AnthropicAuth::new(key).with_base_url(base_url),
+                    None => AnthropicAuth::from_env()?.with_base_url(base_url),
+                };
+                Ok(Self::new().with(Arc::new(AnthropicClient::new(auth)?)))
+            }
+            skald_spec::ProviderName::Google | skald_spec::ProviderName::Vertex => {
+                Err(ProviderError::auth(
+                    "google",
+                    "route Google and Vertex models through an OpenAI-compatible gateway \
+                     (use ProviderName::OpenAi with provider_base_url pointing at the gateway)",
+                ))
+            }
+            skald_spec::ProviderName::Custom(name) => Err(ProviderError::auth(
+                name,
+                "custom providers do not support provider_base_url overrides",
+            )),
+        }
     }
 }
 

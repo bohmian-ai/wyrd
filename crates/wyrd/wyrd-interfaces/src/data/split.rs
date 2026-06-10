@@ -149,9 +149,9 @@ impl PySplit {
     }
 
     #[staticmethod]
-    fn materialized(artifact_ref: &Bound<'_, PyAny>) -> CardPyResult<Self> {
+    fn materialized(card_ref: &Bound<'_, PyAny>) -> CardPyResult<Self> {
         Ok(Self::from_inner(SplitStrategy::Materialized(
-            artifact_ref_from_py(artifact_ref)?,
+            card_ref_from_py(card_ref)?,
         )))
     }
 
@@ -232,31 +232,31 @@ fn col_value_from_py(value: &Bound<'_, PyAny>) -> CardPyResult<ColValue> {
 }
 
 #[cfg(feature = "python")]
-fn artifact_ref_from_py(value: &Bound<'_, PyAny>) -> CardPyResult<CardRef> {
+fn card_ref_from_py(value: &Bound<'_, PyAny>) -> CardPyResult<CardRef> {
     let raw = pyobject_to_json(value).map_err(|error| {
         invalid_split_rule(
-            "materialized split artifact_ref must be a CardRef mapping",
+            "materialized split card_ref must be a CardRef mapping",
             json!({ "source": error.to_string() }),
         )
     })?;
-    let artifact_ref: CardRef = serde_json::from_value(raw.clone()).map_err(|error| {
+    let card_ref: CardRef = serde_json::from_value(raw.clone()).map_err(|error| {
         invalid_split_rule(
-            "materialized split artifact_ref must be a valid CardRef",
+            "materialized split card_ref must be a valid CardRef",
             json!({
                 "source": error.to_string(),
                 "value": raw,
             }),
         )
     })?;
-    if artifact_ref.kind != CardKind::Artifact {
+    if card_ref.kind != CardKind::Artifact {
         return Err(invalid_split_rule(
             "materialized split references must target Artifact cards",
             json!({
-                "kind": artifact_ref.kind.wire_name(),
+                "kind": card_ref.kind.wire_name(),
             }),
         ));
     }
-    Ok(artifact_ref)
+    Ok(card_ref)
 }
 
 #[cfg(test)]

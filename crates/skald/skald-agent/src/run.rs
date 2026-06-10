@@ -1,5 +1,7 @@
 //! Runtime configuration and per-run output for the bounded tool loop.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use skald_spec::ProviderResponse;
 use wyrd_spec::error::WyrdError;
@@ -169,7 +171,8 @@ pub struct AgentRun {
     /// Convenience projection of the final assistant text.
     pub output: String,
     /// Final native provider response, when the run reached one.
-    pub final_response: Option<ProviderResponse>,
+    #[serde(skip)]
+    pub final_response: Option<Arc<ProviderResponse>>,
     /// Number of loop iterations executed (1-based).
     pub iterations: u32,
     /// Why the loop terminated.
@@ -182,6 +185,17 @@ pub struct AgentRun {
     /// Errors recorded without aborting the run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<RunError>,
+    /// Parsed JSON object for prompts that declared a structured output schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Typed model instance when the prompt declared an output class.
+    ///
+    /// Populated by `instantiate_parsed` in `py_run` after a successful
+    /// structured-output run. None for text prompts, YAML prompts with no
+    /// class bound at the Agent level, or when no class was passed.
+    #[serde(skip)]
+    #[cfg(feature = "python")]
+    pub parsed: Option<pyo3::Py<pyo3::PyAny>>,
 }
 
 #[cfg(feature = "python")]
@@ -262,6 +276,51 @@ impl AgentRun {
             .clone()
             .map(|error| wyrd_utils::py::wyrd_error_to_py_object(py, error))
             .and_then(Result::ok)
+    }
+
+    /// Return parsed structured output, when the prompt declared an output schema.
+    ///
+    /// Returns:
+    ///     dict[str, Any] | None: Parsed JSON object for structured-output prompts.
+    #[getter]
+    pub fn structured_output(
+        &self,
+        py: pyo3::Python<'_>,
+    ) -> pyo3::PyResult<Option<pyo3::Py<pyo3::PyAny>>> {
+        let Some(map) = self.structured_output.as_ref() else {
+            return Ok(None);
+        };
+        let value = serde_json::Value::Object(map.clone());
+        wyrd_utils::py::json_to_pyobject(py, &value).map(Some)
+    }
+
+    /// Return the typed model instance when the prompt declared an output class.
+    ///
+    /// Returns:
+    ///     Any | None: Typed model instance, or None when no class was declared.
+    #[getter]
+    pub fn parsed(&self, py: pyo3::Python<'_>) -> Option<pyo3::Py<pyo3::PyAny>> {
+        self.parsed.as_ref().map(|p| p.clone_ref(py))
+    }
+
+    /// Return the final provider response as a typed wrapper, if the run reached one.
+    ///
+    /// Returns:
+    ///     ProviderResponse | None: Typed provider response wrapper.
+    #[getter]
+    pub fn provider_response(
+        &self,
+        py: pyo3::Python<'_>,
+    ) -> pyo3::PyResult<Option<pyo3::Py<pyo3::PyAny>>> {
+        let Some(arc) = self.final_response.as_ref() else {
+            return Ok(None);
+        };
+        let py_response = pyo3::Py::new(
+            py,
+            skald_prompt::wire_py::PyProviderResponse::from_arc(Arc::clone(arc)),
+        )?
+        .into_any();
+        Ok(Some(py_response))
     }
 
     /// Return a concise Python representation.

@@ -70,15 +70,13 @@ pub fn extract_messages_for_handoff(
 
     match (response, src_provider) {
         (ProviderResponse::OpenAiChatCompletion(_), ProviderName::OpenAi)
-        | (ProviderResponse::OpenAiResponses(_), ProviderName::OpenAi) => {
-            Ok(vec![MessageNum::OpenAi(OpenAiChatMessage {
+        | (ProviderResponse::OpenAiResponses(_), ProviderName::OpenAi)
+        | (ProviderResponse::OpenAiChatCompletion(_), ProviderName::Custom(_)) => {
+            Ok(vec![MessageNum::OpenAi(Box::new(OpenAiChatMessage {
                 role: "assistant".to_owned(),
                 content: Some(OpenAiMessageContent::Text(text)),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                refusal: None,
-            })])
+                ..Default::default()
+            }))])
         }
         (ProviderResponse::AnthropicMessage(_), ProviderName::Anthropic) => {
             Ok(vec![MessageNum::Anthropic(AnthropicMessage {

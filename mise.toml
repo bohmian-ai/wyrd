@@ -106,7 +106,7 @@ fi
 for crate in skald-agent skald-workflow skald-tool skald-runtime; do
   forbidden_skald_member=$(cargo tree -p "$crate" --all-features -e normal | \
     rg '(^|[ ─└├])(wyrd-|vala-)' | \
-    rg -v '(^|[ ─└├])(wyrd-spec|wyrd-interfaces|wyrd-utils|wyrd-runtime|wyrd-error-derive)' || true)
+    rg -v '(^|[ ─└├])(wyrd-spec|wyrd-interfaces|wyrd-utils|wyrd-runtime|wyrd-error-derive|wyrd-observe)' || true)
   if [ -n "$forbidden_skald_member" ]; then
     echo "FAIL: $crate pulls forbidden Wyrd/Vala deps outside the locked foundation set:"
     echo "$forbidden_skald_member"
@@ -118,7 +118,8 @@ if rg -n 'wyrd_spec|wyrd-' crates/skald \
   --glob '!crates/skald/skald-prompt/**' \
   --glob '!crates/skald/skald-agent/**' \
   --glob '!crates/skald/skald-agent/Cargo.toml' \
-  --glob '!crates/skald/skald-tool/Cargo.toml'; then
+  --glob '!crates/skald/skald-tool/Cargo.toml' \
+  --glob '!crates/skald/skald-workflow/**'; then
   echo 'Skald engine crates must remain free of Wyrd references outside locked boundary crates'
   exit 1
 fi
@@ -144,7 +145,9 @@ if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/wyrd-spec; then
   exit 1
 fi
 
-if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/shared --glob '!crates/shared/wyrd-utils/**'; then
+if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/shared \
+  --glob '!crates/shared/wyrd-utils/**' \
+  --glob '!crates/shared/wyrd-observe/**'; then
   echo 'PyO3 scope violation detected in Python-free shared crates'
   exit 1
 fi
@@ -164,12 +167,17 @@ if rg -n 'pyo3|pymodule|pyclass|pymethods|Python|Bound<|Py<|PyErr' crates/skald 
   --glob '!crates/skald/skald-tool/Cargo.toml' \
   --glob '!crates/skald/skald-tool/src/lib.rs' \
   --glob '!crates/skald/skald-tool/src/python.rs' \
-  --glob '!crates/skald/skald-workflow/Cargo.toml'; then
+  --glob '!crates/skald/skald-workflow/Cargo.toml' \
+  --glob '!crates/skald/skald-workflow/src/lib.rs' \
+  --glob '!crates/skald/skald-workflow/src/python.rs' \
+  --glob '!crates/skald/skald-workflow/src/run.rs' \
+  --glob '!crates/skald/skald-workflow/src/task.rs' \
+  --glob '!crates/skald/skald-workflow/src/workflow_surface.rs'; then
   echo 'PyO3 scope violation detected in Python-free Skald engine crates'
   exit 1
 fi
 
-for crate in skald-prompt skald-runtime skald-agent skald-tool; do
+for crate in skald-prompt skald-runtime skald-agent skald-tool skald-workflow; do
   manifest="crates/skald/$crate/Cargo.toml"
   if ! rg -q 'python = \\[' "$manifest" || ! rg -q 'dep:pyo3' "$manifest"; then
     echo "$crate must gate PyO3 behind its python feature"
@@ -302,6 +310,34 @@ description = "Run the local DataCard Python example"
 dir = "python/py-wyrd"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/datacard_local_workflow.py"
+
+[tasks."examples:python:workflow:openai"]
+description = "Run the sequential OpenAI workflow example"
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = "uv run python ../../examples/python/workflow_openai.py"
+
+[tasks."examples:python:workflow:anthropic"]
+description = "Run the sequential Anthropic workflow example"
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = "uv run python ../../examples/python/workflow_anthropic.py"
+
+[tasks."examples:python:workflow:gemini"]
+description = "Run the sequential Gemini workflow example"
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = "uv run python ../../examples/python/workflow_gemini.py"
+
+[tasks."examples:python:workflow:gateway"]
+description = "Run the split-registry gateway workflow example"
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = "uv run python ../../examples/python/workflow_gateway.py"
+
+[tasks."check:examples"]
+description = "Build all example binaries"
+run = "cargo build -p skald-workflow --examples --all-features"
 
 [tasks."dev:backend"]
 description = "Build and run wyrd-server on :8080"
@@ -439,7 +475,7 @@ diff -u "$BEFORE" "$AFTER" \
 
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
-depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:error-coverage", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:docs"]
+depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:error-coverage", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
 
 [tasks."dev:pg:nuke"]
 description = "Wipe embedded pg cache"

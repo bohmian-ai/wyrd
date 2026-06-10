@@ -763,6 +763,17 @@
         "model": {
           "type": "string"
         },
+        "output_config": {
+          "description": "Provider-side structured-output declaration.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AnthropicOutputConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "stop_sequences": {
           "description": "Stop sequences.",
           "type": [
@@ -837,6 +848,47 @@
         }
       },
       "additionalProperties": true
+    },
+    "AnthropicOutputConfig": {
+      "description": "Anthropic `output_config` block on a `/v1/messages` request.",
+      "type": "object",
+      "required": [
+        "format"
+      ],
+      "properties": {
+        "format": {
+          "description": "Declared output format.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AnthropicOutputFormat"
+            }
+          ]
+        }
+      }
+    },
+    "AnthropicOutputFormat": {
+      "description": "Anthropic output-format variants.",
+      "oneOf": [
+        {
+          "description": "JSON schema enforced by Anthropic at generation time.",
+          "type": "object",
+          "required": [
+            "schema",
+            "type"
+          ],
+          "properties": {
+            "schema": {
+              "description": "JSON Schema object describing the response shape."
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "json_schema"
+              ]
+            }
+          }
+        }
+      ]
     },
     "AnthropicSystem": {
       "anyOf": [
@@ -979,56 +1031,28 @@
     },
     "CardKind": {
       "title": "CardKind",
-      "description": "Native Wyrd Card kind string or external kind object.",
-      "oneOf": [
-        {
-          "title": "NativeCardKind",
-          "description": "Native Wyrd Card kind.",
-          "type": "string",
-          "enum": [
-            "Data",
-            "Model",
-            "Experiment",
-            "Prompt",
-            "Tool",
-            "Agent",
-            "Workflow",
-            "Eval",
-            "Drift",
-            "Service",
-            "Policy",
-            "Mcp",
-            "Skill",
-            "SubAgent",
-            "Audit",
-            "Artifact",
-            "Trigger",
-            "Operator"
-          ]
-        },
-        {
-          "title": "ExternalCardKind",
-          "description": "External Card kind with schema hash.",
-          "type": "object",
-          "required": [
-            "kind",
-            "schema_hash"
-          ],
-          "properties": {
-            "kind": {
-              "type": "string",
-              "minLength": 1,
-              "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"
-            },
-            "schema_hash": {
-              "type": "string",
-              "maxLength": 64,
-              "minLength": 64,
-              "pattern": "^[0-9a-f]{64}$"
-            }
-          },
-          "additionalProperties": false
-        }
+      "description": "Wyrd Card kind.",
+      "type": "string",
+      "enum": [
+        "Data",
+        "Model",
+        "Experiment",
+        "Prompt",
+        "Tool",
+        "Agent",
+        "Workflow",
+        "Eval",
+        "Drift",
+        "Service",
+        "Policy",
+        "Mcp",
+        "Skill",
+        "SubAgent",
+        "Audit",
+        "Artifact",
+        "Trigger",
+        "Operator",
+        "External"
       ]
     },
     "CardName": {
@@ -1787,6 +1811,24 @@
         "role"
       ],
       "properties": {
+        "annotations": {
+          "description": "URL citations from web search, when present.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/OpenAiMessageAnnotation"
+          }
+        },
+        "audio": {
+          "description": "Audio output, when present.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiMessageAudio"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "content": {
           "anyOf": [
             {
@@ -1827,8 +1869,7 @@
             "$ref": "#/definitions/OpenAiToolCall"
           }
         }
-      },
-      "additionalProperties": false
+      }
     },
     "OpenAiChatRequest": {
       "description": "`POST /v1/chat/completions`.",
@@ -2497,6 +2538,48 @@
         }
       },
       "additionalProperties": false
+    },
+    "OpenAiMessageAnnotation": {
+      "description": "A URL citation annotation returned by web search.",
+      "type": "object",
+      "required": [
+        "type",
+        "url_citation"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "url_citation": {
+          "$ref": "#/definitions/OpenAiUrlCitation"
+        }
+      }
+    },
+    "OpenAiMessageAudio": {
+      "description": "Audio output returned by the model.",
+      "type": "object",
+      "required": [
+        "data",
+        "expires_at",
+        "id",
+        "transcript"
+      ],
+      "properties": {
+        "data": {
+          "type": "string"
+        },
+        "expires_at": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "id": {
+          "type": "string"
+        },
+        "transcript": {
+          "type": "string"
+        }
+      }
     },
     "OpenAiMessageContent": {
       "anyOf": [
@@ -3744,6 +3827,34 @@
       },
       "additionalProperties": false
     },
+    "OpenAiUrlCitation": {
+      "description": "Citation metadata for a web search result.",
+      "type": "object",
+      "required": [
+        "end_index",
+        "start_index",
+        "title",
+        "url"
+      ],
+      "properties": {
+        "end_index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "start_index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "title": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      }
+    },
     "OpenAiVoice": {
       "anyOf": [
         {
@@ -3775,7 +3886,7 @@
           "type": "string"
         },
         "request": {
-          "description": "Native provider-shaped request authored with `{{variable}}` placeholders.",
+          "description": "Native provider-shaped request authored with `${variable}` or `{{variable}}` placeholders.",
           "allOf": [
             {
               "$ref": "#/definitions/ProviderRequest"

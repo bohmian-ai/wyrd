@@ -1,0 +1,135 @@
+# =============================================================================
+# Example 5 — Datadog as a Wyrd-declared observability sink
+#
+# Scenario: An ML/AI platform team is standardized on Datadog. They want one
+# canonical sink declared once, then referenced by every workflow/eval/sub-agent
+# that should forward observations to Datadog. The sink itself is just a
+# ServiceCard whose `service_type: observability` declares the routing
+# semantics; the runtime adapter (datadog) is named in `runtime.framework`.
+#
+# This file is a focused walk-through of the observation-routing pattern.
+#
+# Card inventory:
+#   - Service   ddog-sink-prod              # canonical Datadog sink (prod)
+#   - Service   ddog-sink-staging           # staging sink with different tags
+#   - Workflow  example-flow                # workflow routing observations to prod sink
+#   - SubAgent  example-subagent            # sub-agent routing observations to prod sink
+#
+# Design notes carried in comments to surface design questions:
+#
+#   1. ObservationHooks lives on EvalSpec, WorkflowSpec, and SubAgentSpec
+#      today. ServiceSpec, ModelSpec, AgentSpec do NOT carry observation_hooks.
+#      Question for the spec lock: should observation_hooks move up to a shared
+#      foundation field on every spec that *produces* runs?
+#
+#   2. Event names below are illustrative. The spec lock should pick a closed
+#      taxonomy (eval.run.finished, workflow.step.failed, agent.tool.called,
+#      model.predict.failed, ...) so authors don't drift.
+#
+#   3. Multi-sink fanout works by listing multiple `route_refs`.
+# =============================================================================
+
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: ddog-sink-prod
+  version: "1.0.0"
+  space: prod
+  labels:
+    role: observability-sink
+    vendor: datadog
+    env: prod
+spec:
+  description: Datadog sink for runs, drift, eval, workflow, and agent observations in prod.
+  service_type: observability
+  runtime:
+    kind: api
+    framework: datadog
+    strict: true
+    config:
+      site:    { type: str, value: datadoghq.com }
+      env:     { type: str, value: prod }
+      service: { type: str, value: acme-wyrd }
+      version: { type: str, value: "1.0.0" }
+      tags:
+        type: list
+        value:
+          - { type: str, value: "team:ai-platform" }
+          - { type: str, value: "env:prod" }
+      metric_prefix: { type: str, value: "wyrd." }
+  credential_refs:
+    - { provider: aws_secrets_manager, name: prod/datadog/api_key }
+    - { provider: aws_secrets_manager, name: prod/datadog/app_key }
+
+---
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: ddog-sink-staging
+  version: "1.0.0"
+  space: staging
+spec:
+  description: Same sink for staging; separate API keys and tag set.
+  service_type: observability
+  runtime:
+    kind: api
+    framework: datadog
+    strict: true
+    config:
+      site: { type: str, value: datadoghq.com }
+      env:  { type: str, value: staging }
+      tags:
+        type: list
+        value:
+          - { type: str, value: "team:ai-platform" }
+          - { type: str, value: "env:staging" }
+  credential_refs:
+    - { provider: aws_secrets_manager, name: staging/datadog/api_key }
+
+---
+apiVersion: wyrd/v1
+kind: Workflow
+metadata:
+  name: example-flow
+  version: "1.0.0"
+  space: prod
+spec:
+  description: Trivial workflow showing observation routing to both Datadog sinks (fanout).
+  inputs:
+    request: { type: str, value: "" }
+  steps:
+    - id: noop
+      action:
+        type: prompt
+        target: { kind: Prompt, name: noop-prompt, version: "1.0.0", space: prod }
+  outputs:
+    response: "{{ steps.noop.output }}"
+  observation_hooks:
+    route_refs:
+      - { kind: Service, name: ddog-sink-prod,    version: "1.0.0", space: prod }
+      - { kind: Service, name: ddog-sink-staging, version: "1.0.0", space: staging }
+    events:
+      - workflow.run.started
+      - workflow.run.finished
+      - workflow.step.failed
+
+---
+apiVersion: wyrd/v1
+kind: SubAgent
+metadata:
+  name: example-subagent
+  version: "1.0.0"
+  space: prod
+spec:
+  description: Specialized review sub-agent; routes its run telemetry to Datadog.
+  prompt: "Review this diff and return a short verdict."
+  model: claude-opus-4-7
+  max_turns: 4
+  permission_mode: read_only
+  observation_hooks:
+    route_refs:
+      - { kind: Service, name: ddog-sink-prod, version: "1.0.0", space: prod }
+    events:
+      - subagent.run.started
+      - subagent.run.finished
+      - subagent.tool.failed

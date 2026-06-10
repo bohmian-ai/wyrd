@@ -2491,7 +2491,7 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
   },
   "description": "Pure-data contract for a Data Card.",
   "properties": {
-    "artifact_refs": {
+    "card_refs": {
       "default": [],
       "description": "Durable ArtifactCard references linked to this data card.",
       "items": {
@@ -4565,7 +4565,7 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
   },
   "description": "Grouping and comparison context for related runs.",
   "properties": {
-    "artifact_refs": {
+    "card_refs": {
       "description": "Artifact references.",
       "items": {
         "$ref": "#/definitions/CardRef"
@@ -6018,7 +6018,7 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
   },
   "description": "Body of a Model card.\n\nThis pure contract describes which framework loads the model, which task it performs, which fields it consumes and produces, and which Artifact cards hold model-related bytes.",
   "properties": {
-    "artifact_refs": {
+    "card_refs": {
       "default": [],
       "description": "Durable Artifact card references linked to this model card.",
       "items": {

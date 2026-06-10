@@ -1,0 +1,27 @@
+---
+title: Error Codes
+description: Stable Wyrd error codes for clients and agents.
+---
+
+# Error Codes
+
+Use `code` for programmatic branching. Preserve structured details when
+surfacing failures to humans or agents.
+
+## Workflow And Agent Authoring
+
+| Code | Where | Meaning |
+|---|---|---|
+| `WYRD_WORKFLOW_422_CYCLE` | `WorkflowSpec::validate_dag` | DAG contains a cycle. |
+| `WYRD_WORKFLOW_422_MISSING_DEPENDENCY` | `WorkflowSpec::validate_dag` | A step depends on an id that does not exist. |
+| `WYRD_WORKFLOW_422_DUPLICATE_STEP_ID` | `WorkflowSpec::validate_dag` | Two steps share the same id. |
+| `WYRD_WORKFLOW_422_MISSING_NAME` | `Workflow::to_card` | `save` or `to_card` was called on an anonymous workflow. |
+| `WYRD_WORKFLOW_422_MISSING_PARAMETER` | DAG executor | A prompt placeholder exists in neither workflow input nor upstream parameters. |
+| `WYRD_CARD_400_BAD_EXTENSION` | Card save/load | Extension is not `.yaml`, `.yml`, or `.json`. |
+| `WYRD_CARD_500_IO` | Card save/load | Filesystem error. |
+| `WYRD_AGENT_422_STRUCTURED_DECODE` | Agent loop | Response text is not valid JSON when `Prompt.output` is set. |
+| `WYRD_PROMPT_422_PYDANTIC_REQUIRED` | Python `Prompt(output=Model)` | Pydantic is required for class-based output schemas. |
+| `WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA` | Python `Prompt(output=...)` | The output dict cannot be reduced to JSON Schema. |
+| `WYRD_PROMPT_400_PROVIDER_MISMATCH` | Provider accessors | Provider accessor called on a different provider response. |
+| `WYRD_REGISTRATION_409_CONFLICT` | Cascade registration | Child card name+version exists with a different content hash. |
+| `WYRD_REGISTRATION_500_CASCADE_ROLLBACK` | Cascade registration | Child registration failed and the submission was rolled back. |

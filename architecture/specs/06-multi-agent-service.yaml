@@ -1,0 +1,206 @@
+# =============================================================================
+# Example 6 — Multi-agent service with policy, audit, and MCP
+#
+# Scenario: An internal "engineering copilot" exposes two specialized agents
+# (a code-review agent and a release-notes agent) behind one service. They
+# pull external tools through a registered MCP server (GitHub), are governed
+# by a single PolicyCard, and the whole bundle is covered by an AuditCard.
+#
+# Note: there is no `Tool` or `Skill` CardKind in v1.
+#   - Reusable instructions (e.g. Conventional Commits) live inline in the
+#     Prompt that needs them, or as a dedicated Prompt with variables.
+#   - Tool resolution is by name from the runtime tool registry; MCP servers
+#     auto-register their advertised tools.
+#
+# Card inventory (7 cards):
+#   - Mcp      github-mcp                     # MCP server registration
+#   - Prompt   code-review-prompt
+#   - Prompt   release-notes-prompt
+#   - Agent    code-review-agent
+#   - Agent    release-notes-agent
+#   - Policy   eng-copilot-runtime-policy
+#   - Service  eng-copilot-svc
+#   - Audit    eng-copilot-audit
+# =============================================================================
+
+apiVersion: wyrd/v1
+kind: Mcp
+metadata:
+  name: github-mcp
+  version: "1.0.0"
+  space: prod
+spec:
+  description: GitHub MCP server (PRs, comments, issues).
+  server_name: github
+  transport: stdio
+  scopes: [repo:read, pull_requests:write, issues:read]
+  credential_refs:
+    - { provider: aws_secrets_manager, name: prod/github/pat }
+  details:
+    command:
+      type: list
+      value:
+        - { type: str, value: "npx" }
+        - { type: str, value: "-y" }
+        - { type: str, value: "@modelcontextprotocol/server-github" }
+
+---
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: code-review-prompt
+  version: "1.0.0"
+  space: prod
+spec:
+  provider: anthropic
+  model: claude-opus-4-7
+  messages:
+    - role: system
+      content: |
+        You review pull requests. Comment on correctness, readability, and
+        risk. Be specific. Cite file:line. Format commit message suggestions
+        using Conventional Commits 1.0.0 (type(scope): subject, body,
+        BREAKING CHANGE: footer where applicable).
+    - role: user
+      content: |
+        Diff:
+        {{diff}}
+  variables: [diff]
+  response_format: text
+
+---
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: release-notes-prompt
+  version: "1.0.0"
+  space: prod
+spec:
+  provider: anthropic
+  model: claude-opus-4-7
+  messages:
+    - role: system
+      content: |
+        You summarize a list of commits into user-facing release notes.
+        Group by Conventional-Commit type. Lead with breaking changes.
+    - role: user
+      content: |
+        Commits:
+        {{commits}}
+  variables: [commits]
+  response_format: text
+
+---
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: code-review-agent
+  version: "1.0.0"
+  space: prod
+spec:
+  prompt:
+    kind: Prompt
+    name: code-review-prompt
+    version: "1.0.0"
+    space: prod
+  # Tool names resolve from the runtime tool registry. github-mcp auto-
+  # registers tools like `gh_pr_get`, `gh_pr_comment`.
+  tool_names: [gh_pr_get, gh_pr_comment]
+  run_config:
+    max_iterations: 8
+    timeout_ms:    60000
+
+---
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: release-notes-agent
+  version: "1.0.0"
+  space: prod
+spec:
+  prompt:
+    kind: Prompt
+    name: release-notes-prompt
+    version: "1.0.0"
+    space: prod
+  tool_names: [gh_commits_list, gh_release_create]
+  run_config:
+    max_iterations: 5
+    timeout_ms:    45000
+
+---
+apiVersion: wyrd/v1
+kind: Policy
+metadata:
+  name: eng-copilot-runtime-policy
+  version: "1.0.0"
+  space: prod
+spec:
+  description: Runtime gates on the engineering-copilot agents.
+  rules:
+    - name: no-write-to-main
+      expression: "tool.name == 'gh_pr_merge' and tool.args.base_branch == 'main'"
+      action: block
+    - name: limit-comment-volume
+      expression: "tool.name == 'gh_pr_comment' and run.tool_calls('gh_pr_comment') > 20"
+      action: warn
+    - name: release-requires-approval
+      expression: "tool.name == 'gh_release_create'"
+      action: approval_required
+      metadata:
+        approver_role: { type: str, value: release-manager }
+  enforcement: pre_invoke
+
+---
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: eng-copilot-svc
+  version: "1.0.0"
+  space: prod
+spec:
+  description: One service hosting both engineering-copilot agents.
+  service_type: agent
+  components:
+    - alias: reviewer
+      ref: { kind: Agent,  name: code-review-agent,    version: "1.0.0", space: prod }
+    - alias: releaser
+      ref: { kind: Agent,  name: release-notes-agent,  version: "1.0.0", space: prod }
+    - alias: github
+      ref: { kind: Mcp,    name: github-mcp,           version: "1.0.0", space: prod }
+    - alias: policy
+      ref: { kind: Policy, name: eng-copilot-runtime-policy, version: "1.0.0", space: prod }
+  entry_point: acme.engcopilot.service:app
+  deployment:
+    image:    { type: str, value: registry.acme.com/eng-copilot:1.0.0 }
+    replicas: { type: number, value: 2 }
+  runtime:
+    kind: agent
+    mode: in_process
+    strict: true
+    policy:
+      runtime_hooks: true
+
+---
+apiVersion: wyrd/v1
+kind: Audit
+metadata:
+  name: eng-copilot-audit
+  version: "1.0.0"
+  space: prod
+spec:
+  description: Internal audit object for the engineering copilot service.
+  subject_refs:
+    - { kind: Service, name: eng-copilot-svc,         version: "1.0.0", space: prod }
+    - { kind: Agent,   name: code-review-agent,       version: "1.0.0", space: prod }
+    - { kind: Agent,   name: release-notes-agent,     version: "1.0.0", space: prod }
+  policy_refs:
+    - { kind: Policy,  name: eng-copilot-runtime-policy, version: "1.0.0", space: prod }
+  evidence_refs: []
+  details:
+    review_cadence: { type: str, value: quarterly }
+    owners:
+      type: list
+      value:
+        - { type: str, value: "ai-platform@acme.com" }
+        - { type: str, value: "developer-tools@acme.com" }

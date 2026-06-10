@@ -28,7 +28,7 @@ use crate::wire::openai_responses::{
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Prompt {
-    /// Native provider-shaped request authored with `{{variable}}` placeholders.
+    /// Native provider-shaped request authored with `${variable}` or `{{variable}}` placeholders.
     pub request: ProviderRequest,
     /// Model identifier used for indexing and selection.
     pub model: String,
@@ -84,12 +84,18 @@ pub enum TextSegment {
     Placeholder(String),
 }
 
-/// Returns the compiled `{{name}}` text placeholder regex.
+/// Returns the compiled text placeholder regex.
+///
+/// Accepts both `${name}` and `{{name}}`. Names must match
+/// `[a-zA-Z_][a-zA-Z0-9_]*`. The `${media:name}` form is reserved for the
+/// media-bind path and is not matched here.
 pub fn text_placeholder_regex() -> &'static Regex {
     static TEXT_PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
-    TEXT_PLACEHOLDER_RE.get_or_init(|| match Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}") {
-        Ok(regex) => regex,
-        Err(error) => panic!("text placeholder regex is static and valid: {error}"),
+    TEXT_PLACEHOLDER_RE.get_or_init(|| {
+        match Regex::new(r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}|\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}") {
+            Ok(regex) => regex,
+            Err(error) => panic!("text placeholder regex is static and valid: {error}"),
+        }
     })
 }
 
@@ -185,7 +191,7 @@ impl Prompt {
         Ok(())
     }
 
-    /// Return a copy with the supplied `{{name}}` placeholders bound.
+    /// Return a copy with the supplied `${name}` or `{{name}}` placeholders bound.
     ///
     /// This is the reusable primitive behind higher-level prompt binding. It performs
     /// replacement inside JSON string leaves after serializing the native
@@ -196,7 +202,7 @@ impl Prompt {
         Ok(prompt)
     }
 
-    /// Bind supplied `{{name}}` placeholders into this prompt in place.
+    /// Bind supplied `${name}` or `{{name}}` placeholders into this prompt in place.
     ///
     /// Unlike `render`, this may bind only a subset of declared variables. Any
     /// names still present in `variables` remain required for a later render.
@@ -254,7 +260,7 @@ impl Prompt {
         Ok(())
     }
 
-    /// Render declared `{{name}}` placeholders into the native request.
+    /// Render declared `${name}` or `{{name}}` placeholders into the native request.
     ///
     /// Values are escaped as JSON string content before substitution, so a
     /// variable value cannot inject new fields into the serialized provider
@@ -279,6 +285,7 @@ fn replace_string_leaves(value: &mut Value, vars: &[(&str, &str)]) {
     match value {
         Value::String(text) => {
             for (name, replacement) in vars {
+                *text = text.replace(&format!("${{{name}}}"), replacement);
                 *text = text.replace(&format!("{{{{{name}}}}}"), replacement);
             }
         }
@@ -333,7 +340,10 @@ fn extract_text_variables(request: &ProviderRequest) -> SkaldResult<Vec<String>>
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for capture in text_placeholder_regex().captures_iter(&json) {
-        let name = capture[1].to_owned();
+        let Some(name_match) = capture.get(1).or_else(|| capture.get(2)) else {
+            continue;
+        };
+        let name = name_match.as_str().to_owned();
         if seen.insert(name.clone()) {
             out.push(name);
         }
@@ -969,4 +979,106 @@ fn data_url(mime_type: &str, data: &str) -> String {
 fn is_gemini_file_api_url(url: &str) -> bool {
     url.starts_with("https://generativelanguage.googleapis.com/v1/")
         || url.starts_with("https://generativelanguage.googleapis.com/v1beta/")
+}
+
+#[cfg(test)]
+mod placeholder_syntax_tests {
+    use super::*;
+    use crate::request::ProviderRequest;
+    use crate::wire::openai_chat::{OpenAiChatMessage, OpenAiChatRequest, OpenAiMessageContent};
+
+    fn openai_request_with_user(text: &str) -> ProviderRequest {
+        ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
+            model: "gpt-test".into(),
+            messages: vec![OpenAiChatMessage {
+                role: "user".into(),
+                content: Some(OpenAiMessageContent::Text(text.into())),
+                ..Default::default()
+            }],
+            response_format: None,
+            stream: None,
+            stream_options: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            settings: Default::default(),
+        })
+    }
+
+    #[test]
+    fn extract_finds_dollar_brace() {
+        let request = openai_request_with_user("hello ${name}");
+        let vars = extract_text_variables(&request).expect("extracts");
+        assert_eq!(vars, vec!["name".to_string()]);
+    }
+
+    #[test]
+    fn extract_finds_mustache() {
+        let request = openai_request_with_user("hello {{name}}");
+        let vars = extract_text_variables(&request).expect("extracts");
+        assert_eq!(vars, vec!["name".to_string()]);
+    }
+
+    #[test]
+    fn extract_finds_mixed() {
+        let request = openai_request_with_user("${a} and {{b}} and ${a}");
+        let vars = extract_text_variables(&request).expect("extracts");
+        assert_eq!(vars, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn extract_does_not_capture_media_prefix() {
+        let request = openai_request_with_user("hello ${media:img}");
+        let vars = extract_text_variables(&request).expect("extracts");
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn extract_does_not_capture_single_brace() {
+        let request = openai_request_with_user("hello {name}");
+        let vars = extract_text_variables(&request).expect("extracts");
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn render_binds_dollar_brace() {
+        let prompt = Prompt::new(
+            openai_request_with_user("hello ${name}"),
+            "gpt-test",
+            None,
+            ResponseType::Text,
+        )
+        .expect("prompt builds");
+        let rendered = prompt.render(&[("name", "world")]).expect("renders");
+        let json = serde_json::to_string(&rendered).expect("serializes");
+        assert!(json.contains("hello world"));
+    }
+
+    #[test]
+    fn render_binds_mustache() {
+        let prompt = Prompt::new(
+            openai_request_with_user("hello {{name}}"),
+            "gpt-test",
+            None,
+            ResponseType::Text,
+        )
+        .expect("prompt builds");
+        let rendered = prompt.render(&[("name", "world")]).expect("renders");
+        let json = serde_json::to_string(&rendered).expect("serializes");
+        assert!(json.contains("hello world"));
+    }
+
+    #[test]
+    fn render_binds_mixed_syntax_in_one_pass() {
+        let prompt = Prompt::new(
+            openai_request_with_user("${a} or {{a}}"),
+            "gpt-test",
+            None,
+            ResponseType::Text,
+        )
+        .expect("prompt builds");
+        let rendered = prompt.render(&[("a", "X")]).expect("renders");
+        let json = serde_json::to_string(&rendered).expect("serializes");
+        assert!(json.contains("X or X"));
+    }
 }

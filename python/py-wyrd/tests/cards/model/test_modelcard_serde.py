@@ -28,7 +28,7 @@ def test_model_dump_json_round_trips_through_public_validator() -> None:
     assert restored.annotations == {"acme.com/source": "notebook"}
     assert payload["apiVersion"] == "wyrd/v1"
     assert payload["kind"] == "Model"
-    assert payload["spec"]["artifact_refs"] == []
+    assert payload["spec"]["card_refs"] == []
     assert "tags" not in payload["metadata"]
 
 
@@ -80,7 +80,7 @@ spec:
       - name: prediction
         dtype: float64
         nullable: false
-  artifact_refs: []
+  card_refs: []
 relationships: []
 """
     )

@@ -18,7 +18,7 @@
 /// This is idempotent. Rust users may call it manually when they want Skald
 /// agent runs to resolve observers through Wyrd observer state.
 pub fn init() {
-    wyrd_observe_impl::init();
+    wyrd_observe::init();
     skald_runtime::refresh_default_registry_from_env();
 }
 
@@ -26,12 +26,16 @@ pub fn init() {
 /// observer hook, and `SKALD_AGENT_*` error catalog.
 pub mod agent;
 
-pub use skald_agent::Agent;
-pub use wyrd_spec::AgentCard;
+/// Prompt authoring helpers and structured-output response formats.
+pub mod prompt {
+    pub use skald_prompt::{
+        AnthropicOptions, GeminiOptions, OpenAiChatOptions, OpenAiResponsesOptions, Prompt,
+        ResponseFormat, ResponseFormatKind, anthropic, gemini, openai_chat, openai_responses,
+        vertex,
+    };
+}
 
-/// Negative public-surface pins.
-///
-/// ```compile_fail
-/// use wyrd::Workflow;
-/// ```
-pub mod __doc_neg_pins {}
+pub use skald_agent::Agent;
+pub use skald_runtime::ProviderRegistry;
+pub use skald_workflow::Workflow;
+pub use wyrd_spec::{AgentCard, WorkflowCard};

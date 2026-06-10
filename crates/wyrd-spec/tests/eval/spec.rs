@@ -68,7 +68,7 @@ fn spec_minimal_round_trip() {
 #[test]
 fn spec_with_full_fields_round_trip() {
     let mut spec = EvalSpec::new(one_task_map()).unwrap();
-    spec.target_ref = Some(prompt_ref("retriever-quality"));
+    spec.subject_ref = Some(prompt_ref("retriever-quality"));
     spec.dataset = Some(DatasetRef::new(data_ref("eval-set")).unwrap());
     spec.sampling = Some(EvalSampling::Ratio { ratio: 0.1 });
     spec.pass_gate = Some(EvalPassGate::OverallPassRate { threshold: 0.9 });

@@ -41,6 +41,20 @@ pub enum EvalExecError {
     #[error("judge invoker unavailable: {reason}")]
     JudgeUnavailable { reason: String },
 
+    /// All retry attempts for an `LlmJudge` task were exhausted.
+    #[error(
+        "llm_judge task {task_id:?}: judge failed after {attempts} attempt(s); last error: {last_error}"
+    )]
+    JudgeRetriesExhausted {
+        task_id: TaskId,
+        attempts: u32,
+        last_error: String,
+    },
+
+    /// The judge returned malformed structured output.
+    #[error("llm_judge task {task_id:?}: judge returned invalid structured output: {reason}")]
+    JudgeInvalidOutput { task_id: TaskId, reason: String },
+
     /// `TraceSource::fetch` returned `Err` or timed out before the deadline.
     #[error("trace {trace_id} unavailable: {reason}")]
     TraceUnavailable { trace_id: String, reason: String },
@@ -49,6 +63,10 @@ pub enum EvalExecError {
     /// supply.
     #[error("media binding {binding} missing for judge invocation")]
     MediaBindingMissing { binding: String },
+
+    /// A required media id was absent from the record binding set.
+    #[error("llm_judge task {task_id:?}: required media id {media_id:?} not bound to the record")]
+    MediaBindingMissingForTask { task_id: TaskId, media_id: String },
 
     /// Operator received an input whose JSON kind it cannot evaluate.
     #[error("operator {op} is not defined on inputs of kind ({left_kind}, {right_kind})")]
@@ -312,6 +330,25 @@ impl From<EvalExecError> for EvalError {
                 message,
                 details: serde_json::json!({ "reason": reason }),
             },
+            EvalExecError::JudgeRetriesExhausted {
+                task_id,
+                attempts,
+                last_error,
+            } => Self::JudgeUnavailable {
+                message,
+                details: serde_json::json!({
+                    "task_id": task_id.as_str(),
+                    "attempts": attempts,
+                    "last_error": last_error,
+                }),
+            },
+            EvalExecError::JudgeInvalidOutput { task_id, reason } => Self::JudgeUnavailable {
+                message,
+                details: serde_json::json!({
+                    "task_id": task_id.as_str(),
+                    "reason": reason,
+                }),
+            },
             EvalExecError::TraceUnavailable { trace_id, reason } => Self::TraceUnavailable {
                 message,
                 details: serde_json::json!({
@@ -323,6 +360,15 @@ impl From<EvalExecError> for EvalError {
                 message,
                 details: serde_json::json!({ "binding": binding }),
             },
+            EvalExecError::MediaBindingMissingForTask { task_id, media_id } => {
+                Self::MediaBindingMissing {
+                    message,
+                    details: serde_json::json!({
+                        "task_id": task_id.as_str(),
+                        "binding": media_id,
+                    }),
+                }
+            }
             EvalExecError::OperatorMismatch {
                 op,
                 left_kind,

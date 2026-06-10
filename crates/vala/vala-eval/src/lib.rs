@@ -22,7 +22,7 @@
 //! - `operators` - runtime semantics for the 56-variant `ComparisonOperator`
 //!   catalog.
 //! - `context` - `ExecutionContext`, `ContextSnapshot`, `TaskOutput`,
-//!   `RunIdentity`. Per-stage state is rebuilt at each stage barrier via
+//!   `RecordIdentity`. Per-stage state is rebuilt at each stage barrier via
 //!   `ContextSnapshot::extend` (Arc bumps, no JSON cloning).
 //! - `store` - immutable `TaskRegistry`, `EvalTaskKind`, `JudgeOutcome`.
 //! - `tasks` - the four executors (`assertion`, `judge`, `trace`, `agent`)
@@ -57,12 +57,14 @@ pub mod tasks;
 pub mod trace_source;
 
 pub use context::{
-    ContextSnapshot, ExecutionContext, RunIdentity, TaskOutput, extract_jsonpath_from,
+    ContextSnapshot, ExecutionContext, RecordIdentity, TaskOutput, extract_jsonpath_from,
     extract_required_jsonpath_from,
 };
 pub use error::{EvalError, EvalExecError};
 pub use executor::{
     EvalReport, Executors, RunLedger, SkipReason, TaskExecutor, TaskRunOutcome, execute_plan,
 };
+pub use judge::{JudgeError, JudgeInvoker, MockJudgeInvoker};
 pub use operators::{OperatorVerdict, evaluate_operator};
 pub use store::{EvalTaskKind, JudgeOutcome, TaskRegistry};
+pub use tasks::{EvalMediaBinding, MediaBindings};

@@ -7,7 +7,7 @@
 //! bumps rather than JSON deep clones.
 //!
 //! [`ExecutionContext`] is a thin per-record wrapper the orchestrator
-//! constructs once per [`crate::context::RunIdentity`]. It exposes the current
+//! constructs once per [`crate::context::RecordIdentity`]. It exposes the current
 //! snapshot to the driver.
 //!
 //! Predecessor reference (parity citation only):
@@ -25,10 +25,11 @@ use wyrd_spec::vala::eval::result::AssertionResult;
 
 use crate::error::EvalExecError;
 use crate::store::JudgeOutcome;
+use crate::tasks::MediaBindings;
 
 /// Typed identity tuple every [`AssertionResult`] row aggregates against.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RunIdentity {
+pub struct RecordIdentity {
     /// The eval run.
     pub run_id: RunId,
     /// The record this context represents.
@@ -80,21 +81,37 @@ impl TaskOutput {
 #[derive(Debug, Clone)]
 pub struct ContextSnapshot {
     /// Typed identity of the enclosing run / record / scenario.
-    pub identity: RunIdentity,
+    pub identity: RecordIdentity,
     /// The immutable observation document.
     pub base_context: Arc<Value>,
     /// Per-task outputs accumulated by prior stages.
     pub task_outputs: Arc<HashMap<TaskId, Arc<TaskOutput>>>,
+    /// Per-record opaque media bindings.
+    pub media: Arc<MediaBindings>,
+    /// Media ids required by this record's judge context.
+    pub required_media: Arc<Vec<String>>,
 }
 
 impl ContextSnapshot {
     /// Build a fresh snapshot with no recorded outputs.
     #[must_use]
-    pub fn new(base_context: Arc<Value>, identity: RunIdentity) -> Self {
+    pub fn new(base_context: Arc<Value>, identity: RecordIdentity) -> Self {
         Self {
             identity,
             base_context,
             task_outputs: Arc::new(HashMap::new()),
+            media: Arc::new(MediaBindings::new()),
+            required_media: Arc::new(Vec::new()),
+        }
+    }
+
+    /// Attach media and required media ids to this snapshot.
+    #[must_use]
+    pub fn with_media(self, media: MediaBindings, required_media: Vec<String>) -> Self {
+        Self {
+            media: Arc::new(media),
+            required_media: Arc::new(required_media),
+            ..self
         }
     }
 
@@ -118,6 +135,8 @@ impl ContextSnapshot {
             identity: self.identity.clone(),
             base_context: Arc::clone(&self.base_context),
             task_outputs: Arc::new(next),
+            media: Arc::clone(&self.media),
+            required_media: Arc::clone(&self.required_media),
         }
     }
 
@@ -183,7 +202,7 @@ fn result_view(result: &AssertionResult) -> Map<String, Value> {
     map
 }
 
-/// Per-record handle the orchestrator constructs once per [`RunIdentity`].
+/// Per-record handle the orchestrator constructs once per [`RecordIdentity`].
 ///
 /// Wraps an `Arc<ContextSnapshot>` so the driver can swap snapshots between
 /// stages without rebuilding the wrapper. Tests construct one of these per
@@ -209,12 +228,23 @@ impl ExecutionContext {
         record_id: RecordId,
         scenario_id: Option<ScenarioId>,
     ) -> Self {
-        let identity = RunIdentity {
+        let identity = RecordIdentity {
             run_id,
             record_id,
             scenario_id,
         };
         let snapshot = ContextSnapshot::new(Arc::new(base_context), identity);
+        Self::from_snapshot(Arc::new(snapshot))
+    }
+
+    /// Return a context with per-record media attached.
+    #[must_use]
+    pub fn with_media(self, media: MediaBindings, required_media: Vec<String>) -> Self {
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .clone()
+            .with_media(media, required_media);
         Self::from_snapshot(Arc::new(snapshot))
     }
 

@@ -15,6 +15,7 @@ use vala_eval::store::{JudgeOutcome, TaskRegistry};
 use vala_eval::tasks::{
     AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, TraceTaskExecutor,
 };
+use vala_eval::{JudgeError, MockJudgeInvoker};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::CardName;
 use wyrd_spec::reference::CardRef;
@@ -91,9 +92,12 @@ fn spec_of(tasks: Vec<EvalTask>) -> EvalSpec {
 }
 
 fn executors() -> Executors {
+    let mock = MockJudgeInvoker::new([Err(JudgeError::Terminal {
+        reason: "default assertion-stage judge mock was invoked".to_owned(),
+    })]);
     Executors {
         assertion: Arc::new(AssertionTaskExecutor::new()),
-        judge: Arc::new(JudgeTaskExecutor::new()),
+        judge: Arc::new(JudgeTaskExecutor::new(mock)),
         trace: Arc::new(TraceTaskExecutor::new()),
         agent: Arc::new(AgentTaskExecutor::new()),
     }

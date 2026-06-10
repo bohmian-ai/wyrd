@@ -19,6 +19,7 @@ default = []
 arrow = { workspace = true }
 async-trait = { workspace = true }
 jsonpath-rust = { workspace = true }
+regex = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

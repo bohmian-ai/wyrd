@@ -4447,6 +4447,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "jsonpath-rust",
+ "regex",
  "schemars",
  "serde",
  "serde_json",

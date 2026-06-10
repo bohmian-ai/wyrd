@@ -54,3 +54,4 @@ pub mod task;
 pub mod trace_source;
 
 pub use error::{EvalError, EvalExecError};
+pub use operators::{OperatorVerdict, evaluate_operator};

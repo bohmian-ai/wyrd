@@ -49,12 +49,25 @@ pub enum EvalExecError {
     #[error("media binding {binding} missing for judge invocation")]
     MediaBindingMissing { binding: String },
 
-    /// A `ComparisonOperator` variant rejected the actual / expected pair.
-    #[error("operator {operator} rejected actual / expected pair for task {task_id}: {reason}")]
+    /// Operator received an input whose JSON kind it cannot evaluate.
+    #[error("operator {op} is not defined on inputs of kind ({left_kind}, {right_kind})")]
     OperatorMismatch {
-        task_id: String,
-        operator: String,
-        reason: String,
+        op: String,
+        left_kind: &'static str,
+        right_kind: &'static str,
+    },
+
+    /// Operator parameters are valid wire shapes but nonsense at runtime.
+    #[error("operator {op}: invalid configuration: {message}")]
+    OperatorInvalidConfig { op: String, message: String },
+
+    /// User-supplied regex pattern failed to compile at evaluation time.
+    #[error("operator {op}: regex pattern {pattern:?} is invalid: {source}")]
+    OperatorRegexInvalid {
+        op: String,
+        pattern: String,
+        #[source]
+        source: regex::Error,
     },
 
     /// A scenario / record lookup by `RecordId` returned no row.
@@ -283,15 +296,37 @@ impl From<EvalExecError> for EvalError {
                 details: serde_json::json!({ "binding": binding }),
             },
             EvalExecError::OperatorMismatch {
-                task_id,
-                operator,
-                reason,
+                op,
+                left_kind,
+                right_kind,
             } => Self::OperatorMismatch {
                 message,
                 details: serde_json::json!({
-                    "task_id": task_id,
-                    "operator": operator,
+                    "operator": op,
+                    "left_kind": left_kind,
+                    "right_kind": right_kind,
+                }),
+            },
+            EvalExecError::OperatorInvalidConfig {
+                op,
+                message: reason,
+            } => Self::OperatorMismatch {
+                message,
+                details: serde_json::json!({
+                    "operator": op,
                     "reason": reason,
+                }),
+            },
+            EvalExecError::OperatorRegexInvalid {
+                op,
+                pattern,
+                source,
+            } => Self::OperatorMismatch {
+                message,
+                details: serde_json::json!({
+                    "operator": op,
+                    "pattern": pattern,
+                    "reason": source.to_string(),
                 }),
             },
             EvalExecError::RecordMissing { record_id } => Self::RecordMissing {

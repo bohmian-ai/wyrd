@@ -140,6 +140,22 @@ pub enum EvalExecError {
     /// The task registry saw a dependency absent from the indexed task set.
     #[error("task {task:?} depends on unknown task {dep:?}")]
     UnknownDependency { task: TaskId, dep: TaskId },
+
+    /// Failed to serialize an eval results artifact to JSON.
+    #[error("failed to serialize eval results: {reason}")]
+    ResultsSerializeFailed { reason: String },
+
+    /// Failed to deserialize an eval results artifact from JSON.
+    #[error("failed to deserialize eval results: {reason}")]
+    ResultsDeserializeFailed { reason: String },
+
+    /// IO error while reading or writing an eval results artifact.
+    #[error("eval results IO failed at {path}: {reason}")]
+    ResultsIoFailed { path: String, reason: String },
+
+    /// Context capture hashing could not canonicalize a JSON value.
+    #[error("failed to canonicalize context value for hashing: {reason}")]
+    ContextHashFailed { reason: String },
 }
 
 /// Errors raised while loading an offline scenario collection.
@@ -521,6 +537,34 @@ impl From<EvalExecError> for EvalError {
                 details: serde_json::json!({
                     "task_id": task.as_str(),
                     "depends_on": dep.as_str(),
+                }),
+            },
+            EvalExecError::ResultsSerializeFailed { reason } => Self::ScenarioLoaderFailure {
+                message,
+                details: serde_json::json!({
+                    "source": "eval_results",
+                    "reason": reason,
+                }),
+            },
+            EvalExecError::ResultsDeserializeFailed { reason } => Self::ScenarioLoaderFailure {
+                message,
+                details: serde_json::json!({
+                    "source": "eval_results",
+                    "reason": reason,
+                }),
+            },
+            EvalExecError::ResultsIoFailed { path, reason } => Self::ScenarioLoaderFailure {
+                message,
+                details: serde_json::json!({
+                    "source": path,
+                    "reason": reason,
+                }),
+            },
+            EvalExecError::ContextHashFailed { reason } => Self::OperatorMismatch {
+                message,
+                details: serde_json::json!({
+                    "operator": "context_capture_hash",
+                    "reason": reason,
                 }),
             },
         }

@@ -66,6 +66,11 @@ pub use executor::{
 };
 pub use judge::{JudgeError, JudgeInvoker, MockJudgeInvoker};
 pub use operators::{OperatorVerdict, evaluate_operator};
+pub use results::{
+    AggregationInput, EvalMetrics, EvalResults, MechanicSubjectInput, PassGateVerdict,
+    ResultsConfig, RunIdentity, ScenarioAggregationInput, ScenarioResult, SubjectKey,
+    SubjectMetrics, SubjectResults, TaskSummary, aggregate_run, apply_context_capture,
+};
 pub use scenario::{
     EvalScenarioCollection, RecordTaskResult, RecordWithMedia, ScenarioExecutionInputs,
     ScenarioExecutionResults, execute_scenario, load_scenario_collection,

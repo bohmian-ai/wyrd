@@ -24,6 +24,7 @@ regex = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros"] }
 tracing = { workspace = true }
@@ -34,4 +35,5 @@ wyrd-utils = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "test-util"] }

@@ -61,6 +61,7 @@ base64 = "0.22"
 insta = { version = "1.43", features = ["json"] }
 wiremock = "0.6"
 temp-env = "0.3"
+tempfile = "3"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 flate2 = "1.*"
 zstd = "0.13"

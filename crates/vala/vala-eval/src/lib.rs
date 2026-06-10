@@ -60,12 +60,16 @@ pub use context::{
     ContextSnapshot, ExecutionContext, RecordIdentity, TaskOutput, extract_jsonpath_from,
     extract_required_jsonpath_from,
 };
-pub use error::{EvalError, EvalExecError};
+pub use error::{EvalError, EvalExecError, EvalPlanError};
 pub use executor::{
     EvalReport, Executors, RunLedger, SkipReason, TaskExecutor, TaskRunOutcome, execute_plan,
 };
 pub use judge::{JudgeError, JudgeInvoker, MockJudgeInvoker};
 pub use operators::{OperatorVerdict, evaluate_operator};
+pub use scenario::{
+    EvalScenarioCollection, RecordTaskResult, RecordWithMedia, ScenarioExecutionInputs,
+    ScenarioExecutionResults, execute_scenario, load_scenario_collection,
+};
 pub use store::{EvalTaskKind, JudgeOutcome, TaskRegistry};
 pub use tasks::{EvalMediaBinding, MediaBindings};
 pub use trace_source::{InMemoryTraceSource, MockTraceSource, TraceSource, TraceUnavailable};

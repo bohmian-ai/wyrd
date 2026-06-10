@@ -1,8 +1,10 @@
 //! Two-phase error model for the eval engine.
 //!
 //! - [`EvalExecError`] is crate-local and uses plain `thiserror`. The
-//!   executors, stores, scenario loader, and operator dispatcher raise this.
-//!   It is never serialized and never crosses an external boundary.
+//!   executors, stores, and operator dispatcher raise this. It is never
+//!   serialized and never crosses an external boundary.
+//! - [`EvalPlanError`] is the typed scenario-loader failure surface. Loader
+//!   failures are plan/input failures, not execution failures.
 //! - [`EvalError`] is the public-facing enum. Variants carry
 //!   `#[wyrd_error(code = "WYRD_EVAL_<STATUS>_<SLUG>", status, title,
 //!   remediation)]` so the `WyrdError` derive supplies stable metadata.
@@ -138,6 +140,42 @@ pub enum EvalExecError {
     /// The task registry saw a dependency absent from the indexed task set.
     #[error("task {task:?} depends on unknown task {dep:?}")]
     UnknownDependency { task: TaskId, dep: TaskId },
+}
+
+/// Errors raised while loading an offline scenario collection.
+#[derive(Debug, Error)]
+pub enum EvalPlanError {
+    /// The scenario file path did not exist.
+    #[error("scenario file not found: {path}")]
+    ScenarioFileMissing { path: String },
+
+    /// The scenario file could not be read or parsed.
+    #[error("scenario file unreadable: {path}{}: {reason}", line.map(|n| format!(" (line {n})")).unwrap_or_default())]
+    ScenarioFileUnreadable {
+        path: String,
+        line: Option<usize>,
+        reason: String,
+    },
+
+    /// The scenario file extension is not one of json, yaml, yml, or jsonl.
+    #[error("scenario file extension not supported: {path} (got {ext:?})")]
+    ScenarioFileExtUnsupported { path: String, ext: Option<String> },
+
+    /// A scenario failed per-scenario validation.
+    #[error("scenario invalid: {path}{}: {reason}", scenario_id.as_deref().map(|s| format!(" (scenario {s})")).unwrap_or_default())]
+    ScenarioCollectionInvalid {
+        path: String,
+        scenario_id: Option<String>,
+        reason: String,
+    },
+
+    /// The collection contains the same scenario id more than once.
+    #[error("scenario collection has duplicate id {scenario_id}: {path}")]
+    ScenarioCollectionDuplicateId { path: String, scenario_id: String },
+
+    /// The collection had no scenarios after parsing.
+    #[error("scenario collection is empty: {path}")]
+    ScenarioCollectionEmpty { path: String },
 }
 
 /// Public-facing eval error.

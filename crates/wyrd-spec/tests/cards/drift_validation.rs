@@ -141,6 +141,25 @@ fn rejects_psi_with_metric_signal() {
 }
 
 #[test]
+fn rejects_custom_with_external_signal() {
+    let err = DriftSpec::new(
+        DriftMethod::Custom,
+        model_ref("subject-model"),
+        external_signal(),
+        DriftCondition::Statistical,
+        Some(DriftProfile::Custom(custom_profile())),
+        None,
+        BTreeMap::new(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        DriftValidationError::SignalMethodMismatch { .. }
+    ));
+}
+
+#[test]
 fn rejects_distribution_with_non_data_baseline_ref() {
     let signal = DriftSignal::Distribution {
         baseline_ref: model_ref("baseline-model"),

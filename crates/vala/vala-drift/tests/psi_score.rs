@@ -161,7 +161,16 @@ fn psi_new_categorical_values_count_in_denominator_only() {
     let report = score_psi(&baseline, &target_batch, &profile).expect("report");
 
     let feature_report = report.features.get(&fname).expect("feature report");
-    let expected = vala_drift::psi::score::psi(&[0.5, 0.5], &[0.5, 0.4]);
+    // Inline PSI formula with epsilon=1e-10 for the two-bin case: baseline=[0.5,0.5], target=[0.5,0.4]
+    const EPS: f64 = 1e-10;
+    let expected: f64 = [(0.5_f64, 0.5_f64), (0.5, 0.4)]
+        .iter()
+        .map(|(p, q)| {
+            let pe = p + EPS;
+            let qe = q + EPS;
+            (pe - qe) * (pe / qe).ln()
+        })
+        .sum();
     assert!((feature_report.score - expected).abs() < 1e-12);
 }
 

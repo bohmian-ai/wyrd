@@ -4,7 +4,7 @@ use arrow::record_batch::RecordBatch;
 use vala_drift::{
     DriftFitError, DriftReport, DriftScoreError, DriftVerdict, FeatureDriftReport, FittedBaseline,
     FittedPsiFeature, FittedSpcFeature, PsiBaseline, SpcBaseline, fit_baseline, fit_psi_baseline,
-    fit_spc_baseline, score, score_custom, score_psi, score_spc,
+    fit_spc_baseline, score_custom, score_drift, score_psi, score_spc,
 };
 use wyrd_spec::card::drift::{CustomProfile, DriftSpec, PsiProfile, SpcProfile};
 use wyrd_spec::ids::FeatureName;
@@ -48,5 +48,5 @@ fn public_surface_is_visible() {
         &FittedBaseline,
         &RecordBatch,
         &DriftSpec,
-    ) -> Result<DriftReport, DriftScoreError> = score;
+    ) -> Result<DriftReport, DriftScoreError> = score_drift;
 }

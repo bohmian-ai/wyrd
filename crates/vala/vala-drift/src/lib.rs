@@ -17,14 +17,14 @@
 //! and do not participate in the `WyrdError` derive (no HTTP surface this phase).
 
 pub mod baseline;
-pub mod custom;
+pub(crate) mod custom;
 pub mod error;
-pub mod feature;
+pub(crate) mod feature;
 pub mod psi;
 pub mod report;
 pub mod spc;
 
-pub use baseline::{FittedBaseline, fit_baseline, score};
+pub use baseline::{FittedBaseline, fit_baseline, score_drift};
 pub use custom::score_custom;
 pub use error::{DriftFitError, DriftScoreError};
 pub use psi::{FittedPsiFeature, PsiBaseline, fit_psi_baseline, score_psi};

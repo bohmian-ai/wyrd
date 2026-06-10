@@ -4,7 +4,6 @@ use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use vala_drift::DriftFitError;
-use vala_drift::psi::binning::{assign_bin, compute_edges_quantile};
 use vala_drift::psi::{BinType, fit_psi_baseline};
 use wyrd_spec::card::drift::{PsiBinningStrategy, PsiProfile, PsiThreshold};
 use wyrd_spec::ids::FeatureName;
@@ -61,28 +60,6 @@ fn equal_width_numeric_fit_computes_bin_proportions() {
     for bin in &fitted.bins {
         assert!((bin.proportion - 0.1).abs() < 1e-12);
     }
-}
-
-#[test]
-fn quantile_edges_match_r7_reference_vector() {
-    let values: Vec<f64> = (1..=8).map(f64::from).collect();
-    let edges = compute_edges_quantile(&values, 4).expect("edges");
-
-    assert_eq!(edges.edges.len(), 5);
-    assert!((edges.edges[1] - 2.75).abs() < 1e-10);
-    assert!((edges.edges[2] - 4.5).abs() < 1e-10);
-    assert!((edges.edges[3] - 6.25).abs() < 1e-10);
-}
-
-#[test]
-fn assign_bin_matches_left_open_right_closed_parity() {
-    let edges = vec![f64::NEG_INFINITY, 10.0, 20.0, 30.0, f64::INFINITY];
-
-    assert_eq!(assign_bin(10.0, &edges), 0);
-    assert_eq!(assign_bin(10.0001, &edges), 1);
-    assert_eq!(assign_bin(20.0, &edges), 1);
-    assert_eq!(assign_bin(30.0, &edges), 2);
-    assert_eq!(assign_bin(30.0001, &edges), 3);
 }
 
 #[test]

@@ -1,8 +1,8 @@
 //! PSI baseline fit and target scoring.
 
-pub mod binning;
-pub mod score;
-pub mod threshold;
+pub(crate) mod binning;
+pub(crate) mod score;
+pub(crate) mod threshold;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -20,9 +20,13 @@ use crate::psi::threshold::compute_psi_threshold;
 use crate::report::{DriftReport, DriftVerdict, FeatureDriftReport};
 
 /// PSI fitted baseline, one entry per feature.
+///
+/// Serialization and persistence are out of phase; store baselines via the
+/// server-side baseline store.
 #[derive(Debug, Clone)]
 pub struct PsiBaseline {
     pub features: BTreeMap<FeatureName, FittedPsiFeature>,
+    /// Vala version at fit time; used by the persistence layer for forward-compatibility checks.
     pub wyrd_version: WyrdVersion,
 }
 
@@ -59,7 +63,9 @@ pub fn fit_psi_baseline(
     let mut fitted_features = BTreeMap::new();
 
     for feature in features {
-        let column = resolve_column(batch, feature)?;
+        let column = resolve_column(batch, feature).map_err(|_| DriftFitError::FeatureMissing {
+            feature: feature.as_str().to_string(),
+        })?;
         let fitted = if profile.categorical_features.contains(feature) {
             fit_categorical(feature, &column)?
         } else {

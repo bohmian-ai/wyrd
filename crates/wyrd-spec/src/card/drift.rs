@@ -527,9 +527,7 @@ fn validate_signal_method(
         ),
         DriftMethod::Custom => matches!(
             signal,
-            DriftSignal::Metric { .. }
-                | DriftSignal::EvalScore { .. }
-                | DriftSignal::External { .. }
+            DriftSignal::Metric { .. } | DriftSignal::EvalScore { .. }
         ),
         DriftMethod::External => matches!(signal, DriftSignal::External { .. }),
     };
@@ -694,6 +692,10 @@ fn validate_psi_profile(profile: &PsiProfile) -> Result<(), DriftValidationError
 fn validate_spc_profile(profile: &SpcProfile) -> Result<(), DriftValidationError> {
     if profile.sample_size == 1 {
         return Err(DriftValidationError::SpcSampleSizeOutOfRange);
+    }
+
+    if profile.weco_rule.rule_string.len() > 256 {
+        return Err(DriftValidationError::SpcWecoMalformed);
     }
 
     let parts: Vec<&str> = profile.weco_rule.rule_string.split_whitespace().collect();

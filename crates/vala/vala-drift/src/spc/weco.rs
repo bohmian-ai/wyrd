@@ -41,16 +41,22 @@ pub const SPC_TREND_MIN_MONOTONIC: u32 = 6;
 pub fn parse_rule(s: &str) -> Result<WecoRule, DriftScoreError> {
     let parts: Vec<&str> = s.split_whitespace().collect();
     if parts.len() != 8 {
-        return Err(DriftScoreError::WecoMalformed { got: s.to_string() });
+        return Err(DriftScoreError::WecoMalformed {
+            got: s.chars().take(200).collect::<String>(),
+        });
     }
 
     let mut vals = [0u32; 8];
     for (idx, part) in parts.iter().enumerate() {
         let value = part
             .parse::<u32>()
-            .map_err(|_| DriftScoreError::WecoMalformed { got: s.to_string() })?;
+            .map_err(|_| DriftScoreError::WecoMalformed {
+                got: s.chars().take(200).collect::<String>(),
+            })?;
         if value == 0 {
-            return Err(DriftScoreError::WecoMalformed { got: s.to_string() });
+            return Err(DriftScoreError::WecoMalformed {
+                got: s.chars().take(200).collect::<String>(),
+            });
         }
         vals[idx] = value;
     }
@@ -139,9 +145,9 @@ fn scan_zone(
     zone: u8,
     consec_threshold: u32,
     alt_threshold: u32,
-) -> (Option<i8>, bool) {
+) -> (Vec<i8>, bool) {
     let z = zone as i8;
-    let mut consec_hit = None;
+    let mut consec_hits: Vec<i8> = Vec::new();
     let mut alt_hit = false;
 
     for (idx, &value) in drift_array.iter().enumerate() {
@@ -153,7 +159,7 @@ fn scan_zone(
         if idx + 1 >= consec_len {
             let start = idx + 1 - consec_len;
             if let Some(sign) = slice_consecutive_hit(&drift_array[start..=idx], zone) {
-                consec_hit = Some(sign);
+                consec_hits.push(sign);
             }
         }
 
@@ -165,7 +171,7 @@ fn scan_zone(
         }
     }
 
-    (consec_hit, alt_hit)
+    (consec_hits, alt_hit)
 }
 
 fn scan_trend(drift_array: &[i8]) -> Vec<WecoViolation> {
@@ -225,8 +231,8 @@ pub fn evaluate(
 
     let mut violations = Vec::new();
     for &(zone, consec_threshold, alt_threshold) in zones {
-        let (consec_hit, alt_hit) = scan_zone(drift_array, zone, consec_threshold, alt_threshold);
-        if let Some(sign) = consec_hit {
+        let (consec_hits, alt_hit) = scan_zone(drift_array, zone, consec_threshold, alt_threshold);
+        for sign in consec_hits {
             violations.push(WecoViolation::Consecutive { zone, sign });
         }
         if alt_hit {
@@ -277,23 +283,20 @@ mod tests {
     }
 
     #[test]
-    fn assign_zone_in_control() {
+    fn assign_zone_covers_all_regions() {
         let limits = limits_basic();
-        assert_eq!(assign_zone(0.5, &limits), 1);
-        assert_eq!(assign_zone(-0.5, &limits), -1);
-    }
-
-    #[test]
-    fn assign_zone_exactly_center_is_zero() {
-        let limits = limits_basic();
+        // Negative side
+        assert_eq!(assign_zone(-3.5, &limits), -4); // beyond 3σ
+        assert_eq!(assign_zone(-2.5, &limits), -3); // 2σ–3σ
+        assert_eq!(assign_zone(-1.5, &limits), -2); // 1σ–2σ
+        assert_eq!(assign_zone(-0.5, &limits), -1); // center–1σ
+        // Center
         assert_eq!(assign_zone(0.0, &limits), 0);
-    }
-
-    #[test]
-    fn assign_zone_above_three_sigma() {
-        let limits = limits_basic();
-        assert_eq!(assign_zone(3.5, &limits), 4);
-        assert_eq!(assign_zone(-3.5, &limits), -4);
+        // Positive side
+        assert_eq!(assign_zone(0.5, &limits), 1); // center–1σ
+        assert_eq!(assign_zone(1.5, &limits), 2); // 1σ–2σ
+        assert_eq!(assign_zone(2.5, &limits), 3); // 2σ–3σ
+        assert_eq!(assign_zone(3.5, &limits), 4); // beyond 3σ
     }
 
     #[test]
@@ -374,6 +377,76 @@ mod tests {
             !violations
                 .iter()
                 .any(|violation| matches!(violation, WecoViolation::Trend { .. }))
+        );
+    }
+
+    #[test]
+    fn zone2_consecutive_needs_full_window_same_side() {
+        let drift = vec![2i8, 2, 2, -2];
+        let rule = parse_rule("8 16 4 8 2 4 1 1").expect("valid rule");
+        let violations = evaluate(&drift, &rule, SpcAlertThreshold::Zone2);
+        assert!(
+            !violations
+                .iter()
+                .any(|v| matches!(v, WecoViolation::Consecutive { zone: 2, .. }))
+        );
+    }
+
+    #[test]
+    fn zone2_consecutive_fires_when_all_same_side_at_threshold() {
+        let drift = vec![2i8, 2, 2, 2];
+        let rule = parse_rule("8 16 4 8 2 4 1 1").expect("valid rule");
+        let violations = evaluate(&drift, &rule, SpcAlertThreshold::Zone2);
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, WecoViolation::Consecutive { zone: 2, sign: 1 }))
+        );
+    }
+
+    #[test]
+    fn alternating_zero_resets_run() {
+        let drift = vec![3i8, -3, 0, 3, -3];
+        let rule = parse_rule("8 16 4 8 2 4 1 1").expect("valid rule");
+        let violations = evaluate(&drift, &rule, SpcAlertThreshold::Zone3);
+        assert!(
+            !violations
+                .iter()
+                .any(|v| matches!(v, WecoViolation::Alternating { zone: 3 }))
+        );
+    }
+
+    #[test]
+    fn per_zone_rule_only_evaluates_at_matching_zone_index() {
+        let drift = vec![3i8, 4];
+        let rule = parse_rule("8 16 2 4 2 4 1 1").expect("valid rule");
+        let violations = evaluate(&drift, &rule, SpcAlertThreshold::Zone1);
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, WecoViolation::Consecutive { zone: 4, .. }))
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|v| matches!(v, WecoViolation::Consecutive { zone: 3, .. }))
+        );
+    }
+
+    #[test]
+    fn two_non_overlapping_zone4_windows_produce_score_two() {
+        // Two isolated zone-4 points with zone4_consec=1 should each fire
+        // independently, yielding two Consecutive violations (score == 2.0).
+        let drift = vec![4i8, 0, 0, 0, 4];
+        let rule = parse_rule("8 16 4 8 2 4 1 1").expect("valid rule");
+        let violations = evaluate(&drift, &rule, SpcAlertThreshold::Zone4);
+        let consec_count = violations
+            .iter()
+            .filter(|v| matches!(v, WecoViolation::Consecutive { zone: 4, sign: 1 }))
+            .count();
+        assert_eq!(
+            consec_count, 2,
+            "expected 2 zone-4 violations, got {violations:?}"
         );
     }
 

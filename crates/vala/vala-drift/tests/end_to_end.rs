@@ -7,7 +7,7 @@ use std::sync::Arc;
 use arrow::array::Float64Array;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
-use vala_drift::{DriftReport, DriftVerdict, FittedBaseline, fit_baseline, score};
+use vala_drift::{DriftReport, DriftVerdict, FittedBaseline, fit_baseline, score_drift};
 use wyrd_spec::card::drift::{
     CustomProfile, DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec,
     PsiBinningStrategy, PsiProfile, PsiThreshold, SpcAlertThreshold, SpcProfile, SpcWecoRule,
@@ -134,7 +134,11 @@ fn assert_report_shape(
     assert_eq!(feature_report.feature, *feature);
     assert_eq!(feature_report.verdict, verdict);
     assert!(feature_report.score.is_finite());
-    assert!(feature_report.threshold.is_finite());
+    if method == DriftMethod::Spc {
+        assert!(feature_report.threshold.is_nan());
+    } else {
+        assert!(feature_report.threshold.is_finite());
+    }
 }
 
 #[test]
@@ -146,7 +150,7 @@ fn psi_dispatch_scores_report_shape() -> Result<(), Box<dyn Error>> {
     assert!(matches!(baseline, FittedBaseline::Psi(_)));
 
     let target = numeric_batch("score", (5_000..6_000).map(f64::from).collect())?;
-    let report = score(&baseline, &target, &spec)?;
+    let report = score_drift(&baseline, &target, &spec)?;
 
     assert_report_shape(&report, DriftMethod::Psi, &feature, DriftVerdict::Drift);
     Ok(())
@@ -162,7 +166,7 @@ fn spc_distribution_dispatch_scores_report_shape() -> Result<(), Box<dyn Error>>
     assert!(matches!(baseline, FittedBaseline::Spc(_)));
 
     let target = numeric_batch("latency", vec![100.0; 200])?;
-    let report = score(&baseline, &target, &spec)?;
+    let report = score_drift(&baseline, &target, &spec)?;
 
     assert_report_shape(&report, DriftMethod::Spc, &feature, DriftVerdict::Drift);
     Ok(())
@@ -178,7 +182,7 @@ fn spc_metric_dispatch_scores_single_feature_report() -> Result<(), Box<dyn Erro
     assert!(matches!(baseline, FittedBaseline::Spc(_)));
 
     let target = numeric_batch(feature.as_str(), vec![100.0; 200])?;
-    let report = score(&baseline, &target, &spec)?;
+    let report = score_drift(&baseline, &target, &spec)?;
 
     assert_report_shape(&report, DriftMethod::Spc, &feature, DriftVerdict::Drift);
     Ok(())
@@ -193,7 +197,7 @@ fn custom_dispatch_scores_report_shape() -> Result<(), Box<dyn Error>> {
     assert!(matches!(baseline, FittedBaseline::Custom));
 
     let target = numeric_batch(feature.as_str(), vec![200.0, 210.0, 220.0])?;
-    let report = score(&baseline, &target, &spec)?;
+    let report = score_drift(&baseline, &target, &spec)?;
 
     assert_report_shape(&report, DriftMethod::Custom, &feature, DriftVerdict::Drift);
     Ok(())

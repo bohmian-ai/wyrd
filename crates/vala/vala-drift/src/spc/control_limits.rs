@@ -1,6 +1,8 @@
 //! SPC control limits: c4 bias correction, adaptive sample-size table,
 //! and fit_control_limits (X-bar/S chart per NIST section 3.2.1).
 
+use statrs::function::gamma::ln_gamma;
+
 use crate::error::DriftFitError;
 
 /// Seven control limits per feature, ordered:
@@ -16,14 +18,17 @@ pub struct ControlLimits {
     pub three_ucl: f64,
 }
 
-/// c4 unbiased-stddev correction factor.
+/// c4 unbiased-stddev correction factor (exact Gamma-based formula).
 ///
-/// `c4(n) = (4n - 4) / (4n - 3)`. Used to scale the average of per-chunk
-/// stddevs before computing control limits.
+/// `c4(n) = sqrt(2/(n-1)) · Γ(n/2) / Γ((n-1)/2)`
+///
+/// Computed in log-space via `ln_gamma` for numerical stability across all
+/// chunk sizes. References: NIST e-Handbook §6.3.2; Montgomery "Introduction
+/// to Statistical Quality Control" Table VI.
 #[must_use]
 pub fn c4(n: u32) -> f64 {
-    let n4 = 4.0 * f64::from(n);
-    (n4 - 4.0) / (n4 - 3.0)
+    let nf = f64::from(n);
+    (0.5 * (2.0 / (nf - 1.0)).ln() + ln_gamma(nf / 2.0) - ln_gamma((nf - 1.0) / 2.0)).exp()
 }
 
 /// Adaptive sample chunk size from total baseline row count.
@@ -149,16 +154,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn c4_at_n_25_matches_formula() {
-        let value = c4(25);
-        assert!((value - 96.0 / 97.0).abs() < 1e-12);
+    fn c4_n2_equals_sqrt_2_over_pi() {
+        // Exact closed form: sqrt(2) * Γ(1) / Γ(1/2) = sqrt(2/π)
+        let expected = (2.0_f64 / std::f64::consts::PI).sqrt();
+        assert!((c4(2) - expected).abs() < 1e-12);
     }
 
     #[test]
-    fn c4_grows_toward_one() {
-        assert!(c4(1_000) > c4(25));
-        assert!(c4(1_000) < 1.0);
-        assert!(c4(1_000_000) > 0.999);
+    fn c4_n3_equals_sqrt_pi_over_2() {
+        // Exact closed form: Γ(3/2) / Γ(1) = (sqrt(π)/2) / 1 = sqrt(π)/2
+        let expected = std::f64::consts::PI.sqrt() / 2.0;
+        assert!((c4(3) - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn c4_nist_table_regression() {
+        // NIST e-Handbook §6.3.2 / Montgomery Table VI — 4 sig figs
+        let cases: &[(u32, f64)] = &[(5, 0.9400), (10, 0.9727), (25, 0.9896)];
+        for &(n, expected) in cases {
+            assert!((c4(n) - expected).abs() < 5e-5, "n={n}: got {}", c4(n));
+        }
+    }
+
+    #[test]
+    fn c4_grows_monotonically_toward_one() {
+        let ns: &[u32] = &[2, 5, 10, 25, 100, 1_000, 100_000];
+        for pair in ns.windows(2) {
+            let (a, b) = (c4(pair[0]), c4(pair[1]));
+            assert!(b > a && b < 1.0, "n={}: c4={}", pair[1], b);
+        }
     }
 
     #[test]
@@ -191,7 +215,7 @@ mod tests {
     fn x_bar_s_formula_matches_hand_computation() {
         let values = vec![1.0, 3.0, 2.0, 4.0, 3.0, 5.0, 4.0, 6.0];
         let limits = fit_control_limits(&values, 2).expect("control limits");
-        let expected_stddev_adj = (2.0_f64).sqrt() / 0.8;
+        let expected_stddev_adj = (2.0_f64).sqrt() / (2.0_f64 / std::f64::consts::PI).sqrt();
         assert!((limits.center - 3.5).abs() < 1e-12);
         assert!((limits.one_ucl - (3.5 + expected_stddev_adj)).abs() < 1e-9);
         assert!((limits.three_lcl - (3.5 - 3.0 * expected_stddev_adj)).abs() < 1e-9);

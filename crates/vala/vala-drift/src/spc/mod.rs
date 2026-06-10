@@ -1,7 +1,7 @@
 //! SPC baseline fit and target scoring.
 
-pub mod control_limits;
-pub mod weco;
+pub(crate) mod control_limits;
+pub(crate) mod weco;
 
 use std::collections::BTreeMap;
 
@@ -13,10 +13,14 @@ use crate::error::{DriftFitError, DriftScoreError};
 use crate::report::DriftReport;
 
 /// SPC fitted baseline, one entry per feature plus the chunk size used.
+///
+/// Serialization and persistence are out of phase; store baselines via the
+/// server-side baseline store.
 #[derive(Debug, Clone)]
 pub struct SpcBaseline {
     pub features: BTreeMap<FeatureName, FittedSpcFeature>,
     pub chunk_size: u32,
+    /// Vala version at fit time; used by the persistence layer for forward-compatibility checks.
     pub wyrd_version: WyrdVersion,
 }
 
@@ -49,7 +53,9 @@ pub fn fit_spc_baseline(
 
     let mut fitted = BTreeMap::new();
     for feature in features {
-        let column = resolve_column(batch, feature)?;
+        let column = resolve_column(batch, feature).map_err(|_| DriftFitError::FeatureMissing {
+            feature: feature.as_str().to_string(),
+        })?;
         if !column.is_numeric() {
             return Err(DriftFitError::FeatureNotNumeric {
                 feature: feature.as_str().to_string(),
@@ -182,7 +188,7 @@ pub fn score_spc(
             FeatureDriftReport {
                 feature: feature_name.clone(),
                 score,
-                threshold: 0.0,
+                threshold: f64::NAN,
                 verdict,
             },
         );

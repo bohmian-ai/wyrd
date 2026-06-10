@@ -12,6 +12,9 @@ use crate::spc::SpcBaseline;
 use crate::spc::{fit_spc_baseline, score_spc};
 
 /// Fitted baseline state produced by `fit_baseline`.
+///
+/// Serialization and persistence are out of phase; store baselines via the
+/// server-side baseline store.
 #[derive(Debug, Clone)]
 pub enum FittedBaseline {
     /// PSI fitted baseline state.
@@ -91,7 +94,7 @@ pub fn fit_baseline(
 /// Returns a [`DriftScoreError`] when the fitted baseline does not match the
 /// selected method, the method profile is missing or mismatched, scoring fails,
 /// or the spec selects the out-of-phase External method.
-pub fn score(
+pub fn score_drift(
     baseline: &FittedBaseline,
     target: &arrow::record_batch::RecordBatch,
     spec: &DriftSpec,

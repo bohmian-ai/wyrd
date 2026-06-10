@@ -38,6 +38,8 @@ fn openai_user(text: &str) -> OpenAiChatMessage {
         tool_calls: None,
         tool_call_id: None,
         refusal: None,
+        annotations: Vec::new(),
+        audio: None,
     }
 }
 
@@ -56,6 +58,8 @@ fn openai_text_response(text: &str) -> ProviderResponse {
                 tool_calls: None,
                 tool_call_id: None,
                 refusal: None,
+                annotations: Vec::new(),
+                audio: None,
             },
             finish_reason: Some("stop".to_owned()),
             logprobs: None,
@@ -88,6 +92,8 @@ fn openai_tool_call_response(name: &str, args: serde_json::Value) -> ProviderRes
                 }]),
                 tool_call_id: None,
                 refusal: None,
+                annotations: Vec::new(),
+                audio: None,
             },
             finish_reason: Some("tool_calls".to_owned()),
             logprobs: None,
@@ -190,6 +196,8 @@ async fn run_prompt_sends_rendered_prompt_verbatim_on_first_turn() {
                 tool_calls: None,
                 tool_call_id: None,
                 refusal: None,
+                annotations: Vec::new(),
+                audio: None,
             },
             openai_user("hello {{name}}"),
         ],
@@ -211,6 +219,8 @@ async fn run_prompt_sends_rendered_prompt_verbatim_on_first_turn() {
                 tool_calls: None,
                 tool_call_id: None,
                 refusal: None,
+                annotations: Vec::new(),
+                audio: None,
             },
             openai_user("hello Ada"),
         ],
@@ -243,6 +253,7 @@ async fn run_prompt_sends_rendered_prompt_verbatim_on_first_turn() {
                 SpecPrompt::new(template_request, "gpt-4o", None, ResponseType::Text).unwrap(),
             ),
             &[("name", "Ada")],
+            None,
         )
         .await
         .expect("prompt run must succeed");
@@ -273,7 +284,7 @@ async fn run_prompt_provider_mismatch_returns_409_provider_mismatch() {
         build_agent(agent_request, MockProvider::new(ProviderName::OpenAi), 10);
 
     let err = agent
-        .run_prompt(&providers, &prompt, &[])
+        .run_prompt(&providers, &prompt, &[], None)
         .await
         .expect_err("provider mismatch must fail");
     assert_eq!(err.code(), "SKALD_AGENT_409_PROVIDER_MISMATCH");
@@ -299,7 +310,7 @@ async fn run_prompt_missing_variable_emits_prompt_error() {
     ));
 
     let err = agent
-        .run_prompt(&providers, &prompt, &[])
+        .run_prompt(&providers, &prompt, &[], None)
         .await
         .expect_err("missing variables must fail");
     assert_eq!(err.code(), "SKALD_AGENT_422_PROMPT");

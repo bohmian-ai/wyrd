@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 from typing import Any
 
+from .cards import CardRef
 from .error import WyrdError
 from .header import JsonDict, PathLike
 
@@ -227,6 +228,26 @@ class ProviderRequest:
         """
         ...
 
+    def openai(self) -> OpenAiChatRequest:
+        """Return the typed OpenAI Chat request accessor."""
+        ...
+
+    def openai_responses(self) -> OpenAiResponsesRequest:
+        """Return the typed OpenAI Responses request accessor."""
+        ...
+
+    def anthropic(self) -> AnthropicMessagesRequest:
+        """Return the typed Anthropic Messages request accessor."""
+        ...
+
+    def gemini(self) -> GeminiRequest:
+        """Return the typed Google Gemini request accessor."""
+        ...
+
+    def vertex(self) -> VertexRequest:
+        """Return the typed Vertex AI request accessor."""
+        ...
+
     def __str__(self) -> str:
         """Return pretty JSON for interactive inspection.
 
@@ -234,6 +255,289 @@ class ProviderRequest:
             str: Pretty JSON representation of the provider request.
         """
         ...
+
+class ProviderResponse:
+    """Typed provider response wrapper. Use provider accessors for typed field access."""
+
+    @property
+    def provider(self) -> str: ...
+    def openai(self) -> OpenAiChatResponse: ...
+    def openai_responses(self) -> OpenAiResponsesResponse: ...
+    def anthropic(self) -> AnthropicMessagesResponse: ...
+    def gemini(self) -> GeminiResponse: ...
+    def vertex(self) -> VertexResponse: ...
+    def model_dump(self) -> JsonDict: ...
+    def model_dump_json(self) -> str: ...
+
+class OpenAiChatRequest:
+    @property
+    def model(self) -> str: ...
+    @property
+    def messages(self) -> list[OpenAiChatMessage]: ...
+    @property
+    def stream(self) -> bool | None: ...
+    @property
+    def parallel_tool_calls(self) -> bool | None: ...
+
+class OpenAiChatResponse:
+    @property
+    def id(self) -> str: ...
+    @property
+    def object(self) -> str: ...
+    @property
+    def created(self) -> int: ...
+    @property
+    def model(self) -> str: ...
+    @property
+    def system_fingerprint(self) -> str | None: ...
+    @property
+    def service_tier(self) -> str | None: ...
+    @property
+    def usage(self) -> OpenAiUsage | None: ...
+    @property
+    def choices(self) -> list[OpenAiChatChoice]: ...
+
+class OpenAiChatChoice:
+    @property
+    def index(self) -> int: ...
+    @property
+    def finish_reason(self) -> str | None: ...
+    @property
+    def message(self) -> OpenAiChatMessage: ...
+    @property
+    def logprobs(self) -> OpenAiChatLogprobs | None: ...
+
+class OpenAiChatMessage:
+    @property
+    def role(self) -> str: ...
+    @property
+    def content(self) -> OpenAiMessageContent | None: ...
+    @property
+    def name(self) -> str | None: ...
+    @property
+    def tool_calls(self) -> list[OpenAiToolCall] | None: ...
+    @property
+    def tool_call_id(self) -> str | None: ...
+    @property
+    def refusal(self) -> str | None: ...
+    @property
+    def annotations(self) -> list[OpenAiMessageAnnotation]: ...
+    @property
+    def audio(self) -> OpenAiMessageAudio | None: ...
+
+class OpenAiMessageContent:
+    @property
+    def kind(self) -> str: ...
+    def as_text(self) -> str: ...
+    def as_parts(self) -> list[OpenAiContentPart]: ...
+
+class OpenAiContentPart:
+    @property
+    def kind(self) -> str: ...
+    def as_text(self) -> str: ...
+    def as_image_url(self) -> OpenAiImageUrl: ...
+    def as_input_audio(self) -> OpenAiInputAudio: ...
+    def as_file(self) -> OpenAiFilePart: ...
+
+class OpenAiImageUrl:
+    @property
+    def url(self) -> str: ...
+    @property
+    def detail(self) -> str | None: ...
+
+class OpenAiInputAudio:
+    @property
+    def data(self) -> str: ...
+    @property
+    def format(self) -> str: ...
+
+class OpenAiFilePart:
+    @property
+    def file_id(self) -> str | None: ...
+    @property
+    def file_data(self) -> str | None: ...
+    @property
+    def filename(self) -> str | None: ...
+
+class OpenAiToolCall:
+    @property
+    def id(self) -> str: ...
+    @property
+    def kind(self) -> str: ...
+    @property
+    def function(self) -> OpenAiToolFunctionCall: ...
+
+class OpenAiToolFunctionCall:
+    @property
+    def name(self) -> str: ...
+    @property
+    def arguments(self) -> str: ...
+
+class OpenAiMessageAnnotation:
+    @property
+    def kind(self) -> str: ...
+    @property
+    def url_citation(self) -> OpenAiUrlCitation: ...
+
+class OpenAiUrlCitation:
+    @property
+    def url(self) -> str: ...
+    @property
+    def title(self) -> str: ...
+    @property
+    def start_index(self) -> int: ...
+    @property
+    def end_index(self) -> int: ...
+
+class OpenAiMessageAudio:
+    @property
+    def id(self) -> str: ...
+    @property
+    def expires_at(self) -> int: ...
+    @property
+    def data(self) -> str: ...
+    @property
+    def transcript(self) -> str: ...
+
+class OpenAiUsage:
+    @property
+    def prompt_tokens(self) -> int: ...
+    @property
+    def completion_tokens(self) -> int: ...
+    @property
+    def total_tokens(self) -> int: ...
+    @property
+    def prompt_tokens_details(self) -> OpenAiPromptTokensDetails | None: ...
+    @property
+    def completion_tokens_details(self) -> OpenAiCompletionTokensDetails | None: ...
+
+class OpenAiPromptTokensDetails:
+    @property
+    def audio_tokens(self) -> int: ...
+    @property
+    def cached_tokens(self) -> int: ...
+
+class OpenAiCompletionTokensDetails:
+    @property
+    def accepted_prediction_tokens(self) -> int: ...
+    @property
+    def audio_tokens(self) -> int: ...
+    @property
+    def reasoning_tokens(self) -> int: ...
+    @property
+    def rejected_prediction_tokens(self) -> int: ...
+
+class OpenAiChatLogprobs:
+    @property
+    def content(self) -> list[Any]: ...
+    @property
+    def refusal(self) -> list[Any]: ...
+
+class AnthropicMessagesRequest:
+    @property
+    def model(self) -> str: ...
+
+class AnthropicMessagesResponse:
+    @property
+    def id(self) -> str: ...
+    @property
+    def model(self) -> str: ...
+    @property
+    def role(self) -> str: ...
+    @property
+    def stop_reason(self) -> str | None: ...
+    @property
+    def stop_sequence(self) -> str | None: ...
+    @property
+    def usage(self) -> AnthropicUsage: ...
+
+class AnthropicMessage:
+    @property
+    def role(self) -> str: ...
+    @property
+    def content(self) -> list[AnthropicContentBlock]: ...
+
+class AnthropicContentBlock:
+    @property
+    def kind(self) -> str: ...
+    def as_text(self) -> str: ...
+
+class AnthropicUsage:
+    @property
+    def input_tokens(self) -> int: ...
+    @property
+    def output_tokens(self) -> int: ...
+    @property
+    def cache_creation_input_tokens(self) -> int: ...
+    @property
+    def cache_read_input_tokens(self) -> int: ...
+
+class GeminiRequest:
+    @property
+    def contents(self) -> list[GoogleContent]: ...
+
+class GeminiResponse:
+    @property
+    def candidates(self) -> list[GoogleCandidate]: ...
+    @property
+    def usage_metadata(self) -> GoogleUsageMetadata | None: ...
+
+class GoogleContent:
+    @property
+    def role(self) -> str: ...
+    @property
+    def parts(self) -> list[GooglePart]: ...
+
+class GooglePart:
+    @property
+    def kind(self) -> str: ...
+    def as_text(self) -> str: ...
+
+class GoogleCandidate:
+    @property
+    def finish_reason(self) -> str | None: ...
+    @property
+    def index(self) -> int | None: ...
+
+class GoogleUsageMetadata:
+    @property
+    def prompt_token_count(self) -> int: ...
+    @property
+    def candidates_token_count(self) -> int: ...
+    @property
+    def total_token_count(self) -> int: ...
+
+class VertexRequest:
+    @property
+    def contents(self) -> list[GoogleContent]: ...
+
+class VertexResponse:
+    @property
+    def candidates(self) -> list[GoogleCandidate]: ...
+
+class OpenAiResponsesRequest:
+    @property
+    def model(self) -> str: ...
+    @property
+    def instructions(self) -> str | None: ...
+
+class OpenAiResponsesResponse:
+    @property
+    def id(self) -> str: ...
+    @property
+    def model(self) -> str: ...
+    @property
+    def status(self) -> str: ...
+    @property
+    def usage(self) -> OpenAiResponsesUsage | None: ...
+
+class OpenAiResponsesUsage:
+    @property
+    def input_tokens(self) -> int: ...
+    @property
+    def output_tokens(self) -> int: ...
+    @property
+    def total_tokens(self) -> int: ...
 
 class ResponseFormat:
     """Provider-independent response-format authoring helper."""
@@ -561,6 +865,7 @@ class Prompt:
         provider: str,
         system: str | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
+        output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         operation: str | None = ...,
         cache: str | Mapping[str, Any] | None = ...,
         model_settings: OpenAISettings
@@ -587,13 +892,14 @@ class Prompt:
                 the selected provider.
             response_format (ResponseFormat | JsonDict | None): Optional
                 structured-output helper or schema dictionary.
+            output (dict[str, type] | type | JsonDict | ResponseFormat | None): Optional structured-output declaration. Accepts dict[str, type], raw JSON Schema, ResponseFormat, or pydantic BaseModel subclass. When set, output wins over response_format.
             operation (str | None): Optional provider operation selector used
                 by provider families with more than one request shape.
             cache (str | Mapping[str, Any] | None): Optional cache sugar for
                 providers with a native cache key.
             model_settings (OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | Mapping[str, Any] | None): Native provider generation settings object or mapping. Explicit settings take precedence over cache sugar.
             variables (list[str] | None): Declared text variables. When
-                omitted, Wyrd infers `{{name}}` placeholders from the request.
+                omitted, Wyrd infers `${name}` and `{{name}}` placeholders from the request.
             version (str | None): Optional prompt version string stored on the
                 native prompt.
         """
@@ -606,6 +912,7 @@ class Prompt:
         system: str | None = ...,
         messages: Any | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
+        output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         cache: str | Mapping[str, Any] | None = ...,
         model_settings: OpenAISettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
@@ -619,10 +926,11 @@ class Prompt:
             messages (Any | None): Optional user-authored chat messages.
             response_format (ResponseFormat | JsonDict | None): Optional
                 response-format helper or schema dictionary.
+            output (dict[str, type] | type | JsonDict | ResponseFormat | None): Optional structured-output declaration. When set, output wins over response_format.
             cache (str | Mapping[str, Any] | None): Optional prompt cache key.
             model_settings (OpenAISettings | Mapping[str, Any] | None): OpenAI settings object or mapping.
             variables (list[str] | None): Declared text variables. When
-                omitted, Wyrd infers `{{name}}` placeholders.
+                omitted, Wyrd infers `${name}` and `{{name}}` placeholders.
             version (str | None): Optional prompt version string.
 
         Returns:
@@ -637,6 +945,7 @@ class Prompt:
         instructions: str | None = ...,
         messages: Any | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
+        output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: OpenAIResponsesSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
         version: str | None = ...,
@@ -649,9 +958,10 @@ class Prompt:
             messages (Any | None): Optional Responses API input items.
             response_format (ResponseFormat | JsonDict | None): Optional
                 response-format helper or schema dictionary.
+            output (dict[str, type] | type | JsonDict | ResponseFormat | None): Optional structured-output declaration. When set, output wins over response_format.
             model_settings (OpenAIResponsesSettings | Mapping[str, Any] | None): OpenAI Responses settings object or mapping.
             variables (list[str] | None): Declared text variables. When
-                omitted, Wyrd infers `{{name}}` placeholders.
+                omitted, Wyrd infers `${name}` and `{{name}}` placeholders.
             version (str | None): Optional prompt version string.
 
         Returns:
@@ -666,6 +976,7 @@ class Prompt:
         system: str | None = ...,
         messages: Any | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
+        output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: AnthropicSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
         version: str | None = ...,
@@ -678,9 +989,10 @@ class Prompt:
             messages (Any | None): Optional Anthropic message list.
             response_format (ResponseFormat | JsonDict | None): Optional
                 response-format helper or schema dictionary.
+            output (dict[str, type] | type | JsonDict | ResponseFormat | None): Optional structured-output declaration. When set, output wins over response_format.
             model_settings (AnthropicSettings | Mapping[str, Any] | None): Anthropic settings object or mapping.
             variables (list[str] | None): Declared text variables. When
-                omitted, Wyrd infers `{{name}}` placeholders.
+                omitted, Wyrd infers `${name}` and `{{name}}` placeholders.
             version (str | None): Optional prompt version string.
 
         Returns:
@@ -695,6 +1007,7 @@ class Prompt:
         system: str | None = ...,
         messages: Any | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
+        output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: GeminiSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
         version: str | None = ...,
@@ -707,9 +1020,10 @@ class Prompt:
             messages (Any | None): Optional Gemini content turns.
             response_format (ResponseFormat | JsonDict | None): Optional
                 response-format helper or schema dictionary.
+            output (dict[str, type] | type | JsonDict | ResponseFormat | None): Optional structured-output declaration. When set, output wins over response_format.
             model_settings (GeminiSettings | Mapping[str, Any] | None): Gemini settings object or mapping.
             variables (list[str] | None): Declared text variables. When
-                omitted, Wyrd infers `{{name}}` placeholders.
+                omitted, Wyrd infers `${name}` and `{{name}}` placeholders.
             version (str | None): Optional prompt version string.
 
         Returns:
@@ -724,6 +1038,7 @@ class Prompt:
         system: str | None = ...,
         messages: Any | None = ...,
         response_format: ResponseFormat | JsonDict | None = ...,
+        output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: GeminiSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
         version: str | None = ...,
@@ -736,9 +1051,10 @@ class Prompt:
             messages (Any | None): Optional Vertex content turns.
             response_format (ResponseFormat | JsonDict | None): Optional
                 response-format helper or schema dictionary.
+            output (dict[str, type] | type | JsonDict | ResponseFormat | None): Optional structured-output declaration. When set, output wins over response_format.
             model_settings (GeminiSettings | Mapping[str, Any] | None): Gemini settings object or mapping.
             variables (list[str] | None): Declared text variables. When
-                omitted, Wyrd infers `{{name}}` placeholders.
+                omitted, Wyrd infers `${name}` and `{{name}}` placeholders.
             version (str | None): Optional prompt version string.
 
         Returns:
@@ -1142,7 +1458,6 @@ class PromptCard:
     content_hash: str
     parameters: list[str]
     is_fully_bound: bool
-    card_ref: str
     is_card: bool
 
     def __init__(
@@ -1245,6 +1560,17 @@ class PromptCard:
         """
         ...
 
+    def as_card_ref(self) -> CardRef:
+        """Return a CardRef pointing at this PromptCard.
+
+        Returns:
+            CardRef: Reference with kind `Kind.Prompt`.
+
+        Raises:
+            WyrdError: If holder identity fields are invalid.
+        """
+        ...
+
     @staticmethod
     def model_validate_json(json_string: str) -> PromptCard:
         """Build a PromptCard from serialized card-envelope JSON.
@@ -1280,6 +1606,7 @@ __all__ = [
     "PromptCardMetadata",
     "PromptRef",
     "ProviderRequest",
+    "ProviderResponse",
     "ResponseFormat",
     "WyrdError",
 ]

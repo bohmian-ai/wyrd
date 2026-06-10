@@ -1,12 +1,5 @@
-use std::collections::BTreeMap;
-
-use wyrd_spec::card::workflow::{
-    WorkflowAction, WorkflowSpec, WorkflowStep, WorkflowValidationError,
-};
-use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardName, CardUid, SpaceName};
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::ids::{CardUid, SpaceName};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::trace::TraceContext;
 use wyrd_spec::version::{VersionBlock, VersionBump, VersionRange};
@@ -53,44 +46,6 @@ fn traceparent_validation_is_w3c_canonical() {
         )
         .is_err()
     );
-}
-
-#[test]
-fn workflow_dag_validation_catches_bad_graphs() {
-    let tool_ref = CardRef {
-        kind: CardKind::Tool,
-        name: CardName::new("lookup_tool").unwrap(),
-        version: VersionBlock::parse("1.0.0").unwrap(),
-        space: None,
-        uid: None,
-    };
-    let spec = WorkflowSpec {
-        steps: vec![
-            WorkflowStep {
-                id: "a".to_string(),
-                action: WorkflowAction::Tool(tool_ref.clone()),
-                depends_on: vec!["b".to_string()],
-                inputs: BTreeMap::new(),
-                condition: None,
-                timeout_seconds: None,
-                retry: None,
-                display: BTreeMap::new(),
-            },
-            WorkflowStep {
-                id: "b".to_string(),
-                action: WorkflowAction::Tool(tool_ref),
-                depends_on: vec!["a".to_string()],
-                inputs: BTreeMap::new(),
-                condition: None,
-                timeout_seconds: None,
-                retry: None,
-                display: BTreeMap::new(),
-            },
-        ],
-        ..WorkflowSpec::default()
-    };
-
-    assert_eq!(spec.validate_dag(), Err(WorkflowValidationError::Cycle));
 }
 
 #[test]

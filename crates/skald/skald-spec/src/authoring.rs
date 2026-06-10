@@ -142,20 +142,14 @@ fn build_openai_chat(
         chat_messages.push(OpenAiChatMessage {
             role: "system".to_owned(),
             content: Some(OpenAiMessageContent::Text(system_text)),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-            refusal: None,
+            ..Default::default()
         });
     }
     for text in messages {
         chat_messages.push(OpenAiChatMessage {
             role: "user".to_owned(),
             content: Some(OpenAiMessageContent::Text(text)),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-            refusal: None,
+            ..Default::default()
         });
     }
     Ok(ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
@@ -228,6 +222,7 @@ fn build_anthropic(
             stream: None,
             tools: None,
             tool_choice: None,
+            output_config: None,
             settings,
         },
     ))

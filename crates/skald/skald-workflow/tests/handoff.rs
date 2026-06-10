@@ -14,7 +14,7 @@ use skald_spec::{
     MessageNum, Prompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
 };
 use skald_workflow::WorkflowAgent;
-use skald_workflow::{Context, TaskDef, Workflow, WorkflowDef, extract_messages_for_handoff};
+use skald_workflow::{Context, DagExecutor, TaskDef, WorkflowDef, extract_messages_for_handoff};
 
 fn openai_prompt() -> Prompt {
     Prompt {
@@ -27,6 +27,8 @@ fn openai_prompt() -> Prompt {
                 tool_calls: None,
                 tool_call_id: None,
                 refusal: None,
+                annotations: Vec::new(),
+                audio: None,
             }],
             response_format: None,
             stream: None,
@@ -53,6 +55,7 @@ fn anthropic_prompt() -> Prompt {
             stream: None,
             tools: None,
             tool_choice: None,
+            output_config: None,
             settings: AnthropicMessagesSettings::default(),
         }),
         model: "claude-3-5-sonnet-latest".to_owned(),
@@ -78,6 +81,8 @@ fn openai_text(text: &str) -> ProviderResponse {
                 tool_calls: None,
                 tool_call_id: None,
                 refusal: None,
+                annotations: Vec::new(),
+                audio: None,
             },
             finish_reason: Some("stop".to_owned()),
             logprobs: None,
@@ -155,7 +160,7 @@ async fn same_provider_handoff_is_passthrough() {
     };
 
     let workflow = Arc::new(
-        Workflow::build(def, &providers)
+        DagExecutor::build(def, &providers)
             .await
             .expect("workflow builds"),
     );
@@ -183,6 +188,7 @@ async fn cross_provider_handoff_uses_message_conversion() {
         stream: None,
         tools: None,
         tool_choice: None,
+        output_config: None,
         settings: AnthropicMessagesSettings::default(),
     });
     let anthropic = MockProvider::new(ProviderName::Anthropic)
@@ -219,7 +225,7 @@ async fn cross_provider_handoff_uses_message_conversion() {
     };
 
     let workflow = Arc::new(
-        Workflow::build(def, &providers)
+        DagExecutor::build(def, &providers)
             .await
             .expect("workflow builds"),
     );
@@ -245,14 +251,16 @@ fn handoff_messages_rejects_raw_v1() {
 
 #[test]
 fn handoff_messages_same_provider_is_clone_passthrough() {
-    let messages = vec![MessageNum::OpenAi(OpenAiChatMessage {
+    let messages = vec![MessageNum::OpenAi(Box::new(OpenAiChatMessage {
         role: "user".to_owned(),
         content: Some(OpenAiMessageContent::Text("hi".to_owned())),
         name: None,
         tool_calls: None,
         tool_call_id: None,
         refusal: None,
-    })];
+        annotations: Vec::new(),
+        audio: None,
+    }))];
 
     let out =
         skald_workflow::handoff_messages(&ProviderName::OpenAi, &ProviderName::OpenAi, &messages)
@@ -263,14 +271,16 @@ fn handoff_messages_same_provider_is_clone_passthrough() {
 
 #[test]
 fn handoff_messages_rejects_missing_conversion() {
-    let messages = vec![MessageNum::OpenAi(OpenAiChatMessage {
+    let messages = vec![MessageNum::OpenAi(Box::new(OpenAiChatMessage {
         role: "assistant".to_owned(),
         content: Some(OpenAiMessageContent::Text("hi".to_owned())),
         name: None,
         tool_calls: None,
         tool_call_id: None,
         refusal: None,
-    })];
+        annotations: Vec::new(),
+        audio: None,
+    }))];
 
     let err = skald_workflow::handoff_messages(
         &ProviderName::OpenAi,

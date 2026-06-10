@@ -5,8 +5,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use skald_agent::{
-    Agent, AgentError, FinishReason, Journal, JournalError, JournalEvent, NoopObserver, Observer,
-    ObserverProvider, RunConfig, set_observer_provider,
+    Agent, AgentError, FinishReason, Journal, JournalError, JournalEvent, RunConfig,
 };
 use skald_prompt::Prompt;
 use skald_providers::{ProviderError, ProviderStream};
@@ -20,6 +19,7 @@ use skald_spec::{
 };
 use skald_tool::{AgentTool, ToolError};
 use tokio::sync::Notify;
+use wyrd_observe::{NoopObserver, Observer, set_global, with_observer};
 
 static OBSERVER_SLOT: OnceLock<Arc<ObserverSlot>> = OnceLock::new();
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -58,7 +58,7 @@ async fn agent_run_prompt_observer_auto_attached_via_provider() {
     let agent = Agent::from_resolved("test", Arc::clone(&prompt));
 
     let run = agent
-        .run_prompt(&providers, &prompt, &[])
+        .run_prompt(&providers, &prompt, &[], None)
         .await
         .expect("run ok");
 
@@ -125,7 +125,11 @@ async fn agent_observer_captured_once_per_run_then_cloned_into_spawned_tool_futu
             ..Default::default()
         });
 
-    let handle = tokio::spawn(async move { agent.run_with(&providers, None, "hello").await });
+    let obs = Arc::clone(&observer_a) as Arc<dyn Observer>;
+    let handle =
+        tokio::spawn(
+            async move { with_observer(obs, agent.run_with(&providers, None, "hello")).await },
+        );
     started.notified().await;
     observer_slot().set(observer_b.clone());
     release.notify_one();
@@ -247,9 +251,7 @@ fn observer_slot() -> Arc<ObserverSlot> {
     OBSERVER_SLOT
         .get_or_init(|| {
             let slot = Arc::new(ObserverSlot::new());
-            set_observer_provider(Box::new(SwappableObserverProvider {
-                slot: Arc::clone(&slot),
-            }));
+            set_global(Arc::clone(&slot) as Arc<dyn Observer>);
             slot
         })
         .clone()
@@ -282,13 +284,62 @@ impl ObserverSlot {
     }
 }
 
-struct SwappableObserverProvider {
-    slot: Arc<ObserverSlot>,
-}
+#[async_trait]
+impl Observer for ObserverSlot {
+    async fn on_agent_start(&self, a: &str, b: Option<&str>, c: &str, d: &str, e: Option<&str>) {
+        self.current().on_agent_start(a, b, c, d, e).await;
+    }
 
-impl ObserverProvider for SwappableObserverProvider {
-    fn current(&self) -> Arc<dyn Observer> {
-        self.slot.current()
+    async fn on_iteration(&self, a: &str, b: &str, c: u32) {
+        self.current().on_iteration(a, b, c).await;
+    }
+
+    async fn on_model_call(
+        &self,
+        a: &str,
+        b: &str,
+        c: u32,
+        d: &str,
+        e: &str,
+        f: &skald_spec::ProviderRequest,
+    ) {
+        self.current().on_model_call(a, b, c, d, e, f).await;
+    }
+
+    async fn on_model_result(
+        &self,
+        a: &str,
+        b: &str,
+        c: u32,
+        d: &str,
+        e: bool,
+        f: &skald_spec::ProviderResponse,
+    ) {
+        self.current().on_model_result(a, b, c, d, e, f).await;
+    }
+
+    async fn on_tool_call(&self, a: &str, b: &str, c: u32, d: &str, e: &str) {
+        self.current().on_tool_call(a, b, c, d, e).await;
+    }
+
+    async fn on_tool_result(&self, a: &str, b: &str, c: u32, d: &str, e: bool) {
+        self.current().on_tool_result(a, b, c, d, e).await;
+    }
+
+    async fn on_agent_finish(&self, a: &str, b: &str, c: &str, d: u32, e: std::time::Duration) {
+        self.current().on_agent_finish(a, b, c, d, e).await;
+    }
+
+    async fn on_agent_error(&self, a: &str, b: &str, c: &str, d: &str) {
+        self.current().on_agent_error(a, b, c, d).await;
+    }
+
+    async fn on_workflow_start(&self, a: &str, b: &str, c: usize) {
+        self.current().on_workflow_start(a, b, c).await;
+    }
+
+    async fn on_workflow_finish(&self, a: &str, b: &str, c: std::time::Duration) {
+        self.current().on_workflow_finish(a, b, c).await;
     }
 }
 
@@ -434,7 +485,14 @@ impl RecordingObserver {
 
 #[async_trait]
 impl Observer for RecordingObserver {
-    async fn on_agent_start(&self, agent_id: &str, input: &str, session_id: Option<&str>) {
+    async fn on_agent_start(
+        &self,
+        _run_id: &str,
+        _parent_run_id: Option<&str>,
+        agent_id: &str,
+        input: &str,
+        session_id: Option<&str>,
+    ) {
         self.push(ObserverEvent::AgentStart {
             agent_id: agent_id.to_owned(),
             input: input.to_owned(),
@@ -442,11 +500,19 @@ impl Observer for RecordingObserver {
         });
     }
 
-    async fn on_iteration(&self, _agent_id: &str, index: u32) {
+    async fn on_iteration(&self, _run_id: &str, _agent_id: &str, index: u32) {
         self.push(ObserverEvent::Iteration { index });
     }
 
-    async fn on_model_call(&self, _agent_id: &str, iteration: u32, provider: &str, model: &str) {
+    async fn on_model_call(
+        &self,
+        _run_id: &str,
+        _agent_id: &str,
+        iteration: u32,
+        provider: &str,
+        model: &str,
+        _request: &skald_spec::ProviderRequest,
+    ) {
         self.push(ObserverEvent::ModelCall {
             iteration,
             provider: provider.to_owned(),
@@ -456,10 +522,12 @@ impl Observer for RecordingObserver {
 
     async fn on_model_result(
         &self,
+        _run_id: &str,
         _agent_id: &str,
         iteration: u32,
         finish_reason: &str,
         synthetic: bool,
+        _response: &skald_spec::ProviderResponse,
     ) {
         self.push(ObserverEvent::ModelResult {
             iteration,
@@ -468,7 +536,14 @@ impl Observer for RecordingObserver {
         });
     }
 
-    async fn on_tool_call(&self, _agent_id: &str, iteration: u32, call_id: &str, tool_name: &str) {
+    async fn on_tool_call(
+        &self,
+        _run_id: &str,
+        _agent_id: &str,
+        iteration: u32,
+        call_id: &str,
+        tool_name: &str,
+    ) {
         self.push(ObserverEvent::ToolCall {
             iteration,
             call_id: call_id.to_owned(),
@@ -476,7 +551,14 @@ impl Observer for RecordingObserver {
         });
     }
 
-    async fn on_tool_result(&self, _agent_id: &str, iteration: u32, call_id: &str, ok: bool) {
+    async fn on_tool_result(
+        &self,
+        _run_id: &str,
+        _agent_id: &str,
+        iteration: u32,
+        call_id: &str,
+        ok: bool,
+    ) {
         self.push(ObserverEvent::ToolResult {
             iteration,
             call_id: call_id.to_owned(),
@@ -486,6 +568,7 @@ impl Observer for RecordingObserver {
 
     async fn on_agent_finish(
         &self,
+        _run_id: &str,
         agent_id: &str,
         finish_reason: &str,
         iterations: u32,
@@ -498,7 +581,7 @@ impl Observer for RecordingObserver {
         });
     }
 
-    async fn on_agent_error(&self, agent_id: &str, code: &str, message: &str) {
+    async fn on_agent_error(&self, _run_id: &str, agent_id: &str, code: &str, message: &str) {
         self.push(ObserverEvent::AgentError {
             agent_id: agent_id.to_owned(),
             code: code.to_owned(),
@@ -823,6 +906,8 @@ fn test_prompt() -> Arc<Prompt> {
             tool_calls: None,
             tool_call_id: None,
             refusal: None,
+            annotations: Vec::new(),
+            audio: None,
         }],
         response_format: None,
         stream: None,
@@ -852,6 +937,8 @@ fn openai_text_response(text: &str) -> ProviderResponse {
                 tool_calls: None,
                 tool_call_id: None,
                 refusal: None,
+                annotations: Vec::new(),
+                audio: None,
             },
             finish_reason: Some("stop".to_owned()),
             logprobs: None,
@@ -877,6 +964,8 @@ fn openai_tool_call_response(calls: Vec<OpenAiToolCall>) -> ProviderResponse {
                 tool_calls: Some(calls),
                 tool_call_id: None,
                 refusal: None,
+                annotations: Vec::new(),
+                audio: None,
             },
             finish_reason: Some("tool_calls".to_owned()),
             logprobs: None,

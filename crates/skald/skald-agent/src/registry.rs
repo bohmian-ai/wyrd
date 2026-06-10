@@ -14,14 +14,11 @@ pub fn system_messages(prompt: &str, provider: &ProviderName) -> AgentResult<Vec
     }
 
     match provider {
-        ProviderName::OpenAi => Ok(vec![MessageNum::OpenAi(OpenAiChatMessage {
+        ProviderName::OpenAi => Ok(vec![MessageNum::OpenAi(Box::new(OpenAiChatMessage {
             role: "system".to_owned(),
             content: Some(OpenAiMessageContent::Text(prompt.to_owned())),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-            refusal: None,
-        })]),
+            ..Default::default()
+        }))]),
         ProviderName::Anthropic => Ok(vec![MessageNum::Anthropic(AnthropicMessage {
             role: "system".to_owned(),
             content: vec![AnthropicContentBlock::Text {

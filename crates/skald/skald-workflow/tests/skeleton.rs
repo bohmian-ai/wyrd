@@ -49,6 +49,8 @@ fn openai_chat_request() -> OpenAiChatRequest {
             tool_calls: None,
             tool_call_id: None,
             refusal: None,
+            annotations: Vec::new(),
+            audio: None,
         }],
         response_format: None,
         stream: None,
@@ -102,6 +104,8 @@ fn openai_response(content: Option<&str>) -> ProviderResponse {
                 tool_calls: None,
                 tool_call_id: None,
                 refusal: None,
+                annotations: Vec::new(),
+                audio: None,
             },
             finish_reason: Some("stop".to_owned()),
             logprobs: None,
@@ -325,7 +329,7 @@ fn workflow_def_validate_graph_rejects_duplicate_task() {
     let err = workflow_def(vec![task_def("a", Vec::new()), task_def("a", Vec::new())])
         .validate_graph()
         .expect_err("duplicate task fails");
-    assert_eq!(err.code(), "SKALD_WORKFLOW_409_TASK_EXISTS");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_DUPLICATE_STEP_ID");
 }
 
 #[test]
@@ -333,7 +337,7 @@ fn workflow_def_validate_graph_rejects_self_dependency() {
     let err = workflow_def(vec![task_def("a", vec!["a".to_owned()])])
         .validate_graph()
         .expect_err("self dependency fails");
-    assert_eq!(err.code(), "SKALD_WORKFLOW_422_SELF_DEP");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_MISSING_DEPENDENCY");
 }
 
 #[test]
@@ -341,7 +345,7 @@ fn workflow_def_validate_graph_rejects_missing_dependency() {
     let err = workflow_def(vec![task_def("a", vec!["missing".to_owned()])])
         .validate_graph()
         .expect_err("missing dependency fails");
-    assert_eq!(err.code(), "SKALD_WORKFLOW_422_DEP_MISSING");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_MISSING_DEPENDENCY");
 }
 
 #[test]
@@ -353,7 +357,7 @@ fn workflow_def_validate_graph_rejects_cycle() {
     ])
     .validate_graph()
     .expect_err("cycle fails");
-    assert_eq!(err.code(), "SKALD_WORKFLOW_422_CYCLE");
+    assert_eq!(err.code(), "WYRD_WORKFLOW_422_CYCLE");
 }
 
 #[test]
@@ -443,15 +447,15 @@ fn workflow_error_codes_match_catalog() {
     );
     assert_eq!(
         WorkflowError::DependencyNotFound("d".to_owned()).code(),
-        "SKALD_WORKFLOW_422_DEP_MISSING"
+        "WYRD_WORKFLOW_422_MISSING_DEPENDENCY"
     );
     assert_eq!(
         WorkflowError::TaskAlreadyExists("t".to_owned()).code(),
-        "SKALD_WORKFLOW_409_TASK_EXISTS"
+        "WYRD_WORKFLOW_422_DUPLICATE_STEP_ID"
     );
     assert_eq!(
         WorkflowError::TaskDependsOnItself("t".to_owned()).code(),
-        "SKALD_WORKFLOW_422_SELF_DEP"
+        "WYRD_WORKFLOW_422_MISSING_DEPENDENCY"
     );
     assert_eq!(
         WorkflowError::MaxRetriesExceeded("t".to_owned()).code(),
@@ -480,7 +484,7 @@ fn workflow_error_codes_match_catalog() {
     );
     assert_eq!(
         WorkflowError::Cycle("t".to_owned()).code(),
-        "SKALD_WORKFLOW_422_CYCLE"
+        "WYRD_WORKFLOW_422_CYCLE"
     );
     assert_eq!(WorkflowError::Lock.code(), "SKALD_WORKFLOW_500_LOCK");
 }

@@ -701,6 +701,34 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Prompt output schema helper received an invalid shape.
+    #[error("[WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA",
+        status = 422,
+        title = "Invalid output schema",
+        remediation = "Pass a dict[str, type], raw JSON Schema object, ResponseFormat, or pydantic BaseModel subclass."
+    )]
+    PromptInvalidOutputSchema {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Prompt output schema helper needs pydantic for a class input.
+    #[error("[WYRD_PROMPT_422_PYDANTIC_REQUIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PROMPT_422_PYDANTIC_REQUIRED",
+        status = 422,
+        title = "Pydantic required",
+        remediation = "Install pydantic or use the stdlib dict[str, type] output schema path."
+    )]
+    PromptPydanticRequired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// PromptCard codec extension was unsupported.
     #[error("[WYRD_PROMPT_400_LOADER_BAD_EXTENSION] {message}")]
     #[wyrd_error(
@@ -1023,6 +1051,90 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// WorkflowCard validation failed.
+    #[error("[WYRD_WORKFLOW_422_VALIDATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_422_VALIDATION",
+        status = 422,
+        title = "WorkflowCard validation failed",
+        remediation = "Fix the Workflow Card envelope, metadata, steps, inputs, or outputs fields."
+    )]
+    WorkflowValidation {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// WorkflowCard save or envelope projection is missing a name.
+    #[error("[WYRD_WORKFLOW_422_MISSING_NAME] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_422_MISSING_NAME",
+        status = 422,
+        title = "WorkflowCard name is missing",
+        remediation = "Set a card name before saving or projecting the workflow to a card envelope."
+    )]
+    WorkflowMissingName {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// WorkflowCard save or envelope projection is missing a version.
+    #[error("[WYRD_WORKFLOW_422_MISSING_VERSION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_422_MISSING_VERSION",
+        status = 422,
+        title = "WorkflowCard version is missing",
+        remediation = "Set a concrete semantic version before saving or projecting the workflow to a card envelope."
+    )]
+    WorkflowMissingVersion {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Workflow DAG contains two steps that share the same id.
+    #[error("[WYRD_WORKFLOW_422_DUPLICATE_STEP_ID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_422_DUPLICATE_STEP_ID",
+        status = 422,
+        title = "Workflow contains a duplicate step id",
+        remediation = "Give each workflow step a unique id."
+    )]
+    WorkflowDuplicateStepId {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Workflow step depends on an id that no step defines.
+    #[error("[WYRD_WORKFLOW_422_MISSING_DEPENDENCY] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_422_MISSING_DEPENDENCY",
+        status = 422,
+        title = "Workflow step depends on an unknown id",
+        remediation = "Ensure every depends_on entry matches the id of a step defined in the workflow."
+    )]
+    WorkflowMissingDependency {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Workflow DAG contains a dependency cycle.
+    #[error("[WYRD_WORKFLOW_422_CYCLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_422_CYCLE",
+        status = 422,
+        title = "Workflow contains a dependency cycle",
+        remediation = "Break the dependency cycle by removing or reordering depends_on edges."
+    )]
+    WorkflowCycle {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
 }
 
 impl WyrdError {
@@ -1092,6 +1204,8 @@ impl WyrdError {
             | Self::PromptMediaIo { message, details }
             | Self::PromptEmptyModel { message, details }
             | Self::PromptInvalidResponseSchema { message, details }
+            | Self::PromptInvalidOutputSchema { message, details }
+            | Self::PromptPydanticRequired { message, details }
             | Self::PromptLoaderBadExtension { message, details }
             | Self::PromptLoaderIo { message, details }
             | Self::PromptSerializeRequest { message, details }
@@ -1114,7 +1228,13 @@ impl WyrdError {
             | Self::AgentRuntimeLocalToolsNotRegistrable { message, details }
             | Self::AgentCallbackReturnType { message, details }
             | Self::AgentCallbackAborted { message, details }
-            | Self::AgentLoopMessageType { message, details } => (message, details),
+            | Self::AgentLoopMessageType { message, details }
+            | Self::WorkflowValidation { message, details }
+            | Self::WorkflowMissingName { message, details }
+            | Self::WorkflowMissingVersion { message, details }
+            | Self::WorkflowDuplicateStepId { message, details }
+            | Self::WorkflowMissingDependency { message, details }
+            | Self::WorkflowCycle { message, details } => (message, details),
         }
     }
 

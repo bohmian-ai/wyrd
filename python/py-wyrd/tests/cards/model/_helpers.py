@@ -46,5 +46,5 @@ def assert_model_card_json(path: Path, interface_kind: str) -> None:
     assert payload["apiVersion"] == "wyrd/v1"
     assert payload["kind"] == "Model"
     assert payload["spec"]["interface"]["kind"] == interface_kind
-    assert payload["spec"]["artifact_refs"] == []
+    assert payload["spec"]["card_refs"] == []
     assert payload["relationships"] == []

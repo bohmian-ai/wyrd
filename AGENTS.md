@@ -52,7 +52,10 @@ Locked cross-cutting decisions that any contributor must honor:
   envelope. **Locked 2026-05-21.**
 - `CardRef` carries `kind`, `name`, one `version` field, optional `space`, and
   optional `uid`. Do not introduce a separate version requirement field.
-- `wyrd-spec` is PyO3-free, IO-free, async-free, and foundational.
+- `wyrd-spec` is IO-free, async-free, and foundational. It is strictly
+  PyO3-free. Specs, schemas, validators, the error catalog, and identity
+  newtypes stay PyO3-free. Python-boundary wrappers for `wyrd-spec` types
+  live in `wyrd-interfaces` behind its `python` feature gate.
 - Client-tier crates do not depend on `sqlx`, cloud SDKs, `datafusion`, or
   `deltalake`.
 - Vala and Skald do not depend on each other directly.

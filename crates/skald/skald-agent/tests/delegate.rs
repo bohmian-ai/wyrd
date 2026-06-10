@@ -239,6 +239,8 @@ fn openai_text_response(text: &str) -> ProviderResponse {
                 tool_calls: None,
                 tool_call_id: None,
                 refusal: None,
+                annotations: Vec::new(),
+                audio: None,
             },
             finish_reason: Some("stop".to_owned()),
             logprobs: None,

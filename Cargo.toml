@@ -6,6 +6,7 @@ members = [
     "crates/skald/*",
     "crates/shared/*",
     "crates/wyrd-spec",
+    "examples/rust",
     "python/py-wyrd",
 ]
 default-members = [
@@ -35,8 +36,7 @@ skald-agent = { path = "crates/skald/skald-agent", version = "0.0.1" }
 skald-workflow = { path = "crates/skald/skald-workflow", version = "0.0.1" }
 vala-client = { path = "crates/vala/vala-client", version = "0.0.1" }
 vala-drift = { path = "crates/vala/vala-drift", version = "0.0.1" }
-wyrd-observe = { path = "crates/wyrd/wyrd-observe", version = "0.0.1" }
-wyrd-observe-impl = { path = "crates/wyrd/wyrd-observe-impl", version = "0.0.1" }
+wyrd-observe = { path = "crates/shared/wyrd-observe", version = "0.0.1" }
 wyrd-utils = { path = "crates/shared/wyrd-utils", version = "0.0.1" }
 wyrd-version = { path = "crates/shared/wyrd-version", version = "0.0.1" }
 wyrd-test-contract-macros = { path = "crates/shared/wyrd-test-contract-macros", version = "0.0.1" }
@@ -93,11 +93,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
-pyo3 = { version = "0.28", features = ["abi3-py310", "chrono"] }
 arrow = "55"
 arrow-array = "55"
 arrow-schema = "55"
 statrs = "0.18"
+pyo3 = { version = "0.28", features = ["abi3-py310", "chrono", "py-clone"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

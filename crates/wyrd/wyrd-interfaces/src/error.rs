@@ -304,6 +304,12 @@ fn wyrd_py_error_from_py_err(py: Python<'_>, error: &pyo3::PyErr) -> WyrdPyError
         Some("WYRD_MODEL_501_SERIALIZER_UNAVAILABLE") => {
             WyrdError::ModelSerializerUnavailable { message, details }.into()
         }
+        Some("WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA") => {
+            WyrdError::PromptInvalidOutputSchema { message, details }.into()
+        }
+        Some("WYRD_PROMPT_422_PYDANTIC_REQUIRED") => {
+            WyrdError::PromptPydanticRequired { message, details }.into()
+        }
         _ => WyrdPyError::Python(error.to_string()),
     }
 }

@@ -19,7 +19,7 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 
 | Field | Type | Required |
 | --- | --- | --- |
-| `artifact_refs` | `array` | no |
+| `card_refs` | `array` | no |
 | `best_run_ref` | `object` | no |
 | `default_parameters` | `object` | no |
 | `description` | `string \| null` | no |

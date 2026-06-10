@@ -10,7 +10,7 @@ use skald_spec::wire::openai_chat::{
 };
 use skald_spec::{Prompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType};
 use skald_workflow::WorkflowAgent;
-use skald_workflow::{Context, TaskDef, TaskStatus, Workflow, WorkflowDef};
+use skald_workflow::{Context, DagExecutor, TaskDef, TaskStatus, WorkflowDef};
 
 fn text_prompt() -> Prompt {
     Prompt {
@@ -23,6 +23,8 @@ fn text_prompt() -> Prompt {
                 tool_calls: None,
                 tool_call_id: None,
                 refusal: None,
+                annotations: Vec::new(),
+                audio: None,
             }],
             response_format: None,
             stream: None,
@@ -68,6 +70,8 @@ fn ok_response() -> ProviderResponse {
                 tool_calls: None,
                 tool_call_id: None,
                 refusal: None,
+                annotations: Vec::new(),
+                audio: None,
             },
             finish_reason: Some("stop".to_owned()),
             logprobs: None,
@@ -78,7 +82,7 @@ fn ok_response() -> ProviderResponse {
     })
 }
 
-async fn workflow_with(mock: MockProvider, max_retries: u32) -> Arc<Workflow> {
+async fn workflow_with(mock: MockProvider, max_retries: u32) -> Arc<DagExecutor> {
     workflow_with_prompt(mock, text_prompt(), max_retries).await
 }
 
@@ -86,7 +90,7 @@ async fn workflow_with_prompt(
     mock: MockProvider,
     prompt: Prompt,
     max_retries: u32,
-) -> Arc<Workflow> {
+) -> Arc<DagExecutor> {
     let def = WorkflowDef {
         id: "wf".to_owned(),
         name: "test".to_owned(),
@@ -106,7 +110,7 @@ async fn workflow_with_prompt(
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(mock));
     Arc::new(
-        Workflow::build(def, &providers)
+        DagExecutor::build(def, &providers)
             .await
             .expect("workflow builds"),
     )

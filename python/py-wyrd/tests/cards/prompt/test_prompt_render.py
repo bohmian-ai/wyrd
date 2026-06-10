@@ -36,10 +36,10 @@ def test_render_substitutes_double_brace_placeholder() -> None:
     assert rendered_text(rendered) == "Hello Ada"
 
 
-def test_render_dollar_and_single_brace_remain_literal() -> None:
+def test_render_dollar_and_double_brace_placeholders() -> None:
     rendered = Prompt.openai_chat("gpt-4o", messages="${name} {name} {{name}}").render(name="Ada")
 
-    assert rendered_text(rendered) == "${name} {name} Ada"
+    assert rendered_text(rendered) == "Ada {name} Ada"
 
 
 @pytest.mark.parametrize("prompt", provider_prompts())

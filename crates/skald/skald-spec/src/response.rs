@@ -2,6 +2,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
 
+use crate::request::ProviderName;
+
 use crate::wire::anthropic_messages::AnthropicMessagesResponse;
 use crate::wire::google_embeddings::GoogleBatchEmbedResponse;
 use crate::wire::google_generate::GoogleGenerateContentResponse;
@@ -99,5 +101,18 @@ impl ProviderResponse {
     /// Borrow response text, tool calls, usage, structured output, and finish reason.
     pub const fn adapter(&self) -> crate::adapter::ResponseAdapter<'_> {
         crate::adapter::ResponseAdapter::new(self)
+    }
+
+    /// Returns the provider that produced this response.
+    pub fn provider(&self) -> ProviderName {
+        match self {
+            Self::OpenAiChatCompletion(_)
+            | Self::OpenAiResponses(_)
+            | Self::OpenAiEmbeddings(_) => ProviderName::OpenAi,
+            Self::AnthropicMessage(_) => ProviderName::Anthropic,
+            Self::GeminiGenerateContent(_) | Self::GoogleBatchEmbed(_) => ProviderName::Google,
+            Self::VertexGenerateContent(_) | Self::VertexPredict(_) => ProviderName::Vertex,
+            Self::RawV1(_) => ProviderName::Custom("raw".to_owned()),
+        }
     }
 }

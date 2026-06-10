@@ -45,6 +45,22 @@ pub enum PromptBuilderError {
         /// Source IO message.
         message: String,
     },
+    /// Provider accessor called on a request/response belonging to a different provider.
+    #[error("provider response is '{actual}', not '{expected}'")]
+    WrongProvider {
+        /// Provider name the accessor expects.
+        expected: String,
+        /// Provider name the value actually has.
+        actual: String,
+    },
+    /// Enum-variant accessor called when the value holds a different variant.
+    #[error("variant is '{actual}', not '{expected}'")]
+    WrongVariant {
+        /// Variant the accessor expects.
+        expected: String,
+        /// Variant the value actually holds.
+        actual: String,
+    },
 }
 
 impl PromptBuilderError {
@@ -60,6 +76,9 @@ impl PromptBuilderError {
             Self::Wyrd(error) => error.code(),
             Self::Skald(error) => error.code(),
             Self::Io { .. } => "SKALD_PROMPT_500_IO",
+            Self::WrongProvider { .. } | Self::WrongVariant { .. } => {
+                "WYRD_PROMPT_400_PROVIDER_MISMATCH"
+            }
         }
     }
 }
@@ -109,6 +128,14 @@ impl From<PromptBuilderError> for wyrd_interfaces::error::WyrdPyError {
                 wyrd_spec::error::WyrdError::PromptProviderMismatch {
                     message,
                     details: json!({ "provider": provider, "role": role }),
+                }
+                .into()
+            }
+            PromptBuilderError::WrongProvider { expected, actual }
+            | PromptBuilderError::WrongVariant { expected, actual } => {
+                wyrd_spec::error::WyrdError::PromptProviderMismatch {
+                    message,
+                    details: json!({ "expected": expected, "actual": actual }),
                 }
                 .into()
             }

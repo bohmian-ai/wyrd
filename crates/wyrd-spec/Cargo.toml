@@ -32,7 +32,7 @@ utoipa = { workspace = true, optional = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
-wyrd-error-derive = { path = "../shared/wyrd-error-derive", version = "0.0.1" }
+wyrd-error-derive = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1"

@@ -18,6 +18,66 @@ use crate::error::WyrdError;
 #[serde(transparent)]
 pub struct SessionId(pub uuid::Uuid);
 
+/// Run identifier carried by every observation from one agent invocation.
+///
+/// UUIDv7 string at the wire boundary. Client-generated so retries converge on
+/// the same id, and so observability surfaces can correlate records emitted
+/// before the server first sees the run.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(transparent)]
+pub struct RunId(String);
+
+impl RunId {
+    /// Generate a fresh UUIDv7 run identifier.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(crate::ids::uuid7())
+    }
+
+    /// Adopt a caller-supplied run identifier.
+    #[must_use]
+    pub fn from_string(value: String) -> Self {
+        Self(value)
+    }
+
+    /// Borrow the identifier as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Deterministic bucket assignment for stable sampling decisions.
+    ///
+    /// SHA-256 over the id bytes; the first eight digest bytes are read
+    /// big-endian as a `u64` and reduced modulo `buckets`.
+    #[must_use]
+    pub fn hash_bucket(&self, buckets: u32) -> u32 {
+        use sha2::{Digest, Sha256};
+
+        if buckets == 0 {
+            return 0;
+        }
+        let digest = Sha256::digest(self.0.as_bytes());
+        let mut prefix = [0_u8; 8];
+        prefix.copy_from_slice(&digest[..8]);
+        let value = u64::from_be_bytes(prefix);
+        (value % u64::from(buckets)) as u32
+    }
+}
+
+impl Default for RunId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for RunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Identifier for a single vala record.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]

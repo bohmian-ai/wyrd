@@ -29,7 +29,6 @@ wyrd-utils = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
-sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 tracing = { workspace = true }
 opentelemetry = { workspace = true, optional = true }

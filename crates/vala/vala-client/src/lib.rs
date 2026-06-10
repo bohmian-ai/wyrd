@@ -3,12 +3,19 @@
 //! This crate owns the typed records that Wyrd-side integrations enqueue for
 //! Vala. Transport, batching, retry, and back-pressure belong behind
 //! implementations of [`ValaClient`].
+//!
+//! Span tagging context: `wyrd.run_id` is a span attribute. In local /
+//! serverless eval mode, the scenario id is carried as the
+//! `wyrd.eval.scenario_id` span attribute. Cross-service ancestry rides the
+//! `Wyrd-Request-Id` HTTP header as a label on every emitted observation. The
+//! source of truth is `architecture/v1/00-foundations/tracing.md`.
 
 #![deny(missing_docs)]
 #![allow(clippy::module_name_repetitions)]
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use wyrd_spec::vala::ids::{RecordId, RunId};
 
 /// Result returned by Vala client enqueue operations.
 pub type ValaClientResult<T> = Result<T, ValaClientError>;
@@ -57,15 +64,17 @@ pub trait ValaClient: Send + Sync {
     }
 }
 
-/// Shared fields present on every Skald-originated Vala observation.
+/// Shared identity fields present on every Vala observation.
+///
+/// `record_id` is the per-emission identity; `run_id` is the run identity of
+/// the agent invocation that produced it. Card identity is not carried here: it
+/// derives from `run_id -> run -> card` via the emit-plane token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservationEnvelope {
     /// Vala observation identifier.
-    pub observation_id: String,
+    pub record_id: RecordId,
     /// Wyrd run identifier carried across the agent invocation.
-    pub run_id: String,
-    /// Agent identifier supplied by Skald.
-    pub agent_id: String,
+    pub run_id: RunId,
 }
 
 /// Agent-start observation.

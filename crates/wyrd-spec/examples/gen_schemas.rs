@@ -35,7 +35,7 @@ use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::run::{RunKind, RunRef};
 use wyrd_spec::vala::eval::{
-    ComparisonOperator, DagError, EvalCondition, EvalPassGate, EvalSampling,
+    ComparisonOperator, DagError, EvalCondition, EvalPassGate, EvalRecordObservation, EvalSampling,
     EvalScenarioCollection, EvalSpec, EvalTask, ExecutionPlan,
 };
 use wyrd_spec::vala::trace::{
@@ -111,6 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_fixture::<ComparisonOperator>(eval_fixtures, "comparison_operator")?;
     write_fixture::<ExecutionPlan>(eval_fixtures, "execution_plan")?;
     write_fixture::<DagError>(eval_fixtures, "dag_error")?;
+    write_fixture::<EvalRecordObservation>(eval_fixtures, "eval_record_observation")?;
     write_fixture::<EvalScenarioCollection>(eval_fixtures, "eval_scenario_collection")?;
     write_fixture::<EvalPassGate>(eval_fixtures, "eval_pass_gate")?;
     write_fixture::<EvalSampling>(eval_fixtures, "eval_sampling")?;

@@ -30,7 +30,7 @@ serde_yaml = { workspace = true }
 petgraph = { version = "0.6", default-features = false, features = ["graphmap"] }
 utoipa = { workspace = true, optional = true }
 thiserror = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["std", "v7", "js"] }
 sha2 = { workspace = true }
 wyrd-error-derive = { workspace = true }
 

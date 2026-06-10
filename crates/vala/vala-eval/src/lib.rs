@@ -56,6 +56,10 @@ pub mod store;
 pub mod tasks;
 pub mod trace_source;
 
+pub use compare::{
+    ChangeFlag, CompareConfig, ComparisonResults, ScenarioDelta, SubjectDelta, SystemDelta,
+    TaskDelta, TaskStatusChange, compare,
+};
 pub use context::{
     ContextSnapshot, ExecutionContext, RecordIdentity, TaskOutput, extract_jsonpath_from,
     extract_required_jsonpath_from,

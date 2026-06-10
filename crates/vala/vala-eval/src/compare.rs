@@ -1,4 +1,514 @@
-//! Four-quadrant comparison: per-subject aggregate / per-task, system
-//! aggregate / per-task. Regression threshold plus scenario / subject deltas.
+//! Four-quadrant baseline-vs-candidate comparison for `EvalResults`.
 //!
-//! Body lands in Commit 13 (`14-comparison-four-quadrant.md`).
+//! Quadrants per DESIGN section 8:
+//!
+//! |              | aggregate                         | per-task                           |
+//! |--------------|-----------------------------------|------------------------------------|
+//! | per-subject  | subject pass-rate deltas          | task deltas and status changes     |
+//! | system       | overall and scenario transitions  | cross-cutting per-task deltas      |
+//!
+//! All subject maps use [`SubjectKey`] as the canonical key. The full
+//! [`CardRef`] for a subject is carried from [`SubjectResults::subject_ref`].
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::Path;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use wyrd_spec::reference::CardRef;
+use wyrd_spec::vala::eval::{AssertionResult, ScenarioId, TaskId};
+use wyrd_spec::vala::ids::RunId;
+
+use crate::error::EvalExecError;
+use crate::results::{EvalResults, ScenarioResult, SubjectKey, SubjectResults};
+
+/// Configuration for [`compare`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompareConfig {
+    /// Magnitude beyond which a pass-rate delta is flagged as changed.
+    ///
+    /// Negative deltas below `-regression_threshold` are regressions. Positive
+    /// deltas above `regression_threshold` are improvements.
+    pub regression_threshold: f64,
+    /// Per-task pass-rate cutoff used to classify a task as passed.
+    pub per_task_pass_cut: f64,
+}
+
+impl Default for CompareConfig {
+    fn default() -> Self {
+        Self {
+            regression_threshold: 0.05,
+            per_task_pass_cut: 0.5,
+        }
+    }
+}
+
+/// Direction flag for a comparison delta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeFlag {
+    /// Candidate dropped by more than the configured threshold.
+    Regressed,
+    /// Candidate improved by more than the configured threshold.
+    Improved,
+    /// Delta is within the configured threshold, including exact boundary.
+    Unchanged,
+}
+
+impl ChangeFlag {
+    fn from_delta(delta: f64, threshold: f64) -> Self {
+        let boundary_epsilon = f64::EPSILON * threshold.abs().max(1.0) * 8.0;
+        if delta < -threshold && (delta + threshold).abs() > boundary_epsilon {
+            Self::Regressed
+        } else if delta > threshold && (delta - threshold).abs() > boundary_epsilon {
+            Self::Improved
+        } else {
+            Self::Unchanged
+        }
+    }
+}
+
+/// Top-level four-quadrant comparison artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComparisonResults {
+    /// Baseline run id.
+    pub baseline_run_id: RunId,
+    /// Candidate run id.
+    pub candidate_run_id: RunId,
+    /// Per-subject aggregate and per-task deltas for subjects present in both
+    /// runs.
+    pub subjects: BTreeMap<SubjectKey, SubjectDelta>,
+    /// Per-scenario transitions for scenarios present in both runs.
+    pub scenarios: BTreeMap<ScenarioId, ScenarioDelta>,
+    /// System aggregate deltas.
+    pub system: SystemDelta,
+    /// System per-task deltas computed from run-level per-task pass rates.
+    pub cross_cutting_task_deltas: BTreeMap<TaskId, TaskDelta>,
+    /// Subjects present only in the baseline run.
+    pub subjects_baseline_only: Vec<SubjectAbsence>,
+    /// Subjects present only in the candidate run.
+    pub subjects_candidate_only: Vec<SubjectAbsence>,
+    /// Scenarios present only in the baseline run.
+    pub scenarios_baseline_only: Vec<ScenarioId>,
+    /// Scenarios present only in the candidate run.
+    pub scenarios_candidate_only: Vec<ScenarioId>,
+    /// Subjects whose aggregate pass rate regressed.
+    pub regressed_subjects: Vec<SubjectKey>,
+    /// Subjects whose aggregate pass rate improved.
+    pub improved_subjects: Vec<SubjectKey>,
+    /// Threshold used for this comparison.
+    pub regression_threshold: f64,
+    /// Per-task pass cutoff used for this comparison.
+    pub per_task_pass_cut: f64,
+    /// UTC creation timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+/// One subject in the comparison.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubjectDelta {
+    /// Canonical subject key.
+    pub subject_key: SubjectKey,
+    /// Full subject card reference.
+    pub subject_ref: CardRef,
+    /// Baseline subject pass rate.
+    pub baseline_pass_rate: f64,
+    /// Candidate subject pass rate.
+    pub candidate_pass_rate: f64,
+    /// Candidate pass rate minus baseline pass rate.
+    pub pass_rate_delta: f64,
+    /// Direction flag derived from the configured threshold.
+    pub flag: ChangeFlag,
+    /// Per-task pass-rate deltas for tasks present on both sides.
+    pub per_task_deltas: BTreeMap<TaskId, TaskDelta>,
+    /// Tasks whose pass/fail label changed.
+    pub task_status_changes: Vec<TaskStatusChange>,
+    /// Tasks present in baseline subject but absent from candidate subject.
+    pub missing_tasks_candidate_only: Vec<TaskId>,
+    /// Tasks present in candidate subject but absent from baseline subject.
+    pub missing_tasks_baseline_only: Vec<TaskId>,
+}
+
+/// Per-task delta used in subject and system quadrants.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskDelta {
+    /// Task identifier.
+    pub task_id: TaskId,
+    /// Baseline pass rate.
+    pub baseline_pass_rate: f64,
+    /// Candidate pass rate.
+    pub candidate_pass_rate: f64,
+    /// Candidate pass rate minus baseline pass rate.
+    pub delta: f64,
+    /// Direction flag derived from the configured threshold.
+    pub flag: ChangeFlag,
+}
+
+/// Per-task pass/fail label transition within a subject.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskStatusChange {
+    /// Task identifier.
+    pub task_id: TaskId,
+    /// Baseline label, using `CompareConfig::per_task_pass_cut`.
+    pub baseline_passed: bool,
+    /// Candidate label, using `CompareConfig::per_task_pass_cut`.
+    pub candidate_passed: bool,
+}
+
+/// Subject present on only one side of a comparison.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubjectAbsence {
+    /// Canonical subject key.
+    pub subject_key: SubjectKey,
+    /// Full subject card reference.
+    pub subject_ref: CardRef,
+}
+
+/// Per-scenario transition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScenarioDelta {
+    /// Scenario identifier.
+    pub scenario_id: ScenarioId,
+    /// Whether the baseline scenario passed.
+    pub baseline_passed: bool,
+    /// Whether the candidate scenario passed.
+    pub candidate_passed: bool,
+    /// Whether the scenario pass/fail label changed.
+    pub status_changed: bool,
+    /// Per-subject pass-rate deltas inside the scenario.
+    pub per_subject_deltas: BTreeMap<SubjectKey, f64>,
+    /// Subjects present in baseline scenario but absent from candidate scenario.
+    pub missing_subjects_candidate_only: Vec<SubjectKey>,
+    /// Subjects present in candidate scenario but absent from baseline scenario.
+    pub missing_subjects_baseline_only: Vec<SubjectKey>,
+}
+
+/// System-level aggregate quadrant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SystemDelta {
+    /// Baseline overall pass rate.
+    pub baseline_pass_rate: f64,
+    /// Candidate overall pass rate.
+    pub candidate_pass_rate: f64,
+    /// Candidate overall pass rate minus baseline overall pass rate.
+    pub pass_rate_delta: f64,
+    /// Direction flag for the overall pass-rate delta.
+    pub flag: ChangeFlag,
+    /// Baseline scenario pass rate.
+    pub baseline_scenario_pass_rate: f64,
+    /// Candidate scenario pass rate.
+    pub candidate_scenario_pass_rate: f64,
+    /// Candidate scenario pass rate minus baseline scenario pass rate.
+    pub scenario_pass_rate_delta: f64,
+    /// Count of common scenarios whose pass/fail label changed.
+    pub scenario_status_changes: usize,
+}
+
+/// Compute the four-quadrant comparison between two [`EvalResults`] artifacts.
+#[must_use]
+pub fn compare(
+    baseline: &EvalResults,
+    candidate: &EvalResults,
+    config: &CompareConfig,
+) -> ComparisonResults {
+    let threshold = config.regression_threshold;
+    let cut = config.per_task_pass_cut;
+
+    let baseline_keys: BTreeSet<&SubjectKey> = baseline.subjects.keys().collect();
+    let candidate_keys: BTreeSet<&SubjectKey> = candidate.subjects.keys().collect();
+
+    let mut subjects = BTreeMap::new();
+    let mut regressed_subjects = Vec::new();
+    let mut improved_subjects = Vec::new();
+    for key in baseline_keys.intersection(&candidate_keys).copied() {
+        let baseline_subject = &baseline.subjects[key];
+        let candidate_subject = &candidate.subjects[key];
+        let delta = compute_subject_delta(key, baseline_subject, candidate_subject, threshold, cut);
+        match delta.flag {
+            ChangeFlag::Regressed => regressed_subjects.push(key.clone()),
+            ChangeFlag::Improved => improved_subjects.push(key.clone()),
+            ChangeFlag::Unchanged => {}
+        }
+        subjects.insert(key.clone(), delta);
+    }
+
+    let subjects_baseline_only = baseline_keys
+        .difference(&candidate_keys)
+        .copied()
+        .map(|key| SubjectAbsence {
+            subject_key: key.clone(),
+            subject_ref: baseline.subjects[key].subject_ref.clone(),
+        })
+        .collect();
+    let subjects_candidate_only = candidate_keys
+        .difference(&baseline_keys)
+        .copied()
+        .map(|key| SubjectAbsence {
+            subject_key: key.clone(),
+            subject_ref: candidate.subjects[key].subject_ref.clone(),
+        })
+        .collect();
+
+    let baseline_scenarios: BTreeSet<&ScenarioId> = baseline.scenarios.keys().collect();
+    let candidate_scenarios: BTreeSet<&ScenarioId> = candidate.scenarios.keys().collect();
+    let mut scenarios = BTreeMap::new();
+    for scenario_id in baseline_scenarios
+        .intersection(&candidate_scenarios)
+        .copied()
+    {
+        scenarios.insert(
+            scenario_id.clone(),
+            compute_scenario_delta(
+                scenario_id,
+                &baseline.scenarios[scenario_id],
+                &candidate.scenarios[scenario_id],
+            ),
+        );
+    }
+
+    let scenarios_baseline_only = baseline_scenarios
+        .difference(&candidate_scenarios)
+        .copied()
+        .cloned()
+        .collect();
+    let scenarios_candidate_only = candidate_scenarios
+        .difference(&baseline_scenarios)
+        .copied()
+        .cloned()
+        .collect();
+
+    let pass_rate_delta = candidate.metrics.pass_rate - baseline.metrics.pass_rate;
+    let system = SystemDelta {
+        baseline_pass_rate: baseline.metrics.pass_rate,
+        candidate_pass_rate: candidate.metrics.pass_rate,
+        pass_rate_delta,
+        flag: ChangeFlag::from_delta(pass_rate_delta, threshold),
+        baseline_scenario_pass_rate: baseline.metrics.scenario_pass_rate,
+        candidate_scenario_pass_rate: candidate.metrics.scenario_pass_rate,
+        scenario_pass_rate_delta: candidate.metrics.scenario_pass_rate
+            - baseline.metrics.scenario_pass_rate,
+        scenario_status_changes: scenarios
+            .values()
+            .filter(|delta| delta.status_changed)
+            .count(),
+    };
+
+    let cross_cutting_task_deltas = compute_cross_cutting_task_deltas(
+        &baseline.metrics.per_task_pass_rate,
+        &candidate.metrics.per_task_pass_rate,
+        threshold,
+    );
+
+    ComparisonResults {
+        baseline_run_id: baseline.identity.run_id.clone(),
+        candidate_run_id: candidate.identity.run_id.clone(),
+        subjects,
+        scenarios,
+        system,
+        cross_cutting_task_deltas,
+        subjects_baseline_only,
+        subjects_candidate_only,
+        scenarios_baseline_only,
+        scenarios_candidate_only,
+        regressed_subjects,
+        improved_subjects,
+        regression_threshold: threshold,
+        per_task_pass_cut: cut,
+        created_at: Utc::now(),
+    }
+}
+
+fn compute_subject_delta(
+    key: &SubjectKey,
+    baseline: &SubjectResults,
+    candidate: &SubjectResults,
+    threshold: f64,
+    cut: f64,
+) -> SubjectDelta {
+    let pass_rate_delta = candidate.metrics.pass_rate - baseline.metrics.pass_rate;
+    let baseline_tasks: BTreeSet<&TaskId> = baseline.metrics.per_task_pass_rate.keys().collect();
+    let candidate_tasks: BTreeSet<&TaskId> = candidate.metrics.per_task_pass_rate.keys().collect();
+
+    let mut per_task_deltas = BTreeMap::new();
+    let mut task_status_changes = Vec::new();
+    for task_id in baseline_tasks.intersection(&candidate_tasks).copied() {
+        let baseline_pass_rate = baseline.metrics.per_task_pass_rate[task_id];
+        let candidate_pass_rate = candidate.metrics.per_task_pass_rate[task_id];
+        let delta = candidate_pass_rate - baseline_pass_rate;
+        per_task_deltas.insert(
+            task_id.clone(),
+            TaskDelta {
+                task_id: task_id.clone(),
+                baseline_pass_rate,
+                candidate_pass_rate,
+                delta,
+                flag: ChangeFlag::from_delta(delta, threshold),
+            },
+        );
+
+        let baseline_passed = baseline_pass_rate >= cut;
+        let candidate_passed = candidate_pass_rate >= cut;
+        if baseline_passed != candidate_passed {
+            task_status_changes.push(TaskStatusChange {
+                task_id: task_id.clone(),
+                baseline_passed,
+                candidate_passed,
+            });
+        }
+    }
+
+    let missing_tasks_candidate_only = baseline_tasks
+        .difference(&candidate_tasks)
+        .copied()
+        .cloned()
+        .collect();
+    let missing_tasks_baseline_only = candidate_tasks
+        .difference(&baseline_tasks)
+        .copied()
+        .cloned()
+        .collect();
+
+    SubjectDelta {
+        subject_key: key.clone(),
+        subject_ref: baseline.subject_ref.clone(),
+        baseline_pass_rate: baseline.metrics.pass_rate,
+        candidate_pass_rate: candidate.metrics.pass_rate,
+        pass_rate_delta,
+        flag: ChangeFlag::from_delta(pass_rate_delta, threshold),
+        per_task_deltas,
+        task_status_changes,
+        missing_tasks_candidate_only,
+        missing_tasks_baseline_only,
+    }
+}
+
+fn compute_scenario_delta(
+    scenario_id: &ScenarioId,
+    baseline: &ScenarioResult,
+    candidate: &ScenarioResult,
+) -> ScenarioDelta {
+    let baseline_subjects: BTreeSet<&SubjectKey> = baseline.mechanic_results.keys().collect();
+    let candidate_subjects: BTreeSet<&SubjectKey> = candidate.mechanic_results.keys().collect();
+
+    let mut per_subject_deltas = BTreeMap::new();
+    for subject_key in baseline_subjects.intersection(&candidate_subjects).copied() {
+        let baseline_rate = scenario_subject_pass_rate(&baseline.mechanic_results[subject_key]);
+        let candidate_rate = scenario_subject_pass_rate(&candidate.mechanic_results[subject_key]);
+        per_subject_deltas.insert(subject_key.clone(), candidate_rate - baseline_rate);
+    }
+
+    let missing_subjects_candidate_only = baseline_subjects
+        .difference(&candidate_subjects)
+        .copied()
+        .cloned()
+        .collect();
+    let missing_subjects_baseline_only = candidate_subjects
+        .difference(&baseline_subjects)
+        .copied()
+        .cloned()
+        .collect();
+
+    ScenarioDelta {
+        scenario_id: scenario_id.clone(),
+        baseline_passed: baseline.scenario_passed,
+        candidate_passed: candidate.scenario_passed,
+        status_changed: baseline.scenario_passed != candidate.scenario_passed,
+        per_subject_deltas,
+        missing_subjects_candidate_only,
+        missing_subjects_baseline_only,
+    }
+}
+
+fn scenario_subject_pass_rate(per_task: &BTreeMap<TaskId, Vec<AssertionResult>>) -> f64 {
+    let total = per_task.values().map(Vec::len).sum::<usize>();
+    if total == 0 {
+        return 0.0;
+    }
+
+    let passed = per_task
+        .values()
+        .flat_map(|rows| rows.iter())
+        .filter(|row| row.passed)
+        .count();
+    passed as f64 / total as f64
+}
+
+fn compute_cross_cutting_task_deltas(
+    baseline: &BTreeMap<TaskId, f64>,
+    candidate: &BTreeMap<TaskId, f64>,
+    threshold: f64,
+) -> BTreeMap<TaskId, TaskDelta> {
+    let baseline_tasks: BTreeSet<&TaskId> = baseline.keys().collect();
+    let candidate_tasks: BTreeSet<&TaskId> = candidate.keys().collect();
+    let mut out = BTreeMap::new();
+
+    for task_id in baseline_tasks.intersection(&candidate_tasks).copied() {
+        let baseline_pass_rate = baseline[task_id];
+        let candidate_pass_rate = candidate[task_id];
+        let delta = candidate_pass_rate - baseline_pass_rate;
+        out.insert(
+            task_id.clone(),
+            TaskDelta {
+                task_id: task_id.clone(),
+                baseline_pass_rate,
+                candidate_pass_rate,
+                delta,
+                flag: ChangeFlag::from_delta(delta, threshold),
+            },
+        );
+    }
+
+    out
+}
+
+impl ComparisonResults {
+    /// Serialize comparison results to pretty JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ResultsSerializeFailed` when JSON serialization fails.
+    pub fn to_json(&self) -> Result<String, EvalExecError> {
+        serde_json::to_string_pretty(self).map_err(|error| EvalExecError::ResultsSerializeFailed {
+            reason: error.to_string(),
+        })
+    }
+
+    /// Deserialize comparison results from JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ResultsDeserializeFailed` when JSON deserialization fails.
+    pub fn from_json(raw: &str) -> Result<Self, EvalExecError> {
+        serde_json::from_str(raw).map_err(|error| EvalExecError::ResultsDeserializeFailed {
+            reason: error.to_string(),
+        })
+    }
+
+    /// Save comparison results to a caller-provided local path.
+    ///
+    /// # Errors
+    ///
+    /// Returns serialization or filesystem errors as `EvalExecError`.
+    pub fn save(&self, path: &Path) -> Result<(), EvalExecError> {
+        let raw = self.to_json()?;
+        fs::write(path, raw).map_err(|error| EvalExecError::ResultsIoFailed {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        })
+    }
+
+    /// Load comparison results from a local path.
+    ///
+    /// # Errors
+    ///
+    /// Returns filesystem or deserialization errors as `EvalExecError`.
+    pub fn load(path: &Path) -> Result<Self, EvalExecError> {
+        let raw = fs::read_to_string(path).map_err(|error| EvalExecError::ResultsIoFailed {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        })?;
+        Self::from_json(&raw)
+    }
+}

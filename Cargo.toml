@@ -36,6 +36,7 @@ skald-agent = { path = "crates/skald/skald-agent", version = "0.0.1" }
 skald-workflow = { path = "crates/skald/skald-workflow", version = "0.0.1" }
 vala-client = { path = "crates/vala/vala-client", version = "0.0.1" }
 vala-drift = { path = "crates/vala/vala-drift", version = "0.0.1" }
+vala-eval = { path = "crates/vala/vala-eval", version = "0.0.1" }
 wyrd-observe = { path = "crates/shared/wyrd-observe", version = "0.0.1" }
 wyrd-utils = { path = "crates/shared/wyrd-utils", version = "0.0.1" }
 wyrd-version = { path = "crates/shared/wyrd-version", version = "0.0.1" }
@@ -98,6 +99,7 @@ arrow = "55"
 arrow-array = "55"
 arrow-schema = "55"
 statrs = "0.18"
+jsonpath-rust = "0.7"
 pyo3 = { version = "0.28", features = ["abi3-py310", "chrono"] }
 
 [workspace.lints.rust]

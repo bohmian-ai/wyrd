@@ -161,6 +161,85 @@ impl schemars::JsonSchema for EntityUid {
     }
 }
 
+/// Opaque lease token returned by the orchestrator when an eval run is opened.
+///
+/// The client returns this bearer-secret value on every subsequent eval
+/// protocol call as proof of ownership. Validation is intentionally minimal:
+/// the cryptographic token shape is a server-internal concern. Wire grammar is
+/// non-empty, length `1..=256`, and no control characters. Do not log values of
+/// this type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "server", schema(value_type = String))]
+#[serde(transparent)]
+pub struct LeaseToken(String);
+
+impl LeaseToken {
+    /// Constructs a validated lease token.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when the value is empty, longer than
+    /// 256 characters, or contains a control character.
+    pub fn new(value: impl Into<String>) -> Result<Self, WyrdError> {
+        let value = value.into();
+        if value.is_empty() || value.len() > 256 {
+            return Err(WyrdError::Validation {
+                message: format!("lease_token length must be 1..=256, got {}", value.len()),
+                details: serde_json::Value::Null,
+            });
+        }
+        if value.chars().any(char::is_control) {
+            return Err(WyrdError::Validation {
+                message: "lease_token contains control characters".to_string(),
+                details: serde_json::Value::Null,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// Borrows the validated token as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for LeaseToken {
+    type Err = WyrdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for LeaseToken {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl schemars::JsonSchema for LeaseToken {
+    fn schema_name() -> String {
+        "LeaseToken".to_string()
+    }
+
+    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, SchemaObject, SingleOrVec, StringValidation};
+
+        SchemaObject {
+            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
+            string: Some(Box::new(StringValidation {
+                max_length: Some(256),
+                min_length: Some(1),
+                pattern: None,
+            })),
+            ..Default::default()
+        }
+        .into()
+    }
+}
+
 /// Sixteen-byte OpenTelemetry trace identifier.
 ///
 /// Wire format is a 32-character lower-case hex string. Deserialization also

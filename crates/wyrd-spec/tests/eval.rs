@@ -24,6 +24,8 @@ mod llm_judge;
 mod operator_catalog;
 #[path = "eval/pass_gate.rs"]
 mod pass_gate;
+#[path = "eval/protocol.rs"]
+mod protocol;
 #[path = "eval/record.rs"]
 mod record;
 #[path = "eval/result.rs"]

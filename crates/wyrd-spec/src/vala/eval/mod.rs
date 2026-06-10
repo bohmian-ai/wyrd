@@ -38,6 +38,7 @@ pub mod ids;
 pub mod llm_judge;
 pub mod operator;
 pub mod plan;
+pub mod protocol;
 pub mod record;
 pub mod result;
 pub mod scenario;
@@ -56,12 +57,17 @@ pub use agent::AgentAssertionTask;
 pub use assertion::AssertionTask;
 pub use condition::{ConditionCombinator, EvalCondition, MAX_CONDITION_DEPTH};
 pub use ids::{
-    EntityUid, JsonPath, RecordId, RunId, ScenarioId, SessionId, SpanId, TaskId, TraceId,
-    WorkflowUid,
+    EntityUid, JsonPath, LeaseToken, RecordId, RunId, ScenarioId, SessionId, SpanId, TaskId,
+    TraceId, WorkflowUid,
 };
 pub use llm_judge::LlmJudgeTask;
 pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
 pub use plan::{DagError, ExecutionPlan, Stage, validate_dag};
+pub use protocol::{
+    AgentTurnSubmission, ConversationTurn, EvalRunOpenRequest, EvalRunOpenResponse,
+    MAX_HISTORY_TURNS, ProtocolError, SimulatedUserMode, SimulatedUserTurn, TurnDirective,
+    TurnRole, UserTurnSubmission,
+};
 pub use record::EvalRecordObservation;
 pub use result::{AssertionResult, EvalContextCapture, EvalPassGate};
 pub use scenario::{

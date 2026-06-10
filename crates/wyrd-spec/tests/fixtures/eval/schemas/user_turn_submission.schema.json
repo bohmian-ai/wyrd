@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UserTurnSubmission",
+  "description": "Client reply to [`TurnDirective::UserTurnNeeded`].",
+  "type": "object",
+  "required": [
+    "message",
+    "scenario_id",
+    "turn"
+  ],
+  "properties": {
+    "message": {
+      "description": "User message the client generated.",
+      "type": "string"
+    },
+    "scenario_id": {
+      "description": "Scenario that produced the directive being answered.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ScenarioId"
+        }
+      ]
+    },
+    "turn": {
+      "description": "Turn cursor that produced the directive being answered.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "ScenarioId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]*$"
+    }
+  }
+}

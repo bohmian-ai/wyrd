@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 
 /// Pointer into the Wyrd runtime secret store.
 ///
-/// Production sources point at environment variables, mounted files, or an
-/// external secret manager. Test-only helpers are excluded from production
+/// The `Inline` variant is compiled only for `cfg(test)` inside `wyrd-spec`
+/// or when the `test-utils` feature is enabled. Public schema goldens are
+/// generated without `test-utils`, so `inline` is absent from production
 /// schemas.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]

@@ -4,7 +4,7 @@
 //! existing `wyrd_spec::vala::eval::ids::*` imports continue to resolve.
 
 pub use crate::vala::ids::{
-    DataTenantId, EntityUid, RecordId, SessionId, SpanId, TraceId, WorkflowUid,
+    DataTenantId, EntityUid, LeaseToken, RecordId, RunId, SessionId, SpanId, TraceId, WorkflowUid,
 };
 
 use std::str::FromStr;

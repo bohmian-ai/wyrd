@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SimulatedUserTurn",
+  "description": "Structured output of the server-side simulated-user judge call.",
+  "type": "object",
+  "required": [
+    "goal_achieved",
+    "message"
+  ],
+  "properties": {
+    "goal_achieved": {
+      "description": "Simulator's verdict on goal achievement after this turn.",
+      "type": "boolean"
+    },
+    "message": {
+      "description": "Next user message the simulator produced.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

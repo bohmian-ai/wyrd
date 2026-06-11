@@ -33,9 +33,9 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 | `model` | `string \| null` | no |
 | `observation_hooks` | `object` | no |
 | `permission_mode` | `string \| null` | no |
+| `prompt` | `string \| null` | no |
 | `sandbox_mode` | `string \| null` | no |
 | `skill_refs` | `array` | no |
-| `system_prompt` | `string \| null` | no |
 | `temperature` | `number \| null` | no |
 | `tool_refs` | `array` | no |
 

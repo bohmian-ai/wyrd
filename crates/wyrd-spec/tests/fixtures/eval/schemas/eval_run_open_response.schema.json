@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvalRunOpenResponse",
+  "description": "Server response to a successful [`EvalRunOpenRequest`].\n\n`run_id` is the existing core [`RunId`]. An eval execution is a `Run` of the referenced Eval card under the Card/Spec/Run/Observation ontology, so no eval-specific run-id noun is introduced.",
+  "type": "object",
+  "required": [
+    "lease_token",
+    "run_id"
+  ],
+  "properties": {
+    "lease_token": {
+      "description": "Opaque lease the client returns on every subsequent call.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/LeaseToken"
+        }
+      ]
+    },
+    "run_id": {
+      "description": "Server-generated handle for the leased eval run.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "LeaseToken": {
+      "type": "string",
+      "maxLength": 256,
+      "minLength": 1
+    }
+  }
+}

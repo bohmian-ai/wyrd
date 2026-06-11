@@ -19,8 +19,8 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 
 | Field | Type | Required |
 | --- | --- | --- |
-| `card_refs` | `array` | no |
 | `best_run_ref` | `object` | no |
+| `card_refs` | `array` | no |
 | `default_parameters` | `object` | no |
 | `description` | `string \| null` | no |
 | `details` | `object` | no |

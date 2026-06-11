@@ -31,12 +31,14 @@ pub const MAX_EVAL_TASKS: usize = 512;
 /// carries the envelope-level `kind: Eval` and `spec: { ... }` wire shape.
 ///
 /// Authors declare:
-/// - `target_ref` — canonical card this rubric evaluates.
+/// - `subject_ref` — canonical card this rubric judges per doctrine #3 and
+///   the `ObservationCriteria.subject_refs` precedent.
 /// - `dataset` — source data, typically a `Data` card with eval scenarios.
 /// - `tasks` — the rubric DAG.
 /// - `workflow` — optional declared workflow shape.
 /// - `sampling` — optional production sampling policy.
 /// - `pass_gate` — optional workflow-level pass criterion.
+/// - `context_capture` — durable storage policy for `AssertionResult::actual`.
 ///
 /// This struct does not carry envelope identity, tenant partitioning, triggers,
 /// or alert dispatch. Alert wiring is deferred until the drift primitives and
@@ -44,12 +46,21 @@ pub const MAX_EVAL_TASKS: usize = 512;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EvalSpec {
-    /// Declarative target.
+    /// Declarative subject — the card whose runs this rubric judges.
     ///
     /// When `Some`, registration can derive an `evaluates` relationship.
-    /// Runtime records may still supply the target when this is `None`.
+    /// Runtime records may still supply the subject when this is `None`.
+    ///
+    /// **Presence rule (D8).** The struct keeps `Option<CardRef>`, but
+    /// registry validation at `wyrd apply` rejects an Eval card with
+    /// `subject_ref = None` whenever the card receives online observations
+    /// (`run.observe.eval(...)` needs the identity chain). It may be `None`
+    /// only for pure-offline rubric cards driven entirely by datasets and
+    /// scenarios. The validator itself ships with the registry surface; this
+    /// field documents the rule the validator enforces, consistent with the
+    /// kind-restriction note on `validate()` below.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_ref: Option<CardRef>,
+    pub subject_ref: Option<CardRef>,
 
     /// Source data for offline runs.
     ///
@@ -84,8 +95,9 @@ pub struct EvalSpec {
 impl EvalSpec {
     /// Construct an eval spec after validating its task DAG.
     ///
-    /// The returned spec has no target, dataset, workflow, sampling policy, or
-    /// pass gate. Call [`EvalSpec::validate`] after mutating optional fields.
+    /// The returned spec has no subject, dataset, workflow, sampling policy,
+    /// pass gate, or context-capture override. Call [`EvalSpec::validate`]
+    /// after mutating optional fields.
     ///
     /// # Errors
     /// Returns [`EvalSpecError::Wyrd`] when a task map key does not match its
@@ -103,7 +115,7 @@ impl EvalSpec {
         validate_task_keys(&tasks).map_err(EvalSpecError::Wyrd)?;
         validate_dag(&tasks).map_err(EvalSpecError::Dag)?;
         Ok(Self {
-            target_ref: None,
+            subject_ref: None,
             dataset: None,
             tasks,
             workflow: None,
@@ -116,8 +128,11 @@ impl EvalSpec {
     /// Validate the task DAG, task-level validators, dataset, pass gate, and
     /// sampling policy.
     ///
-    /// `target_ref` kind restrictions are intentionally deferred to registry
-    /// validators because the target allowlist is not locked in this commit.
+    /// `subject_ref` kind restrictions and the presence rule are intentionally
+    /// deferred to registry validators: the allowlist is not locked here, and
+    /// the D8 presence rule (online-observation Eval cards require
+    /// `subject_ref`) is enforced at `wyrd apply` against the registered card
+    /// graph, not in pure-spec validation.
     ///
     /// # Errors
     /// Returns [`EvalSpecError`] when DAG validation fails or a nested Wyrd

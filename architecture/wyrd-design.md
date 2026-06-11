@@ -62,11 +62,11 @@ Downstream artifacts are brought up to this version in a sync pass.
 17. **Light cards may inline in place of a `CardRef`.** Wherever a `CardRef`
     points at a light card and the inline target has no need for cross-spec
     identity, the parent spec MAY embed the full definition instead. Today
-    `Agent.prompt` and `EvalTask::Judge.prompt` accept `PromptRef = CardRef |
-    Inline`. Inline definitions have no card identity, are not registered
+    `Agent.prompt` accepts `PromptRef = CardRef | Inline`. Inline definitions
+    have no card identity, are not registered
     standalone, and cannot be referenced from outside their parent. To reuse,
     register as a card and reference by `CardRef`. Heavy refs (`subject_ref`,
-    `dataset_ref`, `Service.components.ref`, `Workflow.steps.target`) stay
+    `dataset`, `Service.components.ref`, `Workflow.steps.target`) stay
     `CardRef`-only — identity is the point.
 18. **Auth, Policy, and Emit are three distinct planes.**
     - **Auth** gates Wyrd API calls: `Scope` on the handler, stateless pubkey
@@ -550,8 +550,8 @@ typed refs is a versioned breaking change that adds variants.
 | `Subject`   | `Drift.subject_ref`, `Eval.subject_ref`                           |
 | `Component` | `Service.components[].ref`, `Workflow.steps[].target`             |
 | `Artifact`  | `Data.card_refs[]`, `Model.card_refs[]`                   |
-| `Prompt`    | `Agent.prompt`, `Eval.tasks[].Judge.prompt`                       |
-| `Dataset`   | `Eval.dataset_ref`                                                |
+| `Prompt`    | `Agent.prompt`, `Eval.tasks[].LlmJudge.judge_ref`                 |
+| `Dataset`   | `Eval.dataset`                                                    |
 | `Source`    | `Eval.source_ref`, `Drift.signal.External.source_ref`             |
 | `Baseline`  | `Drift.signal.Distribution.baseline_ref`                          |
 | `Trigger`   | `Trigger.source.drift_ref \| eval_ref`                            |
@@ -681,55 +681,71 @@ authoring; the card stores resolved bounds):
 ### Eval
 Behavioral assessment workflow for a single subject. Envelope is orthogonal:
 **what** is judged (`subject_ref`), **how** (`tasks` DAG), **where to read its
-observations from** (`source_ref`), and an optional **offline driver**
-(`dataset_ref`). No scheduling, no dispatch, no fire condition — fire lives on
-`Drift` with `DriftSignal::EvalScore`. Lifted from Scouter's
-`AgentEvalProfile`; collapses the parallel `EvalType`+`EvalProfile` enums into
-a single typed task workflow.
+observations from** (`source_ref`, deferred), and an optional **offline
+driver** (`dataset`). No scheduling, no dispatch, no fire condition — fire
+lives on `Drift` with `DriftSignal::EvalScore`. Eval is a single typed task
+workflow, not a parallel mode/profile split.
 ```yaml
 spec:
   description?: string
   subject_ref: CardRef           # → Agent | Workflow | Service | Model — WHAT is judged
   tasks: [EvalTask]              # evaluation workflow — DAG via depends_on
-  dataset_ref?: CardRef          # → Data — offline scenario driver
-  source_ref?: CardRef           # → Source — WHERE Wyrd reads observations
+  dataset?: DatasetRef           # → Data — offline scenario driver
+  source_ref?: CardRef           # DEFERRED — landing in §Eval online-mode commit; not implemented
+  sampling?: EvalSampling
+  pass_gate?: EvalPassGate
+  context_capture?: EvalContextCapture
+  workflow?: Workflow
   governance?: Governance
   details: { string: NonSecretValue }
 ```
 
+The typed-id grammar (`TaskId`, `ScenarioId`, `JsonPath`, `SessionId`,
+`RecordId`, `TraceId`, `SpanId`) lives in `wyrd-spec::vala::eval::ids` and
+`wyrd-spec::vala::ids`. `EvalStatus` (`Pending | AwaitingTrace | Processing |
+Completed | Failed | DeadLettered`) lives in
+`wyrd-spec::vala::eval::status`.
+
 **Three modes the same shape supports** (no `eval_mode` discriminator; presence
 of refs is the mode):
 
-| `dataset_ref` | `source_ref` | Runtime behavior |
+| `dataset` | `source_ref` | Runtime behavior |
 |---------------|--------------|------------------|
 | set           | unset        | Offline batch. Engine invokes `subject_ref` against the Data card's scenario rows, captures traces inline. |
-| unset         | set          | Online / archived. Engine reads the user's sink, filters records by subject identity, samples records into the task workflow. |
-| set           | set          | Same tasks, both modes — Scouter's "define once, reuse everywhere." Offline gate and online monitor share one task definition. |
+| unset         | set          | Online / archived (deferred — DESIGN §13). Engine reads the user's sink, filters records by subject identity, samples records into the task workflow. |
+| set           | set          | Same tasks, both modes (online deferred — DESIGN §13). Offline gate and online monitor share one task definition. |
 | unset         | unset        | Online over `vala`'s default observation archive. |
 
 **Directional flow.** All three refs are `CardRef`s authored on `Eval`; nothing
 points back. At runtime: engine resolves `subject_ref` (identity filter),
-resolves `source_ref` (read location), opens the Source, queries records,
-feeds them into the `tasks` workflow, aggregates per-task pass/fail into a
-score stream consumed downstream by a `Drift` card with
+resolves `source_ref` (read location, deferred — see DESIGN.md §13), opens the
+Source, queries records, feeds them into the `tasks` workflow, aggregates
+per-task pass/fail into a score stream consumed downstream by a `Drift` card with
 `DriftSignal::EvalScore`.
 
-`EvalTask` is a closed tagged union (lift of Scouter's four task types). Each
-variant carries `id: string`, optional `depends_on: [string]` (DAG edges), and
-`condition: bool` (conditional gate — short-circuit downstream when this fails):
+`EvalTask` is a closed tagged union. Every variant carries `id: TaskId`,
+`depends_on: Vec<TaskId>`, and `condition: Option<EvalCondition>`.
+`EvalCondition` supports AND/OR chaining bounded at depth 16.
 
 | Variant          | Variant-specific carries                                                                          | Use |
 |------------------|---------------------------------------------------------------------------------------------------|-----|
 | `Assertion`      | `context_path?: string`, `operator: ComparisonOperator`, `expected: ParameterValue`, `description?: string` | Deterministic check on a dot-path into a record |
-| `Judge`          | `prompt: PromptRef` (`CardRef` → Prompt OR inline `PromptSpec`), `operator: ComparisonOperator`, `threshold: ParameterValue` | LLM judge: one Prompt per task, judge score compared to threshold |
-| `TraceAssertion` | `span_property: string`, `operator: ComparisonOperator`, `expected: ParameterValue`               | OTel span property (tokens, duration_ms, retry_count, …) read via `source_ref` |
-| `AgentAssertion` | `check: AgentCheckKind`, `expected: ParameterValue`                                               | Tool-call / response-shape check (`tool_called` \| `tool_args` \| `response_format` \| `step_count`) read via `source_ref` |
+| `LlmJudge` (`llm_judge`) | `judge_ref: CardRef` (→ Prompt card), `operator: ComparisonOperator`, `expected: ParameterValue`, `max_retries: u32` | LLM judge: one Prompt card per task, judge response compared to expected value |
+| `TraceAssertion` | `span_selector: JsonPath`, `operator: ComparisonOperator`, `expected: ParameterValue`             | OTel span selector (tokens, duration_ms, retry_count, etc.) read via `source_ref` (deferred — see DESIGN.md §13) |
+| `AgentAssertion` | `workflow_field_path: JsonPath`, `operator: ComparisonOperator`, `expected: ParameterValue`       | Tool-call / response-shape check read via `source_ref` (deferred — see DESIGN.md §13) |
 
-`ComparisonOperator` is a closed enum:
-`eq | neq | gt | gte | lt | lte | contains | matches | exists`.
+`ComparisonOperator` is a frozen 56-variant catalog (12 numeric, 15 string,
+14 collection, 9 type, 6 tolerance / advanced). Parameterless variants
+serialize as scalar `snake_case`; parameterized variants as `kind`-tagged
+objects. Canonical source:
+`crates/wyrd-spec/src/vala/eval/operator.rs:62-264`. The locked collection /
+type / tolerance families are required to keep authors out of LLM-judge calls
+for deterministic checks ("agent only used allowed tools" → `IsSubset`, "no
+duplicate tool calls" → `UniqueValues`, "score within 10% of baseline" →
+`WithinPctTolerance`, "output is valid JSON" → `IsJson`).
 
 `EvalScenario` is the row shape carried by a `Data` card bound to
-`dataset_ref` (not an Eval field — scenarios and datasets are the same noun):
+`dataset` (not an Eval field — scenarios and datasets are the same noun):
 ```yaml
 - id: string
   initial_query: string
@@ -738,14 +754,17 @@ variant carries `id: string`, optional `depends_on: [string]` (DAG edges), and
   termination_signal?: string
   max_turns?: u32
   expected_outcome?: string
-  tasks?: [EvalTask]               # scenario-local tasks (passenger view: final response)
-  metadata?: { string: NonSecretValue }
+  tasks?: [ScenarioTask]           # scenario-local tasks (passenger view: final response)
 ```
+
+`ScenarioTask` is narrower than `EvalTask` — `id`, `operator`, `expected`,
+optional `condition` — because scenario evaluation operates on `{response,
+expected_outcome}` and is always evaluated together (no DAG).
 
 Scenario-local `tasks` are the **passenger view** (judged against the agent's
 final response for that scenario); top-level `Eval.tasks` are the **mechanic
-view** (judged against intermediate sub-agent records / spans / tool calls).
-Both run in one pass — Scouter's scenario-vs-workflow split lifted intact.
+view** (judged against intermediate workflow records / spans / tool calls).
+Both run in one pass.
 
 ### Source
 Read-side reference to external data system. **Wyrd reads, never writes.**
@@ -852,18 +871,17 @@ Exact field schema for each context lives in OpenAPI.
 
 Two complementary mechanisms — `wyrd apply -f file.yaml` reads + registers in
 one move, and a `PromptRef` may be inlined where its own identity isn't
-needed. Together they support the single-file Scouter/opsml-style workflow
-without breaking Rule 1 ("cards are independent registry entries").
+needed.
 
 ### Pre-registration matrix (Rule 16)
 
 | Kind | Must pre-register? | Why |
 |------|---------------------|-----|
 | `Model`        | **Yes** | Carries weight artifacts; lineage anchor. |
-| `Data`         | **Yes** (unless used purely as inline eval scenarios, which v1 does not support — `dataset_ref` is `CardRef`-only) | Carries dataset bytes; lineage anchor. |
+| `Data`         | **Yes** (unless used purely as inline eval scenarios, which v1 does not support — `dataset` is `DatasetRef`-only) | Carries dataset bytes; lineage anchor. |
 | `Experiment`   | **Yes** | Carries run history. |
 | `Artifact`     | **Yes** (typically derived from heavy cards) | Pointer to durable bytes. |
-| `Prompt`       | Optional | Light. Inlineable as `PromptRef` inside `Agent.prompt` / `EvalTask::Judge.prompt`. |
+| `Prompt`       | Optional | Light. Inlineable as `PromptRef` inside `Agent.prompt`; referenced by `EvalTask::LlmJudge.judge_ref`. |
 | `Agent`        | Optional | Light. Spec-only; `apply` registers it. No v1 field accepts inline `AgentRef` (see Q11). |
 | `Eval`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Workflow`, `Audit`, `Service` | Optional | Light. Spec-only; `apply` registers each card as it's read. |
 
@@ -918,7 +936,7 @@ components:
 
 Same three-key shape applies anywhere a light card is referenced —
 `Service.components[].ref`, `Trigger.target`, `Workflow.steps[].target`,
-`Agent.prompt`, `EvalTask::Judge.prompt`, etc.
+`Agent.prompt`, `EvalTask::LlmJudge.judge_ref`, etc.
 
 ### Path resolution rules (loader contract)
 
@@ -952,13 +970,13 @@ ergonomic they expect from JSON-Schema `$ref` / OpenAPI external-file imports.
 
 | Card    | Refs that authored on it             | Refs that point at it          |
 |---------|--------------------------------------|--------------------------------|
-| Data    | `card_refs`, `splits`            | `Drift.signal.baseline_ref`, `Eval.dataset_ref`, `Experiment.target_refs` |
+| Data    | `card_refs`, `splits`            | `Drift.signal.baseline_ref`, `Eval.dataset`, `Experiment.target_refs` |
 | Model   | `card_refs`                      | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, `Experiment.target_refs` |
 | Agent   | `prompt`, `tool_names`               | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, Agent prompts (sub-agent calls) |
 | Workflow| `steps.*.target`                     | `Eval.subject_ref`, `Service.components.ref`, `Operator.action.workflow_ref` |
 | Mcp     | `server_name`, `transport`, `scopes` | `Service.components.ref` |
 | Drift   | `subject_ref`, `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `Trigger.source.drift_ref`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
-| Eval    | `subject_ref`, `dataset_ref`, `source_ref`, `tasks[].Judge.prompt` (PromptRef) | `Drift.signal.eval_ref`, `Trigger.source.eval_ref` |
+| Eval    | `subject_ref`, `dataset`, `source_ref` (deferred), `tasks[].LlmJudge.judge_ref` (Prompt card ref) | `Drift.signal.eval_ref`, `Trigger.source.eval_ref` |
 | Audit   | `subject_refs`, `query` (roots), `lineage` (nodes), `investigator` (Agent variant) | — |
 | Service | `components[].ref`                   | `Drift.subject_ref` (service-level), `Eval.subject_ref` |
 | Policy  | `rules`                              | `Service.components.ref`, `Operator.pre_invoke`, `Operator.post_invoke` |
@@ -1027,6 +1045,6 @@ services/ops-copilot/
 8. **Closed.** `Eval` does not carry its own `signal` decomposition. Eval IS
     the signal — its per-task pass/fail aggregates into a score stream
     consumed downstream by `Drift` with `DriftSignal::EvalScore`. The input
-    edges (`dataset_ref` vs `source_ref`) are two optional `CardRef`s, not a
-    tagged enum: presence is the mode (offline driver, online sink, both, or
-    neither → vala default archive).
+    edges (`dataset` vs `source_ref`) are optional refs, not a tagged enum:
+    presence is the mode (offline driver, online sink, both, or neither →
+    vala default archive).

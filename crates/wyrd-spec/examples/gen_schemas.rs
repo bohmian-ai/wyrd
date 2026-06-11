@@ -35,8 +35,10 @@ use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::run::{RunKind, RunRef};
 use wyrd_spec::vala::eval::{
-    ComparisonOperator, DagError, EvalCondition, EvalPassGate, EvalSampling,
-    EvalScenarioCollection, EvalSpec, EvalTask, ExecutionPlan,
+    AgentTurnSubmission, ComparisonOperator, ConversationTurn, DagError, EvalCondition,
+    EvalPassGate, EvalRecordObservation, EvalRunOpenRequest, EvalRunOpenResponse, EvalSampling,
+    EvalScenarioCollection, EvalSpec, EvalTask, ExecutionPlan, SimulatedUserMode,
+    SimulatedUserTurn, TurnDirective, UserTurnSubmission,
 };
 use wyrd_spec::vala::trace::{
     AttributeValue, GenAiEvalResult, GenAiSpanRecord, InstrumentationScope, Resource, SpanEvent,
@@ -111,9 +113,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_fixture::<ComparisonOperator>(eval_fixtures, "comparison_operator")?;
     write_fixture::<ExecutionPlan>(eval_fixtures, "execution_plan")?;
     write_fixture::<DagError>(eval_fixtures, "dag_error")?;
+    write_fixture::<EvalRecordObservation>(eval_fixtures, "eval_record_observation")?;
     write_fixture::<EvalScenarioCollection>(eval_fixtures, "eval_scenario_collection")?;
     write_fixture::<EvalPassGate>(eval_fixtures, "eval_pass_gate")?;
     write_fixture::<EvalSampling>(eval_fixtures, "eval_sampling")?;
+    write_fixture::<EvalRunOpenRequest>(eval_fixtures, "eval_run_open_request")?;
+    write_fixture::<EvalRunOpenResponse>(eval_fixtures, "eval_run_open_response")?;
+    write_fixture::<SimulatedUserMode>(eval_fixtures, "simulated_user_mode")?;
+    write_fixture::<TurnDirective>(eval_fixtures, "turn_directive")?;
+    write_fixture::<ConversationTurn>(eval_fixtures, "conversation_turn")?;
+    write_fixture::<AgentTurnSubmission>(eval_fixtures, "agent_turn_submission")?;
+    write_fixture::<UserTurnSubmission>(eval_fixtures, "user_turn_submission")?;
+    write_fixture::<SimulatedUserTurn>(eval_fixtures, "simulated_user_turn")?;
 
     let trace_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/trace/schemas");
     fs::create_dir_all(trace_fixtures)?;

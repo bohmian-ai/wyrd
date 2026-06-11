@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SimulatedUserMode",
+  "description": "Selects who supplies the next user message when the next turn is not already scripted via `EvalScenario.predefined_turns`.\n\nScripted turns always come from `predefined_turns` server-side.",
+  "oneOf": [
+    {
+      "description": "Server-simulated persona drives non-scripted user turns.",
+      "type": "string",
+      "enum": [
+        "server"
+      ]
+    },
+    {
+      "description": "Client supplies non-scripted user turns.",
+      "type": "string",
+      "enum": [
+        "client"
+      ]
+    }
+  ]
+}

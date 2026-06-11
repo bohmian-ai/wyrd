@@ -11,15 +11,14 @@ this repository. Reproduce useful patterns under Wyrd vocabulary and Wyrd paths.
 ## 1. First Pass Before Editing
 
 1. Read this file (AGENTS.md).
-2. Read `docs/src/content/docs/concepts/core-doctrine.mdx` before changing
+2. Read `architecture/wyrd-design.md` - this is the source of truth for Wyrd design principles and the core doctrine. It overrides everything.
+3. Read `docs/src/content/docs/concepts/core-doctrine.mdx` before changing
    Wyrd contracts, public or internal APIs, SDK surfaces, CLI, MCP, UI, docs,
-   generated schemas, or implementation behavior. The canonical planning
-   source is
-   `/Users/stevenforrester/Documents/GitHub/wyrd-plan/architecture/v1/00-foundations/core-doctrine.md`.
-3. Identify the owning crate or Python package (see §3 Ownership Boundaries).
-4. Inspect the nearest existing Wyrd implementation and tests.
-5. Check `mise.toml` for the canonical verification command.
-6. Check `Cargo.toml`, crate manifests, `pyproject.toml`, and lockfiles before
+   generated schemas, or implementation behavior.
+4. Identify the owning crate or Python package (see §3 Ownership Boundaries).
+5. Inspect the nearest existing Wyrd implementation and tests.
+6. Check `mise.toml` for the canonical verification command.
+7. Check `Cargo.toml`, crate manifests, `pyproject.toml`, and lockfiles before
    relying on version-specific behavior.
 
 Do not invent a new architecture until the current Wyrd boundary proves wrong

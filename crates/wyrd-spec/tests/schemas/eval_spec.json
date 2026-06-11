@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "EvalSpec",
-  "description": "The typed spec body for an `Eval` card.\n\nThis struct does not carry a discriminator; the outer `CardBody` enum carries the envelope-level `kind: Eval` and `spec: { ... }` wire shape.\n\nAuthors declare: - `target_ref` — canonical card this rubric evaluates. - `dataset` — source data, typically a `Data` card with eval scenarios. - `tasks` — the rubric DAG. - `workflow` — optional declared workflow shape. - `sampling` — optional production sampling policy. - `pass_gate` — optional workflow-level pass criterion.\n\nThis struct does not carry envelope identity, tenant partitioning, triggers, or alert dispatch. Alert wiring is deferred until the drift primitives and secret reference model are locked.",
+  "description": "The typed spec body for an `Eval` card.\n\nThis struct does not carry a discriminator; the outer `CardBody` enum carries the envelope-level `kind: Eval` and `spec: { ... }` wire shape.\n\nAuthors declare: - `subject_ref` — canonical card this rubric judges per doctrine #3 and the `ObservationCriteria.subject_refs` precedent. - `dataset` — source data, typically a `Data` card with eval scenarios. - `tasks` — the rubric DAG. - `workflow` — optional declared workflow shape. - `sampling` — optional production sampling policy. - `pass_gate` — optional workflow-level pass criterion. - `context_capture` — durable storage policy for `AssertionResult::actual`.\n\nThis struct does not carry envelope identity, tenant partitioning, triggers, or alert dispatch. Alert wiring is deferred until the drift primitives and secret reference model are locked.",
   "type": "object",
   "required": [
     "tasks"
@@ -51,8 +51,8 @@
         }
       ]
     },
-    "target_ref": {
-      "description": "Declarative target.\n\nWhen `Some`, registration can derive an `evaluates` relationship. Runtime records may still supply the target when this is `None`.",
+    "subject_ref": {
+      "description": "Declarative subject — the card whose runs this rubric judges.\n\nWhen `Some`, registration can derive an `evaluates` relationship. Runtime records may still supply the subject when this is `None`.\n\n**Presence rule (D8).** The struct keeps `Option<CardRef>`, but registry validation at `wyrd apply` rejects an Eval card with `subject_ref = None` whenever the card receives online observations (`run.observe.eval(...)` needs the identity chain). It may be `None` only for pure-offline rubric cards driven entirely by datasets and scenarios. The validator itself ships with the registry surface; this field documents the rule the validator enforces, consistent with the kind-restriction note on `validate()` below.",
       "anyOf": [
         {
           "$ref": "#/definitions/CardRef"
@@ -334,7 +334,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Pass iff every `LlmJudge` task passes at the per-judge threshold.\n\nComputed per judge, then AND-reduced across judges.",
+          "description": "Pass iff the minimum per-task pass rate across **all** tasks meets the threshold.\n\nComputed as `min(pass_rate per task across all subjects)`. A task that never appears scores 0.0. This is task-level, not judge-type-level — `LlmJudge` and other task types all contribute equally.",
           "type": "object",
           "required": [
             "kind",
@@ -348,7 +348,7 @@
               ]
             },
             "threshold": {
-              "description": "Minimum accepted per-judge pass rate in `[0.0, 1.0]`.",
+              "description": "Minimum accepted per-task pass rate in `[0.0, 1.0]`.",
               "type": "number",
               "format": "double"
             }

@@ -1362,10 +1362,15 @@ fn response_format_from_py(
     Ok(Some(ResponseFormat::json_schema("response", schema)?))
 }
 
+/// `(response_format, retained_pydantic_class)` produced by `output_from_py`.
+///
+/// The class is `Some` only when the caller passed a Pydantic `BaseModel`
+/// subclass and we need to retain it for structured-output instantiation.
 #[cfg(feature = "python")]
-fn output_from_py(
-    value: Option<&Bound<'_, PyAny>>,
-) -> CardPyResult<(Option<ResponseFormat>, Option<Arc<pyo3::Py<pyo3::PyAny>>>)> {
+type OutputFromPy = (Option<ResponseFormat>, Option<Arc<pyo3::Py<pyo3::PyAny>>>);
+
+#[cfg(feature = "python")]
+fn output_from_py(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<OutputFromPy> {
     let Some(value) = value.filter(|v| !v.is_none()) else {
         return Ok((None, None));
     };

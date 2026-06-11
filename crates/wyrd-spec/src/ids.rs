@@ -98,6 +98,12 @@ id_type!(
 id_type!(SplitName, "DataCard split label.", validate_card_token);
 id_type!(QueryName, "DataCard SQL query key.", validate_card_token);
 
+/// Generate a UUIDv7 string for Wyrd-owned identifiers.
+#[must_use]
+pub fn uuid7() -> String {
+    uuid::Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext)).to_string()
+}
+
 fn validate_token(value: &str) -> Result<(), IdError> {
     if value.len() < 3 || value.len() > 64 {
         return Err(IdError::InvalidToken);

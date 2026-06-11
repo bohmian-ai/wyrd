@@ -7,7 +7,7 @@ description: Generated reference for the Wyrd Drift card spec.
 
 Describe the drift contract Wyrd uses to watch behavior over time.
 
-<dl class="wyrd-defs"><dt data-kind="drift">Drift</dt><dd>Describe the drift contract Wyrd uses to watch behavior over time.</dd><dt>Required</dt><dd><code>method</code></dd><dt>Optional</dt><dd>7 additional spec fields — see table below.</dd></dl>
+<dl class="wyrd-defs"><dt data-kind="drift">Drift</dt><dd>Describe the drift contract Wyrd uses to watch behavior over time.</dd><dt>Required</dt><dd><code>condition</code>, <code>method</code>, <code>signal</code>, <code>subject_ref</code></dd><dt>Optional</dt><dd>3 additional spec fields — see table below.</dd></dl>
 
 This page is generated from the checked-in JSON Schema. Edit the Rust spec, run the schema generator, then run `mise run docs:generate` to refresh this page.
 
@@ -19,14 +19,13 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 
 | Field | Type | Required |
 | --- | --- | --- |
-| `baseline_ref` | `object` | no |
+| `condition` | `object` | yes |
 | `description` | `string \| null` | no |
 | `details` | `object` | no |
-| `features` | `array` | no |
 | `method` | `object` | yes |
 | `profile` | `object` | no |
-| `target_refs` | `array` | no |
-| `thresholds` | `object` | no |
+| `signal` | `object` | yes |
+| `subject_ref` | `object` | yes |
 
 ## Shape
 

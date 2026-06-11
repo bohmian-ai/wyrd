@@ -13,7 +13,7 @@ against current docs before making product decisions.*
 The predecessor scouter `AgentEvaluator` established the four-task evaluation
 shape, dependency DAGs, conditional cost control, and offline/online framing.
 Wyrd supersedes that surface with the locked `EvalCard`, `EvalSpec`, `Scenario`,
-`EvalRecord`, `EvalResults`, and `EvalComparison` contracts covered by the
+`EvalRecord`, `EvalResults`, and `ComparisonResults` contracts covered by the
 stage 17B plan and its `01-parity-audit.md` evidence.
 
 ## Comparison table

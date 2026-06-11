@@ -37,12 +37,13 @@ use crate::reference::CardRef;
 use super::ids::{LeaseToken, RunId, ScenarioId};
 use super::record::EvalRecordObservation;
 
-/// Maximum conversation history carried on a single [`TurnDirective`].
+/// Maximum conversation history entries carried on a single [`TurnDirective`].
 ///
-/// Matches [`super::scenario::MAX_TURNS_HARD_CAP`]. A single scenario cannot
-/// accumulate more turns than the runtime safeguard allows. The server enforces
-/// this; the wire type documents and validates the bound.
-pub const MAX_HISTORY_TURNS: usize = super::scenario::MAX_TURNS_HARD_CAP as usize;
+/// Each completed agent turn produces two entries: a `User` push when the
+/// server advances past the user message and an `Agent` push on agent-turn
+/// submission. The cap is therefore `MAX_TURNS_HARD_CAP * 2` so that a
+/// scenario running the full 256-turn limit never triggers the guard.
+pub const MAX_HISTORY_TURNS: usize = super::scenario::MAX_TURNS_HARD_CAP as usize * 2;
 
 /// Client request to open and lease a new eval run against `eval_ref`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -76,11 +76,14 @@ pub enum EvalPassGate {
         /// Minimum accepted overall pass rate in `[0.0, 1.0]`.
         threshold: f64,
     },
-    /// Pass iff every `LlmJudge` task passes at the per-judge threshold.
+    /// Pass iff the minimum per-task pass rate across **all** tasks meets the
+    /// threshold.
     ///
-    /// Computed per judge, then AND-reduced across judges.
+    /// Computed as `min(pass_rate per task across all subjects)`. A task that
+    /// never appears scores 0.0. This is task-level, not judge-type-level —
+    /// `LlmJudge` and other task types all contribute equally.
     PerJudgePassRate {
-        /// Minimum accepted per-judge pass rate in `[0.0, 1.0]`.
+        /// Minimum accepted per-task pass rate in `[0.0, 1.0]`.
         threshold: f64,
     },
     /// Pass iff every task passes.

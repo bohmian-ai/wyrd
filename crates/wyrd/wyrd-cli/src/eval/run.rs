@@ -35,7 +35,7 @@ pub enum EvalCommand {
 ))]
 pub struct EvalRunArgs {
     /// Eval card filesystem path.
-    #[arg(long, value_name = "PATH_OR_REF")]
+    #[arg(long, value_name = "PATH")]
     pub eval: String,
     /// Scenario collection path for agent-driving modes.
     #[arg(long, value_name = "PATH")]
@@ -52,7 +52,7 @@ pub struct EvalRunArgs {
     /// Drive a remote server protocol router.
     #[arg(long, value_name = "URL", conflicts_with = "local")]
     pub server: Option<Url>,
-    /// Use a deterministic judge invoker.
+    /// Use a deterministic judge invoker (all LLM judge tasks return passed: true; results do not reflect real judge behavior).
     #[arg(long, default_value_t = false)]
     pub judge_mock: bool,
     /// Who supplies unscripted user turns.
@@ -106,8 +106,10 @@ async fn run(args: EvalRunArgs) -> Result<ExitCode, WyrdCliError> {
         crate::eval::server::run_server(args, server_url).await
     } else if args.records.is_some() {
         crate::eval::local_records::run_local_records(args).await
-    } else {
+    } else if args.local || args.agent_url.is_some() {
         crate::eval::local_agent::run_local_agent(args).await
+    } else {
+        Err(WyrdCliError::ScenariosRequired)
     }
 }
 
@@ -185,6 +187,12 @@ pub fn judge_for_spec(
 ) -> Result<Arc<dyn JudgeInvoker>, WyrdCliError> {
     if has_llm_judge(spec) && !judge_mock {
         return Err(WyrdCliError::JudgeMockRequired);
+    }
+    if judge_mock && has_llm_judge(spec) {
+        eprintln!(
+            "[judge-mock] LlmJudge tasks will return {{\"passed\": true}}; \
+             enable a provider for real verdicts."
+        );
     }
     let responses = std::iter::repeat_with(|| Ok(serde_json::json!({"passed": true}))).take(1024);
     Ok(MockJudgeInvoker::new(responses))

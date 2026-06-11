@@ -332,6 +332,20 @@ pub enum EvalError {
         message: String,
         details: serde_json::Value,
     },
+
+    /// Eval results could not be serialized, deserialized, or written to
+    /// storage. This is a server-side failure, not a caller input error.
+    #[error("[WYRD_EVAL_500_RESULTS_PERSISTENCE_FAILED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_EVAL_500_RESULTS_PERSISTENCE_FAILED",
+        status = 500,
+        title = "Eval results persistence failed",
+        remediation = "Check server storage availability and permissions; retry after the underlying I/O issue is resolved."
+    )]
+    ResultsPersistenceFailed {
+        message: String,
+        details: serde_json::Value,
+    },
 }
 
 impl EvalError {
@@ -361,7 +375,8 @@ impl EvalError {
             | Self::OperatorMismatch { message, details }
             | Self::RecordMissing { message, details }
             | Self::ScenarioLoaderFailure { message, details }
-            | Self::JsonPathFailure { message, details } => (message, details),
+            | Self::JsonPathFailure { message, details }
+            | Self::ResultsPersistenceFailed { message, details } => (message, details),
         }
     }
 }
@@ -539,24 +554,29 @@ impl From<EvalExecError> for EvalError {
                     "depends_on": dep.as_str(),
                 }),
             },
-            EvalExecError::ResultsSerializeFailed { reason } => Self::ScenarioLoaderFailure {
+            EvalExecError::ResultsSerializeFailed { reason } => {
+                Self::ResultsPersistenceFailed {
+                    message,
+                    details: serde_json::json!({
+                        "operation": "serialize",
+                        "reason": reason,
+                    }),
+                }
+            }
+            EvalExecError::ResultsDeserializeFailed { reason } => {
+                Self::ResultsPersistenceFailed {
+                    message,
+                    details: serde_json::json!({
+                        "operation": "deserialize",
+                        "reason": reason,
+                    }),
+                }
+            }
+            EvalExecError::ResultsIoFailed { path, reason } => Self::ResultsPersistenceFailed {
                 message,
                 details: serde_json::json!({
-                    "source": "eval_results",
-                    "reason": reason,
-                }),
-            },
-            EvalExecError::ResultsDeserializeFailed { reason } => Self::ScenarioLoaderFailure {
-                message,
-                details: serde_json::json!({
-                    "source": "eval_results",
-                    "reason": reason,
-                }),
-            },
-            EvalExecError::ResultsIoFailed { path, reason } => Self::ScenarioLoaderFailure {
-                message,
-                details: serde_json::json!({
-                    "source": path,
+                    "operation": "io",
+                    "path": path,
                     "reason": reason,
                 }),
             },

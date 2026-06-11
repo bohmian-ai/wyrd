@@ -91,9 +91,8 @@ credential-free CI.
 ## Baselines and exit codes
 
 `--baseline path.json` loads a previous `EvalResults` artifact and runs the
-comparison engine against the current run. Local flows write `results.json`,
-`SUMMARY.json`, and, when a baseline is present, `comparison.json` under
-`--out` or `.wyrd/eval/<run_id>/`.
+comparison engine against the current run. Local flows write `results.json`, and, when a baseline is present,
+`comparison.json` under `--out` or `.wyrd/eval/<run_id>/`.
 
 Pass-gate failure exits with code `2` when `--fail-on-gate` is enabled. Server
 protocol runs complete with `0` because v1 does not fetch server-side results
@@ -102,7 +101,6 @@ back to the CLI.
 ## Outputs
 
 Local outputs are JSON artifacts. `results.json` is the canonical
-`EvalResults` payload. `SUMMARY.json` currently mirrors the same payload for
-human-oriented tooling. `comparison.json` is present only when `--baseline` is
+`EvalResults` payload. `comparison.json` is present only when `--baseline` is
 provided. See [Results and comparison](/evaluation/results-and-comparison/)
 for the field layout.

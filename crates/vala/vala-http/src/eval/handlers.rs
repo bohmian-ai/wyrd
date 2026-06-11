@@ -1,9 +1,12 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Request, StatusCode, header},
+    middleware::{Next, from_fn_with_state},
     response::IntoResponse,
     routing::post,
 };
@@ -24,6 +27,22 @@ use wyrd_spec::vala::eval::{
     },
 };
 use wyrd_spec::vala::ids::{LeaseToken, RunId};
+
+/// Maximum number of concurrently open eval runs. New opens are rejected with
+/// 429 when this cap is reached. Sized for a single-server dev deployment;
+/// production systems with durable state storage can raise this.
+const MAX_CONCURRENT_RUNS: usize = 100;
+
+/// Runs older than this are eligible for lazy eviction on the next `open`
+/// call. A background sweep would be cleaner but requires async context at
+/// construction time; lazy eviction is safe and keeps `AppState::new` sync.
+const RUN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Environment variable name for the preshared API key.
+///
+/// When set, all eval routes require `Authorization: Bearer <key>`.
+/// This is a stopgap until the Wyrd JWT scope-verification auth plane is wired.
+const API_KEY_ENV: &str = "WYRD_API_KEY";
 
 type ScenarioLoader =
     dyn Fn(&CardRef) -> Result<Vec<EvalScenario>, OrchestratorError> + Send + Sync;
@@ -95,15 +114,45 @@ pub enum HttpError {
         #[source]
         source: OrchestratorError,
     },
+
+    /// Too many concurrent eval runs; client must retry after existing runs complete.
+    #[error("too many concurrent eval runs; retry after an existing run completes")]
+    #[wyrd_error(
+        code = "WYRD_EVAL_429_TOO_MANY_RUNS",
+        status = 429,
+        title = "Too many concurrent eval runs",
+        remediation = "Wait for an existing run to complete, then retry."
+    )]
+    TooManyRuns,
+
+    /// API key missing or invalid on a protected eval route.
+    #[error("eval route requires a valid WYRD_API_KEY bearer token")]
+    #[wyrd_error(
+        code = "WYRD_EVAL_401_API_KEY_INVALID",
+        status = 401,
+        title = "Invalid or missing API key",
+        remediation = "Set WYRD_API_KEY on the server and pass it as Authorization: Bearer <key>."
+    )]
+    ApiKeyInvalid,
 }
 
 impl HttpError {
     fn problem_json(&self) -> serde_json::Value {
+        let detail = if self.status() >= 500 {
+            tracing::error!(
+                wyrd.error.code = self.code(),
+                wyrd.error.detail = %self,
+                "eval route internal error"
+            );
+            "Internal server error; see server logs".to_owned()
+        } else {
+            self.to_string()
+        };
         serde_json::json!({
             "type": format!("https://wyrd.dev/problems/{}", self.code()),
             "title": self.title(),
             "status": self.status(),
-            "detail": self.to_string(),
+            "detail": detail,
             "code": self.code(),
             "remediation": self.remediation(),
         })
@@ -132,6 +181,8 @@ pub struct RunEntry {
     pub run_result: Mutex<Option<EvalResults>>,
     /// Bearer lease minted at open.
     pub lease: LeaseToken,
+    /// Wall-clock instant when this run was opened, used for TTL eviction.
+    pub opened_at: Instant,
 }
 
 /// Router-level eval state.
@@ -147,18 +198,28 @@ pub struct AppState {
     pub scenarios_for_eval: Arc<ScenarioLoader>,
     /// Fresh per-run lease issuer.
     pub lease_issuer: Arc<LeaseIssuer>,
+    /// Optional preshared API key loaded from `WYRD_API_KEY` at construction.
+    /// When `Some`, every eval route requires `Authorization: Bearer <key>`.
+    pub api_key: Option<Arc<str>>,
 }
 
 impl AppState {
     /// Build eval route state from injected services.
+    ///
+    /// Reads `WYRD_API_KEY` from the environment at construction time. When the
+    /// variable is set, every eval route requires a matching bearer token.
     #[must_use]
     pub fn new(scenarios_for_eval: Arc<ScenarioLoader>, lease_issuer: Arc<LeaseIssuer>) -> Self {
+        let api_key = std::env::var(API_KEY_ENV)
+            .ok()
+            .map(|k| Arc::from(k.as_str()));
         Self {
             runs: Arc::new(DashMap::new()),
             scoring: None,
             simulator: None,
             scenarios_for_eval,
             lease_issuer,
+            api_key,
         }
     }
 
@@ -175,6 +236,14 @@ impl AppState {
             }),
             Arc::new(default_lease_token),
         )
+    }
+
+    /// Override the API key. Useful in tests that need auth enabled without
+    /// reading the environment.
+    #[must_use]
+    pub fn with_api_key(mut self, key: impl Into<Arc<str>>) -> Self {
+        self.api_key = Some(key.into());
+        self
     }
 
     /// Attach a scoring engine.
@@ -210,7 +279,40 @@ pub fn router(state: AppState) -> Router {
         .route("/runs/{run_id}/next", post(next))
         .route("/runs/{run_id}/agent-turn", post(agent_turn))
         .route("/runs/{run_id}/user-turn", post(user_turn))
+        .layer(from_fn_with_state(state.clone(), api_key_auth))
         .with_state(state)
+}
+
+/// Preshared-key auth middleware.
+///
+/// When `WYRD_API_KEY` is set, all eval routes require
+/// `Authorization: Bearer <key>`. Uses constant-time comparison to resist
+/// timing side channels.
+///
+/// This is a stopgap until Wyrd JWT scope-verification is wired in.
+async fn api_key_auth(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    let Some(expected) = state.api_key.as_ref() else {
+        return next.run(req).await;
+    };
+
+    use subtle::ConstantTimeEq;
+    let valid = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|token| token.as_bytes().ct_eq(expected.as_bytes()).into())
+        .unwrap_or(false);
+
+    if valid {
+        next.run(req).await
+    } else {
+        HttpError::ApiKeyInvalid.into_response()
+    }
 }
 
 #[tracing::instrument(skip(state, req), fields(wyrd.eval_ref = %req.eval_ref.name.as_str()))]
@@ -218,6 +320,16 @@ async fn open(
     State(state): State<AppState>,
     Json(req): Json<EvalRunOpenRequest>,
 ) -> Result<Json<EvalRunOpenResponse>, HttpError> {
+    // Lazy TTL eviction: sweep expired entries before checking the cap so a
+    // burst of stale runs does not starve new callers.
+    state
+        .runs
+        .retain(|_, entry| entry.opened_at.elapsed() < RUN_TTL);
+
+    if state.runs.len() >= MAX_CONCURRENT_RUNS {
+        return Err(HttpError::TooManyRuns);
+    }
+
     let scenarios =
         (state.scenarios_for_eval)(&req.eval_ref).map_err(|source| HttpError::Engine { source })?;
     let run_state = RunState::open(req.eval_ref, req.simulated_user, scenarios);
@@ -229,6 +341,7 @@ async fn open(
         scenario_aggregations: Mutex::new(Vec::new()),
         run_result: Mutex::new(None),
         lease: lease_token.clone(),
+        opened_at: Instant::now(),
     });
     state.runs.insert(run_id.clone(), entry);
     Ok(Json(EvalRunOpenResponse {
@@ -405,11 +518,14 @@ async fn score_completed_scenario(
     let Some(scoring) = state.scoring.as_ref() else {
         return Ok(());
     };
+    // Peek first so the cursor survives a scoring failure. Only take (remove)
+    // after both score and aggregation succeed — otherwise a failed score
+    // would permanently lose the cursor and stall the run.
     let cursor = entry
         .state
         .lock()
         .await
-        .take_completed_scenario(scenario_id)
+        .peek_completed_scenario(scenario_id)
         .map_err(|source| HttpError::Engine { source })?;
     let result = scoring
         .score_scenario(&cursor)
@@ -417,6 +533,12 @@ async fn score_completed_scenario(
         .map_err(|source| HttpError::Engine { source })?;
     let aggregation = scoring
         .scenario_aggregation(&cursor, &result)
+        .map_err(|source| HttpError::Engine { source })?;
+    entry
+        .state
+        .lock()
+        .await
+        .take_completed_scenario(scenario_id)
         .map_err(|source| HttpError::Engine { source })?;
     entry.scenario_results.lock().await.push(result);
     entry.scenario_aggregations.lock().await.push(aggregation);
@@ -438,7 +560,7 @@ async fn finalize_run(state: &AppState, entry: &RunEntry) -> Result<(), HttpErro
     let result = scoring
         .finalize(
             RunIdentity {
-                run_id,
+                run_id: run_id.clone(),
                 eval_ref,
                 started_at,
                 ended_at: Utc::now(),
@@ -447,5 +569,7 @@ async fn finalize_run(state: &AppState, entry: &RunEntry) -> Result<(), HttpErro
         )
         .map_err(|source| HttpError::Engine { source })?;
     *entry.run_result.lock().await = Some(result);
+    // Evict the completed run entry; results are now in the caller's hands.
+    state.runs.remove(&run_id);
     Ok(())
 }

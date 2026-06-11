@@ -39,7 +39,7 @@ fn local_records_run_scores_fixture_records() {
         .success()
         .stdout(predicate::str::contains("pass_gate: PASS"));
 
-    let raw = std::fs::read_to_string(out_dir.join("SUMMARY.json")).expect("summary reads");
+    let raw = std::fs::read_to_string(out_dir.join("results.json")).expect("summary reads");
     let summary: Value = serde_json::from_str(&raw).expect("summary json");
     assert_eq!(summary["metrics"]["total_tasks"], 2);
     assert_eq!(summary["metrics"]["passed_tasks"], 2);

@@ -91,8 +91,6 @@ pub fn write_results(
     std::fs::create_dir_all(&out_dir).map_err(|source| WyrdCliError::Io { source })?;
     run.save(&out_dir.join("results.json"))
         .map_err(|source| WyrdCliError::EvalEngine { source })?;
-    run.save(&out_dir.join("SUMMARY.json"))
-        .map_err(|source| WyrdCliError::EvalEngine { source })?;
     if let Some(comparison) = comparison {
         comparison
             .save(&out_dir.join("comparison.json"))

@@ -62,7 +62,7 @@ pub enum WyrdCliError {
     ServerRejectsRecords,
 
     /// Scenarios are required for local agent-driving.
-    #[error("--local --agent-url requires --scenarios <PATH> in this stage")]
+    #[error("--local --agent-url requires --scenarios <PATH>")]
     #[wyrd_error(
         code = "WYRD_CLI_400_SCENARIOS_REQUIRED",
         status = 400,
@@ -72,7 +72,7 @@ pub enum WyrdCliError {
     ScenariosRequired,
 
     /// LLM judge tasks require the deterministic mock until provider wiring lands.
-    #[error("LLM judge tasks require --judge-mock in this CLI stage")]
+    #[error("LLM judge tasks require --judge-mock")]
     #[wyrd_error(
         code = "WYRD_CLI_400_JUDGE_MOCK_REQUIRED",
         status = 400,

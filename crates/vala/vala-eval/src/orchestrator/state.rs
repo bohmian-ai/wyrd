@@ -383,6 +383,34 @@ impl RunState {
 
     /// Take a completed scenario cursor for scoring.
     ///
+    /// Return a clone of a completed scenario cursor without removing it.
+    ///
+    /// Use this before scoring to ensure the cursor survives a scoring
+    /// failure. Call [`Self::take_completed_scenario`] only after scoring and
+    /// aggregation succeed.
+    ///
+    /// # Errors
+    /// Returns [`OrchestratorError::ScenarioNotReady`] when the scenario has
+    /// not completed yet.
+    pub fn peek_completed_scenario(
+        &self,
+        scenario_id: &ScenarioId,
+    ) -> Result<ScenarioCursor, OrchestratorError> {
+        self.completed
+            .iter()
+            .find(|cursor| &cursor.scenario.id == scenario_id)
+            .cloned()
+            .ok_or_else(|| OrchestratorError::ScenarioNotReady {
+                scenario_id: scenario_id.clone(),
+            })
+    }
+
+    /// Remove a completed scenario cursor.
+    ///
+    /// Call this only after scoring and aggregation for the scenario have
+    /// succeeded. On any scoring failure, leave the cursor in place so the
+    /// next [`Self::next`] retry can attempt scoring again.
+    ///
     /// # Errors
     /// Returns [`OrchestratorError::ScenarioNotReady`] when the scenario has not
     /// completed or was already taken.

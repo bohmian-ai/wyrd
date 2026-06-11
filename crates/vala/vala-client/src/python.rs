@@ -136,8 +136,8 @@ fn history_to_pylist(py: Python<'_>, history: &[ConversationTurn]) -> PyResult<P
         item.set_item(
             "role",
             match turn.role {
-                TurnRole::User => "User",
-                TurnRole::Agent => "Agent",
+                TurnRole::User => "user",
+                TurnRole::Agent => "agent",
             },
         )?;
         item.set_item("content", &turn.content)?;

@@ -55,3 +55,16 @@ The full Wyrd error catalog is not emitted as a standalone generated file yet. T
 | `WYRD_WORKFLOW_422_MISSING_DEPENDENCY` | 422 | A step depends on an id that does not exist. |
 | `WYRD_WORKFLOW_422_DUPLICATE_STEP_ID` | 422 | Two steps share the same id. |
 | `WYRD_WORKFLOW_422_MISSING_PARAMETER` | 422 | A prompt placeholder exists in neither workflow input nor upstream parameters. |
+
+## Eval protocol codes
+
+| Code | Status | When |
+| --- | --- | --- |
+| `WYRD_EVAL_404_RUN_NOT_FOUND` | 404 | The `run_id` path parameter does not match any open run. Re-open with `POST /api/v1/eval/runs`. |
+| `WYRD_EVAL_401_MISSING_LEASE` | 401 | The request did not include an `Authorization: Bearer <token>` header. Send the `lease_token` from the open response. |
+| `WYRD_EVAL_403_INVALID_LEASE` | 403 | The bearer token does not match the lease minted for the run. Re-open the run; leases are bound to one run. |
+| `WYRD_EVAL_401_API_KEY_INVALID` | 401 | The server has `WYRD_API_KEY` set and the request did not send a matching bearer token. |
+| `WYRD_EVAL_409_SUBMISSION_MISMATCH` | 409 | The submission kind, scenario id, or turn counter does not match the outstanding directive. Call `/next` to retrieve the current directive and retry. |
+| `WYRD_EVAL_429_TOO_MANY_RUNS` | 429 | The server has reached its concurrent-run cap. Wait for an existing run to complete, then retry. |
+| `WYRD_EVAL_500_RUN_FAILED` | 500 | The eval engine, simulator, or scenario loader encountered an internal error. Inspect server logs for the chained detail. |
+| `WYRD_EVAL_500_RESULTS_PERSISTENCE_FAILED` | 500 | Results serialization or filesystem write failed after the run completed. Inspect server logs and available disk space. |

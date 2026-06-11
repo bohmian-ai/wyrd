@@ -86,8 +86,8 @@ Tool and system details stay inside the agent runtime and workflow envelope.
 ## Per-run lease auth
 
 The open response includes a per-run lease token. Every post-open request sends
-it as `Authorization: Bearer <lease_token>`. `vala-http::eval::auth` compares
-that token against the stored run lease before allowing the next transition.
+it as `Authorization: Bearer <lease_token>`. The route handlers compare that
+token against the stored run lease before allowing the next transition.
 
 The v1 HTTP router stores run state in memory for a single process. The future
 `vala-control` migration moves lease and run state into a durable control-plane

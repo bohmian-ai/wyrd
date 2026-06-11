@@ -45,7 +45,7 @@ async fn local_agent_run_writes_summary() {
         .success()
         .stdout(predicate::str::contains("pass_gate"));
 
-    assert!(out_dir.join("SUMMARY.json").exists());
+    assert!(out_dir.join("results.json").exists());
 }
 
 #[tokio::test]

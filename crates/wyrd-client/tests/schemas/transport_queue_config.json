@@ -1,0 +1,352 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "QueueConfig",
+  "description": "Shared queue policy for all per-record queues.",
+  "type": "object",
+  "required": [
+    "channel_capacity",
+    "flush_interval_ms",
+    "flush_max_rows",
+    "transport"
+  ],
+  "properties": {
+    "channel_capacity": {
+      "description": "Bounded channel capacity from the user thread to the flush worker.",
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    },
+    "flush_interval_ms": {
+      "description": "Flush at most every N milliseconds regardless of buffer fill.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "flush_max_rows": {
+      "description": "Flush when the buffer reaches this row count. Must be at least 1.",
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    },
+    "sample_ratio": {
+      "description": "Optional drop gate. `None` means no sampling.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "transport": {
+      "description": "Transport variant this queue sends to.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TransportConfig"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "GrpcConfig": {
+      "description": "Configuration for the gRPC transport.\n\ngRPC is the default transport for `wyrd-client`. The server-side endpoint is the Wyrd ingest gateway or any compatible tonic-based receiver.",
+      "type": "object",
+      "required": [
+        "connect_retries",
+        "endpoint",
+        "timeout_ms"
+      ],
+      "properties": {
+        "auth": {
+          "description": "Optional bearer token or mTLS identity reference.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "connect_retries": {
+          "description": "Connection-level retry budget.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "endpoint": {
+          "description": "gRPC server endpoint. Must be `http://host:port` or `https://host:port`.",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "Per-call timeout in milliseconds. Must be at least 1.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tls": {
+          "description": "Optional TLS configuration.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TlsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "HttpConfig": {
+      "description": "Configuration for the HTTP transport.\n\nThe HTTP transport is a fallback for environments where gRPC is unavailable or blocked. Ingest routes are appended by the client at call time.",
+      "type": "object",
+      "properties": {
+        "auth": {
+          "description": "Optional authorization credential reference.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "base_url": {
+          "description": "Base URL for all ingest routes. Must be non-empty.",
+          "default": "http://localhost:50050",
+          "type": "string"
+        },
+        "compression": {
+          "description": "Whether to gzip-compress request bodies.",
+          "default": false,
+          "type": "boolean"
+        },
+        "timeout_ms": {
+          "description": "Request timeout in milliseconds. Must be at least 1.",
+          "default": 30000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tls": {
+          "description": "Optional TLS configuration.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TlsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "MockConfig": {
+      "description": "Configuration for the mock in-memory loopback transport.",
+      "type": "object",
+      "required": [
+        "label"
+      ],
+      "properties": {
+        "fail_on_flush": {
+          "description": "Inject a flush failure on the `nth` flush. `None` means never fail.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "label": {
+          "description": "Buffer label used by the mock recorder implementation.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SecretRef": {
+      "description": "Pointer into the Wyrd runtime secret store.\n\nThe `Inline` variant is compiled only for `cfg(test)` inside `wyrd-spec` or when the `test-utils` feature is enabled. Public schema goldens are generated without `test-utils`, so `inline` is absent from production schemas.",
+      "oneOf": [
+        {
+          "description": "Environment variable name.",
+          "type": "object",
+          "required": [
+            "name",
+            "source"
+          ],
+          "properties": {
+            "name": {
+              "description": "Environment variable name. Must be non-empty when resolved.",
+              "type": "string"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "env"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Local filesystem path to a file containing the secret value.",
+          "type": "object",
+          "required": [
+            "path",
+            "source"
+          ],
+          "properties": {
+            "path": {
+              "description": "File path. Must be non-empty when resolved.",
+              "type": "string"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "file"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Backend-agnostic key in an external secret manager.",
+          "type": "object",
+          "required": [
+            "key",
+            "source"
+          ],
+          "properties": {
+            "key": {
+              "description": "Secret-manager key path. Interpretation is backend-specific.",
+              "type": "string"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "vault"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TlsConfig": {
+      "description": "TLS configuration for a transport connection.",
+      "type": "object",
+      "properties": {
+        "ca_cert": {
+          "description": "PEM-encoded CA certificate bundle.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_cert": {
+          "description": "PEM-encoded client certificate for mTLS.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key": {
+          "description": "PEM-encoded client private key for mTLS.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "insecure_skip_verify": {
+          "description": "Disable peer certificate verification. Defaults to `false`.",
+          "default": false,
+          "type": "boolean"
+        },
+        "server_name_override": {
+          "description": "Override the server name used in SNI and certificate verification.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "TransportConfig": {
+      "description": "Wyrd client transport selection.\n\ngRPC is the default. Queue-backed transports are intentionally absent in this phase and are reserved for a follow-on transport plan.",
+      "oneOf": [
+        {
+          "description": "gRPC transport. Gated on `transport-grpc`.",
+          "type": "object",
+          "required": [
+            "params",
+            "transport"
+          ],
+          "properties": {
+            "params": {
+              "$ref": "#/definitions/GrpcConfig"
+            },
+            "transport": {
+              "type": "string",
+              "enum": [
+                "grpc"
+              ]
+            }
+          }
+        },
+        {
+          "description": "HTTP transport. Gated on `transport-http`.",
+          "type": "object",
+          "required": [
+            "params",
+            "transport"
+          ],
+          "properties": {
+            "params": {
+              "$ref": "#/definitions/HttpConfig"
+            },
+            "transport": {
+              "type": "string",
+              "enum": [
+                "http"
+              ]
+            }
+          }
+        },
+        {
+          "description": "In-memory loopback transport for tests. Always available.",
+          "type": "object",
+          "required": [
+            "params",
+            "transport"
+          ],
+          "properties": {
+            "params": {
+              "$ref": "#/definitions/MockConfig"
+            },
+            "transport": {
+              "type": "string",
+              "enum": [
+                "mock"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -3877,6 +3877,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vala-core"
+version = "0.0.1"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "wyrd-spec",
+]
+
+[[package]]
 name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4534,6 +4545,19 @@ dependencies = [
 [[package]]
 name = "wyrd-cli"
 version = "0.0.1"
+
+[[package]]
+name = "wyrd-client"
+version = "0.0.1"
+dependencies = [
+ "pyo3",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "wyrd-spec",
+]
 
 [[package]]
 name = "wyrd-crypt"

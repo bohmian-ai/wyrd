@@ -1,0 +1,26 @@
+[package]
+name = "vala-core"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "Vala server-internal analytical and alert-routing core."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+schemars = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+wyrd-spec = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[[example]]
+name = "gen_schemas"
+path = "examples/gen_schemas.rs"

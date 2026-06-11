@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MockConfig",
+  "description": "Configuration for the mock in-memory loopback transport.",
+  "type": "object",
+  "required": [
+    "label"
+  ],
+  "properties": {
+    "fail_on_flush": {
+      "description": "Inject a flush failure on the `nth` flush. `None` means never fail.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "label": {
+      "description": "Buffer label used by the mock recorder implementation.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

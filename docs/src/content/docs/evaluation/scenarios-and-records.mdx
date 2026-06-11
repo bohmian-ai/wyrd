@@ -1,0 +1,94 @@
+---
+title: "Scenarios and records"
+description: "How scenarios produce EvalRecord evidence through the eval turn protocol."
+---
+
+# Scenarios and records
+
+## Scenarios as runtime units
+
+A `Scenario` is one runtime case. The orchestrator drives the agent through the
+scenario, captures conversation history, scores passenger-view scenario tasks,
+and gathers mechanic-view `EvalRecord` observations emitted by the agent or
+the protocol client.
+
+One scenario produces one scenario result inside `EvalResults`. A run can have
+many scenarios. Aggregation rolls up per-scenario, per-subject, per-task, and
+run-level metrics.
+
+```yaml
+collection_id: customer-support-smoke
+scenarios:
+  - id: refund_status
+    initial_query: "Where is my refund?"
+    expected_outcome: "The agent explains how to check refund status."
+    predefined_turns:
+      - "The order number is 12345."
+    max_turns: 4
+    tasks:
+      - id: mentions_status
+        operator: contains
+        expected: "status"
+```
+
+Scenario data belongs in a `DataCard` payload whose content kind identifies an
+eval scenario collection. It is test data, not a new card kind.
+
+## Three simulated-user sources
+
+| Source | When to use | Notes |
+|---|---|---|
+| Scripted scenario turns | Deterministic CI, replayable cases, and lowest cost | `initial_query` and `predefined_turns` are part of the scenario data |
+| `server` | Realistic multi-turn dialogues through a Skald persona | Uses server-side simulated-user generation when the scenario needs another user turn |
+| `client` | Caller drives the user side through a callback or CLI script | Python SDK uses `simulated_user_fn`; CLI uses `--simulated-user-script` |
+
+The protocol mode is `server` or `client`. Scripted turns are always honored
+first from scenario data.
+
+## The turn protocol
+
+The server-hosted protocol is a pull loop:
+
+1. Client posts `POST /api/v1/eval/runs` with `{ eval_ref, simulated_user }`.
+2. Server returns `{ run_id, lease_token }`.
+3. Client posts `POST /api/v1/eval/runs/{run_id}/next`.
+4. Server returns one `TurnDirective`.
+5. On `agent_turn`, the caller invokes its agent with `{ message, history }`.
+6. Caller posts the response and emitted records to
+   `POST /api/v1/eval/runs/{run_id}/agent-turn`.
+7. On `user_turn_needed`, the client supplies the next user message to
+   `POST /api/v1/eval/runs/{run_id}/user-turn`.
+8. On `scenario_complete`, the client asks for the next directive.
+9. On `run_complete`, the protocol ends.
+
+The server owns `RunState`: scenario cursor, turn cursor, lease state,
+termination, scoring, aggregation, and judge invocation. The client owns only
+the agent callback and, in `client` mode, the next simulated-user message.
+See [OpenAPI](/api/openapi/) for the generated route reference.
+
+## EvalRecord envelope
+
+`EvalRecord` evidence is carried as `EvalRecordObservation`. It has stable
+record identity, `run_id`, optional `session_id`, `eval_ref`, a JSON `context`
+payload, optional `trace_id` and `span_id`, and `created_at`.
+
+During scoring, the runtime turns records into task outputs:
+
+- assertion outputs from `AssertionTask`
+- judge outputs from `LlmJudgeTask`
+- trace outputs from `TraceAssertionTask`
+- agent outputs from `AgentAssertionTask`
+
+The protocol history uses `ConversationTurn[]` with `{ role, content }`, where
+role is `User` or `Agent` in Python and `user` or `agent` on the JSON wire.
+Tool and system details stay inside the agent runtime and workflow envelope.
+
+## Per-run lease auth
+
+The open response includes a per-run lease token. Every post-open request sends
+it as `Authorization: Bearer <lease_token>`. `vala-http::eval::auth` compares
+that token against the stored run lease before allowing the next transition.
+
+The v1 HTTP router stores run state in memory for a single process. The future
+`vala-control` migration moves lease and run state into a durable control-plane
+backend without changing the client-owned turn loop.

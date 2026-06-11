@@ -107,6 +107,20 @@ export default defineConfig({
                 { label: "Lock and install a service", link: "/guides/lock-install-service/" },
                 { label: "Policy and audit", link: "/policy-audit/" },
                 { label: "Observability", link: "/observability/" },
+                {
+                  label: "Evaluation",
+                  collapsed: true,
+                  items: [
+                    { label: "Overview", link: "/evaluation/" },
+                    { label: "EvalCard and tasks", link: "/evaluation/eval-card-and-tasks/" },
+                    { label: "Scenarios and records", link: "/evaluation/scenarios-and-records/" },
+                    { label: "Running evals", link: "/evaluation/running-evals/" },
+                    { label: "Results and comparison", link: "/evaluation/results-and-comparison/" },
+                    { label: "Python SDK", link: "/evaluation/python-sdk/" },
+                    { label: "Comparison", link: "/evaluation/comparison/" },
+                    { label: "Discussion", link: "/evaluation/discussion/" },
+                  ],
+                },
               ],
             },
             {

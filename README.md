@@ -11,7 +11,6 @@ mise install
 mise run dev:full
 # UI: http://localhost:3000
 # wyrd-server: http://localhost:8080/healthz
-# wyrd-observability-server: http://localhost:8090/healthz
 ```
 
 ## Layout

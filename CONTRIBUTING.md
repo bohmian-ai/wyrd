@@ -33,7 +33,6 @@ The local dev stack starts:
 
 - UI: <http://localhost:3000>
 - wyrd-server: <http://localhost:8080/healthz>
-- wyrd-observability-server: <http://localhost:8090/healthz>
 
 All developer tasks live in `mise.toml`. There is no `Makefile` and no
 `justfile`. Run `mise tasks` to list available commands.

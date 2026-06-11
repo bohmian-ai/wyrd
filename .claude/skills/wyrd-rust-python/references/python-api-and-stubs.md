@@ -1,7 +1,10 @@
 # Python API And Stubs
 
-The Python package is a typed, ergonomic surface over Rust-owned behavior. Do
-not duplicate core logic in Python.
+The Python package is a first-class typed client over Wyrd server contracts and
+Rust-owned local boundary behavior. It may provide ergonomic authoring helpers,
+OTEL hooks, agent workflow integrations, generated stubs, and Python-native
+tests, but it must not duplicate durable server logic or become the source of
+truth for API behavior.
 
 ## Export Checklist
 
@@ -31,6 +34,8 @@ is intentionally the public shape for the feature.
 - Keep helpers small and ergonomic.
 - Use typed dataclasses or Pydantic models only when Python owns the user-facing
   shape.
+- Preserve server/API field names for durable contract data; do not invent
+  Python-only vocabulary for stored facts.
 - Avoid hidden IO in constructors.
 - Avoid global mutable state.
 - Use `uv run` through repo tasks when available.

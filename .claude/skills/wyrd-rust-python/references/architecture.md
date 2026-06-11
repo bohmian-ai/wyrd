@@ -1,7 +1,21 @@
 # Architecture
 
-Wyrd is a Rust-first platform with Python, HTTP, MCP, CLI, and UI surfaces over
-shared contracts. Keep behavior in the owning layer and expose typed boundaries.
+Wyrd is a language-agnostic client/server platform. The server owns durable
+behavior and core logic in Rust. Contracts live on the API wire through typed
+schemas, HTTP/MCP payloads, generated docs, and stable errors so any language
+can implement a client.
+
+Rust and Python are first-class client languages with extra SDK ergonomics and
+integrations where appropriate, such as OTEL hooks, local authoring helpers,
+and agent workflow integration. Those integrations must remain projections over
+server contracts; they must not duplicate durable server behavior or make Wyrd
+language-exclusive.
+
+Wyrd must support both self-hosted deployments and cloud SaaS deployments where
+multiple enterprise tenants share the platform with full separation. Wyrd is
+agent-first and headless: MCP, CLI, HTTP, generated schemas, stable errors, and
+machine-readable docs are primary surfaces. The developer UI is supported, but
+it is not the source of truth.
 
 ## Crate Ownership
 
@@ -53,6 +67,10 @@ as `wyrd-interfaces` and `wyrd-cards`, behind optional `python` features.
 
 Server handlers should:
 
+- Own durable side effects and never rely on a language SDK as the source of
+  truth.
+- Preserve tenant isolation for identity, authz, registry, storage, policy,
+  audit, observability, evaluation, and generated artifacts.
 - Accept typed request structs.
 - Return typed response structs or structured Wyrd errors.
 - Carry trace instrumentation.
@@ -62,6 +80,19 @@ Server handlers should:
 
 Shared application state should be explicit. Use `Arc` for heavy clients only
 when shared ownership is real.
+
+## Client Pattern
+
+Clients should:
+
+- Project server contracts without renaming durable fields.
+- Use API-wire schemas and stable error codes as the compatibility boundary.
+- Keep local helpers local: authoring, local save/load, local validation
+  messages, tracing hooks, and runtime integrations are allowed.
+- Avoid durable side effects that bypass server registry, storage, policy,
+  audit, tenancy, relationship, or status ownership.
+- Treat Rust and Python as first-class clients, not privileged sources of
+  product truth.
 
 ## Storage And Registry Pattern
 

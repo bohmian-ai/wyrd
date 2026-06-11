@@ -72,6 +72,25 @@ If behavior crosses boundaries, put the durable contract in `wyrd-spec`, keep
 runtime implementation in the owning crate, and expose only the necessary API
 through server/Python/client layers.
 
+## Platform Posture
+
+- Wyrd follows a language-agnostic client/server model. The server owns durable
+  behavior and core logic; clients project API-wire contracts.
+- Core durable logic is Rust-only server/service logic. Contracts cross the API
+  wire through typed schemas, HTTP/MCP payloads, generated docs, and stable
+  errors so any language can implement a client.
+- Rust and Python are first-class client languages. They may receive richer SDK
+  ergonomics, local authoring helpers, OTEL integration, agent workflow
+  integration, and test tooling where useful.
+- First-class Rust/Python support must not make Wyrd language-exclusive and
+  must not move server-owned durable behavior into client packages.
+- Wyrd must run self-hosted and as a cloud SaaS product. Enterprise SaaS paths
+  require full tenant separation for identity, authz, registry, storage,
+  policy, audit, observability, evaluation, and generated artifacts.
+- Wyrd is agent-first and headless. MCP, CLI, HTTP, generated schemas, stable
+  errors, and machine-readable docs are primary surfaces. The developer UI is
+  supported, but it is not the source of truth.
+
 ## Rust Core Rules
 
 - Keep core behavior in Rust. Python should be typed and ergonomic, not a
@@ -166,6 +185,12 @@ then run the codegen task.
 
 ## Server And Contract Rules
 
+- Server code owns durable behavior, side effects, tenancy checks, registry
+  writes, storage orchestration, policy decisions, audit records, and generated
+  relationship/status state.
+- Client code may own ergonomic authoring helpers, local save/load, local
+  validation messages, tracing hooks, and runtime integrations, but it must not
+  become the durable source of truth.
 - Public request/response bodies are typed structs.
 - Wire types derive schema support where required by the current feature gate.
 - Public handlers must return structured Wyrd errors.
@@ -174,6 +199,7 @@ then run the codegen task.
   local server pattern.
 - Keep versioned API contracts explicit.
 - Do not add compatibility routes or aliases for old surfaces.
+- Preserve tenant isolation across every public and internal server path.
 
 ## Provider, Evaluation, And Observability Rules
 

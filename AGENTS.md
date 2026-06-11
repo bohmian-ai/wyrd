@@ -42,6 +42,25 @@ Locked cross-cutting decisions that any contributor must honor:
   generated schemas, and agent-facing contracts must align with it.
 - Wyrd is the AI layer for human and agentic workflows, not a general-purpose framework or
   runtime for arbitrary code execution.
+- Wyrd follows a language-agnostic client/server model. The Wyrd server owns
+  durable behavior and core logic; clients project server contracts and call
+  API surfaces.
+- Core durable logic is Rust-only server logic. Contracts live on the API wire
+  through typed schemas, HTTP/MCP payloads, generated docs, and stable error
+  codes so any language can implement a Wyrd client.
+- Python and Rust are first-class client languages. They may receive richer
+  SDK ergonomics, local authoring helpers, OTEL integration, agent workflow
+  integration, and test tooling when useful, but those features must not move
+  server-owned durable behavior out of the server or make the product
+  language-exclusive.
+- Wyrd must work both self-hosted and as a cloud SaaS product. SaaS and
+  enterprise deployments require full tenant separation for identity, authz,
+  storage, registry, policy, audit, observability, evaluation, and generated
+  artifacts.
+- Wyrd is agent-first and headless. MCP, CLI, HTTP, generated schemas, stable
+  errors, and machine-readable docs are primary surfaces. The developer UI is
+  useful and supported, but it is not the source of truth and must not be the
+  only way to perform a workflow.
 - Every registered AI system component is a `Card` with the shared envelope:
   `apiVersion: wyrd/v1`, top-level `metadata`, `kind`, `spec`,
   server-derived `relationships`, and server-managed `status`. There is no
@@ -90,8 +109,9 @@ Locked cross-cutting decisions that any contributor must honor:
   Python-facing tests, and submodule aggregation.
 
 When behavior crosses boundaries, put the durable contract in `wyrd-spec`, keep
-runtime in the owning crate, and expose only the necessary API through
-server/Python/client layers.
+durable server behavior in Rust-owned server/service crates, and expose the
+necessary API through language-agnostic wire contracts plus first-class Rust
+and Python client surfaces where appropriate.
 
 ## 4. Rust Core Rules
 
@@ -193,6 +213,12 @@ then run codegen.
 
 ## 9. Server And Contract Rules
 
+- Server code owns durable behavior, side effects, tenancy checks, registry
+  writes, storage orchestration, policy decisions, audit records, and generated
+  relationship/status state.
+- Client code, including first-class Rust and Python SDKs, may own ergonomic
+  authoring helpers, local save/load, local validation messages, tracing hooks,
+  and runtime integrations, but it must not become the durable source of truth.
 - Public request/response bodies are typed structs.
 - Wire types derive schema support where required by the feature gate.
 - Public handlers return structured Wyrd errors via the `WyrdError` derive.
@@ -202,6 +228,7 @@ then run codegen.
   local server pattern.
 - Versioned API contracts are explicit.
 - Do not add compatibility routes or aliases for old surfaces.
+- Preserve tenant isolation across every public and internal server path.
 
 ## 10. Provider, Evaluation, Observability Rules
 

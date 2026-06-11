@@ -3,8 +3,8 @@
 #### begin imports ####
 from collections.abc import Callable
 from typing import Any, Literal, TypedDict
-#### end of imports ####
 
+#### end of imports ####
 
 class ConversationTurn(TypedDict):
     """One turn of conversation history."""
@@ -12,20 +12,17 @@ class ConversationTurn(TypedDict):
     role: Literal["user", "agent"]
     content: str
 
-
 class AgentTurnResponse(TypedDict, total=False):
     """Return shape accepted from agent_fn."""
 
     response: str
     records: list[dict[str, Any]]
 
-
 class RunSummary(TypedDict):
     """Summary returned when the server emits RunComplete."""
 
     run_id: str
     server_url: str
-
 
 def run_eval(
     server_url: str,
@@ -56,7 +53,6 @@ def run_eval(
             responses, or callback exceptions.
     """
     ...
-
 
 __all__ = [
     "AgentTurnResponse",

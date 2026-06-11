@@ -39,9 +39,7 @@ def test_protocol_client_scripted_run_completes_and_records_submissions():
 
     assert summary["run_id"] == TEST_RUN_ID
     assert agent_calls == [("hello", [])]
-    assert mock.received_agent_turns == [
-        {"scenario_id": "scn-1", "turn": 0, "response": "world"}
-    ]
+    assert mock.received_agent_turns == [{"scenario_id": "scn-1", "turn": 0, "response": "world"}]
     assert mock.received_open == {
         "eval_ref": {
             "kind": "Eval",

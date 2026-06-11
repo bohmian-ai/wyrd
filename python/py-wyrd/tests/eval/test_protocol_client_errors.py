@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from wyrd import WyrdError
 from wyrd.eval import run_eval
 

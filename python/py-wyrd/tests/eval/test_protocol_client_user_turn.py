@@ -50,9 +50,5 @@ def test_protocol_client_delegated_user_turn_round_trips():
     finally:
         server.shutdown()
 
-    assert mock.received_user_turns == [
-        {"scenario_id": "scn-1", "turn": 1, "message": "follow up"}
-    ]
-    assert mock.received_agent_turns == [
-        {"scenario_id": "scn-1", "turn": 1, "response": "ack"}
-    ]
+    assert mock.received_user_turns == [{"scenario_id": "scn-1", "turn": 1, "message": "follow up"}]
+    assert mock.received_agent_turns == [{"scenario_id": "scn-1", "turn": 1, "response": "ack"}]

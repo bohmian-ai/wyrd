@@ -37,7 +37,7 @@ def test_protocol_client_delegated_user_turn_round_trips():
             return "ack"
 
         def simulated_user_fn(history):
-            assert history[-1]["role"] == "Agent"
+            assert history[-1]["role"] == "agent"
             return "follow up"
 
         run_eval(

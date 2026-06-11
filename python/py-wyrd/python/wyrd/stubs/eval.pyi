@@ -9,7 +9,7 @@ from typing import Any, Literal, TypedDict
 class ConversationTurn(TypedDict):
     """One turn of conversation history."""
 
-    role: Literal["User", "Agent"]
+    role: Literal["user", "agent"]
     content: str
 
 

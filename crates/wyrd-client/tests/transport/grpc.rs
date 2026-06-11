@@ -96,7 +96,9 @@ fn grpc_rejects_unknown_fields() {
 }
 
 fn assert_config_error(err: WyrdClientError, expected_field: &str, expected_reason: &str) {
-    let WyrdClientError::Config { field, reason } = err;
+    let WyrdClientError::Config { field, reason } = err else {
+        panic!("expected WyrdClientError::Config");
+    };
     assert_eq!(field, expected_field);
     assert_eq!(reason, expected_reason);
 }

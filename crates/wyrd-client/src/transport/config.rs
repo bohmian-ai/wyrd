@@ -295,3 +295,94 @@ impl TransportConfig {
         }
     }
 }
+
+/// Shared queue policy for all per-record queues.
+///
+/// Every per-record queue in `wyrd-client` (`PsiFeatureQueue`,
+/// `SpcFeatureQueue`, `CustomMetricQueue`, `EvalRecordQueue`,
+/// `AgentTaskQueue`, `DatasetQueue`, `ObservationQueue`, `SpanQueue`,
+/// `QueueBus`) embeds a `QueueConfig` and uses it to decide when to flush.
+///
+/// # Validation
+///
+/// Call [`QueueConfig::validate`] before passing a config to a queue
+/// constructor. The constructor in `wyrd-client` must call `validate` and
+/// propagate the error rather than panicking.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QueueConfig {
+    /// Transport variant this queue sends to.
+    pub transport: TransportConfig,
+
+    /// Flush when the buffer reaches this row count. Must be at least 1.
+    ///
+    /// Default: `10_000` (predecessor parity).
+    pub flush_max_rows: usize,
+
+    /// Flush at most every N milliseconds regardless of buffer fill. Must be
+    /// at least 1. Default: `5_000` (predecessor parity).
+    pub flush_interval_ms: u64,
+
+    /// Bounded channel capacity from the user thread to the flush worker.
+    /// Must be at least 1. Default: `100` (predecessor parity).
+    pub channel_capacity: usize,
+
+    /// Optional drop gate. When `Some(p)`, each record is kept with
+    /// probability `p` and dropped otherwise. `p` must be in `[0.0, 1.0]`.
+    /// `None` means no sampling (all records kept).
+    ///
+    /// Predecessor behavior scattered this across per-queue types. Wyrd
+    /// lifts it to `QueueConfig` so all queues share one policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_ratio: Option<f64>,
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            transport: TransportConfig::default(),
+            flush_max_rows: 10_000,
+            flush_interval_ms: 5_000,
+            channel_capacity: 100,
+            sample_ratio: None,
+        }
+    }
+}
+
+impl QueueConfig {
+    /// Validate the config. Returns `Err` on any of:
+    ///
+    /// - `flush_max_rows < 1`
+    /// - `flush_interval_ms < 1`
+    /// - `channel_capacity < 1`
+    /// - `sample_ratio` is `Some(p)` with `p < 0.0`, `p > 1.0`, or `p` is NaN
+    pub fn validate(&self) -> Result<(), WyrdClientError> {
+        if self.flush_max_rows < 1 {
+            return Err(WyrdClientError::Config {
+                field: "queue_config.flush_max_rows".to_string(),
+                reason: "must be >= 1".to_string(),
+            });
+        }
+        if self.flush_interval_ms < 1 {
+            return Err(WyrdClientError::Config {
+                field: "queue_config.flush_interval_ms".to_string(),
+                reason: "must be >= 1".to_string(),
+            });
+        }
+        if self.channel_capacity < 1 {
+            return Err(WyrdClientError::Config {
+                field: "queue_config.channel_capacity".to_string(),
+                reason: "must be >= 1".to_string(),
+            });
+        }
+        if let Some(ratio) = self.sample_ratio {
+            if !(0.0..=1.0).contains(&ratio) {
+                return Err(WyrdClientError::Config {
+                    field: "queue_config.sample_ratio".to_string(),
+                    reason: format!("must be in [0.0, 1.0], got {ratio}"),
+                });
+            }
+        }
+        Ok(())
+    }
+}

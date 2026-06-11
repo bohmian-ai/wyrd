@@ -6,13 +6,14 @@
 //! `wyrd-spec::security`; this module imports them.
 //!
 //! Module map:
-//! - `config` — `TransportConfig` enum (`Grpc`, `Http`, `Mock`),
-//!   `GrpcConfig`, `HttpConfig`, `MockConfig`.
-//! - `queue` — per-record queue primitives.
+//! - `config` - `TransportConfig` enum (`Grpc`, `Http`, `Mock`),
+//!   `GrpcConfig`, `HttpConfig`, `MockConfig`, `QueueConfig`.
+//! - `queue` - per-record queue primitives.
 //!
 //! Queue-specific re-exports land with the queue primitives.
 
 pub mod config;
 pub mod queue;
 
-pub use config::{GrpcConfig, HttpConfig, MockConfig, TransportConfig};
+pub use config::{GrpcConfig, HttpConfig, MockConfig, QueueConfig, TransportConfig};
+pub use queue::Flushable;

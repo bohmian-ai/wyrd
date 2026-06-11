@@ -9,11 +9,6 @@
 //! [`ExecutionContext`] is a thin per-record wrapper the orchestrator
 //! constructs once per [`crate::context::RecordIdentity`]. It exposes the current
 //! snapshot to the driver.
-//!
-//! Predecessor reference (parity citation only):
-//! `scouter/crates/scouter_evaluate/src/evaluate/evaluator.rs::ExecutionContext`.
-//! Scouter's `Arc<RwLock<…>>` stores are dropped — executors return outputs
-//! instead of pushing into a shared store, so no locks are needed.
 
 use std::collections::HashMap;
 use std::sync::Arc;

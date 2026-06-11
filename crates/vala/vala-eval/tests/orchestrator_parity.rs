@@ -127,7 +127,6 @@ async fn drive(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scripted_walk_llm_judge_parity() {
-    // parity: scouter/crates/scouter_evaluate/tests/fixtures/single_turn_pass.json
     let fixture = fixture_value(include_str!("fixtures/parity/scripted_judge.json"));
     assert_eq!(fixture["expected_pass_rate"], json!(1.0));
     let run_id = wyrd_spec::vala::ids::RunId::from_string("scripted-parity-run".to_owned());
@@ -157,7 +156,6 @@ async fn scripted_walk_llm_judge_parity() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn termination_signal_parity() {
-    // parity: scouter/crates/scouter_evaluate/tests/fixtures/termination_signal.json
     let fixture = fixture_value(include_str!("fixtures/parity/termination_signal.json"));
     assert_eq!(fixture["expected_scenario_passed"], json!(true));
     let run_id = wyrd_spec::vala::ids::RunId::from_string("signal-parity-run".to_owned());
@@ -183,7 +181,6 @@ async fn termination_signal_parity() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn subject_aggregation_parity() {
-    // parity: scouter/crates/scouter_evaluate/tests/fixtures/subject_rollup.json
     let fixture = fixture_value(include_str!("fixtures/parity/subject_rollup.json"));
     assert_eq!(fixture["expected_subject_pass_rate"], json!(1.0));
     let run_id = wyrd_spec::vala::ids::RunId::from_string("subject-parity-run".to_owned());

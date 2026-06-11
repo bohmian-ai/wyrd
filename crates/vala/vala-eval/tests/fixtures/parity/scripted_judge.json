@@ -1,5 +1,4 @@
 {
   "name": "scripted_judge",
-  "parity_source": "scouter/crates/scouter_evaluate/tests/fixtures/single_turn_pass.json",
   "expected_pass_rate": 1.0
 }

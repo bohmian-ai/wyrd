@@ -1,5 +1,4 @@
 {
   "name": "termination_signal",
-  "parity_source": "scouter/crates/scouter_evaluate/tests/fixtures/termination_signal.json",
   "expected_scenario_passed": true
 }

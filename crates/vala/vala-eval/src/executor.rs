@@ -18,11 +18,9 @@
 //! keeps walking the DAG. Plan-level invariants (`EvalExecError::DagInvalid`)
 //! bubble out and abort the run.
 //!
-//! Predecessor reference (parity citation only):
-//! `scouter/crates/scouter_evaluate/src/evaluate/evaluator.rs` -
-//! `tokio::try_join!(assertions, judges, traces, agents)`. Wyrd keeps the
-//! four-bucket fan-out shape and drops the `Arc<RwLock<…>>` stores by having
-//! executors return outputs instead of writing into shared state.
+//! The four-bucket fan-out shape keeps task kinds concurrent within a stage.
+//! Executors return outputs rather than writing into shared state, so no locks
+//! are needed across the stage barrier.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;

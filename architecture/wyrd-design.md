@@ -871,8 +871,7 @@ Exact field schema for each context lives in OpenAPI.
 
 Two complementary mechanisms — `wyrd apply -f file.yaml` reads + registers in
 one move, and a `PromptRef` may be inlined where its own identity isn't
-needed. Together they support the single-file Scouter/opsml-style workflow
-without breaking Rule 1 ("cards are independent registry entries").
+needed.
 
 ### Pre-registration matrix (Rule 16)
 

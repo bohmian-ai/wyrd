@@ -7,7 +7,8 @@ use std::time::Duration;
 use chrono::Utc;
 use serde_json::Value;
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::vala::eval::EvalSpec;
+use wyrd_spec::vala::eval::record::EvalRecordObservation;
+use wyrd_spec::vala::eval::{EvalSpec, ScenarioId};
 
 use crate::tasks::{
     AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, MediaBindings, TraceTaskExecutor,
@@ -16,7 +17,8 @@ use crate::{
     AggregationInput, EvalResults, Executors, InMemoryTraceSource, JudgeInvoker,
     MechanicSubjectInput, RecordTaskResult, RecordWithMedia, ResultsConfig, RunIdentity,
     ScenarioAggregationInput, ScenarioExecutionInputs, ScenarioExecutionResults, SubjectKey,
-    TaskRegistry, TaskSummary, TraceSource, aggregate_run, execute_scenario,
+    TaskRegistry, TaskRunOutcome, TaskSummary, TraceSource, aggregate_run, execute_plan,
+    execute_scenario,
 };
 
 use super::{OrchestratorError, ScenarioCursor};
@@ -158,6 +160,83 @@ impl ScenarioScoring {
                 pass_gate: self.spec.pass_gate.clone(),
             },
         })?)
+    }
+
+    /// Score a batch of pre-collected eval records without driving scenarios.
+    ///
+    /// This is the degenerate replay path used by `wyrd eval run --records`.
+    /// Records do not carry scenario identity in the committed observation
+    /// contract, so the batch is aggregated under one synthetic scenario row.
+    ///
+    /// # Errors
+    /// Returns [`OrchestratorError`] when task execution or aggregation fails.
+    pub async fn score_record_batch(
+        &self,
+        identity: RunIdentity,
+        records: &[EvalRecordObservation],
+    ) -> Result<EvalResults, OrchestratorError> {
+        let scenario_id =
+            ScenarioId::new("records").map_err(|source| OrchestratorError::Invariant {
+                reason: format!("static records scenario id failed validation: {source}"),
+            })?;
+        let started_at = Utc::now();
+        let mut mechanic = Vec::new();
+
+        for record in records {
+            let record_with_media = RecordWithMedia {
+                record_id: record.record_id.clone(),
+                trace_id: record.trace_id,
+                context: record.context.clone(),
+                media: MediaBindings::new(),
+                required_media: Vec::new(),
+            };
+            let snapshot = crate::ContextSnapshot::new(
+                Arc::new(record_with_media.context.clone()),
+                crate::RecordIdentity {
+                    run_id: identity.run_id.clone(),
+                    record_id: record_with_media.record_id.clone(),
+                    scenario_id: Some(scenario_id.clone()),
+                },
+            )
+            .with_media(record_with_media.media, record_with_media.required_media);
+            let snapshot = if let Some(trace_id) = record_with_media.trace_id {
+                snapshot.with_trace_id(trace_id)
+            } else {
+                snapshot
+            };
+            let context = crate::ExecutionContext::from_snapshot(Arc::new(snapshot));
+            let report =
+                execute_plan(&self.plan, &context, &self.registry, &self.executors).await?;
+            for outcome in report.outcomes {
+                if let TaskRunOutcome::Ran(result) = outcome {
+                    mechanic.push(RecordTaskResult {
+                        record_id: record.record_id.clone(),
+                        result,
+                    });
+                }
+            }
+        }
+
+        let scenario = ScenarioExecutionResults {
+            scenario_id: scenario_id.clone(),
+            mechanic,
+            passenger: Vec::new(),
+        };
+        let aggregation = ScenarioAggregationInput {
+            scenario_id,
+            mechanic_results: mechanic_by_subject(
+                self.spec.subject_ref.as_ref(),
+                &scenario.mechanic,
+            )?,
+            passenger_tasks: Vec::new(),
+            conversation_history: Vec::new(),
+            started_at,
+            duration_ms: Utc::now()
+                .signed_duration_since(started_at)
+                .num_milliseconds()
+                .max(0) as u64,
+        };
+        self.finalize(identity, vec![aggregation])
     }
 }
 

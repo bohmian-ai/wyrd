@@ -5,11 +5,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::vala::eval::EvalScenario;
 use wyrd_spec::vala::eval::protocol::{
     AgentTurnSubmission, ConversationTurn, SimulatedUserMode, TurnDirective, UserTurnSubmission,
 };
 use wyrd_spec::vala::eval::record::EvalRecordObservation;
+use wyrd_spec::vala::eval::{EvalScenario, ScenarioId};
 
 use crate::{EvalResults, RunIdentity, ScenarioExecutionResults};
 
@@ -45,7 +45,12 @@ pub trait SimulatedUserFn: Send + Sync {
     ///
     /// # Errors
     /// Returns [`OrchestratorError`] when the callback fails.
-    async fn invoke(&self, history: &[ConversationTurn]) -> Result<String, OrchestratorError>;
+    async fn invoke(
+        &self,
+        scenario_id: &ScenarioId,
+        turn: u32,
+        history: &[ConversationTurn],
+    ) -> Result<String, OrchestratorError>;
 }
 
 /// Final outcome from an embedded run.
@@ -130,7 +135,7 @@ impl EmbeddedOrchestrator {
                                     .to_owned(),
                             }
                         })?;
-                        let message = callback.invoke(&history).await?;
+                        let message = callback.invoke(&scenario_id, turn, &history).await?;
                         state.submit_user_turn(UserTurnSubmission {
                             scenario_id,
                             turn,

@@ -13,7 +13,7 @@ default-members = [
     "crates/wyrd/wyrd-server",
     "crates/wyrd/wyrd-cli",
     "crates/wyrd/wyrd-mcp",
-    "crates/vala/wyrd-observability-server",
+    "crates/vala/vala-http",
 ]
 
 [workspace.package]
@@ -37,6 +37,7 @@ skald-workflow = { path = "crates/skald/skald-workflow", version = "0.0.1" }
 vala-client = { path = "crates/vala/vala-client", version = "0.0.1" }
 vala-drift = { path = "crates/vala/vala-drift", version = "0.0.1" }
 vala-eval = { path = "crates/vala/vala-eval", version = "0.0.1" }
+vala-http = { path = "crates/vala/vala-http", version = "0.0.1" }
 wyrd-observe = { path = "crates/shared/wyrd-observe", version = "0.0.1" }
 wyrd-utils = { path = "crates/shared/wyrd-utils", version = "0.0.1" }
 wyrd-version = { path = "crates/shared/wyrd-version", version = "0.0.1" }
@@ -63,6 +64,7 @@ wiremock = "0.6"
 temp-env = "0.3"
 tempfile = "3"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+dashmap = "6.1"
 flate2 = "1.*"
 zstd = "0.13"
 walkdir = "2.*"
@@ -77,6 +79,7 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 password-hash = { version = "0.5", features = ["getrandom"] }
 secrecy = "0.10"
+subtle = "2.6"
 zeroize = "1"
 governor = "0.10"
 rand = "0.9"

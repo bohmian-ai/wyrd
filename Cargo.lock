@@ -4470,6 +4470,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "vala-http"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "axum 0.8.9",
+ "chrono",
+ "dashmap 6.2.1",
+ "hyper",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower 0.5.3",
+ "tracing",
+ "vala-eval",
+ "wyrd-error-derive",
+ "wyrd-observe",
+ "wyrd-spec",
+]
+
+[[package]]
 name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5196,14 +5218,6 @@ name = "wyrd-mcp"
 version = "0.0.1"
 
 [[package]]
-name = "wyrd-observability-server"
-version = "0.0.1"
-dependencies = [
- "axum 0.8.9",
- "tokio",
-]
-
-[[package]]
 name = "wyrd-observe"
 version = "0.0.1"
 dependencies = [
@@ -5261,6 +5275,7 @@ version = "0.0.1"
 dependencies = [
  "axum 0.8.9",
  "tokio",
+ "vala-http",
  "wyrd-enterprise",
 ]
 

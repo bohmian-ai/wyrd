@@ -554,24 +554,20 @@ impl From<EvalExecError> for EvalError {
                     "depends_on": dep.as_str(),
                 }),
             },
-            EvalExecError::ResultsSerializeFailed { reason } => {
-                Self::ResultsPersistenceFailed {
-                    message,
-                    details: serde_json::json!({
-                        "operation": "serialize",
-                        "reason": reason,
-                    }),
-                }
-            }
-            EvalExecError::ResultsDeserializeFailed { reason } => {
-                Self::ResultsPersistenceFailed {
-                    message,
-                    details: serde_json::json!({
-                        "operation": "deserialize",
-                        "reason": reason,
-                    }),
-                }
-            }
+            EvalExecError::ResultsSerializeFailed { reason } => Self::ResultsPersistenceFailed {
+                message,
+                details: serde_json::json!({
+                    "operation": "serialize",
+                    "reason": reason,
+                }),
+            },
+            EvalExecError::ResultsDeserializeFailed { reason } => Self::ResultsPersistenceFailed {
+                message,
+                details: serde_json::json!({
+                    "operation": "deserialize",
+                    "reason": reason,
+                }),
+            },
             EvalExecError::ResultsIoFailed { path, reason } => Self::ResultsPersistenceFailed {
                 message,
                 details: serde_json::json!({

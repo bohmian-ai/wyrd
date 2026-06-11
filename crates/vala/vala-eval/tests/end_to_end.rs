@@ -305,8 +305,7 @@ async fn full_spec_against_in_memory_record_and_spans_aggregates_correctly() {
     // the only thing this assertion is measuring.
     let spec = full_spec();
     let plan = spec.execution_plan().expect("plan validates");
-    let registry =
-        TaskRegistry::from_plan(&plan, spec.tasks.clone()).expect("registry from plan");
+    let registry = TaskRegistry::from_plan(&plan, spec.tasks.clone()).expect("registry from plan");
 
     let trace_source = Arc::new(InMemoryTraceSource::new());
     trace_source.insert(trace_id(), vec![agent_span()]).await;

@@ -34,7 +34,6 @@ use wyrd_spec::card::workflow::WorkflowSpec;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::run::{RunKind, RunRef};
-use wyrd_spec::security::{SecretRef, TlsConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = Path::new("crates/wyrd-spec/schemas");
@@ -95,8 +94,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<AuditSpec>(out, golden, "audit_spec")?;
     write::<ArtifactSpec>(out, golden, "artifact_spec")?;
     write::<FrameworkAdapterRef>(out, golden, "framework_adapter_ref")?;
-    write::<SecretRef>(out, golden, "security_secret_ref")?;
-    write::<TlsConfig>(out, golden, "security_tls_config")?;
     Ok(())
 }
 

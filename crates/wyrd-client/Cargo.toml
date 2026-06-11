@@ -28,7 +28,3 @@ wyrd-spec = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-
-[[example]]
-name = "gen_schemas"
-path = "examples/gen_schemas.rs"

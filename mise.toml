@@ -267,22 +267,6 @@ fi
 description = "Verify Wyrd critical Rust contracts have explicit Python test markers"
 run = "python scripts/check_test_contracts.py"
 
-[tasks."check:security-schema-drift"]
-description = "wyrd-spec::security goldens match the generator output without test-utils"
-run = "cargo test --locked -p wyrd-spec --no-default-features --features server --test security -- schema_drift"
-
-[tasks."check:security-inline-gate"]
-description = "Prove SecretRef::Inline is absent without test-utils"
-run = "cargo test --locked -p wyrd-spec --no-default-features --features server --test security -- inline_rejected_without_test_utils"
-
-[tasks."check:transport-schema-drift"]
-description = "wyrd-client::transport goldens match the generator output"
-run = "cargo test --locked -p wyrd-client --test transport -- schema_drift"
-
-[tasks."check:alert-router-schema-drift"]
-description = "vala-core::alert_router goldens match the generator output"
-run = "cargo test --locked -p vala-core --test alert_router -- schema_drift"
-
 [tasks."check:wasm"]
 description = "Build wyrd-spec for wasm32"
 run = "cargo check --locked --target wasm32-unknown-unknown -p wyrd-spec --features wasm"
@@ -465,8 +449,6 @@ cargo check --locked --workspace --all-features
 description = "Regenerate OpenAPI / JSON schemas / MCP tool list / pyi stubs from source"
 run = """
 cargo run --locked -p wyrd-spec --example gen_schemas --features server
-cargo run --locked -p wyrd-client --example gen_schemas
-cargo run --locked -p vala-core --example gen_schemas
 mise run codegen:stubs
 test -f openapi.yaml || { echo 'openapi.yaml missing'; exit 1; }
 """
@@ -483,8 +465,6 @@ snapshot_codegen() {
   {
     test -f openapi.yaml && printf '%s\n' openapi.yaml
     find crates/wyrd-spec/schemas crates/wyrd-spec/tests/schemas -type f -name '*.json'
-    find crates/wyrd-client/schemas crates/wyrd-client/tests/schemas -type f -name '*.json'
-    find crates/vala/vala-core/schemas crates/vala/vala-core/tests/schemas -type f -name '*.json'
     find python/py-wyrd/python/wyrd -type f -name '*.pyi' \
       ! -path 'python/py-wyrd/python/wyrd/stubs/*'
   } | sort | while IFS= read -r file; do

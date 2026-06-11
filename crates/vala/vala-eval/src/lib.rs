@@ -50,6 +50,8 @@ pub mod error;
 pub mod executor;
 pub mod judge;
 pub mod operators;
+#[cfg(feature = "orchestrator")]
+pub mod orchestrator;
 pub mod results;
 pub mod scenario;
 pub mod store;

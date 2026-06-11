@@ -1,0 +1,5 @@
+{
+  "name": "subject_rollup",
+  "parity_source": "scouter/crates/scouter_evaluate/tests/fixtures/subject_rollup.json",
+  "expected_subject_pass_rate": 1.0
+}

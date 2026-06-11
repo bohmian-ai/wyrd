@@ -14,6 +14,14 @@ path = "src/lib.rs"
 
 [features]
 default = []
+orchestrator = [
+    "dep:skald-agent",
+    "dep:skald-prompt",
+    "dep:skald-runtime",
+    "tokio/sync",
+    "tokio/time",
+    "tokio/macros",
+]
 
 [dependencies]
 arrow = { workspace = true }
@@ -26,6 +34,9 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
+skald-agent = { workspace = true, optional = true }
+skald-prompt = { workspace = true, optional = true }
+skald-runtime = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros"] }
 tracing = { workspace = true }
@@ -36,5 +47,7 @@ wyrd-utils = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+skald-providers = { workspace = true }
+skald-spec = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "test-util"] }

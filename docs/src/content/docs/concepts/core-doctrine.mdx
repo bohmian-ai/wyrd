@@ -5,38 +5,34 @@ description: The design doctrine behind Wyrd's nouns, layers, services, and publ
 
 # Wyrd core doctrine
 
+`architecture/wyrd-design.md` is the active protocol authority. This page is
+the public doctrine summary for developers and agents.
+
 ## Purpose
 
-Wyrd is the AI layer for human and agentic work. It does not try to become the
-user's application runtime, training framework, workflow engine, or cloud
-platform.
+Wyrd is the AI layer for human and agentic work. It does not become the user's
+application runtime, training framework, workflow engine, or cloud platform.
 
-Wyrd's job is to make AI work declarative, inspectable, reproducible, and
-operable. Users describe the things that matter. Wyrd records those
-descriptions, validates them, links them, observes what happens, governs
-decisions, and exposes the result through human and agent-facing surfaces.
+Wyrd makes AI work declarative, inspectable, reproducible, and operable. Users
+describe the things that matter. Wyrd records those descriptions, validates
+them, links them, observes what happens, governs decisions, and exposes the
+result through human and agent-facing surfaces.
 
-This document defines the Wyrd object model. It is the first filter for public
-contracts, implementation plans, generated schemas, SDKs, CLI commands, MCP
-tools, UI pages, and agent-facing docs.
+## Object model
 
-## The Wyrd object model
-
-Wyrd is built around declared intent. The model has five layers:
+Wyrd is built around declared intent.
 
 | Layer | Meaning |
 |---|---|
-| Core nouns | The durable concepts every other layer uses: card, spec, run, observation. |
-| Card kinds | Domain specializations of `Card`. The kind changes the spec; it does not create a separate ontology. |
-| Foundations | Shared forms every kind and service uses: envelope, metadata, `CardRef`, relationship, status, version. |
-| Services | Capabilities that operate on foundations: registry, storage, lineage, policy, install, audit, observability, evaluation, drift, runtime. |
-| Surfaces | How humans and agents reach services: HTTP, Python SDK, CLI, UI, MCP, IDE integrations, generated docs. |
+| Core nouns | The durable concepts every other layer uses: Card, Spec, Run, Observation. |
+| Card kinds | Domain specializations of `Card`; the kind changes the spec, not the ontology. |
+| Foundations | Envelope, metadata, `CardRef`, relationship, status, and version. |
+| Services | Registry, storage, lineage, policy, install, audit, observability, evaluation, drift, and runtime. |
+| Surfaces | HTTP, Python SDK, CLI, UI, MCP, IDE integrations, and generated docs. |
 
 Do not skip layers. A service operates on Wyrd foundations. A surface exposes a
-service. A card kind specializes `Card`. A runtime detail stays behind the
-contract that explains it.
-
-The short version:
+service. A card kind specializes `Card`. Runtime details stay behind the
+contract that explains them.
 
 ```text
 Cards declare.
@@ -50,20 +46,7 @@ Policy governs decisions.
 Audit records accountability.
 ```
 
-`Card` is the central noun. A card is a declared thing Wyrd can register,
-version, inspect, govern, link, install, and expose to people or agents.
-
-Card kinds give that noun domain meaning. A model is a kind of card. So are
-data, experiment, prompt, tool, agent, workflow, service, policy, artifact,
-eval, drift, audit, mcp, skill, subagent, trigger, and operator. The kind
-changes the spec. It does not create a separate top-level ontology.
-
-User code runs the implementation. Wyrd owns the declared shape.
-
 ## Core nouns
-
-Wyrd keeps the durable ontology small. The core nouns are the concepts every
-other layer uses.
 
 | Noun | What it means in Wyrd |
 |---|---|
@@ -72,56 +55,32 @@ other layer uses.
 | Run | One execution of declared behavior. |
 | Observation | A measured fact produced by or attached to a run, card, service, or workflow. |
 
-Everything else should first try to fit as a card kind, spec field, relationship,
-run, or observation. Add a new noun only when those shapes cannot express the
-concept without lying.
+Everything else should first try to fit as a card kind, spec field,
+relationship, run, or observation. Add a new noun only when those shapes cannot
+express the concept without lying.
 
 ## Card kinds
 
-Kinds are not separate nouns. They are the domain vocabulary attached to
-`Card`. Each kind has a typed spec.
+The v1 doctrine has 16 native kinds plus `External` for forward compatibility.
 
-| Card kind | What it declares |
+| Domain | Kinds |
 |---|---|
-| Model | A callable AI or ML asset. |
-| Data | A dataset, schema, artifact, and optional splits. |
-| Experiment | A training or evaluation run: inputs, outputs, parameters, and metrics. |
-| Prompt | Messages, variables, model hint, and response format. |
-| Tool | A callable capability: function, model, prompt, workflow, MCP, or HTTP. |
-| Agent | A loop over prompts, tools, memory, constraints, and stop rules. |
-| Workflow | A path through agents, tools, services, and evaluation steps. |
-| Service | A deployable boundary around AI behavior with observation routes. |
-| Policy | A rule governing registration, execution, access, or promotion. |
-| Artifact | Durable downloadable bytes with a parent card, role, and optional adapter. |
-| Eval | Judges, assertions, a pass gate, and triggers. |
-| Drift | Algorithm, baseline, thresholds, and alerts. |
-| Audit | Source, requirements, and evidence. |
-| Mcp | An MCP server declaration: transport, tools, resources, and prompts. |
-| Skill | A reusable instruction set with suggested tools. |
-| SubAgent | A delegated agent with its own instructions, provider, and model. |
-| Trigger | A source signal that fires a target card on a cooldown. |
-| Operator | An adapter-backed compute step with inputs, policy hooks, and budget. |
+| Data plane | Data, Model, Artifact, Experiment |
+| Agent plane | Prompt, Agent, Workflow, Mcp |
+| Composition | Service |
+| Governance | Policy, Audit |
+| Observability | Drift, Eval, Source |
+| Reaction | Trigger, Operator |
 
-If a proposed kind sounds like a transport mechanism, helper class,
-implementation pattern, or vendor feature, it is probably not a card kind.
+Tools are runtime names resolved by Skald's tool registry; they are not Cards.
+Sub-agency is an Agent invoking another Agent; it is a relationship, not a
+`SubAgent` kind. Skills are not a v1 Card kind.
+
+Current generated schemas still include stale `Tool`, `Skill`, and `SubAgent`
+specs and do not yet include `SourceSpec`. Treat that as implementation drift
+from `architecture/wyrd-design.md`, not as public doctrine.
 
 ## Foundations
-
-The foundations are the shared forms every layer uses. They are not card kinds.
-
-| Foundation | Meaning |
-|---|---|
-| Envelope | The shared outer shape for every card. |
-| Metadata | User-owned identity, ownership, labels, annotations, and version intent. |
-| CardRef | A typed pointer from one card to another. |
-| Relationship | A server-derived edge produced from CardRefs inside specs. |
-| Status | Server-managed lifecycle state. |
-| Version | The named change boundary users and services can pin. |
-
-Cards declare. Specs define. CardRefs connect. Relationships explain. Runs and
-observations prove what happened.
-
-### The envelope is not optional
 
 Every card uses the same envelope:
 
@@ -144,7 +103,7 @@ status: null
 ```
 
 `metadata.labels` are short indexed classification fields. Use them for values
-you expect humans, agents, policy, or inventory views to filter on.
+humans, agents, policy, or inventory views filter on.
 
 `metadata.annotations` are descriptive metadata fields. Use them for longer
 context that should travel with the Card but should not be indexed as a primary
@@ -153,249 +112,50 @@ classification field.
 `tags` are not Wyrd's public metadata contract. Public Card metadata uses
 `labels` and `annotations`.
 
-Do not create one-off top-level shapes for card kinds. If Wyrd needs to
-register it, browse it, version it, govern it, link it, install it, or expose it
-to agents, make it a card kind.
-
-### Relationships are derived
-
 Authors write `CardRef` values inside specs. The server derives relationships
-from them. Users may add manual relationships, but the server is the source of
-truth for stored relationship state.
+from them. Lineage reads those relationships; users do not author a parallel
+lineage graph.
 
-This keeps lineage consistent across public surfaces, storage, and audit logs.
-If a feature needs graph behavior, first ask which `CardRef` belongs in the
-spec and which `Relationship` the server should derive.
-
-## Service capabilities
-
-Services compose foundations instead of inventing private shapes.
+## Service boundaries
 
 Wyrd ships three products from one source tree, sharing `wyrd-spec`:
 
-- **wyrd**: the control plane: registry, storage, lineage, policy, install, audit.
+- **wyrd**: the control plane: registry, storage, lineage, policy, install,
+  audit.
 - **vala**: observability: drift, eval execution, OTel ingest, OLAP query.
-- **skald**: the LLM runtime, split across `skald-spec` (native wire types),
-  `skald-runtime` (provider dispatch and registry), `skald-providers`,
-  `skald-cache`, `skald-tool`, `skald-prompt` (Python builder), `skald-agent`
-  (bounded tool loop), and `skald-workflow` (DAG scheduling and handoff).
+- **skald**: LLM runtime: providers, prompts, cache, tools, agents, and
+  workflows.
 
-The registry stores cards. Storage stores artifact bytes and metadata. Lineage
-reads CardRefs and relationships. Policy evaluates declared state. Install
-resolves versions and artifacts. Observability records runs and observations.
-Eval and drift are services when they execute declared `Eval` and `Drift` cards.
+Services compose foundations instead of inventing private shapes. The registry
+stores cards. Storage stores artifact bytes and metadata. Lineage reads
+CardRefs and relationships. Policy evaluates declared state. Observability
+records runs and observations.
 
-Producer and consumer are service roles. A producer emits observations or
-records runs. A consumer reads them and produces derived observations, eval
-results, drift findings, alerts, or summaries. They are not nouns,
-foundations, or card kinds unless a future design needs users to register and
-govern them directly.
+## Runtime boundary
 
-When a service needs a new capability, ask which foundation it should operate
-on. If the answer is "a custom object only this service understands," the design
-is too narrow.
+Wyrd records, validates, governs, links, installs, observes, and exposes AI
+system components. User code owns inference loops, training loops, app servers,
+agent processes, and deployment mechanics.
 
-### Policy and audit
-
-Some Wyrd concepts appear in more than one layer. That is expected. The layer
-changes the job.
-
-`Policy` is a card kind when users declare a governable rule. The policy service
-evaluates those rules at Wyrd control points: registration, install, promotion,
-access, trigger firing, runtime execution, and artifact use.
-
-`Audit` is a card kind when users declare audit scope, requirements, source
-material, or evidence. Audit history is service-owned accountability: who
-acted, what changed, which card, run, artifact, or policy was involved, what
-decision was made, and why.
-
-This distinction matters. A `Policy` card declares a rule. A policy decision is
-service behavior. An `Audit` card declares an audit object. Audit history
-records what happened.
-
-### Lineage
-
-Lineage is the graph view over relationships. It is not a separate public object
-model.
-
-Authors write `CardRef` values inside specs. The server derives relationships.
-Lineage reads those relationships and answers graph questions across cards,
-runs, observations, artifacts, services, and policies.
-
-Do not author lineage as a parallel graph contract. Author refs. Let the server
-derive relationships. Query lineage from those relationships.
-
-## Declarative first
-
-A Wyrd spec should describe what the user wants, not how a particular process
-happens to do it.
-
-Good Wyrd specs name durable facts:
-
-- which model, prompt, dataset, tool, policy, or service exists
-- what version it is
-- what it depends on
-- what artifacts it owns
-- what shape its inputs and outputs have
-- what runtime constraints apply
-- what should be observed or evaluated
-
-Bad Wyrd specs smuggle in live process state:
-
-- open file handles
-- live runtime objects
-- cloud SDK clients
-- database pools
-- provider response blobs
-- temporary paths
-- thread handles
-- runtime-only callbacks
-- hidden mutable registries
-
-If a value cannot survive serialization, validation, storage, schema generation,
-and later loading in another process, it does not belong in a durable contract.
-
-## Wyrd records and governs. User code runs.
-
-Wyrd does not own the user's inference loop, training loop, app server, or agent
-process. Those stay in the user's code or platform.
-
-Wyrd owns the control plane:
-
-- registry
-- validation
-- versioning
-- lineage
-- artifact metadata
-- policy decisions
-- audit history
-- install/load contracts
-- observability contracts
-- agent-facing discovery surfaces
-
-This boundary keeps Wyrd useful without making it responsible for arbitrary user
-execution.
-
-## Contracts outlive implementations
-
-A Wyrd declaration should outlive the process, library, machine, or tool that
-created it. The contract is the thing Wyrd stores, validates, links, and shows
-to people and agents. Implementation details sit behind that contract.
-
-This is the test: a different process should be able to read the declaration
-later and know what was meant. It may need an adapter to execute or hydrate the
-thing. It should not need hidden runtime state to understand the declaration.
-
-## Records, signals, and state
-
-Wyrd separates records by job instead of collapsing all change into one public
-event stream.
-
-| Record or signal | Job |
-|---|---|
-| Card | Declares durable intent. |
-| Spec | Gives a card its kind-specific meaning. |
-| CardRef | Links one card to another inside declared intent. |
-| Relationship | Explains a server-derived edge between declared things. |
-| Status | Records server-managed lifecycle state. |
-| Run | Records one execution of declared behavior. |
-| Observation | Records a measured or derived fact about a run, card, service, or workflow. |
-| Audit history | Records accountability for decisions and side effects. |
-| Internal event | Lets a service move work through queues, outboxes, trigger deliveries, replay logs, provider streams, or background jobs. |
-
-Internal events are service mechanics. They are not the public ontology unless a
-future design gives users a reason to declare, version, govern, browse, or link
-them.
-
-The public contract should name what the record means, not how the service
-recorded it. If a signal proves an execution happened, model it as a `Run`. If
-it records evidence or measurement, model it as an `Observation`. If it governs
-behavior, use a `Policy` card plus policy service evaluation. If it explains
-accountability, use audit history or an `Audit` card when the audit itself
-needs identity.
-
-## Artifacts follow the same rules
-
-Artifact is a card kind. Storage is the service that owns the bytes.
-
-Other cards link to artifacts with `CardRef`. Do not create new durable artifact
-reference wrappers unless `ArtifactCard` plus `CardRef` cannot express the
-design and a new architecture decision records why.
-
-The split is intentional:
-
-- storage owns bytes
-- `ArtifactCard` describes stored bytes
-- source cards reference artifacts
-- relationships make lineage queryable
+Runtime results that persist become runs, observations, artifact cards,
+relationships, audit records, or status updates through service-owned paths.
 
 ## Public surfaces
 
-The declarative contract extends to every public surface.
-
 The Python SDK, HTTP API, CLI, IDE integrations, UI, generated schemas, and MCP
-tools all project the same card contract. A surface may add ergonomic shortcuts,
-but it does not invent new shapes, rename fields, or expose server-internal
-state.
+tools all project the same card contract. A surface may add ergonomic
+shortcuts, but it does not invent new shapes, rename durable fields, or expose
+server-internal state.
 
 What a user declares in Python should be recognizable in the HTTP payload, the
-stored card, the generated schema, and the MCP tool input. If a surface requires
-a different vocabulary than the spec, the surface is wrong.
-
-## What belongs where
-
-Use this table before adding a new public concept:
-
-| If the thing... | Put it here |
-|---|---|
-| Declares durable intent | Card or spec |
-| Gives a card domain meaning | Card kind and typed spec |
-| Links cards | `CardRef` in a spec, then server-derived relationship |
-| Needs graph traversal | Lineage query over relationships |
-| Records one execution | Run |
-| Records evidence, measurement, trace data, eval output, drift output, or health signal | Observation |
-| Governs behavior | `Policy` card plus policy service evaluation |
-| Explains who did what and why | Audit history, or `Audit` card if the audit needs identity and versioning |
-| Stores durable bytes | Storage plus `ArtifactCard` linked by `CardRef` |
-| Only moves service work internally | Service-private event, queue message, outbox row, or replay log |
-
-The default answer is not "make it extensible." The default answer is "make the
-contract clear."
-
-## Design tests
-
-Before adding a new Wyrd concept, answer these questions:
-
-1. Does this fit one of the existing Wyrd nouns: card, spec, run, or
-   observation?
-   If yes, use that noun.
-2. Is this a domain specialization of card?
-   If yes, make it a card kind.
-3. Does the card kind need identity, versioning, governance, browsing, installation,
-   or relationships?
-   If no, it is a spec field or service detail.
-4. Is this data inside an existing card kind?
-   If yes, put it in that kind's spec.
-5. Is this a link between cards?
-   If yes, use a CardRef and derive a relationship.
-6. Is this execution history?
-   If yes, model it as a run or observation, not as mutable spec state.
-7. Is this accountability for a decision or side effect?
-   If yes, record audit history, or use an `Audit` card when the audit itself
-   needs identity.
-8. Is this graph behavior?
-   If yes, use CardRefs, derived relationships, and lineage queries.
-9. Does this require a runtime, network, filesystem, database, or external
-   service?
-   If yes, keep it out of the durable contract.
-10. Does this make Wyrd run user code?
-   If yes, challenge the design.
+stored card, the generated schema, and the MCP tool input.
 
 ## What to reject
 
 Reject designs that add:
 
 - compatibility aliases from predecessor projects
+- `Tool`, `Skill`, or `SubAgent` as new v1 public card-kind work
 - per-kind registration methods on card objects
 - live runtime objects in specs
 - server-only fields in client contracts
@@ -410,7 +170,7 @@ Reject designs that add:
 - generated files edited by hand
 - runtime plugins where a closed enum is the real contract
 
-## The implementation rule
+## Implementation rule
 
 Every implementation should preserve the doctrine:
 

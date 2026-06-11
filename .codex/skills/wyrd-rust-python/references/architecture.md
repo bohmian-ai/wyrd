@@ -9,18 +9,25 @@ shared contracts. Keep behavior in the owning layer and expose typed boundaries.
   schema generation.
 - `crates/shared/wyrd-runtime`: shared runtime boundary.
 - `crates/shared/wyrd-telemetry`: telemetry setup and shared tracing helpers.
-- `crates/shared/wyrd-auth`: auth contracts and shared auth types that do not
-  require server-only dependencies.
+- `crates/shared/wyrd-auth-verify`: auth verification contracts and shared
+  auth types that do not require server-only dependencies.
+- `crates/shared/wyrd-utils`: filesystem, codec, JSON, and optional Python
+  boundary helpers.
 - `crates/shared/wyrd-crypt`: cryptographic helpers.
 - `crates/shared/wyrd-testing`: test helpers only.
 - `crates/skald`: provider runtime, prompts, cache, orchestration, and model
   interaction.
 - `crates/vala`: observability, drift, evaluation, traces, archival storage,
   and query behavior.
+- `crates/wyrd/wyrd-interfaces`: Python-visible data/model interface wrappers
+  and shared card helper surfaces.
+- `crates/wyrd/wyrd-cards`: Python-visible Card surfaces and card-local
+  authoring helpers.
 - `crates/wyrd/wyrd-server`: HTTP server and application state.
 - `crates/wyrd/wyrd-cli`: human-facing CLI.
 - `crates/wyrd/wyrd-mcp`: agent-facing tool surface.
-- `python/py-wyrd`: Python package and PyO3 boundary.
+- `python/py-wyrd`: Python package, extension-module root, generated stubs,
+  and PyO3 submodule aggregation.
 
 ## Contract Placement
 
@@ -37,6 +44,10 @@ Keep `wyrd-spec` free of:
 - HTTP clients
 - cloud SDKs
 - telemetry SDK implementation dependencies
+
+Python-visible wrappers around `wyrd-spec` contracts live in owner crates such
+as `wyrd-interfaces` and `wyrd-cards`, behind optional `python` features.
+`python/py-wyrd` registers those wrappers; it does not reimplement their logic.
 
 ## Server Pattern
 

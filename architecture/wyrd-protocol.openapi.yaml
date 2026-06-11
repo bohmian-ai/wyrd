@@ -1,6 +1,10 @@
 # =============================================================================
 # Wyrd Protocol — OpenAPI 3.1 source-of-truth contract
 #
+# SUPERSEDED WORKING DRAFT: `architecture/wyrd-design.md` is the active design
+# authority. This file still reflects older 18-kind protocol exploration and
+# must not be used to justify Tool, Skill, or SubAgent as v1 Card kinds.
+#
 # This document is the machine-readable companion to `wyrd-protocol.md`.
 # It captures the CURRENT-STATE wire contract (envelope + foundations + 18
 # native kind specs + resource operations + errors) so that conflicts

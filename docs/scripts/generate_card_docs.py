@@ -27,9 +27,6 @@ CARD_SPECS = {
     "policy": "policy_spec.json",
     "prompt": "prompt_spec.json",
     "service": "service_spec.json",
-    "skill": "skill_spec.json",
-    "subagent": "subagent_spec.json",
-    "tool": "tool_spec.json",
     "trigger": "trigger_spec.json",
     "workflow": "workflow_spec.json",
 }
@@ -48,9 +45,6 @@ PURPOSES = {
     "policy": "Capture rules that decide whether a card, run, or action is allowed.",
     "prompt": "Version prompt content and the contract around its inputs and outputs.",
     "service": "Describe a deployable service and the runtime rules Wyrd can lock.",
-    "skill": "Declare a reusable skill that an agent can select with predictable inputs.",
-    "subagent": "Describe a narrower agent role that can be called by a parent agent.",
-    "tool": "Declare an executable tool and the constraints around its use.",
     "trigger": "Describe an event source that can start a workflow or service action.",
     "workflow": "Describe a coordinated sequence of operators, tools, agents, or services.",
 }
@@ -93,8 +87,6 @@ def properties(schema: dict) -> list[tuple[str, str, str]]:
 def title_for(slug: str) -> str:
     if slug == "mcp":
         return "MCP"
-    if slug == "subagent":
-        return "SubAgent"
     return slug.title()
 
 
@@ -106,9 +98,6 @@ CARD_KIND_GROUPS = {
     "eval": "experiment",
     "prompt": "prompt",
     "agent": "agent",
-    "subagent": "agent",
-    "skill": "agent",
-    "tool": "agent",
     "mcp": "agent",
     "operator": "agent",
     "workflow": "agent",
@@ -265,6 +254,8 @@ def render(slug: str, schema_file: str) -> str:
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     for slug, schema_file in CARD_SPECS.items():
+        if (OUT_DIR / f"{slug}.mdx").exists():
+            continue
         (OUT_DIR / f"{slug}.md").write_text(render(slug, schema_file), encoding="utf-8")
 
 

@@ -34,9 +34,6 @@ CARD_SPECS = {
     "policy": "policy_spec.json",
     "prompt": "prompt_spec.json",
     "service": "service_spec.json",
-    "skill": "skill_spec.json",
-    "subagent": "subagent_spec.json",
-    "tool": "tool_spec.json",
     "trigger": "trigger_spec.json",
     "workflow": "workflow_spec.json",
 }
@@ -55,11 +52,16 @@ PURPOSES = {
     "policy": "Capture rules that decide whether a card, run, or action is allowed.",
     "prompt": "Version prompt content and the contract around its inputs and outputs.",
     "service": "Describe a deployable service and the runtime rules Wyrd can lock.",
-    "skill": "Declare a reusable skill that an agent can select with predictable inputs.",
-    "subagent": "Describe a narrower agent role that can be called by a parent agent.",
-    "tool": "Declare an executable tool and the constraints around its use.",
+    "source": "Declare where Wyrd reads external observations, archived runs, or object-store evidence.",
     "trigger": "Describe an event source that can start a workflow or service action.",
     "workflow": "Describe a coordinated sequence of operators, tools, agents, or services.",
+}
+
+DESIGN_ONLY_CARDS = {
+    "source": {
+        "url": f"{SITE}/cards/source/",
+        "schema": "SourceSpec is design-authoritative in architecture/wyrd-design.md and pending in wyrd-spec.",
+    }
 }
 
 CONCEPTS = [
@@ -77,8 +79,6 @@ CONCEPTS = [
 def title_for(slug: str) -> str:
     if slug == "mcp":
         return "MCP"
-    if slug == "subagent":
-        return "SubAgent"
     return slug.title()
 
 
@@ -91,7 +91,7 @@ def render_llms_txt() -> str:
     lines = [
         "# Wyrd",
         "",
-        "> Wyrd is the declarative AI layer for developers, engineers, and agents. A standardized ecosystem for every model, prompt, tool, agent, workflow, eval, policy, audit, service, and observation. Declare it once; govern, evaluate, deploy, and observe it everywhere. Execution stays in the user runtime.",
+        "> Wyrd is the declarative AI layer for developers, engineers, and agents. A standardized ecosystem for models, data, prompts, agents, workflows, evals, policies, audits, services, sources, and observations. Runtime tools resolve through tool registries; execution stays in the user runtime.",
         "",
         "## Concepts",
         "",
@@ -99,14 +99,14 @@ def render_llms_txt() -> str:
     for slug, title, purpose in CONCEPTS:
         lines.append(f"- [{title}]({SITE}/concepts/{slug}/): {purpose}")
     lines += ["", "## Card kinds", ""]
-    for slug in sorted(CARD_SPECS):
+    for slug in sorted([*CARD_SPECS, *DESIGN_ONLY_CARDS]):
         lines.append(f"- [{title_for(slug)}Card]({SITE}/cards/{slug}/): {PURPOSES[slug]}")
     lines += [
         "",
         "## Machine-readable schemas",
         "",
-        f"- [llms-full.txt]({SITE}/llms-full.txt): every Card spec schema inline.",
-        "- JSON Schemas: see `crates/wyrd-spec/schemas/` in the wyrd repository.",
+        f"- [llms-full.txt]({SITE}/llms-full.txt): current schema inventory plus doctrine notes.",
+        "- JSON Schemas: see `crates/wyrd-spec/schemas/` in the wyrd repository. `architecture/wyrd-design.md` remains the design authority while schemas are reconciled.",
         "",
     ]
     return "\n".join(lines)
@@ -116,7 +116,7 @@ def render_llms_full() -> str:
     lines = [
         "# Wyrd — full machine-readable reference",
         "",
-        "Generated from `crates/wyrd-spec/schemas/`. Source of truth lives in Rust types under `crates/wyrd-spec/src/`.",
+        "Generated from `crates/wyrd-spec/schemas/`. `architecture/wyrd-design.md` is the design authority; this schema dump may include implementation drift while `wyrd-spec` is reconciled.",
         "",
     ]
     for slug, schema_file in sorted(CARD_SPECS.items()):
@@ -133,6 +133,17 @@ def render_llms_full() -> str:
             "```json",
             json.dumps(schema, indent=2, sort_keys=True),
             "```",
+            "",
+        ]
+    for slug, meta in sorted(DESIGN_ONLY_CARDS.items()):
+        title = title_for(slug)
+        lines += [
+            f"## {title}Card",
+            "",
+            PURPOSES[slug],
+            "",
+            f"URL: {meta['url']}",
+            meta["schema"],
             "",
         ]
     return "\n".join(lines)

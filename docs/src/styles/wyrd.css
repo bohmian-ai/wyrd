@@ -352,13 +352,11 @@ button, input, select, textarea { font: inherit; }
 .sidebar-content a[href$="/cards/eval/"]       { border-left: 3px solid var(--card-experiment); padding-left: calc(0.5rem - 3px); }
 .sidebar-content a[href$="/cards/prompt/"]     { border-left: 3px solid var(--card-prompt);     padding-left: calc(0.5rem - 3px); }
 .sidebar-content a[href$="/cards/agent/"],
-.sidebar-content a[href$="/cards/subagent/"],
-.sidebar-content a[href$="/cards/skill/"],
-.sidebar-content a[href$="/cards/tool/"],
 .sidebar-content a[href$="/cards/mcp/"],
 .sidebar-content a[href$="/cards/operator/"],
 .sidebar-content a[href$="/cards/workflow/"],
 .sidebar-content a[href$="/cards/trigger/"]    { border-left: 3px solid var(--card-agent);      padding-left: calc(0.5rem - 3px); }
+.sidebar-content a[href$="/cards/source/"]     { border-left: 3px solid var(--card-experiment); padding-left: calc(0.5rem - 3px); }
 .sidebar-content a[href$="/cards/service/"]    { border-left: 3px solid var(--color-primary-700); padding-left: calc(0.5rem - 3px); }
 .sidebar-content a[href$="/cards/artifact/"],
 .sidebar-content a[href$="/cards/audit/"],

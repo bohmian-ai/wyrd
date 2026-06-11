@@ -10,6 +10,19 @@ When this disagrees with `wyrd-protocol.openapi.yaml`, `wyrd-protocol.md`,
 `specs/*.yaml`, or the Rust code in `crates/wyrd-spec`, **this file wins**.
 Downstream artifacts are brought up to this version in a sync pass.
 
+## Implementation drift
+
+This repository is mid-reconciliation. The active doctrine is the 16 native
+kind catalog in this document plus `External`. Current `wyrd-spec` code and
+generated schemas still expose stale `Tool`, `Skill`, and `SubAgent` specs and
+do not yet expose `SourceSpec`. New work must follow this document: tools are
+runtime registry entries, sub-agency is an Agent relationship, skills are not a
+v1 Card kind, and external observations are read through `Source` cards.
+
+Do not expand stale card kinds or cite generated schema presence as doctrine.
+Cleanups should remove stale kind surfaces, add `SourceSpec`, regenerate
+schemas/docs, and update card-kind tests.
+
 ---
 
 ## Doctrine

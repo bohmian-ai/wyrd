@@ -19,10 +19,13 @@ in Wyrd vocabulary and Wyrd paths only.
 Before editing:
 
 1. Read `AGENTS.md`.
-2. Identify the owning crate or Python package.
-3. Inspect the nearest existing Wyrd implementation and tests.
-4. Check `mise.toml` for the canonical verification command.
-5. Check `Cargo.toml`, crate manifests, `pyproject.toml`, and lockfiles before
+2. Read `architecture/wyrd-design.md` before changing card/spec, registry,
+   storage, server/client, CLI, MCP, Python SDK, PyO3, generated contract, or
+   implementation-plan behavior. It is the active design authority.
+3. Identify the owning crate or Python package.
+4. Inspect the nearest existing Wyrd implementation and tests.
+5. Check `mise.toml` for the canonical verification command.
+6. Check `Cargo.toml`, crate manifests, `pyproject.toml`, and lockfiles before
    relying on version-specific behavior.
 
 Do not invent a new architecture until the current Wyrd boundary proves wrong
@@ -48,17 +51,22 @@ Load these references only when relevant:
 
 ## Ownership Boundaries
 
-- `crates/wyrd-spec`: pure contracts, ids, cards/specs, schema generation,
-  request/response shapes, validation, stable error codes.
-- `crates/shared`: shared runtime, telemetry, auth shell, cryptography, testing,
-  utilities, and derives.
-- `crates/skald`: model/provider runtime, prompt/cache abstractions,
-  orchestration, and provider-specific wire handling.
-- `crates/vala`: observability, evaluation, drift, tracing, archival query, and
-  background data-plane behavior.
-- `crates/wyrd`: server, CLI, MCP, application integration, and UI host.
-- `python/py-wyrd`: PyO3 module root, Python package exports, stubs, and
-  Python-facing tests.
+- `crates/wyrd-spec`: PyO3-free pure contracts, ids, cards/specs, schema
+  generation, request/response shapes, validation, and stable error catalog.
+- `crates/shared/*`: shared runtime, telemetry, auth shell, cryptography,
+  testing, utilities, derives, and `wyrd-utils` Python helpers behind its
+  optional `python` feature.
+- `crates/skald/*`: model/provider runtime, prompt/cache abstractions,
+  orchestration, tool registry, workflow runtime, and provider-specific wire
+  handling. Python-visible Skald behavior lives in the owning Skald crate
+  behind its optional `python` feature.
+- `crates/vala/*`: observability, evaluation, drift, tracing, archival query,
+  OLAP, and background data-plane behavior. Python-visible Vala client
+  behavior lives in `vala-client` behind its optional `python` feature.
+- `crates/wyrd/*`: server, CLI, MCP, application integration, UI host,
+  `wyrd-interfaces`, and `wyrd-cards`.
+- `python/py-wyrd`: thin PyO3 module aggregator, Python package exports,
+  generated stubs, and Python-facing tests.
 
 If behavior crosses boundaries, put the durable contract in `wyrd-spec`, keep
 runtime implementation in the owning crate, and expose only the necessary API
@@ -113,9 +121,17 @@ Choose abstraction deliberately:
 
 ## PyO3 Boundary Rules
 
-- Keep PyO3 in `python/py-wyrd*` unless an explicit allowlist says otherwise.
-- Keep `Python<'py>`, `Bound<'py, T>`, `Py<T>`, and `PyErr` out of Rust-only
-  core crates.
+- `wyrd-spec` stays PyO3-free. Do not add a `python` feature or PyO3 imports
+  to it.
+- PyO3 belongs in crates that own Python-visible behavior, behind an optional
+  `python` feature with `pyo3 = { workspace = true, optional = true }`.
+- `python/py-wyrd` enables approved owner-crate `python` features and
+  registers submodules. It must stay a thin aggregator with no duplicated
+  validation, lifecycle, registry, storage, or runtime logic.
+- Generic Python boundary helpers belong in `crates/shared/wyrd-utils` behind
+  its `python` feature.
+- Keep `Python<'py>`, `Bound<'py, T>`, `Py<T>`, and `PyErr` out of crates that
+  did not opt into a `python` feature.
 - Convert Python inputs at the boundary, then call Rust-native APIs.
 - Use `Bound<'py, T>` for new PyO3 code.
 - Convert to `Py<T>` before storing Python objects across awaits, threads, or
@@ -136,10 +152,13 @@ Choose abstraction deliberately:
 For any Python-visible change, verify all layers:
 
 1. Rust type/function exists in the owning crate.
-2. PyO3 wrapper or registration exists under `python/py-wyrd/src`.
-3. Python package exports exist under `python/py-wyrd/python/wyrd`.
-4. Generated stubs are updated through the repository generator.
-5. Python tests import from public `wyrd` modules, not private extension paths,
+2. PyO3 wrapper or registration exists in the owning crate behind its
+   `python` feature.
+3. `python/py-wyrd/src` registers the owning crate's submodule or exported
+   class/function.
+4. Python package exports exist under `python/py-wyrd/python/wyrd`.
+5. Generated stubs are updated through the repository generator.
+6. Python tests import from public `wyrd` modules, not private extension paths,
    unless the private path is the intended contract.
 
 Do not hand-edit generated stubs. Update source annotations or the generator,

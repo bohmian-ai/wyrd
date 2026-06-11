@@ -1,0 +1,65 @@
+---
+title: Queue policy
+description: QueueConfig governs flush size, flush interval, channel capacity, and optional sample-ratio drop gate. Applies to every per-record queue in wyrd-client.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import CodeFromFile from '../../../components/CodeFromFile.astro';
+
+# Queue policy
+
+Every per-record queue in `wyrd-client` embeds a `QueueConfig` and uses it
+to decide when to flush. One policy, all queues.
+
+`QueueConfig` is a pure config value. There is no IO at construction;
+`QueueConfig::validate()` runs at the queue constructor and rejects
+invalid combinations before a socket opens.
+
+## Fields
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `transport` | `TransportConfig` | `Grpc(GrpcConfig::default())` | Wire transport for this queue. |
+| `flush_max_rows` | `usize` | `10_000` | Flush when the buffer reaches this row count. Validated `>= 1`. |
+| `flush_interval_ms` | `u64` | `5_000` | Flush at most every N ms, regardless of fill level. Validated `>= 1`. |
+| `channel_capacity` | `usize` | `100` | Bounded channel capacity between the producer thread and the flush worker. Validated `>= 1`. |
+| `sample_ratio` | `Option<f64>` | `None` | Optional drop gate. `None` keeps every record; `Some(p)` keeps each record with probability `p`. Must be finite and in `[0.0, 1.0]`. |
+
+## Example
+
+<Tabs>
+  <TabItem label="Python">
+
+<CodeFromFile file="../../../python/py-wyrd/examples/transport_queue_policy.py" lang="python" />
+
+  </TabItem>
+  <TabItem label="Rust">
+
+<CodeFromFile file="../../../examples/rust/transport_queue_policy.rs" lang="rust" />
+
+  </TabItem>
+</Tabs>
+
+## Tuning guidance
+
+- **High-volume observability** (web traffic, autonomous agents at scale):
+  raise `flush_max_rows` to amortize per-flush overhead; consider
+  `sample_ratio = Some(0.1)` on observation queues to bound storage.
+- **Low-latency dashboards**: lower `flush_interval_ms` to push records
+  to the server faster at the cost of more network calls.
+- **Bursty producers**: raise `channel_capacity` so the producer thread is
+  not blocked by a slow flush; raise queue-side flow control instead.
+
+## Backpressure
+
+`channel_capacity` is bounded by design. When the channel fills, producer
+calls block until the flush worker drains. If the worker fails (transport
+down, server returning 503), the producer eventually surfaces a
+`WyrdClientError::TransportDown` or a `FlushTimeout`. The buffered records are
+not dropped: `Flushable::len()` reflects what was not flushed, and the
+next flush attempt re-sends them.
+
+## Read next
+
+- [Mock transport](/transports/mock/) -- use `MockConfig.fail_on_flush` to exercise the backpressure path in tests.
+- [Troubleshooting](/transports/troubleshooting/)

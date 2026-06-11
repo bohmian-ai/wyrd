@@ -1,0 +1,57 @@
+---
+title: Mock transport
+description: In-memory loopback transport for tests. Records every flushed envelope; supports deterministic failure injection.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import CodeFromFile from '../../../components/CodeFromFile.astro';
+
+# Mock transport
+
+The mock transport is the in-memory loopback used in unit tests. Every
+flushed envelope lands in a buffer keyed by `MockConfig.label`. Tests
+assert on the buffer instead of standing up a server.
+
+`MockConfig` is always compiled into `wyrd-client`; there is no feature
+flag. The per-record queue runtime owns the buffer/drain helpers as it
+lands on top of this config surface.
+
+## Configuration
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `label` | `String` | `"default"` | Buffer key. Use distinct labels to isolate parallel tests. |
+| `fail_on_flush` | `Option<u32>` | `None` | When `Some(n)`, the `n`th flush returns `WyrdClientError`; all other flushes succeed. Counting starts at 1; `Some(0)` is treated as "never fail". |
+
+## Example
+
+<Tabs>
+  <TabItem label="Python">
+
+<CodeFromFile file="../../../python/py-wyrd/examples/transport_mock.py" lang="python" />
+
+  </TabItem>
+  <TabItem label="Rust">
+
+<CodeFromFile file="../../../examples/rust/transport_mock.rs" lang="rust" />
+
+  </TabItem>
+</Tabs>
+
+## Test isolation
+
+Two tests that share the default `label` share the same in-memory buffer
+and can interfere with each other under parallel execution. Pass a unique
+label per test (or per fixture):
+
+```python
+mock_config = {"label": "test::observations::flush-on-rollover"}
+```
+
+`MockConfig` does not enforce uniqueness -- Wyrd trusts you to pick
+non-colliding labels.
+
+## Read next
+
+- [Queue policy](/transports/queue-policy/) -- `fail_on_flush` pairs with `flush_max_rows` and `flush_interval_ms` to test backpressure paths.
+- [Troubleshooting](/transports/troubleshooting/)

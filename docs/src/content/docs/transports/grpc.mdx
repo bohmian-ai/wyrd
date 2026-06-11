@@ -1,0 +1,54 @@
+---
+title: gRPC transport
+description: Default Wyrd client transport. tonic over HTTP/2; TLS via TlsConfig; auth via SecretRef.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import CodeFromFile from '../../../components/CodeFromFile.astro';
+
+# gRPC transport
+
+gRPC is the default Wyrd client transport. The server speaks `tonic`; the
+client-side config uses the `transport-grpc` Cargo feature. No
+`tonic::transport::Server` symbols ever appear in `wyrd-client`.
+
+## Configuration
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `endpoint` | `String` | `"http://localhost:50051"` | `http://` for plaintext, `https://` for TLS. Validated non-empty. |
+| `timeout_ms` | `u64` | `30000` | Per-call timeout. Validated `>= 1`. |
+| `tls` | `Option<TlsConfig>` | `None` | Override the system CA pool, supply an mTLS identity. See [Secrets and TLS](/transports/secrets-and-tls/). |
+| `auth` | `Option<SecretRef>` | `None` | Bearer token or mTLS identity. Resolves at connect time. |
+| `connect_retries` | `u32` | `3` | Connection-level retry budget. `0` means fail on first attempt. |
+
+Per-call retry policy is on [`QueueConfig`](/transports/queue-policy/),
+not here.
+
+## Example
+
+<Tabs>
+  <TabItem label="Python">
+
+<CodeFromFile file="../../../python/py-wyrd/examples/transport_grpc.py" lang="python" />
+
+  </TabItem>
+  <TabItem label="Rust">
+
+<CodeFromFile file="../../../examples/rust/transport_grpc.rs" lang="rust" />
+
+  </TabItem>
+</Tabs>
+
+## Production checklist
+
+- Replace the localhost endpoint with the production address.
+- Set `tls.ca_cert` when terminating at a private CA, or `tls.client_cert`/`tls.client_key` for mTLS.
+- Set `auth` to a `SecretRef::Env`, `File`, or `Vault` -- never an inline string.
+- Keep `connect_retries` modest (`3`-`5`); per-call retry policy lives in `QueueConfig`.
+
+## Read next
+
+- [Secrets and TLS](/transports/secrets-and-tls/)
+- [Queue policy](/transports/queue-policy/)
+- [Troubleshooting](/transports/troubleshooting/)

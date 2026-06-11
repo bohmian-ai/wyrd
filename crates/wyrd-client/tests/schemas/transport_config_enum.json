@@ -1,0 +1,305 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TransportConfig",
+  "description": "Wyrd client transport selection.\n\ngRPC is the default (Steven, 2026-06-02). Variants for queue transports (Kafka, RabbitMQ, Redis) are intentionally absent in this phase; they return in a dedicated follow-on plan when consumers need queue publication.\n\nWire shape: `{\"transport\": \"grpc\", \"params\": { ... }}`.\n\n# Feature gating\n\n`is_enabled()` is feature-aware natively. `Grpc` is gated on `cfg!(feature = \"transport-grpc\")`, `Http` on `cfg!(feature = \"transport-http\")`, and `Mock` is always available. `WyrdClient::new()` (PR4.0 section 22) calls this method and returns `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED { transport, required_feature }` when the selected variant is not compiled into the local build.",
+  "oneOf": [
+    {
+      "description": "gRPC transport (tonic). The default transport. Gated on `transport-grpc`.",
+      "type": "object",
+      "required": [
+        "params",
+        "transport"
+      ],
+      "properties": {
+        "params": {
+          "$ref": "#/definitions/GrpcConfig"
+        },
+        "transport": {
+          "type": "string",
+          "enum": [
+            "grpc"
+          ]
+        }
+      }
+    },
+    {
+      "description": "HTTP transport (reqwest). Secondary path for gRPC-restricted environments. Gated on `transport-http`.",
+      "type": "object",
+      "required": [
+        "params",
+        "transport"
+      ],
+      "properties": {
+        "params": {
+          "$ref": "#/definitions/HttpConfig"
+        },
+        "transport": {
+          "type": "string",
+          "enum": [
+            "http"
+          ]
+        }
+      }
+    },
+    {
+      "description": "In-memory loopback transport for tests. Always available; no feature gate.",
+      "type": "object",
+      "required": [
+        "params",
+        "transport"
+      ],
+      "properties": {
+        "params": {
+          "$ref": "#/definitions/MockConfig"
+        },
+        "transport": {
+          "type": "string",
+          "enum": [
+            "mock"
+          ]
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "GrpcConfig": {
+      "description": "Configuration for the gRPC transport.\n\ngRPC is the default transport for `wyrd-client`. The server-side endpoint is the Wyrd ingest gateway (`vala-ingest`, PR4.2) or any compatible tonic-based receiver.",
+      "type": "object",
+      "required": [
+        "connect_retries",
+        "endpoint",
+        "timeout_ms"
+      ],
+      "properties": {
+        "auth": {
+          "description": "Optional bearer token or mTLS identity reference. The runtime passes this through the gRPC `Authorization` metadata header.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "connect_retries": {
+          "description": "Connection-level retry budget. The transport retries the initial connection up to this many times before surfacing an error. Per-call retry logic lives in `QueueConfig`.\n\nDefault: [`GRPC_DEFAULT_CONNECT_RETRIES`] (`3`).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "endpoint": {
+          "description": "gRPC server endpoint. Must be `http://host:port` (plaintext) or `https://host:port` (TLS). Must be non-empty.\n\nDefault: [`GRPC_DEFAULT_ENDPOINT`] (`\"http://localhost:50051\"`).",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "Per-call timeout in milliseconds.\n\nDefault: [`GRPC_DEFAULT_TIMEOUT_MS`] (`30_000`, 30 s).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tls": {
+          "description": "Optional TLS configuration. When `None`, connections use the scheme in `endpoint` to decide TLS (`https://` implies TLS with the system CA pool, `http://` means plaintext).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TlsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "HttpConfig": {
+      "description": "Configuration for the HTTP transport.\n\nThe HTTP transport is a fallback for environments where gRPC is unavailable or blocked. Ingest routes are appended by the client at call time; `base_url` is the common prefix.",
+      "type": "object",
+      "properties": {
+        "auth": {
+          "description": "Optional authorization credential. Passed through the `Authorization` HTTP header at request time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "base_url": {
+          "description": "Base URL for all ingest routes. Must be non-empty. Ingest routes (`/api/v1/observations`, `/api/v1/records`, etc.) are appended at call time.\n\nExample: `\"https://wyrd-ingest.example.com\"`. Default: [`HTTP_DEFAULT_BASE_URL`] (`\"http://localhost:50050\"`).",
+          "default": "http://localhost:50050",
+          "type": "string"
+        },
+        "compression": {
+          "description": "Whether to gzip-compress request bodies. Useful for high-volume payloads; the server must accept `Content-Encoding: gzip`.\n\nDefault: `false`.",
+          "default": false,
+          "type": "boolean"
+        },
+        "timeout_ms": {
+          "description": "Request timeout in milliseconds.\n\nDefault: [`HTTP_DEFAULT_TIMEOUT_MS`] (`30_000`, 30 s).",
+          "default": 30000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tls": {
+          "description": "Optional TLS configuration. When `None`, the system CA pool is used and the scheme in `base_url` governs whether TLS is active.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TlsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "MockConfig": {
+      "description": "Configuration for the mock (in-memory loopback) transport.\n\nUse this transport in unit tests where you want to assert what was published without touching a network. `wyrd-client::transport::mock` records every flushed envelope into an in-memory buffer keyed by [`MockConfig::label`] and provides `mock::drain(label)` to retrieve flushed records.\n\nThe mock transport is always available in `wyrd-client` (no feature gate). `MockConfig::fail_on_flush` lets tests inject deterministic flush failures - a Wyrd-native addition the predecessor mock did not support.\n\n# Default\n\n`MockConfig::default()` returns `{ label: \"default\", fail_on_flush: None }`. The default is a working config - it does not need `validate()` and is safe to use directly in tests that do not care about label isolation.",
+      "type": "object",
+      "required": [
+        "label"
+      ],
+      "properties": {
+        "fail_on_flush": {
+          "description": "Inject a flush failure. When `Some(n)`, the `nth` call to `Flushable::flush` returns `Err`; all other calls succeed normally. Counting starts from 1 (i.e. `Some(1)` fails the first flush). `None` means the mock always succeeds.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "label": {
+          "description": "Buffer label. Multiple `MockConfig` instances with the same label share the same in-memory buffer in `wyrd-client::transport::mock`. Use distinct labels to isolate test scenarios running in the same process.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SecretRef": {
+      "description": "Pointer into a Wyrd runtime secret source. Production builds support environment variables, mounted files, and external secret-manager keys.",
+      "oneOf": [
+        {
+          "description": "An environment variable name. The runtime reads `std::env::var(name)` at connect time. Conventionally `SCREAMING_SNAKE_CASE`.\n\nExample: `{\"source\": \"env\", \"name\": \"WYRD_SECRET_API_KEY\"}`.",
+          "type": "object",
+          "required": [
+            "name",
+            "source"
+          ],
+          "properties": {
+            "name": {
+              "description": "Environment variable name. Must be non-empty.",
+              "type": "string"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "env"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "An absolute path to a file on the local filesystem. Kubernetes Secret volume mounts land here.\n\nExample: `{\"source\": \"file\", \"path\": \"/var/run/secrets/wyrd/api-key\"}`.",
+          "type": "object",
+          "required": [
+            "path",
+            "source"
+          ],
+          "properties": {
+            "path": {
+              "description": "Absolute path to a file whose contents are the secret value. Must be non-empty.",
+              "type": "string"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "file"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A backend-agnostic key in an external secret manager (HashiCorp Vault, AWS Secrets Manager, Google Secret Manager). The Wyrd auth shell maps the key to the configured backend.\n\nExample: `{\"source\": \"vault\", \"key\": \"secret/data/wyrd/api-key\"}`.",
+          "type": "object",
+          "required": [
+            "key",
+            "source"
+          ],
+          "properties": {
+            "key": {
+              "description": "Backend-agnostic key path. Interpretation is backend-specific.",
+              "type": "string"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "vault"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TlsConfig": {
+      "description": "TLS configuration for a transport connection.\n\nAll certificate fields are optional; an absent field means \"use the system default / skip that verification step\". Setting `insecure_skip_verify` to `true` disables peer certificate validation and SHOULD NOT be used outside local development.",
+      "type": "object",
+      "properties": {
+        "ca_cert": {
+          "description": "PEM-encoded CA certificate bundle. When set, overrides the system CA pool for this connection.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_cert": {
+          "description": "PEM-encoded client certificate for mTLS. Must be paired with `client_key`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key": {
+          "description": "PEM-encoded client private key for mTLS. Must be paired with `client_cert`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "insecure_skip_verify": {
+          "description": "Disable peer certificate verification. Defaults to `false`.\n\n**WARNING:** setting this to `true` opens the connection to man-in-the-middle attacks. Use only in local development.",
+          "default": false,
+          "type": "boolean"
+        },
+        "server_name_override": {
+          "description": "Override the server name used in SNI and certificate verification. Useful when the server's certificate CN does not match the address in `endpoint`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

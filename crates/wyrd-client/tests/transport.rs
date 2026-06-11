@@ -10,3 +10,5 @@ mod http;
 mod mock_transport;
 #[path = "transport/queue_config.rs"]
 mod queue_config;
+#[path = "transport/schema_drift.rs"]
+mod schema_drift;

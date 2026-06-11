@@ -449,6 +449,8 @@ cargo check --locked --workspace --all-features
 description = "Regenerate OpenAPI / JSON schemas / MCP tool list / pyi stubs from source"
 run = """
 cargo run --locked -p wyrd-spec --example gen_schemas --features server
+cargo run --locked -p wyrd-client --example gen_schemas
+cargo run --locked -p vala-core --example gen_schemas
 mise run codegen:stubs
 test -f openapi.yaml || { echo 'openapi.yaml missing'; exit 1; }
 """
@@ -465,6 +467,8 @@ snapshot_codegen() {
   {
     test -f openapi.yaml && printf '%s\n' openapi.yaml
     find crates/wyrd-spec/schemas crates/wyrd-spec/tests/schemas -type f -name '*.json'
+    find crates/wyrd-client/schemas crates/wyrd-client/tests/schemas -type f -name '*.json'
+    find crates/vala/vala-core/schemas crates/vala/vala-core/tests/schemas -type f -name '*.json'
     find python/py-wyrd/python/wyrd -type f -name '*.pyi' \
       ! -path 'python/py-wyrd/python/wyrd/stubs/*'
   } | sort | while IFS= read -r file; do
@@ -484,6 +488,22 @@ diff -u "$BEFORE" "$AFTER" \
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
 depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:error-coverage", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
+
+[tasks."check:security-schema-drift"]
+description = "wyrd-spec::security goldens match the generator's output (no test-utils)"
+run = "cargo test --locked -p wyrd-spec --no-default-features --features server --tests security -- schema_drift"
+
+[tasks."check:security-inline-gate"]
+description = "Prove SecretRef::Inline is absent without `test-utils`"
+run = "cargo test --locked -p wyrd-spec --no-default-features --features server --tests security -- inline_rejected_without_test_utils"
+
+[tasks."check:transport-schema-drift"]
+description = "wyrd-client::transport goldens match the generator's output"
+run = "cargo test --locked -p wyrd-client --tests transport -- schema_drift"
+
+[tasks."check:alert-router-schema-drift"]
+description = "vala-core::alert_router goldens match the generator's output"
+run = "cargo test --locked -p vala-core --tests alert_router -- schema_drift"
 
 [tasks."dev:pg:nuke"]
 description = "Wipe embedded pg cache"

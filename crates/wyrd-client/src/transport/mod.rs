@@ -1,16 +1,9 @@
 //! Wyrd client transport runtime config.
 //!
-//! This module owns the runtime config types that parameterize
-//! `WyrdClient::new()` plus per-record queue primitives.
-//! Durable shared security refs (`TlsConfig`, `SecretRef`) live in
-//! `wyrd-spec::security`; this module imports them.
-//!
 //! Module map:
-//! - `config` - `TransportConfig` enum (`Grpc`, `Http`, `Mock`),
-//!   `GrpcConfig`, `HttpConfig`, `MockConfig`, `QueueConfig`.
-//! - `queue` - per-record queue primitives.
-//!
-//! Queue-specific re-exports land with the queue primitives.
+//! - [`config`] - `TransportConfig`, `GrpcConfig`, `HttpConfig`,
+//!   `MockConfig`, `QueueConfig`.
+//! - [`queue`] - the `Flushable` trait consumed by per-record queues.
 
 pub mod config;
 pub mod queue;

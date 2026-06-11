@@ -265,7 +265,10 @@ def render(slug: str, schema_file: str) -> str:
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     for slug, schema_file in CARD_SPECS.items():
-        (OUT_DIR / f"{slug}.md").write_text(render(slug, schema_file), encoding="utf-8")
+        output = OUT_DIR / f"{slug}.md"
+        if output.with_suffix(".mdx").exists():
+            continue
+        output.write_text(render(slug, schema_file), encoding="utf-8")
 
 
 if __name__ == "__main__":

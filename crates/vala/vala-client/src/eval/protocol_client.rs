@@ -155,9 +155,21 @@ impl ProtocolClient {
 
         let bearer = format!("Bearer {}", open.lease_token.as_str());
         let run_base = format!("{}/{}/", routes::RUNS_BASE, open.run_id);
-        let next_url = join_url(&self.server_url, &format!("{}{}", run_base, routes::NEXT), "next")?;
-        let agent_url = join_url(&self.server_url, &format!("{}{}", run_base, routes::AGENT_TURN), "agent-turn")?;
-        let user_url = join_url(&self.server_url, &format!("{}{}", run_base, routes::USER_TURN), "user-turn")?;
+        let next_url = join_url(
+            &self.server_url,
+            &format!("{}{}", run_base, routes::NEXT),
+            "next",
+        )?;
+        let agent_url = join_url(
+            &self.server_url,
+            &format!("{}{}", run_base, routes::AGENT_TURN),
+            "agent-turn",
+        )?;
+        let user_url = join_url(
+            &self.server_url,
+            &format!("{}{}", run_base, routes::USER_TURN),
+            "user-turn",
+        )?;
 
         loop {
             let directive: TurnDirective = send_with_retry("next", || {

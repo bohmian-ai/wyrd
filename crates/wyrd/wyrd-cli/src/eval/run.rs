@@ -237,4 +237,3 @@ pub fn scripted_message(
             turn,
         })
 }
-

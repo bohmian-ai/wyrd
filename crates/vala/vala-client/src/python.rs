@@ -16,7 +16,7 @@ use wyrd_spec::vala::eval::protocol::{ConversationTurn, SimulatedUserMode, TurnR
 use wyrd_spec::version::VersionBlock;
 
 use crate::eval::protocol_client::{
-    AgentFn, AgentTurnOutput, ProtocolClientError, ProtocolClient, RunSummary, SimulatedUserFn,
+    AgentFn, AgentTurnOutput, ProtocolClient, ProtocolClientError, RunSummary, SimulatedUserFn,
 };
 
 /// Run an Eval card through the server-hosted pull protocol.

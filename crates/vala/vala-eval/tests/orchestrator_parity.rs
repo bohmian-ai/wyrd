@@ -70,9 +70,7 @@ async fn drive(
         let NextDirective(directive) = state.next().expect("next directive");
         match directive {
             TurnDirective::AgentTurn {
-                scenario_id,
-                turn,
-                ..
+                scenario_id, turn, ..
             } => {
                 let (response, records) = agent.pop().await;
                 state

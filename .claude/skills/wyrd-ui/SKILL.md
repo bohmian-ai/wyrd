@@ -1,6 +1,6 @@
 ---
 name: wyrd-ui
-description: "Use this repo-level skill when building, editing, debugging, styling, or extending the Wyrd SvelteKit UI in `crates/wyrd/wyrd-server/wyrd-ui`. Trigger for Svelte 5 components, SvelteKit routes and load functions, Tailwind v4 or Skeleton styling, theme work, frontend UX, visual changes, and any request mentioning Wyrd UI, wyrd-theme.css, brutalism, dark mode, or Wyrd frontend patterns. Wyrd UI is the styling source of truth."
+description: "Use this repo-level skill when building, editing, debugging, styling, or extending the Wyrd SvelteKit UI in `crates/wyrd/wyrd-server/wyrd-ui`. Trigger for Svelte 5 components, SvelteKit routes and load functions, Tailwind v4 or Skeleton styling, theme work, frontend UX, visual changes, and any request mentioning Wyrd UI, wyrd-theme.css, brutalism, dark mode, or Wyrd frontend patterns. Wyrd UI is the styling source of truth, not the product or workflow source of truth."
 ---
 
 # Wyrd UI
@@ -8,6 +8,24 @@ description: "Use this repo-level skill when building, editing, debugging, styli
 This is the canonical repo-level skill for Wyrd frontend work. Use it before touching files under `crates/wyrd/wyrd-server/wyrd-ui/`.
 
 The skill is standalone. Do not rely on external repositories, deprecated product docs, or a user's local filesystem outside this repo. Use the references bundled here.
+
+## Product Boundary
+
+Wyrd follows a language-agnostic client/server model. The Rust server owns
+durable behavior and core logic; contracts live on the API wire through typed
+schemas, HTTP/MCP payloads, generated docs, and stable errors so any language
+can implement a client.
+
+The SvelteKit UI is a supported developer client and the styling source of
+truth. It is not the product or workflow source of truth. Do not add behavior
+that can only be performed through the UI, and do not duplicate server-owned
+registry, storage, policy, audit, tenancy, relationship, status, or evaluation
+logic in frontend code.
+
+Wyrd is agent-first and headless. MCP, CLI, HTTP, generated schemas, stable
+errors, and machine-readable docs are primary surfaces. UI work must preserve
+those headless paths and must respect both self-hosted and cloud SaaS tenant
+separation.
 
 ## Precedence
 

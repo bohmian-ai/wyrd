@@ -27,6 +27,21 @@ surfaces:
 
 - Wyrd remains the AI layer for human and agentic work, not an application
   runtime, training framework, workflow engine, or cloud platform.
+- Wyrd keeps a language-agnostic client/server model. Rust server code owns
+  durable behavior and core logic; clients project API-wire contracts instead
+  of becoming alternate sources of truth.
+- Contracts remain on the wire through typed schemas, HTTP/MCP payloads,
+  generated docs, and stable errors so any language can implement a client.
+- Rust and Python may receive first-class SDK ergonomics, OTEL hooks, agent
+  workflow integrations, local helpers, and tests, but those features must not
+  move server-owned durable behavior into client packages or make Wyrd
+  language-exclusive.
+- Self-hosted and cloud SaaS paths preserve tenant separation for identity,
+  authz, registry, storage, policy, audit, observability, evaluation, and
+  generated artifacts.
+- Wyrd remains agent-first and headless. MCP, CLI, HTTP, schemas, errors, and
+  machine-readable docs are primary surfaces; the developer UI is supported but
+  must not be the only way to perform a workflow.
 - New concepts fit the small ontology first: `Card`, `Spec`, `Run`, or
   `Observation`. New nouns are justified only when those shapes cannot express
   the concept honestly.

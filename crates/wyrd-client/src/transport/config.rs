@@ -216,3 +216,82 @@ impl Default for MockConfig {
         }
     }
 }
+
+/// Wyrd client transport selection.
+///
+/// gRPC is the default (Steven, 2026-06-02). Variants for queue transports
+/// (Kafka, RabbitMQ, Redis) are intentionally absent in this phase; they
+/// return in a dedicated follow-on plan when consumers need queue
+/// publication.
+///
+/// Wire shape: `{"transport": "grpc", "params": { ... }}`.
+///
+/// # Feature gating
+///
+/// `is_enabled()` is feature-aware natively. `Grpc` is gated on
+/// `cfg!(feature = "transport-grpc")`, `Http` on
+/// `cfg!(feature = "transport-http")`, and `Mock` is always available.
+/// `WyrdClient::new()` (PR4.0 section 22) calls this method and returns
+/// `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED { transport, required_feature }`
+/// when the selected variant is not compiled into the local build.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "transport", content = "params", rename_all = "snake_case")]
+pub enum TransportConfig {
+    /// gRPC transport (tonic). The default transport. Gated on `transport-grpc`.
+    Grpc(GrpcConfig),
+    /// HTTP transport (reqwest). Secondary path for gRPC-restricted environments.
+    /// Gated on `transport-http`.
+    Http(HttpConfig),
+    /// In-memory loopback transport for tests. Always available; no feature gate.
+    Mock(MockConfig),
+}
+
+impl Default for TransportConfig {
+    /// Returns `TransportConfig::Grpc(GrpcConfig::default())`.
+    fn default() -> Self {
+        Self::Grpc(GrpcConfig::default())
+    }
+}
+
+impl TransportConfig {
+    /// Short ASCII name matching the serde tag. Values: `"grpc"`, `"http"`,
+    /// `"mock"`.
+    ///
+    /// Useful for log annotations and metric labels.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Grpc(_) => "grpc",
+            Self::Http(_) => "http",
+            Self::Mock(_) => "mock",
+        }
+    }
+
+    /// Returns the Cargo feature name that gates this variant, or `None` if
+    /// the variant is always available. Used by `WyrdClient::new()` to fill
+    /// the `required_feature` field of `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED`.
+    pub fn required_feature(&self) -> Option<&'static str> {
+        match self {
+            Self::Grpc(_) => Some("transport-grpc"),
+            Self::Http(_) => Some("transport-http"),
+            Self::Mock(_) => None,
+        }
+    }
+
+    /// Returns `true` if the variant is compiled into the current build.
+    ///
+    /// `Mock` is always enabled. `Grpc` is enabled when the `transport-grpc`
+    /// Cargo feature is on; `Http` requires `transport-http`.
+    ///
+    /// `WyrdClient::new()` (PR4.0 section 22) calls this and returns
+    /// `Err(WyrdClientError::TransportFeatureDisabled { transport, required_feature })`
+    /// (catalog code `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED`, registered
+    /// in the `WyrdClientError` catalog block) when the selected variant is
+    /// compiled out, rather than panicking at first use.
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            Self::Grpc(_) => cfg!(feature = "transport-grpc"),
+            Self::Http(_) => cfg!(feature = "transport-http"),
+            Self::Mock(_) => true,
+        }
+    }
+}

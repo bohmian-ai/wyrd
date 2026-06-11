@@ -13,6 +13,10 @@
 #![deny(missing_docs)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod eval;
+#[cfg(feature = "python")]
+pub mod python;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use wyrd_spec::vala::ids::{RecordId, RunId};

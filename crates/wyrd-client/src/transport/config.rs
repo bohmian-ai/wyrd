@@ -171,3 +171,48 @@ impl HttpConfig {
         Ok(())
     }
 }
+
+/// Default buffer label used by [`MockConfig::default`].
+pub const MOCK_DEFAULT_LABEL: &str = "default";
+
+/// Configuration for the mock (in-memory loopback) transport.
+///
+/// Use this transport in unit tests where you want to assert what was
+/// published without touching a network. `wyrd-client::transport::mock`
+/// records every flushed envelope into an in-memory buffer keyed by
+/// [`MockConfig::label`] and provides `mock::drain(label)` to retrieve
+/// flushed records.
+///
+/// The mock transport is always available in `wyrd-client` (no feature gate).
+/// `MockConfig::fail_on_flush` lets tests inject deterministic flush
+/// failures - a Wyrd-native addition the predecessor mock did not support.
+///
+/// # Default
+///
+/// `MockConfig::default()` returns `{ label: "default", fail_on_flush: None }`.
+/// The default is a working config - it does not need `validate()` and is
+/// safe to use directly in tests that do not care about label isolation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MockConfig {
+    /// Buffer label. Multiple `MockConfig` instances with the same label share
+    /// the same in-memory buffer in `wyrd-client::transport::mock`. Use
+    /// distinct labels to isolate test scenarios running in the same process.
+    pub label: String,
+
+    /// Inject a flush failure. When `Some(n)`, the `nth` call to
+    /// `Flushable::flush` returns `Err`; all other calls succeed normally.
+    /// Counting starts from 1 (i.e. `Some(1)` fails the first flush).
+    /// `None` means the mock always succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_on_flush: Option<u32>,
+}
+
+impl Default for MockConfig {
+    fn default() -> Self {
+        Self {
+            label: MOCK_DEFAULT_LABEL.to_string(),
+            fail_on_flush: None,
+        }
+    }
+}

@@ -1,0 +1,80 @@
+use wyrd_client::transport::config::{MOCK_DEFAULT_LABEL, MockConfig};
+
+#[test]
+fn mock_config_default_uses_default_label_and_no_failure() {
+    let m = MockConfig::default();
+    assert_eq!(m.label, MOCK_DEFAULT_LABEL);
+    assert_eq!(m.label, "default");
+    assert!(m.fail_on_flush.is_none());
+}
+
+#[test]
+fn mock_config_default_round_trips() {
+    let m = MockConfig::default();
+    let s = serde_json::to_string(&m).unwrap();
+    let back: MockConfig = serde_json::from_str(&s).unwrap();
+    assert_eq!(m, back);
+}
+
+#[test]
+fn mock_config_no_fail_round_trips() {
+    let m = MockConfig {
+        label: "test-buffer".to_string(),
+        fail_on_flush: None,
+    };
+    let s = serde_json::to_string(&m).unwrap();
+    let back: MockConfig = serde_json::from_str(&s).unwrap();
+    assert_eq!(m, back);
+}
+
+#[test]
+fn mock_config_no_fail_omits_fail_on_flush_field() {
+    let m = MockConfig {
+        label: "buf".to_string(),
+        fail_on_flush: None,
+    };
+    let s = serde_json::to_string(&m).unwrap();
+    assert!(!s.contains("fail_on_flush"));
+}
+
+#[test]
+fn mock_config_with_fail_on_flush_round_trips() {
+    let m = MockConfig {
+        label: "buf".to_string(),
+        fail_on_flush: Some(2),
+    };
+    let s = serde_json::to_string(&m).unwrap();
+    let back: MockConfig = serde_json::from_str(&s).unwrap();
+    assert_eq!(m, back);
+}
+
+#[test]
+fn mock_config_fail_on_flush_first_call() {
+    let m = MockConfig {
+        label: "fail-first".to_string(),
+        fail_on_flush: Some(1),
+    };
+    let s = serde_json::to_string(&m).unwrap();
+    let back: MockConfig = serde_json::from_str(&s).unwrap();
+    assert_eq!(back.fail_on_flush, Some(1));
+}
+
+#[test]
+fn mock_config_rejects_unknown_fields() {
+    let r: Result<MockConfig, _> =
+        serde_json::from_str(r#"{"label":"buf","fail_on_flush":null,"extra":true}"#);
+    assert!(r.is_err());
+}
+
+#[test]
+fn mock_config_distinct_labels_are_not_equal() {
+    let a = MockConfig {
+        label: "a".to_string(),
+        fail_on_flush: None,
+    };
+    let b = MockConfig {
+        label: "b".to_string(),
+        fail_on_flush: None,
+    };
+    assert_ne!(a, b);
+}

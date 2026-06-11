@@ -19,6 +19,8 @@ use wyrd_spec::vala::eval::protocol::{
 use wyrd_spec::vala::eval::record::EvalRecordObservation;
 use wyrd_spec::vala::ids::RunId;
 
+use super::routes;
+
 /// Output returned by the caller's agent callback.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentTurnOutput {
@@ -45,19 +47,6 @@ pub struct RunSummary {
     pub run_id: RunId,
     /// Server base URL that owns the run.
     pub server_url: String,
-}
-
-/// Configuration for one protocol-client run.
-#[derive(Debug, Clone)]
-pub struct RunEvalConfig {
-    /// Wyrd server base URL.
-    pub server_url: Url,
-    /// Eval card reference to run.
-    pub eval_ref: CardRef,
-    /// Source for non-scripted user turns.
-    pub simulated_user: SimulatedUserMode,
-    /// Per-request HTTP timeout.
-    pub request_timeout: Duration,
 }
 
 /// Errors raised by the protocol client.
@@ -109,116 +98,163 @@ pub enum ProtocolClientError {
     },
 }
 
-/// Run the server pull protocol to completion.
+/// Shared HTTP client for the server pull protocol.
 ///
-/// # Errors
-/// Returns [`ProtocolClientError`] for transport, malformed protocol response,
-/// or callback failures.
-pub fn run_eval(
-    config: RunEvalConfig,
-    mut agent_fn: AgentFn,
-    mut simulated_user_fn: Option<SimulatedUserFn>,
-) -> Result<RunSummary, ProtocolClientError> {
-    let http = Client::builder()
-        .timeout(config.request_timeout)
-        .build()
-        .map_err(|source| ProtocolClientError::HttpBuild {
-            message: source.to_string(),
-        })?;
+/// One `ProtocolClient` may drive multiple sequential `run_eval` calls without
+/// rebuilding the underlying connection pool. Bearer auth is per-run (issued by
+/// the server on open) and lives inside `run_eval`, not here.
+pub struct ProtocolClient {
+    http: Client,
+    server_url: Url,
+}
 
-    let open_url = join_url(&config.server_url, "api/v1/eval/runs", "open")?;
-    let open: EvalRunOpenResponse = http
-        .post(open_url)
-        .json(&EvalRunOpenRequest {
-            eval_ref: config.eval_ref,
-            simulated_user: config.simulated_user,
-        })
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .map_err(|source| http_error("open", source))?
-        .json()
-        .map_err(|source| ProtocolClientError::Malformed {
-            operation: "open",
-            message: source.to_string(),
-        })?;
+impl ProtocolClient {
+    /// Build a client for one server URL.
+    ///
+    /// # Errors
+    /// Returns [`ProtocolClientError::HttpBuild`] when reqwest cannot
+    /// initialize the connection pool or TLS stack.
+    pub fn new(server_url: Url, request_timeout: Duration) -> Result<Self, ProtocolClientError> {
+        let http = Client::builder()
+            .timeout(request_timeout)
+            .build()
+            .map_err(|source| ProtocolClientError::HttpBuild {
+                message: source.to_string(),
+            })?;
+        Ok(Self { http, server_url })
+    }
 
-    let bearer = format!("Bearer {}", open.lease_token.as_str());
-    let run_path = format!("api/v1/eval/runs/{}/", open.run_id);
-    let next_url = join_url(&config.server_url, &(run_path.clone() + "next"), "next")?;
-    let agent_url = join_url(
-        &config.server_url,
-        &(run_path.clone() + "agent-turn"),
-        "agent-turn",
-    )?;
-    let user_url = join_url(&config.server_url, &(run_path + "user-turn"), "user-turn")?;
-
-    loop {
-        let directive: TurnDirective = http
-            .post(next_url.clone())
-            .header(reqwest::header::AUTHORIZATION, &bearer)
+    /// Run the server pull protocol to completion.
+    ///
+    /// # Errors
+    /// Returns [`ProtocolClientError`] for transport, malformed protocol
+    /// response, or callback failures.
+    pub fn run_eval(
+        &self,
+        eval_ref: CardRef,
+        simulated_user: SimulatedUserMode,
+        mut agent_fn: AgentFn,
+        mut simulated_user_fn: Option<SimulatedUserFn>,
+    ) -> Result<RunSummary, ProtocolClientError> {
+        let open_url = join_url(&self.server_url, routes::RUNS_BASE, "open")?;
+        let open: EvalRunOpenResponse = self
+            .http
+            .post(open_url)
+            .json(&EvalRunOpenRequest {
+                eval_ref,
+                simulated_user,
+            })
             .send()
             .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|source| http_error("next", source))?
+            .map_err(|source| http_error("open", source))?
+            .json()
+            .map_err(|source| ProtocolClientError::Malformed {
+                operation: "open",
+                message: source.to_string(),
+            })?;
+
+        let bearer = format!("Bearer {}", open.lease_token.as_str());
+        let run_base = format!("{}/{}/", routes::RUNS_BASE, open.run_id);
+        let next_url = join_url(&self.server_url, &format!("{}{}", run_base, routes::NEXT), "next")?;
+        let agent_url = join_url(&self.server_url, &format!("{}{}", run_base, routes::AGENT_TURN), "agent-turn")?;
+        let user_url = join_url(&self.server_url, &format!("{}{}", run_base, routes::USER_TURN), "user-turn")?;
+
+        loop {
+            let directive: TurnDirective = send_with_retry("next", || {
+                self.http
+                    .post(next_url.clone())
+                    .header(reqwest::header::AUTHORIZATION, &bearer)
+                    .send()
+                    .and_then(reqwest::blocking::Response::error_for_status)
+            })?
             .json()
             .map_err(|source| ProtocolClientError::Malformed {
                 operation: "next",
                 message: source.to_string(),
             })?;
 
-        match directive {
-            TurnDirective::AgentTurn {
-                scenario_id,
-                turn,
-                message,
-                history,
-            } => {
-                let output = agent_fn(&message, &history)?;
-                http.post(agent_url.clone())
-                    .header(reqwest::header::AUTHORIZATION, &bearer)
-                    .json(&AgentTurnSubmission {
-                        scenario_id,
-                        turn,
-                        response: output.response,
-                        records: output.records,
-                    })
-                    .send()
-                    .and_then(reqwest::blocking::Response::error_for_status)
-                    .map_err(|source| http_error("agent-turn", source))?;
-            }
-            TurnDirective::UserTurnNeeded {
-                scenario_id,
-                turn,
-                history,
-            } => {
-                let callback =
-                    simulated_user_fn
-                        .as_mut()
-                        .ok_or_else(|| ProtocolClientError::SimulatedUserFn {
+            match directive {
+                TurnDirective::AgentTurn {
+                    scenario_id,
+                    turn,
+                    message,
+                    history,
+                } => {
+                    let output = agent_fn(&message, &history)?;
+                    send_with_retry("agent-turn", || {
+                        self.http
+                            .post(agent_url.clone())
+                            .header(reqwest::header::AUTHORIZATION, &bearer)
+                            .json(&AgentTurnSubmission {
+                                scenario_id: scenario_id.clone(),
+                                turn,
+                                response: output.response.clone(),
+                                records: output.records.clone(),
+                            })
+                            .send()
+                            .and_then(reqwest::blocking::Response::error_for_status)
+                    })?;
+                }
+                TurnDirective::UserTurnNeeded {
+                    scenario_id,
+                    turn,
+                    history,
+                } => {
+                    let callback = simulated_user_fn.as_mut().ok_or_else(|| {
+                        ProtocolClientError::SimulatedUserFn {
                             message: "server requested a client-delegated user turn but no simulated_user_fn was supplied".to_string(),
-                        })?;
-                let message = callback(&history)?;
-                http.post(user_url.clone())
-                    .header(reqwest::header::AUTHORIZATION, &bearer)
-                    .json(&UserTurnSubmission {
-                        scenario_id,
-                        turn,
-                        message,
-                    })
-                    .send()
-                    .and_then(reqwest::blocking::Response::error_for_status)
-                    .map_err(|source| http_error("user-turn", source))?;
+                        }
+                    })?;
+                    let message = callback(&history)?;
+                    send_with_retry("user-turn", || {
+                        self.http
+                            .post(user_url.clone())
+                            .header(reqwest::header::AUTHORIZATION, &bearer)
+                            .json(&UserTurnSubmission {
+                                scenario_id: scenario_id.clone(),
+                                turn,
+                                message: message.clone(),
+                            })
+                            .send()
+                            .and_then(reqwest::blocking::Response::error_for_status)
+                    })?;
+                }
+                TurnDirective::ScenarioComplete { .. } => {}
+                TurnDirective::RunComplete => break,
             }
-            TurnDirective::ScenarioComplete { .. } => {}
-            TurnDirective::RunComplete => break,
         }
-    }
 
-    Ok(RunSummary {
-        run_id: open.run_id,
-        server_url: config.server_url.to_string(),
-    })
+        Ok(RunSummary {
+            run_id: open.run_id,
+            server_url: self.server_url.to_string(),
+        })
+    }
 }
 
+/// Retry a request closure on network-level failures (timeout or connection error).
+///
+/// Does not retry on 5xx — agent-turn and user-turn are non-idempotent; a 5xx
+/// may or may not have been processed by the server.
+fn send_with_retry(
+    operation: &'static str,
+    mut f: impl FnMut() -> Result<reqwest::blocking::Response, reqwest::Error>,
+) -> Result<reqwest::blocking::Response, ProtocolClientError> {
+    const MAX_ATTEMPTS: u8 = 3;
+    for attempt in 0..MAX_ATTEMPTS {
+        match f() {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if (error.is_timeout() || error.is_connect()) && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(http_error(operation, error)),
+        }
+    }
+    unreachable!("loop exits via Ok or Err before exhausting attempts")
+}
+
+/// Map a URL parse failure to the typed [`ProtocolClientError::Url`] variant.
 fn join_url(base: &Url, path: &str, operation: &'static str) -> Result<Url, ProtocolClientError> {
     base.join(path).map_err(|source| ProtocolClientError::Url {
         operation,
@@ -226,6 +262,7 @@ fn join_url(base: &Url, path: &str, operation: &'static str) -> Result<Url, Prot
     })
 }
 
+/// Map a reqwest error to [`ProtocolClientError::Http`], preserving the HTTP status code.
 fn http_error(operation: &'static str, source: reqwest::Error) -> ProtocolClientError {
     ProtocolClientError::Http {
         operation,

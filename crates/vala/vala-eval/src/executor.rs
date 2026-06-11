@@ -97,6 +97,9 @@ impl EvalReport {
     }
 }
 
+/// Output of the task-classification pass: runnable buckets by kind and skip outcomes in declaration order.
+type ClassifiedStage = (BTreeMap<EvalTaskKind, Vec<EvalTask>>, Vec<TaskRunOutcome>);
+
 /// Per-run state owned by the driver. Single-threaded — no locks.
 ///
 /// `skipped` is the cumulative skip set used for `DependencySkipped`
@@ -201,7 +204,7 @@ fn classify_stage_tasks(
     snapshot: &ContextSnapshot,
     registry: &TaskRegistry,
     ledger: &mut RunLedger,
-) -> Result<(BTreeMap<EvalTaskKind, Vec<EvalTask>>, Vec<TaskRunOutcome>), EvalExecError> {
+) -> Result<ClassifiedStage, EvalExecError> {
     let mut buckets: BTreeMap<EvalTaskKind, Vec<EvalTask>> = BTreeMap::new();
     let mut skips: Vec<TaskRunOutcome> = Vec::new();
 

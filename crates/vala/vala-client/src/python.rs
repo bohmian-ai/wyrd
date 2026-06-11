@@ -16,8 +16,7 @@ use wyrd_spec::vala::eval::protocol::{ConversationTurn, SimulatedUserMode, TurnR
 use wyrd_spec::version::VersionBlock;
 
 use crate::eval::protocol_client::{
-    AgentFn, AgentTurnOutput, ProtocolClientError, RunEvalConfig, RunSummary, SimulatedUserFn,
-    run_eval,
+    AgentFn, AgentTurnOutput, ProtocolClientError, ProtocolClient, RunSummary, SimulatedUserFn,
 };
 
 /// Run an Eval card through the server-hosted pull protocol.
@@ -74,15 +73,11 @@ pub fn run_eval_py(
         None
     };
 
-    let config = RunEvalConfig {
-        server_url: url,
-        eval_ref,
-        simulated_user: mode,
-        request_timeout: Duration::from_secs(request_timeout_secs),
-    };
+    let client = ProtocolClient::new(url, Duration::from_secs(request_timeout_secs))
+        .map_err(protocol_error_to_py)?;
 
     let summary = py
-        .detach(|| run_eval(config, agent_closure, simulated_closure))
+        .detach(|| client.run_eval(eval_ref, mode, agent_closure, simulated_closure))
         .map_err(protocol_error_to_py)?;
     summary_to_py(py, &summary)
 }
@@ -96,6 +91,7 @@ pub fn python_register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// GIL re-entry point for agent turn callbacks — attaches to the interpreter, calls the Python callable, and extracts the result.
 fn invoke_agent(
     agent_obj: &Py<PyAny>,
     message: &str,
@@ -113,6 +109,7 @@ fn invoke_agent(
     })
 }
 
+/// GIL re-entry point for simulated-user turn callbacks — mirrors [`invoke_agent`] for the user-side callback.
 fn invoke_simulated_user(
     simulated_obj: &Py<PyAny>,
     history: &[ConversationTurn],

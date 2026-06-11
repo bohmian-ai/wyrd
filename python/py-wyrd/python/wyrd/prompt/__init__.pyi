@@ -5,8 +5,8 @@
 from collections.abc import Mapping
 from typing import Any
 
-from .._wyrd import JsonDict, PathLike, WyrdError
 from ..cards import CardRef
+from .._wyrd import JsonDict, PathLike, WyrdError
 
 #### end of imports ####
 

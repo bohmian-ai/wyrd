@@ -7208,7 +7208,7 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
         },
         {
           "additionalProperties": false,
-          "description": "Pass iff every `LlmJudge` task passes at the per-judge threshold.\n\nComputed per judge, then AND-reduced across judges.",
+          "description": "Pass iff the minimum per-task pass rate across **all** tasks meets the threshold.\n\nComputed as `min(pass_rate per task across all subjects)`. A task that never appears scores 0.0. This is task-level, not judge-type-level \u2014 `LlmJudge` and other task types all contribute equally.",
           "properties": {
             "kind": {
               "enum": [
@@ -7217,7 +7217,7 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
               "type": "string"
             },
             "threshold": {
-              "description": "Minimum accepted per-judge pass rate in `[0.0, 1.0]`.",
+              "description": "Minimum accepted per-task pass rate in `[0.0, 1.0]`.",
               "format": "double",
               "type": "number"
             }

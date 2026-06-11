@@ -5,8 +5,8 @@
 from collections.abc import Mapping, Sequence
 from typing import Any, overload
 
-from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError
 from ..cards import CardRef
+from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError
 from ..data import FieldSpec
 
 #### end of imports ####

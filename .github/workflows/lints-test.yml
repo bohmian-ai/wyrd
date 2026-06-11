@@ -85,6 +85,19 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
 
+      - name: Use GNU BFD linker on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          command -v cc
+          command -v ld.bfd
+          rustflags="${RUSTFLAGS:-}"
+          rustflags="${rustflags:+$rustflags }-C linker-features=-lld -C link-arg=-fuse-ld=bfd"
+          {
+            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc"
+            echo "RUSTFLAGS=$rustflags"
+          } >> "$GITHUB_ENV"
+
       - name: Test Rust workspace
         run: mise run test:unit
 

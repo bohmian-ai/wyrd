@@ -165,7 +165,7 @@ pub async fn execute_plan(
     })
 }
 
-/// Execute one stage: resolve skips, fan out buckets, and extend the snapshot.
+/// Execute one stage: classify tasks, fan out concurrently, and extend the snapshot.
 ///
 /// Returns the new snapshot to thread into the next stage.
 async fn execute_stage(
@@ -175,9 +175,35 @@ async fn execute_stage(
     executors: &Executors,
     ledger: &mut RunLedger,
 ) -> Result<Arc<ContextSnapshot>, EvalExecError> {
-    // First pass: resolve skips synchronously and bucket the rest by kind.
+    // prepare the tasks: resolve skips and bucket the runnable tasks by kind
+    let (buckets, skips) = classify_stage_tasks(stage, &snapshot, registry, ledger)?;
+
+    // run the buckets concurrently and collect their outputs flat; no ordering guarantees within the stage yet
+    let outputs =
+        fan_out_all_buckets(buckets, Arc::clone(&snapshot), executors, stage.index).await?;
+    let by_id: HashMap<TaskId, TaskOutput> = outputs.into_iter().collect();
+
+    // merge the skips and outputs back into declaration order, extending the ledger and preparing the snapshot extension
+    let (ordered, new_outputs) = order_stage_outcomes(stage, skips, by_id);
+    ledger.outcomes.extend(ordered);
+    Ok(Arc::new(snapshot.extend(new_outputs)))
+}
+
+/// First pass: resolve skips synchronously and bucket the runnable tasks by kind.
+///
+/// Dependency-skip propagation and condition-gate evaluation are both pure
+/// (no IO). `ledger.skipped` is extended in place so later stages — and later
+/// tasks in this same stage — can propagate skips transitively.
+///
+/// Returns the runnable-task buckets and the skip outcomes in declaration order.
+fn classify_stage_tasks(
+    stage: &Stage,
+    snapshot: &ContextSnapshot,
+    registry: &TaskRegistry,
+    ledger: &mut RunLedger,
+) -> Result<(BTreeMap<EvalTaskKind, Vec<EvalTask>>, Vec<TaskRunOutcome>), EvalExecError> {
     let mut buckets: BTreeMap<EvalTaskKind, Vec<EvalTask>> = BTreeMap::new();
-    let mut staged: Vec<TaskRunOutcome> = Vec::with_capacity(stage.tasks.len());
+    let mut skips: Vec<TaskRunOutcome> = Vec::new();
 
     for task_id in &stage.tasks {
         let task = registry
@@ -191,23 +217,21 @@ async fn execute_stage(
             })?;
 
         if let Some(upstream) = first_skipped_dependency(task, ledger) {
-            let outcome = TaskRunOutcome::Skipped {
+            ledger.skipped.insert(task_id.clone());
+            skips.push(TaskRunOutcome::Skipped {
                 task_id: task_id.clone(),
                 reason: SkipReason::DependencySkipped { upstream },
-            };
-            ledger.skipped.insert(task_id.clone());
-            staged.push(outcome);
+            });
             continue;
         }
 
         if let Some(condition) = task.condition() {
-            if !evaluate_condition(task_id, task.depends_on(), condition, &snapshot)? {
-                let outcome = TaskRunOutcome::Skipped {
+            if !evaluate_condition(task_id, task.depends_on(), condition, snapshot)? {
+                ledger.skipped.insert(task_id.clone());
+                skips.push(TaskRunOutcome::Skipped {
                     task_id: task_id.clone(),
                     reason: SkipReason::ConditionFalse,
-                };
-                ledger.skipped.insert(task_id.clone());
-                staged.push(outcome);
+                });
                 continue;
             }
         }
@@ -218,7 +242,21 @@ async fn execute_stage(
             .push(task.clone());
     }
 
-    // Second pass: fan the four buckets out concurrently.
+    Ok((buckets, skips))
+}
+
+/// Second pass: run all four task-kind buckets concurrently and return their outputs flat.
+///
+/// `tokio::try_join!` keeps the four kinds parallel. Within each kind,
+/// [`fan_out_bucket`] spawns one Tokio task per eval task via `JoinSet`.
+/// The flat output vec arrives in assertion → judge → trace → agent order;
+/// declaration order is restored by [`order_stage_outcomes`].
+async fn fan_out_all_buckets(
+    mut buckets: BTreeMap<EvalTaskKind, Vec<EvalTask>>,
+    snapshot: Arc<ContextSnapshot>,
+    executors: &Executors,
+    stage_index: u32,
+) -> Result<Vec<(TaskId, TaskOutput)>, EvalExecError> {
     let assertion_tasks = buckets.remove(&EvalTaskKind::Assertion).unwrap_or_default();
     let judge_tasks = buckets.remove(&EvalTaskKind::LlmJudge).unwrap_or_default();
     let trace_tasks = buckets
@@ -228,66 +266,72 @@ async fn execute_stage(
         .remove(&EvalTaskKind::AgentAssertion)
         .unwrap_or_default();
 
-    let stage_index = stage.index;
     let (assertion_out, judge_out, trace_out, agent_out) = tokio::try_join!(
         fan_out_bucket(
             assertion_tasks,
             Arc::clone(&snapshot),
             Arc::clone(&executors.assertion),
-            stage_index,
+            stage_index
         ),
         fan_out_bucket(
             judge_tasks,
             Arc::clone(&snapshot),
             Arc::clone(&executors.judge),
-            stage_index,
+            stage_index
         ),
         fan_out_bucket(
             trace_tasks,
             Arc::clone(&snapshot),
             Arc::clone(&executors.trace),
-            stage_index,
+            stage_index
         ),
         fan_out_bucket(
             agent_tasks,
             Arc::clone(&snapshot),
             Arc::clone(&executors.agent),
-            stage_index,
+            stage_index
         ),
     )?;
 
-    // Collect new outputs into a (task_id -> TaskOutput) map for ordered emit.
-    let mut by_id: HashMap<TaskId, TaskOutput> = HashMap::with_capacity(stage.tasks.len());
-    for (task_id, output) in assertion_out
+    Ok(assertion_out
         .into_iter()
         .chain(judge_out)
         .chain(trace_out)
         .chain(agent_out)
-    {
-        by_id.insert(task_id, output);
-    }
+        .collect())
+}
 
-    // Emit outcomes in stage-declaration order, interleaving skips and runs.
-    let mut new_outputs: Vec<(TaskId, Arc<TaskOutput>)> = Vec::with_capacity(by_id.len());
-    let mut ordered: Vec<TaskRunOutcome> = Vec::with_capacity(stage.tasks.len());
-    let mut skips: HashMap<TaskId, TaskRunOutcome> = staged
+/// Merge skip outcomes and task outputs into stage-declaration order.
+///
+/// Skips arrived in declaration order from [`classify_stage_tasks`]; they are
+/// re-indexed by task id so the single pass over `stage.tasks` can interleave
+/// them with ran outputs without a second linear scan.
+///
+/// Returns the ordered outcomes (for the ledger) and the new outputs (for
+/// snapshot extension).
+fn order_stage_outcomes(
+    stage: &Stage,
+    skips: Vec<TaskRunOutcome>,
+    mut by_id: HashMap<TaskId, TaskOutput>,
+) -> (Vec<TaskRunOutcome>, Vec<(TaskId, Arc<TaskOutput>)>) {
+    let mut skips_by_id: HashMap<TaskId, TaskRunOutcome> = skips
         .into_iter()
         .map(|outcome| (outcome_task_id(&outcome).clone(), outcome))
         .collect();
+
+    let mut ordered: Vec<TaskRunOutcome> = Vec::with_capacity(stage.tasks.len());
+    let mut new_outputs: Vec<(TaskId, Arc<TaskOutput>)> = Vec::new();
+
     for task_id in &stage.tasks {
-        if let Some(skip) = skips.remove(task_id) {
+        if let Some(skip) = skips_by_id.remove(task_id) {
             ordered.push(skip);
-            continue;
-        }
-        if let Some(output) = by_id.remove(task_id) {
+        } else if let Some(output) = by_id.remove(task_id) {
             ordered.push(TaskRunOutcome::Ran(output.result().clone()));
             new_outputs.push((task_id.clone(), Arc::new(output)));
         }
     }
 
-    ledger.outcomes.extend(ordered);
-
-    Ok(Arc::new(snapshot.extend(new_outputs)))
+    (ordered, new_outputs)
 }
 
 async fn fan_out_bucket(

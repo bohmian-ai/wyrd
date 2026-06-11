@@ -1,6 +1,6 @@
 # Wyrd
 
-The AI layer: the managed control plane for every AI capability a company runs.
+The AI Operational Layer: the managed control plane for every AI capability a company runs.
 
 > Pre-1.0.
 

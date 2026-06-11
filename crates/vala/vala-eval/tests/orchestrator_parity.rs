@@ -3,84 +3,126 @@ mod orchestrator_support;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use async_trait::async_trait;
+use chrono::Utc;
 use orchestrator_support::{
     assertion_task, eval_ref, fixture_value, judge_task, record, scenario, spec, subject_ref, tid,
 };
 use serde_json::json;
 use tokio::sync::Mutex;
-use vala_eval::orchestrator::{
-    AgentTurnFn, AgentTurnReply, EmbeddedOrchestrator, OrchestratorError, ScenarioScoring,
+use vala_eval::orchestrator::{NextDirective, RunState, ScenarioScoring};
+use vala_eval::{
+    EvalResults, JudgeError, MockJudgeInvoker, RunIdentity, ScenarioAggregationInput,
+    ScenarioExecutionResults, SubjectKey,
 };
-use vala_eval::{MockJudgeInvoker, SubjectKey};
-use wyrd_spec::vala::eval::protocol::{ConversationTurn, SimulatedUserMode};
-use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::vala::eval::protocol::{AgentTurnSubmission, SimulatedUserMode, TurnDirective};
+use wyrd_spec::vala::eval::record::EvalRecordObservation;
+use wyrd_spec::vala::eval::{EvalScenario, EvalTask};
 
 struct ScriptedAgent {
-    replies: Mutex<VecDeque<AgentTurnReply>>,
+    replies: Mutex<VecDeque<(String, Vec<EvalRecordObservation>)>>,
 }
 
 impl ScriptedAgent {
-    fn new(replies: Vec<AgentTurnReply>) -> Arc<Self> {
+    fn new(replies: Vec<(String, Vec<EvalRecordObservation>)>) -> Arc<Self> {
         Arc::new(Self {
             replies: Mutex::new(replies.into_iter().collect()),
         })
     }
-}
 
-#[async_trait]
-impl AgentTurnFn for ScriptedAgent {
-    async fn invoke(
-        &self,
-        _message: &str,
-        _history: &[ConversationTurn],
-    ) -> Result<AgentTurnReply, OrchestratorError> {
+    async fn pop(&self) -> (String, Vec<EvalRecordObservation>) {
         self.replies
             .lock()
             .await
             .pop_front()
-            .ok_or_else(|| OrchestratorError::EmbeddedCallback {
-                reason: "scripted agent has no remaining reply".to_owned(),
-            })
+            .expect("scripted agent has no remaining reply")
     }
 }
 
 fn reply(
     response: &str,
-    records: Vec<wyrd_spec::vala::eval::record::EvalRecordObservation>,
-) -> AgentTurnReply {
-    AgentTurnReply {
-        response: response.to_owned(),
-        records,
-    }
+    records: Vec<EvalRecordObservation>,
+) -> (String, Vec<EvalRecordObservation>) {
+    (response.to_owned(), records)
+}
+
+struct TestOutcome {
+    scenarios: Vec<ScenarioExecutionResults>,
+    run: EvalResults,
 }
 
 async fn drive(
-    tasks: Vec<wyrd_spec::vala::eval::EvalTask>,
-    judge_outputs: Vec<Result<serde_json::Value, vala_eval::JudgeError>>,
-    scenario: wyrd_spec::vala::eval::EvalScenario,
-    replies: Vec<AgentTurnReply>,
-) -> vala_eval::orchestrator::EmbeddedOutcome {
+    tasks: Vec<EvalTask>,
+    judge_outputs: Vec<Result<serde_json::Value, JudgeError>>,
+    input_scenario: EvalScenario,
+    replies: Vec<(String, Vec<EvalRecordObservation>)>,
+) -> TestOutcome {
     let scoring = ScenarioScoring::with_in_memory_traces(
         Arc::new(spec(tasks)),
         MockJudgeInvoker::new(judge_outputs),
     )
     .expect("scoring builds");
-    let orchestrator = EmbeddedOrchestrator {
-        scoring,
-        simulator: None,
-    };
+    let agent = ScriptedAgent::new(replies);
+    let mut state = RunState::open(eval_ref(), SimulatedUserMode::Client, vec![input_scenario]);
+    let mut scenario_results: Vec<ScenarioExecutionResults> = Vec::new();
+    let mut aggregation_inputs: Vec<ScenarioAggregationInput> = Vec::new();
 
-    orchestrator
-        .drive(
-            eval_ref(),
-            SimulatedUserMode::Client,
-            vec![scenario],
-            ScriptedAgent::new(replies),
-            None,
-        )
-        .await
-        .expect("embedded run succeeds")
+    loop {
+        let NextDirective(directive) = state.next().expect("next directive");
+        match directive {
+            TurnDirective::AgentTurn {
+                scenario_id,
+                turn,
+                ..
+            } => {
+                let (response, records) = agent.pop().await;
+                state
+                    .submit_agent_turn(AgentTurnSubmission {
+                        scenario_id,
+                        turn,
+                        response,
+                        records,
+                    })
+                    .expect("submit agent turn");
+            }
+            TurnDirective::UserTurnNeeded { .. } => {
+                panic!("no simulated user configured");
+            }
+            TurnDirective::ScenarioComplete { scenario_id } => {
+                let cursor = state
+                    .take_completed_scenario(&scenario_id)
+                    .expect("take cursor");
+                let result = scoring
+                    .score_scenario(&cursor)
+                    .await
+                    .expect("score scenario");
+                aggregation_inputs.push(
+                    scoring
+                        .scenario_aggregation(&cursor, &result)
+                        .expect("scenario aggregation"),
+                );
+                scenario_results.push(result);
+                state.ack_scenario_complete();
+            }
+            TurnDirective::RunComplete => {
+                state.ack_run_complete();
+                break;
+            }
+        }
+    }
+
+    let identity = RunIdentity {
+        run_id: state.run_id,
+        eval_ref: eval_ref(),
+        started_at: state.opened_at,
+        ended_at: Utc::now(),
+    };
+    let run = scoring
+        .finalize(identity, aggregation_inputs)
+        .expect("finalize");
+    TestOutcome {
+        scenarios: scenario_results,
+        run,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -88,7 +130,7 @@ async fn scripted_walk_llm_judge_parity() {
     // parity: scouter/crates/scouter_evaluate/tests/fixtures/single_turn_pass.json
     let fixture = fixture_value(include_str!("fixtures/parity/scripted_judge.json"));
     assert_eq!(fixture["expected_pass_rate"], json!(1.0));
-    let run_id = RunId::from_string("scripted-parity-run".to_owned());
+    let run_id = wyrd_spec::vala::ids::RunId::from_string("scripted-parity-run".to_owned());
 
     let outcome = drive(
         vec![judge_task("judge_passes")],
@@ -118,7 +160,7 @@ async fn termination_signal_parity() {
     // parity: scouter/crates/scouter_evaluate/tests/fixtures/termination_signal.json
     let fixture = fixture_value(include_str!("fixtures/parity/termination_signal.json"));
     assert_eq!(fixture["expected_scenario_passed"], json!(true));
-    let run_id = RunId::from_string("signal-parity-run".to_owned());
+    let run_id = wyrd_spec::vala::ids::RunId::from_string("signal-parity-run".to_owned());
 
     let outcome = drive(
         vec![assertion_task("context_ok")],
@@ -144,7 +186,7 @@ async fn subject_aggregation_parity() {
     // parity: scouter/crates/scouter_evaluate/tests/fixtures/subject_rollup.json
     let fixture = fixture_value(include_str!("fixtures/parity/subject_rollup.json"));
     assert_eq!(fixture["expected_subject_pass_rate"], json!(1.0));
-    let run_id = RunId::from_string("subject-parity-run".to_owned());
+    let run_id = wyrd_spec::vala::ids::RunId::from_string("subject-parity-run".to_owned());
 
     let outcome = drive(
         vec![assertion_task("subject_context_ok")],

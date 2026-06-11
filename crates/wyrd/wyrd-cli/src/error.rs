@@ -57,19 +57,9 @@ pub enum WyrdCliError {
         code = "WYRD_CLI_400_SERVER_REJECTS_RECORDS",
         status = 400,
         title = "Server mode rejects records",
-        remediation = "Use --local --records or use --server with --agent-url."
+        remediation = "Use --records without --server, or use --server with --agent-url."
     )]
     ServerRejectsRecords,
-
-    /// Scenarios are required for local agent-driving.
-    #[error("--local --agent-url requires --scenarios <PATH>")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_SCENARIOS_REQUIRED",
-        status = 400,
-        title = "Scenarios file required",
-        remediation = "Pass --scenarios <PATH> to a JSON, YAML, or JSONL scenario collection."
-    )]
-    ScenariosRequired,
 
     /// LLM judge tasks require the deterministic mock until provider wiring lands.
     #[error("LLM judge tasks require --judge-mock")]
@@ -217,20 +207,6 @@ pub enum WyrdCliError {
         /// Source error.
         #[source]
         source: vala_eval::EvalExecError,
-    },
-
-    /// Eval plan loading failed.
-    #[error("eval plan failed: {source}")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_EVAL_PLAN",
-        status = 400,
-        title = "Eval plan failed",
-        remediation = "Check scenario files and Eval task DAG configuration."
-    )]
-    EvalPlan {
-        /// Source error.
-        #[source]
-        source: vala_eval::EvalPlanError,
     },
 
     /// Orchestrator failed.

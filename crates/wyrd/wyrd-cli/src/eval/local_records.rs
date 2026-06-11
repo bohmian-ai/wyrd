@@ -12,7 +12,7 @@ use crate::error::WyrdCliError;
 use crate::eval::output;
 use crate::eval::run::{self, EvalRunArgs};
 
-/// Run `--local --records`.
+/// Run `--records`.
 ///
 /// # Errors
 /// Returns an error when input loading, scoring, comparison, or output writing

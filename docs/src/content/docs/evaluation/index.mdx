@@ -1,125 +1,149 @@
 ---
 title: "Evaluation"
-description: "Why agent evaluation is different, and what Wyrd ships for it."
+description: "Measure agent quality before you ship and after you ship, with the same task definitions."
 ---
 
-# Evaluation
+Traditional model evaluation compares an output to a label. Agent evaluation is harder. The final response is one artifact of a process that includes tool calls, multi-turn dialogue, span behavior, and intermediate scores that all matter independently of whether the final answer looks right.
 
-Wyrd evaluation gives agent teams a registered, repeatable way to test whether
-agent behavior still meets the declared quality bar. The unit is an `EvalCard`.
-The runtime executes scenarios, collects `EvalRecord` evidence, scores that
-evidence through task definitions, and emits `EvalResults` that can be compared
-against a saved baseline.
+Wyrd eval gives you two views across the same run: what the user saw (the passenger view), and what happened under the hood (the mechanic view). Both use the same task engine and the same task definitions.
 
-## Agents aren't models
+---
 
-A classifier takes an input and returns an output. You can compare that output
-to a label and get a stable answer. An agent takes an input, decides whether to
-call tools, may hand work to another declared component, carries conversation
-history across turns, and finally returns a response shaped by all of those
-intermediate choices.
+## Two evaluation modes
 
-That makes exact-output tests brittle. Two successful runs can produce
-different wording, token counts, tool order, or trace shape. A failed run can
-look acceptable if the final response happens to be right while the path was
-expensive, fragile, or missing a required tool call.
+### Online — production monitoring
 
-Wyrd treats these as separate signals. The scenario view asks whether the agent
-got the user from start to finish. The workflow view asks whether the declared
-run stayed healthy underneath: span order, retries, token use, tool calls,
-structured fields, and judge scores.
+Your agent emits `EvalRecordObservation` records during inference. The server processes them asynchronously. No impact on your application's response time.
 
-External dependencies make this more important. Provider changes, tool API
-changes, prompt updates, and context-window limits can all change behavior
-without changing the `EvalCard`. A useful evaluation surface has to catch both
-pre-deploy regressions and production-sampling regressions with the same task
-definitions.
-
-```mermaid
-graph LR
-    subgraph "Classifier eval"
-        A["test input"] --> B["model"]
-        B --> C["output"]
-        C --> D["compare to expected label"]
-        D --> E["pass or fail"]
-    end
+```python
+# During inference, emit a record
+record = {
+    "record_id": new_uuid7(),
+    "run_id": current_run_id(),
+    "eval_ref": {"kind": "Eval", "name": "support-eval", "version": "1.0.0"},
+    "context": {
+        "query": user_query,
+        "response": agent_response,
+        "tool_calls": tool_call_log,
+        "score": confidence_score,
+    },
+    "created_at": utc_now(),
+}
+run.observe.eval(record)
 ```
 
-```mermaid
-graph LR
-    subgraph "Agent eval"
-        A["test input"] --> B["orchestrator"]
-        B --> C["agent turn"]
-        C --> D["tool calls"]
-        D --> E["agent response"]
-        E --> F["scenario check"]
-        C --> G["workflow checks"]
-        D --> G
-        G --> H["trace and agent assertions"]
-    end
+The server resolves the Eval card from `eval_ref`, runs the task DAG against `context`, and stores `EvalResults`. Use this to catch quality regressions and distribution shift after deployment.
+
+### Scenario — CI and pre-deploy testing
+
+You define test cases as scenarios. The server drives multi-turn conversations, your agent responds turn by turn, and the server scores the completed interaction.
+
+```bash
+wyrd eval run \
+  --eval eval-cards/support-eval.yaml \
+  --scenarios data/scenarios/support-smoke.json \
+  --local \
+  --agent-url http://127.0.0.1:9000/agent
 ```
 
-## Scope of the evaluation problem
+Use this to gate releases, catch regressions before deployment, and establish the quality baseline you'll compare production samples against.
 
-Agent evaluation is not one check. It spans prompt-level assertions,
-single-agent task quality, multi-turn session quality, and workflow-level
-health across traces and tool calls.
+### Same tasks, both modes
 
-The first split is single-agent versus multi-agent or multi-component
-pipelines. A single agent may only need scenario outcomes and a few workflow
-checks. A pipeline may need the same end-to-end scenario plus per-subject task
-results so one degraded component does not hide behind a passing final answer.
+Task definitions are identical across online and scenario modes. An assertion that gates a release can monitor production without changes. Write them once.
 
-The second split is prompt-level versus session-level behavior. A prompt-level
-check can assert that a response is JSON, contains required fields, or stays
-under a threshold. A session-level check needs a `Scenario`, conversation
-history, termination behavior, and scoring across the full interaction.
+---
 
-The third split is scenario versus workflow. Scenario tasks are the outside
-view: given this scenario, did the interaction pass? Workflow tasks are the
-inside view: did the run call the right tools, emit the right spans, and meet
-the declared structural checks? Wyrd runs both views in one evaluation run.
+## Mechanic vs. passenger
 
-## What Wyrd ships
+Think of it like a car. A passenger only cares whether it got from A to B. A mechanic wants to know whether the engine ran correctly even if it did.
 
-- `EvalCard` and `EvalSpec`: the registered, versioned evaluation unit.
-- Four `EvalTask` kinds: `AssertionTask`, `LlmJudgeTask`,
-  `TraceAssertionTask`, and `AgentAssertionTask`.
-- `Scenario` and the turn protocol: multi-turn agent runs with scripted,
-  server-simulated, or client-delegated user turns.
-- `EmbeddedOrchestrator`: the in-process engine for local CLI runs.
-- `vala-http::eval` routes: the turn-protocol HTTP surface mounted under
-  `wyrd-server`.
-- `wyrd eval run`: the CLI entry for local runs, record replay, and server
-  protocol runs.
-- `wyrd.eval.run_eval`: the Python protocol client for driving a server run
-  from a Python callable.
-- `EvalResults` and `ComparisonResults`: run summaries, pass-gate verdicts, and
-  four-quadrant baseline diffs.
+**Passenger view** — given this input, did the agent produce the right output? Scenario tasks run against the agent's final response. This is your end-to-end quality signal.
 
-## Why it matters
+**Mechanic view** — did the run stay healthy underneath? Tasks defined in the `EvalSpec` run against `EvalRecordObservation` records emitted during execution — intermediate results, tool calls, trace spans, intermediate scores. A passing final response does not imply passing mechanic tasks.
 
-Unit tests catch code-level failures. They do not catch quality regressions
-caused by a model update, a tool returning a subtly different shape, a prompt
-template drifting, or a retriever span running too slowly. Those failures are
-production-blocking for agents because the final response is only one part of
-the behavior users depend on.
+A scenario passes only when both views pass. A run where the final response looked right but a tool call assertion failed is a `scenario_passed: false` result.
 
-Notebook-grade evaluation usually starts as a good prototype and then becomes
-operational debt. Wyrd lets the same declared task definitions gate CI,
-exercise local scenarios, replay captured records, and compare production
-samples to a known baseline. The point is not a new scoring script. The point
-is one versioned evaluation contract that Wyrd can inspect, run, and compare.
+---
+
+## Task types
+
+Tasks are what the engine evaluates against each record. Four kinds, all composable in the same DAG.
+
+| Task | What it checks | Cost |
+|---|---|---|
+| `AssertionTask` | Deterministic rules: values, thresholds, formats, patterns | Zero — pure Rust |
+| `LlmJudgeTask` | Semantic quality via a registered `Prompt` card | One LLM call per record |
+| `TraceAssertionTask` | OTel span properties: order, duration, retries, token budgets | Zero |
+| `AgentAssertionTask` | Tool calls and response structure: which tools ran, with what args | Zero |
+
+The common pattern is cheap-first. Run `AssertionTask` before `LlmJudgeTask`. If format validation fails, the judge never runs.
+
+```yaml
+tasks:
+  response_not_empty:
+    kind: assertion
+    id: response_not_empty
+    context_path: "$.response"
+    operator: has_length_greater_than
+    expected: 10
+
+  helpfulness:
+    kind: llm_judge
+    id: helpfulness
+    judge_ref:
+      kind: Prompt
+      name: helpfulness-judge
+      version: 1.0.0
+    context_path: "$.score"
+    operator: greater_than_or_equal
+    expected: 4
+    depends_on: [response_not_empty]
+```
+
+`depends_on` creates a topological dependency. `helpfulness` only runs when `response_not_empty` passes.
+
+Full reference: [EvalCard and tasks](/evaluation/eval-card-and-tasks/)
+
+---
+
+## How the engine works
+
+Every record — online or scenario — goes through the same path.
+
+```
+Your JSON context
+      │
+      ▼
+ExecutionContext (one per record)
+  └── ContextSnapshot
+        └── base_context: your JSON
+        └── task_outputs: {} (fills as stages run)
+      │
+      ▼
+execute_plan(plan, context, registry, executors)
+  └── stage 0: assertions run concurrently
+  └── stage 1: judges run, assertions that depend on stage-0 outputs run
+  └── stage N: ...
+      │  (each stage extends the snapshot with new task outputs)
+      ▼
+EvalReport
+  └── TaskRunOutcome per task: Ran(AssertionResult) or Skipped
+```
+
+Tasks in the same topological stage run concurrently within each stage — the four task types fan out as parallel Tokio tasks. After each stage, the snapshot extends with new outputs. Downstream tasks JSONPath into `$.task.<id>.passed`, `$.task.<id>.actual`, `$.task.<id>.parsed` (for judge outputs).
+
+---
 
 ## Where to go next
 
-- [EvalCard and tasks](/evaluation/eval-card-and-tasks/) explains the
-  registered unit, the four task kinds, and task DAGs.
-- [Scenarios and records](/evaluation/scenarios-and-records/) explains the
-  runtime units and turn protocol.
-- [Running evals](/evaluation/running-evals/) shows the three CLI flows.
-- [Results and comparison](/evaluation/results-and-comparison/) covers
-  `EvalResults`, pass gates, and baseline diffs.
-- [Python SDK](/evaluation/python-sdk/) documents `wyrd.eval.run_eval`.
-- [Comparison](/evaluation/comparison/) positions Wyrd against adjacent tools.
-- [Discussion](/evaluation/discussion/) records v1 tradeoffs and followups.
+| What you want | Where to go |
+|---|---|
+| Define your first tasks | [EvalCard and tasks](/evaluation/eval-card-and-tasks/) |
+| Understand records and scenarios | [Scenarios and records](/evaluation/scenarios-and-records/) |
+| Run your first eval | [Running evals](/evaluation/running-evals/) |
+| Read the results | [Results and comparison](/evaluation/results-and-comparison/) |
+| Drive from Python | [Python SDK](/evaluation/python-sdk/) |
+| Compare two runs | [Comparison](/evaluation/comparison/) |
+
+If you're starting from scratch, go to [Running evals](/evaluation/running-evals/) first. The other pages explain the concepts referenced in the command examples.

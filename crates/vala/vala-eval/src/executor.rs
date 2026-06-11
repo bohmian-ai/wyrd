@@ -145,6 +145,7 @@ pub struct Executors {
 }
 
 /// Walk `plan.stages` in order, returning the per-run report.
+/// This is the main entry point for the driver.
 ///
 /// # Errors
 /// Returns [`EvalExecError::DagInvalid`] when a plan references a task absent
@@ -166,6 +167,9 @@ pub async fn execute_plan(
     })
 }
 
+/// Execute one stage: resolve skips, fan out buckets, and extend the snapshot.
+///
+/// Returns the new snapshot to thread into the next stage.
 async fn execute_stage(
     stage: &Stage,
     snapshot: Arc<ContextSnapshot>,

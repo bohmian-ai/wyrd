@@ -11,7 +11,7 @@ use url::Url;
 use vala_eval::{JudgeInvoker, MockJudgeInvoker};
 use wyrd_spec::envelope::{Card, CardKind, Spec};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::vala::eval::protocol::{ConversationTurn, SimulatedUserMode};
+use wyrd_spec::vala::eval::protocol::SimulatedUserMode;
 use wyrd_spec::vala::eval::{EvalSpec, EvalTask, ScenarioId};
 
 use crate::error::WyrdCliError;
@@ -31,26 +31,20 @@ pub enum EvalCommand {
 #[command(group(
     clap::ArgGroup::new("source")
         .required(true)
-        .args(["agent_url", "records"]),
+        .args(["server", "records"]),
 ))]
 pub struct EvalRunArgs {
     /// Eval card filesystem path.
     #[arg(long, value_name = "PATH")]
     pub eval: String,
-    /// Scenario collection path for agent-driving modes.
-    #[arg(long, value_name = "PATH")]
-    pub scenarios: Option<PathBuf>,
     /// Agent endpoint URL.
     #[arg(long, value_name = "URL", conflicts_with = "records")]
     pub agent_url: Option<Url>,
     /// JSONL file of pre-collected EvalRecordObservation rows.
-    #[arg(long, value_name = "PATH", conflicts_with = "agent_url")]
+    #[arg(long, value_name = "PATH", conflicts_with = "server")]
     pub records: Option<PathBuf>,
-    /// Run locally in this process.
-    #[arg(long, conflicts_with = "server")]
-    pub local: bool,
     /// Drive a remote server protocol router.
-    #[arg(long, value_name = "URL", conflicts_with = "local")]
+    #[arg(long, value_name = "URL", conflicts_with = "records")]
     pub server: Option<Url>,
     /// Use a deterministic judge invoker (all LLM judge tasks return passed: true; results do not reflect real judge behavior).
     #[arg(long, default_value_t = false)]
@@ -104,21 +98,14 @@ async fn run(args: EvalRunArgs) -> Result<ExitCode, WyrdCliError> {
     validate_args(&args)?;
     if let Some(server_url) = args.server.clone() {
         crate::eval::server::run_server(args, server_url).await
-    } else if args.records.is_some() {
-        crate::eval::local_records::run_local_records(args).await
-    } else if args.local || args.agent_url.is_some() {
-        crate::eval::local_agent::run_local_agent(args).await
     } else {
-        Err(WyrdCliError::ScenariosRequired)
+        crate::eval::local_records::run_local_records(args).await
     }
 }
 
 fn validate_args(args: &EvalRunArgs) -> Result<(), WyrdCliError> {
     if args.server.is_some() && args.agent_url.is_none() {
         return Err(WyrdCliError::ServerRequiresAgentUrl);
-    }
-    if args.server.is_some() && args.records.is_some() {
-        return Err(WyrdCliError::ServerRejectsRecords);
     }
     if matches!(args.simulated_user, SimulatedUserCli::Client)
         && args.simulated_user_script.is_none()
@@ -251,8 +238,3 @@ pub fn scripted_message(
         })
 }
 
-/// Convert conversation history to the protocol wire shape.
-#[must_use]
-pub fn history_ref(history: &[ConversationTurn]) -> &[ConversationTurn] {
-    history
-}

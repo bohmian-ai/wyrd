@@ -1,16 +1,15 @@
 //! Durable shared security primitives.
 //!
-//! This module owns the schema-bearing security refs that both the external
-//! client (`wyrd-client`) and the server-internal alert router
-//! (`vala-core::alert_router`) depend on. It is PyO3-free, async-free,
-//! WASM-safe — the same constraints as the rest of `wyrd-spec`.
-//!
-//! Module map:
-//! - `tls` — `TlsConfig` (CA cert, client cert, SNI override).
-//! - `secret_ref` — `SecretRef` (typed pointer into the runtime secret
-//!   store) and the test-only `InlineSecret` newtype.
-//!
-//! Re-exports below are populated in commit 2.
+//! `TlsConfig` and `SecretRef` are consumed by both the external client
+//! (`wyrd-client::transport`) and the server-internal alert router
+//! (`vala-core::alert_router`). Putting them in `wyrd-spec::security` gives
+//! both consumers one durable, schema-bearing definition without a
+//! cross-crate dependency cycle.
 
 pub mod secret_ref;
 pub mod tls;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use secret_ref::InlineSecret;
+pub use secret_ref::SecretRef;
+pub use tls::TlsConfig;

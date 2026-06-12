@@ -765,12 +765,12 @@ Both run in one pass — Scouter's scenario-vs-workflow split lifted intact.
 ### Source
 Read-side reference to an external data system. **Wyrd reads, never writes.**
 
-`kind` is a **read-shape bucket**, not a vendor. The top-level discriminator is
+`source` is a **read-shape bucket**, not a vendor. The top-level discriminator is
 the shape of data a consuming `Drift`/`Eval` Card sees — a row set, a time
 series, blobs — so a consumer binds to the shape and never to a vendor. The
 vendor (BigQuery vs Snowflake, Prometheus vs Datadog, GCS vs S3) is a
 **connection detail nested below the bucket**. This is the same axis `object_store`
-already used: `kind` was never `gcs` or `s3`; the vendor was the URI scheme.
+already used: `source.kind` was never `gcs` or `s3`; the vendor was the URI scheme.
 
 The bucket set is derived from what consumers read, not from a vendor taxonomy —
 which keeps it small, closed, and stable (Doctrine #2). Adding a vendor is a new
@@ -780,7 +780,8 @@ bucket set and never touches a consuming Card.
 ```yaml
 spec:
   description?: string
-  kind: SourceKind               # the read-shape bucket; vendor nested below
+  source:                         # SourceKind — the read-shape bucket; vendor nested below
+    kind: <bucket>
   defaults: { string: NonSecretValue }   # non-secret read hints (projection, page size)
 ```
 
@@ -806,11 +807,12 @@ at read time — only the env-var *name* is on the Card, exactly like
 `Operator.Http.auth.env`. `SourceAuth` is a closed tagged union (`scheme`
 discriminator): `None`, `Env { env }`, `Basic { username, password_env }`,
 `MultiEnv { vars: { logical_name: env_var } }` (covers multi-key vendors like
-Datadog's api-key + app-key).
+Datadog's api-key + app-key), `SecretStore { provider, name }` (Vault / AWS SSM /
+GCP Secret Manager — carries the store identifier and secret path, never the value).
 
 ```yaml
 # sql_warehouse — vendor + non-secret coordinates + env ref for the secret
-kind:
+source:
   kind: sql_warehouse
   connection:
     vendor: snowflake
@@ -821,8 +823,8 @@ kind:
     role: reader
     auth: { scheme: env, env: SNOWFLAKE_KEYPAIR }   # name only; never a value
 
-# object_store — vendor implied by URI scheme (unchanged from v1)
-kind:
+# object_store — vendor implied by URI scheme; auth defaults to None (ambient IAM)
+source:
   kind: object_store
   uri: gs://acme-telemetry/runs
   format: parquet
@@ -832,9 +834,7 @@ kind:
 `(kind, vendor)`. The three connection families (object/blob list-and-read, SQL
 query, HTTP query) are different drivers behind one read trait; the Card schema
 never declares strategy — `vala` chooses it from the bucket and vendor, the same
-way it chooses the Drift/Eval evaluation strategy. `External { name, schema_hash }`
-remains the forward-compat escape hatch for a vendor before a native adapter
-exists.
+way it chooses the Drift/Eval evaluation strategy.
 
 ### Trigger
 Fires an Operator. A Trigger declares when (`schedule`), what to evaluate

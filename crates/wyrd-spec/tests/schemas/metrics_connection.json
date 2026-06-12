@@ -4,7 +4,7 @@
   "description": "Metrics vendor connection. Discriminated by `vendor`.",
   "oneOf": [
     {
-      "description": "Prometheus / PromQL.",
+      "description": "Prometheus / PromQL. Any PromQL-compatible backend (Grafana Mimir, Grafana Cloud, Thanos, VictoriaMetrics) targets this variant via `endpoint`.",
       "type": "object",
       "required": [
         "endpoint",
@@ -42,6 +42,13 @@
         "vendor"
       ],
       "properties": {
+        "api_scopes": {
+          "description": "Required API read scopes, e.g. `metrics_read`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "auth": {
           "description": "Credential reference.",
           "default": {
@@ -52,13 +59,6 @@
               "$ref": "#/definitions/SourceAuth"
             }
           ]
-        },
-        "scopes": {
-          "description": "Required read scopes, e.g. `metrics_read`.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
         },
         "site": {
           "description": "API site, e.g. `datadoghq.com` or `datadoghq.eu`.",
@@ -113,7 +113,7 @@
   ],
   "definitions": {
     "SourceAuth": {
-      "description": "Credential reference. Every secret is a named server-side environment variable resolved at read time; the Card carries only the env-var *name*, never a secret value (Doctrine #7).",
+      "description": "Credential reference for Source read access. Every secret is a named server-side environment variable resolved at read time; the Card carries only the env-var *name*, never a secret value (Doctrine #7).\n\n`CredentialRef` (see `common.rs`) is a distinct type used on ServiceSpec for outbound service identity. `SourceAuth` is the read-path credential shape, scoped to Source Cards.",
       "oneOf": [
         {
           "description": "No credential (public/unauthenticated endpoint).",
@@ -170,7 +170,7 @@
               ]
             },
             "username": {
-              "description": "Login user.",
+              "description": "Login user (non-secret; printed as `[redacted]` in Debug output).",
               "type": "string"
             }
           }
@@ -195,6 +195,31 @@
               "additionalProperties": {
                 "type": "string"
               }
+            }
+          }
+        },
+        {
+          "description": "Secret stored in a server-side secret store (Vault, AWS SSM, GCP Secret Manager). Carries only the provider identifier and secret path, never the secret value.",
+          "type": "object",
+          "required": [
+            "name",
+            "provider",
+            "scheme"
+          ],
+          "properties": {
+            "name": {
+              "description": "Secret name or path within the provider.",
+              "type": "string"
+            },
+            "provider": {
+              "description": "Provider identifier, e.g. `vault`, `aws-ssm`, `gcp-secretmanager`.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "secret_store"
+              ]
             }
           }
         }

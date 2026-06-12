@@ -1,35 +1,49 @@
 //! Source Card spec.
 //!
 //! A Source is a read-side reference to an external data system. Wyrd reads,
-//! never writes (Doctrine #7). The `kind` is a *read-shape bucket* — the shape
-//! of data a consuming Drift/Eval Card sees — not a vendor. Vendors (BigQuery
-//! vs Snowflake, Prometheus vs Datadog) are a connection detail nested below
-//! the bucket, so a consumer binds to "row set" or "time series", never to a
-//! specific vendor. Adding a vendor is a new `*Connection` variant plus a
-//! runtime read adapter; it never touches the bucket set or any consuming Card.
+//! never writes (Doctrine #7). The `source` field is a *read-shape bucket* —
+//! the shape of data a consuming Drift/Eval Card sees — not a vendor. Vendors
+//! (BigQuery vs Snowflake, Prometheus vs Datadog) are a connection detail
+//! nested below the bucket, so a consumer binds to "row set" or "time series",
+//! never to a specific vendor. Adding a vendor is a new `*Connection` variant
+//! plus a runtime read adapter; it never touches the bucket set or any
+//! consuming Card.
 //!
 //! Cards never carry secret material (Doctrine #7, `NonSecretValue`). All
 //! credentials are named server-side environment variables resolved at read
-//! time; only the env-var *name* lives on the Card.
+//! time; only the env-var *name* lives on the Card. For secret-store backends
+//! (Vault, SSM, GCP Secret Manager), use `SourceAuth::SecretStore` which
+//! carries only the provider identifier and secret path, never the value.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
 use crate::card::common::NonSecretValue;
 
 /// Read-side reference to an external data system. Wyrd reads, never writes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct SourceSpec {
     /// Source description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Read-shape bucket plus its vendor connection.
-    pub kind: SourceKind,
+    pub source: SourceKind,
     /// Non-secret read defaults (projection, page size, time-window hints).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub defaults: BTreeMap<String, NonSecretValue>,
+}
+
+impl fmt::Debug for SourceSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceSpec")
+            .field("description", &self.description)
+            .field("source", &self.source)
+            .field("defaults", &self.defaults)
+            .finish()
+    }
 }
 
 impl SourceSpec {
@@ -38,14 +52,14 @@ impl SourceSpec {
     ///
     /// # Errors
     /// Returns a validation error when a required coordinate or env-var name
-    /// is empty.
+    /// is empty, or when the URI carries embedded credentials.
     pub fn validate(&self) -> Result<(), SourceValidationError> {
-        self.kind.validate()
+        self.source.validate()
     }
 }
 
-/// Read-shape bucket. The top-level discriminator is the *shape of data a
-/// consumer reads*, not the vendor. Vendors live inside each variant.
+/// Read-shape bucket. The top-level discriminator (`kind`) is the *shape of
+/// data a consumer reads*, not the vendor. Vendors live inside each variant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[non_exhaustive]
@@ -55,10 +69,16 @@ pub enum SourceKind {
     /// URI scheme. Yields a record stream.
     ObjectStore {
         /// Object URI, e.g. `gs://bucket/prefix`, `s3://bucket/prefix`,
-        /// `az://container/prefix`, or `file:///path`.
+        /// `az://container/prefix`, or `file:///path`. Must not embed
+        /// credentials in the authority component (Doctrine #7).
         uri: String,
         /// On-disk record format.
         format: ObjectFormat,
+        /// Credential reference for the object store. Defaults to `None`
+        /// (unauthenticated / ambient IAM). Use `Env` for service-account
+        /// keys or `SecretStore` for Vault/SSM-managed credentials.
+        #[serde(default)]
+        auth: SourceAuth,
     },
     /// SQL query against a warehouse. Yields a row set.
     SqlWarehouse {
@@ -85,7 +105,13 @@ pub enum SourceKind {
 impl SourceKind {
     fn validate(&self) -> Result<(), SourceValidationError> {
         match self {
-            Self::ObjectStore { uri, .. } => non_empty("uri", uri),
+            Self::ObjectStore { uri, auth, .. } => {
+                non_empty("uri", uri)?;
+                if uri_has_embedded_credentials(uri) {
+                    return Err(SourceValidationError::EmbeddedCredential { field: "uri" });
+                }
+                auth.validate()
+            }
             Self::SqlWarehouse { connection } => connection.validate(),
             Self::Metrics { connection } => connection.validate(),
             Self::Logs { connection } => connection.validate(),
@@ -204,7 +230,9 @@ impl SqlConnection {
 #[non_exhaustive]
 #[serde(tag = "vendor", rename_all = "snake_case")]
 pub enum MetricsConnection {
-    /// Prometheus / PromQL.
+    /// Prometheus / PromQL. Any PromQL-compatible backend (Grafana Mimir,
+    /// Grafana Cloud, Thanos, VictoriaMetrics) targets this variant via
+    /// `endpoint`.
     Prometheus {
         /// Query endpoint URL.
         endpoint: String,
@@ -216,9 +244,9 @@ pub enum MetricsConnection {
     Datadog {
         /// API site, e.g. `datadoghq.com` or `datadoghq.eu`.
         site: String,
-        /// Required read scopes, e.g. `metrics_read`.
+        /// Required API read scopes, e.g. `metrics_read`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        scopes: Vec<String>,
+        api_scopes: Vec<String>,
         /// Credential reference.
         #[serde(default)]
         auth: SourceAuth,
@@ -306,6 +334,11 @@ impl LogConnection {
 }
 
 /// Trace vendor connection. Discriminated by `vendor`.
+///
+/// No `OtlpHttp` variant: OTLP (OpenTelemetry Protocol) is an
+/// ingestion/push protocol. Wyrd reads traces from vendor query APIs
+/// (Jaeger HTTP Query API, Tempo HTTP API, Datadog APM REST), which are
+/// distinct from OTLP ingest endpoints.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[non_exhaustive]
@@ -352,11 +385,16 @@ impl TraceConnection {
     }
 }
 
-/// Credential reference. Every secret is a named server-side environment
-/// variable resolved at read time; the Card carries only the env-var *name*,
-/// never a secret value (Doctrine #7).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// Credential reference for Source read access. Every secret is a named
+/// server-side environment variable resolved at read time; the Card carries
+/// only the env-var *name*, never a secret value (Doctrine #7).
+///
+/// `CredentialRef` (see `common.rs`) is a distinct type used on ServiceSpec
+/// for outbound service identity. `SourceAuth` is the read-path credential
+/// shape, scoped to Source Cards.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[non_exhaustive]
 #[serde(tag = "scheme", rename_all = "snake_case")]
 pub enum SourceAuth {
     /// No credential (public/unauthenticated endpoint).
@@ -370,7 +408,7 @@ pub enum SourceAuth {
     },
     /// Username (non-secret) plus a password read from an env var.
     Basic {
-        /// Login user.
+        /// Login user (non-secret; printed as `[redacted]` in Debug output).
         username: String,
         /// Server-side env-var name holding the password.
         password_env: String,
@@ -381,6 +419,35 @@ pub enum SourceAuth {
         /// Logical credential name → server-side env-var name.
         vars: BTreeMap<String, String>,
     },
+    /// Secret stored in a server-side secret store (Vault, AWS SSM, GCP
+    /// Secret Manager). Carries only the provider identifier and secret path,
+    /// never the secret value.
+    SecretStore {
+        /// Provider identifier, e.g. `vault`, `aws-ssm`, `gcp-secretmanager`.
+        provider: String,
+        /// Secret name or path within the provider.
+        name: String,
+    },
+}
+
+impl fmt::Debug for SourceAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => write!(f, "None"),
+            Self::Env { env } => f.debug_struct("Env").field("env", env).finish(),
+            Self::Basic { password_env, .. } => f
+                .debug_struct("Basic")
+                .field("username", &"[redacted]")
+                .field("password_env", password_env)
+                .finish(),
+            Self::MultiEnv { vars } => f.debug_struct("MultiEnv").field("vars", vars).finish(),
+            Self::SecretStore { provider, name } => f
+                .debug_struct("SecretStore")
+                .field("provider", provider)
+                .field("name", name)
+                .finish(),
+        }
+    }
 }
 
 impl SourceAuth {
@@ -400,14 +467,14 @@ impl SourceAuth {
                     return Err(SourceValidationError::EmptyField { field: "auth.vars" });
                 }
                 for (key, env) in vars {
-                    if key.is_empty() {
-                        return Err(SourceValidationError::EmptyField {
-                            field: "auth.vars.key",
-                        });
-                    }
+                    non_empty("auth.vars.key", key)?;
                     non_empty("auth.vars.value", env)?;
                 }
                 Ok(())
+            }
+            Self::SecretStore { provider, name } => {
+                non_empty("auth.provider", provider)?;
+                non_empty("auth.name", name)
             }
         }
     }
@@ -420,12 +487,27 @@ fn non_empty(field: &'static str, value: &str) -> Result<(), SourceValidationErr
     Ok(())
 }
 
+/// Returns `true` if the URI has embedded credentials in the authority
+/// component (`scheme://user:password@host`). Wyrd Cards must never carry
+/// secret values (Doctrine #7).
+fn uri_has_embedded_credentials(uri: &str) -> bool {
+    uri.split_once("://")
+        .map(|(_, rest)| rest.contains('@') && rest.split('@').next().is_some_and(|info| info.contains(':')))
+        .unwrap_or(false)
+}
+
 /// Source validation failures.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SourceValidationError {
-    /// A required coordinate or env-var name was empty.
+    /// A required coordinate or env-var name was empty or whitespace-only.
     #[error("source field `{field}` must not be empty")]
     EmptyField {
+        /// Offending field path.
+        field: &'static str,
+    },
+    /// A URI field contained embedded credentials (Doctrine #7 violation).
+    #[error("source field `{field}` must not contain embedded credentials")]
+    EmbeddedCredential {
         /// Offending field path.
         field: &'static str,
     },

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SourceKind",
-  "description": "Read-shape bucket. The top-level discriminator is the *shape of data a consumer reads*, not the vendor. Vendors live inside each variant.",
+  "description": "Read-shape bucket. The top-level discriminator (`kind`) is the *shape of data a consumer reads*, not the vendor. Vendors live inside each variant.",
   "oneOf": [
     {
       "description": "Blobs at a URI parsed by `format`. Vendor (GCS/S3/Azure/file) is the URI scheme. Yields a record stream.",
@@ -12,6 +12,17 @@
         "uri"
       ],
       "properties": {
+        "auth": {
+          "description": "Credential reference for the object store. Defaults to `None` (unauthenticated / ambient IAM). Use `Env` for service-account keys or `SecretStore` for Vault/SSM-managed credentials.",
+          "default": {
+            "scheme": "none"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/SourceAuth"
+            }
+          ]
+        },
         "format": {
           "description": "On-disk record format.",
           "allOf": [
@@ -27,7 +38,7 @@
           ]
         },
         "uri": {
-          "description": "Object URI, e.g. `gs://bucket/prefix`, `s3://bucket/prefix`, `az://container/prefix`, or `file:///path`.",
+          "description": "Object URI, e.g. `gs://bucket/prefix`, `s3://bucket/prefix`, `az://container/prefix`, or `file:///path`. Must not embed credentials in the authority component (Doctrine #7).",
           "type": "string"
         }
       }
@@ -239,7 +250,7 @@
       "description": "Metrics vendor connection. Discriminated by `vendor`.",
       "oneOf": [
         {
-          "description": "Prometheus / PromQL.",
+          "description": "Prometheus / PromQL. Any PromQL-compatible backend (Grafana Mimir, Grafana Cloud, Thanos, VictoriaMetrics) targets this variant via `endpoint`.",
           "type": "object",
           "required": [
             "endpoint",
@@ -277,6 +288,13 @@
             "vendor"
           ],
           "properties": {
+            "api_scopes": {
+              "description": "Required API read scopes, e.g. `metrics_read`.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "auth": {
               "description": "Credential reference.",
               "default": {
@@ -287,13 +305,6 @@
                   "$ref": "#/definitions/SourceAuth"
                 }
               ]
-            },
-            "scopes": {
-              "description": "Required read scopes, e.g. `metrics_read`.",
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
             },
             "site": {
               "description": "API site, e.g. `datadoghq.com` or `datadoghq.eu`.",
@@ -381,7 +392,7 @@
       ]
     },
     "SourceAuth": {
-      "description": "Credential reference. Every secret is a named server-side environment variable resolved at read time; the Card carries only the env-var *name*, never a secret value (Doctrine #7).",
+      "description": "Credential reference for Source read access. Every secret is a named server-side environment variable resolved at read time; the Card carries only the env-var *name*, never a secret value (Doctrine #7).\n\n`CredentialRef` (see `common.rs`) is a distinct type used on ServiceSpec for outbound service identity. `SourceAuth` is the read-path credential shape, scoped to Source Cards.",
       "oneOf": [
         {
           "description": "No credential (public/unauthenticated endpoint).",
@@ -438,7 +449,7 @@
               ]
             },
             "username": {
-              "description": "Login user.",
+              "description": "Login user (non-secret; printed as `[redacted]` in Debug output).",
               "type": "string"
             }
           }
@@ -463,6 +474,31 @@
               "additionalProperties": {
                 "type": "string"
               }
+            }
+          }
+        },
+        {
+          "description": "Secret stored in a server-side secret store (Vault, AWS SSM, GCP Secret Manager). Carries only the provider identifier and secret path, never the secret value.",
+          "type": "object",
+          "required": [
+            "name",
+            "provider",
+            "scheme"
+          ],
+          "properties": {
+            "name": {
+              "description": "Secret name or path within the provider.",
+              "type": "string"
+            },
+            "provider": {
+              "description": "Provider identifier, e.g. `vault`, `aws-ssm`, `gcp-secretmanager`.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "secret_store"
+              ]
             }
           }
         }
@@ -626,7 +662,7 @@
       ]
     },
     "TraceConnection": {
-      "description": "Trace vendor connection. Discriminated by `vendor`.",
+      "description": "Trace vendor connection. Discriminated by `vendor`.\n\nNo `OtlpHttp` variant: OTLP (OpenTelemetry Protocol) is an ingestion/push protocol. Wyrd reads traces from vendor query APIs (Jaeger HTTP Query API, Tempo HTTP API, Datadog APM REST), which are distinct from OTLP ingest endpoints.",
       "oneOf": [
         {
           "description": "Grafana Tempo.",

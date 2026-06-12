@@ -18,6 +18,10 @@ remediation: Rebuild wyrd-client with the transport-<name> Cargo feature
              compiled in.
 ```
 
+> **Note**: This error code is not yet emitted. It lands in PR4.0 section 22
+> when `WyrdClient::new()` is implemented. The payload shape described here
+> is the committed design.
+
 The runtime client constructor raises this when the active build does not
 include the selected variant's driver. The error payload carries
 `transport` (for example, `"http"`) and `required_feature` (for example,

@@ -290,6 +290,12 @@ impl WebhookConfig {
                 reason: "must not be empty".to_string(),
             });
         }
+        if self.secret_ref.is_some() && !self.url.starts_with("https://") {
+            return Err(AlertConfigError::Invalid {
+                field: "webhook_config.url".to_string(),
+                reason: "must use https:// when a signing secret is configured".to_string(),
+            });
+        }
         if self.signature_header.is_empty() {
             return Err(AlertConfigError::Invalid {
                 field: "webhook_config.signature_header".to_string(),
@@ -327,6 +333,16 @@ impl WebhookConfig {
                     reason: "collides with the signing or timestamp header".to_string(),
                 });
             }
+            if self
+                .secret_headers
+                .keys()
+                .any(|k| k.to_ascii_lowercase() == lower)
+            {
+                return Err(AlertConfigError::Invalid {
+                    field: format!("webhook_config.headers.{name}"),
+                    reason: "appears in both `headers` and `secret_headers`".to_string(),
+                });
+            }
         }
 
         // Authorization and similar credential names are permitted here
@@ -337,20 +353,6 @@ impl WebhookConfig {
                 return Err(AlertConfigError::Invalid {
                     field: format!("webhook_config.secret_headers.{name}"),
                     reason: "collides with the signing or timestamp header".to_string(),
-                });
-            }
-        }
-
-        for name in self.headers.keys() {
-            let lower = name.to_ascii_lowercase();
-            if self
-                .secret_headers
-                .keys()
-                .any(|k| k.to_ascii_lowercase() == lower)
-            {
-                return Err(AlertConfigError::Invalid {
-                    field: format!("webhook_config.headers.{name}"),
-                    reason: "appears in both `headers` and `secret_headers`".to_string(),
                 });
             }
         }

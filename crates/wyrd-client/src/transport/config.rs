@@ -203,6 +203,8 @@ pub struct MockConfig {
     /// Inject a flush failure. When `Some(n)`, the `nth` call to
     /// `Flushable::flush` returns `Err`; all other calls succeed normally.
     /// Counting starts from 1 (i.e. `Some(1)` fails the first flush).
+    /// `Some(0)` is treated equivalently to `None` (the counter starts at 1
+    /// after increment, so the 0th call never matches).
     /// `None` means the mock always succeeds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fail_on_flush: Option<u32>,
@@ -267,8 +269,9 @@ impl TransportConfig {
     }
 
     /// Returns the Cargo feature name that gates this variant, or `None` if
-    /// the variant is always available. Used by `WyrdClient::new()` to fill
-    /// the `required_feature` field of `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED`.
+    /// the variant is always available. Used by `WyrdClient::new()` (PR4.0)
+    /// to fill the `required_feature` field of
+    /// `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED`.
     pub fn required_feature(&self) -> Option<&'static str> {
         match self {
             Self::Grpc(_) => Some("transport-grpc"),
@@ -284,14 +287,27 @@ impl TransportConfig {
     ///
     /// `WyrdClient::new()` (PR4.0 section 22) calls this and returns
     /// `Err(WyrdClientError::TransportFeatureDisabled { transport, required_feature })`
-    /// (catalog code `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED`, registered
-    /// in the `WyrdClientError` catalog block) when the selected variant is
-    /// compiled out, rather than panicking at first use.
+    /// when the selected variant is compiled out, rather than panicking at
+    /// first use. Note: `WyrdClientError::TransportFeatureDisabled` is not
+    /// yet in the enum — that variant lands in PR4.0 when `WyrdClient::new()`
+    /// is implemented.
     pub fn is_enabled(&self) -> bool {
         match self {
             Self::Grpc(_) => cfg!(feature = "transport-grpc"),
             Self::Http(_) => cfg!(feature = "transport-http"),
             Self::Mock(_) => true,
+        }
+    }
+
+    /// Validate the wrapped transport config.
+    ///
+    /// Delegates to the inner config's `validate()`. `Mock` always returns
+    /// `Ok(())` — the mock transport has no invalid field combinations.
+    pub fn validate(&self) -> Result<(), WyrdClientError> {
+        match self {
+            Self::Grpc(c) => c.validate(),
+            Self::Http(c) => c.validate(),
+            Self::Mock(_) => Ok(()),
         }
     }
 }
@@ -356,6 +372,12 @@ impl QueueConfig {
     /// - `flush_interval_ms < 1`
     /// - `channel_capacity < 1`
     /// - `sample_ratio` is `Some(p)` with `p < 0.0`, `p > 1.0`, or `p` is NaN
+    ///
+    /// Note: this method does not recursively validate the embedded
+    /// `transport`. Call `transport.validate()` (or the inner
+    /// `GrpcConfig::validate` / `HttpConfig::validate`) separately before
+    /// passing to a queue constructor. Callers who skip this step may receive
+    /// `Ok(())` here but see a `TransportDown` error at connect time.
     pub fn validate(&self) -> Result<(), WyrdClientError> {
         if self.flush_max_rows < 1 {
             return Err(WyrdClientError::Config {

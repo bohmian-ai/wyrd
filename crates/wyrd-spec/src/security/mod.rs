@@ -11,5 +11,5 @@ pub mod tls;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use secret_ref::InlineSecret;
-pub use secret_ref::SecretRef;
+pub use secret_ref::{SecretRef, SecretRefError};
 pub use tls::TlsConfig;

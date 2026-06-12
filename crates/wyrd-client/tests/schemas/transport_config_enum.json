@@ -166,7 +166,7 @@
       ],
       "properties": {
         "fail_on_flush": {
-          "description": "Inject a flush failure. When `Some(n)`, the `nth` call to `Flushable::flush` returns `Err`; all other calls succeed normally. Counting starts from 1 (i.e. `Some(1)` fails the first flush). `None` means the mock always succeeds.",
+          "description": "Inject a flush failure. When `Some(n)`, the `nth` call to `Flushable::flush` returns `Err`; all other calls succeed normally. Counting starts from 1 (i.e. `Some(1)` fails the first flush). `Some(0)` is treated equivalently to `None` (the counter starts at 1 after increment, so the 0th call never matches). `None` means the mock always succeeds.",
           "type": [
             "integer",
             "null"

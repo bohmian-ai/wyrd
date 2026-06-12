@@ -180,10 +180,12 @@ impl PartialEq for SecretRef {
             (Self::Vault { key: a }, Self::Vault { key: b }) => a == b,
             #[cfg(any(test, feature = "test-utils"))]
             (Self::Inline { value: a }, Self::Inline { value: b }) => {
-                // Compare via redacted debug form — the actual secret is never
-                // exposed. Two `Inline` values with the same redacted output
-                // are considered equal for test/debug purposes.
-                format!("{:?}", a) == format!("{:?}", b)
+                // Use expose() deliberately: this arm is cfg-gated to
+                // test/test-utils, so comparing plaintext here is intentional
+                // and safe. The redacted Debug form would make all Inline
+                // values equal regardless of content, making round-trip tests
+                // vacuous.
+                a.expose() == b.expose()
             }
             _ => false,
         }
@@ -207,5 +209,118 @@ impl std::hash::Hash for SecretRef {
                 // and are distinguished by `PartialEq`.
             }
         }
+    }
+}
+
+/// Validation error for [`SecretRef`] field invariants.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SecretRefError {
+    /// A required string field was empty.
+    #[error("field '{0}' must not be empty")]
+    EmptyField(&'static str),
+    /// A `File` path was relative (did not start with `/`).
+    #[error("path must be absolute (must start with '/')")]
+    RelativePath,
+}
+
+impl SecretRef {
+    /// Validate structural field invariants.
+    ///
+    /// Returns `Err` if:
+    /// - `Env.name` is empty
+    /// - `File.path` is empty
+    /// - `File.path` is not absolute (does not start with `/`)
+    /// - `Vault.key` is empty
+    ///
+    /// `Inline` always returns `Ok(())` — inline values are test fixtures
+    /// and carry no path/name field to validate.
+    pub fn validate(&self) -> Result<(), SecretRefError> {
+        match self {
+            Self::Env { name } if name.is_empty() => Err(SecretRefError::EmptyField("name")),
+            Self::File { path } if path.is_empty() => Err(SecretRefError::EmptyField("path")),
+            Self::File { path } if !path.starts_with('/') => Err(SecretRefError::RelativePath),
+            Self::Vault { key } if key.is_empty() => Err(SecretRefError::EmptyField("key")),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_empty_name_is_invalid() {
+        let r = SecretRef::Env {
+            name: String::new(),
+        }
+        .validate();
+        assert_eq!(r.unwrap_err(), SecretRefError::EmptyField("name"));
+    }
+
+    #[test]
+    fn env_non_empty_name_is_valid() {
+        let r = SecretRef::Env {
+            name: "WYRD_KEY".to_string(),
+        }
+        .validate();
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn file_empty_path_is_invalid() {
+        let r = SecretRef::File {
+            path: String::new(),
+        }
+        .validate();
+        assert_eq!(r.unwrap_err(), SecretRefError::EmptyField("path"));
+    }
+
+    #[test]
+    fn file_relative_path_is_invalid() {
+        let r = SecretRef::File {
+            path: "var/run/secrets/key".to_string(),
+        }
+        .validate();
+        assert_eq!(r.unwrap_err(), SecretRefError::RelativePath);
+    }
+
+    #[test]
+    fn file_absolute_path_is_valid() {
+        let r = SecretRef::File {
+            path: "/var/run/secrets/wyrd/api-key".to_string(),
+        }
+        .validate();
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn vault_empty_key_is_invalid() {
+        let r = SecretRef::Vault { key: String::new() }.validate();
+        assert_eq!(r.unwrap_err(), SecretRefError::EmptyField("key"));
+    }
+
+    #[test]
+    fn vault_non_empty_key_is_valid() {
+        let r = SecretRef::Vault {
+            key: "secret/data/wyrd/api-key".to_string(),
+        }
+        .validate();
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn inline_partial_eq_compares_actual_values() {
+        let a = SecretRef::Inline {
+            value: InlineSecret::new("secret-a"),
+        };
+        let b = SecretRef::Inline {
+            value: InlineSecret::new("secret-b"),
+        };
+        let c = SecretRef::Inline {
+            value: InlineSecret::new("secret-a"),
+        };
+        assert_ne!(a, b);
+        assert_eq!(a, c);
     }
 }

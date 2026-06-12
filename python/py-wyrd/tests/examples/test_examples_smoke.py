@@ -17,6 +17,11 @@ sys.path.insert(0, str(EXAMPLES_DIR))
         "from_builder",
         "structured_pipeline",
         "with_observer",
+        "transport_grpc",
+        "transport_http",
+        "transport_mock",
+        "transport_queue_policy",
+        "transport_secrets",
     ],
 )
 def test_example_runs(module_name: str) -> None:

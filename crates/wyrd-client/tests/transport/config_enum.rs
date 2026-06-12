@@ -1,4 +1,7 @@
-use wyrd_client::transport::{GrpcConfig, HttpConfig, MockConfig, TransportConfig};
+use wyrd_client::{
+    error::WyrdClientError,
+    transport::{GrpcConfig, HttpConfig, MockConfig, TransportConfig},
+};
 
 #[test]
 fn transport_config_default_is_grpc() {
@@ -133,6 +136,25 @@ fn transport_config_required_feature_matches_variant() {
         TransportConfig::Http(HttpConfig::default()).required_feature(),
         Some("transport-http"),
     );
+}
+
+#[test]
+fn transport_config_validate_grpc_empty_endpoint_returns_err() {
+    let c = TransportConfig::Grpc(GrpcConfig {
+        endpoint: String::new(),
+        ..GrpcConfig::default()
+    });
+    let err = c.validate().unwrap_err();
+    assert!(
+        matches!(err, WyrdClientError::Config { ref field, .. } if field == "grpc_config.endpoint"),
+        "expected Config {{ field: grpc_config.endpoint }}, got: {err:?}"
+    );
+}
+
+#[test]
+fn transport_config_validate_mock_always_ok() {
+    let c = TransportConfig::Mock(MockConfig::default());
+    assert!(c.validate().is_ok());
 }
 
 #[test]

@@ -67,6 +67,21 @@ fn mock_config_rejects_unknown_fields() {
 }
 
 #[test]
+fn mock_fail_on_flush_zero_round_trips_and_is_distinct_from_none() {
+    // Some(0) is documented as never-fail: the flush counter starts at 1
+    // after increment, so n=0 is never matched. Verify the value round-trips
+    // cleanly and is distinguishable from None at the config level.
+    let cfg = MockConfig {
+        fail_on_flush: Some(0),
+        ..MockConfig::default()
+    };
+    let s = serde_json::to_string(&cfg).unwrap();
+    let back: MockConfig = serde_json::from_str(&s).unwrap();
+    assert_eq!(back.fail_on_flush, Some(0));
+    assert_ne!(back.fail_on_flush, None);
+}
+
+#[test]
 fn mock_config_distinct_labels_are_not_equal() {
     let a = MockConfig {
         label: "a".to_string(),

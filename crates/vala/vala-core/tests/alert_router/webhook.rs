@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use vala_core::alert_router::webhook::{
-    WEBHOOK_DEFAULT_TIMEOUT_MS, WEBHOOK_SIGNATURE_HEADER_DEFAULT, WEBHOOK_TIMESTAMP_HEADER_DEFAULT,
-    WebhookConfig, WebhookMethod,
+    AlertConfigError, WEBHOOK_DEFAULT_TIMEOUT_MS, WEBHOOK_SIGNATURE_HEADER_DEFAULT,
+    WEBHOOK_TIMESTAMP_HEADER_DEFAULT, WebhookConfig, WebhookMethod,
 };
 use wyrd_spec::security::SecretRef;
 
@@ -417,6 +417,44 @@ fn webhook_rejects_duplicate_key_across_headers_and_secret_headers() {
             .to_string()
             .contains("appears in both")
     );
+}
+
+#[test]
+fn webhook_validate_rejects_http_url_with_secret() {
+    let cfg = WebhookConfig {
+        url: "http://hooks.example.com/wyrd".to_string(),
+        secret_ref: Some(SecretRef::Env {
+            name: "WEBHOOK_KEY".to_string(),
+        }),
+        ..WebhookConfig::default()
+    };
+    let err = cfg.validate().unwrap_err();
+    assert!(
+        matches!(err, AlertConfigError::Invalid { ref field, .. } if field == "webhook_config.url"),
+        "expected Invalid {{ field: webhook_config.url, .. }}, got: {err:?}"
+    );
+    assert!(err.to_string().contains("https://"));
+}
+
+#[test]
+fn webhook_validate_allows_http_url_without_secret() {
+    let cfg = WebhookConfig {
+        url: "http://internal.corp/wyrd-alerts".to_string(),
+        ..WebhookConfig::default()
+    };
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn webhook_validate_allows_https_url_with_secret() {
+    let cfg = WebhookConfig {
+        url: "https://hooks.example.com/wyrd".to_string(),
+        secret_ref: Some(SecretRef::Env {
+            name: "WEBHOOK_KEY".to_string(),
+        }),
+        ..WebhookConfig::default()
+    };
+    assert!(cfg.validate().is_ok());
 }
 
 #[test]

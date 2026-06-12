@@ -13,7 +13,7 @@ surfacing failures to humans or agents.
 | Code | Status | Meaning |
 |---|---:|---|
 | `WYRD_CLIENT_400_CONFIG_INVALID` | 400 | Client transport configuration failed validation. |
-| `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED` | 400 | Selected transport variant is not compiled into this build. |
+| `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED` | 400 | Selected transport variant is not compiled into this build. (**Not yet emitted**; lands in PR4.0 when `WyrdClient::new()` is implemented.) |
 | `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE` | 413 | Flush body exceeded the server's accepted payload size. |
 | `WYRD_CLIENT_503_TRANSPORT_DOWN` | 503 | Client transport is unavailable. |
 | `WYRD_CLIENT_504_FLUSH_TIMEOUT` | 504 | Flush exceeded per-call timeout. |

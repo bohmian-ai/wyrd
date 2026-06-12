@@ -19,7 +19,7 @@ invalid combinations before a socket opens.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `transport` | `TransportConfig` | `Grpc(GrpcConfig::default())` | Wire transport for this queue. |
+| `transport` | `TransportConfig` | `Grpc(GrpcConfig::default())` | Wire transport for this queue. Validate separately with `transport.validate()` before calling `QueueConfig::validate()` — the queue validator does not recurse into the embedded transport config. |
 | `flush_max_rows` | `usize` | `10_000` | Flush when the buffer reaches this row count. Validated `>= 1`. |
 | `flush_interval_ms` | `u64` | `5_000` | Flush at most every N ms, regardless of fill level. Validated `>= 1`. |
 | `channel_capacity` | `usize` | `100` | Bounded channel capacity between the producer thread and the flush worker. Validated `>= 1`. |

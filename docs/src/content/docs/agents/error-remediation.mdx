@@ -55,7 +55,8 @@ All Wyrd errors follow RFC 9457 Problem Details with Wyrd extensions. A policy-d
 - For `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED`, the
   `context.required_feature` names the Cargo feature that would
   re-enable the transport. The remediation is a build-time fix, not a
-  retry path.
+  retry path. Note: this error code is not yet emitted — it lands in
+  PR4.0 when `WyrdClient::new()` is implemented.
 - For `WYRD_CLIENT_400_CONFIG_INVALID`, the `context.field` and
   `context.reason` name the offending config field and the rule it
   failed. Fix the field on the config object and reconstruct the

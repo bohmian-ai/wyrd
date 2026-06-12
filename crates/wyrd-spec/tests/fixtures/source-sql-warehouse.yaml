@@ -21,8 +21,10 @@ spec:
       schema: public
       role: reader
       auth:
-        scheme: env
-        env: SNOWFLAKE_KEYPAIR
+        scheme: multi_env
+        vars:
+          user: SNOWFLAKE_USER
+          private_key: SNOWFLAKE_PRIVATE_KEY
 
   defaults:
     page_size:

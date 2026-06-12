@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::card::common::NonSecretValue;
 
 /// Read-side reference to an external data system. Wyrd reads, never writes.
-#[derive(Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct SourceSpec {
     /// Source description.
@@ -34,16 +34,6 @@ pub struct SourceSpec {
     /// Non-secret read defaults (projection, page size, time-window hints).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub defaults: BTreeMap<String, NonSecretValue>,
-}
-
-impl fmt::Debug for SourceSpec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SourceSpec")
-            .field("description", &self.description)
-            .field("source", &self.source)
-            .field("defaults", &self.defaults)
-            .finish()
-    }
 }
 
 impl SourceSpec {
@@ -408,7 +398,7 @@ pub enum SourceAuth {
     },
     /// Username (non-secret) plus a password read from an env var.
     Basic {
-        /// Login user (non-secret; printed as `[redacted]` in Debug output).
+        /// Login user (redacted in Debug output; omitted from logs to avoid accidental exposure).
         username: String,
         /// Server-side env-var name holding the password.
         password_env: String,
@@ -490,10 +480,22 @@ fn non_empty(field: &'static str, value: &str) -> Result<(), SourceValidationErr
 /// Returns `true` if the URI has embedded credentials in the authority
 /// component (`scheme://user:password@host`). Wyrd Cards must never carry
 /// secret values (Doctrine #7).
+///
+/// Only the authority segment (between `://` and the first `/`) is inspected so
+/// that path components containing `:` or `@` (e.g. version tags in GCS/S3 keys)
+/// are not falsely rejected. Percent-encoded delimiters (`%40`, `%3A`) are
+/// decoded before checking so they cannot be used to smuggle credentials past
+/// the check.
 fn uri_has_embedded_credentials(uri: &str) -> bool {
-    uri.split_once("://")
-        .map(|(_, rest)| rest.contains('@') && rest.split('@').next().is_some_and(|info| info.contains(':')))
-        .unwrap_or(false)
+    let Some((_, rest)) = uri.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let decoded = authority
+        .replace("%40", "@")
+        .replace("%3A", ":")
+        .replace("%3a", ":");
+    decoded.contains('@') && decoded.split('@').next().is_some_and(|info| info.contains(':'))
 }
 
 /// Source validation failures.
@@ -511,4 +513,17 @@ pub enum SourceValidationError {
         /// Offending field path.
         field: &'static str,
     },
+}
+
+impl From<SourceValidationError> for crate::error::WyrdError {
+    fn from(e: SourceValidationError) -> Self {
+        let field = match &e {
+            SourceValidationError::EmptyField { field }
+            | SourceValidationError::EmbeddedCredential { field } => *field,
+        };
+        Self::SourceValidation {
+            message: e.to_string(),
+            details: serde_json::json!({ "field": field }),
+        }
+    }
 }

@@ -821,7 +821,11 @@ source:
     database: telemetry
     schema: public
     role: reader
-    auth: { scheme: env, env: SNOWFLAKE_KEYPAIR }   # name only; never a value
+    auth:
+      scheme: multi_env
+      vars:
+        user: SNOWFLAKE_USER
+        private_key: SNOWFLAKE_PRIVATE_KEY   # names only; never values
 
 # object_store — vendor implied by URI scheme; auth defaults to None (ambient IAM)
 source:

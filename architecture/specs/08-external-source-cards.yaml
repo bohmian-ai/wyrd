@@ -21,7 +21,8 @@
 #
 #   1. Auth shapes: each bucket demonstrates a distinct SourceAuth variant.
 #      object_store uses None (ambient GKE Workload Identity via IAM binding).
-#      sql_warehouse uses Env (single service-account keypair JSON via env).
+#      sql_warehouse uses MultiEnv (Snowflake keypair requires user + private_key
+#        as separate env vars: SNOWFLAKE_USER and SNOWFLAKE_PRIVATE_KEY).
 #      metrics uses MultiEnv (Datadog requires both api_key and app_key).
 #      logs uses Env (bearer token).
 #      traces uses None (Tempo is internal-only, network policy is the gate).
@@ -71,8 +72,10 @@ spec:
       schema: public
       role: reader
       auth:
-        scheme: env
-        env: SNOWFLAKE_KEYPAIR   # server resolves at read time; never stored as value
+        scheme: multi_env
+        vars:
+          user: SNOWFLAKE_USER
+          private_key: SNOWFLAKE_PRIVATE_KEY   # names only; server resolves at read time
 
   defaults:
     page_size:

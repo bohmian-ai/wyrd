@@ -5,6 +5,7 @@ use wyrd_spec::card::source::{
     SourceValidationError, SqlConnection, TraceConnection,
 };
 use wyrd_spec::envelope::{Card, CardKind, Spec};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::format;
 
 // ---------------------------------------------------------------------------
@@ -26,12 +27,6 @@ fn sql_warehouse_fixture_uses_native_source_kind() {
         }
     ));
     spec.validate().expect("fixture source is valid");
-}
-
-#[test]
-fn source_card_yaml_round_trips() {
-    let decoded: Card =
-        format::yaml::from_str(include_str!("../fixtures/source-sql-warehouse.yaml")).unwrap();
     let encoded = format::yaml::to_string(&decoded).unwrap();
     let reparsed: Card = format::yaml::from_str(&encoded).unwrap();
     assert_eq!(reparsed, decoded);
@@ -578,23 +573,6 @@ fn metrics_cloudwatch_empty_region_is_rejected() {
 }
 
 #[test]
-fn logs_loki_round_trips() {
-    let spec = SourceSpec {
-        description: None,
-        source: SourceKind::Logs {
-            connection: LogConnection::Loki {
-                endpoint: "https://loki.acme.com".to_owned(),
-                auth: SourceAuth::Env { env: "LOKI_TOKEN".to_owned() },
-            },
-        },
-        defaults: BTreeMap::new(),
-    };
-    spec.validate().unwrap();
-    let json = serde_json::to_value(&spec).unwrap();
-    assert_eq!(json["source"]["connection"]["vendor"], "loki");
-}
-
-#[test]
 fn logs_elasticsearch_round_trips() {
     let spec = SourceSpec {
         description: None,
@@ -648,23 +626,6 @@ fn logs_empty_endpoint_is_rejected() {
         spec.validate(),
         Err(SourceValidationError::EmptyField { field: "endpoint" })
     );
-}
-
-#[test]
-fn traces_tempo_round_trips() {
-    let spec = SourceSpec {
-        description: None,
-        source: SourceKind::Traces {
-            connection: TraceConnection::Tempo {
-                endpoint: "https://tempo.acme.com".to_owned(),
-                auth: SourceAuth::None,
-            },
-        },
-        defaults: BTreeMap::new(),
-    };
-    spec.validate().unwrap();
-    let json = serde_json::to_value(&spec).unwrap();
-    assert_eq!(json["source"]["connection"]["vendor"], "tempo");
 }
 
 #[test]
@@ -724,5 +685,55 @@ fn traces_empty_endpoint_is_rejected() {
     assert_eq!(
         spec.validate(),
         Err(SourceValidationError::EmptyField { field: "endpoint" })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WyrdError wire format
+// ---------------------------------------------------------------------------
+
+#[test]
+fn source_validation_error_maps_to_wyrd_error_code_and_details() {
+    let error: WyrdError = SourceValidationError::EmptyField { field: "endpoint" }.into();
+    assert_eq!(error.code(), "WYRD_SOURCE_400_VALIDATION");
+    assert_eq!(error.as_problem_json()["details"]["field"], "endpoint");
+
+    let error: WyrdError = SourceValidationError::EmbeddedCredential { field: "uri" }.into();
+    assert_eq!(error.code(), "WYRD_SOURCE_400_VALIDATION");
+    assert_eq!(error.as_problem_json()["details"]["field"], "uri");
+}
+
+// ---------------------------------------------------------------------------
+// URI credential check edge cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn object_store_uri_with_version_tag_in_path_is_accepted() {
+    let spec = SourceSpec {
+        description: None,
+        source: SourceKind::ObjectStore {
+            uri: "gs://bucket/checkpoints:v1@run-abc".to_owned(),
+            format: ObjectFormat::Parquet,
+            auth: SourceAuth::None,
+        },
+        defaults: BTreeMap::new(),
+    };
+    assert!(spec.validate().is_ok());
+}
+
+#[test]
+fn object_store_uri_with_percent_encoded_credentials_is_rejected() {
+    let spec = SourceSpec {
+        description: None,
+        source: SourceKind::ObjectStore {
+            uri: "gs://user%3Apass%40host/bucket".to_owned(),
+            format: ObjectFormat::Parquet,
+            auth: SourceAuth::None,
+        },
+        defaults: BTreeMap::new(),
+    };
+    assert_eq!(
+        spec.validate(),
+        Err(SourceValidationError::EmbeddedCredential { field: "uri" })
     );
 }

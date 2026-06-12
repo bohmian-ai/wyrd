@@ -1188,15 +1188,6 @@ impl WyrdError {
     }
 }
 
-impl From<crate::card::source::SourceValidationError> for WyrdError {
-    fn from(e: crate::card::source::SourceValidationError) -> Self {
-        Self::SourceValidation {
-            message: e.to_string(),
-            details: serde_json::json!({}),
-        }
-    }
-}
-
 impl From<skald_spec::SkaldError> for WyrdError {
     fn from(error: skald_spec::SkaldError) -> Self {
         let message = error.to_string();

@@ -43,6 +43,8 @@ pub enum Kind {
     Trigger,
     /// Operator Card.
     Operator,
+    /// Source Card.
+    Source,
     /// Unknown/external card kind.
     External,
 }
@@ -65,6 +67,7 @@ impl Kind {
             Self::Artifact => "Artifact",
             Self::Trigger => "Trigger",
             Self::Operator => "Operator",
+            Self::Source => "Source",
             Self::External => "External",
         }
     }
@@ -86,6 +89,7 @@ impl Kind {
             Self::Artifact => CardKind::Artifact,
             Self::Trigger => CardKind::Trigger,
             Self::Operator => CardKind::Operator,
+            Self::Source => CardKind::Source,
             Self::External => CardKind::External,
         }
     }
@@ -107,6 +111,7 @@ impl Kind {
             CardKind::Artifact => Self::Artifact,
             CardKind::Trigger => Self::Trigger,
             CardKind::Operator => Self::Operator,
+            CardKind::Source => Self::Source,
             CardKind::External => Self::External,
         }
     }

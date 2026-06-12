@@ -1,0 +1,204 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MetricsConnection",
+  "description": "Metrics vendor connection. Discriminated by `vendor`.",
+  "oneOf": [
+    {
+      "description": "Prometheus / PromQL.",
+      "type": "object",
+      "required": [
+        "endpoint",
+        "vendor"
+      ],
+      "properties": {
+        "auth": {
+          "description": "Credential reference.",
+          "default": {
+            "scheme": "none"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/SourceAuth"
+            }
+          ]
+        },
+        "endpoint": {
+          "description": "Query endpoint URL.",
+          "type": "string"
+        },
+        "vendor": {
+          "type": "string",
+          "enum": [
+            "prometheus"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Datadog metrics.",
+      "type": "object",
+      "required": [
+        "site",
+        "vendor"
+      ],
+      "properties": {
+        "auth": {
+          "description": "Credential reference.",
+          "default": {
+            "scheme": "none"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/SourceAuth"
+            }
+          ]
+        },
+        "scopes": {
+          "description": "Required read scopes, e.g. `metrics_read`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "site": {
+          "description": "API site, e.g. `datadoghq.com` or `datadoghq.eu`.",
+          "type": "string"
+        },
+        "vendor": {
+          "type": "string",
+          "enum": [
+            "datadog"
+          ]
+        }
+      }
+    },
+    {
+      "description": "AWS CloudWatch.",
+      "type": "object",
+      "required": [
+        "region",
+        "vendor"
+      ],
+      "properties": {
+        "auth": {
+          "description": "Credential reference.",
+          "default": {
+            "scheme": "none"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/SourceAuth"
+            }
+          ]
+        },
+        "namespace": {
+          "description": "Default metric namespace.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "region": {
+          "description": "AWS region.",
+          "type": "string"
+        },
+        "vendor": {
+          "type": "string",
+          "enum": [
+            "cloudwatch"
+          ]
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "SourceAuth": {
+      "description": "Credential reference. Every secret is a named server-side environment variable resolved at read time; the Card carries only the env-var *name*, never a secret value (Doctrine #7).",
+      "oneOf": [
+        {
+          "description": "No credential (public/unauthenticated endpoint).",
+          "type": "object",
+          "required": [
+            "scheme"
+          ],
+          "properties": {
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "none"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Single secret read from one env var (bearer token, password, connection secret, key-pair, or service-account JSON delivered via env).",
+          "type": "object",
+          "required": [
+            "env",
+            "scheme"
+          ],
+          "properties": {
+            "env": {
+              "description": "Server-side env-var name holding the secret.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "env"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Username (non-secret) plus a password read from an env var.",
+          "type": "object",
+          "required": [
+            "password_env",
+            "scheme",
+            "username"
+          ],
+          "properties": {
+            "password_env": {
+              "description": "Server-side env-var name holding the password.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "basic"
+              ]
+            },
+            "username": {
+              "description": "Login user.",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Multiple named secrets, each read from its own env var. Keys are logical credential names (e.g. `api_key`, `app_key`); values are env-var names.",
+          "type": "object",
+          "required": [
+            "scheme",
+            "vars"
+          ],
+          "properties": {
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "multi_env"
+              ]
+            },
+            "vars": {
+              "description": "Logical credential name → server-side env-var name.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

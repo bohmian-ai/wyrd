@@ -26,6 +26,10 @@ use wyrd_spec::card::service::{LockedComponent, ServiceLock};
 use wyrd_spec::card::service::{
     ServiceRuntime, ServiceRuntimeKind, ServiceRuntimeMode, ServiceRuntimePolicy, ServiceSpec,
 };
+use wyrd_spec::card::source::{
+    LogConnection, MetricsConnection, SourceAuth, SourceKind, SourceSpec, SqlConnection,
+    TraceConnection,
+};
 use wyrd_spec::card::trigger::{TriggerSource, TriggerSpec};
 use wyrd_spec::card::workflow::WorkflowSpec;
 use wyrd_spec::envelope::{Card, CardKind};
@@ -75,6 +79,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<OperatorSpec>(out, golden, "operator_spec")?;
     write::<OperatorInput>(out, golden, "operator_input")?;
     write::<OperatorBudget>(out, golden, "operator_budget")?;
+    write::<SourceSpec>(out, golden, "source_spec")?;
+    write::<SourceKind>(out, golden, "source_kind")?;
+    write::<SqlConnection>(out, golden, "sql_connection")?;
+    write::<MetricsConnection>(out, golden, "metrics_connection")?;
+    write::<LogConnection>(out, golden, "log_connection")?;
+    write::<TraceConnection>(out, golden, "trace_connection")?;
+    write::<SourceAuth>(out, golden, "source_auth")?;
     write::<ServiceSpec>(out, golden, "service_spec")?;
     write::<ServiceRuntime>(out, golden, "service_runtime")?;
     write::<ServiceRuntimeKind>(out, golden, "service_runtime_kind")?;

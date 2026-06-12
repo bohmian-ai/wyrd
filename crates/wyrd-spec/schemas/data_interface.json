@@ -294,6 +294,7 @@
         "Artifact",
         "Trigger",
         "Operator",
+        "Source",
         "External"
       ]
     },

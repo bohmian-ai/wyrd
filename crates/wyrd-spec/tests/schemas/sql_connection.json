@@ -1,0 +1,249 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SqlConnection",
+  "description": "SQL-warehouse vendor connection. Discriminated by `vendor`.",
+  "oneOf": [
+    {
+      "description": "Google BigQuery.",
+      "type": "object",
+      "required": [
+        "project",
+        "vendor"
+      ],
+      "properties": {
+        "auth": {
+          "description": "Credential reference.",
+          "default": {
+            "scheme": "none"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/SourceAuth"
+            }
+          ]
+        },
+        "dataset": {
+          "description": "Default dataset.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "location": {
+          "description": "Processing location, e.g. `US` or `EU`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project": {
+          "description": "GCP project id.",
+          "type": "string"
+        },
+        "vendor": {
+          "type": "string",
+          "enum": [
+            "big_query"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Snowflake.",
+      "type": "object",
+      "required": [
+        "account",
+        "database",
+        "vendor",
+        "warehouse"
+      ],
+      "properties": {
+        "account": {
+          "description": "Account identifier.",
+          "type": "string"
+        },
+        "auth": {
+          "description": "Credential reference.",
+          "default": {
+            "scheme": "none"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/SourceAuth"
+            }
+          ]
+        },
+        "database": {
+          "description": "Database.",
+          "type": "string"
+        },
+        "role": {
+          "description": "Session role.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schema": {
+          "description": "Default schema.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "vendor": {
+          "type": "string",
+          "enum": [
+            "snowflake"
+          ]
+        },
+        "warehouse": {
+          "description": "Virtual warehouse.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "PostgreSQL (and wire-compatible engines).",
+      "type": "object",
+      "required": [
+        "database",
+        "host",
+        "vendor"
+      ],
+      "properties": {
+        "auth": {
+          "description": "Credential reference.",
+          "default": {
+            "scheme": "none"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/SourceAuth"
+            }
+          ]
+        },
+        "database": {
+          "description": "Database name.",
+          "type": "string"
+        },
+        "host": {
+          "description": "Host name.",
+          "type": "string"
+        },
+        "port": {
+          "description": "TCP port.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "sslmode": {
+          "description": "TLS mode, e.g. `require` or `verify-full`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "vendor": {
+          "type": "string",
+          "enum": [
+            "postgres"
+          ]
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "SourceAuth": {
+      "description": "Credential reference. Every secret is a named server-side environment variable resolved at read time; the Card carries only the env-var *name*, never a secret value (Doctrine #7).",
+      "oneOf": [
+        {
+          "description": "No credential (public/unauthenticated endpoint).",
+          "type": "object",
+          "required": [
+            "scheme"
+          ],
+          "properties": {
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "none"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Single secret read from one env var (bearer token, password, connection secret, key-pair, or service-account JSON delivered via env).",
+          "type": "object",
+          "required": [
+            "env",
+            "scheme"
+          ],
+          "properties": {
+            "env": {
+              "description": "Server-side env-var name holding the secret.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "env"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Username (non-secret) plus a password read from an env var.",
+          "type": "object",
+          "required": [
+            "password_env",
+            "scheme",
+            "username"
+          ],
+          "properties": {
+            "password_env": {
+              "description": "Server-side env-var name holding the password.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "basic"
+              ]
+            },
+            "username": {
+              "description": "Login user.",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Multiple named secrets, each read from its own env var. Keys are logical credential names (e.g. `api_key`, `app_key`); values are env-var names.",
+          "type": "object",
+          "required": [
+            "scheme",
+            "vars"
+          ],
+          "properties": {
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "multi_env"
+              ]
+            },
+            "vars": {
+              "description": "Logical credential name → server-side env-var name.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

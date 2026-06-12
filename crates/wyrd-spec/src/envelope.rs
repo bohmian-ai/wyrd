@@ -22,6 +22,7 @@ use crate::card::operator::OperatorSpec;
 use crate::card::policy::PolicySpec;
 use crate::card::prompt::PromptSpec;
 use crate::card::service::ServiceSpec;
+use crate::card::source::SourceSpec;
 use crate::card::trigger::TriggerSpec;
 use crate::card::workflow::WorkflowSpec;
 use crate::ids::{CardName, CardUid, SpaceName};
@@ -122,6 +123,8 @@ pub enum Spec {
     /// Operator card spec.
     // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-2
     Operator(OperatorSpec),
+    /// Source card spec.
+    Source(SourceSpec),
 }
 
 /// Server-derived relationship summary for graph, UI, policy, imports, and diff.
@@ -186,13 +189,15 @@ pub enum CardKind {
     /// Operator Card.
     // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-2
     Operator,
+    /// Source Card.
+    Source,
     /// Unknown/external card kind.
     External,
 }
 
 impl CardKind {
     /// Native v1 Card kind count.
-    pub const NATIVE_COUNT: usize = 16;
+    pub const NATIVE_COUNT: usize = 17;
 
     /// Return every native kind.
     #[must_use]
@@ -213,6 +218,7 @@ impl CardKind {
             Self::Artifact,
             Self::Trigger,
             Self::Operator,
+            Self::Source,
             Self::External,
         ]
     }
@@ -236,6 +242,7 @@ impl CardKind {
             Self::Artifact => "Artifact",
             Self::Trigger => "Trigger",
             Self::Operator => "Operator",
+            Self::Source => "Source",
             Self::External => "External",
         })
     }
@@ -259,6 +266,7 @@ impl CardKind {
             Self::Artifact => "Artifact",
             Self::Trigger => "Trigger",
             Self::Operator => "Operator",
+            Self::Source => "Source",
             Self::External => "External",
         }
     }
@@ -294,6 +302,7 @@ fn native_from_str(value: &str) -> Option<CardKind> {
         "Artifact" => CardKind::Artifact,
         "Trigger" => CardKind::Trigger,
         "Operator" => CardKind::Operator,
+        "Source" => CardKind::Source,
         "External" => CardKind::External,
         _ => return None,
     })
@@ -342,6 +351,7 @@ impl Serialize for Spec {
             Self::Artifact(s) => s.serialize(serializer),
             Self::Trigger(s) => s.serialize(serializer),
             Self::Operator(s) => s.serialize(serializer),
+            Self::Source(s) => s.serialize(serializer),
         }
     }
 }
@@ -426,6 +436,9 @@ fn spec_from_kind_value(kind: &CardKind, mut value: serde_json::Value) -> Result
             .map_err(|e| e.to_string()),
         CardKind::Operator => serde_json::from_value(value)
             .map(Spec::Operator)
+            .map_err(|e| e.to_string()),
+        CardKind::Source => serde_json::from_value(value)
+            .map(Spec::Source)
             .map_err(|e| e.to_string()),
         CardKind::External => Err("unsupported external card kind".to_string()),
     }

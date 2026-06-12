@@ -1,0 +1,30 @@
+# SourceCard - read-side reference to a Snowflake warehouse.
+# `kind` is the read-shape bucket (sql_warehouse -> row set); the vendor is a
+# nested connection detail. Secrets are server-side env-var names only.
+
+apiVersion: wyrd/v1
+kind: Source
+metadata:
+  space: prod
+  name: telemetry-warehouse
+  version: 1.0.0
+
+spec:
+  description: Run telemetry rows for online evaluation.
+  kind:
+    kind: sql_warehouse
+    connection:
+      vendor: snowflake
+      account: acme-prod
+      warehouse: analytics
+      database: telemetry
+      schema: public
+      role: reader
+      auth:
+        scheme: env
+        env: SNOWFLAKE_KEYPAIR
+
+  defaults:
+    page_size:
+      type: number
+      value: 5000

@@ -15,6 +15,7 @@ pub mod operator;
 pub mod policy;
 pub mod prompt;
 pub mod service;
+pub mod source;
 pub mod trigger;
 pub mod workflow;
 

@@ -10,6 +10,8 @@
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
 pub mod postgres_boot;
+pub mod queries;
+pub mod row_types;
 pub mod tenant_conn;
 
 use postgres_boot::PoolConfig;
@@ -76,6 +78,9 @@ pub enum SqlError {
     /// Database migration failed.
     #[error("migration failed")]
     Migrate(#[from] sqlx::migrate::MigrateError),
+    /// Stored tenant identifier violated Wyrd's UUIDv7 contract.
+    #[error("stored tenant identifier violated Wyrd's UUIDv7 contract")]
+    InvalidDataTenantId(#[source] wyrd_spec::ids::IdError),
 }
 
 /// Control-plane Postgres handle.
@@ -216,6 +221,73 @@ mod tests {
                 "migration file {file_name} must use snake_case"
             );
         }
+    }
+
+    #[test]
+    fn queries_module_shape_matches_foundation_plan() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let required_paths = [
+            "src/queries/mod.rs",
+            "src/queries/auth/mod.rs",
+            "src/queries/auth/users.rs",
+            "src/queries/auth/roles.rs",
+            "src/queries/auth/api_keys.rs",
+            "src/queries/auth/refresh_tokens.rs",
+            "src/queries/auth/governance_tokens.rs",
+            "src/queries/auth/sql",
+            "src/queries/platform/mod.rs",
+            "src/queries/platform/tenant_resolver.rs",
+            "src/queries/platform/tenants.rs",
+            "src/queries/platform/users.rs",
+            "src/queries/platform/roles.rs",
+            "src/queries/platform/api_keys.rs",
+            "src/queries/platform/audit_log.rs",
+            "src/queries/platform/sql",
+            "src/row_types/mod.rs",
+            "src/row_types/auth/mod.rs",
+            "src/row_types/platform/mod.rs",
+        ];
+
+        for relative_path in required_paths {
+            assert!(
+                crate_dir.join(relative_path).exists(),
+                "missing planned wyrd-sql path: {relative_path}"
+            );
+        }
+
+        let auth_doc = fs::read_to_string(crate_dir.join("src/queries/auth/mod.rs"))
+            .expect("auth query module doc is readable");
+        assert!(auth_doc.contains("&mut TenantConn<'_>"));
+        assert!(auth_doc.contains("data_tenant_id = $"));
+
+        let resolver =
+            fs::read_to_string(crate_dir.join("src/queries/platform/tenant_resolver.rs"))
+                .expect("tenant resolver module is readable");
+        assert!(resolver.contains("resolve_by_slug_for_app"));
+        assert!(resolver.contains("&TenantSlug"));
+        assert!(resolver.contains("platform.resolve_tenant_by_slug($1)"));
+        assert!(resolver.contains("raw-query grep"));
+    }
+
+    #[test]
+    fn tenant_scoped_query_stubs_do_not_take_raw_pool_executors() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let auth_dir = crate_dir.join("src/queries/auth");
+        let forbidden = fs::read_dir(auth_dir)
+            .expect("auth query directory is readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+            .filter_map(|path| {
+                let body = fs::read_to_string(&path).expect("auth query file is readable");
+                (body.contains("&PgPool") || body.contains("Transaction<'_")).then_some(path)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            forbidden.is_empty(),
+            "tenant-scoped auth query modules must use TenantConn, not raw executors: {forbidden:?}"
+        );
     }
 
     fn migration_files() -> Vec<String> {

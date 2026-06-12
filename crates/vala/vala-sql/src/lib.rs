@@ -8,6 +8,9 @@
 
 use sqlx::PgPool;
 
+pub mod queries;
+pub mod row_types;
+
 pub use wyrd_sql::TenantConn;
 
 /// Tenant-scoped Vala observability schema owned by `vala-sql`.
@@ -148,6 +151,50 @@ mod tests {
                 "migration file {file_name} must use snake_case"
             );
         }
+    }
+
+    #[test]
+    fn queries_module_shape_matches_foundation_plan() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let required_paths = [
+            "src/queries/mod.rs",
+            "src/queries/profiles.rs",
+            "src/queries/queues.rs",
+            "src/queries/anchors.rs",
+            "src/queries/alerts.rs",
+            "src/queries/monitor.rs",
+            "src/queries/olap_catalog.rs",
+            "src/row_types/mod.rs",
+            "src/row_types/profiles.rs",
+            "src/row_types/queues.rs",
+            "src/row_types/anchors.rs",
+            "src/row_types/alerts.rs",
+            "src/row_types/monitor.rs",
+            "src/row_types/olap_catalog.rs",
+        ];
+
+        for relative_path in required_paths {
+            assert!(
+                crate_dir.join(relative_path).exists(),
+                "missing planned vala-sql path: {relative_path}"
+            );
+        }
+
+        let query_doc = fs::read_to_string(crate_dir.join("src/queries/mod.rs"))
+            .expect("Vala query module doc is readable");
+        assert!(query_doc.contains("TenantConn"));
+        assert!(query_doc.contains("data_tenant_id = $"));
+    }
+
+    #[test]
+    fn vala_sql_does_not_depend_on_skald() {
+        let manifest = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .expect("vala-sql manifest is readable");
+
+        assert!(
+            !manifest.contains("skald"),
+            "vala-sql must not depend on Skald crates"
+        );
     }
 
     fn migration_files() -> Vec<String> {

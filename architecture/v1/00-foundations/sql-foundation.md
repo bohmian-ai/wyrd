@@ -63,3 +63,29 @@ cluster roles have already been bootstrapped. The `wyrd-sql` migration tests
 skip when `DATABASE_URL` is unset; when run against a live database they assert
 role metadata, `platform.tenants`, `wyrd.current_tenant()`, tenant-scoped auth
 tables, and RLS catalog state.
+
+## Transaction Discipline
+
+Every tenant-scoped logical operation opens exactly one `TenantConn` from the
+runtime `wyrd_app` pool. Reads, writes, audit rows, relationship updates, and
+same-crate cross-domain work for that operation share the transaction opened by
+that wrapper. Even read-only handlers commit the `TenantConn` at the end so the
+shape stays uniform; dropping it without commit rolls back through SQLx.
+
+Tenant-scoped query functions take `&mut TenantConn<'_>`. They do not take a
+raw `PgPool`, open their own SQLx transaction, or issue raw transaction-control
+SQL. Wyrd v1 does not use nested transactions or savepoints. If a sub-operation
+appears to need a savepoint, split or refactor the operation boundary instead
+of hiding partial rollback inside the query layer.
+
+Platform operations are the exception because `platform.*` is above the tenant
+boundary. Audited platform-admin reads and writes run on the platform-admin
+pool and may use a bare SQLx transaction for one platform-scoped operation.
+Runtime tenant resolution remains the narrow `SECURITY DEFINER` bridge exposed
+to `wyrd_app`; it is not a tenant-scoped data operation.
+
+Cross-crate transactional coordination is not supported. `wyrd-sql` must not
+import `vala-sql` query modules, and `vala-sql` must not call Wyrd query write
+functions to extend a Wyrd transaction. Downstream Vala effects are propagated
+after the Wyrd commit through the future outbox/event fanout path and are
+handled idempotently by Vala.

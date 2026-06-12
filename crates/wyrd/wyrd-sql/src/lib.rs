@@ -141,7 +141,7 @@ mod tests {
     use crate::{MIGRATION_SEARCH_PATH, OWNED_SCHEMAS};
 
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn schema_ownership_is_explicit() {
@@ -272,15 +272,17 @@ mod tests {
     #[test]
     fn tenant_scoped_query_stubs_do_not_take_raw_pool_executors() {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let auth_dir = crate_dir.join("src/queries/auth");
-        let forbidden = fs::read_dir(auth_dir)
-            .expect("auth query directory is readable")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        let forbidden = rust_files_under(&crate_dir.join("src/queries/auth"))
+            .into_iter()
             .filter_map(|path| {
                 let body = fs::read_to_string(&path).expect("auth query file is readable");
-                (body.contains("&PgPool") || body.contains("Transaction<'_")).then_some(path)
+                let checked = without_line_comments(&body);
+                (checked.contains("&PgPool")
+                    || checked.contains("PgPool,")
+                    || checked.contains("Transaction<'_")
+                    || checked.contains("Transaction < '_")
+                    || checked.contains(".begin("))
+                .then_some(path)
             })
             .collect::<Vec<_>>();
 
@@ -288,6 +290,125 @@ mod tests {
             forbidden.is_empty(),
             "tenant-scoped auth query modules must use TenantConn, not raw executors: {forbidden:?}"
         );
+    }
+
+    #[test]
+    fn tenant_scoped_query_modules_do_not_issue_transaction_control_sql() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let forbidden = rust_files_under(&crate_dir.join("src/queries/auth"))
+            .into_iter()
+            .chain(sql_files_under(&crate_dir.join("src/queries/auth/sql")))
+            .filter_map(|path| {
+                let body = fs::read_to_string(&path).expect("query source is readable");
+                let checked = without_line_comments(&body).to_ascii_uppercase();
+                let has_transaction_control = ["BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT"]
+                    .into_iter()
+                    .any(|keyword| checked.contains(keyword));
+                has_transaction_control.then_some(path)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            forbidden.is_empty(),
+            "tenant-scoped query modules must rely on TenantConn, not raw transaction SQL: {forbidden:?}"
+        );
+    }
+
+    #[test]
+    fn wyrd_sql_does_not_coordinate_transactions_with_vala_sql() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest =
+            fs::read_to_string(crate_dir.join("Cargo.toml")).expect("manifest is readable");
+        assert!(
+            !manifest.contains("vala-sql") && !manifest.contains("vala_sql"),
+            "wyrd-sql must not depend on vala-sql for cross-crate transactions"
+        );
+
+        let forbidden = rust_files_under(&crate_dir.join("src"))
+            .into_iter()
+            .filter_map(|path| {
+                let body = fs::read_to_string(&path).expect("source file is readable");
+                let uncommented = without_line_comments(&body);
+                let checked = production_source(&uncommented);
+                (checked.contains("vala_sql::queries") || checked.contains("vala_sql :: queries"))
+                    .then_some(path)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            forbidden.is_empty(),
+            "wyrd-sql must not call vala-sql query modules: {forbidden:?}"
+        );
+    }
+
+    #[test]
+    fn transaction_discipline_is_documented() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_dir = crate_dir
+            .ancestors()
+            .nth(3)
+            .expect("crate lives three levels below repo root");
+        let sql_foundation =
+            fs::read_to_string(repo_dir.join("architecture/v1/00-foundations/sql-foundation.md"))
+                .expect("SQL foundation architecture doc is readable");
+        let tenant_conn = fs::read_to_string(crate_dir.join("src/tenant_conn.rs"))
+            .expect("TenantConn is readable");
+        let queries_doc = fs::read_to_string(crate_dir.join("src/queries/mod.rs"))
+            .expect("query module doc is readable");
+
+        assert!(sql_foundation.contains("Every tenant-scoped logical operation opens exactly one"));
+        assert!(sql_foundation.contains("Cross-crate transactional coordination is not supported"));
+        assert!(tenant_conn.contains("transaction boundary for one tenant-scoped logical"));
+        assert!(tenant_conn.contains("operation. Handlers and workers"));
+        assert!(queries_doc.contains("future outbox path"));
+    }
+
+    fn rust_files_under(dir: &Path) -> Vec<PathBuf> {
+        files_under_with_extension(dir, "rs")
+    }
+
+    fn sql_files_under(dir: &Path) -> Vec<PathBuf> {
+        files_under_with_extension(dir, "sql")
+    }
+
+    fn files_under_with_extension(dir: &Path, extension: &str) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        collect_files_with_extension(dir, extension, &mut files);
+        files.sort();
+        files
+    }
+
+    fn collect_files_with_extension(dir: &Path, extension: &str, files: &mut Vec<PathBuf>) {
+        if !dir.exists() {
+            return;
+        }
+
+        for entry in fs::read_dir(dir).expect("source directory is readable") {
+            let path = entry.expect("source directory entry is readable").path();
+            if path.is_dir() {
+                collect_files_with_extension(&path, extension, files);
+            } else if path
+                .extension()
+                .is_some_and(|actual_extension| actual_extension == extension)
+            {
+                files.push(path);
+            }
+        }
+    }
+
+    fn without_line_comments(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn production_source(source: &str) -> &str {
+        source.split("\n#[cfg(test)]").next().unwrap_or(source)
     }
 
     fn migration_files() -> Vec<String> {

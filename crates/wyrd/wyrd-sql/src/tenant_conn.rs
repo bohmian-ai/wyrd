@@ -1,4 +1,11 @@
 //! Tenant-scoped Postgres transaction wrapper.
+//!
+//! A `TenantConn` is the transaction boundary for one tenant-scoped logical
+//! operation. Handlers and workers acquire one wrapper, pass the same mutable
+//! reference through all tenant-scoped query modules involved in that operation,
+//! then commit once at the boundary. Query modules must not open nested SQLx
+//! transactions or issue transaction-control SQL; dropping the wrapper rolls the
+//! transaction back when an error leaves the operation early.
 
 use sqlx::{PgPool, Postgres, Transaction};
 use wyrd_spec::DataTenantId;
@@ -20,7 +27,10 @@ pub const BIND_CURRENT_TENANT_SQL: &str = "SELECT set_config('app.current_tenant
 /// Acquiring a `TenantConn` opens a transaction on the runtime `wyrd_app` pool
 /// and binds `app.current_tenant` to the supplied tenant UUID for that
 /// transaction only. Dropping without [`commit`](Self::commit) rolls the
-/// transaction back through SQLx's normal `Transaction` drop behavior.
+/// transaction back through SQLx's normal `Transaction` drop behavior. The same
+/// value should be threaded through all reads and writes for the operation;
+/// nested transactions and savepoints are intentionally outside the v1 SQL
+/// foundation.
 pub struct TenantConn<'a> {
     tx: Transaction<'a, Postgres>,
     data_tenant_id: DataTenantId,

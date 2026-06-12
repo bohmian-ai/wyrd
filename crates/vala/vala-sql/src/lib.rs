@@ -2,7 +2,11 @@
 //!
 //! `vala-sql` owns the `vala` PostgreSQL schema for observability control-plane
 //! state. Wyrd control-plane and platform schemas remain owned by `wyrd-sql`;
-//! no `skald` schema exists in this phase.
+//! no `skald` schema exists in this phase. Vala tenant-scoped work uses the
+//! shared [`TenantConn`] wrapper for one Vala logical operation at a time, but
+//! it does not extend Wyrd write transactions or call Wyrd query modules for
+//! cross-crate transactional coordination. Downstream effects from committed
+//! Wyrd state are a future outbox/event fanout concern.
 
 #![deny(missing_docs)]
 
@@ -73,7 +77,7 @@ mod tests {
     use crate::{MIGRATION_SEARCH_PATH, OWNED_SCHEMAS};
 
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn schema_ownership_is_explicit() {
@@ -184,6 +188,84 @@ mod tests {
             .expect("Vala query module doc is readable");
         assert!(query_doc.contains("TenantConn"));
         assert!(query_doc.contains("data_tenant_id = $"));
+        assert!(query_doc.contains("future outbox path"));
+    }
+
+    #[test]
+    fn tenant_scoped_query_stubs_do_not_take_raw_pool_executors() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let forbidden = rust_files_under(&crate_dir.join("src/queries"))
+            .into_iter()
+            .filter_map(|path| {
+                let body = fs::read_to_string(&path).expect("Vala query file is readable");
+                let checked = without_line_comments(&body);
+                (checked.contains("&PgPool")
+                    || checked.contains("PgPool,")
+                    || checked.contains("Transaction<'_")
+                    || checked.contains("Transaction < '_")
+                    || checked.contains(".begin("))
+                .then_some(path)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            forbidden.is_empty(),
+            "tenant-scoped Vala query modules must use TenantConn, not raw executors: {forbidden:?}"
+        );
+    }
+
+    #[test]
+    fn tenant_scoped_query_modules_do_not_issue_transaction_control_sql() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let forbidden = rust_files_under(&crate_dir.join("src/queries"))
+            .into_iter()
+            .filter_map(|path| {
+                let body = fs::read_to_string(&path).expect("Vala query source is readable");
+                let checked = without_line_comments(&body).to_ascii_uppercase();
+                let has_transaction_control = ["BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT"]
+                    .into_iter()
+                    .any(|keyword| checked.contains(keyword));
+                has_transaction_control.then_some(path)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            forbidden.is_empty(),
+            "tenant-scoped Vala query modules must rely on TenantConn, not raw transaction SQL: {forbidden:?}"
+        );
+    }
+
+    #[test]
+    fn vala_sql_does_not_call_wyrd_query_modules() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let forbidden = rust_files_under(&crate_dir.join("src"))
+            .into_iter()
+            .filter_map(|path| {
+                let body = fs::read_to_string(&path).expect("Vala source file is readable");
+                let uncommented = without_line_comments(&body);
+                let checked = production_source(&uncommented);
+                (checked.contains("wyrd_sql::queries") || checked.contains("wyrd_sql :: queries"))
+                    .then_some(path)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            forbidden.is_empty(),
+            "vala-sql must not call wyrd-sql query modules for cross-crate transactions: {forbidden:?}"
+        );
+    }
+
+    #[test]
+    fn cross_crate_transaction_boundary_is_documented() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lib_doc = fs::read_to_string(crate_dir.join("src/lib.rs"))
+            .expect("Vala lib module doc is readable");
+        let query_doc = fs::read_to_string(crate_dir.join("src/queries/mod.rs"))
+            .expect("Vala query module doc is readable");
+
+        assert!(lib_doc.contains("does not extend Wyrd write transactions"));
+        assert!(lib_doc.contains("future outbox/event fanout"));
+        assert!(query_doc.contains("must not open nested transactions"));
     }
 
     #[test]
@@ -212,5 +294,42 @@ mod tests {
             .collect::<Vec<_>>();
         files.sort();
         files
+    }
+
+    fn rust_files_under(dir: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        collect_rust_files(dir, &mut files);
+        files.sort();
+        files
+    }
+
+    fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
+        if !dir.exists() {
+            return;
+        }
+
+        for entry in fs::read_dir(dir).expect("source directory is readable") {
+            let path = entry.expect("source directory entry is readable").path();
+            if path.is_dir() {
+                collect_rust_files(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    fn without_line_comments(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn production_source(source: &str) -> &str {
+        source.split("\n#[cfg(test)]").next().unwrap_or(source)
     }
 }

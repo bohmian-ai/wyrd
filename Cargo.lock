@@ -4319,6 +4319,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vala-sql"
+version = "0.0.1"
+dependencies = [
+ "sqlx",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5070,6 +5079,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "urlencoding",
 ]
 

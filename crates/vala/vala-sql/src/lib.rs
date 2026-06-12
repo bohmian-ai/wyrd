@@ -1,18 +1,15 @@
-//! Server-tier SQL scaffold for Wyrd control-plane storage.
+//! Server-tier SQL migrations for Vala observability storage.
 
 #![deny(missing_docs)]
 
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::PgPool;
 
-pub mod postgres_boot;
-
-use postgres_boot::PoolConfig;
-
-/// Apply embedded Wyrd SQL migrations against a boot-only migrator pool.
+/// Apply embedded Vala SQL migrations against a boot-only migrator pool.
 ///
-/// The supplied pool should authenticate as `wyrd_migrator`. Migration runs on
-/// one dedicated connection with `search_path` set to `wyrd, public`, then the
-/// physical connection is closed so session state cannot return to the pool.
+/// The supplied pool is the same `wyrd_migrator` pool used by
+/// `wyrd_sql::migrate`. Migration runs on one dedicated connection with
+/// `search_path` set to `vala, public`, then the physical connection is closed
+/// so session state cannot return to the pool.
 ///
 /// # Errors
 /// Returns [`SqlError::Connect`] when the connection or bootstrap SQL fails.
@@ -21,10 +18,10 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
     let mut conn = migrator_pool.acquire().await.map_err(SqlError::Connect)?;
 
     let result: Result<(), SqlError> = async {
-        sqlx::query("CREATE SCHEMA IF NOT EXISTS wyrd")
+        sqlx::query("CREATE SCHEMA IF NOT EXISTS vala")
             .execute(&mut *conn)
             .await?;
-        sqlx::query("SET search_path TO wyrd, public")
+        sqlx::query("SET search_path TO vala, public")
             .execute(&mut *conn)
             .await?;
         sqlx::migrate!("./migrations")
@@ -37,75 +34,22 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
     if let Err(error) = conn.close().await {
         tracing::warn!(
             error = %error,
-            "failed to close wyrd-sql migration connection cleanly"
+            "failed to close vala-sql migration connection cleanly"
         );
     }
 
     result
 }
 
-/// SQL storage errors.
+/// Vala SQL migration errors.
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
-    /// Database connection failed.
+    /// Database connection or bootstrap SQL failed.
     #[error("database connection failed")]
     Connect(#[from] sqlx::Error),
     /// Database migration failed.
     #[error("migration failed")]
     Migrate(#[from] sqlx::migrate::MigrateError),
-}
-
-/// Control-plane Postgres handle.
-///
-/// The store is cloneable because it wraps an internal connection pool.
-#[derive(Clone)]
-pub struct SqlStore {
-    pool: PgPool,
-}
-
-impl SqlStore {
-    /// Connect to Postgres with a bounded pool.
-    ///
-    /// This does not run migrations.
-    ///
-    /// # Errors
-    /// Returns [`SqlError::Connect`] when the database connection fails.
-    pub async fn connect(database_url: &str, max_connections: u32) -> Result<Self, SqlError> {
-        let pool = PgPoolOptions::new()
-            .max_connections(max_connections)
-            .connect(database_url)
-            .await
-            .map_err(SqlError::Connect)?;
-        Ok(Self { pool })
-    }
-
-    /// Connect to Postgres with role-specific pool configuration.
-    ///
-    /// This does not run migrations.
-    ///
-    /// # Errors
-    /// Returns [`SqlError::Connect`] when the DSN cannot be parsed or the
-    /// database connection fails.
-    pub async fn connect_with(database_url: &str, config: PoolConfig) -> Result<Self, SqlError> {
-        let pool = postgres_boot::connect_pool(database_url, config)
-            .await
-            .map_err(SqlError::Connect)?;
-        Ok(Self { pool })
-    }
-
-    /// Apply embedded SQL migrations.
-    ///
-    /// # Errors
-    /// Returns [`SqlError::Migrate`] when migration execution fails.
-    pub async fn migrate(&self) -> Result<(), SqlError> {
-        migrate(&self.pool).await
-    }
-
-    /// Borrow the underlying Postgres pool.
-    #[must_use]
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
-    }
 }
 
 #[cfg(test)]
@@ -121,7 +65,7 @@ mod tests {
         assert_eq!(migrator.migrations.len(), files.len());
         assert!(
             !migrator.migrations.is_empty(),
-            "wyrd-sql must embed at least one migration"
+            "vala-sql must embed at least one migration"
         );
     }
 

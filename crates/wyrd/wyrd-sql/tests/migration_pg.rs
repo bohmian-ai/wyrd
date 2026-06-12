@@ -39,7 +39,8 @@ async fn refresh_token_hash_unique_constraint_exists() {
     let row: (bool,) = sqlx::query_as(
         "SELECT EXISTS (
             SELECT 1 FROM pg_indexes
-            WHERE tablename = 'refresh_tokens'
+            WHERE schemaname = 'wyrd'
+              AND tablename = 'refresh_tokens'
               AND indexname = 'idx_refresh_tokens_token_hash'
         )",
     )
@@ -67,17 +68,17 @@ async fn duplicate_refresh_token_hash_rejected() {
     let pool = store.pool();
 
     let user_id = "test-user-unique-hash";
-    let _ = sqlx::query("DELETE FROM refresh_tokens WHERE user_id = $1")
+    let _ = sqlx::query("DELETE FROM wyrd.refresh_tokens WHERE user_id = $1")
         .bind(user_id)
         .execute(pool)
         .await;
-    let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+    let _ = sqlx::query("DELETE FROM wyrd.users WHERE id = $1")
         .bind(user_id)
         .execute(pool)
         .await;
 
     let _ = sqlx::query(
-        "INSERT INTO users (id, email, auth_type, status)
+        "INSERT INTO wyrd.users (id, email, auth_type, status)
          VALUES ($1, $2, 'password', 'active')
          ON CONFLICT DO NOTHING",
     )
@@ -87,7 +88,7 @@ async fn duplicate_refresh_token_hash_rejected() {
     .await
     .expect("user insert");
 
-    let insert = "INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at)
+    let insert = "INSERT INTO wyrd.refresh_tokens (id, user_id, token_hash, expires_at)
                   VALUES ($1, $2, $3, now() + interval '1 day')";
 
     sqlx::query(insert)
@@ -110,11 +111,11 @@ async fn duplicate_refresh_token_hash_rejected() {
         "duplicate token_hash must be rejected by unique index"
     );
 
-    let _ = sqlx::query("DELETE FROM refresh_tokens WHERE user_id = $1")
+    let _ = sqlx::query("DELETE FROM wyrd.refresh_tokens WHERE user_id = $1")
         .bind(user_id)
         .execute(pool)
         .await;
-    let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+    let _ = sqlx::query("DELETE FROM wyrd.users WHERE id = $1")
         .bind(user_id)
         .execute(pool)
         .await;

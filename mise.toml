@@ -267,6 +267,10 @@ run = "cargo check --locked --target wasm32-unknown-unknown -p wyrd-spec --featu
 description = "cargo-deny check (licenses, advisories, sources, bans)"
 run = "cargo deny check"
 
+[tasks."sqlx:prepare"]
+description = "Refresh committed sqlx offline query metadata"
+run = "cargo sqlx prepare --workspace"
+
 [tasks."py:setup"]
 description = "Sync Python dev dependencies and build the Wyrd native extension"
 dir = "python/py-wyrd"

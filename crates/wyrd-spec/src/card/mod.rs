@@ -15,9 +15,6 @@ pub mod operator;
 pub mod policy;
 pub mod prompt;
 pub mod service;
-pub mod skill;
-pub mod subagent;
-pub mod tool;
 pub mod trigger;
 pub mod workflow;
 

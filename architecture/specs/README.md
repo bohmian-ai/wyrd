@@ -1,5 +1,9 @@
 # Wyrd spec examples
 
+> Superseded sandbox examples. `architecture/wyrd-design.md` is the active
+> design authority. These examples still contain older 18-kind exploration and
+> are not public doctrine for Tool, Skill, or SubAgent card kinds.
+
 This folder is the iteration sandbox for the **declarative Wyrd envelope**.
 Every YAML here is a complete, end-to-end scenario expressed in cards. The goal
 is not to ship these files — it is to pressure-test the spec until the envelope

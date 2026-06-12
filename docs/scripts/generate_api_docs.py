@@ -92,7 +92,7 @@ def render_schemas() -> str:
         "",
         "# Schemas",
         "",
-        "These schemas are generated from the Wyrd spec crate and checked into the repository for clients, docs, and agents.",
+        "These schemas are generated from the Wyrd spec crate and checked into the repository for clients, docs, and agents. `architecture/wyrd-design.md` remains the design authority; this inventory may include implementation drift while contracts are being reconciled.",
         "",
         "| Schema | Title |",
         "| --- | --- |",

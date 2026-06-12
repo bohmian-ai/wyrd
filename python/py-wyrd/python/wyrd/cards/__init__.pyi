@@ -14,7 +14,6 @@ class CardKind:
     Model: CardKind
     Experiment: CardKind
     Prompt: CardKind
-    Tool: CardKind
     Agent: CardKind
     Workflow: CardKind
     Eval: CardKind
@@ -22,8 +21,6 @@ class CardKind:
     Service: CardKind
     Policy: CardKind
     Mcp: CardKind
-    Skill: CardKind
-    SubAgent: CardKind
     Audit: CardKind
     Artifact: CardKind
     Trigger: CardKind

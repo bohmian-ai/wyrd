@@ -1,6 +1,6 @@
 # Wyrd
 
-> Wyrd is the declarative AI layer for developers, engineers, and agents. A standardized ecosystem for every model, prompt, tool, agent, workflow, eval, policy, audit, service, and observation. Declare it once; govern, evaluate, deploy, and observe it everywhere. Execution stays in the user runtime.
+> Wyrd is the declarative AI layer for developers, engineers, and agents. A standardized ecosystem for models, data, prompts, agents, workflows, evals, policies, audits, services, sources, and observations. Runtime tools resolve through tool registries; execution stays in the user runtime.
 
 ## Concepts
 
@@ -28,13 +28,11 @@
 - [PolicyCard](https://wyrd.ai/cards/policy/): Capture rules that decide whether a card, run, or action is allowed.
 - [PromptCard](https://wyrd.ai/cards/prompt/): Version prompt content and the contract around its inputs and outputs.
 - [ServiceCard](https://wyrd.ai/cards/service/): Describe a deployable service and the runtime rules Wyrd can lock.
-- [SkillCard](https://wyrd.ai/cards/skill/): Declare a reusable skill that an agent can select with predictable inputs.
-- [SubAgentCard](https://wyrd.ai/cards/subagent/): Describe a narrower agent role that can be called by a parent agent.
-- [ToolCard](https://wyrd.ai/cards/tool/): Declare an executable tool and the constraints around its use.
+- [SourceCard](https://wyrd.ai/cards/source/): Declare where Wyrd reads external observations, archived runs, or object-store evidence.
 - [TriggerCard](https://wyrd.ai/cards/trigger/): Describe an event source that can start a workflow or service action.
 - [WorkflowCard](https://wyrd.ai/cards/workflow/): Describe a coordinated sequence of operators, tools, agents, or services.
 
 ## Machine-readable schemas
 
-- [llms-full.txt](https://wyrd.ai/llms-full.txt): every Card spec schema inline.
-- JSON Schemas: see `crates/wyrd-spec/schemas/` in the wyrd repository.
+- [llms-full.txt](https://wyrd.ai/llms-full.txt): current schema inventory plus doctrine notes.
+- JSON Schemas: see `crates/wyrd-spec/schemas/` in the wyrd repository. `architecture/wyrd-design.md` remains the design authority while schemas are reconciled.

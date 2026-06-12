@@ -1,0 +1,43 @@
+---
+title: Source
+description: Design-authoritative reference for the Wyrd Source card.
+---
+
+# Source
+
+Source declares where Wyrd reads external observations, archived runs, object
+store evidence, or vendor telemetry. Wyrd reads from Sources; it does not accept
+external push event vocabulary as public doctrine.
+
+`SourceSpec` is design-authoritative in `architecture/wyrd-design.md` and is
+pending implementation in `wyrd-spec`. Until that reconciliation lands, this
+page is the public doctrine reference and generated schema inventories may not
+include Source.
+
+## Shape
+
+```yaml
+apiVersion: wyrd/v1
+metadata:
+  name: run-archive
+  version: "1.0.0"
+kind: Source
+spec:
+  kind: object_store
+  uri: s3://acme-wyrd/runs/
+  format: parquet
+relationships: []
+status: null
+```
+
+## Relationships
+
+Drift cards use Source through `Drift.signal.External.source_ref`. Eval online
+mode uses Source through `Eval.source_ref` when that deferred contract lands.
+
+## Doctrine
+
+- Source is a light card.
+- External pushes are not Trigger sources.
+- Source describes read location and format, not a runtime client object.
+- Credentials, adapters, and vendor SDK handles stay out of the Card spec.

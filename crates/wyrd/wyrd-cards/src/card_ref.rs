@@ -21,8 +21,6 @@ pub enum Kind {
     Experiment,
     /// Prompt Card.
     Prompt,
-    /// Tool Card.
-    Tool,
     /// Agent Card.
     Agent,
     /// Workflow Card.
@@ -37,10 +35,6 @@ pub enum Kind {
     Policy,
     /// MCP Card.
     Mcp,
-    /// Skill Card.
-    Skill,
-    /// Sub-agent Card.
-    SubAgent,
     /// Audit Card.
     Audit,
     /// Artifact Card.
@@ -60,7 +54,6 @@ impl Kind {
             Self::Model => "Model",
             Self::Experiment => "Experiment",
             Self::Prompt => "Prompt",
-            Self::Tool => "Tool",
             Self::Agent => "Agent",
             Self::Workflow => "Workflow",
             Self::Eval => "Eval",
@@ -68,8 +61,6 @@ impl Kind {
             Self::Service => "Service",
             Self::Policy => "Policy",
             Self::Mcp => "Mcp",
-            Self::Skill => "Skill",
-            Self::SubAgent => "SubAgent",
             Self::Audit => "Audit",
             Self::Artifact => "Artifact",
             Self::Trigger => "Trigger",
@@ -84,7 +75,6 @@ impl Kind {
             Self::Model => CardKind::Model,
             Self::Experiment => CardKind::Experiment,
             Self::Prompt => CardKind::Prompt,
-            Self::Tool => CardKind::Tool,
             Self::Agent => CardKind::Agent,
             Self::Workflow => CardKind::Workflow,
             Self::Eval => CardKind::Eval,
@@ -92,8 +82,6 @@ impl Kind {
             Self::Service => CardKind::Service,
             Self::Policy => CardKind::Policy,
             Self::Mcp => CardKind::Mcp,
-            Self::Skill => CardKind::Skill,
-            Self::SubAgent => CardKind::SubAgent,
             Self::Audit => CardKind::Audit,
             Self::Artifact => CardKind::Artifact,
             Self::Trigger => CardKind::Trigger,
@@ -108,7 +96,6 @@ impl Kind {
             CardKind::Model => Self::Model,
             CardKind::Experiment => Self::Experiment,
             CardKind::Prompt => Self::Prompt,
-            CardKind::Tool => Self::Tool,
             CardKind::Agent => Self::Agent,
             CardKind::Workflow => Self::Workflow,
             CardKind::Eval => Self::Eval,
@@ -116,8 +103,6 @@ impl Kind {
             CardKind::Service => Self::Service,
             CardKind::Policy => Self::Policy,
             CardKind::Mcp => Self::Mcp,
-            CardKind::Skill => Self::Skill,
-            CardKind::SubAgent => Self::SubAgent,
             CardKind::Audit => Self::Audit,
             CardKind::Artifact => Self::Artifact,
             CardKind::Trigger => Self::Trigger,
@@ -156,9 +141,9 @@ impl CardRefPy {
     /// Build a `CardRef` from its identity components.
     ///
     /// `kind` accepts the native wire name of a registered card kind
-    /// (one of `Data`, `Model`, `Experiment`, `Prompt`, `Tool`, `Agent`,
-    /// `Workflow`, `Eval`, `Drift`, `Service`, `Policy`, `Mcp`, `Skill`,
-    /// `SubAgent`, `Audit`, `Artifact`, `Trigger`, `Operator`). External
+    /// (one of `Data`, `Model`, `Experiment`, `Prompt`, `Agent`, `Workflow`,
+    /// `Eval`, `Drift`, `Service`, `Policy`, `Mcp`, `Audit`, `Artifact`,
+    /// `Trigger`, `Operator`). External
     /// kinds are not constructable from Python in v1.
     #[new]
     #[pyo3(signature = (kind, name, version, *, space=None, uid=None))]

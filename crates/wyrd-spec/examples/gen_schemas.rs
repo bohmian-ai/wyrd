@@ -26,9 +26,6 @@ use wyrd_spec::card::service::{LockedComponent, ServiceLock};
 use wyrd_spec::card::service::{
     ServiceRuntime, ServiceRuntimeKind, ServiceRuntimeMode, ServiceRuntimePolicy, ServiceSpec,
 };
-use wyrd_spec::card::skill::SkillSpec;
-use wyrd_spec::card::subagent::SubAgentSpec;
-use wyrd_spec::card::tool::ToolSpec;
 use wyrd_spec::card::trigger::{TriggerSource, TriggerSpec};
 use wyrd_spec::card::workflow::WorkflowSpec;
 use wyrd_spec::envelope::{Card, CardKind};
@@ -79,7 +76,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<PromptSpec>(out, golden, "prompt_spec")?;
     write::<PromptRef>(out, golden, "prompt_ref")?;
     write::<ParameterName>(out, golden, "parameter_name")?;
-    write::<ToolSpec>(out, golden, "tool_spec")?;
     write::<AgentSpec>(out, golden, "agent_spec")?;
     write::<WorkflowSpec>(out, golden, "workflow_spec")?;
     write::<CardEvalSpec>(out, golden, "eval_spec")?;
@@ -99,8 +95,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<InvokeOutcome>(out, golden, "invoke_outcome")?;
     write::<PolicyDecision>(out, golden, "policy_decision")?;
     write::<McpSpec>(out, golden, "mcp_spec")?;
-    write::<SkillSpec>(out, golden, "skill_spec")?;
-    write::<SubAgentSpec>(out, golden, "subagent_spec")?;
     write::<AuditSpec>(out, golden, "audit_spec")?;
     write::<ArtifactSpec>(out, golden, "artifact_spec")?;
     write::<FrameworkAdapterRef>(out, golden, "framework_adapter_ref")?;

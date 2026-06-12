@@ -5,9 +5,26 @@ inputs into domain types before calling core behavior.
 
 ## Placement
 
-PyO3 code belongs in `python/py-wyrd*` unless an explicit allowlist says
-otherwise. Do not add PyO3 to foundation, client, spec, storage, telemetry, or
-provider-core crates without an approved boundary.
+`wyrd-spec` is PyO3-free: no `python` feature, no PyO3 imports, and no
+Python-lifetime types.
+
+PyO3 code belongs in the crate that owns the Python-visible behavior, behind an
+optional `python` feature. The dependency shape is:
+
+```toml
+[features]
+python = ["dep:pyo3"]
+
+[dependencies]
+pyo3 = { workspace = true, optional = true }
+```
+
+`python/py-wyrd` is the extension-module aggregator. It enables approved owner
+crate `python` features and registers their submodules; it must not duplicate
+validation, lifecycle, registry, storage, or runtime logic.
+
+Approved owner crates are enforced by `mise run check:pyo3-scope`. Do not add
+PyO3 to another crate without updating the architecture and the boundary gate.
 
 ## Modern API
 
@@ -53,7 +70,8 @@ Good boundary shape:
 4. Convert Rust errors into typed Python exceptions.
 5. Return Python-friendly values.
 
-Do not pass `PyAny`, `PyDict`, `PyList`, or `PyErr` into reusable Rust core code.
+Do not pass `PyAny`, `PyDict`, `PyList`, or `PyErr` into reusable Rust core code
+outside an approved `python` feature boundary.
 
 ## GIL Discipline
 

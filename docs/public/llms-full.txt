@@ -1017,7 +1017,6 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
         "Model",
         "Experiment",
         "Prompt",
-        "Tool",
         "Agent",
         "Workflow",
         "Eval",
@@ -1025,8 +1024,6 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
         "Service",
         "Policy",
         "Mcp",
-        "Skill",
-        "SubAgent",
         "Audit",
         "Artifact",
         "Trigger",
@@ -4250,7 +4247,6 @@ Schema source: crates/wyrd-spec/schemas/artifact_spec.json
         "Model",
         "Experiment",
         "Prompt",
-        "Tool",
         "Agent",
         "Workflow",
         "Eval",
@@ -4258,8 +4254,6 @@ Schema source: crates/wyrd-spec/schemas/artifact_spec.json
         "Service",
         "Policy",
         "Mcp",
-        "Skill",
-        "SubAgent",
         "Audit",
         "Artifact",
         "Trigger",
@@ -4574,7 +4568,6 @@ Schema source: crates/wyrd-spec/schemas/audit_spec.json
         "Model",
         "Experiment",
         "Prompt",
-        "Tool",
         "Agent",
         "Workflow",
         "Eval",
@@ -4582,8 +4575,6 @@ Schema source: crates/wyrd-spec/schemas/audit_spec.json
         "Service",
         "Policy",
         "Mcp",
-        "Skill",
-        "SubAgent",
         "Audit",
         "Artifact",
         "Trigger",
@@ -4876,7 +4867,6 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
         "Model",
         "Experiment",
         "Prompt",
-        "Tool",
         "Agent",
         "Workflow",
         "Eval",
@@ -4884,8 +4874,6 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
         "Service",
         "Policy",
         "Mcp",
-        "Skill",
-        "SubAgent",
         "Audit",
         "Artifact",
         "Trigger",
@@ -6191,7 +6179,6 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
         "Model",
         "Experiment",
         "Prompt",
-        "Tool",
         "Agent",
         "Workflow",
         "Eval",
@@ -6199,8 +6186,6 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
         "Service",
         "Policy",
         "Mcp",
-        "Skill",
-        "SubAgent",
         "Audit",
         "Artifact",
         "Trigger",
@@ -6770,7 +6755,6 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
         "Model",
         "Experiment",
         "Prompt",
-        "Tool",
         "Agent",
         "Workflow",
         "Eval",
@@ -6778,8 +6762,6 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
         "Service",
         "Policy",
         "Mcp",
-        "Skill",
-        "SubAgent",
         "Audit",
         "Artifact",
         "Trigger",
@@ -7543,7 +7525,6 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
         "Model",
         "Experiment",
         "Prompt",
-        "Tool",
         "Agent",
         "Workflow",
         "Eval",
@@ -7551,8 +7532,6 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
         "Service",
         "Policy",
         "Mcp",
-        "Skill",
-        "SubAgent",
         "Audit",
         "Artifact",
         "Trigger",
@@ -8157,7 +8136,6 @@ Schema source: crates/wyrd-spec/schemas/mcp_spec.json
         "Model",
         "Experiment",
         "Prompt",
-        "Tool",
         "Agent",
         "Workflow",
         "Eval",
@@ -8165,8 +8143,6 @@ Schema source: crates/wyrd-spec/schemas/mcp_spec.json
         "Service",
         "Policy",
         "Mcp",
-        "Skill",
-        "SubAgent",
         "Audit",
         "Artifact",
         "Trigger",
@@ -8425,7 +8401,6 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
         "Model",
         "Experiment",
         "Prompt",
-        "Tool",
         "Agent",
         "Workflow",
         "Eval",
@@ -8433,8 +8408,6 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
         "Service",
         "Policy",
         "Mcp",
-        "Skill",
-        "SubAgent",
         "Audit",
         "Artifact",
         "Trigger",
@@ -9535,7 +9508,6 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
         "Model",
         "Experiment",
         "Prompt",
-        "Tool",
         "Agent",
         "Workflow",
         "Eval",
@@ -9543,8 +9515,6 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
         "Service",
         "Policy",
         "Mcp",
-        "Skill",
-        "SubAgent",
         "Audit",
         "Artifact",
         "Trigger",
@@ -14101,7 +14071,6 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
         "Model",
         "Experiment",
         "Prompt",
-        "Tool",
         "Agent",
         "Workflow",
         "Eval",
@@ -14109,8 +14078,6 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
         "Service",
         "Policy",
         "Mcp",
-        "Skill",
-        "SubAgent",
         "Audit",
         "Artifact",
         "Trigger",
@@ -14607,7 +14574,6 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
         "Model",
         "Experiment",
         "Prompt",
-        "Tool",
         "Agent",
         "Workflow",
         "Eval",
@@ -14615,8 +14581,6 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
         "Service",
         "Policy",
         "Mcp",
-        "Skill",
-        "SubAgent",
         "Audit",
         "Artifact",
         "Trigger",
@@ -15992,7 +15956,6 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
         "Model",
         "Experiment",
         "Prompt",
-        "Tool",
         "Agent",
         "Workflow",
         "Eval",
@@ -16000,8 +15963,6 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
         "Service",
         "Policy",
         "Mcp",
-        "Skill",
-        "SubAgent",
         "Audit",
         "Artifact",
         "Trigger",
@@ -19441,25 +19402,6 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
       "description": "Workflow action target.",
       "oneOf": [
         {
-          "description": "Skill action.",
-          "properties": {
-            "target": {
-              "$ref": "#/definitions/CardRef"
-            },
-            "type": {
-              "enum": [
-                "skill"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "target",
-            "type"
-          ],
-          "type": "object"
-        },
-        {
           "description": "Agent action \u2014 inline body or Agent Card reference.",
           "properties": {
             "target": {
@@ -19487,25 +19429,6 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
             "type": {
               "enum": [
                 "mcp"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "target",
-            "type"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "Tool action.",
-          "properties": {
-            "target": {
-              "$ref": "#/definitions/CardRef"
-            },
-            "type": {
-              "enum": [
-                "tool"
               ],
               "type": "string"
             }

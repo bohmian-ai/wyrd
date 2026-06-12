@@ -51,13 +51,10 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 | `crates/wyrd-spec/schemas/service_runtime_mode.json` | ServiceRuntimeMode |
 | `crates/wyrd-spec/schemas/service_runtime_policy.json` | ServiceRuntimePolicy |
 | `crates/wyrd-spec/schemas/service_spec.json` | ServiceSpec |
-| `crates/wyrd-spec/schemas/skill_spec.json` | SkillSpec |
 | `crates/wyrd-spec/schemas/split_strategy.json` | SplitStrategy |
 | `crates/wyrd-spec/schemas/sql_logic.json` | SqlLogic |
-| `crates/wyrd-spec/schemas/subagent_spec.json` | SubAgentSpec |
 | `crates/wyrd-spec/schemas/task_type.json` | TaskType |
 | `crates/wyrd-spec/schemas/tf_save_format.json` | TfSaveFormat |
-| `crates/wyrd-spec/schemas/tool_spec.json` | ToolSpec |
 | `crates/wyrd-spec/schemas/torch_save_format.json` | TorchSaveFormat |
 | `crates/wyrd-spec/schemas/trigger_source.json` | TriggerSource |
 | `crates/wyrd-spec/schemas/trigger_spec.json` | TriggerSpec |

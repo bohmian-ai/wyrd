@@ -4635,6 +4635,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vala-core"
+version = "0.0.1"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "wyrd-spec",
+]
+
+[[package]]
 name = "vala-drift"
 version = "0.0.1"
 dependencies = [
@@ -4696,17 +4707,6 @@ dependencies = [
  "vala-eval",
  "wyrd-error-derive",
  "wyrd-observe",
- "wyrd-spec",
-]
-
-[[package]]
-name = "vala-core"
-version = "0.0.1"
-dependencies = [
- "schemars",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
  "wyrd-spec",
 ]
 

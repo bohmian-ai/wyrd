@@ -16,3 +16,4 @@ path = "src/lib.rs"
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+wyrd-sql = { path = "../../wyrd/wyrd-sql", version = "0.0.1" }

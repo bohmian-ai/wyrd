@@ -10,8 +10,10 @@
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
 pub mod postgres_boot;
+pub mod tenant_conn;
 
 use postgres_boot::PoolConfig;
+pub use tenant_conn::TenantConn;
 
 /// Platform-global schema owned by `wyrd-sql`.
 pub const PLATFORM_SCHEMA: &str = "platform";
@@ -68,6 +70,9 @@ pub enum SqlError {
     /// Database connection failed.
     #[error("database connection failed")]
     Connect(#[from] sqlx::Error),
+    /// Tenant-scoped transaction failed.
+    #[error("tenant-scoped transaction failed")]
+    Transaction(#[source] sqlx::Error),
     /// Database migration failed.
     #[error("migration failed")]
     Migrate(#[from] sqlx::migrate::MigrateError),

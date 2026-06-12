@@ -8,6 +8,8 @@
 
 use sqlx::PgPool;
 
+pub use wyrd_sql::TenantConn;
+
 /// Tenant-scoped Vala observability schema owned by `vala-sql`.
 pub const OBSERVABILITY_SCHEMA: &str = "vala";
 /// Schemas whose migration lifecycle is owned by `vala-sql`.

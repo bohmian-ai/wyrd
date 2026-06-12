@@ -19,3 +19,45 @@ database layer.
 `platform.*` is above the tenant boundary and does not carry `data_tenant_id` on
 every row. `platform.tenants` is the tenant catalog whose primary key is
 `data_tenant_id`.
+
+## Runtime Tenant Binding
+
+Row-level security is the primary tenant boundary for tenant-scoped `wyrd.*`
+and `vala.*` tables. Runtime request paths use the `wyrd_app` database role,
+which does not bypass RLS. Migration paths use the boot-only `wyrd_migrator`
+role, and audited cross-tenant support paths use `wyrd_platform_admin` when
+that credential is provisioned.
+
+Tenant-scoped query modules run inside `wyrd_sql::TenantConn`. Acquiring a
+`TenantConn` opens a transaction on the runtime pool and binds
+`app.current_tenant` with:
+
+```sql
+SELECT set_config('app.current_tenant', $1, true)
+```
+
+The tenant value is always parameter-bound from `DataTenantId`; callers do not
+compose tenant SQL strings. The third `set_config` argument keeps the setting
+local to the transaction, so commit or rollback clears the tenant before the
+connection returns to the pool.
+
+RLS policies call the shared SQL helper `wyrd.current_tenant()`, which reads
+`app.current_tenant` and casts it to `uuid`. Policies use the strict
+`current_setting` form so a missing tenant binding fails loudly instead of
+returning an empty result set.
+
+Every tenant-scoped table in `wyrd.*` and `vala.*` follows this policy shape
+once the platform and auth migrations own those tables:
+
+```sql
+ALTER TABLE wyrd.example ENABLE ROW LEVEL SECURITY;
+ALTER TABLE wyrd.example FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON wyrd.example
+    USING (data_tenant_id = wyrd.current_tenant())
+    WITH CHECK (data_tenant_id = wyrd.current_tenant());
+```
+
+Live verification of policy behavior depends on the platform/auth migrations
+that create `platform.tenants`, `wyrd.current_tenant()`, and tenant-scoped
+tables with RLS enabled. Until those migrations land, non-live tests cover the
+Rust API shape and transaction-local binding contract.

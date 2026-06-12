@@ -46,8 +46,9 @@ RLS policies call the shared SQL helper `wyrd.current_tenant()`, which reads
 `current_setting` form so a missing tenant binding fails loudly instead of
 returning an empty result set.
 
-Every tenant-scoped table in `wyrd.*` and `vala.*` follows this policy shape
-once the platform and auth migrations own those tables:
+Every tenant-scoped table in `wyrd.*` and `vala.*` follows this policy shape.
+The `wyrd-sql` `0002_auth.sql` migration applies it inline for every
+`wyrd.auth_*` table:
 
 ```sql
 ALTER TABLE wyrd.example ENABLE ROW LEVEL SECURITY;
@@ -57,7 +58,8 @@ CREATE POLICY tenant_isolation ON wyrd.example
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
 ```
 
-Live verification of policy behavior depends on the platform/auth migrations
-that create `platform.tenants`, `wyrd.current_tenant()`, and tenant-scoped
-tables with RLS enabled. Until those migrations land, non-live tests cover the
-Rust API shape and transaction-local binding contract.
+Live verification of policy behavior depends on a Postgres database whose
+cluster roles have already been bootstrapped. The `wyrd-sql` migration tests
+skip when `DATABASE_URL` is unset; when run against a live database they assert
+role metadata, `platform.tenants`, `wyrd.current_tenant()`, tenant-scoped auth
+tables, and RLS catalog state.

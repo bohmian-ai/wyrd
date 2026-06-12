@@ -9,6 +9,21 @@ SQL ownership is split by crate:
 - `vala-sql` owns `vala`.
 - No `skald` schema exists in this phase.
 
+`wyrd-sql` boots its schemas through two forward-only migrations:
+
+1. `0001_platform.sql` creates the `platform` and `wyrd` schemas, validates the
+   three pre-provisioned login roles, grants object privileges, defines
+   `wyrd.current_tenant()`, creates `platform.tenants`, and installs the
+   hardened `platform.resolve_tenant_by_slug(text)` lookup.
+2. `0002_auth.sql` creates tenant-scoped `wyrd.auth_*` identity and credential
+   tables. Every row carries `data_tenant_id UUID NOT NULL REFERENCES
+   platform.tenants(data_tenant_id)`, tenant-aware child foreign keys use
+   composite keys, and every table ships with the `ENABLE` + `FORCE` +
+   `tenant_isolation` RLS policy block.
+
+Migrations never create cluster roles. Role provisioning is handled by external
+infrastructure bootstrap or embedded Postgres boot before SQL migrations run.
+
 `wyrd-server` applies migrators in this order:
 
 1. `wyrd_sql::migrate(pool)`

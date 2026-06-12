@@ -10,13 +10,14 @@
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
 pub mod error;
+pub mod pool;
 pub mod postgres_boot;
 pub mod queries;
 pub mod row_types;
 pub mod tenant_conn;
 
 pub use error::SqlError;
-use postgres_boot::PoolConfig;
+pub use pool::PoolConfig;
 pub use tenant_conn::TenantConn;
 
 /// Platform-global schema owned by `wyrd-sql`.
@@ -103,7 +104,7 @@ impl SqlStore {
     /// Returns [`SqlError::Connect`] when the DSN cannot be parsed or the
     /// database connection fails.
     pub async fn connect_with(database_url: &str, config: PoolConfig) -> Result<Self, SqlError> {
-        let pool = postgres_boot::connect_pool(database_url, config)
+        let pool = pool::connect_pool(database_url, config)
             .await
             .map_err(SqlError::Connect)?;
         Ok(Self { pool })

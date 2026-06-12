@@ -89,3 +89,75 @@ import `vala-sql` query modules, and `vala-sql` must not call Wyrd query write
 functions to extend a Wyrd transaction. Downstream Vala effects are propagated
 after the Wyrd commit through the future outbox/event fanout path and are
 handled idempotently by Vala.
+
+## Connection Pools
+
+Wyrd server boot uses three Postgres login roles but only runtime-safe pools
+survive into `AppState`.
+
+| Role | Pool lifetime | Default max | Statement cache | Purpose |
+|---|---:|---:|---:|---|
+| `wyrd_app` | runtime | 32 | 256 | Tenant-scoped HTTP, MCP, worker, and Vala query traffic. RLS applies. |
+| `wyrd_migrator` | boot only | 2 | 0 | DDL and migrations for Wyrd and Vala schemas. Has `BYPASSRLS` and is closed before runtime state exists. |
+| `wyrd_platform_admin` | optional runtime | 2 | 64 | Audited cross-tenant platform operations. Dedicated deployments may omit it. |
+
+The server boot sequence is:
+
+1. Resolve role DSNs from `WYRD_DATABASE_URL`,
+   `WYRD_DATABASE_URL_MIGRATOR`, and optional
+   `WYRD_DATABASE_URL_PLATFORM_ADMIN`, or derive all three from embedded
+   Postgres.
+2. Build the `wyrd_migrator` pool with migrator defaults.
+3. Run `wyrd-sql` migrations and `vala-sql` migrations against that same
+   migrator pool.
+4. Close the migrator pool.
+5. Build the runtime `wyrd_app` pool and optional `wyrd_platform_admin` pool.
+6. Assemble `AppState { pool, platform_admin_pool }`.
+
+`AppState` carries only `pool: PgPool` for runtime tenant-scoped traffic and
+`platform_admin_pool: Option<PgPool>` for audited platform routes. The migrator
+pool is never stored on `AppState`; keeping a long-lived `BYPASSRLS` migrator
+connection available to handlers would bypass the tenancy model. `PgPool`
+clones are cheap handles over shared pool state, so axum `State<AppState>`
+threads those pools into request handlers.
+
+Vala consumes the shared Wyrd runtime pool by reference through
+`TenantConn<'_>` for tenant-scoped work. It does not build a fourth pool or own
+a separate runtime connection budget. Vala migrations consume the same
+boot-only migrator pool before it is closed.
+
+Pool tuning lives in `wyrd-sql` `PoolConfig`. Unsuffixed `WYRD_DB_*` variables
+tune the runtime `wyrd_app` pool. The same names suffixed with `_MIGRATOR` or
+`_PLATFORM_ADMIN` tune the boot migrator and platform-admin pools
+respectively. Missing suffixed variables fall back to that role's defaults, not
+to the unsuffixed app value.
+
+| Variable | Runtime default | Notes |
+|---|---:|---|
+| `WYRD_DB_MAX_CONNECTIONS` | 32 | Per server pod. |
+| `WYRD_DB_MIN_CONNECTIONS` | 2 | Warm runtime connections. |
+| `WYRD_DB_ACQUIRE_TIMEOUT_SECS` | 5 | Fail fast when the pool is exhausted. |
+| `WYRD_DB_IDLE_TIMEOUT_SECS` | 300 | Use `off` to disable idle reaping. |
+| `WYRD_DB_MAX_LIFETIME_SECS` | 1800 | Use `off` to disable lifetime recycling. |
+| `WYRD_DB_STATEMENT_CACHE_CAPACITY` | 256 | Set to `0` behind transaction-mode PgBouncer. |
+| `WYRD_DB_TEST_BEFORE_ACQUIRE` | true | Checks stale connections before reuse. |
+
+The connection budget formula is:
+
+```text
+pods * (app_max + platform_admin_max) + migrator_max <= pg.max_connections - reserved
+```
+
+Reserve at least ten server-side connections for Postgres administration and
+extension roles. The migrator budget is short-lived at boot; steady-state
+runtime capacity is dominated by `app_max`.
+
+For transaction-mode PgBouncer, set
+`WYRD_DB_STATEMENT_CACHE_CAPACITY=0`. SQLx prepared statement caches live on a
+physical upstream Postgres connection, while transaction pooling can reassign
+that upstream connection between client transactions. Tenant binding remains
+valid because Wyrd uses `set_config('app.current_tenant', $1, true)`, which is
+transaction-scoped rather than session-scoped. Future worker code must avoid
+session-scoped advisory locks and prefer transaction-scoped locking patterns.
+`LISTEN`/`NOTIFY` is not compatible with transaction pooling and is not part of
+the current SQL foundation.

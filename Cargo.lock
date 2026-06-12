@@ -5044,8 +5044,13 @@ name = "wyrd-server"
 version = "0.0.1"
 dependencies = [
  "axum 0.8.9",
+ "secrecy",
+ "sqlx",
+ "thiserror 2.0.18",
  "tokio",
+ "vala-sql",
  "wyrd-enterprise",
+ "wyrd-sql",
 ]
 
 [[package]]

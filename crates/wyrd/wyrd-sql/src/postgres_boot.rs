@@ -8,7 +8,6 @@ use std::fs;
 use std::io;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::time::Duration;
 
 use pg_embed::pg_enums::PgAuthMethod;
@@ -17,9 +16,11 @@ use pg_embed::postgres::{PgEmbed, PgSettings};
 use rand::distr::{Alphanumeric, SampleString};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::AssertSqlSafe;
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
+use crate::pool::build_pool;
 use role_bootstrap::{WYRD_DATABASE, role_bootstrap_sql};
+
+pub use crate::pool::PoolConfig;
 
 /// Runtime application DSN environment variable.
 pub const APP_DSN_ENV: &str = "WYRD_DATABASE_URL";
@@ -410,152 +411,6 @@ impl EmbeddedRoleCredentials {
     }
 }
 
-/// Role-specific Postgres pool configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PoolConfig {
-    /// Maximum connections held by the pool.
-    pub max_connections: u32,
-    /// Minimum idle connections maintained by the pool.
-    pub min_connections: u32,
-    /// Maximum time to wait for an available connection.
-    pub acquire_timeout: Duration,
-    /// Idle connection timeout. `None` disables idle reaping.
-    pub idle_timeout: Option<Duration>,
-    /// Maximum connection lifetime. `None` disables lifetime recycling.
-    pub max_lifetime: Option<Duration>,
-    /// Per-connection SQLx statement cache capacity.
-    pub statement_cache_capacity: usize,
-    /// Whether SQLx tests a connection before handing it out.
-    pub test_before_acquire: bool,
-}
-
-impl PoolConfig {
-    /// Defaults for the runtime `wyrd_app` pool.
-    #[must_use]
-    pub fn app_defaults() -> Self {
-        Self {
-            max_connections: 32,
-            min_connections: 2,
-            acquire_timeout: Duration::from_secs(5),
-            idle_timeout: Some(Duration::from_secs(300)),
-            max_lifetime: Some(Duration::from_secs(1_800)),
-            statement_cache_capacity: 256,
-            test_before_acquire: true,
-        }
-    }
-
-    /// Defaults for the boot-only `wyrd_migrator` pool.
-    #[must_use]
-    pub fn migrator_defaults() -> Self {
-        Self {
-            max_connections: 2,
-            min_connections: 1,
-            acquire_timeout: Duration::from_secs(10),
-            idle_timeout: None,
-            max_lifetime: None,
-            statement_cache_capacity: 0,
-            test_before_acquire: false,
-        }
-    }
-
-    /// Defaults for the optional `wyrd_platform_admin` pool.
-    #[must_use]
-    pub fn platform_admin_defaults() -> Self {
-        Self {
-            max_connections: 2,
-            min_connections: 0,
-            acquire_timeout: Duration::from_secs(5),
-            idle_timeout: Some(Duration::from_secs(60)),
-            max_lifetime: Some(Duration::from_secs(900)),
-            statement_cache_capacity: 64,
-            test_before_acquire: true,
-        }
-    }
-
-    /// Runtime pool config from `WYRD_DB_*` env vars.
-    #[must_use]
-    pub fn from_env() -> Self {
-        Self::app_from_env()
-    }
-
-    /// Runtime pool config from `WYRD_DB_*` env vars.
-    #[must_use]
-    pub fn app_from_env() -> Self {
-        Self::from_env_with_suffix(Self::app_defaults(), "")
-    }
-
-    /// Migrator pool config from `WYRD_DB_*_MIGRATOR` env vars.
-    #[must_use]
-    pub fn migrator_from_env() -> Self {
-        Self::from_env_with_suffix(Self::migrator_defaults(), "_MIGRATOR")
-    }
-
-    /// Platform-admin pool config from `WYRD_DB_*_PLATFORM_ADMIN` env vars.
-    #[must_use]
-    pub fn platform_admin_from_env() -> Self {
-        Self::from_env_with_suffix(Self::platform_admin_defaults(), "_PLATFORM_ADMIN")
-    }
-
-    fn from_env_with_suffix(defaults: Self, suffix: &str) -> Self {
-        Self {
-            max_connections: env_u32("WYRD_DB_MAX_CONNECTIONS", suffix, defaults.max_connections),
-            min_connections: env_u32("WYRD_DB_MIN_CONNECTIONS", suffix, defaults.min_connections),
-            acquire_timeout: env_secs(
-                "WYRD_DB_ACQUIRE_TIMEOUT_SECS",
-                suffix,
-                defaults.acquire_timeout,
-            ),
-            idle_timeout: env_opt_secs("WYRD_DB_IDLE_TIMEOUT_SECS", suffix, defaults.idle_timeout),
-            max_lifetime: env_opt_secs("WYRD_DB_MAX_LIFETIME_SECS", suffix, defaults.max_lifetime),
-            statement_cache_capacity: env_usize(
-                "WYRD_DB_STATEMENT_CACHE_CAPACITY",
-                suffix,
-                defaults.statement_cache_capacity,
-            ),
-            test_before_acquire: env_bool(
-                "WYRD_DB_TEST_BEFORE_ACQUIRE",
-                suffix,
-                defaults.test_before_acquire,
-            ),
-        }
-    }
-}
-
-impl Default for PoolConfig {
-    fn default() -> Self {
-        Self::app_defaults()
-    }
-}
-
-/// Build a Postgres pool with the supplied role-specific config.
-///
-/// # Errors
-/// Returns [`BootError::PoolConnect`] when the DSN cannot be parsed or SQLx
-/// cannot connect.
-pub async fn build_pool(database_url: &str, config: PoolConfig) -> Result<PgPool, BootError> {
-    connect_pool(database_url, config)
-        .await
-        .map_err(BootError::PoolConnect)
-}
-
-pub(crate) async fn connect_pool(
-    database_url: &str,
-    config: PoolConfig,
-) -> Result<PgPool, sqlx::Error> {
-    let options = PgConnectOptions::from_str(database_url)?
-        .statement_cache_capacity(config.statement_cache_capacity);
-
-    PgPoolOptions::new()
-        .max_connections(config.max_connections)
-        .min_connections(config.min_connections)
-        .acquire_timeout(config.acquire_timeout)
-        .idle_timeout(config.idle_timeout)
-        .max_lifetime(config.max_lifetime)
-        .test_before_acquire(config.test_before_acquire)
-        .connect_with(options)
-        .await
-}
-
 async fn bootstrap_embedded_database(
     port: u16,
     superuser: &str,
@@ -567,7 +422,9 @@ async fn bootstrap_embedded_database(
         port,
         "postgres",
     );
-    let postgres_pool = build_pool(&postgres_dsn, PoolConfig::migrator_defaults()).await?;
+    let postgres_pool = build_pool(&postgres_dsn, PoolConfig::migrator_defaults())
+        .await
+        .map_err(BootError::PoolConnect)?;
 
     let exists: (bool,) =
         sqlx::query_as("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
@@ -589,7 +446,9 @@ async fn bootstrap_embedded_database(
         port,
         WYRD_DATABASE,
     );
-    let wyrd_pool = build_pool(&wyrd_dsn, PoolConfig::migrator_defaults()).await?;
+    let wyrd_pool = build_pool(&wyrd_dsn, PoolConfig::migrator_defaults())
+        .await
+        .map_err(BootError::PoolConnect)?;
     sqlx::raw_sql(AssertSqlSafe(role_bootstrap_sql(credentials)))
         .execute(&wyrd_pool)
         .await
@@ -724,62 +583,6 @@ fn generate_password() -> String {
     Alphanumeric.sample_string(&mut rand::rng(), GENERATED_PASSWORD_LEN)
 }
 
-fn env_name(base: &str, suffix: &str) -> String {
-    format!("{base}{suffix}")
-}
-
-fn env_u32(base: &str, suffix: &str, default: u32) -> u32 {
-    env::var(env_name(base, suffix))
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(default)
-}
-
-fn env_usize(base: &str, suffix: &str, default: usize) -> usize {
-    env::var(env_name(base, suffix))
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(default)
-}
-
-fn env_secs(base: &str, suffix: &str, default: Duration) -> Duration {
-    env::var(env_name(base, suffix))
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-        .map(Duration::from_secs_f64)
-        .unwrap_or(default)
-}
-
-fn env_opt_secs(base: &str, suffix: &str, default: Option<Duration>) -> Option<Duration> {
-    env::var(env_name(base, suffix))
-        .ok()
-        .and_then(|value| {
-            if value.eq_ignore_ascii_case("off") {
-                Some(None)
-            } else {
-                value
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-                    .map(Duration::from_secs_f64)
-                    .map(Some)
-            }
-        })
-        .unwrap_or(default)
-}
-
-fn env_bool(base: &str, suffix: &str, default: bool) -> bool {
-    env::var(env_name(base, suffix))
-        .ok()
-        .and_then(|value| match value.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Some(true),
-            "false" | "0" | "no" | "off" => Some(false),
-            _ => None,
-        })
-        .unwrap_or(default)
-}
-
 fn default_embedded_data_dir() -> PathBuf {
     env::var_os(XDG_DATA_HOME_ENV)
         .filter(|value| !value.is_empty())
@@ -797,13 +600,12 @@ fn default_embedded_data_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::time::Duration;
 
     use secrecy::ExposeSecret;
 
     use super::{
         APP_DSN_ENV, BootError, EmbeddedConfig, EmbeddedRoleCredentials, MIGRATOR_DSN_ENV,
-        PLATFORM_ADMIN_DSN_ENV, PoolConfig, PostgresBoot, write_embedded_postgres_config,
+        PLATFORM_ADMIN_DSN_ENV, PostgresBoot, write_embedded_postgres_config,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -994,74 +796,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn pool_defaults_match_locked_values() {
-        assert_eq!(
-            PoolConfig::app_defaults(),
-            PoolConfig {
-                max_connections: 32,
-                min_connections: 2,
-                acquire_timeout: Duration::from_secs(5),
-                idle_timeout: Some(Duration::from_secs(300)),
-                max_lifetime: Some(Duration::from_secs(1_800)),
-                statement_cache_capacity: 256,
-                test_before_acquire: true,
-            }
-        );
-        assert_eq!(
-            PoolConfig::migrator_defaults(),
-            PoolConfig {
-                max_connections: 2,
-                min_connections: 1,
-                acquire_timeout: Duration::from_secs(10),
-                idle_timeout: None,
-                max_lifetime: None,
-                statement_cache_capacity: 0,
-                test_before_acquire: false,
-            }
-        );
-        assert_eq!(
-            PoolConfig::platform_admin_defaults(),
-            PoolConfig {
-                max_connections: 2,
-                min_connections: 0,
-                acquire_timeout: Duration::from_secs(5),
-                idle_timeout: Some(Duration::from_secs(60)),
-                max_lifetime: Some(Duration::from_secs(900)),
-                statement_cache_capacity: 64,
-                test_before_acquire: true,
-            }
-        );
-    }
-
-    #[test]
-    fn pool_env_overrides_use_role_suffixes() {
-        let _guard = ENV_LOCK.lock().expect("env lock is not poisoned");
-        let vars = [
-            ("WYRD_DB_MAX_CONNECTIONS_PLATFORM_ADMIN", Some("4")),
-            ("WYRD_DB_MIN_CONNECTIONS_PLATFORM_ADMIN", Some("1")),
-            ("WYRD_DB_ACQUIRE_TIMEOUT_SECS_PLATFORM_ADMIN", Some("2.5")),
-            ("WYRD_DB_IDLE_TIMEOUT_SECS_PLATFORM_ADMIN", Some("off")),
-            ("WYRD_DB_MAX_LIFETIME_SECS_PLATFORM_ADMIN", Some("30")),
-            (
-                "WYRD_DB_STATEMENT_CACHE_CAPACITY_PLATFORM_ADMIN",
-                Some("12"),
-            ),
-            ("WYRD_DB_TEST_BEFORE_ACQUIRE_PLATFORM_ADMIN", Some("false")),
-        ];
-        with_env(&vars, || {
-            let cfg = PoolConfig::platform_admin_from_env();
-
-            assert_eq!(cfg.max_connections, 4);
-            assert_eq!(cfg.min_connections, 1);
-            assert_eq!(cfg.acquire_timeout, Duration::from_millis(2_500));
-            assert_eq!(cfg.idle_timeout, None);
-            assert_eq!(cfg.max_lifetime, Some(Duration::from_secs(30)));
-            assert_eq!(cfg.statement_cache_capacity, 12);
-            assert!(!cfg.test_before_acquire);
-        });
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn from_env_uses_wyrd_database_url_names() {
         let previous = {
@@ -1086,15 +820,6 @@ mod tests {
     }
 
     use std::path::PathBuf;
-
-    fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        let previous = snapshot_env(&vars.iter().map(|(name, _)| *name).collect::<Vec<_>>());
-        for (name, value) in vars {
-            set_env(name, *value);
-        }
-        f();
-        restore_env(previous);
-    }
 
     fn snapshot_env(names: &[&str]) -> Vec<(String, Option<std::ffi::OsString>)> {
         names

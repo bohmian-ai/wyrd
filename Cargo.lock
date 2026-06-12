@@ -4323,7 +4323,6 @@ name = "vala-sql"
 version = "0.0.1"
 dependencies = [
  "sqlx",
- "thiserror 2.0.18",
  "tracing",
  "wyrd-sql",
 ]

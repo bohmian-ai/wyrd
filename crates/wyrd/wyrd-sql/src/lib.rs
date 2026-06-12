@@ -9,11 +9,13 @@
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+pub mod error;
 pub mod postgres_boot;
 pub mod queries;
 pub mod row_types;
 pub mod tenant_conn;
 
+pub use error::SqlError;
 use postgres_boot::PoolConfig;
 pub use tenant_conn::TenantConn;
 
@@ -42,17 +44,20 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
     let result: Result<(), SqlError> = async {
         sqlx::query("CREATE SCHEMA IF NOT EXISTS platform")
             .execute(&mut *conn)
-            .await?;
+            .await
+            .map_err(SqlError::Connect)?;
         sqlx::query("CREATE SCHEMA IF NOT EXISTS wyrd")
             .execute(&mut *conn)
-            .await?;
+            .await
+            .map_err(SqlError::Connect)?;
         sqlx::query("SET search_path TO wyrd, platform, public")
             .execute(&mut *conn)
-            .await?;
+            .await
+            .map_err(SqlError::Connect)?;
         sqlx::migrate!("./migrations")
             .run(&mut *conn)
             .await
-            .map_err(SqlError::Migrate)
+            .map_err(SqlError::from)
     }
     .await;
 
@@ -64,23 +69,6 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
     }
 
     result
-}
-
-/// SQL storage errors.
-#[derive(Debug, thiserror::Error)]
-pub enum SqlError {
-    /// Database connection failed.
-    #[error("database connection failed")]
-    Connect(#[from] sqlx::Error),
-    /// Tenant-scoped transaction failed.
-    #[error("tenant-scoped transaction failed")]
-    Transaction(#[source] sqlx::Error),
-    /// Database migration failed.
-    #[error("migration failed")]
-    Migrate(#[from] sqlx::migrate::MigrateError),
-    /// Stored tenant identifier violated Wyrd's UUIDv7 contract.
-    #[error("stored tenant identifier violated Wyrd's UUIDv7 contract")]
-    InvalidDataTenantId(#[source] wyrd_spec::ids::IdError),
 }
 
 /// Control-plane Postgres handle.

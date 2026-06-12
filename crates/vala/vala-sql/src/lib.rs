@@ -15,7 +15,7 @@ use sqlx::PgPool;
 pub mod queries;
 pub mod row_types;
 
-pub use wyrd_sql::TenantConn;
+pub use wyrd_sql::{TenantConn, error::SqlError};
 
 /// Tenant-scoped Vala observability schema owned by `vala-sql`.
 pub const OBSERVABILITY_SCHEMA: &str = "vala";
@@ -40,14 +40,16 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
     let result: Result<(), SqlError> = async {
         sqlx::query("CREATE SCHEMA IF NOT EXISTS vala")
             .execute(&mut *conn)
-            .await?;
+            .await
+            .map_err(SqlError::Connect)?;
         sqlx::query("SET search_path TO vala, public")
             .execute(&mut *conn)
-            .await?;
+            .await
+            .map_err(SqlError::Connect)?;
         sqlx::migrate!("./migrations")
             .run(&mut *conn)
             .await
-            .map_err(SqlError::Migrate)
+            .map_err(SqlError::from)
     }
     .await;
 
@@ -59,17 +61,6 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
     }
 
     result
-}
-
-/// Vala SQL migration errors.
-#[derive(Debug, thiserror::Error)]
-pub enum SqlError {
-    /// Database connection or bootstrap SQL failed.
-    #[error("database connection failed")]
-    Connect(#[from] sqlx::Error),
-    /// Database migration failed.
-    #[error("migration failed")]
-    Migrate(#[from] sqlx::migrate::MigrateError),
 }
 
 #[cfg(test)]
@@ -86,6 +77,14 @@ mod tests {
         assert!(!OWNED_SCHEMAS.contains(&"platform"));
         assert!(!OWNED_SCHEMAS.contains(&"wyrd"));
         assert!(!OWNED_SCHEMAS.contains(&"skald"));
+    }
+
+    #[test]
+    fn error_reexport_uses_wyrd_sql_catalog() {
+        fn assert_same_type(_: Option<crate::SqlError>, _: Option<wyrd_sql::error::SqlError>) {}
+
+        assert_same_type(None, None);
+        assert_eq!(crate::SqlError::NoRows.code(), "WYRD_SQL_404_NO_ROWS");
     }
 
     #[test]

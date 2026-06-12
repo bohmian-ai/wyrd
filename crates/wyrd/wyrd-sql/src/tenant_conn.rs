@@ -41,14 +41,14 @@ impl<'a> TenantConn<'a> {
     ///
     /// # Errors
     /// Returns [`SqlError::Connect`] when the pool cannot begin a transaction.
-    /// Returns [`SqlError::Transaction`] when the tenant binding query fails.
+    /// Returns [`SqlError::TxFailed`] when the tenant binding query fails.
     pub async fn acquire(pool: &'a PgPool, data_tenant_id: DataTenantId) -> Result<Self, SqlError> {
         let mut tx = pool.begin().await.map_err(SqlError::Connect)?;
         sqlx::query(BIND_CURRENT_TENANT_SQL)
             .bind(tenant_binding_value(data_tenant_id))
             .execute(&mut *tx)
             .await
-            .map_err(SqlError::Transaction)?;
+            .map_err(SqlError::TxFailed)?;
 
         Ok(Self { tx, data_tenant_id })
     }
@@ -72,9 +72,9 @@ impl<'a> TenantConn<'a> {
     /// Commit the transaction.
     ///
     /// # Errors
-    /// Returns [`SqlError::Transaction`] when Postgres rejects the commit.
+    /// Returns [`SqlError::TxFailed`] when Postgres rejects the commit.
     pub async fn commit(self) -> Result<(), SqlError> {
-        self.tx.commit().await.map_err(SqlError::Transaction)
+        self.tx.commit().await.map_err(SqlError::TxFailed)
     }
 }
 

@@ -11,7 +11,7 @@ use crate::SqlError;
 /// Returns `Ok(None)` when the slug is absent, suspended, or deleted.
 ///
 /// # Errors
-/// Returns [`SqlError::Connect`] when Postgres rejects the resolver query.
+/// Returns [`SqlError::Query`] when Postgres rejects the resolver query.
 /// Returns [`SqlError::InvalidDataTenantId`] if stored tenant data violates the
 /// Wyrd UUIDv7 tenant-id contract.
 pub async fn resolve_by_slug_for_app(

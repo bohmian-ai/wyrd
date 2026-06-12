@@ -4934,6 +4934,16 @@ dependencies = [
 [[package]]
 name = "wyrd-dev-fixtures"
 version = "0.0.1"
+dependencies = [
+ "secrecy",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "vala-sql",
+ "wyrd-spec",
+ "wyrd-sql",
+]
 
 [[package]]
 name = "wyrd-enterprise"

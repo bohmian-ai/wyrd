@@ -43,8 +43,12 @@ pub(crate) fn role_bootstrap_sql(credentials: &EmbeddedRoleCredentials) -> Strin
 ALTER ROLE {migrator_role} WITH LOGIN BYPASSRLS PASSWORD {migrator_pw};
 ALTER ROLE {app_role} WITH LOGIN NOBYPASSRLS PASSWORD {app_pw};
 ALTER ROLE {admin_role} WITH LOGIN BYPASSRLS PASSWORD {admin_pw};
+
+GRANT CONNECT ON DATABASE {database} TO {migrator_role}, {app_role}, {admin_role};
+GRANT CREATE ON DATABASE {database} TO {migrator_role};
 "#,
         sql = sql,
+        database = WYRD_DATABASE,
         migrator_role = WYRD_MIGRATOR_ROLE,
         app_role = WYRD_APP_ROLE,
         admin_role = WYRD_PLATFORM_ADMIN_ROLE,
@@ -89,5 +93,9 @@ mod tests {
         assert!(sql.contains("ALTER ROLE wyrd_migrator WITH LOGIN BYPASSRLS PASSWORD"));
         assert!(sql.contains("ALTER ROLE wyrd_app WITH LOGIN NOBYPASSRLS PASSWORD"));
         assert!(sql.contains("ALTER ROLE wyrd_platform_admin WITH LOGIN BYPASSRLS PASSWORD"));
+        assert!(sql.contains(
+            "GRANT CONNECT ON DATABASE wyrd TO wyrd_migrator, wyrd_app, wyrd_platform_admin"
+        ));
+        assert!(sql.contains("GRANT CREATE ON DATABASE wyrd TO wyrd_migrator"));
     }
 }

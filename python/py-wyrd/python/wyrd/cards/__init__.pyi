@@ -25,6 +25,7 @@ class CardKind:
     Artifact: CardKind
     Trigger: CardKind
     Operator: CardKind
+    Source: CardKind
     External: CardKind
 
     @property

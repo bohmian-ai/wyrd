@@ -281,6 +281,20 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Source card validation failed.
+    #[error("[WYRD_SOURCE_400_VALIDATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SOURCE_400_VALIDATION",
+        status = 400,
+        title = "Source card validation failed",
+        remediation = "Fix Source card connection coordinates or auth env-var names and retry."
+    )]
+    SourceValidation {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// ModelCard validation failed.
     #[error("[WYRD_MODEL_400_VALIDATION] {message}")]
     #[wyrd_error(
@@ -1097,6 +1111,7 @@ impl WyrdError {
             | Self::InvalidToken { message, details }
             | Self::InsufficientScope { message, details }
             | Self::CredentialRevoked { message, details }
+            | Self::SourceValidation { message, details }
             | Self::DataValidation { message, details }
             | Self::DataUnknownDataType { message, details }
             | Self::DataInvalidSplitRule { message, details }

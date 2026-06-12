@@ -15,13 +15,15 @@ Downstream artifacts are brought up to this version in a sync pass.
 This repository is mid-reconciliation. The active doctrine is the 16 native
 kind catalog in this document plus `External`. Current `wyrd-spec` code and
 generated schemas no longer expose stale `Tool`, `Skill`, or `SubAgent` specs;
-they do not yet expose `SourceSpec`. New work must follow this document: tools
-are runtime registry entries, sub-agency is an Agent relationship, skills are
-not a v1 Card kind, and external observations are read through `Source` cards.
+they now expose `SourceSpec` (the bucket-keyed `SourceKind` union below). New
+work must follow this document: tools are runtime registry entries, sub-agency
+is an Agent relationship, skills are not a v1 Card kind, and external
+observations are read through `Source` cards.
 
 Do not expand stale card kinds or cite generated schema presence as doctrine.
-Follow-up cleanup should add `SourceSpec`, regenerate schemas/docs, and update
-card-kind tests.
+Remaining `Source` follow-up is the runtime read adapter in `vala` keyed on
+`(kind, vendor)` and the `wyrd source check` preflight; the spec, schemas, and
+card-kind tests are landed.
 
 ---
 
@@ -761,14 +763,82 @@ view** (judged against intermediate sub-agent records / spans / tool calls).
 Both run in one pass — Scouter's scenario-vs-workflow split lifted intact.
 
 ### Source
-Read-side reference to external data system. **Wyrd reads, never writes.**
+Read-side reference to an external data system. **Wyrd reads, never writes.**
+
+`source` is a **read-shape bucket**, not a vendor. The top-level discriminator is
+the shape of data a consuming `Drift`/`Eval` Card sees — a row set, a time
+series, blobs — so a consumer binds to the shape and never to a vendor. The
+vendor (BigQuery vs Snowflake, Prometheus vs Datadog, GCS vs S3) is a
+**connection detail nested below the bucket**. This is the same axis `object_store`
+already used: `source.kind` was never `gcs` or `s3`; the vendor was the URI scheme.
+
+The bucket set is derived from what consumers read, not from a vendor taxonomy —
+which keeps it small, closed, and stable (Doctrine #2). Adding a vendor is a new
+`*Connection` variant plus a runtime read adapter in `vala`; it never grows the
+bucket set and never touches a consuming Card.
+
 ```yaml
 spec:
-  kind: object_store             # v1: object_store only
-  uri: string                    # s3:// | gs:// | az:// | file://
-  format: parquet | jsonl | arrow_ipc | csv
-  defaults: { string: NonSecretValue }
+  description?: string
+  source:                         # SourceKind — the read-shape bucket; vendor nested below
+    kind: <bucket>
+  defaults: { string: NonSecretValue }   # non-secret read hints (projection, page size)
 ```
+
+`SourceKind` is a closed tagged union keyed by **bucket** (`kind` discriminator).
+Each bucket carries one uniform read contract; the vendor is a nested
+`*Connection` union keyed by `vendor`:
+
+| Bucket (`kind`)  | Read contract (uniform within bucket) | Vendor union (`vendor`)                 |
+|------------------|---------------------------------------|------------------------------------------|
+| `object_store`   | blobs at `uri` → records by `format`  | URI scheme (`gs://`/`s3://`/`az://`/`file://`) |
+| `sql_warehouse`  | SQL → row set                         | `bigquery` \| `snowflake` \| `postgres`  |
+| `metrics`        | query → labeled time series           | `prometheus` \| `datadog` \| `cloudwatch`|
+| `logs`           | query → log records                   | `loki` \| `elasticsearch` \| `splunk`    |
+| `traces`         | query → spans                         | `tempo` \| `datadog_apm` \| `jaeger`     |
+
+The bucket set lines up with what `Drift`/`Eval` already read: `object_store`/
+`sql_warehouse` feed `DriftSignal::Distribution` (rows), `metrics` feeds
+`DriftSignal::Metric`, `traces` feeds `EvalTask::TraceAssertion`.
+
+**Secrets never live on the Card** (Doctrine #7). Every vendor connection carries
+a `SourceAuth` whose secret material is a **named server-side env var**, resolved
+at read time — only the env-var *name* is on the Card, exactly like
+`Operator.Http.auth.env`. `SourceAuth` is a closed tagged union (`scheme`
+discriminator): `None`, `Env { env }`, `Basic { username, password_env }`,
+`MultiEnv { vars: { logical_name: env_var } }` (covers multi-key vendors like
+Datadog's api-key + app-key), `SecretStore { provider, name }` (Vault / AWS SSM /
+GCP Secret Manager — carries the store identifier and secret path, never the value).
+
+```yaml
+# sql_warehouse — vendor + non-secret coordinates + env ref for the secret
+source:
+  kind: sql_warehouse
+  connection:
+    vendor: snowflake
+    account: acme-prod
+    warehouse: analytics
+    database: telemetry
+    schema: public
+    role: reader
+    auth:
+      scheme: multi_env
+      vars:
+        user: SNOWFLAKE_USER
+        private_key: SNOWFLAKE_PRIVATE_KEY   # names only; never values
+
+# object_store — vendor implied by URI scheme; auth defaults to None (ambient IAM)
+source:
+  kind: object_store
+  uri: gs://acme-telemetry/runs
+  format: parquet
+```
+
+**Runtime read adapter.** `vala` owns the read driver, keyed on
+`(kind, vendor)`. The three connection families (object/blob list-and-read, SQL
+query, HTTP query) are different drivers behind one read trait; the Card schema
+never declares strategy — `vala` chooses it from the bucket and vendor, the same
+way it chooses the Drift/Eval evaluation strategy.
 
 ### Trigger
 Fires an Operator. A Trigger declares when (`schedule`), what to evaluate
@@ -977,7 +1047,7 @@ ergonomic they expect from JSON-Schema `$ref` / OpenAPI external-file imports.
 | Policy  | `rules`                              | `Service.components.ref`, `Operator.pre_invoke`, `Operator.post_invoke` |
 | Trigger | `schedule`, `source.drift_ref` \| `source.eval_ref`, `operator_ref` | — |
 | Operator| `action` (`workflow_ref` \| typed `channel` shape \| `auth.env`), `pre_invoke`, `post_invoke` | `Trigger.operator_ref` |
-| Source  | `kind`, `uri`, `format`              | `Drift.signal.source_ref` (External variant), `Eval.source_ref` |
+| Source  | `kind` (bucket), `connection` (vendor + `*_env`) | `Drift.signal.source_ref` (External variant), `Eval.source_ref` |
 
 `Service.components` accepts: Agent, Prompt, Model, Workflow, Mcp, Policy. No
 other kinds are runtime-aliased into a Service.
@@ -1024,8 +1094,14 @@ services/ops-copilot/
 
 1. Per-component Policy binding on `ServiceComponent`. Workaround: rule
    expressions scope by `agent.name`. Decision pending a real use case.
-2. Source vendor read adapters (Datadog metrics, PromQL, Tempo, Loki).
-   v1 ships `object_store` only.
+2. **Closed.** Source vendor read adapters. `SourceKind` is a closed,
+   bucket-keyed tagged union (`object_store`, `sql_warehouse`, `metrics`,
+   `logs`, `traces`); each bucket nests a `vendor`-keyed `*Connection` union,
+   and secrets are server-side env-var names (`SourceAuth`), never card values.
+   Adding a vendor is a new `*Connection` variant plus a `vala` read adapter —
+   no bucket or consumer churn. Remaining runtime work: the `vala` read trait
+   keyed on `(kind, vendor)`, and a connectivity/scope preflight
+   (`wyrd source check <ref>`) reporting per-capability OK/error.
 3. Format negotiation for `object_store` Source — schema-on-read vs registered
    schema reference.
 4. Time-window semantics for how Drift/Eval cards describe the read range

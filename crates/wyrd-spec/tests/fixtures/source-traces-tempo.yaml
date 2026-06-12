@@ -1,0 +1,17 @@
+# SourceCard - read-side reference to a Grafana Tempo trace store.
+# No auth: internal cluster endpoint accessible via network policy only.
+
+apiVersion: wyrd/v1
+kind: Source
+metadata:
+  space: prod
+  name: service-traces
+  version: 1.0.0
+
+spec:
+  description: Service spans from Tempo for trace-level evaluation.
+  source:
+    kind: traces
+    connection:
+      vendor: tempo
+      endpoint: https://tempo.acme.internal

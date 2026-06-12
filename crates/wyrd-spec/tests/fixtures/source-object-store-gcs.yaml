@@ -1,0 +1,22 @@
+# SourceCard - read-side reference to a GCS object store.
+# `source.kind` is the read-shape bucket (object_store -> record stream); the
+# vendor is the URI scheme. No auth: ambient Workload Identity via GKE.
+
+apiVersion: wyrd/v1
+kind: Source
+metadata:
+  space: prod
+  name: telemetry-archive
+  version: 1.0.0
+
+spec:
+  description: Archived Parquet run records from GCS.
+  source:
+    kind: object_store
+    uri: gs://acme-telemetry-archive/runs
+    format: parquet
+
+  defaults:
+    page_size:
+      type: number
+      value: 10000

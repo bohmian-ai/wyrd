@@ -81,6 +81,7 @@ def test_rejects_invalid_version() -> None:
         "Artifact",
         "Trigger",
         "Operator",
+        "Source",
         "External",
     ],
 )
@@ -108,6 +109,7 @@ def test_every_native_kind_is_accepted(kind: str) -> None:
         (CardKind.Artifact, "Artifact"),
         (CardKind.Trigger, "Trigger"),
         (CardKind.Operator, "Operator"),
+        (CardKind.Source, "Source"),
         (CardKind.External, "External"),
     ],
 )

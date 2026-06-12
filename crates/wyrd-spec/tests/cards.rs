@@ -18,3 +18,5 @@ mod model_roundtrip;
 mod model_schema_drift;
 #[path = "cards/model/validation.rs"]
 mod model_validation;
+#[path = "cards/source.rs"]
+mod source;

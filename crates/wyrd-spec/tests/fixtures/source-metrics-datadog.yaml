@@ -1,0 +1,25 @@
+# SourceCard - read-side reference to Datadog metrics.
+# MultiEnv auth: two env-var names for api_key and app_key. The Card carries
+# only env-var names, never secret values (Doctrine #7).
+
+apiVersion: wyrd/v1
+kind: Source
+metadata:
+  space: prod
+  name: service-metrics
+  version: 1.0.0
+
+spec:
+  description: Service p99 latency and error-rate metrics from Datadog.
+  source:
+    kind: metrics
+    connection:
+      vendor: datadog
+      site: datadoghq.com
+      api_scopes:
+        - metrics_read
+      auth:
+        scheme: multi_env
+        vars:
+          api_key: DD_API_KEY
+          app_key: DD_APP_KEY

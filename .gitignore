@@ -40,3 +40,6 @@ postgres-data/
 
 # dev files
 .dev/
+
+# Git worktrees
+.worktrees/

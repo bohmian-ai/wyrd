@@ -92,6 +92,84 @@ id_type!(RoleName, "RBAC role identifier.", validate_token);
 id_type!(ColumnName, "DataCard column name.", validate_card_token);
 id_type!(SplitName, "DataCard split label.", validate_card_token);
 id_type!(QueryName, "DataCard SQL query key.", validate_card_token);
+id_type!(
+    TenantSlug,
+    "Human-visible tenant slug resolved to a DataTenantId at the auth boundary.",
+    validate_tenant_slug
+);
+
+/// Immutable tenant isolation key used by tenant-scoped Wyrd and Vala rows.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, schemars::JsonSchema,
+)]
+#[serde(transparent)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct DataTenantId(uuid::Uuid);
+
+impl DataTenantId {
+    /// Generate a UUIDv7-backed tenant isolation key.
+    #[must_use]
+    pub fn new_v7() -> Self {
+        Self(uuid::Uuid::now_v7())
+    }
+
+    /// Build a tenant isolation key from a UUIDv7 value.
+    ///
+    /// # Errors
+    /// Returns an error when the UUID is not version 7.
+    pub fn new(value: uuid::Uuid) -> Result<Self, IdError> {
+        if value.get_version_num() == 7 {
+            Ok(Self(value))
+        } else {
+            Err(IdError::InvalidUuid7)
+        }
+    }
+
+    /// Borrow the underlying UUID.
+    #[must_use]
+    pub fn as_uuid(&self) -> uuid::Uuid {
+        self.0
+    }
+}
+
+impl fmt::Display for DataTenantId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl FromStr for DataTenantId {
+    type Err = IdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let uuid = uuid::Uuid::parse_str(value).map_err(|_| IdError::InvalidUuid7)?;
+        Self::new(uuid)
+    }
+}
+
+impl TryFrom<uuid::Uuid> for DataTenantId {
+    type Error = IdError;
+
+    fn try_from(value: uuid::Uuid) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<DataTenantId> for uuid::Uuid {
+    fn from(value: DataTenantId) -> Self {
+        value.0
+    }
+}
+
+impl<'de> Deserialize<'de> for DataTenantId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = uuid::Uuid::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
 
 fn validate_token(value: &str) -> Result<(), IdError> {
     if value.len() < 3 || value.len() > 64 {
@@ -129,6 +207,24 @@ fn validate_card_token(value: &str) -> Result<(), IdError> {
     }
 }
 
+fn validate_tenant_slug(value: &str) -> Result<(), IdError> {
+    if value.is_empty() || value.len() > 63 {
+        return Err(IdError::InvalidTenantSlug);
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return Err(IdError::InvalidTenantSlug);
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return Err(IdError::InvalidTenantSlug);
+    }
+    if chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-') {
+        Ok(())
+    } else {
+        Err(IdError::InvalidTenantSlug)
+    }
+}
+
 fn validate_uuid7(value: &str) -> Result<(), IdError> {
     let uuid = uuid::Uuid::parse_str(value).map_err(|_| IdError::InvalidUuid7)?;
     if uuid.get_version_num() == 7 {
@@ -154,6 +250,9 @@ pub enum IdError {
     /// UID was not a UUIDv7.
     #[error("identifier must be a UUIDv7")]
     InvalidUuid7,
+    /// Tenant slug did not match `[a-z0-9][a-z0-9_-]{0,62}`.
+    #[error("tenant slug must match [a-z0-9][a-z0-9_-]{{0,62}}")]
+    InvalidTenantSlug,
     /// Opaque identifier was empty, too long, too short, or contained whitespace.
     #[error("opaque identifier is invalid")]
     InvalidOpaque,

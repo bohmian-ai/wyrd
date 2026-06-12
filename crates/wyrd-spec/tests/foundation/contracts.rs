@@ -1,5 +1,5 @@
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardUid, SpaceName};
+use wyrd_spec::ids::{CardUid, DataTenantId, SpaceName, TenantSlug};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::trace::TraceContext;
 use wyrd_spec::version::{VersionBlock, VersionBump, VersionRange};
@@ -12,6 +12,11 @@ fn ids_enforce_type_specific_canonical_forms() {
 
     assert!(CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00").is_ok());
     assert!(CardUid::new("550e8400-e29b-41d4-a716-446655440000").is_err());
+
+    assert!(TenantSlug::new("a").is_ok());
+    assert!(TenantSlug::new("0_acme-corp").is_ok());
+    assert!(TenantSlug::new("Acme").is_err());
+    assert!(TenantSlug::new("acme.corp").is_err());
 }
 
 #[test]
@@ -19,6 +24,21 @@ fn request_id_accepts_ulid_or_uuid7_only() {
     assert!(RequestId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").is_ok());
     assert!(RequestId::parse("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00").is_ok());
     assert!(RequestId::parse("550e8400-e29b-41d4-a716-446655440000").is_err());
+}
+
+#[test]
+fn data_tenant_id_is_uuid7_backed() {
+    let generated = DataTenantId::new_v7();
+    assert_eq!(generated.as_uuid().get_version_num(), 7);
+
+    let parsed: DataTenantId = generated.to_string().parse().unwrap();
+    assert_eq!(parsed, generated);
+    assert!(DataTenantId::new(uuid::Uuid::nil()).is_err());
+    assert!(
+        "550e8400-e29b-41d4-a716-446655440000"
+            .parse::<DataTenantId>()
+            .is_err()
+    );
 }
 
 #[test]

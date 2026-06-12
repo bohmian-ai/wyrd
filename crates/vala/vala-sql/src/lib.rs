@@ -1,8 +1,19 @@
 //! Server-tier SQL migrations for Vala observability storage.
+//!
+//! `vala-sql` owns the `vala` PostgreSQL schema for observability control-plane
+//! state. Wyrd control-plane and platform schemas remain owned by `wyrd-sql`;
+//! no `skald` schema exists in this phase.
 
 #![deny(missing_docs)]
 
 use sqlx::PgPool;
+
+/// Tenant-scoped Vala observability schema owned by `vala-sql`.
+pub const OBSERVABILITY_SCHEMA: &str = "vala";
+/// Schemas whose migration lifecycle is owned by `vala-sql`.
+pub const OWNED_SCHEMAS: &[&str] = &[OBSERVABILITY_SCHEMA];
+/// Search path used only by the boot migrator connection.
+pub const MIGRATION_SEARCH_PATH: &str = "vala, public";
 
 /// Apply embedded Vala SQL migrations against a boot-only migrator pool.
 ///
@@ -54,8 +65,19 @@ pub enum SqlError {
 
 #[cfg(test)]
 mod tests {
+    use crate::{MIGRATION_SEARCH_PATH, OWNED_SCHEMAS};
+
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn schema_ownership_is_explicit() {
+        assert_eq!(OWNED_SCHEMAS, &["vala"]);
+        assert_eq!(MIGRATION_SEARCH_PATH, "vala, public");
+        assert!(!OWNED_SCHEMAS.contains(&"platform"));
+        assert!(!OWNED_SCHEMAS.contains(&"wyrd"));
+        assert!(!OWNED_SCHEMAS.contains(&"skald"));
+    }
 
     #[test]
     fn migrations_embed_count_matches_files() {
@@ -66,6 +88,31 @@ mod tests {
         assert!(
             !migrator.migrations.is_empty(),
             "vala-sql must embed at least one migration"
+        );
+    }
+
+    #[test]
+    fn create_table_statements_stay_in_owned_schema() {
+        let unexpected = migration_files()
+            .into_iter()
+            .flat_map(|file_name| {
+                let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("migrations")
+                    .join(file_name);
+                fs::read_to_string(path)
+                    .expect("migration sql is readable")
+                    .lines()
+                    .map(str::trim_start)
+                    .filter(|line| line.starts_with("CREATE TABLE "))
+                    .filter(|line| !line.starts_with("CREATE TABLE vala."))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            unexpected.is_empty(),
+            "CREATE TABLE statements must target vala.*: {unexpected:?}"
         );
     }
 

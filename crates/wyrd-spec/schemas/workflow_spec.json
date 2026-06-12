@@ -1120,7 +1120,6 @@
         "Model",
         "Experiment",
         "Prompt",
-        "Tool",
         "Agent",
         "Workflow",
         "Eval",
@@ -1128,8 +1127,6 @@
         "Service",
         "Policy",
         "Mcp",
-        "Skill",
-        "SubAgent",
         "Audit",
         "Artifact",
         "Trigger",
@@ -4567,25 +4564,6 @@
       "description": "Workflow action target.",
       "oneOf": [
         {
-          "description": "Skill action.",
-          "type": "object",
-          "required": [
-            "target",
-            "type"
-          ],
-          "properties": {
-            "target": {
-              "$ref": "#/definitions/CardRef"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "skill"
-              ]
-            }
-          }
-        },
-        {
           "description": "Agent action — inline body or Agent Card reference.",
           "type": "object",
           "required": [
@@ -4619,25 +4597,6 @@
               "type": "string",
               "enum": [
                 "mcp"
-              ]
-            }
-          }
-        },
-        {
-          "description": "Tool action.",
-          "type": "object",
-          "required": [
-            "target",
-            "type"
-          ],
-          "properties": {
-            "target": {
-              "$ref": "#/definitions/CardRef"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "tool"
               ]
             }
           }

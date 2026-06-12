@@ -77,11 +77,12 @@ The [quickstart](/start-here/quickstart/) shows the exact setup command.
 
 ## What exists today
 
-Wyrd has generated schemas for all 18 Card kinds, generated reference pages,
-and a Python DataCard surface for local data materialization. The DataCard
-surface supports public `wyrd.data` imports, built-in data interfaces, custom
-Python `DataInterface` subclasses, local `save`, local `load`, labels,
-annotations, and structured Wyrd errors.
+Wyrd's design doctrine defines 16 native Card kinds plus `External`; generated
+schemas still include some implementation drift while `wyrd-spec` catches up.
+The repository has generated reference pages and a Python DataCard surface for
+local data materialization. The DataCard surface supports public `wyrd.data`
+imports, built-in data interfaces, custom Python `DataInterface` subclasses,
+local `save`, local `load`, labels, annotations, and structured Wyrd errors.
 
 Registry, storage, HTTP, CLI, and MCP surfaces build on the same Card envelope.
 When those services own durable registration, card objects still remain local
@@ -89,7 +90,7 @@ holders: user code runs, Wyrd records and governs.
 
 ## Reference
 
-The 18 Card kinds and their schemas live under [Card reference](/cards/).
+The current public Card kinds live under [Card reference](/cards/).
 The [Data card reference](/cards/data/) gives the generated Data spec shape.
 The shared primitives live under [Concepts](/concepts/).
 

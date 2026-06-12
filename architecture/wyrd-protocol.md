@@ -1,5 +1,10 @@
 # Wyrd Protocol — v1 (draft)
 
+> Superseded working draft. `architecture/wyrd-design.md` is the active design
+> authority. This document still reflects older 18-kind protocol exploration
+> and must not be used to justify `Tool`, `Skill`, or `SubAgent` as v1 Card
+> kinds.
+
 **Status:** draft — not locked
 **API group:** `wyrd/v1`
 **Editors' working copy.** Will be published as the canonical Wyrd protocol

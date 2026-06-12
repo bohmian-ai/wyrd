@@ -141,14 +141,10 @@ pub struct WorkflowRetryPolicy {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "type", content = "target", rename_all = "snake_case")]
 pub enum WorkflowAction {
-    /// Skill action.
-    Skill(CardRef),
     /// Agent action — inline body or Agent Card reference.
     Agent(AgentRef),
     /// MCP server action.
     Mcp(CardRef),
-    /// Tool action.
-    Tool(CardRef),
     /// Prompt action.
     Prompt(CardRef),
 }
@@ -184,7 +180,7 @@ pub struct WorkflowCard {
     pub annotations: Annotations,
     /// Workflow Card spec body.
     pub spec: WorkflowSpec,
-    /// Derived cascade children (Agent / Prompt / Tool / Mcp / Skill refs).
+    /// Derived cascade children (Agent / Prompt / Mcp refs).
     pub cascade_children: Vec<CardRef>,
     /// Local creation timestamp.
     pub created_at: DateTime<Utc>,
@@ -418,10 +414,7 @@ fn derive_cascade_children(spec: &WorkflowSpec) -> Vec<CardRef> {
     let mut out: Vec<CardRef> = Vec::new();
     for step in &spec.steps {
         match &step.action {
-            WorkflowAction::Skill(card_ref)
-            | WorkflowAction::Mcp(card_ref)
-            | WorkflowAction::Tool(card_ref)
-            | WorkflowAction::Prompt(card_ref) => {
+            WorkflowAction::Mcp(card_ref) | WorkflowAction::Prompt(card_ref) => {
                 out.push(card_ref.clone());
             }
             WorkflowAction::Agent(AgentRef::Card(card_ref)) => {

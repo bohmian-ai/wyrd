@@ -9,7 +9,7 @@ import PhaseGate from "../../../components/PhaseGate.astro";
 # Services
 
 <Aside title="TL;DR" data-variant="wyrd">
-A ServiceCard is the Card kind that packages a deployable AI surface. It references the Model, Prompt, Tool, and Agent Cards that make up the service.
+A ServiceCard is the Card kind that packages a deployable AI surface. It references the Model, Prompt, Agent, Workflow, Policy, Eval, Drift, Trigger, Operator, Source, MCP, Audit, and Service cards that make up the deployment.
 </Aside>
 
 <dl class="wyrd-defs">
@@ -17,7 +17,7 @@ A ServiceCard is the Card kind that packages a deployable AI surface. It referen
   <dd>Service name, version, and owner — the deployable unit's stable identity.</dd>
 
   <dt>Composition</dt>
-  <dd>References to the Model, Prompt, Tool, and Agent Cards the service is built from.</dd>
+  <dd>References to peer cards in the deployment directory. Runtime tool names resolve through Skald's tool registry, not through Tool cards.</dd>
 
   <dt>Runtime</dt>
   <dd>Adapter, environment, and runtime policy the deploy must satisfy.</dd>
@@ -46,4 +46,4 @@ Lock, install, and rollback flows for Services land in Phase 5a.
 
 ## Related cards
 
-See [Service reference](/cards/service/), [Model](/cards/model/), [Prompt](/cards/prompt/), [Tool](/cards/tool/), and [Agent](/cards/agent/).
+See [Service reference](/cards/service/), [Model](/cards/model/), [Prompt](/cards/prompt/), [Agent](/cards/agent/), [Workflow](/cards/workflow/), and [Source](/cards/source/).

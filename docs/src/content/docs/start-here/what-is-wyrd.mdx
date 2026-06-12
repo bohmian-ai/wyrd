@@ -21,7 +21,7 @@ Wyrd is the AI layer for developers, engineers, and agents. Cards declare durabl
   <dd>Prompt content and the typed contract around its inputs and outputs.</dd>
 
   <dt data-kind="agent">Tools</dt>
-  <dd>Executable surfaces and the constraints around their use.</dd>
+  <dd>Runtime tool names resolved by Skald's tool registry, not Card kinds.</dd>
 
   <dt data-kind="agent">Agents</dt>
   <dd>Agent declarations Wyrd describes and governs but never executes.</dd>
@@ -47,7 +47,7 @@ Wyrd is the AI layer for developers, engineers, and agents. Cards declare durabl
 
 ## The shared envelope
 
-Every registered AI system component in Wyrd is a Card. Cards share a common envelope: `apiVersion`, `metadata`, `kind`, `spec`, `relationships`, and `status`. The `spec` field is typed per kind, so a Model card carries a `ModelSpec` and a Data card carries a `DataSpec`, but the outer envelope is the same across all 18 card kinds.
+Every registered AI system component in Wyrd is a Card. Cards share a common envelope: `apiVersion`, `metadata`, `kind`, `spec`, `relationships`, and `status`. The `spec` field is typed per kind, so a Model card carries a `ModelSpec` and a Data card carries a `DataSpec`, but the outer envelope is the same across all 16 native card kinds plus `External`.
 
 This matters for operations. One envelope means one inventory, one policy entry point, one lineage graph, one audit model, generated contracts, and agent-readable docs. Agents do not need to guess which shape applies to which component before they can inspect or validate it.
 
@@ -87,7 +87,8 @@ This boundary keeps Wyrd useful for teams that already have orchestration framew
 
 ## What exists today
 
-- 18 Card kinds with JSON Schemas (`crates/wyrd-spec/schemas/`).
+- The design doctrine defines 16 native Card kinds plus `External`.
+- Current schemas include some implementation drift while `wyrd-spec` catches up to `architecture/wyrd-design.md`.
 - This docs site, with generated reference pages for Cards, OpenAPI, schemas, and error codes.
 - Python DataCard local workflow support through public `wyrd.data` imports.
 - Built-in Data interfaces, custom Python `DataInterface` subclassing, local `save`, local `load`, labels, annotations, and structured Wyrd errors.

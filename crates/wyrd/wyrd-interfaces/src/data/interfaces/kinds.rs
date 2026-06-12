@@ -13,7 +13,13 @@ use {
     pyo3::prelude::*,
     pyo3::types::{PyAny, PyDict},
     std::path::PathBuf,
+    std::sync::Arc,
 };
+
+#[cfg(feature = "python")]
+fn shared_py(value: Option<Py<PyAny>>) -> Option<Arc<Py<PyAny>>> {
+    value.map(Arc::new)
+}
 
 macro_rules! interface_struct {
     ($(#[$meta:meta])+ $name:ident { $($field:ident : $field_ty:ty),+ $(,)? }) => {
@@ -32,7 +38,7 @@ interface_struct!(
 /// configured parquet compression, and returns deterministic `DataStats`.
 /// `load` reads the local parquet artifact back into a pandas `DataFrame`.
 PandasInterface {
-    data: Option<Py<PyAny>>,
+    data: Option<Arc<Py<PyAny>>>,
     compression: String,
 });
 
@@ -43,7 +49,7 @@ interface_struct!(
 /// configured parquet compression, and returns deterministic `DataStats`.
 /// `load` reads the local parquet artifact back into a polars `DataFrame`.
 PolarsInterface {
-    data: Option<Py<PyAny>>,
+    data: Option<Arc<Py<PyAny>>>,
     compression: String,
 });
 
@@ -54,7 +60,7 @@ interface_struct!(
 /// `data/data.arrow` based on `format`. `load` restores the table from the
 /// matching local artifact.
 ArrowInterface {
-    data: Option<Py<PyAny>>,
+    data: Option<Arc<Py<PyAny>>>,
     format: String,
 });
 
@@ -64,7 +70,7 @@ interface_struct!(
 /// `save` copies a path-like parquet file or writes a table-like source to
 /// `data/data.parquet`. `load` restores the local artifact as a `PyArrow` table.
 ParquetInterface {
-    data: Option<Py<PyAny>>,
+    data: Option<Arc<Py<PyAny>>>,
     compression: String,
     row_group_size: Option<u32>,
 });
@@ -76,7 +82,7 @@ interface_struct!(
 /// `data/data.npz` based on `format`. `load` restores the saved array with
 /// pickle loading disabled.
 NumpyInterface {
-    data: Option<Py<PyAny>>,
+    data: Option<Arc<Py<PyAny>>>,
     dtype: Option<String>,
     shape: Option<Vec<i64>>,
     format: String,
@@ -89,7 +95,7 @@ interface_struct!(
 /// `data/data.pt` based on `save_format`. `load` restores the saved tensor
 /// payload from the local artifact.
 TorchInterface {
-    data: Option<Py<PyAny>>,
+    data: Option<Arc<Py<PyAny>>>,
     save_format: String,
 });
 
@@ -99,7 +105,7 @@ interface_struct!(
 /// `save` serializes SQL logic to `data/sql.json` with deterministic key
 /// ordering. `load` reads that JSON artifact back into a Python object.
 SqlInterface {
-    data: Option<Py<PyAny>>,
+    data: Option<Arc<Py<PyAny>>>,
     dialect: String,
     connection_hint: Option<String>,
 });
@@ -111,7 +117,7 @@ interface_struct!(
 /// artifact path, including gzip or zstd compression when requested. `load`
 /// reads the local JSONL artifact back into Python JSON objects.
 JsonlInterface {
-    data: Option<Py<PyAny>>,
+    data: Option<Arc<Py<PyAny>>>,
     compression: String,
     lines_per_file: Option<u64>,
 });
@@ -123,7 +129,7 @@ interface_struct!(
 /// value and can copy referenced bytes when `save_kwargs["copy_bytes"]` is
 /// true. `load` reads the manifest JSON back into Python.
 ImageInterface {
-    data: Option<Py<PyAny>>,
+    data: Option<Arc<Py<PyAny>>>,
     format: String,
     color_mode: String,
     manifest_ref: Option<CardRef>,
@@ -136,7 +142,7 @@ interface_struct!(
 /// value and can copy referenced bytes when `save_kwargs["copy_bytes"]` is
 /// true. `load` reads the manifest JSON back into Python.
 TextInterface {
-    data: Option<Py<PyAny>>,
+    data: Option<Arc<Py<PyAny>>>,
     encoding: String,
     manifest_ref: Option<CardRef>,
 });
@@ -149,7 +155,7 @@ interface_struct!(
 /// metadata is available. `load` restores local datasets or requires
 /// `load_kwargs["allow_remote"] = True` before loading a remote pointer.
 HuggingfaceInterface {
-    data: Option<Py<PyAny>>,
+    data: Option<Arc<Py<PyAny>>>,
     dataset_id: String,
     revision: Option<String>,
     split: Option<String>,
@@ -280,7 +286,7 @@ impl_interface_methods!(PandasInterface {
         parse_parquet_compression(compression)?;
         Ok((
             Self {
-                data,
+                data: shared_py(data),
                 compression: compression.to_string(),
             },
             DataInterface::marker("Pandas"),
@@ -307,7 +313,7 @@ impl_interface_methods!(PolarsInterface {
         parse_parquet_compression(compression)?;
         Ok((
             Self {
-                data,
+                data: shared_py(data),
                 compression: compression.to_string(),
             },
             DataInterface::marker("Polars"),
@@ -334,7 +340,7 @@ impl_interface_methods!(ArrowInterface {
         parse_arrow_format(format)?;
         Ok((
             Self {
-                data,
+                data: shared_py(data),
                 format: format.to_string(),
             },
             DataInterface::marker("Arrow"),
@@ -366,7 +372,7 @@ impl_interface_methods!(ParquetInterface {
         parse_parquet_compression(compression)?;
         Ok((
             Self {
-                data,
+                data: shared_py(data),
                 compression: compression.to_string(),
                 row_group_size,
             },
@@ -402,7 +408,7 @@ impl_interface_methods!(NumpyInterface {
         parse_numpy_format(format)?;
         Ok((
             Self {
-                data,
+                data: shared_py(data),
                 dtype,
                 shape,
                 format: format.to_string(),
@@ -432,7 +438,7 @@ impl_interface_methods!(TorchInterface {
         parse_torch_save_format(save_format)?;
         Ok((
             Self {
-                data,
+                data: shared_py(data),
                 save_format: save_format.to_string(),
             },
             DataInterface::marker("Torch"),
@@ -463,7 +469,7 @@ impl_interface_methods!(SqlInterface {
         let dialect = parse_sql_dialect(dialect)?;
         Ok((
             Self {
-                data,
+                data: shared_py(data),
                 dialect,
                 connection_hint,
             },
@@ -496,7 +502,7 @@ impl_interface_methods!(JsonlInterface {
         parse_jsonl_compression(compression)?;
         Ok((
             Self {
-                data,
+                data: shared_py(data),
                 compression: compression.to_string(),
                 lines_per_file,
             },
@@ -538,7 +544,7 @@ impl_interface_methods!(ImageInterface {
         parse_color_mode(color_mode)?;
         Ok((
             Self {
-                data,
+                data: shared_py(data),
                 format: format.to_string(),
                 color_mode: color_mode.to_string(),
                 manifest_ref: parse_card_ref(manifest_ref)?,
@@ -575,7 +581,7 @@ impl_interface_methods!(TextInterface {
     ) -> CardPyResult<(Self, DataInterface)> {
         Ok((
             Self {
-                data,
+                data: shared_py(data),
                 encoding: encoding.to_string(),
                 manifest_ref: parse_card_ref(manifest_ref)?,
             },
@@ -624,7 +630,7 @@ impl_interface_methods!(HuggingfaceInterface {
         }
         Ok((
             Self {
-                data,
+                data: shared_py(data),
                 dataset_id,
                 revision,
                 split,

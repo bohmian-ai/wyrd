@@ -24,6 +24,7 @@ pub mod schema;
 pub mod security;
 pub mod storage;
 pub mod trace;
+pub mod vala;
 pub mod version;
 
 pub use authz::{Principal, Role, Scope};
@@ -44,7 +45,7 @@ pub use card::workflow::{
     WorkflowAction, WorkflowCard, WorkflowCardError, WorkflowRetryPolicy, WorkflowSpec,
     WorkflowStep, WorkflowValidationError,
 };
-pub use ids::{ColumnName, QueryName, RoleName, SplitName};
+pub use ids::{ColumnName, QueryName, RoleName, SplitName, uuid7};
 pub use metadata::{
     AnnotationKey, AnnotationValue, Annotations, CardMetadata, LabelKey, LabelValue, Labels,
     MetadataError,

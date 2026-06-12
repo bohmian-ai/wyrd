@@ -18,6 +18,7 @@ test-utils = []
 wasm = []
 
 [dependencies]
+base64 = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 regex = { workspace = true }
@@ -27,13 +28,15 @@ skald-spec = { workspace = true, features = ["schemars"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-thiserror = { workspace = true }
+petgraph = { version = "0.6", default-features = false, features = ["graphmap"] }
 utoipa = { workspace = true, optional = true }
-uuid = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["std", "v7", "js"] }
 sha2 = { workspace = true }
-wyrd-error-derive = { path = "../shared/wyrd-error-derive", version = "0.0.1" }
+wyrd-error-derive = { workspace = true }
 
 [dev-dependencies]
+pretty_assertions = "1"
 proptest = { workspace = true }
 [[example]]
 name = "gen_schemas"

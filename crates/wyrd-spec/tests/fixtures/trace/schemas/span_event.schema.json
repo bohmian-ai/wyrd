@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SpanEvent",
+  "description": "OTel-canonical span event.\n\nFields:\n\n- `timestamp` — wall-clock time the event occurred. Must lie within the span's `[start_time, end_time]` window; that check is enforced by [`crate::vala::trace::SpanRecord::validate`], not here, because the event itself has no knowledge of its parent span. - `name` — event name. Free-form but non-empty; OTel conventions suggest namespaced names (`exception`, `log`, `gen_ai.evaluation.result`). - `attributes` — typed key/value bag stored as flat JSON. Use the constants in [`crate::vala::trace::attributes`] for known keys. - `dropped_attributes_count` — count of attributes the SDK dropped before sending (OTel default 0 means \"none dropped\"). Carried for parity with the OTLP proto.",
+  "type": "object",
+  "required": [
+    "name",
+    "timestamp"
+  ],
+  "properties": {
+    "attributes": {
+      "description": "Event attribute bag.",
+      "default": {},
+      "type": "object",
+      "additionalProperties": true
+    },
+    "dropped_attributes_count": {
+      "description": "Count of attributes the SDK dropped before sending.",
+      "default": 0,
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "name": {
+      "description": "Event name; non-empty.",
+      "type": "string"
+    },
+    "timestamp": {
+      "description": "Wall-clock time the event occurred.",
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

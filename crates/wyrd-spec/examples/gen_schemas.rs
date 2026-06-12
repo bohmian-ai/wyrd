@@ -11,7 +11,7 @@ use wyrd_spec::card::data::{
     DataInterface, DataSchema, DataSpec, DataSplit, DataStats, SplitStrategy, SqlLogic,
 };
 use wyrd_spec::card::drift::DriftSpec;
-use wyrd_spec::card::eval::EvalSpec;
+use wyrd_spec::card::eval::EvalSpec as CardEvalSpec;
 use wyrd_spec::card::experiment::ExperimentSpec;
 use wyrd_spec::card::field::FieldSpec;
 use wyrd_spec::card::mcp::McpSpec;
@@ -26,15 +26,22 @@ use wyrd_spec::card::service::{LockedComponent, ServiceLock};
 use wyrd_spec::card::service::{
     ServiceRuntime, ServiceRuntimeKind, ServiceRuntimeMode, ServiceRuntimePolicy, ServiceSpec,
 };
-use wyrd_spec::card::skill::SkillSpec;
-use wyrd_spec::card::subagent::SubAgentSpec;
-use wyrd_spec::card::tool::ToolSpec;
 use wyrd_spec::card::trigger::{TriggerSource, TriggerSpec};
 use wyrd_spec::card::workflow::WorkflowSpec;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::run::{RunKind, RunRef};
 use wyrd_spec::security::{SecretRef, TlsConfig};
+use wyrd_spec::vala::eval::{
+    AgentTurnSubmission, ComparisonOperator, ConversationTurn, DagError, EvalCondition,
+    EvalPassGate, EvalRecordObservation, EvalRunOpenRequest, EvalRunOpenResponse, EvalSampling,
+    EvalScenarioCollection, EvalSpec, EvalTask, ExecutionPlan, SimulatedUserMode,
+    SimulatedUserTurn, TurnDirective, UserTurnSubmission,
+};
+use wyrd_spec::vala::trace::{
+    AttributeValue, GenAiEvalResult, GenAiSpanRecord, InstrumentationScope, Resource, SpanEvent,
+    SpanKind, SpanLink, SpanRecord, SpanStatus, TraceSummaryRecord,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = Path::new("crates/wyrd-spec/schemas");
@@ -70,10 +77,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<PromptSpec>(out, golden, "prompt_spec")?;
     write::<PromptRef>(out, golden, "prompt_ref")?;
     write::<ParameterName>(out, golden, "parameter_name")?;
-    write::<ToolSpec>(out, golden, "tool_spec")?;
     write::<AgentSpec>(out, golden, "agent_spec")?;
     write::<WorkflowSpec>(out, golden, "workflow_spec")?;
-    write::<EvalSpec>(out, golden, "eval_spec")?;
+    write::<CardEvalSpec>(out, golden, "eval_spec")?;
     write::<DriftSpec>(out, golden, "drift_spec")?;
     write::<TriggerSpec>(out, golden, "trigger_spec")?;
     write::<TriggerSource>(out, golden, "trigger_source")?;
@@ -90,8 +96,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<InvokeOutcome>(out, golden, "invoke_outcome")?;
     write::<PolicyDecision>(out, golden, "policy_decision")?;
     write::<McpSpec>(out, golden, "mcp_spec")?;
-    write::<SkillSpec>(out, golden, "skill_spec")?;
-    write::<SubAgentSpec>(out, golden, "subagent_spec")?;
     write::<AuditSpec>(out, golden, "audit_spec")?;
     write::<ArtifactSpec>(out, golden, "artifact_spec")?;
     write::<FrameworkAdapterRef>(out, golden, "framework_adapter_ref")?;
@@ -99,6 +103,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 4 section 16: shared security primitives.
     write::<SecretRef>(out, golden, "security_secret_ref")?;
     write::<TlsConfig>(out, golden, "security_tls_config")?;
+    let eval_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/eval/schemas");
+    fs::create_dir_all(eval_fixtures)?;
+    write_fixture::<EvalSpec>(eval_fixtures, "eval_spec")?;
+    write_fixture::<EvalTask>(eval_fixtures, "eval_task")?;
+    write_fixture::<EvalCondition>(eval_fixtures, "eval_condition")?;
+    write_fixture::<ComparisonOperator>(eval_fixtures, "comparison_operator")?;
+    write_fixture::<ExecutionPlan>(eval_fixtures, "execution_plan")?;
+    write_fixture::<DagError>(eval_fixtures, "dag_error")?;
+    write_fixture::<EvalRecordObservation>(eval_fixtures, "eval_record_observation")?;
+    write_fixture::<EvalScenarioCollection>(eval_fixtures, "eval_scenario_collection")?;
+    write_fixture::<EvalPassGate>(eval_fixtures, "eval_pass_gate")?;
+    write_fixture::<EvalSampling>(eval_fixtures, "eval_sampling")?;
+    write_fixture::<EvalRunOpenRequest>(eval_fixtures, "eval_run_open_request")?;
+    write_fixture::<EvalRunOpenResponse>(eval_fixtures, "eval_run_open_response")?;
+    write_fixture::<SimulatedUserMode>(eval_fixtures, "simulated_user_mode")?;
+    write_fixture::<TurnDirective>(eval_fixtures, "turn_directive")?;
+    write_fixture::<ConversationTurn>(eval_fixtures, "conversation_turn")?;
+    write_fixture::<AgentTurnSubmission>(eval_fixtures, "agent_turn_submission")?;
+    write_fixture::<UserTurnSubmission>(eval_fixtures, "user_turn_submission")?;
+    write_fixture::<SimulatedUserTurn>(eval_fixtures, "simulated_user_turn")?;
+
+    let trace_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/trace/schemas");
+    fs::create_dir_all(trace_fixtures)?;
+    write_fixture::<SpanRecord>(trace_fixtures, "span_record")?;
+    write_fixture::<SpanKind>(trace_fixtures, "span_kind")?;
+    write_fixture::<SpanStatus>(trace_fixtures, "span_status")?;
+    write_fixture::<SpanEvent>(trace_fixtures, "span_event")?;
+    write_fixture::<SpanLink>(trace_fixtures, "span_link")?;
+    write_fixture::<Resource>(trace_fixtures, "resource")?;
+    write_fixture::<InstrumentationScope>(trace_fixtures, "instrumentation_scope")?;
+    write_fixture::<TraceSummaryRecord>(trace_fixtures, "trace_summary_record")?;
+    write_fixture::<GenAiSpanRecord>(trace_fixtures, "gen_ai_span_record")?;
+    write_fixture::<GenAiEvalResult>(trace_fixtures, "gen_ai_eval_result")?;
+    write_fixture::<AttributeValue>(trace_fixtures, "attribute_value")?;
     Ok(())
 }
 
@@ -112,5 +150,16 @@ fn write<T: schemars::JsonSchema>(
     let json = serde_json::to_string_pretty(&schema)?;
     fs::write(out.join(format!("{name}.json")), format!("{json}\n"))?;
     fs::write(golden.join(format!("{name}.json")), format!("{json}\n"))?;
+    Ok(())
+}
+
+fn write_fixture<T: schemars::JsonSchema>(
+    dir: &Path,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut schema = schema_for!(T);
+    schema.meta_schema = Some("https://json-schema.org/draft/2020-12/schema".to_string());
+    let json = serde_json::to_string_pretty(&schema)?;
+    fs::write(dir.join(format!("{name}.schema.json")), format!("{json}\n"))?;
     Ok(())
 }

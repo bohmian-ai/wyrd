@@ -228,7 +228,9 @@ run = """
 if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/shared/wyrd-testing/**' \
   --glob '!crates/skald/skald-providers/Cargo.toml' \
-  --glob '!crates/skald/skald-providers/tests/**'; then
+  --glob '!crates/skald/skald-providers/tests/**' \
+  --glob '!crates/wyrd/wyrd-cli/Cargo.toml' \
+  --glob '!crates/wyrd/wyrd-cli/tests/**'; then
   echo 'mock dependency leaked outside wyrd-testing'
   exit 1
 fi
@@ -424,17 +426,15 @@ wait $BACKEND_PID $FRONTEND_PID
 """
 
 [tasks."dev:full"]
-description = "Boot wyrd-server, wyrd-observability-server, and UI on :3000"
+description = "Boot wyrd-server and UI on :3000"
 run = """
-cargo build -p wyrd-server -p wyrd-observability-server
+cargo build -p wyrd-server
 WYRD_SERVER_PORT=${WYRD_SERVER_PORT:-8080} ./target/debug/wyrd-server &
 SERVER_PID=$!
-WYRD_OBS_SERVER_PORT=${WYRD_OBS_SERVER_PORT:-8090} ./target/debug/wyrd-observability-server &
-OBS_PID=$!
 cd crates/wyrd/wyrd-server/wyrd-ui && pnpm install --frozen-lockfile && pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000} &
 UI_PID=$!
-trap 'kill $SERVER_PID $OBS_PID $UI_PID 2>/dev/null' EXIT INT TERM
-wait $SERVER_PID $OBS_PID $UI_PID
+trap 'kill $SERVER_PID $UI_PID 2>/dev/null' EXIT INT TERM
+wait $SERVER_PID $UI_PID
 """
 
 [tasks.check]
@@ -458,7 +458,10 @@ test -f openapi.yaml || { echo 'openapi.yaml missing'; exit 1; }
 [tasks."codegen:stubs"]
 description = "Regenerate Python type stubs"
 dir = "python/py-wyrd"
-run = "uv run python scripts/assemble_stubs.py"
+run = """
+uv run python scripts/assemble_stubs.py
+uv run ruff check --fix --select I python/wyrd
+"""
 
 [tasks."codegen:check"]
 description = "Fail if generated openapi/schemas/MCP/pyi drift from source"

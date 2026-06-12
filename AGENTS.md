@@ -11,15 +11,16 @@ this repository. Reproduce useful patterns under Wyrd vocabulary and Wyrd paths.
 ## 1. First Pass Before Editing
 
 1. Read this file (AGENTS.md).
-2. Read `docs/src/content/docs/concepts/core-doctrine.mdx` before changing
+2. Read `architecture/wyrd-design.md`; it is the active design authority and
+   wins over generated artifacts, older planning files, and implementation
+   drift.
+3. Read `docs/src/content/docs/concepts/core-doctrine.mdx` before changing
    Wyrd contracts, public or internal APIs, SDK surfaces, CLI, MCP, UI, docs,
-   generated schemas, or implementation behavior. The canonical planning
-   source is
-   `/Users/stevenforrester/Documents/GitHub/wyrd-plan/architecture/v1/00-foundations/core-doctrine.md`.
-3. Identify the owning crate or Python package (see §3 Ownership Boundaries).
-4. Inspect the nearest existing Wyrd implementation and tests.
-5. Check `mise.toml` for the canonical verification command.
-6. Check `Cargo.toml`, crate manifests, `pyproject.toml`, and lockfiles before
+   generated schemas, or implementation behavior.
+4. Identify the owning crate or Python package (see §3 Ownership Boundaries).
+5. Inspect the nearest existing Wyrd implementation and tests.
+6. Check `mise.toml` for the canonical verification command.
+7. Check `Cargo.toml`, crate manifests, `pyproject.toml`, and lockfiles before
    relying on version-specific behavior.
 
 Do not invent a new architecture until the current Wyrd boundary proves wrong
@@ -28,41 +29,69 @@ for the user workflow.
 
 ## 2. Current Decisions
 
-Design dialogue, locked decisions, predecessor research, and session history
-live in the [`wyrd-plan`](https://github.com/wyrd-ai/wyrd-plan) repo (private,
-org-internal). `PLAN.md` at the repo root carries the pointer plus the current
-session slug.
+Design dialogue, predecessor research, and older session history live in the
+[`wyrd-plan`](https://github.com/wyrd-ai/wyrd-plan) repo (private,
+org-internal). Active implementation authority now lives in this repo.
+`PLAN.md` remains the pointer back to planning history.
 
 Locked cross-cutting decisions that any contributor must honor:
 
-- The core doctrine in `docs/src/content/docs/concepts/core-doctrine.mdx`
+- The protocol doctrine in `architecture/wyrd-design.md`
   is the first design filter for Wyrd nouns, layers, services, and public
   surfaces. Internal APIs, external APIs, Python SDK, HTTP, CLI, MCP, UI, docs,
   generated schemas, and agent-facing contracts must align with it.
 - Wyrd is the AI layer for human and agentic workflows, not a general-purpose framework or
   runtime for arbitrary code execution.
-- Every registered artifact is a `Card` with the shared envelope:
-  `apiVersion: wyrd/v1`, top-level `metadata`, `kind` (one of the 18 card
-  kinds), `spec` (the kind-specific payload), server-derived
-  `relationships`, and server-managed `status`. There is no outer
-  `kind: Card` wrapper; `kind` is the body discriminator. Rust shape:
-  `struct Card { api_version, metadata, body: CardBody, relationships,
-  status }` where `body` is `#[serde(tag="kind", content="spec")] enum
-  CardBody { Model(ModelSpec), Data(DataSpec), ... }` flattened into the
-  envelope. **Locked 2026-05-21.**
+- Wyrd follows a language-agnostic client/server model. The Wyrd server owns
+  durable behavior and core logic; clients project server contracts and call
+  API surfaces.
+- Core durable logic is Rust-only server logic. Contracts live on the API wire
+  through typed schemas, HTTP/MCP payloads, generated docs, and stable error
+  codes so any language can implement a Wyrd client.
+- Python and Rust are first-class client languages. They may receive richer
+  SDK ergonomics, local authoring helpers, OTEL integration, agent workflow
+  integration, and test tooling when useful, but those features must not move
+  server-owned durable behavior out of the server or make the product
+  language-exclusive.
+- Wyrd must work both self-hosted and as a cloud SaaS product. SaaS and
+  enterprise deployments require full tenant separation for identity, authz,
+  storage, registry, policy, audit, observability, evaluation, and generated
+  artifacts.
+- Wyrd is agent-first and headless. MCP, CLI, HTTP, generated schemas, stable
+  errors, and machine-readable docs are primary surfaces. The developer UI is
+  useful and supported, but it is not the source of truth and must not be the
+  only way to perform a workflow.
+- Every registered AI system component is a `Card` with the shared envelope:
+  `apiVersion: wyrd/v1`, top-level `metadata`, `kind`, `spec`,
+  server-derived `relationships`, and server-managed `status`. There is no
+  outer `kind: Card` wrapper. The target v1 doctrine is 16 native kinds plus
+  `External`: `Data`, `Model`, `Artifact`, `Experiment`, `Prompt`, `Agent`,
+  `Workflow`, `Mcp`, `Service`, `Policy`, `Audit`, `Drift`, `Eval`, `Source`,
+  `Trigger`, and `Operator`.
+- `Tool` is a Skald/runtime registry concept, not a Card kind.
+- Sub-agency is an Agent-to-Agent relationship, not a `SubAgent` Card kind.
+- `Skill` is not a v1 Card kind unless a future architecture decision adds it.
+- Current `wyrd-spec` code still exposes stale `Tool`, `Skill`, and
+  `SubAgent` specs and lacks `SourceSpec`. Treat that as implementation drift
+  to remove, not as contract precedent.
 - `CardRef` carries `kind`, `name`, one `version` field, optional `space`, and
   optional `uid`. Do not introduce a separate version requirement field.
 - `wyrd-spec` is IO-free, async-free, and foundational. It is strictly
   PyO3-free. Specs, schemas, validators, the error catalog, and identity
-  newtypes stay PyO3-free. Python-boundary wrappers for `wyrd-spec` types
-  live in `wyrd-interfaces` behind its `python` feature gate.
+  newtypes stay PyO3-free.
+- Python-visible behavior lives behind optional `python` features in approved
+  owner crates. `python/py-wyrd` is the thin PyO3 module aggregator and Python
+  package surface, not the place for duplicated business logic.
+- Current approved Python owner crates are `wyrd-interfaces`, `wyrd-cards`,
+  `wyrd-utils`, `wyrd-observe`, `vala-client`, `skald-prompt`,
+  `skald-runtime`, `skald-agent`, `skald-tool`, and `skald-workflow`.
 - Client-tier crates do not depend on `sqlx`, cloud SDKs, `datafusion`, or
   `deltalake`.
 - Vala and Skald do not depend on each other directly.
 - MCP is first-class; read tools are always available, write tools require
   explicit scopes.
-- Audit is foundational across CLI, UI, MCP, Python SDK, wyrd-server, and
-  vala-server.
+- Audit is foundational across CLI, UI, MCP, Python SDK, `wyrd-server`, and
+  Vala surfaces.
 
 ## 3. Ownership Boundaries
 
@@ -73,14 +102,16 @@ Locked cross-cutting decisions that any contributor must honor:
 - `crates/skald/*`: model/provider runtime, prompt/cache abstractions,
   orchestration, provider-specific wire handling.
 - `crates/vala/*`: observability, evaluation, drift, tracing, archival query,
-  background data-plane behavior.
+  OLAP, and background data-plane behavior. Python-visible Vala client
+  behavior lives in `vala-client` behind its optional `python` feature.
 - `crates/wyrd/*`: server, CLI, MCP, application integration, UI host.
-- `python/py-wyrd`: PyO3 module root, Python package exports, stubs,
-  Python-facing tests.
+- `python/py-wyrd`: PyO3 module root, Python package exports, generated stubs,
+  Python-facing tests, and submodule aggregation.
 
 When behavior crosses boundaries, put the durable contract in `wyrd-spec`, keep
-runtime in the owning crate, and expose only the necessary API through
-server/Python/client layers.
+durable server behavior in Rust-owned server/service crates, and expose the
+necessary API through language-agnostic wire contracts plus first-class Rust
+and Python client surfaces where appropriate.
 
 ## 4. Rust Core Rules
 
@@ -136,9 +167,17 @@ server/Python/client layers.
 
 ## 7. PyO3 Boundary Rules
 
-- Keep PyO3 in `python/py-wyrd*` unless an explicit allowlist says otherwise.
-- Keep `Python<'py>`, `Bound<'py, T>`, `Py<T>`, `PyErr` out of Rust-only core
-  crates.
+- `wyrd-spec` stays PyO3-free. Do not add a `python` feature or PyO3 imports
+  to `wyrd-spec`.
+- PyO3 belongs in crates that own Python-visible behavior, behind an optional
+  `python` feature with `pyo3 = { workspace = true, optional = true }`.
+- `python/py-wyrd` depends on approved owner crates with `features =
+  ["python"]` and registers their submodules. It must stay a thin aggregator:
+  no duplicated validation, lifecycle, registry, storage, or runtime logic.
+- Generic Python boundary helpers belong in `crates/shared/wyrd-utils` behind
+  its `python` feature.
+- Keep `Python<'py>`, `Bound<'py, T>`, `Py<T>`, and `PyErr` out of crates that
+  did not opt into a `python` feature.
 - Name the `#[new]` method `fn __new__` (not `fn new`) and give it an explicit
   `#[pyo3(signature = (...))]`. The Rust source mirrors the Python slot it
   exposes. Builder-only pyclasses constructed via `#[staticmethod]` take no
@@ -174,6 +213,12 @@ then run codegen.
 
 ## 9. Server And Contract Rules
 
+- Server code owns durable behavior, side effects, tenancy checks, registry
+  writes, storage orchestration, policy decisions, audit records, and generated
+  relationship/status state.
+- Client code, including first-class Rust and Python SDKs, may own ergonomic
+  authoring helpers, local save/load, local validation messages, tracing hooks,
+  and runtime integrations, but it must not become the durable source of truth.
 - Public request/response bodies are typed structs.
 - Wire types derive schema support where required by the feature gate.
 - Public handlers return structured Wyrd errors via the `WyrdError` derive.
@@ -183,6 +228,7 @@ then run codegen.
   local server pattern.
 - Versioned API contracts are explicit.
 - Do not add compatibility routes or aliases for old surfaces.
+- Preserve tenant isolation across every public and internal server path.
 
 ## 10. Provider, Evaluation, Observability Rules
 

@@ -113,6 +113,34 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Vala eval task graph failed DAG validation (cycle, self-loop, or missing dependency).
+    #[error("[WYRD_VALA_400_TASK_DAG_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_TASK_DAG_INVALID",
+        status = 400,
+        title = "Eval task DAG validation failed",
+        remediation = "Remove cycles, self-dependencies, or references to missing eval tasks."
+    )]
+    ValaTaskDagInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Vala eval contract referenced a CardRef kind outside its allowlist.
+    #[error("[WYRD_VALA_400_EVAL_REF_KIND_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_EVAL_REF_KIND_MISMATCH",
+        status = 400,
+        title = "Eval reference kind mismatch",
+        remediation = "Use the required CardRef kind for the eval field being validated."
+    )]
+    ValaEvalRefKindMismatch {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Caller presented no credential or an unparseable one.
     #[error("[WYRD_AUTH_401_UNAUTHENTICATED] {message}")]
     #[wyrd_error(
@@ -262,6 +290,48 @@ pub enum WyrdError {
         remediation = "Pass an explicit DataInterface with enough metadata to describe the data source."
     )]
     DataInterfaceMetadataRequired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// DriftCard validation failed.
+    #[error("[WYRD_DRIFT_400_VALIDATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_DRIFT_400_VALIDATION",
+        status = 400,
+        title = "DriftCard validation failed",
+        remediation = "Fix the DriftCard envelope, profile, condition, or signal fields."
+    )]
+    DriftValidation {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A DriftCard signal variant is not compatible with the requested method.
+    #[error("[WYRD_DRIFT_400_SIGNAL_METHOD_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_DRIFT_400_SIGNAL_METHOD_MISMATCH",
+        status = 400,
+        title = "DriftCard signal/method mismatch",
+        remediation = "Use a signal variant supported by the chosen DriftMethod (see DriftSpec docs)."
+    )]
+    DriftSignalMethodMismatch {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A DriftCard method that requires a profile was registered without one.
+    #[error("[WYRD_DRIFT_400_PROFILE_REQUIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_DRIFT_400_PROFILE_REQUIRED",
+        status = 400,
+        title = "DriftCard profile required",
+        remediation = "Attach the method-matching DriftProfile (PsiProfile, SpcProfile, or CustomProfile)."
+    )]
+    DriftProfileRequired {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -1092,6 +1162,8 @@ impl WyrdError {
             | Self::Internal { message, details }
             | Self::UpstreamFailure { message, details }
             | Self::Timeout { message, details }
+            | Self::ValaTaskDagInvalid { message, details }
+            | Self::ValaEvalRefKindMismatch { message, details }
             | Self::Unauthenticated { message, details }
             | Self::TokenExpired { message, details }
             | Self::InvalidToken { message, details }
@@ -1103,6 +1175,9 @@ impl WyrdError {
             | Self::DataTargetColumnUnknown { message, details }
             | Self::DataInvalidInterfaceOption { message, details }
             | Self::DataInterfaceMetadataRequired { message, details }
+            | Self::DriftValidation { message, details }
+            | Self::DriftSignalMethodMismatch { message, details }
+            | Self::DriftProfileRequired { message, details }
             | Self::ModelUnknownModelType { message, details }
             | Self::ModelValidation { message, details }
             | Self::ModelMissingSignature { message, details }

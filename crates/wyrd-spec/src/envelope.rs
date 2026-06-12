@@ -22,9 +22,6 @@ use crate::card::operator::OperatorSpec;
 use crate::card::policy::PolicySpec;
 use crate::card::prompt::PromptSpec;
 use crate::card::service::ServiceSpec;
-use crate::card::skill::SkillSpec;
-use crate::card::subagent::SubAgentSpec;
-use crate::card::tool::ToolSpec;
 use crate::card::trigger::TriggerSpec;
 use crate::card::workflow::WorkflowSpec;
 use crate::ids::{CardName, CardUid, SpaceName};
@@ -101,13 +98,12 @@ pub enum Spec {
     Experiment(ExperimentSpec),
     /// Prompt card spec.
     Prompt(PromptSpec),
-    /// Tool card spec.
-    Tool(ToolSpec),
     /// Agent card spec.
     Agent(AgentSpec),
     /// Workflow card spec.
     Workflow(WorkflowSpec),
     /// Eval card spec.
+    #[cfg_attr(feature = "server", schema(value_type = serde_json::Value))]
     Eval(EvalSpec),
     /// Drift card spec.
     Drift(DriftSpec),
@@ -117,10 +113,6 @@ pub enum Spec {
     Policy(PolicySpec),
     /// MCP card spec.
     Mcp(McpSpec),
-    /// Skill card spec.
-    Skill(SkillSpec),
-    /// Sub-agent card spec.
-    SubAgent(SubAgentSpec),
     /// Audit card spec.
     Audit(AuditSpec),
     /// Artifact card spec.
@@ -171,8 +163,6 @@ pub enum CardKind {
     Experiment,
     /// Prompt Card.
     Prompt,
-    /// Tool Card.
-    Tool,
     /// Agent Card.
     Agent,
     /// Workflow Card.
@@ -187,10 +177,6 @@ pub enum CardKind {
     Policy,
     /// MCP Card.
     Mcp,
-    /// Skill Card.
-    Skill,
-    /// Sub-agent Card.
-    SubAgent,
     /// Audit Card.
     Audit,
     /// Artifact Card.
@@ -207,7 +193,7 @@ pub enum CardKind {
 
 impl CardKind {
     /// Native v1 Card kind count.
-    pub const NATIVE_COUNT: usize = 19;
+    pub const NATIVE_COUNT: usize = 16;
 
     /// Return every native kind.
     #[must_use]
@@ -217,7 +203,6 @@ impl CardKind {
             Self::Model,
             Self::Experiment,
             Self::Prompt,
-            Self::Tool,
             Self::Agent,
             Self::Workflow,
             Self::Eval,
@@ -225,8 +210,6 @@ impl CardKind {
             Self::Service,
             Self::Policy,
             Self::Mcp,
-            Self::Skill,
-            Self::SubAgent,
             Self::Audit,
             Self::Artifact,
             Self::Trigger,
@@ -243,7 +226,6 @@ impl CardKind {
             Self::Model => "Model",
             Self::Experiment => "Experiment",
             Self::Prompt => "Prompt",
-            Self::Tool => "Tool",
             Self::Agent => "Agent",
             Self::Workflow => "Workflow",
             Self::Eval => "Eval",
@@ -251,8 +233,6 @@ impl CardKind {
             Self::Service => "Service",
             Self::Policy => "Policy",
             Self::Mcp => "Mcp",
-            Self::Skill => "Skill",
-            Self::SubAgent => "SubAgent",
             Self::Audit => "Audit",
             Self::Artifact => "Artifact",
             Self::Trigger => "Trigger",
@@ -269,7 +249,6 @@ impl CardKind {
             Self::Model => "Model",
             Self::Experiment => "Experiment",
             Self::Prompt => "Prompt",
-            Self::Tool => "Tool",
             Self::Agent => "Agent",
             Self::Workflow => "Workflow",
             Self::Eval => "Eval",
@@ -277,8 +256,6 @@ impl CardKind {
             Self::Service => "Service",
             Self::Policy => "Policy",
             Self::Mcp => "Mcp",
-            Self::Skill => "Skill",
-            Self::SubAgent => "SubAgent",
             Self::Audit => "Audit",
             Self::Artifact => "Artifact",
             Self::Trigger => "Trigger",
@@ -307,7 +284,6 @@ fn native_from_str(value: &str) -> Option<CardKind> {
         "Model" => CardKind::Model,
         "Experiment" => CardKind::Experiment,
         "Prompt" => CardKind::Prompt,
-        "Tool" => CardKind::Tool,
         "Agent" => CardKind::Agent,
         "Workflow" => CardKind::Workflow,
         "Eval" => CardKind::Eval,
@@ -315,8 +291,6 @@ fn native_from_str(value: &str) -> Option<CardKind> {
         "Service" => CardKind::Service,
         "Policy" => CardKind::Policy,
         "Mcp" => CardKind::Mcp,
-        "Skill" => CardKind::Skill,
-        "SubAgent" => CardKind::SubAgent,
         "Audit" => CardKind::Audit,
         "Artifact" => CardKind::Artifact,
         "Trigger" => CardKind::Trigger,
@@ -358,7 +332,6 @@ impl Serialize for Spec {
             Self::Model(s) => s.serialize(serializer),
             Self::Experiment(s) => s.serialize(serializer),
             Self::Prompt(s) => s.serialize(serializer),
-            Self::Tool(s) => s.serialize(serializer),
             Self::Agent(s) => s.serialize(serializer),
             Self::Workflow(s) => s.serialize(serializer),
             Self::Eval(s) => s.serialize(serializer),
@@ -366,8 +339,6 @@ impl Serialize for Spec {
             Self::Service(s) => s.serialize(serializer),
             Self::Policy(s) => s.serialize(serializer),
             Self::Mcp(s) => s.serialize(serializer),
-            Self::Skill(s) => s.serialize(serializer),
-            Self::SubAgent(s) => s.serialize(serializer),
             Self::Audit(s) => s.serialize(serializer),
             Self::Artifact(s) => s.serialize(serializer),
             Self::Trigger(s) => s.serialize(serializer),
@@ -424,9 +395,6 @@ fn spec_from_kind_value(kind: &CardKind, mut value: serde_json::Value) -> Result
         CardKind::Prompt => serde_json::from_value(value)
             .map(Spec::Prompt)
             .map_err(|e| e.to_string()),
-        CardKind::Tool => serde_json::from_value(value)
-            .map(Spec::Tool)
-            .map_err(|e| e.to_string()),
         CardKind::Agent => serde_json::from_value(value)
             .map(Spec::Agent)
             .map_err(|e| e.to_string()),
@@ -447,12 +415,6 @@ fn spec_from_kind_value(kind: &CardKind, mut value: serde_json::Value) -> Result
             .map_err(|e| e.to_string()),
         CardKind::Mcp => serde_json::from_value(value)
             .map(Spec::Mcp)
-            .map_err(|e| e.to_string()),
-        CardKind::Skill => serde_json::from_value(value)
-            .map(Spec::Skill)
-            .map_err(|e| e.to_string()),
-        CardKind::SubAgent => serde_json::from_value(value)
-            .map(Spec::SubAgent)
             .map_err(|e| e.to_string()),
         CardKind::Audit => serde_json::from_value(value)
             .map(Spec::Audit)

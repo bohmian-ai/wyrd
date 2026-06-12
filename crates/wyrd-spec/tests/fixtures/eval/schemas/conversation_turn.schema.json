@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConversationTurn",
+  "description": "One turn of conversation history carried by [`TurnDirective`].\n\n`wyrd-spec` cannot depend on Skald, so the protocol's history shape is intentionally minimal: plain `{role, content}` text.",
+  "type": "object",
+  "required": [
+    "content",
+    "role"
+  ],
+  "properties": {
+    "content": {
+      "description": "Verbatim turn content.",
+      "type": "string"
+    },
+    "role": {
+      "description": "Who produced this turn.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TurnRole"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "TurnRole": {
+      "description": "Speaker role on a [`ConversationTurn`].\n\nTool and system roles stay inside the agent runtime layer; the eval protocol cares only about the user and agent dialogue.",
+      "oneOf": [
+        {
+          "description": "Human or simulated-user turn.",
+          "type": "string",
+          "enum": [
+            "user"
+          ]
+        },
+        {
+          "description": "Agent-under-test turn.",
+          "type": "string",
+          "enum": [
+            "agent"
+          ]
+        }
+      ]
+    }
+  }
+}

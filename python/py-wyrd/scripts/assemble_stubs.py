@@ -13,6 +13,7 @@ PUBLIC_MODULE_STUBS = {
     "agent.pyi": PACKAGE_DIR / "agent" / "__init__.pyi",
     "cards.pyi": PACKAGE_DIR / "cards" / "__init__.pyi",
     "data.pyi": PACKAGE_DIR / "data" / "__init__.pyi",
+    "eval.pyi": PACKAGE_DIR / "eval" / "__init__.pyi",
     "model.pyi": PACKAGE_DIR / "model" / "__init__.pyi",
     "observer.pyi": PACKAGE_DIR / "observer.pyi",
     "prompt.pyi": PACKAGE_DIR / "prompt" / "__init__.pyi",

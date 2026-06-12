@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InstrumentationScope",
+  "description": "OTel-canonical instrumentation scope.\n\nFields:\n\n- `name` -- instrumentation library name, such as `wyrd-tracing` or `opentelemetry-instrumentation-requests`. - `version` -- optional library version string. - `attributes` -- rare scope-level attributes.",
+  "type": "object",
+  "required": [
+    "name"
+  ],
+  "properties": {
+    "attributes": {
+      "description": "Scope-level attribute bag.",
+      "default": {},
+      "type": "object",
+      "additionalProperties": true
+    },
+    "name": {
+      "description": "Instrumentation library name.",
+      "type": "string"
+    },
+    "version": {
+      "description": "Instrumentation library version, when known.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

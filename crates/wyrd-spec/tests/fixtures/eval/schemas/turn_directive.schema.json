@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnDirective",
+  "description": "The server's next directive for the eval pull protocol.\n\nThis is a closed kind-tagged enum. Adding a variant is a breaking protocol change, so no open-ended enum marker is used.",
+  "oneOf": [
+    {
+      "description": "Run the agent for one turn against `message` and `history`, then post the response and any emitted eval records via [`AgentTurnSubmission`].",
+      "type": "object",
+      "required": [
+        "history",
+        "kind",
+        "message",
+        "scenario_id",
+        "turn"
+      ],
+      "properties": {
+        "history": {
+          "description": "Conversation so far. Bounded by [`MAX_HISTORY_TURNS`].",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ConversationTurn"
+          }
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "agent_turn"
+          ]
+        },
+        "message": {
+          "description": "User message the agent should respond to this turn.",
+          "type": "string"
+        },
+        "scenario_id": {
+          "description": "Scenario the agent is currently progressing.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ScenarioId"
+            }
+          ]
+        },
+        "turn": {
+          "description": "Zero-indexed turn cursor within the scenario.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "The server delegates the next user message to the client.",
+      "type": "object",
+      "required": [
+        "history",
+        "kind",
+        "scenario_id",
+        "turn"
+      ],
+      "properties": {
+        "history": {
+          "description": "Conversation so far. Bounded by [`MAX_HISTORY_TURNS`].",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ConversationTurn"
+          }
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "user_turn_needed"
+          ]
+        },
+        "scenario_id": {
+          "description": "Scenario the user is currently progressing.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ScenarioId"
+            }
+          ]
+        },
+        "turn": {
+          "description": "Zero-indexed turn cursor.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Server scored the scenario and advanced.",
+      "type": "object",
+      "required": [
+        "kind",
+        "scenario_id"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "scenario_complete"
+          ]
+        },
+        "scenario_id": {
+          "description": "The scenario that just finished.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ScenarioId"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "No more scenarios. The run is finished; results live server-side.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "run_complete"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "definitions": {
+    "ConversationTurn": {
+      "description": "One turn of conversation history carried by [`TurnDirective`].\n\n`wyrd-spec` cannot depend on Skald, so the protocol's history shape is intentionally minimal: plain `{role, content}` text.",
+      "type": "object",
+      "required": [
+        "content",
+        "role"
+      ],
+      "properties": {
+        "content": {
+          "description": "Verbatim turn content.",
+          "type": "string"
+        },
+        "role": {
+          "description": "Who produced this turn.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnRole"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ScenarioId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]*$"
+    },
+    "TurnRole": {
+      "description": "Speaker role on a [`ConversationTurn`].\n\nTool and system roles stay inside the agent runtime layer; the eval protocol cares only about the user and agent dialogue.",
+      "oneOf": [
+        {
+          "description": "Human or simulated-user turn.",
+          "type": "string",
+          "enum": [
+            "user"
+          ]
+        },
+        {
+          "description": "Agent-under-test turn.",
+          "type": "string",
+          "enum": [
+            "agent"
+          ]
+        }
+      ]
+    }
+  }
+}

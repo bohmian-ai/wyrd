@@ -5,7 +5,7 @@ use wyrd_spec::envelope::CardKind;
 #[test]
 fn native_card_kind_count_is_locked() {
     assert_eq!(CardKind::native().len(), CardKind::NATIVE_COUNT);
-    assert_eq!(CardKind::NATIVE_COUNT, 19);
+    assert_eq!(CardKind::NATIVE_COUNT, 16);
     assert!(
         CardKind::native()
             .iter()
@@ -46,7 +46,10 @@ fn card_kind_schema_is_string_enum_with_all_kinds() {
     assert!(enum_values.contains(&json!("Trigger")));
     assert!(enum_values.contains(&json!("Operator")));
     assert!(enum_values.contains(&json!("External")));
-    assert_eq!(enum_values.len(), 19);
+    assert!(!enum_values.contains(&json!("Tool")));
+    assert!(!enum_values.contains(&json!("Skill")));
+    assert!(!enum_values.contains(&json!("SubAgent")));
+    assert_eq!(enum_values.len(), 16);
 }
 
 proptest! {

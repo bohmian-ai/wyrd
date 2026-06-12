@@ -14,7 +14,7 @@ default-members = [
     "crates/wyrd/wyrd-server",
     "crates/wyrd/wyrd-cli",
     "crates/wyrd/wyrd-mcp",
-    "crates/vala/wyrd-observability-server",
+    "crates/vala/vala-http",
 ]
 
 [workspace.package]
@@ -38,16 +38,22 @@ skald-agent = { path = "crates/skald/skald-agent", version = "0.0.1" }
 skald-workflow = { path = "crates/skald/skald-workflow", version = "0.0.1" }
 vala-client = { path = "crates/vala/vala-client", version = "0.0.1" }
 vala-core = { path = "crates/vala/vala-core", version = "0.0.1" }
+vala-drift = { path = "crates/vala/vala-drift", version = "0.0.1" }
+vala-eval = { path = "crates/vala/vala-eval", version = "0.0.1" }
+vala-http = { path = "crates/vala/vala-http", version = "0.0.1" }
 wyrd-observe = { path = "crates/shared/wyrd-observe", version = "0.0.1" }
 wyrd-utils = { path = "crates/shared/wyrd-utils", version = "0.0.1" }
+wyrd-version = { path = "crates/shared/wyrd-version", version = "0.0.1" }
 wyrd-test-contract-macros = { path = "crates/shared/wyrd-test-contract-macros", version = "0.0.1" }
+wyrd-error-derive = { path = "crates/shared/wyrd-error-derive", version = "0.0.1" }
 wyrd-interfaces = { path = "crates/wyrd/wyrd-interfaces", version = "0.0.1" }
 wyrd-cards = { path = "crates/wyrd/wyrd-cards", version = "0.0.1" }
 wyrd-runtime = { path = "crates/shared/wyrd-runtime", version = "0.0.1" }
 wyrd-auth-verify = { path = "crates/shared/wyrd-auth-verify", version = "0.0.1" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "stream"] }
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "stream", "blocking"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -60,7 +66,9 @@ base64 = "0.22"
 insta = { version = "1.43", features = ["json"] }
 wiremock = "0.6"
 temp-env = "0.3"
+tempfile = "3"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+dashmap = "6.1"
 flate2 = "1.*"
 zstd = "0.13"
 walkdir = "2.*"
@@ -75,6 +83,7 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 password-hash = { version = "0.5", features = ["getrandom"] }
 secrecy = "0.10"
+subtle = "2.6"
 zeroize = "1"
 governor = "0.10"
 rand = "0.9"
@@ -94,7 +103,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
-pyo3 = { version = "0.28", features = ["abi3-py310", "chrono", "py-clone"] }
+arrow = "55"
+arrow-array = "55"
+arrow-schema = "55"
+statrs = "0.18"
+jsonpath-rust = "0.7"
+pyo3 = { version = "0.28", features = ["abi3-py310", "chrono"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

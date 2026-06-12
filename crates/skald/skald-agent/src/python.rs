@@ -295,10 +295,16 @@ impl Agent {
         // Resolution order: run(output_type=) > Agent.py_output_cls > Prompt.py_output_cls
         let call_cls = output_cls_from_py(output_type)?;
         let effective_cls = call_cls
-            .or_else(|| self.py_output_cls.as_ref().map(|c| c.clone_ref(py)))
-            .or_else(|| self.prompt.output_cls().map(|c| c.clone_ref(py)));
+            .as_ref()
+            .map(|c| c.as_ref().clone_ref(py))
+            .or_else(|| {
+                self.py_output_cls
+                    .as_ref()
+                    .map(|c| c.as_ref().clone_ref(py))
+            })
+            .or_else(|| self.prompt.output_cls().map(|c| c.as_ref().clone_ref(py)));
         if let (Some(cls), Some(map)) = (effective_cls, run.structured_output.as_ref()) {
-            run.parsed = Some(instantiate_parsed(py, &cls, &run.output, map)?);
+            run.parsed = Some(Arc::new(instantiate_parsed(py, &cls, &run.output, map)?));
         }
 
         Ok(Py::new(py, run)?.into_any())
@@ -921,7 +927,7 @@ fn extract_agent_run_replacement(value: &Bound<'_, PyAny>) -> PyResult<AgentRun>
 ///
 /// Does NOT extract a schema from the class. Schema must already be set on
 /// the Prompt via `Prompt(output=...)` or in the YAML card spec.
-fn output_cls_from_py(value: Option<&Bound<'_, PyAny>>) -> AgentPyResult<Option<Py<PyAny>>> {
+fn output_cls_from_py(value: Option<&Bound<'_, PyAny>>) -> AgentPyResult<Option<Arc<Py<PyAny>>>> {
     let Some(value) = value.filter(|v| !v.is_none()) else {
         return Ok(None);
     };
@@ -933,7 +939,7 @@ fn output_cls_from_py(value: Option<&Bound<'_, PyAny>>) -> AgentPyResult<Option<
             },
         ));
     }
-    Ok(Some(value.clone().unbind()))
+    Ok(Some(Arc::new(value.clone().unbind())))
 }
 
 /// Instantiate a typed model from the agent's raw output text and structured map.

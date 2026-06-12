@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutionPlan",
+  "description": "Topologically sorted task DAG.\n\nStages are produced in dependency-layer order. Stage 0 contains all tasks with no dependencies. Each later stage contains tasks whose dependencies were all emitted by earlier stages.",
+  "type": "object",
+  "required": [
+    "stages",
+    "task_count"
+  ],
+  "properties": {
+    "stages": {
+      "description": "Topological execution layers in dependency order.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Stage"
+      }
+    },
+    "task_count": {
+      "description": "Total task count across all stages. Equals `tasks.len()` from the input map.",
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "Stage": {
+      "description": "One topological execution layer.\n\nTasks within a stage are independent and may execute in parallel.",
+      "type": "object",
+      "required": [
+        "index",
+        "tasks"
+      ],
+      "properties": {
+        "index": {
+          "description": "Zero-based topological layer index.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tasks": {
+          "description": "Task ids in this stage, sorted lexicographically for determinism.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TaskId"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "TaskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]*$"
+    }
+  }
+}

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
@@ -76,14 +77,11 @@ impl ModelInterfaceHandle {
     /// Returns a public Wyrd error when the model object is not supported or
     /// type metadata cannot be inspected.
     pub fn from_raw(py: Python<'_>, model: &Bound<'_, PyAny>) -> CardPyResult<Self> {
-        let model_py = model.clone().unbind();
-        let model_subtype = Some(crate::model::interfaces::helpers::qualname_of(
-            py,
-            model_py.bind(py),
-        )?);
+        let model_py = Arc::new(model.clone().unbind());
+        let model_subtype = Some(crate::model::interfaces::helpers::qualname_of(py, model)?);
         match detect_interface_variant(py, model)? {
             ModelInterfaceKind::Huggingface => Ok(Self::Huggingface(HuggingfaceInterface {
-                model: Some(model_py),
+                model: Some(Arc::clone(&model_py)),
                 processor: None,
                 framework_version: package_version(py, "transformers"),
                 model_subtype,
@@ -92,46 +90,46 @@ impl ModelInterfaceHandle {
                 revision: None,
             })),
             ModelInterfaceKind::Lightning => Ok(Self::Lightning(LightningInterface {
-                model: Some(model_py),
+                model: Some(Arc::clone(&model_py)),
                 trainer: None,
                 preprocessor: None,
                 framework_version: package_version(py, "pytorch-lightning"),
                 model_subtype,
             })),
             ModelInterfaceKind::Torch => Ok(Self::Torch(TorchInterface {
-                model: Some(model_py),
+                model: Some(Arc::clone(&model_py)),
                 preprocessor: None,
                 framework_version: package_version(py, "torch"),
                 model_subtype,
                 save_format: TorchSaveFormat::Pickle,
             })),
             ModelInterfaceKind::Tensorflow => Ok(Self::Tensorflow(TensorflowInterface {
-                model: Some(model_py),
+                model: Some(Arc::clone(&model_py)),
                 preprocessor: None,
                 framework_version: package_version(py, "tensorflow"),
                 model_subtype,
                 save_format: TfSaveFormat::Keras,
             })),
             ModelInterfaceKind::Xgboost => Ok(Self::Xgboost(XgboostInterface {
-                model: Some(model_py),
+                model: Some(Arc::clone(&model_py)),
                 preprocessor: None,
                 framework_version: package_version(py, "xgboost"),
                 model_subtype,
             })),
             ModelInterfaceKind::Lightgbm => Ok(Self::Lightgbm(LightgbmInterface {
-                model: Some(model_py),
+                model: Some(Arc::clone(&model_py)),
                 preprocessor: None,
                 framework_version: package_version(py, "lightgbm"),
                 model_subtype,
             })),
             ModelInterfaceKind::Catboost => Ok(Self::Catboost(CatboostInterface {
-                model: Some(model_py),
+                model: Some(Arc::clone(&model_py)),
                 preprocessor: None,
                 framework_version: package_version(py, "catboost"),
                 model_subtype,
             })),
             ModelInterfaceKind::Sklearn => Ok(Self::Sklearn(SklearnInterface {
-                model: Some(model_py),
+                model: Some(Arc::clone(&model_py)),
                 preprocessor: None,
                 framework_version: package_version(py, "scikit-learn"),
                 model_subtype,
@@ -197,14 +195,14 @@ impl ModelInterfaceHandle {
     #[must_use]
     pub fn model_ref(&self) -> Option<&Py<PyAny>> {
         match self {
-            Self::Sklearn(value) => value.model.as_ref(),
-            Self::Xgboost(value) => value.model.as_ref(),
-            Self::Lightgbm(value) => value.model.as_ref(),
-            Self::Catboost(value) => value.model.as_ref(),
-            Self::Torch(value) => value.model.as_ref(),
-            Self::Lightning(value) => value.model.as_ref(),
-            Self::Tensorflow(value) => value.model.as_ref(),
-            Self::Huggingface(value) => value.model.as_ref(),
+            Self::Sklearn(value) => value.model.as_deref(),
+            Self::Xgboost(value) => value.model.as_deref(),
+            Self::Lightgbm(value) => value.model.as_deref(),
+            Self::Catboost(value) => value.model.as_deref(),
+            Self::Torch(value) => value.model.as_deref(),
+            Self::Lightning(value) => value.model.as_deref(),
+            Self::Tensorflow(value) => value.model.as_deref(),
+            Self::Huggingface(value) => value.model.as_deref(),
             Self::Subclass(_) => None,
         }
     }

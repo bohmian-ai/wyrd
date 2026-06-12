@@ -141,3 +141,5 @@ CREATE INDEX platform_audit_log_by_actor
 CREATE INDEX platform_audit_log_by_target
     ON platform.audit_log (target, created_at DESC);
 
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA platform, wyrd TO wyrd_platform_admin;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA wyrd TO wyrd_app;

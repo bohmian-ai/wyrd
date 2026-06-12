@@ -17,6 +17,10 @@ pub enum WyrdErrorVariant {
     AgentToolArgs,
     /// Prompt rendering or shaping failed.
     AgentPrompt,
+    /// Structured response decoding failed.
+    AgentStructuredDecode,
+    /// Agent constructor or method argument was invalid.
+    AgentInvalidArgument,
     /// Loop history included a message for another provider family.
     AgentLoopMessageType,
     /// Agent hit its iteration cap.
@@ -48,6 +52,8 @@ impl WyrdErrorVariant {
             Self::AgentDelegationDepth => "WYRD_AGENT_412_DELEGATION_DEPTH".to_owned(),
             Self::AgentToolArgs => "WYRD_AGENT_422_TOOL_ARGS".to_owned(),
             Self::AgentPrompt => "WYRD_AGENT_422_PROMPT".to_owned(),
+            Self::AgentStructuredDecode => "WYRD_AGENT_422_STRUCTURED_DECODE".to_owned(),
+            Self::AgentInvalidArgument => "WYRD_AGENT_422_INVALID_ARGUMENT".to_owned(),
             Self::AgentLoopMessageType => WyrdError::AgentLoopMessageType {
                 message: String::new(),
                 details: serde_json::Value::Null,
@@ -85,6 +91,8 @@ pub fn map_skald_code(code: &str) -> Option<WyrdErrorVariant> {
         "SKALD_AGENT_412_DELEGATION_DEPTH" => Some(WyrdErrorVariant::AgentDelegationDepth),
         "SKALD_AGENT_422_TOOL_ARGS" => Some(WyrdErrorVariant::AgentToolArgs),
         "SKALD_AGENT_422_PROMPT" => Some(WyrdErrorVariant::AgentPrompt),
+        "SKALD_AGENT_422_STRUCTURED_DECODE" => Some(WyrdErrorVariant::AgentStructuredDecode),
+        "SKALD_AGENT_422_INVALID_ARGUMENT" => Some(WyrdErrorVariant::AgentInvalidArgument),
         "SKALD_AGENT_422_LOOP_MESSAGE_TYPE" => Some(WyrdErrorVariant::AgentLoopMessageType),
         "SKALD_AGENT_500_CALLBACK_PANIC" => Some(WyrdErrorVariant::AgentCallbackPanic),
         "SKALD_AGENT_500_JOURNAL" => Some(WyrdErrorVariant::AgentJournalAppend),
@@ -147,6 +155,16 @@ mod tests {
             "SKALD_AGENT_422_PROMPT",
             WyrdErrorVariant::AgentPrompt,
             "WYRD_AGENT_422_PROMPT",
+        ),
+        (
+            "SKALD_AGENT_422_STRUCTURED_DECODE",
+            WyrdErrorVariant::AgentStructuredDecode,
+            "WYRD_AGENT_422_STRUCTURED_DECODE",
+        ),
+        (
+            "SKALD_AGENT_422_INVALID_ARGUMENT",
+            WyrdErrorVariant::AgentInvalidArgument,
+            "WYRD_AGENT_422_INVALID_ARGUMENT",
         ),
         (
             "SKALD_AGENT_422_LOOP_MESSAGE_TYPE",

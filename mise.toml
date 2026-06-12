@@ -231,13 +231,15 @@ description = "Audit unwrap/expect calls outside tests and examples"
 run = "python scripts/check_unwrap_audit.py"
 
 [tasks."check:error-coverage"]
-description = "Assert emitted Skald error codes are mapped for observability"
+description = "Assert emitted Skald error codes are mapped and SQL errors have coverage"
 run = """
 set -eu
 
 emitted=$(mktemp)
 mapped=$(mktemp)
-trap 'rm -f "$emitted" "$mapped"' EXIT
+sql_emitted=$(mktemp)
+sql_tested=$(mktemp)
+trap 'rm -f "$emitted" "$mapped" "$sql_emitted" "$sql_tested"' EXIT
 
 {
   rg --no-filename -oN 'SKALD_AGENT_[0-9]{3}_[A-Z_]+' crates/skald/skald-agent/src || true
@@ -246,14 +248,31 @@ trap 'rm -f "$emitted" "$mapped"' EXIT
 } | sort -u > "$emitted"
 
 rg --no-filename -oN 'SKALD_(AGENT|SESSION|WORKFLOW)_[0-9]{3}_[A-Z_]+' \
-  crates/wyrd/wyrd-observe/src/error_map.rs \
+  crates/shared/wyrd-observe/src/error_map.rs \
   | sort -u > "$mapped"
 
 if comm -23 "$emitted" "$mapped" | rg .; then
   echo 'Observed Skald error map is missing emitted source codes'
   exit 1
 fi
+
+rg --no-filename -oN 'WYRD_SQL_[0-9]{3}_[A-Z_]+' \
+  crates/wyrd/wyrd-sql/src/error.rs \
+  | sort -u > "$sql_emitted"
+
+sed -n '/#\\[cfg(test)\\]/,$p' crates/wyrd/wyrd-sql/src/error.rs \
+  | rg --no-filename -oN 'WYRD_SQL_[0-9]{3}_[A-Z_]+' \
+  | sort -u > "$sql_tested"
+
+if comm -23 "$sql_emitted" "$sql_tested" | rg .; then
+  echo 'SQL error coverage is missing stable WYRD_SQL_* codes'
+  exit 1
+fi
 """
+
+[tasks."check:tenant-isolation"]
+description = "Assert SQL foundation tenant isolation and server-tier boundaries"
+run = "python scripts/check_tenant_isolation.py"
 
 [tasks."check:test-contracts"]
 description = "Verify Wyrd critical Rust contracts have explicit Python test markers"
@@ -479,7 +498,7 @@ diff -u "$BEFORE" "$AFTER" \
 
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
-depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:error-coverage", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
+depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
 
 [tasks."dev:pg:nuke"]
 description = "Wipe embedded pg cache"

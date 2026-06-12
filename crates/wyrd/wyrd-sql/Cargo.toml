@@ -8,8 +8,12 @@ repository = { workspace = true }
 authors = { workspace = true }
 
 [dependencies]
+pg-embed = { workspace = true }
+rand = { workspace = true }
+secrecy = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

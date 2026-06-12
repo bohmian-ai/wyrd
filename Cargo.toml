@@ -75,6 +75,7 @@ secrecy = "0.10"
 zeroize = "1"
 governor = "0.10"
 rand = "0.9"
+pg-embed = { version = "1.0.0", default-features = false, features = ["rt_tokio"] }
 url = "2"
 urlencoding = "2"
 httpdate = "1"

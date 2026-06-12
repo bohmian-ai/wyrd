@@ -4,6 +4,10 @@
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+pub mod postgres_boot;
+
+use postgres_boot::PoolConfig;
+
 /// SQL storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
@@ -34,6 +38,20 @@ impl SqlStore {
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .connect(database_url)
+            .await
+            .map_err(SqlError::Connect)?;
+        Ok(Self { pool })
+    }
+
+    /// Connect to Postgres with role-specific pool configuration.
+    ///
+    /// This does not run migrations.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Connect`] when the DSN cannot be parsed or the
+    /// database connection fails.
+    pub async fn connect_with(database_url: &str, config: PoolConfig) -> Result<Self, SqlError> {
+        let pool = postgres_boot::connect_pool(database_url, config)
             .await
             .map_err(SqlError::Connect)?;
         Ok(Self { pool })

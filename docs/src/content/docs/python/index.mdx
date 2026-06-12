@@ -149,6 +149,12 @@ restored.load(path)
 Override `from_metadata(cls, metadata)` when your subclass needs serialized
 metadata to reconstruct configuration before `load(path)`.
 
+## Configure transports
+
+`wyrd-client` ships observations and records to a Wyrd server through a
+transport. See [Transports](/transports/) for the configuration surface:
+gRPC (default), HTTP, Mock, queue policy, and credential management.
+
 ## Common failures
 
 | Failure | Fix |

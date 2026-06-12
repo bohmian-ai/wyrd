@@ -31,6 +31,7 @@ use wyrd_spec::card::workflow::WorkflowSpec;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::run::{RunKind, RunRef};
+use wyrd_spec::security::{SecretRef, TlsConfig};
 use wyrd_spec::vala::eval::{
     AgentTurnSubmission, ComparisonOperator, ConversationTurn, DagError, EvalCondition,
     EvalPassGate, EvalRecordObservation, EvalRunOpenRequest, EvalRunOpenResponse, EvalSampling,
@@ -99,6 +100,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<ArtifactSpec>(out, golden, "artifact_spec")?;
     write::<FrameworkAdapterRef>(out, golden, "framework_adapter_ref")?;
 
+    // Phase 4 section 16: shared security primitives.
+    write::<SecretRef>(out, golden, "security_secret_ref")?;
+    write::<TlsConfig>(out, golden, "security_tls_config")?;
     let eval_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/eval/schemas");
     fs::create_dir_all(eval_fixtures)?;
     write_fixture::<EvalSpec>(eval_fixtures, "eval_spec")?;

@@ -22,6 +22,26 @@ name = "tracing_stdout"
 path = "tracing_stdout.rs"
 
 [[bin]]
+name = "transport_grpc"
+path = "transport_grpc.rs"
+
+[[bin]]
+name = "transport_http"
+path = "transport_http.rs"
+
+[[bin]]
+name = "transport_mock"
+path = "transport_mock.rs"
+
+[[bin]]
+name = "transport_queue_policy"
+path = "transport_queue_policy.rs"
+
+[[bin]]
+name = "transport_secrets"
+path = "transport_secrets.rs"
+
+[[bin]]
 name = "workflow_anthropic"
 path = "workflow_anthropic.rs"
 
@@ -74,4 +94,6 @@ skald-tool = { workspace = true }
 skald-workflow = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wyrd = { path = "../../crates/wyrd/wyrd", features = ["otel"] }
+wyrd-client = { workspace = true }
 wyrd-observe = { workspace = true, features = ["otel"] }
+wyrd-spec = { workspace = true }

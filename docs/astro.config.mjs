@@ -143,6 +143,19 @@ export default defineConfig({
           ],
         },
         {
+          label: "Transports",
+          collapsed: false,
+          items: [
+            { label: "Overview", link: "/transports/" },
+            { label: "gRPC", link: "/transports/grpc/" },
+            { label: "HTTP", link: "/transports/http/" },
+            { label: "Mock", link: "/transports/mock/" },
+            { label: "Queue policy", link: "/transports/queue-policy/" },
+            { label: "Secrets and TLS", link: "/transports/secrets-and-tls/" },
+            { label: "Troubleshooting", link: "/transports/troubleshooting/" },
+          ],
+        },
+        {
           label: "API reference",
           collapsed: true,
           items: [

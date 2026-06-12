@@ -21,6 +21,7 @@ pub mod reference;
 pub mod request_id;
 pub mod run;
 pub mod schema;
+pub mod security;
 pub mod storage;
 pub mod trace;
 pub mod vala;
@@ -50,4 +51,7 @@ pub use metadata::{
     MetadataError,
 };
 pub use reference::AgentRef;
+#[cfg(any(test, feature = "test-utils"))]
+pub use security::InlineSecret;
+pub use security::{SecretRef, SecretRefError, TlsConfig};
 pub use skald_spec::{MessageNum, Prompt, ProviderRequest, ProviderResponse, ResponseType};

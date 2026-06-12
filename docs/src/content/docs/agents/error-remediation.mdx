@@ -52,6 +52,29 @@ All Wyrd errors follow RFC 9457 Problem Details with Wyrd extensions. A policy-d
 - When `remediation` is present, include it verbatim in any human-readable output or escalation.
 - Keep retries bounded and tied to idempotent operations only. Check the `code` before retrying.
 - Preserve `request_id` and `trace_id` in any escalation or support request.
+- For `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED`, the
+  `context.required_feature` names the Cargo feature that would
+  re-enable the transport. The remediation is a build-time fix, not a
+  retry path. Note: this error code is not yet emitted — it lands in
+  PR4.0 when `WyrdClient::new()` is implemented.
+- For `WYRD_CLIENT_400_CONFIG_INVALID`, the `context.field` and
+  `context.reason` name the offending config field and the rule it
+  failed. Fix the field on the config object and reconstruct the
+  client. Not a retry path.
+- For `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE`, the `context.transport`
+  names the wire transport that rejected the body. The remediation is
+  to lower `QueueConfig.flush_max_rows` so the next batched body fits
+  under the server's request size limit. Records remain buffered;
+  re-flush after the config change.
+- For `WYRD_CLIENT_503_TRANSPORT_DOWN`, the `context.transport` names
+  the unavailable transport. Buffered records remain in the queue;
+  retry the flush after the underlying network or server health
+  recovers. Apply exponential backoff between retries.
+- For `WYRD_CLIENT_504_FLUSH_TIMEOUT`, the `context.transport` and
+  `context.timeout_ms` describe the deadline that fired. Buffered
+  records remain queued. Retry once; if the timeout persists, raise the
+  per-call timeout (`GrpcConfig.timeout_ms` / `HttpConfig.timeout_ms`)
+  or investigate server latency.
 
 ## What agents must not do
 

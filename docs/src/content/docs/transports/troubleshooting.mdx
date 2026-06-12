@@ -1,0 +1,109 @@
+---
+title: Troubleshooting transports
+description: Read transport feature-disabled errors, config validation failures, and flush-time errors from wyrd-client.
+---
+
+# Troubleshooting transports
+
+Every public error from the transport surface carries a stable code. Match
+on the code, not the message.
+
+## Feature disabled
+
+```text
+WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED
+title: Selected transport variant is not compiled into this build
+remediation: Rebuild wyrd-client with the transport-<name> Cargo feature
+             enabled, or switch the TransportConfig variant to one that is
+             compiled in.
+```
+
+> **Note**: This error code is not yet emitted. It lands in PR4.0 section 22
+> when `WyrdClient::new()` is implemented. The payload shape described here
+> is the committed design.
+
+The runtime client constructor raises this when the active build does not
+include the selected variant's driver. The error payload carries
+`transport` (for example, `"http"`) and `required_feature` (for example,
+`"transport-http"`).
+
+| Variant | Cargo feature | Default? |
+|---|---|---|
+| `Grpc` | `transport-grpc` | yes |
+| `Http` | `transport-http` | yes |
+| `Mock` | (none) | always available |
+
+**Fix:** rebuild with the missing feature, or switch the variant.
+
+## Config validation
+
+Transport config validation errors all carry the client catalog code:
+
+```text
+WYRD_CLIENT_400_CONFIG_INVALID
+title: Client transport configuration failed validation
+remediation: Inspect the `field` and `reason` payload; fix the offending
+             config field (GrpcConfig, HttpConfig, MockConfig, or
+             QueueConfig) and reconstruct the client.
+```
+
+The `field` payload names the dotted-path field and the `reason` payload
+names the rule it failed. Common transport cases:
+
+| `field` | `reason` | What to do |
+|---|---|---|
+| `grpc_config.endpoint` | `must not be empty` | Set a real endpoint; `http://host:port` or `https://host:port`. |
+| `grpc_config.timeout_ms` | `must be at least 1` | `0` is not a valid per-call timeout. Use `30_000` if you have no better number. |
+| `http_config.base_url` | `must not be empty` | Set a real base URL. Do not include the ingest route -- it is appended. |
+| `http_config.timeout_ms` | `must be at least 1` | `0` is not a valid per-request timeout. Use `30_000` if you have no better number. |
+| `queue_config.flush_max_rows` | `must be >= 1` | `0` disables flushing entirely; set a real cap. |
+| `queue_config.flush_interval_ms` | `must be >= 1` | Same. `0` means "never flush by interval", which is not a supported policy. |
+| `queue_config.channel_capacity` | `must be >= 1` | A zero-capacity channel deadlocks the producer. |
+| `queue_config.sample_ratio` | `must be in [0.0, 1.0], got <value>` | Out of range, infinite, or NaN. Use `None` to disable sampling. |
+
+`WYRD_SPEC_400_VALIDATION` is a different code -- reserved for
+`wyrd-spec` contract violations (cards, specs, security refs). It does
+not surface from transport config validation.
+
+## Flush-time errors
+
+Errors returned by `Flushable::flush` carry the typed `WyrdClientError`
+enum and resolve to public catalog codes at the boundary:
+
+| Rust variant | Public code | Meaning |
+|---|---|---|
+| `WyrdClientError::Config { field, reason }` | `WYRD_CLIENT_400_CONFIG_INVALID` | A validation rule fired late (for example, dynamic config change). |
+| `WyrdClientError::TransportDown { transport, message }` | `WYRD_CLIENT_503_TRANSPORT_DOWN` | DNS, TCP, or gRPC/HTTP connect failure. Records remain buffered. |
+| `WyrdClientError::PayloadTooLarge { transport, message }` | `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE` | Lower `flush_max_rows` to reduce body size. |
+| `WyrdClientError::FlushTimeout { transport, timeout_ms }` | `WYRD_CLIENT_504_FLUSH_TIMEOUT` | Server slow or unreachable. Buffered records will be re-sent on the next flush. |
+
+After any `Err`, `Flushable::len()` reflects the records that were not
+successfully flushed. Wyrd never silently drops on a failed flush.
+
+### Transport down
+
+`WYRD_CLIENT_503_TRANSPORT_DOWN` is raised when DNS resolution, TCP
+connect, or the gRPC / HTTP connect handshake fails before any bytes
+reach the server. Buffered records remain queued. Retry the flush after
+the network or server recovers; apply exponential backoff between
+retries.
+
+### Payload too large
+
+`WYRD_CLIENT_413_PAYLOAD_TOO_LARGE` is raised when the server rejects
+the batched body for exceeding its request size limit. Buffered records
+remain queued. Lower `QueueConfig.flush_max_rows` so the next batched
+body fits under the server's limit, then re-flush.
+
+### Flush timeout
+
+`WYRD_CLIENT_504_FLUSH_TIMEOUT` is raised when the per-call deadline
+(`GrpcConfig.timeout_ms` / `HttpConfig.timeout_ms`) fires before the
+wire call returns. Buffered records remain queued. Retry once; if the
+timeout persists, raise the timeout configuration or investigate
+server-side latency.
+
+## Read next
+
+- [Errors](/api/errors/) -- full public catalog.
+- [Agent error remediation](/agents/error-remediation/) -- agent-facing rules for handling Wyrd errors.

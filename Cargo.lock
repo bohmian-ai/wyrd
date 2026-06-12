@@ -4635,6 +4635,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vala-core"
+version = "0.0.1"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "wyrd-spec",
+]
+
+[[package]]
 name = "vala-drift"
 version = "0.0.1"
 dependencies = [
@@ -5392,6 +5403,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-client"
+version = "0.0.1"
+dependencies = [
+ "pyo3",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "wyrd-spec",
+]
+
+[[package]]
 name = "wyrd-crypt"
 version = "0.0.1"
 dependencies = [
@@ -5497,7 +5521,9 @@ dependencies = [
  "skald-workflow",
  "tokio",
  "wyrd",
+ "wyrd-client",
  "wyrd-observe",
+ "wyrd-spec",
 ]
 
 [[package]]

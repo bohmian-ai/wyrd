@@ -1,0 +1,30 @@
+[package]
+name = "wyrd-client"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "External Wyrd client transport runtime."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["transport-grpc", "transport-http"]
+transport-grpc = []
+transport-http = []
+python = ["dep:pyo3"]
+
+[dependencies]
+pyo3 = { workspace = true, optional = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+wyrd-spec = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

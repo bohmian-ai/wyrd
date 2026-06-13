@@ -79,10 +79,10 @@ impl<'de> Deserialize<'de> for ProviderRequest {
         // dependable fallback. Deriving `Deserialize` directly would ask
         // `Box<RawValue>` to deserialize from any JSON value and can make
         // fallback behavior hard to reason about as typed variants evolve.
-        if value.get("max_tokens").is_some() {
-            if let Ok(request) = serde_json::from_value::<AnthropicMessagesRequest>(value.clone()) {
-                return Ok(Self::AnthropicMessage(request));
-            }
+        if value.get("max_tokens").is_some()
+            && let Ok(request) = serde_json::from_value::<AnthropicMessagesRequest>(value.clone())
+        {
+            return Ok(Self::AnthropicMessage(request));
         }
         if let Ok(request) = serde_json::from_value::<OpenAiChatRequest>(value.clone()) {
             return Ok(Self::OpenAiChatCompletion(request));

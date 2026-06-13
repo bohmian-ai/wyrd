@@ -495,7 +495,11 @@ fn uri_has_embedded_credentials(uri: &str) -> bool {
         .replace("%40", "@")
         .replace("%3A", ":")
         .replace("%3a", ":");
-    decoded.contains('@') && decoded.split('@').next().is_some_and(|info| info.contains(':'))
+    decoded.contains('@')
+        && decoded
+            .split('@')
+            .next()
+            .is_some_and(|info| info.contains(':'))
 }
 
 /// Source validation failures.

@@ -46,13 +46,13 @@ impl Observer for TokenCounter {
         if synthetic {
             return;
         }
-        if let ProviderResponse::OpenAiChatCompletion(response) = response {
-            if let Some(usage) = &response.usage {
-                self.tokens_in
-                    .fetch_add(usage.prompt_tokens, Ordering::Relaxed);
-                self.tokens_out
-                    .fetch_add(usage.completion_tokens, Ordering::Relaxed);
-            }
+        if let ProviderResponse::OpenAiChatCompletion(response) = response
+            && let Some(usage) = &response.usage
+        {
+            self.tokens_in
+                .fetch_add(usage.prompt_tokens, Ordering::Relaxed);
+            self.tokens_out
+                .fetch_add(usage.completion_tokens, Ordering::Relaxed);
         }
     }
 }

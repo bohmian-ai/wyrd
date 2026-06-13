@@ -1,0 +1,115 @@
+---
+title: Postgres setup
+description: Configure Wyrd's Postgres roles, DSNs, migrations, and pool tuning.
+---
+
+# Postgres setup
+
+Wyrd uses one PostgreSQL database per deploy and three login roles. The role
+split is part of the tenant-isolation contract: boot-time DDL uses a short-lived
+migrator pool, runtime requests use an RLS-bound app pool, and audited
+cross-tenant operations use an optional platform-admin pool.
+
+## Deployment modes
+
+| Mode | Required DSNs | Behavior |
+| --- | --- | --- |
+| Embedded local Postgres | none | Wyrd starts managed Postgres, provisions all three roles, runs migrations, then builds runtime pools. |
+| External Postgres | `WYRD_DATABASE_URL`, `WYRD_DATABASE_URL_MIGRATOR` | Infrastructure must provision roles before Wyrd starts. |
+| Dedicated external Postgres | `WYRD_DATABASE_URL`, `WYRD_DATABASE_URL_MIGRATOR` | `WYRD_DATABASE_URL_PLATFORM_ADMIN` may be unset; platform-admin routes must fail closed instead of using the app pool. |
+
+Mixed DSN configuration is rejected. Set both app and migrator DSNs for
+external Postgres, optionally set the platform-admin DSN, or leave all three
+unset for embedded local Postgres.
+
+## Roles
+
+| Role | Uses | RLS posture |
+| --- | --- | --- |
+| `wyrd_migrator` | Boot-only schema migrations and grants. The pool is closed before runtime state exists. | `BYPASSRLS` |
+| `wyrd_app` | Runtime HTTP, MCP, worker, and tenant-scoped Vala/Wyrd queries. | RLS applies |
+| `wyrd_platform_admin` | Audited cross-tenant support and platform operations. Optional in dedicated deployments. | `BYPASSRLS` |
+
+Runtime tenant-scoped operations use `TenantConn`, which opens a transaction on
+the `wyrd_app` pool and binds `app.current_tenant` with `set_config(..., true)`.
+That binding is transaction-local and disappears at commit or rollback.
+
+## External bootstrap
+
+For external Postgres, run
+`crates/wyrd/wyrd-sql/bootstrap/roles.sql` as a cluster superuser before Wyrd
+starts. The migration path does not create roles; it validates that all three
+roles exist with the expected `BYPASSRLS` bits and fails early when bootstrap is
+incomplete.
+
+Before running `roles.sql`, substitute the three `REPLACE_WITH_WYRD_*_PASSWORD`
+placeholders with values from your deploy secret store. For example, using `sed`:
+
+```bash
+sed \
+  -e "s/REPLACE_WITH_WYRD_MIGRATOR_PASSWORD/$WYRD_MIGRATOR_PASSWORD/g" \
+  -e "s/REPLACE_WITH_WYRD_APP_PASSWORD/$WYRD_APP_PASSWORD/g" \
+  -e "s/REPLACE_WITH_WYRD_PLATFORM_ADMIN_PASSWORD/$WYRD_PLATFORM_ADMIN_PASSWORD/g" \
+  crates/wyrd/wyrd-sql/bootstrap/roles.sql | psql -U postgres
+```
+
+Do not commit substituted files. Run the substitution in-memory or pipe it
+directly to `psql` as shown above.
+
+The three DSNs map to distinct code paths:
+
+| Env var | Role | Code path |
+| --- | --- | --- |
+| `WYRD_DATABASE_URL` | `wyrd_app` | Runtime tenant-scoped queries and the hardened slug-to-tenant resolver. |
+| `WYRD_DATABASE_URL_MIGRATOR` | `wyrd_migrator` | Boot migrations only. |
+| `WYRD_DATABASE_URL_PLATFORM_ADMIN` | `wyrd_platform_admin` | Optional audited platform-admin routes. |
+
+## Boot order
+
+Wyrd server boot follows one sequence:
+
+1. Resolve DSNs from environment, or start embedded Postgres when all three are unset.
+2. Build the `wyrd_migrator` pool.
+3. Run `wyrd-sql` migrations.
+4. Run `vala-sql` migrations.
+5. Close the migrator pool.
+6. Build the runtime `wyrd_app` pool and optional `wyrd_platform_admin` pool.
+7. Assemble `AppState { pool, platform_admin_pool }`.
+
+The migrator DSN should connect directly to Postgres. Do not route migrations
+through transaction-mode PgBouncer because migrator setup uses a session-level
+`search_path` on a dedicated connection.
+
+## Pool tuning
+
+Unsuffixed variables tune the runtime `wyrd_app` pool. Add `_MIGRATOR` or
+`_PLATFORM_ADMIN` to tune the other roles. Missing suffixed values fall back to
+that role's defaults, not the app pool values.
+
+| Variable | Meaning |
+| --- | --- |
+| `WYRD_DB_MAX_CONNECTIONS` | Maximum pool connections. |
+| `WYRD_DB_MIN_CONNECTIONS` | Warm idle connections. |
+| `WYRD_DB_ACQUIRE_TIMEOUT_SECS` | Time to wait for an available connection. |
+| `WYRD_DB_IDLE_TIMEOUT_SECS` | Idle reaping timeout; use `off` to disable. |
+| `WYRD_DB_MAX_LIFETIME_SECS` | Connection lifetime; use `off` to disable. |
+| `WYRD_DB_STATEMENT_CACHE_CAPACITY` | SQLx statement cache capacity. Set to `0` behind transaction-mode PgBouncer. |
+| `WYRD_DB_TEST_BEFORE_ACQUIRE` | Whether SQLx checks a connection before reuse. |
+
+Budget connections with:
+
+```text
+pods * (app_max + platform_admin_max) + migrator_max <= pg.max_connections - reserved
+```
+
+Reserve at least ten Postgres connections for administration and extensions.
+
+## Common failures
+
+| Failure | Meaning | Fix |
+| --- | --- | --- |
+| `MixedDsnConfig` | Only one of the required external DSNs was set, or the admin DSN was set without app and migrator DSNs. | Set app and migrator DSNs together, or unset all three for embedded mode. |
+| Role validation failure during migration | External bootstrap did not create roles or set the expected `BYPASSRLS` posture. | Re-run the role bootstrap as a superuser and verify role metadata. |
+| `permission denied` on tenant writes | Runtime is not using the expected role or grants are missing. | Check the app DSN role and rerun migrations after role bootstrap is fixed. |
+| Missing `app.current_tenant` or invalid UUID | A tenant-scoped query bypassed `TenantConn`. | Route the operation through the tenant resolver and `TenantConn`. |
+| Platform-admin route unavailable | `WYRD_DATABASE_URL_PLATFORM_ADMIN` is unset in a dedicated deployment. | Configure the platform-admin DSN only when the audited cross-tenant surface should be enabled. |

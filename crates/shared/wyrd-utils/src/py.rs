@@ -199,17 +199,15 @@ pub fn py_err_to_wyrd_error(py: Python<'_>, error: PyErr) -> SpecWyrdError {
             .unwrap_or_else(|_| error.to_string());
         return wyrd_error_from_python_code(code, message);
     }
-    if let Ok(args_obj) = value.getattr("args") {
-        if let Ok(args) = args_obj.cast::<PyTuple>() {
-            if args.len() >= 2 {
-                if let (Ok(code), Ok(message)) = (
-                    args.get_item(0).and_then(|item| item.extract::<String>()),
-                    args.get_item(1).and_then(|item| item.extract::<String>()),
-                ) {
-                    return wyrd_error_from_python_code(code, message);
-                }
-            }
-        }
+    if let Ok(args_obj) = value.getattr("args")
+        && let Ok(args) = args_obj.cast::<PyTuple>()
+        && args.len() >= 2
+        && let (Ok(code), Ok(message)) = (
+            args.get_item(0).and_then(|item| item.extract::<String>()),
+            args.get_item(1).and_then(|item| item.extract::<String>()),
+        )
+    {
+        return wyrd_error_from_python_code(code, message);
     }
     let type_name = error
         .get_type(py)

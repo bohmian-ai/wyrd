@@ -1,0 +1,18 @@
+[package]
+name = "vala-sql"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "Server-tier SQL migrations for Vala observability storage."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+sqlx = { workspace = true }
+tracing = { workspace = true }
+wyrd-sql = { path = "../../wyrd/wyrd-sql", version = "0.0.1" }

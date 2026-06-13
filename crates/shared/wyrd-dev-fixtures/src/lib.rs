@@ -1,4 +1,7 @@
 //! Development fixture crate.
 //!
-//! Stage 0 keeps SQL ownership in `wyrd-sql`; this crate intentionally carries
-//! no database dependencies.
+//! SQL fixtures are feature-gated so non-Postgres fixture users do not pull in
+//! embedded database dependencies.
+
+#[cfg(feature = "pg")]
+pub mod pg;

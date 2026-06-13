@@ -118,6 +118,13 @@ export default defineConfig({
           ],
         },
         {
+          label: "Setup",
+          collapsed: true,
+          items: [
+            { label: "Postgres", link: "/setup/postgres/" },
+          ],
+        },
+        {
           label: "Integrations",
           collapsed: true,
           items: [

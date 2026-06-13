@@ -610,17 +610,16 @@ impl_interface_methods!(HuggingfaceInterface {
         split: Option<String>,
         config: Option<String>,
     ) -> CardPyResult<(Self, DataInterface)> {
-        if let Some(revision) = revision.as_deref() {
-            if !(7..=40).contains(&revision.len())
+        if let Some(revision) = revision.as_deref()
+            && (!(7..=40).contains(&revision.len())
                 || !revision
                     .chars()
-                    .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
-            {
-                return Err(crate::error::WyrdPyError::validation_with_details(
-                    "Huggingface revision must be a lowercase hex string between 7 and 40 characters",
-                    serde_json::json!({ "revision": revision }),
-                ));
-            }
+                    .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()))
+        {
+            return Err(crate::error::WyrdPyError::validation_with_details(
+                "Huggingface revision must be a lowercase hex string between 7 and 40 characters",
+                serde_json::json!({ "revision": revision }),
+            ));
         }
         Ok((
             Self {

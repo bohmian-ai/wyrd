@@ -689,15 +689,15 @@ impl ModelCardInput {
             )?));
         }
 
-        if let Ok(interface_type) = model_or_interface.cast::<PyType>() {
-            if interface_type.is_subclass_of::<ModelInterface>()? {
-                if !allow_interface_class {
-                    return Err(WyrdPyError::model_validation(
-                        "ModelCard construction requires a raw model or initialized ModelInterface instance; pass interface classes to retrieval surfaces such as cards.get(..., interface=YourInterface)",
-                    ));
-                }
-                return Ok(Self::InterfaceClass(model_or_interface.clone().unbind()));
+        if let Ok(interface_type) = model_or_interface.cast::<PyType>()
+            && interface_type.is_subclass_of::<ModelInterface>()?
+        {
+            if !allow_interface_class {
+                return Err(WyrdPyError::model_validation(
+                    "ModelCard construction requires a raw model or initialized ModelInterface instance; pass interface classes to retrieval surfaces such as cards.get(..., interface=YourInterface)",
+                ));
             }
+            return Ok(Self::InterfaceClass(model_or_interface.clone().unbind()));
         }
 
         Ok(Self::Raw(model_or_interface.clone().unbind()))

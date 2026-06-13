@@ -43,7 +43,7 @@ pub use card::workflow::{
     WorkflowAction, WorkflowCard, WorkflowCardError, WorkflowRetryPolicy, WorkflowSpec,
     WorkflowStep, WorkflowValidationError,
 };
-pub use ids::{ColumnName, QueryName, RoleName, SplitName};
+pub use ids::{ColumnName, DataTenantId, QueryName, RoleName, SplitName, TenantSlug};
 pub use metadata::{
     AnnotationKey, AnnotationValue, Annotations, CardMetadata, LabelKey, LabelValue, Labels,
     MetadataError,

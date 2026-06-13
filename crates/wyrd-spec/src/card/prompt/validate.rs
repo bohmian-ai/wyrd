@@ -333,10 +333,10 @@ pub fn validate(spec: &PromptSpec) -> Result<(), WyrdError> {
         .into());
     }
 
-    if let skald_spec::ResponseType::JsonSchema { schema, .. } = &spec.prompt.response_type {
-        if !schema.is_object() {
-            return Err(PromptError::InvalidResponseSchema.into());
-        }
+    if let skald_spec::ResponseType::JsonSchema { schema, .. } = &spec.prompt.response_type
+        && !schema.is_object()
+    {
+        return Err(PromptError::InvalidResponseSchema.into());
     }
 
     Ok(())

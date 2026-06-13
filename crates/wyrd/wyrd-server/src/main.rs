@@ -1,4 +1,3 @@
-use axum::{Router, routing::get};
 use std::net::SocketAddr;
 
 const PORT_ENV: &str = "WYRD_SERVER_PORT";
@@ -8,11 +7,12 @@ const DEFAULT_PORT: u16 = 8080;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     enterprise_on_start();
 
+    let state = wyrd_server::build_app_state().await?;
     let port: u16 = std::env::var(PORT_ENV)
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PORT);
-    let app = Router::new().route("/healthz", get(|| async { "ok" }));
+    let app = wyrd_server::router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

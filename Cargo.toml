@@ -20,7 +20,7 @@ default-members = [
 version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.87.0"
+rust-version = "1.94.0"
 repository = "https://github.com/wyrd-ai/wyrd"
 authors = ["Thorrester <sjforrester32@gmail.com>"]
 
@@ -75,6 +75,7 @@ secrecy = "0.10"
 zeroize = "1"
 governor = "0.10"
 rand = "0.9"
+pg-embed = { version = "1.0.0", default-features = false, features = ["rt_tokio"] }
 url = "2"
 urlencoding = "2"
 httpdate = "1"
@@ -83,7 +84,8 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
 jsonwebtoken = "9"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "uuid", "chrono"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "macros", "migrate", "chrono", "uuid", "json"] }
+tempfile = "3"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"

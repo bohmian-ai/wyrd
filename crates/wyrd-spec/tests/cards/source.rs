@@ -262,8 +262,14 @@ fn auth_basic_round_trips() {
     spec.validate().unwrap();
     let json = serde_json::to_value(&spec).unwrap();
     assert_eq!(json["source"]["connection"]["auth"]["scheme"], "basic");
-    assert_eq!(json["source"]["connection"]["auth"]["username"], "wyrd_reader");
-    assert_eq!(json["source"]["connection"]["auth"]["password_env"], "PG_PASSWORD");
+    assert_eq!(
+        json["source"]["connection"]["auth"]["username"],
+        "wyrd_reader"
+    );
+    assert_eq!(
+        json["source"]["connection"]["auth"]["password_env"],
+        "PG_PASSWORD"
+    );
 }
 
 #[test]
@@ -286,7 +292,9 @@ fn auth_basic_rejects_empty_username() {
     };
     assert_eq!(
         auth.validate(),
-        Err(SourceValidationError::EmptyField { field: "auth.username" })
+        Err(SourceValidationError::EmptyField {
+            field: "auth.username"
+        })
     );
 }
 
@@ -310,7 +318,9 @@ fn auth_basic_rejects_empty_password_env() {
     };
     assert_eq!(
         spec.validate(),
-        Err(SourceValidationError::EmptyField { field: "auth.password_env" })
+        Err(SourceValidationError::EmptyField {
+            field: "auth.password_env"
+        })
     );
 }
 
@@ -321,7 +331,10 @@ fn auth_basic_debug_redacts_username() {
         password_env: "PG_PASSWORD".to_owned(),
     };
     let debug = format!("{auth:?}");
-    assert!(!debug.contains("john@example.com"), "username must be redacted in Debug output");
+    assert!(
+        !debug.contains("john@example.com"),
+        "username must be redacted in Debug output"
+    );
     assert!(debug.contains("[redacted]"));
     assert!(debug.contains("PG_PASSWORD"));
 }
@@ -345,7 +358,10 @@ fn auth_multi_env_round_trips() {
     spec.validate().unwrap();
     let json = serde_json::to_value(&spec).unwrap();
     assert_eq!(json["source"]["connection"]["auth"]["scheme"], "multi_env");
-    assert_eq!(json["source"]["connection"]["auth"]["vars"]["api_key"], "DD_API_KEY");
+    assert_eq!(
+        json["source"]["connection"]["auth"]["vars"]["api_key"],
+        "DD_API_KEY"
+    );
 }
 
 #[test]
@@ -356,7 +372,9 @@ fn auth_multi_env_rejects_empty_map() {
             connection: MetricsConnection::Datadog {
                 site: "datadoghq.com".to_owned(),
                 api_scopes: vec![],
-                auth: SourceAuth::MultiEnv { vars: BTreeMap::new() },
+                auth: SourceAuth::MultiEnv {
+                    vars: BTreeMap::new(),
+                },
             },
         },
         defaults: BTreeMap::new(),
@@ -384,7 +402,9 @@ fn auth_multi_env_rejects_whitespace_only_key() {
     };
     assert_eq!(
         spec.validate(),
-        Err(SourceValidationError::EmptyField { field: "auth.vars.key" })
+        Err(SourceValidationError::EmptyField {
+            field: "auth.vars.key"
+        })
     );
 }
 
@@ -405,7 +425,9 @@ fn auth_multi_env_rejects_empty_value() {
     };
     assert_eq!(
         spec.validate(),
-        Err(SourceValidationError::EmptyField { field: "auth.vars.value" })
+        Err(SourceValidationError::EmptyField {
+            field: "auth.vars.value"
+        })
     );
 }
 
@@ -430,7 +452,10 @@ fn auth_secret_store_round_trips() {
     };
     spec.validate().unwrap();
     let json = serde_json::to_value(&spec).unwrap();
-    assert_eq!(json["source"]["connection"]["auth"]["scheme"], "secret_store");
+    assert_eq!(
+        json["source"]["connection"]["auth"]["scheme"],
+        "secret_store"
+    );
     assert_eq!(json["source"]["connection"]["auth"]["provider"], "vault");
     assert_eq!(
         json["source"]["connection"]["auth"]["name"],
@@ -459,7 +484,9 @@ fn auth_secret_store_rejects_empty_provider() {
     };
     assert_eq!(
         spec.validate(),
-        Err(SourceValidationError::EmptyField { field: "auth.provider" })
+        Err(SourceValidationError::EmptyField {
+            field: "auth.provider"
+        })
     );
 }
 
@@ -502,7 +529,9 @@ fn sql_postgres_round_trips() {
                 port: Some(5432),
                 database: "telemetry".to_owned(),
                 sslmode: Some("verify-full".to_owned()),
-                auth: SourceAuth::Env { env: "PG_URI".to_owned() },
+                auth: SourceAuth::Env {
+                    env: "PG_URI".to_owned(),
+                },
             },
         },
         defaults: BTreeMap::new(),
@@ -542,7 +571,9 @@ fn metrics_cloudwatch_round_trips() {
             connection: MetricsConnection::Cloudwatch {
                 region: "us-east-1".to_owned(),
                 namespace: Some("AWS/SageMaker".to_owned()),
-                auth: SourceAuth::Env { env: "AWS_WEB_IDENTITY_TOKEN_FILE".to_owned() },
+                auth: SourceAuth::Env {
+                    env: "AWS_WEB_IDENTITY_TOKEN_FILE".to_owned(),
+                },
             },
         },
         defaults: BTreeMap::new(),
@@ -600,7 +631,9 @@ fn logs_splunk_round_trips() {
         source: SourceKind::Logs {
             connection: LogConnection::Splunk {
                 endpoint: "https://splunk.acme.com:8089".to_owned(),
-                auth: SourceAuth::Env { env: "SPLUNK_TOKEN".to_owned() },
+                auth: SourceAuth::Env {
+                    env: "SPLUNK_TOKEN".to_owned(),
+                },
             },
         },
         defaults: BTreeMap::new(),

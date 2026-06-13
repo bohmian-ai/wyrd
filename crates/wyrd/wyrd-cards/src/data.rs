@@ -707,15 +707,15 @@ impl DataCardInput {
             return Ok(Self::Interface(DataInterfaceHandle::from_interface(data)?));
         }
 
-        if let Ok(interface_type) = data.cast::<PyType>() {
-            if interface_type.is_subclass_of::<DataInterface>()? {
-                if !allow_interface_class {
-                    return Err(WyrdPyError::validation(
-                        "DataCard construction requires live data or an initialized DataInterface instance; pass interface classes to retrieval surfaces such as cards.get(..., interface=YourInterface)",
-                    ));
-                }
-                return Ok(Self::InterfaceClass(data.clone().unbind()));
+        if let Ok(interface_type) = data.cast::<PyType>()
+            && interface_type.is_subclass_of::<DataInterface>()?
+        {
+            if !allow_interface_class {
+                return Err(WyrdPyError::validation(
+                    "DataCard construction requires live data or an initialized DataInterface instance; pass interface classes to retrieval surfaces such as cards.get(..., interface=YourInterface)",
+                ));
             }
+            return Ok(Self::InterfaceClass(data.clone().unbind()));
         }
 
         Ok(Self::Raw(data.clone().unbind()))

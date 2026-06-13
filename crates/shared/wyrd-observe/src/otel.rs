@@ -180,14 +180,14 @@ impl Observer for OtelObserver {
         _response: &skald_spec::ProviderResponse,
     ) {
         let key = format!("{run_id}.model.{iteration}");
-        if let Some(mutex) = self.remove_span(&key) {
-            if let Ok(mut span) = mutex.into_inner() {
-                span.set_attribute(opentelemetry::KeyValue::new(
-                    "gen_ai.response.finish_reason",
-                    finish_reason.to_owned(),
-                ));
-                span.end();
-            }
+        if let Some(mutex) = self.remove_span(&key)
+            && let Ok(mut span) = mutex.into_inner()
+        {
+            span.set_attribute(opentelemetry::KeyValue::new(
+                "gen_ai.response.finish_reason",
+                finish_reason.to_owned(),
+            ));
+            span.end();
         }
     }
 
@@ -225,13 +225,13 @@ impl Observer for OtelObserver {
         ok: bool,
     ) {
         let key = format!("{run_id}.tool.{call_id}");
-        if let Some(mutex) = self.remove_span(&key) {
-            if let Ok(mut span) = mutex.into_inner() {
-                if !ok {
-                    span.set_status(Status::error("tool call failed"));
-                }
-                span.end();
+        if let Some(mutex) = self.remove_span(&key)
+            && let Ok(mut span) = mutex.into_inner()
+        {
+            if !ok {
+                span.set_status(Status::error("tool call failed"));
             }
+            span.end();
         }
     }
 
@@ -243,28 +243,28 @@ impl Observer for OtelObserver {
         iterations: u32,
         _duration: Duration,
     ) {
-        if let Some(mutex) = self.remove_span(run_id) {
-            if let Ok(mut span) = mutex.into_inner() {
-                span.set_attribute(opentelemetry::KeyValue::new(
-                    "wyrd.finish_reason",
-                    finish_reason.to_owned(),
-                ));
-                span.set_attribute(opentelemetry::KeyValue::new(
-                    "wyrd.iterations",
-                    i64::from(iterations),
-                ));
-                span.end();
-            }
+        if let Some(mutex) = self.remove_span(run_id)
+            && let Ok(mut span) = mutex.into_inner()
+        {
+            span.set_attribute(opentelemetry::KeyValue::new(
+                "wyrd.finish_reason",
+                finish_reason.to_owned(),
+            ));
+            span.set_attribute(opentelemetry::KeyValue::new(
+                "wyrd.iterations",
+                i64::from(iterations),
+            ));
+            span.end();
         }
     }
 
     async fn on_agent_error(&self, run_id: &str, _agent_id: &str, code: &str, message: &str) {
-        if let Some(mutex) = self.remove_span(run_id) {
-            if let Ok(mut span) = mutex.into_inner() {
-                span.set_status(Status::error(message.to_owned()));
-                span.set_attribute(opentelemetry::KeyValue::new("error.code", code.to_owned()));
-                span.end();
-            }
+        if let Some(mutex) = self.remove_span(run_id)
+            && let Ok(mut span) = mutex.into_inner()
+        {
+            span.set_status(Status::error(message.to_owned()));
+            span.set_attribute(opentelemetry::KeyValue::new("error.code", code.to_owned()));
+            span.end();
         }
     }
 
@@ -287,10 +287,10 @@ impl Observer for OtelObserver {
 
     async fn on_workflow_finish(&self, run_id: &str, _workflow_id: &str, _duration: Duration) {
         let key = format!("wf.{run_id}");
-        if let Some(mutex) = self.remove_span(&key) {
-            if let Ok(mut span) = mutex.into_inner() {
-                span.end();
-            }
+        if let Some(mutex) = self.remove_span(&key)
+            && let Ok(mut span) = mutex.into_inner()
+        {
+            span.end();
         }
     }
 }

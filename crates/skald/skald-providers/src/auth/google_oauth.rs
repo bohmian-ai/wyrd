@@ -106,10 +106,10 @@ impl GoogleOAuth {
         if let Ok(path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
             return Self::from_credentials_file(path);
         }
-        if let Some(path) = gcloud_adc_path() {
-            if path.exists() {
-                return Self::from_credentials_file(path);
-            }
+        if let Some(path) = gcloud_adc_path()
+            && path.exists()
+        {
+            return Self::from_credentials_file(path);
         }
         let base_url = std::env::var("GCE_METADATA_HOST")
             .map(|host| format!("http://{host}"))

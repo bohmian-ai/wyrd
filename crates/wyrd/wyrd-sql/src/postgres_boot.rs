@@ -7,7 +7,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use pg_embed::pg_enums::PgAuthMethod;
@@ -31,6 +31,7 @@ pub const PLATFORM_ADMIN_DSN_ENV: &str = "WYRD_DATABASE_URL_PLATFORM_ADMIN";
 
 const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
 const HOME_ENV: &str = "HOME";
+const WYRD_DEV_PG_CACHE_ENV: &str = "WYRD_DEV_PG_CACHE";
 const GENERATED_PASSWORD_LEN: usize = 48;
 const WYRD_CONFIG_BEGIN: &str = "# BEGIN WYRD EMBEDDED CONFIG";
 const WYRD_CONFIG_END: &str = "# END WYRD EMBEDDED CONFIG";
@@ -211,7 +212,7 @@ impl EmbeddedPgHandle {
     async fn start(mut config: EmbeddedConfig) -> Result<Self, BootError> {
         let dirs = config.data_dirs();
         let credentials = EmbeddedRoleCredentials::load_or_create(&dirs, &config)?;
-        let port = resolve_port(config.port)?;
+        let (port, port_lock) = resolve_port(config.port)?;
         config.port = port;
 
         let pg_settings = PgSettings {
@@ -234,6 +235,7 @@ impl EmbeddedPgHandle {
             .map_err(BootError::Embedded)?;
         pg.setup().await.map_err(BootError::Embedded)?;
         write_embedded_postgres_config(&dirs, config.max_connections)?;
+        drop(port_lock);
         pg.start_db().await.map_err(BootError::Embedded)?;
 
         write_pidfile(&dirs)?;
@@ -468,15 +470,14 @@ fn embedded_dsn(user: &str, password: &str, port: u16, database: &str) -> String
     )
 }
 
-fn resolve_port(configured: u16) -> Result<u16, BootError> {
+fn resolve_port(configured: u16) -> Result<(u16, Option<TcpListener>), BootError> {
     if configured != 0 {
-        return Ok(configured);
+        return Ok((configured, None));
     }
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(BootError::EmbeddedIo)?;
     let port = listener.local_addr().map_err(BootError::EmbeddedIo)?.port();
-    drop(listener);
-    Ok(port)
+    Ok((port, Some(listener)))
 }
 
 fn write_pidfile(dirs: &EmbeddedDataDirs) -> Result<(), BootError> {
@@ -495,7 +496,9 @@ fn write_embedded_postgres_config(
         "{without_wyrd}\n{WYRD_CONFIG_BEGIN}\nmax_connections = {max_connections}\n{WYRD_CONFIG_END}\n"
     );
 
-    fs::write(path, updated).map_err(BootError::EmbeddedIo)
+    let tmp = path.with_extension("conf.tmp");
+    fs::write(&tmp, updated).map_err(BootError::EmbeddedIo)?;
+    fs::rename(&tmp, &path).map_err(BootError::EmbeddedIo)
 }
 
 fn remove_wyrd_config_block(input: &str) -> String {
@@ -514,7 +517,7 @@ fn remove_wyrd_config_block(input: &str) -> String {
     output.join("\n").trim_end().to_owned()
 }
 
-fn read_or_create_secret(path: &PathBuf) -> Result<SecretString, BootError> {
+fn read_or_create_secret(path: &Path) -> Result<SecretString, BootError> {
     match fs::read_to_string(path) {
         Ok(value) => Ok(SecretString::from(
             value.trim_end_matches(['\r', '\n']).to_owned(),
@@ -528,7 +531,7 @@ fn read_or_create_secret(path: &PathBuf) -> Result<SecretString, BootError> {
     }
 }
 
-fn persist_secret_if_missing(path: &PathBuf, value: &str) -> Result<(), BootError> {
+fn persist_secret_if_missing(path: &Path, value: &str) -> Result<(), BootError> {
     match fs::metadata(path) {
         Ok(_) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => write_secret(path, value),
@@ -536,7 +539,7 @@ fn persist_secret_if_missing(path: &PathBuf, value: &str) -> Result<(), BootErro
     }
 }
 
-fn write_secret(path: &PathBuf, value: &str) -> Result<(), BootError> {
+fn write_secret(path: &Path, value: &str) -> Result<(), BootError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(BootError::EmbeddedIo)?;
     }
@@ -546,7 +549,7 @@ fn write_secret(path: &PathBuf, value: &str) -> Result<(), BootError> {
 }
 
 #[cfg(unix)]
-fn write_secret_file(path: &PathBuf, value: &str) -> Result<(), BootError> {
+fn write_secret_file(path: &Path, value: &str) -> Result<(), BootError> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -562,12 +565,13 @@ fn write_secret_file(path: &PathBuf, value: &str) -> Result<(), BootError> {
 }
 
 #[cfg(not(unix))]
-fn write_secret_file(path: &PathBuf, value: &str) -> Result<(), BootError> {
+fn write_secret_file(path: &Path, value: &str) -> Result<(), BootError> {
+    // Credential files are not ACL-restricted on non-Unix; embedded mode is dev-only on these platforms.
     fs::write(path, value).map_err(BootError::EmbeddedIo)
 }
 
 #[cfg(unix)]
-fn set_secret_permissions(path: &PathBuf) -> Result<(), BootError> {
+fn set_secret_permissions(path: &Path) -> Result<(), BootError> {
     use std::os::unix::fs::PermissionsExt;
 
     let permissions = fs::Permissions::from_mode(0o600);
@@ -575,7 +579,7 @@ fn set_secret_permissions(path: &PathBuf) -> Result<(), BootError> {
 }
 
 #[cfg(not(unix))]
-fn set_secret_permissions(_path: &PathBuf) -> Result<(), BootError> {
+fn set_secret_permissions(_path: &Path) -> Result<(), BootError> {
     Ok(())
 }
 
@@ -584,6 +588,10 @@ fn generate_password() -> String {
 }
 
 fn default_embedded_data_dir() -> PathBuf {
+    if let Some(override_dir) = env::var_os(WYRD_DEV_PG_CACHE_ENV).filter(|v| !v.is_empty()) {
+        return PathBuf::from(override_dir);
+    }
+
     env::var_os(XDG_DATA_HOME_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -806,7 +814,8 @@ mod tests {
             set_env(PLATFORM_ADMIN_DSN_ENV, None);
             previous
         };
-
+        // current_thread flavor: from_env() reads env vars before its first await,
+        // so no other tokio task can observe the env between setup and the read.
         let boot = PostgresBoot::from_env()
             .await
             .expect("external env resolves");

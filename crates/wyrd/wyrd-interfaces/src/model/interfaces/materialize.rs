@@ -551,15 +551,15 @@ fn load_huggingface_processor(
     transformers: &Bound<'_, PyAny>,
     model_dir: &Path,
 ) -> Option<Py<PyAny>> {
-    if let Ok(auto_processor) = transformers.getattr("AutoProcessor") {
-        if let Ok(processor) = auto_processor.call_method1("from_pretrained", (model_dir,)) {
-            return Some(processor.unbind());
-        }
+    if let Ok(auto_processor) = transformers.getattr("AutoProcessor")
+        && let Ok(processor) = auto_processor.call_method1("from_pretrained", (model_dir,))
+    {
+        return Some(processor.unbind());
     }
-    if let Ok(auto_tokenizer) = transformers.getattr("AutoTokenizer") {
-        if let Ok(tokenizer) = auto_tokenizer.call_method1("from_pretrained", (model_dir,)) {
-            return Some(tokenizer.unbind());
-        }
+    if let Ok(auto_tokenizer) = transformers.getattr("AutoTokenizer")
+        && let Ok(tokenizer) = auto_tokenizer.call_method1("from_pretrained", (model_dir,))
+    {
+        return Some(tokenizer.unbind());
     }
     None
 }

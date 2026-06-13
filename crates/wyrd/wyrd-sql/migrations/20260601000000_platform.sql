@@ -45,7 +45,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE wyrd_migrator IN SCHEMA platform, wyrd
     GRANT USAGE, SELECT ON SEQUENCES TO wyrd_platform_admin;
 
 CREATE FUNCTION wyrd.current_tenant() RETURNS uuid
-LANGUAGE sql STABLE PARALLEL SAFE AS $$
+LANGUAGE sql STABLE PARALLEL RESTRICTED AS $$
     SELECT current_setting('app.current_tenant')::uuid
 $$;
 
@@ -86,6 +86,7 @@ GRANT EXECUTE ON FUNCTION platform.resolve_tenant_by_slug(TEXT) TO wyrd_platform
 CREATE TABLE platform.users (
     id              TEXT PRIMARY KEY,
     email           TEXT NOT NULL UNIQUE,
+    auth_type       TEXT NOT NULL CHECK (auth_type IN ('password','sso','service_account')),
     password_hash   TEXT,
     status          TEXT NOT NULL CHECK (status IN ('active','suspended','deleted')),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -140,6 +141,10 @@ CREATE INDEX platform_audit_log_by_actor
     ON platform.audit_log (actor_user_id, created_at DESC);
 CREATE INDEX platform_audit_log_by_target
     ON platform.audit_log (target, created_at DESC);
+
+-- Preserve tamper-evidence: platform_admin may INSERT but must not alter or
+-- delete existing audit records.
+REVOKE UPDATE, DELETE ON platform.audit_log FROM wyrd_platform_admin;
 
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA platform, wyrd TO wyrd_platform_admin;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA wyrd TO wyrd_app;

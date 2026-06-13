@@ -334,7 +334,7 @@ mod tests {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let current: (String,) = sqlx::query_as("SELECT current_setting($1)")
             .bind(CURRENT_TENANT_GUC)
-            .fetch_one(&mut **conn.as_executor())
+            .fetch_one(&mut **conn.transaction())
             .await
             .expect("current tenant setting is readable");
 

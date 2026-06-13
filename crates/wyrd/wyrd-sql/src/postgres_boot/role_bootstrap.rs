@@ -59,6 +59,10 @@ GRANT CREATE ON DATABASE {database} TO {migrator_role};
 }
 
 fn sql_literal(value: &str) -> String {
+    debug_assert!(
+        value.chars().all(|c| c.is_ascii_alphanumeric()),
+        "sql_literal received non-alphanumeric input; generated passwords must be alphanumeric"
+    );
     format!("'{}'", value.replace('\'', "''"))
 }
 
@@ -81,15 +85,15 @@ mod tests {
     #[test]
     fn bootstrap_sql_quotes_password_literals() {
         let credentials = EmbeddedRoleCredentials {
-            superuser: SecretString::from("super-secret".to_owned()),
-            migrator: SecretString::from("mig'pw".to_owned()),
-            app: SecretString::from("app-pw".to_owned()),
-            platform_admin: SecretString::from("admin-pw".to_owned()),
+            superuser: SecretString::from("supersecret123".to_owned()),
+            migrator: SecretString::from("migpw456".to_owned()),
+            app: SecretString::from("apppw789".to_owned()),
+            platform_admin: SecretString::from("adminpwABC".to_owned()),
         };
 
         let sql = role_bootstrap_sql(&credentials);
 
-        assert!(sql.contains("PASSWORD 'mig''pw'"));
+        assert!(sql.contains("PASSWORD 'migpw456'"));
         assert!(sql.contains("ALTER ROLE wyrd_migrator WITH LOGIN BYPASSRLS PASSWORD"));
         assert!(sql.contains("ALTER ROLE wyrd_app WITH LOGIN NOBYPASSRLS PASSWORD"));
         assert!(sql.contains("ALTER ROLE wyrd_platform_admin WITH LOGIN BYPASSRLS PASSWORD"));

@@ -42,6 +42,20 @@ starts. The migration path does not create roles; it validates that all three
 roles exist with the expected `BYPASSRLS` bits and fails early when bootstrap is
 incomplete.
 
+Before running `roles.sql`, substitute the three `REPLACE_WITH_WYRD_*_PASSWORD`
+placeholders with values from your deploy secret store. For example, using `sed`:
+
+```bash
+sed \
+  -e "s/REPLACE_WITH_WYRD_MIGRATOR_PASSWORD/$WYRD_MIGRATOR_PASSWORD/g" \
+  -e "s/REPLACE_WITH_WYRD_APP_PASSWORD/$WYRD_APP_PASSWORD/g" \
+  -e "s/REPLACE_WITH_WYRD_PLATFORM_ADMIN_PASSWORD/$WYRD_PLATFORM_ADMIN_PASSWORD/g" \
+  crates/wyrd/wyrd-sql/bootstrap/roles.sql | psql -U postgres
+```
+
+Do not commit substituted files. Run the substitution in-memory or pipe it
+directly to `psql` as shown above.
+
 The three DSNs map to distinct code paths:
 
 | Env var | Role | Code path |

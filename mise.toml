@@ -500,6 +500,14 @@ diff -u "$BEFORE" "$AFTER" \
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
 depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
 
+[tasks."test:sql"]
+description = """Run live Postgres SQL integration tests.
+Required env vars:
+  WYRD_DATABASE_URL_MIGRATOR=postgres://wyrd_migrator:<pw>@localhost/wyrd
+  WYRD_DATABASE_URL=postgres://wyrd_app:<pw>@localhost/wyrd  (required for cross-tenant RLS test)
+"""
+run = "cargo test --locked -p wyrd-sql --all-features --test migration_pg -- --nocapture"
+
 [tasks."dev:pg:nuke"]
 description = "Wipe embedded pg cache"
 run = "rm -rf ${WYRD_DEV_PG_CACHE}"

@@ -11,6 +11,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 
 pub mod error;
 pub mod pool;
+#[cfg(feature = "embedded-postgres")]
 pub mod postgres_boot;
 pub mod queries;
 pub mod row_types;
@@ -31,13 +32,15 @@ pub const MIGRATION_SEARCH_PATH: &str = "wyrd, platform, public";
 
 /// Apply embedded Wyrd SQL migrations against a boot-only migrator pool.
 ///
-/// The supplied pool should authenticate as `wyrd_migrator`. Migration runs on
+/// The supplied pool **must** authenticate as `wyrd_migrator`. Migration runs on
 /// one dedicated connection with `search_path` set to `wyrd, platform, public`,
 /// then the physical connection is closed so session state cannot return to the
-/// pool.
+/// pool. Calling with an `wyrd_app`-role DSN will fail on the bootstrap DDL and
+/// return [`SqlError::InsufficientPrivilege`].
 ///
 /// # Errors
-/// Returns [`SqlError::Connect`] when the connection or bootstrap SQL fails.
+/// Returns [`SqlError::Connect`] when the connection itself fails.
+/// Returns [`SqlError::InsufficientPrivilege`] when the role lacks DDL privileges.
 /// Returns [`SqlError::Migrate`] when migration execution fails.
 pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
     let mut conn = migrator_pool.acquire().await.map_err(SqlError::Connect)?;
@@ -46,15 +49,15 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
         sqlx::query("CREATE SCHEMA IF NOT EXISTS platform")
             .execute(&mut *conn)
             .await
-            .map_err(SqlError::Connect)?;
+            .map_err(classify_bootstrap_error)?;
         sqlx::query("CREATE SCHEMA IF NOT EXISTS wyrd")
             .execute(&mut *conn)
             .await
-            .map_err(SqlError::Connect)?;
+            .map_err(classify_bootstrap_error)?;
         sqlx::query("SET search_path TO wyrd, platform, public")
             .execute(&mut *conn)
             .await
-            .map_err(SqlError::Connect)?;
+            .map_err(classify_bootstrap_error)?;
         sqlx::migrate!("./migrations")
             .run(&mut *conn)
             .await
@@ -70,6 +73,17 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
     }
 
     result
+}
+
+fn classify_bootstrap_error(error: sqlx::Error) -> SqlError {
+    if let sqlx::Error::Database(ref dbe) = error
+        && dbe.code().as_deref() == Some("42501")
+    {
+        return SqlError::InsufficientPrivilege {
+            detail: dbe.message().to_owned(),
+        };
+    }
+    SqlError::Connect(error)
 }
 
 /// Control-plane Postgres handle.
@@ -181,18 +195,24 @@ mod tests {
     }
 
     #[test]
-    fn migration_filenames_match_sequential_versions() {
+    fn migration_filenames_match_timestamp_versions() {
         let migrator = sqlx::migrate!("./migrations");
         let files = migration_files();
 
-        for (index, (migration, file_name)) in migrator.migrations.iter().zip(files).enumerate() {
-            let version = i64::try_from(index + 1).expect("migration index fits in i64");
-            let prefix = format!("{version:04}_");
+        let mut prev_version = 0i64;
+        for (migration, file_name) in migrator.migrations.iter().zip(&files) {
+            let version = migration.version;
+            let prefix = format!("{version}_");
 
-            assert_eq!(migration.version, version);
+            assert!(
+                version > prev_version,
+                "migration version {version} must be greater than previous {prev_version}"
+            );
+            prev_version = version;
+
             assert!(
                 file_name.starts_with(&prefix),
-                "migration file {file_name} must start with {prefix}"
+                "migration file {file_name} must start with its version {prefix}"
             );
             assert!(
                 file_name.ends_with(".sql"),

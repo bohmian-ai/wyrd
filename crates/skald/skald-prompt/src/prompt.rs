@@ -1485,25 +1485,24 @@ fn py_annotation_to_schema<'py>(
         ("bool", "boolean"),
     ];
     for (builtin_name, json_type) in primitives {
-        if let Ok(bt) = builtins.getattr(*builtin_name) {
-            if ann.is(&bt) {
-                return Ok(serde_json::json!({"type": json_type}));
-            }
+        if let Ok(bt) = builtins.getattr(*builtin_name)
+            && ann.is(&bt)
+        {
+            return Ok(serde_json::json!({"type": json_type}));
         }
     }
 
     // Python 3.10+ `T | None` — types.UnionType has __args__ but no __origin__.
     // Must be checked before the __origin__ branch so `str | None` is handled correctly.
-    if ann.getattr("__origin__").is_err() {
-        if let Ok(args) = ann.getattr("__args__") {
-            if args.try_iter().is_ok() {
-                let none_type = py.None().bind(py).get_type().into_any();
-                if let Ok(iter) = args.try_iter() {
-                    let non_none: Vec<_> = iter.flatten().filter(|a| !a.is(&none_type)).collect();
-                    if !non_none.is_empty() {
-                        return py_annotation_to_schema(py, &non_none[0]);
-                    }
-                }
+    if ann.getattr("__origin__").is_err()
+        && let Ok(args) = ann.getattr("__args__")
+        && args.try_iter().is_ok()
+    {
+        let none_type = py.None().bind(py).get_type().into_any();
+        if let Ok(iter) = args.try_iter() {
+            let non_none: Vec<_> = iter.flatten().filter(|a| !a.is(&none_type)).collect();
+            if !non_none.is_empty() {
+                return py_annotation_to_schema(py, &non_none[0]);
             }
         }
     }
@@ -1511,25 +1510,25 @@ fn py_annotation_to_schema<'py>(
     // Generic aliases — inspect __origin__ and __args__.
     if let Ok(origin) = ann.getattr("__origin__") {
         // list[T]
-        if let Ok(list_t) = builtins.getattr("list") {
-            if origin.is(&list_t) {
-                let items = if let Ok(args) = ann.getattr("__args__") {
-                    if let Ok(item) = args.get_item(0) {
-                        py_annotation_to_schema(py, &item)?
-                    } else {
-                        serde_json::json!({})
-                    }
+        if let Ok(list_t) = builtins.getattr("list")
+            && origin.is(&list_t)
+        {
+            let items = if let Ok(args) = ann.getattr("__args__") {
+                if let Ok(item) = args.get_item(0) {
+                    py_annotation_to_schema(py, &item)?
                 } else {
                     serde_json::json!({})
-                };
-                return Ok(serde_json::json!({"type": "array", "items": items}));
-            }
+                }
+            } else {
+                serde_json::json!({})
+            };
+            return Ok(serde_json::json!({"type": "array", "items": items}));
         }
         // dict[K, V]
-        if let Ok(dict_t) = builtins.getattr("dict") {
-            if origin.is(&dict_t) {
-                return Ok(serde_json::json!({"type": "object"}));
-            }
+        if let Ok(dict_t) = builtins.getattr("dict")
+            && origin.is(&dict_t)
+        {
+            return Ok(serde_json::json!({"type": "object"}));
         }
         // Optional[T] / Union[T, None]
         if let Ok(args) = ann.getattr("__args__") {

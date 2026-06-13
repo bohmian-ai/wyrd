@@ -70,12 +70,6 @@ impl PoolConfig {
 
     /// Runtime pool config from `WYRD_DB_*` env vars.
     #[must_use]
-    pub fn from_env() -> Self {
-        Self::app_from_env()
-    }
-
-    /// Runtime pool config from `WYRD_DB_*` env vars.
-    #[must_use]
     pub fn app_from_env() -> Self {
         Self::from_env_with_suffix(Self::app_defaults(), "")
     }

@@ -122,6 +122,20 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// Bootstrap DDL failed because the database role lacks required privileges.
+    #[wyrd_error(
+        code = "WYRD_SQL_500_INSUFFICIENT_PRIVILEGE",
+        status = 500,
+        title = "Insufficient database privileges",
+        remediation = "Ensure WYRD_DATABASE_URL_MIGRATOR authenticates as wyrd_migrator for \
+                       migrate() and WYRD_DATABASE_URL authenticates as wyrd_app for runtime queries."
+    )]
+    #[error("insufficient database privileges: {detail}")]
+    InsufficientPrivilege {
+        /// Privilege denial message from Postgres.
+        detail: String,
+    },
+
     /// Stored tenant identifier violated Wyrd's tenant-id contract.
     #[wyrd_error(
         code = "WYRD_SQL_500_INVALID_TENANT_ID",
@@ -179,6 +193,10 @@ fn constraint_name(error: &(dyn sqlx::error::DatabaseError + 'static)) -> String
 }
 
 fn is_rls_denied(message: &str) -> bool {
+    // Matches English-locale Postgres error text. Non-English clusters with a
+    // different lc_messages will have 42501 errors fall through to SqlError::Query.
+    // If non-English deployments are required, also check db_error.detail() or
+    // set lc_messages = 'en_US.UTF-8' on the Postgres cluster.
     message.to_ascii_lowercase().contains("row-level security")
 }
 

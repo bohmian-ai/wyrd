@@ -19,6 +19,7 @@ pg = [
     "dep:vala-sql",
     "dep:wyrd-sql",
     "dep:wyrd-spec",
+    "wyrd-sql/embedded-postgres",
 ]
 
 [dependencies]

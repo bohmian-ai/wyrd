@@ -137,13 +137,13 @@ pub fn validate_field_dtype(field: &FieldSpec) -> Result<(), ModelCardError> {
 /// Returns the first fixed dimension with a value less than one.
 pub fn validate_shape(field: &FieldSpec) -> Result<(), ModelCardError> {
     for dim in &field.shape {
-        if let Dim::Fixed(value) = dim {
-            if *value <= 0 {
-                return Err(ModelCardError::ShapeFixedNonPositive {
-                    field: field.name.to_string(),
-                    value: *value,
-                });
-            }
+        if let Dim::Fixed(value) = dim
+            && *value <= 0
+        {
+            return Err(ModelCardError::ShapeFixedNonPositive {
+                field: field.name.to_string(),
+                value: *value,
+            });
         }
     }
     Ok(())

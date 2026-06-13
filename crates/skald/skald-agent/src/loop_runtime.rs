@@ -506,23 +506,23 @@ async fn run_loop(
                     observer
                         .on_tool_result(run_id, &ctx.agent_id, iteration, &call.id, ok)
                         .await;
-                    if ok {
-                        if let Some(session_id) = session_id.as_ref() {
-                            session
-                                .append(
-                                    session_id,
-                                    SessionTurn {
-                                        role: Role::Tool,
-                                        content: content.to_string(),
-                                        call_id: Some(call.id.clone()),
-                                    },
-                                )
-                                .await
-                                .map_err(|source| AgentError::SessionAppendFailed {
-                                    session_id: session_id.as_str().to_owned(),
-                                    source,
-                                })?;
-                        }
+                    if ok
+                        && let Some(session_id) = session_id.as_ref()
+                    {
+                        session
+                            .append(
+                                session_id,
+                                SessionTurn {
+                                    role: Role::Tool,
+                                    content: content.to_string(),
+                                    call_id: Some(call.id.clone()),
+                                },
+                            )
+                            .await
+                            .map_err(|source| AgentError::SessionAppendFailed {
+                                session_id: session_id.as_str().to_owned(),
+                                source,
+                            })?;
                     }
                     Ok((
                         idx,

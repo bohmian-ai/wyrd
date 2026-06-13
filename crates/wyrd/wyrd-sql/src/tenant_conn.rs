@@ -64,11 +64,6 @@ impl<'a> TenantConn<'a> {
         &mut self.tx
     }
 
-    /// Borrow the underlying transaction as the SQLx executor value.
-    pub fn as_executor(&mut self) -> &mut Transaction<'a, Postgres> {
-        self.transaction()
-    }
-
     /// Commit the transaction.
     ///
     /// # Errors

@@ -1,12 +1,15 @@
 //! Live Postgres migration integration test.
 //!
-//! Skipped automatically when DATABASE_URL is unset so the default test suite
+//! Skipped automatically when env vars are unset so the default test suite
 //! remains credential-free. Run with:
-//!   DATABASE_URL=postgres://... cargo test -p wyrd-sql --all-features
+//!   WYRD_DATABASE_URL_MIGRATOR=postgres://wyrd_migrator:<pw>@localhost/wyrd \
+//!   WYRD_DATABASE_URL=postgres://wyrd_app:<pw>@localhost/wyrd \
+//!   cargo test -p wyrd-sql --all-features --test migration_pg
 
 use sqlx::PgPool;
 use wyrd_spec::DataTenantId;
-use wyrd_sql::SqlStore;
+use wyrd_sql::pool::build_app_pool;
+use wyrd_sql::{SqlStore, TenantConn};
 
 #[tokio::test]
 async fn migrations_apply_and_are_idempotent() {
@@ -36,6 +39,7 @@ async fn migrations_apply_and_are_idempotent() {
     assert_regclass_exists(pool, "wyrd.auth_refresh_tokens", true).await;
 
     assert_platform_resolver_shape(pool).await;
+    assert_current_tenant_parallel_restricted(pool).await;
     assert_auth_rls_metadata(pool).await;
 }
 
@@ -120,8 +124,142 @@ async fn duplicate_refresh_token_hash_rejected_within_tenant_only() {
         .expect("test rows clean up");
 }
 
+#[tokio::test]
+async fn resolve_tenant_by_slug_behavioral_contract() {
+    let Some(url) = database_url() else {
+        return;
+    };
+
+    let store = SqlStore::connect(&url, 2)
+        .await
+        .expect("connects to postgres");
+    assert_required_roles(store.pool()).await;
+    store.migrate().await.expect("migrations apply");
+
+    let pool = store.pool();
+    let active_id = DataTenantId::new_v7();
+    let suspended_id = DataTenantId::new_v7();
+    let active_slug = format!("rslv-act-{}", active_id.as_uuid());
+    let suspended_slug = format!("rslv-sus-{}", suspended_id.as_uuid());
+
+    sqlx::query(
+        "INSERT INTO platform.tenants (data_tenant_id, slug, display_name, status)
+         VALUES ($1, $2, 'Resolver Active', 'active')",
+    )
+    .bind(active_id.as_uuid())
+    .bind(&active_slug)
+    .execute(pool)
+    .await
+    .expect("active tenant inserts");
+
+    sqlx::query(
+        "INSERT INTO platform.tenants (data_tenant_id, slug, display_name, status)
+         VALUES ($1, $2, 'Resolver Suspended', 'suspended')",
+    )
+    .bind(suspended_id.as_uuid())
+    .bind(&suspended_slug)
+    .execute(pool)
+    .await
+    .expect("suspended tenant inserts");
+
+    let active: (Option<String>,) =
+        sqlx::query_as("SELECT CAST(platform.resolve_tenant_by_slug($1) AS TEXT)")
+            .bind(&active_slug)
+            .fetch_one(pool)
+            .await
+            .expect("resolver query succeeds for active slug");
+    assert_eq!(
+        active.0.as_deref(),
+        Some(active_id.as_uuid().to_string().as_str()),
+        "active slug must resolve to its UUID"
+    );
+
+    let suspended: (Option<String>,) =
+        sqlx::query_as("SELECT CAST(platform.resolve_tenant_by_slug($1) AS TEXT)")
+            .bind(&suspended_slug)
+            .fetch_one(pool)
+            .await
+            .expect("resolver query succeeds for suspended slug");
+    assert_eq!(suspended.0, None, "suspended slug must resolve to NULL");
+
+    let missing: (Option<String>,) =
+        sqlx::query_as("SELECT CAST(platform.resolve_tenant_by_slug($1) AS TEXT)")
+            .bind("no-such-slug-wyrd-test")
+            .fetch_one(pool)
+            .await
+            .expect("resolver query succeeds for missing slug");
+    assert_eq!(missing.0, None, "missing slug must resolve to NULL");
+
+    sqlx::query("DELETE FROM platform.tenants WHERE data_tenant_id IN ($1, $2)")
+        .bind(active_id.as_uuid())
+        .bind(suspended_id.as_uuid())
+        .execute(pool)
+        .await
+        .expect("resolver test tenant cleanup succeeds");
+}
+
+#[tokio::test]
+async fn cross_tenant_rls_filters_row_by_tenant() {
+    let Some(migrator_url) = database_url() else {
+        return;
+    };
+    let Some(app_url) = app_database_url() else {
+        return;
+    };
+
+    let store = SqlStore::connect(&migrator_url, 2)
+        .await
+        .expect("migrator connects");
+    assert_required_roles(store.pool()).await;
+    store.migrate().await.expect("migrations apply");
+
+    let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
+
+    let tenant_a = DataTenantId::new_v7();
+    let tenant_b = DataTenantId::new_v7();
+    let suffix = tenant_a.as_uuid().to_string();
+    let user_id = format!("rls-user-{suffix}");
+
+    insert_tenant(store.pool(), tenant_a, &format!("rls-a-{suffix}")).await;
+    insert_tenant(store.pool(), tenant_b, &format!("rls-b-{suffix}")).await;
+    insert_auth_user(store.pool(), tenant_a, &user_id, "rls").await;
+
+    {
+        let mut conn = TenantConn::acquire(&app_pool, tenant_b)
+            .await
+            .expect("tenant_b conn acquired");
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM wyrd.auth_users")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("count query succeeds");
+        assert_eq!(
+            count.0, 0,
+            "tenant_b must see zero rows seeded for tenant_a"
+        );
+    }
+
+    {
+        let mut conn = TenantConn::acquire(&app_pool, tenant_a)
+            .await
+            .expect("tenant_a conn acquired");
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM wyrd.auth_users")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("count query succeeds");
+        assert_eq!(count.0, 1, "tenant_a must see their own seeded row");
+    }
+
+    cleanup_refresh_token_test_rows(store.pool(), tenant_a, tenant_b)
+        .await
+        .expect("RLS test rows clean up");
+}
+
 fn database_url() -> Option<String> {
-    std::env::var("DATABASE_URL").ok()
+    std::env::var("WYRD_DATABASE_URL_MIGRATOR").ok()
+}
+
+fn app_database_url() -> Option<String> {
+    std::env::var("WYRD_DATABASE_URL").ok()
 }
 
 async fn assert_required_roles(pool: &PgPool) {
@@ -154,6 +292,25 @@ async fn assert_regclass_exists(pool: &PgPool, name: &str, expected: bool) {
         .expect("to_regclass query succeeds");
 
     assert_eq!(row.0, expected, "unexpected existence for {name}");
+}
+
+async fn assert_current_tenant_parallel_restricted(pool: &PgPool) {
+    let row: (bool,) = sqlx::query_as(
+        "SELECT p.proparallel = 'r'
+         FROM pg_proc p
+         JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = 'wyrd'
+           AND p.proname = 'current_tenant'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("current_tenant function metadata query succeeds");
+
+    assert!(
+        row.0,
+        "wyrd.current_tenant() must be PARALLEL RESTRICTED — it reads a transaction-local GUC \
+         that parallel workers do not inherit"
+    );
 }
 
 async fn assert_platform_resolver_shape(pool: &PgPool) {

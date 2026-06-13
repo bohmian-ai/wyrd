@@ -21,5 +21,5 @@ secrecy = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
-wyrd-sql = { path = "../wyrd-sql", version = "0.0.1" }
+wyrd-sql = { path = "../wyrd-sql", version = "0.0.1", features = ["embedded-postgres"] }
 wyrd-enterprise = { path = "../wyrd-enterprise", version = "0.0.1", optional = true }

@@ -125,18 +125,24 @@ mod tests {
     }
 
     #[test]
-    fn migration_filenames_match_sequential_versions() {
+    fn migration_filenames_match_timestamp_versions() {
         let migrator = sqlx::migrate!("./migrations");
         let files = migration_files();
 
-        for (index, (migration, file_name)) in migrator.migrations.iter().zip(files).enumerate() {
-            let version = i64::try_from(index + 1).expect("migration index fits in i64");
-            let prefix = format!("{version:04}_");
+        let mut prev_version = 0i64;
+        for (migration, file_name) in migrator.migrations.iter().zip(&files) {
+            let version = migration.version;
+            let prefix = format!("{version}_");
 
-            assert_eq!(migration.version, version);
+            assert!(
+                version > prev_version,
+                "migration version {version} must be greater than previous {prev_version}"
+            );
+            prev_version = version;
+
             assert!(
                 file_name.starts_with(&prefix),
-                "migration file {file_name} must start with {prefix}"
+                "migration file {file_name} must start with its version {prefix}"
             );
             assert!(
                 file_name.ends_with(".sql"),

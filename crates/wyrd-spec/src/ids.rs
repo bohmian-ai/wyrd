@@ -172,25 +172,15 @@ impl<'de> Deserialize<'de> for DataTenantId {
 }
 
 fn validate_token(value: &str) -> Result<(), IdError> {
-    if value.len() < 3 || value.len() > 64 {
-        return Err(IdError::InvalidToken);
-    }
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return Err(IdError::InvalidToken);
-    };
-    if !first.is_ascii_lowercase() {
-        return Err(IdError::InvalidToken);
-    }
-    if chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-') {
-        Ok(())
-    } else {
-        Err(IdError::InvalidToken)
-    }
+    validate_token_with_min(value, 3)
 }
 
 fn validate_card_token(value: &str) -> Result<(), IdError> {
-    if value.is_empty() || value.len() > 64 {
+    validate_token_with_min(value, 1)
+}
+
+fn validate_token_with_min(value: &str, min_len: usize) -> Result<(), IdError> {
+    if value.len() < min_len || value.len() > 64 {
         return Err(IdError::InvalidToken);
     }
     let mut chars = value.chars();

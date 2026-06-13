@@ -7,15 +7,27 @@ rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 
+[features]
+embedded-postgres = ["dep:pg-embed", "dep:rand", "dep:urlencoding"]
+
 [dependencies]
-pg-embed = { workspace = true }
-rand = { workspace = true }
 secrecy = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-urlencoding = { workspace = true }
 wyrd-spec = { workspace = true }
+
+[dependencies.pg-embed]
+workspace = true
+optional = true
+
+[dependencies.rand]
+workspace = true
+optional = true
+
+[dependencies.urlencoding]
+workspace = true
+optional = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

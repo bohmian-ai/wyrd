@@ -9,7 +9,6 @@ pub use boot::{ServerBootError, build_app_state};
 pub use state::AppState;
 
 /// Build the HTTP router with shared server state.
-#[must_use]
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))

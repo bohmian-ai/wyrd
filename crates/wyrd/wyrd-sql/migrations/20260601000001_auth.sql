@@ -164,7 +164,10 @@ CREATE POLICY tenant_isolation ON wyrd.auth_refresh_tokens
 CREATE TABLE wyrd.auth_governance_tokens (
     token_id            TEXT PRIMARY KEY,
     data_tenant_id      UUID NOT NULL REFERENCES platform.tenants(data_tenant_id),
-    card_uid            TEXT NOT NULL,
+    -- CardRef: references a registered Card by its immutable UUIDv7 UID.
+    -- A foreign key to wyrd.registry_cards will be added when that table lands.
+    card_uid            TEXT NOT NULL
+        CHECK (card_uid ~ '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$'),
     issuer              TEXT NOT NULL,
     issued_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at          TIMESTAMPTZ NOT NULL,

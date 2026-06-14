@@ -8,7 +8,7 @@ use wyrd_spec::card::data::{
 };
 use wyrd_spec::card::{FieldSpec, Inequality};
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{CardName, ColumnName, QueryName, SplitName};
+use wyrd_spec::ids::{CardName, ColumnName, QueryName, SpaceName, SplitName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::version::VersionBlock;
 
@@ -29,7 +29,7 @@ fn card_ref(name: &str) -> CardRef {
         kind: CardKind::Artifact,
         name: CardName::new(name).unwrap(),
         version: VersionBlock::parse("1.0.0").unwrap(),
-        space: None,
+        space: SpaceName::new("default").expect("static space is valid"),
         uid: None,
     }
 }

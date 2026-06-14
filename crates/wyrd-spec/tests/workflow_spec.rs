@@ -6,6 +6,7 @@ use wyrd_spec::card::workflow::{
 };
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::SpaceName;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::{AgentRef, CardRef, PromptRef};
 
@@ -64,7 +65,7 @@ fn card_ref_agent_step(id: &str, agent_name: &str) -> WorkflowStep {
             kind: CardKind::Agent,
             name: agent_name.parse().expect("valid card name"),
             version: "0.1.0".parse().expect("valid version"),
-            space: None,
+            space: SpaceName::new("default").expect("static space is valid"),
             uid: None,
         })),
         depends_on: vec![],
@@ -137,7 +138,7 @@ fn workflow_card_cascade_inline_agent_with_card_prompt() {
             kind: CardKind::Prompt,
             name: "planner-prompt".parse().expect("valid card name"),
             version: "0.3.0".parse().expect("valid version"),
-            space: None,
+            space: SpaceName::new("default").expect("static space is valid"),
             uid: None,
         }),
         tool_names: vec![],

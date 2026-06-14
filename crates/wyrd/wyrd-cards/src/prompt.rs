@@ -810,6 +810,6 @@ mod tests {
         assert_eq!(card_ref.kind, CardKind::Prompt);
         assert_eq!(card_ref.name.to_string(), "lead-scoring");
         assert_eq!(card_ref.version.to_string(), "1.2.3");
-        assert_eq!(card_ref.space.expect("space present").to_string(), "growth");
+        assert_eq!(card_ref.space.to_string(), "growth");
     }
 }

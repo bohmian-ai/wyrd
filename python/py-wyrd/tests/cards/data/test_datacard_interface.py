@@ -211,7 +211,12 @@ def test_datacard_to_card_body_returns_data_variant() -> None:
 
 
 def test_artifact_card_input_requires_or_infers_interface_metadata(tmp_path) -> None:
-    artifact = CardRef(kind=CardKind.Artifact, name="existing-data", version="1.0.0")
+    artifact = CardRef(
+        kind=CardKind.Artifact,
+        name="existing-data",
+        version="1.0.0",
+        space="default",
+    )
     card = DataCard(artifact)
     metadata = card.metadata.to_dict()
 
@@ -220,7 +225,12 @@ def test_artifact_card_input_requires_or_infers_interface_metadata(tmp_path) -> 
 
 
 def test_artifact_card_input_rejects_non_artifact_card_ref() -> None:
-    data_ref = CardRef(kind=CardKind.Data, name="existing-data", version="1.0.0")
+    data_ref = CardRef(
+        kind=CardKind.Data,
+        name="existing-data",
+        version="1.0.0",
+        space="default",
+    )
 
     with pytest.raises(WyrdError) as exc:
         DataCard(data_ref)

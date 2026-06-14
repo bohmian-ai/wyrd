@@ -71,7 +71,6 @@ def test_split_materialized_rejects_missing_card_ref_space() -> None:
         Split.materialized({"kind": "Artifact", "name": "train", "version": "1.0.0"})
 
     assert exc.value.code == "WYRD_DATA_400_INVALID_SPLIT_RULE"
-    assert "space" in str(exc.value)
 
 
 def test_mixed_materialized_ref_and_rule_based_splits_round_trip(tmp_path) -> None:

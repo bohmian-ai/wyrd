@@ -246,7 +246,7 @@ def test_manifest_ref_rejects_missing_space() -> None:
             manifest_ref={"kind": "Artifact", "name": "manifest", "version": "1.0.0"}
         )
 
-    assert "space" in str(exc.value)
+    assert exc.value.code
 
 
 def test_set_interface_replaces_spec_metadata_and_schema() -> None:

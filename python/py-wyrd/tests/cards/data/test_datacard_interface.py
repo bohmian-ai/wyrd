@@ -240,6 +240,15 @@ def test_artifact_card_input_rejects_non_artifact_card_ref() -> None:
     assert exc.value.details["actual_kind"] == "Data"
 
 
+def test_manifest_ref_rejects_missing_space() -> None:
+    with pytest.raises(WyrdError) as exc:
+        ImageInterface(
+            manifest_ref={"kind": "Artifact", "name": "manifest", "version": "1.0.0"}
+        )
+
+    assert "space" in str(exc.value)
+
+
 def test_set_interface_replaces_spec_metadata_and_schema() -> None:
     card = DataCard(PandasInterface(data=pd.DataFrame({"year": [2024]})))
     assert card.interface.kind == "Pandas"

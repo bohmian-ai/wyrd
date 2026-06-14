@@ -84,7 +84,7 @@ impl AgentCard {
             metadata: EnvelopeMetadata {
                 name: card_name("metadata.name", &self.name)?,
                 version: version_block("metadata.version", &self.version)?,
-                space: optional_space_name(&self.space)?,
+                space: Some(space_name(&self.space)?),
                 uid: optional_card_uid(&self.uid)?,
                 labels: self.labels.clone(),
                 annotations: self.annotations.clone(),
@@ -153,7 +153,7 @@ impl AgentCard {
             kind: CardKind::Agent,
             name: card_name("metadata.name", &self.name)?,
             version: version_block("metadata.version", &self.version)?,
-            space: optional_space_name(&self.space)?,
+            space: space_name(&self.space)?,
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -329,11 +329,14 @@ fn version_block(field: &str, value: &str) -> Result<VersionBlock, WyrdError> {
     })
 }
 
-fn optional_space_name(value: &str) -> Result<Option<SpaceName>, WyrdError> {
-    if value.is_empty() || value == "default" {
-        return Ok(None);
+fn space_name(value: &str) -> Result<SpaceName, WyrdError> {
+    if value.is_empty() {
+        return Err(AgentCardError::validation(
+            "metadata.space is required and cannot be empty",
+        )
+        .into());
     }
-    SpaceName::new(value).map(Some).map_err(|error| {
+    SpaceName::new(value).map_err(|error| {
         AgentCardError::validation(format!("metadata.space is invalid: {error}")).into()
     })
 }
@@ -348,13 +351,9 @@ fn optional_card_uid(value: &str) -> Result<Option<CardUid>, WyrdError> {
 }
 
 fn card_ref_display(card_ref: &CardRef) -> String {
-    let space = card_ref
-        .space
-        .as_ref()
-        .map_or_else(|| "default".to_owned(), ToString::to_string);
     format!(
         "{}/{}/{}@{}",
-        space,
+        card_ref.space,
         card_ref.kind.wire_name(),
         card_ref.name,
         card_ref.version

@@ -198,7 +198,7 @@ impl WorkflowCard {
             metadata: EnvelopeMetadata {
                 name: card_name("metadata.name", &self.name)?,
                 version: version_block("metadata.version", &self.version)?,
-                space: optional_space_name(&self.space)?,
+                space: Some(space_name(&self.space)?),
                 uid: optional_card_uid(&self.uid)?,
                 labels: self.labels.clone(),
                 annotations: self.annotations.clone(),
@@ -270,7 +270,7 @@ impl WorkflowCard {
             kind: CardKind::Workflow,
             name: card_name("metadata.name", &self.name)?,
             version: version_block("metadata.version", &self.version)?,
-            space: optional_space_name(&self.space)?,
+            space: space_name(&self.space)?,
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -430,13 +430,13 @@ fn derive_cascade_children(spec: &WorkflowSpec) -> Vec<CardRef> {
     out.sort_by(|a, b| {
         let a_key = (
             a.kind.wire_name(),
-            a.space.as_ref().map_or("", |s| s.as_str()),
+            a.space.as_str(),
             a.name.as_str(),
             a.version.to_string(),
         );
         let b_key = (
             b.kind.wire_name(),
-            b.space.as_ref().map_or("", |s| s.as_str()),
+            b.space.as_str(),
             b.name.as_str(),
             b.version.to_string(),
         );
@@ -458,11 +458,14 @@ fn version_block(field: &str, value: &str) -> Result<VersionBlock, WyrdError> {
     })
 }
 
-fn optional_space_name(value: &str) -> Result<Option<SpaceName>, WyrdError> {
-    if value.is_empty() || value == "default" {
-        return Ok(None);
+fn space_name(value: &str) -> Result<SpaceName, WyrdError> {
+    if value.is_empty() {
+        return Err(WorkflowCardError::validation(
+            "metadata.space is required and cannot be empty",
+        )
+        .into());
     }
-    SpaceName::new(value).map(Some).map_err(|error| {
+    SpaceName::new(value).map_err(|error| {
         WorkflowCardError::validation(format!("metadata.space is invalid: {error}")).into()
     })
 }

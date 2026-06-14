@@ -242,9 +242,7 @@ def test_artifact_card_input_rejects_non_artifact_card_ref() -> None:
 
 def test_manifest_ref_rejects_missing_space() -> None:
     with pytest.raises(WyrdError) as exc:
-        ImageInterface(
-            manifest_ref={"kind": "Artifact", "name": "manifest", "version": "1.0.0"}
-        )
+        ImageInterface(manifest_ref={"kind": "Artifact", "name": "manifest", "version": "1.0.0"})
 
     assert exc.value.code
 

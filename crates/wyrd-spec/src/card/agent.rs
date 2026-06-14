@@ -331,10 +331,9 @@ fn version_block(field: &str, value: &str) -> Result<VersionBlock, WyrdError> {
 
 fn space_name(value: &str) -> Result<SpaceName, WyrdError> {
     if value.is_empty() {
-        return Err(AgentCardError::validation(
-            "metadata.space is required and cannot be empty",
-        )
-        .into());
+        return Err(
+            AgentCardError::validation("metadata.space is required and cannot be empty").into(),
+        );
     }
     SpaceName::new(value).map_err(|error| {
         AgentCardError::validation(format!("metadata.space is invalid: {error}")).into()

@@ -14,9 +14,7 @@ use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::version::ApiVersion;
 
-use crate::identity::{
-    card_name, optional_card_uid, space_name, validation_error, version_block,
-};
+use crate::identity::{card_name, optional_card_uid, space_name, validation_error, version_block};
 
 /// PromptCard filesystem IO helpers.
 pub mod io;
@@ -260,12 +258,7 @@ impl PromptRef {
     /// Returns a Wyrd error when the card identity fields are invalid.
     #[staticmethod]
     #[pyo3(signature = (name, version, *, space, uid=None))]
-    pub fn card(
-        name: &str,
-        version: &str,
-        space: &str,
-        uid: Option<&str>,
-    ) -> CardPyResult<Self> {
+    pub fn card(name: &str, version: &str, space: &str, uid: Option<&str>) -> CardPyResult<Self> {
         let card_ref = CardRef {
             kind: CardKind::Prompt,
             name: card_name("name", name)?,

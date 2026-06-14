@@ -506,9 +506,7 @@ async fn run_loop(
                     observer
                         .on_tool_result(run_id, &ctx.agent_id, iteration, &call.id, ok)
                         .await;
-                    if ok
-                        && let Some(session_id) = session_id.as_ref()
-                    {
+                    if ok && let Some(session_id) = session_id.as_ref() {
                         session
                             .append(
                                 session_id,

@@ -31,9 +31,11 @@ spec:
       ref:
         kind: Trigger
         name: churn-drift-trigger
+        space: retention
         version: "^1"
     - alias: operator
       ref:
         kind: Operator
         name: churn-retrain-on-drift
+        space: retention
         version: "^1"

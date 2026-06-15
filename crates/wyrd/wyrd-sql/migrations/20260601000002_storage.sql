@@ -6,7 +6,7 @@ CREATE TABLE wyrd.storage_multipart_uploads (
     card_uid               TEXT        NOT NULL
         CHECK (card_uid ~ '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$'),
     relative_path          TEXT        NOT NULL,
-    storage_path           TEXT        NOT NULL UNIQUE,
+    storage_path           TEXT        NOT NULL,
     backend                TEXT        NOT NULL CHECK (backend IN ('local', 's3', 'gcs', 'azure')),
     wire_protocol          TEXT        NOT NULL CHECK (wire_protocol IN (
                                       'single_put_v1',
@@ -45,6 +45,10 @@ CREATE INDEX storage_multipart_uploads_initiating_created
 CREATE UNIQUE INDEX storage_multipart_uploads_dedupe_pending
     ON wyrd.storage_multipart_uploads (data_tenant_id, card_uid, expected_sha256)
     WHERE status = 'pending';
+
+CREATE UNIQUE INDEX storage_multipart_uploads_storage_path_active
+    ON wyrd.storage_multipart_uploads (storage_path)
+    WHERE status IN ('initiating', 'pending');
 
 ALTER TABLE wyrd.storage_multipart_uploads ENABLE ROW LEVEL SECURITY;
 ALTER TABLE wyrd.storage_multipart_uploads FORCE ROW LEVEL SECURITY;

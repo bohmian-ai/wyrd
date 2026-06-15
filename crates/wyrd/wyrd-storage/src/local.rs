@@ -139,6 +139,10 @@ impl LocalSigner {
 
     /// Return a local GET URL.
     ///
+    /// Returns a `file://` URL pointing to the on-disk object. Not used by the
+    /// server download flow — see `service.rs::local_download_url` which mints
+    /// an HTTP server route URL. Retained for trait completeness only.
+    ///
     /// # Errors
     /// Returns an invalid URI error if the local file path cannot be rendered
     /// as a file URL.

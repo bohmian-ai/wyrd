@@ -605,7 +605,7 @@ components:
     CardRef:
       type: object
       x-wyrd-source: crates/wyrd-spec/src/reference.rs
-      required: [kind, name, version]
+      required: [kind, name, version, space]
       properties:
         kind: { $ref: "#/components/schemas/CardKindName" }
         name: { $ref: "#/components/schemas/CardName" }

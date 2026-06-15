@@ -165,13 +165,13 @@ impl DataCard {
     /// # Errors
     /// Returns a Wyrd error when identity fields are invalid.
     pub fn as_card_ref(&self) -> Result<CardRef, WyrdError> {
-        use crate::identity::{card_name, optional_card_uid, optional_space_name, version_block};
+        use crate::identity::{card_name, optional_card_uid, space_name, version_block};
 
         Ok(CardRef {
             kind: CardKind::Data,
             name: card_name("name", &self.name)?,
             version: version_block(&self.version)?,
-            space: optional_space_name(&self.space)?,
+            space: space_name(&self.space)?,
             uid: optional_card_uid(&self.uid)?,
         })
     }

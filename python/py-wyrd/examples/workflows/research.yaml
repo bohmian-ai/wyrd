@@ -11,6 +11,7 @@ spec:
       target:
         kind: Agent
         name: planner
+        space: default
         version: 0.1.0
   - id: writer
     action:
@@ -18,6 +19,7 @@ spec:
       target:
         kind: Agent
         name: writer
+        space: default
         version: 0.1.0
     depends_on:
     - planner

@@ -3,6 +3,7 @@ mod prompt_support;
 use prompt_support::{openai_chat_request, prompt_spec};
 use wyrd_spec::PromptRef;
 use wyrd_spec::envelope::CardKind;
+use wyrd_spec::ids::SpaceName;
 use wyrd_spec::reference::CardRef;
 
 #[test]
@@ -11,7 +12,7 @@ fn card_variant_roundtrip() {
         kind: CardKind::Prompt,
         name: "support_prompt".parse().expect("valid card name"),
         version: "1.0.0".parse().expect("valid version"),
-        space: None,
+        space: SpaceName::new("default").expect("static space is valid"),
         uid: None,
     });
 

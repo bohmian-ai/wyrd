@@ -34,9 +34,9 @@ class CardKind:
 class CardRef:
     """Reference to a registered Wyrd Card.
 
-    CardRef carries kind, name, version, optional space, and optional resolved
-    UID. Python callers may pass either a CardKind constant or the native kind
-    wire string to the constructor.
+    CardRef carries kind, name, version, space, and optional resolved UID.
+    Python callers may pass either a CardKind constant or the native kind wire
+    string to the constructor.
     """
 
     @property
@@ -46,7 +46,7 @@ class CardRef:
 
     name: str
     version: str
-    space: str | None
+    space: str
     uid: str | None
 
     def __init__(
@@ -55,7 +55,7 @@ class CardRef:
         name: str,
         version: str,
         *,
-        space: str | None = ...,
+        space: str,
         uid: str | None = ...,
     ) -> None:
         """Create a Wyrd card reference.
@@ -64,7 +64,7 @@ class CardRef:
             kind (CardKind | str): Wyrd card kind.
             name (str): Referenced card name.
             version (str): Exact referenced card version.
-            space (str | None): Optional card space.
+            space (str): Card space; required.
             uid (str | None): Optional resolved card UID.
 
         Raises:

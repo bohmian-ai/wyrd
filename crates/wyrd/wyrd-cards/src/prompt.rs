@@ -14,9 +14,7 @@ use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::version::ApiVersion;
 
-use crate::identity::{
-    card_name, optional_card_uid, optional_space_name, validation_error, version_block,
-};
+use crate::identity::{card_name, optional_card_uid, space_name, validation_error, version_block};
 
 /// PromptCard filesystem IO helpers.
 pub mod io;
@@ -184,7 +182,7 @@ impl PromptCard {
             kind: CardKind::Prompt,
             name: card_name("name", &self.name)?,
             version: version_block(&self.version)?,
-            space: optional_space_name(&self.space)?,
+            space: space_name(&self.space)?,
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -241,7 +239,7 @@ impl PromptCard {
         Ok(EnvelopeMetadata {
             name: card_name("name", &self.name)?,
             version: version_block(&self.version)?,
-            space: optional_space_name(&self.space)?,
+            space: Some(space_name(&self.space)?),
             uid: optional_card_uid(&self.uid)?,
             labels: self.labels.clone(),
             annotations: self.annotations.clone(),
@@ -259,18 +257,13 @@ impl PromptRef {
     /// # Errors
     /// Returns a Wyrd error when the card identity fields are invalid.
     #[staticmethod]
-    #[pyo3(signature = (name, version, *, space=None, uid=None))]
-    pub fn card(
-        name: &str,
-        version: &str,
-        space: Option<&str>,
-        uid: Option<&str>,
-    ) -> CardPyResult<Self> {
+    #[pyo3(signature = (name, version, *, space, uid=None))]
+    pub fn card(name: &str, version: &str, space: &str, uid: Option<&str>) -> CardPyResult<Self> {
         let card_ref = CardRef {
             kind: CardKind::Prompt,
             name: card_name("name", name)?,
             version: version_block(version)?,
-            space: space.map_or(Ok(None), optional_space_name)?,
+            space: space_name(space)?,
             uid: uid.map_or(Ok(None), optional_card_uid)?,
         };
         Ok(Self::from_native(NativePromptRef::Card(card_ref)))
@@ -810,6 +803,6 @@ mod tests {
         assert_eq!(card_ref.kind, CardKind::Prompt);
         assert_eq!(card_ref.name.to_string(), "lead-scoring");
         assert_eq!(card_ref.version.to_string(), "1.2.3");
-        assert_eq!(card_ref.space.expect("space present").to_string(), "growth");
+        assert_eq!(card_ref.space.to_string(), "growth");
     }
 }

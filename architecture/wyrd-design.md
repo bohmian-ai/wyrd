@@ -979,6 +979,11 @@ inline:
   scope: service_local
 ```
 
+The wire `CardRef` requires `space`. Omitting `space` in authored YAML is a
+loader-time convenience: the YAML loader splices the enclosing card's
+`metadata.space` into each child `ref:` before deserialization. A `CardRef`
+that has crossed an API boundary always carries `space` verbatim.
+
 In context — `Service.components[]` mixing all three plus a heavy-card ref:
 
 ```yaml

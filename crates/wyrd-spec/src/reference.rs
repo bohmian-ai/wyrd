@@ -7,7 +7,7 @@ use crate::envelope::CardKind;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::version::VersionBlock;
 
-/// Reference to a registered Card by kind, name, version, optional space, and optional UID.
+/// Reference to a registered Card by kind, name, version, space, and optional UID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct CardRef {
@@ -17,9 +17,8 @@ pub struct CardRef {
     pub name: CardName,
     /// Exact referenced Card version.
     pub version: VersionBlock,
-    /// Optional space; omitted means current/default space.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub space: Option<SpaceName>,
+    /// Space pinning identity together with `name` and `version`.
+    pub space: SpaceName,
     /// Optional resolved UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<CardUid>,
@@ -78,7 +77,7 @@ mod tests {
             kind: CardKind::Artifact,
             name: CardName::new("weights").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
+            space: SpaceName::new("prod").expect("static space is valid"),
             uid: None,
         }
     }
@@ -92,16 +91,29 @@ mod tests {
     }
 
     #[test]
-    fn card_ref_skips_none_fields() {
+    fn card_ref_skips_none_uid() {
         let card_ref = CardRef {
             kind: CardKind::Model,
             name: CardName::new("churn").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: None,
+            space: SpaceName::new("default").expect("static space is valid"),
             uid: None,
         };
         let json = serde_json::to_string(&card_ref).expect("serialize");
-        assert!(!json.contains("space"), "space=None must skip");
+        assert!(
+            json.contains(r#""space":"default""#),
+            "space must serialize"
+        );
         assert!(!json.contains("uid"), "uid=None must skip");
+    }
+
+    #[test]
+    fn card_ref_rejects_missing_space() {
+        let json = r#"{"kind":"Model","name":"churn","version":"1.0.0"}"#;
+        let err = serde_json::from_str::<CardRef>(json).expect_err("space is required");
+        assert!(
+            err.to_string().contains("space"),
+            "error must mention space: {err}"
+        );
     }
 }

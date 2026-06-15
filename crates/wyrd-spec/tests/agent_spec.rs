@@ -62,7 +62,7 @@ fn agent_spec_card_prompt_uses_single_version_field() {
             kind: CardKind::Prompt,
             name: "planner-prompt".parse().expect("valid card name"),
             version: "0.3.0".parse().expect("valid version"),
-            space: Some("research".parse().expect("valid space")),
+            space: "research".parse().expect("valid space"),
             uid: None,
         }),
         tool_names: Vec::new(),

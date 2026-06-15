@@ -32,14 +32,17 @@ spec:
   pre_invoke:
     - kind: Policy
       name: retrain-cost-guard
+      space: retention
       version: "^1"
     - kind: Policy
       name: pii-redaction-check
+      space: retention
       version: "^1"
 
   post_invoke:
     - kind: Policy
       name: outcome-audit-required
+      space: retention
       version: "^1"
 
   budget:

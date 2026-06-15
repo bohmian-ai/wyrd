@@ -156,7 +156,7 @@
               ]
             },
             "username": {
-              "description": "Login user (non-secret; printed as `[redacted]` in Debug output).",
+              "description": "Login user (redacted in Debug output; omitted from logs to avoid accidental exposure).",
               "type": "string"
             }
           }

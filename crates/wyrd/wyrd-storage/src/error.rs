@@ -407,9 +407,12 @@ fn map_s3_error(error: S3Error) -> WyrdStorageError {
         S3Error::MissingEtag => WyrdStorageError::Backend {
             detail: "s3 part upload response did not include etag".to_owned(),
         },
-        S3Error::Sdk(detail) => WyrdStorageError::Backend {
-            detail: format!("s3: {detail}"),
-        },
+        S3Error::Sdk(detail) => {
+            tracing::error!(detail, backend = "s3", error_class = "sdk", "s3 operation failed");
+            WyrdStorageError::Backend {
+                detail: "s3 operation failed".to_owned(),
+            }
+        }
     }
 }
 
@@ -420,9 +423,12 @@ fn map_gcs_error(error: GcsError) -> WyrdStorageError {
         GcsError::MissingSessionUrl => WyrdStorageError::Backend {
             detail: "gcs resumable upload did not return a session url".to_owned(),
         },
-        GcsError::Sdk(detail) => WyrdStorageError::Backend {
-            detail: format!("gcs: {detail}"),
-        },
+        GcsError::Sdk(detail) => {
+            tracing::error!(detail, backend = "gcs", error_class = "sdk", "gcs operation failed");
+            WyrdStorageError::Backend {
+                detail: "gcs operation failed".to_owned(),
+            }
+        }
     }
 }
 
@@ -435,9 +441,12 @@ fn map_azure_error(error: AzureError) -> WyrdStorageError {
         AzureError::MissingAccount => WyrdStorageError::ConfigInvalid {
             detail: "azure storage account missing".to_owned(),
         },
-        AzureError::Sdk(detail) => WyrdStorageError::Backend {
-            detail: format!("azure: {detail}"),
-        },
+        AzureError::Sdk(detail) => {
+            tracing::error!(detail, backend = "azure", error_class = "sdk", "azure operation failed");
+            WyrdStorageError::Backend {
+                detail: "azure operation failed".to_owned(),
+            }
+        }
     }
 }
 
@@ -451,9 +460,9 @@ fn map_local_error(error: LocalError) -> WyrdStorageError {
             detail: format!("local root path does not exist: {path}"),
         },
         LocalError::Io(error) => {
-            tracing::error!(error = ?error, backend = "local", error_class = "io");
+            tracing::error!(error = ?error, backend = "local", error_class = "io", "local io operation failed");
             WyrdStorageError::Backend {
-                detail: format!("local: {error}"),
+                detail: "local io operation failed".to_owned(),
             }
         }
     }
@@ -475,6 +484,6 @@ fn map_reqwest_error(error: &reqwest::Error) -> WyrdStorageError {
         "storage HTTP transport failed"
     );
     WyrdStorageError::Backend {
-        detail: format!("http: {error}"),
+        detail: "http transport failed".to_owned(),
     }
 }

@@ -84,33 +84,33 @@ card-kind tests are landed.
     `dataset_ref`, `Service.components.ref`, `Workflow.steps.target`) stay
     `CardRef`-only — identity is the point.
 18. **Auth, Policy, and Emit are three distinct planes.**
-    - **Auth** gates Wyrd API calls: `Scope` on the handler, stateless pubkey
-      verify of the access token. Answers "is this principal allowed to hit
-      this Wyrd route?"
+    - **Auth** gates Wyrd API calls. `Permission { resource, action }` on the
+      handler; stateless EdDSA verify of the bearer access token. Answers
+      "is this principal allowed to hit this Wyrd route?"
     - **Policy** gates card states (`classify` at register-time, `gate` at
       deploy-time) and cross-service invokes (`invoke` at runtime). Runtime
-      invoke evaluation is centralized at `POST /v1/authz/check`, called
-      transparently by the service mesh's ext_authz filter or by the SDK
-      middleware in non-mesh shops.
+      invoke evaluation is centralized at
+      `POST /v1/authz/check/{callee_card_ref}`, called transparently by the
+      service mesh's ext_authz filter or by the SDK middleware in non-mesh
+      shops.
     - **Emit** is the data-plane channel from a deployed service to Wyrd's
       ingest, signed with the per-card governance token; never propagated
       between services and never read by Policy CEL.
 
-    A deployed Service card runs under a Wyrd-owned service account derived
-    deterministically from its `card_ref`. `wyrd apply` registers the card and
-    creates the SA (idempotent on re-apply); no secret is returned. Credentials
-    are issued out-of-band by an admin-authenticated `wyrd auth issue-key
-    <card_ref>` call, which mints a card-bound API key and returns it to the
-    caller. The caller uploads the key to the deploy environment's secret store
-    (Vault, AWS Secrets Manager, GCP Secret Manager); deploy-time secret
-    injection puts it into the pod as `WYRD_API_KEY`. The SDK exchanges it once
-    at startup for a short-lived JWT carrying the card's `card_ref` claim. On
-    cross-service calls the SDK adds `Wyrd-Caller-Identity: Bearer <jwt>` — the
-    application's `Authorization` header is never touched. The mesh's ext_authz
-    filter (or the SDK middleware) authenticates itself to `/v1/authz/check`
-    with its own card-scoped JWT and forwards the caller's JWT plus the
-    original method/path as headers; the body is empty. Both identities are
-    server-verified from signed claims.
+    A deployed Service or Agent card runs under a Wyrd-owned non-human
+    principal derived deterministically from its `card_ref`. `wyrd apply`
+    registers the card and creates the principal row (idempotent on
+    re-apply); no secret is returned. An admin mints a card-bound API key
+    via `wyrd auth issue-key <card_ref>`; the deploy environment puts it in
+    the pod as `WYRD_API_KEY`. The SDK exchanges it once at startup for a
+    short-lived EdDSA JWT carrying the structured `card_ref` claim and a
+    recursive `act` claim (RFC 8693) for delegation. On cross-service calls
+    the SDK adds the JWT to standard `Authorization: Bearer`; no
+    Wyrd-specific identity header is invented. The application's own
+    end-user `Authorization` (if any) is terminated at the inbound edge and
+    never propagated outbound — outbound calls between Wyrd-registered
+    services construct fresh `Authorization` headers carrying the service's
+    own Wyrd JWT.
 19. **Light-card reference slots accept `ref | path | inline`.** Wherever a
     card spec references a light card (Prompt, Agent, Workflow, Mcp, Policy,
     Eval, Trigger, Operator, Source, Audit, Service), the slot is a
@@ -297,46 +297,82 @@ Closed enums:
 
 ### Runtime identity
 
-A deployed Service card runs under a Wyrd-owned service account derived
-deterministically from the card's `card_ref`. `wyrd apply` registers the card
-and creates the SA (idempotent on re-apply); no secret is returned. The
-declarative and credential operations are separated, matching the kubectl
-pattern (`apply` then `create token`):
+A deployed Service or Agent card runs under a Wyrd-owned non-human principal
+derived deterministically from the card's `card_ref`. `wyrd apply` registers
+the card and creates the principal row (idempotent on re-apply); no secret
+is returned. The declarative and credential operations are separated,
+matching the kubectl pattern (`apply` then `create token`):
 
-| Operation | Wyrd command | What it does |
-|---|---|---|
-| Register card + create SA | `wyrd apply -f service.yaml` | Idempotent. Writes card, creates SA. No secret. |
-| Mint a card-bound API key | `wyrd auth issue-key <card_ref>` | Admin-authenticated. Returns the key to the caller. Caller uploads to the deploy environment's secret store. Re-issuable for rotation. |
+| Operation                        | Wyrd command                       | What it does |
+|----------------------------------|------------------------------------|---|
+| Register card + create principal | `wyrd apply -f service.yaml`       | Idempotent. Writes card, creates principal row. No secret. |
+| Mint a card-bound API key        | `wyrd auth issue-key <card_ref>`   | Admin-authenticated. Returns the key exactly once. Caller uploads to the deploy environment's secret store. Re-issuable for rotation. |
 
 Deploy-time secret injection (Vault Agent, External Secrets Operator, AWS
 Secrets Manager CSI driver, etc.) puts the API key into the pod as
-`WYRD_API_KEY`. The SDK exchanges it ONCE at startup at `POST /auth/token` for a
-short-lived JWT (~15m) carrying the `card_ref` claim, and auto-refreshes before
-expiry.
+`WYRD_API_KEY`. The SDK exchanges it ONCE at startup at `POST /auth/token`
+(`grant_type=wyrd_api_key`) for a short-lived EdDSA JWT (~15m) carrying:
+
+- `sub` — the ultimate initiator of the delegation chain (RFC 8693 §4.1).
+- `principal.kind ∈ {User, Service { card_ref }, Agent { card_ref }}` — the
+  current actor identity.
+- `act` — recursive delegation chain (RFC 8693), depth-capped at
+  `MAX_DELEGATION_DEPTH = 5`.
+
+The SDK auto-refreshes before expiry. The API key is exchanged at startup —
+never on the wire.
 
 Env vars in deployed services:
 
-| Env var | Required? | Source | Used for |
-|---|---|---|---|
-| `WYRD_API_KEY` | REQUIRED | Deploy environment's secret store (key minted by `wyrd auth issue-key <card_ref>`) | Exchanged ONCE at startup at `POST /auth/token` for short-lived JWT. SDK auto-refreshes. JWT carries `card_ref` claim. |
-| `WYRD_API_URL` | REQUIRED | Static config | Wyrd server base URL. |
-| `WYRD_GOV_TOKEN` | OPTIONAL | CI writes from `wyrd gov-token issue` response | Only if the app calls `wyrd.observe(...)`. |
+| Env var          | Required? | Source                                                                 | Used for |
+|------------------|-----------|------------------------------------------------------------------------|---|
+| `WYRD_API_KEY`   | REQUIRED  | Deploy environment's secret store (minted by `wyrd auth issue-key`)    | Exchanged ONCE at startup at `POST /auth/token` for a short-lived JWT. SDK auto-refreshes. JWT carries `card_ref` and `act` claims. |
+| `WYRD_API_URL`   | REQUIRED  | Static config                                                          | Wyrd server base URL. |
+| `WYRD_GOV_TOKEN` | OPTIONAL  | CI writes from `wyrd gov-token issue` response                         | Only if the app calls `wyrd.observe(...)`. Per-card; signs data-plane emit. |
 
-The API key is exchanged at startup — never on the wire. The JWT — not the API
-key — is what travels on cross-service
-calls in the dedicated `Wyrd-Caller-Identity: Bearer <jwt>` header. The
-application's own `Authorization` header is never touched by the SDK.
+#### Cross-service call shape
+
+The SDK adds the JWT to the standard `Authorization` header on every
+outbound call between Wyrd-registered services. There is no Wyrd-specific
+identity header. The application's own `Authorization` semantics (end-user
+OIDC bearer, etc.) are inbound concerns; outbound calls construct fresh
+headers carrying the service's Wyrd JWT.
 
 ```
 POST /charge HTTP/1.1
 Host: billing-svc.acme.svc.cluster.local
-Wyrd-Caller-Identity: Bearer <Service-A's JWT>     ← SDK adds; carries caller's card_ref
-Wyrd-Request-Id:      <ULID>                       ← SDK adds; request correlator
-Authorization: Bearer <app's own JWT>              ← app's own auth; Wyrd never reads
-Content-Type: application/json
+Authorization:   Bearer <caller's Wyrd JWT — carries card_ref + act chain>
+Wyrd-Request-Id: <ULID>
+Content-Type:    application/json
 
 { "amount": 100 }
 ```
+
+#### Agent-to-agent delegation
+
+When a Wyrd-registered actor (Service or Agent) needs to act on behalf of
+another (typically an Agent dispatching a sub-agent or invoking a tool that
+runs as a distinct registered Agent), it exchanges its current JWT at
+`POST /auth/token`
+(`grant_type=urn:ietf:params:oauth:grant-type:token-exchange`) for a JWT
+scoped to the `requested_subject`. The new JWT's `act` claim extends the
+caller's by one hop; `sub` (the ultimate initiator) is propagated unchanged.
+The caller must hold `Permission { Delegation, Issue }`.
+
+`requested_subject` accepts either a stable `PrincipalId` or a structured
+`CardRef`. CardRef is the agent-first form — agents already hold their
+target's CardRef from `wyrd apply` output and `IssueKeyResponse`. The
+`(data_tenant_id, principal_kind, card_ref)` unique index resolves the row.
+Delegation TO User principals is rejected in v1
+(`WYRD_AUTH_404_PRINCIPAL_NOT_FOUND`); user impersonation lands in a
+separate PR with stricter audit.
+
+Chain depth is hard-capped at 5 at both issue time
+(`WYRD_AUTH_400_DELEGATION_DEPTH_EXCEEDED`) and verify time
+(`WYRD_AUTH_401_DELEGATION_DEPTH_EXCEEDED`). The verifier flattens `act`
+into `RequestContext.delegation_chain` once per token-verify cache miss;
+downstream code reads the flattened slice and never re-walks the recursive
+JWT shape.
 
 #### `Wyrd-Request-Id` — request correlator
 
@@ -347,54 +383,64 @@ propagation contract.
 
 Contract:
 
-- Opaque ULID minted by Wyrd at first sighting (no inbound
-  `Wyrd-Request-Id` at `/v1/authz/check`).
-- Propagated unchanged by Wyrd SDK middleware and ext_authz on outbound
-  calls. Never mutated, never re-minted mid-request.
+- Opaque ULID minted by Wyrd at first sighting (no inbound `Wyrd-Request-Id`
+  at `/v1/authz/check`).
+- Propagated unchanged by Wyrd SDK middleware and mesh ext_authz on
+  outbound calls. Never mutated, never re-minted mid-request.
 - Every Wyrd-emitted observation carries it as a label.
-- Ancestry of any request (service1 → service2 → service3) is
-  reconstructable by joining observations on this ID; per-hop caller
-  identity comes from the verified `Wyrd-Caller-Identity` JWT at each
-  call.
+- Per-hop caller identity comes from the verified `Authorization` JWT at
+  each call; chain ancestry of a logical request is reconstructable by
+  joining observations on `Wyrd-Request-Id`.
 
-Storage tier, query API, and CEL surface (e.g. a `chain.*` binding) are
-implementation concerns deferred to the runtime stage.
+### Runtime authz: `POST /v1/authz/check/{callee_card_ref}`
 
-### Runtime authz: `POST /v1/authz/check`
-
-The single CEL evaluation surface for `PolicyAction::Invoke`. Two delivery
-paths, identical semantics:
+The single CEL evaluation surface for `PolicyAction::Invoke`. The callee
+card is encoded in the URL path; the caller's identity is on standard
+`Authorization`. Two delivery paths, identical semantics:
 
 - **Service mesh (ext_authz).** The mesh's local Envoy/Istio sidecar
   intercepts the inbound request transparently (iptables redirect, standard
-  k8s/Istio behavior), and the configured ext_authz filter calls Wyrd's
-  `/v1/authz/check`. The developer's application code makes a normal HTTP
-  call — it does not address Envoy explicitly. One-time platform-team filter
-  config covers every workload.
+  k8s/Istio behavior). The configured ext_authz filter calls Wyrd's
+  `/v1/authz/check/{callee_card_ref}`, forwarding the inbound request's
+  `Authorization` header verbatim. The sidecar→Wyrd connection is
+  authenticated at the network layer via mTLS (mesh-issued certs); Wyrd
+  pins the SPIFFE ID to the callee Service Card. One-time platform-team
+  filter config covers every workload. No Wyrd-specific header is required.
 - **SDK middleware (non-mesh).** Identical semantics in-process. One-line
-  developer install (`app.add_middleware(PolicyMiddleware)`). The middleware
-  reads `Wyrd-Caller-Identity` from the inbound request and calls the same
-  `/v1/authz/check` route.
+  developer install (`app.add_middleware(PolicyMiddleware)`). The
+  middleware reads the inbound request's `Authorization`, identifies itself
+  to Wyrd via its own Wyrd JWT, and forwards the inbound caller bearer per
+  the standard ext_authz convention (`X-Forwarded-Access-Token`, the same
+  name used by oauth2-proxy, AWS ALB, and Envoy HTTP ext_authz forwarders).
+  Wyrd reads `Authorization` to scope the request to the callee tenant and
+  reads `X-Forwarded-Access-Token` for the caller identity being authorized.
 
-The check is **headers-only**. Body is empty. All inputs are headers, which
-matches how Envoy's ext_authz filter natively forwards data — zero
-translation logic on either end.
+The check carries no body. All inputs are URL path + headers, which matches
+how Envoy's ext_authz HTTP filter natively forwards data — zero translation
+logic on either end.
 
 ```
-POST /v1/authz/check HTTP/1.1
+POST /v1/authz/check/{callee_card_ref} HTTP/1.1
 Host: wyrd.acme.com
-Authorization:         Bearer <middleware/sidecar's own JWT — its card identity>
-Wyrd-Caller-Identity:  Bearer <caller's JWT — forwarded from the original request>
-Wyrd-Request-Id:       <ULID — forwarded from inbound, or absent on first hop>
-X-Original-Method:     POST
-X-Original-Path:       /charge
+Authorization:     Bearer <caller's Wyrd JWT — carries principal + act chain>
+Wyrd-Request-Id:   <ULID — forwarded from inbound, or absent on first hop>
+X-Original-Method: POST
+X-Original-Path:   /charge
 Content-Length: 0
 ```
 
+(In the SDK-middleware path, `Authorization` is the middleware's own JWT
+and the caller bearer is on `X-Forwarded-Access-Token`. The mesh path
+forwards the inbound `Authorization` directly and trusts the sidecar via
+mTLS.)
+
 Wyrd:
-1. Verifies `Authorization` JWT → builds `callee` from claims (`card_ref`,
-   `actor`, `scopes`).
-2. Verifies `Wyrd-Caller-Identity` JWT → builds `caller` from claims.
+
+1. Resolves `{callee_card_ref}` (path param) to the callee card.
+2. Verifies the caller JWT (sourced per the active path: `Authorization`
+   for mesh, `X-Forwarded-Access-Token` for SDK middleware) → builds
+   `caller` from claims (`principal.kind`, `principal.card_ref`,
+   `principal.id`, `delegation_chain` flattened from `act`).
 3. Reads `X-Original-Method` / `X-Original-Path` → builds `request`.
 4. Reads `Wyrd-Request-Id` if present; mints a fresh ULID if absent and
    echoes it back so the middleware/sidecar can inject it on the outbound
@@ -403,15 +449,17 @@ Wyrd:
    merged Classify-derived attributes from caller + callee cards).
 6. Evaluates CEL rules where `action == invoke` for the callee card
    (org-global ∪ service-local, deny-overrides).
-7. Returns `200 OK` (Allow) or `403 Forbidden` with `PolicyDecision::Deny { reason }`.
+7. Returns `200 OK` (Allow) or `403 Forbidden` with
+   `PolicyDecision::Deny { reason }`.
 8. Asynchronously emits one `PolicyInvokeDecision` observation per check,
-   labeled with `Wyrd-Request-Id` (signed with Wyrd internal authority —
-   no caller/callee gov-token consumed). Every allow and every deny is
-   audited automatically; no developer wiring.
+   labeled with `Wyrd-Request-Id` and the flattened `delegation_chain`
+   (signed with Wyrd internal authority — no caller/callee gov-token
+   consumed). Every allow and every deny is audited automatically; no
+   developer wiring.
 
-Both identities are server-signed and verified from claims. The pod cannot
-self-assert its identity — no env var, no body field, no header carries
-identity data the pod authored.
+The caller identity is server-signed and verified from claims. The pod
+cannot self-assert its identity — no env var, no body field, no header
+carries identity data the pod authored.
 
 ### Audit
 Immutable case file. Records the result of an investigation against the

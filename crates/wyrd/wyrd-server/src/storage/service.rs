@@ -118,8 +118,7 @@ pub async fn upload_init(
 
     let upload_id = UploadId::new();
     let upload_uuid = upload_id_uuid(&upload_id)?;
-    let (part_count, part_size_bytes, block_count_planned) =
-        upload_row_counts(planned, body.expected_size_bytes, wire_protocol);
+    let counts = upload_row_counts(planned, body.expected_size_bytes, wire_protocol);
     multipart_uploads::insert_initiating(
         &mut conn,
         multipart_uploads::NewMultipartUpload {
@@ -137,19 +136,19 @@ pub async fn upload_init(
                 )
             })?,
             content_type: body.content_type.as_deref(),
-            part_count_planned: i32::try_from(part_count).map_err(|_| {
+            part_count_planned: i32::try_from(counts.part_count).map_err(|_| {
                 internal_error(
                     "planned part count exceeds storage metadata range",
-                    serde_json::json!({ "part_count": part_count }),
+                    serde_json::json!({ "part_count": counts.part_count }),
                 )
             })?,
-            part_size_bytes: i64::try_from(part_size_bytes).map_err(|_| {
+            part_size_bytes: i64::try_from(counts.part_size_bytes).map_err(|_| {
                 internal_error(
                     "planned part size exceeds storage metadata range",
-                    serde_json::json!({ "part_size_bytes": part_size_bytes }),
+                    serde_json::json!({ "part_size_bytes": counts.part_size_bytes }),
                 )
             })?,
-            block_count_planned,
+            block_count_planned: counts.block_count_planned,
             ttl_secs: INIT_TTL_SECS,
         },
     )
@@ -846,11 +845,17 @@ fn derive_wire_protocol(backend: StorageBackendKind, planned: PlannedUpload) -> 
     }
 }
 
+struct UploadRowCounts {
+    part_count: u32,
+    part_size_bytes: u64,
+    block_count_planned: Option<i32>,
+}
+
 fn upload_row_counts(
     planned: PlannedUpload,
     expected_size_bytes: u64,
     wire_protocol: WireProtocol,
-) -> (u32, u64, Option<i32>) {
+) -> UploadRowCounts {
     let (part_count, part_size_bytes) = match planned {
         PlannedUpload::SinglePut => (1, expected_size_bytes),
         PlannedUpload::Multipart {
@@ -863,7 +868,11 @@ fn upload_row_counts(
     } else {
         None
     };
-    (part_count, part_size_bytes, block_count_planned)
+    UploadRowCounts {
+        part_count,
+        part_size_bytes,
+        block_count_planned,
+    }
 }
 
 async fn drive_backend_init(
@@ -1301,14 +1310,16 @@ mod tests {
             part_size_bytes: 16,
         };
 
-        assert_eq!(
-            upload_row_counts(planned, 100, WireProtocol::AzureBlockBlobV1),
-            (7, 16, Some(7))
-        );
-        assert_eq!(
-            upload_row_counts(planned, 100, WireProtocol::S3MultipartV1),
-            (7, 16, None)
-        );
+        let azure = upload_row_counts(planned, 100, WireProtocol::AzureBlockBlobV1);
+        assert_eq!(azure.part_count, 7);
+        assert_eq!(azure.part_size_bytes, 16);
+        assert_eq!(azure.block_count_planned, Some(7));
+
+        let s3 = upload_row_counts(planned, 100, WireProtocol::S3MultipartV1);
+        assert_eq!(s3.part_count, 7);
+        assert_eq!(s3.part_size_bytes, 16);
+        assert_eq!(s3.block_count_planned, None);
+
     }
 
     #[test]
@@ -1522,6 +1533,7 @@ mod tests {
             principal: Principal::new(
                 Actor::Service {
                     name: "test-service".to_owned(),
+                    client_id: "test-service".to_owned(),
                 },
                 scopes,
             ),

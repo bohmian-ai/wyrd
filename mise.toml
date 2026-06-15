@@ -263,8 +263,10 @@ env = { WYRD_STORAGE_INTEGRATION_S3 = "1", AWS_ACCESS_KEY_ID = "wyrd-test-key", 
 run = "cargo test -p wyrd-storage --all-features --test integration_minio -- --nocapture"
 
 [tasks."test:storage:gcs-emu"]
-description = "Reserved emulator task; current GCS signer uses the cloud credential chain"
-run = "echo 'GCS emulator is configured by storage:up; no compiling wyrd-storage test is wired until the signer has emulator-aware credentials.'"
+description = "Run wyrd-storage GCS emulator integration tests; requires storage:up"
+depends = ["storage:up"]
+env = { WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_GCS_EMULATOR_HOST = "http://localhost:4443/storage/v1/" }
+run = "cargo test -p wyrd-storage --all-features --test integration_gcs -- --nocapture"
 
 [tasks."test:storage:azurite"]
 description = "Reserved emulator task; current Azure signer uses the cloud credential chain"

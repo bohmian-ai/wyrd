@@ -70,6 +70,26 @@ pub fn build_object_store(config: &GcsConfig) -> Result<GoogleCloudStorage, Stor
     })
 }
 
+/// Build a GCS signer pointed at a local emulator endpoint.
+///
+/// Uses anonymous credentials and a custom `storage_endpoint`. Set
+/// `WYRD_STORAGE_INTEGRATION_GCS=1` and `WYRD_GCS_EMULATOR_HOST` in tests
+/// to activate. Never call this in production.
+///
+/// # Errors
+/// Returns an error when the bucket probe against the emulator fails.
+pub async fn build_emulator_signer(
+    bucket: &str,
+    emulator_host: &str,
+) -> Result<GcsSigner, StorageError> {
+    let config = ClientConfig {
+        storage_endpoint: emulator_host.trim_end_matches('/').to_owned(),
+        ..ClientConfig::default().anonymous()
+    };
+    let client = Client::new(config);
+    Ok(GcsSigner::new(client, bucket.to_owned()))
+}
+
 async fn build_client_config() -> Result<ClientConfig, gcloud_auth::error::Error> {
     use gcloud_auth::credentials::CredentialsFile;
 

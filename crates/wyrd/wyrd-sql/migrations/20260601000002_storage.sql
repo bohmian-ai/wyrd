@@ -27,7 +27,7 @@ CREATE TABLE wyrd.storage_multipart_uploads (
     failure_reason         TEXT,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at           TIMESTAMPTZ,
-    aborted_at             TIMESTAMPTZ,
+    terminal_at            TIMESTAMPTZ,
     expires_at             TIMESTAMPTZ NOT NULL
 );
 

@@ -87,7 +87,7 @@ pub async fn mark_aborted_admin(
         r#"
         UPDATE wyrd.storage_multipart_uploads
         SET status = 'aborted',
-            aborted_at = now(),
+            terminal_at = now(),
             failure_reason = $2
         WHERE id = $1
           AND status IN ('pending', 'initiating')

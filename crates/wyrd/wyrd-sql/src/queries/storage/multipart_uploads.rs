@@ -124,7 +124,7 @@ pub struct MultipartUploadRow {
     /// Completion time.
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Abort or failure time.
-    pub aborted_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub terminal_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Sweeper expiration time.
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
@@ -149,7 +149,7 @@ struct MultipartUploadRowDb {
     failure_reason: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
-    aborted_at: Option<chrono::DateTime<chrono::Utc>>,
+    terminal_at: Option<chrono::DateTime<chrono::Utc>>,
     expires_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -194,7 +194,7 @@ impl TryFrom<MultipartUploadRowDb> for MultipartUploadRow {
             failure_reason: row.failure_reason,
             created_at: row.created_at,
             completed_at: row.completed_at,
-            aborted_at: row.aborted_at,
+            terminal_at: row.terminal_at,
             expires_at: row.expires_at,
         })
     }
@@ -325,7 +325,7 @@ pub async fn find_by_id(
             failure_reason,
             created_at,
             completed_at,
-            aborted_at,
+            terminal_at,
             expires_at
         FROM wyrd.storage_multipart_uploads
         WHERE id = $1
@@ -369,7 +369,7 @@ pub async fn find_pending_for_dedupe(
             failure_reason,
             created_at,
             completed_at,
-            aborted_at,
+            terminal_at,
             expires_at
         FROM wyrd.storage_multipart_uploads
         WHERE card_uid = $1
@@ -424,7 +424,7 @@ pub async fn mark_aborted(
         r#"
         UPDATE wyrd.storage_multipart_uploads
         SET status = 'aborted',
-            aborted_at = now(),
+            terminal_at = now(),
             failure_reason = $2
         WHERE id = $1
           AND status IN ('initiating', 'pending')
@@ -452,7 +452,7 @@ pub async fn mark_failed(
         r#"
         UPDATE wyrd.storage_multipart_uploads
         SET status = 'failed',
-            aborted_at = now(),
+            terminal_at = now(),
             failure_reason = $2
         WHERE id = $1
           AND status IN ('initiating', 'pending')

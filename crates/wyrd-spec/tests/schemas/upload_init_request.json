@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UploadInitRequest",
+  "description": "Client request to initialize an upload.",
+  "type": "object",
+  "required": [
+    "card_uid",
+    "expected_sha256",
+    "expected_size_bytes",
+    "relative_path"
+  ],
+  "properties": {
+    "card_uid": {
+      "description": "Card that will own the uploaded artifact bytes.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardUid"
+        }
+      ]
+    },
+    "content_type": {
+      "description": "Optional content type.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "expected_sha256": {
+      "description": "Expected base64-encoded SHA-256 digest.",
+      "type": "string"
+    },
+    "expected_size_bytes": {
+      "description": "Expected byte length.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "relative_path": {
+      "description": "Object path under the card.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    }
+  }
+}

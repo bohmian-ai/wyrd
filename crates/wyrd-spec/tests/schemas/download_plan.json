@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DownloadPlan",
+  "description": "Presigned GET plan for any backend.",
+  "type": "object",
+  "required": [
+    "get_url",
+    "ttl_secs"
+  ],
+  "properties": {
+    "get_url": {
+      "description": "Presigned GET URL or local server route URL.",
+      "type": "string"
+    },
+    "ttl_secs": {
+      "description": "URL time-to-live in seconds.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AbortResponse",
+  "description": "Server response for an upload abort request.",
+  "type": "object",
+  "required": [
+    "aborted"
+  ],
+  "properties": {
+    "aborted": {
+      "description": "Whether the upload was marked aborted by this request.",
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false
+}

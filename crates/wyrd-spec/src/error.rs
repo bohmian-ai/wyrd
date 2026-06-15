@@ -22,7 +22,7 @@ pub mod storage {
     /// Wire-stable storage errors returned by Wyrd storage surfaces.
     #[derive(Debug, Clone, Error, Serialize, Deserialize, schemars::JsonSchema, WyrdError)]
     #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-    #[serde(tag = "code", content = "data", rename_all = "snake_case")]
+    #[serde(tag = "variant", content = "data", rename_all = "snake_case")]
     pub enum WyrdStorageError {
         /// Tenant-scoped storage path validation failed.
         #[error("tenant path validation rejected upload: {detail}")]

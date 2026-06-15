@@ -9,7 +9,10 @@ use axum::response::Response;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
-use wyrd_spec::storage::{DownloadInitRequest, UploadCompleteRequest, UploadId, UploadInitRequest};
+use wyrd_spec::storage::{
+    AbortResponse, DownloadInitRequest, PartUrlResponse, UploadCompleteRequest, UploadId,
+    UploadInitRequest,
+};
 use wyrd_storage::BackendConfig;
 
 use crate::auth::Caller;
@@ -57,7 +60,7 @@ async fn part_url(
     caller: Caller,
     Path(id): Path<String>,
     Query(query): Query<PartUrlQuery>,
-) -> Result<Json<service::PartUrlResponse>, WyrdErrorResponse> {
+) -> Result<Json<PartUrlResponse>, WyrdErrorResponse> {
     let upload_id = parse_upload_id(&id)?;
     service::upload_part_url(&state, caller, upload_id, query.part_number)
         .await
@@ -82,7 +85,7 @@ async fn abort(
     State(state): State<AppState>,
     caller: Caller,
     Path(id): Path<String>,
-) -> Result<Json<service::AbortResponse>, WyrdErrorResponse> {
+) -> Result<Json<AbortResponse>, WyrdErrorResponse> {
     let upload_id = parse_upload_id(&id)?;
     service::upload_abort(&state, caller, upload_id)
         .await

@@ -17,7 +17,7 @@ pub use download::{DownloadInitRequest, DownloadInitResponse, DownloadPlan};
 pub use ids::{UploadId, UploadIdParseError};
 pub use protocol::{WireProtocol, WireProtocolParseError};
 pub use upload::{
-    AzureBlockBlobComplete, GcsResumableComplete, HeaderPair, S3CompletedPart, S3MultipartComplete,
-    SinglePutComplete, UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest,
-    UploadInitResponse, UploadPlan,
+    AbortResponse, AzureBlockBlobComplete, GcsResumableComplete, HeaderPair, PartUrlResponse,
+    S3CompletedPart, S3MultipartComplete, SinglePutComplete, UploadCompleteRequest,
+    UploadCompleteResponse, UploadInitRequest, UploadInitResponse, UploadPlan,
 };

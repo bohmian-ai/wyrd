@@ -7,7 +7,6 @@ use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::types::Uuid;
 use tokio_util::io::ReaderStream;
@@ -17,10 +16,10 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::error::storage::WyrdStorageError;
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::storage::{
-    AzureBlockBlobComplete, DownloadInitRequest, DownloadInitResponse, DownloadPlan,
-    S3MultipartComplete, StorageBackendKind, StoredObjectRef, UploadCompleteRequest,
-    UploadCompleteResponse, UploadId, UploadIdParseError, UploadInitRequest, UploadInitResponse,
-    UploadPlan, WireProtocol,
+    AbortResponse, AzureBlockBlobComplete, DownloadInitRequest, DownloadInitResponse, DownloadPlan,
+    PartUrlResponse, S3MultipartComplete, StorageBackendKind, StoredObjectRef,
+    UploadCompleteRequest, UploadCompleteResponse, UploadId, UploadIdParseError, UploadInitRequest,
+    UploadInitResponse, UploadPlan, WireProtocol,
 };
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::storage::artifact_metadata::ArtifactMetadataRow;
@@ -36,22 +35,6 @@ use crate::storage::audit;
 
 const INIT_TTL_SECS: u64 = 24 * 60 * 60;
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
-
-/// Response body for one multipart part URL.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PartUrlResponse {
-    /// Presigned part URL.
-    pub url: String,
-    /// URL TTL in seconds.
-    pub ttl_secs: u32,
-}
-
-/// Response body for upload abort.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct AbortResponse {
-    /// Whether the upload was marked aborted.
-    pub aborted: bool,
-}
 
 struct InitReplay {
     upload_id: UploadId,

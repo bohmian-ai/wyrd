@@ -159,3 +159,23 @@ pub struct UploadCompleteResponse {
     /// Wire-only descriptor for the stored bytes.
     pub stored: StoredObjectRef,
 }
+
+/// Server response for a single multipart part presigned URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct PartUrlResponse {
+    /// Presigned part URL.
+    pub url: String,
+    /// URL TTL in seconds.
+    pub ttl_secs: u32,
+}
+
+/// Server response for an upload abort request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct AbortResponse {
+    /// Whether the upload was marked aborted by this request.
+    pub aborted: bool,
+}

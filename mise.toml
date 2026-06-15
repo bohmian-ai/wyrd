@@ -269,12 +269,14 @@ env = { WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_GCS_EMULATOR_HOST = "http://loc
 run = "cargo test -p wyrd-storage --all-features --test integration_gcs -- --nocapture"
 
 [tasks."test:storage:azurite"]
-description = "Reserved emulator task; current Azure signer uses the cloud credential chain"
-run = "echo 'Azurite is configured by storage:up; no compiling wyrd-storage test is wired until the signer has emulator-aware credentials.'"
+description = "Run wyrd-storage Azurite integration tests; requires storage:up"
+depends = ["storage:up"]
+env = { WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_AZURE_EMULATOR_ENDPOINT = "http://127.0.0.1:10000" }
+run = "cargo test -p wyrd-storage --all-features --test integration_azurite -- --nocapture"
 
 [tasks."test:storage:matrix"]
-description = "Run storage tests that compile against current crates without cloud credentials"
-depends = ["test:storage:local"]
+description = "Run all storage emulator integration tests; requires storage:up"
+depends = ["test:storage:local", "test:storage:gcs-emu", "test:storage:minio", "test:storage:azurite"]
 
 [tasks."check:storage:drift"]
 description = "Assert storage foundation guardrails against paths that exist in this workspace"

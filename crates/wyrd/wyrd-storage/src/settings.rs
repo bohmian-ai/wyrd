@@ -1,5 +1,8 @@
 //! Typed storage settings parsed once at server boot.
 
+use crate::env_parse::{
+    env_optional, env_required, parse_bool, parse_u32_clamped, parse_u64_clamped,
+};
 use crate::error::{ConfigParseError, StorageError};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -162,24 +165,6 @@ pub fn from_env() -> Result<StorageSettings, StorageError> {
     })
 }
 
-fn env_required(var: &'static str) -> Result<String, StorageError> {
-    std::env::var(var).map_err(|source| StorageError::ConfigParse {
-        var,
-        source: ConfigParseError::MissingEnv(source),
-    })
-}
-
-fn env_optional(var: &'static str) -> Result<Option<String>, StorageError> {
-    match std::env::var(var) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(source) => Err(StorageError::ConfigParse {
-            var,
-            source: ConfigParseError::MissingEnv(source),
-        }),
-    }
-}
-
 fn local_root_from_env() -> Result<PathBuf, StorageError> {
     let root = PathBuf::from(env_required("WYRD_STORAGE_LOCAL_ROOT")?);
     if !root.is_absolute() {
@@ -195,69 +180,6 @@ fn local_root_from_env() -> Result<PathBuf, StorageError> {
         );
     }
     Ok(root)
-}
-
-fn parse_bool(var: &'static str, default: bool) -> Result<bool, StorageError> {
-    match std::env::var(var) {
-        Ok(value) => match value.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Ok(true),
-            "false" | "0" | "no" | "off" => Ok(false),
-            _ => config_err(var, ConfigParseError::InvalidBool(value)),
-        },
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(source) => Err(StorageError::ConfigParse {
-            var,
-            source: ConfigParseError::MissingEnv(source),
-        }),
-    }
-}
-
-fn parse_u32_clamped(
-    var: &'static str,
-    default: u32,
-    lower: u32,
-    upper: u32,
-) -> Result<u32, StorageError> {
-    match std::env::var(var) {
-        Ok(value) => {
-            let parsed = value
-                .parse::<u32>()
-                .map_err(|source| StorageError::ConfigParse {
-                    var,
-                    source: ConfigParseError::InvalidU32 { value, source },
-                })?;
-            Ok(parsed.clamp(lower, upper))
-        }
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(source) => Err(StorageError::ConfigParse {
-            var,
-            source: ConfigParseError::MissingEnv(source),
-        }),
-    }
-}
-
-fn parse_u64_clamped(
-    var: &'static str,
-    default: u64,
-    lower: u64,
-    upper: u64,
-) -> Result<u64, StorageError> {
-    match std::env::var(var) {
-        Ok(value) => {
-            let parsed = value
-                .parse::<u64>()
-                .map_err(|source| StorageError::ConfigParse {
-                    var,
-                    source: ConfigParseError::InvalidU64 { value, source },
-                })?;
-            Ok(parsed.clamp(lower, upper))
-        }
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(source) => Err(StorageError::ConfigParse {
-            var,
-            source: ConfigParseError::MissingEnv(source),
-        }),
-    }
 }
 
 fn config_err<T>(var: &'static str, source: ConfigParseError) -> Result<T, StorageError> {

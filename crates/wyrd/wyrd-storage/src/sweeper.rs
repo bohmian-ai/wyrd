@@ -4,7 +4,8 @@
 //! discover cross-tenant expired rows, then audits each row-level mutation under
 //! that row's tenant through a tenant-scoped connection.
 
-use crate::error::{ConfigParseError, StorageError};
+use crate::env_parse::{parse_bool_optional, parse_clamped_i64, parse_u64_optional};
+use crate::error::StorageError;
 use crate::{StorageHandle, tenant_path};
 use sqlx::PgPool;
 use sqlx::pool::PoolConnection;
@@ -27,8 +28,6 @@ pub const DEFAULT_BATCH_SIZE: i64 = 100;
 pub const DEFAULT_INIT_GRACE: Duration = Duration::from_secs(30);
 /// Default maximum idempotency rows deleted per tick.
 pub const DEFAULT_IDEMPOTENCY_BATCH_SIZE: i64 = 500;
-const DEFAULT_BATCH_SIZE_U64: u64 = 100;
-const DEFAULT_IDEMPOTENCY_BATCH_SIZE_U64: u64 = 500;
 
 const ENV_ENABLED: &str = "WYRD_STORAGE_SWEEPER_ENABLED";
 const ENV_TICK_SECS: &str = "WYRD_STORAGE_SWEEPER_TICK_SECS";
@@ -59,28 +58,26 @@ impl SweeperConfig {
     /// an environment value cannot be parsed.
     pub fn from_env() -> Result<Self, StorageError> {
         Ok(Self {
-            enabled: parse_bool_env(ENV_ENABLED)?.unwrap_or(true),
+            enabled: parse_bool_optional(ENV_ENABLED)?.unwrap_or(true),
             tick: Duration::from_secs(
-                parse_u64_env(ENV_TICK_SECS)?
+                parse_u64_optional(ENV_TICK_SECS)?
                     .unwrap_or(DEFAULT_TICK.as_secs())
                     .clamp(10, 3600),
             ),
-            batch_size: parse_clamped_i64_env(
+            batch_size: parse_clamped_i64(
                 ENV_BATCH_SIZE,
-                DEFAULT_BATCH_SIZE_U64,
-                DEFAULT_BATCH_SIZE,
+                DEFAULT_BATCH_SIZE as u64,
                 1,
                 1000,
             )?,
             init_grace: Duration::from_secs(
-                parse_u64_env(ENV_INIT_GRACE_SECS)?
+                parse_u64_optional(ENV_INIT_GRACE_SECS)?
                     .unwrap_or(DEFAULT_INIT_GRACE.as_secs())
                     .clamp(5, 600),
             ),
-            idempotency_batch_size: parse_clamped_i64_env(
+            idempotency_batch_size: parse_clamped_i64(
                 ENV_IDEMPOTENCY_BATCH_SIZE,
-                DEFAULT_IDEMPOTENCY_BATCH_SIZE_U64,
-                DEFAULT_IDEMPOTENCY_BATCH_SIZE,
+                DEFAULT_IDEMPOTENCY_BATCH_SIZE as u64,
                 1,
                 5000,
             )?,
@@ -372,55 +369,6 @@ impl Sweeper {
         conn.commit().await?;
 
         Ok(())
-    }
-}
-
-fn parse_bool_env(var: &'static str) -> Result<Option<bool>, StorageError> {
-    let Some(value) = optional_env(var)? else {
-        return Ok(None);
-    };
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => Ok(Some(true)),
-        "false" | "0" | "no" | "off" => Ok(Some(false)),
-        _ => Err(StorageError::ConfigParse {
-            var,
-            source: ConfigParseError::InvalidBool(value),
-        }),
-    }
-}
-
-fn parse_u64_env(var: &'static str) -> Result<Option<u64>, StorageError> {
-    optional_env(var)?
-        .map(|value| {
-            value
-                .parse::<u64>()
-                .map_err(|source| StorageError::ConfigParse {
-                    var,
-                    source: ConfigParseError::InvalidU64 { value, source },
-                })
-        })
-        .transpose()
-}
-
-fn parse_clamped_i64_env(
-    var: &'static str,
-    default_u64: u64,
-    fallback: i64,
-    min: u64,
-    max: u64,
-) -> Result<i64, StorageError> {
-    let value = parse_u64_env(var)?.unwrap_or(default_u64).clamp(min, max);
-    Ok(i64::try_from(value).unwrap_or(fallback))
-}
-
-fn optional_env(var: &'static str) -> Result<Option<String>, StorageError> {
-    match std::env::var(var) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(source) => Err(StorageError::ConfigParse {
-            var,
-            source: ConfigParseError::MissingEnv(source),
-        }),
     }
 }
 

@@ -9,6 +9,7 @@
 
 pub mod azure;
 pub mod encryption;
+pub mod env_parse;
 pub mod error;
 pub mod factory;
 pub mod gcs;

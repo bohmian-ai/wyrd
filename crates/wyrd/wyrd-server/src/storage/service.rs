@@ -66,6 +66,27 @@ struct PriorAbort {
     backend_upload_id: Option<String>,
 }
 
+pub(crate) enum UploadAuditOperation {
+    UploadInit,
+    UploadComplete,
+}
+
+impl UploadAuditOperation {
+    fn as_sql_str(&self) -> &'static str {
+        match self {
+            Self::UploadInit => "upload_init",
+            Self::UploadComplete => "upload_complete",
+        }
+    }
+}
+
+struct FailureContext<'a> {
+    operation: UploadAuditOperation,
+    reason: &'a str,
+    status_code: i32,
+    error_code: Option<&'a str>,
+}
+
 /// Initialize an artifact upload.
 #[instrument(skip(state, caller, headers, body), fields(tenant = %caller.data_tenant_id))]
 pub async fn upload_init(
@@ -172,10 +193,12 @@ pub async fn upload_init(
                 upload_uuid,
                 &validated,
                 backend,
-                "upload_init",
-                "backend init failed",
-                status_code,
-                Some(&error_code),
+                FailureContext {
+                    operation: UploadAuditOperation::UploadInit,
+                    reason: "backend init failed",
+                    status_code,
+                    error_code: Some(&error_code),
+                },
             )
             .await;
             return Err(error);
@@ -323,10 +346,12 @@ pub async fn upload_complete(
             upload_uuid,
             &validated,
             row.backend,
-            "upload_complete",
-            "backend_complete_failed",
-            status_code,
-            Some(&error_code),
+            FailureContext {
+                operation: UploadAuditOperation::UploadComplete,
+                reason: "backend_complete_failed",
+                status_code,
+                error_code: Some(&error_code),
+            },
         )
         .await;
         return Err(error);
@@ -349,10 +374,12 @@ pub async fn upload_complete(
                 upload_uuid,
                 &validated,
                 row.backend,
-                "upload_complete",
-                "head_for_verification_failed",
-                status_code,
-                Some(&error_code),
+                FailureContext {
+                    operation: UploadAuditOperation::UploadComplete,
+                    reason: "head_for_verification_failed",
+                    status_code,
+                    error_code: Some(&error_code),
+                },
             )
             .await;
             return Err(error);
@@ -375,10 +402,12 @@ pub async fn upload_complete(
             upload_uuid,
             &validated,
             row.backend,
-            "upload_complete",
-            "sha_mismatch",
-            status_code,
-            Some(&error_code),
+            FailureContext {
+                operation: UploadAuditOperation::UploadComplete,
+                reason: "sha_mismatch",
+                status_code,
+                error_code: Some(&error_code),
+            },
         )
         .await;
         return Err(error);
@@ -1090,10 +1119,12 @@ async fn verify_object_head(
             upload_uuid,
             validated,
             row.backend,
-            "upload_complete",
-            "size_mismatch",
-            status_code,
-            Some(&error_code),
+            FailureContext {
+                operation: UploadAuditOperation::UploadComplete,
+                reason: "size_mismatch",
+                status_code,
+                error_code: Some(&error_code),
+            },
         )
         .await;
         return Err(error);
@@ -1108,10 +1139,12 @@ async fn verify_object_head(
             upload_uuid,
             validated,
             row.backend,
-            "upload_complete",
-            "encryption_missing",
-            status_code,
-            Some(&error_code),
+            FailureContext {
+                operation: UploadAuditOperation::UploadComplete,
+                reason: "encryption_missing",
+                status_code,
+                error_code: Some(&error_code),
+            },
         )
         .await;
         return Err(error);
@@ -1119,34 +1152,30 @@ async fn verify_object_head(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn mark_failed_best_effort(
     state: &AppState,
     caller: &Caller,
     upload_uuid: Uuid,
     validated: &ValidatedPath,
     backend: StorageBackendKind,
-    operation: &'static str,
-    reason: &str,
-    status_code: i32,
-    error_code: Option<&str>,
+    ctx: FailureContext<'_>,
 ) {
     let Ok(mut conn) = TenantConn::acquire(&state.pool, caller.data_tenant_id).await else {
         tracing::warn!(upload_id = %upload_uuid, "failed to acquire tenant connection for failure mark");
         return;
     };
-    if let Err(error) = multipart_uploads::mark_failed(&mut conn, upload_uuid, reason).await {
+    if let Err(error) = multipart_uploads::mark_failed(&mut conn, upload_uuid, ctx.reason).await {
         tracing::warn!(error = %error, upload_id = %upload_uuid, "failed to mark upload failed");
     }
     if let Err(error) = audit::write(
         &mut conn,
         caller,
-        operation,
+        ctx.operation.as_sql_str(),
         Some(upload_uuid),
         &validated.full,
         backend,
-        status_code,
-        error_code,
+        ctx.status_code,
+        ctx.error_code,
     )
     .await
     {

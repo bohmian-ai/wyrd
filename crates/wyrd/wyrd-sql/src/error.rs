@@ -99,6 +99,32 @@ pub enum SqlError {
         constraint: String,
     },
 
+    /// Operation conflicted with the current row state.
+    #[wyrd_error(
+        code = "WYRD_SQL_409_CONFLICT",
+        status = 409,
+        title = "SQL operation conflict",
+        remediation = "Reload the affected row and retry only if the row is still in the expected state."
+    )]
+    #[error("sql operation conflict: {detail}")]
+    Conflict {
+        /// Conflict detail.
+        detail: String,
+    },
+
+    /// Stored SQL data violated an invariant guaranteed by Wyrd migrations.
+    #[wyrd_error(
+        code = "WYRD_SQL_500_INVARIANT_VIOLATION",
+        status = 500,
+        title = "SQL invariant violation",
+        remediation = "Inspect the stored row and repair data that no longer matches Wyrd's schema invariants."
+    )]
+    #[error("sql invariant violation: {detail}")]
+    InvariantViolation {
+        /// Invariant violation detail.
+        detail: String,
+    },
+
     /// Tenant-scoped transaction failed.
     #[wyrd_error(
         code = "WYRD_SQL_500_TX_FAILED",
@@ -269,6 +295,22 @@ mod tests {
                 "WYRD_SQL_409_CHECK_VIOLATION",
                 409,
                 "Check constraint violated",
+            ),
+            (
+                SqlError::Conflict {
+                    detail: "state changed".to_owned(),
+                },
+                "WYRD_SQL_409_CONFLICT",
+                409,
+                "SQL operation conflict",
+            ),
+            (
+                SqlError::InvariantViolation {
+                    detail: "bad enum".to_owned(),
+                },
+                "WYRD_SQL_500_INVARIANT_VIOLATION",
+                500,
+                "SQL invariant violation",
             ),
             (
                 SqlError::RlsDenied {

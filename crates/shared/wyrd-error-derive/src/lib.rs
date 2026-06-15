@@ -65,11 +65,16 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
                         (quote! { #name::#ident(inner) }, quote! { inner })
                     }
                     Fields::Named(fields) if fields.named.len() == 1 => {
-                        let field = fields
-                            .named
-                            .first()
-                            .and_then(|field| field.ident.as_ref())
-                            .expect("invariant: named field has ident");
+                        let Some(field) =
+                            fields.named.first().and_then(|field| field.ident.as_ref())
+                        else {
+                            return syn::Error::new_spanned(
+                                variant,
+                                "#[wyrd_error(delegate)] named field must have an identifier",
+                            )
+                            .to_compile_error()
+                            .into();
+                        };
                         (quote! { #name::#ident { #field } }, quote! { #field })
                     }
                     _ => {

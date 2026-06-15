@@ -18,7 +18,7 @@ async fn tick_sweeps_expired_uploads_and_reaps_idempotency_rows() {
         admin_pool.clone(),
         SweeperConfig {
             enabled: true,
-            tick: Duration::from_secs(60),
+            tick: Duration::from_mins(1),
             batch_size: 10,
             init_grace: Duration::from_secs(30),
             idempotency_batch_size: 10,
@@ -88,7 +88,7 @@ async fn local_storage_handle() -> std::sync::Arc<StorageHandle> {
     StorageHandle::from_settings(StorageSettings {
         backend: BackendConfig::Local { root },
         require_encryption: false,
-        presign_ttl: Duration::from_secs(600),
+        presign_ttl: Duration::from_mins(10),
         part_size_bytes: 16 * 1024 * 1024,
         public_base_url: Some("https://wyrd.test".to_owned()),
     })
@@ -112,7 +112,7 @@ async fn insert_upload(
     let storage_path = tenant_path::build(tenant, &card_uid, relative_path);
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO wyrd.storage_multipart_uploads (
             id,
             data_tenant_id,
@@ -145,7 +145,7 @@ async fn insert_upload(
             now() + make_interval(secs => $6),
             now() + make_interval(secs => $7)
         )
-        "#,
+        ",
     )
     .bind(upload_id)
     .bind(card_uid)
@@ -172,7 +172,7 @@ async fn insert_idempotency_key(
         .await
         .expect("tenant conn");
     sqlx::query(
-        r#"
+        r"
         INSERT INTO wyrd.storage_idempotency_keys (
             data_tenant_id,
             idempotency_key,
@@ -182,7 +182,7 @@ async fn insert_idempotency_key(
             expires_at
         )
         VALUES (wyrd.current_tenant(), $1, $2, 200, $3::jsonb, now() + make_interval(secs => $4))
-        "#,
+        ",
     )
     .bind(key)
     .bind(vec![0_u8; 32])
@@ -217,13 +217,13 @@ async fn assert_audit_count(
     expected: i64,
 ) {
     let count = sqlx::query_scalar::<_, i64>(
-        r#"
+        r"
         SELECT count(*)
         FROM wyrd.storage_access_ledger
         WHERE data_tenant_id = $1
           AND subject_id = 'storage-sweeper'
           AND operation = 'sweeper_abort'
-        "#,
+        ",
     )
     .bind(tenant.as_uuid())
     .fetch_one(admin_pool)

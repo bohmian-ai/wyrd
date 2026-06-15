@@ -17,14 +17,14 @@ async fn minio_s3_multipart_round_trip_when_enabled() {
     let path = wyrd_storage::tenant_path::validate(&full, tenant).expect("tenant path");
 
     let init = signer
-        .init_multipart(&path, 2, 5 * 1024 * 1024, Duration::from_secs(600))
+        .init_multipart(&path, 2, 5 * 1024 * 1024, Duration::from_mins(10))
         .await
         .expect("init multipart");
     assert!(matches!(
         init.plan,
         UploadPlan::S3Multipart {
             part_count: 2,
-            part_size_bytes: 5242880,
+            part_size_bytes: 5_242_880,
             ..
         }
     ));
@@ -32,18 +32,19 @@ async fn minio_s3_multipart_round_trip_when_enabled() {
     let http = reqwest::Client::new();
     let mut parts = Vec::new();
     for part_number in 1..=2 {
+        let payload_byte = if part_number == 1 { 1 } else { 2 };
         let url = signer
             .presign_part(
                 &path,
                 &init.backend_upload_id,
                 part_number,
-                Duration::from_secs(600),
+                Duration::from_mins(10),
             )
             .await
             .expect("presign part");
         let response = http
             .put(url)
-            .body(vec![part_number as u8; 5 * 1024 * 1024])
+            .body(vec![payload_byte; 5 * 1024 * 1024])
             .send()
             .await
             .expect("upload part");

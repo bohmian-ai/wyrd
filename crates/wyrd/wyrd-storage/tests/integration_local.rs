@@ -29,7 +29,7 @@ async fn local_signer_round_trips_single_put_contract() {
         .expect("verify sha");
 
     let plan = signer
-        .presign_single_put(&path, head.size_bytes, Duration::from_secs(60))
+        .presign_single_put(&path, head.size_bytes, Duration::from_mins(1))
         .await
         .expect("local upload plan");
     let UploadPlan::SinglePut {

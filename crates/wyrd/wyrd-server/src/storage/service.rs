@@ -824,7 +824,10 @@ fn validate_sha256_b64(value: &str) -> Result<(), WyrdError> {
 }
 
 fn sha256_canonical_json(body: &UploadInitRequest) -> [u8; 32] {
-    let bytes = serde_json::to_vec(body).expect("invariant: UploadInitRequest serializes to JSON");
+    let bytes = match serde_json::to_vec(body) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!("invariant: UploadInitRequest serializes to JSON: {error}"),
+    };
     Sha256::digest(bytes).into()
 }
 

@@ -13,7 +13,7 @@ const ENV_KEYS: &[&str] = &[
 
 #[tokio::test]
 async fn builds_local_handle_from_settings() {
-    let (handle, _root) = local_handle().await;
+    let (handle, _root) = Box::pin(local_handle()).await;
 
     assert!(matches!(handle.signer(), BackendSigner::Local(_)));
     assert_eq!(
@@ -30,7 +30,7 @@ async fn builds_local_handle_from_settings() {
 
 #[tokio::test]
 async fn object_store_for_accepts_local_tenant_uri() {
-    let (handle, _root) = local_handle().await;
+    let (handle, _root) = Box::pin(local_handle()).await;
     let tenant = DataTenantId::new_v7();
     let uri = format!(
         "file://localhost/{tenant}/cards/{}/x.parquet",
@@ -46,7 +46,7 @@ async fn object_store_for_accepts_local_tenant_uri() {
 
 #[tokio::test]
 async fn object_store_for_rejects_foreign_tenant_uri() {
-    let (handle, _root) = local_handle().await;
+    let (handle, _root) = Box::pin(local_handle()).await;
     let caller = DataTenantId::new_v7();
     let foreign = DataTenantId::new_v7();
     let uri = format!(
@@ -54,9 +54,8 @@ async fn object_store_for_rejects_foreign_tenant_uri() {
         uuid::Uuid::now_v7()
     );
 
-    let error = match handle.object_store_for(&uri, caller) {
-        Ok(_) => panic!("foreign tenant uri should be rejected"),
-        Err(error) => error,
+    let Err(error) = handle.object_store_for(&uri, caller) else {
+        panic!("foreign tenant uri should be rejected");
     };
 
     assert!(matches!(
@@ -67,7 +66,7 @@ async fn object_store_for_rejects_foreign_tenant_uri() {
 
 #[tokio::test]
 async fn object_store_for_returns_shared_arc_for_same_tenant() {
-    let (handle, _root) = local_handle().await;
+    let (handle, _root) = Box::pin(local_handle()).await;
     let tenant = DataTenantId::new_v7();
     let uri_a = format!(
         "file://localhost/{tenant}/cards/{}/a.parquet",
@@ -106,12 +105,12 @@ async fn local_handle() -> (Arc<StorageHandle>, tempfile::TempDir) {
         .collect::<Vec<(&'static str, Option<String>)>>();
     all.extend(vars);
 
-    let handle = temp_env::async_with_vars(all, async {
+    let handle = Box::pin(temp_env::async_with_vars(all, async {
         let settings = wyrd_storage::settings::from_env().expect("settings parse");
         StorageHandle::from_settings(settings)
             .await
             .expect("local handle")
-    })
+    }))
     .await;
 
     (handle, root)

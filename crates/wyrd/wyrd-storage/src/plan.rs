@@ -67,8 +67,7 @@ pub fn plan_upload(
         part_count = size_bytes.div_ceil(part_size_bytes);
     }
 
-    let part_count =
-        u32::try_from(part_count).expect("invariant: part count <= MAX_PARTS_PER_UPLOAD");
+    let part_count = u32::try_from(part_count).map_err(|_| PlanError::TooLarge(size_bytes))?;
     Ok(PlannedUpload::Multipart {
         part_count,
         part_size_bytes,

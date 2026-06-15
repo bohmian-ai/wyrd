@@ -12,7 +12,7 @@ static FULL_PATH_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
         r"/cards/(?P<card>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
         r"/(?P<rel>[A-Za-z0-9._\-]+(?:/[A-Za-z0-9._\-]+)*)$",
     ))
-    .expect("invariant: tenant path regex compiles")
+    .unwrap_or_else(|error| panic!("invariant: tenant path regex compiles: {error}"))
 });
 
 /// Tenant path validation errors.
@@ -107,9 +107,6 @@ pub fn build(data_tenant_id: DataTenantId, card_uid: &str, relative_path: &str) 
 /// Returns a [`TenantPathError`] when the path is malformed or belongs to a
 /// different tenant.
 ///
-/// # Panics
-/// Panics only if the compiled path regex captures a match without its
-/// statically declared `tenant`, `card`, or `rel` capture groups.
 pub fn validate(
     path: &str,
     caller_data_tenant_id: DataTenantId,
@@ -128,9 +125,10 @@ pub fn validate(
     let captures = FULL_PATH_RE
         .captures(path)
         .ok_or_else(|| TenantPathError::ShapeMismatch(path.to_owned()))?;
-    let tenant = captures
-        .name("tenant")
-        .expect("invariant: regex match contains tenant")
+    let Some(tenant_match) = captures.name("tenant") else {
+        return Err(TenantPathError::ShapeMismatch(path.to_owned()));
+    };
+    let tenant = tenant_match
         .as_str()
         .parse::<DataTenantId>()
         .map_err(|_| TenantPathError::ShapeMismatch(path.to_owned()))?;
@@ -140,18 +138,17 @@ pub fn validate(
             caller: caller_data_tenant_id,
         });
     }
+    let Some(card_match) = captures.name("card") else {
+        return Err(TenantPathError::ShapeMismatch(path.to_owned()));
+    };
+    let Some(relative_path_match) = captures.name("rel") else {
+        return Err(TenantPathError::ShapeMismatch(path.to_owned()));
+    };
+
     Ok(ValidatedPath {
         full: path.to_owned(),
         data_tenant_id: tenant,
-        card_uid: captures
-            .name("card")
-            .expect("invariant: regex match contains card")
-            .as_str()
-            .to_owned(),
-        relative_path: captures
-            .name("rel")
-            .expect("invariant: regex match contains rel")
-            .as_str()
-            .to_owned(),
+        card_uid: card_match.as_str().to_owned(),
+        relative_path: relative_path_match.as_str().to_owned(),
     })
 }

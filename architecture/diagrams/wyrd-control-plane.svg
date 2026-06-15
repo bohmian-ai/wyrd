@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 920" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <rect width="1400" height="920" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="700" y="58" text-anchor="middle" font-size="44" font-weight="800" fill="#0f172a" letter-spacing="1">Wyrd</text>
+  <text x="700" y="92" text-anchor="middle" font-size="17" font-style="italic" fill="#64748b">The control &amp; operations layer for enterprise AI</text>
+
+  <!-- ====== TOP BAND: WHAT YOU BUILD ====== -->
+  <rect x="80" y="120" width="1240" height="80" rx="12" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="100" y="148" font-size="12" font-weight="700" fill="#475569" letter-spacing="1.6">WHAT YOU BUILD</text>
+  <text x="700" y="182" text-anchor="middle" font-size="20" font-weight="600" fill="#1e293b">AI Apps   ·   Copilots   ·   Internal Agents   ·   Multi-agent Workflows</text>
+
+  <!-- arrows -->
+  <line x1="670" y1="205" x2="670" y2="252" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="730" y1="252" x2="730" y2="205" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="700" y="232" text-anchor="middle" font-size="12" fill="#475569" font-style="italic">every call · every decision · every artifact</text>
+
+  <!-- ====== MIDDLE BAND: WYRD (5 planes / verbs) ====== -->
+  <rect x="80" y="262" width="1240" height="320" rx="14" fill="#ecfdf5" stroke="#10b981" stroke-width="3"/>
+
+  <!-- Wyrd header inside band -->
+  <text x="700" y="304" text-anchor="middle" font-size="38" font-weight="800" fill="#047857" letter-spacing="7">WYRD</text>
+  <text x="700" y="330" text-anchor="middle" font-size="13" font-style="italic" fill="#047857">declarative · card-native · vendor-neutral · agent-first</text>
+
+  <!-- Column dividers -->
+  <line x1="328"  y1="354" x2="328"  y2="568" stroke="#a7f3d0" stroke-width="1"/>
+  <line x1="576"  y1="354" x2="576"  y2="568" stroke="#a7f3d0" stroke-width="1"/>
+  <line x1="824"  y1="354" x2="824"  y2="568" stroke="#a7f3d0" stroke-width="1"/>
+  <line x1="1072" y1="354" x2="1072" y2="568" stroke="#a7f3d0" stroke-width="1"/>
+
+  <!-- COLUMN 1: DEFINE  (center x=204) -->
+  <text x="204" y="380" text-anchor="middle" font-size="17" font-weight="800" fill="#047857" letter-spacing="3">DEFINE</text>
+  <text x="204" y="410" text-anchor="middle" font-size="15" font-weight="700" fill="#0f172a">What exists?</text>
+  <text x="204" y="438" text-anchor="middle" font-size="12" fill="#334155">Declarative source of truth</text>
+  <text x="204" y="454" text-anchor="middle" font-size="12" fill="#334155">for every AI asset.</text>
+  <text x="204" y="490" text-anchor="middle" font-size="10" font-weight="600" fill="#64748b" letter-spacing="1">CARDS</text>
+  <text x="204" y="508" text-anchor="middle" font-size="11" font-weight="700" fill="#047857">Data · Model · Prompt</text>
+  <text x="204" y="524" text-anchor="middle" font-size="11" font-weight="700" fill="#047857">Agent · Mcp · Workflow</text>
+  <text x="204" y="540" text-anchor="middle" font-size="11" font-weight="700" fill="#047857">Service · Artifact · Experiment</text>
+  <text x="204" y="562" text-anchor="middle" font-size="10" font-style="italic" fill="#64748b">lineage derived, never authored</text>
+
+  <!-- COLUMN 2: GOVERN  (center x=452) -->
+  <text x="452" y="380" text-anchor="middle" font-size="17" font-weight="800" fill="#047857" letter-spacing="3">GOVERN</text>
+  <text x="452" y="410" text-anchor="middle" font-size="15" font-weight="700" fill="#0f172a">Who can do what?</text>
+  <text x="452" y="438" text-anchor="middle" font-size="12" fill="#334155">Identity, delegation, and</text>
+  <text x="452" y="454" text-anchor="middle" font-size="12" fill="#334155">policy gates on every call.</text>
+  <text x="452" y="490" text-anchor="middle" font-size="10" font-weight="600" fill="#64748b" letter-spacing="1">CARDS</text>
+  <text x="452" y="508" text-anchor="middle" font-size="11" font-weight="700" fill="#047857">Policy</text>
+  <text x="452" y="540" text-anchor="middle" font-size="10" font-style="italic" fill="#64748b">card-bound JWT · RFC 8693 act</text>
+  <text x="452" y="555" text-anchor="middle" font-size="10" font-style="italic" fill="#64748b">CEL · ext_authz · SDK middleware</text>
+
+  <!-- COLUMN 3: OBSERVE  (center x=700) -->
+  <text x="700" y="380" text-anchor="middle" font-size="17" font-weight="800" fill="#047857" letter-spacing="3">OBSERVE</text>
+  <text x="700" y="410" text-anchor="middle" font-size="15" font-weight="700" fill="#0f172a">What happened?</text>
+  <text x="700" y="438" text-anchor="middle" font-size="12" fill="#334155">Trace, audit, and lineage</text>
+  <text x="700" y="454" text-anchor="middle" font-size="12" fill="#334155">across every agent &amp; run.</text>
+  <text x="700" y="490" text-anchor="middle" font-size="10" font-weight="600" fill="#64748b" letter-spacing="1">CARDS</text>
+  <text x="700" y="508" text-anchor="middle" font-size="11" font-weight="700" fill="#047857">Source · Audit</text>
+  <text x="700" y="540" text-anchor="middle" font-size="10" font-style="italic" fill="#64748b">Vala observability · OTel-native</text>
+  <text x="700" y="555" text-anchor="middle" font-size="10" font-style="italic" fill="#64748b">Wyrd-Request-Id chain ancestry</text>
+
+  <!-- COLUMN 4: EVALUATE  (center x=948) -->
+  <text x="948" y="380" text-anchor="middle" font-size="17" font-weight="800" fill="#047857" letter-spacing="3">EVALUATE</text>
+  <text x="948" y="410" text-anchor="middle" font-size="15" font-weight="700" fill="#0f172a">Is it still working?</text>
+  <text x="948" y="438" text-anchor="middle" font-size="12" fill="#334155">Continuous quality and</text>
+  <text x="948" y="454" text-anchor="middle" font-size="12" fill="#334155">drift detection on outputs.</text>
+  <text x="948" y="490" text-anchor="middle" font-size="10" font-weight="600" fill="#64748b" letter-spacing="1">CARDS</text>
+  <text x="948" y="508" text-anchor="middle" font-size="11" font-weight="700" fill="#047857">Eval · Drift</text>
+  <text x="948" y="540" text-anchor="middle" font-size="10" font-style="italic" fill="#64748b">production-grounded scoring</text>
+  <text x="948" y="555" text-anchor="middle" font-size="10" font-style="italic" fill="#64748b">scheduled · regression-aware</text>
+
+  <!-- COLUMN 5: REACT  (center x=1196) -->
+  <text x="1196" y="380" text-anchor="middle" font-size="17" font-weight="800" fill="#047857" letter-spacing="3">REACT</text>
+  <text x="1196" y="410" text-anchor="middle" font-size="15" font-weight="700" fill="#0f172a">Now what?</text>
+  <text x="1196" y="438" text-anchor="middle" font-size="12" fill="#334155">Closed-loop automation in</text>
+  <text x="1196" y="454" text-anchor="middle" font-size="12" fill="#334155">response to observed signals.</text>
+  <text x="1196" y="490" text-anchor="middle" font-size="10" font-weight="600" fill="#64748b" letter-spacing="1">CARDS</text>
+  <text x="1196" y="508" text-anchor="middle" font-size="11" font-weight="700" fill="#047857">Trigger · Operator</text>
+  <text x="1196" y="540" text-anchor="middle" font-size="10" font-style="italic" fill="#64748b">event-driven · scheduled · webhook</text>
+  <text x="1196" y="555" text-anchor="middle" font-size="10" font-style="italic" fill="#64748b">remediation · alerting · workflows</text>
+
+  <!-- arrows middle <-> bottom -->
+  <line x1="670" y1="587" x2="670" y2="634" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="730" y1="634" x2="730" y2="587" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="700" y="614" text-anchor="middle" font-size="12" fill="#475569" font-style="italic">mediated · audited · evaluated</text>
+
+  <!-- ====== BOTTOM BAND: YOUR EXISTING RUNTIME ====== -->
+  <rect x="80" y="644" width="1240" height="236" rx="12" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="100" y="672" font-size="12" font-weight="700" fill="#475569" letter-spacing="1.6">YOUR EXISTING RUNTIME  ·  WYRD IS VENDOR-NEUTRAL</text>
+
+  <g font-size="13.5">
+    <!-- MODELS -->
+    <text x="115" y="708" font-size="11" font-weight="700" fill="#1e293b" letter-spacing="1.2">MODELS</text>
+    <text x="285" y="708" fill="#334155">OpenAI  ·  Anthropic  ·  Google Gemini  ·  AWS Bedrock  ·  Azure OpenAI  ·  vLLM  ·  Ollama</text>
+
+    <!-- FRAMEWORKS -->
+    <text x="115" y="740" font-size="11" font-weight="700" fill="#1e293b" letter-spacing="1.2">FRAMEWORKS</text>
+    <text x="285" y="740" fill="#334155">LangGraph  ·  Claude Agent SDK  ·  CrewAI  ·  Google ADK  ·  Semantic Kernel</text>
+
+    <!-- TOOLS -->
+    <text x="115" y="772" font-size="11" font-weight="700" fill="#1e293b" letter-spacing="1.2">TOOLS</text>
+    <text x="285" y="772" fill="#334155">MCP Servers  ·  Function Calling  ·  Browser / RPA  ·  Custom APIs</text>
+
+    <!-- DATA &amp; MEMORY -->
+    <text x="115" y="804" font-size="11" font-weight="700" fill="#1e293b" letter-spacing="1.2">DATA &amp; MEMORY</text>
+    <text x="285" y="804" fill="#334155">Snowflake  ·  Databricks  ·  BigQuery  ·  Pinecone  ·  Weaviate  ·  pgvector</text>
+
+    <!-- INFRASTRUCTURE -->
+    <text x="115" y="836" font-size="11" font-weight="700" fill="#1e293b" letter-spacing="1.2">INFRASTRUCTURE</text>
+    <text x="285" y="836" fill="#334155">Kubernetes  ·  Istio / Envoy  ·  Okta / Entra  ·  Vault  ·  OpenTelemetry  ·  Datadog</text>
+  </g>
+
+  <!-- ====== FOOTER ====== -->
+  <text x="700" y="903" text-anchor="middle" font-size="12" fill="#475569">
+    <tspan font-weight="700" fill="#0f172a">Hooks in through the standards you already use:</tspan>
+    <tspan>  service-mesh ext_authz  ·  IdP federation (jwt-bearer)  ·  OpenTelemetry ingest  ·  MCP scope grants  ·  Authorization: Bearer</tspan>
+  </text>
+</svg>

@@ -104,7 +104,10 @@ card-kind tests are landed.
     via `wyrd auth issue-key <card_ref>`; the deploy environment puts it in
     the pod as `WYRD_API_KEY`. The SDK exchanges it once at startup for a
     short-lived EdDSA JWT carrying the structured `card_ref` claim and a
-    recursive `act` claim (RFC 8693) for delegation. On cross-service calls
+    recursive `act` claim (RFC 8693) for delegation.
+    JWT carries `card_ref` for `PrincipalKind::Service`.
+    JWT carries `card_ref` for `PrincipalKind::Agent`.
+    On cross-service calls
     the SDK adds the JWT to standard `Authorization: Bearer`; no
     Wyrd-specific identity header is invented. The application's own
     end-user `Authorization` (if any) is terminated at the inbound edge and

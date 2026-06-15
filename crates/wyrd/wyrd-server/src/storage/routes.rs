@@ -1,14 +1,15 @@
-//! Axum adapters for storage upload service functions.
+//! Axum adapters for storage service functions.
 
 use std::str::FromStr;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
-use axum::routing::{post, put};
+use axum::response::Response;
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
-use wyrd_spec::storage::{UploadCompleteRequest, UploadId, UploadInitRequest};
+use wyrd_spec::storage::{DownloadInitRequest, UploadCompleteRequest, UploadId, UploadInitRequest};
 use wyrd_storage::BackendConfig;
 
 use crate::auth::Caller;
@@ -16,16 +17,19 @@ use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
 use crate::storage::service;
 
-/// Mount upload routes into an existing `/v1` router.
+/// Mount storage routes into an existing `/v1` router.
 pub fn mount(router: Router<AppState>, state: &AppState) -> Router<AppState> {
     let router = router
         .route("/cards/upload/init", post(init))
         .route("/cards/upload/{id}/part-url", post(part_url))
         .route("/cards/upload/{id}/complete", post(complete))
-        .route("/cards/upload/{id}/abort", post(abort));
+        .route("/cards/upload/{id}/abort", post(abort))
+        .route("/cards/download/init", post(download_init));
 
     if matches!(state.storage.backend_config(), BackendConfig::Local { .. }) {
-        router.route("/cards/upload/local/{*path}", put(local_blob))
+        router
+            .route("/cards/upload/local/{*path}", put(local_blob))
+            .route("/cards/download/local/{*path}", get(download_local_blob))
     } else {
         router
     }
@@ -96,6 +100,27 @@ async fn local_blob(
         .await
         .map_err(WyrdErrorResponse::from)?;
     Ok(Json(serde_json::json!({ "uploaded": true })))
+}
+
+async fn download_init(
+    State(state): State<AppState>,
+    caller: Caller,
+    Json(body): Json<DownloadInitRequest>,
+) -> Result<Json<wyrd_spec::storage::DownloadInitResponse>, WyrdErrorResponse> {
+    service::download_init(&state, caller, body)
+        .await
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
+}
+
+async fn download_local_blob(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(path): Path<String>,
+) -> Result<Response, WyrdErrorResponse> {
+    service::download_local_blob(&state, caller, path)
+        .await
+        .map_err(WyrdErrorResponse::from)
 }
 
 fn parse_upload_id(value: &str) -> Result<UploadId, WyrdErrorResponse> {

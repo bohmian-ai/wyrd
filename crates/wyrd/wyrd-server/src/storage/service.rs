@@ -3,22 +3,26 @@
 use std::path::Path;
 use std::time::Duration;
 
-use axum::body::Bytes;
-use axum::http::HeaderMap;
+use axum::body::{Body, Bytes};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::types::Uuid;
+use tokio_util::io::ReaderStream;
 use tracing::instrument;
 use wyrd_spec::authz::Scope;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::storage::{
-    AzureBlockBlobComplete, S3MultipartComplete, StorageBackendKind, StoredObjectRef,
-    UploadCompleteRequest, UploadCompleteResponse, UploadId, UploadIdParseError, UploadInitRequest,
-    UploadInitResponse, UploadPlan, WireProtocol,
+    AzureBlockBlobComplete, DownloadInitRequest, DownloadInitResponse, DownloadPlan,
+    S3MultipartComplete, StorageBackendKind, StoredObjectRef, UploadCompleteRequest,
+    UploadCompleteResponse, UploadId, UploadIdParseError, UploadInitRequest, UploadInitResponse,
+    UploadPlan, WireProtocol,
 };
 use wyrd_sql::TenantConn;
+use wyrd_sql::queries::storage::artifact_metadata::ArtifactMetadataRow;
 use wyrd_sql::queries::storage::multipart_uploads::{self, MultipartUploadRow, UploadStatus};
 use wyrd_storage::error::{AzureError, GcsError, LocalError, S3Error, StorageError};
 use wyrd_storage::plan::{MAX_OBJECT_SIZE_BYTES, PlannedUpload, plan_upload};
@@ -501,6 +505,85 @@ pub async fn upload_local_blob(
         .map_err(map_storage_error)
 }
 
+/// Initialize an artifact download.
+#[instrument(skip(state, caller, body), fields(tenant = %caller.data_tenant_id))]
+pub async fn download_init(
+    state: &AppState,
+    caller: Caller,
+    body: DownloadInitRequest,
+) -> Result<DownloadInitResponse, WyrdError> {
+    authorize_card_read(&caller)?;
+    let validated = validated_download_path(&caller, &body)?;
+
+    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+        .await
+        .map_err(map_sql_error)?;
+    let metadata = load_artifact_metadata(&mut conn, &validated).await?;
+    conn.commit().await.map_err(map_sql_error)?;
+
+    let ttl_secs = compute_download_ttl(&body, state.storage.presign_ttl_secs());
+    let get_url = download_url(state, &validated, ttl_secs).await?;
+
+    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+        .await
+        .map_err(map_sql_error)?;
+    audit::write(
+        &mut conn,
+        &caller,
+        "download_init",
+        None,
+        &validated.full,
+        metadata.backend,
+        200,
+        None,
+    )
+    .await?;
+    conn.commit().await.map_err(map_sql_error)?;
+
+    Ok(DownloadInitResponse {
+        plan: DownloadPlan { get_url, ttl_secs },
+        size_bytes: u64::try_from(metadata.size_bytes).map_err(|_| {
+            internal_error(
+                "stored artifact size is negative",
+                serde_json::json!({
+                    "storage_path": validated.full,
+                    "size_bytes": metadata.size_bytes,
+                }),
+            )
+        })?,
+        sha256: metadata.sha256,
+    })
+}
+
+/// Stream a local-mode blob through the authenticated server route.
+#[instrument(skip(state, caller), fields(tenant = %caller.data_tenant_id))]
+pub async fn download_local_blob(
+    state: &AppState,
+    caller: Caller,
+    path: String,
+) -> Result<Response, WyrdError> {
+    authorize_card_read(&caller)?;
+    let validated = tenant_path::validate(&path, caller.data_tenant_id).map_err(map_tenant_path)?;
+    let wyrd_storage::BackendSigner::Local(local) = state.storage.signer() else {
+        return Err(internal_error(
+            "local download route mounted for non-local backend",
+            serde_json::json!({ "backend": state.storage.backend() }),
+        ));
+    };
+    let (file, len) = open_local_blob(local, &validated).await?;
+    let stream = ReaderStream::new(file);
+
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CONTENT_LENGTH, &len.to_string()),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response())
+}
+
 async fn try_replay_idempotent_init(
     caller: &Caller,
     conn: &mut TenantConn<'_>,
@@ -618,6 +701,16 @@ fn authorize_card_write(caller: &Caller) -> Result<(), WyrdError> {
     })
 }
 
+fn authorize_card_read(caller: &Caller) -> Result<(), WyrdError> {
+    if caller.principal.has_scope(Scope::CardRead) {
+        return Ok(());
+    }
+    Err(WyrdError::InsufficientScope {
+        message: "caller lacks required scope card:read".to_owned(),
+        details: serde_json::json!({ "required": Scope::CardRead.as_str() }),
+    })
+}
+
 fn validated_tenant_path(
     caller: &Caller,
     body: &UploadInitRequest,
@@ -629,6 +722,89 @@ fn validated_tenant_path(
         &body.relative_path,
     );
     tenant_path::validate(&storage_path, caller.data_tenant_id).map_err(map_tenant_path)
+}
+
+fn validated_download_path(
+    caller: &Caller,
+    body: &DownloadInitRequest,
+) -> Result<ValidatedPath, WyrdError> {
+    let storage_path = tenant_path::build(
+        caller.data_tenant_id,
+        body.card_uid.as_str(),
+        &body.relative_path,
+    );
+    tenant_path::validate(&storage_path, caller.data_tenant_id).map_err(map_tenant_path)
+}
+
+async fn load_artifact_metadata(
+    conn: &mut TenantConn<'_>,
+    validated: &ValidatedPath,
+) -> Result<ArtifactMetadataRow, WyrdError> {
+    wyrd_sql::queries::storage::artifact_metadata::get(conn, &validated.full)
+        .await
+        .map_err(map_sql_error)?
+        .ok_or_else(|| {
+            map_storage_error(StorageError::ObjectNotFound {
+                storage_path: validated.full.clone(),
+            })
+        })
+}
+
+fn compute_download_ttl(body: &DownloadInitRequest, default_ttl_secs: u32) -> u32 {
+    body.ttl_secs.unwrap_or(default_ttl_secs).clamp(60, 3600)
+}
+
+async fn download_url(
+    state: &AppState,
+    validated: &ValidatedPath,
+    ttl_secs: u32,
+) -> Result<String, WyrdError> {
+    if state.storage.backend() == StorageBackendKind::Local {
+        return local_download_url(state, validated);
+    }
+
+    state
+        .storage
+        .signer()
+        .presign_get(validated, Duration::from_secs(u64::from(ttl_secs)))
+        .await
+        .map_err(map_storage_error)
+}
+
+fn local_download_url(state: &AppState, validated: &ValidatedPath) -> Result<String, WyrdError> {
+    let base = state.storage.public_base_url().ok_or_else(|| {
+        internal_error(
+            "local storage requires WYRD_PUBLIC_BASE_URL to mint download URLs",
+            serde_json::json!({ "backend": StorageBackendKind::Local }),
+        )
+    })?;
+    let base = base.strip_suffix('/').unwrap_or(base);
+    Ok(format!("{base}/v1/cards/download/local/{}", validated.full))
+}
+
+async fn open_local_blob(
+    local: &wyrd_storage::LocalSigner,
+    validated: &ValidatedPath,
+) -> Result<(tokio::fs::File, u64), WyrdError> {
+    let fs_path = local.root().join(&validated.full);
+    let file = tokio::fs::File::open(&fs_path)
+        .await
+        .map_err(|error| map_local_read_error(error, validated))?;
+    let len = file
+        .metadata()
+        .await
+        .map_err(|error| map_storage_error(StorageError::Io(error)))?
+        .len();
+    Ok((file, len))
+}
+
+fn map_local_read_error(error: std::io::Error, validated: &ValidatedPath) -> WyrdError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return map_storage_error(StorageError::ObjectNotFound {
+            storage_path: validated.full.clone(),
+        });
+    }
+    map_storage_error(StorageError::Io(error))
 }
 
 fn validate_sha256_b64(value: &str) -> Result<(), WyrdError> {
@@ -1133,9 +1309,14 @@ fn internal_error(message: impl Into<String>, details: serde_json::Value) -> Wyr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::actor::Actor;
+    use wyrd_spec::authz::Principal;
+    use wyrd_spec::request_id::RequestId;
     use wyrd_spec::storage::SinglePutComplete;
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
@@ -1252,5 +1433,166 @@ mod tests {
         );
         assert_eq!(ttl_secs, 600);
         assert!(required_headers.is_empty());
+    }
+
+    #[test]
+    fn download_ttl_is_clamped_to_public_bounds() {
+        let card_uid =
+            wyrd_spec::ids::CardUid::new("018f0000-0000-7000-8000-000000000000").expect("card uid");
+
+        let mut body = DownloadInitRequest {
+            card_uid,
+            relative_path: "model.bin".to_owned(),
+            ttl_secs: None,
+        };
+        assert_eq!(compute_download_ttl(&body, 600), 600);
+
+        body.ttl_secs = Some(1);
+        assert_eq!(compute_download_ttl(&body, 600), 60);
+
+        body.ttl_secs = Some(300);
+        assert_eq!(compute_download_ttl(&body, 600), 300);
+
+        body.ttl_secs = Some(10_000);
+        assert_eq!(compute_download_ttl(&body, 600), 3600);
+    }
+
+    #[tokio::test]
+    async fn local_download_url_uses_mounted_http_blob_route() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let storage = StorageHandle::from_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_secs(900),
+            part_size_bytes: 16 * 1024 * 1024,
+            public_base_url: Some("https://wyrd.test/".to_owned()),
+        })
+        .await
+        .expect("local storage handle");
+        let state = AppState::new(
+            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
+            None,
+            Arc::clone(&storage),
+        );
+        let tenant = DataTenantId::new_v7();
+        let validated = ValidatedPath {
+            full: format!("{tenant}/cards/018f0000-0000-7000-8000-000000000000/model.bin"),
+            data_tenant_id: tenant,
+            card_uid: "018f0000-0000-7000-8000-000000000000".to_owned(),
+            relative_path: "model.bin".to_owned(),
+        };
+
+        let url = local_download_url(&state, &validated).expect("download URL");
+
+        assert_eq!(
+            url,
+            format!(
+                "https://wyrd.test/v1/cards/download/local/{}",
+                validated.full
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn download_local_blob_streams_validated_tenant_file() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let storage = StorageHandle::from_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_secs(900),
+            part_size_bytes: 16 * 1024 * 1024,
+            public_base_url: Some("https://wyrd.test".to_owned()),
+        })
+        .await
+        .expect("local storage handle");
+        let state = AppState::new(
+            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
+            None,
+            Arc::clone(&storage),
+        );
+        let caller = read_caller();
+        let path = tenant_path::build(
+            caller.data_tenant_id,
+            "018f0000-0000-7000-8000-000000000000",
+            "nested/model.bin",
+        );
+        let target = root.path().join(&path);
+        tokio::fs::create_dir_all(target.parent().expect("target parent"))
+            .await
+            .expect("create parent");
+        tokio::fs::write(&target, b"download me")
+            .await
+            .expect("write blob");
+
+        let response = download_local_blob(&state, caller, path)
+            .await
+            .expect("download response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("collect body");
+        assert_eq!(&body[..], b"download me");
+    }
+
+    #[tokio::test]
+    async fn download_local_blob_requires_card_read_scope() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let storage = StorageHandle::from_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_secs(900),
+            part_size_bytes: 16 * 1024 * 1024,
+            public_base_url: Some("https://wyrd.test".to_owned()),
+        })
+        .await
+        .expect("local storage handle");
+        let state = AppState::new(
+            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
+            None,
+            Arc::clone(&storage),
+        );
+        let caller = caller_with_scopes(BTreeSet::new());
+        let path = tenant_path::build(
+            caller.data_tenant_id,
+            "018f0000-0000-7000-8000-000000000000",
+            "model.bin",
+        );
+
+        let error = download_local_blob(&state, caller, path)
+            .await
+            .expect_err("missing scope should fail");
+
+        assert_eq!(error.status(), 403);
+    }
+
+    fn read_caller() -> Caller {
+        caller_with_scopes(BTreeSet::from([Scope::CardRead]))
+    }
+
+    fn caller_with_scopes(scopes: BTreeSet<Scope>) -> Caller {
+        Caller {
+            data_tenant_id: DataTenantId::new_v7(),
+            principal: Principal::new(
+                Actor::Service {
+                    name: "test-service".to_owned(),
+                },
+                scopes,
+            ),
+            request_id: RequestId::parse("01HZ7M0N6S9P4WJYX1T0FQ3VEK").expect("request id parses"),
+        }
     }
 }

@@ -1552,6 +1552,39 @@ mod tests {
         assert_eq!(error.status(), 403);
     }
 
+    #[tokio::test]
+    async fn upload_local_blob_requires_card_write_scope() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let storage = StorageHandle::from_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_secs(900),
+            part_size_bytes: 16 * 1024 * 1024,
+            public_base_url: Some("https://wyrd.test".to_owned()),
+        })
+        .await
+        .expect("local storage handle");
+        let state = AppState::new(
+            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
+            None,
+            Arc::clone(&storage),
+        );
+        let caller = caller_with_scopes(BTreeSet::new());
+        let path = tenant_path::build(
+            caller.data_tenant_id,
+            "018f0000-0000-7000-8000-000000000000",
+            "model.bin",
+        );
+
+        let error = upload_local_blob(&state, caller, path, Bytes::from_static(b"data"))
+            .await
+            .expect_err("missing scope should fail");
+
+        assert_eq!(error.status(), 403);
+    }
+
     fn read_caller() -> Caller {
         caller_with_scopes(BTreeSet::from([Scope::CardRead]))
     }

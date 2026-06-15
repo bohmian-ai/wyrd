@@ -6732,9 +6732,13 @@ name = "wyrd-server"
 version = "0.0.1"
 dependencies = [
  "axum 0.8.9",
+ "base64 0.22.1",
+ "chrono",
  "object_store",
  "secrecy",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",

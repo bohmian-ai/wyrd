@@ -1,0 +1,1256 @@
+//! Pure storage upload service functions.
+
+use std::path::Path;
+use std::time::Duration;
+
+use axum::body::Bytes;
+use axum::http::HeaderMap;
+use base64::Engine;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use sqlx::types::Uuid;
+use tracing::instrument;
+use wyrd_spec::authz::Scope;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::IdempotencyKey;
+use wyrd_spec::storage::{
+    AzureBlockBlobComplete, S3MultipartComplete, StorageBackendKind, StoredObjectRef,
+    UploadCompleteRequest, UploadCompleteResponse, UploadId, UploadIdParseError, UploadInitRequest,
+    UploadInitResponse, UploadPlan, WireProtocol,
+};
+use wyrd_sql::TenantConn;
+use wyrd_sql::queries::storage::multipart_uploads::{self, MultipartUploadRow, UploadStatus};
+use wyrd_storage::error::{AzureError, GcsError, LocalError, S3Error, StorageError};
+use wyrd_storage::plan::{MAX_OBJECT_SIZE_BYTES, PlannedUpload, plan_upload};
+use wyrd_storage::signer::{CompletePayload, HeadInfo, MultipartInit, UploadPlanReplayInput};
+use wyrd_storage::tenant_path::{self, TenantPathError, ValidatedPath};
+
+use crate::AppState;
+use crate::auth::Caller;
+use crate::storage::audit;
+
+const INIT_TTL_SECS: i64 = 24 * 60 * 60;
+const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+
+/// Response body for one multipart part URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PartUrlResponse {
+    /// Presigned part URL.
+    pub url: String,
+    /// URL TTL in seconds.
+    pub ttl_secs: u32,
+}
+
+/// Response body for upload abort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AbortResponse {
+    /// Whether the upload was marked aborted.
+    pub aborted: bool,
+}
+
+struct InitReplay {
+    upload_id: UploadId,
+    backend: StorageBackendKind,
+    storage_path: String,
+    validated: ValidatedPath,
+    replay_input: UploadPlanReplayInput,
+}
+
+struct PriorAbort {
+    storage_path: String,
+    backend_upload_id: Option<String>,
+}
+
+/// Initialize an artifact upload.
+#[instrument(skip(state, caller, headers, body), fields(tenant = %caller.data_tenant_id))]
+pub async fn upload_init(
+    state: &AppState,
+    caller: Caller,
+    headers: &HeaderMap,
+    body: UploadInitRequest,
+) -> Result<UploadInitResponse, WyrdError> {
+    authorize_card_write(&caller)?;
+
+    let idempotency_key = extract_idempotency_key(headers)?;
+    let body_sha = sha256_canonical_json(&body);
+    let backend = state.storage.backend();
+    let validated = validated_tenant_path(&caller, &body)?;
+    let planned = plan_upload(body.expected_size_bytes, backend).map_err(|_| {
+        map_storage_error(StorageError::ArtifactTooLarge {
+            actual: body.expected_size_bytes,
+            limit: MAX_OBJECT_SIZE_BYTES,
+        })
+    })?;
+    let wire_protocol = derive_wire_protocol(backend, planned);
+
+    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+        .await
+        .map_err(map_sql_error)?;
+    if let Some(key) = idempotency_key.as_ref()
+        && let Some(response) =
+            try_replay_idempotent_init(&caller, &mut conn, key, &body_sha).await?
+    {
+        conn.commit().await.map_err(map_sql_error)?;
+        let plan = state
+            .storage
+            .signer()
+            .remint_plan(
+                &response.validated,
+                &response.replay_input,
+                state.storage.presign_ttl(),
+            )
+            .await
+            .map_err(map_storage_error)?;
+        return Ok(UploadInitResponse {
+            upload_id: response.upload_id,
+            backend: response.backend,
+            plan,
+            storage_path: response.storage_path,
+        });
+    }
+
+    let prior_abort = find_and_mark_prior_pending(&mut conn, &body).await?;
+
+    let upload_id = UploadId::new();
+    let upload_uuid = upload_id_uuid(&upload_id)?;
+    let (part_count, part_size_bytes, block_count_planned) =
+        upload_row_counts(planned, body.expected_size_bytes, wire_protocol);
+    multipart_uploads::insert_initiating(
+        &mut conn,
+        multipart_uploads::NewMultipartUpload {
+            id: upload_uuid,
+            card_uid: body.card_uid.as_str(),
+            relative_path: &body.relative_path,
+            storage_path: &validated.full,
+            backend,
+            wire_protocol,
+            expected_sha256: &body.expected_sha256,
+            expected_size_bytes: i64::try_from(body.expected_size_bytes).map_err(|_| {
+                validation_error(
+                    "expected_size_bytes exceeds signed storage metadata range",
+                    serde_json::json!({ "expected_size_bytes": body.expected_size_bytes }),
+                )
+            })?,
+            content_type: body.content_type.as_deref(),
+            part_count_planned: i32::try_from(part_count).map_err(|_| {
+                internal_error(
+                    "planned part count exceeds storage metadata range",
+                    serde_json::json!({ "part_count": part_count }),
+                )
+            })?,
+            part_size_bytes: i64::try_from(part_size_bytes).map_err(|_| {
+                internal_error(
+                    "planned part size exceeds storage metadata range",
+                    serde_json::json!({ "part_size_bytes": part_size_bytes }),
+                )
+            })?,
+            block_count_planned,
+            ttl_secs: INIT_TTL_SECS,
+        },
+    )
+    .await
+    .map_err(map_sql_error)?;
+    conn.commit().await.map_err(map_sql_error)?;
+
+    if let Some(prior) = prior_abort {
+        abort_prior_best_effort(state, &caller, prior).await;
+    }
+
+    let init = match drive_backend_init(state, &validated, planned, body.expected_size_bytes).await
+    {
+        Ok(init) => init,
+        Err(error) => {
+            let error_code = error.code().to_owned();
+            let status_code = i32::from(error.status());
+            mark_failed_best_effort(
+                state,
+                &caller,
+                upload_uuid,
+                &validated,
+                backend,
+                "upload_init",
+                "backend init failed",
+                status_code,
+                Some(&error_code),
+            )
+            .await;
+            return Err(error);
+        }
+    };
+
+    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+        .await
+        .map_err(map_sql_error)?;
+    persist_backend_id_and_audit(
+        &mut conn,
+        &caller,
+        upload_uuid,
+        &validated,
+        backend,
+        &init.backend_upload_id,
+    )
+    .await?;
+    if let Some(key) = idempotency_key.as_ref() {
+        cache_init_seed(
+            &mut conn,
+            key,
+            &body_sha,
+            &upload_id,
+            &validated,
+            backend,
+            wire_protocol,
+        )
+        .await?;
+    }
+    conn.commit().await.map_err(map_sql_error)?;
+
+    Ok(UploadInitResponse {
+        upload_id,
+        backend,
+        plan: init.plan,
+        storage_path: validated.full,
+    })
+}
+
+/// Return one S3 multipart part URL.
+#[instrument(skip(state, caller), fields(tenant = %caller.data_tenant_id, upload_id = %upload_id))]
+pub async fn upload_part_url(
+    state: &AppState,
+    caller: Caller,
+    upload_id: UploadId,
+    part_number: u32,
+) -> Result<PartUrlResponse, WyrdError> {
+    authorize_card_write(&caller)?;
+    let upload_uuid = upload_id_uuid(&upload_id)?;
+
+    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+        .await
+        .map_err(map_sql_error)?;
+    let row = load_upload(&mut conn, upload_uuid).await?;
+    if row.status != UploadStatus::Pending {
+        return Err(conflict_error(
+            "upload is not pending",
+            serde_json::json!({ "upload_id": upload_id.to_string(), "status": row.status }),
+        ));
+    }
+    if row.wire_protocol != WireProtocol::S3MultipartV1 {
+        return Err(validation_error(
+            "part-url is only valid for S3 multipart uploads",
+            serde_json::json!({
+                "upload_id": upload_id.to_string(),
+                "wire_protocol": row.wire_protocol,
+            }),
+        ));
+    }
+    let max_part = u32::try_from(row.part_count_planned).unwrap_or(u32::MAX);
+    if part_number == 0 || part_number > max_part {
+        return Err(validation_error(
+            "part_number is outside the planned part range",
+            serde_json::json!({ "part_number": part_number, "max_part": max_part }),
+        ));
+    }
+    let validated =
+        tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
+    let backend_upload_id = row.backend_upload_id.ok_or_else(|| {
+        internal_error(
+            "pending S3 upload is missing backend_upload_id",
+            serde_json::json!({ "upload_id": upload_id.to_string() }),
+        )
+    })?;
+    conn.commit().await.map_err(map_sql_error)?;
+
+    let url = state
+        .storage
+        .signer()
+        .presign_part(
+            &validated,
+            &backend_upload_id,
+            part_number,
+            state.storage.presign_ttl(),
+        )
+        .await
+        .map_err(map_storage_error)?;
+
+    Ok(PartUrlResponse {
+        url,
+        ttl_secs: state.storage.presign_ttl_secs(),
+    })
+}
+
+/// Complete an upload and return the verified stored object descriptor.
+#[instrument(skip(state, caller, body), fields(tenant = %caller.data_tenant_id, upload_id = %upload_id))]
+pub async fn upload_complete(
+    state: &AppState,
+    caller: Caller,
+    upload_id: UploadId,
+    body: UploadCompleteRequest,
+) -> Result<UploadCompleteResponse, WyrdError> {
+    authorize_card_write(&caller)?;
+    let upload_uuid = upload_id_uuid(&upload_id)?;
+
+    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+        .await
+        .map_err(map_sql_error)?;
+    let row = load_pending_upload(&mut conn, upload_uuid).await?;
+    let validated =
+        tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
+    let payload = build_complete_payload(
+        &body,
+        row.wire_protocol,
+        row.backend,
+        row.block_count_planned,
+    )?;
+    conn.commit().await.map_err(map_sql_error)?;
+
+    if let Some(payload) = payload
+        && let Err(error) = state
+            .storage
+            .signer()
+            .complete_server_side(&validated, row.backend_upload_id.as_deref(), payload)
+            .await
+    {
+        let error = map_storage_error(error);
+        let error_code = error.code().to_owned();
+        let status_code = i32::from(error.status());
+        mark_failed_best_effort(
+            state,
+            &caller,
+            upload_uuid,
+            &validated,
+            row.backend,
+            "upload_complete",
+            "backend_complete_failed",
+            status_code,
+            Some(&error_code),
+        )
+        .await;
+        return Err(error);
+    }
+
+    let head = match state
+        .storage
+        .signer()
+        .head_for_verification(&validated)
+        .await
+    {
+        Ok(head) => head,
+        Err(error) => {
+            let error = map_storage_error(error);
+            let error_code = error.code().to_owned();
+            let status_code = i32::from(error.status());
+            mark_failed_best_effort(
+                state,
+                &caller,
+                upload_uuid,
+                &validated,
+                row.backend,
+                "upload_complete",
+                "head_for_verification_failed",
+                status_code,
+                Some(&error_code),
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    verify_object_head(state, &caller, upload_uuid, &validated, &row, &head).await?;
+
+    if let Err(error) = state
+        .storage
+        .signer()
+        .verify_sha256(&validated, &row.expected_sha256, &head)
+        .await
+    {
+        let error = map_storage_error(error);
+        let error_code = error.code().to_owned();
+        let status_code = i32::from(error.status());
+        mark_failed_best_effort(
+            state,
+            &caller,
+            upload_uuid,
+            &validated,
+            row.backend,
+            "upload_complete",
+            "sha_mismatch",
+            status_code,
+            Some(&error_code),
+        )
+        .await;
+        return Err(error);
+    }
+
+    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+        .await
+        .map_err(map_sql_error)?;
+    wyrd_sql::queries::storage::artifact_metadata::insert(
+        &mut conn,
+        wyrd_sql::queries::storage::artifact_metadata::NewArtifactMetadata {
+            storage_path: &validated.full,
+            card_uid: &validated.card_uid,
+            size_bytes: i64::try_from(head.size_bytes).map_err(|_| {
+                internal_error(
+                    "verified object size exceeds storage metadata range",
+                    serde_json::json!({ "size_bytes": head.size_bytes }),
+                )
+            })?,
+            sha256: &row.expected_sha256,
+            content_type: head.content_type.as_deref().or(row.content_type.as_deref()),
+            sse_marker: head.sse_marker.as_deref(),
+            backend: row.backend,
+        },
+    )
+    .await
+    .map_err(map_sql_error)?;
+    multipart_uploads::mark_completed(&mut conn, upload_uuid)
+        .await
+        .map_err(map_sql_error)?;
+    audit::write(
+        &mut conn,
+        &caller,
+        "upload_complete",
+        Some(upload_uuid),
+        &validated.full,
+        row.backend,
+        200,
+        None,
+    )
+    .await?;
+    conn.commit().await.map_err(map_sql_error)?;
+
+    Ok(UploadCompleteResponse {
+        stored: StoredObjectRef {
+            storage_path: validated.full,
+            size_bytes: head.size_bytes,
+            sha256: row.expected_sha256,
+            content_type: head.content_type.or(row.content_type),
+            sse_marker: head.sse_marker,
+            created_at: chrono::Utc::now(),
+        },
+    })
+}
+
+/// Abort an in-flight upload.
+#[instrument(skip(state, caller), fields(tenant = %caller.data_tenant_id, upload_id = %upload_id))]
+pub async fn upload_abort(
+    state: &AppState,
+    caller: Caller,
+    upload_id: UploadId,
+) -> Result<AbortResponse, WyrdError> {
+    authorize_card_write(&caller)?;
+    let upload_uuid = upload_id_uuid(&upload_id)?;
+
+    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+        .await
+        .map_err(map_sql_error)?;
+    let row = load_pending_upload(&mut conn, upload_uuid).await?;
+    let validated =
+        tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
+    conn.commit().await.map_err(map_sql_error)?;
+
+    if let Some(backend_upload_id) = row.backend_upload_id.as_deref()
+        && let Err(error) = state
+            .storage
+            .signer()
+            .abort_multipart(&validated, backend_upload_id)
+            .await
+    {
+        tracing::warn!(error = %error, upload_id = %upload_id, "best-effort backend abort failed");
+    }
+
+    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+        .await
+        .map_err(map_sql_error)?;
+    multipart_uploads::mark_aborted(&mut conn, upload_uuid, Some("client-abort"))
+        .await
+        .map_err(map_sql_error)?;
+    audit::write(
+        &mut conn,
+        &caller,
+        "upload_abort",
+        Some(upload_uuid),
+        &validated.full,
+        row.backend,
+        200,
+        None,
+    )
+    .await?;
+    conn.commit().await.map_err(map_sql_error)?;
+
+    Ok(AbortResponse { aborted: true })
+}
+
+/// Write a local-mode raw blob body.
+#[instrument(skip(state, caller, body), fields(tenant = %caller.data_tenant_id))]
+pub async fn upload_local_blob(
+    state: &AppState,
+    caller: Caller,
+    path: String,
+    body: Bytes,
+) -> Result<(), WyrdError> {
+    authorize_card_write(&caller)?;
+    let validated = tenant_path::validate(&path, caller.data_tenant_id).map_err(map_tenant_path)?;
+    let wyrd_storage::BackendSigner::Local(local) = state.storage.signer() else {
+        return Err(internal_error(
+            "local blob route mounted for non-local backend",
+            serde_json::json!({ "backend": state.storage.backend() }),
+        ));
+    };
+    local
+        .write_atomically(Path::new(&validated.full), &body)
+        .await
+        .map_err(map_storage_error)
+}
+
+async fn try_replay_idempotent_init(
+    caller: &Caller,
+    conn: &mut TenantConn<'_>,
+    key: &IdempotencyKey,
+    body_sha: &[u8; 32],
+) -> Result<Option<InitReplay>, WyrdError> {
+    let Some(cached) = wyrd_sql::queries::storage::idempotency::get(conn, key.as_str(), body_sha)
+        .await
+        .map_err(map_sql_error)?
+    else {
+        return Ok(None);
+    };
+
+    let upload_id: UploadId = cached.seed.upload_id.parse().map_err(invalid_upload_id)?;
+    let row = load_upload(conn, upload_id_uuid(&upload_id)?).await?;
+    let validated = tenant_path::validate(&cached.seed.storage_path, caller.data_tenant_id)
+        .map_err(map_tenant_path)?;
+    let replay = UploadPlanReplayInput {
+        wire_protocol: row.wire_protocol,
+        backend_upload_id: row.backend_upload_id,
+        part_count_planned: u32::try_from(row.part_count_planned).unwrap_or(u32::MAX),
+        part_size_bytes: u64::try_from(row.part_size_bytes).unwrap_or(0),
+        block_count_planned: row
+            .block_count_planned
+            .map(|value| u32::try_from(value).unwrap_or(u32::MAX)),
+    };
+
+    Ok(Some(InitReplay {
+        upload_id,
+        backend: cached.seed.backend,
+        storage_path: cached.seed.storage_path,
+        validated,
+        replay_input: replay,
+    }))
+}
+
+async fn find_and_mark_prior_pending(
+    conn: &mut TenantConn<'_>,
+    body: &UploadInitRequest,
+) -> Result<Option<PriorAbort>, WyrdError> {
+    let prior = multipart_uploads::find_pending_for_dedupe(
+        conn,
+        body.card_uid.as_str(),
+        &body.expected_sha256,
+    )
+    .await
+    .map_err(map_sql_error)?;
+
+    if let Some(prior) = prior {
+        let abort = PriorAbort {
+            storage_path: prior.storage_path,
+            backend_upload_id: prior.backend_upload_id,
+        };
+        multipart_uploads::mark_aborted(conn, prior.id, Some("re-init"))
+            .await
+            .map_err(map_sql_error)?;
+        return Ok(Some(abort));
+    }
+
+    Ok(None)
+}
+
+async fn abort_prior_best_effort(state: &AppState, caller: &Caller, prior: PriorAbort) {
+    let Some(backend_upload_id) = prior.backend_upload_id else {
+        return;
+    };
+    let Ok(validated) = tenant_path::validate(&prior.storage_path, caller.data_tenant_id) else {
+        tracing::warn!(storage_path = %prior.storage_path, "re-init prior upload path failed validation");
+        return;
+    };
+    if let Err(error) = state
+        .storage
+        .signer()
+        .abort_multipart(&validated, &backend_upload_id)
+        .await
+    {
+        tracing::warn!(error = %error, "best-effort re-init backend abort failed");
+    }
+}
+
+fn extract_idempotency_key(headers: &HeaderMap) -> Result<Option<IdempotencyKey>, WyrdError> {
+    headers
+        .get(IDEMPOTENCY_KEY_HEADER)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| {
+                    validation_error(
+                        "idempotency key header is not valid UTF-8",
+                        serde_json::json!({ "header": IDEMPOTENCY_KEY_HEADER }),
+                    )
+                })
+                .and_then(|value| {
+                    IdempotencyKey::new(value).map_err(|error| {
+                        validation_error(
+                            "idempotency key is invalid",
+                            serde_json::json!({
+                                "header": IDEMPOTENCY_KEY_HEADER,
+                                "source": error.to_string(),
+                            }),
+                        )
+                    })
+                })
+        })
+        .transpose()
+}
+
+fn authorize_card_write(caller: &Caller) -> Result<(), WyrdError> {
+    if caller.principal.has_scope(Scope::CardWrite) {
+        return Ok(());
+    }
+    Err(WyrdError::InsufficientScope {
+        message: "caller lacks required scope card:write".to_owned(),
+        details: serde_json::json!({ "required": Scope::CardWrite.as_str() }),
+    })
+}
+
+fn validated_tenant_path(
+    caller: &Caller,
+    body: &UploadInitRequest,
+) -> Result<ValidatedPath, WyrdError> {
+    validate_sha256_b64(&body.expected_sha256)?;
+    let storage_path = tenant_path::build(
+        caller.data_tenant_id,
+        body.card_uid.as_str(),
+        &body.relative_path,
+    );
+    tenant_path::validate(&storage_path, caller.data_tenant_id).map_err(map_tenant_path)
+}
+
+fn validate_sha256_b64(value: &str) -> Result<(), WyrdError> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|error| {
+            validation_error(
+                "expected_sha256 is not valid base64",
+                serde_json::json!({ "source": error.to_string() }),
+            )
+        })?;
+    if decoded.len() != 32 {
+        return Err(validation_error(
+            "expected_sha256 must decode to 32 bytes",
+            serde_json::json!({ "decoded_bytes": decoded.len() }),
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_canonical_json(body: &UploadInitRequest) -> [u8; 32] {
+    let bytes = serde_json::to_vec(body).expect("invariant: UploadInitRequest serializes to JSON");
+    Sha256::digest(bytes).into()
+}
+
+fn derive_wire_protocol(backend: StorageBackendKind, planned: PlannedUpload) -> WireProtocol {
+    match (backend, planned) {
+        (StorageBackendKind::Local, _) => WireProtocol::LocalFsV1,
+        (_, PlannedUpload::SinglePut) => WireProtocol::SinglePutV1,
+        (StorageBackendKind::S3, PlannedUpload::Multipart { .. }) => WireProtocol::S3MultipartV1,
+        (StorageBackendKind::Gcs, PlannedUpload::Multipart { .. }) => WireProtocol::GcsResumableV1,
+        (StorageBackendKind::Azure, PlannedUpload::Multipart { .. }) => {
+            WireProtocol::AzureBlockBlobV1
+        }
+    }
+}
+
+fn upload_row_counts(
+    planned: PlannedUpload,
+    expected_size_bytes: u64,
+    wire_protocol: WireProtocol,
+) -> (u32, u64, Option<i32>) {
+    let (part_count, part_size_bytes) = match planned {
+        PlannedUpload::SinglePut => (1, expected_size_bytes),
+        PlannedUpload::Multipart {
+            part_count,
+            part_size_bytes,
+        } => (part_count, part_size_bytes),
+    };
+    let block_count_planned = if wire_protocol == WireProtocol::AzureBlockBlobV1 {
+        Some(i32::try_from(part_count).unwrap_or(i32::MAX))
+    } else {
+        None
+    };
+    (part_count, part_size_bytes, block_count_planned)
+}
+
+async fn drive_backend_init(
+    state: &AppState,
+    validated: &ValidatedPath,
+    planned: PlannedUpload,
+    expected_size_bytes: u64,
+) -> Result<MultipartInit, WyrdError> {
+    match planned {
+        PlannedUpload::SinglePut => {
+            let plan = if state.storage.backend() == StorageBackendKind::Local {
+                local_single_put_plan(state, validated)?
+            } else {
+                state
+                    .storage
+                    .signer()
+                    .presign_single_put(validated, expected_size_bytes, state.storage.presign_ttl())
+                    .await
+                    .map_err(map_storage_error)?
+            };
+            Ok(MultipartInit {
+                plan,
+                backend_upload_id: String::new(),
+            })
+        }
+        PlannedUpload::Multipart {
+            part_count,
+            part_size_bytes,
+        } => state
+            .storage
+            .signer()
+            .init_multipart(
+                validated,
+                part_count,
+                part_size_bytes,
+                state.storage.presign_ttl(),
+            )
+            .await
+            .map_err(map_storage_error),
+    }
+}
+
+fn local_single_put_plan(
+    state: &AppState,
+    validated: &ValidatedPath,
+) -> Result<UploadPlan, WyrdError> {
+    let base = state.storage.public_base_url().ok_or_else(|| {
+        internal_error(
+            "local storage requires WYRD_PUBLIC_BASE_URL to mint upload URLs",
+            serde_json::json!({ "backend": StorageBackendKind::Local }),
+        )
+    })?;
+    let base = base.strip_suffix('/').unwrap_or(base);
+    Ok(UploadPlan::SinglePut {
+        put_url: format!("{base}/v1/cards/upload/local/{}", validated.full),
+        ttl_secs: state.storage.presign_ttl_secs(),
+        required_headers: Vec::new(),
+    })
+}
+
+async fn persist_backend_id_and_audit(
+    conn: &mut TenantConn<'_>,
+    caller: &Caller,
+    upload_uuid: Uuid,
+    validated: &ValidatedPath,
+    backend: StorageBackendKind,
+    backend_upload_id: &str,
+) -> Result<(), WyrdError> {
+    let persisted_backend_id = (backend == StorageBackendKind::S3).then_some(backend_upload_id);
+    multipart_uploads::mark_pending(conn, upload_uuid, persisted_backend_id)
+        .await
+        .map_err(map_sql_error)?;
+    audit::write(
+        conn,
+        caller,
+        "upload_init",
+        Some(upload_uuid),
+        &validated.full,
+        backend,
+        200,
+        None,
+    )
+    .await
+}
+
+async fn cache_init_seed(
+    conn: &mut TenantConn<'_>,
+    key: &IdempotencyKey,
+    body_sha: &[u8; 32],
+    upload_id: &UploadId,
+    validated: &ValidatedPath,
+    backend: StorageBackendKind,
+    wire_protocol: WireProtocol,
+) -> Result<(), WyrdError> {
+    let seed = wyrd_sql::queries::storage::idempotency::UploadInitReplaySeed {
+        upload_id: upload_id.to_string(),
+        storage_path: validated.full.clone(),
+        backend,
+        wire_protocol,
+    };
+    wyrd_sql::queries::storage::idempotency::store(
+        conn,
+        key.as_str(),
+        body_sha,
+        200,
+        &seed,
+        Duration::from_secs(INIT_TTL_SECS as u64),
+    )
+    .await
+    .map_err(map_sql_error)
+}
+
+async fn load_upload(
+    conn: &mut TenantConn<'_>,
+    upload_uuid: Uuid,
+) -> Result<MultipartUploadRow, WyrdError> {
+    multipart_uploads::find_by_id(conn, upload_uuid)
+        .await
+        .map_err(map_sql_error)?
+        .ok_or_else(|| {
+            not_found_error(
+                "upload not found",
+                serde_json::json!({ "upload_id": upload_uuid }),
+            )
+        })
+}
+
+async fn load_pending_upload(
+    conn: &mut TenantConn<'_>,
+    upload_uuid: Uuid,
+) -> Result<MultipartUploadRow, WyrdError> {
+    let row = load_upload(conn, upload_uuid).await?;
+    if row.status != UploadStatus::Pending {
+        return Err(conflict_error(
+            "upload is not pending",
+            serde_json::json!({ "upload_id": upload_uuid, "status": row.status }),
+        ));
+    }
+    Ok(row)
+}
+
+fn build_complete_payload(
+    body: &UploadCompleteRequest,
+    wire_protocol: WireProtocol,
+    backend: StorageBackendKind,
+    block_count_planned: Option<i32>,
+) -> Result<Option<CompletePayload>, WyrdError> {
+    match (body, wire_protocol, backend) {
+        (
+            UploadCompleteRequest::SinglePut(_),
+            WireProtocol::LocalFsV1,
+            StorageBackendKind::Local,
+        ) => Ok(Some(CompletePayload::Local)),
+        (UploadCompleteRequest::SinglePut(_), WireProtocol::SinglePutV1, _) => Ok(None),
+        (
+            UploadCompleteRequest::S3Multipart(S3MultipartComplete { parts }),
+            WireProtocol::S3MultipartV1,
+            _,
+        ) => Ok(Some(CompletePayload::S3 {
+            parts: parts.clone(),
+        })),
+        (UploadCompleteRequest::GcsResumable(_), WireProtocol::GcsResumableV1, _) => Ok(None),
+        (
+            UploadCompleteRequest::AzureBlockBlob(AzureBlockBlobComplete { block_count }),
+            WireProtocol::AzureBlockBlobV1,
+            _,
+        ) => {
+            let planned = block_count_planned.ok_or_else(|| {
+                internal_error(
+                    "azure upload row is missing block_count_planned",
+                    serde_json::json!({ "wire_protocol": wire_protocol }),
+                )
+            })?;
+            let planned = u32::try_from(planned).map_err(|_| {
+                internal_error(
+                    "azure upload row has invalid block_count_planned",
+                    serde_json::json!({ "block_count_planned": planned }),
+                )
+            })?;
+            if *block_count != planned {
+                return Err(validation_error(
+                    "azure block count does not match planned upload",
+                    serde_json::json!({ "actual": block_count, "planned": planned }),
+                ));
+            }
+            Ok(Some(CompletePayload::Azure {
+                block_count: planned,
+            }))
+        }
+        (_, stored, _) => Err(validation_error(
+            "complete payload does not match upload protocol",
+            serde_json::json!({ "wire_protocol": stored }),
+        )),
+    }
+}
+
+async fn verify_object_head(
+    state: &AppState,
+    caller: &Caller,
+    upload_uuid: Uuid,
+    validated: &ValidatedPath,
+    row: &MultipartUploadRow,
+    head: &HeadInfo,
+) -> Result<(), WyrdError> {
+    let expected = u64::try_from(row.expected_size_bytes).map_err(|_| {
+        internal_error(
+            "stored expected_size_bytes is negative",
+            serde_json::json!({ "upload_id": upload_uuid, "expected_size_bytes": row.expected_size_bytes }),
+        )
+    })?;
+    if head.size_bytes != expected {
+        let error = map_storage_error(StorageError::SizeMismatch {
+            expected,
+            actual: head.size_bytes,
+        });
+        let error_code = error.code().to_owned();
+        let status_code = i32::from(error.status());
+        mark_failed_best_effort(
+            state,
+            caller,
+            upload_uuid,
+            validated,
+            row.backend,
+            "upload_complete",
+            "size_mismatch",
+            status_code,
+            Some(&error_code),
+        )
+        .await;
+        return Err(error);
+    }
+    if state.storage.require_encryption() && head.sse_marker.is_none() {
+        let error = map_storage_error(StorageError::EncryptionMissing);
+        let error_code = error.code().to_owned();
+        let status_code = i32::from(error.status());
+        mark_failed_best_effort(
+            state,
+            caller,
+            upload_uuid,
+            validated,
+            row.backend,
+            "upload_complete",
+            "encryption_missing",
+            status_code,
+            Some(&error_code),
+        )
+        .await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mark_failed_best_effort(
+    state: &AppState,
+    caller: &Caller,
+    upload_uuid: Uuid,
+    validated: &ValidatedPath,
+    backend: StorageBackendKind,
+    operation: &'static str,
+    reason: &str,
+    status_code: i32,
+    error_code: Option<&str>,
+) {
+    let Ok(mut conn) = TenantConn::acquire(&state.pool, caller.data_tenant_id).await else {
+        tracing::warn!(upload_id = %upload_uuid, "failed to acquire tenant connection for failure mark");
+        return;
+    };
+    if let Err(error) = multipart_uploads::mark_failed(&mut conn, upload_uuid, reason).await {
+        tracing::warn!(error = %error, upload_id = %upload_uuid, "failed to mark upload failed");
+    }
+    if let Err(error) = audit::write(
+        &mut conn,
+        caller,
+        operation,
+        Some(upload_uuid),
+        &validated.full,
+        backend,
+        status_code,
+        error_code,
+    )
+    .await
+    {
+        tracing::warn!(error = %error, upload_id = %upload_uuid, "failed to append storage failure audit");
+    }
+    if let Err(error) = conn.commit().await {
+        tracing::warn!(error = %error, upload_id = %upload_uuid, "failed to commit failure mark");
+    }
+}
+
+fn upload_id_uuid(upload_id: &UploadId) -> Result<Uuid, WyrdError> {
+    let ulid = upload_id.as_ulid().map_err(invalid_upload_id)?;
+    Ok(Uuid::from_bytes(ulid.to_bytes()))
+}
+
+fn invalid_upload_id(error: UploadIdParseError) -> WyrdError {
+    validation_error(
+        "upload_id is invalid",
+        serde_json::json!({ "source": error.to_string() }),
+    )
+}
+
+pub(crate) fn invalid_upload_id_for_route(error: UploadIdParseError) -> WyrdError {
+    invalid_upload_id(error)
+}
+
+fn map_tenant_path(error: TenantPathError) -> WyrdError {
+    match error {
+        TenantPathError::TenantMismatch { prefix, caller } => WyrdError::PermissionDenied {
+            message: "storage path belongs to a different tenant".to_owned(),
+            details: serde_json::json!({ "prefix": prefix, "caller": caller }),
+        },
+        other => validation_error(
+            "storage path failed tenant validation",
+            serde_json::json!({ "source": other.to_string() }),
+        ),
+    }
+}
+
+/// Map a SQL-layer error into the current public error catalog.
+pub fn map_sql_error(error: wyrd_sql::SqlError) -> WyrdError {
+    let code = error.code();
+    let message = error.to_string();
+    let details = serde_json::json!({ "source_code": code });
+    match error {
+        wyrd_sql::SqlError::NoRows => not_found_error(&message, details),
+        wyrd_sql::SqlError::UniqueViolation { .. }
+        | wyrd_sql::SqlError::FkViolation { .. }
+        | wyrd_sql::SqlError::CheckViolation { .. }
+        | wyrd_sql::SqlError::Conflict { .. } => conflict_error(&message, details),
+        wyrd_sql::SqlError::RlsDenied { .. } => WyrdError::PermissionDenied { message, details },
+        wyrd_sql::SqlError::Connect(_)
+        | wyrd_sql::SqlError::Migrate(_)
+        | wyrd_sql::SqlError::MigrateChecksum { .. }
+        | wyrd_sql::SqlError::Query(_)
+        | wyrd_sql::SqlError::InvariantViolation { .. }
+        | wyrd_sql::SqlError::TxFailed(_)
+        | wyrd_sql::SqlError::InsufficientPrivilege { .. }
+        | wyrd_sql::SqlError::InvalidDataTenantId(_) => WyrdError::Internal { message, details },
+    }
+}
+
+fn map_storage_error(error: StorageError) -> WyrdError {
+    let code = map_storage_error_code(&error);
+    let message = error.to_string();
+    let details = serde_json::json!({ "source": "wyrd_storage", "source_code": code });
+    match error {
+        StorageError::TenantPathMismatch(_)
+        | StorageError::ArtifactTooLarge { .. }
+        | StorageError::InvalidExpectedSha256(_)
+        | StorageError::InvalidExpectedSize(_)
+        | StorageError::SizeMismatch { .. }
+        | StorageError::Sha256Mismatch { .. }
+        | StorageError::InvalidUri(_)
+        | StorageError::TenantPrefixInvalid(_) => validation_error(&message, details),
+        StorageError::TenantPrefixForeign { .. } => {
+            WyrdError::PermissionDenied { message, details }
+        }
+        StorageError::EncryptionMissing | StorageError::BackendCapabilityMismatch { .. } => {
+            conflict_error(&message, details)
+        }
+        StorageError::ObjectNotFound { .. } => not_found_error(&message, details),
+        StorageError::S3(boxed) if matches!(&*boxed, S3Error::NoSuchKey { .. }) => {
+            not_found_error(&message, details)
+        }
+        StorageError::Gcs(boxed) if matches!(&*boxed, GcsError::NotFound { .. }) => {
+            not_found_error(&message, details)
+        }
+        StorageError::Azure(boxed) if matches!(&*boxed, AzureError::BlobNotFound { .. }) => {
+            not_found_error(&message, details)
+        }
+        StorageError::Local(LocalError::NotFound { .. }) => not_found_error(&message, details),
+        StorageError::CredentialChain(_)
+        | StorageError::LifecycleRuleMissing(_)
+        | StorageError::ConfigParse { .. }
+        | StorageError::Local(LocalError::NonAbsoluteRoot(_) | LocalError::RootNotFound(_)) => {
+            WyrdError::Internal { message, details }
+        }
+        StorageError::PresignExpired(_)
+        | StorageError::Backend { .. }
+        | StorageError::S3(_)
+        | StorageError::Gcs(_)
+        | StorageError::Azure(_)
+        | StorageError::Local(LocalError::Io(_))
+        | StorageError::Io(_)
+        | StorageError::Reqwest(_) => WyrdError::UpstreamFailure { message, details },
+    }
+}
+
+fn map_storage_error_code(error: &StorageError) -> String {
+    match error {
+        StorageError::TenantPathMismatch(_) => "storage_tenant_path_mismatch",
+        StorageError::ArtifactTooLarge { .. } => "storage_artifact_too_large",
+        StorageError::InvalidExpectedSha256(_) => "storage_invalid_expected_sha256",
+        StorageError::InvalidExpectedSize(_) => "storage_invalid_expected_size",
+        StorageError::EncryptionMissing => "storage_encryption_missing",
+        StorageError::Sha256Mismatch { .. } => "storage_sha256_mismatch",
+        StorageError::SizeMismatch { .. } => "storage_size_mismatch",
+        StorageError::CredentialChain(_) => "storage_credential_chain",
+        StorageError::LifecycleRuleMissing(_) => "storage_lifecycle_missing",
+        StorageError::PresignExpired(_) => "storage_presign_expired",
+        StorageError::ObjectNotFound { .. } => "storage_object_not_found",
+        StorageError::BackendCapabilityMismatch { .. } => "storage_backend_capability_mismatch",
+        StorageError::Backend { .. } => "storage_backend",
+        StorageError::ConfigParse { .. } => "storage_config_parse",
+        StorageError::InvalidUri(_) => "storage_invalid_uri",
+        StorageError::TenantPrefixInvalid(_) => "storage_tenant_prefix_invalid",
+        StorageError::TenantPrefixForeign { .. } => "storage_tenant_prefix_foreign",
+        StorageError::S3(_) => "storage_s3",
+        StorageError::Gcs(_) => "storage_gcs",
+        StorageError::Azure(_) => "storage_azure",
+        StorageError::Local(_) => "storage_local",
+        StorageError::Io(_) => "storage_io",
+        StorageError::Reqwest(_) => "storage_http",
+    }
+    .to_owned()
+}
+
+fn validation_error(message: impl Into<String>, details: serde_json::Value) -> WyrdError {
+    WyrdError::Validation {
+        message: message.into(),
+        details,
+    }
+}
+
+fn not_found_error(message: impl Into<String>, details: serde_json::Value) -> WyrdError {
+    WyrdError::NotFound {
+        message: message.into(),
+        details,
+    }
+}
+
+fn conflict_error(message: impl Into<String>, details: serde_json::Value) -> WyrdError {
+    WyrdError::Conflict {
+        message: message.into(),
+        details,
+    }
+}
+
+fn internal_error(message: impl Into<String>, details: serde_json::Value) -> WyrdError {
+    WyrdError::Internal {
+        message: message.into(),
+        details,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use std::sync::Arc;
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::storage::SinglePutComplete;
+    use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
+
+    #[test]
+    fn local_backend_uses_local_fs_protocol_even_for_large_uploads() {
+        let planned = PlannedUpload::Multipart {
+            part_count: 2,
+            part_size_bytes: 16,
+        };
+
+        assert_eq!(
+            derive_wire_protocol(StorageBackendKind::Local, planned),
+            WireProtocol::LocalFsV1
+        );
+    }
+
+    #[test]
+    fn azure_complete_rejects_block_count_drift() {
+        let body = UploadCompleteRequest::AzureBlockBlob(AzureBlockBlobComplete { block_count: 2 });
+        let err = build_complete_payload(
+            &body,
+            WireProtocol::AzureBlockBlobV1,
+            StorageBackendKind::Azure,
+            Some(3),
+        )
+        .expect_err("block count mismatch should fail");
+
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn cloud_single_put_is_server_verified_without_backend_commit_payload() {
+        let body = UploadCompleteRequest::SinglePut(SinglePutComplete {});
+        let payload = build_complete_payload(
+            &body,
+            WireProtocol::SinglePutV1,
+            StorageBackendKind::S3,
+            None,
+        )
+        .expect("single put payload builds");
+
+        assert!(payload.is_none());
+    }
+
+    #[test]
+    fn upload_row_counts_persists_azure_block_count_only() {
+        let planned = PlannedUpload::Multipart {
+            part_count: 7,
+            part_size_bytes: 16,
+        };
+
+        assert_eq!(
+            upload_row_counts(planned, 100, WireProtocol::AzureBlockBlobV1),
+            (7, 16, Some(7))
+        );
+        assert_eq!(
+            upload_row_counts(planned, 100, WireProtocol::S3MultipartV1),
+            (7, 16, None)
+        );
+    }
+
+    #[test]
+    fn upload_plan_wire_protocol_is_closed() {
+        let plan = UploadPlan::SinglePut {
+            put_url: "https://example.test/upload".to_owned(),
+            ttl_secs: 60,
+            required_headers: Vec::new(),
+        };
+        let json = serde_json::to_value(plan).expect("plan serializes");
+
+        assert_eq!(json["protocol"], "single_put");
+    }
+
+    #[tokio::test]
+    async fn local_single_put_plan_uses_mounted_http_blob_route() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let storage = StorageHandle::from_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_secs(600),
+            part_size_bytes: 16 * 1024 * 1024,
+            public_base_url: Some("https://wyrd.test/".to_owned()),
+        })
+        .await
+        .expect("local storage handle");
+        let state = AppState::new(
+            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
+            None,
+            Arc::clone(&storage),
+        );
+        let tenant = DataTenantId::new_v7();
+        let validated = ValidatedPath {
+            full: format!("{tenant}/cards/018f0000-0000-7000-8000-000000000000/model.bin"),
+            data_tenant_id: tenant,
+            card_uid: "018f0000-0000-7000-8000-000000000000".to_owned(),
+            relative_path: "model.bin".to_owned(),
+        };
+
+        let plan = local_single_put_plan(&state, &validated).expect("local plan");
+
+        let UploadPlan::SinglePut {
+            put_url,
+            ttl_secs,
+            required_headers,
+        } = plan
+        else {
+            panic!("expected single put plan");
+        };
+        assert_eq!(
+            put_url,
+            format!("https://wyrd.test/v1/cards/upload/local/{}", validated.full)
+        );
+        assert_eq!(ttl_secs, 600);
+        assert!(required_headers.is_empty());
+    }
+}

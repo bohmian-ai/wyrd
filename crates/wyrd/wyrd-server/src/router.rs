@@ -12,7 +12,7 @@ use crate::state::AppState;
 
 /// Build the HTTP router with shared server state.
 pub fn build_router(state: AppState) -> Router {
-    let v1 = Router::new().fallback(v1_not_found);
+    let v1 = crate::storage::routes::mount(Router::new(), &state).fallback(v1_not_found);
 
     Router::new()
         .route("/healthz", get(crate::healthz))

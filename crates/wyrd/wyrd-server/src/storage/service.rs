@@ -34,7 +34,7 @@ use crate::AppState;
 use crate::auth::Caller;
 use crate::storage::audit;
 
-const INIT_TTL_SECS: i64 = 24 * 60 * 60;
+const INIT_TTL_SECS: u64 = 24 * 60 * 60;
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 
 /// Response body for one multipart part URL.
@@ -170,7 +170,7 @@ pub async fn upload_init(
                 )
             })?,
             block_count_planned: counts.block_count_planned,
-            ttl_secs: INIT_TTL_SECS,
+            ttl_secs: INIT_TTL_SECS as i64,
         },
     )
     .await
@@ -208,7 +208,7 @@ pub async fn upload_init(
     let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
-    persist_backend_id_and_audit(
+    persist_s3_upload_id_and_audit(
         &mut conn,
         &caller,
         upload_uuid,
@@ -810,7 +810,7 @@ fn local_download_url(state: &AppState, validated: &ValidatedPath) -> Result<Str
             serde_json::json!({ "backend": StorageBackendKind::Local }),
         )
     })?;
-    let base = base.strip_suffix('/').unwrap_or(base);
+    let base = normalize_base_url(base);
     Ok(format!("{base}/v1/cards/download/local/{}", validated.full))
 }
 
@@ -954,7 +954,7 @@ fn local_single_put_plan(
             serde_json::json!({ "backend": StorageBackendKind::Local }),
         )
     })?;
-    let base = base.strip_suffix('/').unwrap_or(base);
+    let base = normalize_base_url(base);
     Ok(UploadPlan::SinglePut {
         put_url: format!("{base}/v1/cards/upload/local/{}", validated.full),
         ttl_secs: state.storage.presign_ttl_secs(),
@@ -962,7 +962,7 @@ fn local_single_put_plan(
     })
 }
 
-async fn persist_backend_id_and_audit(
+async fn persist_s3_upload_id_and_audit(
     conn: &mut TenantConn<'_>,
     caller: &Caller,
     upload_uuid: Uuid,
@@ -1008,7 +1008,7 @@ async fn cache_init_seed(
         body_sha,
         200,
         &seed,
-        Duration::from_secs(INIT_TTL_SECS as u64),
+        Duration::from_secs(INIT_TTL_SECS),
     )
     .await
     .map_err(map_sql_error)
@@ -1191,15 +1191,15 @@ fn upload_id_uuid(upload_id: &UploadId) -> Result<Uuid, WyrdError> {
     Ok(Uuid::from_bytes(ulid.to_bytes()))
 }
 
-fn invalid_upload_id(error: UploadIdParseError) -> WyrdError {
+pub(crate) fn invalid_upload_id(error: UploadIdParseError) -> WyrdError {
     WyrdStorageError::InvalidUploadId {
         reason: error.to_string(),
     }
     .into()
 }
 
-pub(crate) fn invalid_upload_id_for_route(error: UploadIdParseError) -> WyrdError {
-    invalid_upload_id(error)
+fn normalize_base_url(base: &str) -> &str {
+    base.strip_suffix('/').unwrap_or(base)
 }
 
 fn map_tenant_path(error: TenantPathError) -> WyrdError {

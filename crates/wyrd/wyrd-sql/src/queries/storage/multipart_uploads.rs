@@ -412,13 +412,15 @@ pub async fn mark_completed(conn: &mut TenantConn<'_>, id: Uuid) -> Result<(), S
 /// Mark an upload as aborted.
 ///
 /// # Errors
-/// Returns [`SqlError`] when Postgres rejects the update.
+/// Returns [`SqlError::Conflict`] when the upload is not in an abortable state
+/// (concurrent complete or already terminal), or another [`SqlError`] when
+/// Postgres rejects the update.
 pub async fn mark_aborted(
     conn: &mut TenantConn<'_>,
     id: Uuid,
     reason: Option<&str>,
 ) -> Result<(), SqlError> {
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         UPDATE wyrd.storage_multipart_uploads
         SET status = 'aborted',
@@ -434,7 +436,7 @@ pub async fn mark_aborted(
     .await
     .map_err(SqlError::from)?;
 
-    Ok(())
+    ensure_one_row(result.rows_affected(), "mark upload aborted")
 }
 
 /// Mark an upload as failed.

@@ -72,14 +72,18 @@ pub async fn expired_uploads_batch(
 
 /// Mark an upload aborted from the admin pool.
 ///
+/// Returns the number of rows updated. Zero indicates the upload was already
+/// in a terminal state (e.g., completed concurrently), which the caller should
+/// treat as a best-effort no-op rather than an error.
+///
 /// # Errors
 /// Returns [`SqlError`] when Postgres rejects the update.
 pub async fn mark_aborted_admin(
     admin_pool: &PgPool,
     id: Uuid,
     reason: &str,
-) -> Result<(), SqlError> {
-    sqlx::query(
+) -> Result<u64, SqlError> {
+    let result = sqlx::query(
         r#"
         UPDATE wyrd.storage_multipart_uploads
         SET status = 'aborted',
@@ -95,7 +99,7 @@ pub async fn mark_aborted_admin(
     .await
     .map_err(SqlError::from)?;
 
-    Ok(())
+    Ok(result.rows_affected())
 }
 
 /// Try to acquire the storage sweeper leader advisory lock.

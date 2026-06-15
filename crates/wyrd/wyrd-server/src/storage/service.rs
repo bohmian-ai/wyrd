@@ -465,9 +465,11 @@ pub async fn upload_abort(
     let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
-    multipart_uploads::mark_aborted(&mut conn, upload_uuid, Some("client-abort"))
-        .await
-        .map_err(map_sql_error)?;
+    let aborted = match multipart_uploads::mark_aborted(&mut conn, upload_uuid, Some("client-abort")).await {
+        Ok(()) => true,
+        Err(wyrd_sql::SqlError::Conflict { .. }) => false,
+        Err(error) => return Err(map_sql_error(error)),
+    };
     audit::write(
         &mut conn,
         &caller,
@@ -481,7 +483,7 @@ pub async fn upload_abort(
     .await?;
     conn.commit().await.map_err(map_sql_error)?;
 
-    Ok(AbortResponse { aborted: true })
+    Ok(AbortResponse { aborted })
 }
 
 /// Write a local-mode raw blob body.

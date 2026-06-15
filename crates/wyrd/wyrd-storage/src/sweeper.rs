@@ -323,12 +323,20 @@ impl Sweeper {
             }
         };
 
-        wyrd_sql::queries::storage::admin::multipart_uploads::mark_aborted_admin(
+        let rows_updated = wyrd_sql::queries::storage::admin::multipart_uploads::mark_aborted_admin(
             &self.admin_pool,
             row.id,
             "sweeper-ttl-expired",
         )
         .await?;
+
+        if rows_updated == 0 {
+            tracing::debug!(
+                upload_id = %row.id,
+                "sweeper race: upload completed before abort, skipping audit"
+            );
+            return Ok(());
+        }
 
         self.audit_abort(data_tenant_id, row, backend, status_code, error_code)
             .await

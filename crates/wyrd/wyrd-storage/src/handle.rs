@@ -39,6 +39,13 @@ impl std::fmt::Debug for StorageHandle {
 
 impl StorageHandle {
     /// Build a storage handle from already-constructed components.
+    ///
+    /// Intended for tests and local-mode harnesses. The resulting
+    /// [`BackendConfig`] is synthesized from the signer alone, so
+    /// optional fields (`region`, `endpoint_url`, `force_path_style`,
+    /// `public_base_url`) are defaulted, `require_encryption` is `false`,
+    /// `presign_ttl` is the crate default, and `default_part_size_bytes`
+    /// is the crate default. Production paths must use [`Self::from_settings`].
     #[must_use]
     pub fn new(signer: BackendSigner, object_store: Arc<dyn ObjectStore>) -> Self {
         let backend_config = match &signer {

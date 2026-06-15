@@ -22,7 +22,6 @@ pub mod sha;
 pub mod signer;
 pub mod sweeper;
 pub mod tenant_path;
-pub mod upload_id;
 
 pub use azure::{AzureSasMode, AzureSigner};
 pub use error::{AzureError, ConfigParseError, GcsError, LocalError, S3Error, StorageError};
@@ -32,4 +31,3 @@ pub use plan::{PlanError, PlannedUpload, plan_upload};
 pub use settings::{BackendConfig, StorageSettings};
 pub use signer::{BackendSigner, CompletePayload, HeadInfo, MultipartInit, UploadPlanReplayInput};
 pub use tenant_path::{TenantPathError, ValidatedPath};
-pub use upload_id::{UploadId, UploadIdParseError};

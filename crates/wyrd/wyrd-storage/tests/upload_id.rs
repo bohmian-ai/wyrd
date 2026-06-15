@@ -1,5 +1,5 @@
 use std::str::FromStr;
-use wyrd_storage::UploadId;
+use wyrd_spec::storage::UploadId;
 
 #[test]
 fn upload_id_round_trips_display_parse() {

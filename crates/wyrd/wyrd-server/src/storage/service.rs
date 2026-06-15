@@ -1234,6 +1234,8 @@ fn map_storage_error(error: StorageError) -> WyrdError {
         StorageError::Local(LocalError::NotFound { .. }) => not_found_error(&message, details),
         StorageError::CredentialChain(_)
         | StorageError::LifecycleRuleMissing(_)
+        | StorageError::AdminPool { .. }
+        | StorageError::Sql(_)
         | StorageError::ConfigParse { .. }
         | StorageError::Local(LocalError::NonAbsoluteRoot(_) | LocalError::RootNotFound(_)) => {
             WyrdError::Internal { message, details }
@@ -1264,6 +1266,8 @@ fn map_storage_error_code(error: &StorageError) -> String {
         StorageError::ObjectNotFound { .. } => "storage_object_not_found",
         StorageError::BackendCapabilityMismatch { .. } => "storage_backend_capability_mismatch",
         StorageError::Backend { .. } => "storage_backend",
+        StorageError::AdminPool { .. } => "storage_admin_pool",
+        StorageError::Sql(_) => "storage_sql",
         StorageError::ConfigParse { .. } => "storage_config_parse",
         StorageError::InvalidUri(_) => "storage_invalid_uri",
         StorageError::TenantPrefixInvalid(_) => "storage_tenant_prefix_invalid",

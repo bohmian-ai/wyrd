@@ -118,6 +118,16 @@ pub enum StorageError {
         /// Safe diagnostic message.
         message: String,
     },
+    /// Platform-admin pool acquisition failed.
+    #[error("platform admin pool failed")]
+    AdminPool {
+        /// `SQLx` source error.
+        #[source]
+        source: sqlx::Error,
+    },
+    /// SQL query failed.
+    #[error(transparent)]
+    Sql(#[from] wyrd_sql::SqlError),
     /// Storage boot configuration failed to parse.
     #[error("config parse failed for `{var}`: {source}")]
     ConfigParse {

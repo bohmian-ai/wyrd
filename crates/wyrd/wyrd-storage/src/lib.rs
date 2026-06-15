@@ -20,6 +20,7 @@ pub mod s3;
 pub mod settings;
 pub mod sha;
 pub mod signer;
+pub mod sweeper;
 pub mod tenant_path;
 pub mod upload_id;
 

@@ -6815,6 +6815,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx",
  "temp-env",
  "tempfile",
  "thiserror 2.0.18",
@@ -6824,7 +6825,9 @@ dependencies = [
  "ulid",
  "url",
  "uuid",
+ "wyrd-dev-fixtures",
  "wyrd-spec",
+ "wyrd-sql",
 ]
 
 [[package]]

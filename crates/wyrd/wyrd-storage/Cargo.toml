@@ -12,11 +12,13 @@ description = "Server-tier storage handles and backend signers for Wyrd artifact
 path = "src/lib.rs"
 
 [dependencies]
+wyrd-sql = { path = "../wyrd-sql", version = "0.0.1" }
 wyrd-spec = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sqlx = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 time = { workspace = true }
@@ -42,6 +44,7 @@ azure_storage_blobs = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
+wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
 
 [lints]
 workspace = true

@@ -15,7 +15,7 @@ name = "wyrd-server"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 tokio-util = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }

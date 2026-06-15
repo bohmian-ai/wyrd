@@ -226,6 +226,17 @@ if rg -n 'mockall|wiremock|mockito' crates \
 fi
 """
 
+[tasks."check:object-store-pin"]
+description = "Assert the workspace resolves exactly one object_store 0.13 package"
+run = """
+cargo tree -e=no-dev -i object_store --all-features 2>&1 \
+  | awk '/^object_store / { v=$2; count++ } END {
+      if (count != 1) { print "FAIL: expected exactly 1 object_store version, got "count; exit 1 }
+      if (v !~ /^v0\\.13\\./) { print "FAIL: object_store "v" is not 0.13.*"; exit 1 }
+      print "OK: "v
+    }'
+"""
+
 [tasks."check:unwrap-audit"]
 description = "Audit unwrap/expect calls outside tests and examples"
 run = "python scripts/check_unwrap_audit.py"

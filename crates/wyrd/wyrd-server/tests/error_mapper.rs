@@ -2,6 +2,7 @@ use axum::body::to_bytes;
 use axum::response::IntoResponse;
 use wyrd_server::error::WyrdErrorResponse;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::error::storage::WyrdStorageError;
 
 #[tokio::test]
 async fn all_wyrd_error_variants_render_problem_json() {
@@ -26,6 +27,26 @@ async fn all_wyrd_error_variants_render_problem_json() {
     }
 }
 
+#[tokio::test]
+async fn storage_error_renders_storage_problem_json_code() {
+    let response = WyrdErrorResponse::from(WyrdError::from(WyrdStorageError::BackendUnavailable {
+        status: 503,
+    }))
+    .into_response();
+
+    assert_eq!(response.status().as_u16(), 503);
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collects");
+    let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
+    assert_eq!(problem["code"], "WYRD_STORAGE_503_BACKEND_UNAVAILABLE");
+    assert_eq!(problem["status"], 503);
+    assert_eq!(problem["title"], "Backend transiently unavailable");
+    assert_eq!(problem["details"]["code"], "backend_unavailable");
+    assert_eq!(problem["details"]["data"]["status"], 503);
+}
+
 fn sample_errors() -> Vec<WyrdError> {
     macro_rules! sample {
         ($($variant:ident),+ $(,)?) => {
@@ -40,7 +61,7 @@ fn sample_errors() -> Vec<WyrdError> {
         };
     }
 
-    sample!(
+    let mut errors = sample!(
         Validation,
         NotFound,
         Conflict,
@@ -117,5 +138,12 @@ fn sample_errors() -> Vec<WyrdError> {
         WorkflowDuplicateStepId,
         WorkflowMissingDependency,
         WorkflowCycle,
-    )
+    );
+    errors.push(
+        WyrdStorageError::ObjectNotFound {
+            storage_path: "tenant/cards/card/model.bin".to_owned(),
+        }
+        .into(),
+    );
+    errors
 }

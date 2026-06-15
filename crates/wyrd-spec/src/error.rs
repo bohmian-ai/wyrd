@@ -1,5 +1,7 @@
 //! Stable Wyrd error hierarchy and error-code helpers.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -9,6 +11,269 @@ use crate::error::derive::WyrdError as WyrdErrorMeta;
 pub mod derive {
     pub use wyrd_error_derive::WyrdError;
 }
+
+/// Public storage error catalog.
+pub mod storage {
+    use serde::{Deserialize, Serialize};
+    use thiserror::Error;
+
+    use crate::error::derive::WyrdError;
+
+    /// Wire-stable storage errors returned by Wyrd storage surfaces.
+    #[derive(Debug, Clone, Error, Serialize, Deserialize, schemars::JsonSchema, WyrdError)]
+    #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+    #[serde(tag = "code", content = "data", rename_all = "snake_case")]
+    pub enum WyrdStorageError {
+        /// Tenant-scoped storage path validation failed.
+        #[error("tenant path validation rejected upload: {detail}")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_400_TENANT_PATH_MISMATCH",
+            status = 400,
+            title = "Tenant path validation rejected upload init",
+            remediation = "Ensure relative_path contains no `..`, no leading `/`, and only [A-Za-z0-9._-] characters."
+        )]
+        TenantPathMismatch {
+            /// Safe validation detail.
+            detail: String,
+        },
+        /// Artifact exceeded backend capacity.
+        #[error("artifact size {actual} exceeds backend limit {limit}")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_400_ARTIFACT_TOO_LARGE",
+            status = 400,
+            title = "Artifact size exceeds backend capacity",
+            remediation = "Split the artifact into multiple cards or use a backend with higher per-object limits."
+        )]
+        ArtifactTooLarge {
+            /// Requested artifact size.
+            actual: u64,
+            /// Backend size limit.
+            limit: u64,
+        },
+        /// Expected SHA-256 failed base64 or length validation.
+        #[error("expected_sha256 is not a valid base64 SHA-256: {detail}")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_400_SHA256_INVALID",
+            status = 400,
+            title = "Invalid SHA-256 in upload init",
+            remediation = "Recompute SHA-256 of the artifact and base64-encode the 32-byte digest."
+        )]
+        Sha256Invalid {
+            /// Safe validation detail.
+            detail: String,
+        },
+        /// Expected byte size failed validation.
+        #[error("expected_size_bytes is invalid: {0}")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_400_SIZE_INVALID",
+            status = 400,
+            title = "Invalid expected_size_bytes",
+            remediation = "Pass a u64 byte length that matches the actual file size."
+        )]
+        SizeInvalid(u64),
+        /// Stored SHA-256 did not match the expected digest.
+        #[error("sha256 mismatch: expected {expected}, computed {actual}")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_400_SHA256_MISMATCH",
+            status = 400,
+            title = "Stored object SHA-256 does not match expected_sha256",
+            remediation = "Recompute the SHA-256 of the artifact bytes and retry."
+        )]
+        Sha256Mismatch {
+            /// Expected base64 SHA-256.
+            expected: String,
+            /// Actual base64 SHA-256.
+            actual: String,
+        },
+        /// Stored byte size did not match the expected size.
+        #[error("size mismatch: expected {expected}, stored {actual}")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_400_SIZE_MISMATCH",
+            status = 400,
+            title = "Stored object byte length does not match expected_size_bytes",
+            remediation = "Verify the file size you reported in upload_init matches the bytes you uploaded."
+        )]
+        SizeMismatch {
+            /// Expected bytes.
+            expected: u64,
+            /// Actual bytes.
+            actual: u64,
+        },
+        /// Upload id failed parsing or protocol validation.
+        #[error("invalid upload_id: {reason}")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_400_INVALID_UPLOAD_ID",
+            status = 400,
+            title = "Upload id not recognised",
+            remediation = "Use the upload_id returned by POST /v1/cards/upload/init."
+        )]
+        InvalidUploadId {
+            /// Safe validation reason.
+            reason: String,
+        },
+        /// Source URI failed backend parsing.
+        #[error("invalid source uri: {detail}")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_400_INVALID_URI",
+            status = 400,
+            title = "Source URI failed to parse",
+            remediation = "Pass an absolute URI with a scheme and authority recognised by the configured backend."
+        )]
+        InvalidUri {
+            /// Safe validation detail.
+            detail: String,
+        },
+        /// Source URI tenant prefix was not a valid tenant id.
+        #[error("source uri tenant prefix invalid: {detail}")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_400_TENANT_PREFIX_INVALID",
+            status = 400,
+            title = "Source URI tenant prefix is not a UUIDv7",
+            remediation = "Object URIs must start with the caller's data_tenant_id."
+        )]
+        TenantPrefixInvalid {
+            /// Safe validation detail.
+            detail: String,
+        },
+        /// Upload or object belongs to a different tenant.
+        #[error("upload belongs to a different tenant")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT",
+            status = 403,
+            title = "Upload belongs to a different tenant",
+            remediation = "Authenticate with a token whose data_tenant_id matches the upload's tenant prefix."
+        )]
+        TenantPathForeign,
+        /// Object was not present in the configured backend.
+        #[error("object not found at {storage_path}")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_404_OBJECT_NOT_FOUND",
+            status = 404,
+            title = "Object not found in backend",
+            remediation = "Verify card_uid and relative_path; re-upload if the object was deleted."
+        )]
+        ObjectNotFound {
+            /// Tenant-scoped storage path.
+            storage_path: String,
+        },
+        /// Upload id was not found.
+        #[error("upload not found")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_404_UPLOAD_NOT_FOUND",
+            status = 404,
+            title = "Upload id not found",
+            remediation = "Use the upload_id returned by POST /v1/cards/upload/init."
+        )]
+        UploadNotFound,
+        /// Upload was already terminal.
+        #[error("upload is not pending")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_409_UPLOAD_NOT_PENDING",
+            status = 409,
+            title = "Cannot complete or abort a terminal upload",
+            remediation = "Inspect upload status; only pending uploads can be completed or aborted."
+        )]
+        UploadNotPending,
+        /// Backend encryption verification failed.
+        #[error("encryption required but backend HEAD did not advertise SSE")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_409_ENCRYPTION_MISSING",
+            status = 409,
+            title = "Server-side encryption verification failed",
+            remediation = "Configure backend server-side encryption and retry."
+        )]
+        EncryptionMissing,
+        /// Object changed during a conditional read.
+        #[error("object precondition failed during read")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_412_PRECONDITION",
+            status = 412,
+            title = "Object changed during download",
+            remediation = "Delete the partial file and re-issue download init for a fresh URL."
+        )]
+        PreconditionFailed,
+        /// Requested byte range cannot be satisfied.
+        #[error("range not satisfiable")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_416_RANGE_NOT_SATISFIABLE",
+            status = 416,
+            title = "Source changed mid-download",
+            remediation = "Delete the partial file and sidecar, then re-download."
+        )]
+        RangeNotSatisfiable,
+        /// Backend SDK or IO operation failed.
+        #[error("backend storage operation failed: {detail}")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_500_BACKEND",
+            status = 500,
+            title = "Backend storage operation failed",
+            remediation = "Retry the operation. If failures persist, check backend dashboard and storage server logs."
+        )]
+        Backend {
+            /// Safe backend detail.
+            detail: String,
+        },
+        /// Storage settings were invalid.
+        #[error("storage settings invalid at boot: {detail}")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_500_CONFIG_INVALID",
+            status = 500,
+            title = "Storage settings invalid",
+            remediation = "Inspect server startup logs; fix the named env var and restart."
+        )]
+        ConfigInvalid {
+            /// Safe configuration detail.
+            detail: String,
+        },
+        /// Backend credential chain returned no credentials.
+        #[error("backend {backend} credential chain returned no credentials")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_500_CREDENTIAL_CHAIN",
+            status = 500,
+            title = "Backend credential chain failed",
+            remediation = "Verify backend credentials are reachable in the server environment."
+        )]
+        CredentialChain {
+            /// Backend name.
+            backend: String,
+        },
+        /// Required S3 lifecycle rule was missing.
+        #[error("S3 bucket lifecycle missing AbortIncompleteMultipartUpload rule")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_500_LIFECYCLE_MISSING",
+            status = 500,
+            title = "S3 lifecycle missing required rule",
+            remediation = "Apply the recommended lifecycle policy for incomplete multipart uploads."
+        )]
+        LifecycleMissing,
+        /// Presigned URL has expired.
+        #[error("presigned URL refused as expired: {detail}")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_503_PRESIGN_EXPIRED",
+            status = 503,
+            title = "Presigned URL expired",
+            remediation = "Call upload part-url or download init to obtain a fresh URL and retry."
+        )]
+        PresignExpired {
+            /// Safe expiry detail.
+            detail: String,
+        },
+        /// Backend is transiently unavailable.
+        #[error("backend transiently unavailable: status {status}")]
+        #[wyrd_error(
+            code = "WYRD_STORAGE_503_BACKEND_UNAVAILABLE",
+            status = 503,
+            title = "Backend transiently unavailable",
+            remediation = "Retry with exponential backoff."
+        )]
+        BackendUnavailable {
+            /// Backend or synthetic status.
+            status: u16,
+        },
+    }
+}
+
+pub use storage::WyrdStorageError;
 
 /// Top-level Wyrd error value passed across crate and wire boundaries.
 #[derive(Debug, Clone, Error, Serialize, Deserialize, schemars::JsonSchema, WyrdErrorMeta)]
@@ -182,6 +447,15 @@ pub enum WyrdError {
         message: String,
         /// Structured detail payload.
         details: serde_json::Value,
+    },
+    /// Storage subsystem error with a stable storage-specific public code.
+    #[error(transparent)]
+    #[wyrd_error(delegate)]
+    Storage {
+        /// Stable storage error catalog value.
+        #[from]
+        #[serde(flatten)]
+        error: WyrdStorageError,
     },
     /// DataCard validation failed.
     #[error("[WYRD_DATA_400_VALIDATION] {message}")]
@@ -1097,7 +1371,7 @@ impl WyrdError {
         })
     }
 
-    fn message_details(&self) -> (&str, &serde_json::Value) {
+    fn message_details(&self) -> (Cow<'_, str>, serde_json::Value) {
         match self {
             Self::Validation { message, details }
             | Self::NotFound { message, details }
@@ -1174,7 +1448,13 @@ impl WyrdError {
             | Self::WorkflowMissingVersion { message, details }
             | Self::WorkflowDuplicateStepId { message, details }
             | Self::WorkflowMissingDependency { message, details }
-            | Self::WorkflowCycle { message, details } => (message, details),
+            | Self::WorkflowCycle { message, details } => {
+                (Cow::Borrowed(message.as_str()), details.clone())
+            }
+            Self::Storage { error } => (
+                Cow::Owned(error.to_string()),
+                serde_json::to_value(error).unwrap_or_else(|_| serde_json::json!({})),
+            ),
         }
     }
 

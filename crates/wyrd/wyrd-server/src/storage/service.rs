@@ -14,6 +14,7 @@ use tokio_util::io::ReaderStream;
 use tracing::instrument;
 use wyrd_spec::authz::Scope;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::error::storage::WyrdStorageError;
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::storage::{
     AzureBlockBlobComplete, DownloadInitRequest, DownloadInitResponse, DownloadPlan,
@@ -24,7 +25,7 @@ use wyrd_spec::storage::{
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::storage::artifact_metadata::ArtifactMetadataRow;
 use wyrd_sql::queries::storage::multipart_uploads::{self, MultipartUploadRow, UploadStatus};
-use wyrd_storage::error::{AzureError, GcsError, LocalError, S3Error, StorageError};
+use wyrd_storage::error::StorageError;
 use wyrd_storage::plan::{MAX_OBJECT_SIZE_BYTES, PlannedUpload, plan_upload};
 use wyrd_storage::signer::{CompletePayload, HeadInfo, MultipartInit, UploadPlanReplayInput};
 use wyrd_storage::tenant_path::{self, TenantPathError, ValidatedPath};
@@ -810,17 +811,14 @@ fn map_local_read_error(error: std::io::Error, validated: &ValidatedPath) -> Wyr
 fn validate_sha256_b64(value: &str) -> Result<(), WyrdError> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(value)
-        .map_err(|error| {
-            validation_error(
-                "expected_sha256 is not valid base64",
-                serde_json::json!({ "source": error.to_string() }),
-            )
+        .map_err(|error| WyrdStorageError::Sha256Invalid {
+            detail: error.to_string(),
         })?;
     if decoded.len() != 32 {
-        return Err(validation_error(
-            "expected_sha256 must decode to 32 bytes",
-            serde_json::json!({ "decoded_bytes": decoded.len() }),
-        ));
+        return Err(WyrdStorageError::Sha256Invalid {
+            detail: format!("decoded digest was {} bytes", decoded.len()),
+        }
+        .into());
     }
     Ok(())
 }
@@ -979,12 +977,7 @@ async fn load_upload(
     multipart_uploads::find_by_id(conn, upload_uuid)
         .await
         .map_err(map_sql_error)?
-        .ok_or_else(|| {
-            not_found_error(
-                "upload not found",
-                serde_json::json!({ "upload_id": upload_uuid }),
-            )
-        })
+        .ok_or_else(|| WyrdStorageError::UploadNotFound.into())
 }
 
 async fn load_pending_upload(
@@ -993,10 +986,7 @@ async fn load_pending_upload(
 ) -> Result<MultipartUploadRow, WyrdError> {
     let row = load_upload(conn, upload_uuid).await?;
     if row.status != UploadStatus::Pending {
-        return Err(conflict_error(
-            "upload is not pending",
-            serde_json::json!({ "upload_id": upload_uuid, "status": row.status }),
-        ));
+        return Err(WyrdStorageError::UploadNotPending.into());
     }
     Ok(row)
 }
@@ -1156,10 +1146,10 @@ fn upload_id_uuid(upload_id: &UploadId) -> Result<Uuid, WyrdError> {
 }
 
 fn invalid_upload_id(error: UploadIdParseError) -> WyrdError {
-    validation_error(
-        "upload_id is invalid",
-        serde_json::json!({ "source": error.to_string() }),
-    )
+    WyrdStorageError::InvalidUploadId {
+        reason: error.to_string(),
+    }
+    .into()
 }
 
 pub(crate) fn invalid_upload_id_for_route(error: UploadIdParseError) -> WyrdError {
@@ -1168,14 +1158,19 @@ pub(crate) fn invalid_upload_id_for_route(error: UploadIdParseError) -> WyrdErro
 
 fn map_tenant_path(error: TenantPathError) -> WyrdError {
     match error {
-        TenantPathError::TenantMismatch { prefix, caller } => WyrdError::PermissionDenied {
-            message: "storage path belongs to a different tenant".to_owned(),
-            details: serde_json::json!({ "prefix": prefix, "caller": caller }),
-        },
-        other => validation_error(
-            "storage path failed tenant validation",
-            serde_json::json!({ "source": other.to_string() }),
-        ),
+        TenantPathError::TenantMismatch { prefix, caller } => {
+            tracing::warn!(
+                %prefix,
+                %caller,
+                error_class = "tenant_path_foreign",
+                "storage path belongs to a different tenant"
+            );
+            WyrdStorageError::TenantPathForeign.into()
+        }
+        other => WyrdStorageError::TenantPathMismatch {
+            detail: other.to_string(),
+        }
+        .into(),
     }
 }
 
@@ -1203,83 +1198,7 @@ pub fn map_sql_error(error: wyrd_sql::SqlError) -> WyrdError {
 }
 
 fn map_storage_error(error: StorageError) -> WyrdError {
-    let code = map_storage_error_code(&error);
-    let message = error.to_string();
-    let details = serde_json::json!({ "source": "wyrd_storage", "source_code": code });
-    match error {
-        StorageError::TenantPathMismatch(_)
-        | StorageError::ArtifactTooLarge { .. }
-        | StorageError::InvalidExpectedSha256(_)
-        | StorageError::InvalidExpectedSize(_)
-        | StorageError::SizeMismatch { .. }
-        | StorageError::Sha256Mismatch { .. }
-        | StorageError::InvalidUri(_)
-        | StorageError::TenantPrefixInvalid(_) => validation_error(&message, details),
-        StorageError::TenantPrefixForeign { .. } => {
-            WyrdError::PermissionDenied { message, details }
-        }
-        StorageError::EncryptionMissing | StorageError::BackendCapabilityMismatch { .. } => {
-            conflict_error(&message, details)
-        }
-        StorageError::ObjectNotFound { .. } => not_found_error(&message, details),
-        StorageError::S3(boxed) if matches!(&*boxed, S3Error::NoSuchKey { .. }) => {
-            not_found_error(&message, details)
-        }
-        StorageError::Gcs(boxed) if matches!(&*boxed, GcsError::NotFound { .. }) => {
-            not_found_error(&message, details)
-        }
-        StorageError::Azure(boxed) if matches!(&*boxed, AzureError::BlobNotFound { .. }) => {
-            not_found_error(&message, details)
-        }
-        StorageError::Local(LocalError::NotFound { .. }) => not_found_error(&message, details),
-        StorageError::CredentialChain(_)
-        | StorageError::LifecycleRuleMissing(_)
-        | StorageError::AdminPool { .. }
-        | StorageError::Sql(_)
-        | StorageError::ConfigParse { .. }
-        | StorageError::Local(LocalError::NonAbsoluteRoot(_) | LocalError::RootNotFound(_)) => {
-            WyrdError::Internal { message, details }
-        }
-        StorageError::PresignExpired(_)
-        | StorageError::Backend { .. }
-        | StorageError::S3(_)
-        | StorageError::Gcs(_)
-        | StorageError::Azure(_)
-        | StorageError::Local(LocalError::Io(_))
-        | StorageError::Io(_)
-        | StorageError::Reqwest(_) => WyrdError::UpstreamFailure { message, details },
-    }
-}
-
-fn map_storage_error_code(error: &StorageError) -> String {
-    match error {
-        StorageError::TenantPathMismatch(_) => "storage_tenant_path_mismatch",
-        StorageError::ArtifactTooLarge { .. } => "storage_artifact_too_large",
-        StorageError::InvalidExpectedSha256(_) => "storage_invalid_expected_sha256",
-        StorageError::InvalidExpectedSize(_) => "storage_invalid_expected_size",
-        StorageError::EncryptionMissing => "storage_encryption_missing",
-        StorageError::Sha256Mismatch { .. } => "storage_sha256_mismatch",
-        StorageError::SizeMismatch { .. } => "storage_size_mismatch",
-        StorageError::CredentialChain(_) => "storage_credential_chain",
-        StorageError::LifecycleRuleMissing(_) => "storage_lifecycle_missing",
-        StorageError::PresignExpired(_) => "storage_presign_expired",
-        StorageError::ObjectNotFound { .. } => "storage_object_not_found",
-        StorageError::BackendCapabilityMismatch { .. } => "storage_backend_capability_mismatch",
-        StorageError::Backend { .. } => "storage_backend",
-        StorageError::AdminPool { .. } => "storage_admin_pool",
-        StorageError::Sql(_) => "storage_sql",
-        StorageError::ConfigParse { .. } => "storage_config_parse",
-        StorageError::InvalidUri(_) => "storage_invalid_uri",
-        StorageError::TenantPrefixInvalid(_) => "storage_tenant_prefix_invalid",
-        StorageError::TenantPrefixForeign { .. } => "storage_tenant_prefix_foreign",
-        StorageError::S3(_) => "storage_s3",
-        StorageError::Gcs(_) => "storage_gcs",
-        StorageError::Azure(_) => "storage_azure",
-        StorageError::Local(_) => "storage_local",
-        StorageError::Io(_) => "storage_io",
-        StorageError::Reqwest(_) => "storage_http",
-    }
-    .to_owned()
+    WyrdStorageError::from(error).into()
 }
 
 fn validation_error(message: impl Into<String>, details: serde_json::Value) -> WyrdError {

@@ -1,6 +1,7 @@
 //! Internal storage errors.
 
 use wyrd_spec::DataTenantId;
+use wyrd_spec::error::storage::WyrdStorageError;
 use wyrd_spec::storage::StorageBackendKind;
 
 /// Storage configuration parse failure.
@@ -271,5 +272,209 @@ impl LocalError {
         } else {
             Self::Io(source)
         }
+    }
+}
+
+impl From<StorageError> for WyrdStorageError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::TenantPathMismatch(detail) => Self::TenantPathMismatch { detail },
+            StorageError::ArtifactTooLarge { actual, limit } => {
+                Self::ArtifactTooLarge { actual, limit }
+            }
+            StorageError::InvalidExpectedSha256(detail) => Self::Sha256Invalid { detail },
+            StorageError::InvalidExpectedSize(value) => Self::SizeInvalid(value),
+            StorageError::EncryptionMissing => Self::EncryptionMissing,
+            StorageError::Sha256Mismatch { expected, actual } => {
+                Self::Sha256Mismatch { expected, actual }
+            }
+            StorageError::SizeMismatch { expected, actual } => {
+                Self::SizeMismatch { expected, actual }
+            }
+            StorageError::CredentialChain(backend) => Self::CredentialChain {
+                backend: backend.to_owned(),
+            },
+            StorageError::LifecycleRuleMissing(_) => Self::LifecycleMissing,
+            StorageError::PresignExpired(detail) => Self::PresignExpired { detail },
+            StorageError::ObjectNotFound { storage_path } => Self::ObjectNotFound { storage_path },
+            StorageError::BackendCapabilityMismatch { signer, op } => {
+                tracing::error!(
+                    ?signer,
+                    op,
+                    error_class = "capability_mismatch",
+                    "backend signer does not support requested operation"
+                );
+                Self::Backend {
+                    detail: format!("capability mismatch: {signer:?} does not support {op}"),
+                }
+            }
+            StorageError::Backend {
+                backend,
+                op,
+                message,
+            } => {
+                tracing::error!(
+                    ?backend,
+                    op,
+                    message,
+                    error_class = "backend",
+                    "storage backend operation failed"
+                );
+                Self::Backend {
+                    detail: format!("{backend:?} {op}: {message}"),
+                }
+            }
+            StorageError::AdminPool { source } => {
+                tracing::warn!(
+                    error = ?source,
+                    error_class = "admin_pool",
+                    "storage admin pool unavailable"
+                );
+                Self::BackendUnavailable { status: 503 }
+            }
+            StorageError::Sql(error) => map_sql_error(error),
+            StorageError::ConfigParse { var, source } => {
+                tracing::error!(
+                    var,
+                    error = ?source,
+                    error_class = "config_parse",
+                    "storage configuration parse failed"
+                );
+                Self::ConfigInvalid {
+                    detail: format!("{var}: {source}"),
+                }
+            }
+            StorageError::InvalidUri(detail) => Self::InvalidUri { detail },
+            StorageError::TenantPrefixInvalid(detail) => Self::TenantPrefixInvalid { detail },
+            StorageError::TenantPrefixForeign { prefix, caller } => {
+                tracing::warn!(
+                    %prefix,
+                    %caller,
+                    error_class = "tenant_prefix_foreign",
+                    "storage URI prefix does not match caller tenant"
+                );
+                Self::TenantPathForeign
+            }
+            StorageError::S3(error) => map_s3_error(*error),
+            StorageError::Gcs(error) => map_gcs_error(*error),
+            StorageError::Azure(error) => map_azure_error(*error),
+            StorageError::Local(error) => map_local_error(error),
+            StorageError::Io(error) => {
+                tracing::error!(error = ?error, error_class = "io", "storage IO error");
+                Self::Backend {
+                    detail: format!("io: {error}"),
+                }
+            }
+            StorageError::Reqwest(error) => map_reqwest_error(&error),
+        }
+    }
+}
+
+fn map_sql_error(error: wyrd_sql::SqlError) -> WyrdStorageError {
+    match error {
+        wyrd_sql::SqlError::RlsDenied { detail } => {
+            tracing::warn!(
+                detail,
+                error_class = "sql_rls_denied",
+                "storage SQL tenant isolation rejected request"
+            );
+            WyrdStorageError::TenantPathForeign
+        }
+        other => {
+            tracing::error!(
+                error = ?other,
+                error_class = "sql",
+                "storage SQL error mapped to public backend failure"
+            );
+            WyrdStorageError::Backend {
+                detail: format!("sql: {other}"),
+            }
+        }
+    }
+}
+
+fn map_s3_error(error: S3Error) -> WyrdStorageError {
+    match error {
+        S3Error::NoSuchKey { storage_path } => WyrdStorageError::ObjectNotFound { storage_path },
+        S3Error::Lifecycle => WyrdStorageError::LifecycleMissing,
+        S3Error::Throttled => WyrdStorageError::BackendUnavailable { status: 503 },
+        S3Error::Presign(detail) => WyrdStorageError::Backend {
+            detail: format!("s3 presign: {detail}"),
+        },
+        S3Error::MissingUploadId => WyrdStorageError::Backend {
+            detail: "s3 create multipart response did not include upload_id".to_owned(),
+        },
+        S3Error::MissingEtag => WyrdStorageError::Backend {
+            detail: "s3 part upload response did not include etag".to_owned(),
+        },
+        S3Error::Sdk(detail) => WyrdStorageError::Backend {
+            detail: format!("s3: {detail}"),
+        },
+    }
+}
+
+fn map_gcs_error(error: GcsError) -> WyrdStorageError {
+    match error {
+        GcsError::NotFound { storage_path } => WyrdStorageError::ObjectNotFound { storage_path },
+        GcsError::Throttled => WyrdStorageError::BackendUnavailable { status: 503 },
+        GcsError::MissingSessionUrl => WyrdStorageError::Backend {
+            detail: "gcs resumable upload did not return a session url".to_owned(),
+        },
+        GcsError::Sdk(detail) => WyrdStorageError::Backend {
+            detail: format!("gcs: {detail}"),
+        },
+    }
+}
+
+fn map_azure_error(error: AzureError) -> WyrdStorageError {
+    match error {
+        AzureError::BlobNotFound { storage_path } => {
+            WyrdStorageError::ObjectNotFound { storage_path }
+        }
+        AzureError::Throttled => WyrdStorageError::BackendUnavailable { status: 503 },
+        AzureError::MissingAccount => WyrdStorageError::ConfigInvalid {
+            detail: "azure storage account missing".to_owned(),
+        },
+        AzureError::Sdk(detail) => WyrdStorageError::Backend {
+            detail: format!("azure: {detail}"),
+        },
+    }
+}
+
+fn map_local_error(error: LocalError) -> WyrdStorageError {
+    match error {
+        LocalError::NotFound { storage_path } => WyrdStorageError::ObjectNotFound { storage_path },
+        LocalError::NonAbsoluteRoot(path) => WyrdStorageError::ConfigInvalid {
+            detail: format!("local root path is not absolute: {path}"),
+        },
+        LocalError::RootNotFound(path) => WyrdStorageError::ConfigInvalid {
+            detail: format!("local root path does not exist: {path}"),
+        },
+        LocalError::Io(error) => {
+            tracing::error!(error = ?error, backend = "local", error_class = "io");
+            WyrdStorageError::Backend {
+                detail: format!("local: {error}"),
+            }
+        }
+    }
+}
+
+fn map_reqwest_error(error: &reqwest::Error) -> WyrdStorageError {
+    if error.is_timeout() || error.is_connect() {
+        tracing::warn!(
+            error = ?error,
+            error_class = "http_transient",
+            "storage HTTP transport failed transiently"
+        );
+        return WyrdStorageError::BackendUnavailable { status: 503 };
+    }
+
+    tracing::error!(
+        error = ?error,
+        error_class = "http",
+        "storage HTTP transport failed"
+    );
+    WyrdStorageError::Backend {
+        detail: format!("http: {error}"),
     }
 }

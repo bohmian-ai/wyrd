@@ -23,34 +23,70 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
     let mut remediation_arms = Vec::new();
 
     for variant in &data.variants {
-        let Some(metadata) = parse_attr(variant) else {
-            return syn::Error::new_spanned(
-                variant,
-                "missing #[wyrd_error(code = \"WYRD_<DOMAIN>_<STATUS>_<SLUG>\", status = N, title = \"...\", remediation = \"...\")]",
-            )
-            .to_compile_error()
-            .into();
-        };
-        if let Err(message) = validate_code(&metadata.code, metadata.status) {
-            return syn::Error::new_spanned(variant, message)
+        let metadata = match parse_attr(variant) {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => {
+                return syn::Error::new_spanned(
+                    variant,
+                    "missing #[wyrd_error(code = \"WYRD_<DOMAIN>_<STATUS>_<SLUG>\", status = N, title = \"...\", remediation = \"...\")] or #[wyrd_error(delegate)]",
+                )
                 .to_compile_error()
                 .into();
-        }
+            }
+            Err(error) => return error.to_compile_error().into(),
+        };
 
         let ident = &variant.ident;
-        let pattern = match &variant.fields {
-            Fields::Unit => quote! { #name::#ident },
-            Fields::Unnamed(_) => quote! { #name::#ident(..) },
-            Fields::Named(_) => quote! { #name::#ident { .. } },
-        };
-        let code = metadata.code;
-        let status = metadata.status;
-        let title = metadata.title;
-        let remediation = metadata.remediation;
-        code_arms.push(quote! { #pattern => #code });
-        status_arms.push(quote! { #pattern => #status });
-        title_arms.push(quote! { #pattern => #title });
-        remediation_arms.push(quote! { #pattern => #remediation });
+        match metadata {
+            ErrorMetadata::Static {
+                code,
+                status,
+                title,
+                remediation,
+            } => {
+                if let Err(message) = validate_code(&code, status) {
+                    return syn::Error::new_spanned(variant, message)
+                        .to_compile_error()
+                        .into();
+                }
+                let pattern = match &variant.fields {
+                    Fields::Unit => quote! { #name::#ident },
+                    Fields::Unnamed(_) => quote! { #name::#ident(..) },
+                    Fields::Named(_) => quote! { #name::#ident { .. } },
+                };
+                code_arms.push(quote! { #pattern => #code });
+                status_arms.push(quote! { #pattern => #status });
+                title_arms.push(quote! { #pattern => #title });
+                remediation_arms.push(quote! { #pattern => #remediation });
+            }
+            ErrorMetadata::Delegate => {
+                let (pattern, binding) = match &variant.fields {
+                    Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                        (quote! { #name::#ident(inner) }, quote! { inner })
+                    }
+                    Fields::Named(fields) if fields.named.len() == 1 => {
+                        let field = fields
+                            .named
+                            .first()
+                            .and_then(|field| field.ident.as_ref())
+                            .expect("invariant: named field has ident");
+                        (quote! { #name::#ident { #field } }, quote! { #field })
+                    }
+                    _ => {
+                        return syn::Error::new_spanned(
+                            variant,
+                            "#[wyrd_error(delegate)] requires exactly one named or unnamed field",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                };
+                code_arms.push(quote! { #pattern => #binding.code() });
+                status_arms.push(quote! { #pattern => #binding.status() });
+                title_arms.push(quote! { #pattern => #binding.title() });
+                remediation_arms.push(quote! { #pattern => #binding.remediation() });
+            }
+        }
     }
 
     quote! {
@@ -87,24 +123,35 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
     .into()
 }
 
-struct ErrorMetadata {
-    code: String,
-    status: u16,
-    title: String,
-    remediation: String,
+enum ErrorMetadata {
+    Static {
+        code: String,
+        status: u16,
+        title: String,
+        remediation: String,
+    },
+    Delegate,
 }
 
-fn parse_attr(variant: &syn::Variant) -> Option<ErrorMetadata> {
-    let attr = variant
+fn parse_attr(variant: &syn::Variant) -> syn::Result<Option<ErrorMetadata>> {
+    let Some(attr) = variant
         .attrs
         .iter()
-        .find(|attr| attr.path().is_ident("wyrd_error"))?;
+        .find(|attr| attr.path().is_ident("wyrd_error"))
+    else {
+        return Ok(None);
+    };
     let mut code = None;
     let mut status = None;
     let mut title = None;
     let mut remediation = None;
+    let mut delegate = false;
 
     attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("delegate") {
+            delegate = true;
+            return Ok(());
+        }
         if meta.path.is_ident("code") {
             let value = meta.value()?;
             let Lit::Str(lit) = value.parse()? else {
@@ -138,15 +185,30 @@ fn parse_attr(variant: &syn::Variant) -> Option<ErrorMetadata> {
             return Ok(());
         }
         Err(meta.error("unsupported wyrd_error attribute key"))
-    })
-    .ok()?;
+    })?;
 
-    Some(ErrorMetadata {
-        code: code?,
-        status: status?,
-        title: title?,
-        remediation: remediation?,
-    })
+    if delegate {
+        if code.is_some() || status.is_some() || title.is_some() || remediation.is_some() {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "#[wyrd_error(delegate)] cannot be combined with code, status, title, or remediation",
+            ));
+        }
+        return Ok(Some(ErrorMetadata::Delegate));
+    }
+
+    let (Some(code), Some(status), Some(title), Some(remediation)) =
+        (code, status, title, remediation)
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(ErrorMetadata::Static {
+        code,
+        status,
+        title,
+        remediation,
+    }))
 }
 
 fn validate_code(code: &str, status: u16) -> Result<(), String> {
@@ -167,4 +229,42 @@ fn validate_code(code: &str, status: u16) -> Result<(), String> {
         return Err("code segments must not be empty".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_attr;
+
+    #[test]
+    fn delegate_metadata_rejects_static_fields() {
+        let input: syn::DeriveInput = syn::parse_str(
+            r#"
+            enum Example {
+                #[wyrd_error(
+                    delegate,
+                    code = "WYRD_TEST_500_INTERNAL",
+                    status = 500,
+                    title = "Internal failure",
+                    remediation = "Retry later."
+                )]
+                Wrapped(Inner),
+            }
+            "#,
+        )
+        .expect("test enum parses");
+        let syn::Data::Enum(data) = input.data else {
+            panic!("test input is an enum");
+        };
+        let variant = data.variants.first().expect("test variant exists");
+
+        let Err(error) = parse_attr(variant) else {
+            panic!("delegate mixed with static metadata should fail");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be combined with code, status, title, or remediation")
+        );
+    }
 }

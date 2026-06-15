@@ -33,6 +33,11 @@ CREATE POLICY tenant_isolation ON wyrd.storage_idempotency_keys
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
 
+CREATE POLICY admin_cross_tenant ON wyrd.storage_idempotency_keys
+    TO wyrd_platform_admin
+    USING (true)
+    WITH CHECK (true);
+
 REVOKE ALL ON TABLE wyrd.storage_idempotency_keys FROM wyrd_app;
 REVOKE ALL ON TABLE wyrd.storage_idempotency_keys FROM wyrd_platform_admin;
 GRANT SELECT, INSERT ON wyrd.storage_idempotency_keys TO wyrd_app;

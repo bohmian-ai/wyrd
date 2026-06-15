@@ -6,6 +6,8 @@ use crate::signer::BackendSigner;
 use object_store::ObjectStore;
 use std::sync::Arc;
 use std::time::Duration;
+use url::Url;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::StorageBackendKind;
 
 /// Shared storage handle.
@@ -112,6 +114,27 @@ impl StorageHandle {
         Arc::clone(&self.object_store)
     }
 
+    /// Clone the shared object-store substrate after tenant-prefix validation.
+    ///
+    /// Tenancy isolation is path prefix plus Postgres RLS. The object store is
+    /// shared across tenants by design; callers must pass the verified data
+    /// tenant id from their request context before using a source URI.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] when the URI is malformed, uses an unsupported
+    /// substrate scheme, has an invalid tenant prefix, or belongs to another
+    /// tenant.
+    pub fn object_store_for(
+        &self,
+        uri: &str,
+        caller_data_tenant_id: DataTenantId,
+    ) -> Result<Arc<dyn ObjectStore>, StorageError> {
+        let parsed =
+            Url::parse(uri).map_err(|error| StorageError::InvalidUri(error.to_string()))?;
+        validate_tenant_prefix(&parsed, caller_data_tenant_id)?;
+        Ok(Arc::clone(&self.object_store))
+    }
+
     /// Whether upload completion must verify server-side encryption markers.
     #[must_use]
     pub fn require_encryption(&self) -> bool {
@@ -141,4 +164,21 @@ impl StorageHandle {
     pub fn public_base_url(&self) -> Option<&str> {
         self.public_base_url.as_deref()
     }
+}
+
+fn validate_tenant_prefix(
+    uri: &Url,
+    caller_data_tenant_id: DataTenantId,
+) -> Result<(), StorageError> {
+    let post_bucket = crate::tenant_path::strip_bucket(uri.scheme(), uri)?;
+    let first_segment = post_bucket.split('/').next().unwrap_or("");
+    let prefix = crate::tenant_path::parse_prefix(first_segment)
+        .map_err(|error| StorageError::TenantPrefixInvalid(error.to_string()))?;
+    if prefix != caller_data_tenant_id {
+        return Err(StorageError::TenantPrefixForeign {
+            prefix,
+            caller: caller_data_tenant_id,
+        });
+    }
+    Ok(())
 }

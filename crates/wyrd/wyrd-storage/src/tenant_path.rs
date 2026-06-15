@@ -1,6 +1,8 @@
 //! Tenant-scoped object path validation.
 
+use crate::error::StorageError;
 use std::sync::LazyLock;
+use url::Url;
 use wyrd_spec::DataTenantId;
 
 /// Full tenant path regex.
@@ -57,6 +59,38 @@ pub fn parse_prefix(first_segment: &str) -> Result<DataTenantId, TenantPathError
     first_segment
         .parse::<DataTenantId>()
         .map_err(|_| TenantPathError::ShapeMismatch(first_segment.to_owned()))
+}
+
+/// Return the post-bucket path portion of a substrate URI.
+///
+/// For `s3://`, `gs://`, and `file://`, the URL authority is the bucket or
+/// host and the path is already post-bucket. For `az://`, the first path
+/// segment is the container, so it is stripped before tenant-prefix checks.
+///
+/// # Errors
+/// Returns [`StorageError::InvalidUri`] for unsupported schemes or malformed
+/// Azure URIs that do not contain a tenant segment after the container.
+pub fn strip_bucket<'a>(scheme: &str, uri: &'a Url) -> Result<&'a str, StorageError> {
+    let path = uri.path().trim_start_matches('/');
+    match scheme {
+        "s3" | "gs" | "file" => Ok(path),
+        "az" => {
+            let (_container, rest) = path.split_once('/').ok_or_else(|| {
+                StorageError::InvalidUri(format!(
+                    "az:// uri missing tenant segment after container: {uri}"
+                ))
+            })?;
+            if rest.is_empty() {
+                return Err(StorageError::InvalidUri(format!(
+                    "az:// uri missing tenant segment after container: {uri}"
+                )));
+            }
+            Ok(rest)
+        }
+        other => Err(StorageError::InvalidUri(format!(
+            "unsupported scheme: {other}"
+        ))),
+    }
 }
 
 /// Build a full tenant-scoped storage path.

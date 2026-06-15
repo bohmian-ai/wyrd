@@ -25,7 +25,10 @@ run = "cargo clippy --locked --workspace --all-features --all-targets -- -D warn
 
 [tasks."test:unit"]
 description = "Run all Rust unit tests"
-run = "cargo test --locked --workspace --exclude py-wyrd"
+run = """
+cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server
+cargo test --locked -p wyrd-server --features stub-auth
+"""
 
 [tasks."test:wyrd-spec"]
 description = "Run wyrd-spec Rust tests"

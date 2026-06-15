@@ -1,14 +1,18 @@
-//! Stub Principal extractor until the auth verifier lands.
-
-use std::collections::BTreeSet;
+// TODO(auth-wiring): remove when JWT verifier lands
 
 use axum::extract::FromRequestParts;
-use axum::http::{header::AUTHORIZATION, request::Parts};
-use wyrd_spec::actor::Actor;
+use axum::http::request::Parts;
 use wyrd_spec::authz::Principal;
 use wyrd_spec::error::WyrdError;
 
 use crate::error::WyrdErrorResponse;
+
+#[cfg(feature = "stub-auth")]
+use std::collections::BTreeSet;
+#[cfg(feature = "stub-auth")]
+use axum::http::header::AUTHORIZATION;
+#[cfg(feature = "stub-auth")]
+use wyrd_spec::actor::Actor;
 
 /// Server-owned extractor wrapper for an authenticated Wyrd principal.
 #[derive(Debug, Clone)]
@@ -23,6 +27,7 @@ impl From<AuthenticatedPrincipal> for Principal {
     }
 }
 
+#[cfg(feature = "stub-auth")]
 impl<S: Send + Sync> FromRequestParts<S> for AuthenticatedPrincipal {
     type Rejection = WyrdErrorResponse;
 
@@ -39,6 +44,19 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthenticatedPrincipal {
     }
 }
 
+#[cfg(not(feature = "stub-auth"))]
+impl<S: Send + Sync> FromRequestParts<S> for AuthenticatedPrincipal {
+    type Rejection = WyrdErrorResponse;
+
+    async fn from_request_parts(_parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Err(WyrdErrorResponse::from(WyrdError::InvalidToken {
+            message: "auth not configured: enable the stub-auth feature in non-production builds, or wire the JWT verifier".to_owned(),
+            details: serde_json::json!({}),
+        }))
+    }
+}
+
+#[cfg(feature = "stub-auth")]
 fn bearer_token(parts: &Parts) -> Result<&str, WyrdError> {
     let Some(header) = parts.headers.get(AUTHORIZATION) else {
         return Err(WyrdError::Unauthenticated {

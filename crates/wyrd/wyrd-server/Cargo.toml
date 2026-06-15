@@ -9,6 +9,7 @@ authors = { workspace = true }
 
 [features]
 enterprise = ["dep:wyrd-enterprise"]
+stub-auth = []
 
 [[bin]]
 name = "wyrd-server"

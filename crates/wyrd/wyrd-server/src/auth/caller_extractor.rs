@@ -1,4 +1,5 @@
-//! Caller extraction for tenant-scoped handlers.
+// TODO(auth-wiring): remove when JWT verifier lands
+// DEPRECATED(auth-wiring): x-wyrd-data-tenant-id will be removed when tenant comes from JWT claims.
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
@@ -11,7 +12,10 @@ use crate::auth::AuthenticatedPrincipal;
 use crate::error::WyrdErrorResponse;
 
 /// Header used only by the skeleton stub until auth claims carry tenant data.
-const STUB_TENANT_HEADER: &str = "x-wyrd-data-tenant-id";
+///
+/// Expects a DataTenantId (UUIDv7) value. Temporary — will be removed when
+/// tenant isolation comes from verified JWT claims.
+pub const STUB_TENANT_HEADER: &str = "x-wyrd-data-tenant-id";
 
 /// Authenticated caller context used by tenant-scoped service code.
 #[derive(Debug, Clone)]
@@ -54,10 +58,11 @@ fn missing_request_id() -> WyrdError {
     }
 }
 
+#[cfg(feature = "stub-auth")]
 fn stub_tenant_id(parts: &Parts) -> Result<DataTenantId, WyrdError> {
     let Some(header) = parts.headers.get(STUB_TENANT_HEADER) else {
         return Err(WyrdError::InvalidToken {
-            message: "missing tenant claim in stub principal".to_owned(),
+            message: format!("missing required header: {STUB_TENANT_HEADER}"),
             details: serde_json::json!({ "header": STUB_TENANT_HEADER }),
         });
     };
@@ -74,4 +79,12 @@ fn stub_tenant_id(parts: &Parts) -> Result<DataTenantId, WyrdError> {
                 "source": error.to_string(),
             }),
         })
+}
+
+#[cfg(not(feature = "stub-auth"))]
+fn stub_tenant_id(_parts: &Parts) -> Result<DataTenantId, WyrdError> {
+    Err(WyrdError::InvalidToken {
+        message: "auth not configured: enable the stub-auth feature in non-production builds, or wire the JWT verifier".to_owned(),
+        details: serde_json::json!({}),
+    })
 }

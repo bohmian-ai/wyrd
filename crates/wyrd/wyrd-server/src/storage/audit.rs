@@ -41,7 +41,7 @@ pub async fn write(
 fn subject_id(caller: &Caller) -> String {
     match &caller.principal.actor {
         Actor::User { id, .. } => format!("user:{id}"),
-        Actor::Service { name } => format!("service:{name}"),
+        Actor::Service { client_id, .. } => format!("service:{client_id}"),
         Actor::Agent { id, .. } => format!("agent:{id}"),
     }
 }

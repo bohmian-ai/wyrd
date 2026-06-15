@@ -37,6 +37,7 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthenticatedPrincipal {
             principal: Principal::new(
                 Actor::Service {
                     name: token.to_owned(),
+                    client_id: token.to_owned(),
                 },
                 BTreeSet::new(),
             ),

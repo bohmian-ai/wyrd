@@ -92,6 +92,7 @@ impl LocalSigner {
     /// # Errors
     /// Returns an invalid URI error if the local file path cannot be rendered
     /// as a file URL.
+    #[allow(clippy::unused_async)]
     pub async fn presign_single_put(
         &self,
         path: &ValidatedPath,
@@ -110,6 +111,7 @@ impl LocalSigner {
     /// # Errors
     /// Returns an invalid URI error if the local file path cannot be rendered
     /// as a file URL.
+    #[allow(clippy::unused_async)]
     pub async fn init_multipart(
         &self,
         path: &ValidatedPath,
@@ -140,6 +142,7 @@ impl LocalSigner {
     /// # Errors
     /// Returns an invalid URI error if the local file path cannot be rendered
     /// as a file URL.
+    #[allow(clippy::unused_async)]
     pub async fn presign_get(
         &self,
         path: &ValidatedPath,

@@ -41,6 +41,7 @@ azure_storage_blobs = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+temp-env = { workspace = true, features = ["async_closure"] }
 
 [lints]
 workspace = true

@@ -42,6 +42,10 @@ pub enum PlanError {
 /// # Errors
 /// Returns [`PlanError::TooLarge`] when the object exceeds the cross-backend
 /// maximum object size.
+///
+/// # Panics
+/// Panics only if the internal planner invariant is broken and a computed part
+/// count greater than [`MAX_PARTS_PER_UPLOAD`] reaches the final conversion.
 pub fn plan_upload(
     size_bytes: u64,
     backend: StorageBackendKind,

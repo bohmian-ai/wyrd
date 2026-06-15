@@ -143,7 +143,7 @@ impl AzureSigner {
         self.blob_client(path)
             .put_block_list(block_list)
             .await
-            .map_err(|err| azure_sdk_path("complete_blocklist_server", path, err))?;
+            .map_err(|err| azure_sdk_path("complete_blocklist_server", path, &err))?;
         Ok(())
     }
 
@@ -155,7 +155,7 @@ impl AzureSigner {
         self.blob_client(path)
             .delete()
             .await
-            .map_err(|err| azure_sdk_path("abort_multipart", path, err))?;
+            .map_err(|err| azure_sdk_path("abort_multipart", path, &err))?;
         Ok(())
     }
 
@@ -181,7 +181,7 @@ impl AzureSigner {
             .blob_client(path)
             .get_properties()
             .await
-            .map_err(|err| azure_sdk_path("head", path, err))?;
+            .map_err(|err| azure_sdk_path("head", path, &err))?;
         let properties = response.blob.properties;
         Ok(HeadInfo {
             size_bytes: properties.content_length,
@@ -220,7 +220,7 @@ impl AzureSigner {
             .blob_client(path)
             .get_content()
             .await
-            .map_err(|err| azure_sdk_path("verify_sha256", path, err))?;
+            .map_err(|err| azure_sdk_path("verify_sha256", path, &err))?;
         check_sha(expected, sha::bytes_sha256(&bytes))
     }
 
@@ -264,22 +264,22 @@ impl AzureSigner {
             AzureSasMode::AccountKey => blob
                 .shared_access_signature(permissions, expiry)
                 .await
-                .map_err(|err| azure_sdk(op, err))?,
+                .map_err(|err| azure_sdk(op, &err))?,
             AzureSasMode::UserDelegation => {
                 let start = OffsetDateTime::now_utc();
                 let key = self
                     .service_client
                     .get_user_deligation_key(start, expiry)
                     .await
-                    .map_err(|err| azure_sdk(op, err))?;
+                    .map_err(|err| azure_sdk(op, &err))?;
                 blob.user_delegation_shared_access_signature(permissions, &key.user_deligation_key)
                     .await
-                    .map_err(|err| azure_sdk(op, err))?
+                    .map_err(|err| azure_sdk(op, &err))?
             }
         };
         blob.generate_signed_blob_url(&sas)
             .map(|url| url.to_string())
-            .map_err(|err| azure_sdk(op, err))
+            .map_err(|err| azure_sdk(op, &err))
     }
 
     fn blob_client(&self, path: &ValidatedPath) -> BlobClient {
@@ -308,19 +308,17 @@ fn azure_block_id(zero_based_index: u32) -> Vec<u8> {
     format!("{zero_based_index:06}").into_bytes()
 }
 
-fn azure_sdk_path(op: &'static str, path: &ValidatedPath, err: azure_core::Error) -> StorageError {
+fn azure_sdk_path(op: &'static str, path: &ValidatedPath, err: &azure_core::Error) -> StorageError {
     if err
         .as_http_error()
-        .map(|http| http.status() == azure_core::StatusCode::NotFound)
-        .unwrap_or_default()
+        .is_some_and(|http| http.status() == azure_core::StatusCode::NotFound)
     {
         StorageError::Azure(Box::new(AzureError::BlobNotFound {
-            storage_path: path.full.to_owned(),
+            storage_path: path.full.clone(),
         }))
     } else if err
         .as_http_error()
-        .map(|http| http.status() == azure_core::StatusCode::TooManyRequests)
-        .unwrap_or_default()
+        .is_some_and(|http| http.status() == azure_core::StatusCode::TooManyRequests)
     {
         StorageError::Azure(Box::new(AzureError::Throttled))
     } else {
@@ -328,7 +326,7 @@ fn azure_sdk_path(op: &'static str, path: &ValidatedPath, err: azure_core::Error
     }
 }
 
-fn azure_sdk(op: &'static str, err: azure_core::Error) -> StorageError {
+fn azure_sdk(op: &'static str, err: &azure_core::Error) -> StorageError {
     StorageError::Azure(Box::new(AzureError::Sdk(format!("{op}: {err}"))))
 }
 

@@ -51,7 +51,7 @@ pub struct ValidatedPath {
 /// Parse a tenant prefix segment.
 ///
 /// # Errors
-/// Returns [`TenantPathError::ShapeMismatch`] when the segment is not a UUIDv7
+/// Returns [`TenantPathError::ShapeMismatch`] when the segment is not a `UUIDv7`
 /// tenant id.
 pub fn parse_prefix(first_segment: &str) -> Result<DataTenantId, TenantPathError> {
     first_segment
@@ -72,6 +72,10 @@ pub fn build(data_tenant_id: DataTenantId, card_uid: &str, relative_path: &str) 
 /// # Errors
 /// Returns a [`TenantPathError`] when the path is malformed or belongs to a
 /// different tenant.
+///
+/// # Panics
+/// Panics only if the compiled path regex captures a match without its
+/// statically declared `tenant`, `card`, or `rel` capture groups.
 pub fn validate(
     path: &str,
     caller_data_tenant_id: DataTenantId,

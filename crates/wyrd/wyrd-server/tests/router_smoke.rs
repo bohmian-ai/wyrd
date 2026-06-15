@@ -1,8 +1,11 @@
 use axum::body::to_bytes;
 use axum::http::{Request, StatusCode};
+use object_store::local::LocalFileSystem;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use std::sync::Arc;
 use tower::ServiceExt;
 use wyrd_server::{AppState, build_router};
+use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
 #[tokio::test]
 async fn healthz_returns_ok_and_request_id() {
@@ -57,5 +60,16 @@ async fn unauthenticated_v1_request_returns_problem_json() {
 
 fn test_state() -> AppState {
     let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
-    AppState::new(app_pool, None)
+    let root = tempfile::tempdir().expect("temp dir");
+    let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
+    let object_store =
+        Arc::new(LocalFileSystem::new_with_prefix(root.path()).expect("local object store"));
+    AppState::new(
+        app_pool,
+        None,
+        Arc::new(StorageHandle::new(
+            BackendSigner::Local(signer),
+            object_store,
+        )),
+    )
 }

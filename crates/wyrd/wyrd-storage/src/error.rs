@@ -3,6 +3,49 @@
 use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::StorageBackendKind;
 
+/// Storage configuration parse failure.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigParseError {
+    /// Required environment variable was missing or unreadable.
+    #[error("required environment variable is missing or unreadable: {0}")]
+    MissingEnv(#[source] std::env::VarError),
+    /// Environment variable used an unknown enum value.
+    #[error("unknown value `{value}`; expected {expected}")]
+    UnknownValue {
+        /// Supplied value.
+        value: String,
+        /// Expected values.
+        expected: &'static str,
+    },
+    /// Environment variable was not a recognized boolean.
+    #[error("invalid boolean `{0}`; expected true/false, 1/0, yes/no, or on/off")]
+    InvalidBool(String),
+    /// Environment variable was not a valid unsigned 32-bit integer.
+    #[error("invalid u32 `{value}`")]
+    InvalidU32 {
+        /// Supplied value.
+        value: String,
+        /// Parse source.
+        #[source]
+        source: std::num::ParseIntError,
+    },
+    /// Environment variable was not a valid unsigned 64-bit integer.
+    #[error("invalid u64 `{value}`")]
+    InvalidU64 {
+        /// Supplied value.
+        value: String,
+        /// Parse source.
+        #[source]
+        source: std::num::ParseIntError,
+    },
+    /// Part size was not aligned to one MiB.
+    #[error("part size {0} is not a multiple of 1 MiB")]
+    PartSizeNotMiBAligned(u64),
+    /// Environment variable path failed validation.
+    #[error("invalid path `{0}`")]
+    InvalidPath(String),
+}
+
 /// Top-level error returned by storage operations.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -75,6 +118,15 @@ pub enum StorageError {
         /// Safe diagnostic message.
         message: String,
     },
+    /// Storage boot configuration failed to parse.
+    #[error("config parse failed for `{var}`: {source}")]
+    ConfigParse {
+        /// Environment variable name.
+        var: &'static str,
+        /// Parse failure.
+        #[source]
+        source: ConfigParseError,
+    },
     /// URI validation failed.
     #[error("invalid uri: {0}")]
     InvalidUri(String),
@@ -130,7 +182,7 @@ pub enum S3Error {
     /// Create-multipart response did not include an upload id.
     #[error("s3 create multipart response did not include upload_id")]
     MissingUploadId,
-    /// A part-upload response did not include an ETag.
+    /// A part-upload response did not include an `ETag`.
     #[error("s3 part upload response did not include etag")]
     MissingEtag,
     /// SDK call failed.

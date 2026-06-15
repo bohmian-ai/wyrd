@@ -101,12 +101,12 @@ impl GcsSigner {
                     ..Default::default()
                 },
                 &UploadType::Multipart(Box::new(Object {
-                    name: path.full.to_owned(),
+                    name: path.full.clone(),
                     ..Default::default()
                 })),
             )
             .await
-            .map_err(|err| gcs_http("init_multipart", err))?;
+            .map_err(|err| gcs_http("init_multipart", &err))?;
         let session_uri = upload.url().to_owned();
         if session_uri.is_empty() {
             return Err(StorageError::Gcs(Box::new(GcsError::MissingSessionUrl)));
@@ -219,7 +219,7 @@ impl GcsSigner {
     fn get_request(&self, path: &ValidatedPath) -> GetObjectRequest {
         GetObjectRequest {
             bucket: self.bucket.clone(),
-            object: path.full.to_owned(),
+            object: path.full.clone(),
             ..Default::default()
         }
     }
@@ -233,17 +233,17 @@ fn gcs_http_path(
     match err {
         gcloud_storage::http::Error::Response(response) if response.code == 404 => {
             StorageError::Gcs(Box::new(GcsError::NotFound {
-                storage_path: path.full.to_owned(),
+                storage_path: path.full.clone(),
             }))
         }
         gcloud_storage::http::Error::Response(response) if response.code == 429 => {
             StorageError::Gcs(Box::new(GcsError::Throttled))
         }
-        other => gcs_http(op, other),
+        other => gcs_http(op, &other),
     }
 }
 
-fn gcs_http(op: &'static str, err: gcloud_storage::http::Error) -> StorageError {
+fn gcs_http(op: &'static str, err: &gcloud_storage::http::Error) -> StorageError {
     StorageError::Gcs(Box::new(GcsError::Sdk(format!("{op}: {err}"))))
 }
 

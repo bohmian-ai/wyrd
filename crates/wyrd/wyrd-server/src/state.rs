@@ -1,6 +1,8 @@
 //! Shared axum application state.
 
 use sqlx::PgPool;
+use std::sync::Arc;
+use wyrd_storage::StorageHandle;
 
 /// Process-wide handle registry. One instance is shared by all HTTP handlers.
 ///
@@ -15,15 +17,22 @@ pub struct AppState {
     /// Optional audited `wyrd_platform_admin` pool for cross-tenant platform
     /// operations. Dedicated deployments may leave this unset.
     pub platform_admin_pool: Option<PgPool>,
+    /// Process-wide artifact storage handle.
+    pub storage: Arc<StorageHandle>,
 }
 
 impl AppState {
     /// Build runtime state from the pools that survive boot.
     #[must_use]
-    pub fn new(pool: PgPool, platform_admin_pool: Option<PgPool>) -> Self {
+    pub fn new(
+        pool: PgPool,
+        platform_admin_pool: Option<PgPool>,
+        storage: Arc<StorageHandle>,
+    ) -> Self {
         Self {
             pool,
             platform_admin_pool,
+            storage,
         }
     }
 }

@@ -5395,6 +5395,7 @@ version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96374855068f47402c3121c6eed88d29cb1de8f3ab27090e273e420bdabcf050"
 dependencies = [
+ "futures",
  "parking_lot",
 ]
 
@@ -6731,9 +6732,11 @@ name = "wyrd-server"
 version = "0.0.1"
 dependencies = [
  "axum 0.8.9",
+ "object_store",
  "secrecy",
  "serde_json",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tower 0.5.3",
@@ -6743,6 +6746,7 @@ dependencies = [
  "wyrd-runtime",
  "wyrd-spec",
  "wyrd-sql",
+ "wyrd-storage",
 ]
 
 [[package]]
@@ -6804,6 +6808,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "temp-env",
  "tempfile",
  "thiserror 2.0.18",
  "time",

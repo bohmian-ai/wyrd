@@ -1,0 +1,69 @@
+//! S3 backend factory.
+
+use crate::error::StorageError;
+use crate::s3::S3Signer;
+use crate::settings::S3Config;
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::Client;
+use aws_sdk_s3::config::{Builder, Region};
+use object_store::aws::{AmazonS3, AmazonS3Builder};
+use wyrd_spec::storage::StorageBackendKind;
+
+/// Build the S3 signer from the AWS default credential chain.
+///
+/// # Errors
+/// Returns an error when the SDK probe cannot access the configured bucket.
+pub async fn build_signer(config: &S3Config) -> Result<S3Signer, StorageError> {
+    let shared = aws_config::defaults(BehaviorVersion::latest()).load().await;
+    let mut builder = Builder::from(&shared);
+    if let Some(region) = &config.region {
+        builder = builder.region(Region::new(region.clone()));
+    }
+    if let Some(endpoint_url) = &config.endpoint_url {
+        builder = builder.endpoint_url(endpoint_url.clone());
+    }
+    if config.force_path_style || config.endpoint_url.is_some() {
+        builder = builder.force_path_style(true);
+    }
+    let client = Client::from_conf(builder.build());
+    client
+        .head_bucket()
+        .bucket(config.bucket.as_str())
+        .send()
+        .await
+        .map_err(|source| {
+            tracing::error!(
+                bucket = %config.bucket,
+                error = ?source,
+                "S3 boot probe failed; check credentials and bucket permissions"
+            );
+            StorageError::CredentialChain("s3")
+        })?;
+
+    Ok(S3Signer::new(client, config.bucket.clone()))
+}
+
+/// Build the shared S3 object-store substrate.
+///
+/// # Errors
+/// Returns an error when the object-store builder rejects configuration.
+pub fn build_object_store(config: &S3Config) -> Result<AmazonS3, StorageError> {
+    let mut builder = AmazonS3Builder::from_env().with_bucket_name(config.bucket.clone());
+    if let Some(region) = &config.region {
+        builder = builder.with_region(region.clone());
+    }
+    if let Some(endpoint_url) = &config.endpoint_url {
+        builder = builder.with_endpoint(endpoint_url.clone());
+        if endpoint_url.starts_with("http://") {
+            builder = builder.with_allow_http(true);
+        }
+    }
+    if config.force_path_style || config.endpoint_url.is_some() {
+        builder = builder.with_virtual_hosted_style_request(false);
+    }
+    builder.build().map_err(|source| StorageError::Backend {
+        backend: StorageBackendKind::S3,
+        op: "build_object_store",
+        message: source.to_string(),
+    })
+}

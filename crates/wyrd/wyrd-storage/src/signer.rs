@@ -324,10 +324,7 @@ pub struct UploadPlanReplayInput {
 /// Convert a duration to a saturated `u32` seconds value.
 #[must_use]
 pub(crate) fn ttl_secs(ttl: Duration) -> u32 {
-    match u32::try_from(ttl.as_secs()) {
-        Ok(value) => value,
-        Err(_) => u32::MAX,
-    }
+    u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX)
 }
 
 /// Compare an expected SHA against an actual SHA.

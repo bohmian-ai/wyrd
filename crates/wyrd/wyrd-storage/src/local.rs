@@ -153,17 +153,26 @@ impl LocalSigner {
 
     /// Read local object metadata.
     ///
+    /// The local backend is the only signer where the server is also the
+    /// storage substrate, so computing SHA-256 here does not violate the
+    /// no-bytes-on-server invariant.
+    ///
     /// # Errors
-    /// Returns a local error if metadata cannot be read.
+    /// Returns a local error if metadata or the file itself cannot be read.
     pub async fn head(&self, path: &ValidatedPath) -> Result<HeadInfo, StorageError> {
-        let metadata = fs::metadata(self.object_path(path))
+        let object_path = self.object_path(path);
+        let metadata = fs::metadata(&object_path)
             .await
             .map_err(|err| LocalError::from_io(err, &path.full))?;
+        let mut file = fs::File::open(&object_path)
+            .await
+            .map_err(|err| LocalError::from_io(err, &path.full))?;
+        let sha256 = stream_sha256(&mut file).await?;
         Ok(HeadInfo {
             size_bytes: metadata.len(),
             sse_marker: Some("none".to_owned()),
             content_type: None,
-            sha256_b64: None,
+            sha256_b64: Some(sha256),
         })
     }
 

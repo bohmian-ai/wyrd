@@ -166,11 +166,19 @@ impl GcsSigner {
             size_bytes,
             sse_marker: object.kms_key_name,
             content_type: object.content_type,
+            // gcloud-storage v1.3.0 does not expose a sha256_hash field; GCS
+            // JSON API only provides MD5 and CRC32c as standard object hashes.
+            // SHA-256 verification falls back to download in verify_sha256.
             sha256_b64: None,
         })
     }
 
     /// Verify SHA-256.
+    ///
+    /// gcloud-storage v1.3.0 does not expose SHA-256 from object metadata
+    /// (only MD5 and CRC32c), so verification requires downloading the object.
+    /// This is a known violation of the no-bytes-on-server invariant for GCS;
+    /// remove the fallback when the SDK exposes a sha256_hash field.
     ///
     /// # Errors
     /// Returns SHA mismatch or a typed backend error when the object cannot be

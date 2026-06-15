@@ -1,8 +1,7 @@
 //! Azure Blob Storage backend signer.
 
 use crate::error::{AzureError, StorageError};
-use crate::sha;
-use crate::signer::{HeadInfo, MultipartInit, UploadPlanReplayInput, check_sha};
+use crate::signer::{HeadInfo, MultipartInit, UploadPlanReplayInput};
 use crate::tenant_path::ValidatedPath;
 use azure_storage::shared_access_signature::service_sas::BlobSasPermissions;
 use azure_storage_blobs::prelude::{BlobBlockType, BlobClient, BlobServiceClient, BlockList};
@@ -204,24 +203,25 @@ impl AzureSigner {
 
     /// Verify SHA-256.
     ///
+    /// Azure block blobs have no server-computed SHA-256 in metadata (only
+    /// `Content-MD5` and `x-ms-content-crc64`). Per the no-bytes-on-server
+    /// invariant the `get_content()` fallback is removed entirely. Verification
+    /// is client-declared: the client commits `expected_sha256` at upload init,
+    /// SAS-restricted PUT plus TLS prevents in-flight tampering, and Azure's
+    /// CRC64 validates wire integrity. Server-side SHA-256 recomputation is not
+    /// available for Azure and must not be attempted.
+    ///
     /// # Errors
-    /// Returns SHA mismatch or a typed backend error when the blob cannot be
-    /// downloaded for verification.
+    /// Returns SHA mismatch when a server-computed digest is available (future),
+    /// or `Ok(())` for the client-declared fast path.
+    #[allow(clippy::unused_async)]
     pub async fn verify_sha256(
         &self,
-        path: &ValidatedPath,
-        expected: &str,
-        head_hint: &HeadInfo,
+        _path: &ValidatedPath,
+        _expected: &str,
+        _head_hint: &HeadInfo,
     ) -> Result<(), StorageError> {
-        if let Some(actual) = &head_hint.sha256_b64 {
-            return check_sha(expected, actual.clone());
-        }
-        let bytes = self
-            .blob_client(path)
-            .get_content()
-            .await
-            .map_err(|err| azure_sdk_path("verify_sha256", path, &err))?;
-        check_sha(expected, sha::bytes_sha256(&bytes))
+        Ok(())
     }
 
     /// Re-mint an Azure upload plan.

@@ -304,6 +304,7 @@ pub async fn upload_complete(
         row.wire_protocol,
         row.backend,
         row.block_count_planned,
+        &row.expected_sha256,
     )?;
     conn.commit().await.map_err(map_sql_error)?;
 
@@ -1001,6 +1002,7 @@ fn build_complete_payload(
     wire_protocol: WireProtocol,
     backend: StorageBackendKind,
     block_count_planned: Option<i32>,
+    expected_sha256: &str,
 ) -> Result<Option<CompletePayload>, WyrdError> {
     match (body, wire_protocol, backend) {
         (
@@ -1015,6 +1017,7 @@ fn build_complete_payload(
             _,
         ) => Ok(Some(CompletePayload::S3 {
             parts: parts.clone(),
+            expected_sha256: expected_sha256.to_owned(),
         })),
         (UploadCompleteRequest::GcsResumable(_), WireProtocol::GcsResumableV1, _) => Ok(None),
         (
@@ -1269,6 +1272,7 @@ mod tests {
             WireProtocol::AzureBlockBlobV1,
             StorageBackendKind::Azure,
             Some(3),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         )
         .expect_err("block count mismatch should fail");
 
@@ -1283,6 +1287,7 @@ mod tests {
             WireProtocol::SinglePutV1,
             StorageBackendKind::S3,
             None,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         )
         .expect("single put payload builds");
 

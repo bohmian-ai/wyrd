@@ -237,6 +237,164 @@ cargo tree -e=no-dev -i object_store --all-features 2>&1 \
     }'
 """
 
+[tasks."storage:up"]
+description = "Start local storage emulators: MinIO, fake-gcs-server, and Azurite"
+run = "docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d"
+
+[tasks."storage:down"]
+description = "Stop local storage emulators and remove their volumes"
+run = "docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml down -v"
+
+[tasks."storage:logs"]
+description = "Tail local storage emulator logs"
+run = "docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml logs -f"
+
+[tasks."test:storage:local"]
+description = "Run wyrd-storage local backend integration tests"
+run = "cargo test -p wyrd-storage --all-features --test integration_local"
+
+[tasks."test:storage:minio"]
+description = "Run wyrd-storage MinIO integration tests; requires storage:up"
+depends = ["storage:up"]
+env = { WYRD_STORAGE_INTEGRATION_S3 = "1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1" }
+run = "cargo test -p wyrd-storage --all-features --test integration_minio -- --nocapture"
+
+[tasks."test:storage:gcs-emu"]
+description = "Reserved emulator task; current GCS signer uses the cloud credential chain"
+run = "echo 'GCS emulator is configured by storage:up; no compiling wyrd-storage test is wired until the signer has emulator-aware credentials.'"
+
+[tasks."test:storage:azurite"]
+description = "Reserved emulator task; current Azure signer uses the cloud credential chain"
+run = "echo 'Azurite is configured by storage:up; no compiling wyrd-storage test is wired until the signer has emulator-aware credentials.'"
+
+[tasks."test:storage:matrix"]
+description = "Run storage tests that compile against current crates without cloud credentials"
+depends = ["test:storage:local"]
+
+[tasks."check:storage:drift"]
+description = "Assert storage foundation guardrails against paths that exist in this workspace"
+run = """
+set -eu
+
+rg_optional() {
+  pattern="$1"
+  shift
+  existing=""
+  for path in "$@"; do
+    if [ -e "$path" ]; then
+      existing="$existing $path"
+    else
+      echo "skip missing path: $path"
+    fi
+  done
+  if [ -n "$existing" ]; then
+    # shellcheck disable=SC2086
+    rg -n "$pattern" $existing
+  else
+    return 1
+  fi
+}
+
+rg_fixed_optional() {
+  pattern="$1"
+  shift
+  existing=""
+  for path in "$@"; do
+    if [ -e "$path" ]; then
+      existing="$existing $path"
+    else
+      echo "skip missing path: $path"
+    fi
+  done
+  if [ -n "$existing" ]; then
+    # shellcheck disable=SC2086
+    rg -nF "$pattern" $existing
+  else
+    return 1
+  fi
+}
+
+if rg_optional 'pyo3|pymodule|pyclass|pymethods' \
+  crates/wyrd/wyrd-storage \
+  crates/wyrd/wyrd-server/src/storage \
+  crates/wyrd-spec/src/storage; then
+  echo 'storage foundation must stay PyO3-free'
+  exit 1
+fi
+
+if rg_optional 'session_uri|session_url|sas|presigned_url' \
+  crates/wyrd/wyrd-sql/migrations \
+  crates/wyrd/wyrd-sql/src/queries/storage; then
+  echo 'bearer-equivalent upload tokens must not be persisted in migrations or storage queries'
+  exit 1
+fi
+
+if rg_fixed_optional 'partial.state' \
+  crates/wyrd/wyrd-client/src/artifacts \
+  crates/wyrd/wyrd-client/src/cards; then
+  echo 'upload sidecar state is forbidden'
+  exit 1
+fi
+
+if rg_fixed_optional 'storage_multipart_upload_parts' crates/wyrd/wyrd-sql/migrations; then
+  echo 'per-part multipart upload tables are forbidden'
+  exit 1
+fi
+
+if rg_optional 'presign_batch|next_parts|part_batch_size|batch_presign|presign.*batch|batch.*presign' \
+  crates/wyrd/wyrd-storage/src \
+  crates/wyrd-spec/src/storage \
+  crates/wyrd/wyrd-client/src; then
+  echo 'per-part presign batching is forbidden'
+  exit 1
+fi
+
+if rg_optional 'aws_sdk_s3|gcloud_storage|azure_storage|azure_core|object_store|sqlx' \
+  crates/wyrd/wyrd-client/src \
+  crates/wyrd/wyrd-client/Cargo.toml; then
+  echo 'client tier must stay free of cloud SDK, object_store, and sqlx dependencies'
+  exit 1
+fi
+
+if rg_optional '&PgPool' \
+  crates/wyrd/wyrd-sql/src/queries/storage/multipart_uploads.rs \
+  crates/wyrd/wyrd-sql/src/queries/storage/artifact_metadata.rs \
+  crates/wyrd/wyrd-sql/src/queries/storage/access_ledger.rs \
+  crates/wyrd/wyrd-sql/src/queries/storage/idempotency.rs; then
+  echo 'tenant-scoped storage queries must use TenantConn, not PgPool'
+  exit 1
+fi
+
+if rg_optional 'PendingMap|storage_pending' \
+  crates/wyrd/wyrd-server/src \
+  crates/wyrd-spec/src; then
+  echo 'storage uploads must not rely on in-memory cross-request state'
+  exit 1
+fi
+
+if rg -n --glob '*.rs' 'wire_protocol\\s*==\\s*"' crates; then
+  echo 'WireProtocol dispatch must not use string equality'
+  exit 1
+fi
+
+if rg_optional 'ArtifactRef' \
+  crates/wyrd-spec/src/storage \
+  .dev/plan/foundations/04-storage; then
+  echo 'storage must not introduce a second artifact identity surface'
+  exit 1
+fi
+
+if ! rg -q '#\\[serde\\(tag = "protocol", content = "data"' crates/wyrd-spec/src/storage/upload.rs; then
+  echo 'UploadPlan must remain a closed tagged union'
+  exit 1
+fi
+
+if rg -n -e '\\.unwrap\\(\\)' crates/wyrd/wyrd-storage/src crates/wyrd/wyrd-server/src/storage; then
+  echo 'unwrap is forbidden in non-test storage code'
+  exit 1
+fi
+"""
+
 [tasks."check:unwrap-audit"]
 description = "Audit unwrap/expect calls outside tests and examples"
 run = "python scripts/check_unwrap_audit.py"
@@ -534,7 +692,7 @@ esac
 
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
-depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
+depends = ["check", "test:unit", "test:storage:local", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:storage:drift", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
 
 [tasks."test:sql"]
 description = """Run live Postgres SQL integration tests.

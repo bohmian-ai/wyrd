@@ -1,0 +1,54 @@
+services:
+  # Local-only emulator images are intentionally not pinned to fabricated
+  # dated releases; pin audited concrete tags when this matrix moves into CI.
+  minio:
+    image: minio/minio:latest
+    container_name: wyrd-storage-minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: wyrd-test-key
+      MINIO_ROOT_PASSWORD: wyrd-test-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  minio-setup:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "/setup/setup-buckets.sh"]
+    volumes:
+      - ./setup-buckets.sh:/setup/setup-buckets.sh:ro
+
+  fake-gcs-server:
+    image: fsouza/fake-gcs-server:latest
+    container_name: wyrd-storage-gcs
+    command:
+      - "-scheme"
+      - "http"
+      - "-port"
+      - "4443"
+      - "-data"
+      - "/data"
+      - "-public-host"
+      - "localhost:4443"
+    ports:
+      - "4443:4443"
+    volumes:
+      - gcs-data:/data
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    container_name: wyrd-storage-azurite
+    command: ["azurite-blob", "--blobHost", "0.0.0.0", "--blobPort", "10000"]
+    ports:
+      - "10000:10000"
+    volumes:
+      - azurite-data:/data
+
+volumes:
+  minio-data:
+  gcs-data:
+  azurite-data:

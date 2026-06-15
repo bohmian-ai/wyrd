@@ -18,8 +18,15 @@ path = "src/main.rs"
 tokio = { workspace = true }
 axum = { workspace = true }
 secrecy = { workspace = true }
+serde_json = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
+wyrd-runtime = { workspace = true }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1", features = ["embedded-postgres"] }
+wyrd-spec = { workspace = true }
 wyrd-enterprise = { path = "../wyrd-enterprise", version = "0.0.1", optional = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }

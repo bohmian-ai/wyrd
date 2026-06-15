@@ -2,7 +2,11 @@
 
 use sqlx::PgPool;
 
-/// Runtime state shared by Wyrd HTTP handlers.
+/// Process-wide handle registry. One instance is shared by all HTTP handlers.
+///
+/// Foundation commits append their owned handles here, for example storage,
+/// auth verification, and policy evaluation. This skeleton ships only the
+/// runtime database pools that already survive boot.
 #[derive(Clone)]
 pub struct AppState {
     /// Runtime `wyrd_app` pool. Tenant-scoped traffic uses this pool and RLS

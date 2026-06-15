@@ -1,8 +1,10 @@
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
+import mermaid from "astro-mermaid";
 
 export default defineConfig({
   integrations: [
+    mermaid({ theme: "neutral", autoTheme: true }),
     starlight({
       title: "Wyrd",
       description: "Developer and agent documentation for Wyrd.",
@@ -152,6 +154,23 @@ export default defineConfig({
             { label: "Overview", link: "/reference/" },
             { label: "Generated docs", link: "/reference/generated-docs/" },
             { label: "Predecessor mapping", link: "/migration/predecessor-mapping/" },
+          ],
+        },
+        {
+          label: "Tech specs",
+          collapsed: true,
+          items: [
+            { label: "Overview", link: "/tech-specs/" },
+            {
+              label: "Storage",
+              collapsed: true,
+              items: [
+                { label: "Architecture", link: "/tech-specs/storage/" },
+                { label: "Upload flow", link: "/tech-specs/storage/upload-flow/" },
+                { label: "Download flow", link: "/tech-specs/storage/download-flow/" },
+                { label: "Lifecycle and errors", link: "/tech-specs/storage/lifecycle/" },
+              ],
+            },
           ],
         },
       ],

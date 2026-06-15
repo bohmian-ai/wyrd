@@ -29,7 +29,9 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 | `crates/wyrd-spec/schemas/invoke_context.json` | InvokeContext |
 | `crates/wyrd-spec/schemas/invoke_outcome.json` | InvokeOutcome |
 | `crates/wyrd-spec/schemas/locked_component.json` | LockedComponent |
+| `crates/wyrd-spec/schemas/log_connection.json` | LogConnection |
 | `crates/wyrd-spec/schemas/mcp_spec.json` | McpSpec |
+| `crates/wyrd-spec/schemas/metrics_connection.json` | MetricsConnection |
 | `crates/wyrd-spec/schemas/model_interface.json` | ModelInterface |
 | `crates/wyrd-spec/schemas/model_signature.json` | ModelSignature |
 | `crates/wyrd-spec/schemas/model_spec.json` | ModelSpec |
@@ -51,11 +53,16 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 | `crates/wyrd-spec/schemas/service_runtime_mode.json` | ServiceRuntimeMode |
 | `crates/wyrd-spec/schemas/service_runtime_policy.json` | ServiceRuntimePolicy |
 | `crates/wyrd-spec/schemas/service_spec.json` | ServiceSpec |
+| `crates/wyrd-spec/schemas/source_auth.json` | SourceAuth |
+| `crates/wyrd-spec/schemas/source_kind.json` | SourceKind |
+| `crates/wyrd-spec/schemas/source_spec.json` | SourceSpec |
 | `crates/wyrd-spec/schemas/split_strategy.json` | SplitStrategy |
+| `crates/wyrd-spec/schemas/sql_connection.json` | SqlConnection |
 | `crates/wyrd-spec/schemas/sql_logic.json` | SqlLogic |
 | `crates/wyrd-spec/schemas/task_type.json` | TaskType |
 | `crates/wyrd-spec/schemas/tf_save_format.json` | TfSaveFormat |
 | `crates/wyrd-spec/schemas/torch_save_format.json` | TorchSaveFormat |
+| `crates/wyrd-spec/schemas/trace_connection.json` | TraceConnection |
 | `crates/wyrd-spec/schemas/trigger_source.json` | TriggerSource |
 | `crates/wyrd-spec/schemas/trigger_spec.json` | TriggerSpec |
 | `crates/wyrd-spec/schemas/workflow_spec.json` | WorkflowSpec |

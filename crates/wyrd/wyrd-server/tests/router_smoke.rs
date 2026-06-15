@@ -58,6 +58,60 @@ async fn unauthenticated_v1_request_returns_problem_json() {
     assert_eq!(problem["status"], 401);
 }
 
+#[cfg(feature = "stub-auth")]
+#[tokio::test]
+async fn authenticated_request_without_tenant_header_returns_401() {
+    let response = build_router(test_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/cards/upload/init")
+                .header("authorization", "Bearer test-token")
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collects");
+    let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
+    assert_eq!(problem["code"], "WYRD_AUTH_401_INVALID_TOKEN");
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("x-wyrd-data-tenant-id"),
+        "error message must name the missing header"
+    );
+}
+
+#[cfg(feature = "stub-auth")]
+#[tokio::test]
+async fn authenticated_request_with_malformed_tenant_returns_401() {
+    let response = build_router(test_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/cards/upload/init")
+                .header("authorization", "Bearer test-token")
+                .header("x-wyrd-data-tenant-id", "not-a-uuid")
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collects");
+    let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
+    assert_eq!(problem["code"], "WYRD_AUTH_401_INVALID_TOKEN");
+}
+
 fn test_state() -> AppState {
     let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
     let root = tempfile::tempdir().expect("temp dir");

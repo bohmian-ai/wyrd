@@ -1566,6 +1566,67 @@ mod tests {
         assert_eq!(error.status(), 403);
     }
 
+    #[test]
+    fn build_complete_payload_catch_all_rejects_protocol_mismatch() {
+        let body = UploadCompleteRequest::SinglePut(SinglePutComplete {});
+        let err = build_complete_payload(
+            &body,
+            WireProtocol::S3MultipartV1,
+            StorageBackendKind::S3,
+            None,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
+        .expect_err("protocol mismatch must fail");
+
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn derive_wire_protocol_gcs_multipart_is_gcs_resumable() {
+        let planned = PlannedUpload::Multipart {
+            part_count: 4,
+            part_size_bytes: 16 * 1024 * 1024,
+        };
+        assert_eq!(
+            derive_wire_protocol(StorageBackendKind::Gcs, planned),
+            WireProtocol::GcsResumableV1,
+        );
+    }
+
+    #[test]
+    fn derive_wire_protocol_azure_multipart_is_block_blob() {
+        let planned = PlannedUpload::Multipart {
+            part_count: 4,
+            part_size_bytes: 16 * 1024 * 1024,
+        };
+        assert_eq!(
+            derive_wire_protocol(StorageBackendKind::Azure, planned),
+            WireProtocol::AzureBlockBlobV1,
+        );
+    }
+
+    #[test]
+    fn extract_idempotency_key_rejects_non_utf8_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static("idempotency-key"),
+            axum::http::HeaderValue::from_bytes(&[0xFF, 0xFE]).expect("raw bytes header"),
+        );
+        let err = extract_idempotency_key(&headers).expect_err("non-UTF-8 key must fail");
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn extract_idempotency_key_rejects_invalid_key_format() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static("idempotency-key"),
+            axum::http::HeaderValue::from_static("bad"),
+        );
+        let err = extract_idempotency_key(&headers).expect_err("invalid key must fail");
+        assert_eq!(err.status(), 400);
+    }
+
     fn read_caller() -> Caller {
         caller_with_scopes(BTreeSet::from([Scope::CardRead]))
     }

@@ -38,7 +38,7 @@ use wyrd_spec::run::{RunKind, RunRef};
 use wyrd_spec::storage::{
     AbortResponse, DownloadInitRequest, DownloadInitResponse, DownloadPlan, PartUrlResponse,
     UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest, UploadInitResponse,
-    UploadPlan, WireProtocol,
+    UploadPlan, VerificationGuarantee, WireProtocol,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -115,6 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<DownloadInitResponse>(out, golden, "download_init_response")?;
     write::<DownloadPlan>(out, golden, "download_plan")?;
     write::<WireProtocol>(out, golden, "wire_protocol")?;
+    write::<VerificationGuarantee>(out, golden, "verification_guarantee")?;
     Ok(())
 }
 

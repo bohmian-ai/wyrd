@@ -47,6 +47,41 @@
       }
     },
     {
+      "description": "Local filesystem auth-gated upload.\n\nSignals that the upload URL is an auth-gated server route, not a presigned PUT. SDK clients must include `Authorization: Bearer` and `x-wyrd-data-tenant-id` on the PUT request.",
+      "type": "object",
+      "required": [
+        "data",
+        "protocol"
+      ],
+      "properties": {
+        "data": {
+          "type": "object",
+          "required": [
+            "put_url",
+            "ttl_secs"
+          ],
+          "properties": {
+            "put_url": {
+              "description": "Server route PUT URL.",
+              "type": "string"
+            },
+            "ttl_secs": {
+              "description": "URL time-to-live in seconds.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        },
+        "protocol": {
+          "type": "string",
+          "enum": [
+            "local_fs"
+          ]
+        }
+      }
+    },
+    {
       "description": "AWS S3 multipart upload.",
       "type": "object",
       "required": [

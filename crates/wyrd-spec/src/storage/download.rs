@@ -13,6 +13,9 @@ pub struct DownloadInitRequest {
     /// Object path under the card.
     pub relative_path: String,
     /// Optional presign TTL override in seconds.
+    ///
+    /// Clamped to [60, 3600] seconds; out-of-range values are silently
+    /// clamped. Defaults to the configured backend presign TTL when absent.
     #[serde(default)]
     pub ttl_secs: Option<u32>,
 }
@@ -38,5 +41,9 @@ pub struct DownloadPlan {
     /// Presigned GET URL or local server route URL.
     pub get_url: String,
     /// URL time-to-live in seconds.
+    ///
+    /// For presigned URL backends (S3, GCS, Azure) this is the URL expiry in
+    /// seconds. For the local filesystem backend this field is `0` (the server
+    /// route does not expire).
     pub ttl_secs: u32,
 }

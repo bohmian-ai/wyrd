@@ -27,7 +27,7 @@
       ]
     },
     "expected_sha256": {
-      "description": "Expected base64-encoded SHA-256 digest.",
+      "description": "Expected base64-encoded SHA-256 digest.\n\nPer-backend verification semantics: - **S3**: server-verified-against-client via `x-amz-checksum-sha256` at multipart complete; S3 rejects the commit on mismatch. - **GCS**: server-computed from stored object metadata; the server independently verifies the stored hash. - **Azure**: client-declared only; no server-side SHA-256 recomputation is available. SAS-restricted PUT and TLS prevent in-flight tampering. - **Local**: server-computed by streaming the on-disk file; the local backend is the only signer where the server reads object bytes by design.",
       "type": "string"
     },
     "expected_size_bytes": {

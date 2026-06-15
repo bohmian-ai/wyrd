@@ -6,6 +6,14 @@ use crate::storage::backend::StorageBackendKind;
 use crate::storage::ids::UploadId;
 use serde::{Deserialize, Serialize};
 
+/// HTTP header name for upload initialization idempotency.
+///
+/// Include this header on `POST /v1/cards/upload/init` to enable idempotent
+/// replay. The server caches the response keyed on `(tenant, idempotency_key,
+/// body_sha256)`. Reusing the same key with a different request body returns
+/// a conflict error.
+pub const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+
 /// Client request to initialize an upload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -16,6 +24,16 @@ pub struct UploadInitRequest {
     /// Object path under the card.
     pub relative_path: String,
     /// Expected base64-encoded SHA-256 digest.
+    ///
+    /// Per-backend verification semantics:
+    /// - **S3**: server-verified-against-client via `x-amz-checksum-sha256` at
+    ///   multipart complete; S3 rejects the commit on mismatch.
+    /// - **GCS**: server-computed from stored object metadata; the server
+    ///   independently verifies the stored hash.
+    /// - **Azure**: client-declared only; no server-side SHA-256 recomputation
+    ///   is available. SAS-restricted PUT and TLS prevent in-flight tampering.
+    /// - **Local**: server-computed by streaming the on-disk file; the local
+    ///   backend is the only signer where the server reads object bytes by design.
     pub expected_sha256: String,
     /// Expected byte length.
     pub expected_size_bytes: u64,
@@ -54,6 +72,17 @@ pub enum UploadPlan {
         #[serde(default)]
         required_headers: Vec<HeaderPair>,
     },
+    /// Local filesystem auth-gated upload.
+    ///
+    /// Signals that the upload URL is an auth-gated server route, not a
+    /// presigned PUT. SDK clients must include `Authorization: Bearer` and
+    /// `x-wyrd-data-tenant-id` on the PUT request.
+    LocalFs {
+        /// Server route PUT URL.
+        put_url: String,
+        /// URL time-to-live in seconds.
+        ttl_secs: u32,
+    },
     /// AWS S3 multipart upload.
     S3Multipart {
         /// Number of parts planned.
@@ -82,6 +111,34 @@ pub enum UploadPlan {
         /// Number of blocks the server expects to commit.
         block_count_planned: u32,
     },
+}
+
+/// Per-backend SHA-256 verification guarantee.
+///
+/// Describes how the server validates `expected_sha256` for each backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationGuarantee {
+    /// Server independently computes SHA-256 from stored object metadata.
+    ServerComputed,
+    /// Server passes the client-declared SHA-256 to the backend at commit
+    /// time; the backend rejects the commit on mismatch.
+    ServerVerifiedAgainstClient,
+    /// Client declares SHA-256 at upload init; the server has no independent
+    /// verification path for this backend.
+    ClientDeclared,
+}
+
+/// Return the SHA-256 verification guarantee for a storage backend.
+#[must_use]
+pub fn backend_verification_guarantee(backend: StorageBackendKind) -> VerificationGuarantee {
+    match backend {
+        StorageBackendKind::S3 => VerificationGuarantee::ServerVerifiedAgainstClient,
+        StorageBackendKind::Gcs => VerificationGuarantee::ServerComputed,
+        StorageBackendKind::Azure => VerificationGuarantee::ClientDeclared,
+        StorageBackendKind::Local => VerificationGuarantee::ServerComputed,
+    }
 }
 
 /// Required HTTP header for a client upload request.

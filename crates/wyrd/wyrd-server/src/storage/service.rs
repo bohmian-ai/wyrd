@@ -536,8 +536,13 @@ pub async fn download_init(
     let metadata = load_artifact_metadata(&mut conn, &validated).await?;
     conn.commit().await.map_err(map_sql_error)?;
 
-    let ttl_secs = compute_download_ttl(&body, state.storage.presign_ttl_secs());
-    let get_url = download_url(state, &validated, ttl_secs).await?;
+    let request_ttl_secs = compute_download_ttl(&body, state.storage.presign_ttl_secs());
+    let get_url = download_url(state, &validated, request_ttl_secs).await?;
+    let ttl_secs = if state.storage.backend() == StorageBackendKind::Local {
+        0
+    } else {
+        request_ttl_secs
+    };
 
     let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
         .await
@@ -938,10 +943,9 @@ fn local_single_put_plan(
         )
     })?;
     let base = normalize_base_url(base);
-    Ok(UploadPlan::SinglePut {
+    Ok(UploadPlan::LocalFs {
         put_url: format!("{base}/v1/cards/upload/local/{}", validated.full),
         ttl_secs: state.storage.presign_ttl_secs(),
-        required_headers: Vec::new(),
     })
 }
 
@@ -1375,20 +1379,14 @@ mod tests {
 
         let plan = local_single_put_plan(&state, &validated).expect("local plan");
 
-        let UploadPlan::SinglePut {
-            put_url,
-            ttl_secs,
-            required_headers,
-        } = plan
-        else {
-            panic!("expected single put plan");
+        let UploadPlan::LocalFs { put_url, ttl_secs } = plan else {
+            panic!("expected local_fs plan");
         };
         assert_eq!(
             put_url,
             format!("https://wyrd.test/v1/cards/upload/local/{}", validated.full)
         );
         assert_eq!(ttl_secs, 600);
-        assert!(required_headers.is_empty());
     }
 
     #[test]

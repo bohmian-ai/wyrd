@@ -272,7 +272,7 @@ impl S3Signer {
     /// # Errors
     /// Returns SHA mismatch or a backend invariant error when the checksum is
     /// absent from the HEAD response.
-    pub async fn verify_sha256(
+    pub fn verify_sha256(
         &self,
         path: &ValidatedPath,
         expected: &str,

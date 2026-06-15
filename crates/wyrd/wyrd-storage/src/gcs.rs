@@ -176,9 +176,9 @@ impl GcsSigner {
     /// Verify SHA-256.
     ///
     /// gcloud-storage v1.3.0 does not expose SHA-256 from object metadata
-    /// (only MD5 and CRC32c), so verification requires downloading the object.
+    /// (only MD5 and `CRC32c`), so verification requires downloading the object.
     /// This is a known violation of the no-bytes-on-server invariant for GCS;
-    /// remove the fallback when the SDK exposes a sha256_hash field.
+    /// remove the fallback when the SDK exposes a `sha256_hash` field.
     ///
     /// # Errors
     /// Returns SHA mismatch or a typed backend error when the object cannot be

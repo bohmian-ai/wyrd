@@ -274,9 +274,30 @@ depends = ["storage:up"]
 env = { WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_AZURE_EMULATOR_ENDPOINT = "http://127.0.0.1:10000" }
 run = "cargo test -p wyrd-storage --all-features --test integration_azurite -- --nocapture"
 
+[tasks."test:storage:e2e"]
+description = "Run server-level storage HTTP e2e tests (requires WYRD_DATABASE_URL_MIGRATOR and storage:up)"
+depends = ["storage:up"]
+env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_INTEGRATION_S3 = "1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1" }
+run = "cargo test -p wyrd-server --features stub-auth --test storage_e2e -- --nocapture"
+
+[tasks."test:storage:s3:cloud"]
+description = "Run storage e2e tests against real AWS S3 (requires AWS credentials in env)"
+env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_BACKEND = "s3" }
+run = "cargo test -p wyrd-server --features stub-auth --test storage_e2e -- --nocapture"
+
+[tasks."test:storage:gcs:cloud"]
+description = "Run storage e2e tests against real GCS (requires GCP credentials in env)"
+env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_BACKEND = "gcs" }
+run = "cargo test -p wyrd-server --features stub-auth --test storage_e2e -- --nocapture"
+
+[tasks."test:storage:azure:cloud"]
+description = "Run storage e2e tests against real Azure Blob Storage (requires Azure credentials in env)"
+env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_BACKEND = "azure" }
+run = "cargo test -p wyrd-server --features stub-auth --test storage_e2e -- --nocapture"
+
 [tasks."test:storage:matrix"]
 description = "Run all storage emulator integration tests; requires storage:up"
-depends = ["test:storage:local", "test:storage:gcs-emu", "test:storage:minio", "test:storage:azurite"]
+depends = ["test:storage:local", "test:storage:gcs-emu", "test:storage:minio", "test:storage:azurite", "test:storage:e2e"]
 
 [tasks."check:storage:drift"]
 description = "Assert storage foundation guardrails against paths that exist in this workspace"

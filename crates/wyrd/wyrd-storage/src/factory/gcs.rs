@@ -78,7 +78,7 @@ pub fn build_object_store(config: &GcsConfig) -> Result<GoogleCloudStorage, Stor
 ///
 /// # Errors
 /// Returns an error when the bucket probe against the emulator fails.
-pub async fn build_emulator_signer(
+pub fn build_emulator_signer(
     bucket: &str,
     emulator_host: &str,
 ) -> Result<GcsSigner, StorageError> {

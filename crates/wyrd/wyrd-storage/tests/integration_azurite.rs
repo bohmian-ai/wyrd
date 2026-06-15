@@ -17,9 +17,7 @@ async fn azure_block_blob_round_trip_when_enabled() {
     let endpoint = std::env::var("WYRD_AZURE_EMULATOR_ENDPOINT")
         .unwrap_or_else(|_| AZURITE_ENDPOINT.to_owned());
 
-    let signer = build_emulator_signer(AZURITE_CONTAINER, &endpoint)
-        .await
-        .expect("azurite signer");
+    let signer = build_emulator_signer(AZURITE_CONTAINER, &endpoint).expect("azurite signer");
 
     let tenant = DataTenantId::new_v7();
     let card_uid = uuid::Uuid::now_v7();
@@ -29,7 +27,7 @@ async fn azure_block_blob_round_trip_when_enabled() {
     let content = b"hello azurite emulator";
 
     let init = signer
-        .init_multipart(&path, 1, content.len() as u64, Duration::from_secs(600))
+        .init_multipart(&path, 1, content.len() as u64, Duration::from_mins(10))
         .await
         .expect("init multipart");
 
@@ -73,9 +71,7 @@ async fn azure_abort_is_not_silent_success_with_emulator() {
     let endpoint = std::env::var("WYRD_AZURE_EMULATOR_ENDPOINT")
         .unwrap_or_else(|_| AZURITE_ENDPOINT.to_owned());
 
-    let signer = build_emulator_signer(AZURITE_CONTAINER, &endpoint)
-        .await
-        .expect("azurite signer");
+    let signer = build_emulator_signer(AZURITE_CONTAINER, &endpoint).expect("azurite signer");
 
     let tenant = DataTenantId::new_v7();
     let full = wyrd_storage::tenant_path::build(

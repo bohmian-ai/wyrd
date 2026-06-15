@@ -51,11 +51,11 @@ pub async fn build_signer(config: &AzureConfig) -> Result<AzureSigner, StorageEr
 /// # Errors
 /// Returns an error when the endpoint cannot be parsed or the container probe
 /// fails.
-pub async fn build_emulator_signer(
+pub fn build_emulator_signer(
     container: &str,
     azurite_endpoint: &str,
 ) -> Result<AzureSigner, StorageError> {
-    let (address, port) = parse_azurite_endpoint(azurite_endpoint).map_err(|_| {
+    let (address, port) = parse_azurite_endpoint(azurite_endpoint).map_err(|()| {
         StorageError::Backend {
             backend: StorageBackendKind::Azure,
             op: "build_emulator_signer",

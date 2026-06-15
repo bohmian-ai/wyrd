@@ -173,7 +173,7 @@ impl BackendSigner {
     ) -> Result<(), StorageError> {
         match self {
             Self::Local(signer) => signer.verify_sha256(path, expected, head_hint).await,
-            Self::S3(signer) => signer.verify_sha256(path, expected, head_hint).await,
+            Self::S3(signer) => signer.verify_sha256(path, expected, head_hint),
             Self::Gcs(signer) => signer.verify_sha256(path, expected, head_hint).await,
             Self::Azure(signer) => signer.verify_sha256(path, expected, head_hint).await,
         }

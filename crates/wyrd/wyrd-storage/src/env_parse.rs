@@ -166,6 +166,10 @@ pub fn parse_u64_optional(var: &'static str) -> Result<Option<u64>, StorageError
 /// # Errors
 /// Returns [`StorageError::ConfigParse`] when the value cannot be parsed as
 /// `u64`.
+///
+/// # Panics
+/// Panics if `max > i64::MAX`, which violates the caller invariant that
+/// clamped values are always representable as `i64`.
 pub fn parse_clamped_i64(
     var: &'static str,
     default: u64,

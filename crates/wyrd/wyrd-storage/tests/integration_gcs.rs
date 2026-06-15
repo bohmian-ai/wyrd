@@ -16,9 +16,7 @@ async fn gcs_resumable_round_trip_when_enabled() {
     let host = std::env::var("WYRD_GCS_EMULATOR_HOST")
         .unwrap_or_else(|_| EMULATOR_HOST.to_owned());
 
-    let signer = build_emulator_signer(EMULATOR_BUCKET, &host)
-        .await
-        .expect("emulator signer");
+    let signer = build_emulator_signer(EMULATOR_BUCKET, &host).expect("emulator signer");
 
     let tenant = DataTenantId::new_v7();
     let card_uid = uuid::Uuid::now_v7();
@@ -33,7 +31,7 @@ async fn gcs_resumable_round_trip_when_enabled() {
     };
 
     let init = signer
-        .init_multipart(&path, 1, content.len() as u64, Duration::from_secs(600))
+        .init_multipart(&path, 1, content.len() as u64, Duration::from_mins(10))
         .await
         .expect("init multipart");
 

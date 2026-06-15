@@ -152,7 +152,7 @@ fn storage_error_lifts_into_problem_json_without_losing_code() {
         "object not found at tenant/cards/card/model.bin"
     );
     assert_eq!(
-        problem["details"]["code"], "object_not_found",
+        problem["details"]["variant"], "object_not_found",
         "storage details retain the storage enum discriminant"
     );
 }

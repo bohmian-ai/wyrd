@@ -1,3 +1,5 @@
+use base64::Engine;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::{S3CompletedPart, UploadPlan};
@@ -28,6 +30,12 @@ async fn minio_s3_multipart_round_trip_when_enabled() {
             ..
         }
     ));
+
+    let mut full_content = Vec::with_capacity(10 * 1024 * 1024);
+    full_content.extend_from_slice(&vec![1u8; 5 * 1024 * 1024]);
+    full_content.extend_from_slice(&vec![2u8; 5 * 1024 * 1024]);
+    let expected_sha256 = base64::engine::general_purpose::STANDARD
+        .encode(Sha256::digest(&full_content));
 
     let http = reqwest::Client::new();
     let mut parts = Vec::new();
@@ -64,7 +72,7 @@ async fn minio_s3_multipart_round_trip_when_enabled() {
     }
 
     signer
-        .complete_multipart(&path, &init.backend_upload_id, &parts)
+        .complete_multipart(&path, &init.backend_upload_id, &parts, &expected_sha256)
         .await
         .expect("complete multipart");
     let head = signer.head(&path).await.expect("head completed object");

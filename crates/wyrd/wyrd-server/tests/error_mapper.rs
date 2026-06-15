@@ -43,7 +43,7 @@ async fn storage_error_renders_storage_problem_json_code() {
     assert_eq!(problem["code"], "WYRD_STORAGE_503_BACKEND_UNAVAILABLE");
     assert_eq!(problem["status"], 503);
     assert_eq!(problem["title"], "Backend transiently unavailable");
-    assert_eq!(problem["details"]["code"], "backend_unavailable");
+    assert_eq!(problem["details"]["variant"], "backend_unavailable");
     assert_eq!(problem["details"]["data"]["status"], 503);
 }
 

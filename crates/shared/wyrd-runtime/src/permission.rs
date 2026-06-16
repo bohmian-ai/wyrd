@@ -397,26 +397,117 @@ impl FromIterator<Permission> for PermissionSet {
 #[cfg(test)]
 mod tests {
     use super::{Action, Permission, PermissionSet, Resource};
+    use serde_json::json;
 
     #[test]
-    fn wildcard_covers_specific_permission() {
-        let set = PermissionSet::from_iter([Permission::wildcard()]);
+    fn serde_round_trip_every_variant() {
+        let resources = [
+            Resource::Cards,
+            Resource::Services,
+            Resource::Operators,
+            Resource::Evals,
+            Resource::Drift,
+            Resource::Artifacts,
+            Resource::Audit,
+            Resource::Policy,
+            Resource::Triggers,
+            Resource::ServiceAccounts,
+            Resource::Users,
+            Resource::Delegation,
+            Resource::AnyOf(vec![Resource::Operators, Resource::Evals]),
+            Resource::Wildcard,
+        ];
+        for resource in resources {
+            let value = serde_json::to_value(&resource).expect("resource serializes");
+            let round_trip: Resource =
+                serde_json::from_value(value).expect("resource deserializes");
+            assert_eq!(round_trip, resource);
+        }
 
-        assert!(set.contains(&Permission::card_write()));
+        let actions = [
+            Action::Read,
+            Action::Write,
+            Action::Delete,
+            Action::Invoke,
+            Action::Install,
+            Action::Lock,
+            Action::Run,
+            Action::Issue,
+            Action::AnyOf(vec![Action::Read, Action::Write]),
+            Action::Wildcard,
+        ];
+        for action in actions {
+            let value = serde_json::to_value(&action).expect("action serializes");
+            let round_trip: Action = serde_json::from_value(value).expect("action deserializes");
+            assert_eq!(round_trip, action);
+        }
     }
 
     #[test]
-    fn insert_drops_permission_covered_by_existing_wildcard() {
-        let mut set = PermissionSet::from_iter([Permission::wildcard()]);
-        set.insert(Permission::card_write());
+    fn covers_wildcard_resource() {
+        let permission = Permission {
+            resource: Resource::Wildcard,
+            action: Action::Read,
+        };
 
-        assert_eq!(set.len(), 1);
-        assert!(set.contains(&Permission::card_write()));
+        assert!(permission.covers(&Permission::card_read()));
+        assert!(!permission.covers(&Permission::card_write()));
     }
 
     #[test]
-    fn insert_removes_entries_covered_by_new_wildcard() {
-        let mut set = PermissionSet::from_iter([Permission::card_read(), Permission::card_write()]);
+    fn covers_wildcard_action() {
+        let permission = Permission {
+            resource: Resource::Cards,
+            action: Action::Wildcard,
+        };
+
+        assert!(permission.covers(&Permission::card_read()));
+        assert!(permission.covers(&Permission::card_write()));
+        assert!(!permission.covers(&Permission::artifact_write()));
+    }
+
+    #[test]
+    fn covers_double_wildcard() {
+        let permission = Permission::wildcard();
+
+        assert!(permission.covers(&Permission::card_read()));
+        assert!(permission.covers(&Permission::card_write()));
+        assert!(permission.covers(&Permission::delegation_issue()));
+    }
+
+    #[test]
+    fn covers_anyof_resource() {
+        let permission = Permission {
+            resource: Resource::AnyOf(vec![Resource::Operators, Resource::Evals]),
+            action: Action::Invoke,
+        };
+
+        assert!(permission.covers(&Permission::operator_invoke()));
+        assert!(permission.covers(&Permission {
+            resource: Resource::Evals,
+            action: Action::Invoke,
+        }));
+        assert!(!permission.covers(&Permission {
+            resource: Resource::Cards,
+            action: Action::Invoke,
+        }));
+    }
+
+    #[test]
+    fn delegation_issue_const_fn_round_trips() {
+        let permission = Permission::delegation_issue();
+        let value = serde_json::to_value(&permission).expect("permission serializes");
+
+        assert_eq!(value, json!({"resource": "delegation", "action": "issue"}));
+
+        let round_trip: Permission =
+            serde_json::from_value(value).expect("permission deserializes");
+        assert_eq!(round_trip, permission);
+    }
+
+    #[test]
+    fn permission_set_subsumption_drops_redundant() {
+        let mut set = PermissionSet::from_iter([Permission::card_read()]);
         set.insert(Permission::wildcard());
 
         assert_eq!(set.len(), 1);
@@ -424,14 +515,50 @@ mod tests {
     }
 
     #[test]
-    fn any_of_covers_member_resource() {
-        let permission = Permission {
-            resource: Resource::AnyOf(vec![Resource::Operators, Resource::Evals]),
-            action: Action::Invoke,
-        };
+    fn permission_set_subsumption_skips_covered() {
+        let mut set = PermissionSet::from_iter([Permission::wildcard()]);
+        set.insert(Permission::card_read());
 
-        assert!(permission.covers(&Permission::operator_invoke()));
-        assert!(!permission.covers(&Permission::card_write()));
+        assert_eq!(set.len(), 1);
+        assert_eq!(set.iter().next(), Some(&Permission::wildcard()));
+    }
+
+    #[test]
+    fn permission_set_contains_resolves_through_wildcard() {
+        let set = PermissionSet::from_iter([Permission::wildcard()]);
+
+        assert!(set.contains(&Permission::card_read()));
+        assert!(set.contains(&Permission::delegation_issue()));
+    }
+
+    #[test]
+    fn permission_set_jsonb_round_trip() {
+        let permissions = vec![
+            Permission::card_write(),
+            Permission::card_read(),
+            Permission {
+                resource: Resource::AnyOf(vec![Resource::Operators, Resource::Evals]),
+                action: Action::Invoke,
+            },
+            Permission::delegation_issue(),
+            Permission::wildcard(),
+        ];
+        let value = serde_json::to_value(&permissions).expect("permissions serialize");
+
+        assert_eq!(
+            value,
+            json!([
+                {"resource": "cards", "action": "write"},
+                {"resource": "cards", "action": "read"},
+                {"resource": {"any_of": ["operators", "evals"]}, "action": "invoke"},
+                {"resource": "delegation", "action": "issue"},
+                {"resource": "wildcard", "action": "wildcard"}
+            ])
+        );
+
+        let round_trip: Vec<Permission> =
+            serde_json::from_value(value).expect("permissions deserialize");
+        assert_eq!(round_trip, permissions);
     }
 
     #[test]

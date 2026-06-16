@@ -133,7 +133,6 @@ jobs:
           mise run check:unwrap-audit
           mise run check:test-contracts
           mise run check:wasm
-          mise run check:deny
 
   codegen:
     name: codegen

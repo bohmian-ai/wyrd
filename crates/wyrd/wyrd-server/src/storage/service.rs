@@ -31,7 +31,7 @@ use wyrd_storage::tenant_path::{self, TenantPathError, ValidatedPath};
 
 use crate::AppState;
 use crate::auth::Caller;
-use crate::storage::audit;
+use crate::storage::audit::{self, UploadAuditOperation};
 
 const INIT_TTL_SECS: u64 = 24 * 60 * 60;
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
@@ -47,20 +47,6 @@ struct InitReplay {
 struct PriorAbort {
     storage_path: String,
     backend_upload_id: Option<String>,
-}
-
-pub(crate) enum UploadAuditOperation {
-    UploadInit,
-    UploadComplete,
-}
-
-impl UploadAuditOperation {
-    fn as_sql_str(&self) -> &'static str {
-        match self {
-            Self::UploadInit => "upload_init",
-            Self::UploadComplete => "upload_complete",
-        }
-    }
 }
 
 struct FailureContext<'a> {
@@ -424,7 +410,7 @@ pub async fn upload_complete(
     audit::write(
         &mut conn,
         &caller,
-        "upload_complete",
+        UploadAuditOperation::UploadComplete,
         Some(upload_uuid),
         &validated.full,
         row.backend,
@@ -492,7 +478,7 @@ pub async fn upload_abort(
     audit::write(
         &mut conn,
         &caller,
-        "upload_abort",
+        UploadAuditOperation::UploadAbort,
         Some(upload_uuid),
         &validated.full,
         row.backend,
@@ -557,7 +543,7 @@ pub async fn download_init(
     audit::write(
         &mut conn,
         &caller,
-        "download_init",
+        UploadAuditOperation::DownloadInit,
         None,
         &validated.full,
         metadata.backend,
@@ -971,7 +957,7 @@ async fn persist_s3_upload_id_and_audit(
     audit::write(
         conn,
         caller,
-        "upload_init",
+        UploadAuditOperation::UploadInit,
         Some(upload_uuid),
         &validated.full,
         backend,
@@ -1164,7 +1150,7 @@ async fn mark_failed_best_effort(
     if let Err(error) = audit::write(
         &mut conn,
         caller,
-        ctx.operation.as_sql_str(),
+        ctx.operation,
         Some(upload_uuid),
         &validated.full,
         backend,

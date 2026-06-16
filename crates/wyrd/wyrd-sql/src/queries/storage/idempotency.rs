@@ -1,4 +1,5 @@
 //! Tenant-scoped upload initialization idempotency cache.
+// raw-query grep allowlist: storage tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use crate::error::SqlError;
 use crate::tenant_conn::TenantConn;

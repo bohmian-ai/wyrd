@@ -140,8 +140,7 @@ fn auth_request<B: Into<axum::body::Body>>(
 }
 
 fn local_path(url: &str) -> &str {
-    url.strip_prefix("https://wyrd.test")
-        .unwrap_or(url)
+    url.strip_prefix("https://wyrd.test").unwrap_or(url)
 }
 
 #[tokio::test]
@@ -228,9 +227,8 @@ async fn local_backend_upload_download_round_trip() {
         "local blob PUT must succeed"
     );
 
-    let complete_body =
-        serde_json::to_vec(&UploadCompleteRequest::SinglePut(SinglePutComplete {}))
-            .expect("complete body serializes");
+    let complete_body = serde_json::to_vec(&UploadCompleteRequest::SinglePut(SinglePutComplete {}))
+        .expect("complete body serializes");
 
     let complete_response = build_router(state.clone())
         .oneshot(auth_request(
@@ -309,7 +307,11 @@ async fn local_backend_upload_download_round_trip() {
     let downloaded = to_bytes(get_response.into_body(), usize::MAX)
         .await
         .expect("download body");
-    assert_eq!(downloaded.as_ref(), content, "round-tripped bytes must match");
+    assert_eq!(
+        downloaded.as_ref(),
+        content,
+        "round-tripped bytes must match"
+    );
 
     cleanup_tenant(&setup_pool, tenant).await;
 }
@@ -422,8 +424,7 @@ async fn abort_of_already_aborted_upload_returns_aborted_false() {
     let init_bytes = to_bytes(init_response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let init: wyrd_spec::storage::UploadInitResponse =
-        serde_json::from_slice(&init_bytes).unwrap();
+    let init: wyrd_spec::storage::UploadInitResponse = serde_json::from_slice(&init_bytes).unwrap();
     let upload_id = init.upload_id;
 
     let first_abort = build_router(state.clone())
@@ -438,11 +439,12 @@ async fn abort_of_already_aborted_upload_returns_aborted_false() {
         .expect("router responds");
 
     assert_eq!(first_abort.status(), StatusCode::OK);
-    let first_bytes = to_bytes(first_abort.into_body(), usize::MAX)
-        .await
-        .unwrap();
+    let first_bytes = to_bytes(first_abort.into_body(), usize::MAX).await.unwrap();
     let first: AbortResponse = serde_json::from_slice(&first_bytes).unwrap();
-    assert!(first.aborted, "first abort of initiating upload must succeed");
+    assert!(
+        first.aborted,
+        "first abort of initiating upload must succeed"
+    );
 
     let second_abort = build_router(state)
         .oneshot(auth_request(
@@ -528,15 +530,19 @@ async fn reinit_to_same_path_after_completion_succeeds() {
     let put_path = local_path(put_url).to_owned();
 
     let put = build_router(state.clone())
-        .oneshot(auth_request("PUT", &put_path, tenant, content.to_vec(), None))
+        .oneshot(auth_request(
+            "PUT",
+            &put_path,
+            tenant,
+            content.to_vec(),
+            None,
+        ))
         .await
         .expect("router responds");
     assert_eq!(put.status(), StatusCode::OK);
 
-    let complete_body = serde_json::to_vec(&UploadCompleteRequest::SinglePut(
-        SinglePutComplete {},
-    ))
-    .expect("complete body");
+    let complete_body = serde_json::to_vec(&UploadCompleteRequest::SinglePut(SinglePutComplete {}))
+        .expect("complete body");
     let complete = build_router(state.clone())
         .oneshot(auth_request(
             "POST",

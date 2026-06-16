@@ -79,10 +79,7 @@ pub fn build_object_store(config: &GcsConfig) -> Result<GoogleCloudStorage, Stor
 /// # Errors
 /// Returns an error when the bucket probe against the emulator fails.
 #[cfg(any(test, feature = "emulator"))]
-pub fn build_emulator_signer(
-    bucket: &str,
-    emulator_host: &str,
-) -> Result<GcsSigner, StorageError> {
+pub fn build_emulator_signer(bucket: &str, emulator_host: &str) -> Result<GcsSigner, StorageError> {
     let config = ClientConfig {
         storage_endpoint: emulator_host.trim_end_matches('/').to_owned(),
         ..ClientConfig::default().anonymous()

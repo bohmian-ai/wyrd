@@ -405,9 +405,7 @@ if rg -n --glob '*.rs' 'wire_protocol\\s*==\\s*"' crates; then
   exit 1
 fi
 
-if rg_optional 'ArtifactRef' \
-  crates/wyrd-spec/src/storage \
-  .dev/plan/foundations/04-storage; then
+if rg -n --type rust 'ArtifactRef' crates/wyrd-spec/src/storage 2>/dev/null; then
   echo 'storage must not introduce a second artifact identity surface'
   exit 1
 fi

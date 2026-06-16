@@ -13,8 +13,7 @@ async fn gcs_resumable_round_trip_when_enabled() {
         return;
     }
 
-    let host = std::env::var("WYRD_GCS_EMULATOR_HOST")
-        .unwrap_or_else(|_| EMULATOR_HOST.to_owned());
+    let host = std::env::var("WYRD_GCS_EMULATOR_HOST").unwrap_or_else(|_| EMULATOR_HOST.to_owned());
 
     let signer = build_emulator_signer(EMULATOR_BUCKET, &host).expect("emulator signer");
 
@@ -60,5 +59,8 @@ async fn gcs_resumable_round_trip_when_enabled() {
     let head = signer.head(&path).await.expect("head after upload");
     assert_eq!(head.size_bytes, content.len() as u64);
 
-    signer.verify_sha256(&path, &sha256, &head).await.expect("sha256 verify");
+    signer
+        .verify_sha256(&path, &sha256, &head)
+        .await
+        .expect("sha256 verify");
 }

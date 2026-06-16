@@ -168,14 +168,18 @@ pub fn parse_u64_optional(var: &'static str) -> Result<Option<u64>, StorageError
 /// `u64`.
 ///
 /// # Panics
-/// Panics if `max > i64::MAX`, which violates the caller invariant that
-/// clamped values are always representable as `i64`.
+/// In debug builds, panics if `max > i64::MAX` (caller invariant violation).
+/// In release builds, saturates to `i64::MAX` if the invariant is broken.
 pub fn parse_clamped_i64(
     var: &'static str,
     default: u64,
     min: u64,
     max: u64,
 ) -> Result<i64, StorageError> {
+    debug_assert!(
+        i64::try_from(max).is_ok(),
+        "parse_clamped_i64: max={max} exceeds i64::MAX"
+    );
     let value = parse_u64_optional(var)?.unwrap_or(default).clamp(min, max);
-    Ok(i64::try_from(value).expect("clamped value fits in i64"))
+    Ok(i64::try_from(value).unwrap_or(i64::MAX))
 }

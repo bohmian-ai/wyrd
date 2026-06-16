@@ -64,12 +64,7 @@ impl SweeperConfig {
                     .unwrap_or(DEFAULT_TICK.as_secs())
                     .clamp(10, 3600),
             ),
-            batch_size: parse_clamped_i64(
-                ENV_BATCH_SIZE,
-                DEFAULT_BATCH_SIZE,
-                1,
-                1000,
-            )?,
+            batch_size: parse_clamped_i64(ENV_BATCH_SIZE, DEFAULT_BATCH_SIZE, 1, 1000)?,
             init_grace: Duration::from_secs(
                 parse_u64_optional(ENV_INIT_GRACE_SECS)?
                     .unwrap_or(DEFAULT_INIT_GRACE.as_secs())
@@ -320,12 +315,13 @@ impl Sweeper {
             }
         };
 
-        let rows_updated = wyrd_sql::queries::storage::admin::multipart_uploads::mark_aborted_admin(
-            &self.admin_pool,
-            row.id,
-            "sweeper-ttl-expired",
-        )
-        .await?;
+        let rows_updated =
+            wyrd_sql::queries::storage::admin::multipart_uploads::mark_aborted_admin(
+                &self.admin_pool,
+                row.id,
+                "sweeper-ttl-expired",
+            )
+            .await?;
 
         if rows_updated == 0 {
             tracing::debug!(
@@ -409,7 +405,10 @@ mod tests {
             assert_eq!(cfg.tick, DEFAULT_TICK);
             assert_eq!(cfg.batch_size, DEFAULT_BATCH_SIZE.cast_signed());
             assert_eq!(cfg.init_grace, DEFAULT_INIT_GRACE);
-            assert_eq!(cfg.idempotency_batch_size, DEFAULT_IDEMPOTENCY_BATCH_SIZE.cast_signed());
+            assert_eq!(
+                cfg.idempotency_batch_size,
+                DEFAULT_IDEMPOTENCY_BATCH_SIZE.cast_signed()
+            );
         });
     }
 

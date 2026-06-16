@@ -4,9 +4,12 @@ use crate::azure::{AzureSasMode, AzureSigner};
 use crate::error::StorageError;
 use crate::settings::AzureConfig;
 use azure_identity::create_credential;
+#[cfg(any(test, feature = "emulator"))]
 use azure_storage::CloudLocation;
 use azure_storage::StorageCredentials;
-use azure_storage_blobs::prelude::{BlobServiceClient, ClientBuilder};
+use azure_storage_blobs::prelude::BlobServiceClient;
+#[cfg(any(test, feature = "emulator"))]
+use azure_storage_blobs::prelude::ClientBuilder;
 use object_store::azure::{MicrosoftAzure, MicrosoftAzureBuilder};
 use wyrd_spec::storage::StorageBackendKind;
 
@@ -56,13 +59,12 @@ pub fn build_emulator_signer(
     container: &str,
     azurite_endpoint: &str,
 ) -> Result<AzureSigner, StorageError> {
-    let (address, port) = parse_azurite_endpoint(azurite_endpoint).map_err(|()| {
-        StorageError::Backend {
+    let (address, port) =
+        parse_azurite_endpoint(azurite_endpoint).map_err(|()| StorageError::Backend {
             backend: StorageBackendKind::Azure,
             op: "build_emulator_signer",
             message: format!("invalid azurite endpoint: {azurite_endpoint}"),
-        }
-    })?;
+        })?;
     let service_client = ClientBuilder::with_location(
         CloudLocation::Emulator { address, port },
         StorageCredentials::emulator(),
@@ -76,6 +78,7 @@ pub fn build_emulator_signer(
     ))
 }
 
+#[cfg(any(test, feature = "emulator"))]
 fn parse_azurite_endpoint(endpoint: &str) -> Result<(String, u16), ()> {
     let url = endpoint.trim_end_matches('/');
     let stripped = url.strip_prefix("http://").ok_or(())?;

@@ -17,9 +17,9 @@ use wyrd_spec::error::storage::WyrdStorageError;
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::storage::{
     AbortResponse, AzureBlockBlobComplete, DownloadInitRequest, DownloadInitResponse, DownloadPlan,
-    IDEMPOTENCY_KEY_HEADER, PartUrlResponse, S3MultipartComplete, StorageBackendKind, StoredObjectRef,
-    UploadCompleteRequest, UploadCompleteResponse, UploadId, UploadIdParseError, UploadInitRequest,
-    UploadInitResponse, UploadPlan, WireProtocol,
+    IDEMPOTENCY_KEY_HEADER, PartUrlResponse, S3MultipartComplete, StorageBackendKind,
+    StoredObjectRef, UploadCompleteRequest, UploadCompleteResponse, UploadId, UploadIdParseError,
+    UploadInitRequest, UploadInitResponse, UploadPlan, WireProtocol,
 };
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::storage::artifact_metadata::ArtifactMetadataRow;
@@ -469,11 +469,12 @@ pub async fn upload_abort(
     let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
-    let aborted = match multipart_uploads::mark_aborted(&mut conn, upload_uuid, Some("client-abort")).await {
-        Ok(()) => true,
-        Err(wyrd_sql::SqlError::Conflict { .. }) => false,
-        Err(error) => return Err(map_sql_error(error)),
-    };
+    let aborted =
+        match multipart_uploads::mark_aborted(&mut conn, upload_uuid, Some("client-abort")).await {
+            Ok(()) => true,
+            Err(wyrd_sql::SqlError::Conflict { .. }) => false,
+            Err(error) => return Err(map_sql_error(error)),
+        };
     audit::write(
         &mut conn,
         &caller,
@@ -1337,7 +1338,6 @@ mod tests {
         assert_eq!(s3.part_count, 7);
         assert_eq!(s3.part_size_bytes, 16);
         assert_eq!(s3.block_count_planned, None);
-
     }
 
     #[test]

@@ -8,9 +8,9 @@ use wyrd_spec::error::WyrdError;
 use crate::error::WyrdErrorResponse;
 
 #[cfg(feature = "stub-auth")]
-use std::collections::BTreeSet;
-#[cfg(feature = "stub-auth")]
 use axum::http::header::AUTHORIZATION;
+#[cfg(feature = "stub-auth")]
+use std::collections::BTreeSet;
 #[cfg(feature = "stub-auth")]
 use wyrd_spec::actor::Actor;
 

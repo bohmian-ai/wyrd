@@ -34,8 +34,8 @@ async fn minio_s3_multipart_round_trip_when_enabled() {
     let mut full_content = Vec::with_capacity(10 * 1024 * 1024);
     full_content.extend_from_slice(&vec![1u8; 5 * 1024 * 1024]);
     full_content.extend_from_slice(&vec![2u8; 5 * 1024 * 1024]);
-    let expected_sha256 = base64::engine::general_purpose::STANDARD
-        .encode(Sha256::digest(&full_content));
+    let expected_sha256 =
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&full_content));
 
     let http = reqwest::Client::new();
     let mut parts = Vec::new();

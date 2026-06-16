@@ -113,13 +113,11 @@ async fn sweeper_skips_audit_when_upload_already_completed() {
     )
     .await;
 
-    sqlx::query(
-        "UPDATE wyrd.storage_multipart_uploads SET status = 'completed' WHERE id = $1",
-    )
-    .bind(upload_id)
-    .execute(&admin_pool)
-    .await
-    .expect("force-complete upload");
+    sqlx::query("UPDATE wyrd.storage_multipart_uploads SET status = 'completed' WHERE id = $1")
+        .bind(upload_id)
+        .execute(&admin_pool)
+        .await
+        .expect("force-complete upload");
 
     sweeper.tick().await.expect("tick runs");
 

@@ -408,7 +408,12 @@ fn map_s3_error(error: S3Error) -> WyrdStorageError {
             detail: "s3 part upload response did not include etag".to_owned(),
         },
         S3Error::Sdk(detail) => {
-            tracing::error!(detail, backend = "s3", error_class = "sdk", "s3 operation failed");
+            tracing::error!(
+                detail,
+                backend = "s3",
+                error_class = "sdk",
+                "s3 operation failed"
+            );
             WyrdStorageError::Backend {
                 detail: "s3 operation failed".to_owned(),
             }
@@ -424,7 +429,12 @@ fn map_gcs_error(error: GcsError) -> WyrdStorageError {
             detail: "gcs resumable upload did not return a session url".to_owned(),
         },
         GcsError::Sdk(detail) => {
-            tracing::error!(detail, backend = "gcs", error_class = "sdk", "gcs operation failed");
+            tracing::error!(
+                detail,
+                backend = "gcs",
+                error_class = "sdk",
+                "gcs operation failed"
+            );
             WyrdStorageError::Backend {
                 detail: "gcs operation failed".to_owned(),
             }
@@ -442,7 +452,12 @@ fn map_azure_error(error: AzureError) -> WyrdStorageError {
             detail: "azure storage account missing".to_owned(),
         },
         AzureError::Sdk(detail) => {
-            tracing::error!(detail, backend = "azure", error_class = "sdk", "azure operation failed");
+            tracing::error!(
+                detail,
+                backend = "azure",
+                error_class = "sdk",
+                "azure operation failed"
+            );
             WyrdStorageError::Backend {
                 detail: "azure operation failed".to_owned(),
             }

@@ -1,4 +1,5 @@
 //! Cross-tenant cleanup for expired storage idempotency rows.
+// raw-query grep allowlist: storage tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use crate::error::SqlError;
 use sqlx::PgPool;

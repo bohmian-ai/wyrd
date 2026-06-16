@@ -1,4 +1,5 @@
 //! Cross-tenant sweeper queries for storage uploads.
+// raw-query grep allowlist: storage tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use crate::error::SqlError;
 use serde::Serialize;

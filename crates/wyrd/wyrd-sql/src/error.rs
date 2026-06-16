@@ -327,6 +327,14 @@ mod tests {
                 "Transaction failed",
             ),
             (
+                SqlError::InsufficientPrivilege {
+                    detail: "permission denied".to_owned(),
+                },
+                "WYRD_SQL_500_INSUFFICIENT_PRIVILEGE",
+                500,
+                "Insufficient database privileges",
+            ),
+            (
                 SqlError::InvalidDataTenantId(wyrd_spec::ids::IdError::InvalidUuid7),
                 "WYRD_SQL_500_INVALID_TENANT_ID",
                 500,

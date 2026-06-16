@@ -128,13 +128,21 @@ impl BackendSigner {
         complete: CompletePayload,
     ) -> Result<(), StorageError> {
         match (self, complete) {
-            (Self::S3(signer), CompletePayload::S3 { parts, expected_sha256 }) => {
+            (
+                Self::S3(signer),
+                CompletePayload::S3 {
+                    parts,
+                    expected_sha256,
+                },
+            ) => {
                 let upload_id =
                     backend_upload_id.ok_or(StorageError::BackendCapabilityMismatch {
                         signer: StorageBackendKind::S3,
                         op: "complete_server_side",
                     })?;
-                signer.complete_multipart(path, upload_id, &parts, &expected_sha256).await
+                signer
+                    .complete_multipart(path, upload_id, &parts, &expected_sha256)
+                    .await
             }
             (Self::Azure(signer), CompletePayload::Azure { block_count }) => {
                 signer.complete_blocklist_server(path, block_count).await

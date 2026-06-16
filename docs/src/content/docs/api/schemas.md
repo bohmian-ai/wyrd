@@ -9,6 +9,7 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 
 | Schema | Title |
 | --- | --- |
+| `crates/wyrd-spec/schemas/abort_response.json` | AbortResponse |
 | `crates/wyrd-spec/schemas/agent_spec.json` | AgentSpec |
 | `crates/wyrd-spec/schemas/artifact_spec.json` | ArtifactSpec |
 | `crates/wyrd-spec/schemas/audit_spec.json` | AuditSpec |
@@ -20,6 +21,9 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 | `crates/wyrd-spec/schemas/data_spec.json` | DataSpec |
 | `crates/wyrd-spec/schemas/data_split.json` | DataSplit |
 | `crates/wyrd-spec/schemas/data_stats.json` | DataStats |
+| `crates/wyrd-spec/schemas/download_init_request.json` | DownloadInitRequest |
+| `crates/wyrd-spec/schemas/download_init_response.json` | DownloadInitResponse |
+| `crates/wyrd-spec/schemas/download_plan.json` | DownloadPlan |
 | `crates/wyrd-spec/schemas/drift_spec.json` | DriftSpec |
 | `crates/wyrd-spec/schemas/eval_spec.json` | EvalSpec |
 | `crates/wyrd-spec/schemas/experiment_spec.json` | ExperimentSpec |
@@ -28,6 +32,7 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 | `crates/wyrd-spec/schemas/hugging_face_task.json` | HuggingFaceTask |
 | `crates/wyrd-spec/schemas/invoke_context.json` | InvokeContext |
 | `crates/wyrd-spec/schemas/invoke_outcome.json` | InvokeOutcome |
+| `crates/wyrd-spec/schemas/local_blob_upload_response.json` | LocalBlobUploadResponse |
 | `crates/wyrd-spec/schemas/locked_component.json` | LockedComponent |
 | `crates/wyrd-spec/schemas/log_connection.json` | LogConnection |
 | `crates/wyrd-spec/schemas/mcp_spec.json` | McpSpec |
@@ -39,6 +44,7 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 | `crates/wyrd-spec/schemas/operator_input.json` | OperatorInput |
 | `crates/wyrd-spec/schemas/operator_spec.json` | OperatorSpec |
 | `crates/wyrd-spec/schemas/parameter_name.json` | String |
+| `crates/wyrd-spec/schemas/part_url_response.json` | PartUrlResponse |
 | `crates/wyrd-spec/schemas/policy_decision.json` | PolicyDecision |
 | `crates/wyrd-spec/schemas/policy_spec.json` | PolicySpec |
 | `crates/wyrd-spec/schemas/prompt_ref.json` | PromptRef |
@@ -65,4 +71,11 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 | `crates/wyrd-spec/schemas/trace_connection.json` | TraceConnection |
 | `crates/wyrd-spec/schemas/trigger_source.json` | TriggerSource |
 | `crates/wyrd-spec/schemas/trigger_spec.json` | TriggerSpec |
+| `crates/wyrd-spec/schemas/upload_complete_request.json` | UploadCompleteRequest |
+| `crates/wyrd-spec/schemas/upload_complete_response.json` | UploadCompleteResponse |
+| `crates/wyrd-spec/schemas/upload_init_request.json` | UploadInitRequest |
+| `crates/wyrd-spec/schemas/upload_init_response.json` | UploadInitResponse |
+| `crates/wyrd-spec/schemas/upload_plan.json` | UploadPlan |
+| `crates/wyrd-spec/schemas/verification_guarantee.json` | VerificationGuarantee |
+| `crates/wyrd-spec/schemas/wire_protocol.json` | WireProtocol |
 | `crates/wyrd-spec/schemas/workflow_spec.json` | WorkflowSpec |

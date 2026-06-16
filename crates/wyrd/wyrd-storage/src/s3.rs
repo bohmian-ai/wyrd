@@ -288,7 +288,9 @@ impl S3Signer {
         Err(StorageError::Backend {
             backend: StorageBackendKind::S3,
             op: "verify_sha256",
-            message: "S3 full-object SHA-256 checksum absent; cannot verify without reading object bytes".to_owned(),
+            message:
+                "S3 full-object SHA-256 checksum absent; cannot verify without reading object bytes"
+                    .to_owned(),
         })
     }
 

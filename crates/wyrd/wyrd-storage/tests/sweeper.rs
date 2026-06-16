@@ -228,7 +228,7 @@ async fn insert_idempotency_key(
     .bind(key)
     .bind(vec![0_u8; 32])
     .bind(serde_json::json!({
-        "upload_id": "wyu_01HZ7M0N6S9P4WJYX1T0FQ3VEK",
+        "upload_id": "wyu_01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00",
         "storage_path": "tenant/cards/card/file.bin",
         "backend": "local",
         "wire_protocol": "local_fs_v1"

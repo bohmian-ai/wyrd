@@ -1160,15 +1160,15 @@ clients MUST NOT send extensions or kinds the server has not advertised.
 ```yaml
 observation:
   schema:       wyrd/v1
-  observation_id: <ULID>
+  observation_id: <UUIDv7>
   emitted_at:   <RFC3339>
   emitter:
     kind:       <CardKind>          # what kind produced this observation
     ref:        <CardRef>           # the producing Card
     service_ref: <CardRef?>          # service composition context
   run:
-    run_id:     <ULID?>             # if attached to a run
-    parent_run_id: <ULID?>
+    run_id:     <UUIDv7?>           # if attached to a run
+    parent_run_id: <UUIDv7?>
   event:        <EventName>         # from the closed taxonomy (OPEN-A7)
   payload:      <kind-specific>     # event-shape-defined
   trace:

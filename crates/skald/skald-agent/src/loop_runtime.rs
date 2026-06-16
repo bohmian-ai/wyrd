@@ -40,7 +40,7 @@ pub(crate) async fn run(
     input: &str,
 ) -> AgentResult<AgentRun> {
     let providers = this.effective_providers(providers);
-    let run_id = ulid::Ulid::new().to_string();
+    let run_id = uuid::Uuid::now_v7().to_string();
     let observer = current();
     let started_at = Instant::now();
     let span = debug_span!(
@@ -165,7 +165,7 @@ pub(crate) async fn run_prompt(
     parent_run_id: Option<&str>,
 ) -> AgentResult<AgentRun> {
     let providers = this.effective_providers(providers);
-    let run_id = ulid::Ulid::new().to_string();
+    let run_id = uuid::Uuid::now_v7().to_string();
     let observer = current();
     let started_at = Instant::now();
     let span = debug_span!(

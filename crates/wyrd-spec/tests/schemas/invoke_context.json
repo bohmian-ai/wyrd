@@ -238,7 +238,7 @@
       "type": "string"
     },
     "RequestId": {
-      "description": "Request correlation ID accepted as a ULID or UUID.",
+      "description": "Request correlation ID; required to be a UUID v7.",
       "type": "string"
     },
     "RunKind": {

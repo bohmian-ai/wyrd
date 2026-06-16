@@ -3,9 +3,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
-use ulid::Ulid;
+use uuid::Uuid;
 
-/// Typed upload identifier displayed as `wyu_{ulid}`.
+/// Typed upload identifier displayed as `wyu_{uuid_v7}`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(transparent)]
@@ -15,12 +15,12 @@ impl UploadId {
     /// Generate a new upload identifier.
     #[must_use]
     pub fn new() -> Self {
-        Self::from_ulid(Ulid::new())
+        Self::from_uuid(Uuid::now_v7())
     }
 
-    /// Build an upload identifier from an existing ULID.
+    /// Build an upload identifier from an existing UUID.
     #[must_use]
-    pub fn from_ulid(value: Ulid) -> Self {
+    pub fn from_uuid(value: Uuid) -> Self {
         Self(format!("wyu_{value}"))
     }
 
@@ -30,13 +30,13 @@ impl UploadId {
         &self.0
     }
 
-    /// Parse and return the ULID body.
+    /// Parse and return the UUID body.
     ///
     /// # Errors
     /// Returns an error if the stored identifier has somehow lost its valid
-    /// `wyu_` ULID shape.
-    pub fn as_ulid(&self) -> Result<Ulid, UploadIdParseError> {
-        parse_ulid_body(&self.0)
+    /// `wyu_` UUID shape.
+    pub fn as_uuid(&self) -> Result<Uuid, UploadIdParseError> {
+        parse_uuid_body(&self.0)
     }
 }
 
@@ -56,7 +56,7 @@ impl FromStr for UploadId {
     type Err = UploadIdParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        parse_ulid_body(value)?;
+        parse_uuid_body(value)?;
         Ok(Self(value.to_owned()))
     }
 }
@@ -71,11 +71,15 @@ impl<'de> Deserialize<'de> for UploadId {
     }
 }
 
-fn parse_ulid_body(value: &str) -> Result<Ulid, UploadIdParseError> {
+fn parse_uuid_body(value: &str) -> Result<Uuid, UploadIdParseError> {
     let Some(body) = value.strip_prefix("wyu_") else {
         return Err(UploadIdParseError::MissingPrefix);
     };
-    Ulid::from_string(body).map_err(|_| UploadIdParseError::InvalidUlid)
+    let uuid = Uuid::parse_str(body).map_err(|_| UploadIdParseError::InvalidUuid)?;
+    if uuid.get_version_num() != 7 {
+        return Err(UploadIdParseError::InvalidUuid);
+    }
+    Ok(uuid)
 }
 
 /// Error returned when parsing an [`UploadId`] fails.
@@ -84,7 +88,7 @@ pub enum UploadIdParseError {
     /// The identifier did not start with `wyu_`.
     #[error("upload id must start with wyu_")]
     MissingPrefix,
-    /// The identifier body was not a valid ULID.
-    #[error("upload id body must be a valid ULID")]
-    InvalidUlid,
+    /// The identifier body was not a valid UUID v7.
+    #[error("upload id body must be a valid UUIDv7")]
+    InvalidUuid,
 }

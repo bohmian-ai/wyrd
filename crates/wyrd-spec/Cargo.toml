@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [features]
 default = []
 server = ["dep:utoipa"]
-wasm = []
+wasm = ["uuid/js"]
 
 [dependencies]
 chrono = { workspace = true }
@@ -27,7 +27,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
-ulid = { workspace = true }
 utoipa = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["std", "v7"] }
 sha2 = { workspace = true }

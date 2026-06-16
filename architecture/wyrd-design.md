@@ -355,7 +355,7 @@ the application and is never read or written by the SDK or by Wyrd.
 POST /charge HTTP/1.1
 Host: billing-svc.acme.svc.cluster.local
 X-Wyrd-Access-Token: Bearer <delegated Wyrd JWT — principal=callee, act=caller chain>
-Wyrd-Request-Id:     <ULID>                       ← SDK adds; request correlator
+Wyrd-Request-Id:     <UUIDv7>                     ← SDK adds; request correlator
 Authorization: Bearer <app's own token>           ← app's own auth; Wyrd never reads
 Content-Type: application/json
 
@@ -371,7 +371,7 @@ propagation contract.
 
 Contract:
 
-- Opaque ULID minted by Wyrd at first sighting (no inbound
+- Opaque UUIDv7 minted by Wyrd at first sighting (no inbound
   `Wyrd-Request-Id` at `/v1/authz/check`).
 - Propagated unchanged by Wyrd SDK middleware and ext_authz on outbound
   calls. Never mutated, never re-minted mid-request.
@@ -429,7 +429,7 @@ translation logic on either end.
 POST /v1/authz/check HTTP/1.1
 Host: wyrd.acme.com
 X-Wyrd-Access-Token: Bearer <delegated Wyrd JWT — principal=callee, act=caller chain>
-Wyrd-Request-Id:     <ULID — forwarded from inbound, or absent on first hop>
+Wyrd-Request-Id:     <UUIDv7 — forwarded from inbound, or absent on first hop>
 X-Original-Method:   POST
 X-Original-Path:     /charge
 X-Original-Host:     billing-svc.acme.svc.cluster.local
@@ -449,7 +449,7 @@ Wyrd:
    callee derivation — one delegated token carries both sides.
 3. Reads `X-Original-Method` / `X-Original-Path` / `X-Original-Host`
    → builds `request`.
-4. Reads `Wyrd-Request-Id` if present; mints a fresh ULID if absent and
+4. Reads `Wyrd-Request-Id` if present; mints a fresh UUIDv7 if absent and
    echoes it back so the middleware/sidecar can inject it on the outbound
    call.
 5. Assembles `InvokeContext { caller, callee, chain, request, attrs }`

@@ -65,7 +65,6 @@ zstd = "0.13"
 walkdir = "2.*"
 sha2 = "0.10"
 uuid = { version = "1", default-features = false, features = ["serde"] }
-ulid = { version = "1", features = ["serde"] }
 semver = { version = "1", features = ["serde"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 mini-moka = { version = "0.10", features = ["sync"] }

@@ -1167,8 +1167,7 @@ async fn mark_failed_best_effort(
 }
 
 fn upload_id_uuid(upload_id: &UploadId) -> Result<Uuid, WyrdError> {
-    let ulid = upload_id.as_ulid().map_err(invalid_upload_id)?;
-    Ok(Uuid::from_bytes(ulid.to_bytes()))
+    upload_id.as_uuid().map_err(invalid_upload_id)
 }
 
 pub(crate) fn invalid_upload_id(error: UploadIdParseError) -> WyrdError {
@@ -1643,7 +1642,8 @@ mod tests {
                 },
                 scopes,
             ),
-            request_id: RequestId::parse("01HZ7M0N6S9P4WJYX1T0FQ3VEK").expect("request id parses"),
+            request_id: RequestId::parse("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
+                .expect("request id parses"),
         }
     }
 }

@@ -26,7 +26,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 time = { workspace = true }
 chrono = { workspace = true }
-ulid = { workspace = true }
 uuid = { workspace = true, features = ["std", "v7"] }
 url = { workspace = true }
 base64 = { workspace = true }

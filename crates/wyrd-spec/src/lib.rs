@@ -9,6 +9,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod actor;
+pub mod auth;
 pub mod authz;
 pub mod card;
 pub mod envelope;

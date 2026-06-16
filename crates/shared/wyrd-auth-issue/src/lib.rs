@@ -167,6 +167,41 @@ impl IssuingKey {
         self.issue_access_token_with_claims(sa_id.to_string(), principal, roles, None, ttl)
     }
 
+    /// Mint an access token for an Agent principal.
+    ///
+    /// # Errors
+    /// Returns an error when the card reference is not an Agent, TTL is invalid, or signing fails.
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, card_ref),
+        fields(
+            kid = %self.kid,
+            agent_id = %agent_id,
+            tenant_id = %tenant_id,
+            jti = tracing::field::Empty,
+        ),
+        err,
+    )]
+    pub fn issue_agent_access_token(
+        &self,
+        agent_id: PrincipalId,
+        tenant_id: DataTenantId,
+        card_ref: CardRef,
+        roles: Vec<RoleRef>,
+        ttl: Duration,
+    ) -> Result<String, IssueError> {
+        if card_ref.kind != CardKind::Agent {
+            return Err(IssueError::InvalidCardRef);
+        }
+        let principal = PrincipalRef {
+            id: agent_id,
+            kind: PrincipalKindWire::Agent,
+            tenant_id,
+            card_ref: Some(card_ref),
+        };
+        self.issue_access_token_with_claims(agent_id.to_string(), principal, roles, None, ttl)
+    }
+
     /// Mint a delegated access token via RFC 8693 token exchange.
     ///
     /// # Errors
@@ -428,6 +463,38 @@ mod tests {
             tenant_id(),
             card_ref(CardKind::Agent),
             vec![role("service")],
+            Duration::minutes(5),
+        );
+
+        assert!(matches!(result, Err(IssueError::InvalidCardRef)));
+    }
+
+    #[test]
+    fn issue_agent_access_token_forces_agent_card_ref() {
+        let card_ref = card_ref(CardKind::Agent);
+        let token = issuing_key()
+            .issue_agent_access_token(
+                principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04"),
+                tenant_id(),
+                card_ref.clone(),
+                vec![role("agent")],
+                Duration::minutes(5),
+            )
+            .expect("token issues");
+        let claims = verify_access_token(&token);
+
+        assert_eq!(claims.principal.kind, PrincipalKindWire::Agent);
+        assert_eq!(claims.principal.card_ref, Some(card_ref));
+        assert_eq!(claims.sub, claims.principal.id.to_string());
+    }
+
+    #[test]
+    fn issue_agent_access_token_rejects_service_card_ref() {
+        let result = issuing_key().issue_agent_access_token(
+            principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04"),
+            tenant_id(),
+            card_ref(CardKind::Service),
+            vec![role("agent")],
             Duration::minutes(5),
         );
 

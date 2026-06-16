@@ -16,6 +16,7 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(crate::healthz))
+        .merge(crate::auth::routes::router())
         .nest("/v1", v1)
         .layer(middleware::from_fn(
             crate::middleware::request_id::attach_request_id,

@@ -1,5 +1,8 @@
 //! Card references authored inside specs.
 
+use std::fmt;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 
 use crate::card::agent::AgentSpec;
@@ -68,6 +71,105 @@ impl From<CardRef> for AgentRef {
         Self::Card(card_ref)
     }
 }
+
+impl fmt::Display for CardRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}/{}/{}@{}",
+            self.space,
+            self.kind.wire_name(),
+            self.name,
+            self.version
+        )?;
+        if let Some(uid) = &self.uid {
+            write!(f, "#{uid}")?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for CardRef {
+    type Err = CardRefParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (head, uid) = match value.split_once('#') {
+            Some((head, uid)) => (head, Some(uid.parse().map_err(CardRefParseError::Uid)?)),
+            None => (value, None),
+        };
+        let (before_version, version) = head
+            .rsplit_once('@')
+            .ok_or(CardRefParseError::MissingVersion)?;
+        let mut parts = before_version.split('/');
+        let space = parts
+            .next()
+            .ok_or(CardRefParseError::MissingSpace)?
+            .parse()
+            .map_err(CardRefParseError::Space)?;
+        let kind = parts
+            .next()
+            .ok_or(CardRefParseError::MissingKind)
+            .and_then(parse_card_kind)?;
+        let name = parts
+            .next()
+            .ok_or(CardRefParseError::MissingName)?
+            .parse()
+            .map_err(CardRefParseError::Name)?;
+        if parts.next().is_some() {
+            return Err(CardRefParseError::TooManySegments);
+        }
+
+        Ok(Self {
+            kind,
+            name,
+            version: version.parse().map_err(CardRefParseError::Version)?,
+            space,
+            uid,
+        })
+    }
+}
+
+fn parse_card_kind(value: &str) -> Result<CardKind, CardRefParseError> {
+    CardKind::native()
+        .into_iter()
+        .find(|kind| kind.wire_name() == value)
+        .ok_or_else(|| CardRefParseError::Kind(value.to_owned()))
+}
+
+/// Card reference text parse error.
+#[derive(Debug, thiserror::Error)]
+pub enum CardRefParseError {
+    /// Missing space segment.
+    #[error("card ref is missing space")]
+    MissingSpace,
+    /// Missing kind segment.
+    #[error("card ref is missing kind")]
+    MissingKind,
+    /// Missing name segment.
+    #[error("card ref is missing name")]
+    MissingName,
+    /// Missing version suffix.
+    #[error("card ref is missing @version")]
+    MissingVersion,
+    /// Too many slash-delimited segments.
+    #[error("card ref must be space/kind/name@version[#uid]")]
+    TooManySegments,
+    /// Unknown card kind.
+    #[error("unknown card kind: {0}")]
+    Kind(String),
+    /// Space failed validation.
+    #[error("invalid space: {0}")]
+    Space(crate::ids::IdError),
+    /// Name failed validation.
+    #[error("invalid name: {0}")]
+    Name(crate::ids::IdError),
+    /// Version failed validation.
+    #[error("invalid version: {0}")]
+    Version(crate::version::VersionError),
+    /// UID failed validation.
+    #[error("invalid uid: {0}")]
+    Uid(crate::ids::IdError),
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,6 +182,23 @@ mod tests {
             space: SpaceName::new("prod").expect("static space is valid"),
             uid: None,
         }
+    }
+
+    #[test]
+    fn card_ref_display_and_from_str_roundtrip() {
+        let card_ref = CardRef {
+            kind: CardKind::Service,
+            name: CardName::new("billing").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("prod").expect("static space is valid"),
+            uid: None,
+        };
+
+        let text = card_ref.to_string();
+        let parsed: CardRef = text.parse().expect("card ref parses");
+
+        assert_eq!(text, "prod/Service/billing@1.0.0");
+        assert_eq!(parsed, card_ref);
     }
 
     #[test]

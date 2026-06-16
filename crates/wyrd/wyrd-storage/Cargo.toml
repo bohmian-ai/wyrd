@@ -49,5 +49,13 @@ tempfile = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
 
+[[test]]
+name = "integration_gcs"
+required-features = ["emulator"]
+
+[[test]]
+name = "integration_azurite"
+required-features = ["emulator"]
+
 [lints]
 workspace = true

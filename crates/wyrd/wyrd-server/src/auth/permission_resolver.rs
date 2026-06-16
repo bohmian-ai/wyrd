@@ -72,10 +72,17 @@ fn permissions_from_row(row: &RoleRow) -> Result<Vec<Permission>, ResolveError> 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::json;
-    use wyrd_runtime::Permission;
+    use wyrd_auth_verify::PermissionResolver;
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_runtime::{Permission, RoleRef};
     use wyrd_sql::queries::auth::RoleRow;
 
+    use crate::auth::seed::seed_builtin_roles_for_tenant;
+
+    use super::SqlPermissionResolver;
     use super::permission_set_from_rows;
 
     #[test]
@@ -114,5 +121,51 @@ mod tests {
             error.to_string().contains("bad_role"),
             "error should identify the corrupt role: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn resolved_set_matches_constant() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        seed_builtin_roles_for_tenant(&mut conn, tenant)
+            .await
+            .expect("builtin roles seed");
+        conn.commit().await.expect("seed transaction commits");
+        let resolver = SqlPermissionResolver::new(Arc::new(fixture.app_pool().clone()));
+
+        let set = resolver
+            .resolve(
+                &tenant,
+                &[RoleRef::new("agent").expect("role name is valid")],
+            )
+            .await
+            .expect("permissions resolve");
+
+        assert!(set.contains(&Permission::card_write()));
+        assert!(!set.contains(&Permission::trigger_write()));
+    }
+
+    #[tokio::test]
+    async fn runtime_admin_can_delegate() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        seed_builtin_roles_for_tenant(&mut conn, tenant)
+            .await
+            .expect("builtin roles seed");
+        conn.commit().await.expect("seed transaction commits");
+        let resolver = SqlPermissionResolver::new(Arc::new(fixture.app_pool().clone()));
+
+        let set = resolver
+            .resolve(
+                &tenant,
+                &[RoleRef::new("runtime_admin").expect("role name is valid")],
+            )
+            .await
+            .expect("permissions resolve");
+
+        assert!(set.contains(&Permission::delegation_issue()));
+        assert!(set.contains(&Permission::service_accounts_write()));
     }
 }

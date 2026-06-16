@@ -18,7 +18,8 @@ pub use ids::{UploadId, UploadIdParseError};
 pub use protocol::{WireProtocol, WireProtocolParseError};
 pub use upload::{
     AbortResponse, AzureBlockBlobComplete, GcsResumableComplete, HeaderPair,
-    IDEMPOTENCY_KEY_HEADER, PartUrlResponse, S3CompletedPart, S3MultipartComplete,
-    SinglePutComplete, UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest,
-    UploadInitResponse, UploadPlan, VerificationGuarantee, backend_verification_guarantee,
+    IDEMPOTENCY_KEY_HEADER, LocalBlobUploadResponse, PartUrlResponse, S3CompletedPart,
+    S3MultipartComplete, SinglePutComplete, UploadCompleteRequest, UploadCompleteResponse,
+    UploadInitRequest, UploadInitResponse, UploadPlan, VerificationGuarantee,
+    backend_verification_guarantee,
 };

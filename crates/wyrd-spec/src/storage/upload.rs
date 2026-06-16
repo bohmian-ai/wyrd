@@ -28,8 +28,8 @@ pub struct UploadInitRequest {
     /// Per-backend verification semantics:
     /// - **S3**: server-verified-against-client via `x-amz-checksum-sha256` at
     ///   multipart complete; S3 rejects the commit on mismatch.
-    /// - **GCS**: server-computed from stored object metadata; the server
-    ///   independently verifies the stored hash.
+    /// - **GCS**: client-declared; GCS stores CRC32c and MD5 only. The declared
+    ///   hash is recorded at init and trusted at complete.
     /// - **Azure**: client-declared only; no server-side SHA-256 recomputation
     ///   is available. SAS-restricted PUT and TLS prevent in-flight tampering.
     /// - **Local**: server-computed by streaming the on-disk file; the local
@@ -206,6 +206,15 @@ pub struct GcsResumableComplete {}
 pub struct AzureBlockBlobComplete {
     /// Number of blocks the client uploaded.
     pub block_count: u32,
+}
+
+/// Server response for a local-filesystem blob upload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct LocalBlobUploadResponse {
+    /// Whether the blob was written successfully.
+    pub uploaded: bool,
 }
 
 /// Server response after an upload completes.

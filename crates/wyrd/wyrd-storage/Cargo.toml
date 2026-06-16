@@ -11,6 +11,9 @@ description = "Server-tier storage handles and backend signers for Wyrd artifact
 [lib]
 path = "src/lib.rs"
 
+[features]
+emulator = []
+
 [dependencies]
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1" }
 wyrd-spec = { workspace = true }

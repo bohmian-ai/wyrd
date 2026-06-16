@@ -51,6 +51,7 @@ pub async fn build_signer(config: &AzureConfig) -> Result<AzureSigner, StorageEr
 /// # Errors
 /// Returns an error when the endpoint cannot be parsed or the container probe
 /// fails.
+#[cfg(any(test, feature = "emulator"))]
 pub fn build_emulator_signer(
     container: &str,
     azurite_endpoint: &str,

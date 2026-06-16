@@ -36,9 +36,9 @@ use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::run::{RunKind, RunRef};
 use wyrd_spec::storage::{
-    AbortResponse, DownloadInitRequest, DownloadInitResponse, DownloadPlan, PartUrlResponse,
-    UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest, UploadInitResponse,
-    UploadPlan, VerificationGuarantee, WireProtocol,
+    AbortResponse, DownloadInitRequest, DownloadInitResponse, DownloadPlan, LocalBlobUploadResponse,
+    PartUrlResponse, UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest,
+    UploadInitResponse, UploadPlan, VerificationGuarantee, WireProtocol,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -111,6 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<UploadCompleteResponse>(out, golden, "upload_complete_response")?;
     write::<PartUrlResponse>(out, golden, "part_url_response")?;
     write::<AbortResponse>(out, golden, "abort_response")?;
+    write::<LocalBlobUploadResponse>(out, golden, "local_blob_upload_response")?;
     write::<DownloadInitRequest>(out, golden, "download_init_request")?;
     write::<DownloadInitResponse>(out, golden, "download_init_response")?;
     write::<DownloadPlan>(out, golden, "download_plan")?;

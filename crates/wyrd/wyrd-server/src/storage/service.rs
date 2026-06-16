@@ -17,7 +17,7 @@ use wyrd_spec::error::storage::WyrdStorageError;
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::storage::{
     AbortResponse, AzureBlockBlobComplete, DownloadInitRequest, DownloadInitResponse, DownloadPlan,
-    PartUrlResponse, S3MultipartComplete, StorageBackendKind, StoredObjectRef,
+    IDEMPOTENCY_KEY_HEADER, PartUrlResponse, S3MultipartComplete, StorageBackendKind, StoredObjectRef,
     UploadCompleteRequest, UploadCompleteResponse, UploadId, UploadIdParseError, UploadInitRequest,
     UploadInitResponse, UploadPlan, WireProtocol,
 };
@@ -34,7 +34,6 @@ use crate::auth::Caller;
 use crate::storage::audit::{self, UploadAuditOperation};
 
 const INIT_TTL_SECS: u64 = 24 * 60 * 60;
-const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 
 struct InitReplay {
     upload_id: UploadId,

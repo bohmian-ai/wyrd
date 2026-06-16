@@ -10,8 +10,8 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use wyrd_spec::storage::{
-    AbortResponse, DownloadInitRequest, PartUrlResponse, UploadCompleteRequest, UploadId,
-    UploadInitRequest,
+    AbortResponse, DownloadInitRequest, LocalBlobUploadResponse, PartUrlResponse,
+    UploadCompleteRequest, UploadId, UploadInitRequest,
 };
 use wyrd_storage::BackendConfig;
 
@@ -98,11 +98,11 @@ async fn local_blob(
     caller: Caller,
     Path(path): Path<String>,
     body: Bytes,
-) -> Result<Json<serde_json::Value>, WyrdErrorResponse> {
+) -> Result<Json<LocalBlobUploadResponse>, WyrdErrorResponse> {
     service::upload_local_blob(&state, caller, path, body)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    Ok(Json(serde_json::json!({ "uploaded": true })))
+    Ok(Json(LocalBlobUploadResponse { uploaded: true }))
 }
 
 async fn download_init(

@@ -23,11 +23,11 @@ pub const SWEEPER_LEADER_LOCK_KEY: i64 = 0x5759_7264_5374_6f72_i64;
 /// Default interval between sweeper ticks.
 pub const DEFAULT_TICK: Duration = Duration::from_mins(1);
 /// Default maximum multipart rows processed per tick.
-pub const DEFAULT_BATCH_SIZE: i64 = 100;
+pub const DEFAULT_BATCH_SIZE: u64 = 100;
 /// Default age after which `initiating` rows are treated as orphaned.
 pub const DEFAULT_INIT_GRACE: Duration = Duration::from_secs(30);
 /// Default maximum idempotency rows deleted per tick.
-pub const DEFAULT_IDEMPOTENCY_BATCH_SIZE: i64 = 500;
+pub const DEFAULT_IDEMPOTENCY_BATCH_SIZE: u64 = 500;
 
 const ENV_ENABLED: &str = "WYRD_STORAGE_SWEEPER_ENABLED";
 const ENV_TICK_SECS: &str = "WYRD_STORAGE_SWEEPER_TICK_SECS";
@@ -66,7 +66,7 @@ impl SweeperConfig {
             ),
             batch_size: parse_clamped_i64(
                 ENV_BATCH_SIZE,
-                DEFAULT_BATCH_SIZE as u64,
+                DEFAULT_BATCH_SIZE,
                 1,
                 1000,
             )?,
@@ -77,7 +77,7 @@ impl SweeperConfig {
             ),
             idempotency_batch_size: parse_clamped_i64(
                 ENV_IDEMPOTENCY_BATCH_SIZE,
-                DEFAULT_IDEMPOTENCY_BATCH_SIZE as u64,
+                DEFAULT_IDEMPOTENCY_BATCH_SIZE,
                 1,
                 5000,
             )?,
@@ -90,9 +90,9 @@ impl Default for SweeperConfig {
         Self {
             enabled: true,
             tick: DEFAULT_TICK,
-            batch_size: DEFAULT_BATCH_SIZE,
+            batch_size: DEFAULT_BATCH_SIZE as i64,
             init_grace: DEFAULT_INIT_GRACE,
-            idempotency_batch_size: DEFAULT_IDEMPOTENCY_BATCH_SIZE,
+            idempotency_batch_size: DEFAULT_IDEMPOTENCY_BATCH_SIZE as i64,
         }
     }
 }
@@ -407,9 +407,9 @@ mod tests {
 
             assert!(cfg.enabled);
             assert_eq!(cfg.tick, DEFAULT_TICK);
-            assert_eq!(cfg.batch_size, DEFAULT_BATCH_SIZE);
+            assert_eq!(cfg.batch_size, DEFAULT_BATCH_SIZE as i64);
             assert_eq!(cfg.init_grace, DEFAULT_INIT_GRACE);
-            assert_eq!(cfg.idempotency_batch_size, DEFAULT_IDEMPOTENCY_BATCH_SIZE);
+            assert_eq!(cfg.idempotency_batch_size, DEFAULT_IDEMPOTENCY_BATCH_SIZE as i64);
         });
     }
 

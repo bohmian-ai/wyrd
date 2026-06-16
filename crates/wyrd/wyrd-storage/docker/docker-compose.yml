@@ -1,9 +1,6 @@
 services:
-  # Image pins audited 2026-06-15. To add SHA256 digests after initial pull:
-  #   docker inspect --format='{{index .RepoDigests 0}}' <image>:<tag>
-  # then append @sha256:<digest> to each image line.
   minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
     container_name: wyrd-storage-minio
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
@@ -24,7 +21,7 @@ services:
       - ./setup-buckets.sh:/setup/setup-buckets.sh:ro
 
   fake-gcs-server:
-    image: fsouza/fake-gcs-server:1.50.2
+    image: fsouza/fake-gcs-server:1.50.2@sha256:23996047676fe5312001b828d800670519181c57a5943c2270e7421f3ab3f477
     container_name: wyrd-storage-gcs
     command:
       - "-scheme"
@@ -41,7 +38,7 @@ services:
       - gcs-data:/data
 
   azurite:
-    image: mcr.microsoft.com/azure-storage/azurite:3.34.0
+    image: mcr.microsoft.com/azure-storage/azurite:3.34.0@sha256:0a47e12e3693483cef5c71f35468b91d751611f172d2f97414e9c69113b106d9
     container_name: wyrd-storage-azurite
     command: ["azurite-blob", "--blobHost", "0.0.0.0", "--blobPort", "10000"]
     ports:

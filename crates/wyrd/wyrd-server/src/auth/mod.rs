@@ -1,6 +1,7 @@
 //! Authentication extractors for Wyrd HTTP handlers.
 
 pub mod caller_extractor;
+pub mod permission_resolver;
 pub mod principal_extractor;
 
 pub use caller_extractor::Caller;

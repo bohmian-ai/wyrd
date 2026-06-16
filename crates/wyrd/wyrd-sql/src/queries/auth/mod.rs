@@ -11,3 +11,5 @@ pub mod governance_tokens;
 pub mod refresh_tokens;
 pub mod roles;
 pub mod users;
+
+pub use roles::{RoleRow, roles_by_name};

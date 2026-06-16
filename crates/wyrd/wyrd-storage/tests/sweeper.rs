@@ -83,6 +83,49 @@ async fn tick_sweeps_expired_uploads_and_reaps_idempotency_rows() {
     assert_idempotency_count(&admin_pool, "live-key", 1).await;
 }
 
+#[tokio::test]
+async fn sweeper_skips_audit_when_upload_already_completed() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let admin_pool = fixture.platform_admin_pool().clone();
+    let tenant = fixture.data_tenant_id();
+    let handle = local_storage_handle().await;
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let sweeper = Sweeper::new(
+        handle,
+        admin_pool.clone(),
+        SweeperConfig {
+            enabled: true,
+            tick: Duration::from_mins(1),
+            batch_size: 10,
+            init_grace: Duration::from_secs(30),
+            idempotency_batch_size: 10,
+        },
+        shutdown_rx,
+    );
+
+    let upload_id = insert_upload(
+        fixture.app_pool(),
+        tenant,
+        "completed.bin",
+        "pending",
+        -3600,
+        -60,
+    )
+    .await;
+
+    sqlx::query(
+        "UPDATE wyrd.storage_multipart_uploads SET status = 'completed' WHERE id = $1",
+    )
+    .bind(upload_id)
+    .execute(&admin_pool)
+    .await
+    .expect("force-complete upload");
+
+    sweeper.tick().await.expect("tick runs");
+
+    assert_audit_count(&admin_pool, tenant, 0).await;
+}
+
 async fn local_storage_handle() -> std::sync::Arc<StorageHandle> {
     let root = tempfile::tempdir().expect("temp dir").keep();
     StorageHandle::from_settings(StorageSettings {

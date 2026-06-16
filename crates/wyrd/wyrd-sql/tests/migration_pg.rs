@@ -387,6 +387,12 @@ async fn storage_queries_round_trip_under_tenant_conn() {
         assert_eq!(cached.status, 200);
         assert_eq!(cached.seed.storage_path, storage_path);
 
+        let conflict = storage::idempotency::get(&mut conn, "idem-key", &[8_u8; 32]).await;
+        assert!(
+            matches!(conflict, Err(wyrd_sql::SqlError::Conflict { .. })),
+            "idempotency key reused with different body must return SqlError::Conflict, got {conflict:?}"
+        );
+
         conn.commit().await.expect("storage transaction commits");
     }
 

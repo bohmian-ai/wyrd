@@ -467,3 +467,110 @@ async fn abort_of_already_aborted_upload_returns_aborted_false() {
 
     cleanup_tenant(&setup_pool, tenant).await;
 }
+
+#[tokio::test]
+#[cfg(feature = "stub-auth")]
+async fn reinit_to_same_path_after_completion_succeeds() {
+    if skip_unless_e2e() {
+        return;
+    }
+    let Some(migrator_url) = migrator_url() else {
+        eprintln!("skipping: WYRD_DATABASE_URL_MIGRATOR not set");
+        return;
+    };
+
+    let setup_pool = SqlStore::connect(&migrator_url, 2)
+        .await
+        .expect("migrator pool")
+        .pool()
+        .clone();
+
+    let tenant = DataTenantId::new_v7();
+    setup_tenant(&setup_pool, tenant).await;
+
+    let root = tempfile::tempdir().expect("temp dir");
+    let state = local_app_state(root.path()).await;
+
+    let content = b"checkpoint payload v1";
+    let card_uid = CardUid::new(FIXED_CARD_UID).expect("card uid");
+    let relative_path = "model/checkpoint.bin".to_owned();
+
+    let init_body = || {
+        serde_json::to_vec(&UploadInitRequest {
+            card_uid: card_uid.clone(),
+            relative_path: relative_path.clone(),
+            expected_sha256: sha256_b64(content),
+            expected_size_bytes: content.len() as u64,
+            content_type: None,
+        })
+        .expect("body serializes")
+    };
+
+    let first_init = build_router(state.clone())
+        .oneshot(auth_request(
+            "POST",
+            "/v1/cards/upload/init",
+            tenant,
+            init_body(),
+            Some("application/json"),
+        ))
+        .await
+        .expect("router responds");
+    assert_eq!(first_init.status(), StatusCode::OK);
+    let first_bytes = to_bytes(first_init.into_body(), usize::MAX).await.unwrap();
+    let first: wyrd_spec::storage::UploadInitResponse =
+        serde_json::from_slice(&first_bytes).unwrap();
+    let first_upload_id = first.upload_id.clone();
+
+    let UploadPlan::LocalFs { put_url, .. } = &first.plan else {
+        panic!("expected LocalFs plan");
+    };
+    let put_path = local_path(put_url).to_owned();
+
+    let put = build_router(state.clone())
+        .oneshot(auth_request("PUT", &put_path, tenant, content.to_vec(), None))
+        .await
+        .expect("router responds");
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let complete_body = serde_json::to_vec(&UploadCompleteRequest::SinglePut(
+        SinglePutComplete {},
+    ))
+    .expect("complete body");
+    let complete = build_router(state.clone())
+        .oneshot(auth_request(
+            "POST",
+            &format!("/v1/cards/upload/{first_upload_id}/complete"),
+            tenant,
+            complete_body,
+            Some("application/json"),
+        ))
+        .await
+        .expect("router responds");
+    assert_eq!(complete.status(), StatusCode::OK);
+
+    let second_init = build_router(state.clone())
+        .oneshot(auth_request(
+            "POST",
+            "/v1/cards/upload/init",
+            tenant,
+            init_body(),
+            Some("application/json"),
+        ))
+        .await
+        .expect("router responds");
+    assert_eq!(
+        second_init.status(),
+        StatusCode::OK,
+        "re-init to a completed path must succeed, not 409"
+    );
+    let second_bytes = to_bytes(second_init.into_body(), usize::MAX).await.unwrap();
+    let second: wyrd_spec::storage::UploadInitResponse =
+        serde_json::from_slice(&second_bytes).unwrap();
+    assert_ne!(
+        second.upload_id, first_upload_id,
+        "re-init must issue a new upload_id"
+    );
+
+    cleanup_tenant(&setup_pool, tenant).await;
+}

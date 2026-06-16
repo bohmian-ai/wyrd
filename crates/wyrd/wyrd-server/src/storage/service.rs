@@ -459,7 +459,14 @@ pub async fn upload_abort(
     let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
-    let row = load_pending_upload(&mut conn, upload_uuid).await?;
+    let row = load_upload(&mut conn, upload_uuid).await?;
+    if matches!(
+        row.status,
+        UploadStatus::Aborted | UploadStatus::Completed | UploadStatus::Failed
+    ) {
+        conn.commit().await.map_err(map_sql_error)?;
+        return Ok(AbortResponse { aborted: false });
+    }
     let validated =
         tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
     conn.commit().await.map_err(map_sql_error)?;

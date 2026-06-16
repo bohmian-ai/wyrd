@@ -5809,6 +5809,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ulid"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
+dependencies = [
+ "rand 0.9.4",
+ "web-time",
+]
+
+[[package]]
 name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6549,7 +6559,10 @@ dependencies = [
  "secrecy",
  "serde",
  "thiserror 2.0.18",
+ "tracing",
+ "ulid",
  "wyrd-auth-verify",
+ "wyrd-runtime",
  "wyrd-spec",
  "zeroize",
 ]
@@ -6561,6 +6574,7 @@ dependencies = [
  "jsonwebtoken 9.3.1",
  "serde",
  "thiserror 2.0.18",
+ "wyrd-runtime",
  "wyrd-spec",
 ]
 

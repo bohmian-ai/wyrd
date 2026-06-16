@@ -2,13 +2,12 @@
 
 #![deny(missing_docs)]
 
-use std::collections::BTreeSet;
-
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use wyrd_spec::actor::Actor;
-use wyrd_spec::authz::{Principal, Scope};
+use wyrd_runtime::{Principal, PrincipalId, PrincipalKind, RoleRef};
+use wyrd_spec::DataTenantId;
+use wyrd_spec::reference::CardRef;
 
 /// Authentication helper errors.
 #[derive(Debug, thiserror::Error)]
@@ -19,30 +18,105 @@ pub enum AuthError {
 }
 
 /// Resolved Wyrd access-token claims.
-///
-/// The token carries the authenticated subject and its resolved scopes so
-/// verification can reconstruct a principal without a runtime lookup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessTokenClaims {
-    /// Subject id, JWT `sub`.
+    /// Ultimate initiator, JWT `sub`.
     pub sub: String,
-    /// Full authenticated identity.
-    pub actor: Actor,
-    /// Scopes resolved from the subject's roles at issue time.
-    pub scopes: BTreeSet<Scope>,
+    /// Current actor whose roles are evaluated for authorization.
+    pub principal: PrincipalRef,
+    /// Roles assigned to the current actor at issue time.
+    pub roles: Vec<RoleRef>,
+    /// RFC 8693 actor chain for delegated tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<Box<ActClaim>>,
     /// Expiry as Unix seconds, JWT `exp`.
     pub exp: usize,
     /// Issued-at as Unix seconds, JWT `iat`.
     pub iat: usize,
     /// Issuer, JWT `iss`.
     pub iss: String,
+    /// Token identifier.
+    pub jti: String,
 }
 
-impl AccessTokenClaims {
-    /// Build a runtime principal from verified claims.
-    #[must_use]
-    pub fn to_principal(&self) -> Principal {
-        Principal::new(self.actor.clone(), self.scopes.clone())
+/// One layer of an RFC 8693 `act` delegation chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActClaim {
+    /// Subject at this delegation layer.
+    pub sub: String,
+    /// Principal at this delegation layer.
+    pub principal: PrincipalRef,
+    /// Next older delegation layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<Box<ActClaim>>,
+}
+
+/// Wire-side projection of a runtime principal safe to embed in JWT claims.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalRef {
+    /// Stable principal id.
+    pub id: PrincipalId,
+    /// Principal kind without inline runtime payloads.
+    pub kind: PrincipalKindWire,
+    /// Tenant isolation key.
+    pub tenant_id: DataTenantId,
+    /// Bound card reference for Service and Agent principals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_ref: Option<CardRef>,
+}
+
+/// Principal kind discriminant used in token claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalKindWire {
+    /// Human user identity.
+    User,
+    /// Card-bound service identity.
+    Service,
+    /// Card-bound agent identity.
+    Agent,
+}
+
+/// Refresh-token claims for any principal kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshTokenClaims {
+    /// Subject id, equal to `principal_id`.
+    pub sub: String,
+    /// Principal kind.
+    pub principal_kind: PrincipalKindWire,
+    /// Stable principal id.
+    pub principal_id: PrincipalId,
+    /// Tenant isolation key.
+    pub tenant_id: DataTenantId,
+    /// Expiry as Unix seconds, JWT `exp`.
+    pub exp: usize,
+    /// Issued-at as Unix seconds, JWT `iat`.
+    pub iat: usize,
+    /// Issuer, JWT `iss`.
+    pub iss: String,
+    /// Token identifier.
+    pub jti: String,
+}
+
+impl From<&Principal> for PrincipalRef {
+    fn from(principal: &Principal) -> Self {
+        let (kind, card_ref) = match &principal.kind {
+            PrincipalKind::User => (PrincipalKindWire::User, None),
+            PrincipalKind::Service { card_ref } => {
+                (PrincipalKindWire::Service, Some(card_ref.clone()))
+            }
+            PrincipalKind::Agent { card_ref } => (PrincipalKindWire::Agent, Some(card_ref.clone())),
+        };
+        Self {
+            id: principal.id,
+            kind,
+            tenant_id: principal.tenant_id,
+            card_ref,
+        }
     }
 }
 
@@ -103,14 +177,18 @@ pub fn public_key_from_pem(pem: &[u8]) -> Result<DecodingKey, AuthError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use jsonwebtoken::{Algorithm, EncodingKey, Header, Validation, encode};
-    use wyrd_spec::authz::Scope;
-    use wyrd_spec::ids::CardUid;
+    use wyrd_runtime::{Principal, PrincipalId, PrincipalKind, RoleRef};
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::version::VersionBlock;
 
-    use super::verify_eddsa_with;
-    use super::{AccessTokenClaims, decode_kid, public_key_from_pem, verify_eddsa};
+    use super::{
+        AccessTokenClaims, PrincipalKindWire, PrincipalRef, decode_kid, public_key_from_pem,
+        verify_eddsa, verify_eddsa_with,
+    };
 
     const PRIVATE_KEY_PEM: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -123,18 +201,30 @@ mod tests {
             .expect("valid token verifies");
 
         assert_eq!(decoded.sub, claims.sub);
-        assert_eq!(decoded.actor, claims.actor);
-        assert_eq!(decoded.scopes, claims.scopes);
+        assert_eq!(decoded.principal, claims.principal);
+        assert_eq!(decoded.roles, claims.roles);
+        assert_eq!(decoded.jti, claims.jti);
     }
 
     #[test]
-    fn to_principal_carries_actor_and_scopes() {
-        let claims = claims_with_times(now() + 3_600, now());
-        let principal = claims.to_principal();
+    fn principal_ref_projects_runtime_principal() {
+        let card_ref = card_ref(CardKind::Service);
+        let principal = Principal::new(
+            principal_id(),
+            PrincipalKind::Service {
+                card_ref: card_ref.clone(),
+            },
+            tenant_id(),
+            vec![role()],
+            wyrd_runtime::PermissionSet::new(),
+        );
 
-        assert_eq!(principal.actor, claims.actor);
-        assert_eq!(principal.scopes, claims.scopes);
-        assert!(principal.has_all(claims.scopes));
+        let projected = PrincipalRef::from(&principal);
+
+        assert_eq!(projected.id, principal.id);
+        assert_eq!(projected.kind, PrincipalKindWire::Service);
+        assert_eq!(projected.tenant_id, principal.tenant_id);
+        assert_eq!(projected.card_ref, Some(card_ref));
     }
 
     #[test]
@@ -191,19 +281,20 @@ mod tests {
     }
 
     fn claims_with_times(exp: usize, iat: usize) -> AccessTokenClaims {
-        let actor = wyrd_spec::actor::Actor::User {
-            id: CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
-                .expect("test fixture uses a UUIDv7"),
-            email: "user@example.com".to_owned(),
-        };
-
         AccessTokenClaims {
-            sub: "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00".to_owned(),
-            actor,
-            scopes: BTreeSet::from([Scope::CardRead, Scope::CardWrite]),
+            sub: principal_id().to_string(),
+            principal: PrincipalRef {
+                id: principal_id(),
+                kind: PrincipalKindWire::User,
+                tenant_id: tenant_id(),
+                card_ref: None,
+            },
+            roles: vec![role()],
+            act: None,
             exp,
             iat,
             iss: "wyrd".to_owned(),
+            jti: "01K00000000000000000000000".to_owned(),
         }
     }
 
@@ -226,6 +317,32 @@ mod tests {
             &EncodingKey::from_secret(b"secret"),
         )
         .expect("test token signs")
+    }
+
+    fn card_ref(kind: CardKind) -> CardRef {
+        CardRef {
+            kind,
+            name: CardName::new("billing").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("prod").expect("static space is valid"),
+            uid: None,
+        }
+    }
+
+    fn principal_id() -> PrincipalId {
+        "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00"
+            .parse()
+            .expect("static principal id is valid")
+    }
+
+    fn tenant_id() -> DataTenantId {
+        "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
+            .parse()
+            .expect("static tenant id is valid")
+    }
+
+    fn role() -> RoleRef {
+        RoleRef::new("runtime_admin").expect("static role is valid")
     }
 
     fn now() -> usize {

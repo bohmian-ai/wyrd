@@ -11,3 +11,4 @@ jsonwebtoken = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
+wyrd-runtime = { workspace = true }

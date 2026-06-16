@@ -15,6 +15,9 @@ chrono = { workspace = true }
 argon2 = { workspace = true }
 password-hash = { workspace = true }
 secrecy = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
 zeroize = { workspace = true }
 wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
 wyrd-auth-verify = { workspace = true }
+wyrd-runtime = { workspace = true }

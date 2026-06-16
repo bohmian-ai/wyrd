@@ -51,9 +51,8 @@ use skald_spec::wire::openai_responses::{
     OpenAiReasoning, OpenAiReasoningSummary, OpenAiResponseContentPart, OpenAiResponseItem,
     OpenAiResponsesAllowedToolsChoice, OpenAiResponsesAllowedToolsKind,
     OpenAiResponsesAllowedToolsMode, OpenAiResponsesCustomToolChoice,
-    OpenAiResponsesCustomToolFormat, OpenAiResponsesFunctionToolChoice,
-    OpenAiResponsesFunctionToolKind, OpenAiResponsesGrammar, OpenAiResponsesGrammarSyntax,
-    OpenAiResponsesHostedToolChoice, OpenAiResponsesHostedToolKind,
+    OpenAiResponsesFunctionToolChoice, OpenAiResponsesFunctionToolKind, OpenAiResponsesGrammar,
+    OpenAiResponsesGrammarSyntax, OpenAiResponsesHostedToolChoice, OpenAiResponsesHostedToolKind,
     OpenAiResponsesInputTokensDetails, OpenAiResponsesMcpToolChoice, OpenAiResponsesMcpToolKind,
     OpenAiResponsesOutputTokensDetails, OpenAiResponsesRequest, OpenAiResponsesSettings,
     OpenAiResponsesText, OpenAiResponsesTool, OpenAiResponsesToolChoice,
@@ -154,41 +153,6 @@ impl PyProviderResponse {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Shared message source enum (Rule 5)
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-pub enum ChatMessageSource {
-    Request {
-        inner: Arc<ProviderRequest>,
-        index: usize,
-    },
-    Choice {
-        inner: Arc<ProviderResponse>,
-        choice_index: usize,
-    },
-}
-
-impl ChatMessageSource {
-    fn msg(&self) -> &OpenAiChatMessage {
-        match self {
-            Self::Request { inner, index } => match inner.as_ref() {
-                ProviderRequest::OpenAiChatCompletion(r) => &r.messages[*index],
-                ProviderRequest::OpenAiChatCompatible { request, .. } => &request.messages[*index],
-                _ => unreachable!(),
-            },
-            Self::Choice {
-                inner,
-                choice_index,
-            } => match inner.as_ref() {
-                ProviderResponse::OpenAiChatCompletion(r) => &r.choices[*choice_index].message,
-                _ => unreachable!(),
-            },
-        }
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // OpenAI Chat — request side
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -218,12 +182,11 @@ impl PyOpenAiChatRequest {
     }
     #[getter]
     fn messages(&self) -> Vec<PyOpenAiChatMessage> {
-        (0..self.req().messages.len())
-            .map(|i| PyOpenAiChatMessage {
-                src: ChatMessageSource::Request {
-                    inner: Arc::clone(&self.inner),
-                    index: i,
-                },
+        self.req()
+            .messages
+            .iter()
+            .map(|m| PyOpenAiChatMessage {
+                inner: Arc::new(m.clone()),
             })
             .collect()
     }
@@ -232,8 +195,8 @@ impl PyOpenAiChatRequest {
         self.req()
             .response_format
             .as_ref()
-            .map(|_| PyOpenAiResponseFormat {
-                inner: Arc::clone(&self.inner),
+            .map(|f| PyOpenAiResponseFormat {
+                inner: Arc::new(f.clone()),
             })
     }
     #[getter]
@@ -245,27 +208,31 @@ impl PyOpenAiChatRequest {
         self.req()
             .stream_options
             .as_ref()
-            .map(|_| PyOpenAiStreamOptions {
-                inner: Arc::clone(&self.inner),
+            .map(|s| PyOpenAiStreamOptions {
+                inner: Arc::new(s.clone()),
             })
     }
     #[getter]
     fn tools(&self) -> Vec<PyOpenAiTool> {
-        let n = self.req().tools.as_ref().map_or(0, |t| t.len());
-        (0..n)
-            .map(|i| PyOpenAiTool {
-                inner: Arc::clone(&self.inner),
-                index: i,
+        self.req()
+            .tools
+            .as_ref()
+            .map(|ts| {
+                ts.iter()
+                    .map(|t| PyOpenAiTool {
+                        inner: Arc::new(t.clone()),
+                    })
+                    .collect()
             })
-            .collect()
+            .unwrap_or_default()
     }
     #[getter]
     fn tool_choice(&self) -> Option<PyOpenAiChatToolChoice> {
         self.req()
             .tool_choice
             .as_ref()
-            .map(|_| PyOpenAiChatToolChoice {
-                inner: Arc::clone(&self.inner),
+            .map(|c| PyOpenAiChatToolChoice {
+                inner: Arc::new(c.clone()),
             })
     }
     #[getter]
@@ -320,8 +287,8 @@ impl PyOpenAiChatSettings {
     }
     #[getter]
     fn stop(&self) -> Option<PyOpenAiStop> {
-        self.s().stop.as_ref().map(|_| PyOpenAiStop {
-            inner: Arc::clone(&self.inner),
+        self.s().stop.as_ref().map(|stop| PyOpenAiStop {
+            inner: Arc::new(stop.clone()),
         })
     }
     #[getter]
@@ -367,8 +334,8 @@ impl PyOpenAiChatSettings {
     }
     #[getter]
     fn audio(&self) -> Option<PyOpenAiChatAudio> {
-        self.s().audio.as_ref().map(|_| PyOpenAiChatAudio {
-            inner: Arc::clone(&self.inner),
+        self.s().audio.as_ref().map(|audio| PyOpenAiChatAudio {
+            inner: Arc::new(audio.clone()),
         })
     }
     #[getter]
@@ -376,8 +343,8 @@ impl PyOpenAiChatSettings {
         self.s()
             .prediction
             .as_ref()
-            .map(|_| PyOpenAiPredictionContent {
-                inner: Arc::clone(&self.inner),
+            .map(|p| PyOpenAiPredictionContent {
+                inner: Arc::new(p.clone()),
             })
     }
     #[getter]
@@ -444,17 +411,11 @@ fn openai_response_modality_str(m: &OpenAiResponseModality) -> &'static str {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiStop")]
 pub struct PyOpenAiStop {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiStop>,
 }
 impl PyOpenAiStop {
     fn s(&self) -> &OpenAiStop {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => r.settings.stop.as_ref().expect("guarded"),
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                request.settings.stop.as_ref().expect("guarded")
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -485,17 +446,11 @@ impl PyOpenAiStop {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiChatAudio")]
 pub struct PyOpenAiChatAudio {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiChatAudio>,
 }
 impl PyOpenAiChatAudio {
     fn a(&self) -> &OpenAiChatAudio {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => r.settings.audio.as_ref().expect("guarded"),
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                request.settings.audio.as_ref().expect("guarded")
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -503,7 +458,7 @@ impl PyOpenAiChatAudio {
     #[getter]
     fn voice(&self) -> PyOpenAiVoice {
         PyOpenAiVoice {
-            inner: Arc::clone(&self.inner),
+            inner: Arc::new(self.inner.voice.clone()),
         }
     }
     #[getter]
@@ -524,19 +479,11 @@ impl PyOpenAiChatAudio {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiVoice")]
 pub struct PyOpenAiVoice {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiVoice>,
 }
 impl PyOpenAiVoice {
     fn v(&self) -> &OpenAiVoice {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => {
-                &r.settings.audio.as_ref().expect("guarded").voice
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                &request.settings.audio.as_ref().expect("guarded").voice
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -583,19 +530,11 @@ fn openai_built_in_voice_str(v: &OpenAiBuiltInVoice) -> &'static str {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiPredictionContent")]
 pub struct PyOpenAiPredictionContent {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiPredictionContent>,
 }
 impl PyOpenAiPredictionContent {
     fn p(&self) -> &OpenAiPredictionContent {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => {
-                r.settings.prediction.as_ref().expect("guarded")
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                request.settings.prediction.as_ref().expect("guarded")
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -609,7 +548,7 @@ impl PyOpenAiPredictionContent {
     #[getter]
     fn content(&self) -> PyOpenAiPredictionPayload {
         PyOpenAiPredictionPayload {
-            inner: Arc::clone(&self.inner),
+            inner: Arc::new(self.inner.content.clone()),
         }
     }
     fn __repr__(&self) -> String {
@@ -619,32 +558,11 @@ impl PyOpenAiPredictionContent {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiPredictionPayload")]
 pub struct PyOpenAiPredictionPayload {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiPredictionPayload>,
 }
 impl PyOpenAiPredictionPayload {
     fn p(&self) -> &OpenAiPredictionPayload {
-        &self
-            .inner
-            .as_ref()
-            .prediction_ref()
-            .expect("guarded")
-            .content
-    }
-}
-
-// Helper trait to reach prediction content from the request
-trait PredictionRef {
-    fn prediction_ref(&self) -> Option<&OpenAiPredictionContent>;
-}
-impl PredictionRef for ProviderRequest {
-    fn prediction_ref(&self) -> Option<&OpenAiPredictionContent> {
-        match self {
-            ProviderRequest::OpenAiChatCompletion(r) => r.settings.prediction.as_ref(),
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                request.settings.prediction.as_ref()
-            }
-            _ => None,
-        }
+        &self.inner
     }
 }
 
@@ -665,10 +583,10 @@ impl PyOpenAiPredictionPayload {
     }
     fn as_parts(&self) -> CardPyResult<Vec<PyOpenAiPredictionContentPart>> {
         match self.p() {
-            OpenAiPredictionPayload::Parts(ps) => Ok((0..ps.len())
-                .map(|i| PyOpenAiPredictionContentPart {
-                    inner: Arc::clone(&self.inner),
-                    index: i,
+            OpenAiPredictionPayload::Parts(ps) => Ok(ps
+                .iter()
+                .map(|p| PyOpenAiPredictionContentPart {
+                    inner: Arc::new(p.clone()),
                 })
                 .collect()),
             _ => Err(wrong_variant("parts", self.kind()).into()),
@@ -681,15 +599,11 @@ impl PyOpenAiPredictionPayload {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiPredictionContentPart")]
 pub struct PyOpenAiPredictionContentPart {
-    inner: Arc<ProviderRequest>,
-    index: usize,
+    inner: Arc<OpenAiPredictionContentPart>,
 }
 impl PyOpenAiPredictionContentPart {
     fn p(&self) -> &OpenAiPredictionContentPart {
-        match self.inner.prediction_ref().expect("guarded").content {
-            OpenAiPredictionPayload::Parts(ref ps) => &ps[self.index],
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -712,17 +626,11 @@ impl PyOpenAiPredictionContentPart {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiStreamOptions")]
 pub struct PyOpenAiStreamOptions {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiStreamOptions>,
 }
 impl PyOpenAiStreamOptions {
     fn s(&self) -> &OpenAiStreamOptions {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => r.stream_options.as_ref().expect("guarded"),
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                request.stream_options.as_ref().expect("guarded")
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -742,19 +650,11 @@ impl PyOpenAiStreamOptions {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponseFormat")]
 pub struct PyOpenAiResponseFormat {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiResponseFormat>,
 }
 impl PyOpenAiResponseFormat {
     fn f(&self) -> &OpenAiResponseFormat {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => {
-                r.response_format.as_ref().expect("guarded")
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                request.response_format.as_ref().expect("guarded")
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -769,8 +669,8 @@ impl PyOpenAiResponseFormat {
     }
     fn as_json_schema(&self) -> CardPyResult<PyOpenAiJsonSchema> {
         match self.f() {
-            OpenAiResponseFormat::JsonSchema { .. } => Ok(PyOpenAiJsonSchema {
-                inner: Arc::clone(&self.inner),
+            OpenAiResponseFormat::JsonSchema { json_schema } => Ok(PyOpenAiJsonSchema {
+                inner: Arc::new(json_schema.clone()),
             }),
             _ => Err(wrong_variant("json_schema", self.kind()).into()),
         }
@@ -782,25 +682,11 @@ impl PyOpenAiResponseFormat {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiJsonSchema")]
 pub struct PyOpenAiJsonSchema {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<skald_spec::wire::openai_chat::OpenAiJsonSchema>,
 }
 impl PyOpenAiJsonSchema {
     fn s(&self) -> &skald_spec::wire::openai_chat::OpenAiJsonSchema {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => {
-                match r.response_format.as_ref().expect("guarded") {
-                    OpenAiResponseFormat::JsonSchema { json_schema } => json_schema,
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match request.response_format.as_ref().expect("guarded") {
-                    OpenAiResponseFormat::JsonSchema { json_schema } => json_schema,
-                    _ => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -835,20 +721,11 @@ impl PyOpenAiJsonSchema {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiTool")]
 pub struct PyOpenAiTool {
-    inner: Arc<ProviderRequest>,
-    index: usize,
+    inner: Arc<OpenAiTool>,
 }
 impl PyOpenAiTool {
     fn t(&self) -> &OpenAiTool {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => {
-                &r.tools.as_ref().expect("guarded")[self.index]
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                &request.tools.as_ref().expect("guarded")[self.index]
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -862,18 +739,16 @@ impl PyOpenAiTool {
     }
     fn as_function(&self) -> CardPyResult<PyOpenAiFunction> {
         match self.t() {
-            OpenAiTool::Function { .. } => Ok(PyOpenAiFunction {
-                inner: Arc::clone(&self.inner),
-                tool_index: self.index,
+            OpenAiTool::Function { function } => Ok(PyOpenAiFunction {
+                inner: Arc::new(function.clone()),
             }),
             _ => Err(wrong_variant("function", self.kind()).into()),
         }
     }
     fn as_custom_tool(&self) -> CardPyResult<PyOpenAiCustomTool> {
         match self.t() {
-            OpenAiTool::Custom { .. } => Ok(PyOpenAiCustomTool {
-                inner: Arc::clone(&self.inner),
-                tool_index: self.index,
+            OpenAiTool::Custom { custom } => Ok(PyOpenAiCustomTool {
+                inner: Arc::new(custom.clone()),
             }),
             _ => Err(wrong_variant("custom", self.kind()).into()),
         }
@@ -885,26 +760,11 @@ impl PyOpenAiTool {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiFunction")]
 pub struct PyOpenAiFunction {
-    inner: Arc<ProviderRequest>,
-    tool_index: usize,
+    inner: Arc<skald_spec::wire::openai_chat::OpenAiFunction>,
 }
 impl PyOpenAiFunction {
     fn f(&self) -> &skald_spec::wire::openai_chat::OpenAiFunction {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => {
-                match &r.tools.as_ref().expect("guarded")[self.tool_index] {
-                    OpenAiTool::Function { function } => function,
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match &request.tools.as_ref().expect("guarded")[self.tool_index] {
-                    OpenAiTool::Function { function } => function,
-                    _ => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -939,26 +799,11 @@ impl PyOpenAiFunction {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiCustomTool")]
 pub struct PyOpenAiCustomTool {
-    inner: Arc<ProviderRequest>,
-    tool_index: usize,
+    inner: Arc<OpenAiCustomTool>,
 }
 impl PyOpenAiCustomTool {
     fn c(&self) -> &OpenAiCustomTool {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => {
-                match &r.tools.as_ref().expect("guarded")[self.tool_index] {
-                    OpenAiTool::Custom { custom } => custom,
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match &request.tools.as_ref().expect("guarded")[self.tool_index] {
-                    OpenAiTool::Custom { custom } => custom,
-                    _ => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -973,9 +818,8 @@ impl PyOpenAiCustomTool {
     }
     #[getter]
     fn format(&self) -> Option<PyOpenAiCustomToolFormat> {
-        self.c().format.as_ref().map(|_| PyOpenAiCustomToolFormat {
-            inner: Arc::clone(&self.inner),
-            tool_index: self.tool_index,
+        self.c().format.as_ref().map(|f| PyOpenAiCustomToolFormat {
+            inner: Arc::new(f.clone()),
         })
     }
     fn __repr__(&self) -> String {
@@ -985,26 +829,11 @@ impl PyOpenAiCustomTool {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiCustomToolFormat")]
 pub struct PyOpenAiCustomToolFormat {
-    inner: Arc<ProviderRequest>,
-    tool_index: usize,
+    inner: Arc<OpenAiCustomToolFormat>,
 }
 impl PyOpenAiCustomToolFormat {
     fn f(&self) -> &OpenAiCustomToolFormat {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => {
-                match &r.tools.as_ref().expect("guarded")[self.tool_index] {
-                    OpenAiTool::Custom { custom } => custom.format.as_ref().expect("guarded"),
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match &request.tools.as_ref().expect("guarded")[self.tool_index] {
-                    OpenAiTool::Custom { custom } => custom.format.as_ref().expect("guarded"),
-                    _ => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -1018,9 +847,8 @@ impl PyOpenAiCustomToolFormat {
     }
     fn as_grammar(&self) -> CardPyResult<PyOpenAiGrammar> {
         match self.f() {
-            OpenAiCustomToolFormat::Grammar { .. } => Ok(PyOpenAiGrammar {
-                inner: Arc::clone(&self.inner),
-                tool_index: self.tool_index,
+            OpenAiCustomToolFormat::Grammar { grammar } => Ok(PyOpenAiGrammar {
+                inner: Arc::new(grammar.clone()),
             }),
             _ => Err(wrong_variant("grammar", self.kind()).into()),
         }
@@ -1032,33 +860,11 @@ impl PyOpenAiCustomToolFormat {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiGrammar")]
 pub struct PyOpenAiGrammar {
-    inner: Arc<ProviderRequest>,
-    tool_index: usize,
+    inner: Arc<OpenAiGrammar>,
 }
 impl PyOpenAiGrammar {
     fn g(&self) -> &OpenAiGrammar {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => match &r.tools.as_ref().expect("guarded")
-                [self.tool_index]
-            {
-                OpenAiTool::Custom { custom } => match custom.format.as_ref().expect("guarded") {
-                    OpenAiCustomToolFormat::Grammar { grammar } => grammar,
-                    OpenAiCustomToolFormat::Text => unreachable!(),
-                },
-                OpenAiTool::Function { .. } => unreachable!(),
-            },
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match &request.tools.as_ref().expect("guarded")[self.tool_index] {
-                    OpenAiTool::Custom { custom } => match custom.format.as_ref().expect("guarded")
-                    {
-                        OpenAiCustomToolFormat::Grammar { grammar } => grammar,
-                        OpenAiCustomToolFormat::Text => unreachable!(),
-                    },
-                    OpenAiTool::Function { .. } => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -1081,17 +887,11 @@ impl PyOpenAiGrammar {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiChatToolChoice")]
 pub struct PyOpenAiChatToolChoice {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiChatToolChoice>,
 }
 impl PyOpenAiChatToolChoice {
     fn c(&self) -> &OpenAiChatToolChoice {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => r.tool_choice.as_ref().expect("guarded"),
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                request.tool_choice.as_ref().expect("guarded")
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -1117,24 +917,24 @@ impl PyOpenAiChatToolChoice {
     }
     fn as_allowed(&self) -> CardPyResult<PyOpenAiAllowedToolsChoice> {
         match self.c() {
-            OpenAiChatToolChoice::Allowed(_) => Ok(PyOpenAiAllowedToolsChoice {
-                inner: Arc::clone(&self.inner),
+            OpenAiChatToolChoice::Allowed(a) => Ok(PyOpenAiAllowedToolsChoice {
+                inner: Arc::new(a.clone()),
             }),
             _ => Err(wrong_variant("allowed", self.kind()).into()),
         }
     }
     fn as_function_choice(&self) -> CardPyResult<PyOpenAiNamedFunctionToolChoice> {
         match self.c() {
-            OpenAiChatToolChoice::Function(_) => Ok(PyOpenAiNamedFunctionToolChoice {
-                inner: Arc::clone(&self.inner),
+            OpenAiChatToolChoice::Function(f) => Ok(PyOpenAiNamedFunctionToolChoice {
+                inner: Arc::new(f.clone()),
             }),
             _ => Err(wrong_variant("function", self.kind()).into()),
         }
     }
     fn as_custom_choice(&self) -> CardPyResult<PyOpenAiNamedCustomToolChoice> {
         match self.c() {
-            OpenAiChatToolChoice::Custom(_) => Ok(PyOpenAiNamedCustomToolChoice {
-                inner: Arc::clone(&self.inner),
+            OpenAiChatToolChoice::Custom(c) => Ok(PyOpenAiNamedCustomToolChoice {
+                inner: Arc::new(c.clone()),
             }),
             _ => Err(wrong_variant("custom", self.kind()).into()),
         }
@@ -1146,25 +946,11 @@ impl PyOpenAiChatToolChoice {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiAllowedToolsChoice")]
 pub struct PyOpenAiAllowedToolsChoice {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiAllowedToolsChoice>,
 }
 impl PyOpenAiAllowedToolsChoice {
     fn a(&self) -> &OpenAiAllowedToolsChoice {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => {
-                match r.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Allowed(a) => a,
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match request.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Allowed(a) => a,
-                    _ => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -1178,7 +964,7 @@ impl PyOpenAiAllowedToolsChoice {
     #[getter]
     fn allowed_tools(&self) -> PyOpenAiAllowedTools {
         PyOpenAiAllowedTools {
-            inner: Arc::clone(&self.inner),
+            inner: Arc::new(self.inner.allowed_tools.clone()),
         }
     }
     fn __repr__(&self) -> String {
@@ -1188,25 +974,11 @@ impl PyOpenAiAllowedToolsChoice {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiAllowedTools")]
 pub struct PyOpenAiAllowedTools {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiAllowedTools>,
 }
 impl PyOpenAiAllowedTools {
     fn a(&self) -> &OpenAiAllowedTools {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => {
-                match r.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Allowed(a) => &a.allowed_tools,
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match request.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Allowed(a) => &a.allowed_tools,
-                    _ => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -1236,25 +1008,11 @@ impl PyOpenAiAllowedTools {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiNamedFunctionToolChoice")]
 pub struct PyOpenAiNamedFunctionToolChoice {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiNamedFunctionToolChoice>,
 }
 impl PyOpenAiNamedFunctionToolChoice {
     fn n(&self) -> &OpenAiNamedFunctionToolChoice {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => {
-                match r.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Function(f) => f,
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match request.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Function(f) => f,
-                    _ => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -1268,7 +1026,7 @@ impl PyOpenAiNamedFunctionToolChoice {
     #[getter]
     fn function(&self) -> PyOpenAiFunctionChoice {
         PyOpenAiFunctionChoice {
-            inner: Arc::clone(&self.inner),
+            inner: Arc::new(self.inner.function.clone()),
         }
     }
     fn __repr__(&self) -> String {
@@ -1278,25 +1036,11 @@ impl PyOpenAiNamedFunctionToolChoice {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiFunctionChoice")]
 pub struct PyOpenAiFunctionChoice {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiFunctionChoice>,
 }
 impl PyOpenAiFunctionChoice {
     fn f(&self) -> &OpenAiFunctionChoice {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => {
-                match r.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Function(f) => &f.function,
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match request.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Function(f) => &f.function,
-                    _ => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -1312,25 +1056,11 @@ impl PyOpenAiFunctionChoice {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiNamedCustomToolChoice")]
 pub struct PyOpenAiNamedCustomToolChoice {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiNamedCustomToolChoice>,
 }
 impl PyOpenAiNamedCustomToolChoice {
     fn n(&self) -> &OpenAiNamedCustomToolChoice {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => {
-                match r.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Custom(c) => c,
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match request.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Custom(c) => c,
-                    _ => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -1344,7 +1074,7 @@ impl PyOpenAiNamedCustomToolChoice {
     #[getter]
     fn custom(&self) -> PyOpenAiCustomChoice {
         PyOpenAiCustomChoice {
-            inner: Arc::clone(&self.inner),
+            inner: Arc::new(self.inner.custom.clone()),
         }
     }
     fn __repr__(&self) -> String {
@@ -1354,25 +1084,11 @@ impl PyOpenAiNamedCustomToolChoice {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiCustomChoice")]
 pub struct PyOpenAiCustomChoice {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiCustomChoice>,
 }
 impl PyOpenAiCustomChoice {
     fn c(&self) -> &OpenAiCustomChoice {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiChatCompletion(r) => {
-                match r.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Custom(c) => &c.custom,
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match request.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Custom(c) => &c.custom,
-                    _ => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -1392,11 +1108,11 @@ impl PyOpenAiCustomChoice {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiChatMessage")]
 pub struct PyOpenAiChatMessage {
-    pub(crate) src: ChatMessageSource,
+    pub(crate) inner: Arc<OpenAiChatMessage>,
 }
 impl PyOpenAiChatMessage {
     fn m(&self) -> &OpenAiChatMessage {
-        self.src.msg()
+        &self.inner
     }
 }
 #[pymethods]
@@ -1407,8 +1123,8 @@ impl PyOpenAiChatMessage {
     }
     #[getter]
     fn content(&self) -> Option<PyOpenAiMessageContent> {
-        self.m().content.as_ref().map(|_| PyOpenAiMessageContent {
-            src: self.src.clone(),
+        self.m().content.as_ref().map(|c| PyOpenAiMessageContent {
+            inner: Arc::new(c.clone()),
         })
     }
     #[getter]
@@ -1418,10 +1134,9 @@ impl PyOpenAiChatMessage {
     #[getter]
     fn tool_calls(&self) -> Option<Vec<PyOpenAiToolCall>> {
         self.m().tool_calls.as_ref().map(|tc| {
-            (0..tc.len())
-                .map(|i| PyOpenAiToolCall {
-                    src: self.src.clone(),
-                    call_index: i,
+            tc.iter()
+                .map(|c| PyOpenAiToolCall {
+                    inner: Arc::new(c.clone()),
                 })
                 .collect()
         })
@@ -1436,17 +1151,18 @@ impl PyOpenAiChatMessage {
     }
     #[getter]
     fn annotations(&self) -> Vec<PyOpenAiMessageAnnotation> {
-        (0..self.m().annotations.len())
-            .map(|i| PyOpenAiMessageAnnotation {
-                src: self.src.clone(),
-                index: i,
+        self.m()
+            .annotations
+            .iter()
+            .map(|a| PyOpenAiMessageAnnotation {
+                inner: Arc::new(a.clone()),
             })
             .collect()
     }
     #[getter]
     fn audio(&self) -> Option<PyOpenAiMessageAudio> {
-        self.m().audio.as_ref().map(|_| PyOpenAiMessageAudio {
-            src: self.src.clone(),
+        self.m().audio.as_ref().map(|a| PyOpenAiMessageAudio {
+            inner: Arc::new(a.clone()),
         })
     }
     fn __repr__(&self) -> String {
@@ -1456,11 +1172,11 @@ impl PyOpenAiChatMessage {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiMessageContent")]
 pub struct PyOpenAiMessageContent {
-    src: ChatMessageSource,
+    inner: Arc<OpenAiMessageContent>,
 }
 impl PyOpenAiMessageContent {
     fn c(&self) -> &OpenAiMessageContent {
-        self.src.msg().content.as_ref().expect("guarded")
+        &self.inner
     }
 }
 #[pymethods]
@@ -1480,10 +1196,10 @@ impl PyOpenAiMessageContent {
     }
     fn as_parts(&self) -> CardPyResult<Vec<PyOpenAiContentPart>> {
         match self.c() {
-            OpenAiMessageContent::Parts(ps) => Ok((0..ps.len())
-                .map(|i| PyOpenAiContentPart {
-                    src: self.src.clone(),
-                    part_index: i,
+            OpenAiMessageContent::Parts(ps) => Ok(ps
+                .iter()
+                .map(|p| PyOpenAiContentPart {
+                    inner: Arc::new(p.clone()),
                 })
                 .collect()),
             OpenAiMessageContent::Text(_) => Err(wrong_variant("parts", self.kind()).into()),
@@ -1496,15 +1212,11 @@ impl PyOpenAiMessageContent {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiContentPart")]
 pub struct PyOpenAiContentPart {
-    src: ChatMessageSource,
-    part_index: usize,
+    inner: Arc<OpenAiContentPart>,
 }
 impl PyOpenAiContentPart {
     fn p(&self) -> &OpenAiContentPart {
-        match self.src.msg().content.as_ref().expect("guarded") {
-            OpenAiMessageContent::Parts(ps) => &ps[self.part_index],
-            OpenAiMessageContent::Text(_) => unreachable!("guarded by parent"),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -1526,27 +1238,24 @@ impl PyOpenAiContentPart {
     }
     fn as_image_url(&self) -> CardPyResult<PyOpenAiImageUrl> {
         match self.p() {
-            OpenAiContentPart::ImageUrl { .. } => Ok(PyOpenAiImageUrl {
-                src: self.src.clone(),
-                part_index: self.part_index,
+            OpenAiContentPart::ImageUrl { image_url } => Ok(PyOpenAiImageUrl {
+                inner: Arc::new(image_url.clone()),
             }),
             _ => Err(wrong_variant("image_url", self.kind()).into()),
         }
     }
     fn as_input_audio(&self) -> CardPyResult<PyOpenAiInputAudio> {
         match self.p() {
-            OpenAiContentPart::InputAudio { .. } => Ok(PyOpenAiInputAudio {
-                src: self.src.clone(),
-                part_index: self.part_index,
+            OpenAiContentPart::InputAudio { input_audio } => Ok(PyOpenAiInputAudio {
+                inner: Arc::new(input_audio.clone()),
             }),
             _ => Err(wrong_variant("input_audio", self.kind()).into()),
         }
     }
     fn as_file(&self) -> CardPyResult<PyOpenAiFilePart> {
         match self.p() {
-            OpenAiContentPart::File { .. } => Ok(PyOpenAiFilePart {
-                src: self.src.clone(),
-                part_index: self.part_index,
+            OpenAiContentPart::File { file } => Ok(PyOpenAiFilePart {
+                inner: Arc::new(file.clone()),
             }),
             _ => Err(wrong_variant("file", self.kind()).into()),
         }
@@ -1558,18 +1267,11 @@ impl PyOpenAiContentPart {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiImageUrl")]
 pub struct PyOpenAiImageUrl {
-    src: ChatMessageSource,
-    part_index: usize,
+    inner: Arc<OpenAiImageUrl>,
 }
 impl PyOpenAiImageUrl {
     fn i(&self) -> &OpenAiImageUrl {
-        match self.src.msg().content.as_ref().expect("guarded") {
-            OpenAiMessageContent::Parts(ps) => match &ps[self.part_index] {
-                OpenAiContentPart::ImageUrl { image_url } => image_url,
-                _ => unreachable!(),
-            },
-            OpenAiMessageContent::Text(_) => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -1589,18 +1291,11 @@ impl PyOpenAiImageUrl {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiInputAudio")]
 pub struct PyOpenAiInputAudio {
-    src: ChatMessageSource,
-    part_index: usize,
+    inner: Arc<OpenAiInputAudio>,
 }
 impl PyOpenAiInputAudio {
     fn a(&self) -> &OpenAiInputAudio {
-        match self.src.msg().content.as_ref().expect("guarded") {
-            OpenAiMessageContent::Parts(ps) => match &ps[self.part_index] {
-                OpenAiContentPart::InputAudio { input_audio } => input_audio,
-                _ => unreachable!(),
-            },
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -1620,18 +1315,11 @@ impl PyOpenAiInputAudio {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiFilePart")]
 pub struct PyOpenAiFilePart {
-    src: ChatMessageSource,
-    part_index: usize,
+    inner: Arc<OpenAiFilePart>,
 }
 impl PyOpenAiFilePart {
     fn f(&self) -> &OpenAiFilePart {
-        match self.src.msg().content.as_ref().expect("guarded") {
-            OpenAiMessageContent::Parts(ps) => match &ps[self.part_index] {
-                OpenAiContentPart::File { file } => file,
-                _ => unreachable!(),
-            },
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -1655,12 +1343,11 @@ impl PyOpenAiFilePart {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiToolCall")]
 pub struct PyOpenAiToolCall {
-    src: ChatMessageSource,
-    call_index: usize,
+    inner: Arc<OpenAiToolCall>,
 }
 impl PyOpenAiToolCall {
     fn c(&self) -> &OpenAiToolCall {
-        &self.src.msg().tool_calls.as_ref().expect("guarded")[self.call_index]
+        &self.inner
     }
 }
 #[pymethods]
@@ -1676,8 +1363,7 @@ impl PyOpenAiToolCall {
     #[getter]
     fn function(&self) -> PyOpenAiToolFunctionCall {
         PyOpenAiToolFunctionCall {
-            src: self.src.clone(),
-            call_index: self.call_index,
+            inner: Arc::new(self.inner.function.clone()),
         }
     }
     fn __repr__(&self) -> String {
@@ -1687,12 +1373,11 @@ impl PyOpenAiToolCall {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiToolFunctionCall")]
 pub struct PyOpenAiToolFunctionCall {
-    src: ChatMessageSource,
-    call_index: usize,
+    inner: Arc<OpenAiToolFunctionCall>,
 }
 impl PyOpenAiToolFunctionCall {
     fn f(&self) -> &OpenAiToolFunctionCall {
-        &self.src.msg().tool_calls.as_ref().expect("guarded")[self.call_index].function
+        &self.inner
     }
 }
 #[pymethods]
@@ -1712,12 +1397,11 @@ impl PyOpenAiToolFunctionCall {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiMessageAnnotation")]
 pub struct PyOpenAiMessageAnnotation {
-    src: ChatMessageSource,
-    index: usize,
+    inner: Arc<OpenAiMessageAnnotation>,
 }
 impl PyOpenAiMessageAnnotation {
     fn a(&self) -> &OpenAiMessageAnnotation {
-        &self.src.msg().annotations[self.index]
+        &self.inner
     }
 }
 #[pymethods]
@@ -1729,8 +1413,7 @@ impl PyOpenAiMessageAnnotation {
     #[getter]
     fn url_citation(&self) -> PyOpenAiUrlCitation {
         PyOpenAiUrlCitation {
-            src: self.src.clone(),
-            index: self.index,
+            inner: Arc::new(self.inner.url_citation.clone()),
         }
     }
     fn __repr__(&self) -> String {
@@ -1740,12 +1423,11 @@ impl PyOpenAiMessageAnnotation {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiUrlCitation")]
 pub struct PyOpenAiUrlCitation {
-    src: ChatMessageSource,
-    index: usize,
+    inner: Arc<OpenAiUrlCitation>,
 }
 impl PyOpenAiUrlCitation {
     fn u(&self) -> &OpenAiUrlCitation {
-        &self.src.msg().annotations[self.index].url_citation
+        &self.inner
     }
 }
 #[pymethods]
@@ -1773,11 +1455,11 @@ impl PyOpenAiUrlCitation {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiMessageAudio")]
 pub struct PyOpenAiMessageAudio {
-    src: ChatMessageSource,
+    inner: Arc<OpenAiMessageAudio>,
 }
 impl PyOpenAiMessageAudio {
     fn a(&self) -> &OpenAiMessageAudio {
-        self.src.msg().audio.as_ref().expect("guarded")
+        &self.inner
     }
 }
 #[pymethods]
@@ -1850,8 +1532,8 @@ impl PyOpenAiChatResponse {
     }
     #[getter]
     fn usage(&self) -> Option<PyOpenAiUsage> {
-        self.resp().usage.as_ref().map(|_| PyOpenAiUsage {
-            inner: Arc::clone(&self.inner),
+        self.resp().usage.as_ref().map(|u| PyOpenAiUsage {
+            inner: Arc::new(u.clone()),
         })
     }
     #[getter]
@@ -1898,17 +1580,13 @@ impl PyOpenAiChatChoice {
     #[getter]
     fn message(&self) -> PyOpenAiChatMessage {
         PyOpenAiChatMessage {
-            src: ChatMessageSource::Choice {
-                inner: Arc::clone(&self.inner),
-                choice_index: self.index,
-            },
+            inner: Arc::new(self.c().message.clone()),
         }
     }
     #[getter]
     fn logprobs(&self) -> Option<PyOpenAiChatLogprobs> {
-        self.c().logprobs.as_ref().map(|_| PyOpenAiChatLogprobs {
-            inner: Arc::clone(&self.inner),
-            choice_index: self.index,
+        self.c().logprobs.as_ref().map(|l| PyOpenAiChatLogprobs {
+            inner: Arc::new(l.clone()),
         })
     }
     fn __repr__(&self) -> String {
@@ -1922,18 +1600,11 @@ impl PyOpenAiChatChoice {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiChatLogprobs")]
 pub struct PyOpenAiChatLogprobs {
-    inner: Arc<ProviderResponse>,
-    choice_index: usize,
+    inner: Arc<OpenAiChatLogprobs>,
 }
 impl PyOpenAiChatLogprobs {
     fn l(&self) -> &OpenAiChatLogprobs {
-        match self.inner.as_ref() {
-            ProviderResponse::OpenAiChatCompletion(r) => r.choices[self.choice_index]
-                .logprobs
-                .as_ref()
-                .expect("guarded"),
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -1955,14 +1626,11 @@ impl PyOpenAiChatLogprobs {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiUsage")]
 pub struct PyOpenAiUsage {
-    inner: Arc<ProviderResponse>,
+    inner: Arc<OpenAiUsage>,
 }
 impl PyOpenAiUsage {
     fn u(&self) -> &OpenAiUsage {
-        match self.inner.as_ref() {
-            ProviderResponse::OpenAiChatCompletion(r) => r.usage.as_ref().expect("guarded"),
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -1984,8 +1652,8 @@ impl PyOpenAiUsage {
         self.u()
             .prompt_tokens_details
             .as_ref()
-            .map(|_| PyOpenAiPromptTokensDetails {
-                inner: Arc::clone(&self.inner),
+            .map(|d| PyOpenAiPromptTokensDetails {
+                inner: Arc::new(d.clone()),
             })
     }
     #[getter]
@@ -1993,8 +1661,8 @@ impl PyOpenAiUsage {
         self.u()
             .completion_tokens_details
             .as_ref()
-            .map(|_| PyOpenAiCompletionTokensDetails {
-                inner: Arc::clone(&self.inner),
+            .map(|d| PyOpenAiCompletionTokensDetails {
+                inner: Arc::new(d.clone()),
             })
     }
     fn __repr__(&self) -> String {
@@ -2009,20 +1677,11 @@ impl PyOpenAiUsage {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiPromptTokensDetails")]
 pub struct PyOpenAiPromptTokensDetails {
-    inner: Arc<ProviderResponse>,
+    inner: Arc<OpenAiPromptTokensDetails>,
 }
 impl PyOpenAiPromptTokensDetails {
     fn d(&self) -> &OpenAiPromptTokensDetails {
-        match self.inner.as_ref() {
-            ProviderResponse::OpenAiChatCompletion(r) => r
-                .usage
-                .as_ref()
-                .expect("guarded")
-                .prompt_tokens_details
-                .as_ref()
-                .expect("guarded"),
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -2042,20 +1701,11 @@ impl PyOpenAiPromptTokensDetails {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiCompletionTokensDetails")]
 pub struct PyOpenAiCompletionTokensDetails {
-    inner: Arc<ProviderResponse>,
+    inner: Arc<OpenAiCompletionTokensDetails>,
 }
 impl PyOpenAiCompletionTokensDetails {
     fn d(&self) -> &OpenAiCompletionTokensDetails {
-        match self.inner.as_ref() {
-            ProviderResponse::OpenAiChatCompletion(r) => r
-                .usage
-                .as_ref()
-                .expect("guarded")
-                .completion_tokens_details
-                .as_ref()
-                .expect("guarded"),
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -2117,8 +1767,8 @@ impl PyAnthropicMessagesRequest {
     }
     #[getter]
     fn system(&self) -> Option<PyAnthropicSystem> {
-        self.req().system.as_ref().map(|_| PyAnthropicSystem {
-            inner: Arc::clone(&self.inner),
+        self.req().system.as_ref().map(|s| PyAnthropicSystem {
+            inner: Arc::new(s.clone()),
         })
     }
     #[getter]
@@ -2127,21 +1777,25 @@ impl PyAnthropicMessagesRequest {
     }
     #[getter]
     fn tools(&self) -> Vec<PyAnthropicTool> {
-        let n = self.req().tools.as_ref().map_or(0, |t| t.len());
-        (0..n)
-            .map(|i| PyAnthropicTool {
-                inner: Arc::clone(&self.inner),
-                index: i,
+        self.req()
+            .tools
+            .as_ref()
+            .map(|ts| {
+                ts.iter()
+                    .map(|t| PyAnthropicTool {
+                        inner: Arc::new(t.clone()),
+                    })
+                    .collect()
             })
-            .collect()
+            .unwrap_or_default()
     }
     #[getter]
     fn output_config(&self) -> Option<PyAnthropicOutputConfig> {
         self.req()
             .output_config
             .as_ref()
-            .map(|_| PyAnthropicOutputConfig {
-                inner: Arc::clone(&self.inner),
+            .map(|c| PyAnthropicOutputConfig {
+                inner: Arc::new(c.clone()),
             })
     }
     #[getter]
@@ -2194,8 +1848,8 @@ impl PyAnthropicMessagesSettings {
         self.s()
             .thinking
             .as_ref()
-            .map(|_| PyAnthropicThinkingConfig {
-                inner: Arc::clone(&self.inner),
+            .map(|t| PyAnthropicThinkingConfig {
+                inner: Arc::new(t.clone()),
             })
     }
     #[getter]
@@ -2210,14 +1864,11 @@ impl PyAnthropicMessagesSettings {
 
 #[pyclass(module = "wyrd.prompt", name = "AnthropicSystem")]
 pub struct PyAnthropicSystem {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<AnthropicSystem>,
 }
 impl PyAnthropicSystem {
     fn s(&self) -> &AnthropicSystem {
-        match self.inner.as_ref() {
-            ProviderRequest::AnthropicMessage(r) => r.system.as_ref().expect("guarded"),
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -2237,10 +1888,10 @@ impl PyAnthropicSystem {
     }
     fn as_blocks(&self) -> CardPyResult<Vec<PyAnthropicSystemBlock>> {
         match self.s() {
-            AnthropicSystem::Blocks(bs) => Ok((0..bs.len())
-                .map(|i| PyAnthropicSystemBlock {
-                    inner: Arc::clone(&self.inner),
-                    index: i,
+            AnthropicSystem::Blocks(bs) => Ok(bs
+                .iter()
+                .map(|b| PyAnthropicSystemBlock {
+                    inner: Arc::new(b.clone()),
                 })
                 .collect()),
             _ => Err(wrong_variant("blocks", self.kind()).into()),
@@ -2253,18 +1904,11 @@ impl PyAnthropicSystem {
 
 #[pyclass(module = "wyrd.prompt", name = "AnthropicSystemBlock")]
 pub struct PyAnthropicSystemBlock {
-    inner: Arc<ProviderRequest>,
-    index: usize,
+    inner: Arc<AnthropicSystemBlock>,
 }
 impl PyAnthropicSystemBlock {
     fn b(&self) -> &AnthropicSystemBlock {
-        match self.inner.as_ref() {
-            ProviderRequest::AnthropicMessage(r) => match r.system.as_ref().expect("guarded") {
-                AnthropicSystem::Blocks(bs) => &bs[self.index],
-                _ => unreachable!(),
-            },
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -2284,9 +1928,8 @@ impl PyAnthropicSystemBlock {
     fn cache_control(&self) -> Option<PyAnthropicCacheControl> {
         match self.b() {
             AnthropicSystemBlock::Text { cache_control, .. } => {
-                cache_control.as_ref().map(|_| PyAnthropicCacheControl {
-                    inner: Arc::clone(&self.inner),
-                    path: AnthropicCacheControlPath::SystemBlock(self.index),
+                cache_control.as_ref().map(|cc| PyAnthropicCacheControl {
+                    inner: Arc::new(cc.clone()),
                 })
             }
         }
@@ -2296,41 +1939,13 @@ impl PyAnthropicSystemBlock {
     }
 }
 
-// Path enum for cache control location
-#[derive(Clone)]
-enum AnthropicCacheControlPath {
-    SystemBlock(usize),
-    #[allow(dead_code)]
-    Tool(usize),
-}
-
 #[pyclass(module = "wyrd.prompt", name = "AnthropicCacheControl")]
 pub struct PyAnthropicCacheControl {
-    inner: Arc<ProviderRequest>,
-    path: AnthropicCacheControlPath,
+    inner: Arc<AnthropicCacheControl>,
 }
 impl PyAnthropicCacheControl {
     fn c(&self) -> &AnthropicCacheControl {
-        let req = match self.inner.as_ref() {
-            ProviderRequest::AnthropicMessage(r) => r,
-            _ => unreachable!(),
-        };
-        match &self.path {
-            AnthropicCacheControlPath::SystemBlock(i) => {
-                match req.system.as_ref().expect("guarded") {
-                    AnthropicSystem::Blocks(bs) => match &bs[*i] {
-                        AnthropicSystemBlock::Text { cache_control, .. } => {
-                            cache_control.as_ref().expect("guarded")
-                        }
-                    },
-                    AnthropicSystem::Text(_) => unreachable!(),
-                }
-            }
-            AnthropicCacheControlPath::Tool(i) => req.tools.as_ref().expect("guarded")[*i]
-                .cache_control
-                .as_ref()
-                .expect("guarded"),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -2350,14 +1965,11 @@ impl PyAnthropicCacheControl {
 
 #[pyclass(module = "wyrd.prompt", name = "AnthropicThinkingConfig")]
 pub struct PyAnthropicThinkingConfig {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<AnthropicThinkingConfig>,
 }
 impl PyAnthropicThinkingConfig {
     fn t(&self) -> &AnthropicThinkingConfig {
-        match self.inner.as_ref() {
-            ProviderRequest::AnthropicMessage(r) => r.settings.thinking.as_ref().expect("guarded"),
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -2542,15 +2154,11 @@ impl PyAnthropicToolResultContent {
 
 #[pyclass(module = "wyrd.prompt", name = "AnthropicTool")]
 pub struct PyAnthropicTool {
-    inner: Arc<ProviderRequest>,
-    index: usize,
+    inner: Arc<AnthropicTool>,
 }
 impl PyAnthropicTool {
     fn t(&self) -> &AnthropicTool {
-        match self.inner.as_ref() {
-            ProviderRequest::AnthropicMessage(r) => &r.tools.as_ref().expect("guarded")[self.index],
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -2590,14 +2198,11 @@ impl PyAnthropicTool {
 
 #[pyclass(module = "wyrd.prompt", name = "AnthropicOutputConfig")]
 pub struct PyAnthropicOutputConfig {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<AnthropicOutputConfig>,
 }
 impl PyAnthropicOutputConfig {
     fn c(&self) -> &AnthropicOutputConfig {
-        match self.inner.as_ref() {
-            ProviderRequest::AnthropicMessage(r) => r.output_config.as_ref().expect("guarded"),
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -2776,11 +2381,11 @@ impl PyGeminiRequest {
 impl PyGeminiRequest {
     #[getter]
     fn contents(&self) -> Vec<PyGoogleContent> {
-        let n = google_request(&self.inner).contents.len();
-        (0..n)
-            .map(|i| PyGoogleContent {
-                inner: Arc::clone(&self.inner),
-                index: i,
+        google_request(&self.inner)
+            .contents
+            .iter()
+            .map(|c| PyGoogleContent {
+                inner: Arc::new(c.clone()),
             })
             .collect()
     }
@@ -2789,9 +2394,8 @@ impl PyGeminiRequest {
         google_request(&self.inner)
             .system_instruction
             .as_ref()
-            .map(|_| PyGoogleContent {
-                inner: Arc::clone(&self.inner),
-                index: usize::MAX,
+            .map(|c| PyGoogleContent {
+                inner: Arc::new(c.clone()),
             })
     }
     #[getter]
@@ -2818,11 +2422,11 @@ impl PyVertexRequest {
 impl PyVertexRequest {
     #[getter]
     fn contents(&self) -> Vec<PyGoogleContent> {
-        let n = google_request(&self.inner).contents.len();
-        (0..n)
-            .map(|i| PyGoogleContent {
-                inner: Arc::clone(&self.inner),
-                index: i,
+        google_request(&self.inner)
+            .contents
+            .iter()
+            .map(|c| PyGoogleContent {
+                inner: Arc::new(c.clone()),
             })
             .collect()
     }
@@ -2839,17 +2443,11 @@ impl PyVertexRequest {
 
 #[pyclass(module = "wyrd.prompt", name = "GoogleContent")]
 pub struct PyGoogleContent {
-    inner: Arc<ProviderRequest>,
-    index: usize,
+    inner: Arc<GoogleContent>,
 }
 impl PyGoogleContent {
     fn c(&self) -> &GoogleContent {
-        let req = google_request(&self.inner);
-        if self.index == usize::MAX {
-            req.system_instruction.as_ref().expect("guarded")
-        } else {
-            &req.contents[self.index]
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -2860,12 +2458,11 @@ impl PyGoogleContent {
     }
     #[getter]
     fn parts(&self) -> Vec<PyGooglePart> {
-        let n = self.c().parts.len();
-        (0..n)
-            .map(|i| PyGooglePart {
-                inner: Arc::clone(&self.inner),
-                content_index: self.index,
-                part_index: i,
+        self.c()
+            .parts
+            .iter()
+            .map(|p| PyGooglePart {
+                inner: Arc::new(p.clone()),
             })
             .collect()
     }
@@ -2876,19 +2473,11 @@ impl PyGoogleContent {
 
 #[pyclass(module = "wyrd.prompt", name = "GooglePart")]
 pub struct PyGooglePart {
-    inner: Arc<ProviderRequest>,
-    content_index: usize,
-    part_index: usize,
+    inner: Arc<GooglePart>,
 }
 impl PyGooglePart {
     fn p(&self) -> &GooglePart {
-        let req = google_request(&self.inner);
-        let content = if self.content_index == usize::MAX {
-            req.system_instruction.as_ref().expect("guarded")
-        } else {
-            &req.contents[self.content_index]
-        };
-        &content.parts[self.part_index]
+        &self.inner
     }
 }
 #[pymethods]
@@ -2914,40 +2503,32 @@ impl PyGooglePart {
     }
     fn as_inline_data(&self) -> CardPyResult<PyGoogleInlineData> {
         match self.p() {
-            GooglePart::InlineData { .. } => Ok(PyGoogleInlineData {
-                inner: Arc::clone(&self.inner),
-                content_index: self.content_index,
-                part_index: self.part_index,
+            GooglePart::InlineData { inline_data } => Ok(PyGoogleInlineData {
+                inner: Arc::new(inline_data.clone()),
             }),
             _ => Err(wrong_variant("inline_data", self.kind()).into()),
         }
     }
     fn as_file_data(&self) -> CardPyResult<PyGoogleFileData> {
         match self.p() {
-            GooglePart::FileData { .. } => Ok(PyGoogleFileData {
-                inner: Arc::clone(&self.inner),
-                content_index: self.content_index,
-                part_index: self.part_index,
+            GooglePart::FileData { file_data } => Ok(PyGoogleFileData {
+                inner: Arc::new(file_data.clone()),
             }),
             _ => Err(wrong_variant("file_data", self.kind()).into()),
         }
     }
     fn as_function_call(&self) -> CardPyResult<PyGoogleFunctionCall> {
         match self.p() {
-            GooglePart::FunctionCall { .. } => Ok(PyGoogleFunctionCall {
-                inner: Arc::clone(&self.inner),
-                content_index: self.content_index,
-                part_index: self.part_index,
+            GooglePart::FunctionCall { function_call } => Ok(PyGoogleFunctionCall {
+                inner: Arc::new(function_call.clone()),
             }),
             _ => Err(wrong_variant("function_call", self.kind()).into()),
         }
     }
     fn as_function_response(&self) -> CardPyResult<PyGoogleFunctionResponse> {
         match self.p() {
-            GooglePart::FunctionResponse { .. } => Ok(PyGoogleFunctionResponse {
-                inner: Arc::clone(&self.inner),
-                content_index: self.content_index,
-                part_index: self.part_index,
+            GooglePart::FunctionResponse { function_response } => Ok(PyGoogleFunctionResponse {
+                inner: Arc::new(function_response.clone()),
             }),
             _ => Err(wrong_variant("function_response", self.kind()).into()),
         }
@@ -2959,22 +2540,11 @@ impl PyGooglePart {
 
 #[pyclass(module = "wyrd.prompt", name = "GoogleInlineData")]
 pub struct PyGoogleInlineData {
-    inner: Arc<ProviderRequest>,
-    content_index: usize,
-    part_index: usize,
+    inner: Arc<GoogleInlineData>,
 }
 impl PyGoogleInlineData {
     fn d(&self) -> &GoogleInlineData {
-        let req = google_request(&self.inner);
-        let c = if self.content_index == usize::MAX {
-            req.system_instruction.as_ref().expect("guarded")
-        } else {
-            &req.contents[self.content_index]
-        };
-        match &c.parts[self.part_index] {
-            GooglePart::InlineData { inline_data } => inline_data,
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -2994,22 +2564,11 @@ impl PyGoogleInlineData {
 
 #[pyclass(module = "wyrd.prompt", name = "GoogleFileData")]
 pub struct PyGoogleFileData {
-    inner: Arc<ProviderRequest>,
-    content_index: usize,
-    part_index: usize,
+    inner: Arc<GoogleFileData>,
 }
 impl PyGoogleFileData {
     fn d(&self) -> &GoogleFileData {
-        let req = google_request(&self.inner);
-        let c = if self.content_index == usize::MAX {
-            req.system_instruction.as_ref().expect("guarded")
-        } else {
-            &req.contents[self.content_index]
-        };
-        match &c.parts[self.part_index] {
-            GooglePart::FileData { file_data } => file_data,
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -3029,22 +2588,11 @@ impl PyGoogleFileData {
 
 #[pyclass(module = "wyrd.prompt", name = "GoogleFunctionCall")]
 pub struct PyGoogleFunctionCall {
-    inner: Arc<ProviderRequest>,
-    content_index: usize,
-    part_index: usize,
+    inner: Arc<GoogleFunctionCall>,
 }
 impl PyGoogleFunctionCall {
     fn f(&self) -> &GoogleFunctionCall {
-        let req = google_request(&self.inner);
-        let c = if self.content_index == usize::MAX {
-            req.system_instruction.as_ref().expect("guarded")
-        } else {
-            &req.contents[self.content_index]
-        };
-        match &c.parts[self.part_index] {
-            GooglePart::FunctionCall { function_call } => function_call,
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -3064,22 +2612,11 @@ impl PyGoogleFunctionCall {
 
 #[pyclass(module = "wyrd.prompt", name = "GoogleFunctionResponse")]
 pub struct PyGoogleFunctionResponse {
-    inner: Arc<ProviderRequest>,
-    content_index: usize,
-    part_index: usize,
+    inner: Arc<GoogleFunctionResponse>,
 }
 impl PyGoogleFunctionResponse {
     fn f(&self) -> &GoogleFunctionResponse {
-        let req = google_request(&self.inner);
-        let c = if self.content_index == usize::MAX {
-            req.system_instruction.as_ref().expect("guarded")
-        } else {
-            &req.contents[self.content_index]
-        };
-        match &c.parts[self.part_index] {
-            GooglePart::FunctionResponse { function_response } => function_response,
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -3193,8 +2730,8 @@ impl PyGoogleGenerationConfig {
     fn thinking_config(&self) -> Option<PyGoogleThinkingConfig> {
         self.cfg()
             .and_then(|c| c.thinking_config.as_ref())
-            .map(|_| PyGoogleThinkingConfig {
-                inner: Arc::clone(&self.inner),
+            .map(|t| PyGoogleThinkingConfig {
+                inner: Arc::new(t.clone()),
             })
     }
     fn __repr__(&self) -> String {
@@ -3204,18 +2741,11 @@ impl PyGoogleGenerationConfig {
 
 #[pyclass(module = "wyrd.prompt", name = "GoogleThinkingConfig")]
 pub struct PyGoogleThinkingConfig {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<GoogleThinkingConfig>,
 }
 impl PyGoogleThinkingConfig {
     fn t(&self) -> &GoogleThinkingConfig {
-        google_request(&self.inner)
-            .settings
-            .generation_config
-            .as_ref()
-            .expect("guarded")
-            .thinking_config
-            .as_ref()
-            .expect("guarded")
+        &self.inner
     }
 }
 #[pymethods]
@@ -3235,16 +2765,11 @@ impl PyGoogleThinkingConfig {
 
 #[pyclass(module = "wyrd.prompt", name = "GoogleSafetySetting")]
 pub struct PyGoogleSafetySetting {
-    inner: Arc<ProviderRequest>,
-    index: usize,
+    inner: Arc<GoogleSafetySetting>,
 }
 impl PyGoogleSafetySetting {
     fn s(&self) -> &GoogleSafetySetting {
-        &google_request(&self.inner)
-            .settings
-            .safety_settings
-            .as_ref()
-            .expect("guarded")[self.index]
+        &self.inner
     }
 }
 #[pymethods]
@@ -3264,30 +2789,28 @@ impl PyGoogleSafetySetting {
 
 #[pyclass(module = "wyrd.prompt", name = "GoogleTool")]
 pub struct PyGoogleTool {
-    inner: Arc<ProviderRequest>,
-    index: usize,
+    inner: Arc<GoogleTool>,
 }
 impl PyGoogleTool {
     fn t(&self) -> &GoogleTool {
-        &google_request(&self.inner).tools.as_ref().expect("guarded")[self.index]
+        &self.inner
     }
 }
 #[pymethods]
 impl PyGoogleTool {
     #[getter]
     fn function_declarations(&self) -> Vec<PyGoogleFunctionDeclaration> {
-        let n = self
-            .t()
+        self.t()
             .function_declarations
             .as_ref()
-            .map_or(0, |v| v.len());
-        (0..n)
-            .map(|i| PyGoogleFunctionDeclaration {
-                inner: Arc::clone(&self.inner),
-                tool_index: self.index,
-                fn_index: i,
+            .map(|ds| {
+                ds.iter()
+                    .map(|d| PyGoogleFunctionDeclaration {
+                        inner: Arc::new(d.clone()),
+                    })
+                    .collect()
             })
-            .collect()
+            .unwrap_or_default()
     }
     fn __repr__(&self) -> String {
         "GoogleTool".to_owned()
@@ -3296,16 +2819,11 @@ impl PyGoogleTool {
 
 #[pyclass(module = "wyrd.prompt", name = "GoogleFunctionDeclaration")]
 pub struct PyGoogleFunctionDeclaration {
-    inner: Arc<ProviderRequest>,
-    tool_index: usize,
-    fn_index: usize,
+    inner: Arc<GoogleFunctionDeclaration>,
 }
 impl PyGoogleFunctionDeclaration {
     fn f(&self) -> &GoogleFunctionDeclaration {
-        &google_request(&self.inner).tools.as_ref().expect("guarded")[self.tool_index]
-            .function_declarations
-            .as_ref()
-            .expect("guarded")[self.fn_index]
+        &self.inner
     }
 }
 #[pymethods]
@@ -3329,15 +2847,12 @@ impl PyGoogleFunctionDeclaration {
 
 #[pyclass(module = "wyrd.prompt", name = "GoogleToolConfig")]
 pub struct PyGoogleToolConfig {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<GoogleToolConfig>,
 }
 impl PyGoogleToolConfig {
     #[allow(dead_code)]
     fn c(&self) -> &GoogleToolConfig {
-        google_request(&self.inner)
-            .tool_config
-            .as_ref()
-            .expect("guarded")
+        &self.inner
     }
 }
 #[pymethods]
@@ -3345,7 +2860,7 @@ impl PyGoogleToolConfig {
     #[getter]
     fn function_calling_config(&self) -> PyGoogleFunctionCallingConfig {
         PyGoogleFunctionCallingConfig {
-            inner: Arc::clone(&self.inner),
+            inner: Arc::new(self.inner.function_calling_config.clone()),
         }
     }
     fn __repr__(&self) -> String {
@@ -3355,15 +2870,11 @@ impl PyGoogleToolConfig {
 
 #[pyclass(module = "wyrd.prompt", name = "GoogleFunctionCallingConfig")]
 pub struct PyGoogleFunctionCallingConfig {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<GoogleFunctionCallingConfig>,
 }
 impl PyGoogleFunctionCallingConfig {
     fn c(&self) -> &GoogleFunctionCallingConfig {
-        &google_request(&self.inner)
-            .tool_config
-            .as_ref()
-            .expect("guarded")
-            .function_calling_config
+        &self.inner
     }
 }
 #[pymethods]
@@ -3396,11 +2907,11 @@ impl PyGeminiResponse {
 impl PyGeminiResponse {
     #[getter]
     fn candidates(&self) -> Vec<PyGoogleCandidate> {
-        let n = google_response(&self.inner).candidates.len();
-        (0..n)
-            .map(|i| PyGoogleCandidate {
-                inner: Arc::clone(&self.inner),
-                index: i,
+        google_response(&self.inner)
+            .candidates
+            .iter()
+            .map(|c| PyGoogleCandidate {
+                inner: Arc::new(c.clone()),
             })
             .collect()
     }
@@ -3409,8 +2920,8 @@ impl PyGeminiResponse {
         google_response(&self.inner)
             .usage_metadata
             .as_ref()
-            .map(|_| PyGoogleUsageMetadata {
-                inner: Arc::clone(&self.inner),
+            .map(|u| PyGoogleUsageMetadata {
+                inner: Arc::new(u.clone()),
             })
     }
     #[getter]
@@ -3435,11 +2946,11 @@ impl PyVertexResponse {
 impl PyVertexResponse {
     #[getter]
     fn candidates(&self) -> Vec<PyGoogleCandidate> {
-        let n = google_response(&self.inner).candidates.len();
-        (0..n)
-            .map(|i| PyGoogleCandidate {
-                inner: Arc::clone(&self.inner),
-                index: i,
+        google_response(&self.inner)
+            .candidates
+            .iter()
+            .map(|c| PyGoogleCandidate {
+                inner: Arc::new(c.clone()),
             })
             .collect()
     }
@@ -3448,8 +2959,8 @@ impl PyVertexResponse {
         google_response(&self.inner)
             .usage_metadata
             .as_ref()
-            .map(|_| PyGoogleUsageMetadata {
-                inner: Arc::clone(&self.inner),
+            .map(|u| PyGoogleUsageMetadata {
+                inner: Arc::new(u.clone()),
             })
     }
     fn __repr__(&self) -> String {
@@ -3459,12 +2970,11 @@ impl PyVertexResponse {
 
 #[pyclass(module = "wyrd.prompt", name = "GoogleCandidate")]
 pub struct PyGoogleCandidate {
-    inner: Arc<ProviderResponse>,
-    index: usize,
+    inner: Arc<GoogleCandidate>,
 }
 impl PyGoogleCandidate {
     fn c(&self) -> &GoogleCandidate {
-        &google_response(&self.inner).candidates[self.index]
+        &self.inner
     }
 }
 #[pymethods]
@@ -3496,12 +3006,11 @@ impl PyGoogleCandidate {
     }
     #[getter]
     fn safety_ratings(&self) -> Vec<PyGoogleSafetyRating> {
-        let n = self.c().safety_ratings.len();
-        (0..n)
-            .map(|i| PyGoogleSafetyRating {
-                inner: Arc::clone(&self.inner),
-                candidate_index: self.index,
-                rating_index: i,
+        self.c()
+            .safety_ratings
+            .iter()
+            .map(|r| PyGoogleSafetyRating {
+                inner: Arc::new(r.clone()),
             })
             .collect()
     }
@@ -3512,14 +3021,11 @@ impl PyGoogleCandidate {
 
 #[pyclass(module = "wyrd.prompt", name = "GoogleUsageMetadata")]
 pub struct PyGoogleUsageMetadata {
-    inner: Arc<ProviderResponse>,
+    inner: Arc<GoogleUsageMetadata>,
 }
 impl PyGoogleUsageMetadata {
     fn u(&self) -> &GoogleUsageMetadata {
-        google_response(&self.inner)
-            .usage_metadata
-            .as_ref()
-            .expect("guarded")
+        &self.inner
     }
 }
 #[pymethods]
@@ -3551,14 +3057,11 @@ impl PyGoogleUsageMetadata {
 
 #[pyclass(module = "wyrd.prompt", name = "GoogleSafetyRating")]
 pub struct PyGoogleSafetyRating {
-    inner: Arc<ProviderResponse>,
-    candidate_index: usize,
-    rating_index: usize,
+    inner: Arc<GoogleSafetyRating>,
 }
 impl PyGoogleSafetyRating {
     fn r(&self) -> &GoogleSafetyRating {
-        &google_response(&self.inner).candidates[self.candidate_index].safety_ratings
-            [self.rating_index]
+        &self.inner
     }
 }
 #[pymethods]
@@ -3621,27 +3124,31 @@ impl PyOpenAiResponsesRequest {
     }
     #[getter]
     fn text(&self) -> Option<PyOpenAiResponsesText> {
-        self.req().text.as_ref().map(|_| PyOpenAiResponsesText {
-            inner: Arc::clone(&self.inner),
+        self.req().text.as_ref().map(|t| PyOpenAiResponsesText {
+            inner: Arc::new(t.clone()),
         })
     }
     #[getter]
     fn tools(&self) -> Vec<PyOpenAiResponsesTool> {
-        let n = self.req().tools.as_ref().map_or(0, |t| t.len());
-        (0..n)
-            .map(|i| PyOpenAiResponsesTool {
-                inner: Arc::clone(&self.inner),
-                index: i,
+        self.req()
+            .tools
+            .as_ref()
+            .map(|ts| {
+                ts.iter()
+                    .map(|t| PyOpenAiResponsesTool {
+                        inner: Arc::new(t.clone()),
+                    })
+                    .collect()
             })
-            .collect()
+            .unwrap_or_default()
     }
     #[getter]
     fn tool_choice(&self) -> Option<PyOpenAiResponsesToolChoice> {
         self.req()
             .tool_choice
             .as_ref()
-            .map(|_| PyOpenAiResponsesToolChoice {
-                inner: Arc::clone(&self.inner),
+            .map(|c| PyOpenAiResponsesToolChoice {
+                inner: Arc::new(c.clone()),
             })
     }
     #[getter]
@@ -3695,8 +3202,8 @@ impl PyOpenAiResponsesSettings {
     }
     #[getter]
     fn reasoning(&self) -> Option<PyOpenAiReasoning> {
-        self.s().reasoning.as_ref().map(|_| PyOpenAiReasoning {
-            inner: Arc::clone(&self.inner),
+        self.s().reasoning.as_ref().map(|r| PyOpenAiReasoning {
+            inner: Arc::new(r.clone()),
         })
     }
     #[getter]
@@ -3726,14 +3233,11 @@ impl PyOpenAiResponsesSettings {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesText")]
 pub struct PyOpenAiResponsesText {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiResponsesText>,
 }
 impl PyOpenAiResponsesText {
     fn t(&self) -> &OpenAiResponsesText {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiResponses(r) => r.text.as_ref().expect("guarded"),
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -3753,14 +3257,11 @@ impl PyOpenAiResponsesText {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiReasoning")]
 pub struct PyOpenAiReasoning {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiReasoning>,
 }
 impl PyOpenAiReasoning {
     fn r(&self) -> &OpenAiReasoning {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiResponses(r) => r.settings.reasoning.as_ref().expect("guarded"),
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -3792,14 +3293,11 @@ impl PyOpenAiReasoning {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesToolChoice")]
 pub struct PyOpenAiResponsesToolChoice {
-    inner: Arc<ProviderRequest>,
+    inner: Arc<OpenAiResponsesToolChoice>,
 }
 impl PyOpenAiResponsesToolChoice {
     fn c(&self) -> &OpenAiResponsesToolChoice {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiResponses(r) => r.tool_choice.as_ref().expect("guarded"),
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -3829,57 +3327,55 @@ impl PyOpenAiResponsesToolChoice {
     }
     fn as_hosted(&self) -> CardPyResult<PyOpenAiResponsesHostedToolChoice> {
         match self.c() {
-            OpenAiResponsesToolChoice::Hosted(_) => Ok(PyOpenAiResponsesHostedToolChoice {
-                inner: Arc::clone(&self.inner),
+            OpenAiResponsesToolChoice::Hosted(c) => Ok(PyOpenAiResponsesHostedToolChoice {
+                inner: Arc::new(c.clone()),
             }),
             _ => Err(wrong_variant("hosted", self.kind()).into()),
         }
     }
     fn as_function_choice(&self) -> CardPyResult<PyOpenAiResponsesFunctionToolChoice> {
         match self.c() {
-            OpenAiResponsesToolChoice::Function(_) => Ok(PyOpenAiResponsesFunctionToolChoice {
-                inner: Arc::clone(&self.inner),
+            OpenAiResponsesToolChoice::Function(c) => Ok(PyOpenAiResponsesFunctionToolChoice {
+                inner: Arc::new(c.clone()),
             }),
             _ => Err(wrong_variant("function", self.kind()).into()),
         }
     }
     fn as_allowed(&self) -> CardPyResult<PyOpenAiResponsesAllowedToolsChoice> {
         match self.c() {
-            OpenAiResponsesToolChoice::Allowed(_) => Ok(PyOpenAiResponsesAllowedToolsChoice {
-                inner: Arc::clone(&self.inner),
+            OpenAiResponsesToolChoice::Allowed(c) => Ok(PyOpenAiResponsesAllowedToolsChoice {
+                inner: Arc::new(c.clone()),
             }),
             _ => Err(wrong_variant("allowed", self.kind()).into()),
         }
     }
     fn as_mcp(&self) -> CardPyResult<PyOpenAiResponsesMcpToolChoice> {
         match self.c() {
-            OpenAiResponsesToolChoice::Mcp(_) => Ok(PyOpenAiResponsesMcpToolChoice {
-                inner: Arc::clone(&self.inner),
+            OpenAiResponsesToolChoice::Mcp(c) => Ok(PyOpenAiResponsesMcpToolChoice {
+                inner: Arc::new(c.clone()),
             }),
             _ => Err(wrong_variant("mcp", self.kind()).into()),
         }
     }
     fn as_custom_choice(&self) -> CardPyResult<PyOpenAiResponsesCustomToolChoice> {
         match self.c() {
-            OpenAiResponsesToolChoice::Custom(_) => Ok(PyOpenAiResponsesCustomToolChoice {
-                inner: Arc::clone(&self.inner),
+            OpenAiResponsesToolChoice::Custom(c) => Ok(PyOpenAiResponsesCustomToolChoice {
+                inner: Arc::new(c.clone()),
             }),
             _ => Err(wrong_variant("custom", self.kind()).into()),
         }
     }
     fn as_apply_patch(&self) -> CardPyResult<PyOpenAiResponsesApplyPatchToolChoice> {
         match self.c() {
-            OpenAiResponsesToolChoice::ApplyPatch(_) => Ok(PyOpenAiResponsesApplyPatchToolChoice {
-                inner: Arc::clone(&self.inner),
-            }),
+            OpenAiResponsesToolChoice::ApplyPatch(_) => {
+                Ok(PyOpenAiResponsesApplyPatchToolChoice {})
+            }
             _ => Err(wrong_variant("apply_patch", self.kind()).into()),
         }
     }
     fn as_shell(&self) -> CardPyResult<PyOpenAiResponsesShellToolChoice> {
         match self.c() {
-            OpenAiResponsesToolChoice::Shell(_) => Ok(PyOpenAiResponsesShellToolChoice {
-                inner: Arc::clone(&self.inner),
-            }),
+            OpenAiResponsesToolChoice::Shell(_) => Ok(PyOpenAiResponsesShellToolChoice {}),
             _ => Err(wrong_variant("shell", self.kind()).into()),
         }
     }
@@ -3889,22 +3385,14 @@ impl PyOpenAiResponsesToolChoice {
 }
 
 macro_rules! simple_responses_choice {
-    ($name:ident, $py_name:literal, $variant:ident, $inner_ty:ident, $kind_fn:expr) => {
+    ($name:ident, $py_name:literal, $inner_ty:ident) => {
         #[pyclass(module = "wyrd.prompt", name = $py_name)]
         pub struct $name {
-            inner: Arc<ProviderRequest>,
+            inner: Arc<$inner_ty>,
         }
         impl $name {
             fn c(&self) -> &$inner_ty {
-                match self.inner.as_ref() {
-                    ProviderRequest::OpenAiResponses(r) => {
-                        match r.tool_choice.as_ref().expect("guarded") {
-                            OpenAiResponsesToolChoice::$variant(c) => c,
-                            _ => unreachable!(),
-                        }
-                    }
-                    _ => unreachable!(),
-                }
+                &self.inner
             }
         }
     };
@@ -3913,9 +3401,7 @@ macro_rules! simple_responses_choice {
 simple_responses_choice!(
     PyOpenAiResponsesAllowedToolsChoice,
     "OpenAiResponsesAllowedToolsChoice",
-    Allowed,
-    OpenAiResponsesAllowedToolsChoice,
-    |_| "allowed_tools"
+    OpenAiResponsesAllowedToolsChoice
 );
 #[pymethods]
 impl PyOpenAiResponsesAllowedToolsChoice {
@@ -3940,9 +3426,7 @@ impl PyOpenAiResponsesAllowedToolsChoice {
 simple_responses_choice!(
     PyOpenAiResponsesHostedToolChoice,
     "OpenAiResponsesHostedToolChoice",
-    Hosted,
-    OpenAiResponsesHostedToolChoice,
-    |_| "hosted"
+    OpenAiResponsesHostedToolChoice
 );
 #[pymethods]
 impl PyOpenAiResponsesHostedToolChoice {
@@ -3969,9 +3453,7 @@ impl PyOpenAiResponsesHostedToolChoice {
 simple_responses_choice!(
     PyOpenAiResponsesFunctionToolChoice,
     "OpenAiResponsesFunctionToolChoice",
-    Function,
-    OpenAiResponsesFunctionToolChoice,
-    |_| "function"
+    OpenAiResponsesFunctionToolChoice
 );
 #[pymethods]
 impl PyOpenAiResponsesFunctionToolChoice {
@@ -3996,9 +3478,7 @@ impl PyOpenAiResponsesFunctionToolChoice {
 simple_responses_choice!(
     PyOpenAiResponsesMcpToolChoice,
     "OpenAiResponsesMcpToolChoice",
-    Mcp,
-    OpenAiResponsesMcpToolChoice,
-    |_| "mcp"
+    OpenAiResponsesMcpToolChoice
 );
 #[pymethods]
 impl PyOpenAiResponsesMcpToolChoice {
@@ -4024,9 +3504,7 @@ impl PyOpenAiResponsesMcpToolChoice {
 simple_responses_choice!(
     PyOpenAiResponsesCustomToolChoice,
     "OpenAiResponsesCustomToolChoice",
-    Custom,
-    OpenAiResponsesCustomToolChoice,
-    |_| "custom"
+    OpenAiResponsesCustomToolChoice
 );
 #[pymethods]
 impl PyOpenAiResponsesCustomToolChoice {
@@ -4046,10 +3524,7 @@ impl PyOpenAiResponsesCustomToolChoice {
 }
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesApplyPatchToolChoice")]
-pub struct PyOpenAiResponsesApplyPatchToolChoice {
-    #[allow(dead_code)]
-    inner: Arc<ProviderRequest>,
-}
+pub struct PyOpenAiResponsesApplyPatchToolChoice {}
 #[pymethods]
 impl PyOpenAiResponsesApplyPatchToolChoice {
     #[getter]
@@ -4062,10 +3537,7 @@ impl PyOpenAiResponsesApplyPatchToolChoice {
 }
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesShellToolChoice")]
-pub struct PyOpenAiResponsesShellToolChoice {
-    #[allow(dead_code)]
-    inner: Arc<ProviderRequest>,
-}
+pub struct PyOpenAiResponsesShellToolChoice {}
 #[pymethods]
 impl PyOpenAiResponsesShellToolChoice {
     #[getter]
@@ -4161,15 +3633,11 @@ impl PyOpenAiResponseContentPart {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesTool")]
 pub struct PyOpenAiResponsesTool {
-    inner: Arc<ProviderRequest>,
-    index: usize,
+    inner: Arc<OpenAiResponsesTool>,
 }
 impl PyOpenAiResponsesTool {
     fn t(&self) -> &OpenAiResponsesTool {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiResponses(r) => &r.tools.as_ref().expect("guarded")[self.index],
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -4211,23 +3679,11 @@ impl PyOpenAiResponsesTool {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesGrammar")]
 pub struct PyOpenAiResponsesGrammar {
-    inner: Arc<ProviderRequest>,
-    tool_index: usize,
+    inner: Arc<OpenAiResponsesGrammar>,
 }
 impl PyOpenAiResponsesGrammar {
     fn g(&self) -> &OpenAiResponsesGrammar {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiResponses(r) => {
-                match &r.tools.as_ref().expect("guarded")[self.tool_index] {
-                    OpenAiResponsesTool::Custom {
-                        format: Some(OpenAiResponsesCustomToolFormat::Grammar { grammar }),
-                        ..
-                    } => grammar,
-                    _ => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -4293,8 +3749,8 @@ impl PyOpenAiResponsesResponse {
     }
     #[getter]
     fn usage(&self) -> Option<PyOpenAiResponsesUsage> {
-        self.resp().usage.as_ref().map(|_| PyOpenAiResponsesUsage {
-            inner: Arc::clone(&self.inner),
+        self.resp().usage.as_ref().map(|u| PyOpenAiResponsesUsage {
+            inner: Arc::new(u.clone()),
         })
     }
     fn __repr__(&self) -> String {
@@ -4308,14 +3764,11 @@ impl PyOpenAiResponsesResponse {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesUsage")]
 pub struct PyOpenAiResponsesUsage {
-    inner: Arc<ProviderResponse>,
+    inner: Arc<OpenAiResponsesUsage>,
 }
 impl PyOpenAiResponsesUsage {
     fn u(&self) -> &OpenAiResponsesUsage {
-        match self.inner.as_ref() {
-            ProviderResponse::OpenAiResponses(r) => r.usage.as_ref().expect("guarded"),
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -4337,8 +3790,8 @@ impl PyOpenAiResponsesUsage {
         self.u()
             .input_tokens_details
             .as_ref()
-            .map(|_| PyOpenAiResponsesInputTokensDetails {
-                inner: Arc::clone(&self.inner),
+            .map(|d| PyOpenAiResponsesInputTokensDetails {
+                inner: Arc::new(d.clone()),
             })
     }
     #[getter]
@@ -4346,8 +3799,8 @@ impl PyOpenAiResponsesUsage {
         self.u()
             .output_tokens_details
             .as_ref()
-            .map(|_| PyOpenAiResponsesOutputTokensDetails {
-                inner: Arc::clone(&self.inner),
+            .map(|d| PyOpenAiResponsesOutputTokensDetails {
+                inner: Arc::new(d.clone()),
             })
     }
     fn __repr__(&self) -> String {
@@ -4357,20 +3810,11 @@ impl PyOpenAiResponsesUsage {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesInputTokensDetails")]
 pub struct PyOpenAiResponsesInputTokensDetails {
-    inner: Arc<ProviderResponse>,
+    inner: Arc<OpenAiResponsesInputTokensDetails>,
 }
 impl PyOpenAiResponsesInputTokensDetails {
     fn d(&self) -> &OpenAiResponsesInputTokensDetails {
-        match self.inner.as_ref() {
-            ProviderResponse::OpenAiResponses(r) => r
-                .usage
-                .as_ref()
-                .expect("guarded")
-                .input_tokens_details
-                .as_ref()
-                .expect("guarded"),
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]
@@ -4386,20 +3830,11 @@ impl PyOpenAiResponsesInputTokensDetails {
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesOutputTokensDetails")]
 pub struct PyOpenAiResponsesOutputTokensDetails {
-    inner: Arc<ProviderResponse>,
+    inner: Arc<OpenAiResponsesOutputTokensDetails>,
 }
 impl PyOpenAiResponsesOutputTokensDetails {
     fn d(&self) -> &OpenAiResponsesOutputTokensDetails {
-        match self.inner.as_ref() {
-            ProviderResponse::OpenAiResponses(r) => r
-                .usage
-                .as_ref()
-                .expect("guarded")
-                .output_tokens_details
-                .as_ref()
-                .expect("guarded"),
-            _ => unreachable!(),
-        }
+        &self.inner
     }
 }
 #[pymethods]

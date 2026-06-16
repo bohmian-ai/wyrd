@@ -889,7 +889,9 @@ fn redact_in_place(value: &mut serde_json::Value) {
 }
 
 fn synthetic_null_response() -> ProviderResponse {
-    ProviderResponse::RawV1(
-        serde_json::value::RawValue::from_string("null".to_owned()).expect("'null' is valid JSON"),
-    )
+    let raw = match serde_json::value::RawValue::from_string("null".to_owned()) {
+        Ok(raw) => raw,
+        Err(_) => unreachable!("'null' is valid JSON"),
+    };
+    ProviderResponse::RawV1(raw)
 }

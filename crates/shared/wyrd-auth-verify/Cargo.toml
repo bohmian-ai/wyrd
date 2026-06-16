@@ -7,8 +7,17 @@ rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 [dependencies]
+chrono = { workspace = true }
 jsonwebtoken = { workspace = true }
+moka = { version = "0.12", features = ["future"] }
+secrecy = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
 wyrd-runtime = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

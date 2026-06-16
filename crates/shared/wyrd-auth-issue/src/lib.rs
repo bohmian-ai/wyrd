@@ -2,8 +2,6 @@
 
 #![deny(missing_docs)]
 
-use std::fmt;
-
 use argon2::{Algorithm, Argon2, Params, Version};
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{EncodingKey, Header};
@@ -11,7 +9,7 @@ use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, 
 use secrecy::{ExposeSecret, SecretString};
 use ulid::Ulid;
 use wyrd_auth_verify::{
-    AccessTokenClaims, ActClaim, PrincipalKindWire, PrincipalRef, RefreshTokenClaims,
+    AccessTokenClaims, ActClaim, Kid, PrincipalKindWire, PrincipalRef, RefreshTokenClaims,
 };
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
@@ -32,44 +30,6 @@ pub const ARGON2_T_COST: u32 = 2;
 
 /// OWASP-recommended Argon2id lane count.
 pub const ARGON2_P_COST: u32 = 1;
-
-/// Validated JWT key identifier.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Kid(String);
-
-impl Kid {
-    /// Build a validated key id.
-    ///
-    /// # Errors
-    /// Returns an error when the key id does not match `^[A-Za-z0-9._-]{1,64}$`.
-    pub fn new(value: impl Into<String>) -> Result<Self, IssueError> {
-        let value = value.into();
-        let ok = !value.is_empty()
-            && value.len() <= 64
-            && value.bytes().all(|byte| {
-                matches!(
-                    byte,
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'
-                )
-            });
-        if !ok {
-            return Err(IssueError::InvalidKid);
-        }
-        Ok(Self(value))
-    }
-
-    /// Borrow as a string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for Kid {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 /// Plaintext access and refresh tokens returned by server-tier issue paths.
 #[derive(Debug)]
@@ -627,12 +587,9 @@ mod tests {
 
     #[test]
     fn kid_validation_rejects_empty_space_and_too_long() {
-        assert!(matches!(Kid::new(""), Err(IssueError::InvalidKid)));
-        assert!(matches!(Kid::new("bad kid"), Err(IssueError::InvalidKid)));
-        assert!(matches!(
-            Kid::new("a".repeat(65)),
-            Err(IssueError::InvalidKid)
-        ));
+        assert!(Kid::new("").is_err());
+        assert!(Kid::new("bad kid").is_err());
+        assert!(Kid::new("a".repeat(65)).is_err());
     }
 
     #[test]

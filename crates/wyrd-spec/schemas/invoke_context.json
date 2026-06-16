@@ -92,12 +92,17 @@
           "description": "Service-account identity.",
           "type": "object",
           "required": [
+            "client_id",
             "name",
             "type"
           ],
           "properties": {
+            "client_id": {
+              "description": "Stable opaque client identifier from verified claims — never a credential. Populated from the JWT `sub` or equivalent claim when real auth lands; stubbed as a generated ID in stub-auth builds.",
+              "type": "string"
+            },
             "name": {
-              "description": "Service account name.",
+              "description": "Service account name (human-readable label).",
               "type": "string"
             },
             "type": {
@@ -233,7 +238,7 @@
       "type": "string"
     },
     "RequestId": {
-      "description": "Request correlation ID accepted as a ULID or UUID.",
+      "description": "Request correlation ID; required to be a UUID v7.",
       "type": "string"
     },
     "RunKind": {

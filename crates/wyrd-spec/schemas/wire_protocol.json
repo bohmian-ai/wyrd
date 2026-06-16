@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WireProtocol",
+  "description": "On-wire upload protocol.\n\nThis is plan-shaped, not backend-shaped: one backend can emit different protocols depending on artifact size. It is also the only protocol string intended for SQL persistence and backend dispatch.",
+  "oneOf": [
+    {
+      "description": "Cloud single PUT to a presigned URL.",
+      "type": "string",
+      "enum": [
+        "single_put_v1"
+      ]
+    },
+    {
+      "description": "AWS S3 multipart upload.",
+      "type": "string",
+      "enum": [
+        "s3_multipart_v1"
+      ]
+    },
+    {
+      "description": "Google Cloud Storage resumable upload.",
+      "type": "string",
+      "enum": [
+        "gcs_resumable_v1"
+      ]
+    },
+    {
+      "description": "Azure block blob upload.",
+      "type": "string",
+      "enum": [
+        "azure_block_blob_v1"
+      ]
+    },
+    {
+      "description": "Local filesystem upload through a server-owned temporary object.",
+      "type": "string",
+      "enum": [
+        "local_fs_v1"
+      ]
+    }
+  ]
+}

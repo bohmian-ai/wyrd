@@ -9,17 +9,34 @@ authors = { workspace = true }
 
 [features]
 enterprise = ["dep:wyrd-enterprise"]
+stub-auth = []
 
 [[bin]]
 name = "wyrd-server"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
+tokio-util = { workspace = true }
 axum = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+base64 = { workspace = true }
+chrono = { workspace = true }
 secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
+wyrd-runtime = { workspace = true }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1", features = ["embedded-postgres"] }
+wyrd-spec = { workspace = true }
+wyrd-storage = { workspace = true }
 wyrd-enterprise = { path = "../wyrd-enterprise", version = "0.0.1", optional = true }
+
+[dev-dependencies]
+object_store = { workspace = true }
+tempfile = { workspace = true }
+tower = { workspace = true, features = ["util"] }

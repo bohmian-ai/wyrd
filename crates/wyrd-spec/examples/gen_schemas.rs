@@ -35,6 +35,11 @@ use wyrd_spec::card::workflow::WorkflowSpec;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::run::{RunKind, RunRef};
+use wyrd_spec::storage::{
+    AbortResponse, DownloadInitRequest, DownloadInitResponse, DownloadPlan,
+    LocalBlobUploadResponse, PartUrlResponse, UploadCompleteRequest, UploadCompleteResponse,
+    UploadInitRequest, UploadInitResponse, UploadPlan, VerificationGuarantee, WireProtocol,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = Path::new("crates/wyrd-spec/schemas");
@@ -99,6 +104,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<AuditSpec>(out, golden, "audit_spec")?;
     write::<ArtifactSpec>(out, golden, "artifact_spec")?;
     write::<FrameworkAdapterRef>(out, golden, "framework_adapter_ref")?;
+    write::<UploadInitRequest>(out, golden, "upload_init_request")?;
+    write::<UploadInitResponse>(out, golden, "upload_init_response")?;
+    write::<UploadPlan>(out, golden, "upload_plan")?;
+    write::<UploadCompleteRequest>(out, golden, "upload_complete_request")?;
+    write::<UploadCompleteResponse>(out, golden, "upload_complete_response")?;
+    write::<PartUrlResponse>(out, golden, "part_url_response")?;
+    write::<AbortResponse>(out, golden, "abort_response")?;
+    write::<LocalBlobUploadResponse>(out, golden, "local_blob_upload_response")?;
+    write::<DownloadInitRequest>(out, golden, "download_init_request")?;
+    write::<DownloadInitResponse>(out, golden, "download_init_response")?;
+    write::<DownloadPlan>(out, golden, "download_plan")?;
+    write::<WireProtocol>(out, golden, "wire_protocol")?;
+    write::<VerificationGuarantee>(out, golden, "verification_guarantee")?;
     Ok(())
 }
 

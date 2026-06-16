@@ -25,7 +25,10 @@ run = "cargo clippy --locked --workspace --all-features --all-targets -- -D warn
 
 [tasks."test:unit"]
 description = "Run all Rust unit tests"
-run = "cargo test --locked --workspace --exclude py-wyrd"
+run = """
+cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server
+cargo test --locked -p wyrd-server --features stub-auth
+"""
 
 [tasks."test:wyrd-spec"]
 description = "Run wyrd-spec Rust tests"
@@ -222,6 +225,198 @@ if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/skald/skald-providers/Cargo.toml' \
   --glob '!crates/skald/skald-providers/tests/**'; then
   echo 'mock dependency leaked outside wyrd-testing'
+  exit 1
+fi
+"""
+
+[tasks."check:object-store-pin"]
+description = "Assert the workspace resolves exactly one object_store 0.13 package"
+run = """
+cargo tree -e=no-dev -i object_store --all-features 2>&1 \
+  | awk '/^object_store / { v=$2; count++ } END {
+      if (count != 1) { print "FAIL: expected exactly 1 object_store version, got "count; exit 1 }
+      if (v !~ /^v0\\.13\\./) { print "FAIL: object_store "v" is not 0.13.*"; exit 1 }
+      print "OK: "v
+    }'
+"""
+
+[tasks."storage:up"]
+description = "Start local storage emulators: MinIO, fake-gcs-server, and Azurite"
+run = "docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d"
+
+[tasks."storage:down"]
+description = "Stop local storage emulators and remove their volumes"
+run = "docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml down -v"
+
+[tasks."storage:logs"]
+description = "Tail local storage emulator logs"
+run = "docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml logs -f"
+
+[tasks."test:storage:local"]
+description = "Run wyrd-storage local backend integration tests"
+run = "cargo test -p wyrd-storage --all-features --test integration_local"
+
+[tasks."test:storage:minio"]
+description = "Run wyrd-storage MinIO integration tests; requires storage:up"
+depends = ["storage:up"]
+env = { WYRD_STORAGE_INTEGRATION_S3 = "1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1" }
+run = "cargo test -p wyrd-storage --all-features --test integration_minio -- --nocapture"
+
+[tasks."test:storage:gcs-emu"]
+description = "Run wyrd-storage GCS emulator integration tests; requires storage:up"
+depends = ["storage:up"]
+env = { WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_GCS_EMULATOR_HOST = "http://localhost:4443/storage/v1/" }
+run = "cargo test -p wyrd-storage --all-features --test integration_gcs -- --nocapture"
+
+[tasks."test:storage:azurite"]
+description = "Run wyrd-storage Azurite integration tests; requires storage:up"
+depends = ["storage:up"]
+env = { WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_AZURE_EMULATOR_ENDPOINT = "http://127.0.0.1:10000" }
+run = "cargo test -p wyrd-storage --all-features --test integration_azurite -- --nocapture"
+
+[tasks."test:storage:e2e"]
+description = "Run server-level storage HTTP e2e tests (requires WYRD_DATABASE_URL_MIGRATOR and storage:up)"
+depends = ["storage:up"]
+env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_INTEGRATION_S3 = "1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1" }
+run = "cargo test -p wyrd-server --features stub-auth --test storage_e2e -- --nocapture"
+
+[tasks."test:storage:s3:cloud"]
+description = "Run storage e2e tests against real AWS S3 (requires AWS credentials in env)"
+env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_BACKEND = "s3" }
+run = "cargo test -p wyrd-server --features stub-auth --test storage_e2e -- --nocapture"
+
+[tasks."test:storage:gcs:cloud"]
+description = "Run storage e2e tests against real GCS (requires GCP credentials in env)"
+env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_BACKEND = "gcs" }
+run = "cargo test -p wyrd-server --features stub-auth --test storage_e2e -- --nocapture"
+
+[tasks."test:storage:azure:cloud"]
+description = "Run storage e2e tests against real Azure Blob Storage (requires Azure credentials in env)"
+env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_BACKEND = "azure" }
+run = "cargo test -p wyrd-server --features stub-auth --test storage_e2e -- --nocapture"
+
+[tasks."test:storage:matrix"]
+description = "Run all storage emulator integration tests; requires storage:up"
+depends = ["test:storage:local", "test:storage:gcs-emu", "test:storage:minio", "test:storage:azurite", "test:storage:e2e"]
+
+[tasks."check:storage:drift"]
+description = "Assert storage foundation guardrails against paths that exist in this workspace"
+run = """
+set -eu
+
+rg_optional() {
+  pattern="$1"
+  shift
+  existing=""
+  for path in "$@"; do
+    if [ -e "$path" ]; then
+      existing="$existing $path"
+    else
+      echo "skip missing path: $path"
+    fi
+  done
+  if [ -n "$existing" ]; then
+    # shellcheck disable=SC2086
+    rg -n "$pattern" $existing
+  else
+    return 1
+  fi
+}
+
+rg_fixed_optional() {
+  pattern="$1"
+  shift
+  existing=""
+  for path in "$@"; do
+    if [ -e "$path" ]; then
+      existing="$existing $path"
+    else
+      echo "skip missing path: $path"
+    fi
+  done
+  if [ -n "$existing" ]; then
+    # shellcheck disable=SC2086
+    rg -nF "$pattern" $existing
+  else
+    return 1
+  fi
+}
+
+if rg_optional 'pyo3|pymodule|pyclass|pymethods' \
+  crates/wyrd/wyrd-storage \
+  crates/wyrd/wyrd-server/src/storage \
+  crates/wyrd-spec/src/storage; then
+  echo 'storage foundation must stay PyO3-free'
+  exit 1
+fi
+
+if rg_optional 'session_uri|session_url|sas|presigned_url' \
+  crates/wyrd/wyrd-sql/migrations \
+  crates/wyrd/wyrd-sql/src/queries/storage; then
+  echo 'bearer-equivalent upload tokens must not be persisted in migrations or storage queries'
+  exit 1
+fi
+
+if rg_fixed_optional 'partial.state' \
+  crates/wyrd/wyrd-client/src/artifacts \
+  crates/wyrd/wyrd-client/src/cards; then
+  echo 'upload sidecar state is forbidden'
+  exit 1
+fi
+
+if rg_fixed_optional 'storage_multipart_upload_parts' crates/wyrd/wyrd-sql/migrations; then
+  echo 'per-part multipart upload tables are forbidden'
+  exit 1
+fi
+
+if rg_optional 'presign_batch|next_parts|part_batch_size|batch_presign|presign.*batch|batch.*presign' \
+  crates/wyrd/wyrd-storage/src \
+  crates/wyrd-spec/src/storage \
+  crates/wyrd/wyrd-client/src; then
+  echo 'per-part presign batching is forbidden'
+  exit 1
+fi
+
+if rg_optional 'aws_sdk_s3|gcloud_storage|azure_storage|azure_core|object_store|sqlx' \
+  crates/wyrd/wyrd-client/src \
+  crates/wyrd/wyrd-client/Cargo.toml; then
+  echo 'client tier must stay free of cloud SDK, object_store, and sqlx dependencies'
+  exit 1
+fi
+
+if rg_optional '&PgPool' \
+  crates/wyrd/wyrd-sql/src/queries/storage/multipart_uploads.rs \
+  crates/wyrd/wyrd-sql/src/queries/storage/artifact_metadata.rs \
+  crates/wyrd/wyrd-sql/src/queries/storage/access_ledger.rs \
+  crates/wyrd/wyrd-sql/src/queries/storage/idempotency.rs; then
+  echo 'tenant-scoped storage queries must use TenantConn, not PgPool'
+  exit 1
+fi
+
+if rg_optional 'PendingMap|storage_pending' \
+  crates/wyrd/wyrd-server/src \
+  crates/wyrd-spec/src; then
+  echo 'storage uploads must not rely on in-memory cross-request state'
+  exit 1
+fi
+
+if rg -n --glob '*.rs' 'wire_protocol\\s*==\\s*"' crates; then
+  echo 'WireProtocol dispatch must not use string equality'
+  exit 1
+fi
+
+if rg -n --type rust 'ArtifactRef' crates/wyrd-spec/src/storage 2>/dev/null; then
+  echo 'storage must not introduce a second artifact identity surface'
+  exit 1
+fi
+
+if ! rg -q '#\\[serde\\(tag = "protocol", content = "data"' crates/wyrd-spec/src/storage/upload.rs; then
+  echo 'UploadPlan must remain a closed tagged union'
+  exit 1
+fi
+
+if rg -n -e '\\.unwrap\\(\\)' crates/wyrd/wyrd-storage/src crates/wyrd/wyrd-server/src/storage; then
+  echo 'unwrap is forbidden in non-test storage code'
   exit 1
 fi
 """
@@ -496,9 +691,34 @@ diff -u "$BEFORE" "$AFTER" \
   || { echo 'codegen drift detected - run mise run codegen:regen and commit'; exit 1; }
 """
 
+[tasks."check:single-into-response-impl"]
+description = "Assert Wyrd HTTP errors flow through one server IntoResponse mapper"
+run = """
+set -eu
+
+matches=$(rg -n 'impl IntoResponse for (WyrdErrorResponse|.*Wyrd.*Error)' crates --glob '*.rs' || true)
+count=$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')
+
+if [ "$count" != "1" ]; then
+  echo "expected exactly one Wyrd error IntoResponse mapper, found $count"
+  printf '%s\n' "$matches"
+  exit 1
+fi
+
+case "$matches" in
+  crates/wyrd/wyrd-server/src/error.rs:*'impl IntoResponse for WyrdErrorResponse'*)
+    ;;
+  *)
+    echo "Wyrd error IntoResponse mapper must stay in wyrd-server/src/error.rs"
+    printf '%s\n' "$matches"
+    exit 1
+    ;;
+esac
+"""
+
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
-depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
+depends = ["check", "test:unit", "test:storage:local", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:storage:drift", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
 
 [tasks."test:sql"]
 description = """Run live Postgres SQL integration tests.

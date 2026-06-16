@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VerificationGuarantee",
+  "description": "Per-backend SHA-256 verification guarantee.\n\nDescribes how the server validates `expected_sha256` for each backend.",
+  "oneOf": [
+    {
+      "description": "Server independently computes SHA-256 from stored object data.\n\nCurrently used only for the `Local` backend, which reads from the server's local filesystem (zero egress cost, no SDK limitation).",
+      "type": "string",
+      "enum": [
+        "server_computed"
+      ]
+    },
+    {
+      "description": "Server passes the client-declared SHA-256 to the backend at commit time; the backend rejects the commit on mismatch.",
+      "type": "string",
+      "enum": [
+        "server_verified_against_client"
+      ]
+    },
+    {
+      "description": "Client declares SHA-256 at upload init; the server has no independent verification path for this backend.",
+      "type": "string",
+      "enum": [
+        "client_declared"
+      ]
+    }
+  ]
+}

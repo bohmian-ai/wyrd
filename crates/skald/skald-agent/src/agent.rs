@@ -843,5 +843,5 @@ fn duration_to_millis(duration: Duration) -> u64 {
 }
 
 fn generate_agent_id() -> String {
-    ulid::Ulid::new().to_string()
+    uuid::Uuid::now_v7().to_string()
 }

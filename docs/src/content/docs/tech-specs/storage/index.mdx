@@ -40,8 +40,8 @@ enforced by a `mise run check:*` grep at CI time.
 | L11 | Single `Arc<dyn ObjectStore>` per process | Tenancy is path-prefix + RLS, not per-tenant stores. |
 | L12 | No in-memory cross-request upload state | Every field `complete` reads lives on the `storage_multipart_uploads` row. |
 | L13 | Init-row insert precedes backend SDK call | Two-phase init; sweeper picks up orphans. |
-| L15 | Server-owned or server-verified completion | S3/Azure/Local finalize server-side; GCS resumable + cloud SinglePut are server-verified via HEAD + SHA. |
-| L17 | Server-verified SHA-256 before `mark_completed` | Backend-supplied checksum is primary; streaming recompute is the fallback. |
+| L15 | Server-owned or server-verified completion | S3 and Local finalize server-side with SHA-256 enforcement; GCS and Azure are client-declared (see [Storage setup](/setup/storage/#sha-256-integrity-guarantees)). |
+| L17 | SHA-256 recorded before `mark_completed` | S3: backend-enforced at commit. Local: server-computed from written bytes. GCS/Azure: client-declared at init, recorded in artifact metadata and audit ledger. |
 
 The full L1–L17 table is in `.dev/plan/foundations/04-storage/00-README.md`.
 
@@ -143,7 +143,7 @@ state the client needs for that protocol, and only for that protocol.
 | Local | `LocalFsV1 { put_url }` | No | Server writes temp + fsync + rename | Streaming recompute |
 | S3 (large) | `S3Multipart { upload_id, part_urls }` | Yes | Server `CompleteMultipartUpload` with persisted `upload_id` + client ETags | `x-amz-checksum-sha256` (backend) |
 | S3 (small) | `SinglePutV1 { put_url }` | No | Client PUT is the commit; server HEAD + verify | Streaming recompute (fallback) |
-| GCS | `GcsResumable { session_uri }` | Chunked PUT | Client finalizes; server HEAD + verify | `x-goog-hash` (backend) or recompute |
+| GCS | `GcsResumable { session_uri }` | Chunked PUT | Client finalizes; server records client-declared SHA-256 | Client-declared (GCS stores CRC32c/MD5 only) |
 | Azure | `AzureBlock { sas, block_count }` | Yes | Server `PutBlockList` with derived block IDs | Streaming recompute |
 
 Bearer pieces (`session_uri`, `sas`, presigned URLs) leave the server

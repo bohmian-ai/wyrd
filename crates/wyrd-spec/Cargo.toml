@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [features]
 default = []
 server = ["dep:utoipa"]
-wasm = []
+wasm = ["uuid/js"]
 
 [dependencies]
 chrono = { workspace = true }

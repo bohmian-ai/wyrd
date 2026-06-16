@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DownloadInitRequest",
+  "description": "Client request to initialize a download.",
+  "type": "object",
+  "required": [
+    "card_uid",
+    "relative_path"
+  ],
+  "properties": {
+    "card_uid": {
+      "description": "Card that owns the stored object.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardUid"
+        }
+      ]
+    },
+    "relative_path": {
+      "description": "Object path under the card.",
+      "type": "string"
+    },
+    "ttl_secs": {
+      "description": "Optional presign TTL override in seconds.\n\nClamped to [60, 3600] seconds; out-of-range values are silently clamped. Defaults to the configured backend presign TTL when absent.",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    }
+  }
+}

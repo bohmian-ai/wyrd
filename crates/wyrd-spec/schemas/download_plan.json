@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DownloadPlan",
+  "description": "Presigned GET plan for any backend.",
+  "type": "object",
+  "required": [
+    "get_url",
+    "ttl_secs"
+  ],
+  "properties": {
+    "get_url": {
+      "description": "Presigned GET URL or local server route URL.",
+      "type": "string"
+    },
+    "ttl_secs": {
+      "description": "URL time-to-live in seconds.\n\nFor presigned URL backends (S3, GCS, Azure) this is the URL expiry in seconds. For the local filesystem backend this field is `0` (the server route does not expire).",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  },
+  "additionalProperties": false
+}

@@ -124,6 +124,7 @@ export default defineConfig({
           collapsed: true,
           items: [
             { label: "Postgres", link: "/setup/postgres/" },
+            { label: "Storage", link: "/setup/storage/" },
           ],
         },
         {

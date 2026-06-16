@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PartUrlResponse",
+  "description": "Server response for a single multipart part presigned URL.",
+  "type": "object",
+  "required": [
+    "ttl_secs",
+    "url"
+  ],
+  "properties": {
+    "ttl_secs": {
+      "description": "URL TTL in seconds.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "url": {
+      "description": "Presigned part URL.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

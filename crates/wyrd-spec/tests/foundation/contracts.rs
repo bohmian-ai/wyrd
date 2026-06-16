@@ -20,10 +20,10 @@ fn ids_enforce_type_specific_canonical_forms() {
 }
 
 #[test]
-fn request_id_accepts_ulid_or_uuid7_only() {
-    assert!(RequestId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").is_ok());
+fn request_id_accepts_uuid7_only() {
     assert!(RequestId::parse("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00").is_ok());
     assert!(RequestId::parse("550e8400-e29b-41d4-a716-446655440000").is_err());
+    assert!(RequestId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").is_err());
 }
 
 #[test]

@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Audit unwrap/expect calls outside Rust tests and examples."""
+"""Audit unwrap/expect calls outside Rust tests and examples.
+
+Policy:
+- `.unwrap()` is always blocked in production code.
+- `.expect(<arg>)` is permitted iff `<arg>` is a non-empty Rust string
+  literal (regular, byte, raw, or raw-byte). Dynamic messages,
+  empty literals, and non-literal arguments are blocked.
+"""
 
 from __future__ import annotations
 
@@ -25,6 +32,73 @@ def is_ignored_path(path: Path) -> bool:
     """Return whether `path` is a Rust test/example path."""
     parts = path.relative_to(ROOT).parts
     return "tests" in parts or "examples" in parts
+
+
+def read_string_literal(text: str, i: int) -> tuple[int, str] | None:
+    """If `text` at offset `i` begins a Rust string literal, return
+    `(end_index, body)`; otherwise return `None`.
+
+    Recognized forms: regular `"..."`, byte `b"..."`, raw `r"..."` and
+    `r#"..."#` (any hash count), raw-byte `br"..."` / `br#"..."#`.
+    """
+    n = len(text)
+    if i >= n:
+        return None
+    j = i
+    if text[j] == "b" and j + 1 < n and text[j + 1] in "r\"":
+        j += 1
+    if j < n and text[j] == "r" and j + 1 < n and text[j + 1] in "#\"":
+        hashes = 0
+        k = j + 1
+        while k < n and text[k] == "#":
+            hashes += 1
+            k += 1
+        if k >= n or text[k] != '"':
+            return None
+        terminator = '"' + "#" * hashes
+        end = text.find(terminator, k + 1)
+        if end == -1:
+            return None
+        return end + len(terminator), text[k + 1 : end]
+    if j < n and text[j] == '"':
+        k = j + 1
+        body: list[str] = []
+        while k < n:
+            if text[k] == "\\" and k + 1 < n:
+                body.append(text[k : k + 2])
+                k += 2
+                continue
+            if text[k] == '"':
+                return k + 1, "".join(body)
+            body.append(text[k])
+            k += 1
+        return None
+    return None
+
+
+def expect_arg_is_named_literal(line: str, after_open_paren: int) -> bool:
+    """Return whether the argument to `.expect(` starting at
+    `after_open_paren` is a single non-empty Rust string literal.
+
+    The match must be a plain literal with only optional surrounding
+    whitespace inside the parentheses. Constructs like
+    `.expect(&format!(...))`, `.expect(var)`, `.expect("")`,
+    `.expect("msg".into())` are all rejected.
+    """
+    n = len(line)
+    i = after_open_paren
+    while i < n and line[i] in " \t":
+        i += 1
+    parsed = read_string_literal(line, i)
+    if parsed is None:
+        return False
+    end, body = parsed
+    if not body:
+        return False
+    j = end
+    while j < n and line[j] in " \t":
+        j += 1
+    return j < n and line[j] == ")"
 
 
 def strip_strings_and_comments(text: str) -> str:
@@ -56,51 +130,15 @@ def strip_strings_and_comments(text: str) -> str:
                     out[k] = " "
             i = j
             continue
-        if ch == "r" and nxt in "#\"":
-            hashes = 0
-            j = i + 1
-            while j < n and text[j] == "#":
-                hashes += 1
-                j += 1
-            if j < n and text[j] == '"':
-                terminator = '"' + "#" * hashes
-                end = text.find(terminator, j + 1)
-                end = n if end == -1 else end + len(terminator)
+        if ch in ("r", "b") or ch == '"':
+            parsed = read_string_literal(text, i)
+            if parsed is not None:
+                end, _ = parsed
                 for k in range(i, end):
                     if out[k] != "\n":
                         out[k] = " "
                 i = end
                 continue
-        if ch == '"':
-            j = i + 1
-            while j < n:
-                if text[j] == "\\" and j + 1 < n:
-                    j += 2
-                    continue
-                if text[j] == '"':
-                    j += 1
-                    break
-                j += 1
-            for k in range(i, j):
-                if out[k] != "\n":
-                    out[k] = " "
-            i = j
-            continue
-        if ch == "b" and nxt == '"':
-            j = i + 2
-            while j < n:
-                if text[j] == "\\" and j + 1 < n:
-                    j += 2
-                    continue
-                if text[j] == '"':
-                    j += 1
-                    break
-                j += 1
-            for k in range(i, j):
-                if out[k] != "\n":
-                    out[k] = " "
-            i = j
-            continue
         if ch == "'":
             j = i + 1
             if j < n and text[j] == "\\" and j + 1 < n:
@@ -157,15 +195,28 @@ def in_ranges(line: int, ranges: list[tuple[int, int]]) -> bool:
 
 
 def scan_file(path: Path) -> list[Finding]:
-    """Return production unwrap/expect calls from one Rust file."""
+    """Return production unwrap/expect findings from one Rust file.
+
+    `.unwrap()` is always a finding. `.expect(<arg>)` is a finding unless
+    `<arg>` is a non-empty Rust string literal.
+    """
     text = path.read_text(encoding="utf-8")
+    sanitized = strip_strings_and_comments(text)
     ignored_ranges = cfg_test_ranges(text)
     findings: list[Finding] = []
-    for line_number, line in enumerate(text.splitlines(), start=1):
+    raw_lines = text.splitlines()
+    scan_lines = sanitized.splitlines()
+    for line_number, (raw_line, scan_line) in enumerate(
+        zip(raw_lines, scan_lines, strict=False), start=1
+    ):
         if in_ranges(line_number, ignored_ranges):
             continue
-        if CALL_RE.search(line):
-            findings.append(Finding(path, line_number, line.strip()))
+        for match in CALL_RE.finditer(scan_line):
+            kind = match.group(1)
+            if kind == "unwrap":
+                findings.append(Finding(path, line_number, raw_line.strip()))
+            elif not expect_arg_is_named_literal(raw_line, match.end()):
+                findings.append(Finding(path, line_number, raw_line.strip()))
     return findings
 
 

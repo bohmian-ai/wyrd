@@ -120,7 +120,10 @@ pub enum UploadPlan {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationGuarantee {
-    /// Server independently computes SHA-256 from stored object metadata.
+    /// Server independently computes SHA-256 from stored object data.
+    ///
+    /// Currently used only for the `Local` backend, which reads from the
+    /// server's local filesystem (zero egress cost, no SDK limitation).
     ServerComputed,
     /// Server passes the client-declared SHA-256 to the backend at commit
     /// time; the backend rejects the commit on mismatch.

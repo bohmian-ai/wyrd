@@ -90,9 +90,9 @@ impl Default for SweeperConfig {
         Self {
             enabled: true,
             tick: DEFAULT_TICK,
-            batch_size: DEFAULT_BATCH_SIZE as i64,
+            batch_size: DEFAULT_BATCH_SIZE.cast_signed(),
             init_grace: DEFAULT_INIT_GRACE,
-            idempotency_batch_size: DEFAULT_IDEMPOTENCY_BATCH_SIZE as i64,
+            idempotency_batch_size: DEFAULT_IDEMPOTENCY_BATCH_SIZE.cast_signed(),
         }
     }
 }
@@ -407,9 +407,9 @@ mod tests {
 
             assert!(cfg.enabled);
             assert_eq!(cfg.tick, DEFAULT_TICK);
-            assert_eq!(cfg.batch_size, DEFAULT_BATCH_SIZE as i64);
+            assert_eq!(cfg.batch_size, DEFAULT_BATCH_SIZE.cast_signed());
             assert_eq!(cfg.init_grace, DEFAULT_INIT_GRACE);
-            assert_eq!(cfg.idempotency_batch_size, DEFAULT_IDEMPOTENCY_BATCH_SIZE as i64);
+            assert_eq!(cfg.idempotency_batch_size, DEFAULT_IDEMPOTENCY_BATCH_SIZE.cast_signed());
         });
     }
 

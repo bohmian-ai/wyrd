@@ -170,7 +170,7 @@ impl GcsSigner {
 
     /// GCS SHA-256 verification is client-declared.
     ///
-    /// `gcloud-storage` v1.3.0 exposes only MD5 and CRC32c from object
+    /// `gcloud-storage` v1.3.0 exposes only MD5 and `CRC32c` from object
     /// metadata — no SHA-256 field. Downloading the object to compute SHA-256
     /// violates the no-bytes-on-server invariant and causes OOM for large
     /// artifacts. GCS backend is therefore `VerificationGuarantee::ClientDeclared`;

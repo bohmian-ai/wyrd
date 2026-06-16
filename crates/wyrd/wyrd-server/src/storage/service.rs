@@ -708,8 +708,8 @@ fn authorize_card_write(caller: &Caller) -> Result<(), WyrdError> {
     if caller.principal.has_scope(Scope::CardWrite) {
         return Ok(());
     }
-    Err(WyrdError::InsufficientScope {
-        message: "caller lacks required scope card:write".to_owned(),
+    Err(WyrdError::PermissionDeniedRbac {
+        message: "caller lacks required permission card:write".to_owned(),
         details: serde_json::json!({ "required": Scope::CardWrite.as_str() }),
     })
 }
@@ -718,8 +718,8 @@ fn authorize_card_read(caller: &Caller) -> Result<(), WyrdError> {
     if caller.principal.has_scope(Scope::CardRead) {
         return Ok(());
     }
-    Err(WyrdError::InsufficientScope {
-        message: "caller lacks required scope card:read".to_owned(),
+    Err(WyrdError::PermissionDeniedRbac {
+        message: "caller lacks required permission card:read".to_owned(),
         details: serde_json::json!({ "required": Scope::CardRead.as_str() }),
     })
 }
@@ -1210,7 +1210,9 @@ pub fn map_sql_error(error: wyrd_sql::SqlError) -> WyrdError {
         | wyrd_sql::SqlError::FkViolation { .. }
         | wyrd_sql::SqlError::CheckViolation { .. }
         | wyrd_sql::SqlError::Conflict { .. } => conflict_error(&message, details),
-        wyrd_sql::SqlError::RlsDenied { .. } => WyrdError::PermissionDenied { message, details },
+        wyrd_sql::SqlError::RlsDenied { .. } => {
+            WyrdError::PermissionDeniedRbac { message, details }
+        }
         wyrd_sql::SqlError::Connect(_)
         | wyrd_sql::SqlError::Migrate(_)
         | wyrd_sql::SqlError::MigrateChecksum { .. }

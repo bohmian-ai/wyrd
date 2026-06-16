@@ -235,8 +235,8 @@ see [Lifecycle](/tech-specs/storage/lifecycle/).
 
 ## Authz
 
-Every upload route gates on `Scope::CardWrite`. Failures return
-`WyrdError::InsufficientScope` directly (not through any storage-specific
+Every upload route gates on the card write permission. Failures return
+`WyrdError::PermissionDeniedRbac` directly (not through any storage-specific
 mapper). The single `IntoResponse for WyrdError` impl in
 `wyrd-server::error` (commit 00a) renders both `WyrdError` and lifted
 `WyrdStorageError` into the same problem+json envelope.

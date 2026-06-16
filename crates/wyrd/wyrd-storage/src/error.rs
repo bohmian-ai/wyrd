@@ -387,7 +387,7 @@ fn map_sql_error(error: wyrd_sql::SqlError) -> WyrdStorageError {
                 "storage SQL error mapped to public backend failure"
             );
             WyrdStorageError::Backend {
-                detail: format!("sql: {other}"),
+                detail: "storage sql error".to_owned(),
             }
         }
     }

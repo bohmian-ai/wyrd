@@ -1226,7 +1226,17 @@ pub fn map_sql_error(error: wyrd_sql::SqlError) -> WyrdError {
         | wyrd_sql::SqlError::InvariantViolation { .. }
         | wyrd_sql::SqlError::TxFailed(_)
         | wyrd_sql::SqlError::InsufficientPrivilege { .. }
-        | wyrd_sql::SqlError::InvalidDataTenantId(_) => WyrdError::Internal { message, details },
+        | wyrd_sql::SqlError::InvalidDataTenantId(_) => {
+            tracing::error!(
+                error = %message,
+                source_code = code,
+                "storage sql internal error"
+            );
+            WyrdError::Internal {
+                message: "storage operation failed".to_owned(),
+                details: serde_json::json!({}),
+            }
+        }
     }
 }
 

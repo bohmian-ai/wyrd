@@ -19,6 +19,7 @@ path = "src/main.rs"
 tokio = { workspace = true, features = ["signal"] }
 tokio-util = { workspace = true }
 axum = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 base64 = { workspace = true }
 chrono = { workspace = true }
 secrecy = { workspace = true }

@@ -423,6 +423,7 @@ mod tests {
     fn test_actor() -> Actor {
         Actor::Service {
             name: "test-service".to_owned(),
+            client_id: "test-service".to_owned(),
         }
     }
 

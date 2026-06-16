@@ -1,0 +1,117 @@
+name: storage-integration-cloud
+
+# Runs credentialed storage e2e tests against real S3, GCS, and Azure Blob.
+# Emulators cannot verify: S3 ChecksumType::FullObject SHA-256 server-side
+# computation, real IAM/role assumption, GCS workload-identity signed URLs,
+# Azure user-delegation SAS, and provider-specific error shapes.
+#
+# Triggers on main-branch pushes and a weekly Monday cron. Never runs on PRs
+# from forks (credential exposure risk).
+#
+# Activation: populate the repository secrets listed below, then un-comment the
+# `schedule` trigger. Until secrets are provisioned the workflow file can safely
+# land with only the `push` trigger — the jobs will fail at credential setup and
+# surface a clear error rather than silently skipping.
+
+on:
+  push:
+    branches: [main]
+  # Activate by un-commenting after secrets are populated:
+  # schedule:
+  #   - cron: '0 6 * * 1'   # 06:00 UTC every Monday
+
+# Required repository secrets:
+#   AWS_CLOUD_ROLE_ARN          — IAM role ARN for OIDC assumption (e.g. arn:aws:iam::ACCOUNT:role/wyrd-ci-storage)
+#   AWS_CLOUD_BUCKET_NAME       — S3 bucket name (e.g. wyrd-ci-storage)
+#   AWS_CLOUD_REGION            — S3 region (e.g. us-east-1)
+#   GCP_CLOUD_WORKLOAD_IDENTITY — GCP workload identity provider resource name
+#   GCP_CLOUD_SERVICE_ACCOUNT   — GCP service account email for impersonation
+#   GCP_CLOUD_BUCKET_NAME       — GCS bucket name
+#   AZURE_CLOUD_CLIENT_ID       — Azure AD app client ID for OIDC federation
+#   AZURE_CLOUD_TENANT_ID       — Azure AD tenant ID
+#   AZURE_CLOUD_SUBSCRIPTION_ID — Azure subscription ID
+#   AZURE_CLOUD_ACCOUNT_NAME    — Azure storage account name
+#   AZURE_CLOUD_CONTAINER_NAME  — Azure blob container name
+#   WYRD_DATABASE_URL_MIGRATOR  — Postgres migrator DSN for e2e test tenant setup
+
+permissions:
+  contents: read
+  id-token: write   # Required for OIDC credential federation
+
+env:
+  MISE_LOCKED: "true"
+
+jobs:
+  s3-cloud:
+    name: S3 real-cloud
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CLOUD_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_CLOUD_REGION }}
+
+      - name: Run S3 cloud e2e tests
+        env:
+          WYRD_STORAGE_BACKEND: s3
+          WYRD_STORAGE_S3_BUCKET: ${{ secrets.AWS_CLOUD_BUCKET_NAME }}
+          WYRD_STORAGE_S3_REGION: ${{ secrets.AWS_CLOUD_REGION }}
+          WYRD_DATABASE_URL_MIGRATOR: ${{ secrets.WYRD_DATABASE_URL_MIGRATOR }}
+        run: mise run test:storage:s3:cloud
+
+  gcs-cloud:
+    name: GCS real-cloud
+    needs: s3-cloud
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+
+      - name: Authenticate to GCP (workload identity)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_CLOUD_WORKLOAD_IDENTITY }}
+          service_account: ${{ secrets.GCP_CLOUD_SERVICE_ACCOUNT }}
+
+      - name: Run GCS cloud e2e tests
+        env:
+          WYRD_STORAGE_BACKEND: gcs
+          WYRD_STORAGE_GCS_BUCKET: ${{ secrets.GCP_CLOUD_BUCKET_NAME }}
+          WYRD_DATABASE_URL_MIGRATOR: ${{ secrets.WYRD_DATABASE_URL_MIGRATOR }}
+        run: mise run test:storage:gcs:cloud
+
+  azure-cloud:
+    name: Azure real-cloud
+    needs: gcs-cloud
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+
+      - name: Authenticate to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLOUD_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_CLOUD_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_CLOUD_SUBSCRIPTION_ID }}
+
+      - name: Run Azure cloud e2e tests
+        env:
+          WYRD_STORAGE_BACKEND: azure
+          WYRD_STORAGE_AZURE_ACCOUNT: ${{ secrets.AZURE_CLOUD_ACCOUNT_NAME }}
+          WYRD_STORAGE_AZURE_CONTAINER: ${{ secrets.AZURE_CLOUD_CONTAINER_NAME }}
+          WYRD_DATABASE_URL_MIGRATOR: ${{ secrets.WYRD_DATABASE_URL_MIGRATOR }}
+        run: mise run test:storage:azure:cloud

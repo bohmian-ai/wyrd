@@ -22,7 +22,6 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
-ulid = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]

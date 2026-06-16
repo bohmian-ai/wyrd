@@ -78,7 +78,7 @@ impl IssuingKey {
 
         let sub = match &actor {
             Actor::User { id, .. } => id.to_string(),
-            Actor::Service { name } => name.clone(),
+            Actor::Service { client_id, .. } => client_id.clone(),
             Actor::Agent { id, .. } => id.to_string(),
         };
 
@@ -211,7 +211,7 @@ mod tests {
         let actor = test_actor();
         let expected_sub = match &actor {
             Actor::User { id, .. } => id.to_string(),
-            Actor::Service { name } => name.clone(),
+            Actor::Service { client_id, .. } => client_id.clone(),
             Actor::Agent { id, .. } => id.to_string(),
         };
         let token = issuing_key()

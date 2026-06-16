@@ -88,7 +88,7 @@ impl DagExecutor {
     /// Returns `WorkflowError` when no ready tasks remain, agent execution
     /// fails, task locks fail, or a spawned task cannot return an outcome.
     pub async fn run(self: &Arc<Self>, context: Context) -> WorkflowResult<WorkflowRun> {
-        let workflow_run_id = ulid::Ulid::new().to_string();
+        let workflow_run_id = uuid::Uuid::now_v7().to_string();
         let observer = current();
         let workflow_started_at = Instant::now();
         let step_count = self.task_list.len();

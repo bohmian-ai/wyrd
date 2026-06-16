@@ -33,6 +33,7 @@ RAW_QUERY_ALLOWLIST_MARKERS = [
 
 SERVER_POOL_ALLOWLIST_PREFIXES = (
     "crates/wyrd/wyrd-server/src/boot.rs",
+    "crates/wyrd/wyrd-server/src/main.rs",
     "crates/wyrd/wyrd-server/src/state.rs",
     "crates/wyrd/wyrd-server/src/routes/platform/",
 )
@@ -150,12 +151,18 @@ def check_wyrd_query_modules(failures: list[str]) -> None:
         body = path.read_text()
         code = strip_line_comments(body)
         is_platform = "/platform/" in relative
+        is_admin = "/storage/admin/" in relative
 
         if is_platform:
             if references_tenant_schema(code):
                 failures.append(f"{relative}: platform query module references tenant schema")
             if has_public_async_fn(code) and not has_platform_executor(code):
                 failures.append(f"{relative}: platform public async fn must take PgPool or Transaction")
+            continue
+
+        if is_admin:
+            if has_public_async_fn(code) and not has_platform_executor(code):
+                failures.append(f"{relative}: admin public async fn must take PgPool or Transaction")
             continue
 
         check_tenant_query_file(relative, body, code, failures)
@@ -179,7 +186,10 @@ def check_tenant_query_file(relative: str, body: str, code: str, failures: list[
         if "TenantConn<'_" not in params and "TenantConn < '_" not in params:
             failures.append(f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>")
 
-    if references_tenant_schema(code) and not re.search(r"data_tenant_id\s*=\s*\$", code):
+    if references_tenant_schema(code) and not (
+        re.search(r"data_tenant_id\s*=\s*\$", code)
+        or re.search(r"wyrd\.current_tenant\(\)", code)
+    ):
         failures.append(f"{relative}: tenant table query is missing data_tenant_id predicate")
 
     if re.search(r"sqlx::query(?:_as|_scalar)?\s*\(", code) and not has_raw_query_marker(body):

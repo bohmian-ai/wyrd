@@ -5,18 +5,18 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-/// Request correlation ID accepted as a ULID or UUID.
+/// Request correlation ID; required to be a UUID v7.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct RequestId(String);
 
 impl RequestId {
-    /// Parse a `RequestId` from a ULID or UUID string.
+    /// Parse a `RequestId` from a UUID v7 string.
     ///
     /// # Errors
-    /// Returns an error when the input is neither a valid ULID nor UUID.
+    /// Returns an error when the input is not a valid UUID v7.
     pub fn parse(value: &str) -> Result<Self, RequestIdError> {
-        if is_ulid(value) || is_uuid7(value) {
+        if is_uuid7(value) {
             return Ok(Self(value.to_string()));
         }
         Err(RequestIdError::Invalid)
@@ -27,13 +27,6 @@ impl RequestId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-}
-
-fn is_ulid(value: &str) -> bool {
-    value.len() == 26
-        && value
-            .chars()
-            .all(|ch| matches!(ch, '0'..='9' | 'A'..='H' | 'J'..='K' | 'M'..='N' | 'P'..='T' | 'V'..='Z'))
 }
 
 fn is_uuid7(value: &str) -> bool {
@@ -59,7 +52,7 @@ impl FromStr for RequestId {
 /// Request ID validation errors.
 #[derive(Debug, thiserror::Error)]
 pub enum RequestIdError {
-    /// Input did not parse as a ULID or UUID.
+    /// Input did not parse as a UUID v7.
     #[error("invalid request id")]
     Invalid,
 }

@@ -42,7 +42,9 @@ wyrd-interfaces = { path = "crates/wyrd/wyrd-interfaces", version = "0.0.1" }
 wyrd-cards = { path = "crates/wyrd/wyrd-cards", version = "0.0.1" }
 wyrd-runtime = { path = "crates/shared/wyrd-runtime", version = "0.0.1" }
 wyrd-auth-verify = { path = "crates/shared/wyrd-auth-verify", version = "0.0.1" }
+wyrd-storage = { path = "crates/wyrd/wyrd-storage", version = "0.0.1" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
+tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "stream"] }
 axum = "0.8"
@@ -63,7 +65,6 @@ zstd = "0.13"
 walkdir = "2.*"
 sha2 = "0.10"
 uuid = { version = "1", default-features = false, features = ["serde"] }
-ulid = { version = "1", features = ["serde"] }
 semver = { version = "1", features = ["serde"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 mini-moka = { version = "0.10", features = ["sync"] }
@@ -90,10 +91,27 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+time = "0.3"
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 pyo3 = { version = "0.28", features = ["abi3-py310", "chrono", "py-clone"] }
+
+# Cloud SDKs are server-tier only.
+aws-sdk-s3 = "=1.75.0"
+aws-config = { version = "1", features = ["sso", "behavior-version-latest"] }
+aws-types = "1"
+gcloud-storage = { version = "1", features = ["auth"] }
+gcloud-auth = "1"
+azure_core = "0.21.0"
+azure_identity = "0.21.0"
+azure_storage = "0.21.0"
+azure_storage_blobs = "0.21.0"
+# Keep object_store, datafusion, and deltalake aligned; see
+# .dev/plan/foundations/04-storage/10a-datafusion-deltalake-pin.md.
+object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
+datafusion = "=54.0.0"
+deltalake = { version = "=0.32.4", features = ["s3", "gcs", "azure"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

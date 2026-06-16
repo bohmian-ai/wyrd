@@ -17,6 +17,20 @@ enum ExampleError {
         remediation = "Retry the test request later."
     )]
     Internal,
+    #[wyrd_error(delegate)]
+    Wrapped { source: InnerError },
+}
+
+#[derive(WyrdError)]
+#[allow(dead_code)]
+enum InnerError {
+    #[wyrd_error(
+        code = "WYRD_TEST_503_UPSTREAM",
+        status = 503,
+        title = "Upstream failed",
+        remediation = "Retry after the upstream recovers."
+    )]
+    Upstream,
 }
 
 #[test]
@@ -34,4 +48,12 @@ fn derives_all_error_metadata_accessors() {
     assert_eq!(internal.status(), 500);
     assert_eq!(internal.title(), "Internal failure");
     assert_eq!(internal.remediation(), "Retry the test request later.");
+
+    let wrapped = ExampleError::Wrapped {
+        source: InnerError::Upstream,
+    };
+    assert_eq!(wrapped.code(), "WYRD_TEST_503_UPSTREAM");
+    assert_eq!(wrapped.status(), 503);
+    assert_eq!(wrapped.title(), "Upstream failed");
+    assert_eq!(wrapped.remediation(), "Retry after the upstream recovers.");
 }

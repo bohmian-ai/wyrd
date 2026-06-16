@@ -6686,6 +6686,10 @@ name = "wyrd-runtime"
 version = "0.0.1"
 dependencies = [
  "axum 0.8.9",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tower 0.5.3",
  "tower-http",

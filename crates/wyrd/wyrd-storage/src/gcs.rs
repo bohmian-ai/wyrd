@@ -1,12 +1,10 @@
 //! Google Cloud Storage backend signer.
 
 use crate::error::{GcsError, StorageError};
-use crate::sha;
-use crate::signer::{HeadInfo, MultipartInit, UploadPlanReplayInput, check_sha, ttl_secs};
+use crate::signer::{HeadInfo, MultipartInit, UploadPlanReplayInput, ttl_secs};
 use crate::tenant_path::ValidatedPath;
 use gcloud_storage::client::Client;
 use gcloud_storage::http::objects::Object;
-use gcloud_storage::http::objects::download::Range;
 use gcloud_storage::http::objects::get::GetObjectRequest;
 use gcloud_storage::http::objects::upload::{UploadObjectRequest, UploadType};
 use gcloud_storage::sign::{SignedURLMethod, SignedURLOptions};
@@ -166,38 +164,26 @@ impl GcsSigner {
             size_bytes,
             sse_marker: object.kms_key_name,
             content_type: object.content_type,
-            // gcloud-storage v1.3.0 does not expose a sha256_hash field; GCS
-            // JSON API only provides MD5 and CRC32c as standard object hashes.
-            // SHA-256 verification falls back to download in verify_sha256.
             sha256_b64: None,
         })
     }
 
-    /// Verify SHA-256.
+    /// GCS SHA-256 verification is client-declared.
     ///
-    /// gcloud-storage v1.3.0 does not expose SHA-256 from object metadata
-    /// (only MD5 and `CRC32c`), so verification requires downloading the object.
-    /// This is a known violation of the no-bytes-on-server invariant for GCS;
-    /// remove the fallback when the SDK exposes a `sha256_hash` field.
-    ///
-    /// # Errors
-    /// Returns SHA mismatch or a typed backend error when the object cannot be
-    /// downloaded for verification.
+    /// `gcloud-storage` v1.3.0 exposes only MD5 and CRC32c from object
+    /// metadata — no SHA-256 field. Downloading the object to compute SHA-256
+    /// violates the no-bytes-on-server invariant and causes OOM for large
+    /// artifacts. GCS backend is therefore `VerificationGuarantee::ClientDeclared`;
+    /// the client-declared hash is recorded at init time and trusted at complete.
+    /// Revisit if a future SDK version exposes `sha256_hash` in the Object struct.
+    #[allow(clippy::unused_async)]
     pub async fn verify_sha256(
         &self,
-        path: &ValidatedPath,
-        expected: &str,
-        head_hint: &HeadInfo,
+        _path: &ValidatedPath,
+        _expected: &str,
+        _head_hint: &HeadInfo,
     ) -> Result<(), StorageError> {
-        if let Some(actual) = &head_hint.sha256_b64 {
-            return check_sha(expected, actual.clone());
-        }
-        let bytes = self
-            .client
-            .download_object(&self.get_request(path), &Range::default())
-            .await
-            .map_err(|err| gcs_http_path("verify_sha256", path, err))?;
-        check_sha(expected, sha::bytes_sha256(&bytes))
+        Ok(())
     }
 
     /// Re-mint a GCS upload plan.

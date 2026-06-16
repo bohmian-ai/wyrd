@@ -1,0 +1,621 @@
+/* ============================================================
+   Mitari Agent — Design System
+   Palette: charcoal bg · neon-lime accent · dark panels
+   ============================================================ */
+
+:root {
+  --bg:          #131416;
+  --panel:       #1c1d20;
+  --panel-alt:   #242527;
+  --border:      #2d2e33;
+  --border-mid:  #3a3b40;
+
+  --lime:        #c8f400;
+  --lime-dim:    #9bbd00;
+  --lime-glow:   rgba(200, 244, 0, 0.18);
+  --lime-glow-sm:rgba(200, 244, 0, 0.10);
+
+  --text:        #f0f0f0;
+  --text-muted:  #8a8c94;
+  --text-dim:    #5a5c65;
+
+  --crit:        #f74d4d;
+  --crit-bg:     rgba(247, 77, 77, 0.12);
+  --warn:        #f5a523;
+  --warn-bg:     rgba(245, 165, 35, 0.12);
+  --opp:         #58a6ff;
+  --opp-bg:      rgba(88, 166, 255, 0.12);
+  --success:     #3fb950;
+  --success-bg:  rgba(63, 185, 80, 0.12);
+
+  --radius-sm:   6px;
+  --radius:      10px;
+  --radius-lg:   14px;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  line-height: 1.5;
+}
+
+a { color: var(--lime); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ============================================================
+   Unified authenticated app shell
+   ------------------------------------------------------------
+   Canonical .app-nav* styling used by every logged-in page via
+   templates/partials/app_nav.html.  Individual page <style>
+   blocks must NOT redeclare these selectors — that is what
+   caused the prior Runs-vs-Admin nav drift (panel vs bg
+   background, 56px vs 52px height, sticky vs not).
+   ============================================================ */
+.app-nav {
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  padding: 0 32px;
+  height: 56px;
+  min-height: 56px;
+  width: 100%;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  position: sticky;
+  top: 0;
+  z-index: 1000;
+}
+.app-nav-logo {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.app-nav-logo:hover { text-decoration: none; }
+/* Defensive sizing: width/height alone is reduced by flex-shrink in Chrome/
+   Safari when the nav overflows, which is why the brand image rendered at
+   its 668×650 natural size in some sessions. Locking min/max + object-fit
+   + flex-shrink:0 + display:block keeps the logo at 28×28 across Chrome,
+   Safari, Firefox, desktop and mobile. */
+.app-nav-logo img {
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  max-width: 28px;
+  max-height: 28px;
+  object-fit: contain;
+  display: block;
+  flex: 0 0 auto;
+  flex-shrink: 0;
+  border-radius: 7px;
+}
+.app-nav-logo span { font-size: 1rem; font-weight: 700; color: var(--text); }
+.app-nav-spacer { flex: 1 1 auto; }
+.app-nav a.nav-link,
+.app-nav .nav-logout-button {
+  font-size: 0.86rem;
+  color: var(--text-muted);
+  text-decoration: none;
+  padding: 5px 10px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: 0;
+  font-family: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  line-height: 1;
+  transition: color 0.15s;
+}
+.app-nav a.nav-link:hover,
+.app-nav .nav-logout-button:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+.app-nav a.nav-link.active { color: var(--lime); }
+.app-nav .nav-logout-button:hover { color: var(--crit); }
+.app-nav-logout-form,
+.app-nav form {
+  display: inline-flex;
+  align-items: center;
+  margin: 0;
+}
+
+/* Add Repo lime CTA — previously declared in an inline <style> block inside
+   the nav partial, moved into the canonical theme so it inherits the same
+   cache-busting and so the partial has no nav-specific inline CSS. */
+.app-nav .nav-btn-add-repo,
+.nav-btn-add-repo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--lime);
+  color: #0a0a0a !important;
+  border-radius: 6px;
+  padding: 5px 14px;
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-decoration: none !important;
+  white-space: nowrap;
+  transition: opacity 0.15s;
+  margin-left: 4px;
+  flex-shrink: 0;
+}
+.app-nav .nav-btn-add-repo:hover,
+.nav-btn-add-repo:hover {
+  opacity: 0.85;
+  text-decoration: none !important;
+  color: #0a0a0a !important;
+}
+.app-nav .nav-btn-add-repo.active,
+.nav-btn-add-repo.active { opacity: 0.9; }
+
+/* Mobile: let the nav scroll horizontally rather than wrap and overlap. */
+@media (max-width: 720px) {
+  .app-nav {
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0 16px;
+    gap: 10px;
+    -webkit-overflow-scrolling: touch;
+  }
+  .app-nav a.nav-link,
+  .app-nav .nav-logout-button { padding: 5px 6px; }
+}
+
+/* Shared content wrapper for authenticated pages.  Pages with
+   intentionally different widths (Run Report 1280, Billing 920,
+   Observability fluid) override max-width locally but should
+   keep the same top padding so vertical rhythm stays consistent. */
+.app-shell-main {
+  max-width: 1140px;
+  margin: 0 auto;
+  padding: 32px 24px;
+}
+
+/* ---- Header ---- */
+.m-header {
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  padding: 0 32px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+.m-header img { width: 30px; height: 30px; border-radius: 7px; }
+.m-header-title { font-size: 1rem; font-weight: 600; color: var(--text); }
+.m-badge {
+  background: var(--lime);
+  color: #111;
+  font-size: 0.65rem;
+  font-weight: 700;
+  padding: 2px 9px;
+  border-radius: 20px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+.m-header-spacer { flex: 1; }
+
+/* ---- Status chips ---- */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.chip-queued    { background: rgba(88,166,255,0.15); color: var(--opp); }
+.chip-running   { background: rgba(245,165,35,0.15); color: var(--warn); }
+.chip-succeeded { background: var(--lime-glow-sm); color: var(--lime); border: 1px solid rgba(200,244,0,0.3); }
+.chip-failed    { background: var(--crit-bg); color: var(--crit); }
+.chip-noop      { background: rgba(88,166,255,0.10); color: var(--text-muted); }
+
+/* ---- Cards ---- */
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.card-glow {
+  box-shadow: 0 0 0 1px var(--border), 0 4px 24px rgba(0,0,0,0.4);
+}
+.card-section {
+  padding: 18px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.card-section:last-child { border-bottom: none; }
+
+/* ---- Severity dots + badges ---- */
+.sev-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: inline-block;
+}
+.sev-dot-high   { background: var(--crit); box-shadow: 0 0 6px var(--crit); }
+.sev-dot-medium { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+.sev-dot-low    { background: var(--opp);  box-shadow: 0 0 6px var(--opp); }
+
+.sev-pill {
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.sev-pill-high   { background: var(--crit-bg); color: var(--crit); }
+.sev-pill-medium { background: var(--warn-bg); color: var(--warn); }
+.sev-pill-low    { background: var(--opp-bg);  color: var(--opp); }
+
+.conf-pill {
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  font-size: 0.68rem;
+  font-weight: 600;
+  background: var(--panel-alt);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+
+/* ---- Mono / code ---- */
+.mono { font-family: "SFMono-Regular", "Consolas", monospace; font-size: 0.82em; }
+.loc-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px 8px;
+  font-family: monospace;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* ---- Report card stat blocks ---- */
+.stat-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 14px 20px;
+  border-radius: var(--radius);
+  min-width: 90px;
+}
+.stat-num {
+  font-size: 2rem;
+  font-weight: 700;
+  line-height: 1;
+}
+.stat-label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+.stat-crit  { background: var(--crit-bg); color: var(--crit); }
+.stat-warn  { background: var(--warn-bg); color: var(--warn); }
+.stat-opp   { background: var(--opp-bg);  color: var(--opp); }
+.stat-clean { background: var(--lime-glow-sm); color: var(--lime); }
+
+/* ---- Model report card categories ---- */
+.mrc-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.mrc-item:last-child { border-bottom: none; }
+.mrc-icon {
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.65rem;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.mrc-icon-ok      { background: var(--lime-glow-sm); color: var(--lime); border: 1px solid rgba(200,244,0,0.3); }
+.mrc-icon-warn    { background: var(--crit-bg); color: var(--crit); }
+.mrc-icon-neutral { background: var(--panel-alt); color: var(--text-dim); border: 1px solid var(--border); }
+.mrc-name { font-size: 0.82rem; font-weight: 600; color: var(--text); }
+.mrc-desc { font-size: 0.75rem; color: var(--text-muted); margin-top: 2px; }
+
+/* ---- Buttons ---- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 16px;
+  border-radius: var(--radius-sm);
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: none;
+  transition: opacity 0.15s;
+  text-decoration: none;
+}
+.btn:hover { opacity: 0.85; text-decoration: none; }
+.btn-primary {
+  background: var(--lime);
+  color: #111;
+}
+.btn-secondary {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border-mid);
+}
+.btn-secondary:hover { color: var(--text); border-color: var(--text-muted); }
+
+/* ---- Collapsible finding card ---- */
+details.finding-card { border-radius: var(--radius); overflow: hidden; }
+details.finding-card summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 18px;
+  cursor: pointer;
+  list-style: none;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  transition: border-color 0.15s, box-shadow 0.15s;
+  user-select: none;
+}
+details.finding-card[open] summary {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+  border-color: var(--border-mid);
+}
+details.finding-card summary::-webkit-details-marker { display: none; }
+details.finding-card summary:hover { border-color: var(--border-mid); }
+
+details.finding-card[open] summary { box-shadow: none; }
+details.finding-card > summary ~ * {
+  background: var(--panel);
+  border: 1px solid var(--border-mid);
+  border-top: none;
+  border-bottom-left-radius: var(--radius);
+  border-bottom-right-radius: var(--radius);
+  padding: 16px 18px;
+}
+
+.finding-chevron {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  transition: transform 0.2s;
+  flex-shrink: 0;
+}
+details[open] .finding-chevron { transform: rotate(180deg); }
+
+.finding-title-text {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text);
+  flex: 1;
+  min-width: 0;
+}
+
+.finding-body-grid {
+  display: grid;
+  gap: 14px;
+}
+.finding-field label {
+  display: block;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-dim);
+  font-weight: 600;
+  margin-bottom: 5px;
+}
+.finding-field p {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+.finding-locs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+details.diff-toggle {
+  margin-top: 10px;
+}
+details.diff-toggle summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--lime);
+  cursor: pointer;
+  list-style: none;
+  padding: 4px 0;
+  user-select: none;
+}
+details.diff-toggle summary::-webkit-details-marker { display: none; }
+details.diff-toggle summary:hover { opacity: 0.8; }
+details.diff-toggle > div {
+  margin-top: 8px;
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  font-family: monospace;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  overflow-x: auto;
+  line-height: 1.6;
+}
+
+/* ---- Section label ---- */
+.section-heading {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+}
+
+/* ---- Meta grid ---- */
+.meta-grid {
+  display: grid;
+  /* The `min-width: 0` on .meta-item below is load-bearing: without it,
+     CSS-Grid items default to `min-width: auto`, which lets a
+     `white-space:nowrap` child inflate the track to fit its content.
+     That was the cause of the Run Report "PR / Filename" cell spilling
+     into the "Commit" column when the PR title was long. With
+     `min-width: 0`, the track may shrink below the content size and
+     the inner `.meta-truncate` cell ellipsises to the column width. */
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+.meta-item {
+  /* Required to let the grid track shrink — see comment on .meta-grid. */
+  min-width: 0;
+}
+.meta-item label {
+  display: block;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-dim);
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.meta-item span { font-size: 0.85rem; color: var(--text-muted); }
+
+/* Shared value styling for every cell in the Run Report top metadata
+   row (Repository / PR / Filename / Commit / Check Run / Created /
+   Updated). Locks `display`, `font-size`, and `line-height` so all
+   value cells share a baseline — previously Repository was wrapped in
+   `.mono` (font-size 0.82em) which rendered smaller than its
+   siblings, and inline-vs-block anchor differences across cells made
+   Created/Updated look off-baseline. Applied to the wrapper element;
+   inner anchors keep their link color via the global `a` rule. */
+.meta-value {
+  display: block;
+  font-size: 0.85rem;
+  line-height: 1.25;
+  color: var(--text-muted);
+}
+/* Specificity bump: `.meta-item span { color: var(--text-muted) }` above
+   (specificity 0,1,1) would otherwise override a bare `.meta-value--muted`
+   class selector (0,1,0). Created/Updated previously used an inline
+   `style="color:var(--text-dim)"` precisely because of this; the
+   compound selector below replaces that with a proper class hook. */
+.meta-item span.meta-value--muted { color: var(--text-dim); }
+
+/* Reusable ellipsis truncation for meta-grid values that can be
+   arbitrarily long (PR titles, file paths, repo full names). Applied
+   to the link/span inside the value cell so it truncates to the actual
+   column width instead of a hardcoded pixel cap. Pair with a `title`
+   attribute carrying the full value for hover. */
+.meta-truncate {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- Empty state ---- */
+.empty-state {
+  text-align: center;
+  padding: 64px 24px;
+  color: var(--text-dim);
+}
+.empty-state .icon { font-size: 2.5rem; margin-bottom: 12px; }
+.empty-state p { font-size: 0.9rem; }
+
+/* ---- Responsive ---- */
+@media (max-width: 860px) {
+  .run-layout { grid-template-columns: 1fr !important; }
+  .sidebar { display: none; }
+}
+
+/* ---- Authenticated app shell footer ---- */
+/* Rendered by templates/partials/app_footer.html on every page that
+   already pulls in partials/app_nav.html.  Mirrors the public footer
+   link set (info@mitari.ai / Terms / Privacy Policy) so logged-in
+   users always have one-click access to legal + contact pages. */
+.app-footer {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 22px;
+  padding: 32px 24px 40px;
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  border-top: 1px solid var(--border);
+  margin-top: 48px;
+}
+.app-footer a {
+  color: var(--text-dim);
+  text-decoration: none;
+  transition: color 0.15s;
+}
+.app-footer a:hover { color: var(--lime); }
+@media (max-width: 640px) {
+  .app-footer { flex-wrap: wrap; gap: 12px 18px; padding: 24px 16px 32px; }
+}
+
+/* ---- Shared public-site footer ---- */
+/* Rendered by templates/partials/public_footer.html on the public
+   marketing pages (home / signup / enterprise / about).  Mirrors the
+   muted treatment that previously lived inline in home.html/about.html. */
+.public-footer {
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  padding: 28px 40px;
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+}
+.public-footer .footer-left { display: flex; align-items: center; gap: 40px; flex-wrap: wrap; }
+.public-footer .footer-brand { display: flex; align-items: center; gap: 8px; font-size: 0.88rem; font-weight: 600; color: var(--text-muted); flex-shrink: 0; }
+.public-footer .footer-brand img { width: 22px; border-radius: 5px; }
+.public-footer .footer-company-info { display: flex; flex-direction: column; gap: 4px; font-size: 0.82rem; color: var(--text-dim); line-height: 1.5; }
+.public-footer .footer-spacer { flex: 1; }
+.public-footer .footer-links { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.public-footer .footer-contact,
+.public-footer .footer-legal { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.public-footer a { font-size: 0.82rem; color: var(--text-dim); text-decoration: none; }
+.public-footer a:hover { color: var(--text-muted); }
+@media (max-width: 640px) {
+  .public-footer {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 22px;
+    padding: 28px 20px;
+  }
+  .public-footer .footer-left { flex-direction: column; align-items: flex-start; gap: 14px; }
+  .public-footer .footer-spacer { display: none; }
+  .public-footer .footer-links { flex-direction: column; align-items: flex-start; gap: 20px; }
+  .public-footer .footer-contact,
+  .public-footer .footer-legal { flex-direction: column; align-items: flex-start; gap: 12px; }
+}

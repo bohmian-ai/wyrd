@@ -209,6 +209,8 @@ fn sample_errors() -> Vec<WyrdError> {
         AuthPreviewDisabled,
         AuditUnavailable,
         AuthzRequiresDelegatedToken,
+        MissingRequiredField,
+        PolicyDenied,
         PermissionUnauthenticated,
         PermissionDeniedRbac,
         RoleCorrupt,

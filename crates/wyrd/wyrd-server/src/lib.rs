@@ -5,6 +5,7 @@ pub mod boot;
 pub mod error;
 pub mod middleware;
 pub mod router;
+pub mod routes;
 pub mod state;
 pub mod storage;
 

@@ -240,6 +240,7 @@ mod tests {
             "src/queries/auth/mod.rs",
             "src/queries/auth/users.rs",
             "src/queries/auth/roles.rs",
+            "src/queries/auth/role_assignments.rs",
             "src/queries/auth/api_keys.rs",
             "src/queries/auth/refresh_tokens.rs",
             "src/queries/auth/governance_tokens.rs",

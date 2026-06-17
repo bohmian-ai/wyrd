@@ -9,13 +9,13 @@ authors = { workspace = true }
 
 [features]
 enterprise = ["dep:wyrd-enterprise"]
-stub-auth = []
 
 [[bin]]
 name = "wyrd-server"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 tokio-util = { workspace = true }
 axum = { workspace = true }
@@ -35,6 +35,7 @@ vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
 wyrd-runtime = { workspace = true }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-verify = { workspace = true }
+wyrd-auth-check = { workspace = true }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1", features = ["embedded-postgres"] }
 tower_governor = { workspace = true }
 wyrd-spec = { workspace = true }
@@ -42,8 +43,11 @@ wyrd-storage = { workspace = true }
 wyrd-enterprise = { path = "../wyrd-enterprise", version = "0.0.1", optional = true }
 
 [dev-dependencies]
+insta = { workspace = true }
 object_store = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
 wyrd-semver = { workspace = true }
+wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
+wyrd-testing = { path = "../wyrd-testing", version = "0.0.1" }

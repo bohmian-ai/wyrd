@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use sqlx::types::Uuid;
 use tokio_util::io::ReaderStream;
 use tracing::instrument;
-use wyrd_spec::authz::Scope;
+use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::error::storage::WyrdStorageError;
 use wyrd_spec::ids::IdempotencyKey;
@@ -705,22 +705,24 @@ fn extract_idempotency_key(headers: &HeaderMap) -> Result<Option<IdempotencyKey>
 }
 
 fn authorize_card_write(caller: &Caller) -> Result<(), WyrdError> {
-    if caller.principal.has_scope(Scope::CardWrite) {
+    let required = Permission::card_write();
+    if caller.principal.effective_permissions.contains(&required) {
         return Ok(());
     }
     Err(WyrdError::PermissionDeniedRbac {
         message: "caller lacks required permission card:write".to_owned(),
-        details: serde_json::json!({ "required": Scope::CardWrite.as_str() }),
+        details: serde_json::json!({ "required": required }),
     })
 }
 
 fn authorize_card_read(caller: &Caller) -> Result<(), WyrdError> {
-    if caller.principal.has_scope(Scope::CardRead) {
+    let required = Permission::card_read();
+    if caller.principal.effective_permissions.contains(&required) {
         return Ok(());
     }
     Err(WyrdError::PermissionDeniedRbac {
         message: "caller lacks required permission card:read".to_owned(),
-        details: serde_json::json!({ "required": Scope::CardRead.as_str() }),
+        details: serde_json::json!({ "required": required }),
     })
 }
 
@@ -1271,11 +1273,9 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-    use std::collections::BTreeSet;
     use std::sync::Arc;
+    use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::actor::Actor;
-    use wyrd_spec::authz::Principal;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::storage::SinglePutComplete;
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
@@ -1504,7 +1504,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_local_blob_requires_card_read_scope() {
+    async fn download_local_blob_requires_card_read_permission() {
         let root = tempfile::tempdir().expect("temp dir");
         let storage = StorageHandle::from_settings(StorageSettings {
             backend: BackendConfig::Local {
@@ -1522,7 +1522,7 @@ mod tests {
             None,
             Arc::clone(&storage),
         );
-        let caller = caller_with_scopes(BTreeSet::new());
+        let caller = caller_with_permissions([]);
         let path = tenant_path::build(
             caller.data_tenant_id,
             "018f0000-0000-7000-8000-000000000000",
@@ -1531,13 +1531,13 @@ mod tests {
 
         let error = download_local_blob(&state, caller, path)
             .await
-            .expect_err("missing scope should fail");
+            .expect_err("missing permission should fail");
 
         assert_eq!(error.status(), 403);
     }
 
     #[tokio::test]
-    async fn upload_local_blob_requires_card_write_scope() {
+    async fn upload_local_blob_requires_card_write_permission() {
         let root = tempfile::tempdir().expect("temp dir");
         let storage = StorageHandle::from_settings(StorageSettings {
             backend: BackendConfig::Local {
@@ -1555,7 +1555,7 @@ mod tests {
             None,
             Arc::clone(&storage),
         );
-        let caller = caller_with_scopes(BTreeSet::new());
+        let caller = caller_with_permissions([]);
         let path = tenant_path::build(
             caller.data_tenant_id,
             "018f0000-0000-7000-8000-000000000000",
@@ -1564,7 +1564,7 @@ mod tests {
 
         let error = upload_local_blob(&state, caller, path, Bytes::from_static(b"data"))
             .await
-            .expect_err("missing scope should fail");
+            .expect_err("missing permission should fail");
 
         assert_eq!(error.status(), 403);
     }
@@ -1631,20 +1631,21 @@ mod tests {
     }
 
     fn read_caller() -> Caller {
-        caller_with_scopes(BTreeSet::from([Scope::CardRead]))
+        caller_with_permissions([Permission::card_read()])
     }
 
-    fn caller_with_scopes(scopes: BTreeSet<Scope>) -> Caller {
+    fn caller_with_permissions(permissions: impl IntoIterator<Item = Permission>) -> Caller {
+        let tenant = DataTenantId::new_v7();
         Caller {
-            data_tenant_id: DataTenantId::new_v7(),
+            data_tenant_id: tenant,
             principal: Principal::new(
-                Actor::Service {
-                    name: "test-service".to_owned(),
-                    client_id: "test-service".to_owned(),
-                },
-                scopes,
+                PrincipalId::new(uuid::Uuid::now_v7()),
+                PrincipalKind::User,
+                tenant,
+                vec![],
+                PermissionSet::from_iter(permissions),
             ),
-            request_id: RequestId::parse("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
+            request_id: RequestId::parse(&uuid::Uuid::now_v7().to_string())
                 .expect("request id parses"),
         }
     }

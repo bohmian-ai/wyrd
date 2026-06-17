@@ -9,6 +9,9 @@ members = [
     "examples/rust",
     "python/py-wyrd",
 ]
+exclude = [
+    "crates/shared/wyrd-testing",
+]
 default-members = [
     "crates/wyrd/wyrd-server",
     "crates/wyrd/wyrd-cli",
@@ -44,11 +47,15 @@ wyrd-runtime = { path = "crates/shared/wyrd-runtime", version = "0.0.1" }
 wyrd-auth-issue = { path = "crates/shared/wyrd-auth-issue", version = "0.0.1" }
 wyrd-auth-verify = { path = "crates/shared/wyrd-auth-verify", version = "0.0.1" }
 wyrd-auth-check = { path = "crates/shared/wyrd-auth-check", version = "0.0.1" }
+wyrd-dev-fixtures = { path = "crates/shared/wyrd-dev-fixtures", version = "0.0.1" }
+wyrd-sql = { path = "crates/wyrd/wyrd-sql", version = "0.0.1" }
 wyrd-storage = { path = "crates/wyrd/wyrd-storage", version = "0.0.1" }
+wyrd-server = { path = "crates/wyrd/wyrd-server", version = "0.0.1" }
 wyrd-semver = { path = "crates/shared/wyrd-semver", version = "0.0.1" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
+ed25519-dalek = { version = "2.2", features = ["pkcs8"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "stream"] }
 axum = "0.8"
 http = "1"

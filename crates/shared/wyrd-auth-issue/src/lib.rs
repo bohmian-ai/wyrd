@@ -367,10 +367,9 @@ fn timestamps(ttl: Duration) -> Result<(usize, usize), IssueError> {
     }
 
     let issued_at = Utc::now();
-    Ok((
-        issued_at.timestamp() as usize,
-        (issued_at + ttl).timestamp() as usize,
-    ))
+    let iat: usize = issued_at.timestamp().try_into().map_err(|_| IssueError::InvalidTtl)?;
+    let exp: usize = (issued_at + ttl).timestamp().try_into().map_err(|_| IssueError::InvalidTtl)?;
+    Ok((iat, exp))
 }
 
 fn new_jti() -> String {

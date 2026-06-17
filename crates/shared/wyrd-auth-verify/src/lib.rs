@@ -471,7 +471,8 @@ fn wire_kind_into_principal_kind(
     card_ref: Option<&CardRef>,
 ) -> Result<PrincipalKind, AuthError> {
     match (wire, card_ref) {
-        (PrincipalKindWire::User, _) => Ok(PrincipalKind::User),
+        (PrincipalKindWire::User, Some(_)) => Err(AuthError::InvalidCardRef),
+        (PrincipalKindWire::User, None) => Ok(PrincipalKind::User),
         (PrincipalKindWire::Service, Some(card_ref)) if card_ref.kind == CardKind::Service => {
             Ok(PrincipalKind::Service {
                 card_ref: card_ref.clone(),

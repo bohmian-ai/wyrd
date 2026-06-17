@@ -34,7 +34,7 @@ async fn token(
             let parsed = WyrdApiKey::parse(api_key.expose()).map_err(|_| {
                 WyrdErrorResponse::from(WyrdError::ApiKeyInvalid {
                     message: "API key not found, revoked, expired, or hash mismatch".to_owned(),
-                    details: serde_json::json!({}),
+                    details: serde_json::json!({ "reason": "format" }),
                 })
             })?;
             let issuing_key = state.issuing_key.clone().ok_or_else(auth_not_configured)?;

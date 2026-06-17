@@ -6585,6 +6585,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-auth-check"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "http 1.4.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+ "wyrd-auth-verify",
+ "wyrd-runtime",
+ "wyrd-spec",
+]
+
+[[package]]
 name = "wyrd-auth-issue"
 version = "0.0.1"
 dependencies = [

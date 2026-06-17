@@ -496,9 +496,11 @@ mod tests {
     use wyrd_spec::version::VersionBlock;
     use wyrd_sql::TenantConn;
 
+    use super::{
+        DelegateError, DelegateToken, ExchangeApiKey, ExchangeError, TokenExchangeSettings,
+    };
     use crate::auth::issue_api_key::WyrdApiKey;
     use crate::auth::permission_resolver::SqlPermissionResolver;
-    use super::{DelegateError, DelegateToken, ExchangeApiKey, ExchangeError, TokenExchangeSettings};
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -750,10 +752,7 @@ mod tests {
 
         let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
         let mut decoding_keys = HashMap::new();
-        decoding_keys.insert(
-            Kid::new("k1").expect("kid is valid"),
-            Arc::new(public_key),
-        );
+        decoding_keys.insert(Kid::new("k1").expect("kid is valid"), Arc::new(public_key));
         let verifier = Arc::new(TokenVerifier::new(
             decoding_keys,
             "wyrd",

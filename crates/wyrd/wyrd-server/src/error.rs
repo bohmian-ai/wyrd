@@ -107,7 +107,9 @@ pub fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
             details: serde_json::json!({}),
         },
         AuthError::DelegationDepthExceeded => WyrdError::DelegationDepthExceededVerify {
-            message: format!("delegation chain exceeds MAX_DELEGATION_DEPTH={MAX_DELEGATION_DEPTH}"),
+            message: format!(
+                "delegation chain exceeds MAX_DELEGATION_DEPTH={MAX_DELEGATION_DEPTH}"
+            ),
             details: serde_json::json!({ "max": MAX_DELEGATION_DEPTH }),
         },
         AuthError::Revoked => WyrdError::CredentialRevoked {

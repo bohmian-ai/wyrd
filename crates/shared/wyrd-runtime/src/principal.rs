@@ -178,7 +178,9 @@ impl PrincipalRef {
     #[must_use]
     pub fn card_ref(&self) -> Option<&CardRef> {
         match &self.kind {
-            PrincipalKind::Service { card_ref } | PrincipalKind::Agent { card_ref } => Some(card_ref),
+            PrincipalKind::Service { card_ref } | PrincipalKind::Agent { card_ref } => {
+                Some(card_ref)
+            }
             PrincipalKind::User => None,
         }
     }

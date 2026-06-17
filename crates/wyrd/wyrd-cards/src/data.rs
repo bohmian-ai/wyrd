@@ -647,7 +647,15 @@ impl DataCard {
                     .as_ref()
                     .map_or_else(|| "default".to_string(), ToString::to_string),
                 name: envelope.metadata.name.to_string(),
-                version: envelope.metadata.version.to_string(),
+                version: envelope
+                    .metadata
+                    .resolved_pin()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| {
+                        WyrdPyError::validation(
+                            "DataCard envelope missing resolved version pin",
+                        )
+                    })?,
                 uid: envelope
                     .metadata
                     .uid

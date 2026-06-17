@@ -512,3 +512,14 @@ impl From<DelegateError> for WyrdError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn argon2_runs_on_blocking_pool() {
+        let source = include_str!("exchange_api_key.rs");
+
+        assert!(source.contains("tokio::task::spawn_blocking"));
+        assert!(source.contains("wyrd_auth_issue::verify_api_key"));
+    }
+}

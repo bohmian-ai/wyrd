@@ -131,4 +131,19 @@ mod tests {
         assert_eq!(value["format"], "password");
         assert_eq!(value["writeOnly"], true);
     }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn to_schema_is_opaque_string() {
+        fn assert_to_schema<T: utoipa::ToSchema>() {}
+
+        assert_to_schema::<SecretBearer>();
+        let schema = <SecretBearer as utoipa::PartialSchema>::schema();
+        let value = serde_json::to_value(schema).expect("schema serializes");
+
+        assert!(
+            value.to_string().contains("password"),
+            "schema must remain password formatted: {value}"
+        );
+    }
 }

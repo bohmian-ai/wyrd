@@ -661,6 +661,18 @@ mod tests {
         assert!(public_key_from_pem(b"not a pem").is_err());
     }
 
+    #[test]
+    fn auth_error_is_clone() {
+        fn assert_clone<T: Clone>() {}
+
+        assert_clone::<AuthError>();
+    }
+
+    #[test]
+    fn no_sqlx_in_crate() {
+        assert_no_sqlx_in_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+    }
+
     #[tokio::test]
     async fn into_verified_resolves_permissions_and_flattens_delegation_initiator_first() {
         let resolver = TestResolver::default();
@@ -734,6 +746,29 @@ mod tests {
         let result = claims.into_verified(&TestResolver::default()).await;
 
         assert!(matches!(result, Err(AuthError::InvalidCardRef)));
+    }
+
+    #[tokio::test]
+    async fn agent_token_with_card_ref_promotes_to_typed_kind() {
+        let card_ref = card_ref(CardKind::Agent);
+        let claims = AccessTokenClaims {
+            principal: PrincipalRef {
+                kind: PrincipalKindWire::Agent,
+                card_ref: Some(card_ref.clone()),
+                ..user_ref()
+            },
+            ..claims_with_times(now() + 3_600, now())
+        };
+
+        let verified = claims
+            .into_verified(&TestResolver::default())
+            .await
+            .expect("agent claims verify");
+
+        assert!(matches!(
+            verified.principal.kind,
+            PrincipalKind::Agent { card_ref: ref actual } if actual == &card_ref
+        ));
     }
 
     #[tokio::test]
@@ -936,6 +971,28 @@ mod tests {
 
     fn role() -> RoleRef {
         RoleRef::new("runtime_admin").expect("static role is valid")
+    }
+
+    fn assert_no_sqlx_in_dir(path: impl AsRef<std::path::Path>) {
+        for entry in std::fs::read_dir(path).expect("source directory is readable") {
+            let entry = entry.expect("source entry is readable");
+            let path = entry.path();
+            if path.is_dir() {
+                assert_no_sqlx_in_dir(path);
+                continue;
+            }
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("source file is readable");
+            let module_path = ["sql", "x::"].concat();
+            let import_path = ["use sql", "x"].concat();
+            assert!(
+                !source.contains(&module_path) && !source.contains(&import_path),
+                "{} must stay sqlx-free",
+                path.display()
+            );
+        }
     }
 
     fn now() -> usize {

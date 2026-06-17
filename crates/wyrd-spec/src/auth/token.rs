@@ -120,6 +120,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn serde_grant_type_discriminator() {
+        let api_key_request = TokenRequest::WyrdApiKey {
+            api_key: SecretBearer::new("key".to_owned()),
+        };
+        let exchange_request = TokenRequest::TokenExchange {
+            subject_token: SecretBearer::new("access".to_owned()),
+            subject_token_type: super::SubjectTokenType::AccessToken,
+            requested_subject: RequestedSubject::CardRef {
+                card_ref: card_ref(CardKind::Agent),
+            },
+        };
+
+        let api_key_json = serde_json::to_value(&api_key_request).expect("serializes");
+        let exchange_json = serde_json::to_value(&exchange_request).expect("serializes");
+
+        assert_eq!(api_key_json["grant_type"], "wyrd_api_key");
+        assert_eq!(
+            exchange_json["grant_type"],
+            "urn:ietf:params:oauth:grant-type:token-exchange"
+        );
+        assert_eq!(
+            serde_json::from_value::<TokenRequest>(api_key_json).expect("deserializes"),
+            api_key_request
+        );
+        assert_eq!(
+            serde_json::from_value::<TokenRequest>(exchange_json).expect("deserializes"),
+            exchange_request
+        );
+    }
+
     fn card_ref(kind: CardKind) -> CardRef {
         CardRef {
             kind,

@@ -686,6 +686,11 @@ mod tests {
     }
 
     #[test]
+    fn no_sqlx_in_crate() {
+        assert_no_sqlx_in_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+    }
+
+    #[test]
     fn from_ed_pem_rejects_invalid_pem() {
         let result = IssuingKey::from_ed_pem(
             SecretString::from("not a pem"),
@@ -781,5 +786,27 @@ mod tests {
 
     fn role(name: &str) -> RoleRef {
         RoleRef::new(name).expect("static role is valid")
+    }
+
+    fn assert_no_sqlx_in_dir(path: impl AsRef<std::path::Path>) {
+        for entry in std::fs::read_dir(path).expect("source directory is readable") {
+            let entry = entry.expect("source entry is readable");
+            let path = entry.path();
+            if path.is_dir() {
+                assert_no_sqlx_in_dir(path);
+                continue;
+            }
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("source file is readable");
+            let module_path = ["sql", "x::"].concat();
+            let import_path = ["use sql", "x"].concat();
+            assert!(
+                !source.contains(&module_path) && !source.contains(&import_path),
+                "{} must stay sqlx-free",
+                path.display()
+            );
+        }
     }
 }

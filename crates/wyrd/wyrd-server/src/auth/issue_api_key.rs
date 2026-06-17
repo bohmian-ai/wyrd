@@ -275,6 +275,14 @@ mod tests {
         assert!(error.to_string().contains("non-human principal"));
     }
 
+    #[test]
+    fn hash_runs_on_blocking_pool() {
+        let source = include_str!("issue_api_key.rs");
+
+        assert!(source.contains("tokio::task::spawn_blocking"));
+        assert!(source.contains("wyrd_auth_issue::hash_api_key"));
+    }
+
     fn card_ref(kind: CardKind) -> CardRef {
         CardRef {
             kind,

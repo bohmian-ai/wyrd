@@ -202,6 +202,60 @@ mod tests {
     }
 
     #[test]
+    fn card_ref_canonical_round_trip() {
+        let card_ref = sample_ref();
+
+        let parsed: CardRef = card_ref.to_string().parse().expect("card ref parses");
+
+        assert_eq!(parsed, card_ref);
+    }
+
+    #[test]
+    fn card_ref_with_uid_round_trip() {
+        let card_ref = CardRef {
+            uid: Some(
+                CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11").expect("static uid is valid"),
+            ),
+            ..sample_ref()
+        };
+
+        let text = card_ref.to_string();
+        let parsed: CardRef = text.parse().expect("card ref parses");
+
+        assert_eq!(
+            text,
+            "prod/Artifact/weights@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11"
+        );
+        assert_eq!(parsed, card_ref);
+    }
+
+    #[test]
+    fn card_ref_display_fromstr_inverse() {
+        let card_ref = sample_ref();
+
+        let parsed: CardRef = card_ref.to_string().parse().expect("card ref parses");
+
+        assert_eq!(parsed.to_string(), card_ref.to_string());
+    }
+
+    #[test]
+    fn card_ref_canonical_bytes_pinned() {
+        let card_ref = CardRef {
+            uid: Some(
+                CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11").expect("static uid is valid"),
+            ),
+            ..sample_ref()
+        };
+
+        let bytes = serde_json::to_vec(&card_ref).expect("card ref serializes");
+
+        assert_eq!(
+            std::str::from_utf8(&bytes).expect("json is utf8"),
+            r#"{"kind":"Artifact","name":"weights","version":"1.0.0","space":"prod","uid":"01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11"}"#
+        );
+    }
+
+    #[test]
     fn card_ref_serde_roundtrips() {
         let card_ref = sample_ref();
         let json = serde_json::to_string(&card_ref).expect("serialize");

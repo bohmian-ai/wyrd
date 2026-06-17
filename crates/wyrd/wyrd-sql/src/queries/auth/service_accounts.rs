@@ -7,6 +7,21 @@ use wyrd_spec::reference::CardRef;
 
 use crate::TenantConn;
 
+const SERVICE_ACCOUNT_BY_CARD_REF_SQL: &str = r#"
+        SELECT id, principal_kind, card_ref, status
+          FROM wyrd.auth_service_accounts
+         WHERE data_tenant_id = $1
+           AND principal_kind = $2
+           AND card_ref = $3
+           AND status = 'active'
+        "#;
+
+const INSERT_REFRESH_TOKEN_SQL: &str = r#"
+        INSERT INTO wyrd.auth_refresh_tokens (
+            id, data_tenant_id, principal_kind, principal_id, token_hash, expires_at
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        "#;
+
 /// Active Service/Agent principal row.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ServiceAccountPrincipalRow {
@@ -43,21 +58,12 @@ pub async fn service_account_by_card_ref(
     principal_kind: &str,
     card_ref: &CardRef,
 ) -> Result<Option<ServiceAccountPrincipalRow>, sqlx::Error> {
-    sqlx::query_as::<_, ServiceAccountPrincipalRow>(
-        r#"
-        SELECT id, principal_kind, card_ref, status
-          FROM wyrd.auth_service_accounts
-         WHERE data_tenant_id = $1
-           AND principal_kind = $2
-           AND card_ref = $3
-           AND status = 'active'
-        "#,
-    )
-    .bind(conn.data_tenant_id().as_uuid())
-    .bind(principal_kind)
-    .bind(Json(card_ref))
-    .fetch_optional(&mut **conn.transaction())
-    .await
+    sqlx::query_as::<_, ServiceAccountPrincipalRow>(SERVICE_ACCOUNT_BY_CARD_REF_SQL)
+        .bind(conn.data_tenant_id().as_uuid())
+        .bind(principal_kind)
+        .bind(Json(card_ref))
+        .fetch_optional(&mut **conn.transaction())
+        .await
 }
 
 /// Find an active Service/Agent principal by id.
@@ -192,21 +198,15 @@ pub async fn insert_refresh_token(
     token_hash: &str,
     expires_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        INSERT INTO wyrd.auth_refresh_tokens (
-            id, data_tenant_id, principal_kind, principal_id, token_hash, expires_at
-        ) VALUES ($1, $2, $3, $4, $5, $6)
-        "#,
-    )
-    .bind(id)
-    .bind(conn.data_tenant_id().as_uuid())
-    .bind(principal_kind)
-    .bind(principal_id)
-    .bind(token_hash)
-    .bind(expires_at)
-    .execute(&mut **conn.transaction())
-    .await?;
+    sqlx::query(INSERT_REFRESH_TOKEN_SQL)
+        .bind(id)
+        .bind(conn.data_tenant_id().as_uuid())
+        .bind(principal_kind)
+        .bind(principal_id)
+        .bind(token_hash)
+        .bind(expires_at)
+        .execute(&mut **conn.transaction())
+        .await?;
     Ok(())
 }
 
@@ -272,6 +272,14 @@ pub async fn insert_audit_token_exchange(
 
 #[cfg(test)]
 mod tests {
+    use sqlx::types::Json;
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::version::VersionBlock;
+
+    use super::{INSERT_REFRESH_TOKEN_SQL, SERVICE_ACCOUNT_BY_CARD_REF_SQL};
+
     #[test]
     fn api_key_lookup_filters_all_public_invalid_key_cases() {
         let sql = r#"
@@ -296,5 +304,30 @@ mod tests {
         assert!(sql.contains("k.revoked_at IS NULL"));
         assert!(sql.contains("k.expires_at > now()"));
         assert!(sql.contains("sa.data_tenant_id = k.data_tenant_id"));
+    }
+
+    #[test]
+    fn service_account_by_card_ref_uses_jsonb_card_ref_binding() {
+        let card_ref = CardRef {
+            kind: CardKind::Agent,
+            name: CardName::new("runtime").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("prod").expect("static space is valid"),
+            uid: None,
+        };
+        let Json(bound) = Json(card_ref.clone());
+
+        assert_eq!(bound, card_ref);
+        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("card_ref = $3"));
+        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("principal_kind = $2"));
+        assert!(!SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("card_ref::text"));
+    }
+
+    #[test]
+    fn refresh_token_insert_is_principal_generic() {
+        assert!(INSERT_REFRESH_TOKEN_SQL.contains("principal_kind, principal_id"));
+        assert!(INSERT_REFRESH_TOKEN_SQL.contains("token_hash"));
+        assert!(!INSERT_REFRESH_TOKEN_SQL.contains("user_id"));
+        assert!(!INSERT_REFRESH_TOKEN_SQL.contains("service_account_id"));
     }
 }

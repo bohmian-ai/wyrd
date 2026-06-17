@@ -3,7 +3,7 @@
 use axum::body::Body;
 use axum::http::{StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
-use wyrd_auth_verify::AuthError;
+use wyrd_auth_verify::{AuthError, MAX_DELEGATION_DEPTH};
 use wyrd_runtime::PermissionDenyReason;
 use wyrd_spec::error::WyrdError;
 
@@ -107,8 +107,8 @@ pub fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
             details: serde_json::json!({}),
         },
         AuthError::DelegationDepthExceeded => WyrdError::DelegationDepthExceededVerify {
-            message: "delegation chain exceeds MAX_DELEGATION_DEPTH=5".to_owned(),
-            details: serde_json::json!({ "max": 5 }),
+            message: format!("delegation chain exceeds MAX_DELEGATION_DEPTH={MAX_DELEGATION_DEPTH}"),
+            details: serde_json::json!({ "max": MAX_DELEGATION_DEPTH }),
         },
         AuthError::Revoked => WyrdError::CredentialRevoked {
             message: "credential revoked".to_owned(),

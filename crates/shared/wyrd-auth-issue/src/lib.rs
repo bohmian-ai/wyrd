@@ -16,11 +16,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::reference::CardRef;
 
-/// Hard cap on RFC 8693 delegation depth.
-pub const MAX_DELEGATION_DEPTH: usize = 5;
-
-/// Hard cap on a raw bearer token before verifier-side decoding.
-pub const MAX_BEARER_TOKEN_BYTES: usize = 8 * 1024;
+pub use wyrd_auth_verify::{MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH};
 
 /// OWASP-recommended Argon2id memory cost in KiB.
 pub const ARGON2_M_COST_KIB: u32 = 19_456;

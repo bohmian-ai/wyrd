@@ -2,7 +2,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, DataTenantId, SpaceName, TenantSlug};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::trace::TraceContext;
-use wyrd_spec::version::{VersionBlock, VersionBump, VersionRange};
+use wyrd_semver::{VersionBlock, VersionBump, VersionRange};
 
 #[test]
 fn ids_enforce_type_specific_canonical_forms() {

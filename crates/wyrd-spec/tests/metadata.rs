@@ -9,7 +9,8 @@ use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
 use wyrd_spec::format;
 use wyrd_spec::ids::CardName;
 use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError};
-use wyrd_spec::version::{ApiVersion, VersionBlock};
+use wyrd_semver::VersionBlock;
+use wyrd_spec::api_version::ApiVersion;
 
 #[test]
 fn labels_and_annotations_round_trip_as_string_maps() {

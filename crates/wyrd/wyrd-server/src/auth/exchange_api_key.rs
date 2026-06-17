@@ -505,7 +505,7 @@ mod tests {
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
-    use wyrd_spec::version::VersionBlock;
+    use wyrd_semver::VersionBlock;
     use wyrd_sql::TenantConn;
 
     use super::{
@@ -601,7 +601,7 @@ mod tests {
         use wyrd_spec::envelope::CardKind;
         use wyrd_spec::ids::{CardName, SpaceName};
         use wyrd_spec::reference::CardRef;
-        use wyrd_spec::version::VersionBlock;
+        use wyrd_semver::VersionBlock;
 
         let tenant_id: DataTenantId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
             .parse()

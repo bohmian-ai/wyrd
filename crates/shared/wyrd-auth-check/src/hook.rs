@@ -55,7 +55,7 @@ mod tests {
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::version::VersionBlock;
+    use wyrd_semver::VersionBlock;
 
     use crate::context::AuthzCheckContext;
     use crate::hook::{DenyAllPolicyHook, PolicyHook, StubAllowPolicyHook};

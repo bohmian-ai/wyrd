@@ -108,7 +108,7 @@ mod tests {
     use wyrd_spec::ids::{CardName, IdempotencyKey, SpaceName};
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::version::VersionBlock;
+    use wyrd_semver::VersionBlock;
 
     fn request_id() -> RequestId {
         RequestId::parse(&uuid::Uuid::now_v7().to_string())

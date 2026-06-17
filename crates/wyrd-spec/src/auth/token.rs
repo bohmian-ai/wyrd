@@ -85,7 +85,7 @@ mod tests {
     use crate::envelope::CardKind;
     use crate::ids::{CardName, SpaceName};
     use crate::reference::CardRef;
-    use crate::version::VersionBlock;
+    use wyrd_semver::VersionBlock;
     use chrono::Utc;
 
     #[test]

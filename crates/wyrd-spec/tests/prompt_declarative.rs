@@ -37,11 +37,11 @@ fn native_yaml(provider: &str, model: &str) -> String {
 
     let spec = PromptSpec::new(prompt).unwrap();
     let card = Card {
-        api_version: wyrd_spec::version::ApiVersion::v1(),
+        api_version: wyrd_spec::api_version::ApiVersion::v1(),
         kind: CardKind::Prompt,
         metadata: wyrd_spec::envelope::Metadata {
             name: wyrd_spec::ids::CardName::new("test").unwrap(),
-            version: wyrd_spec::version::VersionBlock::parse("0.1.0").unwrap(),
+            version: wyrd_semver::VersionBlock::parse("0.1.0").unwrap(),
             space: None,
             uid: None,
             labels: Default::default(),

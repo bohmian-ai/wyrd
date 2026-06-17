@@ -46,3 +46,4 @@ object_store = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
+wyrd-semver = { workspace = true }

@@ -21,3 +21,6 @@ zeroize = { workspace = true }
 wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
 wyrd-auth-verify = { workspace = true }
 wyrd-runtime = { workspace = true }
+
+[dev-dependencies]
+wyrd-semver = { path = "../wyrd-semver", version = "0.0.1" }

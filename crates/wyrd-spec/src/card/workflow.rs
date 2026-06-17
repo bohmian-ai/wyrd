@@ -13,8 +13,9 @@ use crate::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationship
 use crate::error::WyrdError;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
+use crate::api_version::ApiVersion;
 use crate::reference::{AgentRef, CardRef, PromptRef};
-use crate::version::{ApiVersion, VersionBlock};
+use wyrd_semver::VersionBlock;
 
 /// Declarative workflow definition.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -197,7 +198,8 @@ impl WorkflowCard {
             kind: CardKind::Workflow,
             metadata: EnvelopeMetadata {
                 name: card_name("metadata.name", &self.name)?,
-                version: version_block("metadata.version", &self.version)?,
+                version: Some(version_block("metadata.version", &self.version)?.into()),
+                bump: None,
                 space: Some(space_name(&self.space)?),
                 uid: optional_card_uid(&self.uid)?,
                 labels: self.labels.clone(),
@@ -246,7 +248,15 @@ impl WorkflowCard {
                 .as_ref()
                 .map_or_else(|| "default".to_owned(), ToString::to_string),
             name: card.metadata.name.to_string(),
-            version: card.metadata.version.to_string(),
+            version: card
+                .metadata
+                .resolved_pin()
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    WorkflowCardError::validation(
+                        "Workflow Card envelope missing resolved version pin",
+                    )
+                })?,
             uid: card
                 .metadata
                 .uid

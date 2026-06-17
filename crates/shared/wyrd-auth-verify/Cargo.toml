@@ -21,3 +21,4 @@ wyrd-runtime = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+wyrd-semver = { path = "../wyrd-semver", version = "0.0.1" }

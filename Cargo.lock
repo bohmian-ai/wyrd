@@ -6662,6 +6662,7 @@ dependencies = [
  "uuid",
  "wyrd-auth-verify",
  "wyrd-runtime",
+ "wyrd-semver",
  "wyrd-spec",
 ]
 
@@ -6680,6 +6681,7 @@ dependencies = [
  "ulid",
  "wyrd-auth-verify",
  "wyrd-runtime",
+ "wyrd-semver",
  "wyrd-spec",
  "zeroize",
 ]
@@ -6699,6 +6701,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wyrd-runtime",
+ "wyrd-semver",
  "wyrd-spec",
 ]
 
@@ -6716,6 +6719,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "wyrd-interfaces",
+ "wyrd-semver",
  "wyrd-spec",
  "wyrd-test-contract-macros",
  "wyrd-utils",
@@ -6832,6 +6836,7 @@ dependencies = [
  "tower 0.5.3",
  "tower-http",
  "uuid",
+ "wyrd-semver",
  "wyrd-spec",
 ]
 
@@ -6865,6 +6870,7 @@ dependencies = [
  "schemars",
  "semver",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "utoipa",
 ]
@@ -6898,6 +6904,7 @@ dependencies = [
  "wyrd-dev-fixtures",
  "wyrd-enterprise",
  "wyrd-runtime",
+ "wyrd-semver",
  "wyrd-spec",
  "wyrd-sql",
  "wyrd-storage",
@@ -6941,6 +6948,7 @@ dependencies = [
  "tokio",
  "tracing",
  "urlencoding",
+ "wyrd-semver",
  "wyrd-spec",
 ]
 

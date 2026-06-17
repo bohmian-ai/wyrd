@@ -71,6 +71,44 @@ impl VersionRange {
         range.matches(&version.semver().expect("VersionBlock invariant: stored value is valid"))
     }
 
+    /// Returns true only when this range was parsed from a bare partial input
+    /// (`"1"` or `"1.2"`), normalized to `"^X"` or `"~X.Y"` respectively.
+    ///
+    /// Used by register-path validators that accept partial-pin scopes but
+    /// reject explicit comparator syntax (`^1.0.0`, `~1.0.0`, `1.*`, `>=1.0`).
+    /// All other inputs — including explicit `^1` (normalized to `^1.0.0`) or
+    /// `~1.0` (normalized to `~1.0.0`) — return false.
+    #[must_use]
+    pub fn is_loose_partial(&self) -> bool {
+        let s = self.0.as_str();
+        let mut chars = s.chars();
+        let prefix = match chars.next() {
+            Some('^') | Some('~') => s.as_bytes()[0],
+            _ => return false,
+        };
+        let body = &s[1..];
+        if body.is_empty()
+            || body.contains('-')
+            || body.contains('+')
+            || body.contains('*')
+            || body.contains(',')
+        {
+            return false;
+        }
+        let parts: Vec<&str> = body.split('.').collect();
+        let all_digits = parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+        if !all_digits {
+            return false;
+        }
+        match prefix {
+            b'^' => parts.len() == 1,
+            b'~' => parts.len() == 2,
+            _ => false,
+        }
+    }
+
     /// Compute the (inclusive lower, optional upper) semver triple bounds for
     /// this range expression, for use in SQL predicates of the form
     /// `(major, minor, patch) >= lower AND (major, minor, patch) < upper`.
@@ -626,5 +664,67 @@ mod tests {
             .to_bounds()
             .unwrap_err();
         assert!(matches!(err, VersionError::NotRepresentable { .. }));
+    }
+
+    #[test]
+    fn is_loose_partial_bare_major() {
+        assert!(VersionRange::parse_loose("1").unwrap().is_loose_partial());
+    }
+
+    #[test]
+    fn is_loose_partial_bare_minor() {
+        assert!(VersionRange::parse_loose("1.2").unwrap().is_loose_partial());
+    }
+
+    #[test]
+    fn is_loose_partial_rejects_explicit_caret() {
+        assert!(!VersionRange::parse_loose("^1").unwrap().is_loose_partial());
+        assert!(!VersionRange::parse_loose("^1.2").unwrap().is_loose_partial());
+        assert!(
+            !VersionRange::parse_loose("^1.2.3")
+                .unwrap()
+                .is_loose_partial()
+        );
+    }
+
+    #[test]
+    fn is_loose_partial_rejects_explicit_tilde() {
+        assert!(!VersionRange::parse_loose("~1").unwrap().is_loose_partial());
+        assert!(!VersionRange::parse_loose("~1.2").unwrap().is_loose_partial());
+        assert!(
+            !VersionRange::parse_loose("~1.2.3")
+                .unwrap()
+                .is_loose_partial()
+        );
+    }
+
+    #[test]
+    fn is_loose_partial_rejects_wildcard() {
+        assert!(!VersionRange::parse_loose("*").unwrap().is_loose_partial());
+        assert!(!VersionRange::parse_loose("1.*").unwrap().is_loose_partial());
+        assert!(
+            !VersionRange::parse_loose("1.2.*")
+                .unwrap()
+                .is_loose_partial()
+        );
+    }
+
+    #[test]
+    fn is_loose_partial_rejects_comparator_chain() {
+        assert!(
+            !VersionRange::parse(">=1.0.0, <2.0.0")
+                .unwrap()
+                .is_loose_partial()
+        );
+    }
+
+    #[test]
+    fn is_loose_partial_rejects_full_triple() {
+        // bare "1.2.3" normalizes to "=1.2.3" → no '^' or '~' prefix → false.
+        assert!(
+            !VersionRange::parse_loose("1.2.3")
+                .unwrap()
+                .is_loose_partial()
+        );
     }
 }

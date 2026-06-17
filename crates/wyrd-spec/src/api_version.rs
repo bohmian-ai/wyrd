@@ -1,16 +1,13 @@
-//! API and artifact version values.
+//! Canonical Wyrd API-version value.
 //!
-//! Semver primitives live in the [`wyrd_semver`] crate; this module
-//! re-exports them so downstream code can keep importing from
-//! `wyrd_spec::version`.
+//! Semver primitives (`VersionBlock`, `VersionRange`, `VersionBump`,
+//! `VersionBounds`, `SemverTriple`, `VersionError`, `VersionSpec`) live in
+//! the [`wyrd_semver`] crate. Import them from there directly — this module
+//! intentionally does not re-export them.
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-
-pub use wyrd_semver::{
-    SemverTriple, VersionBlock, VersionBounds, VersionBump, VersionError, VersionRange,
-};
 
 /// Canonical Wyrd API version.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]

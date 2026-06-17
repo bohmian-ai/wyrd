@@ -10,7 +10,7 @@ use wyrd_spec::card::{FieldSpec, Inequality};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, ColumnName, QueryName, SpaceName, SplitName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::VersionBlock;
+use wyrd_semver::VersionBlock;
 
 fn col(name: &str) -> ColumnName {
     ColumnName::new(name).unwrap()

@@ -34,3 +34,4 @@ optional = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wyrd-semver = { workspace = true }

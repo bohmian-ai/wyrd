@@ -1,5 +1,7 @@
 //! SQL-pushdown bounds for semver range queries.
 
+use std::fmt;
+
 /// A lexicographically-comparable (major, minor, patch) triple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SemverTriple {
@@ -27,6 +29,12 @@ impl SemverTriple {
             minor,
             patch,
         }
+    }
+}
+
+impl fmt::Display for SemverTriple {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
     }
 }
 
@@ -110,5 +118,11 @@ mod tests {
     #[test]
     fn triple_zero_constant() {
         assert_eq!(SemverTriple::ZERO, SemverTriple::new(0, 0, 0));
+    }
+
+    #[test]
+    fn triple_display_canonical_dotted() {
+        assert_eq!(SemverTriple::new(1, 4, 2).to_string(), "1.4.2");
+        assert_eq!(SemverTriple::ZERO.to_string(), "0.0.0");
     }
 }

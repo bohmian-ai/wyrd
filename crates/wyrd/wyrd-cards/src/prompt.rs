@@ -12,7 +12,7 @@ use wyrd_spec::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relation
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::ApiVersion;
+use wyrd_spec::api_version::ApiVersion;
 
 use crate::identity::{card_name, optional_card_uid, space_name, validation_error, version_block};
 

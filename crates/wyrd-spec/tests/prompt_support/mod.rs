@@ -18,7 +18,8 @@ use skald_spec::{
 use wyrd_spec::card::prompt::PromptSpec;
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
 use wyrd_spec::ids::CardName;
-use wyrd_spec::version::{ApiVersion, VersionBlock};
+use wyrd_semver::VersionBlock;
+use wyrd_spec::api_version::ApiVersion;
 
 pub fn prompt_spec(request: ProviderRequest, variables: Vec<&str>) -> PromptSpec {
     PromptSpec::new(prompt(request, variables)).expect("static prompt spec is valid")

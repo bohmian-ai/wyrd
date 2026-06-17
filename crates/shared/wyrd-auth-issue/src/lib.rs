@@ -418,7 +418,7 @@ mod tests {
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
-    use wyrd_spec::version::VersionBlock;
+    use wyrd_semver::VersionBlock;
 
     use super::{
         ARGON2_M_COST_KIB, DelegationCaller, IssueError, IssuingKey, Kid, MAX_DELEGATION_DEPTH,

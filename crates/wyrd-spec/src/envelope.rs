@@ -25,9 +25,10 @@ use crate::card::service::ServiceSpec;
 use crate::card::source::SourceSpec;
 use crate::card::trigger::TriggerSpec;
 use crate::card::workflow::WorkflowSpec;
+use crate::api_version::ApiVersion;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
-use crate::version::{ApiVersion, VersionBlock};
+use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
 
 /// Universal registered Card envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
@@ -53,13 +54,35 @@ pub struct Card {
 }
 
 /// Card metadata common to every kind.
+///
+/// `version` and `bump` capture the author's declarative intent on the
+/// register path. The server resolves both to a concrete pin before the
+/// envelope is returned to the caller:
+///
+/// - Pre-register: `version` may be `None` (server bumps absolute latest or
+///   seeds `0.1.0`), `Some(VersionSpec::Scope("1.0"))` (server bumps within
+///   the prefix line), or `Some(VersionSpec::Pin("1.4.2"))` (exact pin).
+///   `bump` selects the bump level applied on the auto-bump paths (defaults
+///   to `Patch` if unset).
+/// - Post-register: `version` is always `Some(VersionSpec::Pin(resolved))`;
+///   readers may use [`Metadata::resolved_pin`] to extract the
+///   [`VersionBlock`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct Metadata {
     /// Card name.
     pub name: CardName,
-    /// Exact Card version.
-    pub version: VersionBlock,
+    /// Authored version: `None` (auto-bump from absolute latest), a bare
+    /// partial scope (`"1"` / `"1.0"` — bump within the prefix line), or a
+    /// full triple pin (`"1.4.2"`). Always populated and always a pin
+    /// post-register.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<VersionSpec>,
+    /// Bump level applied on the auto-bump paths (`None` or `Scope`
+    /// `version`). Defaults to `Patch` when unset. Ignored on the exact-pin
+    /// path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bump: Option<VersionBump>,
     /// Optional space.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space: Option<SpaceName>,
@@ -84,6 +107,21 @@ pub struct Metadata {
     /// Artifact content hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_hash: Option<String>,
+}
+
+impl Metadata {
+    /// Extract the resolved version pin from a post-register envelope.
+    ///
+    /// Returns `Some(&VersionBlock)` when `version` is
+    /// `Some(VersionSpec::Pin(_))`. Returns `None` when the envelope is
+    /// pre-register (`version` is `None` or `Some(VersionSpec::Scope(_))`).
+    #[must_use]
+    pub fn resolved_pin(&self) -> Option<&VersionBlock> {
+        match &self.version {
+            Some(VersionSpec::Pin(block)) => Some(block),
+            _ => None,
+        }
+    }
 }
 
 /// Kind-specific Card spec payload.

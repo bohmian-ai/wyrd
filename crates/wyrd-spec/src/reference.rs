@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::card::agent::AgentSpec;
 use crate::envelope::CardKind;
 use crate::ids::{CardName, CardUid, SpaceName};
-use crate::version::VersionBlock;
+use wyrd_semver::VersionBlock;
 
 /// Reference to a registered Card by kind, name, version, space, and optional UID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -165,7 +165,7 @@ pub enum CardRefParseError {
     Name(crate::ids::IdError),
     /// Version failed validation.
     #[error("invalid version: {0}")]
-    Version(crate::version::VersionError),
+    Version(wyrd_semver::VersionError),
     /// UID failed validation.
     #[error("invalid uid: {0}")]
     Uid(crate::ids::IdError),

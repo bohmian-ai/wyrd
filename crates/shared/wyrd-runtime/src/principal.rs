@@ -193,7 +193,7 @@ mod tests {
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
-    use wyrd_spec::version::VersionBlock;
+    use wyrd_semver::VersionBlock;
 
     fn service_card_ref() -> CardRef {
         CardRef {

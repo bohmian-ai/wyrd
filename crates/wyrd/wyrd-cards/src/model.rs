@@ -15,7 +15,7 @@ use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::ApiVersion;
+use wyrd_spec::api_version::ApiVersion;
 
 #[cfg(feature = "python")]
 use {

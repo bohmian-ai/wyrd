@@ -3,7 +3,7 @@
 use serde_json::json;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
-use wyrd_spec::version::VersionBlock;
+use wyrd_semver::VersionBlock;
 
 pub(crate) fn card_name(field: &str, value: &str) -> Result<CardName, WyrdError> {
     CardName::new(value).map_err(|error| invalid_identity(field, value, error))

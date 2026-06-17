@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bounds::SemverTriple;
 use crate::bump::VersionBump;
 use crate::error::VersionError;
 
@@ -14,6 +15,21 @@ use crate::error::VersionError;
 pub struct VersionBlock(String);
 
 impl VersionBlock {
+    /// Construct from a `(major, minor, patch)` triple.
+    ///
+    /// Always produces a valid `VersionBlock` because the components are typed
+    /// `u64`s that format to a valid semver triple. Used to seed a
+    /// `VersionBlock` from a `VersionBounds::lower()` value on the register
+    /// path.
+    #[must_use]
+    pub fn from_triple(triple: SemverTriple) -> Self {
+        Self::parse(format!(
+            "{}.{}.{}",
+            triple.major, triple.minor, triple.patch
+        ))
+        .expect("SemverTriple components always form a valid semver triple")
+    }
+
     /// Parse a semver version.
     ///
     /// # Errors
@@ -321,5 +337,17 @@ mod tests {
             .bump(VersionBump::Patch)
             .unwrap();
         assert_eq!(next.as_str(), "1.2.4");
+    }
+
+    #[test]
+    fn from_triple_round_trips_to_block() {
+        let block = VersionBlock::from_triple(SemverTriple::new(1, 4, 2));
+        assert_eq!(block.as_str(), "1.4.2");
+    }
+
+    #[test]
+    fn from_triple_zero() {
+        let block = VersionBlock::from_triple(SemverTriple::ZERO);
+        assert_eq!(block.as_str(), "0.0.0");
     }
 }

@@ -9,6 +9,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod actor;
+pub mod api_version;
 pub mod auth;
 pub mod authz;
 pub mod card;
@@ -24,7 +25,6 @@ pub mod run;
 pub mod schema;
 pub mod storage;
 pub mod trace;
-pub mod version;
 
 pub use authz::{Principal, Role, Scope};
 pub use card::agent::{AgentCard, AgentCardError, AgentRunConfigSpec, AgentSpec};

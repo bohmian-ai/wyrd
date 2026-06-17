@@ -205,8 +205,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_jwt_string() {
+    fn rejects_bad_base64_payload() {
         let result = tenant_from_unverified_access_token("not.a.jwt");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_wrong_segment_count() {
+        let result = tenant_from_unverified_access_token("onlyone");
         assert!(result.is_err());
     }
 

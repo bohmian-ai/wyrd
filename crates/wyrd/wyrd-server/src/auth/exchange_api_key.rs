@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wyrd_auth_issue::{IssueError, IssuingKey};
 use wyrd_auth_verify::{
-    AccessTokenClaims, ActClaim, AuthError, PrincipalKindWire, PrincipalRef, TokenVerifier,
+    AccessTokenClaims, ActClaim, AuthError, PrincipalKindWire, TokenPrincipalRef, TokenVerifier,
 };
 use wyrd_runtime::{Permission, PermissionCheck, PrincipalId, PrincipalKind, RoleRef};
 use wyrd_spec::auth::{RequestedSubject, SecretBearer, TokenResponse, TokenType};
@@ -406,8 +406,8 @@ fn principal_ref(
     kind: &str,
     tenant_id: wyrd_spec::DataTenantId,
     card_ref: CardRef,
-) -> Option<PrincipalRef> {
-    Some(PrincipalRef {
+) -> Option<TokenPrincipalRef> {
+    Some(TokenPrincipalRef {
         id: PrincipalId::new(id),
         kind: principal_kind_wire(kind)?,
         tenant_id,
@@ -419,7 +419,7 @@ fn claims_from_verified(
     principal: &wyrd_runtime::Principal,
     chain: &[wyrd_runtime::DelegationStep],
 ) -> AccessTokenClaims {
-    let principal_ref = PrincipalRef::from(principal);
+    let principal_ref = TokenPrincipalRef::from(principal);
     AccessTokenClaims {
         sub: chain
             .first()
@@ -442,7 +442,7 @@ fn act_from_chain(
     chain.iter().fold(None, |act, step| {
         Some(Box::new(ActClaim {
             sub: step.principal.id.to_string(),
-            principal: PrincipalRef {
+            principal: TokenPrincipalRef {
                 id: step.principal.id,
                 kind: match &step.principal.kind {
                     PrincipalKind::User => PrincipalKindWire::User,

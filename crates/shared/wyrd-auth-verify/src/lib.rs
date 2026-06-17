@@ -317,7 +317,7 @@ pub struct AccessTokenClaims {
     /// Ultimate initiator, JWT `sub`.
     pub sub: String,
     /// Current actor whose roles are evaluated for authorization.
-    pub principal: PrincipalRef,
+    pub principal: TokenPrincipalRef,
     /// Roles assigned to the current actor at issue time.
     pub roles: Vec<RoleRef>,
     /// RFC 8693 actor chain for delegated tokens.
@@ -340,7 +340,7 @@ pub struct ActClaim {
     /// Subject at this delegation layer.
     pub sub: String,
     /// Principal at this delegation layer.
-    pub principal: PrincipalRef,
+    pub principal: TokenPrincipalRef,
     /// Next older delegation layer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub act: Option<Box<ActClaim>>,
@@ -349,7 +349,7 @@ pub struct ActClaim {
 /// Wire-side projection of a runtime principal safe to embed in JWT claims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PrincipalRef {
+pub struct TokenPrincipalRef {
     /// Stable principal id.
     pub id: PrincipalId,
     /// Principal kind without inline runtime payloads.
@@ -395,7 +395,7 @@ pub struct RefreshTokenClaims {
     pub jti: String,
 }
 
-impl From<&Principal> for PrincipalRef {
+impl From<&Principal> for TokenPrincipalRef {
     fn from(principal: &Principal) -> Self {
         let (kind, card_ref) = match &principal.kind {
             PrincipalKind::User => (PrincipalKindWire::User, None),
@@ -567,7 +567,7 @@ mod tests {
 
     use super::{
         AccessTokenClaims, ActClaim, AuthError, Kid, MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH,
-        PermissionResolver, PrincipalKindWire, PrincipalRef, ResolveError, TokenVerifier,
+        PermissionResolver, PrincipalKindWire, TokenPrincipalRef, ResolveError, TokenVerifier,
         WyrdAuthVerifySettings, decode_kid, public_key_from_pem, verify_eddsa, verify_eddsa_with,
     };
 
@@ -600,7 +600,7 @@ mod tests {
             wyrd_runtime::PermissionSet::new(),
         );
 
-        let projected = PrincipalRef::from(&principal);
+        let projected = TokenPrincipalRef::from(&principal);
 
         assert_eq!(projected.id, principal.id);
         assert_eq!(projected.kind, PrincipalKindWire::Service);
@@ -719,7 +719,7 @@ mod tests {
     #[tokio::test]
     async fn into_verified_rejects_non_user_without_card_ref() {
         let claims = AccessTokenClaims {
-            principal: PrincipalRef {
+            principal: TokenPrincipalRef {
                 kind: PrincipalKindWire::Service,
                 card_ref: None,
                 ..user_ref()
@@ -735,7 +735,7 @@ mod tests {
     #[tokio::test]
     async fn into_verified_rejects_card_ref_kind_mismatch() {
         let claims = AccessTokenClaims {
-            principal: PrincipalRef {
+            principal: TokenPrincipalRef {
                 kind: PrincipalKindWire::Agent,
                 card_ref: Some(card_ref(CardKind::Service)),
                 ..user_ref()
@@ -752,7 +752,7 @@ mod tests {
     async fn agent_token_with_card_ref_promotes_to_typed_kind() {
         let card_ref = card_ref(CardKind::Agent);
         let claims = AccessTokenClaims {
-            principal: PrincipalRef {
+            principal: TokenPrincipalRef {
                 kind: PrincipalKindWire::Agent,
                 card_ref: Some(card_ref.clone()),
                 ..user_ref()
@@ -877,7 +877,7 @@ mod tests {
     fn claims_with_times(exp: usize, iat: usize) -> AccessTokenClaims {
         AccessTokenClaims {
             sub: principal_id().to_string(),
-            principal: PrincipalRef {
+            principal: TokenPrincipalRef {
                 id: principal_id(),
                 kind: PrincipalKindWire::User,
                 tenant_id: tenant_id(),
@@ -935,8 +935,8 @@ mod tests {
             .expect("static principal id is valid")
     }
 
-    fn user_ref() -> PrincipalRef {
-        PrincipalRef {
+    fn user_ref() -> TokenPrincipalRef {
+        TokenPrincipalRef {
             id: principal_id(),
             kind: PrincipalKindWire::User,
             tenant_id: tenant_id(),
@@ -944,8 +944,8 @@ mod tests {
         }
     }
 
-    fn service_ref(name: &str) -> PrincipalRef {
-        PrincipalRef {
+    fn service_ref(name: &str) -> TokenPrincipalRef {
+        TokenPrincipalRef {
             id: principal_id(),
             kind: PrincipalKindWire::Service,
             tenant_id: tenant_id(),

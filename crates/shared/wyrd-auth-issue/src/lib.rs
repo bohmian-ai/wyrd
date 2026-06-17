@@ -9,7 +9,7 @@ use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, 
 use secrecy::{ExposeSecret, SecretString};
 use ulid::Ulid;
 use wyrd_auth_verify::{
-    AccessTokenClaims, ActClaim, Kid, PrincipalKindWire, PrincipalRef, RefreshTokenClaims,
+    AccessTokenClaims, ActClaim, Kid, PrincipalKindWire, TokenPrincipalRef, RefreshTokenClaims,
 };
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
@@ -117,7 +117,7 @@ impl IssuingKey {
     )]
     pub fn issue_user_access_token(
         &self,
-        principal: PrincipalRef,
+        principal: TokenPrincipalRef,
         roles: Vec<RoleRef>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
@@ -154,7 +154,7 @@ impl IssuingKey {
         if card_ref.kind != CardKind::Service {
             return Err(IssueError::InvalidCardRef);
         }
-        let principal = PrincipalRef {
+        let principal = TokenPrincipalRef {
             id: sa_id,
             kind: PrincipalKindWire::Service,
             tenant_id,
@@ -189,7 +189,7 @@ impl IssuingKey {
         if card_ref.kind != CardKind::Agent {
             return Err(IssueError::InvalidCardRef);
         }
-        let principal = PrincipalRef {
+        let principal = TokenPrincipalRef {
             id: agent_id,
             kind: PrincipalKindWire::Agent,
             tenant_id,
@@ -217,7 +217,7 @@ impl IssuingKey {
     pub fn issue_delegated_access_token(
         &self,
         caller_claims: &AccessTokenClaims,
-        requested_subject: PrincipalRef,
+        requested_subject: TokenPrincipalRef,
         requested_roles: Vec<RoleRef>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
@@ -287,7 +287,7 @@ impl IssuingKey {
     fn issue_access_token_with_claims(
         &self,
         sub: String,
-        principal: PrincipalRef,
+        principal: TokenPrincipalRef,
         roles: Vec<RoleRef>,
         act: Option<Box<ActClaim>>,
         ttl: Duration,
@@ -371,7 +371,7 @@ fn act_depth(act: Option<&ActClaim>) -> usize {
     1 + act_depth(act.act.as_deref())
 }
 
-fn validate_principal_ref(principal: &PrincipalRef) -> Result<(), IssueError> {
+fn validate_principal_ref(principal: &TokenPrincipalRef) -> Result<(), IssueError> {
     match (
         principal.kind,
         principal.card_ref.as_ref().map(|card_ref| &card_ref.kind),
@@ -392,7 +392,7 @@ mod tests {
     use jsonwebtoken::{Algorithm, decode_header};
     use secrecy::SecretString;
     use wyrd_auth_verify::{
-        AccessTokenClaims, ActClaim, PrincipalKindWire, PrincipalRef, RefreshTokenClaims,
+        AccessTokenClaims, ActClaim, PrincipalKindWire, TokenPrincipalRef, RefreshTokenClaims,
         decode_kid, public_key_from_pem, verify_eddsa,
     };
     use wyrd_runtime::{PrincipalId, RoleRef};
@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn issue_user_access_token_rejects_user_with_card_ref() {
         let result = issuing_key().issue_user_access_token(
-            PrincipalRef {
+            TokenPrincipalRef {
                 card_ref: Some(card_ref(CardKind::Service)),
                 ..user_principal()
             },
@@ -720,8 +720,8 @@ mod tests {
             .expect("issued token verifies")
     }
 
-    fn user_principal() -> PrincipalRef {
-        PrincipalRef {
+    fn user_principal() -> TokenPrincipalRef {
+        TokenPrincipalRef {
             id: principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00"),
             kind: PrincipalKindWire::User,
             tenant_id: tenant_id(),
@@ -729,8 +729,8 @@ mod tests {
         }
     }
 
-    fn service_principal() -> PrincipalRef {
-        PrincipalRef {
+    fn service_principal() -> TokenPrincipalRef {
+        TokenPrincipalRef {
             id: principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02"),
             kind: PrincipalKindWire::Service,
             tenant_id: tenant_id(),
@@ -738,8 +738,8 @@ mod tests {
         }
     }
 
-    fn agent_principal() -> PrincipalRef {
-        PrincipalRef {
+    fn agent_principal() -> TokenPrincipalRef {
+        TokenPrincipalRef {
             id: principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03"),
             kind: PrincipalKindWire::Agent,
             tenant_id: tenant_id(),

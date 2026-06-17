@@ -442,7 +442,7 @@ fn act_from_chain(
     chain: &[wyrd_runtime::DelegationStep],
     tenant_id: wyrd_spec::DataTenantId,
 ) -> Option<Box<ActClaim>> {
-    chain.iter().rev().fold(None, |act, step| {
+    chain.iter().fold(None, |act, step| {
         Some(Box::new(ActClaim {
             sub: step.principal.id.to_string(),
             principal: PrincipalRef {
@@ -521,5 +521,72 @@ mod tests {
 
         assert!(source.contains("tokio::task::spawn_blocking"));
         assert!(source.contains("wyrd_auth_issue::verify_api_key"));
+    }
+
+    #[test]
+    fn act_from_chain_roundtrip() {
+        use wyrd_runtime::{
+            DelegationStep, PrincipalId, PrincipalKind, PrincipalRef as RuntimePrincipalRef,
+        };
+        use wyrd_spec::DataTenantId;
+        use wyrd_spec::envelope::CardKind;
+        use wyrd_spec::ids::{CardName, SpaceName};
+        use wyrd_spec::reference::CardRef;
+        use wyrd_spec::version::VersionBlock;
+
+        let tenant_id: DataTenantId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
+            .parse()
+            .expect("static tenant id");
+        let make_card = |name: &str| CardRef {
+            kind: CardKind::Service,
+            name: CardName::new(name).expect("static name"),
+            version: VersionBlock::parse("1.0.0").expect("static version"),
+            space: SpaceName::new("prod").expect("static space"),
+            uid: None,
+        };
+        let id_a: PrincipalId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02"
+            .parse()
+            .expect("static id");
+        let id_b: PrincipalId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03"
+            .parse()
+            .expect("static id");
+        let a = DelegationStep {
+            principal: RuntimePrincipalRef {
+                id: id_a,
+                kind: PrincipalKind::Service {
+                    card_ref: make_card("initiator"),
+                },
+                card_ref: Some(make_card("initiator")),
+            },
+        };
+        let b = DelegationStep {
+            principal: RuntimePrincipalRef {
+                id: id_b,
+                kind: PrincipalKind::Service {
+                    card_ref: make_card("immediate"),
+                },
+                card_ref: Some(make_card("immediate")),
+            },
+        };
+
+        let result = super::act_from_chain(&[a.clone(), b.clone()], tenant_id)
+            .expect("non-empty chain builds act");
+
+        assert_eq!(result.sub, b.principal.id.to_string());
+        assert_eq!(
+            result.act.as_ref().expect("inner act present").sub,
+            a.principal.id.to_string()
+        );
+
+        // Round-trip: walk outermost-first, reverse → initiator-first order
+        let mut flat = Vec::new();
+        let mut cur = Some(result.as_ref());
+        while let Some(layer) = cur {
+            flat.push(layer.sub.clone());
+            cur = layer.act.as_deref();
+        }
+        flat.reverse();
+        assert_eq!(flat[0], a.principal.id.to_string());
+        assert_eq!(flat[1], b.principal.id.to_string());
     }
 }

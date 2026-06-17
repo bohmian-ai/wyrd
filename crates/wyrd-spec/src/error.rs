@@ -1871,6 +1871,126 @@ impl WyrdError {
             details: serde_json::json!({ "skald_code": code }),
         }
     }
+
+    /// Construct [`WyrdError::Internal`].
+    #[must_use]
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal {
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryInvalidCardSpec`].
+    #[must_use]
+    pub fn registry_invalid_card_spec(message: impl Into<String>) -> Self {
+        Self::RegistryInvalidCardSpec {
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryInvalidVersionBlock`].
+    #[must_use]
+    pub fn registry_invalid_version_block(message: impl Into<String>) -> Self {
+        Self::RegistryInvalidVersionBlock {
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistrySpecTooLarge`].
+    #[must_use]
+    pub fn registry_spec_too_large(actual: usize, limit: usize) -> Self {
+        Self::RegistrySpecTooLarge {
+            message: format!("spec is {actual} bytes, exceeds {limit} byte limit"),
+            details: serde_json::json!({ "actual": actual, "limit": limit }),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryVersionRequired`].
+    #[must_use]
+    pub fn registry_version_required(message: impl Into<String>) -> Self {
+        Self::RegistryVersionRequired {
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryCardNotFound`].
+    #[must_use]
+    pub fn registry_card_not_found(message: impl Into<String>) -> Self {
+        Self::RegistryCardNotFound {
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistrySpecDrift`].
+    #[must_use]
+    pub fn registry_spec_drift(
+        card_uid: impl Into<String>,
+        stored_hash: impl Into<String>,
+        submitted_hash: impl Into<String>,
+    ) -> Self {
+        let stored = stored_hash.into();
+        let submitted = submitted_hash.into();
+        let uid = card_uid.into();
+        Self::RegistrySpecDrift {
+            message: format!(
+                "spec hash mismatch for card {uid}: stored {stored}, submitted {submitted}"
+            ),
+            details: serde_json::json!({
+                "stored_hash": stored,
+                "submitted_hash": submitted,
+            }),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryUnavailable`].
+    #[must_use]
+    pub fn registry_unavailable(message: impl Into<String>) -> Self {
+        Self::RegistryUnavailable {
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryListLimitOutOfRange`].
+    #[must_use]
+    pub fn registry_list_limit_out_of_range(limit: u32, max: u32) -> Self {
+        Self::RegistryListLimitOutOfRange {
+            message: format!("limit {limit} is out of range 1..={max}"),
+            details: serde_json::json!({ "limit": limit, "max": max }),
+        }
+    }
+
+    /// Convert an [`crate::ids::IdError`] to a [`WyrdError`] (registry context).
+    #[must_use]
+    pub fn from_card_uid_error(e: crate::ids::IdError) -> Self {
+        Self::Internal {
+            message: format!("card_uid construction failed: {e}"),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Convert a [`crate::envelope::SpecCanonicalizationError`] to [`WyrdError`].
+    #[must_use]
+    pub fn from_spec_canonicalization(e: crate::envelope::SpecCanonicalizationError) -> Self {
+        Self::RegistryInvalidCardSpec {
+            message: format!("spec canonicalization failed: {e}"),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Convert a spec serialization [`serde_json::Error`] to [`WyrdError`].
+    #[must_use]
+    pub fn from_spec_serialization(e: serde_json::Error) -> Self {
+        Self::Internal {
+            message: format!("spec serialization failed: {e}"),
+            details: serde_json::json!({}),
+        }
+    }
 }
 
 impl From<skald_spec::SkaldError> for WyrdError {

@@ -97,14 +97,10 @@ async fn token(
 }
 
 async fn issue_key(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     caller: Caller,
     Json(_request): Json<IssueKeyRequest>,
 ) -> Result<Json<wyrd_spec::auth::IssueKeyResponse>, WyrdErrorResponse> {
-    if !state.allow_preview_auth {
-        return Err(WyrdErrorResponse::from(preview_disabled()));
-    }
-
     // Full route wiring waits for the JWT middleware to expose
     // `wyrd_runtime::Principal`. The service implementation is complete and
     // testable; this skeletal route refuses rather than inventing a lossy

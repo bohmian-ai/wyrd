@@ -13,6 +13,10 @@ that happens to hold the bootstrap secret.
 
 Issue an API key for a Service card:
 
+:::caution[Preview]
+The `issue-key` route is pending JWT middleware for runtime principal extraction. Running this command against a current deploy returns `WYRD_AUTH_503_PREVIEW_DISABLED`.
+:::
+
 ```bash
 wyrd auth issue-key prod/Service/billing@1.0.0
 ```

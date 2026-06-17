@@ -80,6 +80,10 @@ Use the Wyrd `code` value, not HTTP status alone:
 | `WYRD_AUTH_401_DELEGATION_DEPTH_EXCEEDED` | Do not retry. Contact the issuer; the token came from a non-conforming source. |
 | `WYRD_AUTH_400_UNSUPPORTED_GRANT_TYPE` | Check the Wyrd version and exact `grant_type` value. |
 | `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND` | Verify the requested subject is a registered Service or Agent CardRef in the current tenant. User impersonation is not supported in this version. |
+| `WYRD_AUTH_401_API_KEY_INVALID` | Do not retry with the same key. Rotate credentials via `wyrd auth issue-key` and update the deployment secret store. |
+| `WYRD_AUTHZ_403_REQUIRES_DELEGATED_TOKEN` | Do not retry. The presented token is a direct token; re-authenticate using the delegation flow (`POST /auth/token` with `grant_type: urn:ietf:params:oauth:grant-type:token-exchange`). |
+| `WYRD_AUTH_503_PREVIEW_DISABLED` | Do not retry. This route is not active in the current deploy. Contact the platform operator. |
+| `WYRD_PERMISSION_403_DENIED_RBAC` | Do not retry. The caller lacks the required RBAC permission. Request the required role from a workspace admin. |
 
 ## Retry behavior
 

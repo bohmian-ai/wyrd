@@ -18,7 +18,8 @@ fn card_yaml_round_trip() {
         kind: CardKind::Prompt,
         metadata: Metadata {
             name: CardName::new("support_prompt").unwrap(),
-            version: VersionBlock::parse("1.0.0").unwrap(),
+            version: Some(VersionBlock::parse("1.0.0").unwrap().into()),
+            bump: None,
             space: None,
             uid: None,
             labels: BTreeMap::new(),

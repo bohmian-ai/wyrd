@@ -221,7 +221,10 @@ impl PromptCard {
                 .resolved_pin()
                 .map(ToString::to_string)
                 .ok_or_else(|| {
-                    validation_error("PromptCard envelope missing resolved version pin")
+                    validation_error(
+                        "PromptCard envelope missing resolved version pin",
+                        serde_json::Value::Null,
+                    )
                 })?,
             uid: card
                 .metadata

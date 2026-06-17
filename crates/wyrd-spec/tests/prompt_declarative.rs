@@ -41,7 +41,8 @@ fn native_yaml(provider: &str, model: &str) -> String {
         kind: CardKind::Prompt,
         metadata: wyrd_spec::envelope::Metadata {
             name: wyrd_spec::ids::CardName::new("test").unwrap(),
-            version: wyrd_semver::VersionBlock::parse("0.1.0").unwrap(),
+            version: Some(wyrd_semver::VersionBlock::parse("0.1.0").unwrap().into()),
+            bump: None,
             space: None,
             uid: None,
             labels: Default::default(),

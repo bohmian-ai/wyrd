@@ -199,7 +199,6 @@ impl ExchangeApiKey {
             &row.principal_kind,
             row.card_ref.0,
             roles,
-            None,
         )
         .await
         .map_err(ExchangeError::from)
@@ -295,18 +294,17 @@ async fn issue_for_subject(
     principal_kind: &str,
     card_ref: CardRef,
     roles: Vec<RoleRef>,
-    act: Option<Box<ActClaim>>,
 ) -> Result<ExchangedToken, IssueOrSqlError> {
     let id = PrincipalId::new(principal_id);
-    let access_token = match (principal_kind, act) {
-        ("service", None) => issuing_key.issue_service_access_token(
+    let access_token = match principal_kind {
+        "service" => issuing_key.issue_service_access_token(
             id,
             conn.data_tenant_id(),
             card_ref.clone(),
             roles.clone(),
             settings.access_ttl,
         )?,
-        ("agent", None) => issuing_key.issue_agent_access_token(
+        "agent" => issuing_key.issue_agent_access_token(
             id,
             conn.data_tenant_id(),
             card_ref.clone(),

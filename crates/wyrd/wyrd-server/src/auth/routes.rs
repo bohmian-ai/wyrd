@@ -17,7 +17,6 @@ use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Build auth routes.
-#[must_use]
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/auth/token", axum::routing::post(token))

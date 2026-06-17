@@ -7,12 +7,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wyrd_interfaces::error::CardPyResult;
+use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::prompt::{PromptRef as NativePromptRef, PromptSpec};
 use wyrd_spec::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::api_version::ApiVersion;
 
 use crate::identity::{card_name, optional_card_uid, space_name, validation_error, version_block};
 

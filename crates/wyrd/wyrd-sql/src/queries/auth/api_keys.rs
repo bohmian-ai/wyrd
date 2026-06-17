@@ -18,7 +18,10 @@ const REVOKE_API_KEY_SQL: &str = "UPDATE wyrd.auth_api_keys
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the update.
-pub async fn revoke_api_key(conn: &mut TenantConn<'_>, api_key_id: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn revoke_api_key(
+    conn: &mut TenantConn<'_>,
+    api_key_id: Uuid,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(REVOKE_API_KEY_SQL)
         .bind(api_key_id)
         .execute(&mut **conn.transaction())

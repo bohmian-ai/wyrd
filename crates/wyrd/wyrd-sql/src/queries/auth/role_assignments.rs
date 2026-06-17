@@ -54,7 +54,8 @@ const LIST_SERVICE_ACCOUNT_ROLES_SQL: &str = r#"
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the insert.
-pub async fn grant_role_to_user(conn: &mut TenantConn<'_>,
+pub async fn grant_role_to_user(
+    conn: &mut TenantConn<'_>,
     user_id: Uuid,
     role_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
@@ -73,7 +74,8 @@ pub async fn grant_role_to_user(conn: &mut TenantConn<'_>,
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the delete.
-pub async fn revoke_role_from_user(conn: &mut TenantConn<'_>,
+pub async fn revoke_role_from_user(
+    conn: &mut TenantConn<'_>,
     user_id: Uuid,
     role_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
@@ -105,7 +107,8 @@ pub async fn list_user_roles(
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the insert.
-pub async fn grant_role_to_service_account(conn: &mut TenantConn<'_>,
+pub async fn grant_role_to_service_account(
+    conn: &mut TenantConn<'_>,
     service_account_id: Uuid,
     role_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
@@ -124,7 +127,8 @@ pub async fn grant_role_to_service_account(conn: &mut TenantConn<'_>,
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the delete.
-pub async fn revoke_role_from_service_account(conn: &mut TenantConn<'_>,
+pub async fn revoke_role_from_service_account(
+    conn: &mut TenantConn<'_>,
     service_account_id: Uuid,
     role_id: Uuid,
 ) -> Result<bool, sqlx::Error> {

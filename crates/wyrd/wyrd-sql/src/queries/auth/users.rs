@@ -32,7 +32,8 @@ pub struct UserRow {
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the insert.
-pub async fn insert_user(conn: &mut TenantConn<'_>,
+pub async fn insert_user(
+    conn: &mut TenantConn<'_>,
     id: Uuid,
     email: &str,
     auth_type: &str,

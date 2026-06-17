@@ -96,7 +96,8 @@ DELETE FROM wyrd.auth_roles
 /// # Errors
 /// Returns a SQLx error when the constraint trigger fires (builtin role name)
 /// or when Postgres rejects the query.
-pub async fn insert_role(conn: &mut TenantConn<'_>,
+pub async fn insert_role(
+    conn: &mut TenantConn<'_>,
     id: Uuid,
     name: &str,
     permissions: &serde_json::Value,

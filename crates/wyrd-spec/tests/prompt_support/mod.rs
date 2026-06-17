@@ -15,11 +15,11 @@ use skald_spec::{
     OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, OpenAiResponsesRequest,
     OpenAiResponsesSettings, Prompt, ProviderName, ProviderRequest, ResponseType,
 };
+use wyrd_semver::VersionBlock;
+use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::prompt::PromptSpec;
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
 use wyrd_spec::ids::CardName;
-use wyrd_semver::VersionBlock;
-use wyrd_spec::api_version::ApiVersion;
 
 pub fn prompt_spec(request: ProviderRequest, variables: Vec<&str>) -> PromptSpec {
     PromptSpec::new(prompt(request, variables)).expect("static prompt spec is valid")

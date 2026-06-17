@@ -72,7 +72,8 @@ pub enum ApiKeyStatus {
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the insert.
-pub async fn insert_service_account(conn: &mut TenantConn<'_>,
+pub async fn insert_service_account(
+    conn: &mut TenantConn<'_>,
     id: Uuid,
     principal_kind: &str,
     card_ref: &CardRef,
@@ -113,7 +114,8 @@ pub async fn insert_service_account(conn: &mut TenantConn<'_>,
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the update.
-pub async fn delete_service_account(conn: &mut TenantConn<'_>,
+pub async fn delete_service_account(
+    conn: &mut TenantConn<'_>,
     id: Uuid,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
@@ -162,7 +164,8 @@ pub async fn service_account_by_id(
 }
 
 /// Insert a hashed API key row.
-pub async fn insert_api_key(conn: &mut TenantConn<'_>,
+pub async fn insert_api_key(
+    conn: &mut TenantConn<'_>,
     id: Uuid,
     sa_id: Uuid,
     prefix: &str,
@@ -282,7 +285,8 @@ pub async fn service_account_roles(
 }
 
 /// Insert a principal-generic refresh token row.
-pub async fn insert_refresh_token(conn: &mut TenantConn<'_>,
+pub async fn insert_refresh_token(
+    conn: &mut TenantConn<'_>,
     id: Uuid,
     principal_kind: &str,
     principal_id: Uuid,
@@ -302,7 +306,8 @@ pub async fn insert_refresh_token(conn: &mut TenantConn<'_>,
 }
 
 /// Insert durable credential issuance audit.
-pub async fn insert_audit_credential_issuance(conn: &mut TenantConn<'_>,
+pub async fn insert_audit_credential_issuance(
+    conn: &mut TenantConn<'_>,
     id: Uuid,
     issuer_principal_id: Uuid,
     target_sa_id: Uuid,
@@ -331,7 +336,8 @@ pub async fn insert_audit_credential_issuance(conn: &mut TenantConn<'_>,
 }
 
 /// Insert durable token-exchange audit.
-pub async fn insert_audit_token_exchange(conn: &mut TenantConn<'_>,
+pub async fn insert_audit_token_exchange(
+    conn: &mut TenantConn<'_>,
     id: Uuid,
     subject_principal_id: Uuid,
     actor_principal_id: Uuid,

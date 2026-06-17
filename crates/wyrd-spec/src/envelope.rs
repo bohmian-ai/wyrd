@@ -9,6 +9,7 @@ use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;
 
+use crate::api_version::ApiVersion;
 use crate::card::agent::AgentSpec;
 use crate::card::artifact::ArtifactSpec;
 use crate::card::audit::AuditSpec;
@@ -25,7 +26,6 @@ use crate::card::service::ServiceSpec;
 use crate::card::source::SourceSpec;
 use crate::card::trigger::TriggerSpec;
 use crate::card::workflow::WorkflowSpec;
-use crate::api_version::ApiVersion;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
 use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};

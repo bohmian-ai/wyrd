@@ -2,11 +2,11 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
+use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_semver::VersionBlock;
 use wyrd_utils::py::wyrd_error_to_py_err;
 
 /// Wyrd card kind exposed to Python.

@@ -8,12 +8,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;
 use thiserror::Error;
 
+use crate::api_version::ApiVersion;
 use crate::card::common::{Governance, NonSecretValue, ObservationHooks, ParameterValue};
 use crate::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
 use crate::error::WyrdError;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
-use crate::api_version::ApiVersion;
 use crate::reference::{AgentRef, CardRef, PromptRef};
 use wyrd_semver::VersionBlock;
 

@@ -68,7 +68,11 @@ impl VersionRange {
     pub fn matches(&self, version: &VersionBlock) -> bool {
         let range = semver::VersionReq::parse(&self.0)
             .expect("VersionRange invariant: stored value is valid");
-        range.matches(&version.semver().expect("VersionBlock invariant: stored value is valid"))
+        range.matches(
+            &version
+                .semver()
+                .expect("VersionBlock invariant: stored value is valid"),
+        )
     }
 
     /// Returns true only when this range was parsed from a bare partial input
@@ -679,7 +683,11 @@ mod tests {
     #[test]
     fn is_loose_partial_rejects_explicit_caret() {
         assert!(!VersionRange::parse_loose("^1").unwrap().is_loose_partial());
-        assert!(!VersionRange::parse_loose("^1.2").unwrap().is_loose_partial());
+        assert!(
+            !VersionRange::parse_loose("^1.2")
+                .unwrap()
+                .is_loose_partial()
+        );
         assert!(
             !VersionRange::parse_loose("^1.2.3")
                 .unwrap()
@@ -690,7 +698,11 @@ mod tests {
     #[test]
     fn is_loose_partial_rejects_explicit_tilde() {
         assert!(!VersionRange::parse_loose("~1").unwrap().is_loose_partial());
-        assert!(!VersionRange::parse_loose("~1.2").unwrap().is_loose_partial());
+        assert!(
+            !VersionRange::parse_loose("~1.2")
+                .unwrap()
+                .is_loose_partial()
+        );
         assert!(
             !VersionRange::parse_loose("~1.2.3")
                 .unwrap()

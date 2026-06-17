@@ -216,7 +216,13 @@ impl PromptCard {
                 .as_ref()
                 .map_or_else(|| "default".to_owned(), ToString::to_string),
             name: card.metadata.name.to_string(),
-            version: card.metadata.version.to_string(),
+            version: card
+                .metadata
+                .resolved_pin()
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    validation_error("PromptCard envelope missing resolved version pin")
+                })?,
             uid: card
                 .metadata
                 .uid
@@ -238,7 +244,8 @@ impl PromptCard {
     fn to_envelope_metadata(&self, spec: &PromptSpec) -> Result<EnvelopeMetadata, WyrdError> {
         Ok(EnvelopeMetadata {
             name: card_name("name", &self.name)?,
-            version: version_block(&self.version)?,
+            version: Some(version_block(&self.version)?.into()),
+            bump: None,
             space: Some(space_name(&self.space)?),
             uid: optional_card_uid(&self.uid)?,
             labels: self.labels.clone(),

@@ -1,0 +1,45 @@
+---
+title: Security overview
+description: How Wyrd authenticates principals, checks permissions, and emits audit records.
+---
+
+# Security overview
+
+Wyrd separates security into three planes. The Auth plane identifies the caller
+and checks API permissions. The Policy plane evaluates card and runtime policy
+decisions in a later phase. The Emit plane records security-relevant facts for
+audit and observability. PR 5.3 ships the Auth foundation and the audit rows
+needed for credential issuance and token exchange.
+
+```text
+HTTP boundary
+  -> token verification
+  -> permission check
+  -> handler
+  -> transactional audit write
+  -> response
+```
+
+## What this covers
+
+| Page | Use it for |
+| --- | --- |
+| [Identity](/security/identity/) | Principal kinds, bare UUID principal ids, and card-bound non-human identity. |
+| [Roles and permissions](/security/roles-and-permissions/) | The typed RBAC vocabulary and builtin role grants. |
+| [Tokens](/security/tokens/) | Access tokens, refresh tokens, API keys, TTLs, and verifier behavior. |
+| [Service identity](/security/service-identity/) | Issuing and exchanging API keys for Service and Agent cards. |
+| [Delegation](/security/delegation/) | RFC 8693 token exchange and delegated Wyrd JWTs. |
+| [Operations](/security/operations/) | Rollout, preview gate, audit durability, and recovery notes. |
+| [Threat model](/security/threat-model/) | Threats handled by this foundation and deferred work. |
+
+## Glossary
+
+| Term | Meaning |
+| --- | --- |
+| Principal | The current authenticated caller inside Wyrd. |
+| Permission | A typed `{ resource, action }` authorization tuple. |
+| Role | A named set of permissions resolved inside one tenant. |
+| Service identity | A non-human principal bound to a Service card. |
+| Agent identity | A non-human principal bound to an Agent card. |
+| Bound `card_ref` | The structured CardRef stored on Service and Agent principals and encoded in their JWT claims. |
+| Delegation chain | The flattened actor chain from RFC 8693 token exchange, stored in request context and audit rows. |

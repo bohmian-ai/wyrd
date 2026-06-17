@@ -68,6 +68,19 @@ The `code` and `detail` identify the failing policy. The `context` map contains 
 
 Audit failures follow the same shape. If a write is rejected because an audit record could not be committed, the `code` will identify the audit step and `remediation` will describe what the agent or operator needs to resolve before retrying.
 
+## Authorization errors
+
+Use the Wyrd `code` value, not HTTP status alone:
+
+| Code | Agent action |
+| --- | --- |
+| `WYRD_AUTH_503_VERIFY_UNAVAILABLE` | Back off and retry the same operation. Do not re-authenticate; the credential was not rejected. |
+| `WYRD_PERMISSION_500_ROLE_CORRUPT` | Do not retry. Surface the failure to a workspace admin; the stored role permission JSON must be fixed. |
+| `WYRD_AUTH_401_INVALID_CARD_REF` | Re-issue the Service or Agent credential with `wyrd auth issue-key`. |
+| `WYRD_AUTH_401_DELEGATION_DEPTH_EXCEEDED` | Do not retry. Contact the issuer; the token came from a non-conforming source. |
+| `WYRD_AUTH_400_UNSUPPORTED_GRANT_TYPE` | Check the Wyrd version and exact `grant_type` value. |
+| `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND` | Verify the requested subject is a registered Service or Agent CardRef in the current tenant. User impersonation is not supported in this version. |
+
 ## Retry behavior
 
 Retries are only safe for idempotent operations. The `code` field is the signal for retryability:

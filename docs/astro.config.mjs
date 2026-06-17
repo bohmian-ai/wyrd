@@ -72,6 +72,20 @@ export default defineConfig({
           ],
         },
         {
+          label: "Security",
+          collapsed: true,
+          items: [
+            { label: "Overview", link: "/security/" },
+            { label: "Identity", link: "/security/identity/" },
+            { label: "Roles and permissions", link: "/security/roles-and-permissions/" },
+            { label: "Tokens", link: "/security/tokens/" },
+            { label: "Service identity", link: "/security/service-identity/" },
+            { label: "Delegation", link: "/security/delegation/" },
+            { label: "Operations", link: "/security/operations/" },
+            { label: "Threat model", link: "/security/threat-model/" },
+          ],
+        },
+        {
           label: "Card reference",
           collapsed: true,
           items: [

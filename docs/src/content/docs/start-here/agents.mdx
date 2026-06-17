@@ -43,6 +43,13 @@ same workflow is explained step by step in the
 - Preserve exact error messages and operation context when reporting a failure.
 - Use `labels` for short indexed classification fields and `annotations` for descriptive metadata.
 
+## Agent identity
+
+Agent runtimes authenticate as `PrincipalKind::Agent { card_ref }`. The
+`card_ref` binds the runtime credential to the registered Agent card, and
+delegated tokens preserve the caller chain for audit. See [Identity](/security/identity/)
+and [Delegation](/security/delegation/).
+
 ## Never do this
 
 - Do not import private native-extension modules directly.

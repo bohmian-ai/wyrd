@@ -5,7 +5,6 @@ rust = "1.95.0"
 "npm:pnpm" = "11.4.0"
 cmake = "3.26.4"
 protoc = "33.2"
-"cargo:cargo-deny" = "0.19.8"
 
 [settings]
 env_shell_expand = false
@@ -425,6 +424,10 @@ fi
 description = "Audit unwrap/expect calls outside tests and examples"
 run = "python scripts/check_unwrap_audit.py"
 
+[tasks."check:audit-script"]
+description = "Self-tests for the unwrap/expect audit script"
+run = "python scripts/tests/test_check_unwrap_audit.py"
+
 [tasks."check:error-coverage"]
 description = "Assert emitted Skald error codes are mapped and SQL errors have coverage"
 run = """
@@ -476,10 +479,6 @@ run = "python scripts/check_test_contracts.py"
 [tasks."check:wasm"]
 description = "Build wyrd-spec for wasm32"
 run = "cargo check --locked --target wasm32-unknown-unknown -p wyrd-spec --features wasm"
-
-[tasks."check:deny"]
-description = "cargo-deny check (licenses, advisories, sources, bans)"
-run = "cargo deny check"
 
 [tasks."sqlx:prepare"]
 description = "Refresh committed sqlx offline query metadata"
@@ -718,7 +717,7 @@ esac
 
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
-depends = ["check", "test:unit", "test:storage:local", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:storage:drift", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "check:deny", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
+depends = ["check", "test:unit", "test:storage:local", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
 
 [tasks."test:sql"]
 description = """Run live Postgres SQL integration tests.

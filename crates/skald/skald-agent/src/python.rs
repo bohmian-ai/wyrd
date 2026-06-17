@@ -565,7 +565,7 @@ pub fn wrap_after_model(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterModelFn
             |py| {
                 let py_response = Py::new(
                     py,
-                    skald_prompt::wire_py::PyProviderResponse::from_native(response.clone()),
+                    skald_prompt::python::PyProviderResponse::from_native(response.clone()),
                 )?
                 .into_any();
                 cb.bind(py).call1((ctx_to_py(py, ctx)?, py_response))
@@ -892,7 +892,7 @@ fn extract_provider_request_replacement(value: &Bound<'_, PyAny>) -> PyResult<Pr
 }
 
 fn extract_provider_response_replacement(value: &Bound<'_, PyAny>) -> PyResult<ProviderResponse> {
-    if let Ok(py_resp) = value.extract::<PyRef<'_, skald_prompt::wire_py::PyProviderResponse>>() {
+    if let Ok(py_resp) = value.extract::<PyRef<'_, skald_prompt::python::PyProviderResponse>>() {
         return Ok(py_resp.native().clone());
     }
     serde_json::from_value(wyrd_utils::py::pyobject_to_json(value)?)

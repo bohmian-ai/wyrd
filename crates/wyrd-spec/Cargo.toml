@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-server = ["dep:utoipa"]
+server = ["dep:utoipa", "wyrd-semver/server"]
 wasm = ["uuid/js"]
 
 [dependencies]
@@ -32,6 +32,7 @@ utoipa = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["std", "v7"] }
 sha2 = { workspace = true }
 wyrd-error-derive = { path = "../shared/wyrd-error-derive", version = "0.0.1" }
+wyrd-semver = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

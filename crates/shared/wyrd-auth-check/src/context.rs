@@ -3,6 +3,7 @@
 use thiserror::Error;
 use wyrd_auth_verify::VerifiedToken;
 use wyrd_runtime::{Principal, PrincipalKind, PrincipalRef};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
 use crate::request::AuthzCheckRequest;
@@ -25,24 +26,51 @@ pub struct AuthzCheckContext {
 /// Context construction failures.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthzCheckContextError {
-    /// The verified token was not a delegated Service or Agent token.
-    #[error("authz check requires a delegated Service or Agent token")]
-    RequiresDelegatedToken,
+    /// The principal kind is not Service or Agent.
+    #[error("authz check requires a Service or Agent principal kind")]
+    RequiresServiceOrAgentKind,
+    /// The principal has no card_ref.
+    #[error("authz check requires a card_ref on the principal")]
+    RequiresCardRef,
+    /// The delegation chain is empty (direct token).
+    #[error("authz check requires a non-empty delegation chain (direct token not accepted)")]
+    RequiresDelegationChain,
+}
+
+impl From<AuthzCheckContextError> for WyrdError {
+    fn from(error: AuthzCheckContextError) -> Self {
+        let condition = match &error {
+            AuthzCheckContextError::RequiresServiceOrAgentKind => "requires_service_or_agent_kind",
+            AuthzCheckContextError::RequiresCardRef => "requires_card_ref",
+            AuthzCheckContextError::RequiresDelegationChain => "requires_delegation_chain",
+        };
+        WyrdError::AuthzRequiresDelegatedToken {
+            message: error.to_string(),
+            details: serde_json::json!({ "condition": condition }),
+        }
+    }
 }
 
 impl AuthzCheckContext {
     /// Build an authz-check context from a verified delegated token.
     ///
     /// # Errors
-    /// Returns [`AuthzCheckContextError::RequiresDelegatedToken`] when the token is direct,
-    /// user-owned, or lacks a card reference.
+    /// Returns a specific [`AuthzCheckContextError`] variant for each failure condition:
+    /// wrong principal kind, missing card_ref, or empty delegation chain.
     pub fn from_verified(
         verified: &VerifiedToken,
         request: AuthzCheckRequest,
         request_id: RequestId,
     ) -> Result<Self, AuthzCheckContextError> {
-        if !is_delegated_token(verified) {
-            return Err(AuthzCheckContextError::RequiresDelegatedToken);
+        if !matches!(
+            verified.principal.kind,
+            PrincipalKind::Service { .. } | PrincipalKind::Agent { .. }
+        ) {
+            return Err(AuthzCheckContextError::RequiresServiceOrAgentKind);
+        }
+
+        if verified.principal.card_ref().is_none() {
+            return Err(AuthzCheckContextError::RequiresCardRef);
         }
 
         let callee = verified.principal.clone();
@@ -52,7 +80,7 @@ impl AuthzCheckContext {
             .map(|step| step.principal.clone())
             .collect();
         let Some(caller) = chain.last().cloned() else {
-            return Err(AuthzCheckContextError::RequiresDelegatedToken);
+            return Err(AuthzCheckContextError::RequiresDelegationChain);
         };
 
         Ok(Self {
@@ -165,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_service_token_is_rejected_before_policy_hook() {
+    fn direct_service_token_is_rejected_with_delegation_chain_error() {
         let callee = principal(PrincipalKind::Service {
             card_ref: card_ref(CardKind::Service, "callee"),
         });
@@ -174,12 +202,12 @@ mod tests {
         assert!(!is_delegated_token(&verified));
         assert_eq!(
             AuthzCheckContext::from_verified(&verified, request(), request_id()),
-            Err(AuthzCheckContextError::RequiresDelegatedToken)
+            Err(AuthzCheckContextError::RequiresDelegationChain)
         );
     }
 
     #[test]
-    fn delegated_user_token_is_rejected_before_policy_hook() {
+    fn delegated_user_token_is_rejected_with_kind_error() {
         let user = principal(PrincipalKind::User);
         let initiator = principal(PrincipalKind::Service {
             card_ref: card_ref(CardKind::Service, "initiator"),
@@ -189,7 +217,7 @@ mod tests {
         assert!(!is_delegated_token(&verified));
         assert_eq!(
             AuthzCheckContext::from_verified(&verified, request(), request_id()),
-            Err(AuthzCheckContextError::RequiresDelegatedToken)
+            Err(AuthzCheckContextError::RequiresServiceOrAgentKind)
         );
     }
 

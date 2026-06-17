@@ -6941,6 +6941,7 @@ dependencies = [
  "axum 0.8.9",
  "base64 0.22.1",
  "chrono",
+ "insta",
  "jsonwebtoken 9.3.1",
  "object_store",
  "rand 0.9.4",

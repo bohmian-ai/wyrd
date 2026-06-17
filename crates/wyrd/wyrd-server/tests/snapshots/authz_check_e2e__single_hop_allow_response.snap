@@ -1,0 +1,7 @@
+---
+source: crates/wyrd/wyrd-server/tests/authz_check_e2e.rs
+expression: body_json(resp).await
+---
+{
+  "decision": "allow"
+}

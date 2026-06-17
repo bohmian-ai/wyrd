@@ -29,9 +29,6 @@ pub enum AuthzCheckContextError {
     /// The principal kind is not Service or Agent.
     #[error("authz check requires a Service or Agent principal kind")]
     RequiresServiceOrAgentKind,
-    /// The principal has no card_ref.
-    #[error("authz check requires a card_ref on the principal")]
-    RequiresCardRef,
     /// The delegation chain is empty (direct token).
     #[error("authz check requires a non-empty delegation chain (direct token not accepted)")]
     RequiresDelegationChain,
@@ -41,7 +38,6 @@ impl From<AuthzCheckContextError> for WyrdError {
     fn from(error: AuthzCheckContextError) -> Self {
         let condition = match &error {
             AuthzCheckContextError::RequiresServiceOrAgentKind => "requires_service_or_agent_kind",
-            AuthzCheckContextError::RequiresCardRef => "requires_card_ref",
             AuthzCheckContextError::RequiresDelegationChain => "requires_delegation_chain",
         };
         WyrdError::AuthzRequiresDelegatedToken {
@@ -56,7 +52,7 @@ impl AuthzCheckContext {
     ///
     /// # Errors
     /// Returns a specific [`AuthzCheckContextError`] variant for each failure condition:
-    /// wrong principal kind, missing card_ref, or empty delegation chain.
+    /// wrong principal kind or empty delegation chain.
     pub fn from_verified(
         verified: &VerifiedToken,
         request: AuthzCheckRequest,
@@ -67,10 +63,6 @@ impl AuthzCheckContext {
             PrincipalKind::Service { .. } | PrincipalKind::Agent { .. }
         ) {
             return Err(AuthzCheckContextError::RequiresServiceOrAgentKind);
-        }
-
-        if verified.principal.card_ref().is_none() {
-            return Err(AuthzCheckContextError::RequiresCardRef);
         }
 
         let callee = verified.principal.clone();
@@ -99,8 +91,7 @@ pub fn is_delegated_token(verified: &VerifiedToken) -> bool {
     matches!(
         verified.principal.kind,
         PrincipalKind::Service { .. } | PrincipalKind::Agent { .. }
-    ) && verified.principal.card_ref().is_some()
-        && !verified.delegation_chain.is_empty()
+    ) && !verified.delegation_chain.is_empty()
 }
 
 #[cfg(test)]

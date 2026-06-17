@@ -11,7 +11,8 @@ use wyrd_spec::reference::CardRef;
 pub struct AuthzCheckRequest {
     /// Target card for the simulated permission check.
     pub target: CardRef,
-    /// Action to check against the current actor.
+    /// Action to check against the current actor. Well-known value: `"card_write"`.
+    /// Custom actions must be valid `Permission` identifiers.
     pub action: String,
     /// Additional policy context.
     #[serde(default)]
@@ -29,7 +30,7 @@ pub struct AuthzCheckRequestMetadata {
     pub host: String,
 }
 
-/// Header parsing failures for [`AuthzCheckRequest`].
+/// Header parsing failures for [`AuthzCheckRequestMetadata`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthzCheckRequestError {
     /// A required projected request header was missing.

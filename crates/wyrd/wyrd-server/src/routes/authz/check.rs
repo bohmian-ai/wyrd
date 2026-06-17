@@ -4,24 +4,22 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Extension, State};
 use axum::http::HeaderMap;
-use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_check::guard::{GuardOutcome, guard_reason};
 use wyrd_auth_check::{
     AuthzCheckContext, AuthzCheckRequest, AuthzCheckRequestError, AuthzCheckRequestMetadata,
     AuthzCheckResponse,
 };
-use wyrd_auth_verify::AccessTokenClaims;
 use wyrd_runtime::{Permission, PermissionDenyReason, PermissionVerdict};
-use wyrd_spec::DataTenantId;
 use wyrd_spec::card::policy::PolicyDecision;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
+use crate::auth::token_extract::{
+    WYRD_ACCESS_TOKEN_HEADER, auth_not_configured, tenant_from_unverified_access_token,
+};
 use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
-
-const WYRD_ACCESS_TOKEN_HEADER: &str = "x-wyrd-access-token";
 
 /// Check a delegated Service/Agent invoke request.
 #[tracing::instrument(skip(state, headers, body), fields(request_id = %request_id))]
@@ -83,6 +81,8 @@ pub async fn check_authz(
         },
     };
 
+    // Skip audit write when using the default stub writer (test/dev environments).
+    // build_production() prevents this branch from being reached in production.
     if !state.audit_writer.is_stub_default() {
         let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, ctx.callee.tenant_id)
             .await
@@ -118,7 +118,7 @@ fn permission_for_action(action: &str) -> Result<Permission, WyrdErrorResponse> 
         value => value.parse::<Permission>().map_err(|_| {
             WyrdErrorResponse::from(WyrdError::Validation {
                 message: "authz-check action is unknown".to_owned(),
-                details: serde_json::json!({ "action": value }),
+                details: serde_json::json!({ "action": value, "example_actions": ["card_write"] }),
             })
         }),
     }
@@ -155,16 +155,6 @@ fn extract_wyrd_access_token(headers: &HeaderMap) -> Result<SecretString, WyrdEr
     Ok(SecretString::from(token.to_owned()))
 }
 
-fn tenant_from_unverified_access_token(token: &str) -> Result<DataTenantId, WyrdErrorResponse> {
-    let payload = token.split('.').nth(1).ok_or_else(bad_token_format)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| bad_token_format())?;
-    let claims: AccessTokenClaims =
-        serde_json::from_slice(&bytes).map_err(|_| bad_token_format())?;
-    Ok(claims.principal.tenant_id)
-}
-
 fn request_error_to_wyrd(error: AuthzCheckRequestError) -> WyrdErrorResponse {
     match error {
         AuthzCheckRequestError::MissingHeader { header } => WyrdError::MissingRequiredField {
@@ -191,20 +181,6 @@ fn display_header_name(header: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("-")
-}
-
-fn bad_token_format() -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::BadTokenFormat {
-        message: "X-Wyrd-Access-Token is not a compact Wyrd JWT".to_owned(),
-        details: serde_json::json!({ "header": "x-wyrd-access-token" }),
-    })
-}
-
-fn auth_not_configured() -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
-        message: "auth backend not configured".to_owned(),
-        details: serde_json::json!({ "retry_after_seconds": 1 }),
-    })
 }
 
 fn sql_error(error: wyrd_sql::SqlError) -> WyrdErrorResponse {

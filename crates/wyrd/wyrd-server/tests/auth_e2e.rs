@@ -56,7 +56,9 @@ async fn permission_check_via_delegation(
     if resp.status() != StatusCode::OK {
         let status = resp.status();
         let body = body_json(resp).await;
-        panic!("authz-check journey expected an RBAC decision response: status={status}, body={body}");
+        panic!(
+            "authz-check journey expected an RBAC decision response: status={status}, body={body}"
+        );
     }
     body_json(resp).await
 }
@@ -204,7 +206,10 @@ async fn journey_delegated_call_via_token_exchange() {
     let decoded = decode_jwt_claims_for_test(&delegated);
     let act = decoded["act"].as_object().expect("act chain");
     assert_eq!(act["sub"], a.id().to_string());
-    assert!(act.get("act").is_none(), "single-hop chain has no parent act");
+    assert!(
+        act.get("act").is_none(),
+        "single-hop chain has no parent act"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -12,7 +12,7 @@ use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use tower::ServiceExt;
 use uuid::Uuid;
-use wyrd_auth_check::{AuthzCheckRequest, PolicyHook};
+use wyrd_auth_check::{AuthzCheckRequest, AuthzCheckResponse, PolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::{
     Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
@@ -138,6 +138,8 @@ pub struct CheckResult {
     pub status: StatusCode,
     /// Request id emitted by the request-id middleware.
     pub wyrd_request_id: RequestId,
+    /// Parsed authz-check response body when the route returned a valid JSON payload.
+    pub response: Option<AuthzCheckResponse>,
 }
 
 impl WyrdTestEnv {
@@ -473,9 +475,14 @@ impl WyrdTestEnv {
             .and_then(|value| {
                 RequestId::parse(value).map_err(|error| WyrdTestError::Io(error.to_string()))
             })?;
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map_err(|error| WyrdTestError::Io(error.to_string()))?;
+        let check_response: Option<AuthzCheckResponse> = serde_json::from_slice(&body).ok();
         Ok(CheckResult {
             status,
             wyrd_request_id: request_id,
+            response: check_response,
         })
     }
 

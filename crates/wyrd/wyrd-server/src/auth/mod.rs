@@ -11,6 +11,7 @@ pub mod repo;
 pub mod roles;
 pub mod routes;
 pub mod seed;
+pub(crate) mod token_extract;
 
 pub use caller_extractor::Caller;
 pub use principal_extractor::AuthenticatedPrincipal;

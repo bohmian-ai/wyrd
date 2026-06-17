@@ -128,6 +128,30 @@ async fn authz_missing_x_original_method_still_uses_body_check() {
     assert_eq!(problem.1["reason"], "missing_permission");
 }
 
+#[tokio::test]
+async fn authz_unknown_action_returns_validation_error() {
+    let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+        .await
+        .expect("fixture starts");
+    let state = test_state(fixture.app_pool().clone());
+    let token = mint_delegated_service_jwt(&state, fixture.data_tenant_id());
+
+    let response = build_router(state)
+        .oneshot(authz_request_with_action(&token, "not_a_real_action"))
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collects");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json parses");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "WYRD_SPEC_400_VALIDATION");
+    assert_eq!(value["details"]["action"], "not_a_real_action");
+    assert!(value["details"]["example_actions"].is_array());
+}
+
 async fn post_authz(
     state: AppState,
     token: &str,
@@ -177,6 +201,26 @@ fn authz_request_without_token(target: &CardRef, include_method: bool) -> Reques
     builder
         .body(Body::from(
             serde_json::to_vec(&authz_body(target)).expect("body serializes"),
+        ))
+        .expect("request builds")
+}
+
+fn authz_request_with_action(token: &str, action: &str) -> Request<Body> {
+    let body = serde_json::json!({
+        "target": card_ref(CardKind::Service, "callee"),
+        "action": action,
+        "context": {},
+    });
+    Request::builder()
+        .method("POST")
+        .uri("/v1/authz/check")
+        .header("x-wyrd-access-token", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("x-original-method", "POST")
+        .header("x-original-path", "/invoke")
+        .header("x-original-host", "service.wyrd")
+        .body(Body::from(
+            serde_json::to_vec(&body).expect("body serializes"),
         ))
         .expect("request builds")
 }

@@ -20,7 +20,7 @@ const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIE
 const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
 
 #[tokio::test]
-async fn healthz_returns_ok_and_request_id() {
+async fn healthz_returns_ok_without_request_id() {
     let response = build_router(test_state())
         .oneshot(
             Request::builder()
@@ -32,7 +32,7 @@ async fn healthz_returns_ok_and_request_id() {
         .expect("router responds");
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.headers().contains_key("x-request-id"));
+    assert!(!response.headers().contains_key("wyrd-request-id"));
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body collects");
@@ -60,7 +60,7 @@ async fn unauthenticated_v1_request_returns_problem_json() {
             .and_then(|value| value.to_str().ok()),
         Some("application/problem+json")
     );
-    assert!(response.headers().contains_key("x-request-id"));
+    assert!(response.headers().contains_key("wyrd-request-id"));
 
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
@@ -118,6 +118,23 @@ async fn request_with_missing_header_returns_401_unauthenticated() {
         .expect("body collects");
     let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
     assert_eq!(problem["code"], "WYRD_AUTH_401_UNAUTHENTICATED");
+}
+
+#[tokio::test]
+async fn auth_routes_do_not_receive_request_id_layer() {
+    let response = build_router(test_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/token")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{}"))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert!(!response.headers().contains_key("wyrd-request-id"));
 }
 
 fn test_state() -> AppState {

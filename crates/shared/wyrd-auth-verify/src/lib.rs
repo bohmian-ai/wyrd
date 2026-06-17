@@ -554,6 +554,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use chrono::{DateTime, Utc};
 
     use jsonwebtoken::{Algorithm, EncodingKey, Header, Validation, encode};
     use secrecy::SecretString;
@@ -872,6 +875,46 @@ mod tests {
         let result = verifier.verify(&token, &tenant_id()).await;
 
         assert!(matches!(result, Err(AuthError::BadTokenFormat)));
+    }
+
+    #[tokio::test]
+    async fn invalidate_removes_entry_and_forces_re_resolve() {
+        let resolver = Arc::new(TestResolver::default());
+        let verifier = verifier(Arc::clone(&resolver), WyrdAuthVerifySettings::default());
+        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
+            now() + 3_600,
+            now(),
+        )));
+
+        verifier
+            .verify(&token, &tenant_id())
+            .await
+            .expect("first verify succeeds");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+
+        verifier.invalidate(&token).await;
+
+        verifier
+            .verify(&token, &tenant_id())
+            .await
+            .expect("verify after invalidate succeeds");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn is_expired_with_zero_skew_returns_true_for_past_timestamp() {
+        let settings = WyrdAuthVerifySettings {
+            allowed_clock_skew: Duration::ZERO,
+            ..WyrdAuthVerifySettings::default()
+        };
+        let v = verifier(Arc::new(TestResolver::default()), settings);
+        let past = DateTime::<Utc>::from_timestamp((now() as i64) - 3_600, 0)
+            .expect("static past timestamp is valid");
+        let future = DateTime::<Utc>::from_timestamp((now() as i64) + 3_600, 0)
+            .expect("static future timestamp is valid");
+
+        assert!(v.is_expired(past));
+        assert!(!v.is_expired(future));
     }
 
     fn claims_with_times(exp: usize, iat: usize) -> AccessTokenClaims {

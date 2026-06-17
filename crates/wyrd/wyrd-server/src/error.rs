@@ -231,9 +231,10 @@ pub fn sqlx_error_to_wyrd(error: sqlx::Error) -> WyrdError {
         }
     }
 
+    tracing::warn!(error = %error, "database operation failed");
     WyrdError::Internal {
         message: "database operation failed".to_owned(),
-        details: serde_json::json!({ "source": error.to_string() }),
+        details: serde_json::json!({}),
     }
 }
 

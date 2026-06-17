@@ -4,6 +4,7 @@ use axum::extract::{Extension, State};
 use axum::{Json, Router};
 use base64::Engine;
 use secrecy::SecretString;
+use uuid::Uuid;
 use wyrd_auth_verify::AccessTokenClaims;
 use wyrd_spec::auth::{IssueKeyRequest, TokenRequest, TokenResponse};
 use wyrd_spec::error::WyrdError;
@@ -67,10 +68,14 @@ async fn token(
             let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, tenant_id)
                 .await
                 .map_err(sql_error)?;
-            let request_id = request_id
-                .as_ref()
-                .map(|Extension(id)| id.as_str())
-                .unwrap_or("missing-request-id");
+            let request_id_buf: String;
+            let request_id = match request_id.as_ref() {
+                Some(Extension(id)) => id.as_str(),
+                None => {
+                    request_id_buf = Uuid::new_v4().to_string();
+                    &request_id_buf
+                }
+            };
             let exchanged = DelegateToken {
                 issuing_key,
                 verifier,
@@ -119,9 +124,10 @@ fn auth_not_configured() -> WyrdErrorResponse {
 }
 
 fn sql_error(error: wyrd_sql::SqlError) -> WyrdErrorResponse {
+    tracing::warn!(error = %error, "auth db unavailable");
     WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
         message: "auth backend unavailable".to_owned(),
-        details: serde_json::json!({ "source": error.to_string() }),
+        details: serde_json::json!({}),
     })
 }
 

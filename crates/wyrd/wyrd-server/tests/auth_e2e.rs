@@ -53,11 +53,11 @@ async fn permission_check_via_delegation(
         .call(&delegated, authz_check_request(callee, action))
         .await
         .expect("authz_check call");
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "stage 09 never exercises guard / hook denies",
-    );
+    if resp.status() != StatusCode::OK {
+        let status = resp.status();
+        let body = body_json(resp).await;
+        panic!("stage 09 never exercises guard / hook denies: status={status}, body={body}");
+    }
     body_json(resp).await
 }
 
@@ -104,7 +104,7 @@ async fn journey_user_admin_creates_service_account_and_grants_writer_role() {
         .await
         .expect("bootstrap admin");
     let sa = env
-        .bootstrap_service("sa", &["writer"])
+        .bootstrap_service("svc-admin", &["writer"])
         .await
         .expect("bootstrap sa");
     let initiator = neutral_initiator(&env, "j1-init").await;
@@ -202,9 +202,9 @@ async fn journey_delegated_call_via_token_exchange() {
     assert_allow(&body);
 
     let decoded = decode_jwt_claims_for_test(&delegated);
-    let act = decoded["act"].as_array().expect("act chain");
-    assert_eq!(act.len(), 1, "single-hop");
-    assert_eq!(act[0]["sub"], a.id().to_string());
+    let act = decoded["act"].as_object().expect("act chain");
+    assert_eq!(act["sub"], a.id().to_string());
+    assert!(act.get("act").is_none(), "single-hop chain has no parent act");
 }
 
 #[tokio::test(flavor = "current_thread")]

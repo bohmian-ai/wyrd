@@ -34,9 +34,9 @@ pub struct AppState {
     pub issuing_key: Option<Arc<IssuingKey>>,
     /// JWT verifier for token-exchange routes.
     pub token_verifier: Option<Arc<TokenVerifier<SqlPermissionResolver>>>,
-    /// Policy hook for `/v1/authz/check`.
+    /// Policy hook for authz-check evaluation.
     pub policy_hook: Arc<dyn PolicyHook>,
-    /// Audit-fact writer for `/v1/authz/check`.
+    /// Audit-fact writer for authz-check decisions.
     pub audit_writer: Arc<dyn AuthzAuditWriter>,
     /// Trust gate for inbound Wyrd request ID propagation.
     pub trusted_request_id_propagation: bool,

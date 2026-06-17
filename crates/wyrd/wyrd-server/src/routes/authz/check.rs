@@ -83,14 +83,16 @@ pub async fn check_authz(
         },
     };
 
-    let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, ctx.callee.tenant_id)
-        .await
-        .map_err(sql_error)?;
-    state
-        .audit_writer
-        .write_authz_check(&mut conn, &ctx, &decision)
-        .await?;
-    conn.commit().await.map_err(sql_error)?;
+    if !state.audit_writer.is_stub_default() {
+        let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, ctx.callee.tenant_id)
+            .await
+            .map_err(sql_error)?;
+        state
+            .audit_writer
+            .write_authz_check(&mut conn, &ctx, &decision)
+            .await?;
+        conn.commit().await.map_err(sql_error)?;
+    }
 
     match decision {
         PolicyDecision::Allow => Ok(Json(AuthzCheckResponse::allow())),

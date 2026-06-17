@@ -219,13 +219,13 @@ impl WyrdTestEnv {
         })
     }
 
-    /// Binding a socket is deferred to the follow-up wrapper.
+    /// Binding a socket is not supported by the in-process test harness.
     ///
     /// # Errors
     /// Always returns [`WyrdTestError::Unsupported`] in this stage.
     pub async fn start_bound() -> Result<Self, WyrdTestError> {
         Err(WyrdTestError::Unsupported(
-            "start_bound() is deferred to the PyO3 wrapper PR".to_owned(),
+            "start_bound() is not supported by the in-process test harness".to_owned(),
         ))
     }
 

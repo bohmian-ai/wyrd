@@ -56,7 +56,7 @@ async fn permission_check_via_delegation(
     if resp.status() != StatusCode::OK {
         let status = resp.status();
         let body = body_json(resp).await;
-        panic!("stage 09 never exercises guard / hook denies: status={status}, body={body}");
+        panic!("authz-check journey expected an RBAC decision response: status={status}, body={body}");
     }
     body_json(resp).await
 }

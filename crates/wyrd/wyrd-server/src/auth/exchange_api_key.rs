@@ -646,7 +646,6 @@ mod tests {
                 kind: PrincipalKind::Service {
                     card_ref: make_card("initiator"),
                 },
-                card_ref: Some(make_card("initiator")),
             },
         };
         let b = DelegationStep {
@@ -655,7 +654,6 @@ mod tests {
                 kind: PrincipalKind::Service {
                     card_ref: make_card("immediate"),
                 },
-                card_ref: Some(make_card("immediate")),
             },
         };
 

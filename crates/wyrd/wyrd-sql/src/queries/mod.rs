@@ -9,5 +9,6 @@
 //! observes committed Wyrd state directly or through the future outbox path.
 
 pub mod auth;
+pub mod cards;
 pub mod platform;
 pub mod storage;

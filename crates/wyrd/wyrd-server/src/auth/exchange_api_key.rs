@@ -90,12 +90,6 @@ pub struct ExchangedToken {
     pub token_type: TokenType,
     /// Access token expiry.
     pub expires_at: chrono::DateTime<Utc>,
-    /// Principal id.
-    pub principal_id: PrincipalId,
-    /// Principal kind.
-    pub principal_kind: PrincipalKind,
-    /// Bound card ref.
-    pub card_ref: CardRef,
 }
 
 impl ExchangedToken {
@@ -227,6 +221,8 @@ impl DelegateToken {
             .map_err(|_| DelegateError::PermissionDenied)?;
 
         let row = resolve_requested_subject(conn, requested_subject).await?;
+        let _ = runtime_principal_kind(&row.principal_kind, row.card_ref.0.clone())
+            .ok_or(DelegateError::SubjectNotFound)?;
         let roles = role_refs(service_account_roles(conn, row.id).await?)
             .map_err(|_| DelegateError::InvalidRole)?;
         let caller = DelegationCaller {
@@ -284,10 +280,6 @@ impl DelegateToken {
             refresh_token: SecretString::from(refresh_token),
             token_type: TokenType::Bearer,
             expires_at,
-            principal_id: PrincipalId::new(row.id),
-            principal_kind: runtime_principal_kind(&row.principal_kind, row.card_ref.0.clone())
-                .ok_or(DelegateError::SubjectNotFound)?,
-            card_ref: row.card_ref.0,
         })
     }
 }
@@ -341,10 +333,6 @@ async fn issue_for_subject(
         refresh_token: SecretString::from(refresh_token),
         token_type: TokenType::Bearer,
         expires_at,
-        principal_id: id,
-        principal_kind: runtime_principal_kind(principal_kind, card_ref.clone())
-            .ok_or(IssueError::InvalidPrincipalKind)?,
-        card_ref,
     })
 }
 

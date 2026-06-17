@@ -440,16 +440,7 @@ fn act_from_chain(
     chain.iter().fold(None, |act, step| {
         Some(Box::new(ActClaim {
             sub: step.principal.id.to_string(),
-            principal: TokenPrincipalRef {
-                id: step.principal.id,
-                kind: match &step.principal.kind {
-                    PrincipalKind::User => PrincipalKindWire::User,
-                    PrincipalKind::Service { .. } => PrincipalKindWire::Service,
-                    PrincipalKind::Agent { .. } => PrincipalKindWire::Agent,
-                },
-                tenant_id,
-                card_ref: step.principal.card_ref().cloned(),
-            },
+            principal: TokenPrincipalRef::from((&step.principal, tenant_id)),
             act,
         }))
     })

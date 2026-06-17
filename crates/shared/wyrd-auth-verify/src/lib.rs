@@ -395,6 +395,21 @@ pub struct RefreshTokenClaims {
     pub jti: String,
 }
 
+impl From<(&RuntimePrincipalRef, DataTenantId)> for TokenPrincipalRef {
+    fn from((ref_, tenant_id): (&RuntimePrincipalRef, DataTenantId)) -> Self {
+        Self {
+            id: ref_.id,
+            kind: match &ref_.kind {
+                PrincipalKind::User => PrincipalKindWire::User,
+                PrincipalKind::Service { .. } => PrincipalKindWire::Service,
+                PrincipalKind::Agent { .. } => PrincipalKindWire::Agent,
+            },
+            tenant_id,
+            card_ref: ref_.card_ref().cloned(),
+        }
+    }
+}
+
 impl From<&Principal> for TokenPrincipalRef {
     fn from(principal: &Principal) -> Self {
         let (kind, card_ref) = match &principal.kind {

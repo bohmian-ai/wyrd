@@ -71,16 +71,8 @@ fn traceparent_validation_is_w3c_canonical() {
 #[test]
 fn version_helpers_match_bump_and_sort() {
     let range = VersionRange::parse("^1.2").unwrap();
-    assert!(
-        range
-            .matches(&VersionBlock::parse("1.4.0").unwrap())
-            .unwrap()
-    );
-    assert!(
-        !range
-            .matches(&VersionBlock::parse("2.0.0").unwrap())
-            .unwrap()
-    );
+    assert!(range.matches(&VersionBlock::parse("1.4.0").unwrap()));
+    assert!(!range.matches(&VersionBlock::parse("2.0.0").unwrap()));
 
     let version = VersionBlock::parse("1.2.3").unwrap();
     assert_eq!(version.bump(VersionBump::Minor).unwrap().as_str(), "1.3.0");
@@ -89,7 +81,7 @@ fn version_helpers_match_bump_and_sort() {
         VersionBlock::parse("1.10.0").unwrap(),
         VersionBlock::parse("1.2.0").unwrap(),
     ];
-    VersionBlock::sort_versions(&mut versions).unwrap();
+    VersionBlock::sort_versions(&mut versions);
     assert_eq!(versions[0].as_str(), "1.2.0");
 }
 

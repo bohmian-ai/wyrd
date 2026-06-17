@@ -108,9 +108,18 @@ impl ExchangedToken {
 /// API-key exchange failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ExchangeError {
-    /// Invalid public API-key failure.
-    #[error("api key invalid")]
-    InvalidApiKey,
+    /// Key format is invalid or the key's embedded tenant does not match the connection tenant.
+    #[error("api key tenant mismatch")]
+    CrossTenant,
+    /// No unexpired, unrevoked key matching this prefix exists.
+    #[error("api key not found")]
+    NotFound,
+    /// Key exists but the associated service account is not active.
+    #[error("service account is not active")]
+    AccountDisabled,
+    /// Key exists and account is active but Argon2 hash verification failed.
+    #[error("api key hash mismatch")]
+    HashMismatch,
     /// JWT issue failure.
     #[error("token issue failed")]
     Issue(#[from] IssueError),
@@ -152,8 +161,8 @@ impl ExchangeApiKey {
     /// Exchange a Wyrd API key for access and refresh tokens.
     ///
     /// # Errors
-    /// Returns a single observable invalid-key error for parse, lookup, status,
-    /// expiry, revocation, or hash mismatch failures.
+    /// All authentication failures map to `WyrdError::ApiKeyInvalid` at the HTTP
+    /// boundary. Internal variants carry distinct failure paths for diagnostics.
     #[tracing::instrument(level = "debug", skip(self, conn, api_key), err)]
     pub async fn execute(
         &self,
@@ -161,15 +170,15 @@ impl ExchangeApiKey {
         api_key: SecretString,
     ) -> Result<ExchangedToken, ExchangeError> {
         let parsed =
-            WyrdApiKey::parse(api_key.expose_secret()).map_err(|_| ExchangeError::InvalidApiKey)?;
+            WyrdApiKey::parse(api_key.expose_secret()).map_err(|_| ExchangeError::NotFound)?;
         if parsed.tenant_id != conn.data_tenant_id() {
-            return Err(ExchangeError::InvalidApiKey);
+            return Err(ExchangeError::CrossTenant);
         }
         let Some(row) = api_key_by_prefix(conn, &parsed.prefix).await? else {
-            return Err(ExchangeError::InvalidApiKey);
+            return Err(ExchangeError::NotFound);
         };
         if row.status != "active" {
-            return Err(ExchangeError::InvalidApiKey);
+            return Err(ExchangeError::AccountDisabled);
         }
 
         let raw = api_key.clone();
@@ -177,7 +186,7 @@ impl ExchangeApiKey {
         let ok = tokio::task::spawn_blocking(move || wyrd_auth_issue::verify_api_key(&raw, &hash))
             .await?;
         if !ok {
-            return Err(ExchangeError::InvalidApiKey);
+            return Err(ExchangeError::HashMismatch);
         }
 
         let roles = role_refs(service_account_roles(conn, row.principal_id).await?)
@@ -427,7 +436,10 @@ fn token_hash(token: &str) -> String {
 impl From<ExchangeError> for WyrdError {
     fn from(error: ExchangeError) -> Self {
         match error {
-            ExchangeError::InvalidApiKey => WyrdError::ApiKeyInvalid {
+            ExchangeError::CrossTenant
+            | ExchangeError::NotFound
+            | ExchangeError::AccountDisabled
+            | ExchangeError::HashMismatch => WyrdError::ApiKeyInvalid {
                 message: "API key not found, revoked, expired, or hash mismatch".to_owned(),
                 details: json!({}),
             },
@@ -496,9 +508,11 @@ mod tests {
     use wyrd_spec::version::VersionBlock;
     use wyrd_sql::TenantConn;
 
+    use super::{
+        DelegateError, DelegateToken, ExchangeApiKey, ExchangeError, TokenExchangeSettings,
+    };
     use crate::auth::issue_api_key::WyrdApiKey;
     use crate::auth::permission_resolver::SqlPermissionResolver;
-    use super::{DelegateError, DelegateToken, ExchangeApiKey, ExchangeError, TokenExchangeSettings};
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -661,7 +675,7 @@ mod tests {
             .expect("tenant B conn opens");
         let result = exchange_service().execute(&mut conn, key.secret).await;
 
-        assert!(matches!(result, Err(ExchangeError::InvalidApiKey)));
+        assert!(matches!(result, Err(ExchangeError::CrossTenant)));
     }
 
     #[tokio::test]
@@ -677,7 +691,7 @@ mod tests {
 
         // Insert the key row with revoked_at = now(). The prefix-lookup query
         // filters on `revoked_at IS NULL`, so this row is invisible and the
-        // service returns InvalidApiKey.
+        // service returns NotFound.
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
                  (id, data_tenant_id, sa_id, prefix, key_hash, created_by, expires_at, revoked_at)
@@ -694,7 +708,7 @@ mod tests {
 
         let result = exchange_service().execute(&mut conn, key.secret).await;
 
-        assert!(matches!(result, Err(ExchangeError::InvalidApiKey)));
+        assert!(matches!(result, Err(ExchangeError::NotFound)));
     }
 
     #[tokio::test]
@@ -709,7 +723,7 @@ mod tests {
         let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
 
         // Store a hash that is not a valid Argon2 PHC string for this key.
-        // verify_api_key() returns false → InvalidApiKey.
+        // verify_api_key() returns false → HashMismatch.
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
                  (id, data_tenant_id, sa_id, prefix, key_hash, created_by, expires_at)
@@ -726,7 +740,7 @@ mod tests {
 
         let result = exchange_service().execute(&mut conn, key.secret).await;
 
-        assert!(matches!(result, Err(ExchangeError::InvalidApiKey)));
+        assert!(matches!(result, Err(ExchangeError::HashMismatch)));
     }
 
     #[tokio::test]
@@ -750,10 +764,7 @@ mod tests {
 
         let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
         let mut decoding_keys = HashMap::new();
-        decoding_keys.insert(
-            Kid::new("k1").expect("kid is valid"),
-            Arc::new(public_key),
-        );
+        decoding_keys.insert(Kid::new("k1").expect("kid is valid"), Arc::new(public_key));
         let verifier = Arc::new(TokenVerifier::new(
             decoding_keys,
             "wyrd",

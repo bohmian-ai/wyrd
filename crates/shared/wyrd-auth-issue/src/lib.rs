@@ -9,7 +9,7 @@ use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, 
 use secrecy::{ExposeSecret, SecretString};
 use ulid::Ulid;
 use wyrd_auth_verify::{
-    AccessTokenClaims, ActClaim, Kid, PrincipalKindWire, TokenPrincipalRef, RefreshTokenClaims,
+    AccessTokenClaims, ActClaim, Kid, PrincipalKindWire, RefreshTokenClaims, TokenPrincipalRef,
 };
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
@@ -367,8 +367,14 @@ fn timestamps(ttl: Duration) -> Result<(usize, usize), IssueError> {
     }
 
     let issued_at = Utc::now();
-    let iat: usize = issued_at.timestamp().try_into().map_err(|_| IssueError::InvalidTtl)?;
-    let exp: usize = (issued_at + ttl).timestamp().try_into().map_err(|_| IssueError::InvalidTtl)?;
+    let iat: usize = issued_at
+        .timestamp()
+        .try_into()
+        .map_err(|_| IssueError::InvalidTtl)?;
+    let exp: usize = (issued_at + ttl)
+        .timestamp()
+        .try_into()
+        .map_err(|_| IssueError::InvalidTtl)?;
     Ok((iat, exp))
 }
 
@@ -404,7 +410,7 @@ mod tests {
     use jsonwebtoken::{Algorithm, decode_header};
     use secrecy::SecretString;
     use wyrd_auth_verify::{
-        AccessTokenClaims, ActClaim, PrincipalKindWire, TokenPrincipalRef, RefreshTokenClaims,
+        AccessTokenClaims, ActClaim, PrincipalKindWire, RefreshTokenClaims, TokenPrincipalRef,
         decode_kid, public_key_from_pem, verify_eddsa,
     };
     use wyrd_runtime::{PrincipalId, RoleRef};

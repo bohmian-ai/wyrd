@@ -585,7 +585,7 @@ mod tests {
 
     use super::{
         AccessTokenClaims, ActClaim, AuthError, Kid, MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH,
-        PermissionResolver, PrincipalKindWire, TokenPrincipalRef, ResolveError, TokenVerifier,
+        PermissionResolver, PrincipalKindWire, ResolveError, TokenPrincipalRef, TokenVerifier,
         WyrdAuthVerifySettings, decode_kid, public_key_from_pem, verify_eddsa, verify_eddsa_with,
     };
 

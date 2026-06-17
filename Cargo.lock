@@ -6859,6 +6859,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-semver"
+version = "0.0.1"
+dependencies = [
+ "schemars",
+ "semver",
+ "serde",
+ "thiserror 2.0.18",
+ "utoipa",
+]
+
+[[package]]
 name = "wyrd-server"
 version = "0.0.1"
 dependencies = [
@@ -6912,6 +6923,7 @@ dependencies = [
  "utoipa",
  "uuid",
  "wyrd-error-derive",
+ "wyrd-semver",
 ]
 
 [[package]]

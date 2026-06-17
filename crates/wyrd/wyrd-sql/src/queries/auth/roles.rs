@@ -1,6 +1,7 @@
 //! Queries for `wyrd.auth_roles` and `wyrd.auth_user_roles`.
 //!
 //! Tenant-scoped functions here take `&mut TenantConn<'_>`.
+// raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use serde_json::Value;
 use sqlx::Row;
@@ -17,18 +18,21 @@ SELECT id, name, permissions
 const ROLE_BY_ID_SQL: &str = r#"
 SELECT id, name, permissions
   FROM wyrd.auth_roles
- WHERE id = $1
+ WHERE data_tenant_id = wyrd.current_tenant()
+   AND id = $1
 "#;
 
 const ROLE_BY_NAME_SQL: &str = r#"
 SELECT id, name, permissions
   FROM wyrd.auth_roles
- WHERE name = $1
+ WHERE data_tenant_id = wyrd.current_tenant()
+   AND name = $1
 "#;
 
 const LIST_ROLES_SQL: &str = r#"
 SELECT id, name, permissions
   FROM wyrd.auth_roles
+ WHERE data_tenant_id = wyrd.current_tenant()
  ORDER BY name
 "#;
 
@@ -84,7 +88,8 @@ ON CONFLICT (data_tenant_id, name) DO UPDATE
 
 const DELETE_ROLE_SQL: &str = r#"
 DELETE FROM wyrd.auth_roles
- WHERE name = $1
+ WHERE data_tenant_id = wyrd.current_tenant()
+   AND name = $1
 "#;
 
 /// Insert or update a role's permission payload.
@@ -209,7 +214,8 @@ mod tests {
     #[test]
     fn delete_role_query_targets_auth_roles_by_name() {
         assert!(DELETE_ROLE_SQL.contains("FROM wyrd.auth_roles"));
-        assert!(DELETE_ROLE_SQL.contains("WHERE name = $1"));
+        assert!(DELETE_ROLE_SQL.contains("AND name = $1"));
+        assert!(DELETE_ROLE_SQL.contains("data_tenant_id = wyrd.current_tenant()"));
     }
 
     #[test]
@@ -217,9 +223,10 @@ mod tests {
         for sql in [ROLE_BY_ID_SQL, ROLE_BY_NAME_SQL, LIST_ROLES_SQL] {
             assert!(sql.contains("SELECT id, name, permissions"));
             assert!(sql.contains("FROM wyrd.auth_roles"));
+            assert!(sql.contains("data_tenant_id = wyrd.current_tenant()"));
         }
-        assert!(ROLE_BY_ID_SQL.contains("WHERE id = $1"));
-        assert!(ROLE_BY_NAME_SQL.contains("WHERE name = $1"));
+        assert!(ROLE_BY_ID_SQL.contains("AND id = $1"));
+        assert!(ROLE_BY_NAME_SQL.contains("AND name = $1"));
         assert!(LIST_ROLES_SQL.contains("ORDER BY name"));
     }
 }

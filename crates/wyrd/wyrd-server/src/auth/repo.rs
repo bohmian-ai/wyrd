@@ -1,8 +1,7 @@
 //! Shared auth repository helpers.
+// raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
-use sqlx::PgPool;
 use wyrd_runtime::PrincipalId;
-use wyrd_spec::DataTenantId;
 use wyrd_sql::{SqlError, TenantConn};
 
 /// Look up a User principal's email in the caller's tenant.
@@ -10,11 +9,9 @@ use wyrd_sql::{SqlError, TenantConn};
 /// Returns `Ok(None)` for unknown principals and for Service / Agent
 /// principals, which have no `auth_users` row by design.
 pub async fn lookup_user_email(
-    pool: &PgPool,
-    tenant_id: &DataTenantId,
+    conn: &mut TenantConn<'_>,
     principal_id: &PrincipalId,
 ) -> Result<Option<String>, SqlError> {
-    let mut conn = TenantConn::acquire(pool, *tenant_id).await?;
     let row: Option<(String,)> =
         sqlx::query_as("SELECT email FROM wyrd.auth_users WHERE id = $1 LIMIT 1")
             .bind(principal_id.as_uuid())
@@ -39,7 +36,8 @@ mod tests {
         let principal_id = PrincipalId::new(uuid::Uuid::new_v4());
         insert_user(&fixture, tenant, principal_id, "known@example.com").await;
 
-        let email = lookup_user_email(fixture.app_pool(), &tenant, &principal_id)
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let email = lookup_user_email(&mut conn, &principal_id)
             .await
             .expect("lookup succeeds");
 
@@ -49,10 +47,10 @@ mod tests {
     #[tokio::test]
     async fn lookup_user_email_returns_none_for_unknown_uuid() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
         let principal_id = PrincipalId::new(uuid::Uuid::new_v4());
 
-        let email = lookup_user_email(fixture.app_pool(), &tenant, &principal_id)
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let email = lookup_user_email(&mut conn, &principal_id)
             .await
             .expect("lookup succeeds");
 
@@ -75,7 +73,11 @@ mod tests {
         let principal_id = PrincipalId::new(uuid::Uuid::new_v4());
         insert_user(&fixture, tenant_a, principal_id, "tenant-a@example.com").await;
 
-        let email = lookup_user_email(fixture.app_pool(), &tenant_b, &principal_id)
+        let mut conn = fixture
+            .tenant_conn_for(tenant_b)
+            .await
+            .expect("tenant B conn opens");
+        let email = lookup_user_email(&mut conn, &principal_id)
             .await
             .expect("lookup succeeds");
 

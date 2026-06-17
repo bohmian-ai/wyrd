@@ -2,6 +2,7 @@
 //!
 //! Functions take `&mut TenantConn<'_>` and rely on database RLS for tenant
 //! scoping.
+// raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use sqlx::types::Uuid;
 
@@ -14,7 +15,8 @@ const GRANT_ROLE_TO_USER_SQL: &str = r#"
         "#;
 
 const REVOKE_ROLE_FROM_USER_SQL: &str = "DELETE FROM wyrd.auth_user_roles
-           WHERE user_id = $1
+           WHERE data_tenant_id = wyrd.current_tenant()
+             AND user_id = $1
              AND role_id = $2";
 
 const LIST_USER_ROLES_SQL: &str = r#"
@@ -23,7 +25,8 @@ const LIST_USER_ROLES_SQL: &str = r#"
           JOIN wyrd.auth_roles r
             ON r.data_tenant_id = ur.data_tenant_id
            AND r.id = ur.role_id
-         WHERE ur.user_id = $1
+         WHERE ur.data_tenant_id = wyrd.current_tenant()
+           AND ur.user_id = $1
          ORDER BY r.name
         "#;
 
@@ -35,7 +38,8 @@ const GRANT_ROLE_TO_SERVICE_ACCOUNT_SQL: &str = r#"
         "#;
 
 const REVOKE_ROLE_FROM_SERVICE_ACCOUNT_SQL: &str = "DELETE FROM wyrd.auth_service_account_roles
-           WHERE service_account_id = $1
+           WHERE data_tenant_id = wyrd.current_tenant()
+             AND service_account_id = $1
              AND role_id = $2";
 
 const LIST_SERVICE_ACCOUNT_ROLES_SQL: &str = r#"
@@ -44,7 +48,8 @@ const LIST_SERVICE_ACCOUNT_ROLES_SQL: &str = r#"
           JOIN wyrd.auth_roles r
             ON r.data_tenant_id = sar.data_tenant_id
            AND r.id = sar.role_id
-         WHERE sar.service_account_id = $1
+         WHERE sar.data_tenant_id = wyrd.current_tenant()
+           AND sar.service_account_id = $1
          ORDER BY r.name
         "#;
 

@@ -664,7 +664,7 @@ fn card_ref(kind: CardKind, name: &str) -> Result<CardRef, WyrdTestError> {
         version: VersionBlock::parse("1.0.0").expect("static semantic version block is valid"),
         space: SpaceName::new("test").expect("static space name is valid"),
         uid: Some(
-            CardUid::new(&Uuid::now_v7().to_string()).expect("generated UUIDv7 is a valid CardUid"),
+            CardUid::new(Uuid::now_v7().to_string()).expect("generated UUIDv7 is a valid CardUid"),
         ),
     })
 }

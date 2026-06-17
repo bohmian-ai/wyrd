@@ -55,10 +55,10 @@ async fn body_json(resp: Response<Body>) -> Value {
 
 fn redact_volatile(body: &Value) -> Value {
     let mut redacted = body.clone();
-    if let Some(obj) = redacted.as_object_mut() {
-        if obj.contains_key("wyrd_request_id") {
-            obj["wyrd_request_id"] = json!("[redacted]");
-        }
+    if let Some(obj) = redacted.as_object_mut()
+        && obj.contains_key("wyrd_request_id")
+    {
+        obj["wyrd_request_id"] = json!("[redacted]");
     }
     redacted
 }

@@ -1,4 +1,5 @@
 //! Tenant-scoped non-human principal and API-key queries.
+// raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -121,7 +122,8 @@ pub async fn delete_service_account(
     let result = sqlx::query(
         "UPDATE wyrd.auth_service_accounts
             SET status = 'deleted', updated_at = now()
-          WHERE id = $1",
+          WHERE data_tenant_id = wyrd.current_tenant()
+            AND id = $1",
     )
     .bind(id)
     .execute(&mut **conn.transaction())

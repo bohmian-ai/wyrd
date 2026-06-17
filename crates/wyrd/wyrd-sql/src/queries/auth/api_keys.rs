@@ -1,6 +1,7 @@
 //! Tenant-scoped API-key mutation queries.
 //!
 //! Tenant-scoped functions here take `&mut TenantConn<'_>`.
+// raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use sqlx::types::Uuid;
 
@@ -8,7 +9,8 @@ use crate::TenantConn;
 
 const REVOKE_API_KEY_SQL: &str = "UPDATE wyrd.auth_api_keys
             SET revoked_at = now()
-          WHERE id = $1
+          WHERE data_tenant_id = wyrd.current_tenant()
+            AND id = $1
             AND revoked_at IS NULL";
 
 /// Mark an API key revoked.

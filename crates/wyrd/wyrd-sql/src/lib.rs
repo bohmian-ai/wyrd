@@ -318,7 +318,8 @@ mod tests {
             .chain(sql_files_under(&crate_dir.join("src/queries/auth/sql")))
             .filter_map(|path| {
                 let body = fs::read_to_string(&path).expect("query source is readable");
-                let checked = without_line_comments(&body).to_ascii_uppercase();
+                let uncommented = without_line_comments(&body);
+                let checked = production_source(&uncommented).to_ascii_uppercase();
                 let has_transaction_control = ["BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT"]
                     .into_iter()
                     .any(|keyword| checked.contains(keyword));

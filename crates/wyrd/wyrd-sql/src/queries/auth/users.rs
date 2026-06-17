@@ -2,6 +2,7 @@
 //!
 //! Tenant-scoped functions here take `&mut TenantConn<'_>`.
 //! Database RLS enforces tenant scoping.
+// raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use chrono::{DateTime, Utc};
 use sqlx::types::Uuid;
@@ -68,7 +69,8 @@ pub async fn user_by_id(
         r#"
         SELECT id, email, auth_type, status, created_at, updated_at
           FROM wyrd.auth_users
-         WHERE id = $1
+         WHERE data_tenant_id = wyrd.current_tenant()
+           AND id = $1
         "#,
     )
     .bind(id)
@@ -90,7 +92,8 @@ pub async fn user_by_email(
         r#"
         SELECT id, email, auth_type, status, created_at, updated_at
           FROM wyrd.auth_users
-         WHERE email = $1
+         WHERE data_tenant_id = wyrd.current_tenant()
+           AND email = $1
         "#,
     )
     .bind(email)
@@ -108,7 +111,8 @@ pub async fn delete_user(conn: &mut TenantConn<'_>, id: Uuid) -> Result<bool, sq
     let result = sqlx::query(
         "UPDATE wyrd.auth_users
             SET status = 'deleted', updated_at = now()
-          WHERE id = $1",
+          WHERE data_tenant_id = wyrd.current_tenant()
+            AND id = $1",
     )
     .bind(id)
     .execute(&mut **conn.transaction())
@@ -125,7 +129,8 @@ mod tests {
         "#;
     const DELETE_USER_SQL: &str = "UPDATE wyrd.auth_users
             SET status = 'deleted', updated_at = now()
-          WHERE id = $1";
+          WHERE data_tenant_id = wyrd.current_tenant()
+            AND id = $1";
 
     #[test]
     fn insert_user_sets_tenant_and_active_status() {

@@ -25,6 +25,13 @@ PLATFORM_QUERY_ALLOWLIST = {
     "crates/wyrd/wyrd-sql/src/queries/platform/tenant_resolver.rs",
 }
 
+# Files under queries/platform/ whose public async fns may take TenantConn
+# instead of PgPool/Transaction. These are cross-domain helpers that delegate
+# tenant-scoped writes to tenant-shaped APIs.
+PLATFORM_EXECUTOR_ALLOWLIST = {
+    "crates/wyrd/wyrd-sql/src/queries/platform/audit_log.rs",
+}
+
 RAW_QUERY_ALLOWLIST_MARKERS = [
     "Dynamic query is intentional",
     "raw-query grep allowlist",
@@ -120,9 +127,9 @@ def check_migration_drift(failures: list[str]) -> None:
     if re.search(r"\bCREATE\s+ROLE\b", migration_text, re.IGNORECASE):
         failures.append("SQL migrations must not create cluster roles")
 
-    platform_sql = read_required(WYRD_SQL_MIGRATIONS / "0001_platform.sql", failures)
-    if platform_sql:
-        platform_normalized = normalize_sql(platform_sql)
+    platform_path = find_platform_migration(failures)
+    if platform_path is not None:
+        platform_normalized = normalize_sql(platform_path.read_text())
         required_patterns = {
             "wyrd_migrator BYPASSRLS role assertion": r"rolname\s*=\s*'wyrd_migrator'\s+AND\s+rolbypassrls\s*=\s*true",
             "wyrd_app non-BYPASSRLS role assertion": r"rolname\s*=\s*'wyrd_app'\s+AND\s+rolbypassrls\s*=\s*false",
@@ -137,7 +144,21 @@ def check_migration_drift(failures: list[str]) -> None:
         }
         for label, pattern in required_patterns.items():
             if not re.search(pattern, platform_normalized, re.IGNORECASE):
-                failures.append(f"{rel(WYRD_SQL_MIGRATIONS / '0001_platform.sql')}: missing {label}")
+                failures.append(f"{rel(platform_path)}: missing {label}")
+
+
+def find_platform_migration(failures: list[str]) -> Path | None:
+    matches = sorted(WYRD_SQL_MIGRATIONS.glob("*_platform.sql"))
+    if not matches:
+        failures.append(f"missing platform migration in {rel(WYRD_SQL_MIGRATIONS)}")
+        return None
+    if len(matches) > 1:
+        failures.append(
+            "multiple platform migrations found: "
+            + ", ".join(rel(p) for p in matches)
+        )
+        return None
+    return matches[0]
 
 
 def check_query_modules(failures: list[str]) -> None:
@@ -156,7 +177,11 @@ def check_wyrd_query_modules(failures: list[str]) -> None:
         if is_platform:
             if references_tenant_schema(code):
                 failures.append(f"{relative}: platform query module references tenant schema")
-            if has_public_async_fn(code) and not has_platform_executor(code):
+            if (
+                has_public_async_fn(code)
+                and not has_platform_executor(code)
+                and relative not in PLATFORM_EXECUTOR_ALLOWLIST
+            ):
                 failures.append(f"{relative}: platform public async fn must take PgPool or Transaction")
             continue
 
@@ -366,13 +391,6 @@ def source_files(paths: list[Path]) -> list[Path]:
 
 def sql_migration_files() -> list[Path]:
     return sorted([*WYRD_SQL_MIGRATIONS.glob("*.sql"), *VALA_SQL_MIGRATIONS.glob("*.sql")])
-
-
-def read_required(path: Path, failures: list[str]) -> str:
-    if not path.exists():
-        failures.append(f"missing required file: {rel(path)}")
-        return ""
-    return path.read_text()
 
 
 def is_server_pool_allowlisted(relative: str) -> bool:

@@ -802,6 +802,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn into_verified_accepts_delegation_depth_at_max() {
+        let claims = AccessTokenClaims {
+            act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH))),
+            ..claims_with_times(now() + 3_600, now())
+        };
+
+        let result = claims.into_verified(&TestResolver::default()).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
     async fn into_verified_maps_resolver_unavailable_to_verify_unavailable() {
         let resolver = TestResolver {
             unavailable: true,
@@ -1092,6 +1104,7 @@ mod tests {
     struct TestResolver {
         calls: AtomicUsize,
         unavailable: bool,
+        bad_json: bool,
     }
 
     impl PermissionResolver for TestResolver {
@@ -1107,8 +1120,28 @@ mod tests {
                 if self.unavailable {
                     return Err(ResolveError::Unavailable("test outage".to_owned()));
                 }
+                if self.bad_json {
+                    let source = serde_json::from_str::<serde_json::Value>("not json")
+                        .expect_err("bad json is not valid");
+                    return Err(ResolveError::BadPermissionsJson {
+                        role: "test_role".to_owned(),
+                        source,
+                    });
+                }
                 Ok(PermissionSet::from_iter([Permission::card_read()]))
             }
         }
+    }
+
+    #[tokio::test]
+    async fn into_verified_maps_bad_permissions_json_to_permissions_corrupt() {
+        let resolver = TestResolver {
+            bad_json: true,
+            ..TestResolver::default()
+        };
+        let result = claims_with_times(now() + 3_600, now())
+            .into_verified(&resolver)
+            .await;
+        assert!(matches!(result, Err(AuthError::PermissionsCorrupt)));
     }
 }

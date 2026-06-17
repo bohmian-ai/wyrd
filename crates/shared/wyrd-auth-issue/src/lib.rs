@@ -635,6 +635,24 @@ mod tests {
     }
 
     #[test]
+    fn issue_delegated_access_token_accepts_depth_at_max() {
+        let caller = DelegationCaller {
+            sub: user_principal().id.to_string(),
+            principal: user_principal(),
+            act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH - 1))),
+        };
+
+        let result = issuing_key().issue_delegated_access_token(
+            &caller,
+            agent_principal(),
+            vec![role("agent")],
+            Duration::minutes(5),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn issue_refresh_token_is_principal_generic() {
         let token = issuing_key()
             .issue_refresh_token(

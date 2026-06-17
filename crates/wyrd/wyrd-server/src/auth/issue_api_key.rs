@@ -269,6 +269,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_wrong_prefix() {
+        assert!(WyrdApiKey::parse("sk_12345").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_missing_segments() {
+        assert!(WyrdApiKey::parse("wyrd_sk_onlythree").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_non_uuid_tenant() {
+        assert!(WyrdApiKey::parse("wyrd_sk_notauuid_aaaa_bbbb").is_err());
+    }
+
+    #[test]
     fn principal_kind_rejects_non_human_card_kind() {
         let error = principal_kind_for_card(&card_ref(CardKind::Model)).expect_err("rejected");
 

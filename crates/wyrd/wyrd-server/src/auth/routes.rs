@@ -158,10 +158,64 @@ fn bad_subject_token_format() -> WyrdErrorResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::router;
+    use base64::Engine;
+    use wyrd_auth_verify::{AccessTokenClaims, PrincipalKindWire, TokenPrincipalRef};
+    use wyrd_runtime::PrincipalId;
+    use wyrd_spec::DataTenantId;
+
+    use super::{router, tenant_from_unverified_access_token};
 
     #[test]
     fn mounts_token_and_issue_key_routes() {
         let _router = router();
+    }
+
+    #[test]
+    fn extracts_tenant_from_unverified_access_token() {
+        let tenant_id: DataTenantId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
+            .parse()
+            .expect("static tenant id is valid");
+        let principal_id: PrincipalId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00"
+            .parse()
+            .expect("static principal id is valid");
+        let claims = AccessTokenClaims {
+            sub: principal_id.to_string(),
+            principal: TokenPrincipalRef {
+                id: principal_id,
+                kind: PrincipalKindWire::User,
+                tenant_id,
+                card_ref: None,
+            },
+            roles: vec![],
+            act: None,
+            exp: 9_999_999_999,
+            iat: 0,
+            iss: "test".to_owned(),
+            jti: "01K00000000000000000000000".to_owned(),
+        };
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_string(&claims)
+                .expect("claims serialize")
+                .as_bytes(),
+        );
+        let fake_jwt = format!("header.{payload}.sig");
+
+        let result = tenant_from_unverified_access_token(&fake_jwt).expect("extracts tenant");
+        assert_eq!(result, tenant_id);
+    }
+
+    #[test]
+    fn rejects_non_jwt_string() {
+        let result = tenant_from_unverified_access_token("not.a.jwt");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_non_json_payload() {
+        let garbage = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json at all");
+        let fake_jwt = format!("header.{garbage}.sig");
+
+        let result = tenant_from_unverified_access_token(&fake_jwt);
+        assert!(result.is_err());
     }
 }

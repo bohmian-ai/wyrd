@@ -484,7 +484,6 @@ fn flatten_act_chain(mut act: Option<&ActClaim>) -> Result<Vec<DelegationStep>, 
         out.push(DelegationStep {
             principal: RuntimePrincipalRef {
                 id: layer.principal.id,
-                card_ref: layer.principal.card_ref.clone(),
                 kind,
             },
         });
@@ -709,12 +708,12 @@ mod tests {
         );
         assert_eq!(verified.delegation_chain.len(), 2);
         assert_eq!(
-            verified.delegation_chain[0].principal.card_ref,
-            initiator.card_ref
+            verified.delegation_chain[0].principal.card_ref(),
+            initiator.card_ref.as_ref()
         );
         assert_eq!(
-            verified.delegation_chain[1].principal.card_ref,
-            immediate.card_ref
+            verified.delegation_chain[1].principal.card_ref(),
+            immediate.card_ref.as_ref()
         );
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
     }

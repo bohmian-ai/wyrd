@@ -162,8 +162,6 @@ pub struct PrincipalRef {
     pub id: PrincipalId,
     /// Principal kind.
     pub kind: PrincipalKind,
-    /// Bound card reference for card-backed principals.
-    pub card_ref: Option<CardRef>,
 }
 
 impl PrincipalRef {
@@ -173,7 +171,15 @@ impl PrincipalRef {
         Self {
             id: principal.id,
             kind: principal.kind.clone(),
-            card_ref: principal.card_ref().cloned(),
+        }
+    }
+
+    /// Returns the card ref for service and agent principals.
+    #[must_use]
+    pub fn card_ref(&self) -> Option<&CardRef> {
+        match &self.kind {
+            PrincipalKind::Service { card_ref } | PrincipalKind::Agent { card_ref } => Some(card_ref),
+            PrincipalKind::User => None,
         }
     }
 }
@@ -251,7 +257,7 @@ mod tests {
         let principal_ref = PrincipalRef::from_principal(&principal);
 
         assert_eq!(principal_ref.id, principal.id);
-        assert_eq!(principal_ref.card_ref.as_ref(), Some(&card_ref));
+        assert_eq!(principal_ref.card_ref(), Some(&card_ref));
         assert_eq!(principal_ref.kind, principal.kind);
     }
 }

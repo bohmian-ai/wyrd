@@ -450,7 +450,7 @@ fn act_from_chain(
                     PrincipalKind::Agent { .. } => PrincipalKindWire::Agent,
                 },
                 tenant_id,
-                card_ref: step.principal.card_ref.clone(),
+                card_ref: step.principal.card_ref().cloned(),
             },
             act,
         }))

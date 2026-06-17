@@ -154,7 +154,7 @@ mod tests {
 
         assert_eq!(step.principal.id, principal.id);
         assert_eq!(step.principal.kind, principal.kind);
-        assert!(step.principal.card_ref.is_some());
+        assert!(step.principal.card_ref().is_some());
     }
 
     #[test]

@@ -1,13 +1,13 @@
 //! Given/When/Then helpers for the cards e2e suite.
 
+use wyrd_runtime::principal::Principal;
 use wyrd_spec::envelope::Card;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, DataTenantId};
-use wyrd_runtime::principal::Principal;
-use wyrd_sql::queries::cards::{RegisterCardOutcome, RegisterCardRequest, soft_delete_card};
 use wyrd_sql::queries::cards::register_card;
+use wyrd_sql::queries::cards::{RegisterCardOutcome, RegisterCardRequest, soft_delete_card};
 
-use super::{per_kind, TestEnv};
+use super::{TestEnv, per_kind};
 
 pub async fn register_fresh(
     env: &TestEnv,
@@ -16,11 +16,14 @@ pub async fn register_fresh(
     card: &Card,
 ) -> Result<RegisterCardOutcome, WyrdError> {
     let mut conn = env.tenant_conn(tenant).await;
-    let outcome = register_card(&mut conn, RegisterCardRequest {
-        card,
-        actor,
-        request_id: None,
-    })
+    let outcome = register_card(
+        &mut conn,
+        RegisterCardRequest {
+            card,
+            actor,
+            request_id: None,
+        },
+    )
     .await?;
     conn.commit().await.expect("commit failed");
     Ok(outcome)
@@ -57,11 +60,14 @@ pub async fn expect_register_error(
     card: &Card,
 ) -> WyrdError {
     let mut conn = env.tenant_conn(tenant).await;
-    register_card(&mut conn, RegisterCardRequest {
-        card,
-        actor,
-        request_id: None,
-    })
+    register_card(
+        &mut conn,
+        RegisterCardRequest {
+            card,
+            actor,
+            request_id: None,
+        },
+    )
     .await
     .expect_err("expected registration to fail")
 }

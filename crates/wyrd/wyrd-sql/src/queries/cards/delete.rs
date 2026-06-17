@@ -38,9 +38,8 @@ pub async fn soft_delete_card(
     .await
     .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?;
 
-    let (spec_hash, kind_str) = existing.ok_or_else(|| {
-        WyrdError::registry_card_not_found(format!("no card with uid {uid}"))
-    })?;
+    let (spec_hash, kind_str) = existing
+        .ok_or_else(|| WyrdError::registry_card_not_found(format!("no card with uid {uid}")))?;
 
     let rows_affected = sqlx::query(
         "UPDATE wyrd.cards SET status = 'deleted' \
@@ -68,12 +67,9 @@ pub async fn soft_delete_card(
         .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?;
     }
 
-    let card_kind =
-        wyrd_spec::envelope::CardKind::from_wire_name(&kind_str).ok_or_else(|| {
-            WyrdError::internal(format!(
-                "stored kind {kind_str:?} is not a known CardKind"
-            ))
-        })?;
+    let card_kind = wyrd_spec::envelope::CardKind::from_wire_name(&kind_str).ok_or_else(|| {
+        WyrdError::internal(format!("stored kind {kind_str:?} is not a known CardKind"))
+    })?;
 
     record_card_registration_audit(
         conn,

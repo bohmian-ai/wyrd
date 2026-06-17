@@ -19,7 +19,10 @@ fn test_spec_hash_rejects_invalid_hex_length() {
 
     let short = "a".repeat(63);
     let err2 = SpecHash::from_str(&short).unwrap_err();
-    assert!(matches!(err2, SpecHashParseError::InvalidLength { len: 63 }));
+    assert!(matches!(
+        err2,
+        SpecHashParseError::InvalidLength { len: 63 }
+    ));
 }
 
 #[test]

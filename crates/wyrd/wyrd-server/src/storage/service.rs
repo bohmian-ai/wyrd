@@ -1220,7 +1220,8 @@ pub fn map_sql_error(error: wyrd_sql::SqlError) -> WyrdError {
         | wyrd_sql::SqlError::InvariantViolation { .. }
         | wyrd_sql::SqlError::TxFailed(_)
         | wyrd_sql::SqlError::InsufficientPrivilege { .. }
-        | wyrd_sql::SqlError::InvalidDataTenantId(_) => {
+        | wyrd_sql::SqlError::InvalidDataTenantId(_)
+        | wyrd_sql::SqlError::TriggerException { .. } => {
             tracing::error!(
                 error = %message,
                 source_code = code,

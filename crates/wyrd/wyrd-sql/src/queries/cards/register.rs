@@ -103,8 +103,8 @@ pub async fn register_card(
         ));
     }
 
-    let spec_json: JsonValue = serde_json::to_value(&req.card.spec)
-        .map_err(WyrdError::from_spec_serialization)?;
+    let spec_json: JsonValue =
+        serde_json::to_value(&req.card.spec).map_err(WyrdError::from_spec_serialization)?;
     let labels_json: JsonValue = serde_json::to_value(&req.card.metadata.labels)
         .map_err(WyrdError::from_spec_serialization)?;
     let annotations_json: JsonValue = serde_json::to_value(&req.card.metadata.annotations)
@@ -117,8 +117,7 @@ pub async fn register_card(
         .as_ref()
         .expect("space presence verified in validate_boundary");
 
-    let card_uid = CardUid::from_uuid7(Uuid::now_v7())
-        .map_err(WyrdError::from_card_uid_error)?;
+    let card_uid = CardUid::from_uuid7(Uuid::now_v7()).map_err(WyrdError::from_card_uid_error)?;
 
     let inserted = sqlx::query_as::<_, (Uuid, String)>(
         r#"
@@ -155,15 +154,22 @@ pub async fn register_card(
             CardUid::from_uuid(inserted_uid).map_err(WyrdError::from_card_uid_error)?
         }
         None => {
-            return handle_conflict(conn, req.card, space.as_str(), &version_block, spec_hash.as_str(), &req).await;
+            return handle_conflict(
+                conn,
+                req.card,
+                space.as_str(),
+                &version_block,
+                spec_hash.as_str(),
+                &req,
+            )
+            .await;
         }
     };
 
     let principal_id = match &req.card.spec {
         Spec::Service(_) | Spec::Agent(_) => {
-            let pid =
-                upsert_service_account_from_card(conn, &uid_for_writes, req.card, req.actor)
-                    .await?;
+            let pid = upsert_service_account_from_card(conn, &uid_for_writes, req.card, req.actor)
+                .await?;
             Some(pid)
         }
         _ => None,
@@ -204,20 +210,20 @@ fn validate_boundary(card: &Card) -> Result<(), WyrdError> {
             "metadata.space is required at the registration boundary",
         ));
     }
-    let version_spec = card.metadata.version.as_ref().ok_or_else(|| {
-        WyrdError::registry_version_required("metadata.version is required")
-    })?;
+    let version_spec = card
+        .metadata
+        .version
+        .as_ref()
+        .ok_or_else(|| WyrdError::registry_version_required("metadata.version is required"))?;
     if version_spec.as_str().is_empty() {
         return Err(WyrdError::registry_version_required(
             "metadata.version must not be empty",
         ));
     }
-    if matches!(card.spec, Spec::Service(_) | Spec::Agent(_)) {
-        if !version_spec.is_pin() {
-            return Err(WyrdError::registry_invalid_version_block(
-                "Service and Agent cards require a pinned version",
-            ));
-        }
+    if matches!(card.spec, Spec::Service(_) | Spec::Agent(_)) && !version_spec.is_pin() {
+        return Err(WyrdError::registry_invalid_version_block(
+            "Service and Agent cards require a pinned version",
+        ));
     }
     Ok(())
 }

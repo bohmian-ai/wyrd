@@ -88,8 +88,8 @@ pub(crate) async fn upsert_service_account_from_card(
         uid: Some(card_uid.clone()),
     };
 
-    let card_ref_json: JsonValue = serde_json::to_value(&card_ref)
-        .map_err(WyrdError::from_spec_serialization)?;
+    let card_ref_json: JsonValue =
+        serde_json::to_value(&card_ref).map_err(WyrdError::from_spec_serialization)?;
 
     let card_kind_str = card.kind.wire_name();
 

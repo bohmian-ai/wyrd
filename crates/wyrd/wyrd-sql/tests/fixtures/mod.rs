@@ -6,15 +6,15 @@ pub mod scenarios;
 
 use std::env;
 
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
+use wyrd_semver::{VersionBlock, VersionSpec};
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{CardName, DataTenantId, SpaceName};
-use wyrd_semver::{VersionBlock, VersionSpec};
 use wyrd_sql::TenantConn;
 
 pub struct TestEnv {

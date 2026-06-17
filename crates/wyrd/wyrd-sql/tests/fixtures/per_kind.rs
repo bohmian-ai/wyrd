@@ -1,5 +1,6 @@
 //! Minimal spec constructors and drift mutators for each CardKind.
 
+use wyrd_semver::VersionBlock;
 use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec};
 use wyrd_spec::card::artifact::{ArtifactSpec, FrameworkAdapterRef};
 use wyrd_spec::card::audit::AuditSpec;
@@ -21,7 +22,6 @@ use wyrd_spec::card::workflow::WorkflowSpec;
 use wyrd_spec::envelope::{Card, CardKind, Spec};
 use wyrd_spec::ids::{CardName, ColumnName, SpaceName};
 use wyrd_spec::reference::{CardRef, PromptRef};
-use wyrd_semver::VersionBlock;
 
 fn col(name: &str) -> ColumnName {
     ColumnName::new(name).expect("fixture column name")
@@ -158,7 +158,10 @@ pub fn minimal_spec(kind: CardKind) -> Spec {
 pub fn mutate_for_drift(card: &mut Card) {
     match &mut card.spec {
         Spec::Data(s) => s.stats.byte_count += 1,
-        Spec::Model(s) => s.signature.inputs.push(FieldSpec::new(col("drift"), "int64")),
+        Spec::Model(s) => s
+            .signature
+            .inputs
+            .push(FieldSpec::new(col("drift"), "int64")),
         Spec::Experiment(s) => s.description = Some("drift".to_string()),
         Spec::Prompt(_) => {
             card.spec = Spec::from_kind_and_value(

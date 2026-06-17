@@ -219,18 +219,17 @@ pub fn seed_error_to_wyrd(error: SeedError) -> WyrdError {
 /// Convert SQLx database errors that have public auth/RBAC contract meaning.
 #[must_use]
 pub fn sqlx_error_to_wyrd(error: sqlx::Error) -> WyrdError {
-    if let sqlx::Error::Database(db_error) = &error {
-        if db_error.code().as_deref() == Some("23514")
-            && db_error.constraint() == Some("auth_builtin_role_immutable_name")
-        {
-            return WyrdError::BuiltinRoleImmutableName {
-                message: "builtin role names are immutable".to_owned(),
-                details: serde_json::json!({
-                    "sqlstate": "23514",
-                    "constraint": "auth_builtin_role_immutable_name",
-                }),
-            };
-        }
+    if let sqlx::Error::Database(db_error) = &error
+        && db_error.code().as_deref() == Some("23514")
+        && db_error.constraint() == Some("auth_builtin_role_immutable_name")
+    {
+        return WyrdError::BuiltinRoleImmutableName {
+            message: "builtin role names are immutable".to_owned(),
+            details: serde_json::json!({
+                "sqlstate": "23514",
+                "constraint": "auth_builtin_role_immutable_name",
+            }),
+        };
     }
 
     tracing::warn!(error = %error, "database operation failed");

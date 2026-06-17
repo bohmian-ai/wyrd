@@ -138,19 +138,23 @@ impl TryFrom<CardRow> for ParsedCardRow {
     type Error = SqlError;
 
     fn try_from(row: CardRow) -> Result<Self, Self::Error> {
-        let kind = CardKind::from_wire_name(&row.kind).ok_or_else(|| SqlError::InvariantViolation {
-            detail: format!("cards.kind has invalid value {:?}", row.kind),
-        })?;
+        let kind =
+            CardKind::from_wire_name(&row.kind).ok_or_else(|| SqlError::InvariantViolation {
+                detail: format!("cards.kind has invalid value {:?}", row.kind),
+            })?;
         let space = SpaceName::new(row.space).map_err(SqlError::from_id_error)?;
         let name = CardName::new(row.name).map_err(SqlError::from_id_error)?;
         let version: VersionBlock = row.version.parse().map_err(SqlError::from_version)?;
-        let spec = Spec::from_kind_and_value(&kind, row.spec).map_err(SqlError::from_spec_decode)?;
-        let labels: Labels = serde_json::from_value(row.labels).map_err(|e| SqlError::InvariantViolation {
-            detail: format!("cards.labels decode failed: {e}"),
-        })?;
-        let annotations: Annotations = serde_json::from_value(row.annotations).map_err(|e| SqlError::InvariantViolation {
-            detail: format!("cards.annotations decode failed: {e}"),
-        })?;
+        let spec =
+            Spec::from_kind_and_value(&kind, row.spec).map_err(SqlError::from_spec_decode)?;
+        let labels: Labels =
+            serde_json::from_value(row.labels).map_err(|e| SqlError::InvariantViolation {
+                detail: format!("cards.labels decode failed: {e}"),
+            })?;
+        let annotations: Annotations =
+            serde_json::from_value(row.annotations).map_err(|e| SqlError::InvariantViolation {
+                detail: format!("cards.annotations decode failed: {e}"),
+            })?;
         let status = CardStatus::from_db_str(&row.status)?;
         let card_uid = CardUid::from_uuid(row.card_uid).map_err(SqlError::from_id_error)?;
         let created_by = row.created_by.map(PrincipalId::new);

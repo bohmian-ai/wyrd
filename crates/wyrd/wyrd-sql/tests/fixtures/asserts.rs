@@ -1,4 +1,5 @@
 //! Named assertion helpers for the cards e2e suite.
+#![allow(dead_code)]
 
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
@@ -36,10 +37,7 @@ pub fn assert_no_principal(o: &RegisterCardOutcome) {
 }
 
 pub fn assert_principal_projected(o: &RegisterCardOutcome) {
-    assert!(
-        o.principal_id.is_some(),
-        "expected principal_id to be set"
-    );
+    assert!(o.principal_id.is_some(), "expected principal_id to be set");
 }
 
 pub fn assert_same_uid(a: &RegisterCardOutcome, b: &RegisterCardOutcome) {

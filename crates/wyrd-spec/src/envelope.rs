@@ -9,6 +9,7 @@ use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;
 
+use crate::api_version::ApiVersion;
 use crate::card::agent::AgentSpec;
 use crate::card::artifact::ArtifactSpec;
 use crate::card::audit::AuditSpec;
@@ -25,7 +26,6 @@ use crate::card::service::ServiceSpec;
 use crate::card::source::SourceSpec;
 use crate::card::trigger::TriggerSpec;
 use crate::card::workflow::WorkflowSpec;
-use crate::api_version::ApiVersion;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
 use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
@@ -77,7 +77,10 @@ impl std::str::FromStr for SpecHash {
         if s.len() != 64 {
             return Err(SpecHashParseError::InvalidLength { len: s.len() });
         }
-        if let Some(pos) = s.bytes().position(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        if let Some(pos) = s
+            .bytes()
+            .position(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
             return Err(SpecHashParseError::InvalidChar { pos });
         }
         Ok(Self(s.to_owned()))
@@ -281,7 +284,10 @@ impl Spec {
     ///
     /// Calls the private `spec_from_kind_value` and wraps any error in
     /// [`SpecDecodeError`] with the kind name attached.
-    pub fn from_kind_and_value(kind: &CardKind, value: serde_json::Value) -> Result<Self, SpecDecodeError> {
+    pub fn from_kind_and_value(
+        kind: &CardKind,
+        value: serde_json::Value,
+    ) -> Result<Self, SpecDecodeError> {
         spec_from_kind_value(kind, value).map_err(|message| SpecDecodeError {
             kind: kind.wire_name().to_owned(),
             message,
@@ -290,8 +296,7 @@ impl Spec {
 
     /// Return the JCS-canonicalized JSON bytes for this spec.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, SpecCanonicalizationError> {
-        let value =
-            serde_json::to_value(self).map_err(SpecCanonicalizationError::Serialize)?;
+        let value = serde_json::to_value(self).map_err(SpecCanonicalizationError::Serialize)?;
         serde_jcs::to_vec(&value).map_err(|err| {
             if err.classify() == serde_json::error::Category::Data {
                 SpecCanonicalizationError::NonFiniteFloat

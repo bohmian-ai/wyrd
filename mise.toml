@@ -434,7 +434,7 @@ fi
 [tasks."check:registry-tx-coupling"]
 description = "Card registry writes must stay inside the caller's TenantConn tx; no tokio::spawn / emit_async / raw PgPool"
 run = """
-rg -n 'tokio::spawn\b|emit_async\(|sqlx::PgPool' crates/wyrd/wyrd-sql/src/queries/cards/ && exit 1 || exit 0
+rg -n 'tokio::spawn|emit_async|sqlx::PgPool' crates/wyrd/wyrd-sql/src/queries/cards/ && exit 1 || exit 0
 """
 
 [tasks."check:registry-immutable-spec-hash"]
@@ -749,6 +749,16 @@ esac
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
 depends = ["check", "test:unit", "test:storage:local", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
+
+[tasks."db:migrate"]
+description = """Apply wyrd-sql migrations against WYRD_DATABASE_URL_MIGRATOR.
+Runs the idempotent migration test, which also verifies that required Postgres
+roles (wyrd_migrator BYPASSRLS, wyrd_app no-BYPASSRLS, wyrd_platform_admin
+BYPASSRLS) are present before applying DDL.
+Required env vars:
+  WYRD_DATABASE_URL_MIGRATOR=postgres://wyrd_migrator:<pw>@localhost/wyrd
+"""
+run = "cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture"
 
 [tasks."test:sql"]
 description = """Run live Postgres SQL integration tests.

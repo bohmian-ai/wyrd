@@ -8,7 +8,7 @@
 use wyrd_spec::error::WyrdError;
 
 use crate::row_types::cards::{
-    actor_kind_db_str, CardRegistrationOperation, NewAuditCardRegistrationRow,
+    CardRegistrationOperation, NewAuditCardRegistrationRow, actor_kind_db_str,
 };
 use crate::tenant_conn::TenantConn;
 

@@ -145,9 +145,6 @@ pub enum DelegateError {
     /// Permission denied.
     #[error("caller lacks delegation issue permission")]
     PermissionDenied,
-    /// Delegation chain too deep.
-    #[error("delegation chain would exceed max depth")]
-    DelegationDepthExceeded,
     /// JWT issue failure.
     #[error("token issue failed")]
     Issue(#[from] IssueError),
@@ -497,10 +494,12 @@ impl From<DelegateError> for WyrdError {
                 message: "caller lacks delegation issue permission".to_owned(),
                 details: json!({ "required": Permission::delegation_issue() }),
             },
-            DelegateError::DelegationDepthExceeded => WyrdError::DelegationDepthExceededIssue {
-                message: "delegation chain would exceed max depth".to_owned(),
-                details: json!({ "max": wyrd_auth_issue::MAX_DELEGATION_DEPTH }),
-            },
+            DelegateError::Issue(IssueError::DelegationDepthExceeded { max }) => {
+                WyrdError::DelegationDepthExceededIssue {
+                    message: format!("delegation chain would exceed max depth of {max}"),
+                    details: json!({ "max": max }),
+                }
+            }
             DelegateError::Issue(_) | DelegateError::InvalidRole => WyrdError::Internal {
                 message: "failed to issue delegated token".to_owned(),
                 details: json!({}),

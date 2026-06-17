@@ -36,6 +36,7 @@ wyrd-runtime = { workspace = true }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1", features = ["embedded-postgres"] }
+tower_governor = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-storage = { workspace = true }
 wyrd-enterprise = { path = "../wyrd-enterprise", version = "0.0.1", optional = true }

@@ -20,9 +20,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = wyrd_server::router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()))
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()))
+    .await?;
     let _ = shutdown_tx.send(true);
     if let Some(handle) = sweeper_handle {
         let _ = handle.await;

@@ -6993,6 +6993,8 @@ dependencies = [
  "tokio",
  "tracing",
  "urlencoding",
+ "uuid",
+ "wyrd-runtime",
  "wyrd-semver",
  "wyrd-spec",
 ]

@@ -101,6 +101,16 @@ pub enum SpecHashParseError {
     },
 }
 
+/// Error produced by [`Spec::from_kind_and_value`].
+#[derive(Debug, thiserror::Error)]
+#[error("spec decode failed for kind {kind}: {message}")]
+pub struct SpecDecodeError {
+    /// Card kind that failed to decode.
+    pub kind: String,
+    /// Decode error detail.
+    pub message: String,
+}
+
 /// Error produced by [`Spec::canonical_hash`] / [`Spec::canonical_bytes`].
 #[derive(Debug, thiserror::Error)]
 pub enum SpecCanonicalizationError {
@@ -267,6 +277,17 @@ impl Spec {
         Ok((hash, canon))
     }
 
+    /// Decode a `serde_json::Value` into a kind-specific [`Spec`] variant.
+    ///
+    /// Calls the private `spec_from_kind_value` and wraps any error in
+    /// [`SpecDecodeError`] with the kind name attached.
+    pub fn from_kind_and_value(kind: &CardKind, value: serde_json::Value) -> Result<Self, SpecDecodeError> {
+        spec_from_kind_value(kind, value).map_err(|message| SpecDecodeError {
+            kind: kind.wire_name().to_owned(),
+            message,
+        })
+    }
+
     /// Return the JCS-canonicalized JSON bytes for this spec.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, SpecCanonicalizationError> {
         let value =
@@ -399,6 +420,13 @@ impl CardKind {
             Self::Source => "Source",
             Self::External => "External",
         })
+    }
+
+    /// Parse a wire-name string (`"Data"`, `"Model"`, …) into a [`CardKind`].
+    ///
+    /// Returns `None` when the string does not match a known kind.
+    pub fn from_wire_name(value: &str) -> Option<Self> {
+        native_from_str(value)
     }
 
     /// Public wire name for this kind.

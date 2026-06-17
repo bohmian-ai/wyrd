@@ -189,6 +189,29 @@ pub enum SqlError {
     InvalidDataTenantId(#[source] wyrd_spec::ids::IdError),
 }
 
+impl SqlError {
+    /// Wrap an [`IdError`] as an [`SqlError::InvariantViolation`].
+    pub fn from_id_error(e: wyrd_spec::ids::IdError) -> Self {
+        Self::InvariantViolation {
+            detail: format!("id validation failed: {e}"),
+        }
+    }
+
+    /// Wrap a [`wyrd_semver::VersionError`] as an [`SqlError::InvariantViolation`].
+    pub fn from_version(e: wyrd_semver::VersionError) -> Self {
+        Self::InvariantViolation {
+            detail: format!("version parse failed: {e}"),
+        }
+    }
+
+    /// Wrap a [`wyrd_spec::envelope::SpecDecodeError`] as an [`SqlError::InvariantViolation`].
+    pub fn from_spec_decode(e: wyrd_spec::envelope::SpecDecodeError) -> Self {
+        Self::InvariantViolation {
+            detail: format!("spec decode failed: {e}"),
+        }
+    }
+}
+
 impl From<sqlx::Error> for SqlError {
     fn from(error: sqlx::Error) -> Self {
         match error {

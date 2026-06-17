@@ -18,6 +18,9 @@ serde_json = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
+wyrd-runtime = { workspace = true }
+wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
 
 [dependencies.pg-embed]

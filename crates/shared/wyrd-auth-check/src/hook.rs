@@ -13,9 +13,11 @@ pub trait PolicyHook: Send + Sync {
 }
 
 /// Pre-v1 policy hook that allows every context after mechanism-layer guards pass.
+#[cfg(any(test, feature = "test-helpers"))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StubAllowPolicyHook;
 
+#[cfg(any(test, feature = "test-helpers"))]
 #[async_trait]
 impl PolicyHook for StubAllowPolicyHook {
     async fn evaluate(&self, _: &AuthzCheckContext) -> PolicyDecision {
@@ -24,12 +26,14 @@ impl PolicyHook for StubAllowPolicyHook {
 }
 
 /// Test helper policy hook that denies every context with a fixed reason.
+#[cfg(any(test, feature = "test-helpers"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenyAllPolicyHook {
     /// Denial reason returned to callers.
     pub reason: String,
 }
 
+#[cfg(any(test, feature = "test-helpers"))]
 #[async_trait]
 impl PolicyHook for DenyAllPolicyHook {
     async fn evaluate(&self, _: &AuthzCheckContext) -> PolicyDecision {

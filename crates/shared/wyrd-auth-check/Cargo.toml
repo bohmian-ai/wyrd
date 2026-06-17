@@ -7,6 +7,9 @@ rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 
+[features]
+test-helpers = []
+
 [dependencies]
 async-trait = { workspace = true }
 http = { workspace = true }

@@ -99,6 +99,22 @@ pub enum SqlError {
         constraint: String,
     },
 
+    /// PL/pgSQL `RAISE EXCEPTION USING ERRCODE='P0001', CONSTRAINT=...`.
+    ///
+    /// Used by cards spec-hash immutability trigger and any trigger that needs
+    /// a dispatchable invariant separate from real CHECK violations.
+    #[wyrd_error(
+        code = "WYRD_SQL_409_TRIGGER_EXCEPTION",
+        status = 409,
+        title = "Trigger exception raised",
+        remediation = "The operation violated a trigger-enforced invariant; inspect the constraint name for details."
+    )]
+    #[error("trigger exception: {constraint}")]
+    TriggerException {
+        /// Constraint name carried by the PL/pgSQL RAISE EXCEPTION USING CONSTRAINT=... clause.
+        constraint: String,
+    },
+
     /// Operation conflicted with the current row state.
     #[wyrd_error(
         code = "WYRD_SQL_409_CONFLICT",
@@ -187,6 +203,9 @@ impl From<sqlx::Error> for SqlError {
                         constraint: constraint_name(db_error.as_ref()),
                     },
                     Some("23514") => Self::CheckViolation {
+                        constraint: constraint_name(db_error.as_ref()),
+                    },
+                    Some("P0001") => Self::TriggerException {
                         constraint: constraint_name(db_error.as_ref()),
                     },
                     Some("42501") if is_rls_denied(db_error.message()) => Self::RlsDenied {

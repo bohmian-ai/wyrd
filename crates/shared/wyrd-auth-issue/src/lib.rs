@@ -82,6 +82,19 @@ pub enum IssueError {
     InvalidCardRef,
 }
 
+/// Minimal caller context for RFC 8693 token delegation.
+///
+/// Contains only the three fields read by [`IssuingKey::issue_delegated_access_token`],
+/// avoiding fabrication of unused fields such as `iss`, `jti`, `roles`, and timestamps.
+pub struct DelegationCaller {
+    /// Subject identifier of the original caller (the `sub` claim of their token).
+    pub sub: String,
+    /// Principal reference of the caller.
+    pub principal: TokenPrincipalRef,
+    /// Act chain from the caller's token, if any.
+    pub act: Option<Box<ActClaim>>,
+}
+
 impl IssuingKey {
     /// Load an Ed25519 private key from PEM bytes.
     ///
@@ -205,7 +218,7 @@ impl IssuingKey {
     /// exceeded, or signing fails.
     #[tracing::instrument(
         level = "debug",
-        skip(self, caller_claims, requested_subject),
+        skip(self, caller, requested_subject),
         fields(
             kid = %self.kid,
             requested_subject = %requested_subject.id,
@@ -216,13 +229,13 @@ impl IssuingKey {
     )]
     pub fn issue_delegated_access_token(
         &self,
-        caller_claims: &AccessTokenClaims,
+        caller: &DelegationCaller,
         requested_subject: TokenPrincipalRef,
         requested_roles: Vec<RoleRef>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
         validate_principal_ref(&requested_subject)?;
-        let resulting_depth = act_depth(caller_claims.act.as_deref()) + 1;
+        let resulting_depth = act_depth(caller.act.as_deref()) + 1;
         tracing::Span::current().record("delegation_depth", resulting_depth);
         if resulting_depth > MAX_DELEGATION_DEPTH {
             return Err(IssueError::DelegationDepthExceeded {
@@ -231,13 +244,13 @@ impl IssuingKey {
         }
 
         let act = Some(Box::new(ActClaim {
-            sub: caller_claims.sub.clone(),
-            principal: caller_claims.principal.clone(),
-            act: caller_claims.act.clone(),
+            sub: caller.sub.clone(),
+            principal: caller.principal.clone(),
+            act: caller.act.clone(),
         }));
 
         self.issue_access_token_with_claims(
-            caller_claims.sub.clone(),
+            caller.sub.clone(),
             requested_subject,
             requested_roles,
             act,
@@ -403,8 +416,8 @@ mod tests {
     use wyrd_spec::version::VersionBlock;
 
     use super::{
-        ARGON2_M_COST_KIB, IssueError, IssuingKey, Kid, MAX_DELEGATION_DEPTH, hash_api_key,
-        verify_api_key,
+        ARGON2_M_COST_KIB, DelegationCaller, IssueError, IssuingKey, Kid, MAX_DELEGATION_DEPTH,
+        hash_api_key, verify_api_key,
     };
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
@@ -574,10 +587,15 @@ mod tests {
                 Duration::minutes(5),
             )
             .expect("caller token issues");
-        let caller_claims = verify_access_token(&caller_token);
+        let raw = verify_access_token(&caller_token);
+        let caller = DelegationCaller {
+            sub: raw.sub.clone(),
+            principal: raw.principal.clone(),
+            act: raw.act.clone(),
+        };
         let delegated_token = issuing_key()
             .issue_delegated_access_token(
-                &caller_claims,
+                &caller,
                 agent_principal(),
                 vec![role("agent")],
                 Duration::minutes(5),
@@ -586,29 +604,24 @@ mod tests {
         let delegated_claims = verify_access_token(&delegated_token);
         let act = delegated_claims.act.as_ref().expect("act chain is present");
 
-        assert_eq!(delegated_claims.sub, caller_claims.sub);
+        assert_eq!(delegated_claims.sub, raw.sub);
         assert_eq!(delegated_claims.principal.kind, PrincipalKindWire::Agent);
         assert_eq!(delegated_claims.roles, vec![role("agent")]);
-        assert_eq!(act.sub, caller_claims.sub);
-        assert_eq!(act.principal, caller_claims.principal);
+        assert_eq!(act.sub, raw.sub);
+        assert_eq!(act.principal, raw.principal);
         assert_eq!(act.act, None);
     }
 
     #[test]
     fn issue_delegated_access_token_rejects_depth_over_max() {
-        let caller_claims = AccessTokenClaims {
+        let caller = DelegationCaller {
             sub: user_principal().id.to_string(),
             principal: user_principal(),
-            roles: vec![role("runtime_admin")],
             act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH))),
-            exp: 100,
-            iat: 1,
-            iss: "wyrd".to_owned(),
-            jti: "01K00000000000000000000000".to_owned(),
         };
 
         let result = issuing_key().issue_delegated_access_token(
-            &caller_claims,
+            &caller,
             agent_principal(),
             vec![role("agent")],
             Duration::minutes(5),

@@ -7,10 +7,8 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-use wyrd_auth_issue::{IssueError, IssuingKey};
-use wyrd_auth_verify::{
-    AccessTokenClaims, ActClaim, AuthError, PrincipalKindWire, TokenPrincipalRef, TokenVerifier,
-};
+use wyrd_auth_issue::{DelegationCaller, IssueError, IssuingKey};
+use wyrd_auth_verify::{ActClaim, AuthError, PrincipalKindWire, TokenPrincipalRef, TokenVerifier};
 use wyrd_runtime::{Permission, PermissionCheck, PrincipalId, PrincipalKind, RoleRef};
 use wyrd_spec::auth::{RequestedSubject, SecretBearer, TokenResponse, TokenType};
 use wyrd_spec::envelope::CardKind;
@@ -231,7 +229,15 @@ impl DelegateToken {
         let row = resolve_requested_subject(conn, requested_subject).await?;
         let roles = role_refs(service_account_roles(conn, row.id).await?)
             .map_err(|_| DelegateError::InvalidRole)?;
-        let caller_claims = claims_from_verified(&verified.principal, &verified.delegation_chain);
+        let caller = DelegationCaller {
+            sub: verified
+                .delegation_chain
+                .first()
+                .map(|step| step.principal.id.to_string())
+                .unwrap_or_else(|| verified.principal.id.to_string()),
+            principal: TokenPrincipalRef::from(&verified.principal),
+            act: act_from_chain(&verified.delegation_chain, conn.data_tenant_id()),
+        };
         let requested_ref = principal_ref(
             row.id,
             &row.principal_kind,
@@ -240,7 +246,7 @@ impl DelegateToken {
         )
         .ok_or(DelegateError::SubjectNotFound)?;
         let access_token = self.issuing_key.issue_delegated_access_token(
-            &caller_claims,
+            &caller,
             requested_ref,
             roles.clone(),
             self.settings.access_ttl,
@@ -411,26 +417,6 @@ fn principal_ref(
         tenant_id,
         card_ref: Some(card_ref),
     })
-}
-
-fn claims_from_verified(
-    principal: &wyrd_runtime::Principal,
-    chain: &[wyrd_runtime::DelegationStep],
-) -> AccessTokenClaims {
-    let principal_ref = TokenPrincipalRef::from(principal);
-    AccessTokenClaims {
-        sub: chain
-            .first()
-            .map(|step| step.principal.id.to_string())
-            .unwrap_or_else(|| principal.id.to_string()),
-        principal: principal_ref,
-        roles: principal.roles.clone(),
-        act: act_from_chain(chain, principal.tenant_id),
-        exp: (Utc::now() + Duration::minutes(5)).timestamp() as usize,
-        iat: Utc::now().timestamp() as usize,
-        iss: "wyrd".to_owned(),
-        jti: "delegation-source".to_owned(),
-    }
 }
 
 fn act_from_chain(

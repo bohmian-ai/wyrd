@@ -14,9 +14,9 @@ CREATE TABLE wyrd.audit_credential_issuance (
     request_id            TEXT         NOT NULL,
     expires_at            TIMESTAMPTZ  NOT NULL,
     FOREIGN KEY (data_tenant_id, api_key_id)
-        REFERENCES wyrd.auth_api_keys(data_tenant_id, id) ON DELETE CASCADE,
+        REFERENCES wyrd.auth_api_keys(data_tenant_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (data_tenant_id, target_sa_id)
-        REFERENCES wyrd.auth_service_accounts(data_tenant_id, id) ON DELETE CASCADE
+        REFERENCES wyrd.auth_service_accounts(data_tenant_id, id) ON DELETE RESTRICT
 );
 
 CREATE INDEX audit_credential_issuance_by_target

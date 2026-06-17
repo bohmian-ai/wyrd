@@ -16,8 +16,8 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    api_key_by_prefix, insert_audit_token_exchange, insert_refresh_token, service_account_by_id,
-    service_account_roles, touch_api_key_last_used,
+    api_key_by_prefix, insert_audit_token_exchange, insert_refresh_token,
+    list_service_account_roles, service_account_by_id, touch_api_key_last_used,
 };
 
 use crate::auth::issue_api_key::{WyrdApiKey, principal_kind_for_card};
@@ -189,7 +189,7 @@ impl ExchangeApiKey {
             return Err(ExchangeError::HashMismatch);
         }
 
-        let roles = role_refs(service_account_roles(conn, row.principal_id).await?)
+        let roles = role_refs(list_service_account_roles(conn, row.principal_id).await?)
             .map_err(|_| ExchangeError::InvalidRole)?;
         touch_api_key_last_used(conn, row.api_key_id).await?;
         issue_for_subject(
@@ -232,7 +232,7 @@ impl DelegateToken {
         let row = resolve_requested_subject(conn, requested_subject).await?;
         let _ = runtime_principal_kind(&row.principal_kind, row.card_ref.0.clone())
             .ok_or(DelegateError::SubjectNotFound)?;
-        let roles = role_refs(service_account_roles(conn, row.id).await?)
+        let roles = role_refs(list_service_account_roles(conn, row.id).await?)
             .map_err(|_| DelegateError::InvalidRole)?;
         let caller = DelegationCaller {
             sub: verified
@@ -500,12 +500,12 @@ mod tests {
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{PrincipalId, RbacCheck};
+    use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::RequestedSubject;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
-    use wyrd_semver::VersionBlock;
     use wyrd_sql::TenantConn;
 
     use super::{
@@ -597,11 +597,11 @@ mod tests {
         use wyrd_runtime::{
             DelegationStep, PrincipalId, PrincipalKind, PrincipalRef as RuntimePrincipalRef,
         };
+        use wyrd_semver::VersionBlock;
         use wyrd_spec::DataTenantId;
         use wyrd_spec::envelope::CardKind;
         use wyrd_spec::ids::{CardName, SpaceName};
         use wyrd_spec::reference::CardRef;
-        use wyrd_semver::VersionBlock;
 
         let tenant_id: DataTenantId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
             .parse()

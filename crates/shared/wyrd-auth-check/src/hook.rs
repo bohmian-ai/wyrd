@@ -12,6 +12,11 @@ use crate::context::AuthzCheckContext;
 pub trait PolicyHook: Send + Sync {
     /// Evaluate an authz-check context.
     async fn evaluate(&self, ctx: &AuthzCheckContext) -> PolicyDecision;
+
+    /// Whether this hook is the placeholder default unsuitable for production.
+    fn is_stub_default(&self) -> bool {
+        false
+    }
 }
 
 /// Pre-v1 policy hook that allows every context after mechanism-layer guards pass.
@@ -22,6 +27,10 @@ pub struct StubAllowPolicyHook;
 impl PolicyHook for StubAllowPolicyHook {
     async fn evaluate(&self, _: &AuthzCheckContext) -> PolicyDecision {
         PolicyDecision::Allow
+    }
+
+    fn is_stub_default(&self) -> bool {
+        true
     }
 }
 

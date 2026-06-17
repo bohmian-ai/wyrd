@@ -602,6 +602,34 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Required request field is missing.
+    #[error("[WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD",
+        status = 400,
+        title = "Required request field is missing",
+        remediation = "Include the named field in the request; see the route's OpenAPI schema for the full required set."
+    )]
+    MissingRequiredField {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Authz check policy evaluation denied the request.
+    #[error("[WYRD_AUTHZ_403_POLICY_DENIED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTHZ_403_POLICY_DENIED",
+        status = 403,
+        title = "Policy denied request",
+        remediation = "Inspect the policy denial reason and update the calling service, target service, or policy configuration before retrying."
+    )]
+    PolicyDenied {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Authentication is required before a permission check can run.
     #[error("[WYRD_PERMISSION_401_UNAUTHENTICATED] {message}")]
     #[wyrd_error(
@@ -1606,6 +1634,8 @@ impl WyrdError {
             | Self::AuthPreviewDisabled { message, details }
             | Self::AuditUnavailable { message, details }
             | Self::AuthzRequiresDelegatedToken { message, details }
+            | Self::MissingRequiredField { message, details }
+            | Self::PolicyDenied { message, details }
             | Self::PermissionUnauthenticated { message, details }
             | Self::PermissionDeniedRbac { message, details }
             | Self::RoleCorrupt { message, details }

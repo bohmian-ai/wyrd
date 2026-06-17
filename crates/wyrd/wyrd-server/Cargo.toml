@@ -15,6 +15,7 @@ name = "wyrd-server"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 tokio-util = { workspace = true }
 axum = { workspace = true }

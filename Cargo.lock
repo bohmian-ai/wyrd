@@ -6656,6 +6656,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "http 1.4.0",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -6879,6 +6880,7 @@ dependencies = [
 name = "wyrd-server"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "axum 0.8.9",
  "base64 0.22.1",
  "chrono",

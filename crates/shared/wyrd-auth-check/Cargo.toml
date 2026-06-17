@@ -13,6 +13,7 @@ test-helpers = []
 [dependencies]
 async-trait = { workspace = true }
 http = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 wyrd-auth-verify = { workspace = true }

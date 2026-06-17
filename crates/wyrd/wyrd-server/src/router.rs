@@ -16,12 +16,15 @@ use crate::state::AppState;
 
 /// Build the HTTP router with shared server state.
 pub fn build_router(state: AppState) -> Router {
-    let v1 = crate::storage::routes::mount(Router::new(), &state)
-        .fallback(v1_not_found)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            crate::middleware::request_id::attach_request_id,
-        ));
+    let v1 = crate::routes::authz::routes::mount(
+        crate::storage::routes::mount(Router::new(), &state),
+        &state,
+    )
+    .fallback(v1_not_found)
+    .layer(middleware::from_fn_with_state(
+        state.clone(),
+        crate::middleware::request_id::attach_request_id,
+    ));
 
     let auth_governor = Arc::new(
         GovernorConfigBuilder::default()

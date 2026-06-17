@@ -1,0 +1,182 @@
+//! `/v1/authz/check` handler.
+
+use axum::Json;
+use axum::body::Bytes;
+use axum::extract::{Extension, State};
+use axum::http::HeaderMap;
+use base64::Engine;
+use secrecy::{ExposeSecret, SecretString};
+use wyrd_auth_check::guard::{GuardOutcome, guard_reason};
+use wyrd_auth_check::{
+    AuthzCheckContext, AuthzCheckRequest, AuthzCheckRequestError, AuthzCheckResponse,
+};
+use wyrd_auth_verify::AccessTokenClaims;
+use wyrd_spec::DataTenantId;
+use wyrd_spec::card::policy::PolicyDecision;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::request_id::RequestId;
+
+use crate::error::WyrdErrorResponse;
+use crate::state::AppState;
+
+const WYRD_ACCESS_TOKEN_HEADER: &str = "x-wyrd-access-token";
+
+/// Check a delegated Service/Agent invoke request.
+#[tracing::instrument(skip(state, headers, body), fields(request_id = %request_id))]
+pub async fn check_authz(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<AuthzCheckResponse>, WyrdErrorResponse> {
+    if !body.is_empty() {
+        return Err(WyrdError::Validation {
+            message: "/v1/authz/check request body must be empty".to_owned(),
+            details: serde_json::json!({ "body": "empty_required" }),
+        }
+        .into());
+    }
+
+    let token = extract_wyrd_access_token(&headers)?;
+    let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
+    let verifier = state
+        .token_verifier
+        .clone()
+        .ok_or_else(auth_not_configured)?;
+    let verified = verifier
+        .verify(&token, &expected_tenant)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
+
+    match guard_reason(&verified.principal, verified.delegation_chain.len()) {
+        GuardOutcome::Allow => {}
+        GuardOutcome::Reject(reason) => {
+            return Err(WyrdError::AuthzRequiresDelegatedToken {
+                message: "delegated-token guard failed".to_owned(),
+                details: serde_json::json!({ "reason": reason.as_str() }),
+            }
+            .into());
+        }
+    }
+
+    let request = AuthzCheckRequest::from_headers(&headers).map_err(request_error_to_wyrd)?;
+    let ctx = AuthzCheckContext::from_verified(&verified, request, request_id)
+        .map_err(WyrdError::from)?;
+    let decision = state.policy_hook.evaluate(&ctx).await;
+
+    let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, ctx.callee.tenant_id)
+        .await
+        .map_err(sql_error)?;
+    state
+        .audit_writer
+        .write_authz_check(&mut conn, &ctx, &decision)
+        .await?;
+    conn.commit().await.map_err(sql_error)?;
+
+    match decision {
+        PolicyDecision::Allow => Ok(Json(AuthzCheckResponse {
+            decision: PolicyDecision::Allow,
+        })),
+        PolicyDecision::Deny { reason } => Err(WyrdError::PolicyDenied {
+            message: "policy denied invoke".to_owned(),
+            details: serde_json::json!({ "reason": reason }),
+        }
+        .into()),
+        _ => Err(WyrdError::PolicyDenied {
+            message: "policy returned unsupported decision".to_owned(),
+            details: serde_json::json!({ "reason": "unsupported_decision" }),
+        }
+        .into()),
+    }
+}
+
+fn extract_wyrd_access_token(headers: &HeaderMap) -> Result<SecretString, WyrdErrorResponse> {
+    let raw = headers
+        .get(WYRD_ACCESS_TOKEN_HEADER)
+        .ok_or_else(|| {
+            WyrdErrorResponse::from(WyrdError::Unauthenticated {
+                message: "missing X-Wyrd-Access-Token header".to_owned(),
+                details: serde_json::json!({ "header": "x-wyrd-access-token" }),
+            })
+        })?
+        .to_str()
+        .map_err(|_| {
+            WyrdErrorResponse::from(WyrdError::BadTokenFormat {
+                message: "X-Wyrd-Access-Token header is not valid UTF-8".to_owned(),
+                details: serde_json::json!({ "header": "x-wyrd-access-token" }),
+            })
+        })?;
+    let Some(token) = raw.strip_prefix("Bearer ") else {
+        return Err(WyrdErrorResponse::from(WyrdError::BadTokenFormat {
+            message: "X-Wyrd-Access-Token header must be a Bearer credential".to_owned(),
+            details: serde_json::json!({ "header": "x-wyrd-access-token" }),
+        }));
+    };
+    if token.is_empty() {
+        return Err(WyrdErrorResponse::from(WyrdError::BadTokenFormat {
+            message: "X-Wyrd-Access-Token bearer token is empty".to_owned(),
+            details: serde_json::json!({ "header": "x-wyrd-access-token" }),
+        }));
+    }
+    Ok(SecretString::from(token.to_owned()))
+}
+
+fn tenant_from_unverified_access_token(token: &str) -> Result<DataTenantId, WyrdErrorResponse> {
+    let payload = token.split('.').nth(1).ok_or_else(bad_token_format)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| bad_token_format())?;
+    let claims: AccessTokenClaims =
+        serde_json::from_slice(&bytes).map_err(|_| bad_token_format())?;
+    Ok(claims.principal.tenant_id)
+}
+
+fn request_error_to_wyrd(error: AuthzCheckRequestError) -> WyrdErrorResponse {
+    match error {
+        AuthzCheckRequestError::MissingHeader { header } => WyrdError::MissingRequiredField {
+            message: "authz-check required header is missing".to_owned(),
+            details: serde_json::json!({ "field": display_header_name(header) }),
+        },
+        AuthzCheckRequestError::InvalidUtf8 { header } => WyrdError::Validation {
+            message: "authz-check required header is not valid UTF-8".to_owned(),
+            details: serde_json::json!({ "field": display_header_name(header) }),
+        },
+    }
+    .into()
+}
+
+fn display_header_name(header: &str) -> String {
+    header
+        .split('-')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn bad_token_format() -> WyrdErrorResponse {
+    WyrdErrorResponse::from(WyrdError::BadTokenFormat {
+        message: "X-Wyrd-Access-Token is not a compact Wyrd JWT".to_owned(),
+        details: serde_json::json!({ "header": "x-wyrd-access-token" }),
+    })
+}
+
+fn auth_not_configured() -> WyrdErrorResponse {
+    WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
+        message: "auth backend not configured".to_owned(),
+        details: serde_json::json!({ "retry_after_seconds": 1 }),
+    })
+}
+
+fn sql_error(error: wyrd_sql::SqlError) -> WyrdErrorResponse {
+    tracing::warn!(error = %error, "authz-check audit database unavailable");
+    WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
+        message: "authz-check audit backend unavailable".to_owned(),
+        details: serde_json::json!({ "source_code": error.code() }),
+    })
+}

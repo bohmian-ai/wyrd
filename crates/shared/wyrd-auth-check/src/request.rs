@@ -1,11 +1,26 @@
-//! Header-derived authz-check request description.
+//! Authz-check request description.
 
 use http::HeaderMap;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use wyrd_spec::reference::CardRef;
+
+/// Request body for an authz check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthzCheckRequest {
+    /// Target card for the simulated permission check.
+    pub target: CardRef,
+    /// Action to check against the current actor.
+    pub action: String,
+    /// Additional policy context.
+    #[serde(default)]
+    pub context: serde_json::Value,
+}
 
 /// Request metadata projected by the service mesh for an authz check.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthzCheckRequest {
+pub struct AuthzCheckRequestMetadata {
     /// HTTP verb of the original request.
     pub method: String,
     /// Path of the original request.
@@ -31,7 +46,7 @@ pub enum AuthzCheckRequestError {
     },
 }
 
-impl AuthzCheckRequest {
+impl AuthzCheckRequestMetadata {
     /// Read `X-Original-Method`, `X-Original-Path`, and `X-Original-Host`.
     ///
     /// # Errors
@@ -57,8 +72,37 @@ impl AuthzCheckRequest {
 #[cfg(test)]
 mod tests {
     use http::{HeaderMap, HeaderValue};
+    use wyrd_semver::VersionBlock;
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::reference::CardRef;
 
-    use super::{AuthzCheckRequest, AuthzCheckRequestError};
+    use super::{AuthzCheckRequest, AuthzCheckRequestError, AuthzCheckRequestMetadata};
+
+    fn card_ref() -> CardRef {
+        CardRef {
+            kind: CardKind::Service,
+            name: CardName::new("callee").expect("static card name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("test").expect("static space is valid"),
+            uid: None,
+        }
+    }
+
+    #[test]
+    fn request_body_serializes_target_action_context() {
+        let request = AuthzCheckRequest {
+            target: card_ref(),
+            action: "card_write".to_owned(),
+            context: serde_json::json!({ "source": "test" }),
+        };
+
+        let value = serde_json::to_value(&request).expect("request serializes");
+
+        assert_eq!(value["target"]["kind"], "Service");
+        assert_eq!(value["action"], "card_write");
+        assert_eq!(value["context"]["source"], "test");
+    }
 
     #[test]
     fn parses_mesh_projected_headers() {
@@ -67,7 +111,7 @@ mod tests {
         headers.insert("x-original-path", HeaderValue::from_static("/v1/cards"));
         headers.insert("x-original-host", HeaderValue::from_static("service.wyrd"));
 
-        let request = AuthzCheckRequest::from_headers(&headers).expect("headers parse");
+        let request = AuthzCheckRequestMetadata::from_headers(&headers).expect("headers parse");
 
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/v1/cards");
@@ -78,7 +122,8 @@ mod tests {
     fn missing_projected_header_is_reported_by_name() {
         let headers = HeaderMap::new();
 
-        let error = AuthzCheckRequest::from_headers(&headers).expect_err("method is required");
+        let error =
+            AuthzCheckRequestMetadata::from_headers(&headers).expect_err("method is required");
 
         assert_eq!(
             error,
@@ -98,7 +143,8 @@ mod tests {
         headers.insert("x-original-path", HeaderValue::from_static("/v1/cards"));
         headers.insert("x-original-host", HeaderValue::from_static("service.wyrd"));
 
-        let error = AuthzCheckRequest::from_headers(&headers).expect_err("method is invalid");
+        let error =
+            AuthzCheckRequestMetadata::from_headers(&headers).expect_err("method is invalid");
 
         assert_eq!(
             error,

@@ -456,10 +456,11 @@ impl WyrdTestEnv {
                     .method("POST")
                     .uri("/v1/authz/check")
                     .header("x-wyrd-access-token", format!("Bearer {jwt}"))
-                    .header("x-original-method", request.method)
-                    .header("x-original-path", request.path)
-                    .header("x-original-host", request.host)
-                    .body(Body::empty())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&request)
+                            .map_err(|error| WyrdTestError::Io(error.to_string()))?,
+                    ))
                     .map_err(|error| WyrdTestError::Io(error.to_string()))?,
             )
             .await?;
@@ -893,9 +894,9 @@ mod tests {
             .authz_check(
                 &delegated,
                 AuthzCheckRequest {
-                    method: "POST".to_owned(),
-                    path: "/invoke".to_owned(),
-                    host: "service.wyrd".to_owned(),
+                    target: callee.card_ref().expect("machine has card ref").clone(),
+                    action: "card_write".to_owned(),
+                    context: serde_json::json!({}),
                 },
             )
             .await

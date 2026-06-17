@@ -88,10 +88,11 @@ mod tests {
         AuthzCheckContext::from_verified(
             &verified,
             AuthzCheckRequest {
-                method: "POST".to_owned(),
-                path: "/invoke".to_owned(),
-                host: "service.wyrd".to_owned(),
+                target: card_ref("callee"),
+                action: "card_write".to_owned(),
+                context: serde_json::json!({}),
             },
+            None,
             RequestId::parse(&uuid::Uuid::now_v7().to_string()).expect("generated UUIDv7 is valid"),
         )
         .expect("context builds")

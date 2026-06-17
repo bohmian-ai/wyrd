@@ -20,6 +20,7 @@ use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+use wyrd_testing::env::WyrdTestEnv;
 
 const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -56,14 +57,32 @@ async fn authz_direct_service_jwt_returns_403_chain_empty() {
 
 #[tokio::test]
 async fn authz_delegated_token_allows() {
-    let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+    let env = WyrdTestEnv::start().await.expect("env starts");
+    let caller = env
+        .bootstrap_service("route-caller", &["runtime_admin"])
         .await
-        .expect("fixture starts");
-    let state = test_state(fixture.app_pool().clone());
-    let token = mint_delegated_service_jwt(&state, fixture.data_tenant_id());
+        .expect("caller bootstraps");
+    let callee = env
+        .bootstrap_service("route-callee", &["writer"])
+        .await
+        .expect("callee bootstraps");
+    let caller_jwt = env
+        .exchange_api_key(caller.api_key().expect("machine has key"))
+        .await
+        .expect("caller key exchanges");
+    let delegated = env
+        .delegate(
+            &caller_jwt,
+            callee.card_ref().expect("machine has card ref"),
+        )
+        .await
+        .expect("delegates");
 
-    let response = build_router(state)
-        .oneshot(authz_request(&token, true))
+    let response = env
+        .call(
+            &delegated,
+            authz_request_without_token(callee.card_ref().expect("machine has card ref"), true),
+        )
         .await
         .expect("router responds");
 
@@ -73,7 +92,7 @@ async fn authz_delegated_token_allows() {
         .await
         .expect("body collects");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("json parses");
-    assert_eq!(value["decision"]["verdict"], "allow");
+    assert_eq!(value["decision"], "allow");
 }
 
 #[tokio::test]
@@ -95,7 +114,7 @@ async fn authz_deny_hook_returns_403_with_reason() {
 }
 
 #[tokio::test]
-async fn authz_missing_x_original_method_returns_400() {
+async fn authz_missing_x_original_method_still_uses_body_check() {
     let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
         .await
         .expect("fixture starts");
@@ -104,12 +123,9 @@ async fn authz_missing_x_original_method_returns_400() {
 
     let problem = post_authz(state, &token, false).await;
 
-    assert_eq!(problem.0, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        problem.1["code"],
-        "WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD"
-    );
-    assert_eq!(problem.1["details"]["field"], "X-Original-Method");
+    assert_eq!(problem.0, StatusCode::OK);
+    assert_eq!(problem.1["decision"], "deny");
+    assert_eq!(problem.1["reason"], "missing_permission");
 }
 
 async fn post_authz(
@@ -134,12 +150,43 @@ fn authz_request(token: &str, include_method: bool) -> Request<Body> {
         .method("POST")
         .uri("/v1/authz/check")
         .header("x-wyrd-access-token", format!("Bearer {token}"))
+        .header("content-type", "application/json")
         .header("x-original-path", "/invoke")
         .header("x-original-host", "service.wyrd");
     if include_method {
         builder = builder.header("x-original-method", "POST");
     }
-    builder.body(Body::empty()).expect("request builds")
+    builder
+        .body(Body::from(
+            serde_json::to_vec(&authz_body(&card_ref(CardKind::Service, "callee")))
+                .expect("body serializes"),
+        ))
+        .expect("request builds")
+}
+
+fn authz_request_without_token(target: &CardRef, include_method: bool) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/v1/authz/check")
+        .header("content-type", "application/json")
+        .header("x-original-path", "/invoke")
+        .header("x-original-host", "service.wyrd");
+    if include_method {
+        builder = builder.header("x-original-method", "POST");
+    }
+    builder
+        .body(Body::from(
+            serde_json::to_vec(&authz_body(target)).expect("body serializes"),
+        ))
+        .expect("request builds")
+}
+
+fn authz_body(target: &CardRef) -> serde_json::Value {
+    serde_json::json!({
+        "target": target,
+        "action": "card_write",
+        "context": {},
+    })
 }
 
 fn test_state(pool: sqlx::PgPool) -> AppState {

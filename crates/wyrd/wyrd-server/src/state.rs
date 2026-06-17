@@ -172,14 +172,14 @@ mod tests {
             exp: chrono::Utc::now(),
         };
         let request = wyrd_auth_check::AuthzCheckRequest {
-            method: "POST".to_owned(),
-            path: "/v1/cards".to_owned(),
-            host: "service.wyrd".to_owned(),
+            target: card_ref("callee"),
+            action: "card_write".to_owned(),
+            context: serde_json::json!({}),
         };
         let request_id = RequestId::parse(&uuid::Uuid::now_v7().to_string())
             .expect("generated UUIDv7 is a valid request id");
 
-        AuthzCheckContext::from_verified(&verified, request, request_id)
+        AuthzCheckContext::from_verified(&verified, request, None, request_id)
             .expect("test context is delegated")
     }
 }

@@ -8,9 +8,11 @@ use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_check::guard::{GuardOutcome, guard_reason};
 use wyrd_auth_check::{
-    AuthzCheckContext, AuthzCheckRequest, AuthzCheckRequestError, AuthzCheckResponse,
+    AuthzCheckContext, AuthzCheckRequest, AuthzCheckRequestError, AuthzCheckRequestMetadata,
+    AuthzCheckResponse,
 };
 use wyrd_auth_verify::AccessTokenClaims;
+use wyrd_runtime::{Permission, PermissionDenyReason, PermissionVerdict};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::policy::PolicyDecision;
 use wyrd_spec::error::WyrdError;
@@ -29,14 +31,6 @@ pub async fn check_authz(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<AuthzCheckResponse>, WyrdErrorResponse> {
-    if !body.is_empty() {
-        return Err(WyrdError::Validation {
-            message: "/v1/authz/check request body must be empty".to_owned(),
-            details: serde_json::json!({ "body": "empty_required" }),
-        }
-        .into());
-    }
-
     let token = extract_wyrd_access_token(&headers)?;
     let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
     let verifier = state
@@ -59,10 +53,35 @@ pub async fn check_authz(
         }
     }
 
-    let request = AuthzCheckRequest::from_headers(&headers).map_err(request_error_to_wyrd)?;
-    let ctx = AuthzCheckContext::from_verified(&verified, request, request_id)
+    let request = serde_json::from_slice::<AuthzCheckRequest>(&body).map_err(|error| {
+        WyrdErrorResponse::from(WyrdError::Validation {
+            message: "/v1/authz/check request body is invalid".to_owned(),
+            details: serde_json::json!({ "error": error.to_string() }),
+        })
+    })?;
+    let metadata = match AuthzCheckRequestMetadata::from_headers(&headers) {
+        Ok(metadata) => Some(metadata),
+        Err(AuthzCheckRequestError::MissingHeader { .. }) => None,
+        Err(error) => return Err(request_error_to_wyrd(error)),
+    };
+    let required = permission_for_action(&request.action)?;
+    let ctx = AuthzCheckContext::from_verified(&verified, request, metadata, request_id)
         .map_err(WyrdError::from)?;
-    let decision = state.policy_hook.evaluate(&ctx).await;
+    let hook_decision = state.policy_hook.evaluate(&ctx).await;
+    let decision = match hook_decision {
+        PolicyDecision::Allow => match state.permission_check.check(&ctx.callee, &required) {
+            PermissionVerdict::Allow => PolicyDecision::Allow,
+            PermissionVerdict::Deny {
+                reason: PermissionDenyReason::Rbac { .. },
+            } => PolicyDecision::Deny {
+                reason: "missing_permission".to_owned(),
+            },
+        },
+        PolicyDecision::Deny { reason } => PolicyDecision::Deny { reason },
+        _ => PolicyDecision::Deny {
+            reason: "unsupported_decision".to_owned(),
+        },
+    };
 
     let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, ctx.callee.tenant_id)
         .await
@@ -74,9 +93,10 @@ pub async fn check_authz(
     conn.commit().await.map_err(sql_error)?;
 
     match decision {
-        PolicyDecision::Allow => Ok(Json(AuthzCheckResponse {
-            decision: PolicyDecision::Allow,
-        })),
+        PolicyDecision::Allow => Ok(Json(AuthzCheckResponse::allow())),
+        PolicyDecision::Deny { reason } if reason == "missing_permission" => Ok(Json(
+            AuthzCheckResponse::missing_permission(required.to_string()),
+        )),
         PolicyDecision::Deny { reason } => Err(WyrdError::PolicyDenied {
             message: "policy denied invoke".to_owned(),
             details: serde_json::json!({ "reason": reason }),
@@ -87,6 +107,18 @@ pub async fn check_authz(
             details: serde_json::json!({ "reason": "unsupported_decision" }),
         }
         .into()),
+    }
+}
+
+fn permission_for_action(action: &str) -> Result<Permission, WyrdErrorResponse> {
+    match action {
+        "card_write" => Ok(Permission::card_write()),
+        value => value.parse::<Permission>().map_err(|_| {
+            WyrdErrorResponse::from(WyrdError::Validation {
+                message: "authz-check action is unknown".to_owned(),
+                details: serde_json::json!({ "action": value }),
+            })
+        }),
     }
 }
 

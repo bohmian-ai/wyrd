@@ -30,6 +30,88 @@ use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
 use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
 
+/// Canonical hash of a [`Spec`] over its RFC 8785 (JCS) canonicalized JSON.
+///
+/// Two specs that differ only in field ordering, whitespace, or unicode escape
+/// representation produce the same hash. Field deletion, addition, or value
+/// change produces a different hash. This is the registry's drift-detection
+/// primitive.
+///
+/// Wire form: 64 lowercase hex characters (BLAKE3-256 digest).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(transparent)]
+pub struct SpecHash(String);
+
+impl SpecHash {
+    /// Compute a [`SpecHash`] from canonicalized JSON bytes.
+    #[must_use]
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Self {
+        let digest = blake3::hash(bytes);
+        Self(hex::encode(digest.as_bytes()))
+    }
+
+    /// Return the underlying hex string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the hash and return its hex form.
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for SpecHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for SpecHash {
+    type Err = SpecHashParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() != 64 {
+            return Err(SpecHashParseError::InvalidLength { len: s.len() });
+        }
+        if let Some(pos) = s.bytes().position(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(SpecHashParseError::InvalidChar { pos });
+        }
+        Ok(Self(s.to_owned()))
+    }
+}
+
+/// Error returned when parsing a [`SpecHash`] from its hex string form.
+#[derive(Debug, thiserror::Error)]
+pub enum SpecHashParseError {
+    /// The string was not exactly 64 characters.
+    #[error("spec_hash must be 64 lowercase hex chars; got {len}")]
+    InvalidLength {
+        /// Length of the offending string.
+        len: usize,
+    },
+    /// The string contained a character outside `[0-9a-f]`.
+    #[error("spec_hash contains non-hex char at position {pos}")]
+    InvalidChar {
+        /// Zero-based position of the offending byte.
+        pos: usize,
+    },
+}
+
+/// Error produced by [`Spec::canonical_hash`] / [`Spec::canonical_bytes`].
+#[derive(Debug, thiserror::Error)]
+pub enum SpecCanonicalizationError {
+    /// `serde_json` failed to serialize the spec to a JSON value.
+    #[error("spec serialization failed: {0}")]
+    Serialize(#[source] serde_json::Error),
+    /// The spec contained a `NaN` or `±Infinity` float; JCS forbids these.
+    #[error("spec contains a non-finite float (NaN or +/-Infinity); cannot canonicalize")]
+    NonFiniteFloat,
+}
+
 /// Universal registered Card envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -163,6 +245,40 @@ pub enum Spec {
     Operator(OperatorSpec),
     /// Source card spec.
     Source(SourceSpec),
+}
+
+impl Spec {
+    /// Compute the canonical hash of this spec.
+    ///
+    /// Pipeline: serialize to JSON → RFC 8785 (JCS) canonicalize → BLAKE3-256 → lowercase hex.
+    /// Returns [`SpecCanonicalizationError::NonFiniteFloat`] when the spec contains a NaN or
+    /// ±Infinity float; JCS forbids non-finite numbers.
+    pub fn canonical_hash(&self) -> Result<SpecHash, SpecCanonicalizationError> {
+        let canon = self.canonical_bytes()?;
+        Ok(SpecHash::from_canonical_bytes(&canon))
+    }
+
+    /// Compute both the canonical hash and the underlying canonical bytes in one pass.
+    pub fn canonical_hash_with_bytes(
+        &self,
+    ) -> Result<(SpecHash, Vec<u8>), SpecCanonicalizationError> {
+        let canon = self.canonical_bytes()?;
+        let hash = SpecHash::from_canonical_bytes(&canon);
+        Ok((hash, canon))
+    }
+
+    /// Return the JCS-canonicalized JSON bytes for this spec.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, SpecCanonicalizationError> {
+        let value =
+            serde_json::to_value(self).map_err(SpecCanonicalizationError::Serialize)?;
+        serde_jcs::to_vec(&value).map_err(|err| {
+            if err.classify() == serde_json::error::Category::Data {
+                SpecCanonicalizationError::NonFiniteFloat
+            } else {
+                SpecCanonicalizationError::Serialize(err)
+            }
+        })
+    }
 }
 
 /// Server-derived relationship summary for graph, UI, policy, imports, and diff.

@@ -658,6 +658,174 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Card spec failed type-driven deserialization.
+    #[error("[WYRD_REG_400_INVALID_CARD_SPEC] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_400_INVALID_CARD_SPEC",
+        status = 400,
+        title = "Card spec failed type-driven deserialization",
+        remediation = "Verify the kind/spec field combination matches the documented Wyrd v1 schema for that kind."
+    )]
+    RegistryInvalidCardSpec {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Service and Agent cards require a Pin version, not a Requirement.
+    #[error("[WYRD_REG_400_INVALID_VERSION_BLOCK] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_400_INVALID_VERSION_BLOCK",
+        status = 400,
+        title = "Service and Agent cards require a Pin version, not a Requirement",
+        remediation = "Set `metadata.version` to an exact semver (e.g. `\"1.0.0\"`), not a range expression (e.g. `\"^1\"`)."
+    )]
+    RegistryInvalidVersionBlock {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Card spec exceeds MAX_SPEC_BYTES (256 KiB).
+    #[error("[WYRD_REG_400_SPEC_TOO_LARGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_400_SPEC_TOO_LARGE",
+        status = 400,
+        title = "Card spec exceeds MAX_SPEC_BYTES (256 KiB)",
+        remediation = "Reduce the spec size or split into multiple cards. If artifacts are inlined, move them to an Artifact card with object_store backing."
+    )]
+    RegistrySpecTooLarge {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// `metadata.version` is required.
+    #[error("[WYRD_REG_400_VERSION_REQUIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_400_VERSION_REQUIRED",
+        status = 400,
+        title = "`metadata.version` is required",
+        remediation = "Add `metadata.version` to the card envelope. v1 does not auto-assign a next-patch version."
+    )]
+    RegistryVersionRequired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// List `limit` is zero or exceeds the per-tenant cap.
+    #[error("[WYRD_REG_400_LIST_LIMIT_OUT_OF_RANGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_400_LIST_LIMIT_OUT_OF_RANGE",
+        status = 400,
+        title = "List `limit` is zero or exceeds the per-tenant cap",
+        remediation = "Pass a `limit` in `1..=LIST_LIMIT_MAX` (currently 200)."
+    )]
+    RegistryListLimitOutOfRange {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// `card_ref.uid` was populated for a registry lookup that resolves by (space, name, version).
+    #[error("[WYRD_REG_400_CARD_REF_UID_NOT_RESOLVABLE_HERE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_400_CARD_REF_UID_NOT_RESOLVABLE_HERE",
+        status = 400,
+        title = "`card_ref.uid` was populated for a registry lookup that resolves by (space, name, version)",
+        remediation = "Submit the request with `card_ref.uid = None`; the registry resolves by identity tuple. Use `get_card_by_uid` if you have a `card_uid`."
+    )]
+    RegistryCardRefUidNotResolvableHere {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// `card_ref.version` is a Requirement; this endpoint accepts a Pin.
+    #[error("[WYRD_REG_400_REQUIREMENT_NOT_RESOLVABLE_HERE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_400_REQUIREMENT_NOT_RESOLVABLE_HERE",
+        status = 400,
+        title = "`card_ref.version` is a Requirement; this endpoint accepts a Pin",
+        remediation = "Resolve the Requirement to a Pin via the future `resolve_card_ref` endpoint, or pass a Pin directly."
+    )]
+    RegistryRequirementNotResolvableHere {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// No card matches the supplied identity.
+    #[error("[WYRD_REG_404_CARD_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_404_CARD_NOT_FOUND",
+        status = 404,
+        title = "No card matches the supplied identity",
+        remediation = "Check (space, kind, name, version) or the `card_uid` is correct and the card is registered in the current tenant."
+    )]
+    RegistryCardNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Defense-in-depth: an existing card with the same identity has a different uid.
+    #[error("[WYRD_REG_500_VERSION_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_500_VERSION_CONFLICT",
+        status = 500,
+        title = "Defense-in-depth: an existing card with the same identity has a different uid (should be unreachable given UUIDv7 monotonicity)",
+        remediation = "Internal invariant violation; report with the request id and audit_id."
+    )]
+    RegistryVersionConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Re-apply with the same identity but a different spec_hash; same-version cards are immutable.
+    #[error("[WYRD_REG_409_SPEC_DRIFT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_409_SPEC_DRIFT",
+        status = 409,
+        title = "Re-apply with the same identity but a different spec_hash; same-version cards are immutable",
+        remediation = "Bump `metadata.version` to publish a new spec, or revert your spec to match the registered version."
+    )]
+    RegistrySpecDrift {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Transient Postgres or RLS misconfiguration; retry with backoff.
+    #[error("[WYRD_REG_503_REGISTRY_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_503_REGISTRY_UNAVAILABLE",
+        status = 503,
+        title = "Transient Postgres or RLS misconfiguration; retry with backoff",
+        remediation = "Retry with exponential backoff (60s cap). If persistent, check Postgres connectivity, the tenant row, and the RLS role bindings."
+    )]
+    RegistryUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The backing Service or Agent card has been soft-deleted.
+    #[error("[WYRD_AUTH_403_PRINCIPAL_ORPHANED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_403_PRINCIPAL_ORPHANED",
+        status = 403,
+        title = "The backing Service or Agent card has been soft-deleted",
+        remediation = "Re-register the card or use a different principal to obtain a token."
+    )]
+    PrincipalOrphaned {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Storage subsystem error with a stable storage-specific public code.
     #[error(transparent)]
     #[wyrd_error(delegate)]
@@ -1673,7 +1841,19 @@ impl WyrdError {
             | Self::WorkflowMissingVersion { message, details }
             | Self::WorkflowDuplicateStepId { message, details }
             | Self::WorkflowMissingDependency { message, details }
-            | Self::WorkflowCycle { message, details } => {
+            | Self::WorkflowCycle { message, details }
+            | Self::RegistryInvalidCardSpec { message, details }
+            | Self::RegistryInvalidVersionBlock { message, details }
+            | Self::RegistrySpecTooLarge { message, details }
+            | Self::RegistryVersionRequired { message, details }
+            | Self::RegistryListLimitOutOfRange { message, details }
+            | Self::RegistryCardRefUidNotResolvableHere { message, details }
+            | Self::RegistryRequirementNotResolvableHere { message, details }
+            | Self::RegistryCardNotFound { message, details }
+            | Self::RegistryVersionConflict { message, details }
+            | Self::RegistrySpecDrift { message, details }
+            | Self::RegistryUnavailable { message, details }
+            | Self::PrincipalOrphaned { message, details } => {
                 (Cow::Borrowed(message.as_str()), details.clone())
             }
             Self::Storage { error } => (
@@ -2084,6 +2264,10 @@ mod tests {
             },
             WyrdError::CredentialRevoked {
                 message: "credential revoked".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::PrincipalOrphaned {
+                message: "backing card deleted".to_owned(),
                 details: serde_json::json!({}),
             },
         ]

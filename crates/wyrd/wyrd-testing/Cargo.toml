@@ -1,0 +1,33 @@
+[package]
+name = "wyrd-testing"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+
+[dependencies]
+axum = { workspace = true }
+chrono = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["pkcs8"] }
+http = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["postgres"] }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tower = { workspace = true, features = ["util"] }
+uuid = { workspace = true, features = ["v4", "v7"] }
+wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
+wyrd-auth-issue = { workspace = true }
+wyrd-auth-verify = { workspace = true }
+wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
+wyrd-runtime = { workspace = true }
+wyrd-semver = { workspace = true }
+wyrd-server = { workspace = true }
+wyrd-spec = { workspace = true }
+wyrd-sql = { workspace = true }
+wyrd-storage = { workspace = true }

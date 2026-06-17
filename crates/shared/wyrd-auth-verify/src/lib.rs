@@ -294,6 +294,19 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
             .await;
     }
 
+    /// Remove cached tokens for a principal from the cache.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn invalidate_principal(&self, principal_id: PrincipalId) {
+        let hashes = self
+            .cache
+            .iter()
+            .filter_map(|(hash, verified)| (verified.principal.id == principal_id).then_some(*hash))
+            .collect::<Vec<_>>();
+        for hash in hashes {
+            self.cache.invalidate(&hash).await;
+        }
+    }
+
     fn validation(&self) -> Validation {
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.validate_aud = false;
@@ -577,11 +590,11 @@ mod tests {
     use secrecy::SecretString;
     use wyrd_runtime::{Permission, PermissionSet};
     use wyrd_runtime::{Principal, PrincipalId, PrincipalKind, RoleRef};
+    use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
-    use wyrd_semver::VersionBlock;
 
     use super::{
         AccessTokenClaims, ActClaim, AuthError, Kid, MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH,
@@ -925,6 +938,29 @@ mod tests {
             .verify(&token, &tenant_id())
             .await
             .expect("verify after invalidate succeeds");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn invalidate_principal_removes_matching_entries_and_forces_re_resolve() {
+        let resolver = Arc::new(TestResolver::default());
+        let verifier = verifier(Arc::clone(&resolver), WyrdAuthVerifySettings::default());
+        let claims = claims_with_times(now() + 3_600, now());
+        let principal_id = claims.principal.id;
+        let token = SecretString::from(encode_eddsa_with_kid(&claims));
+
+        verifier
+            .verify(&token, &tenant_id())
+            .await
+            .expect("first verify succeeds");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+
+        verifier.invalidate_principal(principal_id).await;
+
+        verifier
+            .verify(&token, &tenant_id())
+            .await
+            .expect("verify after principal invalidate succeeds");
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
     }
 

@@ -105,22 +105,12 @@ impl VersionBlock {
     }
 
     /// Sort versions by semantic version precedence.
-    ///
-    /// # Errors
-    /// Returns an error when any version is not valid semantic version syntax.
-    pub fn sort_versions(versions: &mut [Self]) -> Result<(), VersionError> {
+    pub fn sort_versions(versions: &mut [Self]) {
         versions.sort_by(|left, right| {
-            let left = semver::Version::parse(left.as_str());
-            let right = semver::Version::parse(right.as_str());
-            match (left, right) {
-                (Ok(left), Ok(right)) => left.cmp(&right),
-                _ => std::cmp::Ordering::Equal,
-            }
+            left.semver()
+                .expect("VersionBlock invariant")
+                .cmp(&right.semver().expect("VersionBlock invariant"))
         });
-        for version in versions {
-            version.semver()?;
-        }
-        Ok(())
     }
 }
 
@@ -299,7 +289,7 @@ mod tests {
             VersionBlock::parse("1.2.2").unwrap(),
             VersionBlock::parse("0.9.0").unwrap(),
         ];
-        VersionBlock::sort_versions(&mut versions).unwrap();
+        VersionBlock::sort_versions(&mut versions);
         let strs: Vec<_> = versions.iter().map(VersionBlock::as_str).collect();
         assert_eq!(strs, vec!["0.9.0", "1.2.2", "1.2.10"]);
     }
@@ -310,8 +300,26 @@ mod tests {
             VersionBlock::parse("1.2.3").unwrap(),
             VersionBlock::parse("1.2.3-rc.1").unwrap(),
         ];
-        VersionBlock::sort_versions(&mut versions).unwrap();
+        VersionBlock::sort_versions(&mut versions);
         let strs: Vec<_> = versions.iter().map(VersionBlock::as_str).collect();
         assert_eq!(strs, vec!["1.2.3-rc.1", "1.2.3"]);
+    }
+
+    #[test]
+    fn bump_minor_clears_pre_and_build() {
+        let next = VersionBlock::parse("1.2.3-rc.1+meta")
+            .unwrap()
+            .bump(VersionBump::Minor)
+            .unwrap();
+        assert_eq!(next.as_str(), "1.3.0");
+    }
+
+    #[test]
+    fn bump_patch_clears_pre_and_build() {
+        let next = VersionBlock::parse("1.2.3-rc.1+meta")
+            .unwrap()
+            .bump(VersionBump::Patch)
+            .unwrap();
+        assert_eq!(next.as_str(), "1.2.4");
     }
 }

@@ -4,8 +4,6 @@
 //! the bump enum ([`VersionBump`]), the SQL-pushdown bounds shape
 //! ([`VersionBounds`], [`SemverTriple`]), and the shared error type
 //! ([`VersionError`]).
-//!
-//! [`crate::block::VersionBlock`]: VersionBlock
 
 mod block;
 mod bounds;

@@ -15,14 +15,14 @@ use crate::error::VersionError;
 pub struct VersionRange(String);
 
 impl VersionRange {
-    /// Parse a semantic version requirement.
+    /// Parse a semantic version requirement, storing the expression as-is.
     ///
-    /// Strict: rejects opsml-dialect short forms like `^1.2`, `1.*`, or bare
-    /// partials. Use [`VersionRange::parse_loose`] for caller-facing inputs
-    /// (CLI flags, HTTP query params).
+    /// Accepts any form accepted by the `semver` crate, including short forms
+    /// like `^1.2` or `~1`. For caller-facing inputs where you want a
+    /// canonical three-segment stored form, use [`VersionRange::parse_loose`].
     ///
     /// # Errors
-    /// Returns an error when `value` is not a valid semver requirement.
+    /// Returns an error when `value` is empty or not a valid semver requirement.
     pub fn parse(value: impl Into<String>) -> Result<Self, VersionError> {
         let value = value.into();
         if value.is_empty() {
@@ -65,13 +65,10 @@ impl VersionRange {
     }
 
     /// Check whether a concrete version matches this range.
-    ///
-    /// # Errors
-    /// Returns an error when the stored range or version is invalid semver syntax.
-    pub fn matches(&self, version: &VersionBlock) -> Result<bool, VersionError> {
+    pub fn matches(&self, version: &VersionBlock) -> bool {
         let range = semver::VersionReq::parse(&self.0)
-            .map_err(|source| VersionError::InvalidRange { source })?;
-        Ok(range.matches(&version.semver()?))
+            .expect("VersionRange invariant: stored value is valid");
+        range.matches(&version.semver().expect("VersionBlock invariant: stored value is valid"))
     }
 
     /// Compute the (inclusive lower, optional upper) semver triple bounds for
@@ -148,17 +145,15 @@ fn normalize_loose(value: &str) -> Result<String, VersionError> {
     };
 
     if body.is_empty() {
-        return Err(VersionError::InvalidRange {
-            source: semver::VersionReq::parse(trimmed).unwrap_err(),
-        });
+        return Err(VersionError::EmptyVersion);
     }
 
     // X.Y.* / X.* — pass through to semver::VersionReq, which accepts these
     // natively. A wildcard mixed with ^ or ~ is rejected.
     if body.contains('*') {
         if !prefix.is_empty() {
-            return Err(VersionError::InvalidRange {
-                source: semver::VersionReq::parse(trimmed).unwrap_err(),
+            return Err(VersionError::NotRepresentable {
+                reason: "wildcard cannot be combined with ^ or ~",
             });
         }
         return Ok(body.to_string());
@@ -179,8 +174,8 @@ fn normalize_loose(value: &str) -> Result<String, VersionError> {
             2 => format!("{}.{}.0", parts[0], parts[1]),
             3 => body.to_string(),
             _ => {
-                return Err(VersionError::InvalidRange {
-                    source: semver::Version::parse(body).unwrap_err(),
+                return Err(VersionError::NotRepresentable {
+                    reason: "too many version segments",
                 });
             }
         };
@@ -195,8 +190,8 @@ fn normalize_loose(value: &str) -> Result<String, VersionError> {
         1 => Ok(format!("^{}", parts[0])),
         2 => Ok(format!("~{}.{}", parts[0], parts[1])),
         3 => Ok(format!("={}.{}.{}", parts[0], parts[1], parts[2])),
-        _ => Err(VersionError::InvalidRange {
-            source: semver::Version::parse(body).unwrap_err(),
+        _ => Err(VersionError::NotRepresentable {
+            reason: "too many version segments",
         }),
     }
 }
@@ -216,8 +211,8 @@ fn bounds_from_str(raw: &str) -> Result<VersionBounds, VersionError> {
     }
 
     if trimmed.contains(',') {
-        return Err(VersionError::InvalidRange {
-            source: semver::VersionReq::parse("###multi-comparator unsupported###").unwrap_err(),
+        return Err(VersionError::NotRepresentable {
+            reason: "multi-comparator ranges are not bound-representable",
         });
     }
 
@@ -229,8 +224,12 @@ fn bounds_from_str(raw: &str) -> Result<VersionBounds, VersionError> {
     };
 
     if body.is_empty() {
-        return Err(VersionError::InvalidRange {
-            source: semver::VersionReq::parse(trimmed).unwrap_err(),
+        return Err(VersionError::EmptyVersion);
+    }
+
+    if body.contains('-') || body.contains('+') {
+        return Err(VersionError::NotRepresentable {
+            reason: "pre-release and build-metadata ranges cannot be expressed as SQL bounds",
         });
     }
 
@@ -242,16 +241,16 @@ fn bounds_from_str(raw: &str) -> Result<VersionBounds, VersionError> {
             } else {
                 part.parse::<u64>()
                     .map(Segment::Num)
-                    .map_err(|_| VersionError::InvalidRange {
-                        source: semver::Version::parse(body).unwrap_err(),
+                    .map_err(|_| VersionError::NotRepresentable {
+                        reason: "invalid character in version segment",
                     })
             }
         })
         .collect::<Result<_, _>>()?;
 
     if segments.is_empty() || segments.len() > 3 {
-        return Err(VersionError::InvalidRange {
-            source: semver::Version::parse(body).unwrap_err(),
+        return Err(VersionError::NotRepresentable {
+            reason: "too many version segments",
         });
     }
 
@@ -278,8 +277,8 @@ enum Segment {
 fn segment_num(segment: &Segment) -> Result<u64, VersionError> {
     match segment {
         Segment::Num(n) => Ok(*n),
-        Segment::Wildcard => Err(VersionError::InvalidRange {
-            source: semver::Version::parse("*").unwrap_err(),
+        Segment::Wildcard => Err(VersionError::NotRepresentable {
+            reason: "wildcard is not valid here",
         }),
     }
 }
@@ -297,8 +296,8 @@ fn plain_bounds(segments: &[Segment]) -> Result<VersionBounds, VersionError> {
             .iter()
             .any(|s| matches!(s, Segment::Num(_)))
         {
-            return Err(VersionError::InvalidRange {
-                source: semver::Version::parse("*.0.*").unwrap_err(),
+            return Err(VersionError::NotRepresentable {
+                reason: "wildcard must be in a trailing position",
             });
         }
         // wild_at == 0 → bare "*" (handled earlier); shouldn't reach.
@@ -349,18 +348,28 @@ fn plain_bounds(segments: &[Segment]) -> Result<VersionBounds, VersionError> {
 }
 
 fn caret_bounds(segments: &[Segment]) -> Result<VersionBounds, VersionError> {
-    // ^X.Y[.Z] — lock major, allow everything below it to vary.
+    // ^X.Y[.Z] — standard three-way caret rule:
+    //   major != 0 → [X.Y.Z, X+1.0.0)
+    //   major == 0, minor != 0 → [0.Y.Z, 0.Y+1.0)
+    //   major == 0, minor == 0 → [0.0.Z, 0.0.Z+1)
     if segments.iter().any(|s| matches!(s, Segment::Wildcard)) {
-        return Err(VersionError::InvalidRange {
-            source: semver::VersionReq::parse("^*").unwrap_err(),
+        return Err(VersionError::NotRepresentable {
+            reason: "wildcard cannot be combined with ^ or ~",
         });
     }
     let major = segment_num(&segments[0])?;
     let minor = segments.get(1).map(segment_num).transpose()?.unwrap_or(0);
     let patch = segments.get(2).map(segment_num).transpose()?.unwrap_or(0);
+    let upper = if major != 0 {
+        SemverTriple::new(checked_add_one(major)?, 0, 0)
+    } else if minor != 0 {
+        SemverTriple::new(0, checked_add_one(minor)?, 0)
+    } else {
+        SemverTriple::new(0, 0, checked_add_one(patch)?)
+    };
     Ok(VersionBounds {
         lower: SemverTriple::new(major, minor, patch),
-        upper: Some(SemverTriple::new(checked_add_one(major)?, 0, 0)),
+        upper: Some(upper),
         upper_inclusive: false,
     })
 }
@@ -370,8 +379,8 @@ fn eq_bounds(segments: &[Segment]) -> Result<VersionBounds, VersionError> {
     // as a single SemverTriple; partial forms (=X, =X.Y) are rejected because
     // the lower bound is ambiguous (does =1.2 mean any 1.2.* or only 1.2.0?).
     if segments.iter().any(|s| matches!(s, Segment::Wildcard)) || segments.len() != 3 {
-        return Err(VersionError::InvalidRange {
-            source: semver::Version::parse("=invalid").unwrap_err(),
+        return Err(VersionError::NotRepresentable {
+            reason: "wildcard cannot be combined with ^ or ~",
         });
     }
     let major = segment_num(&segments[0])?;
@@ -388,8 +397,8 @@ fn eq_bounds(segments: &[Segment]) -> Result<VersionBounds, VersionError> {
 fn tilde_bounds(segments: &[Segment]) -> Result<VersionBounds, VersionError> {
     // ~X.Y[.Z] — lock major+minor, allow patch to vary.
     if segments.iter().any(|s| matches!(s, Segment::Wildcard)) {
-        return Err(VersionError::InvalidRange {
-            source: semver::VersionReq::parse("~*").unwrap_err(),
+        return Err(VersionError::NotRepresentable {
+            reason: "wildcard cannot be combined with ^ or ~",
         });
     }
     let major = segment_num(&segments[0])?;
@@ -426,141 +435,62 @@ mod tests {
     #[test]
     fn matches_caret_full() {
         let range = VersionRange::parse("^1.2.3").unwrap();
-        assert!(
-            range
-                .matches(&VersionBlock::parse("1.2.3").unwrap())
-                .unwrap()
-        );
-        assert!(
-            range
-                .matches(&VersionBlock::parse("1.9.0").unwrap())
-                .unwrap()
-        );
-        assert!(
-            !range
-                .matches(&VersionBlock::parse("2.0.0").unwrap())
-                .unwrap()
-        );
+        assert!(range.matches(&VersionBlock::parse("1.2.3").unwrap()));
+        assert!(range.matches(&VersionBlock::parse("1.9.0").unwrap()));
+        assert!(!range.matches(&VersionBlock::parse("2.0.0").unwrap()));
     }
 
     #[test]
     fn matches_tilde_full() {
         let range = VersionRange::parse("~1.2.3").unwrap();
-        assert!(
-            range
-                .matches(&VersionBlock::parse("1.2.3").unwrap())
-                .unwrap()
-        );
-        assert!(
-            range
-                .matches(&VersionBlock::parse("1.2.9").unwrap())
-                .unwrap()
-        );
-        assert!(
-            !range
-                .matches(&VersionBlock::parse("1.3.0").unwrap())
-                .unwrap()
-        );
+        assert!(range.matches(&VersionBlock::parse("1.2.3").unwrap()));
+        assert!(range.matches(&VersionBlock::parse("1.2.9").unwrap()));
+        assert!(!range.matches(&VersionBlock::parse("1.3.0").unwrap()));
     }
 
     #[test]
     fn parse_loose_normalizes_partial_minor() {
         let range = VersionRange::parse_loose("1.2").unwrap();
-        assert!(
-            range
-                .matches(&VersionBlock::parse("1.2.0").unwrap())
-                .unwrap()
-        );
-        assert!(
-            range
-                .matches(&VersionBlock::parse("1.2.5").unwrap())
-                .unwrap()
-        );
-        assert!(
-            !range
-                .matches(&VersionBlock::parse("1.3.0").unwrap())
-                .unwrap()
-        );
+        assert!(range.matches(&VersionBlock::parse("1.2.0").unwrap()));
+        assert!(range.matches(&VersionBlock::parse("1.2.5").unwrap()));
+        assert!(!range.matches(&VersionBlock::parse("1.3.0").unwrap()));
     }
 
     #[test]
     fn parse_loose_normalizes_partial_major() {
         let range = VersionRange::parse_loose("1").unwrap();
-        assert!(
-            range
-                .matches(&VersionBlock::parse("1.0.0").unwrap())
-                .unwrap()
-        );
-        assert!(
-            range
-                .matches(&VersionBlock::parse("1.9.9").unwrap())
-                .unwrap()
-        );
-        assert!(
-            !range
-                .matches(&VersionBlock::parse("2.0.0").unwrap())
-                .unwrap()
-        );
+        assert!(range.matches(&VersionBlock::parse("1.0.0").unwrap()));
+        assert!(range.matches(&VersionBlock::parse("1.9.9").unwrap()));
+        assert!(!range.matches(&VersionBlock::parse("2.0.0").unwrap()));
     }
 
     #[test]
     fn parse_loose_normalizes_star_minor() {
         let range = VersionRange::parse_loose("1.*").unwrap();
-        assert!(
-            range
-                .matches(&VersionBlock::parse("1.0.0").unwrap())
-                .unwrap()
-        );
-        assert!(
-            range
-                .matches(&VersionBlock::parse("1.9.9").unwrap())
-                .unwrap()
-        );
-        assert!(
-            !range
-                .matches(&VersionBlock::parse("2.0.0").unwrap())
-                .unwrap()
-        );
+        assert!(range.matches(&VersionBlock::parse("1.0.0").unwrap()));
+        assert!(range.matches(&VersionBlock::parse("1.9.9").unwrap()));
+        assert!(!range.matches(&VersionBlock::parse("2.0.0").unwrap()));
     }
 
     #[test]
     fn parse_loose_caret_short() {
         let range = VersionRange::parse_loose("^1.2").unwrap();
-        assert!(
-            range
-                .matches(&VersionBlock::parse("1.2.0").unwrap())
-                .unwrap()
-        );
-        assert!(
-            range
-                .matches(&VersionBlock::parse("1.9.0").unwrap())
-                .unwrap()
-        );
-        assert!(
-            !range
-                .matches(&VersionBlock::parse("2.0.0").unwrap())
-                .unwrap()
-        );
+        assert!(range.matches(&VersionBlock::parse("1.2.0").unwrap()));
+        assert!(range.matches(&VersionBlock::parse("1.9.0").unwrap()));
+        assert!(!range.matches(&VersionBlock::parse("2.0.0").unwrap()));
     }
 
     #[test]
     fn parse_loose_tilde_short() {
         let range = VersionRange::parse_loose("~1.2").unwrap();
-        assert!(
-            range
-                .matches(&VersionBlock::parse("1.2.0").unwrap())
-                .unwrap()
-        );
-        assert!(
-            range
-                .matches(&VersionBlock::parse("1.2.9").unwrap())
-                .unwrap()
-        );
-        assert!(
-            !range
-                .matches(&VersionBlock::parse("1.3.0").unwrap())
-                .unwrap()
-        );
+        assert!(range.matches(&VersionBlock::parse("1.2.0").unwrap()));
+        assert!(range.matches(&VersionBlock::parse("1.2.9").unwrap()));
+        assert!(!range.matches(&VersionBlock::parse("1.3.0").unwrap()));
+    }
+
+    #[test]
+    fn parse_accepts_short_caret_form() {
+        assert!(VersionRange::parse("^1.2").is_ok());
     }
 
     #[test]
@@ -670,6 +600,31 @@ mod tests {
             .unwrap()
             .to_bounds()
             .unwrap_err();
-        assert!(matches!(err, VersionError::InvalidRange { .. }));
+        assert!(matches!(err, VersionError::NotRepresentable { .. }));
+    }
+
+    #[test]
+    fn to_bounds_caret_pre_1_minor() {
+        let bounds = VersionRange::parse("^0.1.2").unwrap().to_bounds().unwrap();
+        assert_eq!(bounds.lower, SemverTriple::new(0, 1, 2));
+        assert_eq!(bounds.upper, Some(SemverTriple::new(0, 2, 0)));
+        assert!(!bounds.upper_inclusive);
+    }
+
+    #[test]
+    fn to_bounds_caret_pre_1_patch() {
+        let bounds = VersionRange::parse("^0.0.3").unwrap().to_bounds().unwrap();
+        assert_eq!(bounds.lower, SemverTriple::new(0, 0, 3));
+        assert_eq!(bounds.upper, Some(SemverTriple::new(0, 0, 4)));
+        assert!(!bounds.upper_inclusive);
+    }
+
+    #[test]
+    fn to_bounds_rejects_prerelease() {
+        let err = VersionRange::parse("^1.0.0-alpha.1")
+            .unwrap()
+            .to_bounds()
+            .unwrap_err();
+        assert!(matches!(err, VersionError::NotRepresentable { .. }));
     }
 }

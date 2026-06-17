@@ -53,11 +53,47 @@ impl Ord for SemverTriple {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VersionBounds {
     /// Inclusive lower bound.
-    pub lower: SemverTriple,
+    pub(crate) lower: SemverTriple,
     /// Upper bound; `None` means unbounded above.
-    pub upper: Option<SemverTriple>,
+    pub(crate) upper: Option<SemverTriple>,
     /// When true, `upper` is inclusive (used for exact pins).
-    pub upper_inclusive: bool,
+    pub(crate) upper_inclusive: bool,
+}
+
+impl VersionBounds {
+    /// Construct a bounds value.
+    ///
+    /// `upper_inclusive` must be false when `upper` is `None`.
+    #[must_use]
+    pub fn new(lower: SemverTriple, upper: Option<SemverTriple>, upper_inclusive: bool) -> Self {
+        debug_assert!(
+            upper.is_some() || !upper_inclusive,
+            "upper_inclusive must be false when upper is None"
+        );
+        Self {
+            lower,
+            upper,
+            upper_inclusive,
+        }
+    }
+
+    /// Inclusive lower bound.
+    #[must_use]
+    pub fn lower(&self) -> SemverTriple {
+        self.lower
+    }
+
+    /// Upper bound; `None` means unbounded above.
+    #[must_use]
+    pub fn upper(&self) -> Option<SemverTriple> {
+        self.upper
+    }
+
+    /// When true, the upper bound is inclusive (used for exact pins).
+    #[must_use]
+    pub fn upper_inclusive(&self) -> bool {
+        self.upper_inclusive
+    }
 }
 
 #[cfg(test)]

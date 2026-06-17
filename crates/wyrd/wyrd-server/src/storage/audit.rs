@@ -2,7 +2,7 @@
 
 use crate::auth::Caller;
 use sqlx::types::Uuid;
-use wyrd_spec::actor::Actor;
+use wyrd_runtime::PrincipalKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::storage::StorageBackendKind;
 use wyrd_sql::TenantConn;
@@ -63,9 +63,9 @@ pub(crate) async fn write(
 }
 
 fn subject_id(caller: &Caller) -> String {
-    match &caller.principal.actor {
-        Actor::User { id, .. } => format!("user:{id}"),
-        Actor::Service { client_id, .. } => format!("service:{client_id}"),
-        Actor::Agent { id, .. } => format!("agent:{id}"),
+    match &caller.principal.kind {
+        PrincipalKind::User => format!("user:{}", caller.principal.id),
+        PrincipalKind::Service { .. } => format!("service:{}", caller.principal.id),
+        PrincipalKind::Agent { .. } => format!("agent:{}", caller.principal.id),
     }
 }

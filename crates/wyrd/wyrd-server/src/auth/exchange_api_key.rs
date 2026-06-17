@@ -514,6 +514,99 @@ impl From<DelegateError> for WyrdError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use chrono::Duration;
+    use secrecy::SecretString;
+    use sqlx::types::Json;
+    use uuid::Uuid;
+    use wyrd_auth_issue::IssuingKey;
+    use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_runtime::{PrincipalId, RbacCheck};
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::RequestedSubject;
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::version::VersionBlock;
+    use wyrd_sql::TenantConn;
+
+    use crate::auth::issue_api_key::WyrdApiKey;
+    use crate::auth::permission_resolver::SqlPermissionResolver;
+    use super::{DelegateError, DelegateToken, ExchangeApiKey, ExchangeError, TokenExchangeSettings};
+
+    const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
+    const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
+
+    fn test_service_card_ref() -> CardRef {
+        CardRef {
+            kind: CardKind::Service,
+            name: CardName::new("test-service").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("prod").expect("static space is valid"),
+            uid: None,
+        }
+    }
+
+    fn test_issuing_key() -> Arc<IssuingKey> {
+        Arc::new(
+            IssuingKey::from_ed_pem(
+                SecretString::from(PRIVATE_KEY_PEM),
+                Kid::new("k1").expect("kid is valid"),
+                "wyrd",
+            )
+            .expect("test private key loads"),
+        )
+    }
+
+    fn exchange_service() -> ExchangeApiKey {
+        ExchangeApiKey {
+            issuing_key: test_issuing_key(),
+            settings: TokenExchangeSettings::default(),
+        }
+    }
+
+    async fn insert_test_user(conn: &mut TenantConn<'_>, tenant_id: DataTenantId) -> Uuid {
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO wyrd.auth_users (id, data_tenant_id, email, auth_type, status)
+             VALUES ($1, $2, $3, 'password', 'active')",
+        )
+        .bind(user_id)
+        .bind(tenant_id.as_uuid())
+        .bind(format!("test-{}@example.com", user_id))
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("test user inserts");
+        user_id
+    }
+
+    async fn insert_test_service_account(
+        conn: &mut TenantConn<'_>,
+        tenant_id: DataTenantId,
+        created_by: Uuid,
+        card_ref: &CardRef,
+    ) -> Uuid {
+        let sa_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO wyrd.auth_service_accounts
+                 (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref, name, status, created_by)
+             VALUES ($1, $2, 'service', 'Service', $3, $4, $5, 'active', $6)",
+        )
+        .bind(sa_id)
+        .bind(tenant_id.as_uuid())
+        .bind(Uuid::new_v4())
+        .bind(Json(card_ref.clone()))
+        .bind(format!("svc-{}", sa_id))
+        .bind(created_by)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("service account inserts");
+        sa_id
+    }
+
     #[test]
     fn argon2_runs_on_blocking_pool() {
         let source = include_str!("exchange_api_key.rs");
@@ -587,5 +680,147 @@ mod tests {
         flat.reverse();
         assert_eq!(flat[0], a.principal.id.to_string());
         assert_eq!(flat[1], b.principal.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_key_rejected() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant_a = fixture.data_tenant_id();
+        let tenant_b = DataTenantId::new_v7();
+
+        // Key has tenant_a embedded in its prefix.
+        let key = WyrdApiKey::generate(tenant_a);
+
+        // Present it through a tenant_b connection. The tenant mismatch fires
+        // before any database query so tenant_b does not need to exist in
+        // platform.tenants.
+        let mut conn = fixture
+            .tenant_conn_for(tenant_b)
+            .await
+            .expect("tenant B conn opens");
+        let result = exchange_service().execute(&mut conn, key.secret).await;
+
+        assert!(matches!(result, Err(ExchangeError::InvalidApiKey)));
+    }
+
+    #[tokio::test]
+    async fn revoked_key_rejected() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let card_ref = test_service_card_ref();
+        let key = WyrdApiKey::generate(tenant);
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
+
+        // Insert the key row with revoked_at = now(). The prefix-lookup query
+        // filters on `revoked_at IS NULL`, so this row is invisible and the
+        // service returns InvalidApiKey.
+        sqlx::query(
+            "INSERT INTO wyrd.auth_api_keys
+                 (id, data_tenant_id, sa_id, prefix, key_hash, created_by, expires_at, revoked_at)
+             VALUES ($1, $2, $3, $4, 'placeholder-hash', $5, now() + interval '1 year', now())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(tenant.as_uuid())
+        .bind(sa_id)
+        .bind(&key.prefix)
+        .bind(user_id)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("revoked api key inserts");
+
+        let result = exchange_service().execute(&mut conn, key.secret).await;
+
+        assert!(matches!(result, Err(ExchangeError::InvalidApiKey)));
+    }
+
+    #[tokio::test]
+    async fn hash_mismatch_rejected() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let card_ref = test_service_card_ref();
+        let key = WyrdApiKey::generate(tenant);
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
+
+        // Store a hash that is not a valid Argon2 PHC string for this key.
+        // verify_api_key() returns false → InvalidApiKey.
+        sqlx::query(
+            "INSERT INTO wyrd.auth_api_keys
+                 (id, data_tenant_id, sa_id, prefix, key_hash, created_by, expires_at)
+             VALUES ($1, $2, $3, $4, 'not-a-valid-phc-hash', $5, now() + interval '1 year')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(tenant.as_uuid())
+        .bind(sa_id)
+        .bind(&key.prefix)
+        .bind(user_id)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("api key with wrong hash inserts");
+
+        let result = exchange_service().execute(&mut conn, key.secret).await;
+
+        assert!(matches!(result, Err(ExchangeError::InvalidApiKey)));
+    }
+
+    #[tokio::test]
+    async fn delegation_permission_denied() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+
+        let issuing_key = test_issuing_key();
+
+        // Issue a service token with no roles → effective permissions are empty
+        // → delegation_issue check fails before any database lookup.
+        let subject_token = issuing_key
+            .issue_service_access_token(
+                PrincipalId::new(Uuid::new_v4()),
+                tenant,
+                test_service_card_ref(),
+                vec![],
+                Duration::minutes(15),
+            )
+            .expect("subject token issues");
+
+        let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
+        let mut decoding_keys = HashMap::new();
+        decoding_keys.insert(
+            Kid::new("k1").expect("kid is valid"),
+            Arc::new(public_key),
+        );
+        let verifier = Arc::new(TokenVerifier::new(
+            decoding_keys,
+            "wyrd",
+            Arc::new(SqlPermissionResolver::new(Arc::new(
+                fixture.app_pool().clone(),
+            ))),
+            WyrdAuthVerifySettings::default(),
+        ));
+
+        let delegate = DelegateToken {
+            issuing_key,
+            verifier,
+            permission_check: Arc::new(RbacCheck),
+            settings: TokenExchangeSettings::default(),
+        };
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let result = delegate
+            .execute(
+                &mut conn,
+                SecretString::from(subject_token),
+                RequestedSubject::PrincipalId {
+                    id: wyrd_spec::auth::PrincipalId::new(Uuid::new_v4()),
+                },
+                "test-request-id",
+            )
+            .await;
+
+        assert!(matches!(result, Err(DelegateError::PermissionDenied)));
     }
 }

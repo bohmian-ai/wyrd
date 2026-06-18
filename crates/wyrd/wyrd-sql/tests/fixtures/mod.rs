@@ -8,6 +8,7 @@ use std::env;
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use url::Url;
 
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
@@ -24,11 +25,11 @@ pub struct TestEnv {
 
 impl TestEnv {
     pub async fn new() -> Self {
-        let migrator_url = env::var("WYRD_TEST_DATABASE_URL")
-            .or_else(|_| env::var("WYRD_DATABASE_URL_MIGRATOR"))
-            .expect("WYRD_TEST_DATABASE_URL must be set for e2e tests");
         let app_url =
-            env::var("WYRD_TEST_DATABASE_URL_APP").unwrap_or_else(|_| migrator_url.clone());
+            env::var("WYRD_DATABASE_URL").expect("WYRD_DATABASE_URL must be set for e2e tests");
+        let migrator_password = env::var("WYRD_DATABASE_MIGRATOR_PASSWORD")
+            .expect("WYRD_DATABASE_MIGRATOR_PASSWORD must be set for e2e tests");
+        let migrator_url = synth_role_url(&app_url, "wyrd_migrator", &migrator_password);
 
         let pool = PgPoolOptions::new()
             .max_connections(5)
@@ -90,6 +91,14 @@ impl TestEnv {
             PermissionSet::new(),
         )
     }
+}
+
+fn synth_role_url(base_url: &str, role: &str, password: &str) -> String {
+    let mut url = Url::parse(base_url).expect("WYRD_DATABASE_URL is a valid URL");
+    url.set_username(role).expect("role name is URL-safe");
+    url.set_password(Some(password))
+        .expect("password is URL-encodable");
+    url.into()
 }
 
 pub fn fixture_card(kind: CardKind, space: &str, name: &str, version: &str) -> Card {

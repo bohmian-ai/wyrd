@@ -5,8 +5,8 @@
 //!
 //! ```
 //! WYRD_STORAGE_E2E=1 \
-//! WYRD_DATABASE_URL_MIGRATOR=postgres://wyrd_migrator:<pw>@localhost/wyrd \
 //! WYRD_DATABASE_URL=postgres://wyrd_app:<pw>@localhost/wyrd \
+//! WYRD_DATABASE_MIGRATOR_PASSWORD=<migrator_pw> \
 //! cargo test -p wyrd-server --all-features --test storage_e2e -- --nocapture
 //! ```
 //!

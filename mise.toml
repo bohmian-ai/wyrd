@@ -22,12 +22,20 @@ run = "cargo fmt --all"
 description = "Workspace clippy with -D warnings (all features, all targets)"
 run = "cargo clippy --locked --workspace --all-features --all-targets -- -D warnings"
 
-[tasks."test:unit"]
-description = "Run all Rust unit tests"
+[tasks."build:postgres"]
+description = "Start a clean Postgres container via docker compose and wait for it to be healthy"
+run = ["docker compose down --volumes", "docker compose up -d --build postgres --wait"]
+
+[tasks."test:rust:workspace"]
+description = "Run workspace Rust unit tests (no DB required)"
 run = """
 cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server
 cargo test --locked -p wyrd-server --all-features
 """
+
+[tasks."test:unit"]
+description = "Aggregate Rust test gate: workspace + storage:local + sql + registry-e2e"
+depends = ["test:rust:workspace", "test:storage:local", "test:sql", "test:registry-e2e"]
 
 [tasks."test:wyrd-spec"]
 description = "Run wyrd-spec Rust tests"
@@ -280,14 +288,15 @@ env = { WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_AZURE_EMULATOR_ENDPOINT = "ht
 run = "cargo test -p wyrd-storage --all-features --test integration_azurite -- --nocapture"
 
 [tasks."test:storage:e2e"]
-description = "Run server-level storage HTTP e2e tests (requires WYRD_DATABASE_URL_MIGRATOR and storage:up)"
+description = "Run server-level storage HTTP e2e tests (requires WYRD_DATABASE_URL and storage:up)"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_INTEGRATION_S3 = "1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1" }
 run = "cargo test -p wyrd-server --all-features --test storage_e2e -- --nocapture"
 
 [tasks."test:registry-e2e"]
 description = "Cards registration end-to-end against a real Postgres"
-env = { WYRD_REG_E2E = "1" }
+depends = ["build:postgres", "db:setup-roles", "db:migrate"]
+env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = "cargo test --locked -p wyrd-sql --features test-e2e --test cards_e2e -- --include-ignored"
 
 [tasks."test:storage:s3:cloud"]
@@ -748,35 +757,35 @@ esac
 
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
-depends = ["check", "test:unit", "test:storage:local", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
+depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
 
 [tasks."db:setup-roles"]
 description = """Create wyrd_app and wyrd_platform_admin roles in the target Postgres instance.
-Required env vars:
-  WYRD_DATABASE_URL_MIGRATOR=postgres://wyrd_migrator:<pw>@<host>/wyrd
+Targets the local docker-compose Postgres by default; the docker-compose
+bootstrap user is wyrd_migrator (which owns the database).
 """
+env = { WYRD_MIGRATOR_DSN = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd" }
 run = """
-psql "$WYRD_DATABASE_URL_MIGRATOR" -c "ALTER ROLE wyrd_migrator BYPASSRLS;" || true
-psql "$WYRD_DATABASE_URL_MIGRATOR" -c "CREATE ROLE wyrd_app LOGIN PASSWORD 'wyrd_app_pw';" || true
-psql "$WYRD_DATABASE_URL_MIGRATOR" -c "CREATE ROLE wyrd_platform_admin LOGIN PASSWORD 'wyrd_platform_admin_pw' BYPASSRLS;" || true
+psql "$WYRD_MIGRATOR_DSN" -c "ALTER ROLE wyrd_migrator BYPASSRLS;" || true
+psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE wyrd_app LOGIN PASSWORD 'wyrd_app_pw';" || true
+psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE wyrd_platform_admin LOGIN PASSWORD 'wyrd_platform_admin_pw' BYPASSRLS;" || true
 """
 
 [tasks."db:migrate"]
-description = """Apply wyrd-sql migrations against WYRD_DATABASE_URL_MIGRATOR.
+description = """Apply wyrd-sql migrations against the local docker-compose Postgres.
 Runs the idempotent migration test, which also verifies that required Postgres
 roles (wyrd_migrator BYPASSRLS, wyrd_app no-BYPASSRLS, wyrd_platform_admin
 BYPASSRLS) are present before applying DDL.
-Required env vars:
-  WYRD_DATABASE_URL_MIGRATOR=postgres://wyrd_migrator:<pw>@localhost/wyrd
 """
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw" }
 run = "cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture"
 
 [tasks."test:sql"]
-description = """Run live Postgres SQL integration tests.
-Required env vars:
-  WYRD_DATABASE_URL_MIGRATOR=postgres://wyrd_migrator:<pw>@localhost/wyrd
-  WYRD_DATABASE_URL=postgres://wyrd_app:<pw>@localhost/wyrd  (required for cross-tenant RLS test)
+description = """Run live Postgres SQL integration tests against docker-compose Postgres.
+Brings up Postgres, provisions roles, and applies migrations before running tests.
 """
+depends = ["build:postgres", "db:setup-roles", "db:migrate"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = "cargo test --locked -p wyrd-sql --all-features --test migration_pg -- --nocapture"
 
 [tasks."dev:pg:nuke"]

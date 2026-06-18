@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: wyrd
+      POSTGRES_USER: wyrd_migrator
+      POSTGRES_PASSWORD: wyrd_migrator_pw
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "wyrd_migrator", "-d", "wyrd"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

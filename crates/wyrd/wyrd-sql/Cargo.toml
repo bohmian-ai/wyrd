@@ -20,6 +20,7 @@ sqlx = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
@@ -41,3 +42,4 @@ optional = true
 paste = { workspace = true }
 sqlx = { workspace = true, features = ["postgres", "uuid", "json"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+url = { workspace = true }

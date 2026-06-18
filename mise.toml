@@ -34,8 +34,12 @@ cargo test --locked -p wyrd-server --all-features
 """
 
 [tasks."test:unit"]
-description = "Aggregate Rust test gate: workspace + storage:local + sql + registry-e2e"
-depends = ["test:rust:workspace", "test:storage:local", "test:sql", "test:registry-e2e"]
+description = """Aggregate Rust test gate: workspace + storage emulator matrix + sql + registry-e2e.
+Only real-credential cloud storage tests (test:storage:{s3,gcs,azure}:cloud) are gated to
+storage-integration-cloud.yml; emulator-backed storage tests run here because they are just
+docker containers, same difficulty as Postgres.
+"""
+depends = ["test:rust:workspace", "test:storage:matrix", "test:sql", "test:registry-e2e"]
 
 [tasks."test:wyrd-spec"]
 description = "Run wyrd-spec Rust tests"
@@ -254,8 +258,16 @@ cargo tree -e=no-dev -i object_store --all-features 2>&1 \
 """
 
 [tasks."storage:up"]
-description = "Start local storage emulators: MinIO, fake-gcs-server, and Azurite"
-run = "docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d"
+description = """Start local storage emulators (RustFS, fake-gcs-server, Azurite) and
+provision the shared test bucket/container on each. Setup sidecars run in the `setup`
+compose profile so they are explicit one-shots, not background services.
+"""
+run = """
+docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait
+docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm rustfs-setup
+docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm gcs-setup
+docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm azurite-setup
+"""
 
 [tasks."storage:down"]
 description = "Stop local storage emulators and remove their volumes"
@@ -269,16 +281,16 @@ run = "docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml logs
 description = "Run wyrd-storage local backend integration tests"
 run = "cargo test -p wyrd-storage --all-features --test integration_local"
 
-[tasks."test:storage:minio"]
-description = "Run wyrd-storage MinIO integration tests; requires storage:up"
+[tasks."test:storage:rustfs"]
+description = "Run wyrd-storage S3 integration tests against the local RustFS emulator; requires storage:up"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_INTEGRATION_S3 = "1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1" }
-run = "cargo test -p wyrd-storage --all-features --test integration_minio -- --nocapture"
+run = "cargo test -p wyrd-storage --all-features --test integration_rustfs -- --nocapture"
 
 [tasks."test:storage:gcs-emu"]
 description = "Run wyrd-storage GCS emulator integration tests; requires storage:up"
 depends = ["storage:up"]
-env = { WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_GCS_EMULATOR_HOST = "http://localhost:4443/storage/v1/" }
+env = { WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_GCS_EMULATOR_HOST = "http://localhost:4443" }
 run = "cargo test -p wyrd-storage --all-features --test integration_gcs -- --nocapture"
 
 [tasks."test:storage:azurite"]
@@ -288,9 +300,9 @@ env = { WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_AZURE_EMULATOR_ENDPOINT = "ht
 run = "cargo test -p wyrd-storage --all-features --test integration_azurite -- --nocapture"
 
 [tasks."test:storage:e2e"]
-description = "Run server-level storage HTTP e2e tests (requires WYRD_DATABASE_URL and storage:up)"
-depends = ["storage:up"]
-env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_INTEGRATION_S3 = "1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1" }
+description = "Run server-level storage HTTP e2e tests against RustFS + Postgres docker emulators"
+depends = ["storage:up", "build:postgres", "db:setup-roles", "db:migrate"]
+env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_INTEGRATION_S3 = "1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = "cargo test -p wyrd-server --all-features --test storage_e2e -- --nocapture"
 
 [tasks."test:registry-e2e"]
@@ -316,7 +328,7 @@ run = "cargo test -p wyrd-server --all-features --test storage_e2e -- --nocaptur
 
 [tasks."test:storage:matrix"]
 description = "Run all storage emulator integration tests; requires storage:up"
-depends = ["test:storage:local", "test:storage:gcs-emu", "test:storage:minio", "test:storage:azurite", "test:storage:e2e"]
+depends = ["test:storage:local", "test:storage:gcs-emu", "test:storage:rustfs", "test:storage:azurite", "test:storage:e2e"]
 
 [tasks."check:storage:drift"]
 description = "Assert storage foundation guardrails against paths that exist in this workspace"

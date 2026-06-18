@@ -3,7 +3,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::UploadPlan;
 use wyrd_storage::factory::gcs::build_emulator_signer;
 
-const EMULATOR_HOST: &str = "http://localhost:4443/storage/v1/";
+const EMULATOR_HOST: &str = "http://localhost:4443";
 const EMULATOR_BUCKET: &str = "wyrd-storage-test";
 
 #[tokio::test]

@@ -97,7 +97,7 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
 
-      - name: Test Rust workspace
+      - name: Run Rust test gate
         run: mise run test:unit
 
   rust-gates:
@@ -160,62 +160,6 @@ jobs:
           mise run check:unwrap-audit
           mise run check:test-contracts
           mise run check:wasm
-
-  registry-e2e:
-    name: registry e2e (postgres)
-    needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_DB: wyrd
-          POSTGRES_USER: wyrd_migrator
-          POSTGRES_PASSWORD: wyrd_migrator_pw
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-    env:
-      WYRD_DATABASE_URL_MIGRATOR: postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd
-      WYRD_TEST_DATABASE_URL: postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd
-      WYRD_TEST_DATABASE_URL_APP: postgres://wyrd_app:wyrd_app_pw@localhost/wyrd
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - name: Set up mise
-        uses: jdx/mise-action@v3
-        with:
-          install: true
-          cache: true
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Setup database roles
-        run: mise run db:setup-roles
-
-      - name: Run migrations
-        run: mise run db:migrate
-
-      - name: Run registry e2e tests
-        run: mise run test:registry-e2e
 
   codegen:
     name: codegen
@@ -383,7 +327,7 @@ jobs:
 
   ci-complete:
     name: ci complete
-    needs: [changes, matrix-plan, rust, rust-gates, registry-e2e, codegen, python, docs, ui]
+    needs: [changes, matrix-plan, rust, rust-gates, codegen, python, docs, ui]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -395,7 +339,6 @@ jobs:
           for result in \
             "${{ needs.rust.result }}" \
             "${{ needs.rust-gates.result }}" \
-            "${{ needs.registry-e2e.result }}" \
             "${{ needs.codegen.result }}" \
             "${{ needs.python.result }}" \
             "${{ needs.docs.result }}" \

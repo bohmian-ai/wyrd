@@ -32,7 +32,8 @@ on:
 #   AZURE_CLOUD_SUBSCRIPTION_ID — Azure subscription ID
 #   AZURE_CLOUD_ACCOUNT_NAME    — Azure storage account name
 #   AZURE_CLOUD_CONTAINER_NAME  — Azure blob container name
-#   WYRD_DATABASE_URL_MIGRATOR  — Postgres migrator DSN for e2e test tenant setup
+#   WYRD_DATABASE_URL                       — Postgres app DSN (wyrd_app role) for e2e test tenant setup
+#   WYRD_DATABASE_MIGRATOR_PASSWORD         — wyrd_migrator role password for boot-time migrations
 
 permissions:
   contents: read
@@ -63,7 +64,8 @@ jobs:
           WYRD_STORAGE_BACKEND: s3
           WYRD_STORAGE_S3_BUCKET: ${{ secrets.AWS_CLOUD_BUCKET_NAME }}
           WYRD_STORAGE_S3_REGION: ${{ secrets.AWS_CLOUD_REGION }}
-          WYRD_DATABASE_URL_MIGRATOR: ${{ secrets.WYRD_DATABASE_URL_MIGRATOR }}
+          WYRD_DATABASE_URL: ${{ secrets.WYRD_DATABASE_URL }}
+          WYRD_DATABASE_MIGRATOR_PASSWORD: ${{ secrets.WYRD_DATABASE_MIGRATOR_PASSWORD }}
         run: mise run test:storage:s3:cloud
 
   gcs-cloud:
@@ -87,7 +89,8 @@ jobs:
         env:
           WYRD_STORAGE_BACKEND: gcs
           WYRD_STORAGE_GCS_BUCKET: ${{ secrets.GCP_CLOUD_BUCKET_NAME }}
-          WYRD_DATABASE_URL_MIGRATOR: ${{ secrets.WYRD_DATABASE_URL_MIGRATOR }}
+          WYRD_DATABASE_URL: ${{ secrets.WYRD_DATABASE_URL }}
+          WYRD_DATABASE_MIGRATOR_PASSWORD: ${{ secrets.WYRD_DATABASE_MIGRATOR_PASSWORD }}
         run: mise run test:storage:gcs:cloud
 
   azure-cloud:
@@ -113,5 +116,6 @@ jobs:
           WYRD_STORAGE_BACKEND: azure
           WYRD_STORAGE_AZURE_ACCOUNT: ${{ secrets.AZURE_CLOUD_ACCOUNT_NAME }}
           WYRD_STORAGE_AZURE_CONTAINER: ${{ secrets.AZURE_CLOUD_CONTAINER_NAME }}
-          WYRD_DATABASE_URL_MIGRATOR: ${{ secrets.WYRD_DATABASE_URL_MIGRATOR }}
+          WYRD_DATABASE_URL: ${{ secrets.WYRD_DATABASE_URL }}
+          WYRD_DATABASE_MIGRATOR_PASSWORD: ${{ secrets.WYRD_DATABASE_MIGRATOR_PASSWORD }}
         run: mise run test:storage:azure:cloud

@@ -6,13 +6,13 @@ use wyrd_spec::storage::{S3CompletedPart, UploadPlan};
 use wyrd_storage::s3::S3Signer;
 
 #[tokio::test]
-async fn minio_s3_multipart_round_trip_when_enabled() {
+async fn rustfs_s3_multipart_round_trip_when_enabled() {
     if std::env::var("WYRD_STORAGE_INTEGRATION_S3").as_deref() != Ok("1") {
-        eprintln!("skipping MinIO integration test; set WYRD_STORAGE_INTEGRATION_S3=1");
+        eprintln!("skipping RustFS integration test; set WYRD_STORAGE_INTEGRATION_S3=1");
         return;
     }
 
-    let signer = build_minio_signer().await;
+    let signer = build_rustfs_signer().await;
     let tenant = DataTenantId::new_v7();
     let card_uid = uuid::Uuid::now_v7();
     let full = wyrd_storage::tenant_path::build(tenant, &card_uid.to_string(), "matrix/big.bin");
@@ -79,7 +79,7 @@ async fn minio_s3_multipart_round_trip_when_enabled() {
     assert_eq!(head.size_bytes, 10 * 1024 * 1024);
 }
 
-async fn build_minio_signer() -> S3Signer {
+async fn build_rustfs_signer() -> S3Signer {
     use aws_config::BehaviorVersion;
     use aws_sdk_s3::Client;
     use aws_sdk_s3::config::{Builder, Credentials, Region};

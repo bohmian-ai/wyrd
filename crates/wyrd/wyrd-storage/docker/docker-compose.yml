@@ -1,24 +1,40 @@
 services:
-  minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
-    container_name: wyrd-storage-minio
-    command: ["server", "/data", "--console-address", ":9001"]
+  rustfs:
+    image: rustfs/rustfs@sha256:fa19210ac4697c79d7ccca1ec9b0eb91aebacc6691991ffb14014bb3c67e6cc3
+    container_name: wyrd-storage-rustfs
     environment:
-      MINIO_ROOT_USER: wyrd-test-key
-      MINIO_ROOT_PASSWORD: wyrd-test-secret
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ENABLE: "false"
+      RUSTFS_ACCESS_KEY: wyrd-test-key
+      RUSTFS_SECRET_KEY: wyrd-test-secret
+      RUSTFS_OBS_LOGGER_LEVEL: warn
     ports:
       - "9000:9000"
-      - "9001:9001"
     volumes:
-      - minio-data:/data
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9000 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
-  minio-setup:
-    image: minio/mc:RELEASE.2025-04-16T18-16-33Z
+  rustfs-setup:
+    image: amazon/aws-cli@sha256:c14aafe81d3af04ea4e4ed91c1731308b8195881f774e1aaaa7a5f3d88da81df
+    profiles: ["setup"]
     depends_on:
-      - minio
-    entrypoint: ["/bin/sh", "/setup/setup-buckets.sh"]
-    volumes:
-      - ./setup-buckets.sh:/setup/setup-buckets.sh:ro
+      rustfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: wyrd-test-key
+      AWS_SECRET_ACCESS_KEY: wyrd-test-secret
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket wyrd-storage-test 2>&1
+        | grep -v -E 'BucketAlreadyOwnedByYou|BucketAlreadyExists' >&2; true
+    restart: "no"
 
   fake-gcs-server:
     image: fsouza/fake-gcs-server:1.50.2@sha256:23996047676fe5312001b828d800670519181c57a5943c2270e7421f3ab3f477
@@ -36,6 +52,27 @@ services:
       - "4443:4443"
     volumes:
       - gcs-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:4443/storage/v1/b 2>&1 | grep -q 'kind' || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  gcs-setup:
+    image: curlimages/curl@sha256:83a505ba2ba62f208ed6e410c268b7b9aa48f0f7b403c8108b9773b44199dbba
+    profiles: ["setup"]
+    depends_on:
+      fake-gcs-server:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        curl -fsS -o /dev/null -X POST
+        http://fake-gcs-server:4443/storage/v1/b
+        -H 'Content-Type: application/json'
+        -d '{"name":"wyrd-storage-test"}'
+        || curl -fsS http://fake-gcs-server:4443/storage/v1/b/wyrd-storage-test > /dev/null
+    restart: "no"
 
   azurite:
     image: mcr.microsoft.com/azure-storage/azurite:3.34.0@sha256:0a47e12e3693483cef5c71f35468b91d751611f172d2f97414e9c69113b106d9
@@ -45,8 +82,29 @@ services:
       - "10000:10000"
     volumes:
       - azurite-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 10000 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  azurite-setup:
+    image: mcr.microsoft.com/azure-cli@sha256:6d7791e595999664478813ee6da9b340dc087be87cce9f581ded83cc4bf15ca0
+    profiles: ["setup"]
+    depends_on:
+      azurite:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        az storage container create
+        --name wyrd-storage-test
+        --connection-string
+        "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
+        > /dev/null
+    restart: "no"
 
 volumes:
-  minio-data:
+  rustfs-data:
   gcs-data:
   azurite-data:

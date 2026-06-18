@@ -169,8 +169,9 @@ pub enum SqlError {
         code = "WYRD_SQL_500_INSUFFICIENT_PRIVILEGE",
         status = 500,
         title = "Insufficient database privileges",
-        remediation = "Ensure WYRD_DATABASE_URL_MIGRATOR authenticates as wyrd_migrator for \
-                       migrate() and WYRD_DATABASE_URL authenticates as wyrd_app for runtime queries."
+        remediation = "Ensure WYRD_DATABASE_URL authenticates as wyrd_app for runtime queries, \
+                       and WYRD_DATABASE_MIGRATOR_PASSWORD matches the wyrd_migrator role used \
+                       by migrate()."
     )]
     #[error("insufficient database privileges: {detail}")]
     InsufficientPrivilege {

@@ -103,10 +103,12 @@ survive into `AppState`.
 
 The server boot sequence is:
 
-1. Resolve role DSNs from `WYRD_DATABASE_URL`,
-   `WYRD_DATABASE_URL_MIGRATOR`, and optional
-   `WYRD_DATABASE_URL_PLATFORM_ADMIN`, or derive all three from embedded
-   Postgres.
+1. Resolve role DSNs from `WYRD_DATABASE_URL` (canonical app DSN) plus
+   `WYRD_DATABASE_MIGRATOR_PASSWORD` and optional
+   `WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD`. The migrator and platform-admin
+   DSNs are synthesized at boot by swapping the userinfo of the canonical
+   URL to the matching role name and password. All three unset starts
+   embedded Postgres and derives the role DSNs from the managed instance.
 2. Build the `wyrd_migrator` pool with migrator defaults.
 3. Run `wyrd-sql` migrations and `vala-sql` migrations against that same
    migrator pool.

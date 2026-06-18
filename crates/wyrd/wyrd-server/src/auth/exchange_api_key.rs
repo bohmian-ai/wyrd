@@ -626,14 +626,16 @@ mod tests {
         let sa_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO wyrd.auth_service_accounts
-                 (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref, name, status, created_by)
-             VALUES ($1, $2, 'service', 'Service', $3, $4, $5, 'active', $6)",
+                 (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref, space, name, version, status, created_by)
+             VALUES ($1, $2, 'service', 'Service', $3, $4, $5, $6, $7, 'active', $8)",
         )
         .bind(sa_id)
         .bind(tenant_id.as_uuid())
         .bind(Uuid::new_v4())
         .bind(Json(card_ref.clone()))
+        .bind(card_ref.space.as_str())
         .bind(format!("svc-{}", sa_id))
+        .bind(card_ref.version.as_str())
         .bind(created_by)
         .execute(&mut **conn.transaction())
         .await

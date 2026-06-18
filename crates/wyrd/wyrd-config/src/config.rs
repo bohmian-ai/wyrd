@@ -43,16 +43,6 @@ pub struct Defaults {
     /// Default annotations merged per-key into `metadata.annotations`.
     #[serde(default)]
     pub annotations: Annotations,
-    // `version` is intentionally absent. Filling `metadata.version`
-    // from the loader silently changes which auto-bump branch the
-    // server takes (None / Scope / Pin are three distinct intents).
-    // L7 in the overview locks this; Q5 documents the rationale and
-    // the `bump_intent` follow-up that re-enables defaulting.
-    //
-    // `name` is intentionally absent. `deny_unknown_fields` surfaces
-    // `[defaults] name = "..."` as WYRD_CFG_400_SCHEMA_MISMATCH; the
-    // parser additionally maps that specific case to
-    // WYRD_CFG_400_NAME_DEFAULT_REJECTED for a clearer message.
 }
 
 /// `[kind.<Kind>]` override table.

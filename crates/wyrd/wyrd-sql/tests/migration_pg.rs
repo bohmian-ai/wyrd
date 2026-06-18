@@ -609,9 +609,21 @@ async fn assert_platform_resolver_shape(pool: &PgPool) {
         "platform.resolve_tenant_by_slug must pin search_path to pg_catalog, platform"
     );
 
+    // PUBLIC is a pseudo-role and cannot be passed to has_function_privilege
+    // (it errors with `role "PUBLIC" does not exist`). Inspect pg_proc.proacl
+    // directly: aclexplode emits grantee = 0 for the PUBLIC grant entry.
     let privileges: (bool, bool, bool) = sqlx::query_as(
         "SELECT
-             has_function_privilege('PUBLIC', 'platform.resolve_tenant_by_slug(text)', 'EXECUTE'),
+             EXISTS (
+                 SELECT 1
+                 FROM pg_proc p
+                 JOIN pg_namespace n ON n.oid = p.pronamespace
+                 CROSS JOIN LATERAL aclexplode(p.proacl) a
+                 WHERE n.nspname = 'platform'
+                   AND p.proname = 'resolve_tenant_by_slug'
+                   AND a.grantee = 0
+                   AND a.privilege_type = 'EXECUTE'
+             ),
              has_function_privilege('wyrd_app', 'platform.resolve_tenant_by_slug(text)', 'EXECUTE'),
              has_function_privilege('wyrd_platform_admin', 'platform.resolve_tenant_by_slug(text)', 'EXECUTE')",
     )

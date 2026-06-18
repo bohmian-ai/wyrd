@@ -1254,6 +1254,122 @@ ergonomic they expect from JSON-Schema `$ref` / OpenAPI external-file imports.
 
 ---
 
+## Workspace config (`wyrd.toml`)
+
+Wyrd's wire contract pins every card to a full `(kind, name, version,
+space)` identity. Authors writing many cards in one bundle pay a
+verbosity tax for that strictness — `space: prod` and
+`version: "1.4.2"` repeat across every doc in a file. This section
+formalizes the loader-side ergonomic that resolves it without
+touching the wire.
+
+### File and discovery
+
+- Filename: `wyrd.toml`, at the apply-root of the bundle.
+- Discovery: the CLI and SDK ancestor-walk from the working
+  directory and use the first `wyrd.toml` found, **capped at the
+  nearest `.git` ancestor or `$HOME`, whichever comes first**. The
+  walk does not cross those boundaries even when no `wyrd.toml` is
+  present. The cap mirrors the affordances Cargo (`.git`) and npm
+  (package root) already give engineers and prevents a stray
+  `wyrd.toml` outside the user's workspace from being silently
+  loaded in CI runners, containers, or shared user homes.
+- Explicit override: `WyrdConfig::load(Some(&path))` accepts an
+  exact file path (used by the future `wyrd --config <path>` flag
+  and `WYRD_CONFIG` env var; both are spec'd but not wired in this
+  packet). Explicit relative paths are preserved as-given; the
+  ancestor walk does not run.
+- Absent file: not an error. The CLI/SDK operates with system
+  defaults only.
+
+### Schema
+
+```toml
+[defaults]
+space = "prod"
+
+[defaults.labels]
+team   = "churn-ml"
+domain = "customer"
+
+[defaults.annotations]
+"acme.com/owner" = "data-platform"
+
+# Per-kind override; PascalCase keys match CardKind serialization.
+[kind.Model]
+space = "ml-prod"
+
+[kind.Policy.labels]
+tier = "governance"
+```
+
+- Defaultable fields: `space`, `labels`, `annotations`.
+- **`name` is never defaultable.** Every card's identity must be
+  authored. A `name` key under `[defaults]` or any `[kind.<X>]`
+  deserializes to a typed error.
+- **`version` is intentionally not defaultable in v1.** The register
+  path treats a `None`, `Scope`, or `Pin` version as three distinct
+  authored intents (auto-bump from latest, prefix-line bump, exact
+  pin). Filling `metadata.version` from the loader would silently
+  change which branch the server takes — a wire-shape violation
+  even though the field itself remains in the payload. The
+  `bump_intent` semantics required to make defaulting safe are
+  out of scope for this packet; `version` returns to `[defaults]`
+  alongside them.
+- **Per-kind table keys are PascalCase** matching
+  `CardKind::wire_name()` — the same identifier appears identically
+  in YAML (`kind: Model`), TOML (`[kind.Model]`), and Rust source.
+  `[kind.External]` is reserved as a forward-compat catch-all on
+  the wire and is **not** a valid override-table key here; using
+  it raises `WYRD_CFG_400_SCHEMA_MISMATCH`.
+- **Unknown tables and unknown keys are errors**
+  (`#[serde(deny_unknown_fields)]`). A typo like `[default]`
+  (missing `s`) surfaces at parse time, not as silent drop. The
+  `deny_unknown_fields` posture means any future top-level table
+  addition requires a coordinated client release.
+
+### Precedence (most specific wins)
+
+1. Value explicit in the card YAML.
+2. `[kind.<Kind>]` table value.
+3. `[defaults]` table value.
+4. System fallback (`space = "default"`, empty `labels` /
+   `annotations`).
+
+### Merge rules
+
+- **Scalars** (`space`): set if the card field is `None`; otherwise
+  leave.
+- **Maps** (`labels`, `annotations`): per-key merge. For each key
+  present in the config, insert into the card's map only if absent.
+  Per-card values always win for their own keys; other config keys
+  still apply.
+- **`version`, `name`, `uid`, `bump`, `spec_hash`, `artifact_hash`
+  are never touched** by the loader. The first three are author
+  identity / intent (lock L4 plus Q5 for `version`); the last three
+  are server-derived.
+
+This is the same architectural slot as the loader-side
+`metadata.space` inheritance documented in "Light-card reference
+forms" above: the wire payload still arrives at the server fully
+populated; the server never reads `wyrd.toml`.
+
+### No lockfile by design
+
+Wyrd has no version-range resolution. Every `CardRef` is authored
+exact (strict `MAJOR.MINOR.PATCH`, no `latest`, no comparators), so
+there is nothing to "pin" that isn't already pinned at the source.
+Adding a `wyrd.lock` would teach users a mental model that contradicts
+the wire contract — they would expect `version: latest` to be
+resolvable, and the honest answer is "no."
+
+A future `[dependencies]` table in `wyrd.toml` is reserved for
+cross-tenant foreign-card content pinning (a `go.sum`-flavored
+integrity check, not a range resolver). It is **out of scope** until
+cross-tenant card import is a supported workflow.
+
+---
+
 ## Reference-direction quick reference
 
 | Card    | Refs that authored on it             | Refs that point at it          |

@@ -91,8 +91,8 @@ pub async fn insert_service_account(
         r#"
         INSERT INTO wyrd.auth_service_accounts (
             id, data_tenant_id, principal_kind, card_kind, card_uid,
-            card_ref, name, description, status, created_by
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', $9)
+            card_ref, space, name, version, description, status, created_by
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active', $11)
         "#,
     )
     .bind(id)
@@ -101,7 +101,9 @@ pub async fn insert_service_account(
     .bind(card_kind)
     .bind(card_uid)
     .bind(Json(card_ref))
+    .bind(card_ref.space.as_str())
     .bind(name)
+    .bind(card_ref.version.to_string())
     .bind(description)
     .bind(created_by)
     .execute(&mut **conn.transaction())

@@ -253,10 +253,10 @@ impl From<IssueKeyError> for WyrdError {
 mod tests {
     use super::{WyrdApiKey, principal_kind_for_card};
     use secrecy::ExposeSecret;
+    use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
-    use wyrd_semver::VersionBlock;
 
     #[test]
     fn generated_api_key_parses_tenant_and_prefix() {

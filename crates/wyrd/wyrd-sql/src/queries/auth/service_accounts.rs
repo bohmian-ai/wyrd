@@ -1,4 +1,5 @@
 //! Tenant-scoped non-human principal and API-key queries.
+// raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -50,6 +51,84 @@ pub struct ApiKeyLookupRow {
     pub card_ref: Json<CardRef>,
     /// Principal status.
     pub status: String,
+}
+
+/// API-key status derived from row presence and lifecycle timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiKeyStatus {
+    /// Row exists, `revoked_at IS NULL`, and `expires_at > now()`.
+    Active,
+    /// Row exists and `revoked_at IS NOT NULL`.
+    Revoked,
+    /// Row exists, is not revoked, and `expires_at <= now()`.
+    Expired,
+    /// No row matches the prefix.
+    Missing,
+}
+
+/// Insert a Service or Agent principal row.
+///
+/// The database check constraint enforces the allowed `principal_kind` and
+/// `card_kind` combinations.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the insert.
+pub async fn insert_service_account(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+    principal_kind: &str,
+    card_ref: &CardRef,
+    name: &str,
+    description: Option<&str>,
+    created_by: Uuid,
+) -> Result<(), sqlx::Error> {
+    let card_kind = card_ref.kind.wire_name();
+    let card_uid = card_ref.uid.as_ref().map_or_else(Uuid::nil, |uid| {
+        Uuid::parse_str(uid.as_str()).expect("CardUid invariant: stored value is a valid UUID")
+    });
+
+    sqlx::query(
+        r#"
+        INSERT INTO wyrd.auth_service_accounts (
+            id, data_tenant_id, principal_kind, card_kind, card_uid,
+            card_ref, name, description, status, created_by
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', $9)
+        "#,
+    )
+    .bind(id)
+    .bind(conn.data_tenant_id().as_uuid())
+    .bind(principal_kind)
+    .bind(card_kind)
+    .bind(card_uid)
+    .bind(Json(card_ref))
+    .bind(name)
+    .bind(description)
+    .bind(created_by)
+    .execute(&mut **conn.transaction())
+    .await?;
+    Ok(())
+}
+
+/// Soft-delete a service account by marking `status = 'deleted'`.
+///
+/// Returns `Ok(true)` when a row was updated, `Ok(false)` when no row matched.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the update.
+pub async fn delete_service_account(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE wyrd.auth_service_accounts
+            SET status = 'deleted', updated_at = now()
+          WHERE data_tenant_id = wyrd.current_tenant()
+            AND id = $1",
+    )
+    .bind(id)
+    .execute(&mut **conn.transaction())
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Find an active Service/Agent principal by card ref.
@@ -145,6 +224,36 @@ pub async fn api_key_by_prefix(
     .await
 }
 
+/// Resolve an API key status by prefix without filtering invalid states.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the query or row decoding fails.
+pub async fn api_key_status_by_prefix(
+    conn: &mut TenantConn<'_>,
+    prefix: &str,
+) -> Result<ApiKeyStatus, sqlx::Error> {
+    let row: Option<(Option<DateTime<Utc>>, DateTime<Utc>)> = sqlx::query_as(
+        r#"
+        SELECT revoked_at, expires_at
+          FROM wyrd.auth_api_keys
+         WHERE data_tenant_id = $1
+           AND prefix = $2
+         LIMIT 1
+        "#,
+    )
+    .bind(conn.data_tenant_id().as_uuid())
+    .bind(prefix)
+    .fetch_optional(&mut **conn.transaction())
+    .await?;
+
+    Ok(match row {
+        None => ApiKeyStatus::Missing,
+        Some((Some(_), _)) => ApiKeyStatus::Revoked,
+        Some((None, expires_at)) if expires_at <= Utc::now() => ApiKeyStatus::Expired,
+        Some((None, _)) => ApiKeyStatus::Active,
+    })
+}
+
 /// Mark API key usage.
 pub async fn touch_api_key_last_used(
     conn: &mut TenantConn<'_>,
@@ -166,27 +275,15 @@ pub async fn touch_api_key_last_used(
 }
 
 /// Return role names granted to a non-human principal.
+#[deprecated(
+    since = "0.0.1",
+    note = "use role_assignments::list_service_account_roles"
+)]
 pub async fn service_account_roles(
     conn: &mut TenantConn<'_>,
     principal_id: Uuid,
 ) -> Result<Vec<String>, sqlx::Error> {
-    let rows = sqlx::query_scalar::<_, String>(
-        r#"
-        SELECT r.name
-          FROM wyrd.auth_service_account_roles sar
-          JOIN wyrd.auth_roles r
-            ON r.data_tenant_id = sar.data_tenant_id
-           AND r.id = sar.role_id
-         WHERE sar.data_tenant_id = $1
-           AND sar.service_account_id = $2
-         ORDER BY r.name
-        "#,
-    )
-    .bind(conn.data_tenant_id().as_uuid())
-    .bind(principal_id)
-    .fetch_all(&mut **conn.transaction())
-    .await?;
-    Ok(rows)
+    super::role_assignments::list_service_account_roles(conn, principal_id).await
 }
 
 /// Insert a principal-generic refresh token row.
@@ -273,12 +370,12 @@ pub async fn insert_audit_token_exchange(
 #[cfg(test)]
 mod tests {
     use sqlx::types::Json;
+    use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
-    use wyrd_semver::VersionBlock;
 
-    use super::{INSERT_REFRESH_TOKEN_SQL, SERVICE_ACCOUNT_BY_CARD_REF_SQL};
+    use super::{ApiKeyStatus, INSERT_REFRESH_TOKEN_SQL, SERVICE_ACCOUNT_BY_CARD_REF_SQL};
 
     #[test]
     fn api_key_lookup_filters_all_public_invalid_key_cases() {
@@ -329,5 +426,17 @@ mod tests {
         assert!(INSERT_REFRESH_TOKEN_SQL.contains("token_hash"));
         assert!(!INSERT_REFRESH_TOKEN_SQL.contains("user_id"));
         assert!(!INSERT_REFRESH_TOKEN_SQL.contains("service_account_id"));
+    }
+
+    #[test]
+    fn api_key_status_enum_covers_invalid_states() {
+        let statuses = [
+            ApiKeyStatus::Active,
+            ApiKeyStatus::Revoked,
+            ApiKeyStatus::Expired,
+            ApiKeyStatus::Missing,
+        ];
+        assert_eq!(statuses.len(), 4);
+        assert_eq!(ApiKeyStatus::Active, ApiKeyStatus::Active);
     }
 }

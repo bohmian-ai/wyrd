@@ -6,7 +6,7 @@ use wyrd_runtime::{Principal, PrincipalKind, PrincipalRef};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
-use crate::request::AuthzCheckRequest;
+use crate::request::{AuthzCheckRequest, AuthzCheckRequestMetadata};
 
 /// Authz-check evaluation context.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +19,8 @@ pub struct AuthzCheckContext {
     pub chain: Vec<PrincipalRef>,
     /// Header-derived request metadata.
     pub request: AuthzCheckRequest,
+    /// Mesh-projected request metadata, when present.
+    pub metadata: Option<AuthzCheckRequestMetadata>,
     /// Request correlator for audit and response headers.
     pub request_id: RequestId,
 }
@@ -56,6 +58,7 @@ impl AuthzCheckContext {
     pub fn from_verified(
         verified: &VerifiedToken,
         request: AuthzCheckRequest,
+        metadata: Option<AuthzCheckRequestMetadata>,
         request_id: RequestId,
     ) -> Result<Self, AuthzCheckContextError> {
         if !matches!(
@@ -80,6 +83,7 @@ impl AuthzCheckContext {
             caller,
             chain,
             request,
+            metadata,
             request_id,
         })
     }
@@ -100,12 +104,12 @@ mod tests {
     use wyrd_runtime::{
         DelegationStep, PermissionSet, Principal, PrincipalId, PrincipalKind, PrincipalRef, RoleRef,
     };
+    use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_semver::VersionBlock;
 
     use crate::context::{AuthzCheckContext, AuthzCheckContextError, is_delegated_token};
     use crate::request::AuthzCheckRequest;
@@ -132,9 +136,9 @@ mod tests {
 
     fn request() -> AuthzCheckRequest {
         AuthzCheckRequest {
-            method: "POST".to_owned(),
-            path: "/v1/cards".to_owned(),
-            host: "service.wyrd".to_owned(),
+            target: card_ref(CardKind::Service, "callee"),
+            action: "card_write".to_owned(),
+            context: serde_json::json!({}),
         }
     }
 
@@ -169,7 +173,7 @@ mod tests {
         });
         let verified = verified(callee.clone(), vec![initiator.clone(), immediate.clone()]);
 
-        let ctx = AuthzCheckContext::from_verified(&verified, request(), request_id())
+        let ctx = AuthzCheckContext::from_verified(&verified, request(), None, request_id())
             .expect("delegated token is accepted");
 
         assert_eq!(ctx.callee, callee);
@@ -192,7 +196,7 @@ mod tests {
 
         assert!(!is_delegated_token(&verified));
         assert_eq!(
-            AuthzCheckContext::from_verified(&verified, request(), request_id()),
+            AuthzCheckContext::from_verified(&verified, request(), None, request_id()),
             Err(AuthzCheckContextError::RequiresDelegationChain)
         );
     }
@@ -207,7 +211,7 @@ mod tests {
 
         assert!(!is_delegated_token(&verified));
         assert_eq!(
-            AuthzCheckContext::from_verified(&verified, request(), request_id()),
+            AuthzCheckContext::from_verified(&verified, request(), None, request_id()),
             Err(AuthzCheckContextError::RequiresServiceOrAgentKind)
         );
     }

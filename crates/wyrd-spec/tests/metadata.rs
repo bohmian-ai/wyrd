@@ -4,13 +4,13 @@ use skald_spec::wire::openai_chat::OpenAiMessageContent;
 use skald_spec::{
     OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, Prompt, ProviderRequest, ResponseType,
 };
+use wyrd_semver::VersionBlock;
+use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::prompt::PromptSpec;
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
 use wyrd_spec::format;
 use wyrd_spec::ids::CardName;
 use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError};
-use wyrd_semver::VersionBlock;
-use wyrd_spec::api_version::ApiVersion;
 
 #[test]
 fn labels_and_annotations_round_trip_as_string_maps() {

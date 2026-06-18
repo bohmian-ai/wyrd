@@ -11,7 +11,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
 use crate::auth::Caller;
-use crate::auth::exchange_api_key::{DelegateToken, ExchangeApiKey};
+use crate::auth::exchange_api_key::{DelegateToken, ExchangeApiKey, map_exchange_error_to_wyrd};
 use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
 use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
@@ -32,7 +32,7 @@ async fn token(
         TokenRequest::WyrdApiKey { api_key } => {
             let parsed = WyrdApiKey::parse(api_key.expose()).map_err(|_| {
                 WyrdErrorResponse::from(WyrdError::ApiKeyInvalid {
-                    message: "API key not found, revoked, expired, or hash mismatch".to_owned(),
+                    message: "API key format is invalid".to_owned(),
                     details: serde_json::json!({ "reason": "format" }),
                 })
             })?;
@@ -40,13 +40,20 @@ async fn token(
             let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, parsed.tenant_id)
                 .await
                 .map_err(sql_error)?;
+            let prefix = parsed.prefix.clone();
             let exchanged = ExchangeApiKey {
                 issuing_key,
                 settings: Default::default(),
             }
             .execute(&mut conn, SecretString::from(api_key.expose().to_owned()))
-            .await
-            .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
+            .await;
+            let exchanged = match exchanged {
+                Ok(exchanged) => exchanged,
+                Err(error) => {
+                    let wyrd = map_exchange_error_to_wyrd(&mut conn, &prefix, error).await;
+                    return Err(WyrdErrorResponse::from(wyrd));
+                }
+            };
             conn.commit().await.map_err(sql_error)?;
             Ok(Json(exchanged.into_response()))
         }

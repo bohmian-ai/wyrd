@@ -21,8 +21,8 @@ pub enum Actor {
         /// Service account name (human-readable label).
         name: String,
         /// Stable opaque client identifier from verified claims — never a
-        /// credential. Populated from the JWT `sub` or equivalent claim when
-        /// real auth lands; stubbed as a generated ID in stub-auth builds.
+        /// credential. Populated from the JWT `sub` or equivalent verified
+        /// identity claim.
         client_id: String,
     },
     /// Agent identity.

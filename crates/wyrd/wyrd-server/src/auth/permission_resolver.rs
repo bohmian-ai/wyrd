@@ -89,6 +89,7 @@ mod tests {
     fn decodes_and_merges_permissions_from_existing_role_rows() {
         let rows = vec![
             RoleRow {
+                id: uuid::Uuid::nil(),
                 name: "reader".to_owned(),
                 permissions: json!([
                     { "resource": "cards", "action": "read" },
@@ -96,6 +97,7 @@ mod tests {
                 ]),
             },
             RoleRow {
+                id: uuid::Uuid::nil(),
                 name: "admin".to_owned(),
                 permissions: json!([{ "resource": "wildcard", "action": "wildcard" }]),
             },
@@ -111,6 +113,7 @@ mod tests {
     #[test]
     fn reports_role_name_for_malformed_permissions() {
         let rows = vec![RoleRow {
+            id: uuid::Uuid::nil(),
             name: "bad_role".to_owned(),
             permissions: json!([{ "resource": "cards", "action": "unknown" }]),
         }];

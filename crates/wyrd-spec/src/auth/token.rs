@@ -85,8 +85,8 @@ mod tests {
     use crate::envelope::CardKind;
     use crate::ids::{CardName, SpaceName};
     use crate::reference::CardRef;
-    use wyrd_semver::VersionBlock;
     use chrono::Utc;
+    use wyrd_semver::VersionBlock;
 
     #[test]
     fn token_response_has_no_card_ref_wire_field() {

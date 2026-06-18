@@ -16,8 +16,9 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    api_key_by_prefix, insert_audit_token_exchange, insert_refresh_token, service_account_by_id,
-    service_account_roles, touch_api_key_last_used,
+    ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, insert_audit_token_exchange,
+    insert_refresh_token, list_service_account_roles, service_account_by_id,
+    touch_api_key_last_used,
 };
 
 use crate::auth::issue_api_key::{WyrdApiKey, principal_kind_for_card};
@@ -189,7 +190,7 @@ impl ExchangeApiKey {
             return Err(ExchangeError::HashMismatch);
         }
 
-        let roles = role_refs(service_account_roles(conn, row.principal_id).await?)
+        let roles = role_refs(list_service_account_roles(conn, row.principal_id).await?)
             .map_err(|_| ExchangeError::InvalidRole)?;
         touch_api_key_last_used(conn, row.api_key_id).await?;
         issue_for_subject(
@@ -232,7 +233,7 @@ impl DelegateToken {
         let row = resolve_requested_subject(conn, requested_subject).await?;
         let _ = runtime_principal_kind(&row.principal_kind, row.card_ref.0.clone())
             .ok_or(DelegateError::SubjectNotFound)?;
-        let roles = role_refs(service_account_roles(conn, row.id).await?)
+        let roles = role_refs(list_service_account_roles(conn, row.id).await?)
             .map_err(|_| DelegateError::InvalidRole)?;
         let caller = DelegationCaller {
             sub: verified
@@ -433,27 +434,80 @@ fn token_hash(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
-impl From<ExchangeError> for WyrdError {
-    fn from(error: ExchangeError) -> Self {
-        match error {
-            ExchangeError::CrossTenant
-            | ExchangeError::NotFound
-            | ExchangeError::AccountDisabled
-            | ExchangeError::HashMismatch => WyrdError::ApiKeyInvalid {
-                message: "API key not found, revoked, expired, or hash mismatch".to_owned(),
-                details: json!({}),
-            },
-            ExchangeError::Issue(_) | ExchangeError::Join(_) | ExchangeError::InvalidRole => {
-                WyrdError::Internal {
-                    message: "failed to exchange API key".to_owned(),
-                    details: json!({}),
-                }
-            }
-            ExchangeError::Database(_) => WyrdError::AuthVerifyUnavailable {
-                message: "auth backend unavailable".to_owned(),
-                details: json!({ "retry_after_seconds": 1 }),
-            },
+/// Disambiguate `ExchangeError::NotFound` by checking API-key lifecycle status.
+pub(crate) async fn resolve_not_found_reason(
+    conn: &mut TenantConn<'_>,
+    prefix: &str,
+) -> &'static str {
+    reason_from_api_key_status(api_key_status_by_prefix(conn, prefix).await, prefix)
+}
+
+fn reason_from_api_key_status(
+    result: Result<ApiKeyStatus, sqlx::Error>,
+    prefix: &str,
+) -> &'static str {
+    match result {
+        Ok(ApiKeyStatus::Revoked) => "revoked",
+        Ok(ApiKeyStatus::Expired) => "expired",
+        Ok(ApiKeyStatus::Missing) => "not_found",
+        Ok(ApiKeyStatus::Active) => {
+            tracing::warn!(
+                prefix = %prefix,
+                "api_key_status_by_prefix returned Active after ExchangeError::NotFound; race or cache inconsistency",
+            );
+            "not_found"
         }
+        Err(error) => {
+            tracing::error!(
+                prefix = %prefix,
+                error = %error,
+                "api_key_status_by_prefix failed on error path",
+            );
+            "backend_unavailable"
+        }
+    }
+}
+
+/// Map API-key exchange errors to public Wyrd errors.
+///
+/// Credential failures keep the single public
+/// `WYRD_AUTH_401_API_KEY_INVALID` code and discriminate through
+/// `details.reason`.
+pub async fn map_exchange_error_to_wyrd(
+    conn: &mut TenantConn<'_>,
+    prefix: &str,
+    error: ExchangeError,
+) -> WyrdError {
+    match error {
+        ExchangeError::CrossTenant => WyrdError::ApiKeyInvalid {
+            message: "API key tenant does not match connection tenant".to_owned(),
+            details: json!({ "reason": "cross_tenant" }),
+        },
+        ExchangeError::NotFound => {
+            let reason = resolve_not_found_reason(conn, prefix).await;
+            WyrdError::ApiKeyInvalid {
+                message: format!("API key {reason}"),
+                details: json!({ "reason": reason }),
+            }
+        }
+        ExchangeError::AccountDisabled => WyrdError::ApiKeyInvalid {
+            message: "service account is not active".to_owned(),
+            details: json!({ "reason": "account_disabled" }),
+        },
+        ExchangeError::HashMismatch => WyrdError::ApiKeyInvalid {
+            message: "API key hash verification failed".to_owned(),
+            details: json!({ "reason": "hash_mismatch" }),
+        },
+        ExchangeError::Issue(_) | ExchangeError::Join(_) | ExchangeError::InvalidRole => {
+            WyrdError::Internal {
+                message: "failed to exchange API key".to_owned(),
+                details: json!({}),
+            }
+        }
+        ExchangeError::Database(_) => WyrdError::AuthVerifyUnavailable {
+            message: "auth backend unavailable".to_owned(),
+            details: json!({ "retry_after_seconds": 1 }),
+        },
     }
 }
 
@@ -489,10 +543,11 @@ impl From<DelegateError> for WyrdError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use chrono::Duration;
+    use chrono::{Duration, Utc};
     use secrecy::SecretString;
     use sqlx::types::Json;
     use uuid::Uuid;
@@ -500,13 +555,15 @@ mod tests {
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{PrincipalId, RbacCheck};
+    use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::RequestedSubject;
     use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
-    use wyrd_semver::VersionBlock;
     use wyrd_sql::TenantConn;
+    use wyrd_sql::queries::auth::ApiKeyStatus;
 
     use super::{
         DelegateError, DelegateToken, ExchangeApiKey, ExchangeError, TokenExchangeSettings,
@@ -584,6 +641,41 @@ mod tests {
         sa_id
     }
 
+    async fn insert_lifecycle_key(
+        conn: &mut TenantConn<'_>,
+        tenant: DataTenantId,
+        sa_id: Uuid,
+        created_by: Uuid,
+        prefix: &str,
+        expires_at: chrono::DateTime<Utc>,
+        revoked: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO wyrd.auth_api_keys
+                 (id, data_tenant_id, sa_id, prefix, key_hash, created_by, expires_at, revoked_at)
+             VALUES ($1, $2, $3, $4, 'placeholder-hash', $5, $6, CASE WHEN $7 THEN now() ELSE NULL END)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(tenant.as_uuid())
+        .bind(sa_id)
+        .bind(prefix)
+        .bind(created_by)
+        .bind(expires_at)
+        .bind(revoked)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("api key lifecycle row inserts");
+    }
+
+    fn api_key_invalid_reason(error: &WyrdError) -> &str {
+        match error {
+            WyrdError::ApiKeyInvalid { details, .. } => details["reason"]
+                .as_str()
+                .expect("api key invalid details.reason is a string"),
+            other => panic!("expected ApiKeyInvalid, got {other:?}"),
+        }
+    }
+
     #[test]
     fn argon2_runs_on_blocking_pool() {
         let source = include_str!("exchange_api_key.rs");
@@ -597,11 +689,11 @@ mod tests {
         use wyrd_runtime::{
             DelegationStep, PrincipalId, PrincipalKind, PrincipalRef as RuntimePrincipalRef,
         };
+        use wyrd_semver::VersionBlock;
         use wyrd_spec::DataTenantId;
         use wyrd_spec::envelope::CardKind;
         use wyrd_spec::ids::{CardName, SpaceName};
         use wyrd_spec::reference::CardRef;
-        use wyrd_semver::VersionBlock;
 
         let tenant_id: DataTenantId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
             .parse()
@@ -655,6 +747,89 @@ mod tests {
         flat.reverse();
         assert_eq!(flat[0], a.principal.id.to_string());
         assert_eq!(flat[1], b.principal.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn api_key_invalid_reason_distinct_for_every_variant() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let card_ref = test_service_card_ref();
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
+
+        insert_lifecycle_key(
+            &mut conn,
+            tenant,
+            sa_id,
+            user_id,
+            "revoked-prefix",
+            Utc::now() + Duration::days(1),
+            true,
+        )
+        .await;
+        insert_lifecycle_key(
+            &mut conn,
+            tenant,
+            sa_id,
+            user_id,
+            "expired-prefix",
+            Utc::now() - Duration::hours(1),
+            false,
+        )
+        .await;
+
+        let mut reasons = BTreeSet::new();
+        for (prefix, error) in [
+            ("direct", ExchangeError::CrossTenant),
+            ("missing-prefix", ExchangeError::NotFound),
+            ("revoked-prefix", ExchangeError::NotFound),
+            ("expired-prefix", ExchangeError::NotFound),
+            ("direct", ExchangeError::AccountDisabled),
+            ("direct", ExchangeError::HashMismatch),
+        ] {
+            let mapped = super::map_exchange_error_to_wyrd(&mut conn, prefix, error).await;
+            let reason = api_key_invalid_reason(&mapped);
+            assert!(!reason.is_empty());
+            assert!(
+                reasons.insert(reason.to_owned()),
+                "duplicate reason {reason}"
+            );
+        }
+
+        let backend_unavailable =
+            super::reason_from_api_key_status(Err(sqlx::Error::RowNotFound), "prefix");
+        assert_eq!(backend_unavailable, "backend_unavailable");
+        assert!(reasons.insert(backend_unavailable.to_owned()));
+
+        assert_eq!(
+            reasons,
+            BTreeSet::from([
+                "account_disabled".to_owned(),
+                "backend_unavailable".to_owned(),
+                "cross_tenant".to_owned(),
+                "expired".to_owned(),
+                "hash_mismatch".to_owned(),
+                "not_found".to_owned(),
+                "revoked".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn notfound_status_active_logs_race_and_returns_not_found() {
+        let reason = super::reason_from_api_key_status(Ok(ApiKeyStatus::Active), "race-prefix");
+
+        assert_eq!(reason, "not_found");
+    }
+
+    #[test]
+    fn notfound_status_err_returns_backend_unavailable() {
+        let reason =
+            super::reason_from_api_key_status(Err(sqlx::Error::RowNotFound), "error-prefix");
+
+        assert_eq!(reason, "backend_unavailable");
     }
 
     #[tokio::test]

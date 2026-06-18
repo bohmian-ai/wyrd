@@ -26,7 +26,7 @@ run = "cargo clippy --locked --workspace --all-features --all-targets -- -D warn
 description = "Run all Rust unit tests"
 run = """
 cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server
-cargo test --locked -p wyrd-server --features stub-auth
+cargo test --locked -p wyrd-server --all-features
 """
 
 [tasks."test:wyrd-spec"]
@@ -283,7 +283,7 @@ run = "cargo test -p wyrd-storage --all-features --test integration_azurite -- -
 description = "Run server-level storage HTTP e2e tests (requires WYRD_DATABASE_URL_MIGRATOR and storage:up)"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_INTEGRATION_S3 = "1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1" }
-run = "cargo test -p wyrd-server --features stub-auth --test storage_e2e -- --nocapture"
+run = "cargo test -p wyrd-server --all-features --test storage_e2e -- --nocapture"
 
 [tasks."test:registry-e2e"]
 description = "Cards registration end-to-end against a real Postgres"
@@ -293,17 +293,17 @@ run = "cargo test --locked -p wyrd-sql --features test-e2e --test cards_e2e -- -
 [tasks."test:storage:s3:cloud"]
 description = "Run storage e2e tests against real AWS S3 (requires AWS credentials in env)"
 env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_BACKEND = "s3" }
-run = "cargo test -p wyrd-server --features stub-auth --test storage_e2e -- --nocapture"
+run = "cargo test -p wyrd-server --all-features --test storage_e2e -- --nocapture"
 
 [tasks."test:storage:gcs:cloud"]
 description = "Run storage e2e tests against real GCS (requires GCP credentials in env)"
 env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_BACKEND = "gcs" }
-run = "cargo test -p wyrd-server --features stub-auth --test storage_e2e -- --nocapture"
+run = "cargo test -p wyrd-server --all-features --test storage_e2e -- --nocapture"
 
 [tasks."test:storage:azure:cloud"]
 description = "Run storage e2e tests against real Azure Blob Storage (requires Azure credentials in env)"
 env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_BACKEND = "azure" }
-run = "cargo test -p wyrd-server --features stub-auth --test storage_e2e -- --nocapture"
+run = "cargo test -p wyrd-server --all-features --test storage_e2e -- --nocapture"
 
 [tasks."test:storage:matrix"]
 description = "Run all storage emulator integration tests; requires storage:up"

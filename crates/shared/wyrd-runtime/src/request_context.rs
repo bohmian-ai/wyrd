@@ -104,11 +104,11 @@ mod tests {
     use crate::permission::PermissionSet;
     use crate::principal::{Principal, PrincipalId, PrincipalKind, PrincipalRef};
     use chrono::Utc;
+    use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, IdempotencyKey, SpaceName};
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_semver::VersionBlock;
 
     fn request_id() -> RequestId {
         RequestId::parse(&uuid::Uuid::now_v7().to_string())

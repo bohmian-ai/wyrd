@@ -5,11 +5,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;
 use thiserror::Error;
 
+use crate::api_version::ApiVersion;
 use crate::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
 use crate::error::WyrdError;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
-use crate::api_version::ApiVersion;
 use crate::reference::{CardRef, PromptRef};
 use wyrd_semver::VersionBlock;
 
@@ -136,9 +136,7 @@ impl AgentCard {
                 .resolved_pin()
                 .map(ToString::to_string)
                 .ok_or_else(|| {
-                    AgentCardError::validation(
-                        "Agent Card envelope missing resolved version pin",
-                    )
+                    AgentCardError::validation("Agent Card envelope missing resolved version pin")
                 })?,
             uid: card
                 .metadata

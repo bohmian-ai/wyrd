@@ -103,11 +103,10 @@
       "type": "string"
     },
     "Metadata": {
-      "description": "Card metadata common to every kind.",
+      "description": "Card metadata common to every kind.\n\n`version` and `bump` capture the author's declarative intent on the register path. The server resolves both to a concrete pin before the envelope is returned to the caller:\n\n- Pre-register: `version` may be `None` (server bumps absolute latest or seeds `0.1.0`), `Some(VersionSpec::Scope(\"1.0\"))` (server bumps within the prefix line), or `Some(VersionSpec::Pin(\"1.4.2\"))` (exact pin). `bump` selects the bump level applied on the auto-bump paths (defaults to `Patch` if unset). - Post-register: `version` is always `Some(VersionSpec::Pin(resolved))`; readers may use [`Metadata::resolved_pin`] to extract the [`VersionBlock`].",
       "type": "object",
       "required": [
-        "name",
-        "version"
+        "name"
       ],
       "properties": {
         "annotations": {
@@ -122,6 +121,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "bump": {
+          "description": "Bump level applied on the auto-bump paths (`None` or `Scope` `version`). Defaults to `Patch` when unset. Ignored on the exact-pin path.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/VersionBump"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "labels": {
@@ -169,10 +179,13 @@
           ]
         },
         "version": {
-          "description": "Exact Card version.",
-          "allOf": [
+          "description": "Authored version: `None` (auto-bump from absolute latest), a bare partial scope (`\"1\"` / `\"1.0\"` — bump within the prefix line), or a full triple pin (`\"1.4.2\"`). Always populated and always a pin post-register.",
+          "anyOf": [
             {
-              "$ref": "#/definitions/VersionBlock"
+              "$ref": "#/definitions/VersionSpec"
+            },
+            {
+              "type": "null"
             }
           ]
         }
@@ -230,8 +243,111 @@
         }
       }
     },
-    "VersionBlock": {
-      "description": "Semver-compatible version string.",
+    "VersionBump": {
+      "description": "Semantic version bump level.\n\n`Major`, `Minor`, and `Patch` perform a conventional semver bump and clear any pre-release / build metadata. `Pre`, `Build`, and `PreBuild` are additive: they apply the requested pre-release or build metadata to the existing triple without resetting it.",
+      "oneOf": [
+        {
+          "description": "Increment major and reset minor, patch, pre-release, and build metadata.",
+          "type": "string",
+          "enum": [
+            "major"
+          ]
+        },
+        {
+          "description": "Increment minor and reset patch, pre-release, and build metadata.",
+          "type": "string",
+          "enum": [
+            "minor"
+          ]
+        },
+        {
+          "description": "Increment patch and reset pre-release and build metadata.",
+          "type": "string",
+          "enum": [
+            "patch"
+          ]
+        },
+        {
+          "description": "Set the pre-release identifier on the current triple (e.g. \"rc.1\").",
+          "type": "object",
+          "required": [
+            "pre"
+          ],
+          "properties": {
+            "pre": {
+              "type": "object",
+              "required": [
+                "identifier"
+              ],
+              "properties": {
+                "identifier": {
+                  "description": "Pre-release identifier as defined by SemVer 2.0 §9.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Set the build metadata on the current triple (e.g. \"001\", \"sha-abc123\").",
+          "type": "object",
+          "required": [
+            "build"
+          ],
+          "properties": {
+            "build": {
+              "type": "object",
+              "required": [
+                "metadata"
+              ],
+              "properties": {
+                "metadata": {
+                  "description": "Build metadata as defined by SemVer 2.0 §10.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Set both pre-release and build metadata on the current triple.",
+          "type": "object",
+          "required": [
+            "pre_build"
+          ],
+          "properties": {
+            "pre_build": {
+              "type": "object",
+              "required": [
+                "build",
+                "pre"
+              ],
+              "properties": {
+                "build": {
+                  "description": "Build metadata.",
+                  "type": "string"
+                },
+                "pre": {
+                  "description": "Pre-release identifier.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "VersionSpec": {
+      "description": "Authored version on the card-registration path. Either a full semver triple pin (e.g. \"1.4.2\", \"1.4.2-rc.1+meta\") or a bare partial scope (e.g. \"1\", \"1.0\"). Range comparators (^, ~, *, >=, ...) are rejected on this path.",
+      "examples": [
+        "1.4.2",
+        "1.4.2-rc.1+meta",
+        "1.0",
+        "1"
+      ],
       "type": "string"
     }
   }

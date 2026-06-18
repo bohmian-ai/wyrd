@@ -190,10 +190,10 @@ impl PrincipalRef {
 mod tests {
     use super::{Principal, PrincipalId, PrincipalKind, PrincipalRef, RoleRef};
     use crate::permission::{Permission, PermissionSet};
+    use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
-    use wyrd_semver::VersionBlock;
 
     fn service_card_ref() -> CardRef {
         CardRef {

@@ -63,16 +63,33 @@ impl TestEnv {
             .await
             .expect("failed to open TenantConn")
     }
-}
 
-pub fn fixture_principal_user(tenant: DataTenantId) -> Principal {
-    Principal::new(
-        PrincipalId::new(uuid::Uuid::now_v7()),
-        PrincipalKind::User,
-        tenant,
-        vec![],
-        PermissionSet::new(),
-    )
+    /// Insert an active human user under `tenant` and return a `Principal`
+    /// pointing at it. Service / Agent card registration writes
+    /// `created_by = principal.id` into `wyrd.auth_service_accounts`, which
+    /// FK-references `wyrd.auth_users(data_tenant_id, id)`; the row must exist
+    /// before registration runs.
+    pub async fn fixture_user(&self, tenant: DataTenantId) -> Principal {
+        let id = uuid::Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO wyrd.auth_users \
+                 (id, data_tenant_id, email, auth_type, status) \
+             VALUES ($1, $2, $3, 'password', 'active')",
+        )
+        .bind(id)
+        .bind(tenant.as_uuid())
+        .bind(format!("test-{}@wyrd.local", id.simple()))
+        .execute(&self.pool)
+        .await
+        .expect("failed to insert fixture user");
+        Principal::new(
+            PrincipalId::new(id),
+            PrincipalKind::User,
+            tenant,
+            vec![],
+            PermissionSet::new(),
+        )
+    }
 }
 
 pub fn fixture_card(kind: CardKind, space: &str, name: &str, version: &str) -> Card {

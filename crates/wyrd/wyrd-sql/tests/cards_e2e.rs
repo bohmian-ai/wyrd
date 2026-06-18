@@ -16,7 +16,7 @@ use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::CardUid;
 
 mod fixtures;
-use fixtures::{TestEnv, asserts::*, fixture_card, fixture_principal_user, scenarios};
+use fixtures::{TestEnv, asserts::*, fixture_card, scenarios};
 
 fn should_run_e2e() -> bool {
     env::var("WYRD_REG_E2E").as_deref() == Ok("1")
@@ -74,7 +74,7 @@ macro_rules! for_each_card_kind {
 for_each_card_kind!(register, |kind| {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
-    let actor = fixture_principal_user(tenant);
+    let actor = env.fixture_user(tenant).await;
     let card = fixture_card(kind.clone(), "prod", "fresh-card", "1.0.0");
 
     let outcome = scenarios::register_fresh(&env, tenant, &actor, &card)
@@ -93,7 +93,7 @@ for_each_card_kind!(register, |kind| {
 e2e_test!(register_missing_space_returns_400_invalid_card_spec, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
-    let actor = fixture_principal_user(tenant);
+    let actor = env.fixture_user(tenant).await;
     let mut card = fixture_card(CardKind::Model, "prod", "churn", "1.0.0");
     card.metadata.space = None;
 
@@ -107,7 +107,7 @@ e2e_test!(register_missing_space_returns_400_invalid_card_spec, {
 for_each_card_kind!(reapply_identical, |kind| {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
-    let actor = fixture_principal_user(tenant);
+    let actor = env.fixture_user(tenant).await;
     let card = fixture_card(kind.clone(), "prod", "stable-card", "1.0.0");
 
     let (first, second) = scenarios::register_then_reapply_identical(&env, tenant, &actor, &card)
@@ -126,7 +126,7 @@ for_each_card_kind!(reapply_identical, |kind| {
 for_each_card_kind!(reapply_drifted, |kind| {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
-    let actor = fixture_principal_user(tenant);
+    let actor = env.fixture_user(tenant).await;
     let v1 = fixture_card(kind, "prod", "drift-card", "1.0.0");
 
     let (first, err) = scenarios::register_then_reapply_with_drift(&env, tenant, &actor, &v1)
@@ -142,7 +142,7 @@ for_each_card_kind!(reapply_drifted, |kind| {
 e2e_test!(soft_delete_active_card_flips_status, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
-    let actor = fixture_principal_user(tenant);
+    let actor = env.fixture_user(tenant).await;
     let card = fixture_card(CardKind::Prompt, "ops", "triage-prompt", "0.4.0");
     let registered = scenarios::register_fresh(&env, tenant, &actor, &card)
         .await
@@ -156,7 +156,7 @@ e2e_test!(soft_delete_active_card_flips_status, {
 e2e_test!(soft_delete_unknown_uid_returns_404, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
-    let actor = fixture_principal_user(tenant);
+    let actor = env.fixture_user(tenant).await;
 
     let unknown_uid = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("valid uuidv7");
     let mut conn = env.tenant_conn(tenant).await;
@@ -175,8 +175,8 @@ e2e_test!(
         let env = TestEnv::new().await;
         let tenant1 = env.fresh_tenant().await;
         let tenant2 = env.fresh_tenant().await;
-        let actor1 = fixture_principal_user(tenant1);
-        let actor2 = fixture_principal_user(tenant2);
+        let actor1 = env.fixture_user(tenant1).await;
+        let actor2 = env.fixture_user(tenant2).await;
         let card = fixture_card(CardKind::Model, "prod", "shared-name", "1.0.0");
 
         let out1 = scenarios::register_fresh(&env, tenant1, &actor1, &card)

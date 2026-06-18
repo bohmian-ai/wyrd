@@ -1,6 +1,7 @@
 //! Paginated list queries for `wyrd.cards`.
 #![deny(missing_docs)]
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
@@ -17,7 +18,9 @@ pub const MAX_LIST_LIMIT: u32 = 200;
 /// Keyset pagination on `(created_at ASC, card_uid ASC)`.
 #[derive(Debug, Clone)]
 pub struct ListCursor {
-    /// Continue after this card uid (`None` = start from the beginning).
+    /// Continue after this timestamp (`None` = start from the beginning).
+    pub after_created_at: Option<DateTime<Utc>>,
+    /// Continue after this card uid (paired with `after_created_at`).
     pub after_uid: Option<CardUid>,
     /// Page size (must be in `1..=MAX_LIST_LIMIT`).
     pub limit: u32,
@@ -39,9 +42,9 @@ const LIST_BY_KIND: &str = r#"
     FROM wyrd.cards
     WHERE kind = $1
       AND ($2::text IS NULL OR status = $2)
-      AND ($3::uuid IS NULL OR card_uid > $3)
+      AND ($3::timestamptz IS NULL OR (created_at, card_uid) > ($3, $4::uuid))
     ORDER BY created_at ASC, card_uid ASC
-    LIMIT $4
+    LIMIT $5
 "#;
 
 const LIST_BY_SPACE: &str = r#"
@@ -51,9 +54,9 @@ const LIST_BY_SPACE: &str = r#"
     FROM wyrd.cards
     WHERE space = $1
       AND ($2::text IS NULL OR status = $2)
-      AND ($3::uuid IS NULL OR card_uid > $3)
+      AND ($3::timestamptz IS NULL OR (created_at, card_uid) > ($3, $4::uuid))
     ORDER BY created_at ASC, card_uid ASC
-    LIMIT $4
+    LIMIT $5
 "#;
 
 const LIST_BY_STATUS: &str = r#"
@@ -63,9 +66,9 @@ const LIST_BY_STATUS: &str = r#"
     FROM wyrd.cards
     WHERE status = $1
       AND ($2::text IS NULL OR kind = $2)
-      AND ($3::uuid IS NULL OR card_uid > $3)
+      AND ($3::timestamptz IS NULL OR (created_at, card_uid) > ($3, $4::uuid))
     ORDER BY created_at ASC, card_uid ASC
-    LIMIT $4
+    LIMIT $5
 "#;
 
 fn validate_cursor(cursor: &ListCursor) -> Result<(), WyrdError> {
@@ -97,6 +100,7 @@ pub async fn list_cards_by_kind(
     cursor: ListCursor,
 ) -> Result<ListPage<CardRow>, WyrdError> {
     validate_cursor(&cursor)?;
+    let after_created_at = cursor.after_created_at;
     let after_uid: Option<Uuid> = cursor.after_uid.as_ref().map(|u| u.as_uuid());
     let status_filter = status.as_ref().map(|s| s.as_db_str());
     let limit = cursor.limit as i64 + 1;
@@ -104,13 +108,14 @@ pub async fn list_cards_by_kind(
     let rows = sqlx::query_as::<_, CardRow>(LIST_BY_KIND)
         .bind(kind.wire_name())
         .bind(status_filter)
+        .bind(after_created_at)
         .bind(after_uid)
         .bind(limit)
         .fetch_all(&mut **conn.transaction())
         .await
         .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?;
 
-    build_page(rows, cursor)
+    Ok(build_page(rows, cursor))
 }
 
 /// List cards filtered by space.
@@ -129,6 +134,7 @@ pub async fn list_cards_by_space(
     cursor: ListCursor,
 ) -> Result<ListPage<CardRow>, WyrdError> {
     validate_cursor(&cursor)?;
+    let after_created_at = cursor.after_created_at;
     let after_uid: Option<Uuid> = cursor.after_uid.as_ref().map(|u| u.as_uuid());
     let status_filter = status.as_ref().map(|s| s.as_db_str());
     let limit = cursor.limit as i64 + 1;
@@ -136,13 +142,14 @@ pub async fn list_cards_by_space(
     let rows = sqlx::query_as::<_, CardRow>(LIST_BY_SPACE)
         .bind(space.as_str())
         .bind(status_filter)
+        .bind(after_created_at)
         .bind(after_uid)
         .bind(limit)
         .fetch_all(&mut **conn.transaction())
         .await
         .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?;
 
-    build_page(rows, cursor)
+    Ok(build_page(rows, cursor))
 }
 
 /// List cards filtered by status, optionally also by kind.
@@ -161,6 +168,7 @@ pub async fn list_cards_by_status(
     cursor: ListCursor,
 ) -> Result<ListPage<CardRow>, WyrdError> {
     validate_cursor(&cursor)?;
+    let after_created_at = cursor.after_created_at;
     let after_uid: Option<Uuid> = cursor.after_uid.as_ref().map(|u| u.as_uuid());
     let kind_filter = kind.as_ref().map(|k| k.wire_name());
     let limit = cursor.limit as i64 + 1;
@@ -168,16 +176,17 @@ pub async fn list_cards_by_status(
     let rows = sqlx::query_as::<_, CardRow>(LIST_BY_STATUS)
         .bind(status.as_db_str())
         .bind(kind_filter)
+        .bind(after_created_at)
         .bind(after_uid)
         .bind(limit)
         .fetch_all(&mut **conn.transaction())
         .await
         .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?;
 
-    build_page(rows, cursor)
+    Ok(build_page(rows, cursor))
 }
 
-fn build_page(mut rows: Vec<CardRow>, cursor: ListCursor) -> Result<ListPage<CardRow>, WyrdError> {
+fn build_page(mut rows: Vec<CardRow>, cursor: ListCursor) -> ListPage<CardRow> {
     let has_more = rows.len() > cursor.limit as usize;
     if has_more {
         rows.truncate(cursor.limit as usize);
@@ -187,6 +196,7 @@ fn build_page(mut rows: Vec<CardRow>, cursor: ListCursor) -> Result<ListPage<Car
             let last_uid = CardUid::from_uuid(last.card_uid)
                 .expect("card_uid from DB always parses as UUIDv7");
             ListCursor {
+                after_created_at: Some(last.created_at),
                 after_uid: Some(last_uid),
                 limit: cursor.limit,
             }
@@ -194,5 +204,5 @@ fn build_page(mut rows: Vec<CardRow>, cursor: ListCursor) -> Result<ListPage<Car
     } else {
         None
     };
-    Ok(ListPage { items: rows, next })
+    ListPage { items: rows, next }
 }

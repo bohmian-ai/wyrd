@@ -181,6 +181,10 @@ jobs:
           --health-retries 5
         ports:
           - 5432:5432
+    env:
+      WYRD_DATABASE_URL_MIGRATOR: postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd
+      WYRD_TEST_DATABASE_URL: postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd
+      WYRD_TEST_DATABASE_URL_APP: postgres://wyrd_app:wyrd_app_pw@localhost/wyrd
     steps:
       - uses: actions/checkout@v4
 
@@ -204,24 +208,13 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
 
-      - name: Create database roles and schemas
-        env:
-          PGPASSWORD: wyrd_migrator_pw
-        run: |
-          psql -h localhost -U wyrd_migrator -d wyrd -c "ALTER ROLE wyrd_migrator BYPASSRLS;" || true
-          psql -h localhost -U wyrd_migrator -d wyrd -c "CREATE ROLE wyrd_app LOGIN PASSWORD 'wyrd_app_pw';" || true
-          psql -h localhost -U wyrd_migrator -d wyrd -c "CREATE ROLE wyrd_platform_admin LOGIN PASSWORD 'wyrd_platform_admin_pw' BYPASSRLS;" || true
+      - name: Setup database roles
+        run: mise run db:setup-roles
 
       - name: Run migrations
-        env:
-          WYRD_DATABASE_URL_MIGRATOR: postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd
         run: mise run db:migrate
 
       - name: Run registry e2e tests
-        env:
-          WYRD_REG_E2E: "1"
-          WYRD_TEST_DATABASE_URL: postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd
-          WYRD_TEST_DATABASE_URL_APP: postgres://wyrd_app:wyrd_app_pw@localhost/wyrd
         run: mise run test:registry-e2e
 
   codegen:

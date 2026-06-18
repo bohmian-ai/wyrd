@@ -117,12 +117,10 @@ pub struct SpecDecodeError {
 /// Error produced by [`Spec::canonical_hash`] / [`Spec::canonical_bytes`].
 #[derive(Debug, thiserror::Error)]
 pub enum SpecCanonicalizationError {
-    /// `serde_json` failed to serialize the spec to a JSON value.
+    /// `serde_json` failed to serialize the spec to a JSON value, including
+    /// non-finite floats which `serde_json` rejects before JCS runs.
     #[error("spec serialization failed: {0}")]
     Serialize(#[source] serde_json::Error),
-    /// The spec contained a `NaN` or `±Infinity` float; JCS forbids these.
-    #[error("spec contains a non-finite float (NaN or +/-Infinity); cannot canonicalize")]
-    NonFiniteFloat,
 }
 
 /// Universal registered Card envelope.
@@ -198,7 +196,7 @@ pub struct Metadata {
     pub annotations: Annotations,
     /// Spec content hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spec_hash: Option<String>,
+    pub spec_hash: Option<SpecHash>,
     /// Artifact content hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_hash: Option<String>,
@@ -264,8 +262,8 @@ impl Spec {
     /// Compute the canonical hash of this spec.
     ///
     /// Pipeline: serialize to JSON → RFC 8785 (JCS) canonicalize → BLAKE3-256 → lowercase hex.
-    /// Returns [`SpecCanonicalizationError::NonFiniteFloat`] when the spec contains a NaN or
-    /// ±Infinity float; JCS forbids non-finite numbers.
+    /// Returns [`SpecCanonicalizationError::Serialize`] when the spec fails JSON encoding,
+    /// including non-finite floats.
     pub fn canonical_hash(&self) -> Result<SpecHash, SpecCanonicalizationError> {
         let canon = self.canonical_bytes()?;
         Ok(SpecHash::from_canonical_bytes(&canon))
@@ -297,13 +295,7 @@ impl Spec {
     /// Return the JCS-canonicalized JSON bytes for this spec.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, SpecCanonicalizationError> {
         let value = serde_json::to_value(self).map_err(SpecCanonicalizationError::Serialize)?;
-        serde_jcs::to_vec(&value).map_err(|err| {
-            if err.classify() == serde_json::error::Category::Data {
-                SpecCanonicalizationError::NonFiniteFloat
-            } else {
-                SpecCanonicalizationError::Serialize(err)
-            }
-        })
+        serde_jcs::to_vec(&value).map_err(SpecCanonicalizationError::Serialize)
     }
 }
 
@@ -376,10 +368,12 @@ pub enum CardKind {
 }
 
 impl CardKind {
-    /// Native v1 Card kind count.
+    /// Total v1 Card kind count including `External`.
     pub const NATIVE_COUNT: usize = 17;
+    /// Registrable v1 Card kind count (excludes `External`).
+    pub const REGISTRABLE_COUNT: usize = 16;
 
-    /// Return every native kind.
+    /// Return every native kind including [`CardKind::External`].
     #[must_use]
     pub fn native() -> [Self; Self::NATIVE_COUNT] {
         [
@@ -400,6 +394,29 @@ impl CardKind {
             Self::Operator,
             Self::Source,
             Self::External,
+        ]
+    }
+
+    /// Return every registrable kind (excludes [`CardKind::External`]).
+    #[must_use]
+    pub fn registrable() -> [Self; Self::REGISTRABLE_COUNT] {
+        [
+            Self::Data,
+            Self::Model,
+            Self::Experiment,
+            Self::Prompt,
+            Self::Agent,
+            Self::Workflow,
+            Self::Eval,
+            Self::Drift,
+            Self::Service,
+            Self::Policy,
+            Self::Mcp,
+            Self::Audit,
+            Self::Artifact,
+            Self::Trigger,
+            Self::Operator,
+            Self::Source,
         ]
     }
 
@@ -501,7 +518,7 @@ impl JsonSchema for CardKind {
     }
 
     fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
-        let enum_values = Self::native()
+        let enum_values = Self::registrable()
             .iter()
             .map(|kind| json!(kind.wire_name()))
             .collect();
@@ -627,6 +644,8 @@ fn spec_from_kind_value(kind: &CardKind, mut value: serde_json::Value) -> Result
         CardKind::Source => serde_json::from_value(value)
             .map(Spec::Source)
             .map_err(|e| e.to_string()),
-        CardKind::External => Err("unsupported external card kind".to_string()),
+        CardKind::External => Err(
+            "External is a forward-compatibility variant; use a named card kind".to_string(),
+        ),
     }
 }

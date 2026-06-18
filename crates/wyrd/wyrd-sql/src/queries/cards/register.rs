@@ -117,7 +117,7 @@ pub async fn register_card(
         .as_ref()
         .expect("space presence verified in validate_boundary");
 
-    let card_uid = CardUid::from_uuid7(Uuid::now_v7()).map_err(WyrdError::from_card_uid_error)?;
+    let card_uid = CardUid::from_uuid(Uuid::now_v7()).map_err(WyrdError::from_card_uid_error)?;
 
     let inserted = sqlx::query_as::<_, (Uuid, String)>(
         r#"
@@ -238,7 +238,8 @@ async fn handle_conflict(
 ) -> Result<RegisterCardOutcome, WyrdError> {
     let existing = sqlx::query_as::<_, (Uuid, String)>(
         r#"SELECT card_uid, spec_hash FROM wyrd.cards
-           WHERE kind = $1 AND space = $2 AND name = $3 AND version = $4"#,
+           WHERE kind = $1 AND space = $2 AND name = $3 AND version = $4
+             AND data_tenant_id = wyrd.current_tenant()"#,
     )
     .bind(card.kind.wire_name())
     .bind(space)

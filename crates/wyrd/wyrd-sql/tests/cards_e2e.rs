@@ -158,7 +158,7 @@ e2e_test!(soft_delete_unknown_uid_returns_404, {
     let tenant = env.fresh_tenant().await;
     let actor = fixture_principal_user(tenant);
 
-    let unknown_uid = CardUid::from_uuid7(uuid::Uuid::now_v7()).expect("valid uuidv7");
+    let unknown_uid = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("valid uuidv7");
     let mut conn = env.tenant_conn(tenant).await;
     let err = wyrd_sql::queries::cards::soft_delete_card(&mut conn, &unknown_uid, &actor, None)
         .await

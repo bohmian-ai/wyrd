@@ -19,19 +19,27 @@ use wyrd_sql::TenantConn;
 
 pub struct TestEnv {
     pub pool: PgPool,
+    pub app_pool: PgPool,
 }
 
 impl TestEnv {
     pub async fn new() -> Self {
-        let url = env::var("WYRD_TEST_DATABASE_URL")
+        let migrator_url = env::var("WYRD_TEST_DATABASE_URL")
             .or_else(|_| env::var("WYRD_DATABASE_URL_MIGRATOR"))
             .expect("WYRD_TEST_DATABASE_URL must be set for e2e tests");
+        let app_url = env::var("WYRD_TEST_DATABASE_URL_APP").unwrap_or_else(|_| migrator_url.clone());
+
         let pool = PgPoolOptions::new()
             .max_connections(5)
-            .connect(&url)
+            .connect(&migrator_url)
             .await
-            .expect("failed to connect to test database");
-        Self { pool }
+            .expect("failed to connect to test database (migrator)");
+        let app_pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&app_url)
+            .await
+            .expect("failed to connect to test database (app)");
+        Self { pool, app_pool }
     }
 
     pub async fn fresh_tenant(&self) -> DataTenantId {
@@ -50,7 +58,7 @@ impl TestEnv {
     }
 
     pub async fn tenant_conn(&self, tenant: DataTenantId) -> TenantConn<'_> {
-        TenantConn::acquire(&self.pool, tenant)
+        TenantConn::acquire(&self.app_pool, tenant)
             .await
             .expect("failed to open TenantConn")
     }

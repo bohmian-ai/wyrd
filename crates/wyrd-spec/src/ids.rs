@@ -73,15 +73,9 @@ id_type!(CardName, "Human-visible Card name.", validate_token);
 id_type!(CardUid, "Resolved immutable Card UID.", validate_uuid7);
 
 impl CardUid {
-    /// Build a [`CardUid`] from a validated UUIDv7.
+    /// Build a [`CardUid`] from a UUIDv7 value.
     ///
-    /// # Errors
-    /// Returns [`IdError`] when the UUID is not version 7.
-    pub fn from_uuid7(uuid: uuid::Uuid) -> Result<Self, IdError> {
-        Self::new(uuid.to_string())
-    }
-
-    /// Build a [`CardUid`] from any UUID, validating the version nibble.
+    /// The UUID must be version 7; any other version returns [`IdError::InvalidUuid7`].
     ///
     /// # Errors
     /// Returns [`IdError`] when the UUID is not version 7.

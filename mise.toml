@@ -750,6 +750,17 @@ esac
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
 depends = ["check", "test:unit", "test:storage:local", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
 
+[tasks."db:setup-roles"]
+description = """Create wyrd_app and wyrd_platform_admin roles in the target Postgres instance.
+Required env vars:
+  WYRD_DATABASE_URL_MIGRATOR=postgres://wyrd_migrator:<pw>@<host>/wyrd
+"""
+run = """
+psql "$WYRD_DATABASE_URL_MIGRATOR" -c "ALTER ROLE wyrd_migrator BYPASSRLS;" || true
+psql "$WYRD_DATABASE_URL_MIGRATOR" -c "CREATE ROLE wyrd_app LOGIN PASSWORD 'wyrd_app_pw';" || true
+psql "$WYRD_DATABASE_URL_MIGRATOR" -c "CREATE ROLE wyrd_platform_admin LOGIN PASSWORD 'wyrd_platform_admin_pw' BYPASSRLS;" || true
+"""
+
 [tasks."db:migrate"]
 description = """Apply wyrd-sql migrations against WYRD_DATABASE_URL_MIGRATOR.
 Runs the idempotent migration test, which also verifies that required Postgres

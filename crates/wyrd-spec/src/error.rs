@@ -775,7 +775,7 @@ pub enum WyrdError {
     #[wyrd_error(
         code = "WYRD_REG_500_VERSION_CONFLICT",
         status = 500,
-        title = "Defense-in-depth: an existing card with the same identity has a different uid (should be unreachable given UUIDv7 monotonicity)",
+        title = "Card uid mismatch for same identity",
         remediation = "Internal invariant violation; report with the request id and audit_id."
     )]
     RegistryVersionConflict {
@@ -1962,6 +1962,24 @@ impl WyrdError {
         Self::RegistryListLimitOutOfRange {
             message: format!("limit {limit} is out of range 1..={max}"),
             details: serde_json::json!({ "limit": limit, "max": max }),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryCardRefUidNotResolvableHere`].
+    #[must_use]
+    pub fn registry_card_ref_uid_not_resolvable_here(message: impl Into<String>) -> Self {
+        Self::RegistryCardRefUidNotResolvableHere {
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryRequirementNotResolvableHere`].
+    #[must_use]
+    pub fn registry_requirement_not_resolvable_here(message: impl Into<String>) -> Self {
+        Self::RegistryRequirementNotResolvableHere {
+            message: message.into(),
+            details: serde_json::json!({}),
         }
     }
 

@@ -31,7 +31,8 @@ pub async fn soft_delete_card(
     request_id: Option<&RequestId>,
 ) -> Result<(), WyrdError> {
     let existing = sqlx::query_as::<_, (String, String)>(
-        "SELECT spec_hash, kind FROM wyrd.cards WHERE card_uid = $1",
+        "SELECT spec_hash, kind FROM wyrd.cards \
+         WHERE card_uid = $1 AND data_tenant_id = wyrd.current_tenant()",
     )
     .bind(uid.as_uuid())
     .fetch_optional(&mut **conn.transaction())
@@ -43,7 +44,8 @@ pub async fn soft_delete_card(
 
     let rows_affected = sqlx::query(
         "UPDATE wyrd.cards SET status = 'deleted' \
-         WHERE card_uid = $1 AND status = 'active'",
+         WHERE card_uid = $1 AND status = 'active' \
+         AND data_tenant_id = wyrd.current_tenant()",
     )
     .bind(uid.as_uuid())
     .execute(&mut **conn.transaction())

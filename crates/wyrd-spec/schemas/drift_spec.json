@@ -124,8 +124,7 @@
         "Artifact",
         "Trigger",
         "Operator",
-        "Source",
-        "External"
+        "Source"
       ]
     },
     "CardName": {

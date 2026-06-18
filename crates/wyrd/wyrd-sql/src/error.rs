@@ -339,6 +339,14 @@ mod tests {
                 "Check constraint violated",
             ),
             (
+                SqlError::TriggerException {
+                    constraint: "cards_spec_hash_immutable".to_owned(),
+                },
+                "WYRD_SQL_409_TRIGGER_EXCEPTION",
+                409,
+                "Trigger exception raised",
+            ),
+            (
                 SqlError::Conflict {
                     detail: "state changed".to_owned(),
                 },
@@ -408,6 +416,11 @@ mod tests {
             Some("fk_parent"),
         ));
         let check = SqlError::from(database_error("23514", "check failed", Some("ck_value")));
+        let trigger = SqlError::from(database_error(
+            "P0001",
+            "trigger enforced invariant",
+            Some("cards_spec_hash_immutable"),
+        ));
 
         assert!(matches!(
             unique,
@@ -421,6 +434,12 @@ mod tests {
             check,
             SqlError::CheckViolation { ref constraint } if constraint == "ck_value"
         ));
+        assert!(matches!(
+            trigger,
+            SqlError::TriggerException { ref constraint } if constraint == "cards_spec_hash_immutable"
+        ));
+        assert_eq!(trigger.code(), "WYRD_SQL_409_TRIGGER_EXCEPTION");
+        assert_eq!(trigger.status(), 409);
     }
 
     #[test]

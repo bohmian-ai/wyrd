@@ -97,7 +97,10 @@ impl AzureSigner {
         Ok(UploadPlan::SinglePut {
             put_url: sas_url,
             ttl_secs: crate::signer::ttl_secs(ttl),
-            required_headers: Vec::new(),
+            required_headers: vec![wyrd_spec::storage::HeaderPair {
+                name: "x-ms-blob-type".to_owned(),
+                value: "BlockBlob".to_owned(),
+            }],
         })
     }
 

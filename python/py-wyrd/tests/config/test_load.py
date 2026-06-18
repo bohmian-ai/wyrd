@@ -3,7 +3,6 @@
 from pathlib import Path
 
 import pytest
-
 from wyrd.cards import CardKind
 from wyrd.config import WyrdConfig
 from wyrd.errors import CfgInvalidToml, CfgSchemaMismatch
@@ -11,12 +10,7 @@ from wyrd.errors import CfgInvalidToml, CfgSchemaMismatch
 
 def test_load_round_trip(tmp_path: Path) -> None:
     cfg_file = tmp_path / "wyrd.toml"
-    cfg_file.write_text(
-        '[defaults]\n'
-        'space = "prod"\n'
-        '[defaults.labels]\n'
-        'team = "churn-ml"\n'
-    )
+    cfg_file.write_text('[defaults]\nspace = "prod"\n[defaults.labels]\nteam = "churn-ml"\n')
     cfg = WyrdConfig.load(cfg_file)
     assert "WyrdConfig" in repr(cfg)
     assert "space='prod'" in repr(cfg)

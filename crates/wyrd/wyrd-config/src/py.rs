@@ -1,4 +1,4 @@
-//! PyO3 surface for WyrdConfig. Opt-in only — the Python SDK never
+//! `PyO3` surface for `WyrdConfig`. Opt-in only — the Python SDK never
 //! mutates user-constructed cards implicitly (Q4 in the overview).
 
 use std::path::PathBuf;
@@ -25,6 +25,7 @@ impl WyrdConfigPy {
     /// Load `wyrd.toml`.
     #[classmethod]
     #[pyo3(signature = (path=None))]
+    #[allow(clippy::needless_pass_by_value)]
     fn load(_cls: &Bound<'_, PyType>, path: Option<PathBuf>) -> PyResult<Self> {
         let cfg = WyrdConfig::load(path.as_deref()).map_err(to_py_err)?;
         Ok(Self { inner: cfg })
@@ -66,15 +67,14 @@ impl WyrdConfigPy {
             .defaults
             .space
             .as_ref()
-            .map(|s| s.as_str())
-            .unwrap_or("");
+            .map_or("", wyrd_spec::ids::SpaceName::as_str);
         let mut kinds: Vec<&'static str> = self
             .inner
             .kind_overrides
             .keys()
-            .filter_map(|k| k.native_name())
+            .filter_map(CardKind::native_name)
             .collect();
-        kinds.sort();
+        kinds.sort_unstable();
         format!("WyrdConfig(space='{space}', kinds={kinds:?})")
     }
 }

@@ -97,6 +97,8 @@ pub fn apply_defaults(meta: &mut Metadata, kind: &CardKind, cfg: &WyrdConfig) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::metadata::{LabelKey, LabelValue};
@@ -112,8 +114,8 @@ mod tests {
             bump: None,
             space: None,
             uid: None,
-            labels: Default::default(),
-            annotations: Default::default(),
+            labels: BTreeMap::default(),
+            annotations: BTreeMap::default(),
             spec_hash: None,
             artifact_hash: None,
         }
@@ -144,6 +146,9 @@ mod tests {
         meta.labels
             .insert(k.clone(), LabelValue::new("churn-ml").unwrap());
         apply_defaults(&mut meta, &CardKind::Model, &cfg);
-        assert_eq!(meta.labels.get(&k).map(|v| v.as_str()), Some("churn-ml"));
+        assert_eq!(
+            meta.labels.get(&k).map(LabelValue::as_str),
+            Some("churn-ml")
+        );
     }
 }

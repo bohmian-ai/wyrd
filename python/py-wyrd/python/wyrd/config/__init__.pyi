@@ -2,18 +2,17 @@
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
 #### begin imports ####
 from pathlib import Path
-from typing import Any, Union
+from typing import Any
 
 from ..cards import CardKind
 
 #### end of imports ####
 
-
 class WyrdConfig:
     """Workspace configuration loaded from `wyrd.toml`."""
 
     @classmethod
-    def load(cls, path: Path | None = None) -> "WyrdConfig":
+    def load(cls, path: Path | None = None) -> WyrdConfig:
         """Load the workspace config.
 
         Two **asymmetric** missing-file paths:
@@ -29,12 +28,11 @@ class WyrdConfig:
     def apply_defaults(
         self,
         metadata: dict[str, Any],
-        kind: Union[CardKind, str],
+        kind: CardKind | str,
     ) -> None:
         """In-place merge of workspace defaults into a metadata dict."""
         ...
 
     def __repr__(self) -> str: ...
-
 
 __all__ = ["WyrdConfig"]

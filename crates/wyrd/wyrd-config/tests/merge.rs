@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use wyrd_config::{WyrdConfig, apply_defaults};
 use wyrd_spec::envelope::{CardKind, Metadata};
 use wyrd_spec::ids::{CardName, SpaceName};
@@ -17,8 +19,8 @@ fn fresh_meta(name: &str) -> Metadata {
         bump: None,
         space: None,
         uid: None,
-        labels: Default::default(),
-        annotations: Default::default(),
+        labels: BTreeMap::default(),
+        annotations: BTreeMap::default(),
         spec_hash: None,
         artifact_hash: None,
     }
@@ -30,8 +32,10 @@ fn merge_all_set_card_full_config_card_wins() {
     cfg.defaults.space = Some(SpaceName::new("prod").unwrap());
     cfg.defaults.labels.insert(lk("team"), lv("platform"));
 
-    let mut ko = wyrd_config::KindOverride::default();
-    ko.space = Some(SpaceName::new("ml-prod").unwrap());
+    let mut ko = wyrd_config::KindOverride {
+        space: Some(SpaceName::new("ml-prod").unwrap()),
+        ..Default::default()
+    };
     ko.labels.insert(lk("domain"), lv("ml"));
     cfg.kind_overrides.insert(CardKind::Model, ko);
 
@@ -42,14 +46,14 @@ fn merge_all_set_card_full_config_card_wins() {
     let orig_version = meta.version.clone();
     apply_defaults(&mut meta, &CardKind::Model, &cfg);
 
-    assert_eq!(meta.space.as_ref().map(|s| s.as_str()), Some("eval"));
+    assert_eq!(meta.space.as_ref().map(SpaceName::as_str), Some("eval"));
     assert_eq!(meta.version, orig_version);
     assert_eq!(
-        meta.labels.get(&lk("team")).map(|v| v.as_str()),
+        meta.labels.get(&lk("team")).map(LabelValue::as_str),
         Some("ml-team")
     );
     assert_eq!(
-        meta.labels.get(&lk("domain")).map(|v| v.as_str()),
+        meta.labels.get(&lk("domain")).map(LabelValue::as_str),
         Some("ml")
     );
 }
@@ -63,22 +67,27 @@ fn merge_empty_card_defaults_only() {
     let mut meta = fresh_meta("card");
     apply_defaults(&mut meta, &CardKind::Model, &cfg);
 
-    assert_eq!(meta.space.as_ref().map(|s| s.as_str()), Some("prod"));
-    assert_eq!(meta.labels.get(&lk("team")).map(|v| v.as_str()), Some("ml"));
+    assert_eq!(meta.space.as_ref().map(SpaceName::as_str), Some("prod"));
+    assert_eq!(
+        meta.labels.get(&lk("team")).map(LabelValue::as_str),
+        Some("ml")
+    );
 }
 
 #[test]
 fn merge_empty_card_defaults_and_kind_kind_wins() {
     let mut cfg = WyrdConfig::empty();
     cfg.defaults.space = Some(SpaceName::new("prod").unwrap());
-    let mut ko = wyrd_config::KindOverride::default();
-    ko.space = Some(SpaceName::new("ml-prod").unwrap());
+    let ko = wyrd_config::KindOverride {
+        space: Some(SpaceName::new("ml-prod").unwrap()),
+        ..Default::default()
+    };
     cfg.kind_overrides.insert(CardKind::Model, ko);
 
     let mut meta = fresh_meta("card");
     apply_defaults(&mut meta, &CardKind::Model, &cfg);
 
-    assert_eq!(meta.space.as_ref().map(|s| s.as_str()), Some("ml-prod"));
+    assert_eq!(meta.space.as_ref().map(SpaceName::as_str), Some("ml-prod"));
 }
 
 #[test]
@@ -90,7 +99,7 @@ fn merge_card_space_set_defaults_skipped() {
     meta.space = Some(SpaceName::new("eval").unwrap());
     apply_defaults(&mut meta, &CardKind::Model, &cfg);
 
-    assert_eq!(meta.space.as_ref().map(|s| s.as_str()), Some("eval"));
+    assert_eq!(meta.space.as_ref().map(SpaceName::as_str), Some("eval"));
 }
 
 #[test]
@@ -103,9 +112,12 @@ fn merge_label_card_wins_for_existing_key_others_added() {
     meta.labels.insert(lk("team"), lv("ml"));
     apply_defaults(&mut meta, &CardKind::Model, &cfg);
 
-    assert_eq!(meta.labels.get(&lk("team")).map(|v| v.as_str()), Some("ml"));
     assert_eq!(
-        meta.labels.get(&lk("domain")).map(|v| v.as_str()),
+        meta.labels.get(&lk("team")).map(LabelValue::as_str),
+        Some("ml")
+    );
+    assert_eq!(
+        meta.labels.get(&lk("domain")).map(LabelValue::as_str),
         Some("customer")
     );
 }
@@ -122,7 +134,7 @@ fn merge_label_kind_wins_over_defaults_for_same_key() {
     apply_defaults(&mut meta, &CardKind::Model, &cfg);
 
     assert_eq!(
-        meta.labels.get(&lk("team")).map(|v| v.as_str()),
+        meta.labels.get(&lk("team")).map(LabelValue::as_str),
         Some("ml-kind")
     );
 }
@@ -141,15 +153,15 @@ fn merge_three_way_label_precedence_is_order_independent() {
     apply_defaults(&mut meta, &CardKind::Model, &cfg);
 
     assert_eq!(
-        meta.labels.get(&lk("aaa")).map(|v| v.as_str()),
+        meta.labels.get(&lk("aaa")).map(LabelValue::as_str),
         Some("card")
     );
     assert_eq!(
-        meta.labels.get(&lk("bbb")).map(|v| v.as_str()),
+        meta.labels.get(&lk("bbb")).map(LabelValue::as_str),
         Some("kind")
     );
     assert_eq!(
-        meta.labels.get(&lk("ccc")).map(|v| v.as_str()),
+        meta.labels.get(&lk("ccc")).map(LabelValue::as_str),
         Some("defaults")
     );
 }
@@ -158,14 +170,16 @@ fn merge_three_way_label_precedence_is_order_independent() {
 fn merge_defaults_only_for_unconfigured_kind() {
     let mut cfg = WyrdConfig::empty();
     cfg.defaults.space = Some(SpaceName::new("prod").unwrap());
-    let mut ko = wyrd_config::KindOverride::default();
-    ko.space = Some(SpaceName::new("gov-prod").unwrap());
+    let ko = wyrd_config::KindOverride {
+        space: Some(SpaceName::new("gov-prod").unwrap()),
+        ..Default::default()
+    };
     cfg.kind_overrides.insert(CardKind::Policy, ko);
 
     let mut meta = fresh_meta("card");
     apply_defaults(&mut meta, &CardKind::Model, &cfg);
 
-    assert_eq!(meta.space.as_ref().map(|s| s.as_str()), Some("prod"));
+    assert_eq!(meta.space.as_ref().map(SpaceName::as_str), Some("prod"));
 }
 
 #[test]
@@ -192,8 +206,8 @@ fn merge_version_is_never_touched() {
             bump: None,
             space: None,
             uid: None,
-            labels: Default::default(),
-            annotations: Default::default(),
+            labels: BTreeMap::default(),
+            annotations: BTreeMap::default(),
             spec_hash: None,
             artifact_hash: None,
         };

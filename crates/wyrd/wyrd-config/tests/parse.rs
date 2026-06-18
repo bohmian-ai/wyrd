@@ -1,6 +1,8 @@
 use std::io::Write;
 use tempfile::NamedTempFile;
 use wyrd_config::{WyrdConfig, WyrdConfigError};
+use wyrd_spec::envelope::CardKind;
+use wyrd_spec::ids::SpaceName;
 
 fn parse(toml: &str) -> Result<WyrdConfig, WyrdConfigError> {
     let mut tmp = NamedTempFile::new().unwrap();
@@ -19,7 +21,7 @@ fn parse_empty_file_yields_empty_config() {
 fn parse_defaults_only() {
     let cfg = parse("[defaults]\nspace = \"prod\"\n").unwrap();
     assert_eq!(
-        cfg.defaults.space.as_ref().map(|s| s.as_str()),
+        cfg.defaults.space.as_ref().map(SpaceName::as_str),
         Some("prod")
     );
     assert!(cfg.kind_overrides.is_empty());
@@ -29,9 +31,8 @@ fn parse_defaults_only() {
 fn parse_kind_only() {
     let cfg = parse("[kind.Model]\nspace = \"mls\"\n").unwrap();
     assert!(cfg.defaults.space.is_none());
-    use wyrd_spec::envelope::CardKind;
     let ko = cfg.kind_overrides.get(&CardKind::Model).unwrap();
-    assert_eq!(ko.space.as_ref().map(|s| s.as_str()), Some("mls"));
+    assert_eq!(ko.space.as_ref().map(SpaceName::as_str), Some("mls"));
 }
 
 #[test]
@@ -39,10 +40,9 @@ fn parse_defaults_and_kind() {
     let toml = "[defaults]\nspace = \"prod\"\n[kind.Model]\nspace = \"mls\"\n";
     let cfg = parse(toml).unwrap();
     assert_eq!(
-        cfg.defaults.space.as_ref().map(|s| s.as_str()),
+        cfg.defaults.space.as_ref().map(SpaceName::as_str),
         Some("prod")
     );
-    use wyrd_spec::envelope::CardKind;
     assert!(cfg.kind_overrides.contains_key(&CardKind::Model));
 }
 

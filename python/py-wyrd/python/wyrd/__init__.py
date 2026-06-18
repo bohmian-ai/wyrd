@@ -1,7 +1,6 @@
 """Public Python package for Wyrd."""
 
 from . import cards, config, data, eval, model, prompt
-from .config import WyrdConfig
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError, _init
 from .agent import (
     Agent,
@@ -21,6 +20,7 @@ from .agent import (
     tool,
 )
 from .cards import CardKind, CardRef
+from .config import WyrdConfig
 from .data import DataCard, Split
 from .model import ModelCard, ModelSignature, SampleInput
 from .observer import Observer

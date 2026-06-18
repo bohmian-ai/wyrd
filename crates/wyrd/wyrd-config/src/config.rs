@@ -18,7 +18,7 @@ pub struct WyrdConfig {
     #[serde(default)]
     pub defaults: Defaults,
 
-    /// Per-kind overrides. Keys are PascalCase CardKind variants
+    /// Per-kind overrides. Keys are `PascalCase` `CardKind` variants
     /// **excluding `External`** (rejected post-deserialize).
     #[serde(default, rename = "kind")]
     pub kind_overrides: BTreeMap<CardKind, KindOverride>,
@@ -88,22 +88,19 @@ impl WyrdConfig {
     ///   Missing → returns `WyrdConfig::empty()` (not an error).
     #[tracing::instrument(fields(start = ?start))]
     pub fn load(start: Option<&Path>) -> Result<Self, WyrdConfigError> {
-        let resolved_path = match start {
-            Some(explicit) => {
-                if !explicit.is_file() {
-                    return Err(WyrdConfigError::Io {
-                        message: "file not found".to_string(),
-                        path: explicit.to_path_buf(),
-                    });
-                }
-                explicit.to_path_buf()
+        let resolved_path = if let Some(explicit) = start {
+            if !explicit.is_file() {
+                return Err(WyrdConfigError::Io {
+                    message: "file not found".to_string(),
+                    path: explicit.to_path_buf(),
+                });
             }
-            None => {
-                let cwd = std::env::current_dir().map_err(WyrdConfigError::CwdRead)?;
-                match crate::discovery::find_wyrd_toml(&cwd)? {
-                    Some(p) => p,
-                    None => return Ok(Self::empty()),
-                }
+            explicit.to_path_buf()
+        } else {
+            let cwd = std::env::current_dir().map_err(WyrdConfigError::CwdRead)?;
+            match crate::discovery::find_wyrd_toml(&cwd)? {
+                Some(p) => p,
+                None => return Ok(Self::empty()),
             }
         };
 
@@ -151,18 +148,18 @@ fn parse_file(path: &Path) -> Result<WyrdConfig, WyrdConfigError> {
 fn scan_for_name_default(value: &toml::Value) -> Option<String> {
     let root = value.as_table()?;
 
-    if let Some(defaults) = root.get("defaults").and_then(|v| v.as_table()) {
-        if defaults.contains_key("name") {
-            return Some("[defaults]".to_string());
-        }
+    if let Some(defaults) = root.get("defaults").and_then(|v| v.as_table())
+        && defaults.contains_key("name")
+    {
+        return Some("[defaults]".to_string());
     }
 
     if let Some(kind) = root.get("kind").and_then(|v| v.as_table()) {
-        for (key, inner) in kind.iter() {
-            if let Some(table) = inner.as_table() {
-                if table.contains_key("name") {
-                    return Some(format!("[kind.{key}]"));
-                }
+        for (key, inner) in kind {
+            if let Some(table) = inner.as_table()
+                && table.contains_key("name")
+            {
+                return Some(format!("[kind.{key}]"));
             }
         }
     }

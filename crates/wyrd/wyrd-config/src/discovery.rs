@@ -26,6 +26,9 @@ pub(crate) fn find_wyrd_toml(start: &Path) -> Result<Option<PathBuf>, WyrdConfig
         if candidate.is_file() {
             return Ok(Some(candidate));
         }
+        if ancestor == std::path::Path::new("/") {
+            return Ok(None);
+        }
         let is_git_root = ancestor.join(".git").exists();
         let is_home = home.as_deref().is_some_and(|h| h == ancestor);
         if is_git_root || is_home {

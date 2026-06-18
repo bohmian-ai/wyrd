@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 use std::fs;
 
 use tempfile::TempDir;
@@ -124,4 +126,70 @@ fn discovery_explicit_missing_path_errors() {
     let missing = dir.path().join("nope.toml");
     let err = WyrdConfig::load(Some(&missing)).unwrap_err();
     assert!(matches!(err, WyrdConfigError::Io { .. }), "got {err:?}");
+}
+
+#[test]
+#[serial_test::serial]
+fn discovery_stops_at_home_boundary() {
+    let outer = TempDir::new().unwrap();
+    fs::write(outer.path().join("wyrd.toml"), "[defaults]\n").unwrap();
+    let home = outer.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let cwd = home.join("project");
+    fs::create_dir(&cwd).unwrap();
+
+    let home_canonical = home.canonicalize().unwrap();
+    let saved_home = std::env::var_os("HOME");
+    // SAFETY: serial_test::serial ensures single-threaded access to env vars here.
+    unsafe { std::env::set_var("HOME", &home_canonical) };
+    std::env::set_current_dir(&cwd).unwrap();
+
+    let cfg = WyrdConfig::load(None).unwrap();
+
+    // SAFETY: serial_test::serial ensures single-threaded access to env vars here.
+    unsafe {
+        match saved_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    assert!(
+        cfg.root_path.is_none(),
+        "walk must not cross HOME boundary: {cfg:?}"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn discovery_finds_wyrd_toml_at_home() {
+    let home = TempDir::new().unwrap();
+    fs::write(
+        home.path().join("wyrd.toml"),
+        "[defaults]\nspace = \"home\"\n",
+    )
+    .unwrap();
+    let cwd = home.path().join("project");
+    fs::create_dir(&cwd).unwrap();
+
+    let home_canonical = home.path().canonicalize().unwrap();
+    let saved_home = std::env::var_os("HOME");
+    // SAFETY: serial_test::serial ensures single-threaded access to env vars here.
+    unsafe { std::env::set_var("HOME", &home_canonical) };
+    std::env::set_current_dir(&cwd).unwrap();
+
+    let cfg = WyrdConfig::load(None).unwrap();
+
+    // SAFETY: serial_test::serial ensures single-threaded access to env vars here.
+    unsafe {
+        match saved_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    assert!(
+        cfg.root_path.is_some(),
+        "should find wyrd.toml placed at HOME: {cfg:?}"
+    );
 }

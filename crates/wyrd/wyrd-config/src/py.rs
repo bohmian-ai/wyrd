@@ -13,6 +13,8 @@ use crate::config::WyrdConfig;
 use crate::error::WyrdConfigError;
 use crate::merge::apply_defaults as core_apply_defaults;
 
+const METADATA_SENTINEL: &str = "<metadata-dict>";
+
 /// Python-visible wrapper around `WyrdConfig`.
 #[pyclass(module = "wyrd.config", name = "WyrdConfig")]
 #[derive(Debug)]
@@ -43,15 +45,15 @@ impl WyrdConfigPy {
         if metadata.get_item("name").ok().flatten().is_none() {
             return Err(to_py_err(WyrdConfigError::Schema {
                 message: "metadata dict is missing required key `name`".to_string(),
-                path: std::path::PathBuf::new(),
+                path: PathBuf::from(METADATA_SENTINEL),
             }));
         }
 
-        let json_value = dict_to_json(py, metadata)?;
+        let json_value = wyrd_utils::py::pydict_to_json_value(metadata)?;
         let mut meta: Metadata = serde_json::from_value(json_value).map_err(|e| {
             to_py_err(WyrdConfigError::Schema {
                 message: format!("metadata dict invalid: {e}"),
-                path: std::path::PathBuf::new(),
+                path: PathBuf::from(METADATA_SENTINEL),
             })
         })?;
 
@@ -68,13 +70,12 @@ impl WyrdConfigPy {
             .space
             .as_ref()
             .map_or("", wyrd_spec::ids::SpaceName::as_str);
-        let mut kinds: Vec<&'static str> = self
+        let kinds: Vec<&'static str> = self
             .inner
             .kind_overrides
             .keys()
             .filter_map(CardKind::native_name)
             .collect();
-        kinds.sort_unstable();
         format!("WyrdConfig(space='{space}', kinds={kinds:?})")
     }
 }
@@ -84,7 +85,7 @@ fn extract_card_kind(value: &Bound<'_, PyAny>) -> PyResult<CardKind> {
         return CardKind::from_wire_name(&s).ok_or_else(|| {
             to_py_err(WyrdConfigError::Schema {
                 message: format!("unknown CardKind: {s}"),
-                path: std::path::PathBuf::new(),
+                path: PathBuf::from(METADATA_SENTINEL),
             })
         });
     }
@@ -92,21 +93,7 @@ fn extract_card_kind(value: &Bound<'_, PyAny>) -> PyResult<CardKind> {
     CardKind::from_wire_name(&name).ok_or_else(|| {
         to_py_err(WyrdConfigError::Schema {
             message: format!("unknown CardKind: {name}"),
-            path: std::path::PathBuf::new(),
-        })
-    })
-}
-
-fn dict_to_json<'py>(py: Python<'py>, d: &Bound<'py, PyDict>) -> PyResult<serde_json::Value> {
-    let s: String = py
-        .import("json")?
-        .getattr("dumps")?
-        .call1((d,))?
-        .extract()?;
-    serde_json::from_str(&s).map_err(|e| {
-        to_py_err(WyrdConfigError::Schema {
-            message: format!("json: {e}"),
-            path: std::path::PathBuf::new(),
+            path: PathBuf::from(METADATA_SENTINEL),
         })
     })
 }
@@ -116,26 +103,43 @@ fn write_merge_outputs<'py>(
     target: &Bound<'py, PyDict>,
     meta: &Metadata,
 ) -> PyResult<()> {
-    let json = py.import("json")?;
-    let loads = json.getattr("loads")?;
-    let payload = serde_json::to_string(&serde_json::json!({
-        "space": meta.space,
-        "labels": meta.labels,
-        "annotations": meta.annotations,
-    }))
-    .map_err(|e| {
-        to_py_err(WyrdConfigError::Schema {
-            message: format!("metadata reserialize failed: {e}"),
-            path: std::path::PathBuf::new(),
-        })
-    })?;
-    let parsed = loads.call1((payload,))?;
-    let dict = parsed.cast::<PyDict>()?;
-    for (k, v) in dict.iter() {
-        if v.is_none() {
-            continue;
-        }
-        target.set_item(k, v)?;
+    let mut payload = serde_json::Map::new();
+    if let Some(s) = &meta.space {
+        payload.insert(
+            "space".into(),
+            serde_json::to_value(s).map_err(|e| {
+                to_py_err(WyrdConfigError::Schema {
+                    message: format!("metadata reserialize failed: {e}"),
+                    path: PathBuf::from(METADATA_SENTINEL),
+                })
+            })?,
+        );
+    }
+    if !meta.labels.is_empty() {
+        payload.insert(
+            "labels".into(),
+            serde_json::to_value(&meta.labels).map_err(|e| {
+                to_py_err(WyrdConfigError::Schema {
+                    message: format!("metadata reserialize failed: {e}"),
+                    path: PathBuf::from(METADATA_SENTINEL),
+                })
+            })?,
+        );
+    }
+    if !meta.annotations.is_empty() {
+        payload.insert(
+            "annotations".into(),
+            serde_json::to_value(&meta.annotations).map_err(|e| {
+                to_py_err(WyrdConfigError::Schema {
+                    message: format!("metadata reserialize failed: {e}"),
+                    path: PathBuf::from(METADATA_SENTINEL),
+                })
+            })?,
+        );
+    }
+    for (k, v) in &payload {
+        let py_val = wyrd_utils::py::json_to_pyobject(py, v)?;
+        target.set_item(k, py_val.bind(py))?;
     }
     Ok(())
 }

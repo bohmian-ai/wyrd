@@ -51,31 +51,33 @@ pub enum WyrdConfigError {
     },
 }
 
-/// Sentinel path used in `details.path` when the IO error has no
-/// concrete filesystem target (currently only `CwdRead`).
-const CWD_SENTINEL: &str = "<cwd>";
-
 impl From<WyrdConfigError> for wyrd_spec::error::WyrdError {
     fn from(err: WyrdConfigError) -> Self {
         use serde_json::json;
         use wyrd_spec::error::WyrdError;
         match err {
-            WyrdConfigError::CwdRead(io) => WyrdError::CfgInvalidToml {
+            WyrdConfigError::CwdRead(io) => WyrdError::Internal {
                 message: format!("cwd read: {io}"),
-                details: json!({ "path": CWD_SENTINEL, "source": "io" }),
+                details: json!({ "source": "cwd_read" }),
             },
             WyrdConfigError::Io { message, path } => WyrdError::CfgInvalidToml {
                 message,
-                details: json!({ "path": path.display().to_string(), "source": "io" }),
+                details: json!({
+                    "path": path.file_name().and_then(|n| n.to_str()).unwrap_or("<unknown>"),
+                    "source": "io",
+                }),
             },
             WyrdConfigError::TomlParse { message, path } => WyrdError::CfgInvalidToml {
                 message,
-                details: json!({ "path": path.display().to_string(), "source": "toml" }),
+                details: json!({
+                    "path": path.file_name().and_then(|n| n.to_str()).unwrap_or("<unknown>"),
+                    "source": "toml",
+                }),
             },
             WyrdConfigError::Schema { message, path } => WyrdError::CfgSchemaMismatch {
                 message: message.clone(),
                 details: json!({
-                    "path": path.display().to_string(),
+                    "path": path.file_name().and_then(|n| n.to_str()).unwrap_or("<unknown>"),
                     "serde_message": message,
                 }),
             },

@@ -82,3 +82,31 @@ def test_load_missing_path_returns_empty(tmp_path: Path, monkeypatch: pytest.Mon
     meta = {"name": "churn"}
     cfg.apply_defaults(meta, "Model")
     assert "space" not in meta
+
+
+def test_apply_defaults_labels_are_merged(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "wyrd.toml"
+    cfg_file.write_text('[defaults.labels]\nteam = "ml"\n')
+    cfg = WyrdConfig.load(cfg_file)
+    meta = {"name": "churn-classifier"}
+    cfg.apply_defaults(meta, "Model")
+    assert meta["labels"]["team"] == "ml"
+
+
+def test_apply_defaults_card_label_survives_merge(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "wyrd.toml"
+    cfg_file.write_text('[defaults.labels]\nteam = "platform"\n')
+    cfg = WyrdConfig.load(cfg_file)
+    meta = {"name": "churn", "labels": {"team": "ml-team", "domain": "customer"}}
+    cfg.apply_defaults(meta, "Model")
+    assert meta["labels"]["team"] == "ml-team"
+    assert meta["labels"]["domain"] == "customer"
+
+
+def test_apply_defaults_annotations_are_merged(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "wyrd.toml"
+    cfg_file.write_text('[defaults.annotations]\nowner = "ml-platform"\n')
+    cfg = WyrdConfig.load(cfg_file)
+    meta = {"name": "churn-classifier"}
+    cfg.apply_defaults(meta, "Model")
+    assert meta["annotations"]["owner"] == "ml-platform"

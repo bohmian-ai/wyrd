@@ -125,3 +125,12 @@ fn parse_version_under_defaults_rejected() {
     let err = parse("[defaults]\nversion = \"1.0.0\"\n").unwrap_err();
     assert!(matches!(err, WyrdConfigError::Schema { .. }), "got {err:?}");
 }
+
+#[test]
+fn parse_syntax_error_returns_toml_parse_variant() {
+    let err = parse("[defaults\nspace = \"prod\"\n").unwrap_err();
+    assert!(
+        matches!(err, WyrdConfigError::TomlParse { .. }),
+        "got {err:?}"
+    );
+}

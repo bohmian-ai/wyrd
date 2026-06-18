@@ -74,6 +74,7 @@ CREATE TABLE wyrd.auth_service_accounts (
     card_ref        JSONB NOT NULL,
     space           TEXT NOT NULL,
     name            TEXT NOT NULL,
+    version         TEXT NOT NULL,
     description     TEXT,
     status          TEXT NOT NULL CHECK (status IN ('active','suspended','deleted')),
     created_by      UUID NOT NULL,

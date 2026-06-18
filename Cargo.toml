@@ -93,6 +93,7 @@ semver = { version = "1", features = ["serde"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 mini-moka = { version = "0.10", features = ["sync"] }
 proptest = "1"
+serial_test = "3"
 aes-gcm = "0.10"
 argon2 = "0.5"
 password-hash = { version = "0.5", features = ["getrandom"] }

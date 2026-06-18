@@ -103,7 +103,7 @@ pub async fn insert_service_account(
     .bind(Json(card_ref))
     .bind(card_ref.space.as_str())
     .bind(name)
-    .bind(card_ref.version.to_string())
+    .bind(card_ref.version.as_str())
     .bind(description)
     .bind(created_by)
     .execute(&mut **conn.transaction())

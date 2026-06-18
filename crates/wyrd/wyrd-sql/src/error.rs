@@ -99,6 +99,22 @@ pub enum SqlError {
         constraint: String,
     },
 
+    /// PL/pgSQL `RAISE EXCEPTION USING ERRCODE='P0001', CONSTRAINT=...`.
+    ///
+    /// Used by cards spec-hash immutability trigger and any trigger that needs
+    /// a dispatchable invariant separate from real CHECK violations.
+    #[wyrd_error(
+        code = "WYRD_SQL_409_TRIGGER_EXCEPTION",
+        status = 409,
+        title = "Trigger exception raised",
+        remediation = "The operation violated a trigger-enforced invariant; inspect the constraint name for details."
+    )]
+    #[error("trigger exception: {constraint}")]
+    TriggerException {
+        /// Constraint name carried by the PL/pgSQL RAISE EXCEPTION USING CONSTRAINT=... clause.
+        constraint: String,
+    },
+
     /// Operation conflicted with the current row state.
     #[wyrd_error(
         code = "WYRD_SQL_409_CONFLICT",
@@ -173,6 +189,29 @@ pub enum SqlError {
     InvalidDataTenantId(#[source] wyrd_spec::ids::IdError),
 }
 
+impl SqlError {
+    /// Wrap an [`IdError`] as an [`SqlError::InvariantViolation`].
+    pub fn from_id_error(e: wyrd_spec::ids::IdError) -> Self {
+        Self::InvariantViolation {
+            detail: format!("id validation failed: {e}"),
+        }
+    }
+
+    /// Wrap a [`wyrd_semver::VersionError`] as an [`SqlError::InvariantViolation`].
+    pub fn from_version(e: wyrd_semver::VersionError) -> Self {
+        Self::InvariantViolation {
+            detail: format!("version parse failed: {e}"),
+        }
+    }
+
+    /// Wrap a [`wyrd_spec::envelope::SpecDecodeError`] as an [`SqlError::InvariantViolation`].
+    pub fn from_spec_decode(e: wyrd_spec::envelope::SpecDecodeError) -> Self {
+        Self::InvariantViolation {
+            detail: format!("spec decode failed: {e}"),
+        }
+    }
+}
+
 impl From<sqlx::Error> for SqlError {
     fn from(error: sqlx::Error) -> Self {
         match error {
@@ -187,6 +226,9 @@ impl From<sqlx::Error> for SqlError {
                         constraint: constraint_name(db_error.as_ref()),
                     },
                     Some("23514") => Self::CheckViolation {
+                        constraint: constraint_name(db_error.as_ref()),
+                    },
+                    Some("P0001") => Self::TriggerException {
                         constraint: constraint_name(db_error.as_ref()),
                     },
                     Some("42501") if is_rls_denied(db_error.message()) => Self::RlsDenied {
@@ -297,6 +339,14 @@ mod tests {
                 "Check constraint violated",
             ),
             (
+                SqlError::TriggerException {
+                    constraint: "cards_spec_hash_immutable".to_owned(),
+                },
+                "WYRD_SQL_409_TRIGGER_EXCEPTION",
+                409,
+                "Trigger exception raised",
+            ),
+            (
                 SqlError::Conflict {
                     detail: "state changed".to_owned(),
                 },
@@ -366,6 +416,11 @@ mod tests {
             Some("fk_parent"),
         ));
         let check = SqlError::from(database_error("23514", "check failed", Some("ck_value")));
+        let trigger = SqlError::from(database_error(
+            "P0001",
+            "trigger enforced invariant",
+            Some("cards_spec_hash_immutable"),
+        ));
 
         assert!(matches!(
             unique,
@@ -379,6 +434,12 @@ mod tests {
             check,
             SqlError::CheckViolation { ref constraint } if constraint == "ck_value"
         ));
+        assert!(matches!(
+            trigger,
+            SqlError::TriggerException { ref constraint } if constraint == "cards_spec_hash_immutable"
+        ));
+        assert_eq!(trigger.code(), "WYRD_SQL_409_TRIGGER_EXCEPTION");
+        assert_eq!(trigger.status(), 409);
     }
 
     #[test]

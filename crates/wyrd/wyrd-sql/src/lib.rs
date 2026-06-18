@@ -19,6 +19,10 @@ pub mod tenant_conn;
 
 pub use error::SqlError;
 pub use pool::PoolConfig;
+pub use row_types::cards::{
+    AuditCardRegistrationRow, CardRegistrationOperation, CardRow, CardStatus,
+    NewAuditCardRegistrationRow, NewCardRow, ParsedCardRow,
+};
 pub use tenant_conn::TenantConn;
 
 /// Platform-global schema owned by `wyrd-sql`.

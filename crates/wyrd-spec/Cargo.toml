@@ -17,6 +17,7 @@ server = ["dep:utoipa", "wyrd-semver/server"]
 wasm = ["uuid/js"]
 
 [dependencies]
+blake3 = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 regex = { workspace = true }
@@ -25,6 +26,7 @@ semver = { workspace = true }
 secrecy = { workspace = true }
 skald-spec = { workspace = true, features = ["schemars"] }
 serde = { workspace = true }
+serde_jcs = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }

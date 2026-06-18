@@ -137,6 +137,12 @@ if ! rg -q 'wyrd-(spec|interfaces|utils)' crates/skald/skald-prompt/Cargo.toml; 
 fi
 """
 
+[tasks."check:registry-no-server-routes"]
+description = "wyrd-sql must not import axum/hyper/tower from any module (registry seam is durable, not route)"
+run = """
+rg -n 'use axum::|use hyper::|use tower::' crates/wyrd/wyrd-sql/src/ && exit 1 || exit 0
+"""
+
 [tasks."check:pyo3-scope"]
 description = "Assert PyO3 stays out of pure contracts and Python-free shared crates"
 run = """
@@ -279,6 +285,11 @@ depends = ["storage:up"]
 env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_INTEGRATION_S3 = "1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1" }
 run = "cargo test -p wyrd-server --all-features --test storage_e2e -- --nocapture"
 
+[tasks."test:registry-e2e"]
+description = "Cards registration end-to-end against a real Postgres"
+env = { WYRD_REG_E2E = "1" }
+run = "cargo test --locked -p wyrd-sql --features test-e2e --test cards_e2e -- --include-ignored"
+
 [tasks."test:storage:s3:cloud"]
 description = "Run storage e2e tests against real AWS S3 (requires AWS credentials in env)"
 env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_BACKEND = "s3" }
@@ -418,6 +429,26 @@ if rg -n -e '\\.unwrap\\(\\)' crates/wyrd/wyrd-storage/src crates/wyrd/wyrd-serv
   echo 'unwrap is forbidden in non-test storage code'
   exit 1
 fi
+"""
+
+[tasks."check:registry-tx-coupling"]
+description = "Card registry writes must stay inside the caller's TenantConn tx; no tokio::spawn / emit_async / raw PgPool"
+run = """
+rg -n 'tokio::spawn|emit_async|sqlx::PgPool' crates/wyrd/wyrd-sql/src/queries/cards/ && exit 1 || exit 0
+"""
+
+[tasks."check:registry-immutable-spec-hash"]
+description = "wyrd.cards trigger must raise P0001 with the cards_spec_hash_immutable constraint name"
+run = """
+rg -nF 'cards_spec_hash_immutable' crates/wyrd/wyrd-sql/migrations/*_cards.sql || exit 1
+rg -nF 'OLD.spec_hash'             crates/wyrd/wyrd-sql/migrations/*_cards.sql || exit 1
+rg -nF "ERRCODE = 'P0001'"         crates/wyrd/wyrd-sql/migrations/*_cards.sql || exit 1
+"""
+
+[tasks."check:registry-single-table"]
+description = "Single wyrd.cards table; no per-kind shadow tables"
+run = """
+if rg -n 'CREATE TABLE wyrd\\.cards_[a-z]' crates/wyrd/wyrd-sql/migrations/; then exit 1; fi
 """
 
 [tasks."check:unwrap-audit"]
@@ -717,7 +748,28 @@ esac
 
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
-depends = ["check", "test:unit", "test:storage:local", "codegen:check", "cardkind:check", "check:client-tier", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
+depends = ["check", "test:unit", "test:storage:local", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
+
+[tasks."db:setup-roles"]
+description = """Create wyrd_app and wyrd_platform_admin roles in the target Postgres instance.
+Required env vars:
+  WYRD_DATABASE_URL_MIGRATOR=postgres://wyrd_migrator:<pw>@<host>/wyrd
+"""
+run = """
+psql "$WYRD_DATABASE_URL_MIGRATOR" -c "ALTER ROLE wyrd_migrator BYPASSRLS;" || true
+psql "$WYRD_DATABASE_URL_MIGRATOR" -c "CREATE ROLE wyrd_app LOGIN PASSWORD 'wyrd_app_pw';" || true
+psql "$WYRD_DATABASE_URL_MIGRATOR" -c "CREATE ROLE wyrd_platform_admin LOGIN PASSWORD 'wyrd_platform_admin_pw' BYPASSRLS;" || true
+"""
+
+[tasks."db:migrate"]
+description = """Apply wyrd-sql migrations against WYRD_DATABASE_URL_MIGRATOR.
+Runs the idempotent migration test, which also verifies that required Postgres
+roles (wyrd_migrator BYPASSRLS, wyrd_app no-BYPASSRLS, wyrd_platform_admin
+BYPASSRLS) are present before applying DDL.
+Required env vars:
+  WYRD_DATABASE_URL_MIGRATOR=postgres://wyrd_migrator:<pw>@localhost/wyrd
+"""
+run = "cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture"
 
 [tasks."test:sql"]
 description = """Run live Postgres SQL integration tests.

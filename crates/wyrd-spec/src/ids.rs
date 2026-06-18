@@ -71,6 +71,28 @@ id_type!(
 );
 id_type!(CardName, "Human-visible Card name.", validate_token);
 id_type!(CardUid, "Resolved immutable Card UID.", validate_uuid7);
+
+impl CardUid {
+    /// Build a [`CardUid`] from a UUIDv7 value.
+    ///
+    /// The UUID must be version 7; any other version returns [`IdError::InvalidUuid7`].
+    ///
+    /// # Errors
+    /// Returns [`IdError`] when the UUID is not version 7.
+    pub fn from_uuid(uuid: uuid::Uuid) -> Result<Self, IdError> {
+        Self::new(uuid.to_string())
+    }
+
+    /// Parse the underlying string back to a [`uuid::Uuid`].
+    ///
+    /// # Panics
+    /// Never: the constructor guarantees the string is a valid UUID.
+    #[must_use]
+    pub fn as_uuid(&self) -> uuid::Uuid {
+        uuid::Uuid::parse_str(self.as_str()).expect("CardUid was validated at construction")
+    }
+}
+
 id_type!(
     ProfileName,
     "Named execution or configuration profile.",

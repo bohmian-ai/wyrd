@@ -644,8 +644,8 @@ fn spec_from_kind_value(kind: &CardKind, mut value: serde_json::Value) -> Result
         CardKind::Source => serde_json::from_value(value)
             .map(Spec::Source)
             .map_err(|e| e.to_string()),
-        CardKind::External => Err(
-            "External is a forward-compatibility variant; use a named card kind".to_string(),
-        ),
+        CardKind::External => {
+            Err("External is a forward-compatibility variant; use a named card kind".to_string())
+        }
     }
 }

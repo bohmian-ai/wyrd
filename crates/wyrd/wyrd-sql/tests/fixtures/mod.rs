@@ -27,7 +27,8 @@ impl TestEnv {
         let migrator_url = env::var("WYRD_TEST_DATABASE_URL")
             .or_else(|_| env::var("WYRD_DATABASE_URL_MIGRATOR"))
             .expect("WYRD_TEST_DATABASE_URL must be set for e2e tests");
-        let app_url = env::var("WYRD_TEST_DATABASE_URL_APP").unwrap_or_else(|_| migrator_url.clone());
+        let app_url =
+            env::var("WYRD_TEST_DATABASE_URL_APP").unwrap_or_else(|_| migrator_url.clone());
 
         let pool = PgPoolOptions::new()
             .max_connections(5)

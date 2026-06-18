@@ -62,7 +62,9 @@ pub fn apply_defaults(meta: &mut Metadata, kind: &CardKind, cfg: &WyrdConfig) {
     // card's own keys always win.
     if let Some(k) = kind_override {
         for (key, val) in &k.labels {
-            meta.labels.entry(key.clone()).or_insert_with(|| val.clone());
+            meta.labels
+                .entry(key.clone())
+                .or_insert_with(|| val.clone());
         }
         for (key, val) in &k.annotations {
             meta.annotations
@@ -71,7 +73,9 @@ pub fn apply_defaults(meta: &mut Metadata, kind: &CardKind, cfg: &WyrdConfig) {
         }
     }
     for (key, val) in &cfg.defaults.labels {
-        meta.labels.entry(key.clone()).or_insert_with(|| val.clone());
+        meta.labels
+            .entry(key.clone())
+            .or_insert_with(|| val.clone());
     }
     for (key, val) in &cfg.defaults.annotations {
         meta.annotations
@@ -140,9 +144,6 @@ mod tests {
         meta.labels
             .insert(k.clone(), LabelValue::new("churn-ml").unwrap());
         apply_defaults(&mut meta, &CardKind::Model, &cfg);
-        assert_eq!(
-            meta.labels.get(&k).map(|v| v.as_str()),
-            Some("churn-ml")
-        );
+        assert_eq!(meta.labels.get(&k).map(|v| v.as_str()), Some("churn-ml"));
     }
 }

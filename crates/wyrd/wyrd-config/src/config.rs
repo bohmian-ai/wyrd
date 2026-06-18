@@ -43,7 +43,6 @@ pub struct Defaults {
     /// Default annotations merged per-key into `metadata.annotations`.
     #[serde(default)]
     pub annotations: Annotations,
-
     // `version` is intentionally absent. Filling `metadata.version`
     // from the loader silently changes which auto-bump branch the
     // server takes (None / Scope / Pin are three distinct intents).
@@ -118,23 +117,24 @@ fn parse_file(path: &Path) -> Result<WyrdConfig, WyrdConfigError> {
         path: path.to_path_buf(),
     })?;
 
-    let value: toml::Value = text.parse().map_err(|e: toml::de::Error| {
-        WyrdConfigError::TomlParse {
-            message: e.to_string(),
-            path: path.to_path_buf(),
-        }
-    })?;
+    let value: toml::Value =
+        text.parse()
+            .map_err(|e: toml::de::Error| WyrdConfigError::TomlParse {
+                message: e.to_string(),
+                path: path.to_path_buf(),
+            })?;
 
     if let Some(table) = scan_for_name_default(&value) {
         return Err(WyrdConfigError::NameDefaultRejected { table });
     }
 
-    let mut cfg: WyrdConfig = value
-        .try_into()
-        .map_err(|e: toml::de::Error| WyrdConfigError::Schema {
-            message: e.to_string(),
-            path: path.to_path_buf(),
-        })?;
+    let mut cfg: WyrdConfig =
+        value
+            .try_into()
+            .map_err(|e: toml::de::Error| WyrdConfigError::Schema {
+                message: e.to_string(),
+                path: path.to_path_buf(),
+            })?;
 
     if cfg.kind_overrides.contains_key(&CardKind::External) {
         return Err(WyrdConfigError::Schema {

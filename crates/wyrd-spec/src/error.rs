@@ -2013,7 +2013,6 @@ pub enum WyrdError {
     },
 
     // --- WYRD_CFG_* — workspace config (wyrd.toml) ---
-
     /// `wyrd.toml` failed TOML syntax parsing or file IO.
     ///
     /// `details` JSON: `{ "path": <absolute path or "<cwd>">, "source":

@@ -17,7 +17,9 @@ pub(crate) fn find_wyrd_toml(start: &Path) -> Result<Option<PathBuf>, WyrdConfig
         path: start.to_path_buf(),
     })?;
 
-    let home = std::env::var_os("HOME").map(PathBuf::from).and_then(|p| p.canonicalize().ok());
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|p| p.canonicalize().ok());
 
     for ancestor in canonical.ancestors() {
         let candidate = ancestor.join(FILENAME);

@@ -18,7 +18,10 @@ fn parse_empty_file_yields_empty_config() {
 #[test]
 fn parse_defaults_only() {
     let cfg = parse("[defaults]\nspace = \"prod\"\n").unwrap();
-    assert_eq!(cfg.defaults.space.as_ref().map(|s| s.as_str()), Some("prod"));
+    assert_eq!(
+        cfg.defaults.space.as_ref().map(|s| s.as_str()),
+        Some("prod")
+    );
     assert!(cfg.kind_overrides.is_empty());
 }
 
@@ -35,7 +38,10 @@ fn parse_kind_only() {
 fn parse_defaults_and_kind() {
     let toml = "[defaults]\nspace = \"prod\"\n[kind.Model]\nspace = \"mls\"\n";
     let cfg = parse(toml).unwrap();
-    assert_eq!(cfg.defaults.space.as_ref().map(|s| s.as_str()), Some("prod"));
+    assert_eq!(
+        cfg.defaults.space.as_ref().map(|s| s.as_str()),
+        Some("prod")
+    );
     use wyrd_spec::envelope::CardKind;
     assert!(cfg.kind_overrides.contains_key(&CardKind::Model));
 }

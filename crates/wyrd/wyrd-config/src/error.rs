@@ -80,9 +80,7 @@ impl From<WyrdConfigError> for wyrd_spec::error::WyrdError {
                 }),
             },
             WyrdConfigError::NameDefaultRejected { table } => {
-                let message = format!(
-                    "`name` may not be defaulted; remove from table `{table}`"
-                );
+                let message = format!("`name` may not be defaulted; remove from table `{table}`");
                 WyrdError::CfgNameDefaultRejected {
                     message,
                     details: json!({ "table": table }),

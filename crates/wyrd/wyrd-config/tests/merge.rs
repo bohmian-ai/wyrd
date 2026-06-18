@@ -1,4 +1,4 @@
-use wyrd_config::{apply_defaults, WyrdConfig};
+use wyrd_config::{WyrdConfig, apply_defaults};
 use wyrd_spec::envelope::{CardKind, Metadata};
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::metadata::{LabelKey, LabelValue};
@@ -44,8 +44,14 @@ fn merge_all_set_card_full_config_card_wins() {
 
     assert_eq!(meta.space.as_ref().map(|s| s.as_str()), Some("eval"));
     assert_eq!(meta.version, orig_version);
-    assert_eq!(meta.labels.get(&lk("team")).map(|v| v.as_str()), Some("ml-team"));
-    assert_eq!(meta.labels.get(&lk("domain")).map(|v| v.as_str()), Some("ml"));
+    assert_eq!(
+        meta.labels.get(&lk("team")).map(|v| v.as_str()),
+        Some("ml-team")
+    );
+    assert_eq!(
+        meta.labels.get(&lk("domain")).map(|v| v.as_str()),
+        Some("ml")
+    );
 }
 
 #[test]
@@ -98,7 +104,10 @@ fn merge_label_card_wins_for_existing_key_others_added() {
     apply_defaults(&mut meta, &CardKind::Model, &cfg);
 
     assert_eq!(meta.labels.get(&lk("team")).map(|v| v.as_str()), Some("ml"));
-    assert_eq!(meta.labels.get(&lk("domain")).map(|v| v.as_str()), Some("customer"));
+    assert_eq!(
+        meta.labels.get(&lk("domain")).map(|v| v.as_str()),
+        Some("customer")
+    );
 }
 
 #[test]
@@ -112,7 +121,10 @@ fn merge_label_kind_wins_over_defaults_for_same_key() {
     let mut meta = fresh_meta("card");
     apply_defaults(&mut meta, &CardKind::Model, &cfg);
 
-    assert_eq!(meta.labels.get(&lk("team")).map(|v| v.as_str()), Some("ml-kind"));
+    assert_eq!(
+        meta.labels.get(&lk("team")).map(|v| v.as_str()),
+        Some("ml-kind")
+    );
 }
 
 #[test]
@@ -128,9 +140,18 @@ fn merge_three_way_label_precedence_is_order_independent() {
     meta.labels.insert(lk("aaa"), lv("card"));
     apply_defaults(&mut meta, &CardKind::Model, &cfg);
 
-    assert_eq!(meta.labels.get(&lk("aaa")).map(|v| v.as_str()), Some("card"));
-    assert_eq!(meta.labels.get(&lk("bbb")).map(|v| v.as_str()), Some("kind"));
-    assert_eq!(meta.labels.get(&lk("ccc")).map(|v| v.as_str()), Some("defaults"));
+    assert_eq!(
+        meta.labels.get(&lk("aaa")).map(|v| v.as_str()),
+        Some("card")
+    );
+    assert_eq!(
+        meta.labels.get(&lk("bbb")).map(|v| v.as_str()),
+        Some("kind")
+    );
+    assert_eq!(
+        meta.labels.get(&lk("ccc")).map(|v| v.as_str()),
+        Some("defaults")
+    );
 }
 
 #[test]

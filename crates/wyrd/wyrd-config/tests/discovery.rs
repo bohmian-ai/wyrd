@@ -12,7 +12,11 @@ fn plant_git_marker(root: &std::path::Path) {
 fn discovery_finds_in_cwd() {
     let dir = TempDir::new().unwrap();
     plant_git_marker(dir.path());
-    fs::write(dir.path().join("wyrd.toml"), "[defaults]\nspace = \"prod\"\n").unwrap();
+    fs::write(
+        dir.path().join("wyrd.toml"),
+        "[defaults]\nspace = \"prod\"\n",
+    )
+    .unwrap();
     std::env::set_current_dir(dir.path()).unwrap();
 
     let cfg = WyrdConfig::load(None).unwrap();
@@ -24,13 +28,20 @@ fn discovery_finds_in_cwd() {
 fn discovery_walks_three_ancestors_up_within_git_root() {
     let dir = TempDir::new().unwrap();
     plant_git_marker(dir.path());
-    fs::write(dir.path().join("wyrd.toml"), "[defaults]\nspace = \"prod\"\n").unwrap();
+    fs::write(
+        dir.path().join("wyrd.toml"),
+        "[defaults]\nspace = \"prod\"\n",
+    )
+    .unwrap();
     let nested = dir.path().join("a").join("b").join("c");
     fs::create_dir_all(&nested).unwrap();
     std::env::set_current_dir(&nested).unwrap();
 
     let cfg = WyrdConfig::load(None).unwrap();
-    assert!(cfg.root_path.is_some(), "expected to find wyrd.toml up the tree");
+    assert!(
+        cfg.root_path.is_some(),
+        "expected to find wyrd.toml up the tree"
+    );
 }
 
 #[test]
@@ -41,7 +52,10 @@ fn discovery_missing_returns_empty() {
     std::env::set_current_dir(dir.path()).unwrap();
 
     let cfg = WyrdConfig::load(None).unwrap();
-    assert!(cfg.root_path.is_none(), "should return empty when no wyrd.toml found");
+    assert!(
+        cfg.root_path.is_none(),
+        "should return empty when no wyrd.toml found"
+    );
 }
 
 #[test]
@@ -59,7 +73,10 @@ fn discovery_stops_at_git_boundary() {
     std::env::set_current_dir(&cwd).unwrap();
 
     let cfg = WyrdConfig::load(None).unwrap();
-    assert!(cfg.root_path.is_none(), "walk must not cross .git boundary: {cfg:?}");
+    assert!(
+        cfg.root_path.is_none(),
+        "walk must not cross .git boundary: {cfg:?}"
+    );
 }
 
 #[test]

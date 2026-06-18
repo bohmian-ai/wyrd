@@ -6570,6 +6570,7 @@ dependencies = [
  "skald-workflow",
  "vala-client",
  "wyrd-cards",
+ "wyrd-config",
  "wyrd-observe",
  "wyrd-testing",
  "wyrd-utils",

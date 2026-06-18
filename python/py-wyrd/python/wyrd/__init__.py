@@ -1,6 +1,7 @@
 """Public Python package for Wyrd."""
 
-from . import cards, data, eval, model, prompt
+from . import cards, config, data, eval, model, prompt
+from .config import WyrdConfig
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError, _init
 from .agent import (
     Agent,
@@ -81,10 +82,12 @@ __all__ = [
     "WorkflowRun",
     "WyrdError",
     "cards",
+    "config",
     "data",
     "eval",
     "local_registry",
     "model",
     "prompt",
     "tool",
+    "WyrdConfig",
 ]

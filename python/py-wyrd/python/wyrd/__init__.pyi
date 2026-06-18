@@ -1,8 +1,9 @@
 # AUTO-GENERATED STUB FILE. DO NOT EDIT.
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
 #### begin imports ####
-from . import cards, data, eval, model, prompt
+from . import cards, config, data, eval, model, prompt
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError
+from .config import WyrdConfig
 from .agent import (
     Agent,
     AgentRun,
@@ -82,10 +83,12 @@ __all__ = [
     "WorkflowRun",
     "WyrdError",
     "cards",
+    "config",
     "data",
     "eval",
     "local_registry",
     "model",
     "prompt",
     "tool",
+    "WyrdConfig",
 ]

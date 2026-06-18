@@ -448,7 +448,7 @@ rg -nF "ERRCODE = 'P0001'"         crates/wyrd/wyrd-sql/migrations/*_cards.sql |
 [tasks."check:registry-single-table"]
 description = "Single wyrd.cards table; no per-kind shadow tables"
 run = """
-if rg -n 'CREATE TABLE wyrd\.cards_[a-z]' crates/wyrd/wyrd-sql/migrations/; then exit 1; fi
+if rg -n 'CREATE TABLE wyrd\\.cards_[a-z]' crates/wyrd/wyrd-sql/migrations/; then exit 1; fi
 """
 
 [tasks."check:unwrap-audit"]

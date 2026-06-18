@@ -72,20 +72,7 @@ CREATE INDEX idx_cards_created_by
 ALTER TABLE wyrd.cards ENABLE ROW LEVEL SECURITY;
 ALTER TABLE wyrd.cards FORCE ROW LEVEL SECURITY;
 
--- Split into SELECT and modify pairs so `scripts/check_tenant_isolation.py`
--- (which expects the `<table>_tenant_isolation_select` /
--- `<table>_tenant_isolation_modify` naming pair per M18) catches a
--- silent policy regression.
-CREATE POLICY cards_tenant_isolation_select
-    ON wyrd.cards
-    FOR SELECT
-    TO PUBLIC
-    USING (data_tenant_id = wyrd.current_tenant());
-
-CREATE POLICY cards_tenant_isolation_modify
-    ON wyrd.cards
-    FOR ALL
-    TO PUBLIC
+CREATE POLICY tenant_isolation ON wyrd.cards
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
 
@@ -93,9 +80,7 @@ CREATE POLICY cards_tenant_isolation_modify
 -- operator restore. Named permissive policy avoids cluster-level
 -- BYPASSRLS on this role at runtime. Role name confirmed at
 -- crates/wyrd/wyrd-sql/migrations/20260601000000_platform.sql:27-33.
-CREATE POLICY cards_admin_cross_tenant
-    ON wyrd.cards
-    FOR ALL
+CREATE POLICY admin_cross_tenant ON wyrd.cards
     TO wyrd_platform_admin
     USING (true)
     WITH CHECK (true);

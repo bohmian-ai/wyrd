@@ -15,6 +15,7 @@ const SELECT_BY_UID: &str = r#"
            status, created_by, created_at, updated_at
     FROM wyrd.cards
     WHERE card_uid = $1 AND status != 'deleted'
+      AND data_tenant_id = wyrd.current_tenant()
 "#;
 
 const SELECT_BY_REF: &str = r#"
@@ -24,6 +25,7 @@ const SELECT_BY_REF: &str = r#"
     FROM wyrd.cards
     WHERE kind = $1 AND space = $2 AND name = $3 AND version = $4
       AND status != 'deleted'
+      AND data_tenant_id = wyrd.current_tenant()
 "#;
 
 /// Load one card by UID within the current tenant.

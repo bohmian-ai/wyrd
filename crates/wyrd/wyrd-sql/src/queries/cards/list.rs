@@ -43,6 +43,7 @@ const LIST_BY_KIND: &str = r#"
     WHERE kind = $1
       AND ($2::text IS NULL OR status = $2)
       AND ($3::timestamptz IS NULL OR (created_at, card_uid) > ($3, $4::uuid))
+      AND data_tenant_id = wyrd.current_tenant()
     ORDER BY created_at ASC, card_uid ASC
     LIMIT $5
 "#;
@@ -55,6 +56,7 @@ const LIST_BY_SPACE: &str = r#"
     WHERE space = $1
       AND ($2::text IS NULL OR status = $2)
       AND ($3::timestamptz IS NULL OR (created_at, card_uid) > ($3, $4::uuid))
+      AND data_tenant_id = wyrd.current_tenant()
     ORDER BY created_at ASC, card_uid ASC
     LIMIT $5
 "#;
@@ -67,6 +69,7 @@ const LIST_BY_STATUS: &str = r#"
     WHERE status = $1
       AND ($2::text IS NULL OR kind = $2)
       AND ($3::timestamptz IS NULL OR (created_at, card_uid) > ($3, $4::uuid))
+      AND data_tenant_id = wyrd.current_tenant()
     ORDER BY created_at ASC, card_uid ASC
     LIMIT $5
 "#;

@@ -9,7 +9,9 @@ use serde_json::json;
 use wyrd_interfaces::error::CardPyResult;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::prompt::{PromptRef as NativePromptRef, PromptSpec};
-use wyrd_spec::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
+use wyrd_spec::envelope::{
+    Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec, SpecHash,
+};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
@@ -162,12 +164,18 @@ impl PromptCard {
     /// Returns a Wyrd error when `PromptSpec` validation or identity validation
     /// fails.
     pub fn to_card(&self) -> Result<Card, WyrdError> {
-        let spec = self.to_prompt_spec_from_metadata()?;
+        let spec = Spec::Prompt(self.to_prompt_spec_from_metadata()?);
+        let spec_hash = spec.canonical_hash().map_err(|e| {
+            validation_error(
+                "PromptCard spec failed canonicalization",
+                json!({ "source": e.to_string() }),
+            )
+        })?;
         Ok(Card {
             api_version: ApiVersion::v1(),
             kind: CardKind::Prompt,
-            metadata: self.to_envelope_metadata(&spec)?,
-            spec: Spec::Prompt(spec),
+            metadata: self.to_envelope_metadata(spec_hash)?,
+            spec,
             relationships: Relationships::default(),
             status: None,
         })
@@ -244,7 +252,7 @@ impl PromptCard {
         })
     }
 
-    fn to_envelope_metadata(&self, spec: &PromptSpec) -> Result<EnvelopeMetadata, WyrdError> {
+    fn to_envelope_metadata(&self, spec_hash: SpecHash) -> Result<EnvelopeMetadata, WyrdError> {
         Ok(EnvelopeMetadata {
             name: card_name("name", &self.name)?,
             version: Some(version_block(&self.version)?.into()),
@@ -253,7 +261,7 @@ impl PromptCard {
             uid: optional_card_uid(&self.uid)?,
             labels: self.labels.clone(),
             annotations: self.annotations.clone(),
-            spec_hash: Some(spec.content_hash()),
+            spec_hash: Some(spec_hash),
             artifact_hash: None,
         })
     }

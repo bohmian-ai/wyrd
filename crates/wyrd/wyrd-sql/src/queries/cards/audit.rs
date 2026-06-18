@@ -45,6 +45,10 @@ pub(crate) async fn record_card_registration_audit(
     let operation_db = row.operation.as_db_str();
     let actor_kind_db = actor_kind_db_str(&row.actor_kind);
 
+    // Dynamic query is intentional: the audit table is append-only and the
+    // sqlx macro adds no value here. The data_tenant_id is sourced from
+    // `wyrd.current_tenant()` (set by TenantConn) so callers cannot write
+    // an audit row scoped to a different tenant.
     let result = sqlx::query(
         r#"
         INSERT INTO wyrd.audit_card_registration (
@@ -60,11 +64,10 @@ pub(crate) async fn record_card_registration_audit(
             request_id,
             occurred_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+        VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, NOW())
         "#,
     )
     .bind(row.audit_id)
-    .bind(row.data_tenant_id)
     .bind(row.card_uid.as_uuid())
     .bind(kind_db)
     .bind(operation_db)

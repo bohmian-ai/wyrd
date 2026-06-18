@@ -52,23 +52,16 @@ CREATE INDEX idx_audit_card_registration_request_id
 ALTER TABLE wyrd.audit_card_registration ENABLE ROW LEVEL SECURITY;
 ALTER TABLE wyrd.audit_card_registration FORCE  ROW LEVEL SECURITY;
 
-CREATE POLICY audit_card_registration_tenant_insert
-    ON wyrd.audit_card_registration
-    FOR INSERT
-    TO PUBLIC
+-- Unified tenant_isolation policy governs SELECT and INSERT; UPDATE/DELETE
+-- are blocked unconditionally by triggers below.
+CREATE POLICY tenant_isolation ON wyrd.audit_card_registration
+    USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
 
-CREATE POLICY audit_card_registration_tenant_select
-    ON wyrd.audit_card_registration
-    FOR SELECT
-    TO PUBLIC
-    USING (data_tenant_id = wyrd.current_tenant());
-
-CREATE POLICY audit_card_registration_admin_cross_tenant
-    ON wyrd.audit_card_registration
-    FOR SELECT
+CREATE POLICY admin_cross_tenant ON wyrd.audit_card_registration
     TO wyrd_platform_admin
-    USING (true);
+    USING (true)
+    WITH CHECK (true);
 
 CREATE OR REPLACE FUNCTION wyrd.audit_card_registration_block_mutations()
 RETURNS TRIGGER

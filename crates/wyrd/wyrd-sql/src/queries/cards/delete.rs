@@ -1,4 +1,9 @@
 //! Soft-delete query for `wyrd.cards`.
+//!
+//! Dynamic query is intentional: the UPDATE statements use sqlx::query
+//! (not the macro) because the WHERE predicates compose against
+//! `wyrd.current_tenant()` which the macro's offline checker does not
+//! resolve to a fixed tenant.
 #![deny(missing_docs)]
 
 use ulid::Ulid;

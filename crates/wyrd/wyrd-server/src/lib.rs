@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod boot;
+pub mod config;
 pub mod error;
 pub mod middleware;
 pub mod router;

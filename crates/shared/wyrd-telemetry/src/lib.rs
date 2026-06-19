@@ -6,7 +6,8 @@ use tracing_subscriber::EnvFilter;
 use wyrd_spec::error::WyrdError;
 
 /// Telemetry setup config.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     /// Env filter directive.
     pub filter: String,
@@ -36,7 +37,8 @@ impl Default for TelemetryConfig {
 }
 
 /// OTLP exporter protocol selection.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OtlpProtocol {
     /// OTLP over gRPC.
     #[default]

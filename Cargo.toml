@@ -112,6 +112,10 @@ opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 pyo3 = { version = "0.28", features = ["abi3-py310", "chrono", "py-clone"] }
+toml = "0.8"
+shellexpand = "3"
+ipnetwork = "0.20"
+wyrd-telemetry = { path = "crates/shared/wyrd-telemetry", version = "0.0.1" }
 
 # Cloud SDKs are server-tier only.
 aws-sdk-s3 = "=1.75.0"

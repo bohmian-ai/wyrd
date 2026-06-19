@@ -1,5 +1,16 @@
 //! Shared axum application state.
 
+/// Runtime-ready limits derived from config.
+#[derive(Debug, Clone, Copy)]
+pub struct LimitsConfig {
+    /// Maximum allowed request body size in bytes.
+    pub body_bytes: usize,
+    /// Per-request processing timeout.
+    pub timeout: std::time::Duration,
+    /// Maximum in-flight concurrent requests.
+    pub concurrency: usize,
+}
+
 use sqlx::PgPool;
 use std::sync::Arc;
 use wyrd_auth_check::{PolicyHook, StubAllowPolicyHook};

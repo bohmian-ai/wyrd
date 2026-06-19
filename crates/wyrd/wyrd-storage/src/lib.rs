@@ -26,7 +26,7 @@ pub mod tenant_path;
 
 pub use azure::{AzureSasMode, AzureSigner};
 pub use error::{AzureError, ConfigParseError, GcsError, LocalError, S3Error, StorageError};
-pub use handle::StorageHandle;
+pub use handle::{StorageHandle, StorageHealthError};
 pub use local::LocalSigner;
 pub use plan::{PlanError, PlannedUpload, plan_upload};
 pub use settings::{BackendConfig, StorageSettings};

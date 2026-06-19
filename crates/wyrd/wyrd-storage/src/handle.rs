@@ -10,6 +10,23 @@ use url::Url;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::StorageBackendKind;
 
+/// Error returned by [`StorageHandle::health_probe`].
+#[derive(Debug, thiserror::Error)]
+pub enum StorageHealthError {
+    /// The storage backend probe timed out.
+    #[error("storage health probe timed out after {ms}ms")]
+    Timeout {
+        /// Elapsed milliseconds before the probe was cancelled.
+        ms: u64,
+    },
+    /// The storage backend returned an unexpected error.
+    #[error("storage health probe failed")]
+    Backend(#[source] object_store::Error),
+    /// Local storage root is inaccessible.
+    #[error("local storage root is inaccessible")]
+    LocalRoot(#[source] std::io::Error),
+}
+
 /// Shared storage handle.
 ///
 /// The handle carries both the active backend signer and the single
@@ -171,6 +188,36 @@ impl StorageHandle {
     pub fn public_base_url(&self) -> Option<&str> {
         self.public_base_url.as_deref()
     }
+
+    /// Probe the storage backend for liveness.
+    ///
+    /// For the local backend, attempts a `stat` of the configured storage root
+    /// directory. For object-store backends (S3, GCS, Azure), issues a
+    /// `HeadObject` request against `_wyrd/health.sentinel`; `NotFound` is
+    /// treated as healthy (bucket accessible, sentinel absent is expected).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageHealthError`] when the probe times out or the backend
+    /// returns an error that indicates inaccessibility.
+    #[tracing::instrument(skip(self))]
+    pub async fn health_probe(&self) -> Result<(), StorageHealthError> {
+        match &self.backend_config {
+            BackendConfig::Local { root } => tokio::fs::metadata(root)
+                .await
+                .map(|_| ())
+                .map_err(StorageHealthError::LocalRoot),
+            _ => {
+                use object_store::{ObjectStoreExt, path::Path};
+                let sentinel = Path::from("_wyrd/health.sentinel");
+                match self.object_store.head(&sentinel).await {
+                    Ok(_) => Ok(()),
+                    Err(object_store::Error::NotFound { .. }) => Ok(()),
+                    Err(e) => Err(StorageHealthError::Backend(e)),
+                }
+            }
+        }
+    }
 }
 
 fn validate_tenant_prefix(
@@ -188,4 +235,39 @@ fn validate_tenant_prefix(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::local::LocalSigner;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    fn local_handle(root: &std::path::Path) -> StorageHandle {
+        let signer = BackendSigner::Local(LocalSigner::new(root.to_path_buf()).unwrap());
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(root).unwrap());
+        StorageHandle::new(signer, object_store)
+    }
+
+    #[tokio::test]
+    async fn health_probe_local_root_exists() {
+        let dir = TempDir::new().unwrap();
+        let handle = local_handle(dir.path());
+        assert!(handle.health_probe().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn health_probe_local_missing_root() {
+        let dir = TempDir::new().unwrap();
+        let handle = local_handle(dir.path());
+        // Remove the directory after creating the handle to simulate inaccessible root.
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        let result = handle.health_probe().await;
+        assert!(
+            matches!(result, Err(StorageHealthError::LocalRoot(_))),
+            "expected LocalRoot error, got {result:?}"
+        );
+    }
 }

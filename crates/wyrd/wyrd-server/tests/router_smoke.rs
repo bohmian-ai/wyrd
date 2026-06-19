@@ -121,7 +121,9 @@ async fn request_with_missing_header_returns_401_unauthenticated() {
 }
 
 #[tokio::test]
-async fn auth_routes_do_not_receive_request_id_layer() {
+async fn auth_routes_receive_request_id_via_protected_router() {
+    // Auth routes are in the protected router which applies attach_request_id;
+    // the response must include the wyrd-request-id header.
     let response = build_router(test_state())
         .oneshot(
             Request::builder()
@@ -134,7 +136,103 @@ async fn auth_routes_do_not_receive_request_id_layer() {
         .await
         .expect("router responds");
 
-    assert!(!response.headers().contains_key("wyrd-request-id"));
+    assert!(
+        response.headers().contains_key("wyrd-request-id"),
+        "auth routes sit in the protected router and must carry wyrd-request-id"
+    );
+}
+
+#[tokio::test]
+async fn healthz_returns_ok_without_problem_json() {
+    let response = build_router(test_state())
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        !content_type.contains("problem"),
+        "/healthz must not return problem+json"
+    );
+}
+
+#[tokio::test]
+async fn readyz_returns_json_even_on_cold_boot() {
+    // On cold boot ReadinessSnapshot::initial() is all-warmup, so /readyz returns 503.
+    // The body must be application/problem+json with the correct code.
+    let response = build_router(test_state())
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/problem+json")
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collects");
+    let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
+    assert_eq!(problem["code"], "WYRD_SERVER_503_NOT_READY");
+    assert_eq!(problem["status"], 503);
+}
+
+#[tokio::test]
+async fn oversized_body_returns_413_problem_json() {
+    use wyrd_server::state::LimitsConfig;
+
+    // Build state with a 10-byte body limit.
+    let state = test_state().with_limits(LimitsConfig {
+        body_bytes: 10,
+        timeout: std::time::Duration::from_secs(30),
+        concurrency: 1024,
+    });
+
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/cards/upload/init")
+                .header("content-type", "application/json")
+                .header("x-wyrd-access-token", "Bearer invalid.token.here")
+                .body(axum::body::Body::from("a".repeat(100)))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/problem+json")
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collects");
+    let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
+    assert_eq!(problem["code"], "WYRD_SPEC_413_PAYLOAD_TOO_LARGE");
 }
 
 fn test_state() -> AppState {

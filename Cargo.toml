@@ -51,6 +51,7 @@ wyrd-dev-fixtures = { path = "crates/shared/wyrd-dev-fixtures", version = "0.0.1
 wyrd-sql = { path = "crates/wyrd/wyrd-sql", version = "0.0.1" }
 wyrd-storage = { path = "crates/wyrd/wyrd-storage", version = "0.0.1" }
 wyrd-server = { path = "crates/wyrd/wyrd-server", version = "0.0.1" }
+wyrd-tonic = { path = "crates/wyrd/wyrd-tonic", version = "0.0.1" }
 wyrd-semver = { path = "crates/shared/wyrd-semver", version = "0.0.1" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["io"] }

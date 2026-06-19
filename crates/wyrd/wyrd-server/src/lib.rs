@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod boot;
 pub mod config;
+pub mod grpc;
 pub mod error;
 pub mod health;
 pub mod middleware;

@@ -1,0 +1,23 @@
+[package]
+name = "wyrd-tonic"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+tonic = { workspace = true }
+tonic-health = { workspace = true }
+prost = { workspace = true }
+wyrd-spec = { workspace = true }
+arc-swap = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dependencies.tonic-reflection]
+workspace = true
+optional = true
+
+[features]
+default = []
+server = ["dep:tonic-reflection"]

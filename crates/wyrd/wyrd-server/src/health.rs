@@ -228,6 +228,12 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
+impl wyrd_tonic::health::HealthSnapshot for ReadinessSnapshot {
+    fn all_ok(&self) -> bool {
+        self.postgres.ok && self.storage.ok
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use ipnetwork::IpNetwork;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
-use tonic_health::server::HealthReporter;
+use wyrd_tonic::tonic_health::server::HealthReporter;
 use wyrd_auth_check::{PolicyHook, StubAllowPolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::TokenVerifier;
@@ -95,7 +95,7 @@ impl AppState {
         platform_admin_pool: Option<PgPool>,
         storage: Arc<StorageHandle>,
     ) -> Self {
-        let (reporter, _service) = tonic_health::server::health_reporter();
+        let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
         Self {
             pool,
             platform_admin_pool,

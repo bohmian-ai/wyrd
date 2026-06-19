@@ -3986,6 +3986,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost-types"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
+dependencies = [
+ "prost",
+]
+
+[[package]]
 name = "pulldown-cmark"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5769,6 +5778,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -5852,6 +5862,19 @@ checksum = "1eaf34ddb812120f5c601162d5429933c9b527d901ab0e7f930d3147e33a09b2"
 dependencies = [
  "async-stream",
  "prost",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
+name = "tonic-reflection"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "878d81f52e7fcfd80026b7fdb6a9b578b3c3653ba987f87f0dce4b64043cba27"
+dependencies = [
+ "prost",
+ "prost-types",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -7046,7 +7069,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
- "tonic-health",
  "tower 0.5.3",
  "tower-http",
  "tracing",
@@ -7065,6 +7087,7 @@ dependencies = [
  "wyrd-storage",
  "wyrd-telemetry",
  "wyrd-testing",
+ "wyrd-tonic",
 ]
 
 [[package]]
@@ -7207,6 +7230,22 @@ dependencies = [
  "wyrd-spec",
  "wyrd-sql",
  "wyrd-storage",
+]
+
+[[package]]
+name = "wyrd-tonic"
+version = "0.0.1"
+dependencies = [
+ "arc-swap",
+ "prost",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tonic-health",
+ "tonic-reflection",
+ "tracing",
+ "wyrd-spec",
 ]
 
 [[package]]

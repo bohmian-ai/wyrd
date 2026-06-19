@@ -1773,6 +1773,48 @@ pub enum WyrdError {
         /// Structured probe detail payload.
         details: serde_json::Value,
     },
+    /// Server is shedding load to protect in-flight requests.
+    #[error("[WYRD_SERVER_503_SERVICE_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SERVER_503_SERVICE_UNAVAILABLE",
+        status = 503,
+        title = "Service unavailable",
+        remediation = "Retry with exponential backoff; the server is shedding load to protect inflight requests."
+    )]
+    ServiceUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Server's per-request timeout was exceeded.
+    #[error("[WYRD_SERVER_504_REQUEST_TIMEOUT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SERVER_504_REQUEST_TIMEOUT",
+        status = 504,
+        title = "Request timeout",
+        remediation = "Reduce the request size or split the operation; the server's per-request timeout was exceeded."
+    )]
+    RequestTimeout {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Request body exceeds the configured size limit.
+    #[error("[WYRD_SPEC_413_PAYLOAD_TOO_LARGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_413_PAYLOAD_TOO_LARGE",
+        status = 413,
+        title = "Payload too large",
+        remediation = "Reduce the request body size and retry."
+    )]
+    PayloadTooLarge {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
 }
 
 impl WyrdError {
@@ -1898,7 +1940,10 @@ impl WyrdError {
             | Self::RegistrySpecDrift { message, details }
             | Self::RegistryUnavailable { message, details }
             | Self::PrincipalOrphaned { message, details }
-            | Self::ServerNotReady { message, details } => {
+            | Self::ServerNotReady { message, details }
+            | Self::ServiceUnavailable { message, details }
+            | Self::RequestTimeout { message, details }
+            | Self::PayloadTooLarge { message, details } => {
                 (Cow::Borrowed(message.as_str()), details.clone())
             }
             Self::Storage { error } => (

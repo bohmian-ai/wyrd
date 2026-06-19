@@ -101,8 +101,7 @@ jsonwebtoken = "9"
 sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "macros", "migrate", "chrono", "uuid", "json"] }
 tempfile = "3"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
-tower_governor = { version = "0.8", features = ["axum"] }
+tower-http = { version = "0.6", features = ["trace", "catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 paste = "1"

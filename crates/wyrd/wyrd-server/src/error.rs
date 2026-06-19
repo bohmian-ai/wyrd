@@ -63,14 +63,42 @@ impl IntoResponse for WyrdErrorResponse {
 /// Render a Wyrd error as an RFC 9457 problem+json response.
 #[must_use]
 pub fn wyrd_error_response(error: WyrdError) -> Response {
+    wyrd_error_response_from_parts(error, None)
+}
+
+/// Render a Wyrd error as problem+json, optionally inserting the request id
+/// into the `instance` field and the `wyrd-request-id` response header.
+#[must_use]
+pub fn wyrd_error_response_from_parts(
+    error: WyrdError,
+    request_id: Option<&wyrd_spec::request_id::RequestId>,
+) -> Response {
     let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    match serde_json::to_vec(&error.as_problem_json()) {
-        Ok(body) => {
-            let mut response = response_with_body(status, body);
-            if matches!(error, WyrdError::AuthVerifyUnavailable { .. }) {
+    let mut body = error.as_problem_json();
+    if let (serde_json::Value::Object(map), Some(id)) = (&mut body, request_id) {
+        map.insert(
+            "instance".to_owned(),
+            serde_json::Value::String(format!("urn:wyrd:request:{}", id.as_str())),
+        );
+    }
+    let retry_after = matches!(error, WyrdError::AuthVerifyUnavailable { .. });
+    match serde_json::to_vec(&body) {
+        Ok(bytes) => {
+            let mut response = response_with_body(status, bytes);
+            if retry_after {
                 response.headers_mut().insert(
                     axum::http::header::RETRY_AFTER,
                     axum::http::HeaderValue::from_static("1"),
+                );
+            }
+            if let Some(id) = request_id
+                && let Ok(val) = axum::http::HeaderValue::from_str(id.as_str())
+            {
+                response.headers_mut().insert(
+                    axum::http::header::HeaderName::from_static(
+                        crate::middleware::request_id::REQUEST_ID_HEADER,
+                    ),
+                    val,
                 );
             }
             response
@@ -80,6 +108,45 @@ pub fn wyrd_error_response(error: WyrdError) -> Response {
             br#"{"type":"https://wyrd.dev/problems/WYRD_SPEC_500_INTERNAL","title":"Internal error","status":500,"detail":"failed to serialize Wyrd error response","code":"WYRD_SPEC_500_INTERNAL","details":{},"remediation":"Retry later or inspect server logs using the request ID."}"#.to_vec(),
         ),
     }
+}
+
+/// Adapter for `HandleErrorLayer`: converts tower `BoxError` into a Wyrd
+/// problem+json response.
+///
+/// Maps:
+/// - `tower::timeout::error::Elapsed` → 504 `WYRD_SERVER_504_REQUEST_TIMEOUT`
+/// - `tower::load_shed::error::Overloaded` → 503 `WYRD_SERVER_503_SERVICE_UNAVAILABLE`
+/// - Unknown → 500 `WYRD_SPEC_500_INTERNAL`
+pub async fn map_tower_error_to_wyrd(error: tower::BoxError) -> Response {
+    if error.is::<tower::timeout::error::Elapsed>() {
+        return wyrd_error_response(WyrdError::RequestTimeout {
+            message: "request exceeded the configured handler timeout".to_owned(),
+            details: serde_json::json!({}),
+        });
+    }
+    if error.is::<tower::load_shed::error::Overloaded>() {
+        return wyrd_error_response(WyrdError::ServiceUnavailable {
+            message: "server is at capacity; retry with backoff".to_owned(),
+            details: serde_json::json!({}),
+        });
+    }
+    tracing::error!(tower_error_class = "unknown", "unexpected tower BoxError in HandleErrorLayer");
+    wyrd_error_response(WyrdError::Internal {
+        message: "internal server error".to_owned(),
+        details: serde_json::json!({}),
+    })
+}
+
+/// Panic handler for `CatchPanicLayer::custom`.
+///
+/// Returns a fixed 500 problem+json body. The panic payload is never logged or
+/// echoed to the caller.
+pub fn wyrd_panic_response(_panic_info: Box<dyn std::any::Any + Send>) -> Response {
+    tracing::error!(panic.class = "handler", "handler panicked; returning 500");
+    wyrd_error_response(WyrdError::Internal {
+        message: "internal server error".to_owned(),
+        details: serde_json::json!({}),
+    })
 }
 
 fn response_with_body(status: StatusCode, body: Vec<u8>) -> Response {

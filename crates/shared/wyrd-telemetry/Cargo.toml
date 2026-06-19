@@ -8,7 +8,7 @@ repository = { workspace = true }
 authors = { workspace = true }
 [features]
 default = []
-otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:ulid"]
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
@@ -19,3 +19,5 @@ wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+ulid = { workspace = true, optional = true }

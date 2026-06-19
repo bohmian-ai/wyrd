@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
 use wyrd_storage::sweeper::{SWEEPER_LEADER_LOCK_KEY, Sweeper, SweeperConfig};
@@ -12,7 +12,7 @@ async fn tick_sweeps_expired_uploads_and_reaps_idempotency_rows() {
     let admin_pool = fixture.platform_admin_pool().clone();
     let tenant = fixture.data_tenant_id();
     let handle = local_storage_handle().await;
-    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_rx = CancellationToken::new();
     let sweeper = Sweeper::new(
         handle,
         admin_pool.clone(),
@@ -89,7 +89,7 @@ async fn sweeper_skips_audit_when_upload_already_completed() {
     let admin_pool = fixture.platform_admin_pool().clone();
     let tenant = fixture.data_tenant_id();
     let handle = local_storage_handle().await;
-    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_rx = CancellationToken::new();
     let sweeper = Sweeper::new(
         handle,
         admin_pool.clone(),

@@ -4,8 +4,8 @@
 //!
 //! - [`signal_watcher`] — parks until SIGINT or SIGTERM arrives, then cancels a shared
 //!   [`CancellationToken`] so every listener can drain and exit.
-//! - [`await_drain`] — joins a set of background task handles within a time budget,
-//!   aborting any that exceed the deadline.
+//! - [`await_drain`] — drains background workers within a time budget, processes an
+//!   already-joined gRPC result, and cleans up the signal watcher handle.
 
 use tokio_util::sync::CancellationToken;
 
@@ -43,35 +43,70 @@ pub async fn signal_watcher(shutdown: CancellationToken) {
     shutdown.cancel();
 }
 
-/// Wait up to `drain_ms` milliseconds for all background tasks to complete.
+/// Wait up to `drain` for all background workers to complete, then abort any
+/// remaining tasks and clean up the signal watcher handle.
 ///
-/// If the drain budget is exceeded, all remaining tasks are aborted via their
-/// abort handles and the loop exits. Tasks that finish before the deadline are
-/// joined normally. A panic in any task is logged as a warning rather than
-/// propagated.
-#[tracing::instrument(skip(handles))]
-pub async fn await_drain(handles: Vec<tokio::task::JoinHandle<()>>, drain_ms: u64) {
+/// `grpc_result` is the already-joined result of the gRPC serve task when the
+/// gRPC select! arm fired first. When another arm fired, pass `None` — the gRPC
+/// task is detached and will wind down via the cancellation token it holds.
+///
+/// Any terminal errors accumulated in the select! loop are preserved; new errors
+/// from the gRPC result or panicking workers are recorded only if `terminal_error`
+/// is still `None`.
+#[tracing::instrument(skip(grpc_result, workers, signal_handle, terminal_error))]
+pub async fn await_drain(
+    grpc_result: Option<Result<Result<(), crate::grpc::GrpcError>, tokio::task::JoinError>>,
+    mut workers: tokio::task::JoinSet<()>,
+    signal_handle: tokio::task::JoinHandle<()>,
+    drain: std::time::Duration,
+    terminal_error: &mut Option<Box<dyn std::error::Error + Send + Sync>>,
+) {
     use tokio::time::{Instant, timeout_at};
 
-    let deadline = Instant::now() + std::time::Duration::from_millis(drain_ms);
-    let abort_handles: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
+    if let Some(result) = grpc_result {
+        capture_grpc_drain_result(&result, terminal_error);
+    }
 
-    for handle in handles {
-        match timeout_at(deadline, handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) if e.is_cancelled() => {}
-            Ok(Err(_)) => {
+    let deadline = Instant::now() + drain;
+    loop {
+        match timeout_at(deadline, workers.join_next()).await {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(e))) if e.is_cancelled() => {}
+            Ok(Some(Err(_))) => {
                 tracing::warn!("background task panicked during drain");
             }
+            Ok(None) => break,
             Err(_elapsed) => {
-                tracing::warn!(
-                    "drain deadline exceeded; aborting remaining background tasks"
-                );
-                for abort in &abort_handles {
-                    abort.abort();
-                }
+                tracing::warn!("drain deadline exceeded; aborting remaining background workers");
+                workers.abort_all();
                 break;
             }
+        }
+    }
+
+    signal_handle.abort();
+    let _ = signal_handle.await;
+}
+
+fn capture_grpc_drain_result(
+    result: &Result<Result<(), crate::grpc::GrpcError>, tokio::task::JoinError>,
+    terminal_error: &mut Option<Box<dyn std::error::Error + Send + Sync>>,
+) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(grpc_error)) => {
+            terminal_error.get_or_insert_with(|| {
+                Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                    "gRPC serve failed: {grpc_error}"
+                ))
+            });
+        }
+        Err(join_error) => {
+            terminal_error.get_or_insert_with(|| {
+                Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                    "gRPC serve task aborted: {join_error}"
+                ))
+            });
         }
     }
 }
@@ -83,47 +118,45 @@ mod tests {
 
     #[tokio::test]
     async fn await_drain_all_complete() {
-        let handles: Vec<_> = (0..4)
-            .map(|_| tokio::spawn(async { tokio::time::sleep(Duration::from_millis(10)).await }))
-            .collect();
+        let mut workers = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            workers.spawn(async { tokio::time::sleep(Duration::from_millis(10)).await });
+        }
+        let signal_handle = tokio::spawn(std::future::pending::<()>());
 
         let before = Instant::now();
-        await_drain(handles, 1_000).await;
-        // All tasks should finish well within 1 second, and well before the 1s budget.
+        let mut terminal_error = None;
+        await_drain(None, workers, signal_handle, Duration::from_secs(1), &mut terminal_error).await;
+        assert!(terminal_error.is_none());
         assert!(before.elapsed() < Duration::from_millis(500));
     }
 
     #[tokio::test]
     async fn await_drain_timeout_aborts() {
-        // Task that never completes unless cancelled.
-        let handles: Vec<_> = (0..2)
-            .map(|_| tokio::spawn(async { std::future::pending::<()>().await }))
-            .collect();
+        let mut workers = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            workers.spawn(async { std::future::pending::<()>().await });
+        }
+        let signal_handle = tokio::spawn(std::future::pending::<()>());
 
         let before = Instant::now();
-        // Very short drain budget — should return promptly.
-        await_drain(handles, 50).await;
+        let mut terminal_error = None;
+        await_drain(None, workers, signal_handle, Duration::from_millis(50), &mut terminal_error).await;
         let elapsed = before.elapsed();
-        // Should return in roughly 50 ms, not hang indefinitely.
         assert!(elapsed < Duration::from_millis(500), "elapsed={elapsed:?}");
     }
 
     #[tokio::test]
     async fn signal_watcher_cancels_token() {
-        // We cannot inject a real OS signal in unit tests, so instead verify that the
-        // CancellationToken contract works as expected with `await_drain` and independent
-        // cancellation — this is a smoke test for the token integration.
         let token = CancellationToken::new();
         let child = token.child_token();
 
-        // Cancel via a separate task, mimicking what signal_watcher does.
         let token_clone = token.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
             token_clone.cancel();
         });
 
-        // Observe cancellation on the child token.
         child.cancelled().await;
         assert!(token.is_cancelled());
     }

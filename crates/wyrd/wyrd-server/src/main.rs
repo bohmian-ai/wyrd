@@ -1,67 +1,241 @@
-use std::net::SocketAddr;
-use tokio::sync::watch;
-use wyrd_server::AppState;
-use wyrd_storage::sweeper::{Sweeper, SweeperConfig};
+use std::sync::Arc;
+use std::time::Duration;
 
-const PORT_ENV: &str = "WYRD_SERVER_PORT";
-const DEFAULT_PORT: u16 = 8080;
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
+use wyrd_tonic::tonic_health::server::health_reporter;
+
+use wyrd_server::{
+    WyrdServerConfig, build_app_state_from_config, build_router, spawn_storage_sweeper,
+};
+use wyrd_server::boot::production_guards;
+use wyrd_server::grpc::{
+    GrpcError, GrpcRouterConfig, build_grpc_router, drive_health_status, publish_initial_health,
+    serve_grpc,
+};
+use wyrd_server::health::readiness_loop;
+use wyrd_server::shutdown::{await_drain, signal_watcher};
+use wyrd_telemetry::{TelemetryGuard, init as init_telemetry};
+
+const EX_CONFIG: i32 = 78;
+const EX_SOFTWARE: i32 = 70;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    let exit_code = match run().await {
+        Ok(()) => 0,
+        Err(BootExit::Config(err)) => {
+            eprintln!("wyrd-server: config error: {err}");
+            EX_CONFIG
+        }
+        Err(BootExit::Other(err)) => {
+            eprintln!("wyrd-server: fatal error: {err}");
+            EX_SOFTWARE
+        }
+    };
+    std::process::exit(exit_code);
+}
+
+enum BootExit {
+    Config(Box<dyn std::error::Error + Send + Sync>),
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+async fn run() -> Result<(), BootExit> {
     enterprise_on_start();
 
-    let state = wyrd_server::build_app_state().await?;
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let sweeper_handle = spawn_storage_sweeper(&state, shutdown_rx)?;
-    let port: u16 = std::env::var(PORT_ENV)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
-    let app = wyrd_server::router(state);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()))
-    .await?;
-    let _ = shutdown_tx.send(true);
-    if let Some(handle) = sweeper_handle {
-        let _ = handle.await;
-    }
-    Ok(())
-}
+    // Phase 1 — config
+    let config = WyrdServerConfig::load()
+        .map_err(|e| BootExit::Config(Box::new(e)))?;
 
-fn spawn_storage_sweeper(
-    state: &AppState,
-    shutdown: watch::Receiver<bool>,
-) -> Result<Option<tokio::task::JoinHandle<()>>, wyrd_storage::StorageError> {
-    let cfg = SweeperConfig::from_env()?;
-    if !cfg.enabled {
-        tracing::info!("storage sweeper disabled via WYRD_STORAGE_SWEEPER_ENABLED=false");
-        return Ok(None);
-    }
+    // Phase 0 — production guards (before telemetry)
+    production_guards(&config)
+        .map_err(|e| BootExit::Config(Box::new(e)))?;
 
-    let Some(admin_pool) = state.platform_admin_pool.clone() else {
-        tracing::warn!("storage sweeper skipped because platform admin pool is unavailable");
-        return Ok(None);
-    };
-
-    let sweeper = Sweeper::new(
-        std::sync::Arc::clone(&state.storage),
-        admin_pool,
-        cfg,
-        shutdown,
+    // Phase 2 — telemetry
+    let telemetry: Arc<TelemetryGuard> = Arc::new(
+        init_telemetry(config.telemetry.clone())
+            .map_err(|e| BootExit::Other(Box::new(e)))?,
     );
-    Ok(Some(tokio::spawn(async move { sweeper.run().await })))
-}
+    info!(
+        service.name = config.telemetry.service_name.as_deref().unwrap_or("wyrd-server"),
+        "wyrd-server starting"
+    );
 
-async fn shutdown_signal(shutdown_tx: watch::Sender<bool>) {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::warn!(error = %error, "failed to listen for shutdown signal");
+    // Phase 3 — cancellation token
+    let shutdown = CancellationToken::new();
+
+    // Phase 4 — gRPC health reporter (returned once; cannot be reconstructed from reporter alone)
+    let (mut reporter, health_service) = health_reporter();
+
+    // Phases 5–12 — postgres boot, migrations, pools, storage, auth, AppState assembly
+    let state = build_app_state_from_config(
+        &config,
+        shutdown.clone(),
+        telemetry.clone(),
+        reporter.clone(),
+    )
+    .await
+    .map_err(|e| BootExit::Other(Box::new(e)))?;
+
+    // Phase 13 — assembled-state production guard
+    state
+        .production_validate()
+        .map_err(|e| BootExit::Config(Box::new(e)))?;
+
+    // Phase 14 — HTTP router
+    let http_router = build_router(state.clone());
+
+    // Phase 15 — gRPC router
+    let grpc_router = build_grpc_router(
+        health_service,
+        GrpcRouterConfig { reflection_enabled: config.grpc.reflection_enabled },
+    )
+    .map_err(|e| BootExit::Other(Box::new(e)))?;
+
+    // Phase 16 — background workers
+    let mut workers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
+    if let Some(sweeper) = spawn_storage_sweeper(&state, shutdown.clone())
+        .map_err(|e| BootExit::Other(Box::new(e)))?
+    {
+        workers.spawn(async move {
+            match sweeper.await {
+                Ok(()) => {}
+                Err(join_error) if join_error.is_panic() => {
+                    std::panic::resume_unwind(join_error.into_panic());
+                }
+                Err(join_error) => {
+                    panic!("storage sweeper task aborted unexpectedly: {join_error}");
+                }
+            }
+        });
     }
-    let _ = shutdown_tx.send(true);
+
+    workers.spawn(readiness_loop(
+        state.clone(),
+        Duration::from_millis(config.readiness.tick_ms),
+        Duration::from_millis(config.readiness.probe_timeout_ms),
+        shutdown.clone(),
+    ));
+
+    // F-03 closeout: publish snapshot-based gRPC health status before the gRPC
+    // bind opens and before the consumer task spawns.
+    publish_initial_health(&state.readiness, &mut reporter).await;
+
+    workers.spawn(drive_health_status(
+        state.readiness.clone(),
+        reporter.clone(),
+        shutdown.clone(),
+    ));
+
+    // Phase 17 — HTTP bind
+    let http_addr = config.http.bind;
+    let listener = TcpListener::bind(http_addr)
+        .await
+        .map_err(|e| BootExit::Other(Box::new(e)))?;
+    info!(bind = %http_addr, "HTTP server listening");
+
+    // Phase 18 — gRPC serve
+    let grpc_handle = tokio::spawn({
+        let token = shutdown.clone();
+        let bind = config.grpc.bind;
+        async move { serve_grpc(grpc_router, bind, token).await }
+    });
+
+    // Phase 19 — signal watcher
+    let signal_handle = tokio::spawn(signal_watcher(shutdown.clone()));
+
+    // Phase 20 — unified serve loop
+    let http_serve = {
+        let token = shutdown.clone();
+        async move {
+            axum::serve(
+                listener,
+                http_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move { token.cancelled().await })
+            .await
+        }
+    };
+    tokio::pin!(http_serve);
+
+    let mut http_result: Option<Result<(), std::io::Error>> = None;
+    let mut grpc_result: Option<Result<Result<(), GrpcError>, tokio::task::JoinError>> = None;
+    let mut terminal_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+
+    tokio::select! {
+        result = &mut http_serve => {
+            if let Err(ref error) = result {
+                warn!(error = %error, "axum::serve returned error");
+            }
+            http_result = Some(result);
+            shutdown.cancel();
+        }
+        joined = grpc_handle => {
+            match &joined {
+                Ok(Ok(())) => {}
+                Ok(Err(grpc_error)) => {
+                    warn!(error = %grpc_error, "gRPC serve returned error");
+                    let msg = format!("gRPC serve failed: {grpc_error}");
+                    terminal_error.get_or_insert_with(|| {
+                        Box::<dyn std::error::Error + Send + Sync>::from(msg)
+                    });
+                }
+                Err(join_error) => {
+                    warn!(error = %join_error, "gRPC serve task aborted");
+                    let msg = format!("gRPC serve task aborted: {join_error}");
+                    terminal_error.get_or_insert_with(|| {
+                        Box::<dyn std::error::Error + Send + Sync>::from(msg)
+                    });
+                }
+            }
+            grpc_result = Some(joined);
+            shutdown.cancel();
+        }
+        Some(joined) = workers.join_next() => {
+            let message = match &joined {
+                Ok(()) => {
+                    warn!("background worker exited before shutdown signal; cancelling");
+                    "background worker exited before shutdown signal".to_owned()
+                }
+                Err(error) => {
+                    warn!(error = %error, "background worker terminated with error; cancelling");
+                    format!("background worker terminated: {error}")
+                }
+            };
+            terminal_error.get_or_insert_with(|| {
+                Box::<dyn std::error::Error + Send + Sync>::from(message)
+            });
+            shutdown.cancel();
+        }
+        _ = shutdown.cancelled() => {}
+    }
+
+    // Drain HTTP if not already finished
+    if http_result.is_none() {
+        let result = (&mut http_serve).await;
+        if let Err(ref error) = result {
+            warn!(error = %error, "axum::serve returned error during drain");
+        }
+        http_result = Some(result);
+    }
+
+    // Phase 21 — bounded drain
+    let drain = Duration::from_millis(config.shutdown.drain_ms);
+    await_drain(grpc_result, workers, signal_handle, drain, &mut terminal_error).await;
+
+    // Phase 22
+    info!("wyrd-server shutdown complete");
+    drop(telemetry);
+
+    if let Some(error) = terminal_error {
+        return Err(BootExit::Other(error));
+    }
+    http_result
+        .unwrap_or(Ok(()))
+        .map_err(|e| BootExit::Other(Box::new(e)))
 }
 
 #[cfg(feature = "enterprise")]

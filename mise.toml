@@ -767,9 +767,134 @@ case "$matches" in
 esac
 """
 
+[tasks."check:no-legacy-server-vocab"]
+description = "Reject legacy server vocabulary and orphan-rule violations"
+run = """
+set -e
+
+# 1. Route prefix lock (server source only)
+! rg -n --no-heading -e '/api/v1' crates/wyrd/wyrd-server/src/
+
+# 2. Identity vocabulary (server source only)
+! rg -n --no-heading -e '\\bActor\\b' crates/wyrd/wyrd-server/src/
+! rg -n --no-heading -e '\\bScope\\b' crates/wyrd/wyrd-server/src/
+
+# 3. JWT claim leak
+! rg -n --no-heading -e '"scopes"' crates/wyrd/wyrd-server/src/
+
+# 4. Predecessor names
+! rg -n --no-heading -e 'opsml|scouter' crates/wyrd/wyrd-server/src/
+
+# 5. Plan docs: predecessor names allowed only in audit + verification files
+! rg -n --no-heading -e 'opsml|scouter' .dev/plan/foundations/07-server-skeleton \
+    --glob '!11-parity-audit.md' --glob '!10-verification.md'
+
+# 6. Predecessor domain nouns
+! rg -n --no-heading -e '\\b(SubAgent|Skill|RecoveryCode|ScouterApiClient)\\b' \
+    crates/wyrd/wyrd-server/src/
+
+# 7. Single IntoResponse impl for Wyrd errors
+COUNT=$(rg -n --no-heading -e 'impl[[:space:]]+IntoResponse[[:space:]]+for[[:space:]]+Wyrd' crates/ | wc -l)
+test "$COUNT" -eq 1
+
+# 8. Orphan rule: no From<WyrdError> for tonic::Status
+! rg -n --no-heading -e 'impl[[:space:]]+From<WyrdError>[[:space:]]+for[[:space:]]+([a-zA-Z_:]+::)?Status\\b' crates/
+! rg -n --no-heading -e 'From<WyrdError>[[:space:]]+for[[:space:]]+\\S*tonic\\S*::' crates/
+
+# 9. Authorization header not consumed by auth/route handlers
+! rg -n --no-heading -e 'header::AUTHORIZATION' \
+    crates/wyrd/wyrd-server/src/auth/ crates/wyrd/wyrd-server/src/routes/
+
+# 10. Wyrd-Caller-Identity not consumed
+! rg -n --no-heading -e 'Wyrd-Caller-Identity' crates/wyrd/wyrd-server/src/ \
+    | rg -n -e '\\.extract|\\.get'
+
+# 11. tower-http body-limit absent from server source (F-02 closeout)
+! rg -n --no-heading -e 'LengthLimitError|RequestBodyLimitLayer' \
+    crates/wyrd/wyrd-server/src/
+
+# 12. Tower middleware logs do not format raw inner errors (F-05 closeout).
+#     Scoped to middleware only — domain error functions in error.rs log raw
+#     sqlx/storage errors deliberately and are excluded from this gate.
+! rg -n --no-heading -e 'error\\s*=\\s*%error\\b' \
+    crates/wyrd/wyrd-server/src/middleware/
+"""
+
+[tasks."check:no-tower-governor-server-skeleton"]
+description = "Reject in-process auth rate limiter (tower-governor) from the server skeleton"
+run = """
+set -e
+
+# 1. Source code: no governor symbol in wyrd-server
+! rg -n --no-heading -e 'tower_governor|GovernorLayer|GovernorConfigBuilder' \
+    crates/wyrd/wyrd-server/src/
+
+# 2. Server crate manifest: no governor dep entry
+! rg -n --no-heading -e 'tower_governor|tower-governor' \
+    crates/wyrd/wyrd-server/Cargo.toml
+
+# 3. Workspace root manifest: no governor dep declaration
+! rg -n --no-heading -e 'tower_governor|tower-governor' Cargo.toml
+"""
+
+[tasks."check:no-tonic-outside-wyrd-tonic"]
+description = "Reject tonic-family dep declarations outside wyrd-tonic + workspace pins"
+run = """
+set -e
+
+# 1. Manifest declarations must only appear in wyrd-tonic and workspace root
+! rg -n --no-heading \
+    -e '^[[:space:]]*(tonic|tonic-health|tonic-reflection|prost)[[:space:]]*=' \
+    --glob '!crates/wyrd/wyrd-tonic/Cargo.toml' \
+    --glob '!Cargo.toml' \
+    crates/ python/
+
+# 1a. Renamed-dep evasion (package = "tonic")
+! rg -n --no-heading \
+    -e 'package[[:space:]]*=[[:space:]]*"(tonic|tonic-health|tonic-reflection|prost)"' \
+    --glob '!crates/wyrd/wyrd-tonic/Cargo.toml' \
+    --glob '!Cargo.toml' \
+    crates/ python/
+
+# 2. Source-code imports must not bypass wyrd-tonic re-exports
+! rg -n --no-heading \
+    -e '^[[:space:]]*(pub(\\([^)]+\\))?[[:space:]]+)?use[[:space:]]+(tonic|tonic_health|tonic_reflection|prost)::' \
+    --glob '!crates/wyrd/wyrd-tonic/src/**' \
+    crates/ python/
+
+# 2a. extern crate form
+! rg -n --no-heading \
+    -e '^[[:space:]]*extern[[:space:]]+crate[[:space:]]+(tonic|tonic_health|tonic_reflection|prost)\\b' \
+    --glob '!crates/wyrd/wyrd-tonic/src/**' \
+    crates/ python/
+
+# 3. Workspace pin sanity
+rg -q -e '^[[:space:]]*tonic[[:space:]]*=' Cargo.toml
+rg -q -e '^[[:space:]]*tonic-health[[:space:]]*=' Cargo.toml
+rg -q -e '^[[:space:]]*tonic-reflection[[:space:]]*=' Cargo.toml
+rg -q -e '^[[:space:]]*prost[[:space:]]*=' Cargo.toml
+
+# 4. wyrd-server consumes wyrd-tonic with features = ["server"]
+if command -v cargo >/dev/null && command -v jq >/dev/null; then
+    server_features=$(cargo metadata --format-version=1 --no-deps |
+        jq -r '.packages[] | select(.name=="wyrd-server")
+               | .dependencies[]
+               | select(.name=="wyrd-tonic")
+               | .features[]')
+    echo "$server_features" | rg -q '^server$'
+else
+    rg -q -U \
+        -e 'wyrd-tonic[[:space:]]*=.*features[^\n]*"server"' \
+        crates/wyrd/wyrd-server/Cargo.toml || \
+    rg -q -U \
+        -e '\\[dependencies\\.wyrd-tonic\\][^\\[]*features[^\n]*"server"' \
+        crates/wyrd/wyrd-server/Cargo.toml
+fi
+"""
+
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
-depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs"]
+depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs", "check:no-legacy-server-vocab", "check:no-tower-governor-server-skeleton", "check:no-tonic-outside-wyrd-tonic"]
 
 [tasks."db:setup-roles"]
 description = """Create wyrd_app and wyrd_platform_admin roles in the target Postgres instance.

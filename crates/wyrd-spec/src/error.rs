@@ -1759,6 +1759,20 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Server is not ready to serve requests.
+    #[error("[WYRD_SERVER_503_NOT_READY] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SERVER_503_NOT_READY",
+        status = 503,
+        title = "Server not ready",
+        remediation = "Wait for readiness probes to recover; check the `details.checks` object for the failing component and reason code."
+    )]
+    ServerNotReady {
+        /// Human-readable error message.
+        message: String,
+        /// Structured probe detail payload.
+        details: serde_json::Value,
+    },
 }
 
 impl WyrdError {
@@ -1883,7 +1897,8 @@ impl WyrdError {
             | Self::RegistryVersionConflict { message, details }
             | Self::RegistrySpecDrift { message, details }
             | Self::RegistryUnavailable { message, details }
-            | Self::PrincipalOrphaned { message, details } => {
+            | Self::PrincipalOrphaned { message, details }
+            | Self::ServerNotReady { message, details } => {
                 (Cow::Borrowed(message.as_str()), details.clone())
             }
             Self::Storage { error } => (

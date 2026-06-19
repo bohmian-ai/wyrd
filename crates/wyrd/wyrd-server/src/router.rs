@@ -36,6 +36,7 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(crate::healthz))
+        .route("/readyz", get(crate::health::readyz))
         .merge(crate::auth::routes::router().layer(GovernorLayer::new(auth_governor)))
         .nest("/v1", v1)
         .with_state(state)

@@ -84,7 +84,10 @@ Locked cross-cutting decisions that any contributor must honor:
   package surface, not the place for duplicated business logic.
 - Current approved Python owner crates are `wyrd-interfaces`, `wyrd-cards`,
   `wyrd-utils`, `wyrd-observe`, `vala-client`, `skald-prompt`,
-  `skald-runtime`, `skald-agent`, `skald-tool`, and `skald-workflow`.
+  `skald-runtime`, `skald-agent`, `skald-tool`, `skald-workflow`, and
+  `wyrd-testing`. `wyrd-testing`'s `python` feature exposes the
+  `WyrdTestServer` harness only; it is a test-tier crate and is never
+  enabled on production Python wheels.
 - Client-tier crates do not depend on `sqlx`, cloud SDKs, `datafusion`, or
   `deltalake`.
 - Vala and Skald do not depend on each other directly.

@@ -7239,6 +7239,7 @@ version = "0.0.1"
 dependencies = [
  "arc-swap",
  "prost",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

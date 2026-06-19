@@ -130,7 +130,10 @@ pub async fn map_tower_error_to_wyrd(error: tower::BoxError) -> Response {
             details: serde_json::json!({}),
         });
     }
-    tracing::error!(tower_error_class = "unknown", "unexpected tower BoxError in HandleErrorLayer");
+    tracing::error!(
+        tower_error_class = "unknown",
+        "unexpected tower BoxError in HandleErrorLayer"
+    );
     wyrd_error_response(WyrdError::Internal {
         message: "internal server error".to_owned(),
         details: serde_json::json!({}),

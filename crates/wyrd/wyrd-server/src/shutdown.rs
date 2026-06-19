@@ -19,10 +19,8 @@ pub async fn signal_watcher(shutdown: CancellationToken) {
 
     #[cfg(unix)]
     {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        )
-        .expect("SIGTERM handler registration is a process invariant");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler registration is a process invariant");
 
         tokio::select! {
             _ = ctrl_c => {
@@ -126,7 +124,14 @@ mod tests {
 
         let before = Instant::now();
         let mut terminal_error = None;
-        await_drain(None, workers, signal_handle, Duration::from_secs(1), &mut terminal_error).await;
+        await_drain(
+            None,
+            workers,
+            signal_handle,
+            Duration::from_secs(1),
+            &mut terminal_error,
+        )
+        .await;
         assert!(terminal_error.is_none());
         assert!(before.elapsed() < Duration::from_millis(500));
     }
@@ -141,7 +146,14 @@ mod tests {
 
         let before = Instant::now();
         let mut terminal_error = None;
-        await_drain(None, workers, signal_handle, Duration::from_millis(50), &mut terminal_error).await;
+        await_drain(
+            None,
+            workers,
+            signal_handle,
+            Duration::from_millis(50),
+            &mut terminal_error,
+        )
+        .await;
         let elapsed = before.elapsed();
         assert!(elapsed < Duration::from_millis(500), "elapsed={elapsed:?}");
     }

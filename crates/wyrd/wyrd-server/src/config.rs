@@ -382,8 +382,8 @@ impl WyrdServerConfig {
     pub fn load() -> Result<Self, ConfigError> {
         let mut config = match Self::pick_toml_path()? {
             Some(path) => {
-                let contents = std::fs::read_to_string(&path)
-                    .map_err(|source| ConfigError::ReadToml {
+                let contents =
+                    std::fs::read_to_string(&path).map_err(|source| ConfigError::ReadToml {
                         path: path.clone(),
                         source,
                     })?;
@@ -412,9 +412,7 @@ impl WyrdServerConfig {
 
         let candidates = [
             PathBuf::from("/etc/wyrd/server.toml"),
-            PathBuf::from(
-                shellexpand::tilde("~/.config/wyrd/server.toml").as_ref(),
-            ),
+            PathBuf::from(shellexpand::tilde("~/.config/wyrd/server.toml").as_ref()),
         ];
 
         for path in &candidates {
@@ -439,9 +437,7 @@ impl WyrdServerConfig {
                 _ => {
                     return Err(ConfigError::BadEnvVar {
                         key: "WYRD_DEPLOYMENT_PROFILE".to_string(),
-                        message: format!(
-                            "expected 'development' or 'production', got {val:?}"
-                        ),
+                        message: format!("expected 'development' or 'production', got {val:?}"),
                     });
                 }
             };
@@ -449,18 +445,22 @@ impl WyrdServerConfig {
 
         // http.bind
         if let Some(val) = env_opt("WYRD_SERVER_BIND")? {
-            self.http.bind = val.parse::<SocketAddr>().map_err(|e| ConfigError::BadEnvVar {
-                key: "WYRD_SERVER_BIND".to_string(),
-                message: e.to_string(),
-            })?;
+            self.http.bind = val
+                .parse::<SocketAddr>()
+                .map_err(|e| ConfigError::BadEnvVar {
+                    key: "WYRD_SERVER_BIND".to_string(),
+                    message: e.to_string(),
+                })?;
         }
 
         // grpc.bind
         if let Some(val) = env_opt("WYRD_GRPC_BIND")? {
-            self.grpc.bind = val.parse::<SocketAddr>().map_err(|e| ConfigError::BadEnvVar {
-                key: "WYRD_GRPC_BIND".to_string(),
-                message: e.to_string(),
-            })?;
+            self.grpc.bind = val
+                .parse::<SocketAddr>()
+                .map_err(|e| ConfigError::BadEnvVar {
+                    key: "WYRD_GRPC_BIND".to_string(),
+                    message: e.to_string(),
+                })?;
         }
 
         // grpc.reflection_enabled
@@ -523,56 +523,50 @@ impl WyrdServerConfig {
 
         // pools.acquire_ms
         if let Some(val) = env_opt("WYRD_PG_POOL_ACQUIRE_MS")? {
-            self.pools.acquire_ms =
-                val.parse::<u64>().map_err(|e| ConfigError::BadEnvVar {
-                    key: "WYRD_PG_POOL_ACQUIRE_MS".to_string(),
-                    message: e.to_string(),
-                })?;
+            self.pools.acquire_ms = val.parse::<u64>().map_err(|e| ConfigError::BadEnvVar {
+                key: "WYRD_PG_POOL_ACQUIRE_MS".to_string(),
+                message: e.to_string(),
+            })?;
         }
 
         // limits.body_bytes
         if let Some(val) = env_opt("WYRD_HTTP_BODY_LIMIT_BYTES")? {
-            self.limits.body_bytes =
-                val.parse::<usize>().map_err(|e| ConfigError::BadEnvVar {
-                    key: "WYRD_HTTP_BODY_LIMIT_BYTES".to_string(),
-                    message: e.to_string(),
-                })?;
+            self.limits.body_bytes = val.parse::<usize>().map_err(|e| ConfigError::BadEnvVar {
+                key: "WYRD_HTTP_BODY_LIMIT_BYTES".to_string(),
+                message: e.to_string(),
+            })?;
         }
 
         // limits.timeout_ms
         if let Some(val) = env_opt("WYRD_HTTP_REQUEST_TIMEOUT_MS")? {
-            self.limits.timeout_ms =
-                val.parse::<u64>().map_err(|e| ConfigError::BadEnvVar {
-                    key: "WYRD_HTTP_REQUEST_TIMEOUT_MS".to_string(),
-                    message: e.to_string(),
-                })?;
+            self.limits.timeout_ms = val.parse::<u64>().map_err(|e| ConfigError::BadEnvVar {
+                key: "WYRD_HTTP_REQUEST_TIMEOUT_MS".to_string(),
+                message: e.to_string(),
+            })?;
         }
 
         // limits.concurrency
         if let Some(val) = env_opt("WYRD_HTTP_CONCURRENCY_LIMIT")? {
-            self.limits.concurrency =
-                val.parse::<usize>().map_err(|e| ConfigError::BadEnvVar {
-                    key: "WYRD_HTTP_CONCURRENCY_LIMIT".to_string(),
-                    message: e.to_string(),
-                })?;
+            self.limits.concurrency = val.parse::<usize>().map_err(|e| ConfigError::BadEnvVar {
+                key: "WYRD_HTTP_CONCURRENCY_LIMIT".to_string(),
+                message: e.to_string(),
+            })?;
         }
 
         // shutdown.drain_ms
         if let Some(val) = env_opt("WYRD_SHUTDOWN_DRAIN_MS")? {
-            self.shutdown.drain_ms =
-                val.parse::<u64>().map_err(|e| ConfigError::BadEnvVar {
-                    key: "WYRD_SHUTDOWN_DRAIN_MS".to_string(),
-                    message: e.to_string(),
-                })?;
+            self.shutdown.drain_ms = val.parse::<u64>().map_err(|e| ConfigError::BadEnvVar {
+                key: "WYRD_SHUTDOWN_DRAIN_MS".to_string(),
+                message: e.to_string(),
+            })?;
         }
 
         // readiness.tick_ms
         if let Some(val) = env_opt("WYRD_READINESS_TICK_MS")? {
-            self.readiness.tick_ms =
-                val.parse::<u64>().map_err(|e| ConfigError::BadEnvVar {
-                    key: "WYRD_READINESS_TICK_MS".to_string(),
-                    message: e.to_string(),
-                })?;
+            self.readiness.tick_ms = val.parse::<u64>().map_err(|e| ConfigError::BadEnvVar {
+                key: "WYRD_READINESS_TICK_MS".to_string(),
+                message: e.to_string(),
+            })?;
         }
 
         // readiness.probe_timeout_ms
@@ -701,9 +695,10 @@ impl WyrdServerConfig {
 
         // 10. All trusted_upstreams must parse as valid CIDRs.
         for cidr in &self.request_id.trusted_upstreams {
-            cidr.parse::<ipnetwork::IpNetwork>().map_err(|e| ConfigError::Invalid {
-                message: format!("trusted upstream {cidr:?} is not a valid CIDR: {e}"),
-            })?;
+            cidr.parse::<ipnetwork::IpNetwork>()
+                .map_err(|e| ConfigError::Invalid {
+                    message: format!("trusted upstream {cidr:?} is not a valid CIDR: {e}"),
+                })?;
         }
 
         // 11. trust_upstream requires at least one trusted_upstream entry.
@@ -718,14 +713,13 @@ impl WyrdServerConfig {
         if self.deployment_profile.is_production() {
             if self.grpc.reflection_enabled {
                 return Err(ConfigError::Invalid {
-                    message:
-                        "grpc.reflection_enabled must be false in production profile".to_string(),
+                    message: "grpc.reflection_enabled must be false in production profile"
+                        .to_string(),
                 });
             }
             if self.auth.allow_preview {
                 return Err(ConfigError::Invalid {
-                    message:
-                        "auth.allow_preview must be false in production profile".to_string(),
+                    message: "auth.allow_preview must be false in production profile".to_string(),
                 });
             }
         }
@@ -751,9 +745,7 @@ impl WyrdServerConfig {
         if let Some(ratio) = self.telemetry.sample_ratio {
             if !(0.0..=1.0).contains(&ratio) {
                 return Err(ConfigError::Invalid {
-                    message: format!(
-                        "telemetry.sample_ratio must be in [0.0, 1.0], got {ratio}"
-                    ),
+                    message: format!("telemetry.sample_ratio must be in [0.0, 1.0], got {ratio}"),
                 });
             }
         }
@@ -868,17 +860,14 @@ mod tests {
     #[test]
     fn env_server_bind_overrides_http() {
         let _guard = ENV_LOCK.lock().unwrap();
-        temp_env::with_vars(
-            [("WYRD_SERVER_BIND", Some("127.0.0.1:9999"))],
-            || {
-                let mut cfg = WyrdServerConfig::default();
-                cfg.apply_env_overrides().expect("apply succeeds");
-                assert_eq!(
-                    cfg.http.bind,
-                    "127.0.0.1:9999".parse::<SocketAddr>().unwrap()
-                );
-            },
-        );
+        temp_env::with_vars([("WYRD_SERVER_BIND", Some("127.0.0.1:9999"))], || {
+            let mut cfg = WyrdServerConfig::default();
+            cfg.apply_env_overrides().expect("apply succeeds");
+            assert_eq!(
+                cfg.http.bind,
+                "127.0.0.1:9999".parse::<SocketAddr>().unwrap()
+            );
+        });
     }
 
     // ── 4. Same-port collision triggers BindCollision ─────────────────────────
@@ -993,16 +982,13 @@ mod tests {
     #[test]
     fn empty_env_var_produces_error() {
         let _guard = ENV_LOCK.lock().unwrap();
-        temp_env::with_vars(
-            [("WYRD_SERVER_BIND", Some(""))],
-            || {
-                let err = env_opt("WYRD_SERVER_BIND").expect_err("empty var must error");
-                assert!(
-                    matches!(err, ConfigError::EmptyEnvVar { ref key } if key == "WYRD_SERVER_BIND"),
-                    "expected EmptyEnvVar, got {err:?}"
-                );
-            },
-        );
+        temp_env::with_vars([("WYRD_SERVER_BIND", Some(""))], || {
+            let err = env_opt("WYRD_SERVER_BIND").expect_err("empty var must error");
+            assert!(
+                matches!(err, ConfigError::EmptyEnvVar { ref key } if key == "WYRD_SERVER_BIND"),
+                "expected EmptyEnvVar, got {err:?}"
+            );
+        });
     }
 
     // ── 11. tick_ms too low → Invalid ────────────────────────────────────────
@@ -1026,27 +1012,28 @@ mod tests {
     #[test]
     fn bad_deployment_profile_env_var() {
         let _guard = ENV_LOCK.lock().unwrap();
-        temp_env::with_vars(
-            [("WYRD_DEPLOYMENT_PROFILE", Some("staging"))],
-            || {
-                let mut cfg = WyrdServerConfig::default();
-                let err = cfg.apply_env_overrides().expect_err("bad profile must error");
-                assert!(
-                    matches!(err, ConfigError::BadEnvVar { ref key, .. } if key == "WYRD_DEPLOYMENT_PROFILE"),
-                    "expected BadEnvVar, got {err:?}"
-                );
-            },
-        );
+        temp_env::with_vars([("WYRD_DEPLOYMENT_PROFILE", Some("staging"))], || {
+            let mut cfg = WyrdServerConfig::default();
+            let err = cfg
+                .apply_env_overrides()
+                .expect_err("bad profile must error");
+            assert!(
+                matches!(err, ConfigError::BadEnvVar { ref key, .. } if key == "WYRD_DEPLOYMENT_PROFILE"),
+                "expected BadEnvVar, got {err:?}"
+            );
+        });
     }
 
     // ── 13. OTLP endpoint with userinfo → Invalid ────────────────────────────
 
     #[test]
     fn otlp_endpoint_userinfo_invalid() {
-        let err =
-            validate_otlp_endpoint("http://user:pass@collector.example.com:4317")
-                .expect_err("userinfo must fail");
-        assert!(err.contains("userinfo"), "message should mention userinfo: {err}");
+        let err = validate_otlp_endpoint("http://user:pass@collector.example.com:4317")
+            .expect_err("userinfo must fail");
+        assert!(
+            err.contains("userinfo"),
+            "message should mention userinfo: {err}"
+        );
     }
 
     // ── 14. OTLP endpoint with query string → Invalid ────────────────────────
@@ -1064,9 +1051,7 @@ mod tests {
     fn valid_otlp_endpoint_with_path() {
         validate_otlp_endpoint("http://collector.example.com:4317/v1/traces")
             .expect("endpoint with path must be valid");
-        validate_otlp_endpoint("grpc://localhost:4317")
-            .expect("grpc endpoint must be valid");
-        validate_otlp_endpoint("https://otel.example.com")
-            .expect("https endpoint must be valid");
+        validate_otlp_endpoint("grpc://localhost:4317").expect("grpc endpoint must be valid");
+        validate_otlp_endpoint("https://otel.example.com").expect("https endpoint must be valid");
     }
 }

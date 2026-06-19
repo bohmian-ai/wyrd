@@ -59,8 +59,15 @@ impl ReadinessSnapshot {
     /// Seed value: not ready until the background task has ticked once.
     #[must_use]
     pub fn initial() -> Self {
-        let warmup = ProbeOutcome { ok: false, reason: ProbeReason::Warmup, elapsed_ms: 0 };
-        Self { postgres: warmup.clone(), storage: warmup }
+        let warmup = ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::Warmup,
+            elapsed_ms: 0,
+        };
+        Self {
+            postgres: warmup.clone(),
+            storage: warmup,
+        }
     }
 
     /// True when all probes passed in the most recent tick.
@@ -93,13 +100,20 @@ async fn compute_snapshot(state: &AppState, probe_timeout: Duration) -> Readines
         probe_postgres(state, probe_timeout),
         probe_storage(state, probe_timeout),
     );
-    ReadinessSnapshot { postgres: pg, storage }
+    ReadinessSnapshot {
+        postgres: pg,
+        storage,
+    }
 }
 
 async fn probe_postgres(state: &AppState, probe_timeout: Duration) -> ProbeOutcome {
     let started = std::time::Instant::now();
     let result = timeout(probe_timeout, async {
-        let mut conn = state.pool.acquire().await.map_err(|e| (ProbeReason::PoolAcquire, e))?;
+        let mut conn = state
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| (ProbeReason::PoolAcquire, e))?;
         sqlx::query_scalar::<_, i32>("SELECT 1")
             .fetch_one(conn.as_mut())
             .await
@@ -108,7 +122,11 @@ async fn probe_postgres(state: &AppState, probe_timeout: Duration) -> ProbeOutco
     .await;
     let elapsed_ms = started.elapsed().as_millis();
     match result {
-        Ok(Ok(_)) => ProbeOutcome { ok: true, reason: ProbeReason::Ok, elapsed_ms },
+        Ok(Ok(_)) => ProbeOutcome {
+            ok: true,
+            reason: ProbeReason::Ok,
+            elapsed_ms,
+        },
         Ok(Err((reason, error))) => {
             tracing::warn!(
                 reason = ?reason,
@@ -116,7 +134,11 @@ async fn probe_postgres(state: &AppState, probe_timeout: Duration) -> ProbeOutco
                 elapsed_ms,
                 "readiness: postgres probe failed"
             );
-            ProbeOutcome { ok: false, reason, elapsed_ms }
+            ProbeOutcome {
+                ok: false,
+                reason,
+                elapsed_ms,
+            }
         }
         Err(_) => {
             tracing::warn!(
@@ -124,7 +146,11 @@ async fn probe_postgres(state: &AppState, probe_timeout: Duration) -> ProbeOutco
                 elapsed_ms,
                 "readiness: postgres probe timed out"
             );
-            ProbeOutcome { ok: false, reason: ProbeReason::Timeout, elapsed_ms }
+            ProbeOutcome {
+                ok: false,
+                reason: ProbeReason::Timeout,
+                elapsed_ms,
+            }
         }
     }
 }
@@ -153,7 +179,11 @@ async fn probe_storage(state: &AppState, probe_timeout: Duration) -> ProbeOutcom
     let result = timeout(probe_timeout, state.storage.health_probe()).await;
     let elapsed_ms = started.elapsed().as_millis();
     match result {
-        Ok(Ok(())) => ProbeOutcome { ok: true, reason: ProbeReason::Ok, elapsed_ms },
+        Ok(Ok(())) => ProbeOutcome {
+            ok: true,
+            reason: ProbeReason::Ok,
+            elapsed_ms,
+        },
         Ok(Err(error)) => {
             tracing::warn!(
                 reason = ?ProbeReason::BackendError,
@@ -161,7 +191,11 @@ async fn probe_storage(state: &AppState, probe_timeout: Duration) -> ProbeOutcom
                 elapsed_ms,
                 "readiness: storage probe failed"
             );
-            ProbeOutcome { ok: false, reason: ProbeReason::BackendError, elapsed_ms }
+            ProbeOutcome {
+                ok: false,
+                reason: ProbeReason::BackendError,
+                elapsed_ms,
+            }
         }
         Err(_) => {
             tracing::warn!(
@@ -169,7 +203,11 @@ async fn probe_storage(state: &AppState, probe_timeout: Duration) -> ProbeOutcom
                 elapsed_ms,
                 "readiness: storage probe timed out"
             );
-            ProbeOutcome { ok: false, reason: ProbeReason::Timeout, elapsed_ms }
+            ProbeOutcome {
+                ok: false,
+                reason: ProbeReason::Timeout,
+                elapsed_ms,
+            }
         }
     }
 }
@@ -205,8 +243,12 @@ impl PublicReadinessReport {
         Self {
             status,
             checks: PublicChecks {
-                postgres: PublicProbeOutcome { reason: snapshot.postgres.reason },
-                storage: PublicProbeOutcome { reason: snapshot.storage.reason },
+                postgres: PublicProbeOutcome {
+                    reason: snapshot.postgres.reason,
+                },
+                storage: PublicProbeOutcome {
+                    reason: snapshot.storage.reason,
+                },
             },
         }
     }
@@ -240,8 +282,16 @@ mod tests {
 
     fn all_ok_snapshot() -> ReadinessSnapshot {
         ReadinessSnapshot {
-            postgres: ProbeOutcome { ok: true, reason: ProbeReason::Ok, elapsed_ms: 1 },
-            storage: ProbeOutcome { ok: true, reason: ProbeReason::Ok, elapsed_ms: 1 },
+            postgres: ProbeOutcome {
+                ok: true,
+                reason: ProbeReason::Ok,
+                elapsed_ms: 1,
+            },
+            storage: ProbeOutcome {
+                ok: true,
+                reason: ProbeReason::Ok,
+                elapsed_ms: 1,
+            },
         }
     }
 
@@ -252,7 +302,11 @@ mod tests {
                 reason: ProbeReason::PoolAcquire,
                 elapsed_ms: 100,
             },
-            storage: ProbeOutcome { ok: true, reason: ProbeReason::Ok, elapsed_ms: 1 },
+            storage: ProbeOutcome {
+                ok: true,
+                reason: ProbeReason::Ok,
+                elapsed_ms: 1,
+            },
         }
     }
 
@@ -286,11 +340,13 @@ mod tests {
 
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let root = tempfile::tempdir().expect("temp dir");
-        let signer =
-            LocalSigner::new(root.path().to_path_buf()).expect("local signer");
+        let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         let object_store =
             Arc::new(LocalFileSystem::new_with_prefix(root.path()).expect("object store"));
-        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer), object_store));
+        let storage = Arc::new(StorageHandle::new(
+            BackendSigner::Local(signer),
+            object_store,
+        ));
         let state = crate::state::AppState::new(app_pool, None, storage);
 
         let shutdown = CancellationToken::new();
@@ -306,8 +362,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(25)).await;
         shutdown_clone.cancel();
 
-        let result =
-            tokio::time::timeout(Duration::from_millis(200), handle).await;
+        let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
         assert!(result.is_ok(), "readiness_loop did not exit after cancel");
     }
 }

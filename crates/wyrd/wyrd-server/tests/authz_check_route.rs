@@ -59,7 +59,9 @@ async fn authz_direct_service_jwt_returns_403_chain_empty() {
 
 #[tokio::test]
 async fn authz_delegated_token_allows() {
-    let srv = WyrdTestServer::start_in_process().await.expect("env starts");
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("env starts");
     let caller = srv
         .bootstrap_service("route-caller", &["runtime_admin"])
         .await

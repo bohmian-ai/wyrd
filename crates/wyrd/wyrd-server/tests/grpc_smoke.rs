@@ -48,7 +48,10 @@ async fn build_grpc_router_health_only_succeeds() {
             reflection_enabled: false,
         },
     );
-    assert!(result.is_ok(), "health-only gRPC router must build successfully");
+    assert!(
+        result.is_ok(),
+        "health-only gRPC router must build successfully"
+    );
 }
 
 #[cfg(feature = "server")]

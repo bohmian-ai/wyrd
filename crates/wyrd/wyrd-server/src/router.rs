@@ -1,8 +1,8 @@
 //! Axum router namespace for Wyrd server surfaces.
 
 use axum::Router;
-use axum::extract::Request;
 use axum::error_handling::HandleErrorLayer;
+use axum::extract::Request;
 use axum::middleware;
 use axum::routing::get;
 use tower::ServiceBuilder;

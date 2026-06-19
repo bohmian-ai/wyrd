@@ -487,10 +487,9 @@ impl WyrdTestServer {
                     .uri("/v1/authz/check")
                     .header("x-wyrd-access-token", format!("Bearer {jwt}"))
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&request)
-                            .map_err(|error| WyrdTestServerError::Io(error.to_string()))?,
-                    ))
+                    .body(Body::from(serde_json::to_vec(&request).map_err(
+                        |error| WyrdTestServerError::Io(error.to_string()),
+                    )?))
                     .map_err(|error| WyrdTestServerError::Io(error.to_string()))?,
             )
             .await?;
@@ -501,8 +500,7 @@ impl WyrdTestServer {
             .and_then(|value| value.to_str().ok())
             .ok_or_else(|| WyrdTestServerError::Io("missing wyrd-request-id header".to_owned()))
             .and_then(|value| {
-                RequestId::parse(value)
-                    .map_err(|error| WyrdTestServerError::Io(error.to_string()))
+                RequestId::parse(value).map_err(|error| WyrdTestServerError::Io(error.to_string()))
             })?;
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
@@ -594,7 +592,10 @@ impl WyrdTestServer {
         self.inner.fixture.tenant_conn().await.map_err(sql)
     }
 
-    async fn raw_call(&self, mut req: Request<Body>) -> Result<Response<Body>, WyrdTestServerError> {
+    async fn raw_call(
+        &self,
+        mut req: Request<Body>,
+    ) -> Result<Response<Body>, WyrdTestServerError> {
         req.extensions_mut()
             .insert(axum::extract::ConnectInfo(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -651,10 +652,7 @@ impl WyrdTestServerBuilder {
 
     /// Override the default no-op audit writer.
     #[must_use]
-    pub fn with_audit_writer(
-        mut self,
-        writer: Arc<dyn AuthzAuditWriter>,
-    ) -> Self {
+    pub fn with_audit_writer(mut self, writer: Arc<dyn AuthzAuditWriter>) -> Self {
         self.audit_writer = Some(writer);
         self
     }
@@ -681,8 +679,8 @@ impl WyrdTestServerBuilder {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         conn.commit().await.map_err(sql)?;
 
-        let storage_root = tempfile::tempdir()
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let storage_root =
+            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let storage = wyrd_storage::StorageHandle::from_settings(StorageSettings {
             backend: BackendConfig::Local {
                 root: storage_root.path().to_path_buf(),
@@ -858,13 +856,11 @@ fn role_refs(roles: &[&str]) -> Result<Vec<RoleRef>, WyrdTestServerError> {
 fn card_ref(kind: CardKind, name: &str) -> Result<CardRef, WyrdTestServerError> {
     Ok(CardRef {
         kind,
-        name: CardName::new(name)
-            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?,
+        name: CardName::new(name).map_err(|error| WyrdTestServerError::Auth(error.to_string()))?,
         version: VersionBlock::parse("1.0.0").expect("static semantic version block is valid"),
         space: SpaceName::new("test").expect("static space name is valid"),
         uid: Some(
-            CardUid::new(Uuid::now_v7().to_string())
-                .expect("generated UUIDv7 is a valid CardUid"),
+            CardUid::new(Uuid::now_v7().to_string()).expect("generated UUIDv7 is a valid CardUid"),
         ),
     })
 }

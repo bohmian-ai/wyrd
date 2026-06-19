@@ -6,9 +6,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use wyrd_tonic::tonic_health::server::health_reporter;
 
-use wyrd_server::{
-    WyrdServerConfig, build_app_state_from_config, build_router, spawn_storage_sweeper,
-};
 use wyrd_server::boot::production_guards;
 use wyrd_server::grpc::{
     GrpcError, GrpcRouterConfig, build_grpc_router, drive_health_status, publish_initial_health,
@@ -16,6 +13,9 @@ use wyrd_server::grpc::{
 };
 use wyrd_server::health::readiness_loop;
 use wyrd_server::shutdown::{await_drain, signal_watcher};
+use wyrd_server::{
+    WyrdServerConfig, build_app_state_from_config, build_router, spawn_storage_sweeper,
+};
 use wyrd_telemetry::{TelemetryGuard, init as init_telemetry};
 
 const EX_CONFIG: i32 = 78;
@@ -46,20 +46,21 @@ async fn run() -> Result<(), BootExit> {
     enterprise_on_start();
 
     // Phase 1 — config
-    let config = WyrdServerConfig::load()
-        .map_err(|e| BootExit::Config(Box::new(e)))?;
+    let config = WyrdServerConfig::load().map_err(|e| BootExit::Config(Box::new(e)))?;
 
     // Phase 0 — production guards (before telemetry)
-    production_guards(&config)
-        .map_err(|e| BootExit::Config(Box::new(e)))?;
+    production_guards(&config).map_err(|e| BootExit::Config(Box::new(e)))?;
 
     // Phase 2 — telemetry
     let telemetry: Arc<TelemetryGuard> = Arc::new(
-        init_telemetry(config.telemetry.clone())
-            .map_err(|e| BootExit::Other(Box::new(e)))?,
+        init_telemetry(config.telemetry.clone()).map_err(|e| BootExit::Other(Box::new(e)))?,
     );
     info!(
-        service.name = config.telemetry.service_name.as_deref().unwrap_or("wyrd-server"),
+        service.name = config
+            .telemetry
+            .service_name
+            .as_deref()
+            .unwrap_or("wyrd-server"),
         "wyrd-server starting"
     );
 
@@ -90,15 +91,17 @@ async fn run() -> Result<(), BootExit> {
     // Phase 15 — gRPC router
     let grpc_router = build_grpc_router(
         health_service,
-        GrpcRouterConfig { reflection_enabled: config.grpc.reflection_enabled },
+        GrpcRouterConfig {
+            reflection_enabled: config.grpc.reflection_enabled,
+        },
     )
     .map_err(|e| BootExit::Other(Box::new(e)))?;
 
     // Phase 16 — background workers
     let mut workers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
-    if let Some(sweeper) = spawn_storage_sweeper(&state, shutdown.clone())
-        .map_err(|e| BootExit::Other(Box::new(e)))?
+    if let Some(sweeper) =
+        spawn_storage_sweeper(&state, shutdown.clone()).map_err(|e| BootExit::Other(Box::new(e)))?
     {
         workers.spawn(async move {
             match sweeper.await {
@@ -224,7 +227,14 @@ async fn run() -> Result<(), BootExit> {
 
     // Phase 21 — bounded drain
     let drain = Duration::from_millis(config.shutdown.drain_ms);
-    await_drain(grpc_result, workers, signal_handle, drain, &mut terminal_error).await;
+    await_drain(
+        grpc_result,
+        workers,
+        signal_handle,
+        drain,
+        &mut terminal_error,
+    )
+    .await;
 
     // Phase 22
     info!("wyrd-server shutdown complete");

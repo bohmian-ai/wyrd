@@ -77,9 +77,7 @@ where
                     if let Ok(len) = s.parse::<usize>() {
                         if len > max_bytes {
                             let error = WyrdError::PayloadTooLarge {
-                                message: format!(
-                                    "request body exceeds the {max_bytes}-byte limit"
-                                ),
+                                message: format!("request body exceeds the {max_bytes}-byte limit"),
                                 details: serde_json::json!({
                                     "max_bytes": max_bytes,
                                     "declared_bytes": len,

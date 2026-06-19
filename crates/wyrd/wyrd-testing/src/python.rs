@@ -126,16 +126,16 @@ impl WyrdTestServer {
 
     #[getter]
     fn api_key(&self) -> PyResult<String> {
-        self.api_key.clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
-        })
+        self.api_key
+            .clone()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started"))
     }
 
     #[getter]
     fn tenant_id(&self) -> PyResult<String> {
-        self.tenant_id.clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
-        })
+        self.tenant_id
+            .clone()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started"))
     }
 }
 

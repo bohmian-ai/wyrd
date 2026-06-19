@@ -144,9 +144,7 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
         return init_with_otlp(config, filter);
     }
 
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .finish();
+    let subscriber = tracing_subscriber::fmt().with_env_filter(filter).finish();
     tracing::subscriber::set_global_default(subscriber).map_err(|_| WyrdError::Conflict {
         message: "global tracing subscriber already set".to_string(),
         details: serde_json::json!({ "component": "telemetry" }),
@@ -175,13 +173,8 @@ fn init_with_otlp(config: TelemetryConfig, filter: EnvFilter) -> Result<Telemetr
         .endpoint
         .as_deref()
         .expect("caller guarantees endpoint is Some");
-    let timeout =
-        std::time::Duration::from_millis(config.export_timeout_ms.unwrap_or(30_000));
-    let service_name = config
-        .service_name
-        .as_deref()
-        .unwrap_or("wyrd")
-        .to_string();
+    let timeout = std::time::Duration::from_millis(config.export_timeout_ms.unwrap_or(30_000));
+    let service_name = config.service_name.as_deref().unwrap_or("wyrd").to_string();
     let instance_id = ulid::Ulid::new().to_string();
 
     let resource = opentelemetry_sdk::Resource::new(vec![

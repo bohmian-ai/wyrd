@@ -306,8 +306,7 @@ async fn abort_of_already_aborted_upload_returns_aborted_false() {
     let init_bytes = to_bytes(init_response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let init: wyrd_spec::storage::UploadInitResponse =
-        serde_json::from_slice(&init_bytes).unwrap();
+    let init: wyrd_spec::storage::UploadInitResponse = serde_json::from_slice(&init_bytes).unwrap();
     let upload_id = init.upload_id;
 
     let first_abort = srv
@@ -403,10 +402,7 @@ async fn reinit_to_same_path_after_completion_succeeds() {
     let put_path = local_path(put_url).to_owned();
 
     let put = srv
-        .oneshot_authenticated(
-            &token,
-            request("PUT", &put_path, content.to_vec(), None),
-        )
+        .oneshot_authenticated(&token, request("PUT", &put_path, content.to_vec(), None))
         .await
         .expect("router responds");
     assert_eq!(put.status(), StatusCode::OK);

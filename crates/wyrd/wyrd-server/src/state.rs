@@ -6,13 +6,13 @@ use arc_swap::ArcSwap;
 use ipnetwork::IpNetwork;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
-use wyrd_tonic::tonic_health::server::HealthReporter;
 use wyrd_auth_check::{PolicyHook, StubAllowPolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_runtime::{PermissionCheck, RbacCheck};
 use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
+use wyrd_tonic::tonic_health::server::HealthReporter;
 
 use crate::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
 use crate::auth::permission_resolver::SqlPermissionResolver;
@@ -214,19 +214,27 @@ impl AppState {
 #[derive(Debug, thiserror::Error)]
 pub enum ProductionValidationError {
     /// Stub allow policy hook is mounted in a production build.
-    #[error("AppState.policy_hook is StubAllowPolicyHook in a production build; install a real PolicyHook")]
+    #[error(
+        "AppState.policy_hook is StubAllowPolicyHook in a production build; install a real PolicyHook"
+    )]
     StubPolicyHook,
     /// Noop audit writer is mounted in a production build.
-    #[error("AppState.audit_writer is NoopAuthzAuditWriter in a production build; install a real AuthzAuditWriter")]
+    #[error(
+        "AppState.audit_writer is NoopAuthzAuditWriter in a production build; install a real AuthzAuditWriter"
+    )]
     NoopAuditWriter,
     /// Request-id propagation is enabled with no trusted upstream CIDRs.
     #[error("AppState.trusted_request_id_propagation=true requires non-empty trusted_upstreams")]
     UntrustedRequestIdEdge,
     /// Token verifier is absent in a production build.
-    #[error("AppState.token_verifier is None in a production build; auth-plan boot must install it")]
+    #[error(
+        "AppState.token_verifier is None in a production build; auth-plan boot must install it"
+    )]
     MissingTokenVerifier,
     /// Preview auth is still enabled in a production build.
-    #[error("AppState.allow_preview_auth is true in a production build; clear WYRD_AUTH_ALLOW_PREVIEW")]
+    #[error(
+        "AppState.allow_preview_auth is true in a production build; clear WYRD_AUTH_ALLOW_PREVIEW"
+    )]
     PreviewAuthEnabled,
 }
 

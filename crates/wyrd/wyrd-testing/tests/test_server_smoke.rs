@@ -50,7 +50,10 @@ async fn server_in_process_auth_token_round_trip() {
         .await
         .expect("bootstrap_service");
     let api_key = bootstrap.api_key().expect("machine has api key").clone();
-    let jwt = srv.exchange_api_key(&api_key).await.expect("exchange_api_key");
+    let jwt = srv
+        .exchange_api_key(&api_key)
+        .await
+        .expect("exchange_api_key");
     assert!(!jwt.is_empty());
     srv.shutdown().await.expect("shutdown");
 }

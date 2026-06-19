@@ -197,12 +197,8 @@ pub fn spawn_storage_sweeper(
         return Ok(None);
     };
 
-    let sweeper = wyrd_storage::sweeper::Sweeper::new(
-        Arc::clone(&state.storage),
-        admin_pool,
-        cfg,
-        shutdown,
-    );
+    let sweeper =
+        wyrd_storage::sweeper::Sweeper::new(Arc::clone(&state.storage), admin_pool, cfg, shutdown);
     Ok(Some(tokio::spawn(async move { sweeper.run().await })))
 }
 

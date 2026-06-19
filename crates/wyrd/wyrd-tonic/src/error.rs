@@ -77,7 +77,7 @@ mod tests {
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::request_id::RequestId;
 
-    use super::{WYRD_ERROR_HEADER, WYRD_REQUEST_ID_HEADER, wyrd_error_to_status};
+    use super::{wyrd_error_to_status, WYRD_ERROR_HEADER, WYRD_REQUEST_ID_HEADER};
 
     fn make_id() -> RequestId {
         RequestId::parse("01966f13-b6c7-7c04-b9e7-8c1f8f1e5a3c").expect("valid uuid v7")

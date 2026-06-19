@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Server;
 use tonic::transport::server::Router as TonicRouter;
+use tonic::transport::Server;
 use tonic_health::pb::health_server::{Health, HealthServer};
 use tonic_health::server::HealthReporter;
 use tracing::warn;
@@ -67,7 +67,9 @@ pub fn build_grpc_router<H: Health>(
         }
         #[cfg(not(feature = "server"))]
         {
-            tracing::warn!("reflection_enabled=true but wyrd-tonic server feature not enabled; ignoring");
+            tracing::warn!(
+                "reflection_enabled=true but wyrd-tonic server feature not enabled; ignoring"
+            );
             server.add_service(health_service)
         }
     } else {
@@ -158,7 +160,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use tonic_health::server::health_reporter;
 
-    use super::{GrpcRouterConfig, build_grpc_router, drive_health_status, publish_initial_health};
+    use super::{build_grpc_router, drive_health_status, publish_initial_health, GrpcRouterConfig};
     use crate::health::HealthSnapshot;
 
     struct TestSnapshot {
@@ -176,7 +178,9 @@ mod tests {
         let (_, health_service) = health_reporter();
         let result = build_grpc_router(
             health_service,
-            GrpcRouterConfig { reflection_enabled: false },
+            GrpcRouterConfig {
+                reflection_enabled: false,
+            },
         );
         assert!(result.is_ok());
     }
@@ -187,7 +191,9 @@ mod tests {
         let (_, health_service) = health_reporter();
         let result = build_grpc_router(
             health_service,
-            GrpcRouterConfig { reflection_enabled: true },
+            GrpcRouterConfig {
+                reflection_enabled: true,
+            },
         );
         assert!(result.is_ok());
     }
@@ -218,12 +224,9 @@ mod tests {
             consumer_shutdown,
         ));
         shutdown.cancel();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            handle,
-        )
-        .await
-        .expect("drive_health_status did not exit within 2s after cancel")
-        .expect("drive_health_status task panicked");
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("drive_health_status did not exit within 2s after cancel")
+            .expect("drive_health_status task panicked");
     }
 }

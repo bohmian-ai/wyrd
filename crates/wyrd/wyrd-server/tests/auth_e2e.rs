@@ -314,8 +314,7 @@ async fn journey_cross_principal_kind_isolation_via_independent_bootstrap() {
         .await
         .expect("initiator jwt");
 
-    let sa_decision =
-        permission_check_via_delegation(&srv, &init_jwt, &sa, "card_write").await;
+    let sa_decision = permission_check_via_delegation(&srv, &init_jwt, &sa, "card_write").await;
     assert_allow(&sa_decision);
 
     let agent_decision =

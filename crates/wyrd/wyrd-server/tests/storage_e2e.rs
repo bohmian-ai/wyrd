@@ -22,7 +22,7 @@ use wyrd_spec::storage::{
     AbortResponse, DownloadInitRequest, SinglePutComplete, UploadCompleteRequest,
     UploadInitRequest, UploadPlan,
 };
-use wyrd_testing::env::WyrdTestEnv;
+use wyrd_testing::WyrdTestServer;
 
 const FIXED_CARD_UID: &str = "018f0000-0000-7000-8000-000000000001";
 
@@ -55,12 +55,12 @@ fn local_path(url: &str) -> &str {
     url.strip_prefix("https://wyrd.test").unwrap_or(url)
 }
 
-async fn bootstrap_service_jwt(env: &WyrdTestEnv, name: &str, roles: &[&str]) -> String {
-    let service = env
+async fn bootstrap_service_jwt(srv: &WyrdTestServer, name: &str, roles: &[&str]) -> String {
+    let service = srv
         .bootstrap_service(name, roles)
         .await
         .expect("bootstrap service");
-    env.exchange_api_key(
+    srv.exchange_api_key(
         service
             .api_key()
             .expect("service bootstrap returns api key"),
@@ -74,8 +74,8 @@ async fn local_backend_upload_download_round_trip() {
     if skip_unless_e2e() {
         return;
     }
-    let env = WyrdTestEnv::start().await.expect("start env");
-    let token = bootstrap_service_jwt(&env, "storage-writer", &["writer"]).await;
+    let srv = WyrdTestServer::start_in_process().await.expect("start env");
+    let token = bootstrap_service_jwt(&srv, "storage-writer", &["writer"]).await;
 
     let content = b"wyrd storage e2e round-trip payload";
     let sha256 = sha256_b64(content);
@@ -90,8 +90,8 @@ async fn local_backend_upload_download_round_trip() {
     })
     .expect("init body serializes");
 
-    let init_response = env
-        .call(
+    let init_response = srv
+        .oneshot_authenticated(
             &token,
             request(
                 "POST",
@@ -123,8 +123,8 @@ async fn local_backend_upload_download_round_trip() {
     let upload_id = init.upload_id.clone();
     let put_path = local_path(put_url).to_owned();
 
-    let put_response = env
-        .call(
+    let put_response = srv
+        .oneshot_authenticated(
             &token,
             request(
                 "PUT",
@@ -145,8 +145,8 @@ async fn local_backend_upload_download_round_trip() {
     let complete_body = serde_json::to_vec(&UploadCompleteRequest::SinglePut(SinglePutComplete {}))
         .expect("complete body serializes");
 
-    let complete_response = env
-        .call(
+    let complete_response = srv
+        .oneshot_authenticated(
             &token,
             request(
                 "POST",
@@ -171,8 +171,8 @@ async fn local_backend_upload_download_round_trip() {
     })
     .expect("download init body serializes");
 
-    let dl_init_response = env
-        .call(
+    let dl_init_response = srv
+        .oneshot_authenticated(
             &token,
             request(
                 "POST",
@@ -207,8 +207,8 @@ async fn local_backend_upload_download_round_trip() {
     );
 
     let get_path = local_path(&dl_init.plan.get_url).to_owned();
-    let get_response = env
-        .call(&token, request("GET", &get_path, Body::empty(), None))
+    let get_response = srv
+        .oneshot_authenticated(&token, request("GET", &get_path, Body::empty(), None))
         .await
         .expect("router responds");
 
@@ -225,6 +225,7 @@ async fn local_backend_upload_download_round_trip() {
         content,
         "round-tripped bytes must match"
     );
+    srv.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -232,8 +233,8 @@ async fn upload_without_permission_returns_403() {
     if skip_unless_e2e() {
         return;
     }
-    let env = WyrdTestEnv::start().await.expect("start env");
-    let token = bootstrap_service_jwt(&env, "storage-no-permission", &[]).await;
+    let srv = WyrdTestServer::start_in_process().await.expect("start env");
+    let token = bootstrap_service_jwt(&srv, "storage-no-permission", &[]).await;
 
     let card_uid = CardUid::new(FIXED_CARD_UID).expect("card uid");
     let content = b"scope check payload";
@@ -247,8 +248,8 @@ async fn upload_without_permission_returns_403() {
     })
     .expect("body serializes");
 
-    let response = env
-        .call(
+    let response = srv
+        .oneshot_authenticated(
             &token,
             request(
                 "POST",
@@ -265,6 +266,7 @@ async fn upload_without_permission_returns_403() {
         StatusCode::FORBIDDEN,
         "upload without card:write permission must return 403"
     );
+    srv.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -272,8 +274,8 @@ async fn abort_of_already_aborted_upload_returns_aborted_false() {
     if skip_unless_e2e() {
         return;
     }
-    let env = WyrdTestEnv::start().await.expect("start env");
-    let token = bootstrap_service_jwt(&env, "storage-abort-writer", &["writer"]).await;
+    let srv = WyrdTestServer::start_in_process().await.expect("start env");
+    let token = bootstrap_service_jwt(&srv, "storage-abort-writer", &["writer"]).await;
 
     let content = b"abort-race test payload";
     let card_uid = CardUid::new(FIXED_CARD_UID).expect("card uid");
@@ -287,8 +289,8 @@ async fn abort_of_already_aborted_upload_returns_aborted_false() {
     })
     .expect("body serializes");
 
-    let init_response = env
-        .call(
+    let init_response = srv
+        .oneshot_authenticated(
             &token,
             request(
                 "POST",
@@ -304,11 +306,12 @@ async fn abort_of_already_aborted_upload_returns_aborted_false() {
     let init_bytes = to_bytes(init_response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let init: wyrd_spec::storage::UploadInitResponse = serde_json::from_slice(&init_bytes).unwrap();
+    let init: wyrd_spec::storage::UploadInitResponse =
+        serde_json::from_slice(&init_bytes).unwrap();
     let upload_id = init.upload_id;
 
-    let first_abort = env
-        .call(
+    let first_abort = srv
+        .oneshot_authenticated(
             &token,
             request(
                 "POST",
@@ -328,8 +331,8 @@ async fn abort_of_already_aborted_upload_returns_aborted_false() {
         "first abort of initiating upload must succeed"
     );
 
-    let second_abort = env
-        .call(
+    let second_abort = srv
+        .oneshot_authenticated(
             &token,
             request(
                 "POST",
@@ -350,6 +353,7 @@ async fn abort_of_already_aborted_upload_returns_aborted_false() {
         !second.aborted,
         "aborting an already-aborted upload must return aborted: false"
     );
+    srv.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -357,8 +361,8 @@ async fn reinit_to_same_path_after_completion_succeeds() {
     if skip_unless_e2e() {
         return;
     }
-    let env = WyrdTestEnv::start().await.expect("start env");
-    let token = bootstrap_service_jwt(&env, "storage-reinit-writer", &["writer"]).await;
+    let srv = WyrdTestServer::start_in_process().await.expect("start env");
+    let token = bootstrap_service_jwt(&srv, "storage-reinit-writer", &["writer"]).await;
 
     let content = b"checkpoint payload v1";
     let card_uid = CardUid::new(FIXED_CARD_UID).expect("card uid");
@@ -375,8 +379,8 @@ async fn reinit_to_same_path_after_completion_succeeds() {
         .expect("body serializes")
     };
 
-    let first_init = env
-        .call(
+    let first_init = srv
+        .oneshot_authenticated(
             &token,
             request(
                 "POST",
@@ -398,16 +402,19 @@ async fn reinit_to_same_path_after_completion_succeeds() {
     };
     let put_path = local_path(put_url).to_owned();
 
-    let put = env
-        .call(&token, request("PUT", &put_path, content.to_vec(), None))
+    let put = srv
+        .oneshot_authenticated(
+            &token,
+            request("PUT", &put_path, content.to_vec(), None),
+        )
         .await
         .expect("router responds");
     assert_eq!(put.status(), StatusCode::OK);
 
     let complete_body = serde_json::to_vec(&UploadCompleteRequest::SinglePut(SinglePutComplete {}))
         .expect("complete body");
-    let complete = env
-        .call(
+    let complete = srv
+        .oneshot_authenticated(
             &token,
             request(
                 "POST",
@@ -420,8 +427,8 @@ async fn reinit_to_same_path_after_completion_succeeds() {
         .expect("router responds");
     assert_eq!(complete.status(), StatusCode::OK);
 
-    let second_init = env
-        .call(
+    let second_init = srv
+        .oneshot_authenticated(
             &token,
             request(
                 "POST",
@@ -444,4 +451,5 @@ async fn reinit_to_same_path_after_completion_succeeds() {
         second.upload_id, first_upload_id,
         "re-init must issue a new upload_id"
     );
+    srv.shutdown().await.expect("shutdown");
 }

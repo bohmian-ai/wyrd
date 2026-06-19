@@ -4017,6 +4017,7 @@ dependencies = [
  "skald-workflow",
  "wyrd-cards",
  "wyrd-observe",
+ "wyrd-testing",
  "wyrd-utils",
 ]
 
@@ -7211,6 +7212,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "http 1.4.0",
+ "pyo3",
  "reqwest 0.12.28",
  "secrecy",
  "serde",
@@ -7219,7 +7221,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tower 0.5.3",
+ "tracing",
  "uuid",
  "wyrd-auth-check",
  "wyrd-auth-issue",
@@ -7231,6 +7235,7 @@ dependencies = [
  "wyrd-spec",
  "wyrd-sql",
  "wyrd-storage",
+ "wyrd-utils",
 ]
 
 [[package]]

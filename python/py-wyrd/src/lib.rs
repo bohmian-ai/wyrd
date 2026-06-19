@@ -48,6 +48,15 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_submodule(py, "wyrd._wyrd.providers", &providers)?;
 
     wyrd_observe::python::python_register(m)?;
+
+    #[cfg(feature = "testing")]
+    {
+        let testing = PyModule::new(py, "testing")?;
+        wyrd_testing::python::register(&testing)?;
+        m.add_submodule(&testing)?;
+        register_submodule(py, "wyrd._wyrd.testing", &testing)?;
+    }
+
     Ok(())
 }
 

@@ -20,7 +20,9 @@ use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
-use wyrd_testing::env::WyrdTestEnv;
+// Note: tests using test_state() and manual composition are intentional -- they exercise
+// low-level composition directly without the harness.
+use wyrd_testing::WyrdTestServer;
 
 const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -57,20 +59,20 @@ async fn authz_direct_service_jwt_returns_403_chain_empty() {
 
 #[tokio::test]
 async fn authz_delegated_token_allows() {
-    let env = WyrdTestEnv::start().await.expect("env starts");
-    let caller = env
+    let srv = WyrdTestServer::start_in_process().await.expect("env starts");
+    let caller = srv
         .bootstrap_service("route-caller", &["runtime_admin"])
         .await
         .expect("caller bootstraps");
-    let callee = env
+    let callee = srv
         .bootstrap_service("route-callee", &["writer"])
         .await
         .expect("callee bootstraps");
-    let caller_jwt = env
+    let caller_jwt = srv
         .exchange_api_key(caller.api_key().expect("machine has key"))
         .await
         .expect("caller key exchanges");
-    let delegated = env
+    let delegated = srv
         .delegate(
             &caller_jwt,
             callee.card_ref().expect("machine has card ref"),
@@ -78,8 +80,8 @@ async fn authz_delegated_token_allows() {
         .await
         .expect("delegates");
 
-    let response = env
-        .call(
+    let response = srv
+        .oneshot_authenticated(
             &delegated,
             authz_request_without_token(callee.card_ref().expect("machine has card ref"), true),
         )
@@ -93,6 +95,7 @@ async fn authz_delegated_token_allows() {
         .expect("body collects");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("json parses");
     assert_eq!(value["decision"], "allow");
+    srv.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]

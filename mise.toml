@@ -574,6 +574,33 @@ description = "Run ty over the generated Python stub surface"
 dir = "python/py-wyrd"
 run = "uv run ty check python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/cards/data/test_public_surface.py"
 
+[tasks."py:setup:testing"]
+description = "Build py-wyrd with the wyrd.testing test harness enabled"
+dir = "python/py-wyrd"
+depends = ["codegen:stubs"]
+run = [
+  "uv sync --all-extras --group dev",
+  "uv run maturin develop --features testing",
+]
+
+[tasks."py:test:testing"]
+description = "Run the wyrd.testing harness pytest suite"
+dir = "python/py-wyrd"
+depends = ["py:setup:testing"]
+run = "uv run pytest -q tests/test_test_server.py"
+
+[tasks."check:py-wheel-no-testing"]
+description = "Assert the production py-wyrd wheel does not expose wyrd.testing"
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = """
+set -eu
+if uv run python -c 'import wyrd.testing' 2>/dev/null; then
+  echo 'FAIL: wyrd.testing leaked into the default py-wyrd wheel'
+  exit 1
+fi
+"""
+
 [tasks."examples:python:datacard"]
 description = "Run the local DataCard Python example"
 dir = "python/py-wyrd"

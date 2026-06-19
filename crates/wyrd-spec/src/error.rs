@@ -1815,6 +1815,48 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Test harness failed to start.
+    #[error("[WYRD_TESTING_500_HARNESS_START] {message}")]
+    #[wyrd_error(
+        code = "WYRD_TESTING_500_HARNESS_START",
+        status = 500,
+        title = "Test harness failed to start",
+        remediation = "Check the test fixture logs"
+    )]
+    HarnessStart {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Test harness failed to bind listener.
+    #[error("[WYRD_TESTING_500_HARNESS_BOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_TESTING_500_HARNESS_BOUND",
+        status = 500,
+        title = "Test harness failed to bind listener",
+        remediation = "Check the port availability"
+    )]
+    HarnessBound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Test harness failed to bootstrap default principal.
+    #[error("[WYRD_TESTING_500_HARNESS_BOOTSTRAP] {message}")]
+    #[wyrd_error(
+        code = "WYRD_TESTING_500_HARNESS_BOOTSTRAP",
+        status = 500,
+        title = "Test harness failed to bootstrap default principal",
+        remediation = "Check the role configuration"
+    )]
+    HarnessBootstrap {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
 }
 
 impl WyrdError {
@@ -1943,7 +1985,10 @@ impl WyrdError {
             | Self::ServerNotReady { message, details }
             | Self::ServiceUnavailable { message, details }
             | Self::RequestTimeout { message, details }
-            | Self::PayloadTooLarge { message, details } => {
+            | Self::PayloadTooLarge { message, details }
+            | Self::HarnessStart { message, details }
+            | Self::HarnessBound { message, details }
+            | Self::HarnessBootstrap { message, details } => {
                 (Cow::Borrowed(message.as_str()), details.clone())
             }
             Self::Storage { error } => (

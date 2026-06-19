@@ -15,8 +15,10 @@ name = "wyrd-server"
 path = "src/main.rs"
 
 [dependencies]
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 ipnetwork = { workspace = true }
+tonic-health = { workspace = true }
 shellexpand = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }

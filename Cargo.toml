@@ -117,6 +117,11 @@ toml = "0.8"
 shellexpand = "3"
 ipnetwork = "0.20"
 wyrd-telemetry = { path = "crates/shared/wyrd-telemetry", version = "0.0.1" }
+arc-swap = "1.7"
+tonic = "0.12"
+tonic-health = "0.12"
+tonic-reflection = "0.12"
+prost = "0.13"
 
 # Cloud SDKs are server-tier only.
 aws-sdk-s3 = "=1.75.0"

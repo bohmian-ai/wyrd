@@ -1,5 +1,24 @@
 //! Shared axum application state.
 
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use ipnetwork::IpNetwork;
+use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
+use tonic_health::server::HealthReporter;
+use wyrd_auth_check::{PolicyHook, StubAllowPolicyHook};
+use wyrd_auth_issue::IssuingKey;
+use wyrd_auth_verify::TokenVerifier;
+use wyrd_runtime::{PermissionCheck, RbacCheck};
+use wyrd_storage::StorageHandle;
+use wyrd_telemetry::TelemetryGuard;
+
+use crate::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
+use crate::auth::permission_resolver::SqlPermissionResolver;
+use crate::config::DeploymentProfile;
+use crate::health::ReadinessSnapshot;
+
 /// Runtime-ready limits derived from config.
 #[derive(Debug, Clone, Copy)]
 pub struct LimitsConfig {
@@ -11,16 +30,15 @@ pub struct LimitsConfig {
     pub concurrency: usize,
 }
 
-use sqlx::PgPool;
-use std::sync::Arc;
-use wyrd_auth_check::{PolicyHook, StubAllowPolicyHook};
-use wyrd_auth_issue::IssuingKey;
-use wyrd_auth_verify::TokenVerifier;
-use wyrd_runtime::{PermissionCheck, RbacCheck};
-use wyrd_storage::StorageHandle;
-
-use crate::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
-use crate::auth::permission_resolver::SqlPermissionResolver;
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            body_bytes: 1_048_576,
+            timeout: std::time::Duration::from_secs(30),
+            concurrency: 1024,
+        }
+    }
+}
 
 /// Process-wide handle registry. One instance is shared by all HTTP handlers.
 ///
@@ -53,6 +71,20 @@ pub struct AppState {
     pub trusted_request_id_propagation: bool,
     /// Trusted upstream allowlist reserved for the mesh integration.
     pub trusted_upstreams: Vec<String>,
+    /// Deployment posture (Development / Production) locked at boot.
+    pub deployment_profile: DeploymentProfile,
+    /// Shared cancellation token for cooperative shutdown.
+    pub shutdown_token: CancellationToken,
+    /// Telemetry guard (holds the tracer provider).
+    pub telemetry: Arc<TelemetryGuard>,
+    /// Request-shaping limits for the router middleware stack.
+    pub limits: LimitsConfig,
+    /// gRPC health reporter shared between HTTP readiness and gRPC health service.
+    pub grpc_health: HealthReporter,
+    /// Cached readiness snapshot from the background readiness_loop task.
+    pub readiness: Arc<ArcSwap<ReadinessSnapshot>>,
+    /// Parsed CIDR allowlist for the request-id trust gate.
+    pub trusted_upstreams_parsed: Arc<[IpNetwork]>,
 }
 
 impl AppState {
@@ -63,11 +95,12 @@ impl AppState {
         platform_admin_pool: Option<PgPool>,
         storage: Arc<StorageHandle>,
     ) -> Self {
+        let (reporter, _service) = tonic_health::server::health_reporter();
         Self {
             pool,
             platform_admin_pool,
             storage,
-            allow_preview_auth: cfg!(debug_assertions),
+            allow_preview_auth: false,
             permission_check: Arc::new(RbacCheck),
             issuing_key: None,
             token_verifier: None,
@@ -75,6 +108,15 @@ impl AppState {
             audit_writer: Arc::new(NoopAuthzAuditWriter),
             trusted_request_id_propagation: false,
             trusted_upstreams: Vec::new(),
+            deployment_profile: DeploymentProfile::Development,
+            shutdown_token: CancellationToken::new(),
+            telemetry: Arc::new(wyrd_telemetry::init_test_only_no_global(
+                wyrd_telemetry::TelemetryConfig::default(),
+            )),
+            limits: LimitsConfig::default(),
+            grpc_health: reporter,
+            readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
+            trusted_upstreams_parsed: Arc::from(Vec::<IpNetwork>::new()),
         }
     }
 
@@ -95,6 +137,123 @@ impl AppState {
         self.issuing_key = Some(issuing_key);
         self.token_verifier = Some(token_verifier);
         self
+    }
+
+    /// Set the deployment posture.
+    #[must_use]
+    pub fn with_deployment_profile(mut self, profile: DeploymentProfile) -> Self {
+        self.deployment_profile = profile;
+        self
+    }
+
+    /// Set the shared shutdown cancellation token.
+    #[must_use]
+    pub fn with_shutdown_token(mut self, shutdown_token: CancellationToken) -> Self {
+        self.shutdown_token = shutdown_token;
+        self
+    }
+
+    /// Attach the live telemetry guard.
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: Arc<TelemetryGuard>) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
+    /// Attach request-shaping limits from WyrdServerConfig.
+    #[must_use]
+    pub fn with_limits(mut self, limits: LimitsConfig) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Attach the gRPC health reporter.
+    #[must_use]
+    pub fn with_grpc_health(mut self, reporter: HealthReporter) -> Self {
+        self.grpc_health = reporter;
+        self
+    }
+
+    /// Attach the cached readiness publisher.
+    #[must_use]
+    pub fn with_readiness(mut self, readiness: Arc<ArcSwap<ReadinessSnapshot>>) -> Self {
+        self.readiness = readiness;
+        self
+    }
+
+    /// Attach the parsed CIDR allowlist for the request-id trust gate.
+    #[must_use]
+    pub fn with_trusted_upstreams_parsed(mut self, parsed: Arc<[IpNetwork]>) -> Self {
+        self.trusted_upstreams_parsed = parsed;
+        self
+    }
+
+    /// Replace the storage handle.
+    #[must_use]
+    pub fn with_storage(mut self, storage: Arc<StorageHandle>) -> Self {
+        self.storage = storage;
+        self
+    }
+
+    /// Replace the policy hook.
+    #[must_use]
+    pub fn with_policy_hook(mut self, policy_hook: Arc<dyn PolicyHook>) -> Self {
+        self.policy_hook = policy_hook;
+        self
+    }
+
+    /// Replace the authz audit writer.
+    #[must_use]
+    pub fn with_audit_writer(mut self, audit_writer: Arc<dyn AuthzAuditWriter>) -> Self {
+        self.audit_writer = audit_writer;
+        self
+    }
+}
+
+/// Errors raised by [`AppState::production_validate`].
+#[derive(Debug, thiserror::Error)]
+pub enum ProductionValidationError {
+    /// Stub allow policy hook is mounted in a production build.
+    #[error("AppState.policy_hook is StubAllowPolicyHook in a production build; install a real PolicyHook")]
+    StubPolicyHook,
+    /// Noop audit writer is mounted in a production build.
+    #[error("AppState.audit_writer is NoopAuthzAuditWriter in a production build; install a real AuthzAuditWriter")]
+    NoopAuditWriter,
+    /// Request-id propagation is enabled with no trusted upstream CIDRs.
+    #[error("AppState.trusted_request_id_propagation=true requires non-empty trusted_upstreams")]
+    UntrustedRequestIdEdge,
+    /// Token verifier is absent in a production build.
+    #[error("AppState.token_verifier is None in a production build; auth-plan boot must install it")]
+    MissingTokenVerifier,
+    /// Preview auth is still enabled in a production build.
+    #[error("AppState.allow_preview_auth is true in a production build; clear WYRD_AUTH_ALLOW_PREVIEW")]
+    PreviewAuthEnabled,
+}
+
+impl AppState {
+    /// Reject production-profile boots where stubs survived assembly.
+    ///
+    /// Development-profile boots short-circuit to `Ok(())` so unit tests work.
+    pub fn production_validate(&self) -> Result<(), ProductionValidationError> {
+        if !self.deployment_profile.is_production() {
+            return Ok(());
+        }
+        if self.policy_hook.is_stub_default() {
+            return Err(ProductionValidationError::StubPolicyHook);
+        }
+        if self.audit_writer.is_stub_default() {
+            return Err(ProductionValidationError::NoopAuditWriter);
+        }
+        if self.trusted_request_id_propagation && self.trusted_upstreams_parsed.is_empty() {
+            return Err(ProductionValidationError::UntrustedRequestIdEdge);
+        }
+        if self.token_verifier.is_none() {
+            return Err(ProductionValidationError::MissingTokenVerifier);
+        }
+        if self.allow_preview_auth {
+            return Err(ProductionValidationError::PreviewAuthEnabled);
+        }
+        Ok(())
     }
 }
 
@@ -118,7 +277,7 @@ mod tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
-    use super::AppState;
+    use super::{AppState, LimitsConfig, ProductionValidationError};
 
     #[tokio::test]
     async fn defaults_for_test_safe() {
@@ -131,6 +290,50 @@ mod tests {
             PolicyDecision::Allow
         );
         assert!(state.audit_writer.is_stub_default());
+    }
+
+    #[tokio::test]
+    async fn new_state_has_fresh_cancellation_token() {
+        let state = test_state();
+        assert!(!state.shutdown_token.is_cancelled());
+        state.shutdown_token.cancel();
+        assert!(state.shutdown_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn with_shutdown_token_replaces_field() {
+        let state = test_state();
+        let token = tokio_util::sync::CancellationToken::new();
+        let state = state.with_shutdown_token(token.clone());
+        token.cancel();
+        assert!(state.shutdown_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn production_validate_passes_development_profile() {
+        let state = test_state();
+        assert!(state.production_validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn production_validate_rejects_stub_on_production() {
+        let state =
+            test_state().with_deployment_profile(crate::config::DeploymentProfile::Production);
+        let err = state.production_validate().unwrap_err();
+        assert!(matches!(err, ProductionValidationError::StubPolicyHook));
+    }
+
+    #[tokio::test]
+    async fn with_limits_updates_all_fields() {
+        let state = test_state();
+        let limits = LimitsConfig {
+            body_bytes: 2048,
+            timeout: std::time::Duration::from_millis(1000),
+            concurrency: 10,
+        };
+        let state = state.with_limits(limits);
+        assert_eq!(state.limits.body_bytes, 2048);
+        assert_eq!(state.limits.concurrency, 10);
     }
 
     fn test_state() -> AppState {

@@ -4,6 +4,7 @@ pub mod auth;
 pub mod boot;
 pub mod config;
 pub mod error;
+pub mod health;
 pub mod middleware;
 pub mod router;
 pub mod routes;

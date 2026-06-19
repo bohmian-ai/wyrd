@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio_util::sync::CancellationToken;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::server::Router as TonicRouter;
 use tonic::transport::Server;
 use tonic_health::pb::health_server::{Health, HealthServer};
@@ -15,6 +16,21 @@ use tonic_health::server::HealthReporter;
 use tracing::warn;
 
 use crate::health::{HealthSnapshot, WyrdHealthSentinel};
+
+/// Passthrough auth interceptor: accepts every request.
+///
+/// Reserved structural seat for the real auth interceptor that the auth
+/// follow-up commit installs. Threading this through `build_grpc_router`
+/// forces every future gRPC service to be wrapped by the interceptor — there
+/// is no path that mounts a service without going through one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopInterceptor;
+
+impl tonic::service::Interceptor for NoopInterceptor {
+    fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        Ok(request)
+    }
+}
 
 const HEALTH_CONSUMER_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -50,11 +66,17 @@ pub struct GrpcRouterConfig {
 /// No `.layer(...)` is composed here — doing so changes the server's stacked
 /// type and breaks the `TonicRouter` return type. The auth interceptor seat
 /// is wired in the auth follow-up commit via `InterceptedService::new`.
-pub fn build_grpc_router<H: Health>(
+pub fn build_grpc_router<H, I>(
     health_service: HealthServer<H>,
+    interceptor: I,
     cfg: GrpcRouterConfig,
-) -> Result<TonicRouter, GrpcError> {
+) -> Result<TonicRouter, GrpcError>
+where
+    H: Health,
+    I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
+{
     let mut server = Server::builder();
+    let health = InterceptedService::new(health_service, interceptor.clone());
 
     let router = if cfg.reflection_enabled {
         #[cfg(feature = "server")]
@@ -63,17 +85,20 @@ pub fn build_grpc_router<H: Health>(
                 .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
                 .build_v1()
                 .map_err(|e| GrpcError::Reflection(e.to_string()))?;
-            server.add_service(health_service).add_service(reflection)
+            let reflection = InterceptedService::new(reflection, interceptor);
+            server.add_service(health).add_service(reflection)
         }
         #[cfg(not(feature = "server"))]
         {
             tracing::warn!(
                 "reflection_enabled=true but wyrd-tonic server feature not enabled; ignoring"
             );
-            server.add_service(health_service)
+            let _ = interceptor;
+            server.add_service(health)
         }
     } else {
-        server.add_service(health_service)
+        let _ = interceptor;
+        server.add_service(health)
     };
 
     Ok(router)
@@ -160,7 +185,10 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use tonic_health::server::health_reporter;
 
-    use super::{build_grpc_router, drive_health_status, publish_initial_health, GrpcRouterConfig};
+    use super::{
+        build_grpc_router, drive_health_status, publish_initial_health, GrpcRouterConfig,
+        NoopInterceptor,
+    };
     use crate::health::HealthSnapshot;
 
     struct TestSnapshot {
@@ -178,6 +206,7 @@ mod tests {
         let (_, health_service) = health_reporter();
         let result = build_grpc_router(
             health_service,
+            NoopInterceptor,
             GrpcRouterConfig {
                 reflection_enabled: false,
             },
@@ -191,6 +220,7 @@ mod tests {
         let (_, health_service) = health_reporter();
         let result = build_grpc_router(
             health_service,
+            NoopInterceptor,
             GrpcRouterConfig {
                 reflection_enabled: true,
             },

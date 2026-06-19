@@ -488,7 +488,9 @@ impl WyrdServerConfig {
             if val != "grpc" {
                 return Err(ConfigError::BadEnvVar {
                     key: "WYRD_OTLP_PROTOCOL".to_string(),
-                    message: format!("only 'grpc' is accepted, got {val:?}"),
+                    message: format!(
+                        "only 'grpc' is accepted via env var (use telemetry.protocol = 'http' in wyrd.toml for HTTP OTLP), got {val:?}"
+                    ),
                 });
             }
             self.telemetry.protocol = wyrd_telemetry::OtlpProtocol::Grpc;

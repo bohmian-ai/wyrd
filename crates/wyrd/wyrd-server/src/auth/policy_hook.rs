@@ -25,7 +25,7 @@ impl AppState {
         if self.policy_hook.is_stub_default() {
             return Err(BuildError::StubAllowInProduction);
         }
-        if self.trusted_request_id_propagation && self.trusted_upstreams.is_empty() {
+        if self.trusted_request_id_propagation && self.trusted_upstreams_parsed.is_empty() {
             return Err(BuildError::RequestIdPropagationWithoutTrustedUpstreams);
         }
         if self.audit_writer.is_stub_default() {

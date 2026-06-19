@@ -87,57 +87,26 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
     Ok(AppState::new(pool, platform_admin_pool, storage))
 }
 
-/// Errors raised by [`production_guards`].
-#[derive(Debug, thiserror::Error)]
-pub enum ProductionGuardError {
-    /// `request_id.trust_upstream=true` with no CIDR allowlist configured.
-    #[error("request_id.trust_upstream=true requires at least one CIDR in trusted_upstreams")]
-    TrustUpstreamWithoutCidr,
-    /// gRPC reflection must be disabled in Production.
-    #[error("grpc.reflection_enabled=true is not allowed in Production profile")]
-    ReflectionInProduction,
-    /// Preview auth must be disabled in Production.
-    #[error("auth.allow_preview=true is not allowed in Production profile")]
-    PreviewAuthInProduction,
-}
-
-/// Validate config-level production constraints before telemetry starts.
+/// Emit pre-telemetry warnings for relaxed config that is still safe to run.
 ///
-/// Production profile: any violation returns `Err`. Operators see the failure on
-/// stderr before the OTLP exporter ever starts (Phase 0).
-///
-/// Development profile: violations log a warning and continue so local cargo-run
-/// boots still work.
-///
-/// # Errors
-/// Returns [`ProductionGuardError`] when the active profile is Production and
-/// any of the listed constraints are violated.
-pub fn production_guards(
-    config: &crate::config::WyrdServerConfig,
-) -> Result<(), ProductionGuardError> {
-    if !config.deployment_profile.is_production() {
-        if config.request_id.trust_upstream && config.request_id.trusted_upstreams.is_empty() {
-            tracing::warn!("request_id.trust_upstream=true with no trusted_upstreams configured");
-        }
-        if config.grpc.reflection_enabled {
-            tracing::warn!("grpc.reflection_enabled=true in development profile");
-        }
-        if config.auth.allow_preview {
-            tracing::warn!("auth.allow_preview=true in development profile");
-        }
-        return Ok(());
+/// Production-profile rejection lives in `WyrdServerConfig::validate()` and runs
+/// before this function. By the time we reach `production_guards`, any violating
+/// production config has already returned `ConfigError::Invalid`. This function
+/// only surfaces development-profile warnings for the same signals so an operator
+/// running a relaxed dev profile sees them on stderr.
+pub fn production_guards(config: &crate::config::WyrdServerConfig) {
+    if config.deployment_profile.is_production() {
+        return;
     }
-
     if config.request_id.trust_upstream && config.request_id.trusted_upstreams.is_empty() {
-        return Err(ProductionGuardError::TrustUpstreamWithoutCidr);
+        tracing::warn!("request_id.trust_upstream=true with no trusted_upstreams configured");
     }
     if config.grpc.reflection_enabled {
-        return Err(ProductionGuardError::ReflectionInProduction);
+        tracing::warn!("grpc.reflection_enabled=true in development profile");
     }
     if config.auth.allow_preview {
-        return Err(ProductionGuardError::PreviewAuthInProduction);
+        tracing::warn!("auth.allow_preview=true in development profile");
     }
-    Ok(())
 }
 
 /// Assemble runtime state from a resolved `WyrdServerConfig`.
@@ -172,6 +141,7 @@ pub async fn build_app_state_from_config(
         .with_limits(config.limits.into_state())
         .with_grpc_health(reporter)
         .with_trusted_upstreams_parsed(Arc::from(trusted_upstreams_parsed))
+        .with_trusted_request_id_propagation(config.request_id.trust_upstream)
         .with_preview_auth(config.auth.allow_preview))
 }
 

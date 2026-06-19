@@ -69,8 +69,6 @@ pub struct AppState {
     pub audit_writer: Arc<dyn AuthzAuditWriter>,
     /// Trust gate for inbound Wyrd request ID propagation.
     pub trusted_request_id_propagation: bool,
-    /// Trusted upstream allowlist reserved for the mesh integration.
-    pub trusted_upstreams: Vec<String>,
     /// Deployment posture (Development / Production) locked at boot.
     pub deployment_profile: DeploymentProfile,
     /// Shared cancellation token for cooperative shutdown.
@@ -107,7 +105,6 @@ impl AppState {
             policy_hook: Arc::new(StubAllowPolicyHook),
             audit_writer: Arc::new(NoopAuthzAuditWriter),
             trusted_request_id_propagation: false,
-            trusted_upstreams: Vec::new(),
             deployment_profile: DeploymentProfile::Development,
             shutdown_token: CancellationToken::new(),
             telemetry: Arc::new(wyrd_telemetry::init_test_only_no_global(
@@ -185,6 +182,13 @@ impl AppState {
     #[must_use]
     pub fn with_trusted_upstreams_parsed(mut self, parsed: Arc<[IpNetwork]>) -> Self {
         self.trusted_upstreams_parsed = parsed;
+        self
+    }
+
+    /// Toggle inbound Wyrd request-id propagation trust.
+    #[must_use]
+    pub fn with_trusted_request_id_propagation(mut self, trust: bool) -> Self {
+        self.trusted_request_id_propagation = trust;
         self
     }
 
@@ -292,7 +296,7 @@ mod tests {
         let state = test_state();
 
         assert!(!state.trusted_request_id_propagation);
-        assert!(state.trusted_upstreams.is_empty());
+        assert!(state.trusted_upstreams_parsed.is_empty());
         assert_eq!(
             state.policy_hook.evaluate(&context()).await,
             PolicyDecision::Allow

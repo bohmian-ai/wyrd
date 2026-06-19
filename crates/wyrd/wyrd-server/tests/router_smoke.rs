@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use axum::body::to_bytes;
 use axum::http::{Request, StatusCode};
 use chrono::Duration;
@@ -12,6 +13,7 @@ use wyrd_auth_verify::{
     public_key_from_pem,
 };
 use wyrd_runtime::PrincipalId;
+use wyrd_server::health::{ProbeOutcome, ProbeReason, ReadinessSnapshot};
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -194,6 +196,40 @@ async fn readyz_returns_json_even_on_cold_boot() {
     let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
     assert_eq!(problem["code"], "WYRD_SERVER_503_NOT_READY");
     assert_eq!(problem["status"], 503);
+}
+
+#[tokio::test]
+async fn readyz_returns_ok_when_all_probes_pass() {
+    // Inject an all-ok snapshot and assert /readyz returns 200 with status=ok.
+    // Guards the success path so a wrong status code or serialization regression
+    // would block Kubernetes readiness without anyone noticing.
+    let ok_probe = ProbeOutcome {
+        ok: true,
+        reason: ProbeReason::Ok,
+        elapsed_ms: 1,
+    };
+    let snapshot = Arc::new(ArcSwap::from_pointee(ReadinessSnapshot {
+        postgres: ok_probe.clone(),
+        storage: ok_probe,
+    }));
+    let state = test_state().with_readiness(snapshot);
+
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collects");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(json["status"], "ok");
 }
 
 #[tokio::test]

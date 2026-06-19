@@ -8,8 +8,8 @@ use wyrd_tonic::tonic_health::server::health_reporter;
 
 use wyrd_server::boot::production_guards;
 use wyrd_server::grpc::{
-    GrpcError, GrpcRouterConfig, build_grpc_router, drive_health_status, publish_initial_health,
-    serve_grpc,
+    GrpcError, GrpcRouterConfig, NoopInterceptor, build_grpc_router, drive_health_status,
+    publish_initial_health, serve_grpc,
 };
 use wyrd_server::health::readiness_loop;
 use wyrd_server::shutdown::{await_drain, signal_watcher};
@@ -48,8 +48,10 @@ async fn run() -> Result<(), BootExit> {
     // Phase 1 — config
     let config = WyrdServerConfig::load().map_err(|e| BootExit::Config(Box::new(e)))?;
 
-    // Phase 0 — production guards (before telemetry)
-    production_guards(&config).map_err(|e| BootExit::Config(Box::new(e)))?;
+    // Phase 0 — pre-telemetry dev-profile warnings.
+    // Production rejection lives in WyrdServerConfig::validate() and already ran
+    // during WyrdServerConfig::load() above.
+    production_guards(&config);
 
     // Phase 2 — telemetry
     let telemetry: Arc<TelemetryGuard> = Arc::new(
@@ -89,8 +91,12 @@ async fn run() -> Result<(), BootExit> {
     let http_router = build_router(state.clone());
 
     // Phase 15 — gRPC router
+    // NoopInterceptor is the structural seat for the real auth interceptor.
+    // Threading it through build_grpc_router forces every future service to
+    // pass through an interceptor instance.
     let grpc_router = build_grpc_router(
         health_service,
+        NoopInterceptor,
         GrpcRouterConfig {
             reflection_enabled: config.grpc.reflection_enabled,
         },
@@ -198,19 +204,23 @@ async fn run() -> Result<(), BootExit> {
             shutdown.cancel();
         }
         Some(joined) = workers.join_next() => {
-            let message = match &joined {
-                Ok(()) => {
-                    warn!("background worker exited before shutdown signal; cancelling");
-                    "background worker exited before shutdown signal".to_owned()
-                }
-                Err(error) => {
-                    warn!(error = %error, "background worker terminated with error; cancelling");
-                    format!("background worker terminated: {error}")
-                }
-            };
-            terminal_error.get_or_insert_with(|| {
-                Box::<dyn std::error::Error + Send + Sync>::from(message)
-            });
+            if shutdown.is_cancelled() {
+                // Worker exited cooperatively after the shutdown signal — not an error.
+            } else {
+                let message = match &joined {
+                    Ok(()) => {
+                        warn!("background worker exited before shutdown signal; cancelling");
+                        "background worker exited before shutdown signal".to_owned()
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "background worker terminated with error; cancelling");
+                        format!("background worker terminated: {error}")
+                    }
+                };
+                terminal_error.get_or_insert_with(|| {
+                    Box::<dyn std::error::Error + Send + Sync>::from(message)
+                });
+            }
             shutdown.cancel();
         }
         _ = shutdown.cancelled() => {}

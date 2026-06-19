@@ -12,6 +12,7 @@ use std::task::{Context, Poll};
 use axum::body::Body;
 use axum::http::Request;
 use axum::response::{IntoResponse, Response};
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use tower::{Layer, Service};
 use wyrd_spec::error::WyrdError;
 
@@ -89,10 +90,27 @@ where
                 }
             }
 
-            // Collect body into memory, capping at max_bytes + 1.
+            // Collect body into memory, capping at max_bytes + 1 via Limited.
+            // Using http_body_util::Limited directly lets us distinguish
+            // length-limit failures from stream/IO failures by error type.
             let (parts, body) = request.into_parts();
-            match axum::body::to_bytes(body, max_bytes + 1).await {
-                Ok(bytes) if bytes.len() > max_bytes => {
+            let limited = Limited::new(body, max_bytes + 1);
+            match limited.collect().await {
+                Ok(collected) => {
+                    let bytes = collected.to_bytes();
+                    if bytes.len() > max_bytes {
+                        let error = WyrdError::PayloadTooLarge {
+                            message: format!("request body exceeds the {max_bytes}-byte limit"),
+                            details: serde_json::json!({
+                                "max_bytes": max_bytes,
+                            }),
+                        };
+                        return Ok(WyrdErrorResponse::from(error).into_response());
+                    }
+                    let request = Request::from_parts(parts, Body::from(bytes));
+                    inner.call(request).await.map_err(Into::into)
+                }
+                Err(error) if error.is::<LengthLimitError>() => {
                     let error = WyrdError::PayloadTooLarge {
                         message: format!("request body exceeds the {max_bytes}-byte limit"),
                         details: serde_json::json!({
@@ -101,16 +119,14 @@ where
                     };
                     Ok(WyrdErrorResponse::from(error).into_response())
                 }
-                Ok(bytes) => {
-                    let request = Request::from_parts(parts, Body::from(bytes));
-                    inner.call(request).await.map_err(Into::into)
-                }
-                Err(_) => {
-                    let error = WyrdError::PayloadTooLarge {
-                        message: format!("request body exceeds the {max_bytes}-byte limit"),
-                        details: serde_json::json!({
-                            "max_bytes": max_bytes,
-                        }),
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "failed to read request body (stream/io error)"
+                    );
+                    let error = WyrdError::ServiceUnavailable {
+                        message: "failed to read request body".to_owned(),
+                        details: serde_json::json!({}),
                     };
                     Ok(WyrdErrorResponse::from(error).into_response())
                 }

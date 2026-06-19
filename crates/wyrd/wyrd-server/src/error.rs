@@ -201,6 +201,10 @@ pub fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
 fn jwt_error_to_wyrd(error: jsonwebtoken::errors::Error) -> WyrdError {
     use jsonwebtoken::errors::ErrorKind;
 
+    // The specific JWT failure kind is a low-noise oracle for token structure
+    // probing. Log it internally; do not surface it on the public wire.
+    tracing::debug!(jwt_error = ?error.kind(), "JWT validation failed");
+
     match error.kind() {
         ErrorKind::ExpiredSignature => WyrdError::TokenExpired {
             message: "token expired".to_owned(),
@@ -216,24 +220,9 @@ fn jwt_error_to_wyrd(error: jsonwebtoken::errors::Error) -> WyrdError {
         | ErrorKind::InvalidAlgorithm
         | ErrorKind::InvalidAlgorithmName => invalid_token(
             "bearer token signature, issuer, subject, audience, or algorithm invalid",
-            serde_json::json!({ "jwt_error": format!("{:?}", error.kind()) }),
+            serde_json::json!({}),
         ),
-        ErrorKind::InvalidToken
-        | ErrorKind::InvalidEcdsaKey
-        | ErrorKind::InvalidRsaKey(_)
-        | ErrorKind::RsaFailedSigning
-        | ErrorKind::InvalidKeyFormat
-        | ErrorKind::MissingRequiredClaim(_)
-        | ErrorKind::ImmatureSignature
-        | ErrorKind::MissingAlgorithm
-        | ErrorKind::Crypto(_) => invalid_token(
-            "bearer token rejected",
-            serde_json::json!({ "jwt_error": format!("{:?}", error.kind()) }),
-        ),
-        _ => invalid_token(
-            "bearer token rejected",
-            serde_json::json!({ "jwt_error": format!("{:?}", error.kind()) }),
-        ),
+        _ => invalid_token("bearer token rejected", serde_json::json!({})),
     }
 }
 

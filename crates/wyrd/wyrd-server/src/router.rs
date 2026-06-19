@@ -1,5 +1,7 @@
 //! Axum router namespace for Wyrd server surfaces.
 
+use std::sync::Arc;
+
 use axum::Router;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::Request;
@@ -9,6 +11,8 @@ use tower::ServiceBuilder;
 use tower::limit::ConcurrencyLimitLayer;
 use tower::load_shed::LoadShedLayer;
 use tower::timeout::TimeoutLayer;
+use tower_governor::GovernorLayer;
+use tower_governor::governor::GovernorConfigBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use wyrd_spec::error::WyrdError;
@@ -26,7 +30,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/readyz", get(crate::health::readyz))
         .layer(CatchPanicLayer::custom(crate::error::wyrd_panic_response));
 
-    let auth_routes = crate::auth::routes::router();
+    // Per-peer rate limit applied only to auth endpoints (token exchange,
+    // API keys). Keyed by ConnectInfo<SocketAddr> via tower_governor's default
+    // PeerIpKeyExtractor. Mirrors the pre-server-integration posture: 10 req/s
+    // sustained per peer, burst 20.
+    let auth_governor = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(10)
+            .burst_size(20)
+            .finish()
+            .expect("static auth governor config is valid"),
+    );
+    let auth_routes = crate::auth::routes::router().layer(GovernorLayer::new(auth_governor));
 
     let v1_group = crate::routes::authz::routes::mount(
         crate::storage::routes::mount(Router::new(), &state),

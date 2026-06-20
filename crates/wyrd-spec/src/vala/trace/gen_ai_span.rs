@@ -2,7 +2,7 @@
 //!
 //! Computed projection of a [`crate::vala::trace::SpanRecord`] whose
 //! attributes carry `gen_ai.*` semantic-convention keys. The projector
-//! lives in `vala-data` PR4.1: it scans the source span's attribute bag,
+//! lives in `vala-bifrost`: it scans the source span's attribute bag,
 //! lifts every key in [`crate::vala::trace::attributes::GEN_AI_KEYS`] into
 //! a typed column on this record, stores remaining `gen_ai.*` keys in
 //! [`GenAiSpanRecord::extra`], and reads `gen_ai.evaluation.result` events
@@ -316,13 +316,13 @@ impl GenAiSpanRecord {
                 self.response_time_to_first_chunk_seconds,
             ),
         ] {
-            if let Some(value) = value {
-                if !value.is_finite() {
-                    return Err(WyrdError::Validation {
-                        message: format!("gen_ai_span.{field} must be finite, got {value}"),
-                        details: serde_json::Value::Null,
-                    });
-                }
+            if let Some(value) = value
+                && !value.is_finite()
+            {
+                return Err(WyrdError::Validation {
+                    message: format!("gen_ai_span.{field} must be finite, got {value}"),
+                    details: serde_json::Value::Null,
+                });
             }
         }
 

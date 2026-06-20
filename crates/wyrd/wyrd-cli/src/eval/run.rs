@@ -9,6 +9,7 @@ use clap::{Args, Subcommand};
 use serde::Deserialize;
 use url::Url;
 use vala_eval::{JudgeInvoker, MockJudgeInvoker};
+use wyrd_semver::{VersionBlock, VersionSpec};
 use wyrd_spec::envelope::{Card, CardKind, Spec};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::protocol::SimulatedUserMode;
@@ -153,11 +154,30 @@ pub fn load_eval_card(input: &str) -> Result<(CardRef, EvalSpec), WyrdCliError> 
         .map_err(|error| WyrdCliError::EvalSpecInvalid {
             detail: error.to_string(),
         })?;
+    let version: VersionBlock = match card.metadata.version {
+        Some(VersionSpec::Pin(block)) => block,
+        Some(VersionSpec::Scope(_)) => {
+            return Err(WyrdCliError::EvalSpecInvalid {
+                detail: "metadata.version must be an exact semver pin, not a range".to_owned(),
+            });
+        }
+        None => {
+            return Err(WyrdCliError::EvalSpecInvalid {
+                detail: "metadata.version is required to run an eval card".to_owned(),
+            });
+        }
+    };
+    let space = card
+        .metadata
+        .space
+        .ok_or_else(|| WyrdCliError::EvalSpecInvalid {
+            detail: "metadata.space is required to run an eval card".to_owned(),
+        })?;
     let eval_ref = CardRef {
         kind: CardKind::Eval,
         name: card.metadata.name,
-        version: card.metadata.version,
-        space: card.metadata.space,
+        version,
+        space,
         uid: card.metadata.uid,
     };
     Ok((eval_ref, spec))

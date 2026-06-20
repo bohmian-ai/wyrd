@@ -46,13 +46,13 @@ pub fn provider_name_from_py(value: &Bound<'_, PyAny>) -> PyResult<ProviderName>
         return Ok(provider_name_from_str(&value.extract::<String>()?));
     }
 
-    if let Ok(tuple) = value.cast::<PyTuple>() {
-        if tuple.len() == 2 {
-            let tag = tuple.get_item(0)?.extract::<String>()?;
-            let custom = tuple.get_item(1)?.extract::<String>()?;
-            if tag == "custom" && !custom.trim().is_empty() {
-                return Ok(ProviderName::Custom(custom));
-            }
+    if let Ok(tuple) = value.cast::<PyTuple>()
+        && tuple.len() == 2
+    {
+        let tag = tuple.get_item(0)?.extract::<String>()?;
+        let custom = tuple.get_item(1)?.extract::<String>()?;
+        if tag == "custom" && !custom.trim().is_empty() {
+            return Ok(ProviderName::Custom(custom));
         }
     }
 
@@ -67,10 +67,10 @@ pub fn provider_name_from_py(value: &Bound<'_, PyAny>) -> PyResult<ProviderName>
 /// Reads Pydantic `model_json_schema()` explicitly or falls back to JSON coercion.
 #[cfg(feature = "python")]
 pub fn schema_from_py(value: &Bound<'_, PyAny>) -> PyResult<Value> {
-    if let Ok(method) = value.getattr("model_json_schema") {
-        if method.is_callable() {
-            return wyrd_utils::py::pyobject_to_json(&method.call0()?);
-        }
+    if let Ok(method) = value.getattr("model_json_schema")
+        && method.is_callable()
+    {
+        return wyrd_utils::py::pyobject_to_json(&method.call0()?);
     }
     wyrd_utils::py::pyobject_to_json(value)
 }

@@ -15,10 +15,11 @@ use skald_spec::{
     OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, OpenAiResponsesRequest,
     OpenAiResponsesSettings, Prompt, ProviderName, ProviderRequest, ResponseType,
 };
+use wyrd_semver::VersionBlock;
+use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::prompt::PromptSpec;
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
 use wyrd_spec::ids::CardName;
-use wyrd_spec::version::{ApiVersion, VersionBlock};
 
 pub fn prompt_spec(request: ProviderRequest, variables: Vec<&str>) -> PromptSpec {
     PromptSpec::new(prompt(request, variables)).expect("static prompt spec is valid")
@@ -41,7 +42,12 @@ pub fn prompt_card(spec: PromptSpec) -> Card {
         kind: CardKind::Prompt,
         metadata: Metadata {
             name: CardName::new("support_prompt").expect("static card name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            version: Some(
+                VersionBlock::parse("1.0.0")
+                    .expect("static version is valid")
+                    .into(),
+            ),
+            bump: None,
             space: None,
             uid: None,
             labels: BTreeMap::new(),

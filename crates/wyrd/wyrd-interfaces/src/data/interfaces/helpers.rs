@@ -264,10 +264,10 @@ pub(super) fn huggingface_optional_attr(data: &Bound<'_, PyAny>, names: &[&str])
             if value.is_none() {
                 continue;
             }
-            if let Ok(text) = value.extract::<String>() {
-                if !text.is_empty() {
-                    return Some(text);
-                }
+            if let Ok(text) = value.extract::<String>()
+                && !text.is_empty()
+            {
+                return Some(text);
             }
         }
     }

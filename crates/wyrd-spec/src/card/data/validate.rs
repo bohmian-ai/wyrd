@@ -105,10 +105,10 @@ pub fn check_columns_unique(spec: &DataSpec) -> Result<(), DataCardError> {
 /// Enforce that rule-based split predicates reference schema columns that exist.
 pub fn check_split_rule_columns(spec: &DataSpec) -> Result<(), DataCardError> {
     for split in spec.splits.values() {
-        if let Some(name) = split.referenced_column() {
-            if !spec.schema.contains_column(name) {
-                return Err(DataCardError::SplitRuleUnknownColumn(name.to_string()));
-            }
+        if let Some(name) = split.referenced_column()
+            && !spec.schema.contains_column(name)
+        {
+            return Err(DataCardError::SplitRuleUnknownColumn(name.to_string()));
         }
     }
     Ok(())
@@ -143,13 +143,13 @@ pub fn check_split_label_matches_key(spec: &DataSpec) -> Result<(), DataCardErro
 /// Enforce start <= stop for index-range splits.
 pub fn check_index_range_order(spec: &DataSpec) -> Result<(), DataCardError> {
     for split in spec.splits.values() {
-        if let SplitStrategy::IndexRange { start, stop } = &split.strategy {
-            if start > stop {
-                return Err(DataCardError::IndexRangeOrder {
-                    start: *start,
-                    stop: *stop,
-                });
-            }
+        if let SplitStrategy::IndexRange { start, stop } = &split.strategy
+            && start > stop
+        {
+            return Err(DataCardError::IndexRangeOrder {
+                start: *start,
+                stop: *stop,
+            });
         }
     }
     Ok(())

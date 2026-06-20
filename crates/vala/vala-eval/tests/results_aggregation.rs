@@ -9,6 +9,7 @@ use vala_eval::{
     AggregationInput, EvalResults, MechanicSubjectInput, ResultsConfig, RunIdentity,
     ScenarioAggregationInput, SubjectKey, TaskSummary, aggregate_run, apply_context_capture,
 };
+use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
@@ -16,7 +17,6 @@ use wyrd_spec::vala::eval::{
     AssertionResult, ComparisonOperator, EvalContextCapture, EvalPassGate, ScenarioId, TaskId,
 };
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::version::VersionBlock;
 
 type TaskRows = Vec<(TaskId, Vec<AssertionResult>)>;
 type SubjectRows = Vec<(CardRef, TaskRows)>;
@@ -26,7 +26,7 @@ fn card_ref(name: &str) -> CardRef {
         kind: CardKind::Agent,
         name: CardName::new(name).expect("static card name is valid"),
         version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-        space: Some(SpaceName::new("tests").expect("static space is valid")),
+        space: SpaceName::new("tests").expect("static space is valid"),
         uid: None,
     }
 }
@@ -36,7 +36,7 @@ fn eval_card_ref() -> CardRef {
         kind: CardKind::Eval,
         name: CardName::new("rubric").expect("static card name is valid"),
         version: VersionBlock::parse("0.1.0").expect("static version is valid"),
-        space: Some(SpaceName::new("tests").expect("static space is valid")),
+        space: SpaceName::new("tests").expect("static space is valid"),
         uid: None,
     }
 }

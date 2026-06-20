@@ -233,18 +233,20 @@ ref:
   kind:    <CardKind>
   name:    <CardName>
   version: <VersionBlock>
-  space:   <SpaceName?>     # omit ⇒ current/default
+  space:   <SpaceName>
   uid:     <CardUid?>       # optional resolved hint
 ```
 
 ### I.3.1 Resolution
 
+- `space` is required. Card identity on the wire is
+  `(kind, name, version, space)`; the registry also accepts `uid` as a
+  resolved alternative. Authoring tools that infer `space` from the enclosing
+  card MUST fill it in before serialization.
 - A `CardRef` MUST resolve to exactly one registered Card identified by
   `(space, kind, name, version)`.
 - If `uid` is present, the server MUST verify it matches the resolved Card
   and reject the write on mismatch.
-- If `space` is omitted, the resolver uses the writing Card's `metadata.space`,
-  defaulting to `default`.
 - A `CardRef` to a non-existent Card MUST cause the containing Card's
   registration to fail unless explicitly permitted by the field's contract
   (none does in v1).
@@ -257,8 +259,7 @@ via a service-owned promote action that produces a new spec revision.
 
 ### I.3.3 Display form
 
-The canonical display form is `<space>/<kind>/<name>@<version>`. The `default`
-space MAY be elided to `<kind>/<name>@<version>`.
+The canonical display form is `<space>/<kind>/<name>@<version>`.
 
 ### I.3.4 What CardRef is NOT
 
@@ -1159,15 +1160,15 @@ clients MUST NOT send extensions or kinds the server has not advertised.
 ```yaml
 observation:
   schema:       wyrd/v1
-  observation_id: <ULID>
+  observation_id: <UUIDv7>
   emitted_at:   <RFC3339>
   emitter:
     kind:       <CardKind>          # what kind produced this observation
     ref:        <CardRef>           # the producing Card
     service_ref: <CardRef?>          # service composition context
   run:
-    run_id:     <ULID?>             # if attached to a run
-    parent_run_id: <ULID?>
+    run_id:     <UUIDv7?>           # if attached to a run
+    parent_run_id: <UUIDv7?>
   event:        <EventName>         # from the closed taxonomy (OPEN-A7)
   payload:      <kind-specific>     # event-shape-defined
   trace:

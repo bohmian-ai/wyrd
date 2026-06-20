@@ -15,7 +15,51 @@ name = "wyrd-server"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { workspace = true }
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+ipnetwork = { workspace = true }
+wyrd-tonic = { workspace = true, features = ["server"] }
+shellexpand = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
+tokio-util = { workspace = true }
+url = { workspace = true }
 axum = { workspace = true }
 vala-http = { workspace = true }
+wyrd-telemetry = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+base64 = { workspace = true }
+chrono = { workspace = true }
+jsonwebtoken = { workspace = true }
+rand = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
+wyrd-runtime = { workspace = true }
+wyrd-auth-issue = { workspace = true }
+wyrd-auth-verify = { workspace = true }
+wyrd-auth-check = { workspace = true }
+wyrd-sql = { path = "../wyrd-sql", version = "0.0.1", features = ["embedded-postgres"] }
+tower = { workspace = true, features = ["util", "timeout", "limit", "load-shed"] }
+tower-http = { workspace = true, features = ["trace", "catch-panic"] }
+tower_governor = { workspace = true }
+http-body-util = "0.1"
+wyrd-spec = { workspace = true }
+wyrd-storage = { workspace = true }
 wyrd-enterprise = { path = "../wyrd-enterprise", version = "0.0.1", optional = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+object_store = { workspace = true }
+temp-env = { workspace = true }
+tempfile = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
+wyrd-semver = { workspace = true }
+wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
+wyrd-testing = { path = "../wyrd-testing", version = "0.0.1" }

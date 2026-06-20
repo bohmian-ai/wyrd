@@ -13,6 +13,7 @@ use skald_spec::wire::openai_chat::{
 };
 use skald_spec::{ProviderName, ProviderResponse};
 use uuid::Uuid;
+use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
@@ -22,7 +23,6 @@ use wyrd_spec::vala::eval::{
     RecordId, ScenarioId, ScenarioTask, TaskId,
 };
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::version::VersionBlock;
 
 pub fn tid(value: &str) -> TaskId {
     TaskId::new(value).expect("static task id is valid")
@@ -37,7 +37,7 @@ pub fn card_ref(kind: CardKind, name: &str) -> CardRef {
         kind,
         name: CardName::new(name).expect("static card name is valid"),
         version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-        space: Some(SpaceName::new("tests").expect("static space is valid")),
+        space: SpaceName::new("tests").expect("static space is valid"),
         uid: None,
     }
 }

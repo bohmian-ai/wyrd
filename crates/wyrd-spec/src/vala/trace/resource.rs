@@ -81,13 +81,13 @@ impl Resource {
             ("service_version", &self.service_version),
             ("service_instance_id", &self.service_instance_id),
         ] {
-            if let Some(v) = value {
-                if v.len() > 256 {
-                    return Err(WyrdError::Validation {
-                        message: format!("resource.{field} length must be <= 256, got {}", v.len()),
-                        details: serde_json::Value::Null,
-                    });
-                }
+            if let Some(v) = value
+                && v.len() > 256
+            {
+                return Err(WyrdError::Validation {
+                    message: format!("resource.{field} length must be <= 256, got {}", v.len()),
+                    details: serde_json::Value::Null,
+                });
             }
         }
         if self.attributes.len() > 256 {

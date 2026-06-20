@@ -1,0 +1,57 @@
+---
+title: Roles and permissions
+description: The RBAC permission vocabulary, builtin roles, and grant model.
+---
+
+# Roles and permissions
+
+Wyrd API authorization uses typed RBAC:
+
+```rust
+Permission { resource: Resource, action: Action }
+```
+
+`Resource` is one of `Cards`, `Services`, `Operators`, `Evals`, `Drift`,
+`Artifacts`, `Audit`, `Policy`, `Triggers`, `ServiceAccounts`, `Users`,
+`Delegation`, `AnyOf`, or `Wildcard`.
+
+`Action` is one of `Read`, `Write`, `Delete`, `Invoke`, `Install`, `Lock`,
+`Run`, `Issue`, `AnyOf`, or `Wildcard`.
+
+## Builtin roles
+
+| Role | Grants |
+| --- | --- |
+| `admin` | `Wildcard` on all resources and actions. |
+| `writer` | `Cards:Read`, `Cards:Write`, `Artifacts:Read`, `Artifacts:Write`, `Operators:Invoke`, `Evals:Run`, `Triggers:Write`. |
+| `reader` | `Cards:Read`, `Artifacts:Read`, `Audit:Read`. |
+| `agent` | `Cards:Read`, `Cards:Write`, `Artifacts:Read`, `Artifacts:Write`, `Operators:Invoke`, `Evals:Run`. |
+| `runtime_admin` | `ServiceAccounts:Write`, `Delegation:Issue`. |
+
+Builtin roles are seeded per tenant. Their names are stable role-claim values,
+and their row ids are deterministic for a given tenant and role name.
+
+## Subsumption
+
+`Wildcard` covers every value on its axis. `AnyOf` covers any member it
+contains. Otherwise, a resource or action covers only the identical variant.
+A permission grants access only when both the resource and action cover the
+required permission.
+
+## Granting
+
+Role assignment remains an admin-only server operation. PR 5.3 locks the model,
+seed data, and resolver; the route surface for general role administration
+lands after PR 5.4.
+
+Custom roles store their permissions as JSONB using the same typed shape:
+
+```json
+[
+  { "resource": "cards", "action": "read" },
+  { "resource": "artifacts", "action": "write" }
+]
+```
+
+Invalid role permission JSON is a server-side data problem. Wyrd returns
+`WYRD_PERMISSION_500_ROLE_CORRUPT`; clients should surface it to an operator.

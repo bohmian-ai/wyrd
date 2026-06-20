@@ -22,13 +22,13 @@ impl CountingQueue {
 impl Flushable for CountingQueue {
     async fn flush(&mut self) -> Result<usize, WyrdClientError> {
         self.flush_calls += 1;
-        if let Some(n) = self.fail_on_flush {
-            if self.flush_calls == n {
-                return Err(WyrdClientError::TransportDown {
-                    transport: "mock".to_string(),
-                    message: "injected".to_string(),
-                });
-            }
+        if let Some(n) = self.fail_on_flush
+            && self.flush_calls == n
+        {
+            return Err(WyrdClientError::TransportDown {
+                transport: "mock".to_string(),
+                message: "injected".to_string(),
+            });
         }
         let drained = self.buffered;
         self.buffered = 0;

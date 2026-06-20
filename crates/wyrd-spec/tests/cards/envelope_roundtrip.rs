@@ -4,11 +4,12 @@ use skald_spec::wire::openai_chat::OpenAiMessageContent;
 use skald_spec::{
     OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, Prompt, ProviderRequest, ResponseType,
 };
+use wyrd_semver::VersionBlock;
+use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::prompt::PromptSpec;
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
 use wyrd_spec::format;
 use wyrd_spec::ids::CardName;
-use wyrd_spec::version::{ApiVersion, VersionBlock};
 
 #[test]
 fn card_yaml_round_trip() {
@@ -17,7 +18,8 @@ fn card_yaml_round_trip() {
         kind: CardKind::Prompt,
         metadata: Metadata {
             name: CardName::new("support_prompt").unwrap(),
-            version: VersionBlock::parse("1.0.0").unwrap(),
+            version: Some(VersionBlock::parse("1.0.0").unwrap().into()),
+            bump: None,
             space: None,
             uid: None,
             labels: BTreeMap::new(),

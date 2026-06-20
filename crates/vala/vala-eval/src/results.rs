@@ -35,11 +35,7 @@ impl SubjectKey {
     #[must_use]
     pub fn from_ref(card_ref: &CardRef) -> Self {
         let kind = format!("{:?}", card_ref.kind).to_lowercase();
-        let space = card_ref
-            .space
-            .as_ref()
-            .map(wyrd_spec::ids::SpaceName::as_str)
-            .unwrap_or("-");
+        let space = card_ref.space.as_str();
         Self(format!(
             "{kind}::{space}::{}::{}",
             card_ref.name.as_str(),

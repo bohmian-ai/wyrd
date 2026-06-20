@@ -1,9 +1,9 @@
 //! Shared identity parsers for card holders.
 
 use serde_json::json;
+use wyrd_semver::VersionBlock;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
-use wyrd_spec::version::VersionBlock;
 
 pub(crate) fn card_name(field: &str, value: &str) -> Result<CardName, WyrdError> {
     CardName::new(value).map_err(|error| invalid_identity(field, value, error))
@@ -22,14 +22,14 @@ pub(crate) fn version_block(value: &str) -> Result<VersionBlock, WyrdError> {
     })
 }
 
-pub(crate) fn optional_space_name(value: &str) -> Result<Option<SpaceName>, WyrdError> {
+pub(crate) fn space_name(value: &str) -> Result<SpaceName, WyrdError> {
     if value.is_empty() {
-        Ok(None)
-    } else {
-        SpaceName::new(value)
-            .map(Some)
-            .map_err(|error| invalid_identity("space", value, error))
+        return Err(validation_error(
+            "card space is required and cannot be empty",
+            json!({ "field": "space" }),
+        ));
     }
+    SpaceName::new(value).map_err(|error| invalid_identity("space", value, error))
 }
 
 pub(crate) fn optional_card_uid(value: &str) -> Result<Option<CardUid>, WyrdError> {

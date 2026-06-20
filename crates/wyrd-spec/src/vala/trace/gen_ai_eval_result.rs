@@ -20,8 +20,8 @@
 //! [`GEN_AI_EVALUATION_EXPLANATION`](crate::vala::trace::attributes::GEN_AI_EVALUATION_EXPLANATION).
 //!
 //! Extraction from `SpanEvent` to `GenAiEvalResult` happens in the GenAI
-//! projector. Wyrd-side, that is `vala-data` (PR4.1) or the OTLP receiver
-//! (PR4.2). This crate just publishes the shape.
+//! projector. Wyrd-side, that is `vala-bifrost` or the OTLP receiver
+//! (`vala-ingest`). This crate just publishes the shape.
 
 use serde::{Deserialize, Serialize};
 
@@ -84,46 +84,46 @@ impl GenAiEvalResult {
                 details: serde_json::Value::Null,
             });
         }
-        if let Some(value) = self.score_value {
-            if !value.is_finite() {
-                return Err(WyrdError::Validation {
-                    message: format!("gen_ai_eval_result.score_value must be finite, got {value}"),
-                    details: serde_json::Value::Null,
-                });
-            }
+        if let Some(value) = self.score_value
+            && !value.is_finite()
+        {
+            return Err(WyrdError::Validation {
+                message: format!("gen_ai_eval_result.score_value must be finite, got {value}"),
+                details: serde_json::Value::Null,
+            });
         }
-        if let Some(label) = &self.score_label {
-            if label.len() > 64 {
-                return Err(WyrdError::Validation {
-                    message: format!(
-                        "gen_ai_eval_result.score_label length must be <= 64, got {}",
-                        label.len()
-                    ),
-                    details: serde_json::Value::Null,
-                });
-            }
+        if let Some(label) = &self.score_label
+            && label.len() > 64
+        {
+            return Err(WyrdError::Validation {
+                message: format!(
+                    "gen_ai_eval_result.score_label length must be <= 64, got {}",
+                    label.len()
+                ),
+                details: serde_json::Value::Null,
+            });
         }
-        if let Some(explanation) = &self.explanation {
-            if explanation.len() > 4096 {
-                return Err(WyrdError::Validation {
-                    message: format!(
-                        "gen_ai_eval_result.explanation length must be <= 4096, got {}",
-                        explanation.len()
-                    ),
-                    details: serde_json::Value::Null,
-                });
-            }
+        if let Some(explanation) = &self.explanation
+            && explanation.len() > 4096
+        {
+            return Err(WyrdError::Validation {
+                message: format!(
+                    "gen_ai_eval_result.explanation length must be <= 4096, got {}",
+                    explanation.len()
+                ),
+                details: serde_json::Value::Null,
+            });
         }
-        if let Some(response_id) = &self.response_id {
-            if response_id.len() > 128 {
-                return Err(WyrdError::Validation {
-                    message: format!(
-                        "gen_ai_eval_result.response_id length must be <= 128, got {}",
-                        response_id.len()
-                    ),
-                    details: serde_json::Value::Null,
-                });
-            }
+        if let Some(response_id) = &self.response_id
+            && response_id.len() > 128
+        {
+            return Err(WyrdError::Validation {
+                message: format!(
+                    "gen_ai_eval_result.response_id length must be <= 128, got {}",
+                    response_id.len()
+                ),
+                details: serde_json::Value::Null,
+            });
         }
         Ok(())
     }

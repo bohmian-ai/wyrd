@@ -12,13 +12,13 @@ use vala_eval::tasks::{
     TraceTaskExecutor,
 };
 use vala_eval::{InMemoryTraceSource, MockJudgeInvoker};
+use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::CardName;
+use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::{
     ComparisonOperator, EvalSpec, EvalTask, LlmJudgeTask, RecordId, RunId, TaskId,
 };
-use wyrd_spec::version::VersionBlock;
 
 fn tid(value: &str) -> TaskId {
     TaskId::new(value).expect("static task id is valid")
@@ -29,7 +29,7 @@ fn judge_card_ref() -> CardRef {
         kind: CardKind::Prompt,
         name: CardName::new("media-judge").expect("static card name is valid"),
         version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-        space: None,
+        space: SpaceName::new("default").expect("valid space"),
         uid: None,
     }
 }

@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 
+use wyrd_semver::VersionBlock;
+use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::eval::EvalSpec;
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
 use wyrd_spec::format;
 use wyrd_spec::ids::CardName;
 use wyrd_spec::vala::eval::{AssertionTask, ComparisonOperator, EvalTask, JsonPath, TaskId};
-use wyrd_spec::version::{ApiVersion, VersionBlock};
 
 #[test]
 fn card_body_eval_uses_vala_eval_shape() {
@@ -23,7 +24,8 @@ fn eval_card_envelope_round_trips_with_vala_eval_shape() {
         kind: CardKind::Eval,
         metadata: Metadata {
             name: CardName::new("quality_eval").unwrap(),
-            version: VersionBlock::parse("1.0.0").unwrap(),
+            version: Some(VersionBlock::parse("1.0.0").unwrap().into()),
+            bump: None,
             space: None,
             uid: None,
             labels: BTreeMap::new(),

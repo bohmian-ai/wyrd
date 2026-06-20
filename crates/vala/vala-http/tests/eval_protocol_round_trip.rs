@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use vala_eval::orchestrator::OrchestratorError;
 use vala_http::eval::{AppState, router};
+use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
@@ -21,14 +22,13 @@ use wyrd_spec::vala::eval::{
     },
 };
 use wyrd_spec::vala::ids::{LeaseToken, RunId};
-use wyrd_spec::version::VersionBlock;
 
 fn card_ref(kind: CardKind, name: &str) -> CardRef {
     CardRef {
         kind,
         name: CardName::new(name).expect("static card name is valid"),
         version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-        space: Some(SpaceName::new("tests").expect("static space is valid")),
+        space: SpaceName::new("tests").expect("static space is valid"),
         uid: None,
     }
 }

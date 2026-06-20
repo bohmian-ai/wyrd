@@ -5,12 +5,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;
 use thiserror::Error;
 
+use crate::api_version::ApiVersion;
 use crate::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
 use crate::error::WyrdError;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
 use crate::reference::{CardRef, PromptRef};
-use crate::version::{ApiVersion, VersionBlock};
+use wyrd_semver::VersionBlock;
 
 /// Pure-serde mirror of the Skald agent run configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -83,8 +84,9 @@ impl AgentCard {
             kind: CardKind::Agent,
             metadata: EnvelopeMetadata {
                 name: card_name("metadata.name", &self.name)?,
-                version: version_block("metadata.version", &self.version)?,
-                space: optional_space_name(&self.space)?,
+                version: Some(version_block("metadata.version", &self.version)?.into()),
+                bump: None,
+                space: Some(space_name(&self.space)?),
                 uid: optional_card_uid(&self.uid)?,
                 labels: self.labels.clone(),
                 annotations: self.annotations.clone(),
@@ -129,7 +131,13 @@ impl AgentCard {
                 .as_ref()
                 .map_or_else(|| "default".to_owned(), ToString::to_string),
             name: card.metadata.name.to_string(),
-            version: card.metadata.version.to_string(),
+            version: card
+                .metadata
+                .resolved_pin()
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    AgentCardError::validation("Agent Card envelope missing resolved version pin")
+                })?,
             uid: card
                 .metadata
                 .uid
@@ -153,7 +161,7 @@ impl AgentCard {
             kind: CardKind::Agent,
             name: card_name("metadata.name", &self.name)?,
             version: version_block("metadata.version", &self.version)?,
-            space: optional_space_name(&self.space)?,
+            space: space_name(&self.space)?,
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -329,11 +337,13 @@ fn version_block(field: &str, value: &str) -> Result<VersionBlock, WyrdError> {
     })
 }
 
-fn optional_space_name(value: &str) -> Result<Option<SpaceName>, WyrdError> {
-    if value.is_empty() || value == "default" {
-        return Ok(None);
+fn space_name(value: &str) -> Result<SpaceName, WyrdError> {
+    if value.is_empty() {
+        return Err(
+            AgentCardError::validation("metadata.space is required and cannot be empty").into(),
+        );
     }
-    SpaceName::new(value).map(Some).map_err(|error| {
+    SpaceName::new(value).map_err(|error| {
         AgentCardError::validation(format!("metadata.space is invalid: {error}")).into()
     })
 }
@@ -348,13 +358,9 @@ fn optional_card_uid(value: &str) -> Result<Option<CardUid>, WyrdError> {
 }
 
 fn card_ref_display(card_ref: &CardRef) -> String {
-    let space = card_ref
-        .space
-        .as_ref()
-        .map_or_else(|| "default".to_owned(), ToString::to_string);
     format!(
         "{}/{}/{}@{}",
-        space,
+        card_ref.space,
         card_ref.kind.wire_name(),
         card_ref.name,
         card_ref.version

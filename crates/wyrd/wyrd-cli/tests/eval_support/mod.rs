@@ -6,6 +6,8 @@ use std::path::Path;
 use chrono::Utc;
 use serde_json::json;
 use uuid::Uuid;
+use wyrd_semver::VersionBlock;
+use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::metadata::{Annotations, Labels};
@@ -16,7 +18,6 @@ use wyrd_spec::vala::eval::{
     LlmJudgeTask, RecordId, ScenarioId, ScenarioTask, TaskId,
 };
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::version::{ApiVersion, VersionBlock};
 
 pub fn tid(value: &str) -> TaskId {
     TaskId::new(value).expect("static task id is valid")
@@ -31,7 +32,7 @@ pub fn card_ref(kind: CardKind, name: &str) -> CardRef {
         kind,
         name: CardName::new(name).expect("static card name is valid"),
         version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-        space: Some(SpaceName::new("tests").expect("static space is valid")),
+        space: SpaceName::new("tests").expect("static space is valid"),
         uid: None,
     }
 }
@@ -50,7 +51,12 @@ pub fn eval_card(spec: EvalSpec) -> Card {
         kind: CardKind::Eval,
         metadata: Metadata {
             name: CardName::new("cli-eval").expect("static card name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            version: Some(
+                VersionBlock::parse("1.0.0")
+                    .expect("static version is valid")
+                    .into(),
+            ),
+            bump: None,
             space: Some(SpaceName::new("tests").expect("static space is valid")),
             uid: None,
             labels: Labels::default(),

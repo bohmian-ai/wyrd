@@ -9,10 +9,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut save_path = PathBuf::from("/tmp/planner_rust.yaml");
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--save" {
-            if let Some(path) = args.next() {
-                save_path = PathBuf::from(path);
-            }
+        if arg == "--save"
+            && let Some(path) = args.next()
+        {
+            save_path = PathBuf::from(path);
         }
     }
 

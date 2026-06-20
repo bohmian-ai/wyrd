@@ -100,22 +100,21 @@ def rewrite_public_imports(filename: str, content: str) -> str:
             ),
         },
         "data.pyi": {
-            "from .cards import CardRef": "from ..cards import CardRef",
-            "from .error import WyrdError\nfrom .header import CardRefLike, JsonDict, PathLike, StringMap": (
+            "from .cards import CardRef\nfrom .error import WyrdError\nfrom .header import CardRefLike, JsonDict, PathLike, StringMap": (
                 "from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError"
+                "\nfrom ..cards import CardRef"
             ),
         },
         "model.pyi": {
-            "from .cards import CardRef": "from ..cards import CardRef",
-            "from .data import FieldSpec\nfrom .error import WyrdError\nfrom .header import CardRefLike, JsonDict, PathLike, StringMap": (
+            "from .cards import CardRef\nfrom .data import FieldSpec\nfrom .error import WyrdError\nfrom .header import CardRefLike, JsonDict, PathLike, StringMap": (
                 "from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError\n"
+                "from ..cards import CardRef\n"
                 "from ..data import FieldSpec"
             ),
         },
         "prompt.pyi": {
-            "from .cards import CardRef": "from ..cards import CardRef",
-            "from .error import WyrdError\nfrom .header import JsonDict, PathLike": (
-                "from .._wyrd import JsonDict, PathLike, WyrdError"
+            "from .cards import CardRef\nfrom .error import WyrdError\nfrom .header import JsonDict, PathLike": (
+                "from .._wyrd import JsonDict, PathLike, WyrdError\nfrom ..cards import CardRef"
             ),
         },
     }

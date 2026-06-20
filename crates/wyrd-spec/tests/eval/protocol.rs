@@ -1,5 +1,6 @@
+use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::CardName;
+use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::ids::ScenarioId;
 use wyrd_spec::vala::eval::protocol::{
@@ -8,14 +9,13 @@ use wyrd_spec::vala::eval::protocol::{
     UserTurnSubmission,
 };
 use wyrd_spec::vala::ids::{LeaseToken, RunId};
-use wyrd_spec::version::VersionBlock;
 
 fn eval_ref() -> CardRef {
     CardRef {
         kind: CardKind::Eval,
         name: CardName::new("rubric").unwrap(),
         version: VersionBlock::parse("1.0.0").unwrap(),
-        space: None,
+        space: SpaceName::new("default").unwrap(),
         uid: None,
     }
 }

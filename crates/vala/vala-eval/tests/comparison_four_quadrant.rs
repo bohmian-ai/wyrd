@@ -10,12 +10,12 @@ use vala_eval::{
     AggregationInput, ChangeFlag, CompareConfig, EvalResults, MechanicSubjectInput, ResultsConfig,
     RunIdentity, ScenarioAggregationInput, SubjectKey, TaskSummary, aggregate_run, compare,
 };
+use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::{AssertionResult, ComparisonOperator, ScenarioId, TaskId};
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::version::VersionBlock;
 
 type TaskCounts<'a> = Vec<(&'a str, usize, usize)>;
 type SubjectCounts<'a> = Vec<(CardRef, TaskCounts<'a>)>;
@@ -25,7 +25,7 @@ fn card_ref(kind: CardKind, name: &str) -> CardRef {
         kind,
         name: CardName::new(name).expect("static card name is valid"),
         version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-        space: Some(SpaceName::new("tests").expect("static space is valid")),
+        space: SpaceName::new("tests").expect("static space is valid"),
         uid: None,
     }
 }

@@ -15,6 +15,9 @@ path = "src/lib.rs"
 test = false
 doctest = false
 
+[features]
+testing = ["dep:wyrd-testing"]
+
 [dependencies]
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py310", "chrono"] }
 skald-agent = { workspace = true, features = ["python"] }
@@ -26,6 +29,7 @@ vala-client = { workspace = true, features = ["python"] }
 wyrd-cards = { workspace = true, features = ["python"] }
 wyrd-observe = { workspace = true, features = ["python"] }
 wyrd-utils = { workspace = true, features = ["python"] }
+wyrd-testing = { workspace = true, features = ["python"], optional = true }
 
 [lints]
 workspace = true

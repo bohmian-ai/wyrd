@@ -7,6 +7,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use wyrd_interfaces::error::CardPyResult;
+use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::model::{
     CustomMeta as CustomModelMeta, ModelInterface as RustModelInterface,
     ModelSignature as RustModelSignature, ModelSpec, SampleInput as RustSampleInput, TaskType,
@@ -15,7 +16,6 @@ use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::ApiVersion;
 
 #[cfg(feature = "python")]
 use {
@@ -160,13 +160,13 @@ impl ModelCard {
     /// # Errors
     /// Returns a Wyrd error when identity fields are invalid.
     pub fn as_card_ref(&self) -> Result<CardRef, WyrdError> {
-        use crate::identity::{card_name, optional_card_uid, optional_space_name, version_block};
+        use crate::identity::{card_name, optional_card_uid, space_name, version_block};
 
         Ok(CardRef {
             kind: CardKind::Model,
             name: card_name("name", &self.name)?,
             version: version_block(&self.version)?,
-            space: optional_space_name(&self.space)?,
+            space: space_name(&self.space)?,
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -633,7 +633,15 @@ impl ModelCard {
                     .as_ref()
                     .map_or_else(|| "default".to_string(), ToString::to_string),
                 name: envelope.metadata.name.to_string(),
-                version: envelope.metadata.version.to_string(),
+                version: envelope
+                    .metadata
+                    .resolved_pin()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| {
+                        WyrdPyError::model_validation(
+                            "ModelCard envelope missing resolved version pin",
+                        )
+                    })?,
                 uid: envelope
                     .metadata
                     .uid
@@ -689,15 +697,15 @@ impl ModelCardInput {
             )?));
         }
 
-        if let Ok(interface_type) = model_or_interface.cast::<PyType>() {
-            if interface_type.is_subclass_of::<ModelInterface>()? {
-                if !allow_interface_class {
-                    return Err(WyrdPyError::model_validation(
-                        "ModelCard construction requires a raw model or initialized ModelInterface instance; pass interface classes to retrieval surfaces such as cards.get(..., interface=YourInterface)",
-                    ));
-                }
-                return Ok(Self::InterfaceClass(model_or_interface.clone().unbind()));
+        if let Ok(interface_type) = model_or_interface.cast::<PyType>()
+            && interface_type.is_subclass_of::<ModelInterface>()?
+        {
+            if !allow_interface_class {
+                return Err(WyrdPyError::model_validation(
+                    "ModelCard construction requires a raw model or initialized ModelInterface instance; pass interface classes to retrieval surfaces such as cards.get(..., interface=YourInterface)",
+                ));
             }
+            return Ok(Self::InterfaceClass(model_or_interface.clone().unbind()));
         }
 
         Ok(Self::Raw(model_or_interface.clone().unbind()))

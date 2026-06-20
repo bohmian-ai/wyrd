@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use wyrd_semver::VersionBlock;
 use wyrd_spec::card::field::FieldSpec;
 use wyrd_spec::card::model::{
     CatboostMeta, CustomMeta, HuggingFaceTask, HuggingfaceMeta, LightgbmMeta, LightningMeta,
@@ -9,9 +10,8 @@ use wyrd_spec::card::model::{
     TensorflowMeta, TfSaveFormat, TorchMeta, TorchSaveFormat, XgboostMeta,
 };
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{CardName, ColumnName};
+use wyrd_spec::ids::{CardName, ColumnName, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::VersionBlock;
 
 fn col(name: &str) -> ColumnName {
     ColumnName::new(name).unwrap()
@@ -26,7 +26,7 @@ fn model_ref(name: &str) -> CardRef {
         kind: CardKind::Artifact,
         name: CardName::new(name).unwrap(),
         version: VersionBlock::parse("1.0.0").unwrap(),
-        space: None,
+        space: SpaceName::new("default").expect("static space is valid"),
         uid: None,
     }
 }

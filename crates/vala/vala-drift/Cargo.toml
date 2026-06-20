@@ -26,4 +26,5 @@ wyrd-spec = { workspace = true }
 wyrd-version = { workspace = true }
 
 [dev-dependencies]
+wyrd-semver = { workspace = true }
 arrow = { workspace = true }

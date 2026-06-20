@@ -27,6 +27,7 @@ tracing-subscriber = { workspace = true }
 url = { workspace = true }
 vala-eval = { workspace = true, features = ["orchestrator"] }
 wyrd-error-derive = { workspace = true }
+wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
 
 [dev-dependencies]

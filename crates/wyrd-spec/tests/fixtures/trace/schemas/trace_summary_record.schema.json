@@ -17,7 +17,7 @@
   ],
   "properties": {
     "bucket_time": {
-      "description": "Floor-bucketed time the trace started in.\n\nUsed as a Delta partition key for `trace_summaries` and the catalog's `trace_bounds_lookup` index. Default bucket width is 1 minute; callers must floor `start_time` to the bucket boundary before constructing.",
+      "description": "Floor-bucketed time the trace started in.\n\nBacks the catalog's `trace_bounds_lookup` index for `trace_summaries`. Not a partition key — partitioning is the hidden Iceberg `day(wyrd_event_time)` transform. Default bucket width is 1 minute; callers must floor `start_time` to the bucket boundary before constructing.",
       "type": "string",
       "format": "date-time"
     },

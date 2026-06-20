@@ -397,13 +397,13 @@ impl QueueConfig {
                 reason: "must be >= 1".to_string(),
             });
         }
-        if let Some(ratio) = self.sample_ratio {
-            if !(0.0..=1.0).contains(&ratio) {
-                return Err(WyrdClientError::Config {
-                    field: "queue_config.sample_ratio".to_string(),
-                    reason: format!("must be in [0.0, 1.0], got {ratio}"),
-                });
-            }
+        if let Some(ratio) = self.sample_ratio
+            && !(0.0..=1.0).contains(&ratio)
+        {
+            return Err(WyrdClientError::Config {
+                field: "queue_config.sample_ratio".to_string(),
+                reason: format!("must be in [0.0, 1.0], got {ratio}"),
+            });
         }
         Ok(())
     }

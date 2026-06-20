@@ -25,7 +25,7 @@ def test_promptref_inline_roundtrip() -> None:
 
 
 def test_promptref_kind_tag_only_card_or_inline() -> None:
-    ref = PromptRef.card("support-prompt", "1.2.3")
+    ref = PromptRef.card("support-prompt", "1.2.3", space="prod")
     assert ref.kind in {"card", "inline"}
 
     payload = json.loads(ref.model_dump_json())

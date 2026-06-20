@@ -6,6 +6,28 @@ license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
+
 [features]
 default = []
 dev = []
+pg = [
+    "dep:secrecy",
+    "dep:sqlx",
+    "dep:tempfile",
+    "dep:thiserror",
+    "dep:tokio",
+    "dep:vala-sql",
+    "dep:wyrd-sql",
+    "dep:wyrd-spec",
+    "wyrd-sql/embedded-postgres",
+]
+
+[dependencies]
+secrecy = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["macros", "rt-multi-thread"] }
+vala-sql = { path = "../../vala/vala-sql", version = "0.0.1", optional = true }
+wyrd-sql = { path = "../../wyrd/wyrd-sql", version = "0.0.1", optional = true }
+wyrd-spec = { workspace = true, optional = true }

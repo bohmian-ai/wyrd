@@ -59,16 +59,16 @@ impl InstrumentationScope {
                 details: serde_json::Value::Null,
             });
         }
-        if let Some(v) = &self.version {
-            if v.len() > 64 {
-                return Err(WyrdError::Validation {
-                    message: format!(
-                        "instrumentation_scope.version length must be <= 64, got {}",
-                        v.len()
-                    ),
-                    details: serde_json::Value::Null,
-                });
-            }
+        if let Some(v) = &self.version
+            && v.len() > 64
+        {
+            return Err(WyrdError::Validation {
+                message: format!(
+                    "instrumentation_scope.version length must be <= 64, got {}",
+                    v.len()
+                ),
+                details: serde_json::Value::Null,
+            });
         }
         if self.attributes.len() > 32 {
             return Err(WyrdError::Validation {

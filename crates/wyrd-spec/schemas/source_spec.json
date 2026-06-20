@@ -1,0 +1,901 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SourceSpec",
+  "description": "Read-side reference to an external data system. Wyrd reads, never writes.",
+  "type": "object",
+  "required": [
+    "source"
+  ],
+  "properties": {
+    "defaults": {
+      "description": "Non-secret read defaults (projection, page size, time-window hints).",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/NonSecretValue"
+      }
+    },
+    "description": {
+      "description": "Source description.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source": {
+      "description": "Read-shape bucket plus its vendor connection.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SourceKind"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "LogConnection": {
+      "description": "Log vendor connection. Discriminated by `vendor`.",
+      "oneOf": [
+        {
+          "description": "Grafana Loki.",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "vendor"
+          ],
+          "properties": {
+            "auth": {
+              "description": "Credential reference.",
+              "default": {
+                "scheme": "none"
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SourceAuth"
+                }
+              ]
+            },
+            "endpoint": {
+              "description": "Query endpoint URL.",
+              "type": "string"
+            },
+            "vendor": {
+              "type": "string",
+              "enum": [
+                "loki"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Elasticsearch / OpenSearch.",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "vendor"
+          ],
+          "properties": {
+            "auth": {
+              "description": "Credential reference.",
+              "default": {
+                "scheme": "none"
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SourceAuth"
+                }
+              ]
+            },
+            "endpoint": {
+              "description": "Query endpoint URL.",
+              "type": "string"
+            },
+            "index": {
+              "description": "Default index or data stream.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "vendor": {
+              "type": "string",
+              "enum": [
+                "elasticsearch"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Splunk.",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "vendor"
+          ],
+          "properties": {
+            "auth": {
+              "description": "Credential reference.",
+              "default": {
+                "scheme": "none"
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SourceAuth"
+                }
+              ]
+            },
+            "endpoint": {
+              "description": "Query endpoint URL.",
+              "type": "string"
+            },
+            "vendor": {
+              "type": "string",
+              "enum": [
+                "splunk"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "MetricsConnection": {
+      "description": "Metrics vendor connection. Discriminated by `vendor`.",
+      "oneOf": [
+        {
+          "description": "Prometheus / PromQL. Any PromQL-compatible backend (Grafana Mimir, Grafana Cloud, Thanos, VictoriaMetrics) targets this variant via `endpoint`.",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "vendor"
+          ],
+          "properties": {
+            "auth": {
+              "description": "Credential reference.",
+              "default": {
+                "scheme": "none"
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SourceAuth"
+                }
+              ]
+            },
+            "endpoint": {
+              "description": "Query endpoint URL.",
+              "type": "string"
+            },
+            "vendor": {
+              "type": "string",
+              "enum": [
+                "prometheus"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Datadog metrics.",
+          "type": "object",
+          "required": [
+            "site",
+            "vendor"
+          ],
+          "properties": {
+            "api_scopes": {
+              "description": "Required API read scopes, e.g. `metrics_read`.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "auth": {
+              "description": "Credential reference.",
+              "default": {
+                "scheme": "none"
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SourceAuth"
+                }
+              ]
+            },
+            "site": {
+              "description": "API site, e.g. `datadoghq.com` or `datadoghq.eu`.",
+              "type": "string"
+            },
+            "vendor": {
+              "type": "string",
+              "enum": [
+                "datadog"
+              ]
+            }
+          }
+        },
+        {
+          "description": "AWS CloudWatch.",
+          "type": "object",
+          "required": [
+            "region",
+            "vendor"
+          ],
+          "properties": {
+            "auth": {
+              "description": "Credential reference.",
+              "default": {
+                "scheme": "none"
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SourceAuth"
+                }
+              ]
+            },
+            "namespace": {
+              "description": "Default metric namespace.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "region": {
+              "description": "AWS region.",
+              "type": "string"
+            },
+            "vendor": {
+              "type": "string",
+              "enum": [
+                "cloudwatch"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "NonSecretValue": {
+      "description": "Non-secret JSON-like configuration value.",
+      "oneOf": [
+        {
+          "description": "String value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "str"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Numeric value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "number"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "Boolean value.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "List of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "list"
+              ]
+            },
+            "value": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        },
+        {
+          "description": "Object of non-secret values.",
+          "type": "object",
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "object"
+              ]
+            },
+            "value": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/NonSecretValue"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ObjectFormat": {
+      "description": "Object-store record format.",
+      "oneOf": [
+        {
+          "description": "Apache Parquet.",
+          "type": "string",
+          "enum": [
+            "parquet"
+          ]
+        },
+        {
+          "description": "JSON Lines.",
+          "type": "string",
+          "enum": [
+            "jsonl"
+          ]
+        },
+        {
+          "description": "Arrow IPC stream.",
+          "type": "string",
+          "enum": [
+            "arrow_ipc"
+          ]
+        },
+        {
+          "description": "Comma-separated values.",
+          "type": "string",
+          "enum": [
+            "csv"
+          ]
+        }
+      ]
+    },
+    "SourceAuth": {
+      "description": "Credential reference for Source read access. Every secret is a named server-side environment variable resolved at read time; the Card carries only the env-var *name*, never a secret value (Doctrine #7).\n\n`CredentialRef` (see `common.rs`) is a distinct type used on ServiceSpec for outbound service identity. `SourceAuth` is the read-path credential shape, scoped to Source Cards.",
+      "oneOf": [
+        {
+          "description": "No credential (public/unauthenticated endpoint).",
+          "type": "object",
+          "required": [
+            "scheme"
+          ],
+          "properties": {
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "none"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Single secret read from one env var (bearer token, password, connection secret, key-pair, or service-account JSON delivered via env).",
+          "type": "object",
+          "required": [
+            "env",
+            "scheme"
+          ],
+          "properties": {
+            "env": {
+              "description": "Server-side env-var name holding the secret.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "env"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Username (non-secret) plus a password read from an env var.",
+          "type": "object",
+          "required": [
+            "password_env",
+            "scheme",
+            "username"
+          ],
+          "properties": {
+            "password_env": {
+              "description": "Server-side env-var name holding the password.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "basic"
+              ]
+            },
+            "username": {
+              "description": "Login user (redacted in Debug output; omitted from logs to avoid accidental exposure).",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Multiple named secrets, each read from its own env var. Keys are logical credential names (e.g. `api_key`, `app_key`); values are env-var names.",
+          "type": "object",
+          "required": [
+            "scheme",
+            "vars"
+          ],
+          "properties": {
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "multi_env"
+              ]
+            },
+            "vars": {
+              "description": "Logical credential name → server-side env-var name.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "description": "Secret stored in a server-side secret store (Vault, AWS SSM, GCP Secret Manager). Carries only the provider identifier and secret path, never the secret value.",
+          "type": "object",
+          "required": [
+            "name",
+            "provider",
+            "scheme"
+          ],
+          "properties": {
+            "name": {
+              "description": "Secret name or path within the provider.",
+              "type": "string"
+            },
+            "provider": {
+              "description": "Provider identifier, e.g. `vault`, `aws-ssm`, `gcp-secretmanager`.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "secret_store"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "SourceKind": {
+      "description": "Read-shape bucket. The top-level discriminator (`kind`) is the *shape of data a consumer reads*, not the vendor. Vendors live inside each variant.",
+      "oneOf": [
+        {
+          "description": "Blobs at a URI parsed by `format`. Vendor (GCS/S3/Azure/file) is the URI scheme. Yields a record stream.",
+          "type": "object",
+          "required": [
+            "format",
+            "kind",
+            "uri"
+          ],
+          "properties": {
+            "auth": {
+              "description": "Credential reference for the object store. Defaults to `None` (unauthenticated / ambient IAM). Use `Env` for service-account keys or `SecretStore` for Vault/SSM-managed credentials.",
+              "default": {
+                "scheme": "none"
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SourceAuth"
+                }
+              ]
+            },
+            "format": {
+              "description": "On-disk record format.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ObjectFormat"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "object_store"
+              ]
+            },
+            "uri": {
+              "description": "Object URI, e.g. `gs://bucket/prefix`, `s3://bucket/prefix`, `az://container/prefix`, or `file:///path`. Must not embed credentials in the authority component (Doctrine #7).",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "SQL query against a warehouse. Yields a row set.",
+          "type": "object",
+          "required": [
+            "connection",
+            "kind"
+          ],
+          "properties": {
+            "connection": {
+              "description": "Vendor connection coordinates and auth.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SqlConnection"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "sql_warehouse"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Metric/time-series query. Yields a labeled time series.",
+          "type": "object",
+          "required": [
+            "connection",
+            "kind"
+          ],
+          "properties": {
+            "connection": {
+              "description": "Vendor connection coordinates and auth.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/MetricsConnection"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "metrics"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Log query. Yields log records.",
+          "type": "object",
+          "required": [
+            "connection",
+            "kind"
+          ],
+          "properties": {
+            "connection": {
+              "description": "Vendor connection coordinates and auth.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/LogConnection"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "logs"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Trace/span query. Yields spans.",
+          "type": "object",
+          "required": [
+            "connection",
+            "kind"
+          ],
+          "properties": {
+            "connection": {
+              "description": "Vendor connection coordinates and auth.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TraceConnection"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "traces"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "SqlConnection": {
+      "description": "SQL-warehouse vendor connection. Discriminated by `vendor`.",
+      "oneOf": [
+        {
+          "description": "Google BigQuery.",
+          "type": "object",
+          "required": [
+            "project",
+            "vendor"
+          ],
+          "properties": {
+            "auth": {
+              "description": "Credential reference.",
+              "default": {
+                "scheme": "none"
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SourceAuth"
+                }
+              ]
+            },
+            "dataset": {
+              "description": "Default dataset.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "location": {
+              "description": "Processing location, e.g. `US` or `EU`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "project": {
+              "description": "GCP project id.",
+              "type": "string"
+            },
+            "vendor": {
+              "type": "string",
+              "enum": [
+                "big_query"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Snowflake.",
+          "type": "object",
+          "required": [
+            "account",
+            "database",
+            "vendor",
+            "warehouse"
+          ],
+          "properties": {
+            "account": {
+              "description": "Account identifier.",
+              "type": "string"
+            },
+            "auth": {
+              "description": "Credential reference.",
+              "default": {
+                "scheme": "none"
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SourceAuth"
+                }
+              ]
+            },
+            "database": {
+              "description": "Database.",
+              "type": "string"
+            },
+            "role": {
+              "description": "Session role.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "schema": {
+              "description": "Default schema.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "vendor": {
+              "type": "string",
+              "enum": [
+                "snowflake"
+              ]
+            },
+            "warehouse": {
+              "description": "Virtual warehouse.",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "PostgreSQL (and wire-compatible engines).",
+          "type": "object",
+          "required": [
+            "database",
+            "host",
+            "vendor"
+          ],
+          "properties": {
+            "auth": {
+              "description": "Credential reference.",
+              "default": {
+                "scheme": "none"
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SourceAuth"
+                }
+              ]
+            },
+            "database": {
+              "description": "Database name.",
+              "type": "string"
+            },
+            "host": {
+              "description": "Host name.",
+              "type": "string"
+            },
+            "port": {
+              "description": "TCP port.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint16",
+              "minimum": 0.0
+            },
+            "sslmode": {
+              "description": "TLS mode, e.g. `require` or `verify-full`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "vendor": {
+              "type": "string",
+              "enum": [
+                "postgres"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "TraceConnection": {
+      "description": "Trace vendor connection. Discriminated by `vendor`.\n\nNo `OtlpHttp` variant: OTLP (OpenTelemetry Protocol) is an ingestion/push protocol. Wyrd reads traces from vendor query APIs (Jaeger HTTP Query API, Tempo HTTP API, Datadog APM REST), which are distinct from OTLP ingest endpoints.",
+      "oneOf": [
+        {
+          "description": "Grafana Tempo.",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "vendor"
+          ],
+          "properties": {
+            "auth": {
+              "description": "Credential reference.",
+              "default": {
+                "scheme": "none"
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SourceAuth"
+                }
+              ]
+            },
+            "endpoint": {
+              "description": "Query endpoint URL.",
+              "type": "string"
+            },
+            "vendor": {
+              "type": "string",
+              "enum": [
+                "tempo"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Datadog APM.",
+          "type": "object",
+          "required": [
+            "site",
+            "vendor"
+          ],
+          "properties": {
+            "auth": {
+              "description": "Credential reference.",
+              "default": {
+                "scheme": "none"
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SourceAuth"
+                }
+              ]
+            },
+            "site": {
+              "description": "API site, e.g. `datadoghq.com`.",
+              "type": "string"
+            },
+            "vendor": {
+              "type": "string",
+              "enum": [
+                "datadog_apm"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Jaeger.",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "vendor"
+          ],
+          "properties": {
+            "auth": {
+              "description": "Credential reference.",
+              "default": {
+                "scheme": "none"
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SourceAuth"
+                }
+              ]
+            },
+            "endpoint": {
+              "description": "Query endpoint URL.",
+              "type": "string"
+            },
+            "vendor": {
+              "type": "string",
+              "enum": [
+                "jaeger"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -80,6 +80,7 @@ jobs:
         if: runner.os == 'Linux'
         uses: jlumbroso/free-disk-space@main
         with:
+          tool-cache: true
           android: true
           dotnet: true
           haskell: true
@@ -109,7 +110,7 @@ jobs:
             echo "RUSTFLAGS=$rustflags"
           } >> "$GITHUB_ENV"
 
-      - name: Test Rust workspace
+      - name: Run Rust test gate
         run: mise run test:unit
 
   rust-gates:
@@ -120,6 +121,17 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
 
       - name: Set up mise
         uses: jdx/mise-action@v3
@@ -152,12 +164,15 @@ jobs:
         run: |
           mise run cardkind:check
           mise run check:client-tier
+          mise run check:registry-no-server-routes
+          mise run check:registry-tx-coupling
+          mise run check:registry-immutable-spec-hash
+          mise run check:registry-single-table
           mise run check:pyo3-scope
           mise run check:mocks-scope
           mise run check:unwrap-audit
           mise run check:test-contracts
           mise run check:wasm
-          mise run check:deny
 
   codegen:
     name: codegen

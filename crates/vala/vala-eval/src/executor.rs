@@ -228,15 +228,15 @@ fn classify_stage_tasks(
             continue;
         }
 
-        if let Some(condition) = task.condition() {
-            if !evaluate_condition(task_id, task.depends_on(), condition, snapshot)? {
-                ledger.skipped.insert(task_id.clone());
-                skips.push(TaskRunOutcome::Skipped {
-                    task_id: task_id.clone(),
-                    reason: SkipReason::ConditionFalse,
-                });
-                continue;
-            }
+        if let Some(condition) = task.condition()
+            && !evaluate_condition(task_id, task.depends_on(), condition, snapshot)?
+        {
+            ledger.skipped.insert(task_id.clone());
+            skips.push(TaskRunOutcome::Skipped {
+                task_id: task_id.clone(),
+                reason: SkipReason::ConditionFalse,
+            });
+            continue;
         }
 
         buckets

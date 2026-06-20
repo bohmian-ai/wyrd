@@ -8,14 +8,14 @@ use arrow::array::Float64Array;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use vala_drift::{DriftReport, DriftVerdict, FittedBaseline, fit_baseline, score_drift};
+use wyrd_semver::VersionBlock;
 use wyrd_spec::card::drift::{
     CustomProfile, DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec,
     PsiBinningStrategy, PsiProfile, PsiThreshold, SpcAlertThreshold, SpcProfile, SpcWecoRule,
 };
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{CardName, FeatureName};
+use wyrd_spec::ids::{CardName, FeatureName, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::VersionBlock;
 
 fn numeric_batch(name: &str, values: Vec<f64>) -> Result<RecordBatch, Box<dyn Error>> {
     let schema = Schema::new(vec![Field::new(name, DataType::Float64, true)]);
@@ -31,7 +31,7 @@ fn card_ref(kind: CardKind, name: &str) -> Result<CardRef, Box<dyn Error>> {
         kind,
         name: CardName::new(name)?,
         version: VersionBlock::parse("1.0.0")?,
-        space: None,
+        space: SpaceName::new("default")?,
         uid: None,
     })
 }

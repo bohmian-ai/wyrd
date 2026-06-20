@@ -317,7 +317,7 @@ impl AgentRun {
         };
         let py_response = pyo3::Py::new(
             py,
-            skald_prompt::wire_py::PyProviderResponse::from_arc(Arc::clone(arc)),
+            skald_prompt::python::PyProviderResponse::from_arc(Arc::clone(arc)),
         )?
         .into_any();
         Ok(Some(py_response))

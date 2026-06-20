@@ -9,6 +9,8 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod actor;
+pub mod api_version;
+pub mod auth;
 pub mod authz;
 pub mod card;
 pub mod envelope;
@@ -25,7 +27,6 @@ pub mod security;
 pub mod storage;
 pub mod trace;
 pub mod vala;
-pub mod version;
 
 pub use authz::{Principal, Role, Scope};
 pub use card::agent::{AgentCard, AgentCardError, AgentRunConfigSpec, AgentSpec};
@@ -45,7 +46,7 @@ pub use card::workflow::{
     WorkflowAction, WorkflowCard, WorkflowCardError, WorkflowRetryPolicy, WorkflowSpec,
     WorkflowStep, WorkflowValidationError,
 };
-pub use ids::{ColumnName, QueryName, RoleName, SplitName, uuid7};
+pub use ids::{ColumnName, DataTenantId, QueryName, RoleName, SplitName, TenantSlug, uuid7};
 pub use metadata::{
     AnnotationKey, AnnotationValue, Annotations, CardMetadata, LabelKey, LabelValue, Labels,
     MetadataError,

@@ -7,16 +7,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wyrd_interfaces::error::CardPyResult;
+use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::prompt::{PromptRef as NativePromptRef, PromptSpec};
-use wyrd_spec::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
+use wyrd_spec::envelope::{
+    Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec, SpecHash,
+};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::ApiVersion;
 
-use crate::identity::{
-    card_name, optional_card_uid, optional_space_name, validation_error, version_block,
-};
+use crate::identity::{card_name, optional_card_uid, space_name, validation_error, version_block};
 
 /// PromptCard filesystem IO helpers.
 pub mod io;
@@ -164,12 +164,18 @@ impl PromptCard {
     /// Returns a Wyrd error when `PromptSpec` validation or identity validation
     /// fails.
     pub fn to_card(&self) -> Result<Card, WyrdError> {
-        let spec = self.to_prompt_spec_from_metadata()?;
+        let spec = Spec::Prompt(self.to_prompt_spec_from_metadata()?);
+        let spec_hash = spec.canonical_hash().map_err(|e| {
+            validation_error(
+                "PromptCard spec failed canonicalization",
+                json!({ "source": e.to_string() }),
+            )
+        })?;
         Ok(Card {
             api_version: ApiVersion::v1(),
             kind: CardKind::Prompt,
-            metadata: self.to_envelope_metadata(&spec)?,
-            spec: Spec::Prompt(spec),
+            metadata: self.to_envelope_metadata(spec_hash)?,
+            spec,
             relationships: Relationships::default(),
             status: None,
         })
@@ -184,7 +190,7 @@ impl PromptCard {
             kind: CardKind::Prompt,
             name: card_name("name", &self.name)?,
             version: version_block(&self.version)?,
-            space: optional_space_name(&self.space)?,
+            space: space_name(&self.space)?,
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -218,7 +224,16 @@ impl PromptCard {
                 .as_ref()
                 .map_or_else(|| "default".to_owned(), ToString::to_string),
             name: card.metadata.name.to_string(),
-            version: card.metadata.version.to_string(),
+            version: card
+                .metadata
+                .resolved_pin()
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    validation_error(
+                        "PromptCard envelope missing resolved version pin",
+                        serde_json::Value::Null,
+                    )
+                })?,
             uid: card
                 .metadata
                 .uid
@@ -237,15 +252,16 @@ impl PromptCard {
         })
     }
 
-    fn to_envelope_metadata(&self, spec: &PromptSpec) -> Result<EnvelopeMetadata, WyrdError> {
+    fn to_envelope_metadata(&self, spec_hash: SpecHash) -> Result<EnvelopeMetadata, WyrdError> {
         Ok(EnvelopeMetadata {
             name: card_name("name", &self.name)?,
-            version: version_block(&self.version)?,
-            space: optional_space_name(&self.space)?,
+            version: Some(version_block(&self.version)?.into()),
+            bump: None,
+            space: Some(space_name(&self.space)?),
             uid: optional_card_uid(&self.uid)?,
             labels: self.labels.clone(),
             annotations: self.annotations.clone(),
-            spec_hash: Some(spec.content_hash()),
+            spec_hash: Some(spec_hash),
             artifact_hash: None,
         })
     }
@@ -259,18 +275,13 @@ impl PromptRef {
     /// # Errors
     /// Returns a Wyrd error when the card identity fields are invalid.
     #[staticmethod]
-    #[pyo3(signature = (name, version, *, space=None, uid=None))]
-    pub fn card(
-        name: &str,
-        version: &str,
-        space: Option<&str>,
-        uid: Option<&str>,
-    ) -> CardPyResult<Self> {
+    #[pyo3(signature = (name, version, *, space, uid=None))]
+    pub fn card(name: &str, version: &str, space: &str, uid: Option<&str>) -> CardPyResult<Self> {
         let card_ref = CardRef {
             kind: CardKind::Prompt,
             name: card_name("name", name)?,
             version: version_block(version)?,
-            space: space.map_or(Ok(None), optional_space_name)?,
+            space: space_name(space)?,
             uid: uid.map_or(Ok(None), optional_card_uid)?,
         };
         Ok(Self::from_native(NativePromptRef::Card(card_ref)))
@@ -810,6 +821,6 @@ mod tests {
         assert_eq!(card_ref.kind, CardKind::Prompt);
         assert_eq!(card_ref.name.to_string(), "lead-scoring");
         assert_eq!(card_ref.version.to_string(), "1.2.3");
-        assert_eq!(card_ref.space.expect("space present").to_string(), "growth");
+        assert_eq!(card_ref.space.to_string(), "growth");
     }
 }

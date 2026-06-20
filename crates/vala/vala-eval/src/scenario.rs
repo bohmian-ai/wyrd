@@ -241,10 +241,10 @@ fn run_passenger_pass(
     let response_path = response_json_path()?;
     let mut out = Vec::with_capacity(scenario.tasks.len());
     for task in &scenario.tasks {
-        if let Some(condition) = &task.condition {
-            if !evaluate_passenger_condition(&task.id, condition, &pair)? {
-                continue;
-            }
+        if let Some(condition) = &task.condition
+            && !evaluate_passenger_condition(&task.id, condition, &pair)?
+        {
+            continue;
         }
         out.push(evaluate_passenger_task(task, &pair, &response_path)?);
     }

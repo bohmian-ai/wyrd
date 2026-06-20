@@ -311,7 +311,7 @@ pub(crate) fn wrong_variant(expected: &str, actual: &str) -> crate::error::Promp
 }
 
 #[cfg(feature = "python")]
-use crate::wire_py;
+use crate::python;
 
 #[cfg(feature = "python")]
 use {
@@ -1097,11 +1097,11 @@ impl PyProviderRequest {
 
     /// Return a typed `OpenAI` Chat Completions request accessor.
     /// Raises `WyrdError` when the provider is not openai chat.
-    pub fn openai(&self) -> CardPyResult<wire_py::PyOpenAiChatRequest> {
+    pub fn openai(&self) -> CardPyResult<python::PyOpenAiChatRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::OpenAiChatCompletion(_)
             | skald_spec::ProviderRequest::OpenAiChatCompatible { .. } => {
-                Ok(wire_py::PyOpenAiChatRequest::new(Arc::clone(&self.inner)))
+                Ok(python::PyOpenAiChatRequest::new(Arc::clone(&self.inner)))
             }
             other => Err(wrong_provider("openai", other.provider()).into()),
         }
@@ -1109,10 +1109,10 @@ impl PyProviderRequest {
 
     /// Return a typed `OpenAI` Responses API request accessor.
     /// Raises `WyrdError` when the provider is not openai responses.
-    pub fn openai_responses(&self) -> CardPyResult<wire_py::PyOpenAiResponsesRequest> {
+    pub fn openai_responses(&self) -> CardPyResult<python::PyOpenAiResponsesRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::OpenAiResponses(_) => Ok(
-                wire_py::PyOpenAiResponsesRequest::new(Arc::clone(&self.inner)),
+                python::PyOpenAiResponsesRequest::new(Arc::clone(&self.inner)),
             ),
             other => Err(wrong_provider("openai_responses", other.provider()).into()),
         }
@@ -1120,10 +1120,10 @@ impl PyProviderRequest {
 
     /// Return a typed Anthropic Messages request accessor.
     /// Raises `WyrdError` when the provider is not anthropic.
-    pub fn anthropic(&self) -> CardPyResult<wire_py::PyAnthropicMessagesRequest> {
+    pub fn anthropic(&self) -> CardPyResult<python::PyAnthropicMessagesRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::AnthropicMessage(_) => Ok(
-                wire_py::PyAnthropicMessagesRequest::new(Arc::clone(&self.inner)),
+                python::PyAnthropicMessagesRequest::new(Arc::clone(&self.inner)),
             ),
             other => Err(wrong_provider("anthropic", other.provider()).into()),
         }
@@ -1131,10 +1131,10 @@ impl PyProviderRequest {
 
     /// Return a typed Google Gemini request accessor.
     /// Raises `WyrdError` when the provider is not google/gemini.
-    pub fn gemini(&self) -> CardPyResult<wire_py::PyGeminiRequest> {
+    pub fn gemini(&self) -> CardPyResult<python::PyGeminiRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::GeminiGenerateContent(_) => {
-                Ok(wire_py::PyGeminiRequest::new(Arc::clone(&self.inner)))
+                Ok(python::PyGeminiRequest::new(Arc::clone(&self.inner)))
             }
             other => Err(wrong_provider("gemini", other.provider()).into()),
         }
@@ -1142,10 +1142,10 @@ impl PyProviderRequest {
 
     /// Return a typed Vertex AI request accessor.
     /// Raises `WyrdError` when the provider is not vertex.
-    pub fn vertex(&self) -> CardPyResult<wire_py::PyVertexRequest> {
+    pub fn vertex(&self) -> CardPyResult<python::PyVertexRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::Vertex(_) => {
-                Ok(wire_py::PyVertexRequest::new(Arc::clone(&self.inner)))
+                Ok(python::PyVertexRequest::new(Arc::clone(&self.inner)))
             }
             other => Err(wrong_provider("vertex", other.provider()).into()),
         }
@@ -1490,25 +1490,24 @@ fn py_annotation_to_schema<'py>(
         ("bool", "boolean"),
     ];
     for (builtin_name, json_type) in primitives {
-        if let Ok(bt) = builtins.getattr(*builtin_name) {
-            if ann.is(&bt) {
-                return Ok(serde_json::json!({"type": json_type}));
-            }
+        if let Ok(bt) = builtins.getattr(*builtin_name)
+            && ann.is(&bt)
+        {
+            return Ok(serde_json::json!({"type": json_type}));
         }
     }
 
     // Python 3.10+ `T | None` — types.UnionType has __args__ but no __origin__.
     // Must be checked before the __origin__ branch so `str | None` is handled correctly.
-    if ann.getattr("__origin__").is_err() {
-        if let Ok(args) = ann.getattr("__args__") {
-            if args.try_iter().is_ok() {
-                let none_type = py.None().bind(py).get_type().into_any();
-                if let Ok(iter) = args.try_iter() {
-                    let non_none: Vec<_> = iter.flatten().filter(|a| !a.is(&none_type)).collect();
-                    if !non_none.is_empty() {
-                        return py_annotation_to_schema(py, &non_none[0]);
-                    }
-                }
+    if ann.getattr("__origin__").is_err()
+        && let Ok(args) = ann.getattr("__args__")
+        && args.try_iter().is_ok()
+    {
+        let none_type = py.None().bind(py).get_type().into_any();
+        if let Ok(iter) = args.try_iter() {
+            let non_none: Vec<_> = iter.flatten().filter(|a| !a.is(&none_type)).collect();
+            if !non_none.is_empty() {
+                return py_annotation_to_schema(py, &non_none[0]);
             }
         }
     }
@@ -1516,25 +1515,25 @@ fn py_annotation_to_schema<'py>(
     // Generic aliases — inspect __origin__ and __args__.
     if let Ok(origin) = ann.getattr("__origin__") {
         // list[T]
-        if let Ok(list_t) = builtins.getattr("list") {
-            if origin.is(&list_t) {
-                let items = if let Ok(args) = ann.getattr("__args__") {
-                    if let Ok(item) = args.get_item(0) {
-                        py_annotation_to_schema(py, &item)?
-                    } else {
-                        serde_json::json!({})
-                    }
+        if let Ok(list_t) = builtins.getattr("list")
+            && origin.is(&list_t)
+        {
+            let items = if let Ok(args) = ann.getattr("__args__") {
+                if let Ok(item) = args.get_item(0) {
+                    py_annotation_to_schema(py, &item)?
                 } else {
                     serde_json::json!({})
-                };
-                return Ok(serde_json::json!({"type": "array", "items": items}));
-            }
+                }
+            } else {
+                serde_json::json!({})
+            };
+            return Ok(serde_json::json!({"type": "array", "items": items}));
         }
         // dict[K, V]
-        if let Ok(dict_t) = builtins.getattr("dict") {
-            if origin.is(&dict_t) {
-                return Ok(serde_json::json!({"type": "object"}));
-            }
+        if let Ok(dict_t) = builtins.getattr("dict")
+            && origin.is(&dict_t)
+        {
+            return Ok(serde_json::json!({"type": "object"}));
         }
         // Optional[T] / Union[T, None]
         if let Ok(args) = ann.getattr("__args__") {

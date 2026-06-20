@@ -4,19 +4,19 @@ use std::path::PathBuf;
 use chrono::TimeZone;
 use schemars::schema_for;
 use uuid::Uuid;
+use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::CardName;
+use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::record::EvalRecordObservation;
 use wyrd_spec::vala::ids::{RecordId, RunId, SessionId, SpanId};
-use wyrd_spec::version::VersionBlock;
 
 fn eval_ref(name: &str) -> CardRef {
     CardRef {
         kind: CardKind::Eval,
         name: CardName::new(name).unwrap(),
         version: VersionBlock::parse("1.0.0").unwrap(),
-        space: None,
+        space: SpaceName::new("default").unwrap(),
         uid: None,
     }
 }

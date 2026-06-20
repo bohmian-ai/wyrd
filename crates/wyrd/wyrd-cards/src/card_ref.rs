@@ -2,11 +2,11 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
+use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::VersionBlock;
 use wyrd_utils::py::wyrd_error_to_py_err;
 
 /// Wyrd card kind exposed to Python.
@@ -43,6 +43,8 @@ pub enum Kind {
     Trigger,
     /// Operator Card.
     Operator,
+    /// Source Card.
+    Source,
     /// Unknown/external card kind.
     External,
 }
@@ -65,6 +67,7 @@ impl Kind {
             Self::Artifact => "Artifact",
             Self::Trigger => "Trigger",
             Self::Operator => "Operator",
+            Self::Source => "Source",
             Self::External => "External",
         }
     }
@@ -86,6 +89,7 @@ impl Kind {
             Self::Artifact => CardKind::Artifact,
             Self::Trigger => CardKind::Trigger,
             Self::Operator => CardKind::Operator,
+            Self::Source => CardKind::Source,
             Self::External => CardKind::External,
         }
     }
@@ -107,6 +111,7 @@ impl Kind {
             CardKind::Artifact => Self::Artifact,
             CardKind::Trigger => Self::Trigger,
             CardKind::Operator => Self::Operator,
+            CardKind::Source => Self::Source,
             CardKind::External => Self::External,
         }
     }
@@ -143,15 +148,16 @@ impl CardRefPy {
     /// `kind` accepts the native wire name of a registered card kind
     /// (one of `Data`, `Model`, `Experiment`, `Prompt`, `Agent`, `Workflow`,
     /// `Eval`, `Drift`, `Service`, `Policy`, `Mcp`, `Audit`, `Artifact`,
-    /// `Trigger`, `Operator`). External
+    /// `Trigger`, `Operator`, `Source`). External
     /// kinds are not constructable from Python in v1.
+    /// `space` is required; identity is `(kind, name, version, space)`.
     #[new]
-    #[pyo3(signature = (kind, name, version, *, space=None, uid=None))]
+    #[pyo3(signature = (kind, name, version, *, space, uid=None))]
     fn __new__(
         kind: &Bound<'_, PyAny>,
         name: &str,
         version: &str,
-        space: Option<&str>,
+        space: &str,
         uid: Option<&str>,
     ) -> PyResult<Self> {
         let parsed_kind = parse_kind_input(kind).map_err(wyrd_error_to_py_err)?;
@@ -159,13 +165,8 @@ impl CardRefPy {
             .map_err(|error| wyrd_error_to_py_err(invalid_identity("name", name, error)))?;
         let parsed_version = VersionBlock::parse(version)
             .map_err(|error| wyrd_error_to_py_err(invalid_identity("version", version, error)))?;
-        let parsed_space =
-            match space {
-                None | Some("") => None,
-                Some(value) => Some(SpaceName::new(value).map_err(|error| {
-                    wyrd_error_to_py_err(invalid_identity("space", value, error))
-                })?),
-            };
+        let parsed_space = SpaceName::new(space)
+            .map_err(|error| wyrd_error_to_py_err(invalid_identity("space", space, error)))?;
         let parsed_uid = match uid {
             None | Some("") => None,
             Some(value) => Some(
@@ -200,10 +201,10 @@ impl CardRefPy {
         self.0.version.to_string()
     }
 
-    /// Optional space; `None` means current/default space.
+    /// Space pinning identity together with name and version.
     #[getter]
-    fn space(&self) -> Option<String> {
-        self.0.space.as_ref().map(ToString::to_string)
+    fn space(&self) -> String {
+        self.0.space.to_string()
     }
 
     /// Optional resolved UID.
@@ -213,22 +214,17 @@ impl CardRefPy {
     }
 
     fn __repr__(&self) -> String {
-        let space = self
-            .0
-            .space
-            .as_ref()
-            .map_or_else(|| "None".to_string(), |s| format!("'{s}'"));
         let uid = self
             .0
             .uid
             .as_ref()
             .map_or_else(|| "None".to_string(), |u| format!("'{u}'"));
         format!(
-            "CardRef(kind='{}', name='{}', version='{}', space={}, uid={})",
+            "CardRef(kind='{}', name='{}', version='{}', space='{}', uid={})",
             self.0.kind.wire_name(),
             self.0.name,
             self.0.version,
-            space,
+            self.0.space,
             uid,
         )
     }

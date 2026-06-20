@@ -46,6 +46,7 @@ wyrd-spec = { workspace = true }
 wyrd-utils = { workspace = true }
 
 [dev-dependencies]
+wyrd-semver = { workspace = true }
 serde_json = { workspace = true }
 skald-providers = { workspace = true }
 skald-spec = { workspace = true }

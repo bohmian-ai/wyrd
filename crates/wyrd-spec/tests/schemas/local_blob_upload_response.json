@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LocalBlobUploadResponse",
+  "description": "Server response for a local-filesystem blob upload.",
+  "type": "object",
+  "required": [
+    "uploaded"
+  ],
+  "properties": {
+    "uploaded": {
+      "description": "Whether the blob was written successfully.",
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false
+}

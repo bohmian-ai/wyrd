@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
+use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::CardName;
+use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::assertion::AssertionTask;
 use wyrd_spec::vala::eval::condition::{ConditionCombinator, EvalCondition};
@@ -12,14 +13,13 @@ use wyrd_spec::vala::eval::operator::ComparisonOperator;
 use wyrd_spec::vala::eval::result::{AssertionResult, EvalContextCapture, EvalPassGate};
 use wyrd_spec::vala::eval::spec::{DatasetRef, EvalSampling, EvalSpec, MAX_EVAL_TASKS};
 use wyrd_spec::vala::eval::task::EvalTask;
-use wyrd_spec::version::VersionBlock;
 
 fn data_ref(name: &str) -> CardRef {
     CardRef {
         kind: CardKind::Data,
         name: CardName::new(name).unwrap(),
         version: VersionBlock::parse("1.0.0").unwrap(),
-        space: None,
+        space: SpaceName::new("default").unwrap(),
         uid: None,
     }
 }
@@ -29,7 +29,7 @@ fn prompt_ref(name: &str) -> CardRef {
         kind: CardKind::Prompt,
         name: CardName::new(name).unwrap(),
         version: VersionBlock::parse("1.0.0").unwrap(),
-        space: None,
+        space: SpaceName::new("default").unwrap(),
         uid: None,
     }
 }

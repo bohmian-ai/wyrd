@@ -15,13 +15,15 @@ Downstream artifacts are brought up to this version in a sync pass.
 This repository is mid-reconciliation. The active doctrine is the 16 native
 kind catalog in this document plus `External`. Current `wyrd-spec` code and
 generated schemas no longer expose stale `Tool`, `Skill`, or `SubAgent` specs;
-they do not yet expose `SourceSpec`. New work must follow this document: tools
-are runtime registry entries, sub-agency is an Agent relationship, skills are
-not a v1 Card kind, and external observations are read through `Source` cards.
+they now expose `SourceSpec` (the bucket-keyed `SourceKind` union below). New
+work must follow this document: tools are runtime registry entries, sub-agency
+is an Agent relationship, skills are not a v1 Card kind, and external
+observations are read through `Source` cards.
 
 Do not expand stale card kinds or cite generated schema presence as doctrine.
-Follow-up cleanup should add `SourceSpec`, regenerate schemas/docs, and update
-card-kind tests.
+Remaining `Source` follow-up is the runtime read adapter in `vala` keyed on
+`(kind, vendor)` and the `wyrd source check` preflight; the spec, schemas, and
+card-kind tests are landed.
 
 ---
 
@@ -82,9 +84,10 @@ card-kind tests.
     `dataset`, `Service.components.ref`, `Workflow.steps.target`) stay
     `CardRef`-only — identity is the point.
 18. **Auth, Policy, and Emit are three distinct planes.**
-    - **Auth** gates Wyrd API calls: `Scope` on the handler, stateless pubkey
-      verify of the access token. Answers "is this principal allowed to hit
-      this Wyrd route?"
+    - **Auth** gates Wyrd API calls: `Permission { resource, action }` on the
+      handler, stateless pubkey verify of the access token. Answers "is this
+      principal allowed to hit this Wyrd route?" The legacy `Scope` vocabulary
+      is rejected — do not introduce it in new code.
     - **Policy** gates card states (`classify` at register-time, `gate` at
       deploy-time) and cross-service invokes (`invoke` at runtime). Runtime
       invoke evaluation is centralized at `POST /v1/authz/check`, called
@@ -94,21 +97,34 @@ card-kind tests.
       ingest, signed with the per-card governance token; never propagated
       between services and never read by Policy CEL.
 
-    A deployed Service card runs under a Wyrd-owned service account derived
-    deterministically from its `card_ref`. `wyrd apply` registers the card and
-    creates the SA (idempotent on re-apply); no secret is returned. Credentials
-    are issued out-of-band by an admin-authenticated `wyrd auth issue-key
-    <card_ref>` call, which mints a card-bound API key and returns it to the
-    caller. The caller uploads the key to the deploy environment's secret store
-    (Vault, AWS Secrets Manager, GCP Secret Manager); deploy-time secret
-    injection puts it into the pod as `WYRD_API_KEY`. The SDK exchanges it once
-    at startup for a short-lived JWT carrying the card's `card_ref` claim. On
-    cross-service calls the SDK adds `Wyrd-Caller-Identity: Bearer <jwt>` — the
-    application's `Authorization` header is never touched. The mesh's ext_authz
-    filter (or the SDK middleware) authenticates itself to `/v1/authz/check`
-    with its own card-scoped JWT and forwards the caller's JWT plus the
-    original method/path as headers; the body is empty. Both identities are
-    server-verified from signed claims.
+    Runtime identity is a `Principal { id: PrincipalId, kind: PrincipalKind,
+    tenant_id, roles, effective_permissions }`. `PrincipalId` is a `Uuid`
+    newtype; no string-prefix encoding (no `user:`, `sa:`, `agent:`) —
+    discrimination lives on `PrincipalKind`. `PrincipalKind` is closed:
+    `User`, `Service { card_ref }`, `Agent { card_ref }`. Service and Agent
+    are deployable, card-bound, non-human principals; User is the marker for
+    human identity. `wyrd apply -f service.yaml` (or an Agent card) creates
+    or updates the principal row idempotently, keyed on
+    `(tenant_id, card_kind, card_uid)`; re-apply preserves the same
+    `principal_id`. No secret is returned. Credentials are issued out-of-band
+    by `wyrd auth issue-key <card_ref>`, which mints a card-bound API key
+    against the existing principal. The caller uploads the key to the deploy
+    environment's secret store (Vault, AWS Secrets Manager, GCP Secret
+    Manager); deploy-time secret injection puts it into the pod as
+    `WYRD_API_KEY`. The SDK exchanges it once at startup at `POST /auth/token`
+    for a short-lived JWT. `/auth/token` derives `tenant_id` and
+    `principal_id` from the verified API-key record — never from a
+    client-supplied header. The JWT carries top-level `principal` (current
+    actor / callee under delegation) and an RFC 8693 `act` chain
+    (initiator-first delegators); a single delegated token carries both sides
+    of an invoke. On cross-service calls the SDK puts that delegated Wyrd
+    JWT in the `X-Wyrd-Access-Token` header. The application's own
+    `Authorization` header is never touched. `Wyrd-Caller-Identity` is
+    rejected legacy — do not reintroduce. The mesh's ext_authz filter (or
+    the SDK middleware) forwards `X-Wyrd-Access-Token`, `Wyrd-Request-Id`,
+    and `X-Original-*` to `/v1/authz/check`; the body is empty. Both caller
+    and callee identities are server-verified from one signed delegated
+    JWT — no enforcement-point JWT, no SPIFFE/mTLS callee derivation.
 19. **Light-card reference slots accept `ref | path | inline`.** Wherever a
     card spec references a light card (Prompt, Agent, Workflow, Mcp, Policy,
     Eval, Trigger, Operator, Source, Audit, Service), the slot is a
@@ -295,42 +311,52 @@ Closed enums:
 
 ### Runtime identity
 
-A deployed Service card runs under a Wyrd-owned service account derived
-deterministically from the card's `card_ref`. `wyrd apply` registers the card
-and creates the SA (idempotent on re-apply); no secret is returned. The
-declarative and credential operations are separated, matching the kubectl
-pattern (`apply` then `create token`):
+Wyrd principals are UUID-backed runtime identities for `User`, `Service`,
+and `Agent` kinds. `Service` and `Agent` principals are card-bound: each
+carries a `card_ref` discriminated on `PrincipalKind`. `wyrd apply` for a
+Service or Agent card creates or updates the principal row idempotently
+(keyed on `(tenant_id, card_kind, card_uid)`); re-apply preserves the same
+`principal_id`. No secret is returned. The declarative and credential
+operations are separated, matching the kubectl pattern (`apply` then
+`create token`):
 
 | Operation | Wyrd command | What it does |
 |---|---|---|
-| Register card + create SA | `wyrd apply -f service.yaml` | Idempotent. Writes card, creates SA. No secret. |
-| Mint a card-bound API key | `wyrd auth issue-key <card_ref>` | Admin-authenticated. Returns the key to the caller. Caller uploads to the deploy environment's secret store. Re-issuable for rotation. |
+| Register card + create principal | `wyrd apply -f service.yaml` | Idempotent. Writes card, upserts the Service/Agent principal keyed on `(tenant_id, card_kind, card_uid)`. Re-apply preserves `principal_id`. No secret. |
+| Mint a card-bound API key | `wyrd auth issue-key <card_ref>` | Admin-authenticated. Requires an applied principal. Returns the key to the caller. Caller uploads to the deploy environment's secret store. Re-issuable for rotation. |
 
 Deploy-time secret injection (Vault Agent, External Secrets Operator, AWS
 Secrets Manager CSI driver, etc.) puts the API key into the pod as
-`WYRD_API_KEY`. The SDK exchanges it ONCE at startup at `POST /auth/token` for a
-short-lived JWT (~15m) carrying the `card_ref` claim, and auto-refreshes before
-expiry.
+`WYRD_API_KEY`. The SDK exchanges it ONCE at startup at `POST /auth/token` for
+a short-lived JWT (~15m), and auto-refreshes before expiry. `/auth/token`
+derives `tenant_id` and `principal_id` from the verified API-key record;
+no client-supplied tenant header is accepted. The JWT carries the principal
+as the top-level `principal` claim, and for delegated tokens (token
+exchange) an RFC 8693 `act` chain of upstream delegators.
 
 Env vars in deployed services:
 
 | Env var | Required? | Source | Used for |
 |---|---|---|---|
-| `WYRD_API_KEY` | REQUIRED | Deploy environment's secret store (key minted by `wyrd auth issue-key <card_ref>`) | Exchanged ONCE at startup at `POST /auth/token` for short-lived JWT. SDK auto-refreshes. JWT carries `card_ref` claim. |
+| `WYRD_API_KEY` | REQUIRED | Deploy environment's secret store (key minted by `wyrd auth issue-key <card_ref>`) | Exchanged ONCE at startup at `POST /auth/token` for short-lived JWT. SDK auto-refreshes. JWT carries the card-bound `principal` claim (kind, id, tenant, `card_ref`). |
 | `WYRD_API_URL` | REQUIRED | Static config | Wyrd server base URL. |
 | `WYRD_GOV_TOKEN` | OPTIONAL | CI writes from `wyrd gov-token issue` response | Only if the app calls `wyrd.observe(...)`. |
 
 The API key is exchanged at startup — never on the wire. The JWT — not the API
-key — is what travels on cross-service
-calls in the dedicated `Wyrd-Caller-Identity: Bearer <jwt>` header. The
-application's own `Authorization` header is never touched by the SDK.
+key — is what travels on cross-service calls in the dedicated
+`X-Wyrd-Access-Token: Bearer <jwt>` header. The JWT must be a **delegated**
+Wyrd token: its top-level `principal` identifies the protected callee
+(Service or Agent), and its `act` chain identifies the caller(s) that
+delegated to it. The application's own `Authorization` header belongs to
+the application and is never read or written by the SDK or by Wyrd.
+`Wyrd-Caller-Identity` is rejected legacy — do not reintroduce.
 
 ```
 POST /charge HTTP/1.1
 Host: billing-svc.acme.svc.cluster.local
-Wyrd-Caller-Identity: Bearer <Service-A's JWT>     ← SDK adds; carries caller's card_ref
-Wyrd-Request-Id:      <ULID>                       ← SDK adds; request correlator
-Authorization: Bearer <app's own JWT>              ← app's own auth; Wyrd never reads
+X-Wyrd-Access-Token: Bearer <delegated Wyrd JWT — principal=callee, act=caller chain>
+Wyrd-Request-Id:     <UUIDv7>                     ← SDK adds; request correlator
+Authorization: Bearer <app's own token>           ← app's own auth; Wyrd never reads
 Content-Type: application/json
 
 { "amount": 100 }
@@ -345,15 +371,16 @@ propagation contract.
 
 Contract:
 
-- Opaque ULID minted by Wyrd at first sighting (no inbound
+- Opaque UUIDv7 minted by Wyrd at first sighting (no inbound
   `Wyrd-Request-Id` at `/v1/authz/check`).
 - Propagated unchanged by Wyrd SDK middleware and ext_authz on outbound
   calls. Never mutated, never re-minted mid-request.
 - Every Wyrd-emitted observation carries it as a label.
 - Ancestry of any request (service1 → service2 → service3) is
   reconstructable by joining observations on this ID; per-hop caller
-  identity comes from the verified `Wyrd-Caller-Identity` JWT at each
-  call.
+  identity comes from the verified `X-Wyrd-Access-Token` JWT at each
+  call (top-level `principal` is the hop's callee, `act` chain is the
+  caller path).
 
 Storage tier, query API, and CEL surface (e.g. a `chain.*` binding) are
 implementation concerns deferred to the runtime stage.
@@ -366,12 +393,32 @@ paths, identical semantics:
 - **Service mesh (ext_authz).** The mesh's local Envoy/Istio sidecar
   intercepts the inbound request transparently (iptables redirect, standard
   k8s/Istio behavior), and the configured ext_authz filter calls Wyrd's
-  `/v1/authz/check`. The developer's application code makes a normal HTTP
-  call — it does not address Envoy explicitly. One-time platform-team filter
-  config covers every workload.
+  `/v1/authz/check`. Application code makes a normal HTTP call. One-time
+  platform-team filter config covers every workload — no per-team
+  middleware is required. The mesh is configured to forward exactly the
+  Wyrd-defined headers via `includeRequestHeadersInCheck`, e.g.
+
+  ```yaml
+  apiVersion: install.istio.io/v1alpha1
+  kind: IstioOperator
+  spec:
+    meshConfig:
+      extensionProviders:
+        - name: wyrd-authz
+          envoyExtAuthzHttp:
+            service: wyrd-server.wyrd-system.svc.cluster.local
+            port: "8080"
+            pathPrefix: /v1/authz/check
+            includeRequestHeadersInCheck:
+              - x-wyrd-access-token
+              - wyrd-request-id
+              - x-original-method
+              - x-original-path
+              - x-original-host
+  ```
 - **SDK middleware (non-mesh).** Identical semantics in-process. One-line
   developer install (`app.add_middleware(PolicyMiddleware)`). The middleware
-  reads `Wyrd-Caller-Identity` from the inbound request and calls the same
+  reads `X-Wyrd-Access-Token` from the inbound request and calls the same
   `/v1/authz/check` route.
 
 The check is **headers-only**. Body is empty. All inputs are headers, which
@@ -381,24 +428,33 @@ translation logic on either end.
 ```
 POST /v1/authz/check HTTP/1.1
 Host: wyrd.acme.com
-Authorization:         Bearer <middleware/sidecar's own JWT — its card identity>
-Wyrd-Caller-Identity:  Bearer <caller's JWT — forwarded from the original request>
-Wyrd-Request-Id:       <ULID — forwarded from inbound, or absent on first hop>
-X-Original-Method:     POST
-X-Original-Path:       /charge
+X-Wyrd-Access-Token: Bearer <delegated Wyrd JWT — principal=callee, act=caller chain>
+Wyrd-Request-Id:     <UUIDv7 — forwarded from inbound, or absent on first hop>
+X-Original-Method:   POST
+X-Original-Path:     /charge
+X-Original-Host:     billing-svc.acme.svc.cluster.local
 Content-Length: 0
 ```
 
 Wyrd:
-1. Verifies `Authorization` JWT → builds `callee` from claims (`card_ref`,
-   `actor`, `scopes`).
-2. Verifies `Wyrd-Caller-Identity` JWT → builds `caller` from claims.
-3. Reads `X-Original-Method` / `X-Original-Path` → builds `request`.
-4. Reads `Wyrd-Request-Id` if present; mints a fresh ULID if absent and
+1. Verifies `X-Wyrd-Access-Token`. Rejects with `403 Forbidden` if the JWT
+   is not a **delegated** token — i.e. if `principal.kind ∉ {Service,
+   Agent}`, if `principal.card_ref` is `None`, or if the `act` chain is
+   empty. `/v1/authz/check` will not authorize on a direct (non-delegated)
+   token.
+2. Derives `callee = verified.principal` (the protected Service/Agent
+   card identity) and `caller = verified.delegation_chain.last()` (the
+   immediate delegator); the full chain is retained for policy bindings
+   and audit. There is no enforcement-point JWT and no SPIFFE/mTLS
+   callee derivation — one delegated token carries both sides.
+3. Reads `X-Original-Method` / `X-Original-Path` / `X-Original-Host`
+   → builds `request`.
+4. Reads `Wyrd-Request-Id` if present; mints a fresh UUIDv7 if absent and
    echoes it back so the middleware/sidecar can inject it on the outbound
    call.
-5. Assembles `InvokeContext { caller, callee, request, attrs }` (attrs are
-   merged Classify-derived attributes from caller + callee cards).
+5. Assembles `InvokeContext { caller, callee, chain, request, attrs }`
+   (attrs are merged Classify-derived attributes from caller + callee
+   cards).
 6. Evaluates CEL rules where `action == invoke` for the callee card
    (org-global ∪ service-local, deny-overrides).
 7. Returns `200 OK` (Allow) or `403 Forbidden` with `PolicyDecision::Deny { reason }`.
@@ -407,7 +463,7 @@ Wyrd:
    no caller/callee gov-token consumed). Every allow and every deny is
    audited automatically; no developer wiring.
 
-Both identities are server-signed and verified from claims. The pod cannot
+Identity is server-verified from one signed delegated JWT. The pod cannot
 self-assert its identity — no env var, no body field, no header carries
 identity data the pod authored.
 
@@ -780,14 +836,82 @@ view** (judged against intermediate workflow records / spans / tool calls).
 Both run in one pass.
 
 ### Source
-Read-side reference to external data system. **Wyrd reads, never writes.**
+Read-side reference to an external data system. **Wyrd reads, never writes.**
+
+`source` is a **read-shape bucket**, not a vendor. The top-level discriminator is
+the shape of data a consuming `Drift`/`Eval` Card sees — a row set, a time
+series, blobs — so a consumer binds to the shape and never to a vendor. The
+vendor (BigQuery vs Snowflake, Prometheus vs Datadog, GCS vs S3) is a
+**connection detail nested below the bucket**. This is the same axis `object_store`
+already used: `source.kind` was never `gcs` or `s3`; the vendor was the URI scheme.
+
+The bucket set is derived from what consumers read, not from a vendor taxonomy —
+which keeps it small, closed, and stable (Doctrine #2). Adding a vendor is a new
+`*Connection` variant plus a runtime read adapter in `vala`; it never grows the
+bucket set and never touches a consuming Card.
+
 ```yaml
 spec:
-  kind: object_store             # v1: object_store only
-  uri: string                    # s3:// | gs:// | az:// | file://
-  format: parquet | jsonl | arrow_ipc | csv
-  defaults: { string: NonSecretValue }
+  description?: string
+  source:                         # SourceKind — the read-shape bucket; vendor nested below
+    kind: <bucket>
+  defaults: { string: NonSecretValue }   # non-secret read hints (projection, page size)
 ```
+
+`SourceKind` is a closed tagged union keyed by **bucket** (`kind` discriminator).
+Each bucket carries one uniform read contract; the vendor is a nested
+`*Connection` union keyed by `vendor`:
+
+| Bucket (`kind`)  | Read contract (uniform within bucket) | Vendor union (`vendor`)                 |
+|------------------|---------------------------------------|------------------------------------------|
+| `object_store`   | blobs at `uri` → records by `format`  | URI scheme (`gs://`/`s3://`/`az://`/`file://`) |
+| `sql_warehouse`  | SQL → row set                         | `bigquery` \| `snowflake` \| `postgres`  |
+| `metrics`        | query → labeled time series           | `prometheus` \| `datadog` \| `cloudwatch`|
+| `logs`           | query → log records                   | `loki` \| `elasticsearch` \| `splunk`    |
+| `traces`         | query → spans                         | `tempo` \| `datadog_apm` \| `jaeger`     |
+
+The bucket set lines up with what `Drift`/`Eval` already read: `object_store`/
+`sql_warehouse` feed `DriftSignal::Distribution` (rows), `metrics` feeds
+`DriftSignal::Metric`, `traces` feeds `EvalTask::TraceAssertion`.
+
+**Secrets never live on the Card** (Doctrine #7). Every vendor connection carries
+a `SourceAuth` whose secret material is a **named server-side env var**, resolved
+at read time — only the env-var *name* is on the Card, exactly like
+`Operator.Http.auth.env`. `SourceAuth` is a closed tagged union (`scheme`
+discriminator): `None`, `Env { env }`, `Basic { username, password_env }`,
+`MultiEnv { vars: { logical_name: env_var } }` (covers multi-key vendors like
+Datadog's api-key + app-key), `SecretStore { provider, name }` (Vault / AWS SSM /
+GCP Secret Manager — carries the store identifier and secret path, never the value).
+
+```yaml
+# sql_warehouse — vendor + non-secret coordinates + env ref for the secret
+source:
+  kind: sql_warehouse
+  connection:
+    vendor: snowflake
+    account: acme-prod
+    warehouse: analytics
+    database: telemetry
+    schema: public
+    role: reader
+    auth:
+      scheme: multi_env
+      vars:
+        user: SNOWFLAKE_USER
+        private_key: SNOWFLAKE_PRIVATE_KEY   # names only; never values
+
+# object_store — vendor implied by URI scheme; auth defaults to None (ambient IAM)
+source:
+  kind: object_store
+  uri: gs://acme-telemetry/runs
+  format: parquet
+```
+
+**Runtime read adapter.** `vala` owns the read driver, keyed on
+`(kind, vendor)`. The three connection families (object/blob list-and-read, SQL
+query, HTTP query) are different drivers behind one read trait; the Card schema
+never declares strategy — `vala` chooses it from the bucket and vendor, the same
+way it chooses the Drift/Eval evaluation strategy.
 
 ### Trigger
 Fires an Operator. A Trigger declares when (`schedule`), what to evaluate
@@ -927,6 +1051,11 @@ inline:
   scope: service_local
 ```
 
+The wire `CardRef` requires `space`. Omitting `space` in authored YAML is a
+loader-time convenience: the YAML loader splices the enclosing card's
+`metadata.space` into each child `ref:` before deserialization. A `CardRef`
+that has crossed an API boundary always carries `space` verbatim.
+
 In context — `Service.components[]` mixing all three plus a heavy-card ref:
 
 ```yaml
@@ -995,7 +1124,7 @@ ergonomic they expect from JSON-Schema `$ref` / OpenAPI external-file imports.
 | Policy  | `rules`                              | `Service.components.ref`, `Operator.pre_invoke`, `Operator.post_invoke` |
 | Trigger | `schedule`, `source.drift_ref` \| `source.eval_ref`, `operator_ref` | — |
 | Operator| `action` (`workflow_ref` \| typed `channel` shape \| `auth.env`), `pre_invoke`, `post_invoke` | `Trigger.operator_ref` |
-| Source  | `kind`, `uri`, `format`              | `Drift.signal.source_ref` (External variant), `Eval.source_ref` |
+| Source  | `kind` (bucket), `connection` (vendor + `*_env`) | `Drift.signal.source_ref` (External variant), `Eval.source_ref` |
 
 `Service.components` accepts: Agent, Prompt, Model, Workflow, Mcp, Policy. No
 other kinds are runtime-aliased into a Service.
@@ -1042,8 +1171,14 @@ services/ops-copilot/
 
 1. Per-component Policy binding on `ServiceComponent`. Workaround: rule
    expressions scope by `agent.name`. Decision pending a real use case.
-2. Source vendor read adapters (Datadog metrics, PromQL, Tempo, Loki).
-   v1 ships `object_store` only.
+2. **Closed.** Source vendor read adapters. `SourceKind` is a closed,
+   bucket-keyed tagged union (`object_store`, `sql_warehouse`, `metrics`,
+   `logs`, `traces`); each bucket nests a `vendor`-keyed `*Connection` union,
+   and secrets are server-side env-var names (`SourceAuth`), never card values.
+   Adding a vendor is a new `*Connection` variant plus a `vala` read adapter —
+   no bucket or consumer churn. Remaining runtime work: the `vala` read trait
+   keyed on `(kind, vendor)`, and a connectivity/scope preflight
+   (`wyrd source check <ref>`) reporting per-capability OK/error.
 3. Format negotiation for `object_store` Source — schema-on-read vs registered
    schema reference.
 4. Time-window semantics for how Drift/Eval cards describe the read range

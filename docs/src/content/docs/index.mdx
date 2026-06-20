@@ -4,12 +4,21 @@ description: Developer and agent documentation for Wyrd.
 ---
 
 import WyrdHero from "../../components/WyrdHero.astro";
+import WyrdControlPlaneDiagram from "../../components/WyrdControlPlaneDiagram.astro";
 
 <WyrdHero
   title="Wyrd"
   tagline="The AI layer for human and agentic workflows."
   sub="Cards declare durable AI system components. Specs define kind-specific contracts. Registry, policy, lineage, audit, observability, and install services operate on the same envelope."
 />
+
+## Where Wyrd fits
+
+Wyrd is the control & operations layer that sits between the AI products you
+build and the runtime you already use. Five capabilities — **define**,
+**govern**, **observe**, **evaluate**, **react** — across the full AI lifecycle.
+
+<WyrdControlPlaneDiagram />
 
 <ul class="wyrd-stats">
   <li><strong>1</strong><span>Envelope</span></li>

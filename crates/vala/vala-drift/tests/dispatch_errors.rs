@@ -8,21 +8,21 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use vala_drift::{DriftFitError, DriftScoreError};
 use vala_drift::{FittedBaseline, SpcBaseline, fit_baseline, score_drift};
+use wyrd_semver::VersionBlock;
 use wyrd_spec::card::drift::{
     DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec, PsiBinningStrategy,
     PsiProfile, PsiThreshold, SpcAlertThreshold, SpcProfile, SpcWecoRule,
 };
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{CardName, FeatureName};
+use wyrd_spec::ids::{CardName, FeatureName, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::VersionBlock;
 
 fn data_ref(name: &str) -> CardRef {
     CardRef {
         kind: CardKind::Data,
         name: CardName::new(name).expect("valid name"),
         version: VersionBlock::parse("1.0.0").expect("valid version"),
-        space: None,
+        space: SpaceName::new("default").expect("valid space"),
         uid: None,
     }
 }
@@ -32,7 +32,7 @@ fn model_ref(name: &str) -> CardRef {
         kind: CardKind::Model,
         name: CardName::new(name).expect("valid name"),
         version: VersionBlock::parse("1.0.0").expect("valid version"),
-        space: None,
+        space: SpaceName::new("default").expect("valid space"),
         uid: None,
     }
 }
@@ -72,7 +72,7 @@ fn spc_eval_score_spec() -> DriftSpec {
                 kind: CardKind::Eval,
                 name: CardName::new("eval-card").expect("valid name"),
                 version: VersionBlock::parse("1.0.0").expect("valid version"),
-                space: None,
+                space: SpaceName::new("default").expect("valid space"),
                 uid: None,
             },
         },

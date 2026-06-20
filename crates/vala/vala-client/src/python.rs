@@ -8,12 +8,12 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyModule, PyString};
 use url::Url;
+use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::protocol::{ConversationTurn, SimulatedUserMode, TurnRole};
-use wyrd_spec::version::VersionBlock;
 
 use crate::eval::protocol_client::{
     AgentFn, AgentTurnOutput, ProtocolClient, ProtocolClientError, RunSummary, SimulatedUserFn,
@@ -203,19 +203,21 @@ fn parse_eval_ref(value: &str) -> Result<CardRef, WyrdError> {
     let (identity, version) = value
         .rsplit_once('@')
         .ok_or_else(|| WyrdError::Validation {
-            message: "eval_ref must use name@version or space/name@version syntax".to_string(),
+            message: "eval_ref must use space/name@version syntax".to_string(),
             details: serde_json::json!({ "field": "eval_ref", "value": value }),
         })?;
-    let (space, name) = match identity.split_once('/') {
-        Some((space, name)) => (Some(parse_space(space)?), name),
-        None => (None, identity),
-    };
+    let (space, name) = identity
+        .split_once('/')
+        .ok_or_else(|| WyrdError::Validation {
+            message: "eval_ref must use space/name@version syntax".to_string(),
+            details: serde_json::json!({ "field": "eval_ref", "value": value }),
+        })?;
     Ok(CardRef {
         kind: CardKind::Eval,
         name: CardName::new(name).map_err(|source| invalid_ref_field("name", name, source))?,
         version: VersionBlock::parse(version)
             .map_err(|source| invalid_ref_field("version", version, source))?,
-        space,
+        space: parse_space(space)?,
         uid: None,
     })
 }

@@ -30,6 +30,7 @@ wyrd-observe = { workspace = true }
 wyrd-spec = { workspace = true }
 
 [dev-dependencies]
+wyrd-semver = { workspace = true }
 hyper = { version = "1", features = ["full"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tower = { workspace = true, features = ["util"] }

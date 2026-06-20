@@ -84,7 +84,10 @@ Locked cross-cutting decisions that any contributor must honor:
   package surface, not the place for duplicated business logic.
 - Current approved Python owner crates are `wyrd-interfaces`, `wyrd-cards`,
   `wyrd-utils`, `wyrd-observe`, `vala-client`, `skald-prompt`,
-  `skald-runtime`, `skald-agent`, `skald-tool`, and `skald-workflow`.
+  `skald-runtime`, `skald-agent`, `skald-tool`, `skald-workflow`, and
+  `wyrd-testing`. `wyrd-testing`'s `python` feature exposes the
+  `WyrdTestServer` harness only; it is a test-tier crate and is never
+  enabled on production Python wheels.
 - Client-tier crates do not depend on `sqlx`, cloud SDKs, `datafusion`, or
   `deltalake`.
 - Vala and Skald do not depend on each other directly.
@@ -305,21 +308,16 @@ A change is not done until:
 - Never run `git config` to alter identity.
 - If git config is wrong, stop and surface to the user.
 
-## 14. Session-Driven Planning
+## 14. Planning
 
-Planning lives in the [`wyrd-plan`](https://github.com/wyrd-ai/wyrd-plan) repo.
+Planning lives in the [`wyrd`](https://github.com/wyrd-ai/wyrd) repo. Additional/older planning files live in the [`wyrd-plan`](https://github.com/wyrd-ai/wyrd-plan) repo.
 Code in this repo lands one session at a time, via dialogue-locked decisions.
 
-- Active session: `wyrd-plan/sessions/CURRENT.md` (empty between sessions).
-- Per-session folder: `wyrd-plan/sessions/SS-NNN-<slug>/` with five files —
-  `00-audit.md` (predecessor citations), `01-questions.md`,
-  `02-answers.md`, `03-lock-summary.md`, `04-pr.md`.
-- Locked architecture: `wyrd-plan/architecture/v1/` files with
-  `status: locked` front-matter. Each lock has a `wyrd-plan/CHANGELOG.md`
-  entry and lands in `wyrd-plan/STATUS.md`.
-- One session in flight at a time. No parallel sessions, no parallel chunks.
-- Code follows lock. A wyrd PR cites the session folder and the CHANGELOG
-  slug. Demo command in `04-pr.md` must pass from a fresh clone before close.
-- Phase planning skills (`wyrd-phase-planner`, `wyrd-phase-reviewer`,
-  `wyrd-plan-implementor`, `wyrd-plan-interviewer`, `wyrd-migration-planner`)
-  read this file first, then `wyrd-plan/README.md`.
+## 15. Implementation Rules
+
+- `wyrd-spec` is foundational but it not a dumping grounds for all contracts. If it's not spec-related, it doesn't go in `wyrd-spec`. Find another place for it.
+- `wyrd-sql` is the durable Postgres layer.
+- `wyrd-storage` is the durable storage layer that provides storage functionality for wyrd and vala.
+- Deployment: Wyrd is meant to be deployed as self-hosted, cloud SaaS (single-server multi-tenant), and enterprise cloud (single-server single-tenant). Plan work and implementation accordingly.
+- KEEP IT SIMPLE STUPID: when reviewing and implementing, avoid over-engineering and adding unnecessary complexity, YAGNI, and follow a modular design that solves the problem at hand without adding extra layers, abstractions, or future-proofing that isn't justified by current needs. There should be one obvious way to do something, and it should be the way we do it.
+- Follow industry and Rust community best practices. Provide recommendations when appropriate.

@@ -7,6 +7,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use wyrd_interfaces::error::CardPyResult;
+use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::data::{
     CustomDataMeta, DataInterface as RustDataInterface, DataSchema, DataSpec, DataSplit, DataStats,
     SqlLogic,
@@ -16,7 +17,6 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{ColumnName, SplitName};
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::ApiVersion;
 
 #[cfg(feature = "python")]
 use {
@@ -165,13 +165,13 @@ impl DataCard {
     /// # Errors
     /// Returns a Wyrd error when identity fields are invalid.
     pub fn as_card_ref(&self) -> Result<CardRef, WyrdError> {
-        use crate::identity::{card_name, optional_card_uid, optional_space_name, version_block};
+        use crate::identity::{card_name, optional_card_uid, space_name, version_block};
 
         Ok(CardRef {
             kind: CardKind::Data,
             name: card_name("name", &self.name)?,
             version: version_block(&self.version)?,
-            space: optional_space_name(&self.space)?,
+            space: space_name(&self.space)?,
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -647,7 +647,13 @@ impl DataCard {
                     .as_ref()
                     .map_or_else(|| "default".to_string(), ToString::to_string),
                 name: envelope.metadata.name.to_string(),
-                version: envelope.metadata.version.to_string(),
+                version: envelope
+                    .metadata
+                    .resolved_pin()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| {
+                        WyrdPyError::validation("DataCard envelope missing resolved version pin")
+                    })?,
                 uid: envelope
                     .metadata
                     .uid
@@ -707,15 +713,15 @@ impl DataCardInput {
             return Ok(Self::Interface(DataInterfaceHandle::from_interface(data)?));
         }
 
-        if let Ok(interface_type) = data.cast::<PyType>() {
-            if interface_type.is_subclass_of::<DataInterface>()? {
-                if !allow_interface_class {
-                    return Err(WyrdPyError::validation(
-                        "DataCard construction requires live data or an initialized DataInterface instance; pass interface classes to retrieval surfaces such as cards.get(..., interface=YourInterface)",
-                    ));
-                }
-                return Ok(Self::InterfaceClass(data.clone().unbind()));
+        if let Ok(interface_type) = data.cast::<PyType>()
+            && interface_type.is_subclass_of::<DataInterface>()?
+        {
+            if !allow_interface_class {
+                return Err(WyrdPyError::validation(
+                    "DataCard construction requires live data or an initialized DataInterface instance; pass interface classes to retrieval surfaces such as cards.get(..., interface=YourInterface)",
+                ));
             }
+            return Ok(Self::InterfaceClass(data.clone().unbind()));
         }
 
         Ok(Self::Raw(data.clone().unbind()))

@@ -1,8 +1,10 @@
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
+import mermaid from "astro-mermaid";
 
 export default defineConfig({
   integrations: [
+    mermaid({ theme: "neutral", autoTheme: true }),
     starlight({
       title: "Wyrd",
       description: "Developer and agent documentation for Wyrd.",
@@ -70,6 +72,20 @@ export default defineConfig({
           ],
         },
         {
+          label: "Security",
+          collapsed: true,
+          items: [
+            { label: "Overview", link: "/security/" },
+            { label: "Identity", link: "/security/identity/" },
+            { label: "Roles and permissions", link: "/security/roles-and-permissions/" },
+            { label: "Tokens", link: "/security/tokens/" },
+            { label: "Service identity", link: "/security/service-identity/" },
+            { label: "Delegation", link: "/security/delegation/" },
+            { label: "Operations", link: "/security/operations/" },
+            { label: "Threat model", link: "/security/threat-model/" },
+          ],
+        },
+        {
           label: "Card reference",
           collapsed: true,
           items: [
@@ -132,6 +148,14 @@ export default defineConfig({
           ],
         },
         {
+          label: "Setup",
+          collapsed: true,
+          items: [
+            { label: "Postgres", link: "/setup/postgres/" },
+            { label: "Storage", link: "/setup/storage/" },
+          ],
+        },
+        {
           label: "Integrations",
           collapsed: true,
           items: [
@@ -172,6 +196,23 @@ export default defineConfig({
             { label: "Overview", link: "/reference/" },
             { label: "Generated docs", link: "/reference/generated-docs/" },
             { label: "Predecessor mapping", link: "/migration/predecessor-mapping/" },
+          ],
+        },
+        {
+          label: "Tech specs",
+          collapsed: true,
+          items: [
+            { label: "Overview", link: "/tech-specs/" },
+            {
+              label: "Storage",
+              collapsed: true,
+              items: [
+                { label: "Architecture", link: "/tech-specs/storage/" },
+                { label: "Upload flow", link: "/tech-specs/storage/upload-flow/" },
+                { label: "Download flow", link: "/tech-specs/storage/download-flow/" },
+                { label: "Lifecycle and errors", link: "/tech-specs/storage/lifecycle/" },
+              ],
+            },
           ],
         },
       ],

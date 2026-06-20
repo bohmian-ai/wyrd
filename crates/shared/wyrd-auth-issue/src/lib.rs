@@ -2,16 +2,45 @@
 
 #![deny(missing_docs)]
 
-use std::collections::BTreeSet;
-
-use argon2::Argon2;
-use chrono::{Duration, Utc};
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use argon2::{Algorithm, Argon2, Params, Version};
+use chrono::{DateTime, Duration, Utc};
+use jsonwebtoken::{EncodingKey, Header};
 use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng};
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_auth_verify::AccessTokenClaims;
-use wyrd_spec::actor::Actor;
-use wyrd_spec::authz::Scope;
+use ulid::Ulid;
+use wyrd_auth_verify::{
+    AccessTokenClaims, ActClaim, Kid, PrincipalKindWire, RefreshTokenClaims, TokenPrincipalRef,
+};
+use wyrd_runtime::{PrincipalId, RoleRef};
+use wyrd_spec::DataTenantId;
+use wyrd_spec::envelope::CardKind;
+use wyrd_spec::reference::CardRef;
+
+pub use wyrd_auth_verify::{MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH};
+
+/// OWASP-recommended Argon2id memory cost in KiB.
+pub const ARGON2_M_COST_KIB: u32 = 19_456;
+
+/// OWASP-recommended Argon2id iteration count.
+pub const ARGON2_T_COST: u32 = 2;
+
+/// OWASP-recommended Argon2id lane count.
+pub const ARGON2_P_COST: u32 = 1;
+
+/// Plaintext access and refresh tokens returned by server-tier issue paths.
+#[derive(Debug)]
+pub struct IssuedTokenPair {
+    /// Access token `jti`.
+    pub jti: String,
+    /// Signed access token.
+    pub access_token: SecretString,
+    /// Signed refresh token.
+    pub refresh_token: SecretString,
+    /// Access token expiry timestamp.
+    pub access_expires_at: DateTime<Utc>,
+    /// Refresh token expiry timestamp.
+    pub refresh_expires_at: DateTime<Utc>,
+}
 
 /// Server-tier Ed25519 signing key.
 ///
@@ -20,25 +49,50 @@ use wyrd_spec::authz::Scope;
 /// dropped immediately after use, limiting private key material lifetime.
 pub struct IssuingKey {
     pem: SecretString,
-    kid: String,
+    kid: Kid,
     issuer: String,
 }
 
 /// Authentication issuance errors.
 #[derive(Debug, thiserror::Error)]
 pub enum IssueError {
-    /// Private-key load failed.
-    #[error("key load failed")]
-    Key(#[source] jsonwebtoken::errors::Error),
-    /// Token encoding failed.
-    #[error("token encode failed")]
-    Encode(#[source] jsonwebtoken::errors::Error),
+    /// EdDSA key loading or signing failed.
+    #[error("EdDSA signing failed")]
+    Signing(#[source] jsonwebtoken::errors::Error),
     /// API-key hashing failed.
-    #[error("api key hash failed: {0}")]
-    Hash(password_hash::Error),
+    #[error("Argon2 hashing failed")]
+    Hashing(password_hash::Error),
     /// Token TTL was zero or negative.
-    #[error("ttl must be positive")]
+    #[error("ttl must be > 0")]
     InvalidTtl,
+    /// Delegation depth would exceed the configured maximum.
+    #[error("delegation depth exceeded (max {max})")]
+    DelegationDepthExceeded {
+        /// Maximum supported delegation depth.
+        max: usize,
+    },
+    /// Key id was malformed.
+    #[error("kid must match ^[A-Za-z0-9._-]{{1,64}}$")]
+    InvalidKid,
+    /// Principal kind did not match the requested issue helper.
+    #[error("principal kind does not match token issue helper")]
+    InvalidPrincipalKind,
+    /// Principal card reference was missing or mismatched.
+    #[error("principal card_ref is missing or mismatched")]
+    InvalidCardRef,
+}
+
+/// Minimal caller context for RFC 8693 token delegation.
+///
+/// Contains only the three fields read by [`IssuingKey::issue_delegated_access_token`],
+/// avoiding fabrication of unused fields such as `iss`, `jti`, `roles`, and timestamps.
+pub struct DelegationCaller {
+    /// Subject identifier of the original caller (the `sub` claim of their token).
+    pub sub: String,
+    /// Principal reference of the caller.
+    pub principal: TokenPrincipalRef,
+    /// Act chain from the caller's token, if any.
+    pub act: Option<Box<ActClaim>>,
 }
 
 impl IssuingKey {
@@ -48,55 +102,232 @@ impl IssuingKey {
     /// Returns an error when the PEM is not a valid EdDSA private key.
     pub fn from_ed_pem(
         pem: SecretString,
-        kid: impl Into<String>,
+        kid: Kid,
         issuer: impl Into<String>,
     ) -> Result<Self, IssueError> {
-        EncodingKey::from_ed_pem(pem.expose_secret().as_bytes()).map_err(IssueError::Key)?;
+        EncodingKey::from_ed_pem(pem.expose_secret().as_bytes()).map_err(IssueError::Signing)?;
         Ok(Self {
             pem,
-            kid: kid.into(),
+            kid,
             issuer: issuer.into(),
         })
     }
 
-    /// Mint an EdDSA access token carrying the resolved actor and scopes.
+    /// Mint an access token for a user principal.
     ///
     /// # Errors
-    /// Returns an error when token encoding fails.
-    pub fn issue_access_token(
+    /// Returns an error when the principal is not a user, TTL is invalid, or signing fails.
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, principal),
+        fields(
+            kid = %self.kid,
+            principal_id = %principal.id,
+            principal_kind = ?principal.kind,
+            jti = tracing::field::Empty,
+        ),
+        err,
+    )]
+    pub fn issue_user_access_token(
         &self,
-        actor: Actor,
-        scopes: BTreeSet<Scope>,
+        principal: TokenPrincipalRef,
+        roles: Vec<RoleRef>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
-        if ttl <= Duration::zero() {
-            return Err(IssueError::InvalidTtl);
+        if principal.kind != PrincipalKindWire::User {
+            return Err(IssueError::InvalidPrincipalKind);
+        }
+        validate_principal_ref(&principal)?;
+        self.issue_access_token_with_claims(principal.id.to_string(), principal, roles, None, ttl)
+    }
+
+    /// Mint an access token for a Service principal.
+    ///
+    /// # Errors
+    /// Returns an error when the card reference is not a Service, TTL is invalid, or signing fails.
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, card_ref),
+        fields(
+            kid = %self.kid,
+            sa_id = %sa_id,
+            tenant_id = %tenant_id,
+            jti = tracing::field::Empty,
+        ),
+        err,
+    )]
+    pub fn issue_service_access_token(
+        &self,
+        sa_id: PrincipalId,
+        tenant_id: DataTenantId,
+        card_ref: CardRef,
+        roles: Vec<RoleRef>,
+        ttl: Duration,
+    ) -> Result<String, IssueError> {
+        if card_ref.kind != CardKind::Service {
+            return Err(IssueError::InvalidCardRef);
+        }
+        let principal = TokenPrincipalRef {
+            id: sa_id,
+            kind: PrincipalKindWire::Service,
+            tenant_id,
+            card_ref: Some(card_ref),
+        };
+        self.issue_access_token_with_claims(sa_id.to_string(), principal, roles, None, ttl)
+    }
+
+    /// Mint an access token for an Agent principal.
+    ///
+    /// # Errors
+    /// Returns an error when the card reference is not an Agent, TTL is invalid, or signing fails.
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, card_ref),
+        fields(
+            kid = %self.kid,
+            agent_id = %agent_id,
+            tenant_id = %tenant_id,
+            jti = tracing::field::Empty,
+        ),
+        err,
+    )]
+    pub fn issue_agent_access_token(
+        &self,
+        agent_id: PrincipalId,
+        tenant_id: DataTenantId,
+        card_ref: CardRef,
+        roles: Vec<RoleRef>,
+        ttl: Duration,
+    ) -> Result<String, IssueError> {
+        if card_ref.kind != CardKind::Agent {
+            return Err(IssueError::InvalidCardRef);
+        }
+        let principal = TokenPrincipalRef {
+            id: agent_id,
+            kind: PrincipalKindWire::Agent,
+            tenant_id,
+            card_ref: Some(card_ref),
+        };
+        self.issue_access_token_with_claims(agent_id.to_string(), principal, roles, None, ttl)
+    }
+
+    /// Mint a delegated access token via RFC 8693 token exchange.
+    ///
+    /// # Errors
+    /// Returns an error when the requested subject is invalid, TTL is invalid, delegation depth is
+    /// exceeded, or signing fails.
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, caller, requested_subject),
+        fields(
+            kid = %self.kid,
+            requested_subject = %requested_subject.id,
+            delegation_depth = tracing::field::Empty,
+            jti = tracing::field::Empty,
+        ),
+        err,
+    )]
+    pub fn issue_delegated_access_token(
+        &self,
+        caller: &DelegationCaller,
+        requested_subject: TokenPrincipalRef,
+        requested_roles: Vec<RoleRef>,
+        ttl: Duration,
+    ) -> Result<String, IssueError> {
+        validate_principal_ref(&requested_subject)?;
+        let resulting_depth = act_depth(caller.act.as_deref()) + 1;
+        tracing::Span::current().record("delegation_depth", resulting_depth);
+        if resulting_depth > MAX_DELEGATION_DEPTH {
+            return Err(IssueError::DelegationDepthExceeded {
+                max: MAX_DELEGATION_DEPTH,
+            });
         }
 
-        let encoding = EncodingKey::from_ed_pem(self.pem.expose_secret().as_bytes())
-            .map_err(IssueError::Key)?;
+        let act = Some(Box::new(ActClaim {
+            sub: caller.sub.clone(),
+            principal: caller.principal.clone(),
+            act: caller.act.clone(),
+        }));
 
-        let sub = match &actor {
-            Actor::User { id, .. } => id.to_string(),
-            Actor::Service { name } => name.clone(),
-            Actor::Agent { id, .. } => id.to_string(),
-        };
+        self.issue_access_token_with_claims(
+            caller.sub.clone(),
+            requested_subject,
+            requested_roles,
+            act,
+            ttl,
+        )
+    }
 
-        let issued_at = Utc::now();
-        let iat = issued_at.timestamp() as usize;
-        let exp = (issued_at + ttl).timestamp() as usize;
-        let claims = AccessTokenClaims {
-            sub,
-            actor,
-            scopes,
+    /// Mint a refresh token for any principal kind.
+    ///
+    /// # Errors
+    /// Returns an error when TTL is invalid or signing fails.
+    #[tracing::instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            kid = %self.kid,
+            principal_kind = ?principal_kind,
+            principal_id = %principal_id,
+            tenant_id = %tenant_id,
+            jti = tracing::field::Empty,
+        ),
+        err,
+    )]
+    pub fn issue_refresh_token(
+        &self,
+        principal_kind: PrincipalKindWire,
+        principal_id: PrincipalId,
+        tenant_id: DataTenantId,
+        ttl: Duration,
+    ) -> Result<String, IssueError> {
+        let (iat, exp) = timestamps(ttl)?;
+        let jti = new_jti();
+        tracing::Span::current().record("jti", &jti);
+        let claims = RefreshTokenClaims {
+            sub: principal_id.to_string(),
+            principal_kind,
+            principal_id,
+            tenant_id,
             exp,
             iat,
             iss: self.issuer.clone(),
+            jti,
         };
-        let mut header = Header::new(Algorithm::EdDSA);
-        header.kid = Some(self.kid.clone());
+        self.encode(&claims)
+    }
 
-        jsonwebtoken::encode(&header, &claims, &encoding).map_err(IssueError::Encode)
+    fn issue_access_token_with_claims(
+        &self,
+        sub: String,
+        principal: TokenPrincipalRef,
+        roles: Vec<RoleRef>,
+        act: Option<Box<ActClaim>>,
+        ttl: Duration,
+    ) -> Result<String, IssueError> {
+        let (iat, exp) = timestamps(ttl)?;
+        let jti = new_jti();
+        tracing::Span::current().record("jti", &jti);
+        let claims = AccessTokenClaims {
+            sub,
+            principal,
+            roles,
+            act,
+            exp,
+            iat,
+            iss: self.issuer.clone(),
+            jti,
+        };
+        self.encode(&claims)
+    }
+
+    fn encode<T: serde::Serialize>(&self, claims: &T) -> Result<String, IssueError> {
+        let encoding = EncodingKey::from_ed_pem(self.pem.expose_secret().as_bytes())
+            .map_err(IssueError::Signing)?;
+        let mut header = Header::new(jsonwebtoken::Algorithm::EdDSA);
+        header.kid = Some(self.kid.to_string());
+
+        jsonwebtoken::encode(&header, claims, &encoding).map_err(IssueError::Signing)
     }
 }
 
@@ -106,10 +337,10 @@ impl IssuingKey {
 /// Returns an error when Argon2 hashing fails.
 pub fn hash_api_key(raw: &SecretString) -> Result<String, IssueError> {
     let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
+    argon2()
         .hash_password(raw.expose_secret().as_bytes(), &salt)
         .map(|hash| hash.to_string())
-        .map_err(IssueError::Hash)
+        .map_err(IssueError::Hashing)
 }
 
 /// Verify a raw API key against an Argon2 PHC string.
@@ -119,52 +350,199 @@ pub fn verify_api_key(raw: &SecretString, stored_hash: &str) -> bool {
         return false;
     };
 
-    Argon2::default()
+    argon2()
         .verify_password(raw.expose_secret().as_bytes(), &parsed)
         .is_ok()
 }
 
+fn argon2() -> Argon2<'static> {
+    let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None)
+        .expect("OWASP Argon2id params are valid");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
+fn timestamps(ttl: Duration) -> Result<(usize, usize), IssueError> {
+    if ttl <= Duration::zero() {
+        return Err(IssueError::InvalidTtl);
+    }
+
+    let issued_at = Utc::now();
+    let iat: usize = issued_at
+        .timestamp()
+        .try_into()
+        .map_err(|_| IssueError::InvalidTtl)?;
+    let exp: usize = (issued_at + ttl)
+        .timestamp()
+        .try_into()
+        .map_err(|_| IssueError::InvalidTtl)?;
+    Ok((iat, exp))
+}
+
+fn new_jti() -> String {
+    Ulid::new().to_string()
+}
+
+fn act_depth(act: Option<&ActClaim>) -> usize {
+    let Some(act) = act else {
+        return 0;
+    };
+    1 + act_depth(act.act.as_deref())
+}
+
+fn validate_principal_ref(principal: &TokenPrincipalRef) -> Result<(), IssueError> {
+    match (
+        principal.kind,
+        principal.card_ref.as_ref().map(|card_ref| &card_ref.kind),
+    ) {
+        (PrincipalKindWire::User, None) => Ok(()),
+        (PrincipalKindWire::User, Some(_)) => Err(IssueError::InvalidCardRef),
+        (PrincipalKindWire::Service, Some(CardKind::Service)) => Ok(()),
+        (PrincipalKindWire::Agent, Some(CardKind::Agent)) => Ok(()),
+        (PrincipalKindWire::Service | PrincipalKindWire::Agent, _) => {
+            Err(IssueError::InvalidCardRef)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use chrono::Duration;
     use jsonwebtoken::{Algorithm, decode_header};
     use secrecy::SecretString;
-    use wyrd_auth_verify::{AccessTokenClaims, decode_kid, public_key_from_pem, verify_eddsa};
-    use wyrd_spec::actor::Actor;
-    use wyrd_spec::authz::Scope;
-    use wyrd_spec::ids::CardUid;
+    use wyrd_auth_verify::{
+        AccessTokenClaims, ActClaim, PrincipalKindWire, RefreshTokenClaims, TokenPrincipalRef,
+        decode_kid, public_key_from_pem, verify_eddsa,
+    };
+    use wyrd_runtime::{PrincipalId, RoleRef};
+    use wyrd_semver::VersionBlock;
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::reference::CardRef;
 
-    use super::{IssueError, IssuingKey, hash_api_key, verify_api_key};
+    use super::{
+        ARGON2_M_COST_KIB, DelegationCaller, IssueError, IssuingKey, Kid, MAX_DELEGATION_DEPTH,
+        hash_api_key, verify_api_key,
+    };
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
 
     #[test]
-    fn issue_then_verify_roundtrip() {
-        let actor = test_actor();
-        let scopes = BTreeSet::from([Scope::CardRead, Scope::CardWrite]);
+    fn issue_user_access_token_uses_principal_roles_act_and_jti_shape() {
         let token = issuing_key()
-            .issue_access_token(actor.clone(), scopes.clone(), Duration::minutes(5))
+            .issue_user_access_token(
+                user_principal(),
+                vec![role("runtime_admin")],
+                Duration::minutes(5),
+            )
             .expect("token issues");
-        let claims = verify_eddsa::<AccessTokenClaims>(&token, &public_key(), Some("wyrd"))
-            .expect("issued token verifies");
+        let claims = verify_access_token(&token);
 
-        assert_eq!(claims.sub, "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00");
-        assert_eq!(claims.actor, actor);
-        assert_eq!(claims.scopes, scopes);
-        assert_eq!(claims.iss, "wyrd");
-        assert!(
-            claims
-                .to_principal()
-                .has_all([Scope::CardRead, Scope::CardWrite])
+        assert_eq!(
+            claims.sub,
+            principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00").to_string()
         );
+        assert_eq!(claims.principal.kind, PrincipalKindWire::User);
+        assert_eq!(claims.principal.card_ref, None);
+        assert_eq!(claims.roles, vec![role("runtime_admin")]);
+        assert_eq!(claims.act, None);
+        assert_eq!(claims.iss, "wyrd");
+        assert_eq!(claims.jti.len(), 26);
+    }
+
+    #[test]
+    fn issue_service_access_token_forces_service_card_ref() {
+        let card_ref = card_ref(CardKind::Service);
+        let token = issuing_key()
+            .issue_service_access_token(
+                principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02"),
+                tenant_id(),
+                card_ref.clone(),
+                vec![role("service")],
+                Duration::minutes(5),
+            )
+            .expect("token issues");
+        let claims = verify_access_token(&token);
+
+        assert_eq!(claims.principal.kind, PrincipalKindWire::Service);
+        assert_eq!(claims.principal.card_ref, Some(card_ref));
+        assert_eq!(claims.sub, claims.principal.id.to_string());
+    }
+
+    #[test]
+    fn issue_service_access_token_rejects_agent_card_ref() {
+        let result = issuing_key().issue_service_access_token(
+            principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02"),
+            tenant_id(),
+            card_ref(CardKind::Agent),
+            vec![role("service")],
+            Duration::minutes(5),
+        );
+
+        assert!(matches!(result, Err(IssueError::InvalidCardRef)));
+    }
+
+    #[test]
+    fn issue_agent_access_token_forces_agent_card_ref() {
+        let card_ref = card_ref(CardKind::Agent);
+        let token = issuing_key()
+            .issue_agent_access_token(
+                principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04"),
+                tenant_id(),
+                card_ref.clone(),
+                vec![role("agent")],
+                Duration::minutes(5),
+            )
+            .expect("token issues");
+        let claims = verify_access_token(&token);
+
+        assert_eq!(claims.principal.kind, PrincipalKindWire::Agent);
+        assert_eq!(claims.principal.card_ref, Some(card_ref));
+        assert_eq!(claims.sub, claims.principal.id.to_string());
+    }
+
+    #[test]
+    fn issue_agent_access_token_rejects_service_card_ref() {
+        let result = issuing_key().issue_agent_access_token(
+            principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04"),
+            tenant_id(),
+            card_ref(CardKind::Service),
+            vec![role("agent")],
+            Duration::minutes(5),
+        );
+
+        assert!(matches!(result, Err(IssueError::InvalidCardRef)));
+    }
+
+    #[test]
+    fn issue_user_access_token_rejects_non_user_principal() {
+        let result = issuing_key().issue_user_access_token(
+            service_principal(),
+            vec![role("service")],
+            Duration::minutes(5),
+        );
+
+        assert!(matches!(result, Err(IssueError::InvalidPrincipalKind)));
+    }
+
+    #[test]
+    fn issue_user_access_token_rejects_user_with_card_ref() {
+        let result = issuing_key().issue_user_access_token(
+            TokenPrincipalRef {
+                card_ref: Some(card_ref(CardKind::Service)),
+                ..user_principal()
+            },
+            vec![role("runtime_admin")],
+            Duration::minutes(5),
+        );
+
+        assert!(matches!(result, Err(IssueError::InvalidCardRef)));
     }
 
     #[test]
     fn issued_token_header_is_eddsa_with_kid() {
-        let token = issue_test_token(Duration::minutes(5));
+        let token = issue_user_test_token(Duration::minutes(5));
         let header = decode_header(&token).expect("header decodes");
 
         assert_eq!(
@@ -177,9 +555,8 @@ mod tests {
     #[test]
     fn issued_token_sets_iat_and_exp() {
         let ttl = Duration::minutes(5);
-        let token = issue_test_token(ttl);
-        let claims = verify_eddsa::<AccessTokenClaims>(&token, &public_key(), Some("wyrd"))
-            .expect("issued token verifies");
+        let token = issue_user_test_token(ttl);
+        let claims = verify_access_token(&token);
         let delta = claims.exp - claims.iat;
 
         assert!(claims.exp > claims.iat);
@@ -187,52 +564,141 @@ mod tests {
     }
 
     #[test]
-    fn issue_access_token_rejects_zero_ttl() {
-        let result = issuing_key().issue_access_token(
-            test_actor(),
-            BTreeSet::from([Scope::CardRead]),
+    fn issue_user_access_token_rejects_zero_ttl() {
+        let result = issuing_key().issue_user_access_token(
+            user_principal(),
+            vec![role("runtime_admin")],
             Duration::zero(),
         );
         assert!(matches!(result, Err(IssueError::InvalidTtl)));
     }
 
     #[test]
-    fn issue_access_token_rejects_negative_ttl() {
-        let result = issuing_key().issue_access_token(
-            test_actor(),
-            BTreeSet::from([Scope::CardRead]),
+    fn issue_user_access_token_rejects_negative_ttl() {
+        let result = issuing_key().issue_user_access_token(
+            user_principal(),
+            vec![role("runtime_admin")],
             Duration::minutes(-1),
         );
         assert!(matches!(result, Err(IssueError::InvalidTtl)));
     }
 
     #[test]
-    fn sub_is_derived_from_actor_id() {
-        let actor = test_actor();
-        let expected_sub = match &actor {
-            Actor::User { id, .. } => id.to_string(),
-            Actor::Service { name } => name.clone(),
-            Actor::Agent { id, .. } => id.to_string(),
-        };
-        let token = issuing_key()
-            .issue_access_token(
-                actor,
-                BTreeSet::from([Scope::CardRead]),
+    fn issue_delegated_access_token_extends_act_chain() {
+        let caller_token = issuing_key()
+            .issue_user_access_token(
+                user_principal(),
+                vec![role("runtime_admin")],
                 Duration::minutes(5),
             )
-            .expect("token issues");
-        let claims = verify_eddsa::<AccessTokenClaims>(&token, &public_key(), Some("wyrd"))
-            .expect("token verifies");
+            .expect("caller token issues");
+        let raw = verify_access_token(&caller_token);
+        let caller = DelegationCaller {
+            sub: raw.sub.clone(),
+            principal: raw.principal.clone(),
+            act: raw.act.clone(),
+        };
+        let delegated_token = issuing_key()
+            .issue_delegated_access_token(
+                &caller,
+                agent_principal(),
+                vec![role("agent")],
+                Duration::minutes(5),
+            )
+            .expect("delegated token issues");
+        let delegated_claims = verify_access_token(&delegated_token);
+        let act = delegated_claims.act.as_ref().expect("act chain is present");
 
-        assert_eq!(claims.sub, expected_sub);
+        assert_eq!(delegated_claims.sub, raw.sub);
+        assert_eq!(delegated_claims.principal.kind, PrincipalKindWire::Agent);
+        assert_eq!(delegated_claims.roles, vec![role("agent")]);
+        assert_eq!(act.sub, raw.sub);
+        assert_eq!(act.principal, raw.principal);
+        assert_eq!(act.act, None);
     }
 
     #[test]
-    fn hash_api_key_verifies() {
+    fn issue_delegated_access_token_rejects_depth_over_max() {
+        let caller = DelegationCaller {
+            sub: user_principal().id.to_string(),
+            principal: user_principal(),
+            act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH))),
+        };
+
+        let result = issuing_key().issue_delegated_access_token(
+            &caller,
+            agent_principal(),
+            vec![role("agent")],
+            Duration::minutes(5),
+        );
+
+        assert!(matches!(
+            result,
+            Err(IssueError::DelegationDepthExceeded {
+                max: MAX_DELEGATION_DEPTH
+            })
+        ));
+    }
+
+    #[test]
+    fn issue_delegated_access_token_accepts_depth_at_max() {
+        let caller = DelegationCaller {
+            sub: user_principal().id.to_string(),
+            principal: user_principal(),
+            act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH - 1))),
+        };
+
+        let result = issuing_key().issue_delegated_access_token(
+            &caller,
+            agent_principal(),
+            vec![role("agent")],
+            Duration::minutes(5),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn issue_refresh_token_is_principal_generic() {
+        let token = issuing_key()
+            .issue_refresh_token(
+                PrincipalKindWire::Service,
+                principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02"),
+                tenant_id(),
+                Duration::days(30),
+            )
+            .expect("refresh token issues");
+        let claims = verify_eddsa::<RefreshTokenClaims>(&token, &public_key(), Some("wyrd"))
+            .expect("refresh token verifies");
+
+        assert_eq!(claims.principal_kind, PrincipalKindWire::Service);
+        assert_eq!(claims.sub, claims.principal_id.to_string());
+        assert_eq!(claims.tenant_id, tenant_id());
+        assert_eq!(claims.jti.len(), 26);
+    }
+
+    #[test]
+    fn kid_validation_accepts_locked_shape() {
+        let kid = Kid::new("abc.DEF_123-4").expect("kid is valid");
+
+        assert_eq!(kid.as_str(), "abc.DEF_123-4");
+    }
+
+    #[test]
+    fn kid_validation_rejects_empty_space_and_too_long() {
+        assert!(Kid::new("").is_err());
+        assert!(Kid::new("bad kid").is_err());
+        assert!(Kid::new("a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn hash_api_key_verifies_with_pinned_argon2_params() {
         let raw = SecretString::from("wyrd_test_key");
         let hash = hash_api_key(&raw).expect("api key hashes");
 
+        assert!(hash.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
         assert!(verify_api_key(&raw, &hash));
+        assert_eq!(ARGON2_M_COST_KIB, 19_456);
     }
 
     #[test]
@@ -252,35 +718,127 @@ mod tests {
     }
 
     #[test]
+    fn no_sqlx_in_crate() {
+        assert_no_sqlx_in_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+    }
+
+    #[test]
     fn from_ed_pem_rejects_invalid_pem() {
-        let result = IssuingKey::from_ed_pem(SecretString::from("not a pem"), "k1", "wyrd");
-        assert!(matches!(result, Err(IssueError::Key(_))));
+        let result = IssuingKey::from_ed_pem(
+            SecretString::from("not a pem"),
+            Kid::new("k1").expect("kid is valid"),
+            "wyrd",
+        );
+        assert!(matches!(result, Err(IssueError::Signing(_))));
     }
 
     fn issuing_key() -> IssuingKey {
-        IssuingKey::from_ed_pem(SecretString::from(PRIVATE_KEY_PEM), "k1", "wyrd")
-            .expect("test private key loads")
+        IssuingKey::from_ed_pem(
+            SecretString::from(PRIVATE_KEY_PEM),
+            Kid::new("k1").expect("kid is valid"),
+            "wyrd",
+        )
+        .expect("test private key loads")
     }
 
     fn public_key() -> jsonwebtoken::DecodingKey {
         public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads")
     }
 
-    fn issue_test_token(ttl: Duration) -> String {
+    fn issue_user_test_token(ttl: Duration) -> String {
         issuing_key()
-            .issue_access_token(
-                test_actor(),
-                BTreeSet::from([Scope::CardRead, Scope::CardWrite]),
-                ttl,
-            )
+            .issue_user_access_token(user_principal(), vec![role("runtime_admin")], ttl)
             .expect("token issues")
     }
 
-    fn test_actor() -> Actor {
-        Actor::User {
-            id: CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
-                .expect("test fixture uses a UUIDv7"),
-            email: "user@example.com".to_owned(),
+    fn verify_access_token(token: &str) -> AccessTokenClaims {
+        verify_eddsa::<AccessTokenClaims>(token, &public_key(), Some("wyrd"))
+            .expect("issued token verifies")
+    }
+
+    fn user_principal() -> TokenPrincipalRef {
+        TokenPrincipalRef {
+            id: principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00"),
+            kind: PrincipalKindWire::User,
+            tenant_id: tenant_id(),
+            card_ref: None,
+        }
+    }
+
+    fn service_principal() -> TokenPrincipalRef {
+        TokenPrincipalRef {
+            id: principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02"),
+            kind: PrincipalKindWire::Service,
+            tenant_id: tenant_id(),
+            card_ref: Some(card_ref(CardKind::Service)),
+        }
+    }
+
+    fn agent_principal() -> TokenPrincipalRef {
+        TokenPrincipalRef {
+            id: principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03"),
+            kind: PrincipalKindWire::Agent,
+            tenant_id: tenant_id(),
+            card_ref: Some(card_ref(CardKind::Agent)),
+        }
+    }
+
+    fn act_chain(depth: usize) -> ActClaim {
+        let next = if depth > 1 {
+            Some(Box::new(act_chain(depth - 1)))
+        } else {
+            None
+        };
+        ActClaim {
+            sub: user_principal().id.to_string(),
+            principal: user_principal(),
+            act: next,
+        }
+    }
+
+    fn card_ref(kind: CardKind) -> CardRef {
+        CardRef {
+            kind,
+            name: CardName::new("billing").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("prod").expect("static space is valid"),
+            uid: None,
+        }
+    }
+
+    fn principal_id(value: &str) -> PrincipalId {
+        value.parse().expect("static principal id is valid")
+    }
+
+    fn tenant_id() -> DataTenantId {
+        "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
+            .parse()
+            .expect("static tenant id is valid")
+    }
+
+    fn role(name: &str) -> RoleRef {
+        RoleRef::new(name).expect("static role is valid")
+    }
+
+    fn assert_no_sqlx_in_dir(path: impl AsRef<std::path::Path>) {
+        for entry in std::fs::read_dir(path).expect("source directory is readable") {
+            let entry = entry.expect("source entry is readable");
+            let path = entry.path();
+            if path.is_dir() {
+                assert_no_sqlx_in_dir(path);
+                continue;
+            }
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("source file is readable");
+            let module_path = ["sql", "x::"].concat();
+            let import_path = ["use sql", "x"].concat();
+            assert!(
+                !source.contains(&module_path) && !source.contains(&import_path),
+                "{} must stay sqlx-free",
+                path.display()
+            );
         }
     }
 }

@@ -129,7 +129,7 @@
         "Artifact",
         "Trigger",
         "Operator",
-        "External"
+        "Source"
       ]
     },
     "CardName": {
@@ -137,11 +137,12 @@
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
       "type": "object",
       "required": [
         "kind",
         "name",
+        "space",
         "version"
       ],
       "properties": {
@@ -162,13 +163,10 @@
           ]
         },
         "space": {
-          "description": "Optional space; omitted means current/default space.",
-          "anyOf": [
+          "description": "Space pinning identity together with `name` and `version`.",
+          "allOf": [
             {
               "$ref": "#/definitions/SpaceName"
-            },
-            {
-              "type": "null"
             }
           ]
         },

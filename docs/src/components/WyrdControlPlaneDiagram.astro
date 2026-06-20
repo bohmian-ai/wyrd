@@ -1,0 +1,164 @@
+---
+// Brutalist SVG: Wyrd as the control & operations layer for AI.
+// Five capabilities — DEFINE / GOVERN / OBSERVE / EVALUATE / REACT — sit between
+// the apps you build and the runtime you already use. All colors flow through
+// wyrd.css tokens for light/dark parity.
+---
+
+<svg
+  class="wyrd-diagram"
+  viewBox="0 0 960 720"
+  role="img"
+  aria-label="Wyrd is the control and operations layer for AI. It sits between the apps you build (AI apps, copilots, internal agents, workflows) and the runtime you already use (models, frameworks, tools, data, infrastructure). Wyrd provides five capabilities across the AI lifecycle: DEFINE (declarative source of truth for every AI asset via Cards), GOVERN (identity, delegation, policy gates via Policy cards), OBSERVE (trace and audit via Source and Audit cards), EVALUATE (continuous quality and drift via Eval and Drift cards), and REACT (closed-loop automation via Trigger and Operator cards)."
+  xmlns="http://www.w3.org/2000/svg"
+>
+  <defs>
+    <marker
+      id="wyrd-cp-arrow"
+      viewBox="0 0 10 10"
+      refX="9"
+      refY="5"
+      markerWidth="7"
+      markerHeight="7"
+      orient="auto-start-reverse"
+    >
+      <path d="M0,0 L10,5 L0,10 Z" fill="var(--neo-shadow-color)" />
+    </marker>
+  </defs>
+
+  <!-- ========== TOP CAP: WHAT YOU BUILD ========== -->
+  <text class="arrow-label" x="40" y="22">what you build</text>
+  <g transform="translate(40, 30)">
+    <rect class="node-shadow" x="6" y="6" width="880" height="48" />
+    <rect class="node-fill"   x="0" y="0" width="880" height="48" />
+    <rect class="node-stroke" x="0" y="0" width="880" height="48" />
+    <text class="node-text" x="440" y="30">AI APPS  ·  COPILOTS  ·  INTERNAL AGENTS  ·  MULTI-AGENT WORKFLOWS</text>
+  </g>
+
+  <!-- arrows top <-> Wyrd -->
+  <path class="arrow" d="M 460 92 L 460 112" marker-end="url(#wyrd-cp-arrow)" />
+  <path class="arrow" d="M 500 112 L 500 92" marker-end="url(#wyrd-cp-arrow)" />
+  <text class="arrow-label" x="514" y="108">every call · every decision</text>
+
+  <!-- ========== WYRD ACCENT HEADER ========== -->
+  <g transform="translate(40, 120)">
+    <rect class="node-shadow"       x="6" y="6" width="880" height="64" />
+    <rect class="node-fill-accent"  x="0" y="0" width="880" height="64" />
+    <rect class="node-stroke"       x="0" y="0" width="880" height="64" />
+    <text class="node-text node-text-on-accent" x="440" y="34" style="font-size:22px; letter-spacing:6px;">W Y R D</text>
+    <text class="node-sub node-sub-on-accent"   x="440" y="54">control &amp; operations layer for AI</text>
+  </g>
+
+  <!-- ========== FIVE VERB COLUMNS ========== -->
+  <!-- col widths: 168, gaps 10. Lefts: 40, 218, 396, 574, 752. Centers: 124, 302, 480, 658, 836 -->
+
+  <!-- COLUMN 1: DEFINE -->
+  <g transform="translate(40, 196)">
+    <rect class="node-shadow" x="6" y="6" width="168" height="196" />
+    <rect class="node-fill"   x="0" y="0" width="168" height="196" />
+    <rect class="node-stroke" x="0" y="0" width="168" height="196" />
+    <text class="node-text" x="84" y="26" style="font-size:14px; letter-spacing:2px;">DEFINE</text>
+    <text class="node-sub"  x="84" y="44" style="font-style:italic;">what exists?</text>
+    <line x1="20" y1="56" x2="148" y2="56" stroke="var(--neo-shadow-color)" stroke-width="1" opacity="0.4" />
+    <text class="node-sub" x="84" y="76" style="font-weight:700; letter-spacing:1.5px;">CARDS</text>
+    <text class="node-sub" x="84" y="92">Data · Model</text>
+    <text class="node-sub" x="84" y="106">Prompt · Agent</text>
+    <text class="node-sub" x="84" y="120">Mcp · Workflow</text>
+    <text class="node-sub" x="84" y="134">Service · Artifact</text>
+    <line x1="20" y1="148" x2="148" y2="148" stroke="var(--neo-shadow-color)" stroke-width="1" opacity="0.4" />
+    <text class="node-sub" x="84" y="168" style="font-style:italic;">lineage derived</text>
+    <text class="node-sub" x="84" y="182" style="font-style:italic;">never authored</text>
+  </g>
+
+  <!-- COLUMN 2: GOVERN -->
+  <g transform="translate(218, 196)">
+    <rect class="node-shadow" x="6" y="6" width="168" height="196" />
+    <rect class="node-fill"   x="0" y="0" width="168" height="196" />
+    <rect class="node-stroke" x="0" y="0" width="168" height="196" />
+    <text class="node-text" x="84" y="26" style="font-size:14px; letter-spacing:2px;">GOVERN</text>
+    <text class="node-sub"  x="84" y="44" style="font-style:italic;">who can do what?</text>
+    <line x1="20" y1="56" x2="148" y2="56" stroke="var(--neo-shadow-color)" stroke-width="1" opacity="0.4" />
+    <text class="node-sub" x="84" y="76" style="font-weight:700; letter-spacing:1.5px;">CARDS</text>
+    <text class="node-sub" x="84" y="92">Policy</text>
+    <line x1="20" y1="148" x2="148" y2="148" stroke="var(--neo-shadow-color)" stroke-width="1" opacity="0.4" />
+    <text class="node-sub" x="84" y="168" style="font-style:italic;">card-bound JWT</text>
+    <text class="node-sub" x="84" y="182" style="font-style:italic;">CEL · ext_authz</text>
+  </g>
+
+  <!-- COLUMN 3: OBSERVE -->
+  <g transform="translate(396, 196)">
+    <rect class="node-shadow" x="6" y="6" width="168" height="196" />
+    <rect class="node-fill"   x="0" y="0" width="168" height="196" />
+    <rect class="node-stroke" x="0" y="0" width="168" height="196" />
+    <text class="node-text" x="84" y="26" style="font-size:14px; letter-spacing:2px;">OBSERVE</text>
+    <text class="node-sub"  x="84" y="44" style="font-style:italic;">what happened?</text>
+    <line x1="20" y1="56" x2="148" y2="56" stroke="var(--neo-shadow-color)" stroke-width="1" opacity="0.4" />
+    <text class="node-sub" x="84" y="76" style="font-weight:700; letter-spacing:1.5px;">CARDS</text>
+    <text class="node-sub" x="84" y="92">Source · Audit</text>
+    <line x1="20" y1="148" x2="148" y2="148" stroke="var(--neo-shadow-color)" stroke-width="1" opacity="0.4" />
+    <text class="node-sub" x="84" y="168" style="font-style:italic;">Vala · OTel-native</text>
+    <text class="node-sub" x="84" y="182" style="font-style:italic;">chain ancestry</text>
+  </g>
+
+  <!-- COLUMN 4: EVALUATE -->
+  <g transform="translate(574, 196)">
+    <rect class="node-shadow" x="6" y="6" width="168" height="196" />
+    <rect class="node-fill"   x="0" y="0" width="168" height="196" />
+    <rect class="node-stroke" x="0" y="0" width="168" height="196" />
+    <text class="node-text" x="84" y="26" style="font-size:14px; letter-spacing:2px;">EVALUATE</text>
+    <text class="node-sub"  x="84" y="44" style="font-style:italic;">is it still working?</text>
+    <line x1="20" y1="56" x2="148" y2="56" stroke="var(--neo-shadow-color)" stroke-width="1" opacity="0.4" />
+    <text class="node-sub" x="84" y="76" style="font-weight:700; letter-spacing:1.5px;">CARDS</text>
+    <text class="node-sub" x="84" y="92">Eval · Drift</text>
+    <line x1="20" y1="148" x2="148" y2="148" stroke="var(--neo-shadow-color)" stroke-width="1" opacity="0.4" />
+    <text class="node-sub" x="84" y="168" style="font-style:italic;">production-grounded</text>
+    <text class="node-sub" x="84" y="182" style="font-style:italic;">scheduled · scored</text>
+  </g>
+
+  <!-- COLUMN 5: REACT -->
+  <g transform="translate(752, 196)">
+    <rect class="node-shadow" x="6" y="6" width="168" height="196" />
+    <rect class="node-fill"   x="0" y="0" width="168" height="196" />
+    <rect class="node-stroke" x="0" y="0" width="168" height="196" />
+    <text class="node-text" x="84" y="26" style="font-size:14px; letter-spacing:2px;">REACT</text>
+    <text class="node-sub"  x="84" y="44" style="font-style:italic;">now what?</text>
+    <line x1="20" y1="56" x2="148" y2="56" stroke="var(--neo-shadow-color)" stroke-width="1" opacity="0.4" />
+    <text class="node-sub" x="84" y="76" style="font-weight:700; letter-spacing:1.5px;">CARDS</text>
+    <text class="node-sub" x="84" y="92">Trigger · Operator</text>
+    <line x1="20" y1="148" x2="148" y2="148" stroke="var(--neo-shadow-color)" stroke-width="1" opacity="0.4" />
+    <text class="node-sub" x="84" y="168" style="font-style:italic;">event-driven · scheduled</text>
+    <text class="node-sub" x="84" y="182" style="font-style:italic;">alert · remediate</text>
+  </g>
+
+  <!-- arrows Wyrd <-> bottom -->
+  <path class="arrow" d="M 460 414 L 460 434" marker-end="url(#wyrd-cp-arrow)" />
+  <path class="arrow" d="M 500 434 L 500 414" marker-end="url(#wyrd-cp-arrow)" />
+  <text class="arrow-label" x="514" y="430">mediated · audited · evaluated</text>
+
+  <!-- ========== BOTTOM CAP: YOUR EXISTING RUNTIME ========== -->
+  <text class="arrow-label" x="40" y="454">your existing runtime · wyrd is vendor-neutral</text>
+  <g transform="translate(40, 462)">
+    <rect class="node-shadow" x="6" y="6" width="880" height="226" />
+    <rect class="node-fill"   x="0" y="0" width="880" height="226" />
+    <rect class="node-stroke" x="0" y="0" width="880" height="226" />
+
+    <!-- Directory rows: label on left, brands on right -->
+    <text class="node-sub" x="28"  y="36" style="font-weight:700; letter-spacing:1.5px; text-anchor:start;">MODELS</text>
+    <text class="node-sub" x="180" y="36" style="text-anchor:start;">OpenAI · Anthropic · Google Gemini · AWS Bedrock · Azure OpenAI · vLLM · Ollama</text>
+
+    <text class="node-sub" x="28"  y="72" style="font-weight:700; letter-spacing:1.5px; text-anchor:start;">FRAMEWORKS</text>
+    <text class="node-sub" x="180" y="72" style="text-anchor:start;">LangGraph · Claude Agent SDK · CrewAI · Google ADK · Semantic Kernel</text>
+
+    <text class="node-sub" x="28"  y="108" style="font-weight:700; letter-spacing:1.5px; text-anchor:start;">TOOLS</text>
+    <text class="node-sub" x="180" y="108" style="text-anchor:start;">MCP Servers · Function Calling · Browser / RPA · Custom APIs</text>
+
+    <text class="node-sub" x="28"  y="144" style="font-weight:700; letter-spacing:1.5px; text-anchor:start;">DATA</text>
+    <text class="node-sub" x="180" y="144" style="text-anchor:start;">Snowflake · Databricks · BigQuery · Pinecone · Weaviate · pgvector</text>
+
+    <text class="node-sub" x="28"  y="180" style="font-weight:700; letter-spacing:1.5px; text-anchor:start;">INFRA</text>
+    <text class="node-sub" x="180" y="180" style="text-anchor:start;">Kubernetes · Istio / Envoy · Okta / Entra · Vault · OpenTelemetry · Datadog</text>
+
+    <line x1="20" y1="200" x2="860" y2="200" stroke="var(--neo-shadow-color)" stroke-width="1" opacity="0.3" />
+    <text class="node-sub" x="440" y="216" style="font-style:italic;">hooks in via: service-mesh ext_authz · IdP federation · OpenTelemetry · MCP scope · Authorization: Bearer</text>
+  </g>
+</svg>

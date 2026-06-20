@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
+use wyrd_semver::VersionBlock;
 use wyrd_spec::card::data::{
     ArrowFormat, ArrowMeta, ColValue, ColorMode, CustomDataMeta, DataInterface, DataSchema,
     DataSpec, DataSplit, DataStats, HuggingfaceMeta, ImageFormat, ImageMeta, JsonlCompression,
@@ -8,9 +9,8 @@ use wyrd_spec::card::data::{
 };
 use wyrd_spec::card::{FieldSpec, Inequality};
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{CardName, ColumnName, QueryName, SplitName};
+use wyrd_spec::ids::{CardName, ColumnName, QueryName, SpaceName, SplitName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::VersionBlock;
 
 fn col(name: &str) -> ColumnName {
     ColumnName::new(name).unwrap()
@@ -29,7 +29,7 @@ fn card_ref(name: &str) -> CardRef {
         kind: CardKind::Artifact,
         name: CardName::new(name).unwrap(),
         version: VersionBlock::parse("1.0.0").unwrap(),
-        space: None,
+        space: SpaceName::new("default").expect("static space is valid"),
         uid: None,
     }
 }

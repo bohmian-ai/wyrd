@@ -1,0 +1,20 @@
+# SourceCard - read-side reference to a Grafana Loki log store.
+# Bearer-token auth via a single env var.
+
+apiVersion: wyrd/v1
+kind: Source
+metadata:
+  space: prod
+  name: service-logs
+  version: 1.0.0
+
+spec:
+  description: Service error logs from Loki for log-based drift detection.
+  source:
+    kind: logs
+    connection:
+      vendor: loki
+      endpoint: https://loki.acme.internal
+      auth:
+        scheme: env
+        env: LOKI_TOKEN

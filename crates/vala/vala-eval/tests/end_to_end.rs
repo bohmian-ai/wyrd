@@ -61,6 +61,7 @@ use vala_eval::{
     AggregationInput, EvalResults, InMemoryTraceSource, MechanicSubjectInput, MockJudgeInvoker,
     ResultsConfig, RunIdentity, ScenarioAggregationInput, SkipReason, SubjectKey, aggregate_run,
 };
+use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
@@ -71,7 +72,6 @@ use wyrd_spec::vala::eval::{
 };
 use wyrd_spec::vala::ids::{DataTenantId, SpanId, TraceId};
 use wyrd_spec::vala::trace::{InstrumentationScope, Resource, SpanKind, SpanRecord, SpanStatus};
-use wyrd_spec::version::VersionBlock;
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -88,7 +88,7 @@ fn card_ref(kind: CardKind, name: &str) -> CardRef {
         kind,
         name: CardName::new(name).expect("static card name is valid"),
         version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-        space: Some(SpaceName::new("tests").expect("static space is valid")),
+        space: SpaceName::new("tests").expect("static space is valid"),
         uid: None,
     }
 }

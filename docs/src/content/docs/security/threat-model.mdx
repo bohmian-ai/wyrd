@@ -1,0 +1,39 @@
+---
+title: Threat model
+description: What the PR 5.3 security foundation handles and what remains deferred.
+---
+
+# Threat model
+
+PR 5.3 locks the Auth foundation. It protects Wyrd API identity and RBAC
+decisions, but it does not ship the later Policy plane, mesh integration, or
+enterprise login federation.
+
+## Defends against
+
+| Threat | Control |
+| --- | --- |
+| Cross-tenant token leakage | Tenant claim checks and tenant-bound role resolution. |
+| API-key brute force | High-entropy keys, key prefixes, and Argon2id storage. |
+| JWT tampering | EdDSA signatures and strict verifier settings. |
+| Stale role grants | Short access-token TTL and bounded verifier cache. |
+| Unbounded delegation | Maximum depth of five during issue and verify. |
+| Missing credential audit | Transaction rollback if audit insertion fails. |
+
+## Known limits
+
+Access-token revocation is TTL-only, with a default 15-minute window. Role-grant
+changes propagate through the verifier cache within the default 60-second cache
+bound. API-key rotation is manual in v1. Signing keys are configured at process
+start. HSM backing is not part of PR 5.3.
+
+Refresh-token replay detection and rotation-chain enforcement are deferred. PR
+5.3 mints refresh tokens but does not ship the full refresh workflow.
+
+## Deferred work
+
+Policy evaluation for richer card and runtime decisions lands in the Policy
+plane PR. Service mesh `ext_authz` integration lands separately and will use the same
+`X-Wyrd-Access-Token` contract. OIDC and enterprise IdP federation are later
+user-login work. User impersonation is separate from Service and Agent
+delegation.

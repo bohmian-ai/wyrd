@@ -816,15 +816,12 @@ fn prompt_registry() -> &'static RwLock<HashMap<String, Arc<Prompt>>> {
 }
 
 fn prompt_key(card_ref: &CardRef) -> String {
-    let space = card_ref
-        .space
-        .as_ref()
-        .map_or_else(|| "default".to_owned(), ToString::to_string);
     format!(
-        "{space}/{}:{}@{}",
+        "{}/{}:{}@{}",
+        card_ref.space,
         card_ref.kind.wire_name(),
         card_ref.name,
-        card_ref.version
+        card_ref.version,
     )
 }
 
@@ -846,5 +843,5 @@ fn duration_to_millis(duration: Duration) -> u64 {
 }
 
 fn generate_agent_id() -> String {
-    ulid::Ulid::new().to_string()
+    uuid::Uuid::now_v7().to_string()
 }

@@ -130,7 +130,7 @@ impl Observer for PythonObserver {
             Python::attach(|py| {
                 let py_response = match Py::new(
                     py,
-                    skald_prompt::wire_py::PyProviderResponse::from_native(response),
+                    skald_prompt::python::PyProviderResponse::from_native(response),
                 ) {
                     Ok(r) => r.into_any(),
                     Err(_) => return,

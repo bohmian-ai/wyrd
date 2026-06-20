@@ -13,19 +13,22 @@ path = "src/lib.rs"
 
 [features]
 default = []
-server = ["dep:utoipa"]
+server = ["dep:utoipa", "wyrd-semver/server"]
 test-utils = []
-wasm = []
+wasm = ["uuid/js"]
 
 [dependencies]
 base64 = { workspace = true }
+blake3 = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 regex = { workspace = true }
 schemars = { workspace = true }
 semver = { workspace = true }
+secrecy = { workspace = true }
 skald-spec = { workspace = true, features = ["schemars"] }
 serde = { workspace = true }
+serde_jcs = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 petgraph = { version = "0.6", default-features = false, features = ["graphmap"] }
@@ -34,6 +37,7 @@ thiserror = { workspace = true }
 uuid = { workspace = true, features = ["std", "v7", "js"] }
 sha2 = { workspace = true }
 wyrd-error-derive = { workspace = true }
+wyrd-semver = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1"

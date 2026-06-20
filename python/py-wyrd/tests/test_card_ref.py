@@ -5,13 +5,13 @@ from wyrd._wyrd import WyrdError
 from wyrd.cards import CardKind, CardRef
 
 
-def test_constructs_minimal_card_ref() -> None:
-    ref = CardRef(kind="Artifact", name="weights", version="1.0.0")
+def test_constructs_card_ref_with_space() -> None:
+    ref = CardRef(kind="Artifact", name="weights", version="1.0.0", space="default")
 
     assert ref.kind == CardKind.Artifact
     assert ref.name == "weights"
     assert ref.version == "1.0.0"
-    assert ref.space is None
+    assert ref.space == "default"
     assert ref.uid is None
 
 
@@ -29,9 +29,9 @@ def test_constructs_full_card_ref() -> None:
 
 
 def test_equality_by_value() -> None:
-    a = CardRef(kind=CardKind.Data, name="dataset", version="1.0.0")
-    b = CardRef(kind=CardKind.Data, name="dataset", version="1.0.0")
-    c = CardRef(kind=CardKind.Data, name="dataset", version="1.1.0")
+    a = CardRef(kind=CardKind.Data, name="dataset", version="1.0.0", space="default")
+    b = CardRef(kind=CardKind.Data, name="dataset", version="1.0.0", space="default")
+    c = CardRef(kind=CardKind.Data, name="dataset", version="1.1.0", space="default")
 
     assert a == b
     assert a != c
@@ -50,7 +50,7 @@ def test_repr_contains_identity_fields() -> None:
 
 def test_rejects_unknown_kind() -> None:
     with pytest.raises(WyrdError) as exc_info:
-        CardRef(kind="NotAKind", name="card-x", version="1.0.0")
+        CardRef(kind="NotAKind", name="card-x", version="1.0.0", space="default")
 
     assert exc_info.value.code == "WYRD_SPEC_400_VALIDATION"
     assert "unknown card kind" in str(exc_info.value).lower()
@@ -58,7 +58,7 @@ def test_rejects_unknown_kind() -> None:
 
 def test_rejects_invalid_version() -> None:
     with pytest.raises(WyrdError) as exc_info:
-        CardRef(kind=CardKind.Model, name="card-x", version="not-a-version")
+        CardRef(kind=CardKind.Model, name="card-x", version="not-a-version", space="default")
 
     assert exc_info.value.code == "WYRD_SPEC_400_VALIDATION"
 
@@ -81,11 +81,12 @@ def test_rejects_invalid_version() -> None:
         "Artifact",
         "Trigger",
         "Operator",
+        "Source",
         "External",
     ],
 )
 def test_every_native_kind_is_accepted(kind: str) -> None:
-    ref = CardRef(kind=kind, name="card-x", version="1.0.0")
+    ref = CardRef(kind=kind, name="card-x", version="1.0.0", space="default")
 
     assert ref.kind.name == kind
 
@@ -108,11 +109,31 @@ def test_every_native_kind_is_accepted(kind: str) -> None:
         (CardKind.Artifact, "Artifact"),
         (CardKind.Trigger, "Trigger"),
         (CardKind.Operator, "Operator"),
+        (CardKind.Source, "Source"),
         (CardKind.External, "External"),
     ],
 )
 def test_every_native_kind_enum_is_accepted(kind: CardKind, name: str) -> None:
-    ref = CardRef(kind=kind, name="card-x", version="1.0.0")
+    ref = CardRef(kind=kind, name="card-x", version="1.0.0", space="default")
 
     assert ref.kind == kind
     assert ref.kind.name == name
+
+
+def test_rejects_missing_space() -> None:
+    with pytest.raises(TypeError):
+        CardRef(kind=CardKind.Model, name="card-x", version="1.0.0")  # type: ignore[call-arg]
+
+
+def test_rejects_empty_space() -> None:
+    with pytest.raises(WyrdError) as exc_info:
+        CardRef(kind=CardKind.Model, name="card-x", version="1.0.0", space="")
+
+    assert exc_info.value.code == "WYRD_SPEC_400_VALIDATION"
+
+
+def test_rejects_invalid_space() -> None:
+    with pytest.raises(WyrdError) as exc_info:
+        CardRef(kind=CardKind.Model, name="card-x", version="1.0.0", space="A B")
+
+    assert exc_info.value.code == "WYRD_SPEC_400_VALIDATION"

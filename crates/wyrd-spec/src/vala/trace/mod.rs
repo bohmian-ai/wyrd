@@ -4,12 +4,13 @@
 //! `wyrd-telemetry` (PR4.1) and `vala-ingest` (PR4.2).
 //!
 //! Span attributes are stored as opaque `serde_json::Map<String,
-//! serde_json::Value>` on every record. Downstream (`vala-data` PR4.1)
-//! projects them to `Utf8View` Parquet columns; DataFusion 52.1+ JSON
-//! shredding promotes hot keys to typed sidecar columns at compaction
-//! time. The contract does not pre-extract tag or baggage attributes into
-//! separate records — see the trace-primitive README's "Storage doctrine"
-//! section for the rationale.
+//! serde_json::Value>` on every record. Downstream (`vala-bifrost`)
+//! projects them to `Utf8View` Iceberg/Parquet columns and keeps them
+//! opaque: DataFusion 54.0.0 reads a requested key from the projected
+//! `Utf8View` column, with no pre-extraction or JSON shredding into typed
+//! sidecar columns. The contract does not pre-extract tag or baggage
+//! attributes into separate records — see the trace-primitive README's
+//! "Storage doctrine" section for the rationale.
 //!
 //! Module layout (filled in by subsequent commits):
 //!

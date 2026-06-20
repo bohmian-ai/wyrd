@@ -405,7 +405,7 @@ components:
         application/problem+json:
           schema: { $ref: "#/components/schemas/Problem" }
     PermissionDenied:
-      description: Permission denied (WYRD_SPEC_403_PERMISSION_DENIED).
+      description: Permission denied (WYRD_PERMISSION_403_DENIED_RBAC).
       content:
         application/problem+json:
           schema: { $ref: "#/components/schemas/Problem" }
@@ -605,7 +605,7 @@ components:
     CardRef:
       type: object
       x-wyrd-source: crates/wyrd-spec/src/reference.rs
-      required: [kind, name, version]
+      required: [kind, name, version, space]
       properties:
         kind: { $ref: "#/components/schemas/CardKindName" }
         name: { $ref: "#/components/schemas/CardName" }
@@ -1978,14 +1978,10 @@ components:
         status: { type: integer }
         code:
           type: string
-          description: Wyrd error code.
-          enum:
-            - WYRD_SPEC_400_VALIDATION
-            - WYRD_SPEC_403_PERMISSION_DENIED
-            - WYRD_SPEC_404_NOT_FOUND
-            - WYRD_SPEC_409_CONFLICT
-            - WYRD_SPEC_500_INTERNAL
-            - WYRD_SPEC_502_UPSTREAM_FAILURE
+          description: >
+            Wyrd-specific machine-readable error code. Use this field for programmatic
+            branching. The set of valid codes is non-exhaustive and extends across releases.
+            See the agent error remediation guide for the current stable codes and actions.
         detail: { type: string }
         trace_id: { type: string, pattern: "^[0-9a-f]{32}$" }
         remediation: { type: string }

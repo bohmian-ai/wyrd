@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use wyrd_semver::VersionBlock;
 use wyrd_spec::card::drift::{
     CustomProfile, DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec,
     DriftValidationError, PsiBinningStrategy, PsiProfile, PsiThreshold, SpcAlertThreshold,
@@ -7,16 +8,15 @@ use wyrd_spec::card::drift::{
 };
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardName, FeatureName};
+use wyrd_spec::ids::{CardName, FeatureName, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::VersionBlock;
 
 fn card_ref(kind: CardKind, name: &str, version: &str) -> CardRef {
     CardRef {
         kind,
         name: CardName::new(name).expect("valid card name"),
         version: VersionBlock::parse(version).expect("valid version"),
-        space: None,
+        space: SpaceName::new("default").expect("valid space"),
         uid: None,
     }
 }

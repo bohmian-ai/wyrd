@@ -1,10 +1,10 @@
 //! Per-trace rollup record.
 //!
-//! Computed by `vala-data` (PR4.1) once a trace's spans are assembled. One row
+//! Computed by `vala-bifrost` once a trace's spans are assembled. One row
 //! per `(data_tenant_id, trace_id, bucket_time)`. Wyrd lifts `bucket_time`
-//! (the Delta partition key) into the record so vala-data does not recompute it
-//! at SQL time; predecessor implementations computed it inline against
-//! `start_time`.
+//! (the `trace_bounds_lookup` index column) into the record so `vala-bifrost`
+//! does not recompute it at SQL time; predecessor implementations computed it
+//! inline against `start_time`.
 //!
 //! Root-span metadata (`root_span_id`, `root_name`, `root_kind`,
 //! `root_status`, `root_scope`) is populated when a single span has no
@@ -29,9 +29,11 @@ pub struct TraceSummaryRecord {
     pub data_tenant_id: DataTenantId,
     /// Floor-bucketed time the trace started in.
     ///
-    /// Used as a Delta partition key for `trace_summaries` and the catalog's
-    /// `trace_bounds_lookup` index. Default bucket width is 1 minute; callers
-    /// must floor `start_time` to the bucket boundary before constructing.
+    /// Backs the catalog's `trace_bounds_lookup` index for `trace_summaries`.
+    /// Not a partition key — partitioning is the hidden Iceberg
+    /// `day(wyrd_event_time)` transform. Default bucket width is 1 minute;
+    /// callers must floor `start_time` to the bucket boundary before
+    /// constructing.
     pub bucket_time: DateTime<Utc>,
     /// Earliest `start_time` across all spans in the trace.
     pub start_time: DateTime<Utc>,

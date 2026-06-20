@@ -1,0 +1,52 @@
+---
+title: Tokens
+description: JWTs, API keys, TTLs, verification, and rotation behavior.
+---
+
+# Tokens
+
+Wyrd uses API keys only to bootstrap non-human identity. Runtime calls use
+Bearer JWTs carried in `X-Wyrd-Access-Token`.
+
+| Credential | Default TTL | Use |
+| --- | ---: | --- |
+| Access token | 15 minutes | Wyrd API calls. |
+| Refresh token | 30 days | Future refresh-chain workflows. |
+| API key | 365 days | One-time bootstrap for Service and Agent cards. |
+
+Access-token revocation is TTL-only in PR 5.3. The default staleness window is
+15 minutes, bounded by the access-token TTL. Role-grant changes propagate
+through verifier cache expiry; the default role-resolution cache bound is 60
+seconds.
+
+## Verification
+
+Access tokens are EdDSA JWTs. PR 5.3 configures the verifier with an immutable
+key map at startup. JWKS discovery and hot key reload are later work.
+
+The verifier reads the JWT header `kid`, chooses the matching public key, checks
+standard claims, resolves role permissions, and builds the current principal.
+Clock skew defaults to 30 seconds through
+`WyrdAuthVerifySettings.allowed_clock_skew`.
+
+`WYRD_AUTH_503_VERIFY_UNAVAILABLE` means the verifier or resolver dependency is
+temporarily unavailable. Clients should back off and retry the same operation;
+they should not re-authenticate because the credential was not rejected.
+
+## Key rotation
+
+Rotation is a redeploy event in v1:
+
+1. Deploy verifiers with both old and new public keys.
+2. Wait at least the maximum access-token TTL plus a safety margin.
+3. Deploy issuers using the new private key and `kid`.
+4. Wait another TTL plus safety margin.
+5. Deploy verifiers without the old public key.
+
+This keeps rotation additive without adding a hot-reload path to the verifier.
+
+## Hashing API keys
+
+API keys are stored as Argon2id hashes. The hash and verify helpers are
+synchronous, and server callers run them on Tokio's blocking pool with
+`spawn_blocking`. Do not tune async worker threads for Argon2 work.

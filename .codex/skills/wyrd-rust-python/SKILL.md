@@ -1,13 +1,14 @@
 ---
 name: wyrd-rust-python
-description: Repo-local Wyrd skill for Rust core, Python bindings, PyO3, maturin, cards, specs, registry, storage, server/client contracts, telemetry, provider runtime, observability, evaluation, CLI, MCP, generated stubs, and cross-language tests. Use before editing non-UI Wyrd Rust or Python code, especially code under crates/, python/py-wyrd, schemas, OpenAPI generation, or Python-visible APIs. Do not use for Svelte UI work; use wyrd-ui instead.
+description: Repo-local Wyrd skill for Rust core, Python bindings, PyO3, maturin, cards, specs, registry, storage, server/client contracts, telemetry, provider runtime, observability, evaluation, Vala OLAP warehouse, Bifrost, Apache Iceberg, DataFusion, object-store analytical storage, CLI, MCP, generated stubs, and cross-language tests. Use before editing non-UI Wyrd Rust or Python code, especially code under crates/, python/py-wyrd, schemas, OpenAPI generation, Python-visible APIs, or Vala warehouse/OLAP/Iceberg implementation. Do not use for Svelte UI work; use wyrd-ui instead.
 ---
 
 # Wyrd Rust/Python
 
 Use this skill before touching Rust, Python, PyO3, server, client, card/spec,
-registry, storage, runtime, telemetry, provider, observability, evaluation, CLI,
-MCP, codegen, or cross-language behavior in Wyrd.
+registry, storage, runtime, telemetry, provider, observability, evaluation,
+Vala OLAP warehouse, Bifrost, Iceberg, DataFusion, CLI, MCP, codegen, or
+cross-language behavior in Wyrd.
 
 This skill is Wyrd-native. Do not paste legacy names, package names, route
 prefixes, module names, compatibility shims, or migration shorthand into this
@@ -48,6 +49,9 @@ Load these references only when relevant:
   `references/testing-workflows.md`
 - Agent-facing contracts, MCP, structured validation, and harness behavior:
   `references/agent-harness.md`
+- Vala OLAP warehouse, Bifrost, Apache Iceberg, DataFusion, object-store
+  analytical storage, Iceberg catalogs, and Parquet query/write paths:
+  `references/iceberg-bifrost.md`
 
 ## Ownership Boundaries
 

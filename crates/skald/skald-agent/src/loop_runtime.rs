@@ -40,7 +40,7 @@ pub(crate) async fn run(
     input: &str,
 ) -> AgentResult<AgentRun> {
     let providers = this.effective_providers(providers);
-    let run_id = ulid::Ulid::new().to_string();
+    let run_id = uuid::Uuid::now_v7().to_string();
     let observer = current();
     let started_at = Instant::now();
     let span = debug_span!(
@@ -165,7 +165,7 @@ pub(crate) async fn run_prompt(
     parent_run_id: Option<&str>,
 ) -> AgentResult<AgentRun> {
     let providers = this.effective_providers(providers);
-    let run_id = ulid::Ulid::new().to_string();
+    let run_id = uuid::Uuid::now_v7().to_string();
     let observer = current();
     let started_at = Instant::now();
     let span = debug_span!(
@@ -506,23 +506,21 @@ async fn run_loop(
                     observer
                         .on_tool_result(run_id, &ctx.agent_id, iteration, &call.id, ok)
                         .await;
-                    if ok {
-                        if let Some(session_id) = session_id.as_ref() {
-                            session
-                                .append(
-                                    session_id,
-                                    SessionTurn {
-                                        role: Role::Tool,
-                                        content: content.to_string(),
-                                        call_id: Some(call.id.clone()),
-                                    },
-                                )
-                                .await
-                                .map_err(|source| AgentError::SessionAppendFailed {
-                                    session_id: session_id.as_str().to_owned(),
-                                    source,
-                                })?;
-                        }
+                    if ok && let Some(session_id) = session_id.as_ref() {
+                        session
+                            .append(
+                                session_id,
+                                SessionTurn {
+                                    role: Role::Tool,
+                                    content: content.to_string(),
+                                    call_id: Some(call.id.clone()),
+                                },
+                            )
+                            .await
+                            .map_err(|source| AgentError::SessionAppendFailed {
+                                session_id: session_id.as_str().to_owned(),
+                                source,
+                            })?;
                     }
                     Ok((
                         idx,

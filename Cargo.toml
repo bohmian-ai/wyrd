@@ -10,6 +10,7 @@ members = [
     "examples/rust",
     "python/py-wyrd",
 ]
+exclude = []
 default-members = [
     "crates/wyrd/wyrd-server",
     "crates/wyrd/wyrd-cli",
@@ -21,7 +22,7 @@ default-members = [
 version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.87.0"
+rust-version = "1.94.0"
 repository = "https://github.com/wyrd-ai/wyrd"
 authors = ["Thorrester <sjforrester32@gmail.com>"]
 
@@ -49,13 +50,26 @@ wyrd-error-derive = { path = "crates/shared/wyrd-error-derive", version = "0.0.1
 wyrd-interfaces = { path = "crates/wyrd/wyrd-interfaces", version = "0.0.1" }
 wyrd-cards = { path = "crates/wyrd/wyrd-cards", version = "0.0.1" }
 wyrd-runtime = { path = "crates/shared/wyrd-runtime", version = "0.0.1" }
+wyrd-auth-issue = { path = "crates/shared/wyrd-auth-issue", version = "0.0.1" }
 wyrd-auth-verify = { path = "crates/shared/wyrd-auth-verify", version = "0.0.1" }
+wyrd-auth-check = { path = "crates/shared/wyrd-auth-check", version = "0.0.1" }
+wyrd-dev-fixtures = { path = "crates/shared/wyrd-dev-fixtures", version = "0.0.1" }
+wyrd-sql = { path = "crates/wyrd/wyrd-sql", version = "0.0.1" }
+wyrd-storage = { path = "crates/wyrd/wyrd-storage", version = "0.0.1" }
+wyrd-server = { path = "crates/wyrd/wyrd-server", version = "0.0.1" }
+wyrd-testing = { path = "crates/wyrd/wyrd-testing", version = "0.0.1" }
+wyrd-tonic = { path = "crates/wyrd/wyrd-tonic", version = "0.0.1" }
+wyrd-semver = { path = "crates/shared/wyrd-semver", version = "0.0.1" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
+tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
+ed25519-dalek = { version = "2.2", features = ["pkcs8"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "stream", "blocking"] }
 axum = "0.8"
+http = "1"
 serde = { version = "1", features = ["derive"] }
+serde_jcs = "0.1"
 serde_json = "1"
 serde_yaml = "0.9"
 jsonschema = { version = "0.18", default-features = false }
@@ -63,6 +77,7 @@ schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 thiserror = "2.0"
 base64 = "0.22"
+blake3 = "1"
 insta = { version = "1.43", features = ["json"] }
 wiremock = "0.6"
 temp-env = "0.3"
@@ -74,7 +89,6 @@ zstd = "0.13"
 walkdir = "2.*"
 sha2 = "0.10"
 uuid = { version = "1", default-features = false, features = ["serde"] }
-ulid = { version = "1", features = ["serde"] }
 semver = { version = "1", features = ["serde"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 mini-moka = { version = "0.10", features = ["sync"] }
@@ -86,7 +100,9 @@ secrecy = "0.10"
 subtle = "2.6"
 zeroize = "1"
 governor = "0.10"
+tower_governor = { version = "0.8", features = ["axum"] }
 rand = "0.9"
+pg-embed = { version = "1.0.0", default-features = false, features = ["rt_tokio"] }
 url = "2"
 urlencoding = "2"
 httpdate = "1"
@@ -95,11 +111,14 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
 jsonwebtoken = "9"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "uuid", "chrono"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "macros", "migrate", "chrono", "uuid", "json"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace", "catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+paste = "1"
+time = "0.3"
+ulid = "1"
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
@@ -108,7 +127,33 @@ arrow-array = "55"
 arrow-schema = "55"
 statrs = "0.18"
 jsonpath-rust = "0.7"
-pyo3 = { version = "0.28", features = ["abi3-py310", "chrono"] }
+tracing-opentelemetry = "0.28"
+pyo3 = { version = "0.28", features = ["abi3-py310", "chrono", "py-clone"] }
+toml = "0.8"
+shellexpand = "3"
+ipnetwork = "0.20"
+wyrd-telemetry = { path = "crates/shared/wyrd-telemetry", version = "0.0.1" }
+arc-swap = "1.7"
+tonic = "0.12"
+tonic-health = "0.12"
+tonic-reflection = "0.12"
+prost = "0.13"
+
+# Cloud SDKs are server-tier only.
+aws-sdk-s3 = "=1.75.0"
+aws-config = { version = "1", features = ["sso", "behavior-version-latest"] }
+aws-types = "1"
+gcloud-storage = { version = "1", features = ["auth"] }
+gcloud-auth = "1"
+azure_core = "0.21.0"
+azure_identity = "0.21.0"
+azure_storage = "0.21.0"
+azure_storage_blobs = "0.21.0"
+# Keep object_store, datafusion, and deltalake aligned; see
+# .dev/plan/foundations/04-storage/10a-datafusion-deltalake-pin.md.
+object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
+datafusion = "=54.0.0"
+deltalake = { version = "=0.32.4", features = ["s3", "gcs", "azure"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

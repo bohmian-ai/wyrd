@@ -16,14 +16,14 @@ use vala_eval::tasks::{
     AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, TraceTaskExecutor,
 };
 use vala_eval::{InMemoryTraceSource, JudgeError, MockJudgeInvoker};
+use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::CardName;
+use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::{
     AssertionResult, AssertionTask, ComparisonOperator, EvalCondition, EvalSpec, EvalTask,
     ExecutionPlan, JsonPath, LlmJudgeTask, RecordId, RunId, Stage, TaskId,
 };
-use wyrd_spec::version::VersionBlock;
 
 fn tid(value: &str) -> TaskId {
     TaskId::new(value).expect("static test task id is valid")
@@ -57,7 +57,7 @@ fn judge_card_ref() -> CardRef {
         kind: CardKind::Prompt,
         name: CardName::new("test-judge").expect("static name valid"),
         version: VersionBlock::parse("1.0.0").expect("static version valid"),
-        space: None,
+        space: SpaceName::new("default").expect("valid space"),
         uid: None,
     }
 }

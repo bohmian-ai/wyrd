@@ -1028,7 +1028,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -1038,7 +1038,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -1057,15 +1057,12 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "anyOf": [
+          "allOf": [
             {
               "$ref": "#/definitions/SpaceName"
-            },
-            {
-              "type": "null"
             }
           ],
-          "description": "Optional space; omitted means current/default space."
+          "description": "Space pinning identity together with `name` and `version`."
         },
         "uid": {
           "anyOf": [
@@ -1090,6 +1087,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
       "required": [
         "kind",
         "name",
+        "space",
         "version"
       ],
       "type": "object"
@@ -4258,7 +4256,7 @@ Schema source: crates/wyrd-spec/schemas/artifact_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -4268,7 +4266,7 @@ Schema source: crates/wyrd-spec/schemas/artifact_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -4287,15 +4285,12 @@ Schema source: crates/wyrd-spec/schemas/artifact_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "anyOf": [
+          "allOf": [
             {
               "$ref": "#/definitions/SpaceName"
-            },
-            {
-              "type": "null"
             }
           ],
-          "description": "Optional space; omitted means current/default space."
+          "description": "Space pinning identity together with `name` and `version`."
         },
         "uid": {
           "anyOf": [
@@ -4320,6 +4315,7 @@ Schema source: crates/wyrd-spec/schemas/artifact_spec.json
       "required": [
         "kind",
         "name",
+        "space",
         "version"
       ],
       "type": "object"
@@ -4579,7 +4575,7 @@ Schema source: crates/wyrd-spec/schemas/audit_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -4589,7 +4585,7 @@ Schema source: crates/wyrd-spec/schemas/audit_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -4608,15 +4604,12 @@ Schema source: crates/wyrd-spec/schemas/audit_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "anyOf": [
+          "allOf": [
             {
               "$ref": "#/definitions/SpaceName"
-            },
-            {
-              "type": "null"
             }
           ],
-          "description": "Optional space; omitted means current/default space."
+          "description": "Space pinning identity together with `name` and `version`."
         },
         "uid": {
           "anyOf": [
@@ -4641,6 +4634,7 @@ Schema source: crates/wyrd-spec/schemas/audit_spec.json
       "required": [
         "kind",
         "name",
+        "space",
         "version"
       ],
       "type": "object"
@@ -4878,7 +4872,7 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -4888,7 +4882,7 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -4907,15 +4901,12 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "anyOf": [
+          "allOf": [
             {
               "$ref": "#/definitions/SpaceName"
-            },
-            {
-              "type": "null"
             }
           ],
-          "description": "Optional space; omitted means current/default space."
+          "description": "Space pinning identity together with `name` and `version`."
         },
         "uid": {
           "anyOf": [
@@ -4940,6 +4931,7 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
       "required": [
         "kind",
         "name",
+        "space",
         "version"
       ],
       "type": "object"
@@ -6190,7 +6182,7 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -6200,7 +6192,7 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -6219,15 +6211,12 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "anyOf": [
+          "allOf": [
             {
               "$ref": "#/definitions/SpaceName"
-            },
-            {
-              "type": "null"
             }
           ],
-          "description": "Optional space; omitted means current/default space."
+          "description": "Space pinning identity together with `name` and `version`."
         },
         "uid": {
           "anyOf": [
@@ -6252,6 +6241,7 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
       "required": [
         "kind",
         "name",
+        "space",
         "version"
       ],
       "type": "object"
@@ -6766,7 +6756,7 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -6776,7 +6766,7 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -6795,15 +6785,12 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "anyOf": [
+          "allOf": [
             {
               "$ref": "#/definitions/SpaceName"
-            },
-            {
-              "type": "null"
             }
           ],
-          "description": "Optional space; omitted means current/default space."
+          "description": "Space pinning identity together with `name` and `version`."
         },
         "uid": {
           "anyOf": [
@@ -6828,6 +6815,7 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
       "required": [
         "kind",
         "name",
+        "space",
         "version"
       ],
       "type": "object"
@@ -7536,7 +7524,7 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -7546,7 +7534,7 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -7565,15 +7553,12 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "anyOf": [
+          "allOf": [
             {
               "$ref": "#/definitions/SpaceName"
-            },
-            {
-              "type": "null"
             }
           ],
-          "description": "Optional space; omitted means current/default space."
+          "description": "Space pinning identity together with `name` and `version`."
         },
         "uid": {
           "anyOf": [
@@ -7598,6 +7583,7 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
       "required": [
         "kind",
         "name",
+        "space",
         "version"
       ],
       "type": "object"
@@ -8147,7 +8133,7 @@ Schema source: crates/wyrd-spec/schemas/mcp_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -8157,7 +8143,7 @@ Schema source: crates/wyrd-spec/schemas/mcp_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -8176,15 +8162,12 @@ Schema source: crates/wyrd-spec/schemas/mcp_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "anyOf": [
+          "allOf": [
             {
               "$ref": "#/definitions/SpaceName"
-            },
-            {
-              "type": "null"
             }
           ],
-          "description": "Optional space; omitted means current/default space."
+          "description": "Space pinning identity together with `name` and `version`."
         },
         "uid": {
           "anyOf": [
@@ -8209,6 +8192,7 @@ Schema source: crates/wyrd-spec/schemas/mcp_spec.json
       "required": [
         "kind",
         "name",
+        "space",
         "version"
       ],
       "type": "object"
@@ -8412,7 +8396,7 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -8422,7 +8406,7 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -8441,15 +8425,12 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "anyOf": [
+          "allOf": [
             {
               "$ref": "#/definitions/SpaceName"
-            },
-            {
-              "type": "null"
             }
           ],
-          "description": "Optional space; omitted means current/default space."
+          "description": "Space pinning identity together with `name` and `version`."
         },
         "uid": {
           "anyOf": [
@@ -8474,6 +8455,7 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
       "required": [
         "kind",
         "name",
+        "space",
         "version"
       ],
       "type": "object"
@@ -9519,7 +9501,7 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -9529,7 +9511,7 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -9548,15 +9530,12 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "anyOf": [
+          "allOf": [
             {
               "$ref": "#/definitions/SpaceName"
-            },
-            {
-              "type": "null"
             }
           ],
-          "description": "Optional space; omitted means current/default space."
+          "description": "Space pinning identity together with `name` and `version`."
         },
         "uid": {
           "anyOf": [
@@ -9581,6 +9560,7 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
       "required": [
         "kind",
         "name",
+        "space",
         "version"
       ],
       "type": "object"
@@ -14082,7 +14062,7 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -14092,7 +14072,7 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -14111,15 +14091,12 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "anyOf": [
+          "allOf": [
             {
               "$ref": "#/definitions/SpaceName"
-            },
-            {
-              "type": "null"
             }
           ],
-          "description": "Optional space; omitted means current/default space."
+          "description": "Space pinning identity together with `name` and `version`."
         },
         "uid": {
           "anyOf": [
@@ -14144,6 +14121,7 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
       "required": [
         "kind",
         "name",
+        "space",
         "version"
       ],
       "type": "object"
@@ -14585,7 +14563,7 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -14595,7 +14573,7 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -14614,15 +14592,12 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "anyOf": [
+          "allOf": [
             {
               "$ref": "#/definitions/SpaceName"
-            },
-            {
-              "type": "null"
             }
           ],
-          "description": "Optional space; omitted means current/default space."
+          "description": "Space pinning identity together with `name` and `version`."
         },
         "uid": {
           "anyOf": [
@@ -14647,6 +14622,7 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
       "required": [
         "kind",
         "name",
+        "space",
         "version"
       ],
       "type": "object"
@@ -15967,7 +15943,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -15977,7 +15953,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -15996,15 +15972,12 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "anyOf": [
+          "allOf": [
             {
               "$ref": "#/definitions/SpaceName"
-            },
-            {
-              "type": "null"
             }
           ],
-          "description": "Optional space; omitted means current/default space."
+          "description": "Space pinning identity together with `name` and `version`."
         },
         "uid": {
           "anyOf": [
@@ -16029,6 +16002,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
       "required": [
         "kind",
         "name",
+        "space",
         "version"
       ],
       "type": "object"

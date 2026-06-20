@@ -641,6 +641,26 @@ dir = "python/py-wyrd"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/workflow_gateway.py"
 
+[tasks."examples:rust:smoke"]
+description = "Run the credential-free Rust agent smoke example"
+run = "cargo run -p wyrd-rust-examples --bin agent_smoke"
+
+[tasks."examples:rust:workflow:openai"]
+description = "Run the sequential OpenAI workflow example (Rust)"
+run = "cargo run -p wyrd-rust-examples --bin workflow_openai"
+
+[tasks."examples:rust:workflow:anthropic"]
+description = "Run the sequential Anthropic workflow example (Rust)"
+run = "cargo run -p wyrd-rust-examples --bin workflow_anthropic"
+
+[tasks."examples:rust:workflow:gemini"]
+description = "Run the sequential Gemini workflow example (Rust)"
+run = "cargo run -p wyrd-rust-examples --bin workflow_gemini"
+
+[tasks."examples:rust:workflow:gateway"]
+description = "Run the split-registry gateway workflow example (Rust)"
+run = "cargo run -p wyrd-rust-examples --bin workflow_gateway"
+
 [tasks."check:examples"]
 description = "Build all example binaries"
 run = "cargo build -p skald-workflow --examples --all-features"

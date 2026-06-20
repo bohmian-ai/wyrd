@@ -122,13 +122,14 @@ async fn drive_health_status_exits_on_cancel() {
 
 #[tokio::test]
 async fn default_grpc_bind_is_loopback() {
-    // Lock L16: default gRPC bind must be loopback (127.0.0.1:50051).
+    // The default gRPC bind must be loopback so a fresh install never exposes
+    // the gRPC port off-box without explicit operator opt-in.
     use wyrd_server::WyrdServerConfig;
     let config = WyrdServerConfig::default();
     assert_eq!(
         config.grpc.bind.to_string(),
         "127.0.0.1:50051",
-        "default gRPC bind must be loopback (Lock L16)"
+        "default gRPC bind must be loopback"
     );
 }
 

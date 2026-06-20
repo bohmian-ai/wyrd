@@ -25,9 +25,9 @@ pub const WYRD_REQUEST_ID_HEADER: &str = "wyrd-request-id";
 /// `instance` field in the problem+json body and a `wyrd-request-id` ASCII
 /// metadata entry are populated.
 ///
-/// F-T01 closeout: this is a free function, not a `From<WyrdError> for
-/// tonic::Status` impl. Both types are foreign to this crate; the orphan rule
-/// prevents the impl unconditionally.
+/// Provided as a free function, not a `From<WyrdError> for tonic::Status`
+/// impl, because both types are foreign to this crate and the orphan rule
+/// blocks the impl.
 #[must_use]
 pub fn wyrd_error_to_status(error: WyrdError, request_id: Option<&RequestId>) -> Status {
     let code = http_status_to_grpc_code(error.status());

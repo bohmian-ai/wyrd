@@ -32,8 +32,7 @@ pub fn build_router(state: AppState) -> Router {
 
     // Per-peer rate limit applied only to auth endpoints (token exchange,
     // API keys). Keyed by ConnectInfo<SocketAddr> via tower_governor's default
-    // PeerIpKeyExtractor. Mirrors the pre-server-integration posture: 10 req/s
-    // sustained per peer, burst 20.
+    // PeerIpKeyExtractor: 10 req/s sustained per peer, burst 20.
     let auth_governor = Arc::new(
         GovernorConfigBuilder::default()
             .per_second(10)

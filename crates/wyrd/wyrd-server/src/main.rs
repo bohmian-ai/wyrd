@@ -45,15 +45,10 @@ enum BootExit {
 async fn run() -> Result<(), BootExit> {
     enterprise_on_start();
 
-    // Phase 1 — config
     let config = WyrdServerConfig::load().map_err(|e| BootExit::Config(Box::new(e)))?;
 
-    // Phase 0 — pre-telemetry dev-profile warnings.
-    // Production rejection lives in WyrdServerConfig::validate() and already ran
-    // during WyrdServerConfig::load() above.
     production_guards(&config);
 
-    // Phase 2 — telemetry
     let telemetry: Arc<TelemetryGuard> = Arc::new(
         init_telemetry(config.telemetry.clone()).map_err(|e| BootExit::Other(Box::new(e)))?,
     );
@@ -66,13 +61,13 @@ async fn run() -> Result<(), BootExit> {
         "wyrd-server starting"
     );
 
-    // Phase 3 — cancellation token
     let shutdown = CancellationToken::new();
 
-    // Phase 4 — gRPC health reporter (returned once; cannot be reconstructed from reporter alone)
+    // health_reporter() returns the reporter/service pair exactly once; the
+    // reporter is threaded onto AppState while the service is mounted on the
+    // gRPC router below.
     let (mut reporter, health_service) = health_reporter();
 
-    // Phases 5–12 — postgres boot, migrations, pools, storage, auth, AppState assembly
     let state = build_app_state_from_config(
         &config,
         shutdown.clone(),
@@ -82,15 +77,12 @@ async fn run() -> Result<(), BootExit> {
     .await
     .map_err(|e| BootExit::Other(Box::new(e)))?;
 
-    // Phase 13 — assembled-state production guard
     state
         .production_validate()
         .map_err(|e| BootExit::Config(Box::new(e)))?;
 
-    // Phase 14 — HTTP router
     let http_router = build_router(state.clone());
 
-    // Phase 15 — gRPC router
     // NoopInterceptor is the structural seat for the real auth interceptor.
     // Threading it through build_grpc_router forces every future service to
     // pass through an interceptor instance.
@@ -103,7 +95,6 @@ async fn run() -> Result<(), BootExit> {
     )
     .map_err(|e| BootExit::Other(Box::new(e)))?;
 
-    // Phase 16 — background workers
     let mut workers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     if let Some(sweeper) =
@@ -129,8 +120,9 @@ async fn run() -> Result<(), BootExit> {
         shutdown.clone(),
     ));
 
-    // F-03 closeout: publish snapshot-based gRPC health status before the gRPC
-    // bind opens and before the consumer task spawns.
+    // Seed gRPC health from the cached readiness snapshot before binding and
+    // before drive_health_status spawns; otherwise the first probe could land
+    // on the default-NOT_SERVING reporter state.
     publish_initial_health(&state.readiness, &mut reporter).await;
 
     workers.spawn(drive_health_status(
@@ -139,24 +131,20 @@ async fn run() -> Result<(), BootExit> {
         shutdown.clone(),
     ));
 
-    // Phase 17 — HTTP bind
     let http_addr = config.http.bind;
     let listener = TcpListener::bind(http_addr)
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
     info!(bind = %http_addr, "HTTP server listening");
 
-    // Phase 18 — gRPC serve
     let grpc_handle = tokio::spawn({
         let token = shutdown.clone();
         let bind = config.grpc.bind;
         async move { serve_grpc(grpc_router, bind, token).await }
     });
 
-    // Phase 19 — signal watcher
     let signal_handle = tokio::spawn(signal_watcher(shutdown.clone()));
 
-    // Phase 20 — unified serve loop
     let http_serve = {
         let token = shutdown.clone();
         async move {
@@ -235,7 +223,6 @@ async fn run() -> Result<(), BootExit> {
         http_result = Some(result);
     }
 
-    // Phase 21 — bounded drain
     let drain = Duration::from_millis(config.shutdown.drain_ms);
     await_drain(
         grpc_result,
@@ -246,7 +233,6 @@ async fn run() -> Result<(), BootExit> {
     )
     .await;
 
-    // Phase 22
     info!("wyrd-server shutdown complete");
     drop(telemetry);
 

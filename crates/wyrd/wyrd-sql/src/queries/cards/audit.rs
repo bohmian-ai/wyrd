@@ -2,7 +2,8 @@
 //!
 //! The only callers are `register_card` and `soft_delete_card` — both inside
 //! the same `TenantConn` tx as the corresponding `wyrd.cards` write.
-//! Fire-and-forget audit emission is forbidden (F-12 / L6 / L13).
+//! Fire-and-forget audit emission is forbidden: an audit row must commit in
+//! the same transaction as the write it describes.
 #![deny(missing_docs)]
 
 use wyrd_spec::error::WyrdError;

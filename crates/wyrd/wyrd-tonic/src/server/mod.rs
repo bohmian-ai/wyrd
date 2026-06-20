@@ -19,10 +19,10 @@ use crate::health::{HealthSnapshot, WyrdHealthSentinel};
 
 /// Passthrough auth interceptor: accepts every request.
 ///
-/// Reserved structural seat for the real auth interceptor that the auth
-/// follow-up commit installs. Threading this through `build_grpc_router`
-/// forces every future gRPC service to be wrapped by the interceptor — there
-/// is no path that mounts a service without going through one.
+/// Reserved structural seat for the real auth interceptor. Threading this
+/// through `build_grpc_router` forces every future gRPC service to be wrapped
+/// by the interceptor — there is no path that mounts a service without going
+/// through one.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoopInterceptor;
 
@@ -65,7 +65,7 @@ pub struct GrpcRouterConfig {
 ///
 /// No `.layer(...)` is composed here — doing so changes the server's stacked
 /// type and breaks the `TonicRouter` return type. The auth interceptor seat
-/// is wired in the auth follow-up commit via `InterceptedService::new`.
+/// is wired via `InterceptedService::new` on each mounted service.
 pub fn build_grpc_router<H, I>(
     health_service: HealthServer<H>,
     interceptor: I,
@@ -121,12 +121,10 @@ pub async fn serve_grpc(
 
 /// Publish the snapshot-driven initial health status before the gRPC bind opens.
 ///
-/// F-03 closeout: there is NO unconditional `set_serving` boot seed. This
-/// function is the ONLY caller-visible function that writes to the reporter at
-/// boot time. It reads the current snapshot (which is
-/// `ReadinessSnapshot::initial()` on cold boot — all `warmup`, `all_ok() ==
-/// false`) and calls the matching reporter setter. The background consumer
-/// transitions the sentinel from there.
+/// This is the only function that writes to the reporter at boot time. It
+/// reads the current snapshot and calls the matching reporter setter so the
+/// gRPC sentinel never advertises SERVING before readiness has confirmed it.
+/// The background consumer (`drive_health_status`) takes over from there.
 #[tracing::instrument(skip(snapshot, reporter))]
 pub async fn publish_initial_health<S: HealthSnapshot>(
     snapshot: &Arc<ArcSwap<S>>,
@@ -143,9 +141,8 @@ pub async fn publish_initial_health<S: HealthSnapshot>(
 /// Background consumer: reads the cached readiness snapshot and drives the gRPC
 /// health sentinel. Never calls live probes.
 ///
-/// F-03 closeout: `publish_initial_health` in `main.rs` has already written a
-/// snapshot-based status before this task spawned. The first tick here is a
-/// true no-op when the snapshot has not changed.
+/// Callers must invoke `publish_initial_health` first so the reporter reflects
+/// the current snapshot before the consumer's change-detection baseline is set.
 #[tracing::instrument(skip(snapshot, reporter, shutdown))]
 pub async fn drive_health_status<S: HealthSnapshot>(
     snapshot: Arc<ArcSwap<S>>,

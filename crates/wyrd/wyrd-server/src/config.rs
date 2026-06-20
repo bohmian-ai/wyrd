@@ -173,7 +173,8 @@ pub struct PoolsConfig {
 pub struct LimitsConfig {
     /// Maximum request body size in bytes.
     ///
-    /// F-02 closeout: bounded buffering; worst-case memory = body_bytes × concurrency.
+    /// The body-limit middleware buffers up to this many bytes per request;
+    /// worst-case process memory is `body_bytes × concurrency`.
     #[serde(default = "default_body_bytes")]
     pub body_bytes: usize,
     /// Per-request processing timeout in milliseconds.

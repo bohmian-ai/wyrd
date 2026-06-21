@@ -5,16 +5,14 @@ use crate::gcs::GcsSigner;
 use crate::settings::GcsConfig;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use gcloud_storage::client::{Client, ClientConfig};
-use object_store::gcp::{GoogleCloudStorage, GoogleCloudStorageBuilder};
 use opendal::services;
-use wyrd_spec::storage::StorageBackendKind;
 
 pub(crate) fn gcs_service(cfg: &GcsConfig) -> services::Gcs {
     let mut b = services::Gcs::default().bucket(&cfg.bucket);
     let mut has_credential = false;
     if let Ok(b64) = std::env::var("GOOGLE_ACCOUNT_JSON_BASE64") {
         // Pass the base64 string through verbatim — opendal calls from_base64 internally.
-        // object_store wanted decoded JSON; opendal wants the base64. Do NOT decode here.
+        // Do NOT decode here.
         b = b.credential(&b64);
         has_credential = true;
     } else if let Ok(json) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS_JSON") {
@@ -63,39 +61,6 @@ pub async fn build_signer(config: &GcsConfig) -> Result<GcsSigner, StorageError>
         })?;
 
     Ok(GcsSigner::new(client, config.bucket.clone()))
-}
-
-/// Build the shared GCS object-store substrate.
-///
-/// # Errors
-/// Returns an error when the object-store builder rejects configuration.
-pub fn build_object_store(config: &GcsConfig) -> Result<GoogleCloudStorage, StorageError> {
-    let mut builder = GoogleCloudStorageBuilder::from_env().with_bucket_name(config.bucket.clone());
-    if let Ok(raw) = std::env::var("GOOGLE_ACCOUNT_JSON_BASE64") {
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(raw)
-            .map_err(|source| StorageError::Backend {
-                backend: StorageBackendKind::Gcs,
-                op: "build_object_store",
-                message: source.to_string(),
-            })?;
-        let key = String::from_utf8(decoded).map_err(|source| StorageError::Backend {
-            backend: StorageBackendKind::Gcs,
-            op: "build_object_store",
-            message: source.to_string(),
-        })?;
-        builder = builder.with_service_account_key(key);
-    } else if let Ok(raw) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS_JSON") {
-        builder = builder.with_service_account_key(raw);
-    } else if let Ok(path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
-        builder = builder.with_application_credentials(path);
-    }
-
-    builder.build().map_err(|source| StorageError::Backend {
-        backend: StorageBackendKind::Gcs,
-        op: "build_object_store",
-        message: source.to_string(),
-    })
 }
 
 /// Build a GCS signer pointed at a local emulator endpoint.

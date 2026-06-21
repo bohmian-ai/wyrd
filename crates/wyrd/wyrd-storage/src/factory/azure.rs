@@ -10,8 +10,8 @@ use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::BlobServiceClient;
 #[cfg(any(test, feature = "emulator"))]
 use azure_storage_blobs::prelude::ClientBuilder;
-use object_store::azure::{MicrosoftAzure, MicrosoftAzureBuilder};
 use opendal::services;
+#[cfg(any(test, feature = "emulator"))]
 use wyrd_spec::storage::StorageBackendKind;
 
 pub(crate) fn azblob_service(cfg: &AzureConfig) -> services::Azblob {
@@ -101,19 +101,4 @@ fn parse_azurite_endpoint(endpoint: &str) -> Result<(String, u16), ()> {
     let (host, port_str) = stripped.rsplit_once(':').ok_or(())?;
     let port: u16 = port_str.parse().map_err(|_| ())?;
     Ok((host.to_owned(), port))
-}
-
-/// Build the shared Azure object-store substrate.
-///
-/// # Errors
-/// Returns an error when the object-store builder rejects configuration.
-pub fn build_object_store(config: &AzureConfig) -> Result<MicrosoftAzure, StorageError> {
-    let builder = MicrosoftAzureBuilder::from_env()
-        .with_account(config.account.clone())
-        .with_container_name(config.container.clone());
-    builder.build().map_err(|source| StorageError::Backend {
-        backend: StorageBackendKind::Azure,
-        op: "build_object_store",
-        message: source.to_string(),
-    })
 }

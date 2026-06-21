@@ -1,4 +1,4 @@
-//! Backend SDK and object-store construction.
+//! Backend SDK and opendal operator construction.
 
 pub mod azure;
 pub mod gcs;
@@ -8,9 +8,7 @@ pub mod s3;
 use crate::error::StorageError;
 use crate::settings::BackendConfig;
 use crate::signer::BackendSigner;
-use object_store::ObjectStore;
 use opendal::Operator;
-use std::sync::Arc;
 use wyrd_spec::storage::StorageBackendKind;
 
 /// Build the active backend signer.
@@ -66,20 +64,6 @@ pub fn build_operator(backend: &BackendConfig) -> Result<Operator, StorageError>
             .finish(),
     };
     Ok(op)
-}
-
-/// Build the single process-level object store for the selected backend.
-///
-/// # Errors
-/// Returns a storage error when object-store construction fails.
-pub fn build_object_store(backend: &BackendConfig) -> Result<Arc<dyn ObjectStore>, StorageError> {
-    let store: Arc<dyn ObjectStore> = match backend {
-        BackendConfig::Local { root } => Arc::new(local::build_object_store(root)?),
-        BackendConfig::S3(config) => Arc::new(s3::build_object_store(config)?),
-        BackendConfig::Gcs(config) => Arc::new(gcs::build_object_store(config)?),
-        BackendConfig::Azure(config) => Arc::new(azure::build_object_store(config)?),
-    };
-    Ok(store)
 }
 
 #[cfg(test)]

@@ -6,9 +6,7 @@ use crate::settings::S3Config;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Builder, Region};
-use object_store::aws::{AmazonS3, AmazonS3Builder};
 use opendal::services;
-use wyrd_spec::storage::StorageBackendKind;
 
 pub(crate) fn s3_service(cfg: &S3Config) -> services::S3 {
     let mut b = services::S3::default().bucket(&cfg.bucket);
@@ -87,29 +85,4 @@ pub fn build_emulator_signer(bucket: &str, endpoint: &str) -> Result<S3Signer, S
         .credentials_provider(Credentials::new(access, secret, None, None, "static"))
         .build();
     Ok(S3Signer::new(Client::from_conf(conf), bucket.to_owned()))
-}
-
-/// Build the shared S3 object-store substrate.
-///
-/// # Errors
-/// Returns an error when the object-store builder rejects configuration.
-pub fn build_object_store(config: &S3Config) -> Result<AmazonS3, StorageError> {
-    let mut builder = AmazonS3Builder::from_env().with_bucket_name(config.bucket.clone());
-    if let Some(region) = &config.region {
-        builder = builder.with_region(region.clone());
-    }
-    if let Some(endpoint_url) = &config.endpoint_url {
-        builder = builder.with_endpoint(endpoint_url.clone());
-        if endpoint_url.starts_with("http://") {
-            builder = builder.with_allow_http(true);
-        }
-    }
-    if config.force_path_style || config.endpoint_url.is_some() {
-        builder = builder.with_virtual_hosted_style_request(false);
-    }
-    builder.build().map_err(|source| StorageError::Backend {
-        backend: StorageBackendKind::S3,
-        op: "build_object_store",
-        message: source.to_string(),
-    })
 }

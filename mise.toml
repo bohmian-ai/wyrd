@@ -257,14 +257,15 @@ fi
 """
 
 [tasks."check:object-store-pin"]
-description = "Assert the workspace resolves exactly one object_store 0.13 package"
+description = "Assert object_store is absent from the workspace dependency graph (replaced by opendal in stage0)"
 run = """
-cargo tree -e=no-dev -i object_store --all-features 2>&1 \
-  | awk '/^object_store / { v=$2; count++ } END {
-      if (count != 1) { print "FAIL: expected exactly 1 object_store version, got "count; exit 1 }
-      if (v !~ /^v0\\.13\\./) { print "FAIL: object_store "v" is not 0.13.*"; exit 1 }
-      print "OK: "v
-    }'
+n=$(cargo tree -e=no-dev -i object_store --all-features 2>/dev/null | awk '/^object_store /{c++} END{print c+0}')
+if [ "$n" = 0 ]; then
+  echo "OK: object_store absent (off-graph)"
+else
+  echo "FAIL: object_store present ($n) — stage0 dropped it; check for a reintroduced dependency"
+  exit 1
+fi
 """
 
 [tasks."storage:up"]

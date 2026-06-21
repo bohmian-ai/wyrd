@@ -55,7 +55,6 @@ wyrd-enterprise = { path = "../wyrd-enterprise", version = "0.0.1", optional = t
 
 [dev-dependencies]
 insta = { workspace = true }
-object_store = { workspace = true }
 reqwest = { workspace = true }
 wyrd-storage = { workspace = true, features = ["emulator"] }
 temp-env = { workspace = true }

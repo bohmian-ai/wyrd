@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use object_store::local::LocalFileSystem;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio_util::sync::CancellationToken;
 use wyrd_server::AppState;
@@ -19,15 +18,10 @@ fn test_state() -> AppState {
     let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-    let object_store =
-        Arc::new(LocalFileSystem::new_with_prefix(root.path()).expect("local object store"));
     AppState::new(
         pool,
         None,
-        Arc::new(StorageHandle::new(
-            BackendSigner::Local(signer),
-            object_store,
-        )),
+        Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
     )
 }
 

@@ -175,7 +175,6 @@ pub fn spawn_storage_sweeper(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object_store::local::LocalFileSystem;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -187,12 +186,7 @@ mod tests {
         let platform_admin_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let root = tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-        let object_store =
-            Arc::new(LocalFileSystem::new_with_prefix(root.path()).expect("local object store"));
-        let storage = Arc::new(StorageHandle::new(
-            BackendSigner::Local(signer),
-            object_store,
-        ));
+        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
         let state = AppState::new(app_pool, Some(platform_admin_pool), storage);
 
         assert!(state.platform_admin_pool.is_some());

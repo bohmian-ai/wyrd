@@ -3,11 +3,9 @@
 use crate::error::StorageError;
 use crate::settings::{BackendConfig, StorageSettings};
 use crate::signer::BackendSigner;
-use object_store::ObjectStore;
+use opendal::{ErrorKind, Operator};
 use std::sync::Arc;
 use std::time::Duration;
-use url::Url;
-use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::StorageBackendKind;
 
 /// Error returned by [`StorageHandle::health_probe`].
@@ -21,7 +19,7 @@ pub enum StorageHealthError {
     },
     /// The storage backend returned an unexpected error.
     #[error("storage health probe failed")]
-    Backend(#[source] object_store::Error),
+    Backend(#[source] opendal::Error),
     /// Local storage root is inaccessible.
     #[error("local storage root is inaccessible")]
     LocalRoot(#[source] std::io::Error),
@@ -29,12 +27,12 @@ pub enum StorageHealthError {
 
 /// Shared storage handle.
 ///
-/// The handle carries both the active backend signer and the single
-/// process-wide object-store substrate used by server-side readers.
+/// The handle carries the active backend signer and the opendal `Operator`
+/// used for backend health probing.
 #[derive(Clone)]
 pub struct StorageHandle {
     signer: BackendSigner,
-    object_store: Arc<dyn ObjectStore>,
+    operator: Operator,
     backend_config: BackendConfig,
     require_encryption: bool,
     presign_ttl: Duration,
@@ -46,7 +44,7 @@ impl std::fmt::Debug for StorageHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StorageHandle")
             .field("backend", &self.signer.kind())
-            .field("object_store", &"<dyn ObjectStore>")
+            .field("operator", &"<opendal::Operator>")
             .field("require_encryption", &self.require_encryption)
             .field("presign_ttl", &self.presign_ttl)
             .field("default_part_size_bytes", &self.default_part_size_bytes)
@@ -55,7 +53,7 @@ impl std::fmt::Debug for StorageHandle {
 }
 
 impl StorageHandle {
-    /// Build a storage handle from already-constructed components.
+    /// Build a storage handle from an already-constructed signer.
     ///
     /// Intended for tests and local-mode harnesses. The resulting
     /// [`BackendConfig`] is synthesized from the signer alone, so
@@ -63,8 +61,14 @@ impl StorageHandle {
     /// `public_base_url`) are defaulted, `require_encryption` is `false`,
     /// `presign_ttl` is the crate default, and `default_part_size_bytes`
     /// is the crate default. Production paths must use [`Self::from_settings`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if opendal operator construction fails for the synthesized local
+    /// config. All documented call sites pass a `Local` signer; fs-operator
+    /// construction is infallible.
     #[must_use]
-    pub fn new(signer: BackendSigner, object_store: Arc<dyn ObjectStore>) -> Self {
+    pub fn new(signer: BackendSigner) -> Self {
         let backend_config = match &signer {
             BackendSigner::Local(local) => BackendConfig::Local {
                 root: local.root().to_path_buf(),
@@ -83,9 +87,11 @@ impl StorageHandle {
                 container: azure.container().to_owned(),
             }),
         };
+        let operator = crate::factory::build_operator(&backend_config)
+            .expect("operator construction is infallible for the test/local-harness constructor");
         Self {
             signer,
-            object_store,
+            operator,
             backend_config,
             require_encryption: false,
             presign_ttl: Duration::from_secs(u64::from(crate::settings::DEFAULT_PRESIGN_TTL_SECS)),
@@ -97,15 +103,15 @@ impl StorageHandle {
     /// Build a storage handle from boot settings.
     ///
     /// # Errors
-    /// Returns a storage error when signer or object-store construction fails.
+    /// Returns a storage error when signer or operator construction fails.
     pub async fn from_settings(settings: StorageSettings) -> Result<Arc<Self>, StorageError> {
         let signer = crate::factory::build_signer(&settings.backend).await?;
-        let object_store = crate::factory::build_object_store(&settings.backend)?;
+        let operator = crate::factory::build_operator(&settings.backend)?;
         crate::preflight::run(&signer).await;
 
         Ok(Arc::new(Self {
             signer,
-            object_store,
+            operator,
             backend_config: settings.backend,
             require_encryption: settings.require_encryption,
             presign_ttl: settings.presign_ttl,
@@ -130,33 +136,6 @@ impl StorageHandle {
     #[must_use]
     pub fn signer(&self) -> &BackendSigner {
         &self.signer
-    }
-
-    /// Clone the shared object-store substrate.
-    #[must_use]
-    pub fn object_store(&self) -> Arc<dyn ObjectStore> {
-        Arc::clone(&self.object_store)
-    }
-
-    /// Clone the shared object-store substrate after tenant-prefix validation.
-    ///
-    /// Tenancy isolation is path prefix plus Postgres RLS. The object store is
-    /// shared across tenants by design; callers must pass the verified data
-    /// tenant id from their request context before using a source URI.
-    ///
-    /// # Errors
-    /// Returns [`StorageError`] when the URI is malformed, uses an unsupported
-    /// substrate scheme, has an invalid tenant prefix, or belongs to another
-    /// tenant.
-    pub fn object_store_for(
-        &self,
-        uri: &str,
-        caller_data_tenant_id: DataTenantId,
-    ) -> Result<Arc<dyn ObjectStore>, StorageError> {
-        let parsed =
-            Url::parse(uri).map_err(|error| StorageError::InvalidUri(error.to_string()))?;
-        validate_tenant_prefix(&parsed, caller_data_tenant_id)?;
-        Ok(Arc::clone(&self.object_store))
     }
 
     /// Whether upload completion must verify server-side encryption markers.
@@ -192,9 +171,9 @@ impl StorageHandle {
     /// Probe the storage backend for liveness.
     ///
     /// For the local backend, attempts a `stat` of the configured storage root
-    /// directory. For object-store backends (S3, GCS, Azure), issues a
-    /// `HeadObject` request against `_wyrd/health.sentinel`; `NotFound` is
-    /// treated as healthy (bucket accessible, sentinel absent is expected).
+    /// directory. For cloud backends (S3, GCS, Azure), issues a `stat` against
+    /// `_wyrd/health.sentinel`; `NotFound` is treated as healthy (bucket
+    /// accessible, sentinel absent is expected).
     ///
     /// # Errors
     ///
@@ -208,46 +187,24 @@ impl StorageHandle {
                 .map(|_| ())
                 .map_err(StorageHealthError::LocalRoot)
         } else {
-            use object_store::{ObjectStoreExt, path::Path};
-            let sentinel = Path::from("_wyrd/health.sentinel");
-            match self.object_store.head(&sentinel).await {
-                // A present sentinel or a reachable-but-empty backend both prove liveness.
-                Ok(_) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            match self.operator.stat("_wyrd/health.sentinel").await {
+                Ok(_) => Ok(()),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(StorageHealthError::Backend(e)),
             }
         }
     }
 }
 
-fn validate_tenant_prefix(
-    uri: &Url,
-    caller_data_tenant_id: DataTenantId,
-) -> Result<(), StorageError> {
-    let post_bucket = crate::tenant_path::strip_bucket(uri.scheme(), uri)?;
-    let first_segment = post_bucket.split('/').next().unwrap_or("");
-    let prefix = crate::tenant_path::parse_prefix(first_segment)
-        .map_err(|error| StorageError::TenantPrefixInvalid(error.to_string()))?;
-    if prefix != caller_data_tenant_id {
-        return Err(StorageError::TenantPrefixForeign {
-            prefix,
-            caller: caller_data_tenant_id,
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::local::LocalSigner;
-    use object_store::local::LocalFileSystem;
     use tempfile::TempDir;
 
     fn local_handle(root: &std::path::Path) -> StorageHandle {
         let signer = BackendSigner::Local(LocalSigner::new(root.to_path_buf()).unwrap());
-        let object_store: Arc<dyn ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(root).unwrap());
-        StorageHandle::new(signer, object_store)
+        StorageHandle::new(signer)
     }
 
     #[tokio::test]

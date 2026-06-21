@@ -39,7 +39,6 @@ impl AppState {
 mod tests {
     use std::sync::Arc;
 
-    use object_store::local::LocalFileSystem;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use wyrd_auth_check::DenyAllPolicyHook;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -107,16 +106,11 @@ mod tests {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-        let object_store =
-            Arc::new(LocalFileSystem::new_with_prefix(root.path()).expect("local object store"));
 
         AppState::new(
             app_pool,
             None,
-            Arc::new(StorageHandle::new(
-                BackendSigner::Local(signer),
-                object_store,
-            )),
+            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
         )
     }
 }

@@ -2,7 +2,6 @@ use arc_swap::ArcSwap;
 use axum::body::to_bytes;
 use axum::http::{Request, StatusCode};
 use chrono::Duration;
-use object_store::local::LocalFileSystem;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -275,8 +274,6 @@ fn test_state() -> AppState {
     let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-    let object_store =
-        Arc::new(LocalFileSystem::new_with_prefix(root.path()).expect("local object store"));
     let issuing_key = Arc::new(
         IssuingKey::from_ed_pem(
             secrecy::SecretString::from(PRIVATE_KEY_PEM),
@@ -304,10 +301,7 @@ fn test_state() -> AppState {
     AppState::new(
         app_pool,
         None,
-        Arc::new(StorageHandle::new(
-            BackendSigner::Local(signer),
-            object_store,
-        )),
+        Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
     )
     .with_auth_handles(issuing_key, verifier)
 }

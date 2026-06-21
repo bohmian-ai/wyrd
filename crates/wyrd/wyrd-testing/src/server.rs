@@ -80,6 +80,7 @@ pub struct WyrdTestServerBuilder {
     audit_writer: Option<Arc<dyn AuthzAuditWriter>>,
     allow_preview_auth: bool,
     storage_settings: Option<StorageSettings>,
+    storage_handle: Option<Arc<wyrd_storage::StorageHandle>>,
 }
 
 impl Default for WyrdTestServerBuilder {
@@ -89,6 +90,7 @@ impl Default for WyrdTestServerBuilder {
             audit_writer: None,
             allow_preview_auth: true,
             storage_settings: None,
+            storage_handle: None,
         }
     }
 }
@@ -680,6 +682,19 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Inject a pre-built storage handle.
+    ///
+    /// Use this for emulator backends (GCS, Azure) whose backend config carries
+    /// no emulator endpoint, so the handle must be built from an emulator signer
+    /// via [`wyrd_storage::StorageHandle::from_signer`]. The in-process server
+    /// skips the boot health probe, so the handle's operator is never exercised.
+    /// Takes precedence over [`Self::with_storage_settings`].
+    #[must_use]
+    pub fn with_storage_handle(mut self, handle: Arc<wyrd_storage::StorageHandle>) -> Self {
+        self.storage_handle = Some(handle);
+        self
+    }
+
     /// Build and start an in-process server.
     ///
     /// # Errors
@@ -695,7 +710,9 @@ impl WyrdTestServerBuilder {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         conn.commit().await.map_err(sql)?;
 
-        let (storage_root, storage) = if let Some(settings) = self.storage_settings {
+        let (storage_root, storage) = if let Some(handle) = self.storage_handle {
+            (None, handle)
+        } else if let Some(settings) = self.storage_settings {
             let handle = wyrd_storage::StorageHandle::from_settings(settings)
                 .await
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;

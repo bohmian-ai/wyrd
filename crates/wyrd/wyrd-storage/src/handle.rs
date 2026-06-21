@@ -103,6 +103,27 @@ impl StorageHandle {
         }
     }
 
+    /// Build a storage handle from a signer with an explicit multipart
+    /// threshold.
+    ///
+    /// Test/local-harness constructor used to drive server-tier multipart
+    /// uploads against emulator signers (GCS, Azure) whose backend config
+    /// carries no emulator endpoint. Behaves like [`Self::new`] but overrides
+    /// the multipart threshold so a small payload triggers a real multipart
+    /// upload. The synthesized operator is never exercised because the
+    /// in-process test server skips the boot health probe.
+    ///
+    /// # Panics
+    ///
+    /// Panics if operator construction fails for the synthesized config.
+    #[must_use]
+    pub fn from_signer(signer: BackendSigner, multipart_threshold_bytes: u64) -> Self {
+        Self {
+            multipart_threshold_bytes,
+            ..Self::new(signer)
+        }
+    }
+
     /// Build a storage handle from boot settings.
     ///
     /// # Errors
@@ -215,6 +236,22 @@ mod tests {
     fn local_handle(root: &std::path::Path) -> StorageHandle {
         let signer = BackendSigner::Local(LocalSigner::new(root.to_path_buf()).unwrap());
         StorageHandle::new(signer)
+    }
+
+    #[test]
+    fn from_signer_builds_cloud_handles_without_probing() {
+        let gcs = crate::factory::gcs::build_emulator_signer("wyrd-storage-test", "http://localhost:4443")
+            .expect("gcs emulator signer");
+        let handle = StorageHandle::from_signer(BackendSigner::Gcs(gcs), 8 * 1024 * 1024);
+        assert_eq!(handle.backend(), StorageBackendKind::Gcs);
+        assert_eq!(handle.multipart_threshold_bytes(), 8 * 1024 * 1024);
+
+        let azure =
+            crate::factory::azure::build_emulator_signer("wyrd-storage-test", "http://127.0.0.1:10000")
+                .expect("azure emulator signer");
+        let handle = StorageHandle::from_signer(BackendSigner::Azure(azure), 8 * 1024 * 1024);
+        assert_eq!(handle.backend(), StorageBackendKind::Azure);
+        assert_eq!(handle.multipart_threshold_bytes(), 8 * 1024 * 1024);
     }
 
     #[tokio::test]

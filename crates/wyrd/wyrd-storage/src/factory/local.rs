@@ -3,7 +3,12 @@
 use crate::error::StorageError;
 use crate::local::LocalSigner;
 use object_store::local::LocalFileSystem;
+use opendal::services;
 use std::path::{Path, PathBuf};
+
+pub(crate) fn fs_service(root: &Path) -> services::Fs {
+    services::Fs::default().root(&root.to_string_lossy())
+}
 
 /// Build the local signer.
 ///

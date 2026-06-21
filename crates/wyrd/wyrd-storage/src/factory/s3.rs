@@ -7,7 +7,24 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Builder, Region};
 use object_store::aws::{AmazonS3, AmazonS3Builder};
+use opendal::services;
 use wyrd_spec::storage::StorageBackendKind;
+
+pub(crate) fn s3_service(cfg: &S3Config) -> services::S3 {
+    let mut b = services::S3::default().bucket(&cfg.bucket);
+    if let Some(r) = &cfg.region {
+        b = b.region(r);
+    }
+    if let Some(e) = &cfg.endpoint_url {
+        b = b.endpoint(e);
+    }
+    // object_store defaulted to virtual-hosted; opendal defaults to path-style.
+    // Preserve prior behavior: virtual-host unless force_path_style or custom endpoint.
+    if !cfg.force_path_style && cfg.endpoint_url.is_none() {
+        b = b.enable_virtual_host_style();
+    }
+    b
+}
 
 /// Build the S3 signer from the AWS default credential chain.
 ///

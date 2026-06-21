@@ -3,10 +3,27 @@
 use crate::error::StorageError;
 use crate::gcs::GcsSigner;
 use crate::settings::GcsConfig;
-use base64::Engine;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use gcloud_storage::client::{Client, ClientConfig};
 use object_store::gcp::{GoogleCloudStorage, GoogleCloudStorageBuilder};
+use opendal::services;
 use wyrd_spec::storage::StorageBackendKind;
+
+pub(crate) fn gcs_service(cfg: &GcsConfig) -> services::Gcs {
+    let mut b = services::Gcs::default().bucket(&cfg.bucket);
+    if let Ok(b64) = std::env::var("GOOGLE_ACCOUNT_JSON_BASE64") {
+        // Pass the base64 string through verbatim — opendal calls from_base64 internally.
+        // object_store wanted decoded JSON; opendal wants the base64. Do NOT decode here.
+        b = b.credential(&b64);
+    } else if let Ok(json) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS_JSON") {
+        b = b.credential(&STANDARD.encode(&json));
+    } else if let Ok(path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
+        b = b.credential_path(&path);
+    }
+    // else: opendal's default chain = full ADC (env SA path, gcloud well-known file,
+    // GCE/GKE metadata server, Workload Identity, WIF external_account).
+    b
+}
 
 /// Build the GCS signer using the Wyrd credential cascade.
 ///

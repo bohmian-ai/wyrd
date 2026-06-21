@@ -152,6 +152,14 @@ azure_storage_blobs = "0.21.0"
 # Keep object_store, datafusion, and deltalake aligned; see
 # .dev/plan/foundations/04-storage/10a-datafusion-deltalake-pin.md.
 object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
+# opendal 0.57 pinned as the wyrd-storage substrate (stage0) and the future
+# iceberg-storage-opendal substrate (stage1). reqwest-rustls-tls is mandatory:
+# default-features=false drops it, leaving an HTTP-only client that fails all
+# cloud HTTPS requests.
+opendal = { version = "0.57", default-features = false, features = [
+  "services-fs", "services-s3", "services-gcs", "services-azblob",
+  "reqwest-rustls-tls",
+] }
 datafusion = "=54.0.0"
 deltalake = { version = "=0.32.4", features = ["s3", "gcs", "azure"] }
 

@@ -11,7 +11,20 @@ use azure_storage_blobs::prelude::BlobServiceClient;
 #[cfg(any(test, feature = "emulator"))]
 use azure_storage_blobs::prelude::ClientBuilder;
 use object_store::azure::{MicrosoftAzure, MicrosoftAzureBuilder};
+use opendal::services;
 use wyrd_spec::storage::StorageBackendKind;
+
+pub(crate) fn azblob_service(cfg: &AzureConfig) -> services::Azblob {
+    let endpoint = format!("https://{}.blob.core.windows.net", cfg.account);
+    let mut b = services::Azblob::default()
+        .account_name(&cfg.account)
+        .container(&cfg.container)
+        .endpoint(&endpoint);
+    if let Ok(key) = std::env::var("AZURE_STORAGE_ACCOUNT_KEY") {
+        b = b.account_key(&key);
+    }
+    b
+}
 
 /// Build the Azure signer from Azure's default credential chain.
 ///

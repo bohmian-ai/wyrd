@@ -37,6 +37,7 @@ pub struct StorageHandle {
     require_encryption: bool,
     presign_ttl: Duration,
     default_part_size_bytes: u64,
+    multipart_threshold_bytes: u64,
     public_base_url: Option<String>,
 }
 
@@ -48,6 +49,7 @@ impl std::fmt::Debug for StorageHandle {
             .field("require_encryption", &self.require_encryption)
             .field("presign_ttl", &self.presign_ttl)
             .field("default_part_size_bytes", &self.default_part_size_bytes)
+            .field("multipart_threshold_bytes", &self.multipart_threshold_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -96,6 +98,7 @@ impl StorageHandle {
             require_encryption: false,
             presign_ttl: Duration::from_secs(u64::from(crate::settings::DEFAULT_PRESIGN_TTL_SECS)),
             default_part_size_bytes: crate::settings::DEFAULT_PART_SIZE_BYTES,
+            multipart_threshold_bytes: crate::plan::MULTIPART_THRESHOLD_BYTES,
             public_base_url: None,
         }
     }
@@ -116,6 +119,7 @@ impl StorageHandle {
             require_encryption: settings.require_encryption,
             presign_ttl: settings.presign_ttl,
             default_part_size_bytes: settings.part_size_bytes,
+            multipart_threshold_bytes: settings.multipart_threshold_bytes,
             public_base_url: settings.public_base_url,
         }))
     }
@@ -160,6 +164,12 @@ impl StorageHandle {
     #[must_use]
     pub fn default_part_size_bytes(&self) -> u64 {
         self.default_part_size_bytes
+    }
+
+    /// Object size at or above which cloud backends switch to multipart upload.
+    #[must_use]
+    pub fn multipart_threshold_bytes(&self) -> u64 {
+        self.multipart_threshold_bytes
     }
 
     /// Public base URL configured for local-mode routes.

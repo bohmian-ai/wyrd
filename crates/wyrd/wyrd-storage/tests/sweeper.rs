@@ -131,6 +131,7 @@ async fn local_storage_handle() -> std::sync::Arc<StorageHandle> {
         require_encryption: false,
         presign_ttl: Duration::from_mins(10),
         part_size_bytes: 16 * 1024 * 1024,
+        multipart_threshold_bytes: 100 * 1024 * 1024,
         public_base_url: Some("https://wyrd.test".to_owned()),
     })
     .await

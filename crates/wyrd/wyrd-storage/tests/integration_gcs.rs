@@ -8,8 +8,6 @@
 //! service account key) are NOT exercised here. Single-PUT presigning and
 //! `presign_get` are covered by the cloud-credentialed test lane.
 
-use base64::Engine;
-use sha2::{Digest, Sha256};
 use std::time::Duration;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::{StorageBackendKind, UploadPlan, WireProtocol};
@@ -78,8 +76,6 @@ async fn gcs_resumable_round_trip_with_byte_equality() {
     let signer = build_signer();
     let path = fresh_path("multi/large.bin");
     let expected_bytes = assemble_full();
-    let expected_sha =
-        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&expected_bytes));
     let client = MultipartClient::new();
 
     let init = signer
@@ -115,11 +111,6 @@ async fn gcs_resumable_round_trip_with_byte_equality() {
         downloaded, expected_bytes,
         "byte-equality across reassembled resumable upload"
     );
-
-    signer
-        .verify_sha256(&path, &expected_sha, &head)
-        .await
-        .expect("verify sha (client-declared, no-op)");
 }
 
 #[tokio::test]

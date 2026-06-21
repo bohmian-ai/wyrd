@@ -69,7 +69,12 @@ pub async fn upload_init(
     let body_sha = sha256_canonical_json(&body);
     let backend = state.storage.backend();
     let validated = validated_tenant_path(&caller, &body)?;
-    let planned = plan_upload(body.expected_size_bytes, backend).map_err(|_| {
+    let planned = plan_upload(
+        body.expected_size_bytes,
+        backend,
+        state.storage.multipart_threshold_bytes(),
+    )
+    .map_err(|_| {
         map_storage_error(StorageError::ArtifactTooLarge {
             actual: body.expected_size_bytes,
             limit: MAX_OBJECT_SIZE_BYTES,
@@ -354,32 +359,6 @@ pub async fn upload_complete(
         }
     };
     verify_object_head(state, &caller, upload_uuid, &validated, &row, &head).await?;
-
-    if let Err(error) = state
-        .storage
-        .signer()
-        .verify_sha256(&validated, &row.expected_sha256, &head)
-        .await
-    {
-        let error = map_storage_error(error);
-        let error_code = error.code().to_owned();
-        let status_code = i32::from(error.status());
-        mark_failed_best_effort(
-            state,
-            &caller,
-            upload_uuid,
-            &validated,
-            row.backend,
-            FailureContext {
-                operation: UploadAuditOperation::UploadComplete,
-                reason: "sha_mismatch",
-                status_code,
-                error_code: Some(&error_code),
-            },
-        )
-        .await;
-        return Err(error);
-    }
 
     let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
         .await
@@ -1364,6 +1343,7 @@ mod tests {
             require_encryption: false,
             presign_ttl: Duration::from_secs(600),
             part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test/".to_owned()),
         })
         .await
@@ -1425,6 +1405,7 @@ mod tests {
             require_encryption: false,
             presign_ttl: Duration::from_secs(900),
             part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test/".to_owned()),
         })
         .await
@@ -1463,6 +1444,7 @@ mod tests {
             require_encryption: false,
             presign_ttl: Duration::from_secs(900),
             part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test".to_owned()),
         })
         .await
@@ -1514,6 +1496,7 @@ mod tests {
             require_encryption: false,
             presign_ttl: Duration::from_secs(900),
             part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test".to_owned()),
         })
         .await
@@ -1547,6 +1530,7 @@ mod tests {
             require_encryption: false,
             presign_ttl: Duration::from_secs(900),
             part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test".to_owned()),
         })
         .await

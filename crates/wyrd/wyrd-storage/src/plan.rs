@@ -39,6 +39,9 @@ pub enum PlanError {
 
 /// Plan an upload for a backend and object size.
 ///
+/// `multipart_threshold_bytes` is the object size at or above which cloud
+/// backends switch from a single PUT to a multipart upload.
+///
 /// # Errors
 /// Returns [`PlanError::TooLarge`] when the object exceeds the cross-backend
 /// maximum object size.
@@ -49,11 +52,12 @@ pub enum PlanError {
 pub fn plan_upload(
     size_bytes: u64,
     backend: StorageBackendKind,
+    multipart_threshold_bytes: u64,
 ) -> Result<PlannedUpload, PlanError> {
     if size_bytes > MAX_OBJECT_SIZE_BYTES {
         return Err(PlanError::TooLarge(size_bytes));
     }
-    if backend == StorageBackendKind::Local || size_bytes < MULTIPART_THRESHOLD_BYTES {
+    if backend == StorageBackendKind::Local || size_bytes < multipart_threshold_bytes {
         return Ok(PlannedUpload::SinglePut);
     }
 

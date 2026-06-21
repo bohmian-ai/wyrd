@@ -340,6 +340,38 @@ run = "cargo test -p wyrd-server --all-features --test storage_e2e -- --nocaptur
 description = "Run all storage emulator integration tests; requires storage:up"
 depends = ["test:storage:local", "test:storage:gcs-emu", "test:storage:rustfs", "test:storage:azurite", "test:storage:e2e"]
 
+[tasks."test:storage:operator:local"]
+description = "Run opendal operator CRUD tests for the local filesystem backend (no emulator needed)"
+run = "cargo test -p wyrd-storage --all-features --test operator_local -- --nocapture"
+
+[tasks."test:storage:operator:s3-emu"]
+description = "Run opendal operator CRUD tests against the RustFS S3 emulator; requires storage:up"
+depends = ["storage:up"]
+env = { WYRD_STORAGE_INTEGRATION_S3 = "1" }
+run = "cargo test -p wyrd-storage --all-features --test operator_s3_emu -- --nocapture"
+
+[tasks."test:storage:operator:gcs-emu"]
+description = "Run opendal operator CRUD tests against the fake-gcs emulator; requires storage:up"
+depends = ["storage:up"]
+env = { WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_GCS_EMULATOR_HOST = "http://localhost:4443" }
+run = "cargo test -p wyrd-storage --all-features --test operator_gcs_emu -- --nocapture"
+
+[tasks."test:storage:operator:azure-emu"]
+description = "Run opendal operator CRUD tests against the Azurite emulator; requires storage:up"
+depends = ["storage:up"]
+env = { WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_AZURE_EMULATOR_ENDPOINT = "http://127.0.0.1:10000" }
+run = "cargo test -p wyrd-storage --all-features --test operator_azure_emu -- --nocapture"
+
+[tasks."test:storage:operator:emulators"]
+description = "Run all opendal operator CRUD tests against cloud emulators; requires storage:up"
+depends = ["test:storage:operator:s3-emu", "test:storage:operator:gcs-emu", "test:storage:operator:azure-emu"]
+
+[tasks."test:storage:s3:e2e-multipart"]
+description = "Run S3 multipart upload/download e2e test against RustFS + Postgres emulators"
+depends = ["storage:up", "build:postgres", "db:setup-roles", "db:migrate"]
+env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_INTEGRATION_S3 = "1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+run = "cargo test -p wyrd-server --all-features --test storage_e2e s3_multipart_upload_download_round_trip -- --nocapture"
+
 [tasks."check:storage:drift"]
 description = "Assert storage foundation guardrails against paths that exist in this workspace"
 run = """

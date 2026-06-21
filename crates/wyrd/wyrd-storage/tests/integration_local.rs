@@ -20,15 +20,6 @@ async fn local_signer_round_trips_single_put_contract() {
     assert_eq!(head.size_bytes, 10);
     assert_eq!(head.sse_marker.as_deref(), Some("none"));
 
-    signer
-        .verify_sha256(
-            &path,
-            &wyrd_storage::sha::bytes_sha256(b"hello wyrd"),
-            &head,
-        )
-        .await
-        .expect("verify sha");
-
     let plan = signer
         .presign_single_put(&path, head.size_bytes, Duration::from_mins(1))
         .await
@@ -85,32 +76,6 @@ fn storage_path(tenant: DataTenantId) -> wyrd_storage::ValidatedPath {
     let card_uid = uuid::Uuid::now_v7();
     let full = wyrd_storage::tenant_path::build(tenant, &card_uid.to_string(), "matrix/object.bin");
     wyrd_storage::tenant_path::validate(&full, tenant).expect("tenant path")
-}
-
-#[tokio::test]
-async fn local_verify_sha256_mismatch_is_typed() {
-    let root = tempfile::tempdir().expect("temp dir");
-    let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-    let tenant = DataTenantId::new_v7();
-    let path = storage_path(tenant);
-
-    signer
-        .write_atomically(std::path::Path::new(&path.full), b"hello wyrd")
-        .await
-        .expect("write local object");
-    let head = signer.head(&path).await.expect("head local object");
-
-    let wrong_sha = wyrd_storage::sha::bytes_sha256(b"different bytes entirely");
-    let result = signer.verify_sha256(&path, &wrong_sha, &head).await;
-    match result {
-        Err(StorageError::Sha256Mismatch { expected, actual }) => {
-            assert_eq!(expected, wrong_sha);
-            assert_ne!(actual, wrong_sha, "actual must differ from wrong expected");
-        }
-        other => {
-            panic!("verify_sha256 must surface Sha256Mismatch on wrong expected, got: {other:?}")
-        }
-    }
 }
 
 #[tokio::test]

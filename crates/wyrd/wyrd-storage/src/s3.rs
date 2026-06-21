@@ -254,34 +254,11 @@ impl S3Signer {
         };
         Ok(HeadInfo {
             size_bytes,
-            sha256_b64: output.checksum_sha256().map(ToOwned::to_owned),
             content_type: output.content_type().map(ToOwned::to_owned),
             sse_marker: output
                 .server_side_encryption()
                 .map(|value| value.as_str().to_owned()),
         })
-    }
-
-    /// Verify SHA-256.
-    ///
-    /// S3 does not offer a server-side full-object SHA-256 for multipart
-    /// uploads (`FULL_OBJECT` mode is CRC-only; SHA-256 is `COMPOSITE`, a hash
-    /// of per-part hashes, not equal to `SHA256(full_object)`). The storage layer
-    /// therefore does not enforce a SHA-256 check at the backend boundary —
-    /// callers above the storage layer that want cryptographic identity must
-    /// compute and verify it client-side.
-    ///
-    /// # Errors
-    /// Currently infallible; the signature returns `Result` for parity with
-    /// other backends.
-    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
-    pub fn verify_sha256(
-        &self,
-        _path: &ValidatedPath,
-        _expected: &str,
-        _head_hint: &HeadInfo,
-    ) -> Result<(), StorageError> {
-        Ok(())
     }
 
     /// Re-mint an S3 upload plan from non-bearer state.

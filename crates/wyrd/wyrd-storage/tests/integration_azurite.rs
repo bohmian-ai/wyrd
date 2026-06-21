@@ -4,8 +4,6 @@
 //! helper drives reqwest against Azurite via SAS URLs; no bytes transit the
 //! Wyrd server on the upload path.
 
-use base64::Engine;
-use sha2::{Digest, Sha256};
 use std::time::Duration;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::{StorageBackendKind, UploadPlan, WireProtocol};
@@ -94,7 +92,6 @@ async fn azure_multipart_round_trip_with_byte_equality() {
     let signer = build_signer();
     let path = fresh_path("multi/large.bin");
     let expected = assemble_full();
-    let expected_sha = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&expected));
     let client = MultipartClient::new();
 
     let init = signer
@@ -137,11 +134,6 @@ async fn azure_multipart_round_trip_with_byte_equality() {
         downloaded, expected,
         "byte-equality across reassembled block blob"
     );
-
-    signer
-        .verify_sha256(&path, &expected_sha, &head)
-        .await
-        .expect("verify sha (client-declared, no-op)");
 }
 
 #[tokio::test]

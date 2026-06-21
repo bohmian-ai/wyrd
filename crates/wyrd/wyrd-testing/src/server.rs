@@ -56,9 +56,9 @@ pub struct WyrdTestServer {
 
 struct WyrdTestServerInner {
     fixture: PgFixture,
-    // Lifetime guard: the temp dir must outlive the server; it is never read directly.
+    // Lifetime guard: only set for local-backend servers; cloud backends need no tempdir.
     #[allow(dead_code)]
-    storage_root: tempfile::TempDir,
+    storage_root: Option<tempfile::TempDir>,
     state: AppState,
     router: axum::Router,
     verifier: Arc<TokenVerifier<SqlPermissionResolver>>,
@@ -79,6 +79,7 @@ pub struct WyrdTestServerBuilder {
     policy_hook: Option<Arc<dyn PolicyHook>>,
     audit_writer: Option<Arc<dyn AuthzAuditWriter>>,
     allow_preview_auth: bool,
+    storage_settings: Option<StorageSettings>,
 }
 
 impl Default for WyrdTestServerBuilder {
@@ -87,6 +88,7 @@ impl Default for WyrdTestServerBuilder {
             policy_hook: None,
             audit_writer: None,
             allow_preview_auth: true,
+            storage_settings: None,
         }
     }
 }
@@ -666,6 +668,18 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Override the storage backend used by the test server.
+    ///
+    /// By default the server uses a local filesystem backend backed by a
+    /// `tempdir`. Call this to start the server against a real cloud backend
+    /// (e.g. S3/RustFS) for multipart or end-to-end storage tests. Credentials
+    /// must be present in the calling process's environment.
+    #[must_use]
+    pub fn with_storage_settings(mut self, settings: StorageSettings) -> Self {
+        self.storage_settings = Some(settings);
+        self
+    }
+
     /// Build and start an in-process server.
     ///
     /// # Errors
@@ -681,19 +695,28 @@ impl WyrdTestServerBuilder {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         conn.commit().await.map_err(sql)?;
 
-        let storage_root =
-            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let storage = wyrd_storage::StorageHandle::from_settings(StorageSettings {
-            backend: BackendConfig::Local {
-                root: storage_root.path().to_path_buf(),
-            },
-            require_encryption: false,
-            presign_ttl: Duration::from_secs(600),
-            part_size_bytes: 16 * 1024 * 1024,
-            public_base_url: Some("https://wyrd.test".to_owned()),
-        })
-        .await
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let (storage_root, storage) = if let Some(settings) = self.storage_settings {
+            let handle = wyrd_storage::StorageHandle::from_settings(settings)
+                .await
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            (None, handle)
+        } else {
+            let root = tempfile::tempdir()
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            let handle = wyrd_storage::StorageHandle::from_settings(StorageSettings {
+                backend: BackendConfig::Local {
+                    root: root.path().to_path_buf(),
+                },
+                require_encryption: false,
+                presign_ttl: Duration::from_secs(600),
+                part_size_bytes: 16 * 1024 * 1024,
+                multipart_threshold_bytes: 100 * 1024 * 1024,
+                public_base_url: Some("https://wyrd.test".to_owned()),
+            })
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            (Some(root), handle)
+        };
 
         let issuing_key = Arc::new(
             IssuingKey::from_ed_pem(
@@ -740,7 +763,7 @@ impl WyrdTestServerBuilder {
         Ok(WyrdTestServer {
             inner: WyrdTestServerInner {
                 fixture,
-                storage_root,
+                storage_root: storage_root,
                 state,
                 router,
                 verifier,

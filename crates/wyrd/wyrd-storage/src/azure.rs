@@ -200,31 +200,7 @@ impl AzureSigner {
             } else {
                 Some(properties.content_type)
             },
-            sha256_b64: None,
         })
-    }
-
-    /// Verify SHA-256.
-    ///
-    /// Azure block blobs have no server-computed SHA-256 in metadata (only
-    /// `Content-MD5` and `x-ms-content-crc64`). Per the no-bytes-on-server
-    /// invariant the `get_content()` fallback is removed entirely. Verification
-    /// is client-declared: the client commits `expected_sha256` at upload init,
-    /// SAS-restricted PUT plus TLS prevents in-flight tampering, and Azure's
-    /// CRC64 validates wire integrity. Server-side SHA-256 recomputation is not
-    /// available for Azure and must not be attempted.
-    ///
-    /// # Errors
-    /// Returns SHA mismatch when a server-computed digest is available (future),
-    /// or `Ok(())` for the client-declared fast path.
-    #[allow(clippy::unused_async)]
-    pub async fn verify_sha256(
-        &self,
-        _path: &ValidatedPath,
-        _expected: &str,
-        _head_hint: &HeadInfo,
-    ) -> Result<(), StorageError> {
-        Ok(())
     }
 
     /// Re-mint an Azure upload plan.

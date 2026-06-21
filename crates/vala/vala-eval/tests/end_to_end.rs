@@ -62,6 +62,7 @@ use vala_eval::{
     ResultsConfig, RunIdentity, ScenarioAggregationInput, SkipReason, SubjectKey, aggregate_run,
 };
 use wyrd_semver::VersionBlock;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
@@ -70,7 +71,6 @@ use wyrd_spec::vala::eval::{
     EvalPassGate, EvalSpec, EvalTask, JsonPath, LlmJudgeTask, RecordId, RunId, ScenarioId, TaskId,
     TraceAssertionTask,
 };
-use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::vala::trace::{InstrumentationScope, Resource, SpanKind, SpanRecord, SpanStatus};
 

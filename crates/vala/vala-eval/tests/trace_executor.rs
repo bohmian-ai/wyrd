@@ -12,10 +12,10 @@ use vala_eval::tasks::{
     AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, TraceTaskExecutor,
 };
 use vala_eval::{InMemoryTraceSource, MockJudgeInvoker, MockTraceSource, TraceUnavailable};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::eval::{
     ComparisonOperator, EvalSpec, EvalTask, JsonPath, RecordId, RunId, TaskId, TraceAssertionTask,
 };
-use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::vala::trace::{InstrumentationScope, Resource, SpanKind, SpanRecord, SpanStatus};
 

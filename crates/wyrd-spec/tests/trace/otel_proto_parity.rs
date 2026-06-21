@@ -118,7 +118,7 @@ fn span_record_round_trips_otlp_shaped_json() {
                 "host.name": "worker-0"
             }
         },
-        "data_tenant_id": "acme"
+        "data_tenant_id": "018f5c7b-4d0e-7a4d-b8e1-c3d2e1f0a5b9"
     }"#;
 
     let record: SpanRecord =

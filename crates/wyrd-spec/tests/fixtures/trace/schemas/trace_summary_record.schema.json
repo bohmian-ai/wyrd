@@ -23,11 +23,8 @@
     },
     "data_tenant_id": {
       "description": "Tenant partition key.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/DataTenantId"
-        }
-      ]
+      "type": "string",
+      "format": "uuid"
     },
     "duration_ms": {
       "description": "`(end_time - start_time).num_milliseconds() as u64`.\n\nConsistency is asserted by [`TraceSummaryRecord::validate`].",
@@ -124,12 +121,6 @@
   },
   "additionalProperties": false,
   "definitions": {
-    "DataTenantId": {
-      "type": "string",
-      "maxLength": 63,
-      "minLength": 1,
-      "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$"
-    },
     "InstrumentationScope": {
       "description": "OTel-canonical instrumentation scope.\n\nFields:\n\n- `name` -- instrumentation library name, such as `wyrd-tracing` or `opentelemetry-instrumentation-requests`. - `version` -- optional library version string. - `attributes` -- rare scope-level attributes.",
       "type": "object",

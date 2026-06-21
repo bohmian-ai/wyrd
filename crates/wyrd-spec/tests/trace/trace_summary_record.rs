@@ -1,6 +1,7 @@
 use chrono::{DateTime, Duration, TimeZone, Timelike, Utc};
 
-use wyrd_spec::vala::ids::{DataTenantId, SpanId, TraceId};
+use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::vala::trace::{
     InstrumentationScope, Resource, SpanKind, SpanStatus, TraceSummaryRecord,
 };
@@ -15,7 +16,7 @@ fn summary() -> TraceSummaryRecord {
     let end = start + Duration::milliseconds(2_500);
     TraceSummaryRecord {
         trace_id: TraceId::from_hex("0123456789abcdef0123456789abcdef").unwrap(),
-        data_tenant_id: DataTenantId::new("acme").unwrap(),
+        data_tenant_id: DataTenantId::new_v7(),
         bucket_time: floor_to_minute(start),
         start_time: start,
         end_time: end,

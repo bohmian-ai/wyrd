@@ -5,9 +5,7 @@
 //! [`crate::vala::eval::ids`].
 
 use std::str::FromStr;
-use std::sync::OnceLock;
 
-use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::WyrdError;
@@ -500,95 +498,6 @@ impl FromStr for SpanId {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::from_hex(s)
     }
-}
-
-/// Tenant partition key that is mandatory on every vala record.
-///
-/// Tenant ids must match `^[a-z0-9][a-z0-9_-]{0,62}$` and have length
-/// `1..=63`. Deserialization goes through [`DataTenantId::new`] so wire
-/// payloads cannot bypass validation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "server", schema(value_type = String))]
-#[serde(transparent)]
-pub struct DataTenantId(String);
-
-impl DataTenantId {
-    /// Constructs a validated tenant partition key.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] when the value is empty, longer than
-    /// 63 characters, or does not match the tenant-id grammar.
-    pub fn new(value: impl Into<String>) -> Result<Self, WyrdError> {
-        let value = value.into();
-        if value.is_empty() || value.len() > 63 {
-            return Err(WyrdError::Validation {
-                message: format!("data_tenant_id length must be 1..=63, got {}", value.len()),
-                details: serde_json::Value::Null,
-            });
-        }
-
-        if !data_tenant_id_regex().is_match(&value) {
-            return Err(WyrdError::Validation {
-                message: format!(
-                    "data_tenant_id {value:?} must match ^[a-z0-9][a-z0-9_-]{{0,62}}$"
-                ),
-                details: serde_json::Value::Null,
-            });
-        }
-
-        Ok(Self(value))
-    }
-
-    /// Borrows the validated tenant id as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl FromStr for DataTenantId {
-    type Err = WyrdError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::new(value)
-    }
-}
-
-impl<'de> Deserialize<'de> for DataTenantId {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
-    }
-}
-
-impl schemars::JsonSchema for DataTenantId {
-    fn schema_name() -> String {
-        "DataTenantId".to_string()
-    }
-
-    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, SchemaObject, SingleOrVec, StringValidation};
-
-        SchemaObject {
-            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-            string: Some(Box::new(StringValidation {
-                max_length: Some(63),
-                min_length: Some(1),
-                pattern: Some(r"^[a-z0-9][a-z0-9_-]{0,62}$".to_string()),
-            })),
-            ..Default::default()
-        }
-        .into()
-    }
-}
-
-fn data_tenant_id_regex() -> &'static Regex {
-    static DATA_TENANT_ID_REGEX: OnceLock<Regex> = OnceLock::new();
-    DATA_TENANT_ID_REGEX.get_or_init(|| match Regex::new(r"^[a-z0-9][a-z0-9_-]{0,62}$") {
-        Ok(regex) => regex,
-        Err(error) => panic!("data_tenant_id regex is static and valid: {error}"),
-    })
 }
 
 fn hex_nibble(byte: u8) -> Result<u8, WyrdError> {

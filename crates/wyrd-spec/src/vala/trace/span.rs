@@ -12,7 +12,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::WyrdError;
-use crate::vala::ids::{DataTenantId, SpanId, TraceId};
+use crate::ids::DataTenantId;
+use crate::vala::ids::{SpanId, TraceId};
 
 use super::{InstrumentationScope, Resource, SpanEvent, SpanLink};
 

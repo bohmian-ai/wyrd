@@ -16,7 +16,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::WyrdError;
-use crate::vala::ids::{DataTenantId, SpanId, TraceId};
+use crate::ids::DataTenantId;
+use crate::vala::ids::{SpanId, TraceId};
 use crate::vala::trace::{InstrumentationScope, Resource, SpanKind, SpanStatus};
 
 /// Per-trace rollup. One row per `(data_tenant_id, trace_id, bucket_time)`.

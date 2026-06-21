@@ -3,8 +3,9 @@
 //! Vala-wide ids live in [`crate::vala::ids`] and are re-exported here so
 //! existing `wyrd_spec::vala::eval::ids::*` imports continue to resolve.
 
+pub use crate::ids::DataTenantId;
 pub use crate::vala::ids::{
-    DataTenantId, EntityUid, LeaseToken, RecordId, RunId, SessionId, SpanId, TraceId, WorkflowUid,
+    EntityUid, LeaseToken, RecordId, RunId, SessionId, SpanId, TraceId, WorkflowUid,
 };
 
 use std::str::FromStr;

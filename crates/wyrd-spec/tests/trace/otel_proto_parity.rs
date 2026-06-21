@@ -4,7 +4,8 @@ use chrono::{Duration, TimeZone, Timelike, Utc};
 use schemars::schema_for;
 use serde_json::Value;
 
-use wyrd_spec::vala::ids::{DataTenantId, SpanId, TraceId};
+use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::vala::trace::{
     GenAiSpanRecord, InstrumentationScope, Resource, SpanKind, SpanRecord, SpanStatus,
     TraceSummaryRecord,
@@ -117,7 +118,7 @@ fn span_record_round_trips_otlp_shaped_json() {
                 "host.name": "worker-0"
             }
         },
-        "data_tenant_id": "acme"
+        "data_tenant_id": "018f5c7b-4d0e-7a4d-b8e1-c3d2e1f0a5b9"
     }"#;
 
     let record: SpanRecord =
@@ -186,7 +187,7 @@ fn span_record_minimal_otel_compliant_form_validates() {
             service_instance_id: None,
             attributes: serde_json::Map::new(),
         },
-        data_tenant_id: DataTenantId::new("acme").expect("tenant id is valid"),
+        data_tenant_id: DataTenantId::new_v7(),
     };
 
     record.validate().expect("minimal OTel span validates");
@@ -202,7 +203,7 @@ fn trace_summary_record_json_field_names_match_wire_spec() {
     let bucket_time = start.with_second(0).unwrap().with_nanosecond(0).unwrap();
     let record = TraceSummaryRecord {
         trace_id: TraceId::from_hex("0123456789abcdef0123456789abcdef").expect("valid trace id"),
-        data_tenant_id: DataTenantId::new("acme").expect("valid tenant id"),
+        data_tenant_id: DataTenantId::new_v7(),
         bucket_time,
         start_time: start,
         end_time: end,
@@ -261,7 +262,7 @@ fn gen_ai_span_record_json_field_names_match_wire_spec() {
         trace_id: TraceId::from_hex("0123456789abcdef0123456789abcdef").expect("valid trace id"),
         span_id: SpanId::from_hex("0123456789abcdef").expect("valid span id"),
         parent_span_id: None,
-        data_tenant_id: DataTenantId::new("acme").expect("valid tenant id"),
+        data_tenant_id: DataTenantId::new_v7(),
         start_time: start,
         end_time: end,
         duration_ms: 1_000,

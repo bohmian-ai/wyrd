@@ -61,11 +61,8 @@
     },
     "data_tenant_id": {
       "description": "Tenant partition key.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/DataTenantId"
-        }
-      ]
+      "type": "string",
+      "format": "uuid"
     },
     "duration_ms": {
       "description": "Query convenience field equal to `(end_time - start_time)` in milliseconds.",
@@ -443,12 +440,6 @@
   },
   "additionalProperties": false,
   "definitions": {
-    "DataTenantId": {
-      "type": "string",
-      "maxLength": 63,
-      "minLength": 1,
-      "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$"
-    },
     "GenAiEvalResult": {
       "description": "One evaluation result sourced from a `gen_ai.evaluation.result` event on the parent GenAI span.",
       "type": "object",

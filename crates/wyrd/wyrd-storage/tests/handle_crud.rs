@@ -66,6 +66,11 @@ async fn run_handle_crud(handle: &StorageHandle) {
 
     let listed = handle.list_objects(&path("crud")).await.expect("list crud");
     assert_eq!(listed.len(), 3, "expected 3 objects under prefix, got {listed:?}");
+    let a_key = path("crud/a.bin").full.clone();
+    assert!(
+        listed.contains(&a_key),
+        "listed paths must use full backend key format; got {listed:?}"
+    );
 
     handle
         .delete_object(&path("crud/a.bin"))
@@ -137,6 +142,7 @@ fn azure_emu_handle() -> StorageHandle {
     let config = BackendConfig::Azure(AzureConfig {
         account: "devstoreaccount1".to_owned(),
         container,
+        // Azurite path-style addressing requires the account name in the endpoint URL.
         endpoint_url: Some(format!("{base}/devstoreaccount1")),
     });
     StorageHandle::for_testing(signer, config).expect("azure emu handle")

@@ -28,42 +28,30 @@ pub async fn build_signer(backend: &BackendConfig) -> Result<BackendSigner, Stor
     }
 }
 
+fn finish_op<B: opendal::Builder>(
+    builder: B,
+    backend: StorageBackendKind,
+) -> Result<Operator, StorageError> {
+    Ok(Operator::new(builder)
+        .map_err(|e| StorageError::Backend {
+            backend,
+            op: "build_operator",
+            message: e.to_string(),
+        })?
+        .finish())
+}
+
 /// Build the opendal `Operator` for the selected backend.
 ///
 /// # Errors
 /// Returns a storage error when operator construction fails.
 pub fn build_operator(backend: &BackendConfig) -> Result<Operator, StorageError> {
-    let op = match backend {
-        BackendConfig::Local { root } => Operator::new(local::fs_service(root))
-            .map_err(|e| StorageError::Backend {
-                backend: StorageBackendKind::Local,
-                op: "build_operator",
-                message: e.to_string(),
-            })?
-            .finish(),
-        BackendConfig::S3(c) => Operator::new(s3::s3_service(c))
-            .map_err(|e| StorageError::Backend {
-                backend: StorageBackendKind::S3,
-                op: "build_operator",
-                message: e.to_string(),
-            })?
-            .finish(),
-        BackendConfig::Gcs(c) => Operator::new(gcs::gcs_service(c))
-            .map_err(|e| StorageError::Backend {
-                backend: StorageBackendKind::Gcs,
-                op: "build_operator",
-                message: e.to_string(),
-            })?
-            .finish(),
-        BackendConfig::Azure(c) => Operator::new(azure::azblob_service(c))
-            .map_err(|e| StorageError::Backend {
-                backend: StorageBackendKind::Azure,
-                op: "build_operator",
-                message: e.to_string(),
-            })?
-            .finish(),
-    };
-    Ok(op)
+    match backend {
+        BackendConfig::Local { root } => finish_op(local::fs_service(root), StorageBackendKind::Local),
+        BackendConfig::S3(c) => finish_op(s3::s3_service(c), StorageBackendKind::S3),
+        BackendConfig::Gcs(c) => finish_op(gcs::gcs_service(c), StorageBackendKind::Gcs),
+        BackendConfig::Azure(c) => finish_op(azure::azblob_service(c), StorageBackendKind::Azure),
+    }
 }
 
 #[cfg(test)]

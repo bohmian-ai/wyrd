@@ -10,3 +10,14 @@ pub fn bytes_sha256(bytes: &[u8]) -> String {
     hasher.update(bytes);
     base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_vector() {
+        // SHA-256("abc") base64-standard
+        assert_eq!(bytes_sha256(b"abc"), "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
+    }
+}

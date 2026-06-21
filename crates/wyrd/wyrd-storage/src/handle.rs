@@ -67,9 +67,10 @@ impl StorageHandle {
     ///
     /// # Panics
     ///
-    /// Panics if opendal operator construction fails for the synthesized local
-    /// config. All documented call sites pass a `Local` signer; fs-operator
-    /// construction is infallible.
+    /// Panics if opendal operator construction fails for the synthesized config.
+    /// Safe under opendal 0.57 because operator construction is lazy (no network
+    /// calls or credential loading at build time). Production paths must use
+    /// [`Self::from_settings`].
     #[must_use]
     pub fn new(signer: BackendSigner) -> Self {
         let backend_config = match &signer {
@@ -143,6 +144,7 @@ impl StorageHandle {
     /// # Panics
     ///
     /// Panics if operator construction fails for the synthesized config.
+    #[cfg(any(test, feature = "emulator"))]
     #[must_use]
     pub fn from_signer(signer: BackendSigner, multipart_threshold_bytes: u64) -> Self {
         Self {
@@ -296,6 +298,8 @@ impl StorageHandle {
     /// Returns [`StorageError::Backend`] when the backend list fails.
     #[tracing::instrument(skip(self), fields(backend = ?self.backend()))]
     pub async fn list_objects(&self, path: &ValidatedPath) -> Result<Vec<String>, StorageError> {
+        // Trailing slash scopes listing to objects strictly under this prefix;
+        // opendal list_with without it also matches the prefix key itself.
         let prefix = format!("{}/", path.full);
         let entries = self
             .operator

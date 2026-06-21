@@ -23,6 +23,7 @@ pub(crate) fn azblob_service(cfg: &AzureConfig) -> services::Azblob {
         .account_name(&cfg.account)
         .container(&cfg.container)
         .endpoint(&endpoint);
+    #[cfg(any(test, feature = "emulator"))]
     if let Ok(key) = std::env::var("AZURE_STORAGE_ACCOUNT_KEY") {
         b = b.account_key(&key);
     }
@@ -101,4 +102,26 @@ fn parse_azurite_endpoint(endpoint: &str) -> Result<(String, u16), ()> {
     let (host, port_str) = stripped.rsplit_once(':').ok_or(())?;
     let port: u16 = port_str.parse().map_err(|_| ())?;
     Ok((host.to_owned(), port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_azurite_endpoint;
+
+    #[test]
+    fn parses_default_endpoint() {
+        let (host, port) = parse_azurite_endpoint("http://127.0.0.1:10000").unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 10000);
+    }
+
+    #[test]
+    fn rejects_https() {
+        assert!(parse_azurite_endpoint("https://127.0.0.1:10000").is_err());
+    }
+
+    #[test]
+    fn rejects_missing_port() {
+        assert!(parse_azurite_endpoint("http://127.0.0.1").is_err());
+    }
 }

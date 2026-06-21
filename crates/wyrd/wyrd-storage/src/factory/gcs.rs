@@ -7,16 +7,23 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use gcloud_storage::client::{Client, ClientConfig};
 use opendal::services;
 
-pub(crate) fn gcs_service(cfg: &GcsConfig) -> services::Gcs {
-    let mut b = services::Gcs::default().bucket(&cfg.bucket);
-    let mut has_credential = false;
+fn credential_for_gcs() -> Option<String> {
     if let Ok(b64) = std::env::var("GOOGLE_ACCOUNT_JSON_BASE64") {
         // Pass the base64 string through verbatim — opendal calls from_base64 internally.
         // Do NOT decode here.
-        b = b.credential(&b64);
-        has_credential = true;
+        Some(b64)
     } else if let Ok(json) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS_JSON") {
-        b = b.credential(&STANDARD.encode(&json));
+        Some(STANDARD.encode(&json))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn gcs_service(cfg: &GcsConfig) -> services::Gcs {
+    let mut b = services::Gcs::default().bucket(&cfg.bucket);
+    let mut has_credential = false;
+    if let Some(cred) = credential_for_gcs() {
+        b = b.credential(&cred);
         has_credential = true;
     } else if let Ok(path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
         b = b.credential_path(&path);
@@ -102,12 +109,42 @@ async fn build_client_config() -> Result<ClientConfig, gcloud_auth::error::Error
         let credentials = CredentialsFile::new_from_str(json.as_str()).await?;
         return ClientConfig::default().with_credentials(credentials).await;
     }
-    if std::env::var("GOOGLE_APPLICATION_CREDENTIALS_JSON").is_ok()
-        || std::env::var("GOOGLE_APPLICATION_CREDENTIALS").is_ok()
-    {
+    if let Ok(json) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS_JSON") {
+        let credentials = CredentialsFile::new_from_str(&json).await?;
+        return ClientConfig::default().with_credentials(credentials).await;
+    }
+    if std::env::var("GOOGLE_APPLICATION_CREDENTIALS").is_ok() {
         let credentials = CredentialsFile::new().await?;
         return ClientConfig::default().with_credentials(credentials).await;
     }
 
     ClientConfig::default().with_auth().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn b64_env_passed_through_verbatim() {
+        let encoded = STANDARD.encode(b"{\"type\":\"service_account\"}");
+        let vars: Vec<(&str, Option<&str>)> = vec![
+            ("GOOGLE_ACCOUNT_JSON_BASE64", Some(&encoded)),
+            ("GOOGLE_APPLICATION_CREDENTIALS_JSON", None),
+        ];
+        let got = temp_env::with_vars(vars, credential_for_gcs);
+        assert_eq!(got.unwrap(), encoded);
+    }
+
+    #[test]
+    fn json_env_encoded_before_passing() {
+        let raw = r#"{"type":"service_account"}"#;
+        let expected = STANDARD.encode(raw);
+        let vars: Vec<(&str, Option<&str>)> = vec![
+            ("GOOGLE_ACCOUNT_JSON_BASE64", None),
+            ("GOOGLE_APPLICATION_CREDENTIALS_JSON", Some(raw)),
+        ];
+        let got = temp_env::with_vars(vars, credential_for_gcs);
+        assert_eq!(got.unwrap(), expected);
+    }
 }

@@ -11,17 +11,28 @@ use wyrd_spec::storage::StorageBackendKind;
 
 pub(crate) fn gcs_service(cfg: &GcsConfig) -> services::Gcs {
     let mut b = services::Gcs::default().bucket(&cfg.bucket);
+    let mut has_credential = false;
     if let Ok(b64) = std::env::var("GOOGLE_ACCOUNT_JSON_BASE64") {
         // Pass the base64 string through verbatim — opendal calls from_base64 internally.
         // object_store wanted decoded JSON; opendal wants the base64. Do NOT decode here.
         b = b.credential(&b64);
+        has_credential = true;
     } else if let Ok(json) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS_JSON") {
         b = b.credential(&STANDARD.encode(&json));
+        has_credential = true;
     } else if let Ok(path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
         b = b.credential_path(&path);
+        has_credential = true;
     }
     // else: opendal's default chain = full ADC (env SA path, gcloud well-known file,
     // GCE/GKE metadata server, Workload Identity, WIF external_account).
+    if let Some(endpoint) = &cfg.endpoint_url {
+        b = b.endpoint(endpoint);
+        // Anonymous GCS-compatible emulators (fake-gcs) reject signed requests.
+        if !has_credential {
+            b = b.skip_signature();
+        }
+    }
     b
 }
 

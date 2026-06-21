@@ -3,7 +3,8 @@
 use crate::error::StorageError;
 use crate::settings::{BackendConfig, StorageSettings};
 use crate::signer::BackendSigner;
-use opendal::{ErrorKind, Operator};
+use crate::tenant_path::ValidatedPath;
+use opendal::{EntryMode, ErrorKind, Operator};
 use std::sync::Arc;
 use std::time::Duration;
 use wyrd_spec::storage::StorageBackendKind;
@@ -83,14 +84,21 @@ impl StorageHandle {
             }),
             BackendSigner::Gcs(gcs) => BackendConfig::Gcs(crate::settings::GcsConfig {
                 bucket: gcs.bucket().to_owned(),
+                endpoint_url: None,
             }),
             BackendSigner::Azure(azure) => BackendConfig::Azure(crate::settings::AzureConfig {
                 account: azure.account().to_owned(),
                 container: azure.container().to_owned(),
+                endpoint_url: None,
             }),
         };
         let operator = crate::factory::build_operator(&backend_config)
             .expect("operator construction is infallible for the test/local-harness constructor");
+        Self::assemble(signer, operator, backend_config)
+    }
+
+    /// Assemble a handle from its substrate parts with default tuning.
+    fn assemble(signer: BackendSigner, operator: Operator, backend_config: BackendConfig) -> Self {
         Self {
             signer,
             operator,
@@ -101,6 +109,25 @@ impl StorageHandle {
             multipart_threshold_bytes: crate::plan::MULTIPART_THRESHOLD_BYTES,
             public_base_url: None,
         }
+    }
+
+    /// Build a handle from a signer and an explicit backend config, skipping the
+    /// boot health probe.
+    ///
+    /// The operator is built from `backend_config` so any custom endpoint (for
+    /// example a local emulator) is honored. Intended for tests and emulator
+    /// harnesses that need a working data-plane operator without ambient cloud
+    /// credentials. Production paths must use [`Self::from_settings`].
+    ///
+    /// # Errors
+    /// Returns a storage error when operator construction fails.
+    #[cfg(any(test, feature = "emulator"))]
+    pub fn for_testing(
+        signer: BackendSigner,
+        backend_config: BackendConfig,
+    ) -> Result<Self, StorageError> {
+        let operator = crate::factory::build_operator(&backend_config)?;
+        Ok(Self::assemble(signer, operator, backend_config))
     }
 
     /// Build a storage handle from a signer with an explicit multipart
@@ -222,6 +249,96 @@ impl StorageHandle {
                 Ok(_) => Ok(()),
                 Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(StorageHealthError::Backend(e)),
+            }
+        }
+    }
+
+    /// Read an object's bytes directly from the backend.
+    ///
+    /// Server-side data-plane access keyed by a tenant-validated path. For the
+    /// client byte-transfer path use the presign methods on [`Self::signer`].
+    ///
+    /// # Errors
+    /// Returns [`StorageError::ObjectNotFound`] when the object is absent, or
+    /// [`StorageError::Backend`] for any other backend failure.
+    #[tracing::instrument(skip(self), fields(backend = ?self.backend()))]
+    pub async fn get_object(&self, path: &ValidatedPath) -> Result<Vec<u8>, StorageError> {
+        let buf = self
+            .operator
+            .read(&path.full)
+            .await
+            .map_err(|e| self.map_operator_error(&e, "get_object", &path.full))?;
+        Ok(buf.to_vec())
+    }
+
+    /// Write an object's bytes directly to the backend.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Backend`] when the backend write fails.
+    #[tracing::instrument(skip(self, bytes), fields(backend = ?self.backend(), len = bytes.len()))]
+    pub async fn put_object(
+        &self,
+        path: &ValidatedPath,
+        bytes: Vec<u8>,
+    ) -> Result<(), StorageError> {
+        self.operator
+            .write(&path.full, bytes)
+            .await
+            .map_err(|e| self.map_operator_error(&e, "put_object", &path.full))?;
+        Ok(())
+    }
+
+    /// List object keys beneath a tenant-validated path.
+    ///
+    /// Returns the full backend keys of every file under `path` (recursive).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Backend`] when the backend list fails.
+    #[tracing::instrument(skip(self), fields(backend = ?self.backend()))]
+    pub async fn list_objects(&self, path: &ValidatedPath) -> Result<Vec<String>, StorageError> {
+        let prefix = format!("{}/", path.full);
+        let entries = self
+            .operator
+            .list_with(&prefix)
+            .recursive(true)
+            .await
+            .map_err(|e| self.map_operator_error(&e, "list_objects", &path.full))?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| entry.metadata().mode() == EntryMode::FILE)
+            .map(|entry| entry.path().to_owned())
+            .collect())
+    }
+
+    /// Delete an object directly from the backend.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Backend`] when the backend delete fails.
+    #[tracing::instrument(skip(self), fields(backend = ?self.backend()))]
+    pub async fn delete_object(&self, path: &ValidatedPath) -> Result<(), StorageError> {
+        self.operator
+            .delete(&path.full)
+            .await
+            .map_err(|e| self.map_operator_error(&e, "delete_object", &path.full))?;
+        Ok(())
+    }
+
+    /// Map an opendal data-plane error onto the storage error catalog.
+    fn map_operator_error(
+        &self,
+        error: &opendal::Error,
+        op: &'static str,
+        storage_path: &str,
+    ) -> StorageError {
+        if error.kind() == ErrorKind::NotFound {
+            StorageError::ObjectNotFound {
+                storage_path: storage_path.to_owned(),
+            }
+        } else {
+            StorageError::Backend {
+                backend: self.signer.kind(),
+                op,
+                message: error.to_string(),
             }
         }
     }

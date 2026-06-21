@@ -83,6 +83,8 @@ pub struct S3Config {
 pub struct GcsConfig {
     /// Bucket name without a `gs://` prefix.
     pub bucket: String,
+    /// Optional endpoint URL for GCS-compatible backends or emulators.
+    pub endpoint_url: Option<String>,
 }
 
 /// Azure storage settings.
@@ -92,6 +94,8 @@ pub struct AzureConfig {
     pub account: String,
     /// Blob container name.
     pub container: String,
+    /// Optional endpoint URL for Azure-compatible backends or emulators.
+    pub endpoint_url: Option<String>,
 }
 
 /// Parse process environment into typed storage settings.
@@ -114,10 +118,12 @@ pub fn from_env() -> Result<StorageSettings, StorageError> {
         }),
         "gcs" => BackendConfig::Gcs(GcsConfig {
             bucket: env_required("WYRD_STORAGE_GCS_BUCKET")?,
+            endpoint_url: env_optional("WYRD_STORAGE_GCS_ENDPOINT_URL")?,
         }),
         "azure" => BackendConfig::Azure(AzureConfig {
             account: env_required("WYRD_STORAGE_AZURE_ACCOUNT")?,
             container: env_required("WYRD_STORAGE_AZURE_CONTAINER")?,
+            endpoint_url: env_optional("WYRD_STORAGE_AZURE_ENDPOINT_URL")?,
         }),
         other => {
             return config_err(

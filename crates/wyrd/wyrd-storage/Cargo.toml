@@ -59,5 +59,9 @@ required-features = ["emulator"]
 name = "integration_azurite"
 required-features = ["emulator"]
 
+[[test]]
+name = "handle_crud"
+required-features = ["emulator"]
+
 [lints]
 workspace = true

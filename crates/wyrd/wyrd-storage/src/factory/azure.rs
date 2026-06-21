@@ -15,7 +15,10 @@ use opendal::services;
 use wyrd_spec::storage::StorageBackendKind;
 
 pub(crate) fn azblob_service(cfg: &AzureConfig) -> services::Azblob {
-    let endpoint = format!("https://{}.blob.core.windows.net", cfg.account);
+    let endpoint = cfg
+        .endpoint_url
+        .clone()
+        .unwrap_or_else(|| format!("https://{}.blob.core.windows.net", cfg.account));
     let mut b = services::Azblob::default()
         .account_name(&cfg.account)
         .container(&cfg.container)

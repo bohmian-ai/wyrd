@@ -720,6 +720,7 @@ fn gcs_emu_handle() -> Arc<StorageHandle> {
 fn gcs_cloud_settings() -> StorageSettings {
     cloud_settings(BackendConfig::Gcs(GcsConfig {
         bucket: env_required("WYRD_STORAGE_GCS_BUCKET"),
+        endpoint_url: None,
     }))
 }
 
@@ -736,6 +737,7 @@ fn azure_cloud_settings() -> StorageSettings {
     cloud_settings(BackendConfig::Azure(AzureConfig {
         account: env_required("WYRD_STORAGE_AZURE_ACCOUNT"),
         container: env_required("WYRD_STORAGE_AZURE_CONTAINER"),
+        endpoint_url: None,
     }))
 }
 

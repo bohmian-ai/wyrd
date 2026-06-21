@@ -322,29 +322,29 @@ env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw
 run = "cargo test --locked -p wyrd-sql --features test-e2e --test cards_e2e -- --include-ignored"
 
 [tasks."test:storage:s3:cloud"]
-description = "Run the operator CRUD + server multipart e2e against real AWS S3 (merge-to-main only; requires AWS creds + WYRD_STORAGE_S3_BUCKET in env)"
+description = "Run the StorageHandle CRUD + server multipart e2e against real AWS S3 (merge-to-main only; requires AWS creds + WYRD_STORAGE_S3_BUCKET in env)"
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
 env = { WYRD_STORAGE_CLOUD_S3 = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
-cargo test -p wyrd-storage --all-features --test operator_crud s3_cloud_operator_crud -- --nocapture
+cargo test -p wyrd-storage --all-features --test handle_crud s3_cloud_handle_crud -- --nocapture
 cargo test -p wyrd-server --all-features --test storage_e2e s3_multipart_e2e_cloud -- --nocapture
 """
 
 [tasks."test:storage:gcs:cloud"]
-description = "Run the operator CRUD + server multipart e2e against real GCS (merge-to-main only; requires GCP creds + WYRD_STORAGE_GCS_BUCKET in env)"
+description = "Run the StorageHandle CRUD + server multipart e2e against real GCS (merge-to-main only; requires GCP creds + WYRD_STORAGE_GCS_BUCKET in env)"
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
 env = { WYRD_STORAGE_CLOUD_GCS = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
-cargo test -p wyrd-storage --all-features --test operator_crud gcs_cloud_operator_crud -- --nocapture
+cargo test -p wyrd-storage --all-features --test handle_crud gcs_cloud_handle_crud -- --nocapture
 cargo test -p wyrd-server --all-features --test storage_e2e gcs_multipart_e2e_cloud -- --nocapture
 """
 
 [tasks."test:storage:azure:cloud"]
-description = "Run the operator CRUD + server multipart e2e against real Azure Blob Storage (merge-to-main only; requires Azure creds + WYRD_STORAGE_AZURE_{ACCOUNT,CONTAINER} in env)"
+description = "Run the StorageHandle CRUD + server multipart e2e against real Azure Blob Storage (merge-to-main only; requires Azure creds + WYRD_STORAGE_AZURE_{ACCOUNT,CONTAINER} in env)"
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
 env = { WYRD_STORAGE_CLOUD_AZURE = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
-cargo test -p wyrd-storage --all-features --test operator_crud azure_cloud_operator_crud -- --nocapture
+cargo test -p wyrd-storage --all-features --test handle_crud azure_cloud_handle_crud -- --nocapture
 cargo test -p wyrd-server --all-features --test storage_e2e azure_multipart_e2e_cloud -- --nocapture
 """
 
@@ -354,33 +354,33 @@ depends = ["test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azur
 
 [tasks."test:storage:matrix"]
 description = "Run all storage emulator integration tests (signer-tier + operator data-plane + server e2e); requires storage:up"
-depends = ["test:storage:local", "test:storage:gcs-emu", "test:storage:rustfs", "test:storage:azurite", "test:storage:operator:local", "test:storage:operator:emulators", "test:storage:e2e"]
+depends = ["test:storage:local", "test:storage:gcs-emu", "test:storage:rustfs", "test:storage:azurite", "test:storage:handle:local", "test:storage:handle:emulators", "test:storage:e2e"]
 
-[tasks."test:storage:operator:local"]
-description = "Run opendal operator CRUD tests for the local filesystem backend (no emulator needed)"
-run = "cargo test -p wyrd-storage --all-features --test operator_crud local_operator_crud -- --nocapture"
+[tasks."test:storage:handle:local"]
+description = "Run StorageHandle CRUD tests for the local filesystem backend (no emulator needed)"
+run = "cargo test -p wyrd-storage --all-features --test handle_crud local_handle_crud -- --nocapture"
 
-[tasks."test:storage:operator:s3-emu"]
-description = "Run opendal operator CRUD tests against the RustFS S3 emulator; requires storage:up"
+[tasks."test:storage:handle:s3-emu"]
+description = "Run StorageHandle CRUD tests against the RustFS S3 emulator; requires storage:up"
 depends = ["storage:up"]
-env = { WYRD_STORAGE_INTEGRATION_S3 = "1" }
-run = "cargo test -p wyrd-storage --all-features --test operator_crud s3_emu_operator_crud -- --nocapture"
+env = { WYRD_STORAGE_INTEGRATION_S3 = "1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1" }
+run = "cargo test -p wyrd-storage --all-features --test handle_crud s3_emu_handle_crud -- --nocapture"
 
-[tasks."test:storage:operator:gcs-emu"]
-description = "Run opendal operator CRUD tests against the fake-gcs emulator; requires storage:up"
+[tasks."test:storage:handle:gcs-emu"]
+description = "Run StorageHandle CRUD tests against the fake-gcs emulator; requires storage:up"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_GCS_EMULATOR_HOST = "http://localhost:4443" }
-run = "cargo test -p wyrd-storage --all-features --test operator_crud gcs_emu_operator_crud -- --nocapture"
+run = "cargo test -p wyrd-storage --all-features --test handle_crud gcs_emu_handle_crud -- --nocapture"
 
-[tasks."test:storage:operator:azure-emu"]
-description = "Run opendal operator CRUD tests against the Azurite emulator; requires storage:up"
+[tasks."test:storage:handle:azure-emu"]
+description = "Run StorageHandle CRUD tests against the Azurite emulator; requires storage:up"
 depends = ["storage:up"]
-env = { WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_AZURE_EMULATOR_ENDPOINT = "http://127.0.0.1:10000" }
-run = "cargo test -p wyrd-storage --all-features --test operator_crud azure_emu_operator_crud -- --nocapture"
+env = { WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_AZURE_EMULATOR_ENDPOINT = "http://127.0.0.1:10000", AZURE_STORAGE_ACCOUNT_KEY = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" }
+run = "cargo test -p wyrd-storage --all-features --test handle_crud azure_emu_handle_crud -- --nocapture"
 
-[tasks."test:storage:operator:emulators"]
-description = "Run all opendal operator CRUD tests against cloud emulators; requires storage:up"
-depends = ["test:storage:operator:s3-emu", "test:storage:operator:gcs-emu", "test:storage:operator:azure-emu"]
+[tasks."test:storage:handle:emulators"]
+description = "Run all StorageHandle CRUD tests against cloud emulators; requires storage:up"
+depends = ["test:storage:handle:s3-emu", "test:storage:handle:gcs-emu", "test:storage:handle:azure-emu"]
 
 [tasks."check:storage:drift"]
 description = "Assert storage foundation guardrails against paths that exist in this workspace"

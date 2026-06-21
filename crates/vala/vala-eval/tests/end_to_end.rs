@@ -70,7 +70,8 @@ use wyrd_spec::vala::eval::{
     EvalPassGate, EvalSpec, EvalTask, JsonPath, LlmJudgeTask, RecordId, RunId, ScenarioId, TaskId,
     TraceAssertionTask,
 };
-use wyrd_spec::vala::ids::{DataTenantId, SpanId, TraceId};
+use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::vala::trace::{InstrumentationScope, Resource, SpanKind, SpanRecord, SpanStatus};
 
 // ---- helpers ---------------------------------------------------------------
@@ -152,7 +153,7 @@ fn agent_span() -> SpanRecord {
             service_instance_id: None,
             attributes: serde_json::Map::new(),
         },
-        data_tenant_id: DataTenantId::new("tenant-a").expect("static tenant is valid"),
+        data_tenant_id: DataTenantId::new_v7(),
     }
 }
 

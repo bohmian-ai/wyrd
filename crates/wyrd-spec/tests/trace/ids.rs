@@ -1,4 +1,4 @@
-use wyrd_spec::vala::ids::{DataTenantId, EntityUid, SpanId, TraceId};
+use wyrd_spec::vala::ids::{EntityUid, SpanId, TraceId};
 
 #[test]
 fn trace_id_from_hex_accepts_canonical() {
@@ -168,66 +168,6 @@ fn span_id_deserialize_byte_array_rejects_all_zero() {
 }
 
 #[test]
-fn data_tenant_id_accepts_simple() {
-    let id = DataTenantId::new("acme").expect("valid tenant id");
-    assert_eq!(id.as_str(), "acme");
-}
-
-#[test]
-fn data_tenant_id_accepts_digits_underscores_hyphens() {
-    DataTenantId::new("acme_42").expect("underscore is valid");
-    DataTenantId::new("acme-prod").expect("hyphen is valid");
-    DataTenantId::new("0day").expect("digit may lead");
-}
-
-#[test]
-fn data_tenant_id_rejects_empty() {
-    assert!(DataTenantId::new("").is_err());
-}
-
-#[test]
-fn data_tenant_id_rejects_uppercase() {
-    assert!(DataTenantId::new("Acme").is_err());
-}
-
-#[test]
-fn data_tenant_id_rejects_leading_hyphen() {
-    assert!(DataTenantId::new("-acme").is_err());
-}
-
-#[test]
-fn data_tenant_id_rejects_leading_underscore() {
-    assert!(DataTenantId::new("_acme").is_err());
-}
-
-#[test]
-fn data_tenant_id_rejects_overlong() {
-    let long = "a".repeat(64);
-    assert!(DataTenantId::new(long).is_err());
-}
-
-#[test]
-fn data_tenant_id_accepts_max_length() {
-    let max = "a".repeat(63);
-    DataTenantId::new(max).expect("max length is valid");
-}
-
-#[test]
-fn data_tenant_id_serde_transparent() {
-    let id = DataTenantId::new("acme").expect("valid tenant id");
-    let json = serde_json::to_string(&id).expect("tenant id serializes");
-    assert_eq!(json, "\"acme\"");
-    let back: DataTenantId = serde_json::from_str(&json).expect("tenant id deserializes");
-    assert_eq!(id, back);
-}
-
-#[test]
-fn data_tenant_id_deserialize_rejects_uppercase() {
-    let result: Result<DataTenantId, _> = serde_json::from_str("\"Acme\"");
-    assert!(result.is_err());
-}
-
-#[test]
 fn vala_eval_ids_traceid_resolves_to_vala_ids_traceid() {
     let a: wyrd_spec::vala::eval::ids::TraceId =
         TraceId::from_hex("0123456789abcdef0123456789abcdef").expect("valid trace id");
@@ -283,18 +223,6 @@ fn span_id_from_str_parses_valid_hex() {
 #[test]
 fn span_id_from_str_rejects_invalid() {
     let result = "not-a-span-id".parse::<SpanId>();
-    assert!(result.is_err());
-}
-
-#[test]
-fn data_tenant_id_from_str_parses_valid_id() {
-    let id: DataTenantId = "acme-prod".parse().expect("valid tenant id");
-    assert_eq!(id.as_str(), "acme-prod");
-}
-
-#[test]
-fn data_tenant_id_from_str_rejects_invalid_id() {
-    let result = "Acme".parse::<DataTenantId>();
     assert!(result.is_err());
 }
 

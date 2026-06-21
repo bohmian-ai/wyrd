@@ -8,7 +8,7 @@
   ],
   "properties": {
     "context_capture": {
-      "description": "How `vala-eval` captures extracted values in [`AssertionResult::actual`].\n\nSet to [`EvalContextCapture::Redact`] when this eval runs over production traffic where context fields may contain PII. Absent means [`EvalContextCapture::Full`].",
+      "description": "How `vala-eval` captures extracted values in [`super::AssertionResult::actual`].\n\nSet to [`EvalContextCapture::Redact`] when this eval runs over production traffic where context fields may contain PII. Absent means [`EvalContextCapture::Full`].",
       "anyOf": [
         {
           "$ref": "#/definitions/EvalContextCapture"

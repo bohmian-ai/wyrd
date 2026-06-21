@@ -355,21 +355,27 @@ mod tests {
     use tempfile::TempDir;
 
     fn local_handle(root: &std::path::Path) -> StorageHandle {
-        let signer = BackendSigner::Local(LocalSigner::new(root.to_path_buf()).unwrap());
+        let signer =
+            BackendSigner::Local(LocalSigner::new(root.to_path_buf()).expect("local signer"));
         StorageHandle::new(signer)
     }
 
     #[test]
     fn from_signer_builds_cloud_handles_without_probing() {
-        let gcs = crate::factory::gcs::build_emulator_signer("wyrd-storage-test", "http://localhost:4443")
-            .expect("gcs emulator signer");
+        let gcs = crate::factory::gcs::build_emulator_signer(
+            "wyrd-storage-test",
+            "http://localhost:4443",
+        )
+        .expect("gcs emulator signer");
         let handle = StorageHandle::from_signer(BackendSigner::Gcs(gcs), 8 * 1024 * 1024);
         assert_eq!(handle.backend(), StorageBackendKind::Gcs);
         assert_eq!(handle.multipart_threshold_bytes(), 8 * 1024 * 1024);
 
-        let azure =
-            crate::factory::azure::build_emulator_signer("wyrd-storage-test", "http://127.0.0.1:10000")
-                .expect("azure emulator signer");
+        let azure = crate::factory::azure::build_emulator_signer(
+            "wyrd-storage-test",
+            "http://127.0.0.1:10000",
+        )
+        .expect("azure emulator signer");
         let handle = StorageHandle::from_signer(BackendSigner::Azure(azure), 8 * 1024 * 1024);
         assert_eq!(handle.backend(), StorageBackendKind::Azure);
         assert_eq!(handle.multipart_threshold_bytes(), 8 * 1024 * 1024);
@@ -377,17 +383,17 @@ mod tests {
 
     #[tokio::test]
     async fn health_probe_local_root_exists() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("tempdir");
         let handle = local_handle(dir.path());
         assert!(handle.health_probe().await.is_ok());
     }
 
     #[tokio::test]
     async fn health_probe_local_missing_root() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("tempdir");
         let handle = local_handle(dir.path());
         // Remove the directory after creating the handle to simulate inaccessible root.
-        std::fs::remove_dir_all(dir.path()).unwrap();
+        std::fs::remove_dir_all(dir.path()).expect("remove tempdir");
         let result = handle.health_probe().await;
         assert!(
             matches!(result, Err(StorageHealthError::LocalRoot(_))),

@@ -110,7 +110,8 @@ mod tests {
 
     #[test]
     fn parses_default_endpoint() {
-        let (host, port) = parse_azurite_endpoint("http://127.0.0.1:10000").unwrap();
+        let (host, port) =
+            parse_azurite_endpoint("http://127.0.0.1:10000").expect("valid azurite endpoint");
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 10000);
     }

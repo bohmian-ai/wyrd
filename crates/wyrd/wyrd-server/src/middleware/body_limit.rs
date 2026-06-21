@@ -118,7 +118,7 @@ where
                 }
                 Err(error) => {
                     tracing::debug!(
-                        error = %error,
+                        error = ?error,
                         "failed to read request body (stream/io error)"
                     );
                     let error = WyrdError::ServiceUnavailable {

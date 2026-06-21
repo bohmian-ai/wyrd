@@ -913,6 +913,45 @@ query, HTTP query) are different drivers behind one read trait; the Card schema
 never declares strategy — `vala` chooses it from the bucket and vendor, the same
 way it chooses the Drift/Eval evaluation strategy.
 
+### Bifrost — vala's internal OLAP substrate
+
+`Source` is the external read side ("Wyrd reads, never writes" — Doctrine #7).
+**Bifrost** is its internal counterpart: the analytical storage substrate `vala`
+uses to record Wyrd's **own** observations (drift events, eval records, OTel /
+GenAI traces, and any future internal analytical table). It is server-internal
+`vala` state, not an external system and not a vendor.
+
+**Bifrost is not a Card kind, and there is no `WarehouseCard`.** It is the
+general-case storage *shape*, not a registry entry. Per Doctrine #2 (one fact,
+one owning Kind) and Doctrine #7, internal observation storage is owned wholly by
+`vala`; nothing an author writes points at it, so it has no card identity. The
+external read-shape buckets above (`object_store`, `sql_warehouse`, …) describe
+data Wyrd *reads*; `sql_warehouse` is an external `SourceKind` and is unrelated
+to Bifrost. Do not introduce a `warehouse` noun on any internal surface — it
+would collide with the external `sql_warehouse` Source semantics.
+
+**Everything is a Bifrost table.** One table shape underlies every internal
+analytical table, with four reserved system columns: `wyrd_event_time`,
+`wyrd_ingested_at`, `wyrd_batch_id`, and `data_tenant_id`. Each table carries a
+`scope`:
+
+- **TenantOwned** — one physical table per tenant; isolation is structural
+  (per-tenant Iceberg namespace / path). No `data_tenant_id` column.
+- **SystemShared** — one physical table shared across tenants (used for
+  high-tenant-count, low-per-tenant-volume data where one table per tenant would
+  fragment into millions of small files); rows carry `data_tenant_id` and tenant
+  isolation is enforced on read from the authenticated principal's tenant.
+
+The substrate is Apache Iceberg-managed Parquet in object storage, with Postgres
+as the Iceberg catalog and control plane and DataFusion as the query engine —
+consistent with Doctrine #4 (Postgres is control-plane only; analytical data
+lives in object store). Implementation lives in the `vala-bifrost` engine crate.
+
+**Public surface.** Bifrost is internal vocabulary, but two surfaces are public
+and stable: the `WYRD_VALA_*_BIFROST_*` error catalog (crossing HTTP / MCP /
+Python) and the single `wyrd.bifrost` Python SDK submodule. There is no
+`wyrd.warehouse` submodule (it would collide with `sql_warehouse`).
+
 ### Trigger
 Fires an Operator. A Trigger declares when (`schedule`), what to evaluate
 (`source`, optional), and what to fire (`operator_ref`). On each schedule

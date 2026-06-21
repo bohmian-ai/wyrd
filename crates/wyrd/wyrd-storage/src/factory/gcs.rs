@@ -3,7 +3,7 @@
 use crate::error::StorageError;
 use crate::gcs::GcsSigner;
 use crate::settings::GcsConfig;
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use gcloud_storage::client::{Client, ClientConfig};
 use opendal::services;
 
@@ -133,7 +133,7 @@ mod tests {
             ("GOOGLE_APPLICATION_CREDENTIALS_JSON", None),
         ];
         let got = temp_env::with_vars(vars, credential_for_gcs);
-        assert_eq!(got.unwrap(), encoded);
+        assert_eq!(got.expect("b64 var should produce Some"), encoded);
     }
 
     #[test]
@@ -145,6 +145,6 @@ mod tests {
             ("GOOGLE_APPLICATION_CREDENTIALS_JSON", Some(raw)),
         ];
         let got = temp_env::with_vars(vars, credential_for_gcs);
-        assert_eq!(got.unwrap(), expected);
+        assert_eq!(got.expect("json var should produce Some"), expected);
     }
 }

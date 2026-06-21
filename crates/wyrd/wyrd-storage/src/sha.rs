@@ -18,6 +18,9 @@ mod tests {
     #[test]
     fn known_vector() {
         // SHA-256("abc") base64-standard
-        assert_eq!(bytes_sha256(b"abc"), "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
+        assert_eq!(
+            bytes_sha256(b"abc"),
+            "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0="
+        );
     }
 }

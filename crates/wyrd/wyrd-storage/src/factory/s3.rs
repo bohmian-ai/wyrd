@@ -75,8 +75,7 @@ pub fn build_emulator_signer(bucket: &str, endpoint: &str) -> Result<S3Signer, S
         std::env::var("WYRD_S3_EMULATOR_ACCESS_KEY").unwrap_or_else(|_| "wyrd-test-key".to_owned());
     let secret = std::env::var("WYRD_S3_EMULATOR_SECRET_KEY")
         .unwrap_or_else(|_| "wyrd-test-secret".to_owned());
-    let region =
-        std::env::var("WYRD_STORAGE_S3_REGION").unwrap_or_else(|_| "us-east-1".to_owned());
+    let region = std::env::var("WYRD_STORAGE_S3_REGION").unwrap_or_else(|_| "us-east-1".to_owned());
     let conf = Builder::default()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new(region))

@@ -47,7 +47,9 @@ fn finish_op<B: opendal::Builder>(
 /// Returns a storage error when operator construction fails.
 pub fn build_operator(backend: &BackendConfig) -> Result<Operator, StorageError> {
     match backend {
-        BackendConfig::Local { root } => finish_op(local::fs_service(root), StorageBackendKind::Local),
+        BackendConfig::Local { root } => {
+            finish_op(local::fs_service(root), StorageBackendKind::Local)
+        }
         BackendConfig::S3(c) => finish_op(s3::s3_service(c), StorageBackendKind::S3),
         BackendConfig::Gcs(c) => finish_op(gcs::gcs_service(c), StorageBackendKind::Gcs),
         BackendConfig::Azure(c) => finish_op(azure::azblob_service(c), StorageBackendKind::Azure),

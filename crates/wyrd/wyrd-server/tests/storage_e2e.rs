@@ -492,7 +492,9 @@ fn env_required(var: &str) -> String {
 }
 
 fn patterned_payload(len: usize) -> Vec<u8> {
-    (0..len).map(|i| u8::try_from(i % 251).expect("mod 251 fits u8")).collect()
+    (0..len)
+        .map(|i| u8::try_from(i % 251).expect("mod 251 fits u8"))
+        .collect()
 }
 
 fn split_chunks(content: &[u8], chunk: u64) -> Vec<Vec<u8>> {
@@ -509,7 +511,12 @@ enum DownloadVia {
     GcsEmulatorMedia,
 }
 
-async fn post_json(srv: &WyrdTestServer, token: &str, uri: &str, body: Vec<u8>) -> axum::response::Response {
+async fn post_json(
+    srv: &WyrdTestServer,
+    token: &str,
+    uri: &str,
+    body: Vec<u8>,
+) -> axum::response::Response {
     srv.oneshot_authenticated(token, request("POST", uri, body, Some("application/json")))
         .await
         .expect("router responds")
@@ -532,12 +539,23 @@ async fn upload_init(
     })
     .expect("init body serializes");
     let response = post_json(srv, token, "/v1/cards/upload/init", body).await;
-    assert_eq!(response.status(), StatusCode::OK, "upload/init must succeed");
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("init body");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "upload/init must succeed"
+    );
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("init body");
     serde_json::from_slice(&bytes).expect("init response deserializes")
 }
 
-async fn server_part_url(srv: &WyrdTestServer, token: &str, upload_id: &str, part_number: u32) -> String {
+async fn server_part_url(
+    srv: &WyrdTestServer,
+    token: &str,
+    upload_id: &str,
+    part_number: u32,
+) -> String {
     let response = post_json(
         srv,
         token,
@@ -545,9 +563,16 @@ async fn server_part_url(srv: &WyrdTestServer, token: &str, upload_id: &str, par
         Vec::new(),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::OK, "part-url for part {part_number} must succeed");
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("part-url body");
-    let parsed: PartUrlResponse = serde_json::from_slice(&bytes).expect("PartUrlResponse deserializes");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "part-url for part {part_number} must succeed"
+    );
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("part-url body");
+    let parsed: PartUrlResponse =
+        serde_json::from_slice(&bytes).expect("PartUrlResponse deserializes");
     parsed.url
 }
 
@@ -562,9 +587,17 @@ async fn drive_upload(
     content: &[u8],
 ) -> UploadCompleteRequest {
     match plan {
-        UploadPlan::S3Multipart { part_count, part_size_bytes, .. } => {
+        UploadPlan::S3Multipart {
+            part_count,
+            part_size_bytes,
+            ..
+        } => {
             let parts = split_chunks(content, *part_size_bytes);
-            assert_eq!(parts.len(), *part_count as usize, "client splits into the planned part count");
+            assert_eq!(
+                parts.len(),
+                *part_count as usize,
+                "client splits into the planned part count"
+            );
             let mut urls = Vec::with_capacity(parts.len());
             for part_number in 1..=*part_count {
                 urls.push(server_part_url(srv, token, upload_id, part_number).await);
@@ -582,25 +615,55 @@ async fn drive_upload(
                 .expect("s3 multipart upload");
             UploadCompleteRequest::S3Multipart(S3MultipartComplete { parts: completed })
         }
-        UploadPlan::GcsResumable { chunk_size_bytes, .. } => {
+        UploadPlan::GcsResumable {
+            chunk_size_bytes, ..
+        } => {
             let chunks = split_chunks(content, *chunk_size_bytes);
-            mp.gcs_resumable(plan, chunks).await.expect("gcs resumable upload");
+            mp.gcs_resumable(plan, chunks)
+                .await
+                .expect("gcs resumable upload");
             UploadCompleteRequest::GcsResumable(GcsResumableComplete {})
         }
-        UploadPlan::AzureBlockBlob { block_size_bytes, block_count_planned, .. } => {
+        UploadPlan::AzureBlockBlob {
+            block_size_bytes,
+            block_count_planned,
+            ..
+        } => {
             let blocks = split_chunks(content, *block_size_bytes);
-            assert_eq!(blocks.len(), *block_count_planned as usize, "client stages the planned block count");
-            let block_count = mp.azure_block_blob(plan, blocks).await.expect("azure block stage");
+            assert_eq!(
+                blocks.len(),
+                *block_count_planned as usize,
+                "client stages the planned block count"
+            );
+            let block_count = mp
+                .azure_block_blob(plan, blocks)
+                .await
+                .expect("azure block stage");
             UploadCompleteRequest::AzureBlockBlob(AzureBlockBlobComplete { block_count })
         }
         other => panic!("expected a multipart plan for a cloud backend, got: {other:?}"),
     }
 }
 
-async fn upload_complete(srv: &WyrdTestServer, token: &str, upload_id: &str, body: &UploadCompleteRequest) {
+async fn upload_complete(
+    srv: &WyrdTestServer,
+    token: &str,
+    upload_id: &str,
+    body: &UploadCompleteRequest,
+) {
     let bytes = serde_json::to_vec(body).expect("complete body serializes");
-    let response = post_json(srv, token, &format!("/v1/cards/upload/{upload_id}/complete"), bytes).await;
-    assert_eq!(response.status(), StatusCode::OK, "upload/complete must succeed");
+    let response = post_json(
+        srv,
+        token,
+        &format!("/v1/cards/upload/{upload_id}/complete"),
+        bytes,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "upload/complete must succeed"
+    );
 }
 
 async fn server_download_init(
@@ -616,8 +679,14 @@ async fn server_download_init(
     })
     .expect("download init body serializes");
     let response = post_json(srv, token, "/v1/cards/download/init", body).await;
-    assert_eq!(response.status(), StatusCode::OK, "download/init must succeed");
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("download init body");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "download/init must succeed"
+    );
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("download init body");
     serde_json::from_slice(&bytes).expect("download init response deserializes")
 }
 
@@ -636,7 +705,15 @@ async fn run_multipart_e2e(srv: WyrdTestServer, relative_path: &str, download: D
     let card_uid = CardUid::new(FIXED_CARD_UID).expect("card uid");
     let mp = MultipartClient::new();
 
-    let init = upload_init(&srv, &token, &card_uid, relative_path, &sha256, content.len() as u64).await;
+    let init = upload_init(
+        &srv,
+        &token,
+        &card_uid,
+        relative_path,
+        &sha256,
+        content.len() as u64,
+    )
+    .await;
     let upload_id = init.upload_id.to_string();
 
     let complete = drive_upload(&srv, &token, &mp, &init.plan, &upload_id, &content).await;
@@ -646,8 +723,14 @@ async fn run_multipart_e2e(srv: WyrdTestServer, relative_path: &str, download: D
         DownloadVia::ServerPresign => {
             let dl = server_download_init(&srv, &token, &card_uid, relative_path).await;
             assert_eq!(dl.sha256, sha256, "download/init sha256 must match upload");
-            assert_eq!(dl.size_bytes, content.len() as u64, "download/init size must match upload");
-            mp.download(&dl.plan.get_url).await.expect("download via presigned url")
+            assert_eq!(
+                dl.size_bytes,
+                content.len() as u64,
+                "download/init size must match upload"
+            );
+            mp.download(&dl.plan.get_url)
+                .await
+                .expect("download via presigned url")
         }
         DownloadVia::GcsEmulatorMedia => mp
             .download(&gcs_emulator_media_url(&init.storage_path))
@@ -655,8 +738,15 @@ async fn run_multipart_e2e(srv: WyrdTestServer, relative_path: &str, download: D
             .expect("download via gcs emulator media url"),
     };
 
-    assert_eq!(downloaded.len(), content.len(), "downloaded length must match");
-    assert_eq!(downloaded, content, "byte-equality across multipart round-trip");
+    assert_eq!(
+        downloaded.len(),
+        content.len(),
+        "downloaded length must match"
+    );
+    assert_eq!(
+        downloaded, content,
+        "byte-equality across multipart round-trip"
+    );
 
     srv.shutdown().await.expect("shutdown");
 }
@@ -714,7 +804,10 @@ fn gcs_emu_handle() -> Arc<StorageHandle> {
         &env_or("WYRD_GCS_EMULATOR_HOST", "http://localhost:4443"),
     )
     .expect("gcs emulator signer");
-    Arc::new(StorageHandle::from_signer(BackendSigner::Gcs(signer), LOW_THRESHOLD_BYTES))
+    Arc::new(StorageHandle::from_signer(
+        BackendSigner::Gcs(signer),
+        LOW_THRESHOLD_BYTES,
+    ))
 }
 
 fn gcs_cloud_settings() -> StorageSettings {
@@ -730,7 +823,10 @@ fn azure_emu_handle() -> Arc<StorageHandle> {
         &env_or("WYRD_AZURE_EMULATOR_ENDPOINT", "http://127.0.0.1:10000"),
     )
     .expect("azure emulator signer");
-    Arc::new(StorageHandle::from_signer(BackendSigner::Azure(signer), LOW_THRESHOLD_BYTES))
+    Arc::new(StorageHandle::from_signer(
+        BackendSigner::Azure(signer),
+        LOW_THRESHOLD_BYTES,
+    ))
 }
 
 fn azure_cloud_settings() -> StorageSettings {
@@ -770,7 +866,12 @@ async fn gcs_multipart_e2e_emu() {
         return;
     }
     let srv = server_from_handle(gcs_emu_handle()).await;
-    run_multipart_e2e(srv, "gcs-multipart/weights.bin", DownloadVia::GcsEmulatorMedia).await;
+    run_multipart_e2e(
+        srv,
+        "gcs-multipart/weights.bin",
+        DownloadVia::GcsEmulatorMedia,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -790,7 +891,12 @@ async fn azure_multipart_e2e_emu() {
         return;
     }
     let srv = server_from_handle(azure_emu_handle()).await;
-    run_multipart_e2e(srv, "azure-multipart/weights.bin", DownloadVia::ServerPresign).await;
+    run_multipart_e2e(
+        srv,
+        "azure-multipart/weights.bin",
+        DownloadVia::ServerPresign,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -800,5 +906,10 @@ async fn azure_multipart_e2e_cloud() {
         return;
     }
     let srv = server_from_settings(azure_cloud_settings()).await;
-    run_multipart_e2e(srv, "azure-multipart/weights.bin", DownloadVia::ServerPresign).await;
+    run_multipart_e2e(
+        srv,
+        "azure-multipart/weights.bin",
+        DownloadVia::ServerPresign,
+    )
+    .await;
 }

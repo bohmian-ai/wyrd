@@ -83,7 +83,7 @@ pub struct EvalSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass_gate: Option<EvalPassGate>,
 
-    /// How `vala-eval` captures extracted values in [`AssertionResult::actual`].
+    /// How `vala-eval` captures extracted values in [`super::AssertionResult::actual`].
     ///
     /// Set to [`EvalContextCapture::Redact`] when this eval runs over
     /// production traffic where context fields may contain PII. Absent means

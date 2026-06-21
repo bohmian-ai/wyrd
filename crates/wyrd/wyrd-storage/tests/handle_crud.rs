@@ -24,7 +24,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_storage::error::StorageError;
 use wyrd_storage::factory::{azure, gcs, s3};
 use wyrd_storage::settings::{AzureConfig, BackendConfig, GcsConfig, S3Config, StorageSettings};
-use wyrd_storage::{tenant_path, BackendSigner, LocalSigner, StorageHandle, ValidatedPath};
+use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle, ValidatedPath, tenant_path};
 
 fn enabled(var: &str) -> bool {
     std::env::var(var).as_deref() == Ok("1")
@@ -65,7 +65,11 @@ async fn run_handle_crud(handle: &StorageHandle) {
     assert_eq!(bytes, b"aaa", "read content mismatch");
 
     let listed = handle.list_objects(&path("crud")).await.expect("list crud");
-    assert_eq!(listed.len(), 3, "expected 3 objects under prefix, got {listed:?}");
+    assert_eq!(
+        listed.len(),
+        3,
+        "expected 3 objects under prefix, got {listed:?}"
+    );
     let a_key = path("crud/a.bin").full.clone();
     assert!(
         listed.contains(&a_key),
@@ -197,9 +201,8 @@ async fn azure_cloud_handle() -> Arc<StorageHandle> {
 #[tokio::test]
 async fn local_handle_crud() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let signer = BackendSigner::Local(
-        LocalSigner::new(dir.path().to_path_buf()).expect("local signer"),
-    );
+    let signer =
+        BackendSigner::Local(LocalSigner::new(dir.path().to_path_buf()).expect("local signer"));
     let handle = StorageHandle::new(signer);
     run_handle_crud(&handle).await;
 }

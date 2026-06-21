@@ -158,7 +158,6 @@ opendal = { version = "0.57", default-features = false, features = [
   "reqwest-rustls-tls",
 ] }
 datafusion = "=54.0.0"
-deltalake = { version = "=0.32.4", features = ["s3", "gcs", "azure"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

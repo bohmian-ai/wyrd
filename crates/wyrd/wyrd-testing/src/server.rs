@@ -780,7 +780,7 @@ impl WyrdTestServerBuilder {
         Ok(WyrdTestServer {
             inner: WyrdTestServerInner {
                 fixture,
-                storage_root: storage_root,
+                storage_root,
                 state,
                 router,
                 verifier,

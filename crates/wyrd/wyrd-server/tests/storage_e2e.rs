@@ -17,15 +17,17 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use base64::Engine;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::time::Duration;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::storage::{
-    AbortResponse, DownloadInitRequest, PartUrlResponse, S3CompletedPart, S3MultipartComplete,
-    SinglePutComplete, UploadCompleteRequest, UploadInitRequest, UploadPlan,
+    AbortResponse, AzureBlockBlobComplete, DownloadInitRequest, DownloadInitResponse,
+    GcsResumableComplete, PartUrlResponse, S3MultipartComplete, SinglePutComplete,
+    UploadCompleteRequest, UploadInitRequest, UploadInitResponse, UploadPlan,
 };
-use wyrd_storage::settings::S3Config;
-use wyrd_storage::{BackendConfig, StorageSettings};
-use wyrd_testing::WyrdTestServer;
+use wyrd_storage::settings::{AzureConfig, GcsConfig, S3Config};
+use wyrd_storage::{BackendConfig, BackendSigner, StorageHandle, StorageSettings};
+use wyrd_testing::{MultipartClient, WyrdTestServer};
 
 const FIXED_CARD_UID: &str = "018f0000-0000-7000-8000-000000000001";
 
@@ -453,221 +455,348 @@ async fn reinit_to_same_path_after_completion_succeeds() {
     srv.shutdown().await.expect("shutdown");
 }
 
-fn skip_unless_s3_integration() -> bool {
-    if std::env::var("WYRD_STORAGE_INTEGRATION_S3").as_deref() != Ok("1") {
-        eprintln!("skipping S3 multipart e2e; set WYRD_STORAGE_INTEGRATION_S3=1");
-        return true;
-    }
-    false
+// ============================================================================
+// Parameterized cloud multipart e2e
+//
+// One harness, four backends, two lanes. The same upload→complete→download
+// byte-equality flow runs for S3, GCS, and Azure against either the local
+// docker emulator (any CI) or the real cloud (merge-to-main CI). The server
+// planner forces a multipart upload because the payload (20 MiB) exceeds the
+// per-backend `multipart_threshold_bytes` (lowered to 8 MiB), and the planner's
+// fixed 16 MiB part size splits it into exactly two parts/chunks/blocks.
+//
+// `MultipartClient` is the single client-side upload driver shared with the
+// signer-tier integration tests, so the two tiers cannot drift on how bytes
+// reach the backend.
+//
+// GCS note: `fake-gcs-server` is anonymous and cannot mint signed download
+// URLs, so the GCS emulator lane reads back through the emulator media API
+// instead of the server's presigned `download/init`. The presign download path
+// for GCS is covered by the cloud lane.
+// ============================================================================
+
+const MULTIPART_PAYLOAD_BYTES: usize = 20 * 1024 * 1024;
+const LOW_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+const PLANNED_PART_BYTES: u64 = 16 * 1024 * 1024;
+
+fn enabled(var: &str) -> bool {
+    std::env::var(var).as_deref() == Ok("1")
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn s3_multipart_upload_download_round_trip() {
-    if skip_unless_e2e() {
-        return;
-    }
-    if skip_unless_s3_integration() {
-        return;
-    }
+fn env_or(var: &str, default: &str) -> String {
+    std::env::var(var).unwrap_or_else(|_| default.to_owned())
+}
 
-    let settings = StorageSettings {
-        backend: BackendConfig::S3(S3Config {
-            bucket: "wyrd-storage-test".to_owned(),
-            region: Some("us-east-1".to_owned()),
-            endpoint_url: Some("http://localhost:9000".to_owned()),
-            force_path_style: true,
-        }),
-        require_encryption: false,
-        presign_ttl: Duration::from_secs(600),
-        part_size_bytes: 5 * 1024 * 1024,
-        multipart_threshold_bytes: 5 * 1024 * 1024,
-        public_base_url: None,
-    };
+fn env_required(var: &str) -> String {
+    std::env::var(var).unwrap_or_else(|_| panic!("{var} must be set for this cloud lane"))
+}
 
-    let srv = WyrdTestServer::builder()
-        .with_storage_settings(settings)
-        .start_in_process()
+fn patterned_payload(len: usize) -> Vec<u8> {
+    (0..len).map(|i| u8::try_from(i % 251).expect("mod 251 fits u8")).collect()
+}
+
+fn split_chunks(content: &[u8], chunk: u64) -> Vec<Vec<u8>> {
+    let chunk = usize::try_from(chunk).expect("chunk size fits usize");
+    content.chunks(chunk).map(<[u8]>::to_vec).collect()
+}
+
+/// How the harness reads the object back after completion.
+enum DownloadVia {
+    /// Server `download/init` + presigned GET (works for every backend that can
+    /// sign URLs: S3 emu/cloud, Azure emu/cloud, GCS cloud).
+    ServerPresign,
+    /// Direct GCS emulator media API GET (anonymous fake-gcs has no signing).
+    GcsEmulatorMedia,
+}
+
+async fn post_json(srv: &WyrdTestServer, token: &str, uri: &str, body: Vec<u8>) -> axum::response::Response {
+    srv.oneshot_authenticated(token, request("POST", uri, body, Some("application/json")))
         .await
-        .expect("start env with S3");
+        .expect("router responds")
+}
 
-    let token = bootstrap_service_jwt(&srv, "s3-multipart-writer", &["writer"]).await;
-
-    const PART_SIZE: usize = 5 * 1024 * 1024;
-    const PART_COUNT: u32 = 2;
-    let part1 = vec![0x41u8; PART_SIZE];
-    let part2 = vec![0x42u8; PART_SIZE];
-    let full_content: Vec<u8> = [part1.as_slice(), part2.as_slice()].concat();
-    let sha256 = sha256_b64(&full_content);
-    let card_uid = CardUid::new(FIXED_CARD_UID).expect("card uid");
-
-    let init_body = serde_json::to_vec(&UploadInitRequest {
+async fn upload_init(
+    srv: &WyrdTestServer,
+    token: &str,
+    card_uid: &CardUid,
+    relative_path: &str,
+    sha256: &str,
+    size_bytes: u64,
+) -> UploadInitResponse {
+    let body = serde_json::to_vec(&UploadInitRequest {
         card_uid: card_uid.clone(),
-        relative_path: "s3-multipart/weights.bin".to_owned(),
-        expected_sha256: sha256.clone(),
-        expected_size_bytes: full_content.len() as u64,
+        relative_path: relative_path.to_owned(),
+        expected_sha256: sha256.to_owned(),
+        expected_size_bytes: size_bytes,
         content_type: None,
     })
     .expect("init body serializes");
+    let response = post_json(srv, token, "/v1/cards/upload/init", body).await;
+    assert_eq!(response.status(), StatusCode::OK, "upload/init must succeed");
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("init body");
+    serde_json::from_slice(&bytes).expect("init response deserializes")
+}
 
-    let init_response = srv
-        .oneshot_authenticated(
-            &token,
-            request(
-                "POST",
-                "/v1/cards/upload/init",
-                init_body,
-                Some("application/json"),
-            ),
-        )
-        .await
-        .expect("router responds");
-    assert_eq!(init_response.status(), StatusCode::OK, "upload/init must succeed");
+async fn server_part_url(srv: &WyrdTestServer, token: &str, upload_id: &str, part_number: u32) -> String {
+    let response = post_json(
+        srv,
+        token,
+        &format!("/v1/cards/upload/{upload_id}/part-url?part_number={part_number}"),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "part-url for part {part_number} must succeed");
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("part-url body");
+    let parsed: PartUrlResponse = serde_json::from_slice(&bytes).expect("PartUrlResponse deserializes");
+    parsed.url
+}
 
-    let init_bytes = to_bytes(init_response.into_body(), usize::MAX)
-        .await
-        .expect("init body");
-    let init: wyrd_spec::storage::UploadInitResponse =
-        serde_json::from_slice(&init_bytes).expect("init response deserializes");
-
-    let upload_id = init.upload_id.clone();
-    let UploadPlan::S3Multipart { part_count, .. } = &init.plan else {
-        panic!("expected S3Multipart plan for S3 backend, got: {:?}", init.plan);
-    };
-    assert_eq!(*part_count, PART_COUNT, "server planned {PART_COUNT} parts");
-
-    let parts_data = [part1, part2];
-    let http_client = reqwest::Client::new();
-    let mut completed_parts: Vec<S3CompletedPart> = Vec::new();
-
-    for part_number in 1..=PART_COUNT {
-        let part_url_response = srv
-            .oneshot_authenticated(
-                &token,
-                request(
-                    "POST",
-                    &format!("/v1/cards/upload/{upload_id}/part-url?part_number={part_number}"),
-                    Body::empty(),
-                    None,
-                ),
-            )
-            .await
-            .expect("router responds");
-        assert_eq!(
-            part_url_response.status(),
-            StatusCode::OK,
-            "part-url for part {part_number} must succeed"
-        );
-
-        let part_url_bytes = to_bytes(part_url_response.into_body(), usize::MAX)
-            .await
-            .expect("part-url body");
-        let part_url_resp: PartUrlResponse =
-            serde_json::from_slice(&part_url_bytes).expect("PartUrlResponse deserializes");
-
-        let put_response = http_client
-            .put(&part_url_resp.url)
-            .body(parts_data[(part_number - 1) as usize].clone())
-            .send()
-            .await
-            .expect("PUT part to RustFS");
-        assert!(
-            put_response.status().is_success(),
-            "part {part_number} PUT failed: {}",
-            put_response.status()
-        );
-
-        let e_tag = put_response
-            .headers()
-            .get("etag")
-            .expect("part PUT must return ETag header")
-            .to_str()
-            .expect("ETag is UTF-8")
-            .to_owned();
-        completed_parts.push(S3CompletedPart { part_number, e_tag });
+/// Drive the client-side byte upload for the planned protocol and return the
+/// matching completion request.
+async fn drive_upload(
+    srv: &WyrdTestServer,
+    token: &str,
+    mp: &MultipartClient,
+    plan: &UploadPlan,
+    upload_id: &str,
+    content: &[u8],
+) -> UploadCompleteRequest {
+    match plan {
+        UploadPlan::S3Multipart { part_count, part_size_bytes, .. } => {
+            let parts = split_chunks(content, *part_size_bytes);
+            assert_eq!(parts.len(), *part_count as usize, "client splits into the planned part count");
+            let mut urls = Vec::with_capacity(parts.len());
+            for part_number in 1..=*part_count {
+                urls.push(server_part_url(srv, token, upload_id, part_number).await);
+            }
+            let completed = mp
+                .s3_multipart(
+                    plan,
+                    |part_number: u32| {
+                        let url = urls[(part_number - 1) as usize].clone();
+                        async move { Ok::<String, std::convert::Infallible>(url) }
+                    },
+                    |part_number: u32| parts[(part_number - 1) as usize].clone(),
+                )
+                .await
+                .expect("s3 multipart upload");
+            UploadCompleteRequest::S3Multipart(S3MultipartComplete { parts: completed })
+        }
+        UploadPlan::GcsResumable { chunk_size_bytes, .. } => {
+            let chunks = split_chunks(content, *chunk_size_bytes);
+            mp.gcs_resumable(plan, chunks).await.expect("gcs resumable upload");
+            UploadCompleteRequest::GcsResumable(GcsResumableComplete {})
+        }
+        UploadPlan::AzureBlockBlob { block_size_bytes, block_count_planned, .. } => {
+            let blocks = split_chunks(content, *block_size_bytes);
+            assert_eq!(blocks.len(), *block_count_planned as usize, "client stages the planned block count");
+            let block_count = mp.azure_block_blob(plan, blocks).await.expect("azure block stage");
+            UploadCompleteRequest::AzureBlockBlob(AzureBlockBlobComplete { block_count })
+        }
+        other => panic!("expected a multipart plan for a cloud backend, got: {other:?}"),
     }
+}
 
-    let complete_body = serde_json::to_vec(&UploadCompleteRequest::S3Multipart(
-        S3MultipartComplete {
-            parts: completed_parts,
-        },
-    ))
-    .expect("complete body serializes");
+async fn upload_complete(srv: &WyrdTestServer, token: &str, upload_id: &str, body: &UploadCompleteRequest) {
+    let bytes = serde_json::to_vec(body).expect("complete body serializes");
+    let response = post_json(srv, token, &format!("/v1/cards/upload/{upload_id}/complete"), bytes).await;
+    assert_eq!(response.status(), StatusCode::OK, "upload/complete must succeed");
+}
 
-    let complete_response = srv
-        .oneshot_authenticated(
-            &token,
-            request(
-                "POST",
-                &format!("/v1/cards/upload/{upload_id}/complete"),
-                complete_body,
-                Some("application/json"),
-            ),
-        )
-        .await
-        .expect("router responds");
-    assert_eq!(
-        complete_response.status(),
-        StatusCode::OK,
-        "upload/complete must succeed"
-    );
-
-    let download_init_body = serde_json::to_vec(&DownloadInitRequest {
+async fn server_download_init(
+    srv: &WyrdTestServer,
+    token: &str,
+    card_uid: &CardUid,
+    relative_path: &str,
+) -> DownloadInitResponse {
+    let body = serde_json::to_vec(&DownloadInitRequest {
         card_uid: card_uid.clone(),
-        relative_path: "s3-multipart/weights.bin".to_owned(),
+        relative_path: relative_path.to_owned(),
         ttl_secs: None,
     })
     .expect("download init body serializes");
+    let response = post_json(srv, token, "/v1/cards/download/init", body).await;
+    assert_eq!(response.status(), StatusCode::OK, "download/init must succeed");
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("download init body");
+    serde_json::from_slice(&bytes).expect("download init response deserializes")
+}
 
-    let dl_init_response = srv
-        .oneshot_authenticated(
-            &token,
-            request(
-                "POST",
-                "/v1/cards/download/init",
-                download_init_body,
-                Some("application/json"),
-            ),
-        )
-        .await
-        .expect("router responds");
-    assert_eq!(
-        dl_init_response.status(),
-        StatusCode::OK,
-        "download/init must succeed"
-    );
+fn gcs_emulator_media_url(storage_path: &str) -> String {
+    let host = env_or("WYRD_GCS_EMULATOR_HOST", "http://localhost:4443");
+    let bucket = env_or("WYRD_STORAGE_GCS_BUCKET", "wyrd-storage-test");
+    let encoded = storage_path.replace('/', "%2F");
+    format!("{host}/storage/v1/b/{bucket}/o/{encoded}?alt=media")
+}
 
-    let dl_init_bytes = to_bytes(dl_init_response.into_body(), usize::MAX)
-        .await
-        .expect("download init body");
-    let dl_init: wyrd_spec::storage::DownloadInitResponse =
-        serde_json::from_slice(&dl_init_bytes).expect("download init response deserializes");
+/// Full server-tier multipart round-trip with end-to-end byte equality.
+async fn run_multipart_e2e(srv: WyrdTestServer, relative_path: &str, download: DownloadVia) {
+    let token = bootstrap_service_jwt(&srv, "multipart-writer", &["writer"]).await;
+    let content = patterned_payload(MULTIPART_PAYLOAD_BYTES);
+    let sha256 = sha256_b64(&content);
+    let card_uid = CardUid::new(FIXED_CARD_UID).expect("card uid");
+    let mp = MultipartClient::new();
 
-    assert_eq!(dl_init.sha256, sha256, "sha256 must match upload");
-    assert_eq!(
-        dl_init.size_bytes,
-        full_content.len() as u64,
-        "size must match upload"
-    );
+    let init = upload_init(&srv, &token, &card_uid, relative_path, &sha256, content.len() as u64).await;
+    let upload_id = init.upload_id.to_string();
 
-    let downloaded = http_client
-        .get(&dl_init.plan.get_url)
-        .send()
-        .await
-        .expect("GET from RustFS via presigned URL")
-        .bytes()
-        .await
-        .expect("download bytes");
+    let complete = drive_upload(&srv, &token, &mp, &init.plan, &upload_id, &content).await;
+    upload_complete(&srv, &token, &upload_id, &complete).await;
 
-    assert_eq!(
-        downloaded.len(),
-        full_content.len(),
-        "downloaded length must match"
-    );
-    assert_eq!(
-        downloaded.as_ref(),
-        full_content.as_slice(),
-        "byte-equality across multipart round-trip"
-    );
+    let downloaded = match download {
+        DownloadVia::ServerPresign => {
+            let dl = server_download_init(&srv, &token, &card_uid, relative_path).await;
+            assert_eq!(dl.sha256, sha256, "download/init sha256 must match upload");
+            assert_eq!(dl.size_bytes, content.len() as u64, "download/init size must match upload");
+            mp.download(&dl.plan.get_url).await.expect("download via presigned url")
+        }
+        DownloadVia::GcsEmulatorMedia => mp
+            .download(&gcs_emulator_media_url(&init.storage_path))
+            .await
+            .expect("download via gcs emulator media url"),
+    };
+
+    assert_eq!(downloaded.len(), content.len(), "downloaded length must match");
+    assert_eq!(downloaded, content, "byte-equality across multipart round-trip");
 
     srv.shutdown().await.expect("shutdown");
+}
+
+// ---- Server builders -------------------------------------------------------
+
+fn cloud_settings(backend: BackendConfig) -> StorageSettings {
+    StorageSettings {
+        backend,
+        require_encryption: false,
+        presign_ttl: Duration::from_secs(600),
+        part_size_bytes: PLANNED_PART_BYTES,
+        multipart_threshold_bytes: LOW_THRESHOLD_BYTES,
+        public_base_url: None,
+    }
+}
+
+async fn server_from_settings(settings: StorageSettings) -> WyrdTestServer {
+    WyrdTestServer::builder()
+        .with_storage_settings(settings)
+        .start_in_process()
+        .await
+        .expect("start server from storage settings")
+}
+
+async fn server_from_handle(handle: Arc<StorageHandle>) -> WyrdTestServer {
+    WyrdTestServer::builder()
+        .with_storage_handle(handle)
+        .start_in_process()
+        .await
+        .expect("start server from storage handle")
+}
+
+fn s3_emu_settings() -> StorageSettings {
+    cloud_settings(BackendConfig::S3(S3Config {
+        bucket: env_or("WYRD_STORAGE_S3_BUCKET", "wyrd-storage-test"),
+        region: Some(env_or("WYRD_STORAGE_S3_REGION", "us-east-1")),
+        endpoint_url: Some(env_or("WYRD_S3_EMULATOR_ENDPOINT", "http://localhost:9000")),
+        force_path_style: true,
+    }))
+}
+
+fn s3_cloud_settings() -> StorageSettings {
+    cloud_settings(BackendConfig::S3(S3Config {
+        bucket: env_required("WYRD_STORAGE_S3_BUCKET"),
+        region: std::env::var("WYRD_STORAGE_S3_REGION").ok(),
+        endpoint_url: std::env::var("WYRD_STORAGE_S3_ENDPOINT_URL").ok(),
+        force_path_style: false,
+    }))
+}
+
+fn gcs_emu_handle() -> Arc<StorageHandle> {
+    let signer = wyrd_storage::factory::gcs::build_emulator_signer(
+        &env_or("WYRD_STORAGE_GCS_BUCKET", "wyrd-storage-test"),
+        &env_or("WYRD_GCS_EMULATOR_HOST", "http://localhost:4443"),
+    )
+    .expect("gcs emulator signer");
+    Arc::new(StorageHandle::from_signer(BackendSigner::Gcs(signer), LOW_THRESHOLD_BYTES))
+}
+
+fn gcs_cloud_settings() -> StorageSettings {
+    cloud_settings(BackendConfig::Gcs(GcsConfig {
+        bucket: env_required("WYRD_STORAGE_GCS_BUCKET"),
+    }))
+}
+
+fn azure_emu_handle() -> Arc<StorageHandle> {
+    let signer = wyrd_storage::factory::azure::build_emulator_signer(
+        &env_or("WYRD_STORAGE_AZURE_CONTAINER", "wyrd-storage-test"),
+        &env_or("WYRD_AZURE_EMULATOR_ENDPOINT", "http://127.0.0.1:10000"),
+    )
+    .expect("azure emulator signer");
+    Arc::new(StorageHandle::from_signer(BackendSigner::Azure(signer), LOW_THRESHOLD_BYTES))
+}
+
+fn azure_cloud_settings() -> StorageSettings {
+    cloud_settings(BackendConfig::Azure(AzureConfig {
+        account: env_required("WYRD_STORAGE_AZURE_ACCOUNT"),
+        container: env_required("WYRD_STORAGE_AZURE_CONTAINER"),
+    }))
+}
+
+// ---- Entrypoints -----------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn s3_multipart_e2e_emu() {
+    if !enabled("WYRD_STORAGE_INTEGRATION_S3") {
+        eprintln!("skipping S3 multipart e2e (emu); set WYRD_STORAGE_INTEGRATION_S3=1");
+        return;
+    }
+    let srv = server_from_settings(s3_emu_settings()).await;
+    run_multipart_e2e(srv, "s3-multipart/weights.bin", DownloadVia::ServerPresign).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn s3_multipart_e2e_cloud() {
+    if !enabled("WYRD_STORAGE_CLOUD_S3") {
+        eprintln!("skipping S3 multipart e2e (cloud); set WYRD_STORAGE_CLOUD_S3=1");
+        return;
+    }
+    let srv = server_from_settings(s3_cloud_settings()).await;
+    run_multipart_e2e(srv, "s3-multipart/weights.bin", DownloadVia::ServerPresign).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn gcs_multipart_e2e_emu() {
+    if !enabled("WYRD_STORAGE_INTEGRATION_GCS") {
+        eprintln!("skipping GCS multipart e2e (emu); set WYRD_STORAGE_INTEGRATION_GCS=1");
+        return;
+    }
+    let srv = server_from_handle(gcs_emu_handle()).await;
+    run_multipart_e2e(srv, "gcs-multipart/weights.bin", DownloadVia::GcsEmulatorMedia).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn gcs_multipart_e2e_cloud() {
+    if !enabled("WYRD_STORAGE_CLOUD_GCS") {
+        eprintln!("skipping GCS multipart e2e (cloud); set WYRD_STORAGE_CLOUD_GCS=1");
+        return;
+    }
+    let srv = server_from_settings(gcs_cloud_settings()).await;
+    run_multipart_e2e(srv, "gcs-multipart/weights.bin", DownloadVia::ServerPresign).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn azure_multipart_e2e_emu() {
+    if !enabled("WYRD_STORAGE_INTEGRATION_AZURE") {
+        eprintln!("skipping Azure multipart e2e (emu); set WYRD_STORAGE_INTEGRATION_AZURE=1");
+        return;
+    }
+    let srv = server_from_handle(azure_emu_handle()).await;
+    run_multipart_e2e(srv, "azure-multipart/weights.bin", DownloadVia::ServerPresign).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn azure_multipart_e2e_cloud() {
+    if !enabled("WYRD_STORAGE_CLOUD_AZURE") {
+        eprintln!("skipping Azure multipart e2e (cloud); set WYRD_STORAGE_CLOUD_AZURE=1");
+        return;
+    }
+    let srv = server_from_settings(azure_cloud_settings()).await;
+    run_multipart_e2e(srv, "azure-multipart/weights.bin", DownloadVia::ServerPresign).await;
 }

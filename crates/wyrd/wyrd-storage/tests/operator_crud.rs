@@ -5,7 +5,7 @@
 //! in how the `Operator` is built:
 //!
 //! * `*_emu` — gated on `WYRD_STORAGE_INTEGRATION_{S3,GCS,AZURE}=1`, targets the
-//!   local docker emulator (RustFS / fake-gcs / Azurite). Runs on any CI.
+//!   local docker emulator (`RustFS` / fake-gcs / Azurite). Runs on any CI.
 //! * `*_cloud` — gated on `WYRD_STORAGE_CLOUD_{S3,GCS,AZURE}=1`, builds the
 //!   production operator from `WYRD_STORAGE_*` env + ambient credentials. Runs
 //!   only on merge-to-main CI.

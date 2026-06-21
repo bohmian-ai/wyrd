@@ -1,0 +1,85 @@
+name: storage-integration-emulator
+
+# Runs the full storage test surface against the local docker emulators
+# (RustFS / fake-gcs-server / Azurite) on every PR and main-branch push that
+# touches storage code. This is the "any CI" lane: signer-tier integration
+# tests, the opendal operator data-plane CRUD suite, and the server HTTP
+# multipart e2e — the same set of tests for local, S3, GCS, and Azure.
+#
+# The credentialed real-cloud matrix lives in storage-integration-cloud.yml and
+# runs only on merge-to-main.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/wyrd/wyrd-storage/**'
+      - 'crates/wyrd/wyrd-server/**'
+      - 'crates/wyrd/wyrd-testing/**'
+      - 'crates/wyrd-spec/src/storage/**'
+      - 'mise.toml'
+      - '.github/workflows/storage-integration-emulator.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/wyrd/wyrd-storage/**'
+      - 'crates/wyrd/wyrd-server/**'
+      - 'crates/wyrd/wyrd-testing/**'
+      - 'crates/wyrd-spec/src/storage/**'
+      - 'mise.toml'
+      - '.github/workflows/storage-integration-emulator.yml'
+
+permissions:
+  contents: read
+
+env:
+  MISE_LOCKED: "true"
+
+jobs:
+  emulator-matrix:
+    name: storage emulator matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Use GNU BFD linker on Linux
+        shell: bash
+        run: |
+          command -v cc
+          command -v ld.bfd
+          rustflags="${RUSTFLAGS:-}"
+          rustflags="${rustflags:+$rustflags }-C linker-features=-lld -C link-arg=-fuse-ld=bfd"
+          {
+            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc"
+            echo "RUSTFLAGS=$rustflags"
+          } >> "$GITHUB_ENV"
+
+      - name: Start storage emulators
+        run: mise run storage:up
+
+      - name: Run storage emulator matrix
+        run: mise run test:storage:matrix
+
+      - name: Stop storage emulators
+        if: always()
+        run: mise run storage:down

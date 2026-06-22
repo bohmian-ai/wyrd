@@ -76,15 +76,19 @@ async fn run(args: Args) {
         .await
         .expect("migrate bench db");
 
+    let catalog_uri = vala_sql::testing::catalog_uri(&pool);
     let backend = BackendConfig::Local { root: tmp.path().to_path_buf() };
     let (factory, props) = iceberg_storage_factory(&backend).unwrap();
 
-    let catalog = WyrdCatalog::new(&args.postgres_url, &warehouse, pool, factory, props)
+    let catalog = WyrdCatalog::new(&catalog_uri, &warehouse, pool.clone(), factory, props)
         .await
         .unwrap();
 
     let ns = BifrostNamespace::Bifrost;
     let tenant = DataTenantId::new_v7();
+    vala_sql::testing::seed_tenant(&pool, tenant.as_uuid())
+        .await
+        .expect("seed bench tenant");
 
     catalog
         .create_table(
@@ -95,6 +99,7 @@ async fn run(args: Args) {
                 arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Utf8, false),
             ],
             TableScope::TenantOwned,
+            tenant,
             &[],
         )
         .await

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use arrow::array::RecordBatch;
 use iceberg::spec::DataFile;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -109,11 +111,25 @@ async fn write_batches(table: &Table, batches: Vec<RecordBatch>) -> Result<Vec<D
     let table_metadata = table.metadata();
     let iceberg_schema = table_metadata.current_schema().clone();
 
+    // The Iceberg writer requires:
+    // 1. Arrow field metadata contains `PARQUET:field_id` so the NaN visitor
+    //    can match fields by ID (FieldMatchMode::Id).
+    // 2. Column types exactly match the Iceberg-derived Arrow schema (e.g.
+    //    timestamps must use "+00:00" not "UTC").
+    //
+    // We derive the authoritative typed Arrow schema from the Iceberg schema
+    // (which carries both constraints), then cast each batch's columns to
+    // that schema before writing.
+    let typed_schema = Arc::new(
+        iceberg::arrow::schema_to_arrow_schema(&iceberg_schema)
+            .map_err(BifrostError::Iceberg)?,
+    );
+
     let location_gen =
         DefaultLocationGenerator::new(table_metadata).map_err(BifrostError::Iceberg)?;
     let file_name_gen = DefaultFileNameGenerator::new(
         "bifrost".to_string(),
-        None,
+        Some(uuid::Uuid::now_v7().simple().to_string()),
         iceberg::spec::DataFileFormat::Parquet,
     );
 
@@ -131,7 +147,18 @@ async fn write_batches(table: &Table, batches: Vec<RecordBatch>) -> Result<Vec<D
     let mut writer = UnpartitionedWriter::new(data_file_builder);
 
     for batch in batches {
-        writer.write(batch).await.map_err(BifrostError::Iceberg)?;
+        let cast_columns: Vec<arrow::array::ArrayRef> = batch
+            .columns()
+            .iter()
+            .zip(typed_schema.fields().iter())
+            .map(|(col, field)| {
+                arrow::compute::cast(col, field.data_type())
+                    .map_err(|e| BifrostError::Internal(format!("cast column {}: {e}", field.name())))
+            })
+            .collect::<Result<_, _>>()?;
+        let typed = RecordBatch::try_new(typed_schema.clone(), cast_columns)
+            .map_err(|e| BifrostError::Internal(format!("retype batch: {e}")))?;
+        writer.write(typed).await.map_err(BifrostError::Iceberg)?;
     }
 
     writer.close().await.map_err(BifrostError::Iceberg)

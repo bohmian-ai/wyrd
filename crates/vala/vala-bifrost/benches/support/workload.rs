@@ -71,7 +71,7 @@ pub fn make_bench_batch(
         .unwrap()
     } else {
         let tenant_str = tenant.expect("tenant required for SystemShared").to_string();
-        let tenants: StringArray = std::iter::repeat(tenant_str.as_str()).take(n).collect();
+        let tenants: StringArray = std::iter::repeat(Some(tenant_str.as_str())).take(n).collect();
         RecordBatch::try_new(
             full_schema,
             vec![

@@ -81,8 +81,9 @@ fn bench_selectivity(c: &mut Criterion) {
         let start_us = workload::day_us(start_day);
         let end_us = workload::day_us(end_day);
         let sql = format!(
-            "SELECT id FROM sel_tbl WHERE wyrd_event_time >= {} AND wyrd_event_time < {}",
-            start_us, end_us
+            "SELECT id FROM sel_tbl \
+             WHERE wyrd_event_time >= arrow_cast({start_us}, 'Timestamp(Microsecond, Some(\"+00:00\"))') \
+             AND wyrd_event_time < arrow_cast({end_us}, 'Timestamp(Microsecond, Some(\"+00:00\"))')"
         );
         group.bench_with_input(BenchmarkId::new("sel", label), &sql, |b, sql| {
             b.to_async(&rt).iter(|| async {

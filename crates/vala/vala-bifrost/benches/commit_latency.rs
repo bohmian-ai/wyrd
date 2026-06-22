@@ -1,7 +1,8 @@
 mod support;
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use support::{workload, BenchFixture};
+use criterion::{criterion_group, criterion_main, Criterion};
+use support::workload;
+use support::BenchFixture;
 use tokio::runtime::Runtime;
 use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::types::TableScope;
@@ -21,26 +22,24 @@ fn bench_commit_latency(c: &mut Criterion) {
         TableScope::TenantOwned,
     ));
 
-    let batch = workload::make_bench_batch(10_000, workload::day_us(1), None, TableScope::TenantOwned);
-
+    // Measure: warm catalog load + write 10k rows + Iceberg commit + Postgres finalize.
+    // Each iteration produces a new snapshot; the catalog is warm after the first call.
     c.bench_function("commit_latency", |b| {
-        b.to_async(&rt).iter_batched(
-            || {
-                // setup: get a writer handle per iteration (each flush produces a new snapshot)
-                rt.block_on(async {
-                    fixture
-                        .catalog
-                        .writer(ns, "bench_commit_latency", TableScope::TenantOwned, fixture.tenant)
-                        .await
-                        .unwrap()
-                })
-            },
-            |writer| async move {
-                writer.write(batch.clone()).await.unwrap();
-                writer.flush().await.unwrap();
-            },
-            BatchSize::SmallInput,
-        );
+        b.to_async(&rt).iter(|| async {
+            let writer = fixture
+                .catalog
+                .writer(ns, "bench_commit_latency", TableScope::TenantOwned, fixture.tenant)
+                .await
+                .unwrap();
+            let batch = workload::make_bench_batch(
+                10_000,
+                workload::day_us(1),
+                None,
+                TableScope::TenantOwned,
+            );
+            writer.write(batch).await.unwrap();
+            writer.flush().await.unwrap()
+        });
     });
 }
 

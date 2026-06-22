@@ -3,7 +3,6 @@ pub mod workload;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
-use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::catalog::WyrdCatalog;
@@ -12,11 +11,14 @@ use wyrd_spec::ids::DataTenantId;
 use wyrd_storage::factory::iceberg_factory::iceberg_storage_factory;
 use wyrd_storage::settings::BackendConfig;
 
+/// Stable warehouse root for benches — persists across runs so the Iceberg catalog
+/// in Postgres and the on-disk metadata always agree.
+const BENCH_WAREHOUSE_DIR: &str = "/tmp/vala-bifrost-bench";
+
 /// Shared benchmark fixture: Postgres + local object store + WyrdCatalog.
 pub struct BenchFixture {
     pub catalog: WyrdCatalog,
     pub tenant: DataTenantId,
-    _tmp: TempDir,
 }
 
 impl BenchFixture {
@@ -27,8 +29,9 @@ impl BenchFixture {
             .expect("BIFROST_TEST_DB_URL must be set to run vala-bifrost benchmarks");
 
         rt.block_on(async {
-            let tmp = tempfile::tempdir().expect("tmp dir");
-            let warehouse = format!("file://{}", tmp.path().display());
+            let bench_dir = std::path::PathBuf::from(BENCH_WAREHOUSE_DIR);
+            std::fs::create_dir_all(&bench_dir).expect("create bench warehouse dir");
+            let warehouse = format!("file://{}", bench_dir.display());
 
             let pool = Arc::new(
                 sqlx::PgPool::connect(&db_url)
@@ -39,19 +42,25 @@ impl BenchFixture {
                 .await
                 .expect("migrate bench db");
 
-            let backend = BackendConfig::Local { root: tmp.path().to_path_buf() };
+            let catalog_uri = vala_sql::testing::catalog_uri(&pool);
+            let backend = BackendConfig::Local { root: bench_dir };
             let (factory, props) = iceberg_storage_factory(&backend).expect("storage factory");
 
-            let catalog = WyrdCatalog::new(&db_url, &warehouse, pool, factory, props)
+            let catalog = WyrdCatalog::new(&catalog_uri, &warehouse, pool.clone(), factory, props)
                 .await
                 .expect("WyrdCatalog::new");
 
-            Self { catalog, tenant: DataTenantId::new_v7(), _tmp: tmp }
+            let tenant = DataTenantId::new_v7();
+            vala_sql::testing::seed_tenant(&pool, tenant.as_uuid())
+                .await
+                .expect("seed bench tenant");
+
+            Self { catalog, tenant }
         })
     }
 
-    /// Create a tenant-owned bench table with the given extra fields.
-    /// Returns the table name.
+    /// Create a bench table, dropping and recreating if it already exists.
+    /// This ensures the Iceberg location always points to the current warehouse.
     pub async fn create_table(
         &self,
         ns: BifrostNamespace,
@@ -59,10 +68,17 @@ impl BenchFixture {
         extra_fields: Vec<Field>,
         scope: TableScope,
     ) {
-        self.catalog
-            .create_table(ns, name, extra_fields, scope, &[])
-            .await
-            .expect("create bench table");
+        match self.catalog.create_table(ns, name, extra_fields.clone(), scope, self.tenant, &[]).await {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("already exists") => {
+                self.catalog.drop_table(ns, name).await.expect("drop stale bench table");
+                self.catalog
+                    .create_table(ns, name, extra_fields, scope, self.tenant, &[])
+                    .await
+                    .expect("recreate bench table after drop");
+            }
+            Err(e) => panic!("create bench table: {e}"),
+        }
     }
 
     /// Create a wide table with `col_count` Int64 columns for projection benches.
@@ -70,9 +86,6 @@ impl BenchFixture {
         let fields: Vec<Field> = (0..col_count)
             .map(|i| Field::new(format!("col_{i}"), DataType::Int64, false))
             .collect();
-        self.catalog
-            .create_table(ns, name, fields, TableScope::TenantOwned, &[])
-            .await
-            .expect("create wide bench table");
+        self.create_table(ns, name, fields, TableScope::TenantOwned).await;
     }
 }

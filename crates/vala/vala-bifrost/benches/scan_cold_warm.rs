@@ -3,6 +3,7 @@ mod support;
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
+use datafusion::datasource::TableProvider;
 use support::{workload, BenchFixture};
 use tokio::runtime::Runtime;
 use vala_bifrost::catalog::namespaces::BifrostNamespace;
@@ -30,7 +31,7 @@ fn bench_scan_cold_warm(c: &mut Criterion) {
             )
             .await;
 
-        // Ingest 100k rows across 10 files (10k each, different days for partition variety)
+        // Ingest 100k rows across 10 commits on different days
         for day in 0..10_i64 {
             let batch =
                 workload::make_bench_batch(10_000, workload::day_us(day), None, TableScope::TenantOwned);
@@ -44,35 +45,41 @@ fn bench_scan_cold_warm(c: &mut Criterion) {
         }
     });
 
-    let provider = rt.block_on(async {
-        fixture
-            .catalog
-            .provider(ns, "bench_scan_cw", fixture.tenant)
-            .await
-            .unwrap()
+    // Wrap in Arc<dyn TableProvider> so it can be cloned cheaply across iterations
+    let provider: Arc<dyn TableProvider> = rt.block_on(async {
+        Arc::new(
+            fixture
+                .catalog
+                .provider(ns, "bench_scan_cw", fixture.tenant)
+                .await
+                .unwrap(),
+        )
     });
 
     let mut group = c.benchmark_group("scan_cold_warm");
 
     // Cold: fresh SessionContext per iteration
     group.bench_function("cold", |b| {
-        let provider = provider.clone();
-        b.to_async(&rt).iter(|| async {
-            let ctx = vala_bifrost::session::wyrd_session_context(fixture.tenant);
-            ctx.register_table("t", Arc::new(provider.clone())).unwrap();
-            ctx.sql("SELECT id, payload FROM t")
-                .await
-                .unwrap()
-                .collect()
-                .await
-                .unwrap()
+        let p = Arc::clone(&provider);
+        b.to_async(&rt).iter(|| {
+            let p = Arc::clone(&p);
+            async move {
+                let ctx = vala_bifrost::session::wyrd_session_context(fixture.tenant);
+                ctx.register_table("t", p).unwrap();
+                ctx.sql("SELECT id, payload FROM t")
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap()
+            }
         });
     });
 
-    // Warm: shared SessionContext, registered once
+    // Warm: shared SessionContext registered once
     let warm_ctx = rt.block_on(async {
         let ctx = vala_bifrost::session::wyrd_session_context(fixture.tenant);
-        ctx.register_table("t", Arc::new(provider.clone())).unwrap();
+        ctx.register_table("t", Arc::clone(&provider)).unwrap();
         ctx
     });
 

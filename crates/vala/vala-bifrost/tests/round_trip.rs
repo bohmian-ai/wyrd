@@ -129,6 +129,11 @@ async fn round_trip_full() {
     .await
     .unwrap();
 
+    let tenant = wyrd_spec::ids::DataTenantId::new_v7();
+    vala_sql::testing::seed_tenant(&pool, tenant.as_uuid())
+        .await
+        .unwrap();
+
     let user_fields = vec![Field::new("val", DataType::Int64, false)];
     let uid = catalog
         .create_table(
@@ -136,14 +141,13 @@ async fn round_trip_full() {
             "rt_test",
             user_fields,
             TableScope::TenantOwned,
+            tenant,
             &[],
         )
         .await
         .unwrap();
 
     assert_ne!(uid.to_string(), uuid::Uuid::nil().to_string());
-
-    let tenant = wyrd_spec::ids::DataTenantId::new_v7();
     let writer = catalog
         .writer(
             vala_bifrost::catalog::namespaces::BifrostNamespace::Bifrost,

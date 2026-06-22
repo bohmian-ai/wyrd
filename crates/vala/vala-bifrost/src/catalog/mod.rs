@@ -72,6 +72,7 @@ impl WyrdCatalog {
         name: &str,
         user_fields: Vec<Field>,
         scope: TableScope,
+        tenant: wyrd_spec::ids::DataTenantId,
         partition_columns: &[(String, PartitionTransform)],
     ) -> Result<TableUid, BifrostError> {
         self.ensure_namespace(ns).await?;
@@ -115,12 +116,14 @@ impl WyrdCatalog {
             .create_table(&namespace_ident, creation)
             .await?;
 
-        let mut conn = vala_sql::TenantConn::acquire(
-            &self.pool,
-            wyrd_spec::ids::DataTenantId::SYSTEM_OWNER,
-        )
-        .await
-        .map_err(BifrostError::Sql)?;
+        let registration_tenant = match scope {
+            TableScope::SystemShared => wyrd_spec::ids::DataTenantId::SYSTEM_OWNER,
+            TableScope::TenantOwned => tenant,
+        };
+
+        let mut conn = vala_sql::TenantConn::acquire(&self.pool, registration_tenant)
+            .await
+            .map_err(BifrostError::Sql)?;
 
         vala_sql::queries::olap_catalog::upsert_table(
             &mut conn,
@@ -183,6 +186,32 @@ impl WyrdCatalog {
         );
 
         Ok(handle)
+    }
+
+    /// Drop an Iceberg table from both the SQL catalog and the Wyrd control tables.
+    ///
+    /// Ignores not-found errors. Intended for test and bench teardown.
+    pub async fn drop_table(&self, ns: BifrostNamespace, name: &str) -> Result<(), BifrostError> {
+        let fqn = format!("{}.{}", ns.as_str(), name);
+        let table_ident = iceberg::TableIdent::new(ns.to_namespace_ident(), name.to_string());
+
+        // Drop from Iceberg catalog — ignore not-found
+        let _ = self.catalog.drop_table(&table_ident).await;
+
+        // Clean Wyrd control tables (commits before tables due to FK)
+        sqlx::query("DELETE FROM vala.olap_commits WHERE table_uid IN (SELECT table_uid FROM vala.bifrost_tables WHERE fqn = $1)")
+            .bind(&fqn)
+            .execute(&*self.pool)
+            .await
+            .map_err(|e| BifrostError::Internal(format!("drop_table olap_commits: {e}")))?;
+
+        sqlx::query("DELETE FROM vala.bifrost_tables WHERE fqn = $1")
+            .bind(&fqn)
+            .execute(&*self.pool)
+            .await
+            .map_err(|e| BifrostError::Internal(format!("drop_table bifrost_tables: {e}")))?;
+
+        Ok(())
     }
 
     pub async fn provider(

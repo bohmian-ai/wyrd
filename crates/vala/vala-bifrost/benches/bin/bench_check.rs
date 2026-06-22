@@ -108,9 +108,16 @@ fn main() {
 }
 
 fn resolve_estimates_path(criterion_dir: &Path, metric_key: &str) -> PathBuf {
-    // Strip trailing stat suffix (.p50_ns, .p95_ns, etc.) to get the bench/param path
+    // metric_key formats:
+    //   "bench.stat"         → criterion_dir/bench/new/estimates.json
+    //   "bench.param.stat"   → criterion_dir/bench/param/new/estimates.json
+    //   param may contain '/' for nested criterion dirs (e.g. "sel/1pct")
     let parts: Vec<&str> = metric_key.splitn(3, '.').collect();
     let bench = parts.first().copied().unwrap_or(metric_key);
-    let param = parts.get(1).copied().unwrap_or("_");
-    criterion_dir.join(bench).join(param).join("new").join("estimates.json")
+    if parts.len() >= 3 {
+        let param = parts[1];
+        criterion_dir.join(bench).join(param).join("new").join("estimates.json")
+    } else {
+        criterion_dir.join(bench).join("new").join("estimates.json")
+    }
 }

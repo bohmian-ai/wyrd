@@ -135,6 +135,7 @@ async fn tenant_isolation_zero_leak() {
             "shared_isolation",
             user_fields,
             TableScope::SystemShared,
+            wyrd_spec::ids::DataTenantId::SYSTEM_OWNER,
             &[],
         )
         .await

@@ -1,0 +1,53 @@
+[package]
+name = "vala-bifrost"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Vala OLAP write/read engine built on Apache Iceberg and DataFusion."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+python = ["dep:pyo3", "arrow/pyarrow"]
+
+[dependencies]
+wyrd-spec    = { workspace = true }
+wyrd-storage = { workspace = true, features = ["iceberg"] }
+vala-sql     = { path = "../vala-sql", version = "0.0.1" }
+
+iceberg             = { workspace = true }
+iceberg-catalog-sql = { workspace = true }
+iceberg-datafusion  = { workspace = true }
+
+datafusion = { workspace = true }
+arrow      = { workspace = true }
+parquet    = { workspace = true }
+
+sqlx         = { workspace = true }
+sqlx_catalog = { package = "sqlx", version = "=0.8.1", default-features = false, features = ["postgres", "runtime-tokio", "any"] }
+
+tokio      = { workspace = true, features = ["full"] }
+tracing    = { workspace = true }
+thiserror  = { workspace = true }
+dashmap    = { workspace = true }
+async-trait = { workspace = true }
+url        = { workspace = true }
+uuid       = { workspace = true, features = ["v7"] }
+serde      = { workspace = true, features = ["derive"] }
+sha2       = { workspace = true }
+
+pyo3 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile   = { workspace = true }
+serde_json = { workspace = true }
+vala-sql   = { path = "../vala-sql", version = "0.0.1", features = ["testing"] }
+wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
+
+[lints]
+workspace = true

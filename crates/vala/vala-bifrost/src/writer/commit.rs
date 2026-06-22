@@ -1,0 +1,154 @@
+use arrow::array::RecordBatch;
+use iceberg::spec::DataFile;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter;
+use iceberg::table::Table;
+use iceberg_catalog_sql::SqlCatalog;
+use sqlx::PgPool;
+use wyrd_spec::ids::DataTenantId;
+
+use crate::error::BifrostError;
+use crate::types::TableUid;
+use crate::writer::file_writer::bifrost_writer_properties;
+
+pub async fn run_commit(
+    pool: &PgPool,
+    catalog: &SqlCatalog,
+    table: &Table,
+    table_uid: &TableUid,
+    batches: Vec<RecordBatch>,
+    batch_id: [u8; 16],
+    tenant: DataTenantId,
+) -> Result<i64, BifrostError> {
+    let table_fqn = table.identifier().to_string();
+
+    let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
+        .await
+        .map_err(BifrostError::Sql)?;
+
+    let existing = vala_sql::queries::olap_catalog::lookup_idempotent(
+        &mut conn,
+        table_uid.as_bytes(),
+        &batch_id,
+    )
+    .await
+    .map_err(BifrostError::Sql)?;
+
+    match existing {
+        Some(row) if row.state == "committed" => {
+            conn.commit().await.map_err(BifrostError::Sql)?;
+            return Ok(row.snapshot_id.unwrap_or(0));
+        }
+        Some(row) if row.state == "failed" => {
+            conn.commit().await.map_err(BifrostError::Sql)?;
+            return Err(BifrostError::DuplicateFailedBatch(
+                uuid::Uuid::from_bytes(batch_id).to_string(),
+            ));
+        }
+        Some(_) => {
+            conn.commit().await.map_err(BifrostError::Sql)?;
+            return Err(BifrostError::CommitConflict(table_fqn));
+        }
+        None => {}
+    }
+
+    vala_sql::queries::olap_catalog::precommit(&mut conn, table_uid.as_bytes(), &batch_id)
+        .await
+        .map_err(BifrostError::Sql)?;
+
+    conn.commit().await.map_err(BifrostError::Sql)?;
+
+    let data_files_result = write_batches(table, batches).await;
+
+    let snapshot_id = match data_files_result {
+        Err(e) => {
+            let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
+                .await
+                .map_err(BifrostError::Sql)?;
+            let code = e.to_string();
+            let _ = vala_sql::queries::olap_catalog::finalize_failed(
+                &mut conn,
+                table_uid.as_bytes(),
+                &batch_id,
+                "WYRD_VALA_500_INTERNAL",
+                &code,
+            )
+            .await;
+            let _ = conn.commit().await;
+            return Err(e);
+        }
+        Ok(files) => commit_to_iceberg(catalog, table, files).await?,
+    };
+
+    let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
+        .await
+        .map_err(BifrostError::Sql)?;
+
+    vala_sql::queries::olap_catalog::finalize_committed(
+        &mut conn,
+        table_uid.as_bytes(),
+        &batch_id,
+        snapshot_id,
+    )
+    .await
+    .map_err(BifrostError::Sql)?;
+
+    conn.commit().await.map_err(BifrostError::Sql)?;
+
+    Ok(snapshot_id)
+}
+
+async fn write_batches(table: &Table, batches: Vec<RecordBatch>) -> Result<Vec<DataFile>, BifrostError> {
+    let file_io = table.file_io().clone();
+    let table_metadata = table.metadata();
+    let iceberg_schema = table_metadata.current_schema().clone();
+
+    let location_gen =
+        DefaultLocationGenerator::new(table_metadata).map_err(BifrostError::Iceberg)?;
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "bifrost".to_string(),
+        None,
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+
+    let writer_props = bifrost_writer_properties();
+    let parquet_builder = ParquetWriterBuilder::new(writer_props, iceberg_schema);
+
+    let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        file_io,
+        location_gen,
+        file_name_gen,
+    );
+
+    let data_file_builder = DataFileWriterBuilder::new(rolling_builder);
+    let mut writer = UnpartitionedWriter::new(data_file_builder);
+
+    for batch in batches {
+        writer.write(batch).await.map_err(BifrostError::Iceberg)?;
+    }
+
+    writer.close().await.map_err(BifrostError::Iceberg)
+}
+
+async fn commit_to_iceberg(
+    catalog: &SqlCatalog,
+    table: &Table,
+    data_files: Vec<DataFile>,
+) -> Result<i64, BifrostError> {
+    let tx = Transaction::new(table);
+    let action = tx.fast_append().add_data_files(data_files);
+    let tx = action.apply(tx).map_err(BifrostError::Iceberg)?;
+    let committed = tx.commit(catalog).await.map_err(BifrostError::Iceberg)?;
+    let snapshot_id = committed
+        .metadata()
+        .current_snapshot_id()
+        .unwrap_or(0);
+    Ok(snapshot_id)
+}

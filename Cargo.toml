@@ -122,9 +122,9 @@ ulid = "1"
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
-arrow = "55"
-arrow-array = "55"
-arrow-schema = "55"
+arrow = "58"
+arrow-array = "58"
+arrow-schema = "58"
 statrs = "0.18"
 jsonpath-rust = "0.7"
 tracing-opentelemetry = "0.28"
@@ -157,7 +157,14 @@ opendal = { version = "0.57", default-features = false, features = [
   "services-fs", "services-s3", "services-gcs", "services-azblob",
   "reqwest-rustls-tls",
 ] }
-datafusion = "=54.0.0"
+# =53.1.0 matches the iceberg-rust arrow-58 line; git-pinned until iceberg 0.10 publishes.
+datafusion = "=53.1.0"
+parquet = "58"
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "b4c73df" }
+# sqlx 0.8.1 is a hard dep in this crate — there is no sqlx feature flag to add.
+iceberg-catalog-sql = { git = "https://github.com/apache/iceberg-rust", rev = "b4c73df" }
+iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "b4c73df" }
+iceberg-storage-opendal = { git = "https://github.com/apache/iceberg-rust", rev = "b4c73df", features = ["opendal-s3", "opendal-gcs", "opendal-azdls", "opendal-fs", "opendal-memory"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

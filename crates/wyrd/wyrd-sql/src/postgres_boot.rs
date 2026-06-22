@@ -405,6 +405,8 @@ pub struct EmbeddedDataDirs {
     pub app_secret: PathBuf,
     /// Persisted `wyrd_platform_admin` password path.
     pub platform_admin_secret: PathBuf,
+    /// Persisted `wyrd_catalog_app` password path.
+    pub catalog_app_secret: PathBuf,
 }
 
 impl EmbeddedDataDirs {
@@ -417,6 +419,7 @@ impl EmbeddedDataDirs {
             migrator_secret: role_credentials.join("wyrd_migrator.secret"),
             app_secret: role_credentials.join("wyrd_app.secret"),
             platform_admin_secret: role_credentials.join("wyrd_platform_admin.secret"),
+            catalog_app_secret: role_credentials.join("wyrd_catalog_app.secret"),
             role_credentials,
             root,
         }
@@ -428,6 +431,7 @@ pub(crate) struct EmbeddedRoleCredentials {
     pub(crate) migrator: SecretString,
     pub(crate) app: SecretString,
     pub(crate) platform_admin: SecretString,
+    pub(crate) catalog_app: SecretString,
 }
 
 impl EmbeddedRoleCredentials {
@@ -448,6 +452,7 @@ impl EmbeddedRoleCredentials {
             migrator: read_or_create_secret(&dirs.migrator_secret)?,
             app: read_or_create_secret(&dirs.app_secret)?,
             platform_admin: read_or_create_secret(&dirs.platform_admin_secret)?,
+            catalog_app: read_or_create_secret(&dirs.catalog_app_secret)?,
         })
     }
 }

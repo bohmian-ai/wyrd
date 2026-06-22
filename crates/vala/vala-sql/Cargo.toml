@@ -12,6 +12,10 @@ description = "Server-tier SQL migrations for Vala observability storage."
 [lib]
 path = "src/lib.rs"
 
+[features]
+diagnostics = []
+testing = ["wyrd-sql/testing"]
+
 [dependencies]
 sqlx = { workspace = true }
 tracing = { workspace = true }

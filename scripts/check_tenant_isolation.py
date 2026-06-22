@@ -120,7 +120,7 @@ def check_migration_drift(failures: list[str]) -> None:
     for path in sorted(VALA_SQL_MIGRATIONS.glob("*.sql")):
         sql = path.read_text()
         for schema in table_schemas(sql):
-            if schema != "vala":
+            if schema not in {"vala", "iceberg_catalog"}:
                 failures.append(f"{rel(path)}: CREATE TABLE uses non-Vala schema {schema}")
 
     migration_text = "\n".join(path.read_text() for path in sql_migration_files())

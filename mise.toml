@@ -994,6 +994,12 @@ bootstrap user is wyrd_migrator (which owns the database).
 """
 env = { WYRD_MIGRATOR_DSN = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd" }
 run = """
+for i in $(seq 1 30); do
+  if psql "$WYRD_MIGRATOR_DSN" -c "SELECT 1" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
 psql "$WYRD_MIGRATOR_DSN" -c "ALTER ROLE wyrd_migrator BYPASSRLS;" || true
 psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE wyrd_app LOGIN PASSWORD 'wyrd_app_pw';" || true
 psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE wyrd_platform_admin LOGIN PASSWORD 'wyrd_platform_admin_pw' BYPASSRLS;" || true
@@ -1005,6 +1011,7 @@ Runs the idempotent migration test, which also verifies that required Postgres
 roles (wyrd_migrator BYPASSRLS, wyrd_app no-BYPASSRLS, wyrd_platform_admin
 BYPASSRLS) are present before applying DDL.
 """
+depends = ["db:setup-roles"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw" }
 run = "cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture"
 

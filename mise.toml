@@ -1050,3 +1050,24 @@ run = "cargo test --locked -p vala-core --tests alert_router -- schema_drift"
 [tasks."dev:pg:nuke"]
 description = "Wipe embedded pg cache"
 run = "rm -rf ${WYRD_DEV_PG_CACHE}"
+
+[tasks."bench"]
+description = "vala-bifrost criterion microbenches (requires BIFROST_TEST_DB_URL)"
+run = "cargo bench -p vala-bifrost --features bench-bin"
+
+[tasks."bench:workload"]
+description = "vala-bifrost large-workload bench (~5 min, release mode; requires WYRD_BENCH_PG_URL)"
+run = """
+cargo run --release -p vala-bifrost --bin bench_workload --features bench-bin -- \
+  --rows 10000000 --batch-size 65536 --workload selective \
+  --postgres-url "$WYRD_BENCH_PG_URL" \
+  --output crates/vala/vala-bifrost/benches/reports/workload-selective.json
+"""
+
+[tasks."bench:check"]
+description = "Fail if microbenches regressed >10% vs the stage1 baseline"
+run = """
+cargo run --release -p vala-bifrost --bin bench_check --features bench-bin -- \
+  --baseline crates/vala/vala-bifrost/benches/baselines/stage1.json \
+  --criterion-dir target/criterion
+"""

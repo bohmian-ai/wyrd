@@ -1,0 +1,14 @@
+{
+  "version": "stage1",
+  "tolerance_pct": 10,
+  "metrics": {
+    "write_throughput.batch=100000.p50_ns": 0,
+    "commit_latency.p50_ns": 0,
+    "scan_cold_warm.cold.p50_ns": 0,
+    "scan_cold_warm.warm.p50_ns": 0,
+    "selectivity.sel=1pct.p50_ns": 0,
+    "selectivity.sel=100pct.p50_ns": 0,
+    "projection.full_vs_2col.bytes_ratio": 0.0,
+    "plan_overhead.p50_ns": 0
+  }
+}

@@ -1052,11 +1052,24 @@ description = "Wipe embedded pg cache"
 run = "rm -rf ${WYRD_DEV_PG_CACHE}"
 
 [tasks."bench"]
-description = "vala-bifrost criterion microbenches (requires BIFROST_TEST_DB_URL)"
-run = "cargo bench -p vala-bifrost --features bench-bin"
+description = """vala-bifrost criterion microbenches against docker-compose Postgres.
+Brings up a clean Postgres, provisions roles, applies migrations, then runs the
+benches. The warehouse dir is reset so a fresh catalog never disagrees with
+stale on-disk Iceberg metadata.
+"""
+depends = ["build:postgres", "db:setup-roles", "db:migrate"]
+env = { BIFROST_TEST_DB_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd" }
+run = """
+rm -rf /tmp/vala-bifrost-bench
+cargo bench -p vala-bifrost --features bench-bin
+"""
 
 [tasks."bench:workload"]
-description = "vala-bifrost large-workload bench (~5 min, release mode; requires WYRD_BENCH_PG_URL)"
+description = """vala-bifrost large-workload bench (~5 min, release) against docker-compose Postgres.
+Brings up a clean Postgres, provisions roles, and applies migrations first.
+"""
+depends = ["build:postgres", "db:setup-roles", "db:migrate"]
+env = { WYRD_BENCH_PG_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd" }
 run = """
 cargo run --release -p vala-bifrost --bin bench_workload --features bench-bin -- \
   --rows 10000000 --batch-size 65536 --workload selective \

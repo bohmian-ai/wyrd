@@ -45,11 +45,15 @@ fn main() {
 
     let tol = baseline.tolerance_pct / 100.0;
     let mut regressions: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
     let mut checked = 0usize;
 
     for (metric_key, &expected_ns) in &baseline.metrics {
         // metric_key format: "bench_name.param.stat" e.g. "write_throughput.batch=100000.p50_ns"
-        // Expected 0 means placeholder — skip the gate.
+        // A zero baseline is an explicit placeholder (fresh stage, not yet
+        // measured) — skip it. A non-zero baseline MUST have a matching
+        // estimates file; a missing or unreadable one is a hard failure, never
+        // a silent skip, so the gate can never pass on absent data.
         if expected_ns == 0.0 {
             continue;
         }
@@ -60,7 +64,9 @@ fn main() {
         let estimates_raw = match std::fs::read_to_string(&estimates_path) {
             Ok(s) => s,
             Err(_) => {
-                eprintln!("WARN: estimates not found at {:?} (skipping)", estimates_path);
+                missing.push(format!(
+                    "  {metric_key}: no estimates at {estimates_path:?} (run `mise run bench` first)"
+                ));
                 continue;
             }
         };
@@ -68,7 +74,9 @@ fn main() {
         let estimates: Estimates = match serde_json::from_str(&estimates_raw) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("WARN: parse estimates {:?}: {e} (skipping)", estimates_path);
+                missing.push(format!(
+                    "  {metric_key}: unreadable estimates {estimates_path:?}: {e}"
+                ));
                 continue;
             }
         };
@@ -87,14 +95,23 @@ fn main() {
         }
     }
 
-    if checked == 0 {
-        println!("bench:check — baseline has all zeros (Stage 1 placeholder); no regressions checked.");
+    if checked == 0 && missing.is_empty() {
+        println!("bench:check — baseline has all zeros (placeholder); no metrics gated.");
         std::process::exit(0);
     }
 
-    if regressions.is_empty() {
-        println!("bench:check passed — {checked} metric(s) within tolerance.");
-    } else {
+    let mut failed = false;
+    if !missing.is_empty() {
+        eprintln!(
+            "bench:check FAILED — {} baseline metric(s) have no estimates:",
+            missing.len()
+        );
+        for m in &missing {
+            eprintln!("{m}");
+        }
+        failed = true;
+    }
+    if !regressions.is_empty() {
         eprintln!(
             "bench:check FAILED — {} regression(s) of {} checked:",
             regressions.len(),
@@ -103,8 +120,13 @@ fn main() {
         for r in &regressions {
             eprintln!("{r}");
         }
+        failed = true;
+    }
+    if failed {
         std::process::exit(1);
     }
+
+    println!("bench:check passed — {checked} metric(s) within tolerance.");
 }
 
 fn resolve_estimates_path(criterion_dir: &Path, metric_key: &str) -> PathBuf {

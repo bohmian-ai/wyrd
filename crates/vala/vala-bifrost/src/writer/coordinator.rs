@@ -45,6 +45,9 @@ fn now_micros() -> i64 {
 }
 
 impl CommitActor {
+    /// Serially process [`WriteCmd`]s until the channel closes. Serial execution
+    /// is the concurrency boundary: one actor per table means buffered batches
+    /// and the flush commit never race.
     async fn run(mut self) {
         while let Some(cmd) = self.receiver.recv().await {
             match cmd {
@@ -75,6 +78,9 @@ impl CommitActor {
         Ok(())
     }
 
+    /// Stamp every buffered batch with the system columns and commit them as one
+    /// 2PC transaction. On any failure the drained batches are restored to the
+    /// buffer so the caller can retry. An empty buffer is a no-op returning `0`.
     async fn flush(&mut self) -> Result<i64, BifrostError> {
         if self.buffer.is_empty() {
             return Ok(0);
@@ -126,6 +132,11 @@ impl CommitActor {
     }
 }
 
+/// Spawn the per-table commit actor and return a [`TableWriterHandle`] for it.
+///
+/// One actor is spawned per `writer()` call, each bound to a single data tenant
+/// (see [`CommitActor::data_tenant`]). The actor owns the loaded [`Table`] and
+/// advances its snapshot as flushes commit.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_commit_coordinator(
     table: Table,

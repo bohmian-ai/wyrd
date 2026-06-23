@@ -9,6 +9,16 @@ use wyrd_spec::vala::system_columns::{
     DATA_TENANT_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
 };
 
+/// Append the server-stamped system columns to a caller batch (user fields only).
+///
+/// Adds `wyrd_event_time` and `wyrd_ingested_at` (both `ingested_at_us`, UTC
+/// microseconds), `wyrd_batch_id` (the 2PC `batch_id`), and — when `tenant` is
+/// `Some` (i.e. a `SystemShared` table) — `data_tenant_id`. `TenantOwned` tables
+/// pass `None`: the tenant lives in the table's physical path, not a column.
+///
+/// # Errors
+/// Returns [`ArrowError`] when building the batch-id column or assembling the
+/// stamped [`RecordBatch`] fails.
 pub fn stamp_system_columns(
     batch: RecordBatch,
     ingested_at_us: i64,

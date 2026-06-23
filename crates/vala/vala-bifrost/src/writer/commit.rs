@@ -19,6 +19,22 @@ use crate::error::BifrostError;
 use crate::types::TableUid;
 use crate::writer::file_writer::bifrost_writer_properties;
 
+/// Execute one 2PC commit of `batches` under `batch_id` for `table`.
+///
+/// Two phases, each with a clear short-circuit:
+/// 1. [`claim_batch`] inspects the prior 2PC anchor. An already-committed batch
+///    replays its recorded snapshot with no write — returning `(snapshot, None)`
+///    so the caller keeps its current table ref. A prior failure or an in-flight
+///    precommit is rejected.
+/// 2. [`write_and_finalize`] writes Parquet, fast-appends to Iceberg, and records
+///    the terminal FSM transition (`committed`, or `failed` on write error).
+///
+/// On a fresh write the returned [`Table`] is the post-append snapshot the caller
+/// must adopt for its next commit; on replay it is `None`.
+///
+/// # Errors
+/// Returns [`BifrostError`] when the control-plane txn, Parquet write, or Iceberg
+/// append fails, or when the batch_id collides with a failed/in-flight anchor.
 pub async fn run_commit(
     pool: &PgPool,
     catalog: &SqlCatalog,
@@ -30,68 +46,109 @@ pub async fn run_commit(
 ) -> Result<(i64, Option<Table>), BifrostError> {
     let table_fqn = table.identifier().to_string();
 
+    if let Some(snapshot_id) = claim_batch(pool, table_uid, &batch_id, tenant, &table_fqn).await? {
+        return Ok((snapshot_id, None));
+    }
+
+    let (snapshot_id, updated_table) =
+        write_and_finalize(pool, catalog, table, table_uid, batches, &batch_id, tenant).await?;
+
+    Ok((snapshot_id, Some(updated_table)))
+}
+
+/// Phase 1 of [`run_commit`]: dispatch on the prior 2PC anchor, then claim the
+/// batch for a fresh write.
+///
+/// - `Ok(Some(snapshot_id))` — the batch already committed; the caller must
+///   replay this snapshot and write nothing.
+/// - `Ok(None)` — no prior anchor; a `precommit` row has been written and the
+///   caller should proceed with the write.
+/// - `Err(..)` — the batch_id collides with a prior failure
+///   ([`BifrostError::DuplicateFailedBatch`]) or an in-flight precommit
+///   ([`BifrostError::CommitConflict`]); the caller must retry with a new id.
+///
+/// # Errors
+/// Returns [`BifrostError::Sql`] on control-plane failure,
+/// [`BifrostError::MetadataMismatch`] when a `committed` row has a NULL
+/// `snapshot_id` (control-table corruption, not a 0-snapshot success), or the
+/// collision errors above.
+async fn claim_batch(
+    pool: &PgPool,
+    table_uid: &TableUid,
+    batch_id: &[u8; 16],
+    tenant: DataTenantId,
+    table_fqn: &str,
+) -> Result<Option<i64>, BifrostError> {
     let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
         .await
         .map_err(BifrostError::Sql)?;
 
-    let existing = vala_sql::queries::olap_catalog::lookup_idempotent(
-        &mut conn,
-        table_uid.as_bytes(),
-        &batch_id,
-    )
-    .await
-    .map_err(BifrostError::Sql)?;
+    let existing =
+        vala_sql::queries::olap_catalog::lookup_idempotent(&mut conn, table_uid.as_bytes(), batch_id)
+            .await
+            .map_err(BifrostError::Sql)?;
 
     match existing {
         Some(row) if row.state == "committed" => {
-            // Idempotent replay: this batch already committed. Return the prior
-            // snapshot and no fresh table — the caller keeps its current snapshot.
-            // A committed row always has a snapshot_id (finalize_committed sets it);
-            // a NULL here is control-table corruption, not a 0-snapshot success.
             conn.commit().await.map_err(BifrostError::Sql)?;
             let snapshot_id = row.snapshot_id.ok_or_else(|| {
                 BifrostError::MetadataMismatch(format!(
                     "committed olap_commits row for {table_fqn} has NULL snapshot_id"
                 ))
             })?;
-            return Ok((snapshot_id, None));
+            Ok(Some(snapshot_id))
         }
         Some(row) if row.state == "failed" => {
             conn.commit().await.map_err(BifrostError::Sql)?;
-            return Err(BifrostError::DuplicateFailedBatch(
-                uuid::Uuid::from_bytes(batch_id).to_string(),
-            ));
+            Err(BifrostError::DuplicateFailedBatch(
+                uuid::Uuid::from_bytes(*batch_id).to_string(),
+            ))
         }
         Some(_) => {
-            // A precommit row means this batch_id is currently being written by
-            // another actor. Return CommitConflict; the caller must retry with a
-            // new batch_id.
             conn.commit().await.map_err(BifrostError::Sql)?;
-            return Err(BifrostError::CommitConflict(table_fqn));
+            Err(BifrostError::CommitConflict(table_fqn.to_string()))
         }
-        None => {}
+        None => {
+            vala_sql::queries::olap_catalog::precommit(&mut conn, table_uid.as_bytes(), batch_id)
+                .await
+                .map_err(BifrostError::Sql)?;
+            conn.commit().await.map_err(BifrostError::Sql)?;
+            Ok(None)
+        }
     }
+}
 
-    vala_sql::queries::olap_catalog::precommit(&mut conn, table_uid.as_bytes(), &batch_id)
-        .await
-        .map_err(BifrostError::Sql)?;
-
-    conn.commit().await.map_err(BifrostError::Sql)?;
-
-    let data_files_result = write_batches(table, batches).await;
-
-    let (snapshot_id, updated_table) = match data_files_result {
+/// Phase 2 of [`run_commit`]: write the claimed `batches` and record the terminal
+/// FSM transition.
+///
+/// Writes Parquet and fast-appends to Iceberg. On success the anchor moves to
+/// `committed` with the discovered snapshot id and the post-append [`Table`] is
+/// returned. On write failure the anchor moves to `failed` (best-effort — the
+/// original error is preserved and returned).
+///
+/// # Errors
+/// Returns the underlying [`BifrostError`] from the Parquet write or Iceberg
+/// append, or [`BifrostError::Sql`] when the `committed` finalize fails.
+async fn write_and_finalize(
+    pool: &PgPool,
+    catalog: &SqlCatalog,
+    table: &Table,
+    table_uid: &TableUid,
+    batches: Vec<RecordBatch>,
+    batch_id: &[u8; 16],
+    tenant: DataTenantId,
+) -> Result<(i64, Table), BifrostError> {
+    let (snapshot_id, updated_table) = match write_batches(table, batches).await {
         Err(e) => {
             let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
                 .await
                 .map_err(BifrostError::Sql)?;
-            let code = e.to_string();
             let _ = vala_sql::queries::olap_catalog::finalize_failed(
                 &mut conn,
                 table_uid.as_bytes(),
-                &batch_id,
+                batch_id,
                 "WYRD_VALA_500_BIFROST_INTERNAL",
-                &code,
+                &e.to_string(),
             )
             .await;
             let _ = conn.commit().await;
@@ -107,7 +164,7 @@ pub async fn run_commit(
     vala_sql::queries::olap_catalog::finalize_committed(
         &mut conn,
         table_uid.as_bytes(),
-        &batch_id,
+        batch_id,
         snapshot_id,
     )
     .await
@@ -115,9 +172,19 @@ pub async fn run_commit(
 
     conn.commit().await.map_err(BifrostError::Sql)?;
 
-    Ok((snapshot_id, Some(updated_table)))
+    Ok((snapshot_id, updated_table))
 }
 
+/// Write `batches` to Parquet data files under `table`, returning the resulting
+/// [`DataFile`] descriptors for the Iceberg append.
+///
+/// Casts each batch to the authoritative Arrow schema derived from the table's
+/// Iceberg schema (which carries the `PARQUET:field_id` metadata and exact column
+/// types the Iceberg writer requires) before writing.
+///
+/// # Errors
+/// Returns [`BifrostError`] when schema derivation, a column cast, or the
+/// underlying Iceberg/Parquet write fails.
 async fn write_batches(
     table: &Table,
     batches: Vec<RecordBatch>,
@@ -179,6 +246,11 @@ async fn write_batches(
     writer.close().await.map_err(BifrostError::Iceberg)
 }
 
+/// Fast-append `data_files` to `table` as a single Iceberg transaction and return
+/// the new snapshot id alongside the updated [`Table`].
+///
+/// # Errors
+/// Returns [`BifrostError::Iceberg`] when the transaction build or commit fails.
 async fn commit_to_iceberg(
     catalog: &SqlCatalog,
     table: &Table,

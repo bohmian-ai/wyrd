@@ -7,6 +7,14 @@ use iceberg_catalog_sql::{SqlBindStyle, SqlCatalog, SqlCatalogBuilder};
 
 use crate::error::BifrostError;
 
+/// Build an iceberg-rust [`SqlCatalog`] named `wyrd` over the Postgres control
+/// database at `catalog_uri`, backed by `warehouse` storage.
+///
+/// Installs the SQL drivers, forces `$N` bind style (Postgres), and merges the
+/// storage factory's `storage_props` into the catalog config.
+///
+/// # Errors
+/// Returns [`BifrostError::Iceberg`] when the catalog fails to load.
 pub async fn build_catalog(
     catalog_uri: &str,
     warehouse: &str,

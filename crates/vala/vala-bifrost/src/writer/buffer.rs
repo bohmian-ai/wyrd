@@ -13,6 +13,16 @@ impl AppendBuffer {
         }
     }
 
+    /// Rebuild a buffer from previously-drained batches, recomputing `total_rows`.
+    /// Used to restore buffered writes when a flush fails.
+    pub fn from_vec(batches: Vec<RecordBatch>) -> Self {
+        let total_rows = batches.iter().map(RecordBatch::num_rows).sum();
+        Self {
+            batches,
+            total_rows,
+        }
+    }
+
     pub fn push(&mut self, batch: RecordBatch) {
         self.total_rows += batch.num_rows();
         self.batches.push(batch);

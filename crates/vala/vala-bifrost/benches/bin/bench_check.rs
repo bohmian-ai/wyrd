@@ -27,7 +27,7 @@ struct Baseline {
 
 #[derive(Debug, Deserialize)]
 struct Estimates {
-    mean: Estimate,
+    median: Estimate,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,8 +40,8 @@ fn main() {
 
     let baseline_raw = std::fs::read_to_string(&args.baseline)
         .unwrap_or_else(|e| panic!("read baseline {:?}: {e}", args.baseline));
-    let baseline: Baseline = serde_json::from_str(&baseline_raw)
-        .unwrap_or_else(|e| panic!("parse baseline: {e}"));
+    let baseline: Baseline =
+        serde_json::from_str(&baseline_raw).unwrap_or_else(|e| panic!("parse baseline: {e}"));
 
     let tol = baseline.tolerance_pct / 100.0;
     let mut regressions: Vec<String> = Vec::new();
@@ -81,7 +81,7 @@ fn main() {
             }
         };
 
-        let actual_ns = estimates.mean.point_estimate;
+        let actual_ns = estimates.median.point_estimate;
         let threshold = expected_ns * (1.0 + tol);
         checked += 1;
 
@@ -138,7 +138,11 @@ fn resolve_estimates_path(criterion_dir: &Path, metric_key: &str) -> PathBuf {
     let bench = parts.first().copied().unwrap_or(metric_key);
     if parts.len() >= 3 {
         let param = parts[1];
-        criterion_dir.join(bench).join(param).join("new").join("estimates.json")
+        criterion_dir
+            .join(bench)
+            .join(param)
+            .join("new")
+            .join("estimates.json")
     } else {
         criterion_dir.join(bench).join("new").join("estimates.json")
     }

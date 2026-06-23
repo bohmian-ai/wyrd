@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::Field;
 use iceberg::Catalog as _;
-use iceberg::spec::FormatVersion;
 use iceberg::TableCreation;
+use iceberg::spec::FormatVersion;
 use iceberg_catalog_sql::SqlCatalog;
 use sqlx::PgPool;
 
@@ -14,8 +14,8 @@ use crate::error::BifrostError;
 use crate::provider::WyrdTableProvider;
 use crate::schema::system_columns::with_system_columns;
 use crate::types::{PartitionTransform, SchemaFingerprint, TableScope, TableUid};
-use crate::writer::coordinator::spawn_commit_coordinator;
 use crate::writer::TableWriterHandle;
+use crate::writer::coordinator::spawn_commit_coordinator;
 
 pub mod iceberg_sql;
 pub mod namespaces;
@@ -79,9 +79,8 @@ impl WyrdCatalog {
 
         let all_fields = with_system_columns(user_fields, scope);
         let arrow_schema = arrow::datatypes::Schema::new(all_fields);
-        let iceberg_schema =
-            iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)
-                .map_err(BifrostError::Iceberg)?;
+        let iceberg_schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)
+            .map_err(BifrostError::Iceberg)?;
 
         let partition_spec = if partition_columns.is_empty() {
             None
@@ -116,10 +115,7 @@ impl WyrdCatalog {
             .create_table(&namespace_ident, creation)
             .await?;
 
-        let registration_tenant = match scope {
-            TableScope::SystemShared => wyrd_spec::ids::DataTenantId::SYSTEM_OWNER,
-            TableScope::TenantOwned => tenant,
-        };
+        let registration_tenant = scope.control_bind(tenant);
 
         let mut conn = vala_sql::TenantConn::acquire(&self.pool, registration_tenant)
             .await
@@ -130,10 +126,7 @@ impl WyrdCatalog {
             table_uid.as_bytes(),
             &fqn,
             &fingerprint.0,
-            match scope {
-                TableScope::TenantOwned => "tenant_owned",
-                TableScope::SystemShared => "system_shared",
-            },
+            scope.as_db_str(),
             &[],
         )
         .await
@@ -144,6 +137,31 @@ impl WyrdCatalog {
         Ok(table_uid)
     }
 
+    /// Read a `vala.bifrost_tables` registration under a specific control-plane
+    /// RLS bind. The bind decides row visibility: `SystemShared` rows are only
+    /// visible under `SYSTEM_OWNER`, `TenantOwned` rows only under their data tenant.
+    async fn lookup_table_row(
+        &self,
+        fqn: &str,
+        bind: wyrd_spec::ids::DataTenantId,
+    ) -> Result<Option<vala_sql::row_types::olap_catalog::BifrostTableRow>, BifrostError> {
+        let mut conn = vala_sql::TenantConn::acquire(&self.pool, bind)
+            .await
+            .map_err(BifrostError::Sql)?;
+        let row = vala_sql::queries::olap_catalog::get_by_fqn(&mut conn, fqn)
+            .await
+            .map_err(BifrostError::Sql)?;
+        conn.commit().await.map_err(BifrostError::Sql)?;
+        Ok(row)
+    }
+
+    /// Open a writer for `tenant` (the authenticated **data tenant**, for both
+    /// scopes). The control-plane RLS bind for the registration lookup — and for
+    /// the commit coordinator's `vala.olap_commits` precommit/finalize rows — is
+    /// derived from `scope` (C2/N-M12), never from the caller: `SystemShared` binds
+    /// `SYSTEM_OWNER`, `TenantOwned` binds the data tenant. The data tenant itself is
+    /// what gets server-stamped into `data_tenant_id` on `SystemShared` rows; the two
+    /// values must never collapse.
     pub async fn writer(
         &self,
         ns: BifrostNamespace,
@@ -155,21 +173,10 @@ impl WyrdCatalog {
         let table = self.catalog.load_table(&table_ident).await?;
         let fqn = format!("{}.{}", ns.as_str(), name);
 
-        let conn_row = {
-            let mut conn = vala_sql::TenantConn::acquire(
-                &self.pool,
-                wyrd_spec::ids::DataTenantId::SYSTEM_OWNER,
-            )
-            .await
-            .map_err(BifrostError::Sql)?;
-            let row = vala_sql::queries::olap_catalog::get_by_fqn(&mut conn, &fqn)
-                .await
-                .map_err(BifrostError::Sql)?;
-            conn.commit().await.map_err(BifrostError::Sql)?;
-            row
-        };
-
-        let row = conn_row.ok_or_else(|| BifrostError::TableNotFound(fqn))?;
+        let row = self
+            .lookup_table_row(&fqn, scope.control_bind(tenant))
+            .await?
+            .ok_or_else(|| BifrostError::TableNotFound(fqn.clone()))?;
         let table_uid = TableUid(
             row.table_uid
                 .try_into()
@@ -181,6 +188,7 @@ impl WyrdCatalog {
             self.catalog.clone(),
             self.pool.clone(),
             table_uid,
+            fqn,
             scope,
             tenant,
         );
@@ -190,30 +198,45 @@ impl WyrdCatalog {
 
     /// Drop an Iceberg table from both the SQL catalog and the Wyrd control tables.
     ///
-    /// Ignores not-found errors. Intended for test and bench teardown.
-    pub async fn drop_table(&self, ns: BifrostNamespace, name: &str) -> Result<(), BifrostError> {
+    /// Ignores not-found errors. Routes the control-table cleanup through a
+    /// `TenantConn` bound to `tenant` (the registration's owner: the data tenant
+    /// for `TenantOwned`, `SYSTEM_OWNER` for `SystemShared`) so RLS sees the rows, and
+    /// deletes in FK order via `delete_table`.
+    ///
+    /// This is an unconditionally destructive, ownership-free operation, so it is
+    /// gated to test and bench builds and must never be reachable in production.
+    #[cfg(any(test, feature = "bench-bin"))]
+    pub async fn drop_table(
+        &self,
+        ns: BifrostNamespace,
+        name: &str,
+        tenant: wyrd_spec::ids::DataTenantId,
+    ) -> Result<(), BifrostError> {
         let fqn = format!("{}.{}", ns.as_str(), name);
         let table_ident = iceberg::TableIdent::new(ns.to_namespace_ident(), name.to_string());
 
-        // Drop from Iceberg catalog — ignore not-found
+        // Drop from Iceberg catalog — ignore not-found.
         let _ = self.catalog.drop_table(&table_ident).await;
 
-        // Clean Wyrd control tables (commits before tables due to FK)
-        sqlx::query("DELETE FROM vala.olap_commits WHERE table_uid IN (SELECT table_uid FROM vala.bifrost_tables WHERE fqn = $1)")
-            .bind(&fqn)
-            .execute(&*self.pool)
+        let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
             .await
-            .map_err(|e| BifrostError::Internal(format!("drop_table olap_commits: {e}")))?;
-
-        sqlx::query("DELETE FROM vala.bifrost_tables WHERE fqn = $1")
-            .bind(&fqn)
-            .execute(&*self.pool)
+            .map_err(BifrostError::Sql)?;
+        vala_sql::queries::olap_catalog::delete_table(&mut conn, &fqn)
             .await
-            .map_err(|e| BifrostError::Internal(format!("drop_table bifrost_tables: {e}")))?;
+            .map_err(BifrostError::Sql)?;
+        conn.commit().await.map_err(BifrostError::Sql)?;
 
         Ok(())
     }
 
+    /// Open a read provider for `tenant` (the authenticated **data tenant**).
+    ///
+    /// Unlike `writer()`, the caller does not supply the scope — it must be
+    /// *discovered* from the registration. The lookup is therefore two-step
+    /// (MAJOR-3): try the data tenant's bind first (resolves `TenantOwned` rows
+    /// under RLS), then `SYSTEM_OWNER` (resolves `SystemShared` rows). The resolved
+    /// `data_tenant_id` filter on a `SystemShared` scan binds this data tenant; the
+    /// control-plane binds above only decide which registration row is visible.
     pub async fn provider(
         &self,
         ns: BifrostNamespace,
@@ -222,24 +245,16 @@ impl WyrdCatalog {
     ) -> Result<WyrdTableProvider, BifrostError> {
         let table_ident = iceberg::TableIdent::new(ns.to_namespace_ident(), name.to_string());
         let table = self.catalog.load_table(&table_ident).await?;
+        let fqn = format!("{}.{}", ns.as_str(), name);
 
-        let scope = {
-            let fqn = format!("{}.{}", ns.as_str(), name);
-            let mut conn = vala_sql::TenantConn::acquire(
-                &self.pool,
-                wyrd_spec::ids::DataTenantId::SYSTEM_OWNER,
-            )
-            .await
-            .map_err(BifrostError::Sql)?;
-            let row = vala_sql::queries::olap_catalog::get_by_fqn(&mut conn, &fqn)
-                .await
-                .map_err(BifrostError::Sql)?;
-            conn.commit().await.map_err(BifrostError::Sql)?;
-            match row.as_ref().map(|r| r.scope.as_str()) {
-                Some("system_shared") => TableScope::SystemShared,
-                _ => TableScope::TenantOwned,
-            }
+        let row = match self.lookup_table_row(&fqn, tenant).await? {
+            Some(row) => row,
+            None => self
+                .lookup_table_row(&fqn, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
+                .await?
+                .ok_or_else(|| BifrostError::TableNotFound(fqn.clone()))?,
         };
+        let scope = TableScope::from_db_str(row.scope.as_str())?;
 
         WyrdTableProvider::try_new(table, scope, tenant)
             .await

@@ -4,8 +4,8 @@ use std::sync::Arc;
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use tokio::runtime::Runtime;
-use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::catalog::WyrdCatalog;
+use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::types::TableScope;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_storage::factory::iceberg_factory::iceberg_storage_factory;
@@ -77,7 +77,9 @@ async fn run(args: Args) {
         .expect("migrate bench db");
 
     let catalog_uri = vala_sql::testing::catalog_uri(&pool);
-    let backend = BackendConfig::Local { root: tmp.path().to_path_buf() };
+    let backend = BackendConfig::Local {
+        root: tmp.path().to_path_buf(),
+    };
     let (factory, props) = iceberg_storage_factory(&backend).unwrap();
 
     let catalog = WyrdCatalog::new(&catalog_uri, &warehouse, pool.clone(), factory, props)
@@ -117,7 +119,7 @@ async fn run(args: Args) {
             args.batch_size
         };
 
-        let batch = make_batch(n, i as i64);
+        let batch = make_batch(n);
         let writer = catalog
             .writer(ns, "bench_wl", TableScope::TenantOwned, tenant)
             .await
@@ -155,44 +157,22 @@ async fn run(args: Args) {
     println!("{json}");
 }
 
-fn make_batch(n: usize, day: i64) -> arrow::record_batch::RecordBatch {
-    use arrow::array::{FixedSizeBinaryBuilder, Int64Array, StringArray, TimestampMicrosecondArray};
-    use arrow::datatypes::{DataType, Field};
+fn make_batch(n: usize) -> arrow::record_batch::RecordBatch {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
-    let event_time_us = day * 86_400 * 1_000_000;
-    let batch_id = *uuid::Uuid::now_v7().as_bytes();
-
-    let full_schema = vala_bifrost::schema::bifrost_schema(
-        vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("payload", DataType::Utf8, false),
-        ],
-        TableScope::TenantOwned,
-    );
+    // User fields only — the write path server-stamps every system column at flush.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
 
     let ids: Int64Array = (0..n as i64).collect();
     let payloads: StringArray = (0..n).map(|i| Some(format!("p{i}"))).collect();
-    let event_times = TimestampMicrosecondArray::from(vec![event_time_us; n])
-        .with_timezone("UTC".to_string());
-    let ingested = TimestampMicrosecondArray::from(vec![event_time_us; n])
-        .with_timezone("UTC".to_string());
-    let mut bid_builder = FixedSizeBinaryBuilder::with_capacity(n, 16);
-    for _ in 0..n {
-        bid_builder.append_value(batch_id).unwrap();
-    }
 
-    arrow::record_batch::RecordBatch::try_new(
-        full_schema,
-        vec![
-            Arc::new(ids),
-            Arc::new(payloads),
-            Arc::new(event_times),
-            Arc::new(ingested),
-            Arc::new(bid_builder.finish()),
-        ],
-    )
-    .unwrap()
+    arrow::record_batch::RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(payloads)])
+        .unwrap()
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {

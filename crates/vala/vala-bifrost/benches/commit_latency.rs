@@ -1,8 +1,8 @@
 mod support;
 
-use criterion::{criterion_group, criterion_main, Criterion};
-use support::workload;
+use criterion::{Criterion, criterion_group, criterion_main};
 use support::BenchFixture;
+use support::workload;
 use tokio::runtime::Runtime;
 use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::types::TableScope;
@@ -28,15 +28,15 @@ fn bench_commit_latency(c: &mut Criterion) {
         b.to_async(&rt).iter(|| async {
             let writer = fixture
                 .catalog
-                .writer(ns, "bench_commit_latency", TableScope::TenantOwned, fixture.tenant)
+                .writer(
+                    ns,
+                    "bench_commit_latency",
+                    TableScope::TenantOwned,
+                    fixture.tenant,
+                )
                 .await
                 .unwrap();
-            let batch = workload::make_bench_batch(
-                10_000,
-                workload::day_us(1),
-                None,
-                TableScope::TenantOwned,
-            );
+            let batch = workload::make_bench_batch(10_000);
             writer.write(batch).await.unwrap();
             writer.flush().await.unwrap()
         });

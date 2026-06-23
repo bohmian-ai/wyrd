@@ -6,9 +6,7 @@ use arrow::record_batch::RecordBatch;
 use vala_bifrost::batch_builder::stamp_system_columns;
 use vala_bifrost::schema::bifrost_schema;
 use vala_bifrost::types::{SchemaFingerprint, TableScope};
-use wyrd_spec::vala::system_columns::{
-    DATA_TENANT_ID, WYRD_BATCH_ID, WYRD_INGESTED_AT,
-};
+use wyrd_spec::vala::system_columns::{DATA_TENANT_ID, WYRD_BATCH_ID, WYRD_INGESTED_AT};
 
 #[test]
 fn schema_has_correct_field_count_tenant_owned() {
@@ -27,7 +25,11 @@ fn schema_has_correct_field_count_tenant_owned() {
 fn schema_has_correct_field_count_system_shared() {
     let user_fields = vec![Field::new("metric", DataType::Int64, false)];
     let schema = bifrost_schema(user_fields, TableScope::SystemShared);
-    assert_eq!(schema.fields().len(), 5, "1 user + 4 system (with tenant_id)");
+    assert_eq!(
+        schema.fields().len(),
+        5,
+        "1 user + 4 system (with tenant_id)"
+    );
     assert!(schema.field_with_name(DATA_TENANT_ID).is_ok());
 }
 
@@ -54,14 +56,9 @@ fn fingerprint_differs_on_field_change() {
 
 #[test]
 fn stamp_system_columns_appends_batch_id_and_timestamps() {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("val", DataType::Int64, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
-    )
-    .unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))]).unwrap();
 
     let batch_id = *uuid::Uuid::now_v7().as_bytes();
     let now_us = 1_700_000_000_000_000_i64;
@@ -77,11 +74,8 @@ fn stamp_system_columns_appends_tenant_id_when_provided() {
     use wyrd_spec::ids::DataTenantId;
 
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(Int64Array::from(vec![42_i64]))],
-    )
-    .unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![42_i64]))]).unwrap();
 
     let tenant = DataTenantId::new_v7();
     let stamped =
@@ -116,8 +110,8 @@ async fn round_trip_full() {
     let backend = wyrd_storage::settings::BackendConfig::Local {
         root: tmp.path().to_path_buf(),
     };
-    let factory = wyrd_storage::factory::iceberg_factory::iceberg_storage_factory(&backend)
-        .unwrap();
+    let factory =
+        wyrd_storage::factory::iceberg_factory::iceberg_storage_factory(&backend).unwrap();
 
     let catalog = vala_bifrost::catalog::WyrdCatalog::new(
         &db_url,
@@ -158,35 +152,23 @@ async fn round_trip_full() {
         .await
         .unwrap();
 
-    let data_schema = bifrost_schema(
-        vec![Field::new("val", DataType::Int64, false)],
-        TableScope::TenantOwned,
-    );
+    // User fields only — the write path server-stamps every system column. A
+    // batch carrying wyrd_* / data_tenant_id columns is rejected.
+    let user_schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+        "val",
+        DataType::Int64,
+        false,
+    )]));
     let batch = RecordBatch::try_new(
-        data_schema,
-        vec![
-            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
-            Arc::new(
-                arrow::array::TimestampMicrosecondArray::from(vec![0_i64, 0, 0])
-                    .with_timezone("UTC".to_string()),
-            ),
-            Arc::new(
-                arrow::array::TimestampMicrosecondArray::from(vec![0_i64, 0, 0])
-                    .with_timezone("UTC".to_string()),
-            ),
-            {
-                let mut b = arrow::array::FixedSizeBinaryBuilder::with_capacity(3, 16);
-                let id = *uuid::Uuid::now_v7().as_bytes();
-                for _ in 0..3 {
-                    b.append_value(id).unwrap();
-                }
-                Arc::new(b.finish())
-            },
-        ],
+        user_schema,
+        vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
     )
     .unwrap();
 
     writer.write(batch).await.unwrap();
     let snapshot_id = writer.flush().await.unwrap();
-    assert!(snapshot_id > 0, "snapshot_id should be positive after commit");
+    assert!(
+        snapshot_id > 0,
+        "snapshot_id should be positive after commit"
+    );
 }

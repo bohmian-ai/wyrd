@@ -2,16 +2,32 @@ mod support;
 
 use std::sync::Arc;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use support::{workload, BenchFixture};
+use arrow::array::{Int64Array, StringArray};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use support::{BenchFixture, workload};
 use tokio::runtime::Runtime;
 use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::types::TableScope;
 
-/// Table has 100 partitions (days 0..99), 1k rows each = 100k total.
-/// Selectivity levels: 1%, 3%, 10%, 30%, 100% of files (days).
+/// Table has 100 files (days 0..99), 1k rows each = 100k total. Each file holds a
+/// disjoint `id` range (`day*ROWS_PER_DAY .. (day+1)*ROWS_PER_DAY`) so a range
+/// predicate on the user `id` column prunes a known fraction of files. (System
+/// columns are server-stamped at flush, so the bench cannot key pruning on
+/// `wyrd_event_time`.)
 const TOTAL_DAYS: i64 = 100;
 const ROWS_PER_DAY: usize = 1_000;
+
+/// One file's worth of rows with `id` in `[day*ROWS_PER_DAY, (day+1)*ROWS_PER_DAY)`.
+fn day_batch(n: usize, day: i64) -> arrow::record_batch::RecordBatch {
+    let base = day * n as i64;
+    let ids: Int64Array = (0..n as i64).map(|i| base + i).collect();
+    let payloads: StringArray = (0..n).map(|i| Some(format!("p{i}"))).collect();
+    arrow::record_batch::RecordBatch::try_new(
+        workload::simple_schema(),
+        vec![Arc::new(ids), Arc::new(payloads)],
+    )
+    .unwrap()
+}
 
 fn bench_selectivity(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
@@ -36,15 +52,15 @@ fn bench_selectivity(c: &mut Criterion) {
             .await;
 
         for day in 0..TOTAL_DAYS {
-            let batch = workload::make_bench_batch(
-                ROWS_PER_DAY,
-                workload::day_us(day),
-                None,
-                TableScope::TenantOwned,
-            );
+            let batch = day_batch(ROWS_PER_DAY, day);
             let writer = fixture
                 .catalog
-                .writer(ns, "bench_selectivity", TableScope::TenantOwned, fixture.tenant)
+                .writer(
+                    ns,
+                    "bench_selectivity",
+                    TableScope::TenantOwned,
+                    fixture.tenant,
+                )
                 .await
                 .unwrap();
             writer.write(batch).await.unwrap();
@@ -66,7 +82,7 @@ fn bench_selectivity(c: &mut Criterion) {
         ctx
     });
 
-    // Selectivity = fraction of TOTAL_DAYS covered by the time-range predicate
+    // Selectivity = fraction of TOTAL_DAYS (files) covered by the id-range predicate.
     let selectivity_cases: &[(&str, i64, i64)] = &[
         ("1pct", 0, 1),
         ("3pct", 0, 3),
@@ -78,17 +94,12 @@ fn bench_selectivity(c: &mut Criterion) {
     let mut group = c.benchmark_group("selectivity");
 
     for &(label, start_day, end_day) in selectivity_cases {
-        let start_us = workload::day_us(start_day);
-        let end_us = workload::day_us(end_day);
-        let sql = format!(
-            "SELECT id FROM sel_tbl \
-             WHERE wyrd_event_time >= arrow_cast({start_us}, 'Timestamp(Microsecond, Some(\"+00:00\"))') \
-             AND wyrd_event_time < arrow_cast({end_us}, 'Timestamp(Microsecond, Some(\"+00:00\"))')"
-        );
+        let start_id = start_day * ROWS_PER_DAY as i64;
+        let end_id = end_day * ROWS_PER_DAY as i64;
+        let sql = format!("SELECT id FROM sel_tbl WHERE id >= {start_id} AND id < {end_id}");
         group.bench_with_input(BenchmarkId::new("sel", label), &sql, |b, sql| {
-            b.to_async(&rt).iter(|| async {
-                ctx.sql(sql).await.unwrap().collect().await.unwrap()
-            });
+            b.to_async(&rt)
+                .iter(|| async { ctx.sql(sql).await.unwrap().collect().await.unwrap() });
         });
     }
 

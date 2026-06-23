@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::RecordBatch;
 use iceberg::table::Table;
@@ -6,9 +7,12 @@ use iceberg_catalog_sql::SqlCatalog;
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 use wyrd_spec::ids::DataTenantId;
+use wyrd_spec::vala::system_columns::is_reserved_system_column;
 
+use crate::batch_builder::stamp_system_columns;
 use crate::error::BifrostError;
 use crate::types::{TableScope, TableUid};
+use crate::writer::buffer::AppendBuffer;
 use crate::writer::commit::run_commit;
 use crate::writer::{TableWriterHandle, WriteCmd};
 
@@ -18,10 +22,26 @@ struct CommitActor {
     catalog: Arc<SqlCatalog>,
     pool: Arc<PgPool>,
     table_uid: TableUid,
-    #[allow(dead_code)]
     scope: TableScope,
-    tenant: DataTenantId,
-    buffer: Vec<RecordBatch>,
+    /// Authenticated **data tenant** for this writer handle. Server-stamped into
+    /// `data_tenant_id` on `SystemShared` rows; the control-plane RLS bind for the
+    /// `vala.olap_commits` precommit/finalize rows is *derived* from it via
+    /// `scope.control_bind`, never conflated with it (C2/N-M12).
+    ///
+    /// This is per-handle today: one coordinator is spawned per `writer()` call,
+    /// so a handle (and its actor) serves a single data tenant. When the shared
+    /// per-physical-table coordinator (M5/D3/M16) lands, the data tenant must move
+    /// onto `WriteCmd::Write` so one actor can stamp many tenants' writes.
+    data_tenant: DataTenantId,
+    buffer: AppendBuffer,
+}
+
+/// Microseconds since the Unix epoch, used for the server-stamped
+/// `wyrd_event_time` / `wyrd_ingested_at` system columns.
+fn now_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
 }
 
 impl CommitActor {
@@ -29,8 +49,7 @@ impl CommitActor {
         while let Some(cmd) = self.receiver.recv().await {
             match cmd {
                 WriteCmd::Write(batch, reply) => {
-                    self.buffer.push(batch);
-                    let _ = reply.send(Ok(()));
+                    let _ = reply.send(self.accept(batch));
                 }
                 WriteCmd::Flush(reply) => {
                     let result = self.flush().await;
@@ -40,40 +59,82 @@ impl CommitActor {
         }
     }
 
+    /// Validate and buffer a caller batch. Callers supply user fields only — the
+    /// server stamps every system column (`wyrd_event_time`, `wyrd_ingested_at`,
+    /// `wyrd_batch_id`, and `data_tenant_id` on `SystemShared`). A caller batch that
+    /// already carries any reserved system column is rejected (MAJOR-9 step 3):
+    /// the server-stamped value must be the sole source, never coexisting with a
+    /// caller-supplied duplicate.
+    fn accept(&mut self, batch: RecordBatch) -> Result<(), BifrostError> {
+        for field in batch.schema().fields() {
+            if is_reserved_system_column(field.name()) {
+                return Err(BifrostError::ReservedColumn(field.name().clone()));
+            }
+        }
+        self.buffer.push(batch);
+        Ok(())
+    }
+
     async fn flush(&mut self) -> Result<i64, BifrostError> {
         if self.buffer.is_empty() {
             return Ok(0);
         }
 
-        let batches = std::mem::take(&mut self.buffer);
+        let batches = self.buffer.drain();
         let batch_id = *uuid::Uuid::now_v7().as_bytes();
+        let ingested_at_us = now_micros();
+        let stamp_tenant = self.scope.stamp_tenant(self.data_tenant);
 
-        let result = run_commit(
+        let stamped: Vec<RecordBatch> = match batches
+            .iter()
+            .map(|b| stamp_system_columns(b.clone(), ingested_at_us, batch_id, stamp_tenant))
+            .collect::<Result<_, _>>()
+            .map_err(BifrostError::Arrow)
+        {
+            Ok(stamped) => stamped,
+            Err(e) => {
+                self.buffer = AppendBuffer::from_vec(batches);
+                return Err(e);
+            }
+        };
+
+        match run_commit(
             &self.pool,
             &self.catalog,
             &self.table,
             &self.table_uid,
-            batches.clone(),
+            stamped,
             batch_id,
-            self.tenant,
+            self.scope.control_bind(self.data_tenant),
         )
-        .await;
-
-        if result.is_err() {
-            self.buffer = batches;
+        .await
+        {
+            Ok((snapshot_id, updated_table)) => {
+                // Adopt the post-commit table snapshot so the next flush bases its
+                // transaction on the current ref (MAJOR-2). The idempotent-replay
+                // path returns `None` and leaves the snapshot untouched.
+                if let Some(table) = updated_table {
+                    self.table = table;
+                }
+                Ok(snapshot_id)
+            }
+            Err(e) => {
+                self.buffer = AppendBuffer::from_vec(batches);
+                Err(e)
+            }
         }
-
-        result
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_commit_coordinator(
     table: Table,
     catalog: Arc<SqlCatalog>,
     pool: Arc<PgPool>,
     table_uid: TableUid,
+    table_fqn: String,
     scope: TableScope,
-    tenant: DataTenantId,
+    data_tenant: DataTenantId,
 ) -> TableWriterHandle {
     let (sender, receiver) = mpsc::channel(64);
 
@@ -84,11 +145,11 @@ pub fn spawn_commit_coordinator(
         pool,
         table_uid,
         scope,
-        tenant,
-        buffer: Vec::new(),
+        data_tenant,
+        buffer: AppendBuffer::new(),
     };
 
     tokio::spawn(actor.run());
 
-    TableWriterHandle { sender }
+    TableWriterHandle { sender, table_fqn }
 }

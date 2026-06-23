@@ -2,8 +2,8 @@ mod support;
 
 use std::sync::Arc;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use support::{workload, BenchFixture};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use support::{BenchFixture, workload};
 use tokio::runtime::Runtime;
 use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::types::TableScope;
@@ -18,17 +18,20 @@ fn bench_projection(c: &mut Criterion) {
 
     let ns = BifrostNamespace::Bifrost;
     rt.block_on(async {
-        fixture.create_wide_table(ns, "bench_projection", COL_COUNT).await;
+        fixture
+            .create_wide_table(ns, "bench_projection", COL_COUNT)
+            .await;
 
-        for chunk in 0..(ROW_COUNT / BATCH_SIZE) {
-            let batch = workload::make_wide_batch(
-                BATCH_SIZE,
-                COL_COUNT,
-                workload::day_us(chunk as i64),
-            );
+        for _ in 0..(ROW_COUNT / BATCH_SIZE) {
+            let batch = workload::make_wide_batch(BATCH_SIZE, COL_COUNT);
             let writer = fixture
                 .catalog
-                .writer(ns, "bench_projection", TableScope::TenantOwned, fixture.tenant)
+                .writer(
+                    ns,
+                    "bench_projection",
+                    TableScope::TenantOwned,
+                    fixture.tenant,
+                )
                 .await
                 .unwrap();
             writer.write(batch).await.unwrap();
@@ -75,9 +78,8 @@ fn bench_projection(c: &mut Criterion) {
 
     for &(label, sql) in cases {
         group.bench_with_input(BenchmarkId::new("cols", label), &sql, |b, sql| {
-            b.to_async(&rt).iter(|| async {
-                ctx.sql(sql).await.unwrap().collect().await.unwrap()
-            });
+            b.to_async(&rt)
+                .iter(|| async { ctx.sql(sql).await.unwrap().collect().await.unwrap() });
         });
     }
 

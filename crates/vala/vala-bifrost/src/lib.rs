@@ -18,5 +18,6 @@ pub mod writer;
 mod python;
 
 pub use catalog::WyrdCatalog;
+pub use catalog::namespaces::BifrostNamespace;
 pub use error::BifrostError;
 pub use types::{OlapTableKind, PartitionTransform, SchemaFingerprint, TableScope, TableUid};

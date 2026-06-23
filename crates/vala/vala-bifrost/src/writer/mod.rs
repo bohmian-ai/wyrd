@@ -17,6 +17,7 @@ pub enum WriteCmd {
 
 pub struct TableWriterHandle {
     pub(crate) sender: mpsc::Sender<WriteCmd>,
+    pub(crate) table_fqn: String,
 }
 
 impl TableWriterHandle {
@@ -25,9 +26,9 @@ impl TableWriterHandle {
         self.sender
             .send(WriteCmd::Write(batch, tx))
             .await
-            .map_err(|_| BifrostError::WriterUnavailable("channel closed".into()))?;
+            .map_err(|_| BifrostError::WriterUnavailable(self.table_fqn.clone()))?;
         rx.await
-            .map_err(|_| BifrostError::WriterUnavailable("reply dropped".into()))?
+            .map_err(|_| BifrostError::WriterUnavailable(self.table_fqn.clone()))?
     }
 
     pub async fn flush(&self) -> Result<i64, BifrostError> {
@@ -35,8 +36,8 @@ impl TableWriterHandle {
         self.sender
             .send(WriteCmd::Flush(tx))
             .await
-            .map_err(|_| BifrostError::WriterUnavailable("channel closed".into()))?;
+            .map_err(|_| BifrostError::WriterUnavailable(self.table_fqn.clone()))?;
         rx.await
-            .map_err(|_| BifrostError::WriterUnavailable("reply dropped".into()))?
+            .map_err(|_| BifrostError::WriterUnavailable(self.table_fqn.clone()))?
     }
 }

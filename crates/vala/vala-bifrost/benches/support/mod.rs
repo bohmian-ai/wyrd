@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 use tokio::runtime::Runtime;
-use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::catalog::WyrdCatalog;
+use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::types::TableScope;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_storage::factory::iceberg_factory::iceberg_storage_factory;
@@ -68,10 +68,17 @@ impl BenchFixture {
         extra_fields: Vec<Field>,
         scope: TableScope,
     ) {
-        match self.catalog.create_table(ns, name, extra_fields.clone(), scope, self.tenant, &[]).await {
+        match self
+            .catalog
+            .create_table(ns, name, extra_fields.clone(), scope, self.tenant, &[])
+            .await
+        {
             Ok(_) => {}
             Err(e) if e.to_string().contains("already exists") => {
-                self.catalog.drop_table(ns, name).await.expect("drop stale bench table");
+                self.catalog
+                    .drop_table(ns, name, self.tenant)
+                    .await
+                    .expect("drop stale bench table");
                 self.catalog
                     .create_table(ns, name, extra_fields, scope, self.tenant, &[])
                     .await
@@ -86,6 +93,7 @@ impl BenchFixture {
         let fields: Vec<Field> = (0..col_count)
             .map(|i| Field::new(format!("col_{i}"), DataType::Int64, false))
             .collect();
-        self.create_table(ns, name, fields, TableScope::TenantOwned).await;
+        self.create_table(ns, name, fields, TableScope::TenantOwned)
+            .await;
     }
 }

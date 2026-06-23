@@ -62,18 +62,33 @@ impl BifrostError {
             Self::DuplicateFailedBatch(batch_id) => Pub::DuplicateFailedBatch { batch_id },
             Self::MetadataMismatch(detail) => Pub::MetadataMismatch { detail },
             Self::WriterUnavailable(table) => Pub::WriterUnavailable { table },
-            Self::Iceberg(e) => Pub::CatalogUnreachable {
-                detail: e.to_string(),
-            },
-            Self::Sql(e) => Pub::CatalogUnreachable {
-                detail: e.to_string(),
-            },
-            Self::Arrow(e) => Pub::Internal {
-                detail: e.to_string(),
-            },
-            Self::DataFusion(e) => Pub::Internal {
-                detail: e.to_string(),
-            },
+            // Sanitize underlying-engine detail before it crosses the public API:
+            // sqlx/Iceberg/DataFusion errors carry constraint names, column names,
+            // and storage path prefixes. Log the full error; expose a generic detail.
+            Self::Iceberg(e) => {
+                tracing::error!(error = %e, "iceberg catalog error");
+                Pub::CatalogUnreachable {
+                    detail: "catalog metadata operation failed".to_string(),
+                }
+            }
+            Self::Sql(e) => {
+                tracing::error!(error = %e, "sql catalog error");
+                Pub::CatalogUnreachable {
+                    detail: "catalog database connection failed".to_string(),
+                }
+            }
+            Self::Arrow(e) => {
+                tracing::error!(error = %e, "arrow error");
+                Pub::Internal {
+                    detail: "internal data processing error".to_string(),
+                }
+            }
+            Self::DataFusion(e) => {
+                tracing::error!(error = %e, "datafusion error");
+                Pub::Internal {
+                    detail: "internal query error".to_string(),
+                }
+            }
             Self::Internal(detail) => Pub::Internal { detail },
         }
     }

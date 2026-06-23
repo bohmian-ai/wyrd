@@ -8,7 +8,7 @@ use crate::error::derive::WyrdError;
 pub enum BifrostError {
     /// A user-supplied schema field uses a reserved system column name.
     #[wyrd_error(
-        code = "WYRD_VALA_400_RESERVED_COLUMN",
+        code = "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
         status = 400,
         title = "Reserved system column name",
         remediation = "Rename the column — wyrd_event_time, wyrd_ingested_at, wyrd_batch_id, and data_tenant_id are reserved."
@@ -20,7 +20,7 @@ pub enum BifrostError {
 
     /// A SystemShared table schema is missing the required `data_tenant_id` column.
     #[wyrd_error(
-        code = "WYRD_VALA_400_MISSING_TENANT_COLUMN",
+        code = "WYRD_VALA_400_BIFROST_MISSING_TENANT_COLUMN",
         status = 400,
         title = "SystemShared table missing data_tenant_id column",
         remediation = "Add a data_tenant_id Utf8 column to the schema for SystemShared tables."
@@ -32,7 +32,7 @@ pub enum BifrostError {
 
     /// A TenantOwned table schema includes the `data_tenant_id` column, which is not allowed.
     #[wyrd_error(
-        code = "WYRD_VALA_400_UNEXPECTED_TENANT_COLUMN",
+        code = "WYRD_VALA_400_BIFROST_UNEXPECTED_TENANT_COLUMN",
         status = 400,
         title = "TenantOwned table must not include data_tenant_id",
         remediation = "Remove data_tenant_id from the schema — TenantOwned tables are isolated by catalog namespace."
@@ -44,7 +44,7 @@ pub enum BifrostError {
 
     /// No tenant binding was present when attempting an OLAP write or query.
     #[wyrd_error(
-        code = "WYRD_VALA_403_TENANT_BINDING_MISSING",
+        code = "WYRD_VALA_403_BIFROST_TENANT_BINDING_MISSING",
         status = 403,
         title = "No tenant binding for OLAP operation",
         remediation = "Acquire a TenantConn for a valid tenant before writing or querying Bifrost tables."
@@ -53,7 +53,7 @@ pub enum BifrostError {
 
     /// The requested Bifrost table does not exist in the catalog.
     #[wyrd_error(
-        code = "WYRD_VALA_404_TABLE_NOT_FOUND",
+        code = "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
         status = 404,
         title = "Bifrost table not found",
         remediation = "Create the table via the catalog API before writing or querying."
@@ -65,7 +65,7 @@ pub enum BifrostError {
 
     /// The Arrow schema fingerprint does not match the registered table schema.
     #[wyrd_error(
-        code = "WYRD_VALA_409_FINGERPRINT_MISMATCH",
+        code = "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
         status = 409,
         title = "Schema fingerprint mismatch",
         remediation = "The Arrow schema does not match the registered table schema. Evolve the schema explicitly."
@@ -77,7 +77,7 @@ pub enum BifrostError {
 
     /// A concurrent writer committed to the same table at the same time.
     #[wyrd_error(
-        code = "WYRD_VALA_409_COMMIT_CONFLICT",
+        code = "WYRD_VALA_409_BIFROST_COMMIT_CONFLICT",
         status = 409,
         title = "Concurrent OLAP commit conflict",
         remediation = "Retry the write — another writer committed to the same table concurrently."
@@ -89,7 +89,7 @@ pub enum BifrostError {
 
     /// A batch with this ID was previously attempted but failed permanently.
     #[wyrd_error(
-        code = "WYRD_VALA_409_DUPLICATE_FAILED_BATCH",
+        code = "WYRD_VALA_409_BIFROST_DUPLICATE_FAILED_BATCH",
         status = 409,
         title = "Duplicate batch previously failed",
         remediation = "This batch_id was committed but the write failed. Use a new batch_id to retry."
@@ -101,10 +101,10 @@ pub enum BifrostError {
 
     /// Registered catalog metadata is inconsistent with the actual catalog state.
     #[wyrd_error(
-        code = "WYRD_VALA_422_METADATA_MISMATCH",
-        status = 422,
-        title = "Catalog metadata inconsistency",
-        remediation = "The registered table metadata does not match the catalog state. Re-register the table."
+        code = "WYRD_VALA_500_BIFROST_METADATA_MISMATCH",
+        status = 500,
+        title = "Bifrost table metadata mismatch",
+        remediation = "Investigate table metadata integrity; possible mid-flight schema-evolution race."
     )]
     MetadataMismatch {
         /// Human-readable description of the inconsistency.
@@ -113,7 +113,7 @@ pub enum BifrostError {
 
     /// The OLAP catalog database is unreachable.
     #[wyrd_error(
-        code = "WYRD_VALA_503_CATALOG_UNREACHABLE",
+        code = "WYRD_VALA_503_BIFROST_CATALOG_UNREACHABLE",
         status = 503,
         title = "OLAP catalog unreachable",
         remediation = "Check the catalog database connection and retry."
@@ -125,7 +125,7 @@ pub enum BifrostError {
 
     /// The OLAP object storage backend is unreachable.
     #[wyrd_error(
-        code = "WYRD_VALA_503_STORAGE_UNREACHABLE",
+        code = "WYRD_VALA_503_BIFROST_STORAGE_UNREACHABLE",
         status = 503,
         title = "OLAP object storage unreachable",
         remediation = "Check the object storage configuration and credentials, then retry."
@@ -137,7 +137,7 @@ pub enum BifrostError {
 
     /// The Bifrost writer actor for this table is not running.
     #[wyrd_error(
-        code = "WYRD_VALA_503_WRITER_UNAVAILABLE",
+        code = "WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE",
         status = 503,
         title = "Bifrost writer unavailable",
         remediation = "The writer actor for this table is not running. Restart the write operation."
@@ -149,7 +149,7 @@ pub enum BifrostError {
 
     /// An unexpected internal Bifrost failure occurred.
     #[wyrd_error(
-        code = "WYRD_VALA_500_INTERNAL",
+        code = "WYRD_VALA_500_BIFROST_INTERNAL",
         status = 500,
         title = "Internal Bifrost failure",
         remediation = "Check server logs for details and contact support if the issue persists."

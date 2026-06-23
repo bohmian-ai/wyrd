@@ -2,9 +2,9 @@ mod support;
 
 use std::sync::Arc;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::datasource::TableProvider;
-use support::{workload, BenchFixture};
+use support::{BenchFixture, workload};
 use tokio::runtime::Runtime;
 use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::types::TableScope;
@@ -31,10 +31,9 @@ fn bench_scan_cold_warm(c: &mut Criterion) {
             )
             .await;
 
-        // Ingest 100k rows across 10 commits on different days
-        for day in 0..10_i64 {
-            let batch =
-                workload::make_bench_batch(10_000, workload::day_us(day), None, TableScope::TenantOwned);
+        // Ingest 100k rows across 10 commits (one Parquet file each).
+        for _ in 0..10_i64 {
+            let batch = workload::make_bench_batch(10_000);
             let writer = fixture
                 .catalog
                 .writer(ns, "bench_scan_cw", TableScope::TenantOwned, fixture.tenant)

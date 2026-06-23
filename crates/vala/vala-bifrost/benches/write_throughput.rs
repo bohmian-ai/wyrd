@@ -1,7 +1,7 @@
 mod support;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use support::{workload, BenchFixture};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use support::{BenchFixture, workload};
 use tokio::runtime::Runtime;
 use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::types::TableScope;
@@ -29,17 +29,17 @@ fn bench_write_throughput(c: &mut Criterion) {
             BenchmarkId::from_parameter(batch_size),
             &batch_size,
             |b, &size| {
-                let batch = workload::make_bench_batch(
-                    size,
-                    workload::day_us(1),
-                    None,
-                    TableScope::TenantOwned,
-                );
+                let batch = workload::make_bench_batch(size);
 
                 b.to_async(&rt).iter(|| async {
                     let writer = fixture
                         .catalog
-                        .writer(ns, "bench_write_throughput", TableScope::TenantOwned, fixture.tenant)
+                        .writer(
+                            ns,
+                            "bench_write_throughput",
+                            TableScope::TenantOwned,
+                            fixture.tenant,
+                        )
                         .await
                         .unwrap();
                     writer.write(batch.clone()).await.unwrap();

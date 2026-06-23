@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use iceberg::spec::DataFile;
+use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -10,7 +11,6 @@ use iceberg::writer::file_writer::location_generator::{
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter;
-use iceberg::table::Table;
 use iceberg_catalog_sql::SqlCatalog;
 use sqlx::PgPool;
 use wyrd_spec::ids::DataTenantId;
@@ -27,7 +27,7 @@ pub async fn run_commit(
     batches: Vec<RecordBatch>,
     batch_id: [u8; 16],
     tenant: DataTenantId,
-) -> Result<i64, BifrostError> {
+) -> Result<(i64, Option<Table>), BifrostError> {
     let table_fqn = table.identifier().to_string();
 
     let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
@@ -44,8 +44,17 @@ pub async fn run_commit(
 
     match existing {
         Some(row) if row.state == "committed" => {
+            // Idempotent replay: this batch already committed. Return the prior
+            // snapshot and no fresh table — the caller keeps its current snapshot.
+            // A committed row always has a snapshot_id (finalize_committed sets it);
+            // a NULL here is control-table corruption, not a 0-snapshot success.
             conn.commit().await.map_err(BifrostError::Sql)?;
-            return Ok(row.snapshot_id.unwrap_or(0));
+            let snapshot_id = row.snapshot_id.ok_or_else(|| {
+                BifrostError::MetadataMismatch(format!(
+                    "committed olap_commits row for {table_fqn} has NULL snapshot_id"
+                ))
+            })?;
+            return Ok((snapshot_id, None));
         }
         Some(row) if row.state == "failed" => {
             conn.commit().await.map_err(BifrostError::Sql)?;
@@ -54,6 +63,9 @@ pub async fn run_commit(
             ));
         }
         Some(_) => {
+            // A precommit row means this batch_id is currently being written by
+            // another actor. Return CommitConflict; the caller must retry with a
+            // new batch_id.
             conn.commit().await.map_err(BifrostError::Sql)?;
             return Err(BifrostError::CommitConflict(table_fqn));
         }
@@ -68,7 +80,7 @@ pub async fn run_commit(
 
     let data_files_result = write_batches(table, batches).await;
 
-    let snapshot_id = match data_files_result {
+    let (snapshot_id, updated_table) = match data_files_result {
         Err(e) => {
             let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
                 .await
@@ -78,7 +90,7 @@ pub async fn run_commit(
                 &mut conn,
                 table_uid.as_bytes(),
                 &batch_id,
-                "WYRD_VALA_500_INTERNAL",
+                "WYRD_VALA_500_BIFROST_INTERNAL",
                 &code,
             )
             .await;
@@ -103,10 +115,13 @@ pub async fn run_commit(
 
     conn.commit().await.map_err(BifrostError::Sql)?;
 
-    Ok(snapshot_id)
+    Ok((snapshot_id, Some(updated_table)))
 }
 
-async fn write_batches(table: &Table, batches: Vec<RecordBatch>) -> Result<Vec<DataFile>, BifrostError> {
+async fn write_batches(
+    table: &Table,
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<DataFile>, BifrostError> {
     let file_io = table.file_io().clone();
     let table_metadata = table.metadata();
     let iceberg_schema = table_metadata.current_schema().clone();
@@ -121,8 +136,7 @@ async fn write_batches(table: &Table, batches: Vec<RecordBatch>) -> Result<Vec<D
     // (which carries both constraints), then cast each batch's columns to
     // that schema before writing.
     let typed_schema = Arc::new(
-        iceberg::arrow::schema_to_arrow_schema(&iceberg_schema)
-            .map_err(BifrostError::Iceberg)?,
+        iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).map_err(BifrostError::Iceberg)?,
     );
 
     let location_gen =
@@ -152,8 +166,9 @@ async fn write_batches(table: &Table, batches: Vec<RecordBatch>) -> Result<Vec<D
             .iter()
             .zip(typed_schema.fields().iter())
             .map(|(col, field)| {
-                arrow::compute::cast(col, field.data_type())
-                    .map_err(|e| BifrostError::Internal(format!("cast column {}: {e}", field.name())))
+                arrow::compute::cast(col, field.data_type()).map_err(|e| {
+                    BifrostError::Internal(format!("cast column {}: {e}", field.name()))
+                })
             })
             .collect::<Result<_, _>>()?;
         let typed = RecordBatch::try_new(typed_schema.clone(), cast_columns)
@@ -168,14 +183,11 @@ async fn commit_to_iceberg(
     catalog: &SqlCatalog,
     table: &Table,
     data_files: Vec<DataFile>,
-) -> Result<i64, BifrostError> {
+) -> Result<(i64, Table), BifrostError> {
     let tx = Transaction::new(table);
     let action = tx.fast_append().add_data_files(data_files);
     let tx = action.apply(tx).map_err(BifrostError::Iceberg)?;
     let committed = tx.commit(catalog).await.map_err(BifrostError::Iceberg)?;
-    let snapshot_id = committed
-        .metadata()
-        .current_snapshot_id()
-        .unwrap_or(0);
-    Ok(snapshot_id)
+    let snapshot_id = committed.metadata().current_snapshot_id().unwrap_or(0);
+    Ok((snapshot_id, committed))
 }

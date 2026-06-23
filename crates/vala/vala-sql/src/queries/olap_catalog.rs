@@ -69,6 +69,45 @@ pub async fn get_by_fqn(
     .map_err(SqlError::from)
 }
 
+/// Delete a Bifrost table registration and all dependent rows for the current
+/// tenant, in FK order. `vala.refresh_epochs` and `vala.olap_commits` reference
+/// `vala.bifrost_tables` with no `ON DELETE CASCADE`, so children are removed
+/// first. Intended for test/bench teardown.
+///
+/// # Errors
+/// Returns [`SqlError`] when any delete fails.
+pub async fn delete_table(conn: &mut TenantConn<'_>, fqn: &str) -> Result<(), SqlError> {
+    sqlx::query(
+        r#"
+        DELETE FROM vala.refresh_epochs
+         WHERE table_uid IN (SELECT table_uid FROM vala.bifrost_tables WHERE fqn = $1)
+        "#,
+    )
+    .bind(fqn)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM vala.olap_commits
+         WHERE table_uid IN (SELECT table_uid FROM vala.bifrost_tables WHERE fqn = $1)
+        "#,
+    )
+    .bind(fqn)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+
+    sqlx::query("DELETE FROM vala.bifrost_tables WHERE fqn = $1")
+        .bind(fqn)
+        .execute(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)?;
+
+    Ok(())
+}
+
 // ── vala.olap_commits ────────────────────────────────────────────────────────
 
 /// Record a precommit anchor for the given (table, batch) pair.
@@ -198,10 +237,7 @@ pub async fn lookup_idempotent(
 ///
 /// # Errors
 /// Returns [`SqlError`] when the query fails.
-pub async fn bump_epoch(
-    conn: &mut TenantConn<'_>,
-    table_uid: &[u8; 16],
-) -> Result<i64, SqlError> {
+pub async fn bump_epoch(conn: &mut TenantConn<'_>, table_uid: &[u8; 16]) -> Result<i64, SqlError> {
     let epoch: i64 = sqlx::query_scalar(
         r#"
         INSERT INTO vala.refresh_epochs (data_tenant_id, table_uid, epoch)
@@ -227,12 +263,11 @@ pub async fn current_epoch(
     conn: &mut TenantConn<'_>,
     table_uid: &[u8; 16],
 ) -> Result<i64, SqlError> {
-    let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT epoch FROM vala.refresh_epochs WHERE table_uid = $1",
-    )
-    .bind(table_uid.as_slice())
-    .fetch_optional(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)?;
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT epoch FROM vala.refresh_epochs WHERE table_uid = $1")
+            .bind(table_uid.as_slice())
+            .fetch_optional(&mut **conn.transaction())
+            .await
+            .map_err(SqlError::from)?;
     Ok(row.map(|(e,)| e).unwrap_or(0))
 }

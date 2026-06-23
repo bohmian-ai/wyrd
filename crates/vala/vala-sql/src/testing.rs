@@ -22,8 +22,7 @@ use crate::SqlError;
 /// Returns [`SqlError`] when any step fails.
 pub async fn migrate_for_test(pool: &PgPool) -> Result<(), SqlError> {
     let mut conn = pool.acquire().await.map_err(SqlError::Connect)?;
-    wyrd_sql::testing::migrate_for_test(&mut conn)
-        .await?;
+    wyrd_sql::testing::migrate_for_test(&mut conn).await?;
     for schema in crate::OWNED_SCHEMAS {
         sqlx::query(AssertSqlSafe(format!(
             "CREATE SCHEMA IF NOT EXISTS {schema}"

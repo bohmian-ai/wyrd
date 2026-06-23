@@ -13,7 +13,7 @@ const ROW_COUNT: usize = 100_000;
 const BATCH_SIZE: usize = 10_000;
 
 fn bench_projection(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
+    let rt = Runtime::new().expect("create tokio runtime");
     let fixture = BenchFixture::setup(&rt);
 
     let ns = BifrostNamespace::Bifrost;
@@ -33,9 +33,9 @@ fn bench_projection(c: &mut Criterion) {
                     fixture.tenant,
                 )
                 .await
-                .unwrap();
-            writer.write(batch).await.unwrap();
-            writer.flush().await.unwrap();
+                .expect("open bench writer");
+            writer.write(batch).await.expect("write bench batch");
+            writer.flush().await.expect("flush bench writer");
         }
     });
 
@@ -44,12 +44,13 @@ fn bench_projection(c: &mut Criterion) {
             .catalog
             .provider(ns, "bench_projection", fixture.tenant)
             .await
-            .unwrap()
+            .expect("get table provider")
     });
 
     let ctx = rt.block_on(async {
         let ctx = vala_bifrost::session::wyrd_session_context(fixture.tenant);
-        ctx.register_table("proj_tbl", Arc::new(provider)).unwrap();
+        ctx.register_table("proj_tbl", Arc::new(provider))
+            .expect("register proj table");
         ctx
     });
 
@@ -78,8 +79,14 @@ fn bench_projection(c: &mut Criterion) {
 
     for &(label, sql) in cases {
         group.bench_with_input(BenchmarkId::new("cols", label), &sql, |b, sql| {
-            b.to_async(&rt)
-                .iter(|| async { ctx.sql(sql).await.unwrap().collect().await.unwrap() });
+            b.to_async(&rt).iter(|| async {
+                ctx.sql(sql)
+                    .await
+                    .expect("parse SQL")
+                    .collect()
+                    .await
+                    .expect("collect results")
+            });
         });
     }
 

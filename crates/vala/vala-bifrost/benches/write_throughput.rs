@@ -7,7 +7,7 @@ use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::types::TableScope;
 
 fn bench_write_throughput(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
+    let rt = Runtime::new().expect("create tokio runtime");
     let fixture = BenchFixture::setup(&rt);
 
     let ns = BifrostNamespace::Bifrost;
@@ -41,8 +41,11 @@ fn bench_write_throughput(c: &mut Criterion) {
                             fixture.tenant,
                         )
                         .await
-                        .unwrap();
-                    writer.write(batch.clone()).await.unwrap();
+                        .expect("open bench writer");
+                    writer
+                        .write(batch.clone())
+                        .await
+                        .expect("write bench batch");
                 });
             },
         );

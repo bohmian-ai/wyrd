@@ -59,12 +59,12 @@ struct WorkloadReport {
 
 fn main() {
     let args = Args::parse();
-    let rt = Runtime::new().unwrap();
+    let rt = Runtime::new().expect("create tokio runtime");
     rt.block_on(run(args));
 }
 
 async fn run(args: Args) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("create temp dir");
     let warehouse = format!("file://{}", tmp.path().display());
 
     let pool = Arc::new(
@@ -80,11 +80,12 @@ async fn run(args: Args) {
     let backend = BackendConfig::Local {
         root: tmp.path().to_path_buf(),
     };
-    let (factory, props) = iceberg_storage_factory(&backend).unwrap();
+    let (factory, props) =
+        iceberg_storage_factory(&backend).expect("build iceberg storage factory");
 
     let catalog = WyrdCatalog::new(&catalog_uri, &warehouse, pool.clone(), factory, props)
         .await
-        .unwrap();
+        .expect("create WyrdCatalog");
 
     let ns = BifrostNamespace::Bifrost;
     let tenant = DataTenantId::new_v7();
@@ -105,7 +106,7 @@ async fn run(args: Args) {
             &[],
         )
         .await
-        .unwrap();
+        .expect("create bench table");
 
     let batch_count = usize::try_from(args.rows)
         .expect("rows fits usize")
@@ -125,11 +126,11 @@ async fn run(args: Args) {
         let writer = catalog
             .writer(ns, "bench_wl", TableScope::TenantOwned, tenant)
             .await
-            .unwrap();
-        writer.write(batch).await.unwrap();
+            .expect("open bench writer");
+        writer.write(batch).await.expect("write bench batch");
 
         let t0 = std::time::Instant::now();
-        writer.flush().await.unwrap();
+        writer.flush().await.expect("flush bench writer");
         durations_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
         commit_count += 1;
     }
@@ -154,8 +155,8 @@ async fn run(args: Args) {
         commit_count,
     };
 
-    let json = serde_json::to_string_pretty(&report).unwrap();
-    std::fs::write(&args.output, &json).unwrap();
+    let json = serde_json::to_string_pretty(&report).expect("serialize report");
+    std::fs::write(&args.output, &json).expect("write report");
     println!("{json}");
 }
 
@@ -174,7 +175,7 @@ fn make_batch(n: usize) -> arrow::record_batch::RecordBatch {
     let payloads: StringArray = (0..n).map(|i| Some(format!("p{i}"))).collect();
 
     arrow::record_batch::RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(payloads)])
-        .unwrap()
+        .expect("build bench record batch")
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {

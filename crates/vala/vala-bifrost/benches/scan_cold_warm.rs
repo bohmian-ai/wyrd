@@ -10,7 +10,7 @@ use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::types::TableScope;
 
 fn bench_scan_cold_warm(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
+    let rt = Runtime::new().expect("create tokio runtime");
     let fixture = BenchFixture::setup(&rt);
 
     let ns = BifrostNamespace::Bifrost;
@@ -38,9 +38,9 @@ fn bench_scan_cold_warm(c: &mut Criterion) {
                 .catalog
                 .writer(ns, "bench_scan_cw", TableScope::TenantOwned, fixture.tenant)
                 .await
-                .unwrap();
-            writer.write(batch).await.unwrap();
-            writer.flush().await.unwrap();
+                .expect("open bench writer");
+            writer.write(batch).await.expect("write bench batch");
+            writer.flush().await.expect("flush bench writer");
         }
     });
 
@@ -51,7 +51,7 @@ fn bench_scan_cold_warm(c: &mut Criterion) {
                 .catalog
                 .provider(ns, "bench_scan_cw", fixture.tenant)
                 .await
-                .unwrap(),
+                .expect("get table provider"),
         )
     });
 
@@ -64,13 +64,13 @@ fn bench_scan_cold_warm(c: &mut Criterion) {
             let p = Arc::clone(&p);
             async move {
                 let ctx = vala_bifrost::session::wyrd_session_context(fixture.tenant);
-                ctx.register_table("t", p).unwrap();
+                ctx.register_table("t", p).expect("register table");
                 ctx.sql("SELECT id, payload FROM t")
                     .await
-                    .unwrap()
+                    .expect("parse SQL")
                     .collect()
                     .await
-                    .unwrap()
+                    .expect("collect results")
             }
         });
     });
@@ -78,7 +78,8 @@ fn bench_scan_cold_warm(c: &mut Criterion) {
     // Warm: shared SessionContext registered once
     let warm_ctx = rt.block_on(async {
         let ctx = vala_bifrost::session::wyrd_session_context(fixture.tenant);
-        ctx.register_table("t", Arc::clone(&provider)).unwrap();
+        ctx.register_table("t", Arc::clone(&provider))
+            .expect("register table");
         ctx
     });
 
@@ -87,10 +88,10 @@ fn bench_scan_cold_warm(c: &mut Criterion) {
             warm_ctx
                 .sql("SELECT id, payload FROM t")
                 .await
-                .unwrap()
+                .expect("parse SQL")
                 .collect()
                 .await
-                .unwrap()
+                .expect("collect results")
         });
     });
 

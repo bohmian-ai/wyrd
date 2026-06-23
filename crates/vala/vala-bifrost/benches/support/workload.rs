@@ -31,7 +31,8 @@ pub fn wide_schema(col_count: usize) -> SchemaRef {
 pub fn make_bench_batch(n: usize) -> RecordBatch {
     let ids: Int64Array = (0..i64::try_from(n).expect("n fits i64")).collect();
     let payloads: StringArray = (0..n).map(|i| Some(format!("p{i}"))).collect();
-    RecordBatch::try_new(simple_schema(), vec![Arc::new(ids), Arc::new(payloads)]).unwrap()
+    RecordBatch::try_new(simple_schema(), vec![Arc::new(ids), Arc::new(payloads)])
+        .expect("build bench record batch")
 }
 
 /// Build a user-fields-only wide [`RecordBatch`] (`col_count` Int64 columns) for `n` rows.
@@ -45,5 +46,5 @@ pub fn make_wide_batch(n: usize, col_count: usize) -> RecordBatch {
             Arc::new(arr) as _
         })
         .collect();
-    RecordBatch::try_new(wide_schema(col_count), cols).unwrap()
+    RecordBatch::try_new(wide_schema(col_count), cols).expect("build wide record batch")
 }

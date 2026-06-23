@@ -8,7 +8,7 @@ use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::types::TableScope;
 
 fn bench_commit_latency(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
+    let rt = Runtime::new().expect("create tokio runtime");
     let fixture = BenchFixture::setup(&rt);
 
     let ns = BifrostNamespace::Bifrost;
@@ -35,10 +35,10 @@ fn bench_commit_latency(c: &mut Criterion) {
                     fixture.tenant,
                 )
                 .await
-                .unwrap();
+                .expect("open bench writer");
             let batch = workload::make_bench_batch(10_000);
-            writer.write(batch).await.unwrap();
-            writer.flush().await.unwrap()
+            writer.write(batch).await.expect("write bench batch");
+            writer.flush().await.expect("flush bench writer")
         });
     });
 }

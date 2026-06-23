@@ -9,7 +9,7 @@ use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::types::TableScope;
 
 fn bench_plan_overhead(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
+    let rt = Runtime::new().expect("create tokio runtime");
     let fixture = BenchFixture::setup(&rt);
 
     let ns = BifrostNamespace::Bifrost;
@@ -36,12 +36,13 @@ fn bench_plan_overhead(c: &mut Criterion) {
             .catalog
             .provider(ns, "bench_plan_overhead", fixture.tenant)
             .await
-            .unwrap()
+            .expect("get table provider")
     });
 
     let ctx = rt.block_on(async {
         let ctx = vala_bifrost::session::wyrd_session_context(fixture.tenant);
-        ctx.register_table("plan_tbl", Arc::new(provider)).unwrap();
+        ctx.register_table("plan_tbl", Arc::new(provider))
+            .expect("register plan table");
         ctx
     });
 
@@ -50,10 +51,10 @@ fn bench_plan_overhead(c: &mut Criterion) {
         b.to_async(&rt).iter(|| async {
             ctx.sql("SELECT id, payload FROM plan_tbl WHERE id > 0")
                 .await
-                .unwrap()
+                .expect("parse SQL")
                 .create_physical_plan()
                 .await
-                .unwrap()
+                .expect("create physical plan")
         });
     });
 }

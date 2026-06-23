@@ -27,11 +27,11 @@ fn day_batch(n: usize, day: i64) -> arrow::record_batch::RecordBatch {
         workload::simple_schema(),
         vec![Arc::new(ids), Arc::new(payloads)],
     )
-    .unwrap()
+    .expect("build day record batch")
 }
 
 fn bench_selectivity(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
+    let rt = Runtime::new().expect("create tokio runtime");
     let fixture = BenchFixture::setup(&rt);
 
     let ns = BifrostNamespace::Bifrost;
@@ -63,9 +63,9 @@ fn bench_selectivity(c: &mut Criterion) {
                     fixture.tenant,
                 )
                 .await
-                .unwrap();
-            writer.write(batch).await.unwrap();
-            writer.flush().await.unwrap();
+                .expect("open bench writer");
+            writer.write(batch).await.expect("write bench batch");
+            writer.flush().await.expect("flush bench writer");
         }
     });
 
@@ -74,12 +74,13 @@ fn bench_selectivity(c: &mut Criterion) {
             .catalog
             .provider(ns, "bench_selectivity", fixture.tenant)
             .await
-            .unwrap()
+            .expect("get table provider")
     });
 
     let ctx = rt.block_on(async {
         let ctx = vala_bifrost::session::wyrd_session_context(fixture.tenant);
-        ctx.register_table("sel_tbl", Arc::new(provider)).unwrap();
+        ctx.register_table("sel_tbl", Arc::new(provider))
+            .expect("register sel table");
         ctx
     });
 
@@ -100,8 +101,14 @@ fn bench_selectivity(c: &mut Criterion) {
         let end_id = end_day * rows;
         let sql = format!("SELECT id FROM sel_tbl WHERE id >= {start_id} AND id < {end_id}");
         group.bench_with_input(BenchmarkId::new("sel", label), &sql, |b, sql| {
-            b.to_async(&rt)
-                .iter(|| async { ctx.sql(sql).await.unwrap().collect().await.unwrap() });
+            b.to_async(&rt).iter(|| async {
+                ctx.sql(sql)
+                    .await
+                    .expect("parse SQL")
+                    .collect()
+                    .await
+                    .expect("collect results")
+            });
         });
     }
 

@@ -2,6 +2,7 @@
 //! `vala.bifrost_tables`, `vala.olap_commits`, `vala.refresh_epochs`.
 //! All callers must pass a [`TenantConn`] — the wyrd-sql RLS bind enforces
 //! tenant scope.
+// raw-query grep allowlist: olap control tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use wyrd_sql::TenantConn;
 

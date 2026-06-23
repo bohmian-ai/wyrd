@@ -4,6 +4,7 @@
 //! oracle. The whole module is gated behind the `diagnostics` feature (ops +
 //! tests only) and must not be reachable from any request path, HTTP handler,
 //! MCP tool, or Python export.
+// raw-query grep allowlist: iceberg_catalog tables are crate-owned (iceberg-catalog-sql) and absent from the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 #![cfg(feature = "diagnostics")]
 
 use sqlx::PgPool;

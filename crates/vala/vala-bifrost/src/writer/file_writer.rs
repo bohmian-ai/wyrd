@@ -12,6 +12,8 @@ use parquet::file::properties::WriterProperties;
 /// a partition column, so tenant scoping is a post-scan correctness filter, not
 /// file pruning — a bloom buys nothing for the Stage-1 access pattern. Tenant
 /// file-pruning is the Stage-5 tenant-bucket transform.
+/// # Panics
+/// Never panics — ZSTD level 3 is always valid.
 pub fn bifrost_writer_properties() -> WriterProperties {
     WriterProperties::builder()
         .set_compression(Compression::ZSTD(

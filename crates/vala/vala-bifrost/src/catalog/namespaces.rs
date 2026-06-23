@@ -18,6 +18,8 @@ impl BifrostNamespace {
         }
     }
 
+    /// # Panics
+    /// Never panics — all variant strings are valid Iceberg namespace identifiers.
     pub fn to_namespace_ident(self) -> NamespaceIdent {
         NamespaceIdent::from_strs([self.as_str()]).expect("namespace identifier is always valid")
     }

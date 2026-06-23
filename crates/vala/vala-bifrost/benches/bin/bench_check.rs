@@ -39,7 +39,7 @@ fn main() {
     let args = Args::parse();
 
     let baseline_raw = std::fs::read_to_string(&args.baseline)
-        .unwrap_or_else(|e| panic!("read baseline {:?}: {e}", args.baseline));
+        .unwrap_or_else(|e| panic!("read baseline {}: {e}", args.baseline.display()));
     let baseline: Baseline =
         serde_json::from_str(&baseline_raw).unwrap_or_else(|e| panic!("parse baseline: {e}"));
 
@@ -61,21 +61,20 @@ fn main() {
         // Map metric_key → criterion estimates.json path.
         // criterion writes: target/criterion/<bench_name>/<param>/new/estimates.json
         let estimates_path = resolve_estimates_path(&args.criterion_dir, metric_key);
-        let estimates_raw = match std::fs::read_to_string(&estimates_path) {
-            Ok(s) => s,
-            Err(_) => {
-                missing.push(format!(
-                    "  {metric_key}: no estimates at {estimates_path:?} (run `mise run bench` first)"
-                ));
-                continue;
-            }
+        let Ok(estimates_raw) = std::fs::read_to_string(&estimates_path) else {
+            missing.push(format!(
+                "  {metric_key}: no estimates at {} (run `mise run bench` first)",
+                estimates_path.display()
+            ));
+            continue;
         };
 
         let estimates: Estimates = match serde_json::from_str(&estimates_raw) {
             Ok(e) => e,
             Err(e) => {
                 missing.push(format!(
-                    "  {metric_key}: unreadable estimates {estimates_path:?}: {e}"
+                    "  {metric_key}: unreadable estimates {}: {e}",
+                    estimates_path.display()
                 ));
                 continue;
             }

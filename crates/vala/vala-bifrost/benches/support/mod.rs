@@ -15,7 +15,7 @@ use wyrd_storage::settings::BackendConfig;
 /// in Postgres and the on-disk metadata always agree.
 const BENCH_WAREHOUSE_DIR: &str = "/tmp/vala-bifrost-bench";
 
-/// Shared benchmark fixture: Postgres + local object store + WyrdCatalog.
+/// Shared benchmark fixture: Postgres + local object store + `WyrdCatalog`.
 pub struct BenchFixture {
     pub catalog: WyrdCatalog,
     pub tenant: DataTenantId,
@@ -89,6 +89,7 @@ impl BenchFixture {
     }
 
     /// Create a wide table with `col_count` Int64 columns for projection benches.
+    #[allow(dead_code)]
     pub async fn create_wide_table(&self, ns: BifrostNamespace, name: &str, col_count: usize) {
         let fields: Vec<Field> = (0..col_count)
             .map(|i| Field::new(format!("col_{i}"), DataType::Int64, false))

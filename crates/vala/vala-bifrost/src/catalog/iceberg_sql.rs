@@ -15,11 +15,11 @@ use crate::error::BifrostError;
 ///
 /// # Errors
 /// Returns [`BifrostError::Iceberg`] when the catalog fails to load.
-pub async fn build_catalog(
+pub async fn build_catalog<S: std::hash::BuildHasher>(
     catalog_uri: &str,
     warehouse: &str,
     storage_factory: Arc<dyn StorageFactory>,
-    storage_props: HashMap<String, String>,
+    storage_props: HashMap<String, String, S>,
 ) -> Result<SqlCatalog, BifrostError> {
     sqlx_catalog::any::install_default_drivers();
 

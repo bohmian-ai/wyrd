@@ -78,8 +78,8 @@ impl PartitionTransform {
             Self::Day => iceberg::spec::Transform::Day,
             Self::Month => iceberg::spec::Transform::Month,
             Self::Year => iceberg::spec::Transform::Year,
-            Self::Truncate(w) => iceberg::spec::Transform::Truncate(*w as u32),
-            Self::Bucket(n) => iceberg::spec::Transform::Bucket(*n as u32),
+            Self::Truncate(w) => iceberg::spec::Transform::Truncate((*w).cast_unsigned()),
+            Self::Bucket(n) => iceberg::spec::Transform::Bucket((*n).cast_unsigned()),
         }
     }
 }

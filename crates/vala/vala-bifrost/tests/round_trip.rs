@@ -63,7 +63,7 @@ fn stamp_system_columns_appends_batch_id_and_timestamps() {
     let batch_id = *uuid::Uuid::now_v7().as_bytes();
     let now_us = 1_700_000_000_000_000_i64;
 
-    let stamped = stamp_system_columns(batch, now_us, batch_id, None).unwrap();
+    let stamped = stamp_system_columns(&batch, now_us, batch_id, None).unwrap();
     assert_eq!(stamped.num_rows(), 3);
     assert!(stamped.schema().field_with_name(WYRD_BATCH_ID).is_ok());
     assert!(stamped.schema().field_with_name(DATA_TENANT_ID).is_err());
@@ -79,7 +79,7 @@ fn stamp_system_columns_appends_tenant_id_when_provided() {
 
     let tenant = DataTenantId::new_v7();
     let stamped =
-        stamp_system_columns(batch, 0, *uuid::Uuid::now_v7().as_bytes(), Some(tenant)).unwrap();
+        stamp_system_columns(&batch, 0, *uuid::Uuid::now_v7().as_bytes(), Some(tenant)).unwrap();
 
     assert!(stamped.schema().field_with_name(DATA_TENANT_ID).is_ok());
     let col = stamped
@@ -93,9 +93,9 @@ fn stamp_system_columns_appends_tenant_id_when_provided() {
 
 /// Full catalog round-trip: create table, write, read back.
 /// Requires embedded Postgres and a writable tmp directory.
-/// Run with: cargo test -p vala-bifrost --all-features round_trip_full -- --ignored
+/// Run with: `cargo test -p vala-bifrost --all-features round_trip_full -- --ignored`
 #[tokio::test]
-#[ignore]
+#[ignore = "requires BIFROST_TEST_DB_URL; run with --ignored"]
 async fn round_trip_full() {
     // BIFROST_TEST_DB_URL=postgres://... cargo test ... -- --ignored
     let db_url = std::env::var("BIFROST_TEST_DB_URL")

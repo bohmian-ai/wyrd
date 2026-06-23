@@ -7,13 +7,15 @@ use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use crate::error::StorageError;
 use crate::settings::BackendConfig;
 
+/// Iceberg storage factory and catalog properties returned by backend constructors.
+pub type IcebergStorageResult =
+    Result<(Arc<dyn StorageFactory>, HashMap<String, String>), StorageError>;
+
 /// Build an Iceberg `StorageFactory` and extra catalog properties for the active backend.
 ///
 /// # Errors
 /// Returns a `StorageError` if the factory cannot be constructed.
-pub fn iceberg_storage_factory(
-    backend: &BackendConfig,
-) -> Result<(Arc<dyn StorageFactory>, HashMap<String, String>), StorageError> {
+pub fn iceberg_storage_factory(backend: &BackendConfig) -> IcebergStorageResult {
     let factory = Arc::new(OpenDalResolvingStorageFactory::new()) as Arc<dyn StorageFactory>;
     let mut props = HashMap::new();
 

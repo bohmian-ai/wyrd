@@ -93,7 +93,7 @@ impl CommitActor {
 
         let stamped: Vec<RecordBatch> = match batches
             .iter()
-            .map(|b| stamp_system_columns(b.clone(), ingested_at_us, batch_id, stamp_tenant))
+            .map(|b| stamp_system_columns(b, ingested_at_us, batch_id, stamp_tenant))
             .collect::<Result<_, _>>()
             .map_err(BifrostError::Arrow)
         {

@@ -20,7 +20,7 @@ use wyrd_spec::vala::system_columns::{
 /// Returns [`ArrowError`] when building the batch-id column or assembling the
 /// stamped [`RecordBatch`] fails.
 pub fn stamp_system_columns(
-    batch: RecordBatch,
+    batch: &RecordBatch,
     ingested_at_us: i64,
     batch_id: [u8; 16],
     tenant: Option<DataTenantId>,

@@ -5,7 +5,6 @@ use crate::settings::{BackendConfig, StorageSettings};
 use crate::signer::BackendSigner;
 use crate::tenant_path::ValidatedPath;
 use opendal::{EntryMode, ErrorKind, Operator};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use wyrd_spec::storage::StorageBackendKind;
@@ -241,15 +240,7 @@ impl StorageHandle {
     /// # Errors
     /// Returns `StorageError` when backend configuration is invalid.
     #[cfg(feature = "iceberg")]
-    pub fn iceberg_storage_factory(
-        &self,
-    ) -> Result<
-        (
-            Arc<dyn iceberg::io::StorageFactory>,
-            HashMap<String, String>,
-        ),
-        StorageError,
-    > {
+    pub fn iceberg_storage_factory(&self) -> crate::factory::iceberg_factory::IcebergStorageResult {
         crate::factory::iceberg_factory::iceberg_storage_factory(&self.backend_config)
     }
 

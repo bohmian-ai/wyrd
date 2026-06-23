@@ -34,7 +34,7 @@ use crate::writer::file_writer::bifrost_writer_properties;
 ///
 /// # Errors
 /// Returns [`BifrostError`] when the control-plane txn, Parquet write, or Iceberg
-/// append fails, or when the batch_id collides with a failed/in-flight anchor.
+/// append fails, or when the `batch_id` collides with a failed/in-flight anchor.
 pub async fn run_commit(
     pool: &PgPool,
     catalog: &SqlCatalog,
@@ -63,7 +63,7 @@ pub async fn run_commit(
 ///   replay this snapshot and write nothing.
 /// - `Ok(None)` — no prior anchor; a `precommit` row has been written and the
 ///   caller should proceed with the write.
-/// - `Err(..)` — the batch_id collides with a prior failure
+/// - `Err(..)` — the `batch_id` collides with a prior failure
 ///   ([`BifrostError::DuplicateFailedBatch`]) or an in-flight precommit
 ///   ([`BifrostError::CommitConflict`]); the caller must retry with a new id.
 ///

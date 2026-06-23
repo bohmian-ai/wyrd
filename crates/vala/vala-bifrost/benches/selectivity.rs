@@ -19,8 +19,9 @@ const ROWS_PER_DAY: usize = 1_000;
 
 /// One file's worth of rows with `id` in `[day*ROWS_PER_DAY, (day+1)*ROWS_PER_DAY)`.
 fn day_batch(n: usize, day: i64) -> arrow::record_batch::RecordBatch {
-    let base = day * n as i64;
-    let ids: Int64Array = (0..n as i64).map(|i| base + i).collect();
+    let n_i64 = i64::try_from(n).expect("n fits i64");
+    let base = day * n_i64;
+    let ids: Int64Array = (0..n_i64).map(|i| base + i).collect();
     let payloads: StringArray = (0..n).map(|i| Some(format!("p{i}"))).collect();
     arrow::record_batch::RecordBatch::try_new(
         workload::simple_schema(),
@@ -94,8 +95,9 @@ fn bench_selectivity(c: &mut Criterion) {
     let mut group = c.benchmark_group("selectivity");
 
     for &(label, start_day, end_day) in selectivity_cases {
-        let start_id = start_day * ROWS_PER_DAY as i64;
-        let end_id = end_day * ROWS_PER_DAY as i64;
+        let rows = i64::try_from(ROWS_PER_DAY).expect("ROWS_PER_DAY fits i64");
+        let start_id = start_day * rows;
+        let end_id = end_day * rows;
         let sql = format!("SELECT id FROM sel_tbl WHERE id >= {start_id} AND id < {end_id}");
         group.bench_with_input(BenchmarkId::new("sel", label), &sql, |b, sql| {
             b.to_async(&rt)

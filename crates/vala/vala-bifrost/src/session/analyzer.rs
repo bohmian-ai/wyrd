@@ -58,7 +58,7 @@ impl TenantPredicateRule {
 }
 
 impl AnalyzerRule for TenantPredicateRule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "wyrd_tenant_predicate"
     }
 

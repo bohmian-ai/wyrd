@@ -107,13 +107,15 @@ async fn run(args: Args) {
         .await
         .unwrap();
 
-    let batch_count = (args.rows as usize).div_ceil(args.batch_size);
+    let batch_count = usize::try_from(args.rows)
+        .expect("rows fits usize")
+        .div_ceil(args.batch_size);
     let mut commit_count = 0;
     let mut durations_ms = Vec::with_capacity(batch_count);
 
     for i in 0..batch_count {
         let n = if i + 1 == batch_count {
-            let rem = (args.rows as usize) % args.batch_size;
+            let rem = usize::try_from(args.rows).expect("rows fits usize") % args.batch_size;
             if rem == 0 { args.batch_size } else { rem }
         } else {
             args.batch_size
@@ -168,7 +170,7 @@ fn make_batch(n: usize) -> arrow::record_batch::RecordBatch {
         Field::new("payload", DataType::Utf8, false),
     ]));
 
-    let ids: Int64Array = (0..n as i64).collect();
+    let ids: Int64Array = (0..i64::try_from(n).expect("n fits i64")).collect();
     let payloads: StringArray = (0..n).map(|i| Some(format!("p{i}"))).collect();
 
     arrow::record_batch::RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(payloads)])
@@ -179,6 +181,11 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     let idx = ((sorted.len() as f64 * p) as usize).min(sorted.len() - 1);
     sorted[idx]
 }

@@ -98,7 +98,9 @@ mod tests {
             ROLE_BOOTSTRAP_SQL_TEMPLATE.contains("CREATE ROLE wyrd_platform_admin LOGIN BYPASSRLS")
         );
         assert!(ROLE_BOOTSTRAP_SQL_TEMPLATE.contains("CREATE ROLE wyrd_catalog NOLOGIN"));
-        assert!(ROLE_BOOTSTRAP_SQL_TEMPLATE.contains("CREATE ROLE wyrd_catalog_app LOGIN PASSWORD"));
+        assert!(
+            ROLE_BOOTSTRAP_SQL_TEMPLATE.contains("CREATE ROLE wyrd_catalog_app LOGIN PASSWORD")
+        );
         assert!(ROLE_BOOTSTRAP_SQL_TEMPLATE.contains("GRANT wyrd_catalog TO wyrd_catalog_app"));
         assert!(ROLE_BOOTSTRAP_SQL_TEMPLATE.contains("GRANT wyrd_catalog TO wyrd_migrator"));
     }

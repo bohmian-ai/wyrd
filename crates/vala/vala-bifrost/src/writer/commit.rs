@@ -83,10 +83,13 @@ async fn claim_batch(
         .await
         .map_err(BifrostError::Sql)?;
 
-    let existing =
-        vala_sql::queries::olap_catalog::lookup_idempotent(&mut conn, table_uid.as_bytes(), batch_id)
-            .await
-            .map_err(BifrostError::Sql)?;
+    let existing = vala_sql::queries::olap_catalog::lookup_idempotent(
+        &mut conn,
+        table_uid.as_bytes(),
+        batch_id,
+    )
+    .await
+    .map_err(BifrostError::Sql)?;
 
     match existing {
         Some(row) if row.state == "committed" => {

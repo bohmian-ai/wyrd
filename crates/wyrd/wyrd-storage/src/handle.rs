@@ -243,7 +243,13 @@ impl StorageHandle {
     #[cfg(feature = "iceberg")]
     pub fn iceberg_storage_factory(
         &self,
-    ) -> Result<(Arc<dyn iceberg::io::StorageFactory>, HashMap<String, String>), StorageError> {
+    ) -> Result<
+        (
+            Arc<dyn iceberg::io::StorageFactory>,
+            HashMap<String, String>,
+        ),
+        StorageError,
+    > {
         crate::factory::iceberg_factory::iceberg_storage_factory(&self.backend_config)
     }
 

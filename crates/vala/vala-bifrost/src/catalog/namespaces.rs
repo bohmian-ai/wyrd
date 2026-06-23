@@ -19,7 +19,6 @@ impl BifrostNamespace {
     }
 
     pub fn to_namespace_ident(self) -> NamespaceIdent {
-        NamespaceIdent::from_strs([self.as_str()])
-            .expect("namespace identifier is always valid")
+        NamespaceIdent::from_strs([self.as_str()]).expect("namespace identifier is always valid")
     }
 }

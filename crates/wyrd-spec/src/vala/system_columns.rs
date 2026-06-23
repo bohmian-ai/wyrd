@@ -8,8 +8,12 @@ pub const WYRD_BATCH_ID: &str = "wyrd_batch_id";
 pub const DATA_TENANT_ID: &str = "data_tenant_id";
 
 /// Ordered list of column names that are reserved for Bifrost system use.
-pub const RESERVED_SYSTEM_COLUMNS: &[&str] =
-    &[WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_BATCH_ID, DATA_TENANT_ID];
+pub const RESERVED_SYSTEM_COLUMNS: &[&str] = &[
+    WYRD_EVENT_TIME,
+    WYRD_INGESTED_AT,
+    WYRD_BATCH_ID,
+    DATA_TENANT_ID,
+];
 
 /// Describes which system columns are appended to a Bifrost table schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

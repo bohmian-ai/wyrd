@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use iceberg::io::StorageFactory;
 use iceberg::CatalogBuilder;
+use iceberg::io::StorageFactory;
 use iceberg_catalog_sql::{SqlBindStyle, SqlCatalog, SqlCatalogBuilder};
 
 use crate::error::BifrostError;

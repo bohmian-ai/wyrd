@@ -43,7 +43,12 @@ pub fn stamp_system_columns(
     }
     let batch_id_col = Arc::new(fsb_builder.finish()) as Arc<dyn Array>;
 
-    let mut new_schema_fields: Vec<Field> = batch.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+    let mut new_schema_fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
     let mut new_columns: Vec<Arc<dyn Array>> = batch.columns().to_vec();
 
     let ts_field = Field::new(
@@ -66,8 +71,8 @@ pub fn stamp_system_columns(
     new_columns.push(batch_id_col);
 
     if let Some(tenant_id) = tenant {
-        let tid_col = Arc::new(StringArray::from(vec![tenant_id.to_string(); nrows]))
-            as Arc<dyn Array>;
+        let tid_col =
+            Arc::new(StringArray::from(vec![tenant_id.to_string(); nrows])) as Arc<dyn Array>;
         new_schema_fields.push(Field::new(DATA_TENANT_ID, DataType::Utf8, false));
         new_columns.push(tid_col);
     }

@@ -43,15 +43,19 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
 
     let result: Result<(), SqlError> = async {
         for schema in OWNED_SCHEMAS {
-            sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA IF NOT EXISTS {schema}")))
-                .execute(&mut *conn)
-                .await
-                .map_err(SqlError::Connect)?;
-        }
-        sqlx::query(AssertSqlSafe(format!("SET search_path TO {MIGRATION_SEARCH_PATH}")))
+            sqlx::query(AssertSqlSafe(format!(
+                "CREATE SCHEMA IF NOT EXISTS {schema}"
+            )))
             .execute(&mut *conn)
             .await
             .map_err(SqlError::Connect)?;
+        }
+        sqlx::query(AssertSqlSafe(format!(
+            "SET search_path TO {MIGRATION_SEARCH_PATH}"
+        )))
+        .execute(&mut *conn)
+        .await
+        .map_err(SqlError::Connect)?;
         sqlx::migrate!("./migrations")
             .run(&mut *conn)
             .await
@@ -378,8 +382,8 @@ mod tests {
         let mut start = 0;
         while let Some(pos) = text[start..].find(keyword) {
             let abs = start + pos;
-            let before_ok = abs == 0
-                || !matches!(text.as_bytes()[abs - 1], b'A'..=b'Z' | b'0'..=b'9' | b'_');
+            let before_ok =
+                abs == 0 || !matches!(text.as_bytes()[abs - 1], b'A'..=b'Z' | b'0'..=b'9' | b'_');
             let end = abs + keyword.len();
             let after_ok = end >= text.len()
                 || !matches!(text.as_bytes()[end], b'A'..=b'Z' | b'0'..=b'9' | b'_');

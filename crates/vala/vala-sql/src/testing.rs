@@ -26,10 +26,12 @@ pub async fn migrate_for_test(pool: &PgPool) -> Result<(), SqlError> {
         .await
         .map_err(SqlError::from)?;
     for schema in crate::OWNED_SCHEMAS {
-        sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA IF NOT EXISTS {schema}")))
-            .execute(&mut *conn)
-            .await
-            .map_err(SqlError::Connect)?;
+        sqlx::query(AssertSqlSafe(format!(
+            "CREATE SCHEMA IF NOT EXISTS {schema}"
+        )))
+        .execute(&mut *conn)
+        .await
+        .map_err(SqlError::Connect)?;
     }
     sqlx::query(AssertSqlSafe(format!(
         "SET search_path TO {}",

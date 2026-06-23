@@ -2,7 +2,7 @@ mod support;
 
 use std::sync::Arc;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use support::BenchFixture;
 use tokio::runtime::Runtime;
 use vala_bifrost::catalog::namespaces::BifrostNamespace;

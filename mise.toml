@@ -1025,6 +1025,9 @@ done
 psql "$WYRD_MIGRATOR_DSN" -c "ALTER ROLE wyrd_migrator BYPASSRLS;" || true
 psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE wyrd_app LOGIN PASSWORD 'wyrd_app_pw';" || true
 psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE wyrd_platform_admin LOGIN PASSWORD 'wyrd_platform_admin_pw' BYPASSRLS;" || true
+psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE vala_recovery_owner NOLOGIN BYPASSRLS;" || true
+psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE vala_recovery LOGIN PASSWORD 'vala_recovery_pw';" || true
+psql "$WYRD_MIGRATOR_DSN" -c "GRANT vala_recovery_owner TO wyrd_migrator;" || true
 """
 
 [tasks."db:migrate"]

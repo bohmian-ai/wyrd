@@ -29,3 +29,5 @@ wyrd-sql = { path = "../../wyrd/wyrd-sql", version = "0.0.1" }
 # consumers like vala-bifrost).
 [dev-dependencies]
 wyrd-sql = { workspace = true, features = ["testing"] }
+wyrd-spec = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }

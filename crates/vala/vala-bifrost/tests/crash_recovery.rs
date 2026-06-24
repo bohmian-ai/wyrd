@@ -1,7 +1,7 @@
 //! Crash-recovery tests: proves the 2PC pre-commit-row protocol survives
 //! writer crashes and correctly reconciles on engine restart.
 //!
-//! Uses bare `#[sqlx::test]` + in-body `migrate_for_test`; see commit_idempotency.rs
+//! Uses bare `#[sqlx::test]` + in-body `migrate_for_test`; see `commit_idempotency.rs`
 //! for the rationale. Requires a live Postgres:
 //! `DATABASE_URL=... cargo test -p vala-bifrost --all-features --test crash_recovery`.
 
@@ -37,7 +37,7 @@ struct Harness {
     table_uid: TableUid,
 }
 
-async fn test_warehouse(
+fn test_warehouse(
     pool: &Arc<PgPool>,
 ) -> (
     String,
@@ -65,7 +65,7 @@ async fn setup(pool: PgPool) -> Harness {
         .await
         .unwrap();
 
-    let (catalog_uri, warehouse, factory, props, tmp) = test_warehouse(&pool).await;
+    let (catalog_uri, warehouse, factory, props, tmp) = test_warehouse(&pool);
 
     let catalog = WyrdCatalog::new(
         &catalog_uri,
@@ -105,11 +105,11 @@ fn stamped_batch(n: i64, batch_id: [u8; 16]) -> RecordBatch {
     let user = make_batch(n);
     let now_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_micros() as i64);
+        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX));
     stamp_system_columns(&user, now_us, batch_id, None).unwrap()
 }
 
-/// Rebuild the catalog (simulates engine restart). Recovery runs on WyrdCatalog::new.
+/// Rebuild the catalog (simulates engine restart). Recovery runs on `WyrdCatalog::new`.
 async fn rebuild_catalog(h: &Harness) -> WyrdCatalog {
     WyrdCatalog::new(
         &h.catalog_uri,
@@ -136,7 +136,7 @@ async fn load_table(h: &Harness) -> iceberg::table::Table {
     catalog.load_table(&ident).await.unwrap()
 }
 
-/// Load the raw SqlCatalog for `commit_with_fault` calls.
+/// Load the raw `SqlCatalog` for `commit_with_fault` calls.
 async fn load_sql_catalog(h: &Harness) -> iceberg_catalog_sql::SqlCatalog {
     iceberg_sql::build_catalog(
         &h.catalog_uri,
@@ -152,7 +152,7 @@ async fn load_sql_catalog(h: &Harness) -> iceberg_catalog_sql::SqlCatalog {
 
 /// Writer crashes after inserting the precommit row (with an already-expired
 /// lease) but before writing any Parquet. Recovery on the next engine start
-/// claims the orphaned row, finds no matching snapshot (snapshot_absent), and
+/// claims the orphaned row, finds no matching snapshot (`snapshot_absent`), and
 /// finalizes it as 'aborted'.
 #[sqlx::test]
 async fn precommit_row_aborts_on_restart(pool: PgPool) {
@@ -206,8 +206,8 @@ async fn precommit_row_aborts_on_restart(pool: PgPool) {
     assert_eq!(audited, 1, "one snapshot_absent audit row");
 }
 
-/// Writer crashes AFTER the Iceberg commit but BEFORE finalize_committed. The
-/// snapshot is real and carries wyrd_batch_id. Recovery finds it (snapshot_found)
+/// Writer crashes AFTER the Iceberg commit but BEFORE `finalize_committed`. The
+/// snapshot is real and carries `wyrd_batch_id`. Recovery finds it (`snapshot_found`)
 /// and rolls forward: finalizes 'committed'.
 #[sqlx::test]
 async fn snapshot_committed_but_not_finalized_rolls_forward(pool: PgPool) {
@@ -375,8 +375,8 @@ async fn cold_start_maps_table_identity(pool: PgPool) {
 }
 
 /// A transient catalog/object-store failure during the oracle scan must NOT
-/// falsely abort a committed batch. The row stays 'precommit', recovery_attempts
-/// increments, and a scan_failed audit row is written. On retry, the scan
+/// falsely abort a committed batch. The row stays 'precommit', `recovery_attempts`
+/// increments, and a `scan_failed` audit row is written. On retry, the scan
 /// succeeds and the row is finalized correctly.
 #[ignore = "requires a mock StorageFactory that can fail on demand — deferred"]
 #[sqlx::test]
@@ -385,18 +385,18 @@ async fn transient_scan_failure_is_retryable(_pool: PgPool) {
 }
 
 /// After recovery claims an expired precommit row, a zombie writer that resumes
-/// and calls renew_writer_fence() finds recovery_fencing_token IS NOT NULL and
-/// is fenced out before it can fast_append.
+/// and calls `renew_writer_fence()` finds `recovery_fencing_token` IS NOT NULL and
+/// is fenced out before it can `fast_append`.
 ///
 /// Simulates the recovery-claim step by directly stamping `recovery_fencing_token`
 /// (what `vala.claim_stale_precommits` does), then proves the guarded renewal
 /// returns false and leaves the FSM unchanged.
 #[sqlx::test]
 async fn zombie_writer_fenced_after_recovery_claim(pool: PgPool) {
+    const TOKEN: i64 = 99;
     let h = setup(pool).await;
     let batch_id = *uuid::Uuid::now_v7().as_bytes();
     let owner = sqlx::types::Uuid::new_v4();
-    const TOKEN: i64 = 99;
 
     // Insert precommit row with expired lease and stamp recovery_fencing_token
     // (simulating what claim_stale_precommits does atomically).
@@ -465,14 +465,14 @@ async fn zombie_writer_fenced_after_recovery_claim(pool: PgPool) {
 }
 
 /// An expired-lease writer is fenced by the guarded renewal even when recovery
-/// has NOT yet claimed the row — the writer_lease_expires_at > now() predicate
+/// has NOT yet claimed the row — the `writer_lease_expires_at` > `now()` predicate
 /// fails closed before any recovery involvement.
 #[sqlx::test]
 async fn expired_writer_fenced_before_recovery_claim(pool: PgPool) {
+    const TOKEN: i64 = 42;
     let h = setup(pool).await;
     let batch_id = *uuid::Uuid::now_v7().as_bytes();
     let owner = sqlx::types::Uuid::new_v4();
-    const TOKEN: i64 = 42;
 
     // Insert precommit row with already-expired lease; recovery_fencing_token stays NULL.
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
@@ -537,15 +537,15 @@ async fn expired_writer_fenced_before_recovery_claim(pool: PgPool) {
     assert_eq!(events, 0, "no recovery events — no recovery ran");
 }
 
-/// A freshly renewed lease (writer_lease_expires_at well in the future) must
+/// A freshly renewed lease (`writer_lease_expires_at` well in the future) must
 /// prevent recovery from claiming the row, even if recovery runs between the
 /// renewal and the Iceberg append.
 #[sqlx::test]
 async fn recovery_skips_after_unexpired_renewal(pool: PgPool) {
+    const TOKEN: i64 = 55;
     let h = setup(pool).await;
     let batch_id = *uuid::Uuid::now_v7().as_bytes();
     let owner = sqlx::types::Uuid::new_v4();
-    const TOKEN: i64 = 55;
 
     // Insert precommit row with a fresh future lease — simulates a writer that
     // just renewed its lease before being paused between renewal and fast_append.
@@ -616,9 +616,9 @@ async fn recovery_skips_after_unexpired_renewal(pool: PgPool) {
     );
 }
 
-/// The bounded post-append residual (stop-the-world pause longer than lease_ttl
-/// between renewal and fast_append) is detected, audited, and not silent.
-/// fence_lost_after_append audit row is written; rolled_back reflects rollback
+/// The bounded post-append residual (stop-the-world pause longer than `lease_ttl`
+/// between renewal and `fast_append`) is detected, audited, and not silent.
+/// `fence_lost_after_append` audit row is written; `rolled_back` reflects rollback
 /// availability (false in this iceberg-rust version).
 #[sqlx::test]
 async fn fence_lost_after_append_is_detected_and_audited(pool: PgPool) {

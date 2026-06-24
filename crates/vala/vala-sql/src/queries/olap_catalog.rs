@@ -417,6 +417,7 @@ pub async fn renew_writer_fence(
 ///
 /// # Errors
 /// Returns [`SqlError`] when the query fails.
+#[allow(clippy::too_many_arguments)]
 pub async fn record_fence_loss_after_append(
     conn: &mut TenantConn<'_>,
     table_uid: &[u8; 16],

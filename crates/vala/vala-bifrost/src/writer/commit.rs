@@ -34,7 +34,7 @@ const WRITER_LEASE_SECS: i64 = 30;
 /// Fault-injection points for test-only commit path overrides.
 ///
 /// Gated to test and bench builds; must never be reachable in production.
-#[cfg(any(test, feature = "bench-bin"))]
+#[cfg(any(test, feature = "testing", feature = "bench-bin"))]
 #[derive(Clone, Debug)]
 pub enum Lease {
     Expired,
@@ -42,7 +42,7 @@ pub enum Lease {
     Normal,
 }
 
-#[cfg(any(test, feature = "bench-bin"))]
+#[cfg(any(test, feature = "testing", feature = "bench-bin"))]
 #[derive(Clone, Debug)]
 pub enum FaultPoint {
     /// Insert precommit row + lease, optionally expire the lease, then fail
@@ -211,6 +211,7 @@ async fn claim_batch(
 /// # Errors
 /// Returns the underlying [`BifrostError`] from the Parquet write or Iceberg
 /// append, or [`BifrostError::Sql`] when the `committed` finalize fails.
+#[allow(clippy::too_many_arguments)]
 async fn write_and_finalize(
     pool: &PgPool,
     catalog: &SqlCatalog,
@@ -428,7 +429,8 @@ async fn commit_to_iceberg(
 
 // ── Test/bench fault injection ───────────────────────────────────────────────
 
-#[cfg(any(test, feature = "bench-bin"))]
+#[cfg(any(test, feature = "testing", feature = "bench-bin"))]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn run_commit_with_fault(
     pool: &PgPool,
     catalog: &SqlCatalog,

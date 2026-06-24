@@ -75,7 +75,13 @@ END $$;
 --    SECURITY DEFINER functions execute correctly under that role's privileges.
 --    USAGE on the schema is required in addition to table/sequence grants because
 --    BYPASSRLS skips RLS policies but not privilege checks on the schema itself.
+--    CREATE is required so that PostgreSQL 17 allows ALTER FUNCTION OWNER TO
+--    vala_recovery_owner (PG17 enforces that the new owner has CREATE on the
+--    function's schema). vala_sql::migrate() pre-commits this grant outside any
+--    migration transaction so the ACL cache sees it during ALTER FUNCTION OWNER.
 GRANT USAGE ON SCHEMA vala TO vala_recovery_owner, vala_recovery;
+GRANT CREATE ON SCHEMA vala TO vala_recovery_owner;
+
 GRANT SELECT ON vala.bifrost_tables TO vala_recovery_owner;
 GRANT SELECT, UPDATE ON vala.olap_commits TO vala_recovery_owner;
 GRANT INSERT ON vala.olap_recovery_events TO vala_recovery_owner;
@@ -134,6 +140,8 @@ BEGIN
       ON bt.data_tenant_id = cl.data_tenant_id AND bt.table_uid = cl.table_uid;
 END;
 $$;
+-- Grant EXECUTE while wyrd_migrator still owns the function (before owner transfer).
+GRANT EXECUTE ON FUNCTION vala.claim_stale_precommits(uuid, int) TO vala_recovery;
 ALTER FUNCTION vala.claim_stale_precommits(uuid, int) OWNER TO vala_recovery_owner;
 
 CREATE OR REPLACE FUNCTION vala.finalize_recovered_committed(
@@ -177,6 +185,7 @@ BEGIN
      WHERE table_uid = p_table_uid AND batch_id = p_batch_id;
 END;
 $$;
+GRANT EXECUTE ON FUNCTION vala.finalize_recovered_committed(bytea, bytea, bigint, bigint) TO vala_recovery;
 ALTER FUNCTION vala.finalize_recovered_committed(bytea, bytea, bigint, bigint) OWNER TO vala_recovery_owner;
 
 CREATE OR REPLACE FUNCTION vala.finalize_recovered_aborted(
@@ -212,6 +221,7 @@ BEGIN
      WHERE table_uid = p_table_uid AND batch_id = p_batch_id;
 END;
 $$;
+GRANT EXECUTE ON FUNCTION vala.finalize_recovered_aborted(bytea, bytea, bigint, text) TO vala_recovery;
 ALTER FUNCTION vala.finalize_recovered_aborted(bytea, bytea, bigint, text) OWNER TO vala_recovery_owner;
 
 CREATE OR REPLACE FUNCTION vala.mark_recovery_scan_failed(
@@ -245,13 +255,5 @@ BEGIN
      WHERE table_uid = p_table_uid AND batch_id = p_batch_id;
 END;
 $$;
+GRANT EXECUTE ON FUNCTION vala.mark_recovery_scan_failed(bytea, bytea, bigint, text) TO vala_recovery;
 ALTER FUNCTION vala.mark_recovery_scan_failed(bytea, bytea, bigint, text) OWNER TO vala_recovery_owner;
-
--- 8. Grant EXECUTE on recovery routines to the login role used by the recovery
---    worker process.
-GRANT EXECUTE ON FUNCTION
-    vala.claim_stale_precommits(uuid, int),
-    vala.finalize_recovered_committed(bytea, bytea, bigint, bigint),
-    vala.finalize_recovered_aborted(bytea, bytea, bigint, text),
-    vala.mark_recovery_scan_failed(bytea, bytea, bigint, text)
-  TO vala_recovery;

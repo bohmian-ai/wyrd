@@ -180,19 +180,16 @@ impl WyrdCatalog {
         let fqn = format!("{}.{}", ns.as_str(), name);
 
         // Two-step lookup: try tenant bind (TenantOwned), then SYSTEM_OWNER (SystemShared).
-        let (row, owner) = match self.lookup_table_row(&fqn, tenant).await? {
-            Some(row) => {
-                let scope = TableScope::from_db_str(&row.scope)?;
-                let owner = scope.control_bind(tenant);
-                (row, owner)
-            }
-            None => {
-                let row = self
-                    .lookup_table_row(&fqn, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
-                    .await?
-                    .ok_or_else(|| BifrostError::TableNotFound(fqn.clone()))?;
-                (row, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
-            }
+        let (row, owner) = if let Some(row) = self.lookup_table_row(&fqn, tenant).await? {
+            let scope = TableScope::from_db_str(&row.scope)?;
+            let owner = scope.control_bind(tenant);
+            (row, owner)
+        } else {
+            let row = self
+                .lookup_table_row(&fqn, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
+                .await?
+                .ok_or_else(|| BifrostError::TableNotFound(fqn.clone()))?;
+            (row, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
         };
 
         let table_uid = TableUid(
@@ -221,7 +218,7 @@ impl WyrdCatalog {
         Ok(meta)
     }
 
-    /// List tables visible to `tenant` — both TenantOwned and SystemShared rows.
+    /// List tables visible to `tenant` — both `TenantOwned` and `SystemShared` rows.
     /// Engine-internal; no stable public contract yet.
     #[allow(dead_code)]
     pub(crate) async fn list_tables(
@@ -459,13 +456,14 @@ fn fqn_to_table_ident(fqn: &str) -> Result<iceberg::TableIdent, BifrostError> {
     ];
     for ns in namespaces {
         let prefix = format!("{}.", ns.as_str());
-        if let Some(table_name) = fqn.strip_prefix(&prefix) {
-            if !table_name.is_empty() && !table_name.contains('.') {
-                return Ok(iceberg::TableIdent::new(
-                    ns.to_namespace_ident(),
-                    table_name.to_string(),
-                ));
-            }
+        if let Some(table_name) = fqn.strip_prefix(&prefix)
+            && !table_name.is_empty()
+            && !table_name.contains('.')
+        {
+            return Ok(iceberg::TableIdent::new(
+                ns.to_namespace_ident(),
+                table_name.to_string(),
+            ));
         }
     }
     Err(BifrostError::MetadataMismatch(format!(

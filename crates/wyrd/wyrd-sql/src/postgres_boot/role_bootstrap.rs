@@ -120,14 +120,10 @@ mod tests {
             ROLE_BOOTSTRAP_SQL_TEMPLATE
                 .contains("CREATE ROLE vala_recovery_owner NOLOGIN BYPASSRLS")
         );
-        assert!(
-            ROLE_BOOTSTRAP_SQL_TEMPLATE.contains("CREATE ROLE vala_recovery LOGIN PASSWORD")
-        );
+        assert!(ROLE_BOOTSTRAP_SQL_TEMPLATE.contains("CREATE ROLE vala_recovery LOGIN PASSWORD"));
         assert!(ROLE_BOOTSTRAP_SQL_TEMPLATE.contains("GRANT wyrd_catalog TO wyrd_catalog_app"));
         assert!(ROLE_BOOTSTRAP_SQL_TEMPLATE.contains("GRANT wyrd_catalog TO wyrd_migrator"));
-        assert!(
-            ROLE_BOOTSTRAP_SQL_TEMPLATE.contains("GRANT vala_recovery_owner TO wyrd_migrator")
-        );
+        assert!(ROLE_BOOTSTRAP_SQL_TEMPLATE.contains("GRANT vala_recovery_owner TO wyrd_migrator"));
     }
 
     #[test]

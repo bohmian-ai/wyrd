@@ -11,7 +11,7 @@ use crate::types::TableUid;
 ///
 /// `table_uid` is NOT globally unique (PK is `(data_tenant_id, table_uid)`),
 /// so a UID-only key could serve one tenant's metadata to another. `owner` is
-/// `scope.control_bind(data_tenant)` (SystemShared → SYSTEM_OWNER).
+/// `scope.control_bind(data_tenant)` (`SystemShared` → `SYSTEM_OWNER`).
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub(crate) struct RegistryKey {
     pub owner: DataTenantId,
@@ -71,6 +71,7 @@ impl Registry {
     }
 
     /// One narrow PK-indexed `vala.refresh_epochs` read, bound to `key.owner`.
+    #[allow(clippy::cast_sign_loss)]
     pub(crate) async fn current_epoch(&self, key: &RegistryKey) -> Result<u64, BifrostError> {
         let mut conn = vala_sql::TenantConn::acquire(&self.pool, key.owner)
             .await
@@ -98,8 +99,8 @@ impl Registry {
         self.by_key.insert(key, meta);
     }
 
-    /// List all `vala.bifrost_tables` rows visible to `tenant` (TenantOwned) plus
-    /// all SystemShared rows (visible under `SYSTEM_OWNER`).
+    /// List all `vala.bifrost_tables` rows visible to `tenant` (`TenantOwned`) plus
+    /// all `SystemShared` rows (visible under `SYSTEM_OWNER`).
     #[allow(dead_code)]
     pub(crate) async fn list_for_tenant(
         &self,

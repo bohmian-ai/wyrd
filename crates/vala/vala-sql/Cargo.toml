@@ -21,13 +21,10 @@ sqlx = { workspace = true }
 tracing = { workspace = true }
 wyrd-sql = { path = "../../wyrd/wyrd-sql", version = "0.0.1" }
 
-# The `testing` module is gated on `any(test, feature = "testing")`, so it
-# compiles under `cargo test -p vala-sql` even when the `testing` feature is
-# off. Its body calls `wyrd_sql::testing`, which only exists when wyrd-sql is
-# built with its `testing` feature. Enable it here so the crate's own test
-# build is self-sufficient (the `testing` feature still chains it for external
-# consumers like vala-bifrost).
 [dev-dependencies]
+# Self-reference activates `testing` feature for integration tests in `tests/`
+# (cfg(test) does not apply to the lib when building integration test binaries).
+vala-sql = { path = ".", features = ["testing"] }
 wyrd-sql = { workspace = true, features = ["testing"] }
 wyrd-spec = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }

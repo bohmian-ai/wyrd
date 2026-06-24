@@ -63,6 +63,7 @@ pub fn eval_card(spec: EvalSpec) -> Card {
             annotations: Annotations::default(),
             spec_hash: None,
             artifact_hash: None,
+            origin: None,
         },
         spec: Spec::Eval(spec),
         relationships: Relationships::default(),

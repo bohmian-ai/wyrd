@@ -118,6 +118,7 @@ pub fn fixture_card(kind: CardKind, space: &str, name: &str, version: &str) -> C
             annotations: Default::default(),
             spec_hash: None,
             artifact_hash: None,
+            origin: None,
         },
         spec,
         relationships: Default::default(),

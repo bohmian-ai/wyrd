@@ -11,6 +11,9 @@
 //! no IO, no async, no PyO3. See
 //! `architecture/v1/06-crates/wyrd-spec.md` and AGENTS.md §9.
 
+/// Observation correlation: the code axis carried on a run and the reserved
+/// correlation column names.
+pub mod correlation;
 /// Public Bifrost error catalog for HTTP, MCP, and Python SDK boundaries.
 pub mod error;
 pub mod eval;
@@ -19,6 +22,7 @@ pub mod ids;
 pub mod system_columns;
 pub mod trace;
 
+pub use correlation::{CorrelationColumns, CorrelationContext};
 pub use error::BifrostError;
 pub use system_columns::{
     DATA_TENANT_ID, RESERVED_SYSTEM_COLUMNS, SystemColumnSet, WYRD_BATCH_ID, WYRD_EVENT_TIME,

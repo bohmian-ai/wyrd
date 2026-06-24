@@ -49,6 +49,7 @@ fn native_yaml(provider: &str, model: &str) -> String {
             annotations: Default::default(),
             spec_hash: None,
             artifact_hash: None,
+            origin: None,
         },
         spec: Spec::Prompt(spec),
         relationships: Default::default(),

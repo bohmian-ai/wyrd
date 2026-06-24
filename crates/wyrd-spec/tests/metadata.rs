@@ -41,6 +41,7 @@ fn labels_and_annotations_round_trip_as_string_maps() {
             annotations,
             spec_hash: None,
             artifact_hash: None,
+            origin: None,
         },
         spec: Spec::Prompt(prompt_spec()),
         relationships: Relationships::default(),

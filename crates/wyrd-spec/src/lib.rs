@@ -17,7 +17,9 @@ pub mod envelope;
 pub mod error;
 pub mod format;
 pub mod ids;
+pub mod intel;
 pub mod metadata;
+pub mod origin;
 pub mod redaction;
 pub mod reference;
 pub mod request_id;
@@ -47,10 +49,12 @@ pub use card::workflow::{
     WorkflowStep, WorkflowValidationError,
 };
 pub use ids::{ColumnName, DataTenantId, QueryName, RoleName, SplitName, TenantSlug, uuid7};
+pub use intel::{Evidence, Lineage, TimeRange};
 pub use metadata::{
     AnnotationKey, AnnotationValue, Annotations, CardMetadata, LabelKey, LabelValue, Labels,
     MetadataError,
 };
+pub use origin::{CommitSha, Origin, OriginValidationError};
 pub use reference::AgentRef;
 #[cfg(any(test, feature = "test-utils"))]
 pub use security::InlineSecret;

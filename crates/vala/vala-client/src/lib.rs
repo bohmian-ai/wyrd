@@ -19,6 +19,7 @@ pub mod python;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use wyrd_spec::vala::correlation::CorrelationContext;
 use wyrd_spec::vala::ids::{RecordId, RunId};
 
 /// Result returned by Vala client enqueue operations.
@@ -88,6 +89,12 @@ pub struct AgentStartRecord {
     pub envelope: ObservationEnvelope,
     /// Maximum number of iterations configured for the run.
     pub iteration_cap: u32,
+    /// Client-asserted code context for this run: repository, commit, branch,
+    /// and dev-session id. Carried once per run; later observations correlate
+    /// by `run_id`. Server-resolved identity (card, principal, tenant) is never
+    /// carried here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<CorrelationContext>,
 }
 
 /// Agent iteration observation.

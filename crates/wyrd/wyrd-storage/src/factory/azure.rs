@@ -19,14 +19,16 @@ pub(crate) fn azblob_service(cfg: &AzureConfig) -> services::Azblob {
         .endpoint_url
         .clone()
         .unwrap_or_else(|| format!("https://{}.blob.core.windows.net", cfg.account));
-    let mut b = services::Azblob::default()
+    let b = services::Azblob::default()
         .account_name(&cfg.account)
         .container(&cfg.container)
         .endpoint(&endpoint);
     #[cfg(any(test, feature = "emulator"))]
-    if let Ok(key) = std::env::var("AZURE_STORAGE_ACCOUNT_KEY") {
-        b = b.account_key(&key);
-    }
+    let b = if let Ok(key) = std::env::var("AZURE_STORAGE_ACCOUNT_KEY") {
+        b.account_key(&key)
+    } else {
+        b
+    };
     b
 }
 

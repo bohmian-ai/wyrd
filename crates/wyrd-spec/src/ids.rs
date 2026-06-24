@@ -134,6 +134,10 @@ id_type!(
 pub struct DataTenantId(uuid::Uuid);
 
 impl DataTenantId {
+    /// Nil-UUID sentinel that bypasses the v7 validator and represents Wyrd's
+    /// system-owned tables (SystemShared OLAP namespace, catalog bootstrap, etc.).
+    pub const SYSTEM_OWNER: DataTenantId = DataTenantId(uuid::Uuid::nil());
+
     /// Generate a UUIDv7-backed tenant isolation key.
     #[must_use]
     pub fn new_v7() -> Self {

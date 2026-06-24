@@ -9,6 +9,8 @@
 
 pub mod alerts;
 pub mod anchors;
+#[cfg(feature = "diagnostics")]
+pub mod iceberg_catalog;
 pub mod monitor;
 pub mod olap_catalog;
 pub mod profiles;

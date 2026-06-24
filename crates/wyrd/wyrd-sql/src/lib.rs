@@ -16,6 +16,8 @@ pub mod postgres_boot;
 pub mod queries;
 pub mod row_types;
 pub mod tenant_conn;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use error::SqlError;
 pub use pool::PoolConfig;

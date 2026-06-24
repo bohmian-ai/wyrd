@@ -13,8 +13,11 @@ path = "src/lib.rs"
 
 [features]
 emulator = []
+iceberg = ["dep:iceberg-storage-opendal", "dep:iceberg"]
 
 [dependencies]
+iceberg              = { workspace = true, optional = true }
+iceberg-storage-opendal = { workspace = true, optional = true }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1" }
 wyrd-spec = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }

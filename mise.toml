@@ -29,12 +29,28 @@ run = ["docker compose down --volumes", "docker compose up -d --build postgres -
 [tasks."test:rust:workspace"]
 description = "Run workspace Rust unit tests (no DB required)"
 run = """
-cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server
+cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server --exclude vala-bifrost
 cargo test --locked -p wyrd-server --all-features
 """
 
+[tasks."test:bifrost"]
+description = """Run vala-bifrost #[sqlx::test] integration tests against docker-compose Postgres.
+These provision ephemeral per-test databases; migrate_for_test bootstraps the roles and
+schemas inside each one, so the suite needs only a CREATEDB-capable DATABASE_URL (the
+docker-compose bootstrap superuser wyrd_migrator) and nothing pre-provisioned. Excluded
+from test:rust:workspace because that gate is DB-free.
+"""
+depends = ["build:postgres"]
+env = { DATABASE_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost:5432/wyrd" }
+# Default features only: --all-features would enable `python`, which links
+# libpython at runtime and aborts outside the py env. The Stage 1 DB tests need
+# neither `python` nor `bench-bin`; iceberg/datafusion are hard deps.
+run = "cargo test --locked -p vala-bifrost"
+
 [tasks."test:unit"]
 description = """Aggregate Rust test gate: workspace + storage emulator matrix + sql + registry-e2e.
+Bifrost (DataFusion-heavy) runs as a separate CI job via test:bifrost to avoid artifact-lock
+contention; add test:bifrost to pre-pr or run it directly to include it locally.
 Only real-credential cloud storage tests (test:storage:{s3,gcs,azure}:cloud) are gated to
 storage-integration-cloud.yml; emulator-backed storage tests run here because they are just
 docker containers, same difficulty as Postgres.
@@ -257,15 +273,23 @@ fi
 """
 
 [tasks."check:object-store-pin"]
-description = "Assert object_store is absent from the workspace dependency graph (replaced by opendal in stage0)"
+description = "Assert single versions of object_store/datafusion/arrow/parquet across the iceberg cone (stage1+)"
 run = """
-n=$(cargo tree -e=no-dev -i object_store --all-features 2>/dev/null | awk '/^object_store /{c++} END{print c+0}')
-if [ "$n" = 0 ]; then
-  echo "OK: object_store absent (off-graph)"
-else
-  echo "FAIL: object_store present ($n) — stage0 dropped it; check for a reintroduced dependency"
-  exit 1
-fi
+set -e
+fail=0
+for dep in object_store datafusion arrow parquet; do
+  n=$(cargo tree --workspace -e=no-dev -d --all-features 2>/dev/null \
+        | awk -v d="$dep" '$1==d {print $2}' | sort -u | wc -l | tr -d ' ')
+  if [ "$n" != "0" ]; then
+    echo "FAIL: $dep has multiple versions:"
+    cargo tree --workspace -e=no-dev -d --all-features | awk -v d="$dep" '$1==d {print "  "$2}'
+    fail=1
+  fi
+done
+os=$(cargo tree --workspace -e=no-dev -i object_store --all-features 2>/dev/null | awk 'NR==1{print $2}')
+case "$os" in v0.13.*) : ;; *) echo "FAIL: object_store $os is not 0.13.*"; fail=1 ;; esac
+[ "$fail" = 0 ] && echo "OK: single object_store ($os) + single datafusion/arrow/parquet across the iceberg cone"
+exit $fail
 """
 
 [tasks."storage:up"]
@@ -985,7 +1009,7 @@ fi
 
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
-depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs", "check:no-legacy-server-vocab", "check:no-tonic-outside-wyrd-tonic"]
+depends = ["check", "test:unit", "test:bifrost", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs", "check:no-legacy-server-vocab", "check:no-tonic-outside-wyrd-tonic"]
 
 [tasks."db:setup-roles"]
 description = """Create wyrd_app and wyrd_platform_admin roles in the target Postgres instance.
@@ -1042,3 +1066,37 @@ run = "cargo test --locked -p vala-core --tests alert_router -- schema_drift"
 [tasks."dev:pg:nuke"]
 description = "Wipe embedded pg cache"
 run = "rm -rf ${WYRD_DEV_PG_CACHE}"
+
+[tasks."bench"]
+description = """vala-bifrost criterion microbenches against docker-compose Postgres.
+Brings up a clean Postgres, provisions roles, applies migrations, then runs the
+benches. The warehouse dir is reset so a fresh catalog never disagrees with
+stale on-disk Iceberg metadata.
+"""
+depends = ["build:postgres", "db:setup-roles", "db:migrate"]
+env = { BIFROST_TEST_DB_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd" }
+run = """
+rm -rf /tmp/vala-bifrost-bench
+cargo bench -p vala-bifrost --features bench-bin
+"""
+
+[tasks."bench:workload"]
+description = """vala-bifrost large-workload bench (~5 min, release) against docker-compose Postgres.
+Brings up a clean Postgres, provisions roles, and applies migrations first.
+"""
+depends = ["build:postgres", "db:setup-roles", "db:migrate"]
+env = { WYRD_BENCH_PG_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd" }
+run = """
+cargo run --release -p vala-bifrost --bin bench_workload --features bench-bin -- \
+  --rows 10000000 --batch-size 65536 --workload selective \
+  --postgres-url "$WYRD_BENCH_PG_URL" \
+  --output crates/vala/vala-bifrost/benches/reports/workload-selective.json
+"""
+
+[tasks."bench:check"]
+description = "Fail if microbenches regressed >10% vs the stage1 baseline"
+run = """
+cargo run --release -p vala-bifrost --bin bench_check --features bench-bin -- \
+  --baseline crates/vala/vala-bifrost/benches/baselines/stage1.json \
+  --criterion-dir target/criterion
+"""

@@ -113,6 +113,52 @@ jobs:
       - name: Run Rust test gate
         run: mise run test:unit
 
+  rust-bifrost:
+    name: rust bifrost
+    needs: [changes, matrix-plan]
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bifrost
+
+      - name: Use GNU BFD linker on Linux
+        shell: bash
+        run: |
+          command -v cc
+          command -v ld.bfd
+          rustflags="${RUSTFLAGS:-}"
+          rustflags="${rustflags:+$rustflags }-C linker-features=-lld -C link-arg=-fuse-ld=bfd"
+          {
+            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc"
+            echo "RUSTFLAGS=$rustflags"
+          } >> "$GITHUB_ENV"
+
+      - name: Run bifrost tests
+        run: mise run test:bifrost
+
   rust-gates:
     name: rust gates
     needs: changes
@@ -340,7 +386,7 @@ jobs:
 
   ci-complete:
     name: ci complete
-    needs: [changes, matrix-plan, rust, rust-gates, codegen, python, docs, ui]
+    needs: [changes, matrix-plan, rust, rust-bifrost, rust-gates, codegen, python, docs, ui]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -351,6 +397,7 @@ jobs:
           set -euo pipefail
           for result in \
             "${{ needs.rust.result }}" \
+            "${{ needs.rust-bifrost.result }}" \
             "${{ needs.rust-gates.result }}" \
             "${{ needs.codegen.result }}" \
             "${{ needs.python.result }}" \

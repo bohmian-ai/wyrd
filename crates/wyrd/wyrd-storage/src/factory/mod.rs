@@ -2,6 +2,9 @@
 
 pub mod azure;
 pub mod gcs;
+/// Iceberg `StorageFactory` builder wired to the active backend configuration.
+#[cfg(feature = "iceberg")]
+pub mod iceberg_factory;
 pub mod local;
 pub mod s3;
 

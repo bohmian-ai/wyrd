@@ -92,6 +92,12 @@ path = "benches/plan_overhead.rs"
 harness = false
 required-features = ["bench-bin"]
 
+[[bench]]
+name = "registry_hit"
+path = "benches/registry_hit.rs"
+harness = false
+required-features = ["bench-bin"]
+
 [[bin]]
 name = "bench_workload"
 path = "benches/bin/bench_workload.rs"

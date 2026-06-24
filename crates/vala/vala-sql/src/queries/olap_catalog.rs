@@ -277,6 +277,21 @@ pub async fn lookup_idempotent(
     .map_err(SqlError::from)
 }
 
+/// Allocate a monotonically increasing writer fencing token from the shared sequence.
+///
+/// The sequence `vala.writer_fencing_seq` is `GRANT USAGE` to `wyrd_app`, so this
+/// is callable from a normal `TenantConn` (no `SECURITY DEFINER` required).
+///
+/// # Errors
+/// Returns [`SqlError`] when the sequence read fails.
+pub async fn mint_writer_fencing_token(conn: &mut TenantConn<'_>) -> Result<i64, SqlError> {
+    let token: i64 = sqlx::query_scalar("SELECT nextval('vala.writer_fencing_seq')")
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)?;
+    Ok(token)
+}
+
 // ── writer lease ─────────────────────────────────────────────────────────────
 
 /// Stamp writer-lease columns on an existing precommit row.
@@ -455,14 +470,12 @@ pub async fn claim_stale_precommits(
     owner: Uuid,
     limit: i32,
 ) -> Result<Vec<ClaimedPrecommitRow>, SqlError> {
-    sqlx::query_as::<_, ClaimedPrecommitRow>(
-        "SELECT * FROM vala.claim_stale_precommits($1, $2)",
-    )
-    .bind(owner)
-    .bind(limit)
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)
+    sqlx::query_as::<_, ClaimedPrecommitRow>("SELECT * FROM vala.claim_stale_precommits($1, $2)")
+        .bind(owner)
+        .bind(limit)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
 }
 
 /// Finalize a claimed precommit as `committed` via the recovery path.

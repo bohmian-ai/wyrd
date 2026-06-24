@@ -84,7 +84,7 @@ impl PartitionTransform {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TableUid(pub [u8; 16]);
 
 impl TableUid {

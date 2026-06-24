@@ -16,7 +16,9 @@ const BATCH_ID_2: [u8; 16] = [0x21; 16];
 async fn setup(pool: &PgPool) -> DataTenantId {
     vala_sql::testing::migrate_for_test(pool).await.unwrap();
     let tenant = DataTenantId::new_v7();
-    vala_sql::testing::seed_tenant(pool, tenant.as_uuid()).await.unwrap();
+    vala_sql::testing::seed_tenant(pool, tenant.as_uuid())
+        .await
+        .unwrap();
 
     let fingerprint = [0u8; 32];
     let mut conn = vala_sql::TenantConn::acquire(pool, tenant).await.unwrap();
@@ -113,12 +115,7 @@ async fn claim_skips_live_lease(pool: PgPool) {
         .await
         .unwrap();
     vala_sql::queries::olap_catalog::record_writer_lease(
-        &mut conn,
-        &TABLE_UID,
-        &BATCH_ID,
-        owner,
-        token,
-        3600,
+        &mut conn, &TABLE_UID, &BATCH_ID, owner, token, 3600,
     )
     .await
     .unwrap();
@@ -126,13 +123,10 @@ async fn claim_skips_live_lease(pool: PgPool) {
 
     let recovery_owner = Uuid::from_bytes([0x03u8; 16]);
     let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
-    let claimed = vala_sql::queries::olap_catalog::claim_stale_precommits(
-        &mut conn,
-        recovery_owner,
-        10,
-    )
-    .await
-    .unwrap();
+    let claimed =
+        vala_sql::queries::olap_catalog::claim_stale_precommits(&mut conn, recovery_owner, 10)
+            .await
+            .unwrap();
     conn.commit().await.unwrap();
 
     assert!(
@@ -167,13 +161,10 @@ async fn claim_takes_expired_lease(pool: PgPool) {
 
     let recovery_owner = Uuid::from_bytes([0x05u8; 16]);
     let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
-    let claimed = vala_sql::queries::olap_catalog::claim_stale_precommits(
-        &mut conn,
-        recovery_owner,
-        10,
-    )
-    .await
-    .unwrap();
+    let claimed =
+        vala_sql::queries::olap_catalog::claim_stale_precommits(&mut conn, recovery_owner, 10)
+            .await
+            .unwrap();
     conn.commit().await.unwrap();
 
     assert_eq!(claimed.len(), 1, "expired-lease row must be claimed");
@@ -215,13 +206,10 @@ async fn renew_fence_returns_false_after_claim(pool: PgPool) {
 
     let recovery_owner = Uuid::from_bytes([0x07u8; 16]);
     let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
-    let claimed = vala_sql::queries::olap_catalog::claim_stale_precommits(
-        &mut conn,
-        recovery_owner,
-        10,
-    )
-    .await
-    .unwrap();
+    let claimed =
+        vala_sql::queries::olap_catalog::claim_stale_precommits(&mut conn, recovery_owner, 10)
+            .await
+            .unwrap();
     conn.commit().await.unwrap();
 
     assert_eq!(claimed.len(), 1, "recovery must have claimed the row");

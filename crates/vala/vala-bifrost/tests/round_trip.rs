@@ -117,6 +117,7 @@ async fn round_trip_full() {
         &db_url,
         &warehouse,
         pool.clone(),
+        None,
         factory.0,
         factory.1,
     )

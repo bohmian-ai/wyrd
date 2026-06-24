@@ -139,7 +139,7 @@ async fn seeded(pool: PgPool) -> Seeded {
     };
     let (factory, props) = iceberg_storage_factory(&backend).unwrap();
     let catalog_uri = vala_sql::testing::catalog_uri(&pool);
-    let catalog = WyrdCatalog::new(&catalog_uri, &warehouse, pool.clone(), factory, props)
+    let catalog = WyrdCatalog::new(&catalog_uri, &warehouse, pool.clone(), None, factory, props)
         .await
         .unwrap();
 

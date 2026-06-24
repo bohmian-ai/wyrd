@@ -40,7 +40,8 @@ pub struct OlapCommitRow {
     pub batch_id: Vec<u8>,
     /// Iceberg snapshot id — discovered post-commit; `NULL` while precommit.
     pub snapshot_id: Option<i64>,
-    /// FSM state: `precommit`, `committed`, or `failed`.
+    /// FSM state: `precommit` (in-flight), `committed` (terminal), `failed` (terminal),
+    /// or `aborted` (terminal — set by the recovery path when no Iceberg snapshot is found).
     pub state: String,
     /// Wall-clock precommit time.
     pub precommit_at: chrono::DateTime<chrono::Utc>,

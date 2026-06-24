@@ -61,6 +61,7 @@ async fn setup(pool: PgPool) -> Fixture {
         &catalog_uri,
         &warehouse,
         pool.clone(),
+        None,
         factory.clone(),
         props.clone(),
     )

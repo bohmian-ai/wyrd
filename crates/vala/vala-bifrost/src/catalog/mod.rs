@@ -26,6 +26,7 @@ pub mod partition_spec;
 pub struct WyrdCatalog {
     catalog: Arc<SqlCatalog>,
     pool: Arc<PgPool>,
+    recovery_pool: Option<Arc<PgPool>>,
     storage_factory: Arc<dyn iceberg::io::StorageFactory>,
     storage_props: HashMap<String, String>,
     warehouse: String,
@@ -33,10 +34,18 @@ pub struct WyrdCatalog {
 }
 
 impl WyrdCatalog {
+    /// Construct the catalog and run a best-effort startup recovery pass.
+    ///
+    /// `recovery_pool` must be authenticated as `vala_recovery` (the role granted
+    /// EXECUTE on the SECURITY DEFINER recovery routines). When `None`, recovery is
+    /// disabled and startup proceeds without scanning stale precommit rows — the
+    /// `pool` (`wyrd_app` in production) lacks EXECUTE on those routines, so it is
+    /// never used for recovery.
     pub async fn new(
         catalog_uri: &str,
         warehouse: impl Into<String>,
         pool: Arc<PgPool>,
+        recovery_pool: Option<Arc<PgPool>>,
         storage_factory: Arc<dyn iceberg::io::StorageFactory>,
         storage_props: HashMap<String, String>,
     ) -> Result<Self, BifrostError> {
@@ -54,6 +63,7 @@ impl WyrdCatalog {
         let this = Self {
             catalog: Arc::new(catalog),
             pool,
+            recovery_pool,
             storage_factory,
             storage_props,
             warehouse,
@@ -329,19 +339,25 @@ impl WyrdCatalog {
     ///
     /// Claims stale `precommit` rows (lease absent/expired) via the SECURITY
     /// DEFINER `vala.claim_stale_precommits` function and reconciles each by
-    /// scanning Iceberg snapshot summaries for `wyrd_batch_id`. Runs on the
-    /// existing pool; in tests the pool is a superuser and can call the DEFINER
-    /// functions. In production, the `wyrd_app` role is not granted EXECUTE, so
-    /// this pass will silently skip (logged at WARN).
+    /// scanning Iceberg snapshot summaries for `wyrd_batch_id`. Recovery runs only
+    /// when a `recovery_pool` (authenticated as `vala_recovery`) was provided; with
+    /// no recovery pool it is disabled and returns immediately.
     async fn startup_recovery(&self) -> Result<(), BifrostError> {
         use crate::writer::commit::WRITER_INSTANCE;
 
+        let Some(recovery_pool) = self.recovery_pool.as_ref() else {
+            tracing::info!("startup recovery disabled — no vala_recovery pool configured");
+            return Ok(());
+        };
+
         let engine_owner = *WRITER_INSTANCE;
 
-        let mut conn =
-            vala_sql::TenantConn::acquire(&self.pool, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
-                .await
-                .map_err(BifrostError::Sql)?;
+        let mut conn = vala_sql::TenantConn::acquire(
+            recovery_pool,
+            wyrd_spec::ids::DataTenantId::SYSTEM_OWNER,
+        )
+        .await
+        .map_err(BifrostError::Sql)?;
         let claimed =
             vala_sql::queries::olap_catalog::claim_stale_precommits(&mut conn, engine_owner, 100)
                 .await
@@ -349,7 +365,7 @@ impl WyrdCatalog {
         conn.commit().await.map_err(BifrostError::Sql)?;
 
         for row in claimed {
-            if let Err(e) = self.recover_claimed_row(&row).await {
+            if let Err(e) = self.recover_claimed_row(recovery_pool, &row).await {
                 tracing::warn!(
                     fqn = %row.fqn,
                     error = %e,
@@ -363,6 +379,7 @@ impl WyrdCatalog {
 
     async fn recover_claimed_row(
         &self,
+        recovery_pool: &PgPool,
         row: &vala_sql::row_types::olap_catalog::ClaimedPrecommitRow,
     ) -> Result<(), BifrostError> {
         let table_uid: [u8; 16] =
@@ -388,7 +405,7 @@ impl WyrdCatalog {
         let table = match load_result {
             Err(e) => {
                 tracing::warn!(fqn = %row.fqn, error = %e, "recovery: iceberg load failed");
-                let mut conn = vala_sql::TenantConn::acquire(&self.pool, recovery_bind)
+                let mut conn = vala_sql::TenantConn::acquire(recovery_pool, recovery_bind)
                     .await
                     .map_err(BifrostError::Sql)?;
                 vala_sql::queries::olap_catalog::mark_recovery_scan_failed(
@@ -408,7 +425,7 @@ impl WyrdCatalog {
 
         let snapshot_id = find_snapshot_by_batch_id(&table, &batch_id_hex);
 
-        let mut conn = vala_sql::TenantConn::acquire(&self.pool, recovery_bind)
+        let mut conn = vala_sql::TenantConn::acquire(recovery_pool, recovery_bind)
             .await
             .map_err(BifrostError::Sql)?;
 

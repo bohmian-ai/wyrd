@@ -232,3 +232,86 @@ async fn renew_fence_returns_false_after_claim(pool: PgPool) {
         "renew_writer_fence must return false when recovery has claimed the row"
     );
 }
+
+#[sqlx::test(migrations = false)]
+async fn scan_failed_leaves_precommit_and_allows_retry(pool: PgPool) {
+    let tenant = setup(&pool).await;
+
+    // Bare precommit (no lease) is immediately claimable.
+    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    vala_sql::queries::olap_catalog::precommit(&mut conn, &TABLE_UID, &BATCH_ID)
+        .await
+        .unwrap();
+    conn.commit().await.unwrap();
+
+    let recovery_owner = Uuid::from_bytes([0x08u8; 16]);
+    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let claimed =
+        vala_sql::queries::olap_catalog::claim_stale_precommits(&mut conn, recovery_owner, 10)
+            .await
+            .unwrap();
+    conn.commit().await.unwrap();
+    assert_eq!(claimed.len(), 1, "bare precommit must be claimed");
+    let token = claimed[0].fencing_token;
+
+    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    vala_sql::queries::olap_catalog::mark_recovery_scan_failed(
+        &mut conn,
+        &TABLE_UID,
+        &BATCH_ID,
+        token,
+        "transient FileIO error",
+    )
+    .await
+    .unwrap();
+    conn.commit().await.unwrap();
+
+    let (state, attempts, last_error, fencing_token): (String, i32, Option<String>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT state, recovery_attempts, recovery_last_error, recovery_fencing_token
+               FROM vala.olap_commits
+              WHERE table_uid = $1 AND batch_id = $2",
+        )
+        .bind(TABLE_UID.as_slice())
+        .bind(BATCH_ID.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        state, "precommit",
+        "scan_failed must NOT advance to aborted"
+    );
+    assert_eq!(attempts, 1, "recovery_attempts must increment to 1");
+    assert_eq!(last_error.as_deref(), Some("transient FileIO error"));
+    assert!(
+        fencing_token.is_none(),
+        "recovery_fencing_token must be cleared so the row is re-claimable"
+    );
+
+    // Audit row captures the live recovery_owner (proves audit-before-update order).
+    let audit_owner: Option<Uuid> = sqlx::query_scalar(
+        "SELECT recovery_owner FROM vala.olap_recovery_events
+          WHERE table_uid = $1 AND batch_id = $2 AND oracle_result = 'scan_failed'",
+    )
+    .bind(TABLE_UID.as_slice())
+    .bind(BATCH_ID.as_slice())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        audit_owner,
+        Some(recovery_owner),
+        "scan_failed audit row must record the claiming recovery owner"
+    );
+
+    // A second recovery pass can re-claim the row (retry is possible).
+    let retry_owner = Uuid::from_bytes([0x09u8; 16]);
+    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let reclaimed =
+        vala_sql::queries::olap_catalog::claim_stale_precommits(&mut conn, retry_owner, 10)
+            .await
+            .unwrap();
+    conn.commit().await.unwrap();
+    assert_eq!(reclaimed.len(), 1, "scan_failed row must be re-claimable");
+}

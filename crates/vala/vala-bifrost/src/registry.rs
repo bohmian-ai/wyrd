@@ -71,7 +71,6 @@ impl Registry {
     }
 
     /// One narrow PK-indexed `vala.refresh_epochs` read, bound to `key.owner`.
-    #[allow(clippy::cast_sign_loss)]
     pub(crate) async fn current_epoch(&self, key: &RegistryKey) -> Result<u64, BifrostError> {
         let mut conn = vala_sql::TenantConn::acquire(&self.pool, key.owner)
             .await
@@ -81,7 +80,8 @@ impl Registry {
                 .await
                 .map_err(BifrostError::Sql)?;
         conn.commit().await.map_err(BifrostError::Sql)?;
-        Ok(epoch as u64)
+        // `current_epoch` returns 0 when no row exists; the counter is never negative.
+        Ok(u64::try_from(epoch).unwrap_or(0))
     }
 
     /// Cache hit iff an entry exists at `key` AND its epoch matches.
@@ -111,15 +111,9 @@ impl Registry {
         let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
             .await
             .map_err(BifrostError::Sql)?;
-        let tenant_rows: Vec<vala_sql::row_types::olap_catalog::BifrostTableRow> = sqlx::query_as(
-            "SELECT data_tenant_id, table_uid, fqn, fingerprint, scope, status,
-                        partition_columns, registered_at, updated_at, origin, actor
-                   FROM vala.bifrost_tables",
-        )
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .map_err(vala_sql::SqlError::from)
-        .map_err(BifrostError::Sql)?;
+        let tenant_rows = vala_sql::queries::olap_catalog::list_tables_for_tenant(&mut conn)
+            .await
+            .map_err(BifrostError::Sql)?;
         conn.commit().await.map_err(BifrostError::Sql)?;
         rows.extend(tenant_rows);
 
@@ -128,15 +122,9 @@ impl Registry {
                 vala_sql::TenantConn::acquire(&self.pool, DataTenantId::SYSTEM_OWNER)
                     .await
                     .map_err(BifrostError::Sql)?;
-            let sys_rows: Vec<vala_sql::row_types::olap_catalog::BifrostTableRow> = sqlx::query_as(
-                "SELECT data_tenant_id, table_uid, fqn, fingerprint, scope, status,
-                            partition_columns, registered_at, updated_at, origin, actor
-                       FROM vala.bifrost_tables",
-            )
-            .fetch_all(&mut **sys_conn.transaction())
-            .await
-            .map_err(vala_sql::SqlError::from)
-            .map_err(BifrostError::Sql)?;
+            let sys_rows = vala_sql::queries::olap_catalog::list_tables_for_tenant(&mut sys_conn)
+                .await
+                .map_err(BifrostError::Sql)?;
             sys_conn.commit().await.map_err(BifrostError::Sql)?;
             rows.extend(sys_rows);
         }

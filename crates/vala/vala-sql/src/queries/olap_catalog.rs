@@ -73,6 +73,25 @@ pub async fn get_by_fqn(
     .map_err(SqlError::from)
 }
 
+/// List all `vala.bifrost_tables` rows visible to the current tenant bind.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
+pub async fn list_tables_for_tenant(
+    conn: &mut TenantConn<'_>,
+) -> Result<Vec<BifrostTableRow>, SqlError> {
+    sqlx::query_as::<_, BifrostTableRow>(
+        r#"
+        SELECT data_tenant_id, table_uid, fqn, fingerprint, scope, status,
+               partition_columns, registered_at, updated_at, origin, actor
+          FROM vala.bifrost_tables
+        "#,
+    )
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+}
+
 /// Delete a Bifrost table registration and all dependent rows for the current
 /// tenant, in FK order. `vala.refresh_epochs` and `vala.olap_commits` reference
 /// `vala.bifrost_tables` with no `ON DELETE CASCADE`, so children are removed

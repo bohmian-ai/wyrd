@@ -2,8 +2,8 @@
 //! writer crashes and correctly reconciles on engine restart.
 //!
 //! Uses bare `#[sqlx::test]` + in-body `migrate_for_test`; see `commit_idempotency.rs`
-//! for the rationale. Requires a live Postgres:
-//! `DATABASE_URL=... cargo test -p vala-bifrost --all-features --test crash_recovery`.
+//! for the rationale. Requires a live Postgres. Run via `mise run test:bifrost` or
+//! `DATABASE_URL=... cargo test --locked -p vala-bifrost --test crash_recovery`.
 
 use std::sync::Arc;
 
@@ -71,6 +71,7 @@ async fn setup(pool: PgPool) -> Harness {
         &catalog_uri,
         &warehouse,
         pool.clone(),
+        Some(pool.clone()),
         factory.clone(),
         props.clone(),
     )
@@ -115,6 +116,7 @@ async fn rebuild_catalog(h: &Harness) -> WyrdCatalog {
         &h.catalog_uri,
         &h.warehouse,
         h.pool.clone(),
+        Some(h.pool.clone()),
         h.factory.clone(),
         h.props.clone(),
     )
@@ -260,6 +262,16 @@ async fn snapshot_committed_but_not_finalized_rolls_forward(pool: PgPool) {
             .unwrap();
     assert_eq!(committed, 1, "recovery must commit the roll-forward batch");
 
+    let snapshot_id: Option<i64> =
+        sqlx::query_scalar("SELECT snapshot_id FROM vala.olap_commits WHERE state = 'committed'")
+            .fetch_one(&*h.pool)
+            .await
+            .unwrap();
+    assert!(
+        snapshot_id.is_some(),
+        "committed row must carry the discovered snapshot_id after roll-forward recovery"
+    );
+
     let audited: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM vala.olap_recovery_events WHERE oracle_result = 'snapshot_found'",
     )
@@ -374,15 +386,112 @@ async fn cold_start_maps_table_identity(pool: PgPool) {
     );
 }
 
-/// A transient catalog/object-store failure during the oracle scan must NOT
-/// falsely abort a committed batch. The row stays 'precommit', `recovery_attempts`
-/// increments, and a `scan_failed` audit row is written. On retry, the scan
-/// succeeds and the row is finalized correctly.
-#[ignore = "requires a mock StorageFactory that can fail on demand — deferred"]
+/// Same cold-start identity mapping, but for a `SystemShared` table bound to
+/// `SYSTEM_OWNER`. A scope-specific bug in the RLS bind for system tables would
+/// pass `cold_start_maps_table_identity` and fail silently here.
 #[sqlx::test]
-async fn transient_scan_failure_is_retryable(_pool: PgPool) {
-    todo!("inject transient FileIO error via mock StorageFactory");
+async fn cold_start_maps_system_shared_table_identity(pool: PgPool) {
+    let h = setup(pool).await;
+
+    // Register a system-shared table owned by SYSTEM_OWNER.
+    let catalog = rebuild_catalog(&h).await;
+    let fields = vec![Field::new("val", DataType::Int64, false)];
+    let sys_uid = catalog
+        .create_table(
+            NS,
+            "crash_test_sys",
+            fields,
+            TableScope::SystemShared,
+            DataTenantId::SYSTEM_OWNER,
+            &[],
+        )
+        .await
+        .unwrap();
+    drop(catalog);
+
+    // Bare precommit row under SYSTEM_OWNER (no lease = eligible for recovery).
+    let batch_id = *uuid::Uuid::now_v7().as_bytes();
+    let mut conn = vala_sql::TenantConn::acquire(&h.pool, DataTenantId::SYSTEM_OWNER)
+        .await
+        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(&mut conn, sys_uid.as_bytes(), &batch_id)
+        .await
+        .unwrap();
+    conn.commit().await.unwrap();
+
+    // Cold-start rebuild — recovery must resolve the system-shared identity and abort.
+    let _catalog = rebuild_catalog(&h).await;
+
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM vala.olap_commits WHERE table_uid = $1 AND batch_id = $2",
+    )
+    .bind(sys_uid.as_bytes().as_slice())
+    .bind(batch_id.as_slice())
+    .fetch_one(&*h.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        state, "aborted",
+        "cold-start recovery must map SystemShared identity and abort"
+    );
 }
+
+/// Recovery is disabled-by-default: with `recovery_pool = None`, `WyrdCatalog::new`
+/// must skip the startup scan entirely and leave stale precommit rows untouched.
+/// Guards the MAJOR-4 contract — a regression that ran recovery unconditionally
+/// (or on the wrong pool) would abort rows it must never touch.
+#[sqlx::test]
+async fn recovery_disabled_when_no_recovery_pool(pool: PgPool) {
+    let h = setup(pool).await;
+
+    // Bare precommit row (no lease) — would be claimed if recovery ran.
+    let batch_id = *uuid::Uuid::now_v7().as_bytes();
+    let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
+        .await
+        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id)
+        .await
+        .unwrap();
+    conn.commit().await.unwrap();
+
+    // Construct WITHOUT a recovery pool — recovery must be skipped.
+    let _catalog = WyrdCatalog::new(
+        &h.catalog_uri,
+        &h.warehouse,
+        h.pool.clone(),
+        None,
+        h.factory.clone(),
+        h.props.clone(),
+    )
+    .await
+    .unwrap();
+
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM vala.olap_commits WHERE table_uid = $1 AND batch_id = $2",
+    )
+    .bind(h.table_uid.as_bytes().as_slice())
+    .bind(batch_id.as_slice())
+    .fetch_one(&*h.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        state, "precommit",
+        "disabled recovery must leave the stale precommit row untouched"
+    );
+
+    let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_recovery_events")
+        .fetch_one(&*h.pool)
+        .await
+        .unwrap();
+    assert_eq!(events, 0, "disabled recovery must write no audit rows");
+}
+
+// The `scan_failed` oracle branch — a transient catalog/object-store failure
+// must leave the row 'precommit', increment `recovery_attempts`, write a
+// `scan_failed` audit row, and stay re-claimable — is covered deterministically
+// at the SQL contract level by `scan_failed_leaves_precommit_and_allows_retry`
+// in vala-sql/tests/olap_recovery.rs, which does not need a fault-injecting
+// StorageFactory mock.
 
 /// After recovery claims an expired precommit row, a zombie writer that resumes
 /// and calls `renew_writer_fence()` finds `recovery_fencing_token` IS NOT NULL and
@@ -616,57 +725,129 @@ async fn recovery_skips_after_unexpired_renewal(pool: PgPool) {
     );
 }
 
-/// The bounded post-append residual (stop-the-world pause longer than `lease_ttl`
-/// between renewal and `fast_append`) is detected, audited, and not silent.
-/// `fence_lost_after_append` audit row is written; `rolled_back` reflects rollback
-/// availability (false in this iceberg-rust version).
+/// The bounded post-append residual: a writer renews its lease, stalls longer
+/// than `lease_ttl`, recovery claims and aborts the row, and only then does the
+/// writer's `fast_append` land. The writer's `finalize_committed` finds zero
+/// matching rows (the row is no longer `precommit`) and records the loss.
+///
+/// This builds the post-abort state directly — no concurrency needed — and
+/// verifies the writer-side detection + audit contract: `finalize_committed`
+/// returns `false`, and a `fence_lost_after_append` audit row is written with
+/// `old_state = new_state = 'aborted'` and `rolled_back = false` (this
+/// iceberg-rust version cannot roll back the orphaned snapshot). The bare audit
+/// INSERT contract is covered separately by `audit_row_roundtrips_with_byte_ids`
+/// in vala-sql/tests/olap_recovery.rs.
 #[sqlx::test]
 async fn fence_lost_after_append_is_detected_and_audited(pool: PgPool) {
     let h = setup(pool).await;
-    let table = load_table(&h).await;
-    let catalog = load_sql_catalog(&h).await;
 
     let batch_id = *uuid::Uuid::now_v7().as_bytes();
-    let batch = stamped_batch(10, batch_id);
+    let writer_owner = sqlx::types::Uuid::new_v4();
+    let writer_token: i64 = 7;
+    let snapshot_id: i64 = 4242;
 
-    // AfterRenewBeforeAppend: renews, expires the lease, commits Iceberg,
-    // then finalize_committed matches zero rows (recovery claimed and aborted).
-    // record_fence_loss_after_append is called and error is returned.
-    let result = run_commit_with_fault(
-        &h.pool,
-        &catalog,
-        &table,
-        &h.table_uid,
-        vec![batch],
-        batch_id,
-        h.tenant,
-        FaultPoint::AfterRenewBeforeAppend,
+    // Writer inserts the precommit row with an (already-expired) lease, then stalls.
+    let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
+        .await
+        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE vala.olap_commits \
+         SET writer_owner = $1, writer_fencing_token = $2, \
+             writer_lease_expires_at = now() - interval '1 second' \
+         WHERE table_uid = $3 AND batch_id = $4",
     )
-    .await;
+    .bind(writer_owner)
+    .bind(writer_token)
+    .bind(h.table_uid.as_bytes().as_slice())
+    .bind(batch_id.as_slice())
+    .execute(&mut **conn.transaction())
+    .await
+    .unwrap();
+    conn.commit().await.unwrap();
 
-    // The fault path either succeeds (if recovery didn't race) or returns CommitConflict.
-    // In a single-threaded test with no concurrent recovery, finalize_committed
-    // succeeds (no recovery_fencing_token is set), so no audit row is written.
-    // This test proves the fault path compiles and runs; the full residual scenario
-    // requires concurrent recovery orchestration (see fence_lost_after_append plan).
-    match result {
-        Ok(_) => {
-            // No concurrent recovery ran — commit succeeded normally.
-        }
-        Err(vala_bifrost::error::BifrostError::CommitConflict(_)) => {
-            // Concurrent recovery claimed and aborted before finalize_committed.
-            let audited: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM vala.olap_recovery_events \
-                 WHERE event_kind = 'fence_lost_after_append'",
-            )
-            .fetch_one(&*h.pool)
-            .await
-            .unwrap();
-            assert_eq!(
-                audited, 1,
-                "fence_lost_after_append audit row must be written"
-            );
-        }
-        Err(e) => panic!("unexpected error: {e:?}"),
-    }
+    // Recovery claims the expired-lease row and aborts it (snapshot_absent).
+    let _catalog = rebuild_catalog(&h).await;
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM vala.olap_commits WHERE table_uid = $1 AND batch_id = $2",
+    )
+    .bind(h.table_uid.as_bytes().as_slice())
+    .bind(batch_id.as_slice())
+    .fetch_one(&*h.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        state, "aborted",
+        "recovery must abort the stalled precommit"
+    );
+
+    // The writer's delayed fast_append lands; finalize_committed must now fail
+    // (the row is no longer 'precommit' and carries a recovery fencing token).
+    let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
+        .await
+        .unwrap();
+    let committed = vala_sql::queries::olap_catalog::finalize_committed(
+        &mut conn,
+        h.table_uid.as_bytes(),
+        &batch_id,
+        snapshot_id,
+        writer_owner,
+        writer_token,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !committed,
+        "writer that lost the fence must not finalize 'committed'"
+    );
+
+    // Writer records the residual: it appended a snapshot it can no longer own.
+    vala_sql::queries::olap_catalog::record_fence_loss_after_append(
+        &mut conn,
+        h.table_uid.as_bytes(),
+        &batch_id,
+        writer_owner,
+        writer_token,
+        snapshot_id,
+        false,
+        Some("fence lost after fast_append; recovery already aborted the row"),
+    )
+    .await
+    .unwrap();
+    conn.commit().await.unwrap();
+
+    let (old_state, new_state, rolled_back): (String, String, Option<bool>) = sqlx::query_as(
+        "SELECT old_state, new_state, rolled_back FROM vala.olap_recovery_events \
+         WHERE table_uid = $1 AND batch_id = $2 AND event_kind = 'fence_lost_after_append'",
+    )
+    .bind(h.table_uid.as_bytes().as_slice())
+    .bind(batch_id.as_slice())
+    .fetch_one(&*h.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        old_state, "aborted",
+        "fence-loss audit captures post-abort state"
+    );
+    assert_eq!(
+        new_state, "aborted",
+        "fence loss does not change the FSM state"
+    );
+    assert_eq!(
+        rolled_back,
+        Some(false),
+        "snapshot could not be rolled back"
+    );
+
+    // The recovery decision that aborted the row is also on the audit trail.
+    let decisions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM vala.olap_recovery_events \
+         WHERE event_kind = 'recovery_decision' AND new_state = 'aborted'",
+    )
+    .fetch_one(&*h.pool)
+    .await
+    .unwrap();
+    assert_eq!(decisions, 1, "recovery_decision abort row must be present");
 }

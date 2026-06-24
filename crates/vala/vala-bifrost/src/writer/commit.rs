@@ -69,8 +69,9 @@ enum Phase1 {
 /// Two phases, each with a clear short-circuit:
 /// 1. [`claim_batch`] inspects the prior 2PC anchor. An already-committed batch
 ///    replays its recorded snapshot with no write — returning `(snapshot, None)`
-///    so the caller keeps its current table ref. A prior failure or an in-flight
-///    precommit is rejected.
+///    so the caller keeps its current table ref. A prior failure (`failed`),
+///    in-flight precommit, or already-aborted row is rejected. Aborted rows
+///    return `CommitConflict` — the `batch_id` must not be reused.
 /// 2. [`write_and_finalize`] writes Parquet, fast-appends to Iceberg, and records
 ///    the terminal FSM transition (`committed`, or `failed` on write error).
 ///
@@ -123,7 +124,7 @@ pub async fn run_commit(
 /// - [`Phase1::Replay`] — the batch already committed; the caller must replay.
 /// - [`Phase1::Fresh`] — no prior anchor; a `precommit` row + writer lease has
 ///   been written and the caller should proceed with the write.
-/// - `Err(..)` — collision with a prior failure or in-flight precommit.
+/// - `Err(..)` — collision with a prior failure, in-flight precommit, or aborted row.
 ///
 /// # Errors
 /// Returns [`BifrostError::Sql`] on control-plane failure,
@@ -165,6 +166,8 @@ async fn claim_batch(
             ))
         }
         Some(_) => {
+            // Covers in-flight precommit, aborted (dead terminal — batch_id must not be
+            // reused), and any future non-committed state.
             conn.commit().await.map_err(BifrostError::Sql)?;
             Err(BifrostError::CommitConflict(table_fqn.to_string()))
         }

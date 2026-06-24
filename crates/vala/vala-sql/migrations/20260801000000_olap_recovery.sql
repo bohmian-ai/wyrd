@@ -236,15 +236,8 @@ SECURITY DEFINER
 SET search_path = pg_catalog, vala, platform
 AS $$
 BEGIN
-    UPDATE vala.olap_commits
-       SET recovery_attempts      = recovery_attempts + 1,
-           recovery_last_error    = p_error,
-           recovery_last_error_at = now()
-     WHERE table_uid              = p_table_uid
-       AND batch_id               = p_batch_id
-       AND state                  = 'precommit'
-       AND recovery_fencing_token = p_token;
-
+    -- Audit first, while recovery_owner is still populated. The UPDATE below
+    -- clears it so the row can be re-claimed.
     INSERT INTO vala.olap_recovery_events
         (data_tenant_id, table_uid, batch_id, event_kind, old_state, new_state,
          oracle_result, recovery_owner, fencing_token, error, recorded_at)
@@ -253,7 +246,24 @@ BEGIN
            'scan_failed', recovery_owner, p_token, p_error, now()
       FROM vala.olap_commits
      WHERE table_uid = p_table_uid AND batch_id = p_batch_id;
+
+    -- Clear the fencing token/owner so claim_stale_precommits (which filters on
+    -- recovery_fencing_token IS NULL) can re-claim this row on the next pass.
+    UPDATE vala.olap_commits
+       SET recovery_attempts      = recovery_attempts + 1,
+           recovery_last_error    = p_error,
+           recovery_last_error_at = now(),
+           recovery_fencing_token = NULL,
+           recovery_owner         = NULL
+     WHERE table_uid              = p_table_uid
+       AND batch_id               = p_batch_id
+       AND state                  = 'precommit'
+       AND recovery_fencing_token = p_token;
 END;
 $$;
 GRANT EXECUTE ON FUNCTION vala.mark_recovery_scan_failed(bytea, bytea, bigint, text) TO vala_recovery;
 ALTER FUNCTION vala.mark_recovery_scan_failed(bytea, bytea, bigint, text) OWNER TO vala_recovery_owner;
+
+-- vala_recovery_owner only needs CREATE ON SCHEMA vala for the ALTER FUNCTION
+-- OWNER transfers above. Revoke it now that all ownership transfers are done.
+REVOKE CREATE ON SCHEMA vala FROM vala_recovery_owner;

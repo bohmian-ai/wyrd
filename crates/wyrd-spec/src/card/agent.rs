@@ -92,6 +92,7 @@ impl AgentCard {
                 annotations: self.annotations.clone(),
                 spec_hash: None,
                 artifact_hash: None,
+                origin: None,
             },
             spec: Spec::Agent(self.spec.clone()),
             relationships: Relationships::default(),

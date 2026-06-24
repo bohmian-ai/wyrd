@@ -70,8 +70,12 @@ impl CorrelationColumns {
     pub const EXPERIMENT_ID: &'static str = "experiment_id";
 
     /// Column names the client asserts (code axis).
-    pub const CLIENT_ASSERTED: &'static [&'static str] =
-        &[Self::REPO, Self::COMMIT_SHA, Self::BRANCH, Self::DEV_SESSION_ID];
+    pub const CLIENT_ASSERTED: &'static [&'static str] = &[
+        Self::REPO,
+        Self::COMMIT_SHA,
+        Self::BRANCH,
+        Self::DEV_SESSION_ID,
+    ];
 
     /// Column names the server stamps at ingest (identity axis).
     pub const SERVER_STAMPED: &'static [&'static str] = &[
@@ -92,7 +96,9 @@ mod tests {
             repo: "github.com/org/repo".to_string(),
             commit: CommitSha::new("deadbeef").expect("valid commit"),
             branch: None,
-            dev_session_id: DevSessionId::from_string("0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".to_string()),
+            dev_session_id: DevSessionId::from_string(
+                "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".to_string(),
+            ),
         };
         let json = serde_json::to_value(&ctx).expect("serialize");
         assert_eq!(json.get("branch"), None, "absent branch is omitted");

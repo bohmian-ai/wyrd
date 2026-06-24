@@ -98,6 +98,12 @@
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
+    "CommitSha": {
+      "type": "string",
+      "maxLength": 40,
+      "minLength": 7,
+      "pattern": "^[0-9a-f]{7,40}$"
+    },
     "LabelValue": {
       "description": "Validated value for queryable Card and Run labels.",
       "type": "string"
@@ -149,6 +155,17 @@
             }
           ]
         },
+        "origin": {
+          "description": "Code-origin provenance: the repository commit this card was declared from. Populated on the register path for cards authored in a repo; `None` for cards with no code origin (e.g. UI-authored).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Origin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "space": {
           "description": "Optional space.",
           "anyOf": [
@@ -188,6 +205,39 @@
               "type": "null"
             }
           ]
+        }
+      }
+    },
+    "Origin": {
+      "description": "Code-origin provenance for a card: the repository commit it was declared from, plus the in-repo path for monorepo disambiguation.",
+      "type": "object",
+      "required": [
+        "commit",
+        "repo"
+      ],
+      "properties": {
+        "commit": {
+          "description": "Commit the card was declared from. When `dirty`, this is the base commit of the uncommitted working tree.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CommitSha"
+            }
+          ]
+        },
+        "dirty": {
+          "description": "Whether the card was declared from an uncommitted working tree.",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "Declaration path within the repository (monorepo disambiguation).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "description": "Normalized repository identifier, e.g. `github.com/org/repo`.",
+          "type": "string"
         }
       }
     },

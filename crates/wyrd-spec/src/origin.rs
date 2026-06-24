@@ -118,10 +118,10 @@ impl Origin {
         if self.repo.trim().is_empty() {
             return Err(OriginValidationError::EmptyRepo);
         }
-        if let Some(path) = &self.path {
-            if path.trim().is_empty() {
-                return Err(OriginValidationError::EmptyPath);
-            }
+        if let Some(path) = &self.path
+            && path.trim().is_empty()
+        {
+            return Err(OriginValidationError::EmptyPath);
         }
         Ok(())
     }

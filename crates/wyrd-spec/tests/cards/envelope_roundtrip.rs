@@ -26,6 +26,7 @@ fn card_yaml_round_trip() {
             annotations: BTreeMap::new(),
             spec_hash: None,
             artifact_hash: None,
+            origin: None,
         },
         spec: Spec::Prompt(prompt_spec()),
         relationships: Relationships::default(),

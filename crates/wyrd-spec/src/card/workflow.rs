@@ -206,6 +206,7 @@ impl WorkflowCard {
                 annotations: self.annotations.clone(),
                 spec_hash: None,
                 artifact_hash: None,
+                origin: None,
             },
             spec: Spec::Workflow(self.spec.clone()),
             relationships: Relationships::default(),

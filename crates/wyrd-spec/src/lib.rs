@@ -49,11 +49,11 @@ pub use card::workflow::{
     WorkflowStep, WorkflowValidationError,
 };
 pub use ids::{ColumnName, DataTenantId, QueryName, RoleName, SplitName, TenantSlug, uuid7};
+pub use intel::{Evidence, Lineage, TimeRange};
 pub use metadata::{
     AnnotationKey, AnnotationValue, Annotations, CardMetadata, LabelKey, LabelValue, Labels,
     MetadataError,
 };
-pub use intel::{Evidence, Lineage, TimeRange};
 pub use origin::{CommitSha, Origin, OriginValidationError};
 pub use reference::AgentRef;
 #[cfg(any(test, feature = "test-utils"))]

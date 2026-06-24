@@ -32,6 +32,7 @@ fn eval_card_envelope_round_trips_with_vala_eval_shape() {
             annotations: BTreeMap::new(),
             spec_hash: None,
             artifact_hash: None,
+            origin: None,
         },
         spec: Spec::Eval(eval_spec()),
         relationships: Relationships::default(),

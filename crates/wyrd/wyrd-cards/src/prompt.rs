@@ -263,6 +263,7 @@ impl PromptCard {
             annotations: self.annotations.clone(),
             spec_hash: Some(spec_hash),
             artifact_hash: None,
+            origin: None,
         })
     }
 }

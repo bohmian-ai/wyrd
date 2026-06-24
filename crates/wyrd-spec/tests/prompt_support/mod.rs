@@ -54,6 +54,7 @@ pub fn prompt_card(spec: PromptSpec) -> Card {
             annotations: BTreeMap::new(),
             spec_hash: None,
             artifact_hash: None,
+            origin: None,
         },
         spec: Spec::Prompt(spec),
         relationships: Relationships::default(),

@@ -1993,6 +1993,7 @@ impl WyrdError {
             | Self::RoleCorrupt { message, details }
             | Self::BuiltinRoleImmutableName { message, details }
             | Self::SourceValidation { message, details }
+            | Self::OriginValidation { message, details }
             | Self::DataValidation { message, details }
             | Self::DataUnknownDataType { message, details }
             | Self::DataInvalidSplitRule { message, details }

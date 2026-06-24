@@ -1045,6 +1045,20 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Card code-origin provenance failed validation.
+    #[error("[WYRD_ORIGIN_400_VALIDATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_ORIGIN_400_VALIDATION",
+        status = 400,
+        title = "Card origin validation failed",
+        remediation = "Provide a non-empty repo and a 7-40 character lowercase hex commit; omit empty path values."
+    )]
+    OriginValidation {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// ModelCard validation failed.
     #[error("[WYRD_MODEL_400_VALIDATION] {message}")]
     #[wyrd_error(

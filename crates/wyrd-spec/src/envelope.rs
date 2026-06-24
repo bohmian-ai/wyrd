@@ -200,6 +200,11 @@ pub struct Metadata {
     /// Artifact content hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_hash: Option<String>,
+    /// Code-origin provenance: the repository commit this card was declared
+    /// from. Populated on the register path for cards authored in a repo;
+    /// `None` for cards with no code origin (e.g. UI-authored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::origin::Origin>,
 }
 
 impl Metadata {

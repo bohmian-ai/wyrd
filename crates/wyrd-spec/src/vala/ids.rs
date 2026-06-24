@@ -76,6 +76,50 @@ impl std::fmt::Display for RunId {
     }
 }
 
+/// Local development session identifier (the code axis before any service
+/// identity exists).
+///
+/// UUIDv7 string at the wire boundary. Client-generated at the start of a local
+/// dev session so observations emitted while authoring code — before a commit
+/// or a registered card exists — can later be reconciled to the resulting
+/// commit and card. See [`crate::vala::correlation::CorrelationContext`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(transparent)]
+pub struct DevSessionId(String);
+
+impl DevSessionId {
+    /// Generate a fresh UUIDv7 dev-session identifier.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(crate::ids::uuid7())
+    }
+
+    /// Adopt a caller-supplied dev-session identifier.
+    #[must_use]
+    pub fn from_string(value: String) -> Self {
+        Self(value)
+    }
+
+    /// Borrow the identifier as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for DevSessionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for DevSessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Identifier for a single vala record.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]

@@ -15,6 +15,22 @@ prefixes, module names, compatibility shims, or migration shorthand into this
 repository. If a prior implementation pattern is useful, reproduce the pattern
 in Wyrd vocabulary and Wyrd paths only.
 
+## Output Style
+
+Write for a human maintainer who needs the decision quickly.
+
+- Be succinct and direct. Prefer short sentences over dense architecture prose.
+- Lead with the concrete issue, change, or result before explaining context.
+- Use Wyrd doctrine terms when they matter, but do not stack abstractions.
+- Name files, crates, commands, and verification gates explicitly.
+- Avoid metaphor, invented labels, and broad summary language such as
+  "surface alignment" when a specific boundary, type, route, or test can be
+  named.
+- If a rule is subtle, explain it in one plain paragraph and then give the
+  action to take.
+- For implementation summaries, report what changed and what was verified.
+  Do not restate the whole doctrine unless the user asked for it.
+
 ## First Pass
 
 Before editing:

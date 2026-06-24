@@ -46,9 +46,10 @@ impl BenchFixture {
             let backend = BackendConfig::Local { root: bench_dir };
             let (factory, props) = iceberg_storage_factory(&backend).expect("storage factory");
 
-            let catalog = WyrdCatalog::new(&catalog_uri, &warehouse, pool.clone(), factory, props)
-                .await
-                .expect("WyrdCatalog::new");
+            let catalog =
+                WyrdCatalog::new(&catalog_uri, &warehouse, pool.clone(), None, factory, props)
+                    .await
+                    .expect("WyrdCatalog::new");
 
             let tenant = DataTenantId::new_v7();
             vala_sql::testing::seed_tenant(&pool, tenant.as_uuid())

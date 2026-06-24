@@ -12,6 +12,7 @@ use crate::catalog::namespaces::BifrostNamespace;
 use crate::catalog::partition_spec::build_partition_spec;
 use crate::error::BifrostError;
 use crate::provider::WyrdTableProvider;
+use crate::registry::{CachedMeta, Registry, RegistryKey};
 use crate::schema::system_columns::with_system_columns;
 use crate::types::{PartitionTransform, SchemaFingerprint, TableScope, TableUid};
 use crate::writer::TableWriterHandle;
@@ -25,16 +26,26 @@ pub mod partition_spec;
 pub struct WyrdCatalog {
     catalog: Arc<SqlCatalog>,
     pool: Arc<PgPool>,
+    recovery_pool: Option<Arc<PgPool>>,
     storage_factory: Arc<dyn iceberg::io::StorageFactory>,
     storage_props: HashMap<String, String>,
     warehouse: String,
+    registry: Arc<Registry>,
 }
 
 impl WyrdCatalog {
+    /// Construct the catalog and run a best-effort startup recovery pass.
+    ///
+    /// `recovery_pool` must be authenticated as `vala_recovery` (the role granted
+    /// EXECUTE on the SECURITY DEFINER recovery routines). When `None`, recovery is
+    /// disabled and startup proceeds without scanning stale precommit rows — the
+    /// `pool` (`wyrd_app` in production) lacks EXECUTE on those routines, so it is
+    /// never used for recovery.
     pub async fn new(
         catalog_uri: &str,
         warehouse: impl Into<String>,
         pool: Arc<PgPool>,
+        recovery_pool: Option<Arc<PgPool>>,
         storage_factory: Arc<dyn iceberg::io::StorageFactory>,
         storage_props: HashMap<String, String>,
     ) -> Result<Self, BifrostError> {
@@ -47,13 +58,23 @@ impl WyrdCatalog {
         )
         .await?;
 
-        Ok(Self {
+        let registry = Arc::new(Registry::new(pool.clone()));
+
+        let this = Self {
             catalog: Arc::new(catalog),
             pool,
+            recovery_pool,
             storage_factory,
             storage_props,
             warehouse,
-        })
+            registry,
+        };
+
+        if let Err(e) = this.startup_recovery().await {
+            tracing::warn!(error = %e, "startup recovery pass failed (best-effort)");
+        }
+
+        Ok(this)
     }
 
     pub async fn ensure_namespace(&self, ns: BifrostNamespace) -> Result<(), BifrostError> {
@@ -155,6 +176,68 @@ impl WyrdCatalog {
         Ok(row)
     }
 
+    /// Resolve a table's cached Iceberg metadata.
+    ///
+    /// Cheap when the `refresh_epochs` entry matches the cached entry's epoch
+    /// (one narrow PK-indexed SELECT + no Iceberg load). On a miss the catalog
+    /// loads the table from Iceberg and stores it in the registry.
+    pub(crate) async fn get(
+        &self,
+        ns: BifrostNamespace,
+        name: &str,
+        tenant: wyrd_spec::ids::DataTenantId,
+    ) -> Result<Arc<CachedMeta>, BifrostError> {
+        let fqn = format!("{}.{}", ns.as_str(), name);
+
+        // Two-step lookup: try tenant bind (TenantOwned), then SYSTEM_OWNER (SystemShared).
+        let (row, owner) = if let Some(row) = self.lookup_table_row(&fqn, tenant).await? {
+            let scope = TableScope::from_db_str(&row.scope)?;
+            let owner = scope.control_bind(tenant);
+            (row, owner)
+        } else {
+            let row = self
+                .lookup_table_row(&fqn, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
+                .await?
+                .ok_or_else(|| BifrostError::TableNotFound(fqn.clone()))?;
+            (row, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
+        };
+
+        let table_uid = TableUid(
+            row.table_uid
+                .as_slice()
+                .try_into()
+                .map_err(|_| BifrostError::Internal("table_uid length mismatch".to_string()))?,
+        );
+        let key = RegistryKey { owner, table_uid };
+
+        let epoch = self.registry.current_epoch(&key).await?;
+
+        if let Some(cached) = self.registry.lookup_cached(&key, epoch) {
+            return Ok(cached);
+        }
+
+        let table_ident = iceberg::TableIdent::new(ns.to_namespace_ident(), name.to_string());
+        let table = self.catalog.load_table(&table_ident).await?;
+
+        let meta = Arc::new(CachedMeta {
+            row,
+            iceberg_table: Arc::new(table),
+            refresh_epoch: epoch,
+        });
+        self.registry.store(key, Arc::clone(&meta));
+        Ok(meta)
+    }
+
+    /// List tables visible to `tenant` — both `TenantOwned` and `SystemShared` rows.
+    /// Engine-internal; no stable public contract yet.
+    #[allow(dead_code)]
+    pub(crate) async fn list_tables(
+        &self,
+        tenant: wyrd_spec::ids::DataTenantId,
+    ) -> Result<Vec<vala_sql::row_types::olap_catalog::BifrostTableRow>, BifrostError> {
+        self.registry.list_for_tenant(tenant).await
+    }
+
     /// Open a writer for `tenant` (the authenticated **data tenant**, for both
     /// scopes). The control-plane RLS bind for the registration lookup — and for
     /// the commit coordinator's `vala.olap_commits` precommit/finalize rows — is
@@ -191,6 +274,7 @@ impl WyrdCatalog {
             fqn,
             scope,
             tenant,
+            Arc::clone(&self.registry),
         );
 
         Ok(handle)
@@ -243,21 +327,176 @@ impl WyrdCatalog {
         name: &str,
         tenant: wyrd_spec::ids::DataTenantId,
     ) -> Result<WyrdTableProvider, BifrostError> {
-        let table_ident = iceberg::TableIdent::new(ns.to_namespace_ident(), name.to_string());
-        let table = self.catalog.load_table(&table_ident).await?;
-        let fqn = format!("{}.{}", ns.as_str(), name);
-
-        let row = match self.lookup_table_row(&fqn, tenant).await? {
-            Some(row) => row,
-            None => self
-                .lookup_table_row(&fqn, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
-                .await?
-                .ok_or_else(|| BifrostError::TableNotFound(fqn.clone()))?,
-        };
-        let scope = TableScope::from_db_str(row.scope.as_str())?;
-
+        let meta = self.get(ns, name, tenant).await?;
+        let scope = TableScope::from_db_str(&meta.row.scope)?;
+        let table = (*meta.iceberg_table).clone();
         WyrdTableProvider::try_new(table, scope, tenant)
             .await
             .map_err(BifrostError::DataFusion)
     }
+
+    /// Best-effort startup recovery pass.
+    ///
+    /// Claims stale `precommit` rows (lease absent/expired) via the SECURITY
+    /// DEFINER `vala.claim_stale_precommits` function and reconciles each by
+    /// scanning Iceberg snapshot summaries for `wyrd_batch_id`. Recovery runs only
+    /// when a `recovery_pool` (authenticated as `vala_recovery`) was provided; with
+    /// no recovery pool it is disabled and returns immediately.
+    async fn startup_recovery(&self) -> Result<(), BifrostError> {
+        use crate::writer::commit::WRITER_INSTANCE;
+
+        let Some(recovery_pool) = self.recovery_pool.as_ref() else {
+            tracing::info!("startup recovery disabled — no vala_recovery pool configured");
+            return Ok(());
+        };
+
+        let engine_owner = *WRITER_INSTANCE;
+
+        let mut conn = vala_sql::TenantConn::acquire(
+            recovery_pool,
+            wyrd_spec::ids::DataTenantId::SYSTEM_OWNER,
+        )
+        .await
+        .map_err(BifrostError::Sql)?;
+        let claimed =
+            vala_sql::queries::olap_catalog::claim_stale_precommits(&mut conn, engine_owner, 100)
+                .await
+                .map_err(BifrostError::Sql)?;
+        conn.commit().await.map_err(BifrostError::Sql)?;
+
+        for row in claimed {
+            if let Err(e) = self.recover_claimed_row(recovery_pool, &row).await {
+                tracing::warn!(
+                    fqn = %row.fqn,
+                    error = %e,
+                    "recovery scan failed for claimed precommit row"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn recover_claimed_row(
+        &self,
+        recovery_pool: &PgPool,
+        row: &vala_sql::row_types::olap_catalog::ClaimedPrecommitRow,
+    ) -> Result<(), BifrostError> {
+        let table_uid: [u8; 16] =
+            row.table_uid.as_slice().try_into().map_err(|_| {
+                BifrostError::Internal("recovery: table_uid length mismatch".into())
+            })?;
+        let batch_id: [u8; 16] = row
+            .batch_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| BifrostError::Internal("recovery: batch_id length mismatch".into()))?;
+        let fencing_token = row.fencing_token;
+        let batch_id_hex = uuid::Uuid::from_bytes(batch_id).simple().to_string();
+
+        let table_ident = fqn_to_table_ident(&row.fqn)?;
+
+        // SECURITY DEFINER recovery routines bypass RLS regardless of the bind tenant.
+        // Use SYSTEM_OWNER as a stable, always-valid bind for all recovery connections.
+        let recovery_bind = wyrd_spec::ids::DataTenantId::SYSTEM_OWNER;
+
+        let load_result = self.catalog.load_table(&table_ident).await;
+
+        let table = match load_result {
+            Err(e) => {
+                tracing::warn!(fqn = %row.fqn, error = %e, "recovery: iceberg load failed");
+                let mut conn = vala_sql::TenantConn::acquire(recovery_pool, recovery_bind)
+                    .await
+                    .map_err(BifrostError::Sql)?;
+                vala_sql::queries::olap_catalog::mark_recovery_scan_failed(
+                    &mut conn,
+                    &table_uid,
+                    &batch_id,
+                    fencing_token,
+                    &e.to_string(),
+                )
+                .await
+                .map_err(BifrostError::Sql)?;
+                conn.commit().await.map_err(BifrostError::Sql)?;
+                return Ok(());
+            }
+            Ok(t) => t,
+        };
+
+        let snapshot_id = find_snapshot_by_batch_id(&table, &batch_id_hex);
+
+        let mut conn = vala_sql::TenantConn::acquire(recovery_pool, recovery_bind)
+            .await
+            .map_err(BifrostError::Sql)?;
+
+        match snapshot_id {
+            Some(sid) => {
+                vala_sql::queries::olap_catalog::finalize_recovered_committed(
+                    &mut conn,
+                    &table_uid,
+                    &batch_id,
+                    sid,
+                    fencing_token,
+                )
+                .await
+                .map_err(BifrostError::Sql)?;
+            }
+            None => {
+                vala_sql::queries::olap_catalog::finalize_recovered_aborted(
+                    &mut conn,
+                    &table_uid,
+                    &batch_id,
+                    fencing_token,
+                    "snapshot_absent",
+                )
+                .await
+                .map_err(BifrostError::Sql)?;
+            }
+        }
+
+        conn.commit().await.map_err(BifrostError::Sql)?;
+        Ok(())
+    }
+}
+
+/// Parse a Bifrost FQN into an Iceberg `TableIdent`.
+///
+/// FQN format: `{ns.as_str()}.{table_name}`, where `ns.as_str()` may contain
+/// dots (e.g. "vala.bifrost"). Match the known namespace prefix to extract the
+/// table name — avoids relying on the buggy `split_part('.', N)` in the SQL.
+fn fqn_to_table_ident(fqn: &str) -> Result<iceberg::TableIdent, BifrostError> {
+    let namespaces = [
+        BifrostNamespace::System,
+        BifrostNamespace::Bifrost,
+        BifrostNamespace::Traces,
+        BifrostNamespace::Eval,
+    ];
+    for ns in namespaces {
+        let prefix = format!("{}.", ns.as_str());
+        if let Some(table_name) = fqn.strip_prefix(&prefix)
+            && !table_name.is_empty()
+            && !table_name.contains('.')
+        {
+            return Ok(iceberg::TableIdent::new(
+                ns.to_namespace_ident(),
+                table_name.to_string(),
+            ));
+        }
+    }
+    Err(BifrostError::MetadataMismatch(format!(
+        "cannot parse fqn into known namespace: {fqn}"
+    )))
+}
+
+/// Scan an Iceberg table's snapshot history for a snapshot whose summary
+/// carries `wyrd_batch_id == batch_id_hex`. Returns the first matching
+/// `snapshot_id`, or `None` if no snapshot matches.
+fn find_snapshot_by_batch_id(table: &iceberg::table::Table, batch_id_hex: &str) -> Option<i64> {
+    for snapshot in table.metadata().snapshots() {
+        let props = &snapshot.summary().additional_properties;
+        if props.get("wyrd_batch_id").map(String::as_str) == Some(batch_id_hex) {
+            return Some(snapshot.snapshot_id());
+        }
+    }
+    None
 }

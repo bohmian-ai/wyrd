@@ -11,6 +11,7 @@ use wyrd_spec::vala::system_columns::is_reserved_system_column;
 
 use crate::batch_builder::stamp_system_columns;
 use crate::error::BifrostError;
+use crate::registry::Registry;
 use crate::types::{TableScope, TableUid};
 use crate::writer::buffer::AppendBuffer;
 use crate::writer::commit::run_commit;
@@ -34,6 +35,7 @@ struct CommitActor {
     /// onto `WriteCmd::Write` so one actor can stamp many tenants' writes.
     data_tenant: DataTenantId,
     buffer: AppendBuffer,
+    registry: Arc<Registry>,
 }
 
 /// Microseconds since the Unix epoch, used for the server-stamped
@@ -121,6 +123,19 @@ impl CommitActor {
                 // path returns `None` and leaves the snapshot untouched.
                 if let Some(table) = updated_table {
                     self.table = table;
+                    // Bump refresh_epochs + evict cache so other pods see the new
+                    // snapshot on their next get(). Best-effort: a failure here
+                    // means the next reader pays a full reload, not correctness.
+                    let key = crate::registry::RegistryKey {
+                        owner: self.scope.control_bind(self.data_tenant),
+                        table_uid: self.table_uid,
+                    };
+                    if let Err(e) = self.registry.invalidate(key).await {
+                        tracing::warn!(
+                            error = %e,
+                            "epoch bump after commit failed (cache may be stale)"
+                        );
+                    }
                 }
                 Ok(snapshot_id)
             }
@@ -138,7 +153,7 @@ impl CommitActor {
 /// (see [`CommitActor::data_tenant`]). The actor owns the loaded [`Table`] and
 /// advances its snapshot as flushes commit.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_commit_coordinator(
+pub(crate) fn spawn_commit_coordinator(
     table: Table,
     catalog: Arc<SqlCatalog>,
     pool: Arc<PgPool>,
@@ -146,6 +161,7 @@ pub fn spawn_commit_coordinator(
     table_fqn: String,
     scope: TableScope,
     data_tenant: DataTenantId,
+    registry: Arc<Registry>,
 ) -> TableWriterHandle {
     let (sender, receiver) = mpsc::channel(64);
 
@@ -158,6 +174,7 @@ pub fn spawn_commit_coordinator(
         scope,
         data_tenant,
         buffer: AppendBuffer::new(),
+        registry,
     };
 
     tokio::spawn(actor.run());

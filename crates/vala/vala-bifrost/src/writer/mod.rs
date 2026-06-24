@@ -8,8 +8,6 @@ pub mod commit;
 pub mod coordinator;
 pub mod file_writer;
 
-pub use coordinator::spawn_commit_coordinator;
-
 /// A command sent to the per-table [`CommitActor`](coordinator). Each variant
 /// carries a oneshot channel the actor replies on, so callers await the result.
 pub enum WriteCmd {

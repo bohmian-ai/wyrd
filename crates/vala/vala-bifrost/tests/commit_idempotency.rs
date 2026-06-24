@@ -61,6 +61,7 @@ async fn setup(pool: PgPool) -> Fixture {
         &catalog_uri,
         &warehouse,
         pool.clone(),
+        None,
         factory.clone(),
         props.clone(),
     )
@@ -114,11 +115,25 @@ async fn idempotent_replay_committed_returns_prior_snapshot(pool: PgPool) {
     vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID)
         .await
         .unwrap();
+    // Stamp owner + token within the same conn to avoid row-lock deadlock.
+    let owner = sqlx::types::Uuid::new_v4();
+    sqlx::query(
+        "UPDATE vala.olap_commits SET writer_owner = $1, writer_fencing_token = 1 \
+         WHERE table_uid = $2 AND batch_id = $3",
+    )
+    .bind(owner)
+    .bind(fx.table_uid.as_bytes().as_slice())
+    .bind(BATCH_ID.as_slice())
+    .execute(&mut **c.transaction())
+    .await
+    .unwrap();
     vala_sql::queries::olap_catalog::finalize_committed(
         &mut c,
         fx.table_uid.as_bytes(),
         &BATCH_ID,
         4242,
+        owner,
+        1,
     )
     .await
     .unwrap();
@@ -189,12 +204,26 @@ async fn duplicate_failed_batch_returns_error(pool: PgPool) {
     vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID)
         .await
         .unwrap();
+    // Stamp owner + token within the same conn to avoid row-lock deadlock.
+    let owner = sqlx::types::Uuid::new_v4();
+    sqlx::query(
+        "UPDATE vala.olap_commits SET writer_owner = $1, writer_fencing_token = 1 \
+         WHERE table_uid = $2 AND batch_id = $3",
+    )
+    .bind(owner)
+    .bind(fx.table_uid.as_bytes().as_slice())
+    .bind(BATCH_ID.as_slice())
+    .execute(&mut **c.transaction())
+    .await
+    .unwrap();
     vala_sql::queries::olap_catalog::finalize_failed(
         &mut c,
         fx.table_uid.as_bytes(),
         &BATCH_ID,
         "WYRD_VALA_500_BIFROST_INTERNAL",
         "prior failure",
+        owner,
+        1,
     )
     .await
     .unwrap();

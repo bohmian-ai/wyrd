@@ -48,12 +48,14 @@ env = { DATABASE_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost:5432
 run = "cargo test --locked -p vala-bifrost"
 
 [tasks."test:unit"]
-description = """Aggregate Rust test gate: workspace + storage emulator matrix + sql + bifrost + registry-e2e.
+description = """Aggregate Rust test gate: workspace + storage emulator matrix + sql + registry-e2e.
+Bifrost (DataFusion-heavy) runs as a separate CI job via test:bifrost to avoid artifact-lock
+contention; add test:bifrost to pre-pr or run it directly to include it locally.
 Only real-credential cloud storage tests (test:storage:{s3,gcs,azure}:cloud) are gated to
 storage-integration-cloud.yml; emulator-backed storage tests run here because they are just
 docker containers, same difficulty as Postgres.
 """
-depends = ["test:rust:workspace", "test:storage:matrix", "test:sql", "test:bifrost", "test:registry-e2e"]
+depends = ["test:rust:workspace", "test:storage:matrix", "test:sql", "test:registry-e2e"]
 
 [tasks."test:wyrd-spec"]
 description = "Run wyrd-spec Rust tests"
@@ -1007,7 +1009,7 @@ fi
 
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
-depends = ["check", "test:unit", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs", "check:no-legacy-server-vocab", "check:no-tonic-outside-wyrd-tonic"]
+depends = ["check", "test:unit", "test:bifrost", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs", "check:no-legacy-server-vocab", "check:no-tonic-outside-wyrd-tonic"]
 
 [tasks."db:setup-roles"]
 description = """Create wyrd_app and wyrd_platform_admin roles in the target Postgres instance.

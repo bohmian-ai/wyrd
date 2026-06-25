@@ -81,7 +81,7 @@ source of truth and overrides this skill. For any styling or visual change, read
 - `crates/wyrd/wyrd-server/wyrd-ui/brand/DESIGN.md` — rules doctrine (geometry, altitude, the Line, signal rules)
 - `crates/wyrd/wyrd-server/wyrd-ui/brand/palette.json` — canonical tokens (edit here, then `pnpm tokens`)
 - `crates/wyrd/wyrd-server/wyrd-ui/brand/components.json` — per-component contracts (built + specced)
-- `.dev/assets/wyrd-ui-source-of-truth.html` — the rendered visual reference
+- `crates/wyrd/wyrd-server/wyrd-ui/brand/wyrd-ui-source-of-truth.html` — the rendered visual reference
 
 The bundled `references/wyrd-light-mode-style-guide.md`, `references/wyrd-dark-mode-style-guide.md`,
 and `references/wyrd-theme.css` are portable summaries; if they ever disagree with `brand/`, `brand/` wins.

@@ -51,7 +51,7 @@ function modeBlock(mode) {
 const out = [
   '/* GENERATED FILE — do not edit by hand.',
   ' * Source of truth: brand/palette.json. Regenerate with `pnpm tokens`.',
-  ' * Token names are identical to .dev/assets/wyrd-ui-source-of-truth.html. */',
+  ' * Token names are identical to ./wyrd-ui-source-of-truth.html. */',
   '',
   themeBlock(),
   '',

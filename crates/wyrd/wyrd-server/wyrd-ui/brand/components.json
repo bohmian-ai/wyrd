@@ -1,5 +1,5 @@
 {
-  "$comment": "Machine-readable component contracts for the Wyrd design system. `status: built` entries are implemented in src/lib/components and registered in src/lib/registry.ts (parity enforced by registry.test.ts). `status: specced` entries are designed (see .dev/assets/wyrd-ui-source-of-truth.html) and built per-feature against this contract. A dynamic-layout/A2UI renderer consumes this file to compose UIs from standardized pieces.",
+  "$comment": "Machine-readable component contracts for the Wyrd design system. `status: built` entries are implemented in src/lib/components and registered in src/lib/registry.ts (parity enforced by registry.test.ts). `status: specced` entries are designed (see ./wyrd-ui-source-of-truth.html) and built per-feature against this contract. A dynamic-layout/A2UI renderer consumes this file to compose UIs from standardized pieces.",
   "altitudes": {
     "quiet": "workbench default — 3px hard-offset shadow, restrained accent",
     "raised": "drilldown panels — 6px shadow + 4px kind/status top-bar",

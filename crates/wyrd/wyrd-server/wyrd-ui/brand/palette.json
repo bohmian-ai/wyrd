@@ -1,6 +1,6 @@
 {
   "name": "Wyrd",
-  "description": "Canonical token source for the Wyrd neobrutalist design system. Edit here, then run `pnpm tokens` to regenerate theme.css. Consumed directly by agents/A2UI; the human/visual reference is DESIGN.md + ../../../.dev/assets/wyrd-ui-source-of-truth.html.",
+  "description": "Canonical token source for the Wyrd neobrutalist design system. Edit here, then run `pnpm tokens` to regenerate theme.css. Consumed directly by agents/A2UI; the human/visual reference is DESIGN.md + ./wyrd-ui-source-of-truth.html.",
   "modes": ["light", "dark"],
   "scale": {
     "fonts": {

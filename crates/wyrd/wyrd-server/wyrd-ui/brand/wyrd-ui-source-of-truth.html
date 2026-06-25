@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Wyrd UI — Source of Truth</title>
+<title>Mitari UI — Source of Truth</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=Archivo:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -54,7 +54,7 @@
   .panel-label.dark::before{background:#0b0b0e}
 
   /* =====================================================================
-     THE LOCKED THEME SURFACE — every token Wyrd UI is allowed to use.
+     THE LOCKED THEME SURFACE — every token Mitari UI is allowed to use.
      Light and dark carry the SAME geometry; only palette/atmosphere differ.
      ===================================================================== */
   .surface{position:relative;overflow:hidden;border:3px solid var(--border);border-radius:7px;
@@ -371,7 +371,7 @@
 <body>
 
 <header class="pagehead">
-  <h1>WYRD <span class="acid">/</span> UI SOURCE OF TRUTH</h1>
+  <h1>MITARI <span class="acid">/</span> UI SOURCE OF TRUTH</h1>
   <span class="lock">locked · rune × acid</span>
   <nav>
     <a href="#principles">Rules</a>
@@ -388,7 +388,7 @@
 <!-- ============ §0 PRINCIPLES ============ -->
 <section class="sec" id="principles">
   <div class="sechead"><span class="num">00</span><h2>Rules</h2><span class="tag">non-negotiable</span></div>
-  <p class="seclede">This file is the canonical reference for Wyrd UI theming, paired with <code>wyrd-theme.css</code>. Same geometry in light and dark; only palette and atmosphere change. When a styling question comes up, this is the answer.</p>
+  <p class="seclede">This file is the canonical reference for Mitari UI theming, paired with <code>theme.css</code>. Same geometry in light and dark; only palette and atmosphere change. When a styling question comes up, this is the answer.</p>
   <div class="rules">
     <div class="rule"><h3><span class="d" style="background:#8b5cf6"></span>Geometry</h3><p><b>Radius 5px</b> on every surface and control. <b>2px ink borders</b> (3px for hero/feature containers), <b>2px dashed</b> for dividers inside cards. Borders are <b>always present</b> — never gray, hairline, or low-contrast.</p></div>
     <div class="rule"><h3><span class="d" style="background:#8b5cf6"></span>Shadows</h3><p>Hard-offset, <b>zero blur</b> only: <code>3px</code> quiet cards, <code>6px</code> raised/stat, <code>10px</code> hero block. No blur, no glassmorphism, no soft elevation, <b>no glow</b>.</p></div>
@@ -426,7 +426,7 @@
 <!-- ============ §4 ANALYTICS ============ -->
 <section class="sec" id="analytics">
   <div class="sechead"><span class="num">04</span><h2>Analytics</h2><span class="tag">data viz · workbench</span></div>
-  <p class="seclede">Wyrd's workbench is fundamentally an analytics surface. These are the data primitives in the locked style: KPI tiles with sparklines, bar and line charts, a distribution bar, an activity heatmap, an expandable storage/card tree, and a dropdown filter. All flat, all 2px-framed, all token-driven — quiet register.</p>
+  <p class="seclede">The workbench is fundamentally an analytics surface. These are the data primitives in the locked style: KPI tiles with sparklines, bar and line charts, a distribution bar, an activity heatmap, an expandable storage/card tree, and a dropdown filter. All flat, all 2px-framed, all token-driven — quiet register.</p>
   <div class="compare" id="analytics-cols"></div>
 </section>
 
@@ -490,7 +490,7 @@
 <template id="t-quiet">
   <div>
     <div class="q-top">
-      <span class="q-wm">WYRD<i></i></span>
+      <span class="q-wm">MITARI<i></i></span>
       <span class="q-search">⌘K  search cards…</span>
       <span class="q-nav"><b>registry</b> · observations · audit</span>
     </div>
@@ -532,17 +532,17 @@
   <div>
     <div class="l-bar"></div>
     <div class="l-pad">
-      <span class="l-orn">✳ wyrd</span>
-      <span class="l-wm">WYRD<i></i></span>
-      <div><span class="l-hero">The Wyrd Registry</span></div>
-      <p class="l-tag">Card-bound identity for the agentic stack. <b>One credential. Two planes. Zero governance tokens.</b></p>
+      <span class="l-orn">✳ mitari</span>
+      <span class="l-wm">MITARI<i></i></span>
+      <div><span class="l-hero">The Mitari Design System</span></div>
+      <p class="l-tag">Neobrutalism for the agentic stack. <b>One geometry. Two modes. Zero blur.</b></p>
       <div class="l-stats">
-        <div class="l-stat"><div class="n">18</div><div class="k">Card kinds</div></div>
-        <div class="l-stat"><div class="n">2</div><div class="k">Planes</div></div>
-        <div class="l-stat"><div class="n">1</div><div class="k">Credential</div></div>
+        <div class="l-stat"><div class="n">24</div><div class="k">Components</div></div>
+        <div class="l-stat"><div class="n">2</div><div class="k">Modes</div></div>
+        <div class="l-stat"><div class="n">3</div><div class="k">Altitudes</div></div>
       </div>
       <div>
-        <button class="l-cta">wyrd apply &nbsp;→</button>
+        <button class="l-cta">explore &nbsp;→</button>
         <button class="l-cta l-cta2">view docs</button>
       </div>
     </div>

@@ -9,7 +9,7 @@ const base = {
     { label: 'span_id', value: 'span_7c2a4f' },
     { label: 'trace_id', value: 'tr_9f2a', link: true }
   ],
-  tokens: { input: '1.4k', output: '1.0k', cache: '0.2k' },
+  tokens: { input: 1400, output: 1000, cache: 200 },
   outputPreview: 'Based on the retrieved policy docs…'
 };
 
@@ -17,6 +17,7 @@ test('renders attributes, token stats, and the output preview', () => {
   const { container, getByText } = render(SpanPanel, { props: base });
   expect(getByText('llm.synthesize')).toBeTruthy();
   expect(container.querySelectorAll('.d-mstat')).toHaveLength(3);
+  expect(getByText('1.4k')).toBeTruthy();
   expect(container.querySelector('pre code')?.textContent).toContain('retrieved policy docs');
 });
 

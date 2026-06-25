@@ -29,8 +29,8 @@
   const registered = Object.keys(registry);
 
   const traceRows = [
-    { id: 'tr_9f21', op: 'agent.run', kind: 'agent' as const, spans: 14, durationMs: 4210, tokens: '12.4k', cost: '$0.18', score: '0.92', scoreTone: 'hi' as const, status: 'ok' as const },
-    { id: 'tr_8c04', op: 'llm.synthesize', kind: 'llm' as const, spans: 6, durationMs: 1840, tokens: '4.1k', cost: '$0.06', score: '0.71', scoreTone: 'mid' as const, status: 'warn' as const },
+    { id: 'tr_9f21', op: 'agent.run', kind: 'agent' as const, spans: 14, durationMs: 4210, tokens: 12400, cost: 0.18, score: 0.92, scoreTone: 'hi' as const, status: 'ok' as const },
+    { id: 'tr_8c04', op: 'llm.synthesize', kind: 'llm' as const, spans: 6, durationMs: 1840, tokens: 4100, cost: 0.06, score: 0.71, scoreTone: 'mid' as const, status: 'warn' as const },
     { id: 'tr_71be', op: 'tool.search', kind: 'tool' as const, spans: 3, durationMs: 320, status: 'err' as const }
   ];
 
@@ -236,7 +236,7 @@
               { label: 'span_id', value: 'span_7c2a4f' },
               { label: 'trace_id', value: 'tr_9f21', link: true }
             ]}
-            tokens={{ input: '1.4k', output: '1.0k', cache: '0.2k' }}
+            tokens={{ input: 1400, output: 1000, cache: 200 }}
             events={[
               { label: 'first token', at: '+0.4s' },
               { label: 'complete', at: '+1.8s' }

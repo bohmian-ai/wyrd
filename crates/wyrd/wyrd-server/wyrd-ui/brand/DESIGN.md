@@ -132,6 +132,37 @@ white — never ramp with it). Selection/hover wash is `--rune-soft`, never lime
 
 ---
 
+## Data vs. presentation
+
+The server owns **meaning**; the UI owns **presentation**. These are different
+responsibilities and the boundary is load-bearing — Wyrd is agent-first and headless, so
+the API serves the CLI, MCP, other-language clients, and (later) the A2UI renderer, not
+just this workbench.
+
+- **The server owns, and the UI must not re-derive:** canonical values, units, rounding
+  that changes truth, derived status (`pass`, `drifted`), thresholds and policy, sorting,
+  pagination, aggregation. Same number, same verdict, everywhere.
+- **The UI owns, and the server must not bake into the wire:** display formatting
+  (`1400` → `"1.4k"`, `4210` → `"4.21s"`, `0.18` → `"$0.18"`), bar widths, relative time,
+  truncation, and verdict→color/altitude mapping. These depend on the rendering medium and
+  viewport — context the server doesn't have. If the server pre-formatted `"1.4k"`, every
+  non-UI client would have to parse a lossy string back into a number.
+
+The seam: the server sends `value: 0.79, threshold: 0.8, pass: false`; the UI decides the
+value renders red. The **threshold** is policy (server); the **redness** is presentation (UI).
+
+**Prop convention.** Typed-domain components take **raw semantic values** — numbers,
+milliseconds, `0–1` scores, enums — and humanize them internally via `src/lib/format.ts`
+(`fmtCount`, `fmtDuration`, `fmtCost`). Strings are only for genuinely opaque values: IDs,
+names, free-form attribute pairs, ISO timestamps shown as-is, and arbitrary key/value rows
+(`d-kv` lists). A pre-formatted display string in a typed prop (`tokens: "1.4k"`) is a smell
+— it pushes a presentation decision up the call chain and breaks consistency. The generic
+`KpiTile` is the one deliberate exception: its `value` is heterogeneous across uses
+(latency, spend, rate, count), so the caller formats it with the same `format.ts` helpers
+at the call site.
+
+---
+
 ## Building a new component
 
 1. Add its contract to `components.json` (anatomy, tokens, variants, altitude, rules).

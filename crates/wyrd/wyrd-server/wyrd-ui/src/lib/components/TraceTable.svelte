@@ -9,12 +9,14 @@
     kind: Kind;
     spans: number;
     durationMs: number;
-    tokens?: string;
-    cost?: string;
-    score?: string;
+    tokens?: number;
+    cost?: number;
+    score?: number;
     scoreTone?: ScoreTone;
     status: Status;
   };
+
+  import { fmtCost, fmtCount, fmtDuration } from '$lib/format';
 
   let {
     rows,
@@ -23,10 +25,6 @@
   }: { rows: TraceRow[]; selectedId?: string; onselect?: (id: string) => void } = $props();
 
   const maxDur = $derived(Math.max(...rows.map((r) => r.durationMs), 1));
-
-  function fmt(ms: number): string {
-    return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(2)}s`;
-  }
 
   function key(e: KeyboardEvent, id: string): void {
     if (e.key === 'Enter' || e.key === ' ') {
@@ -63,11 +61,11 @@
           <td><span class="op" data-k={t.kind}>{t.op}</span></td>
           <td class="r">{t.spans}</td>
           <td>
-            <span class="mini" style={`width:${((t.durationMs / maxDur) * 60).toFixed(1)}px`}></span>{fmt(t.durationMs)}
+            <span class="mini" style={`width:${((t.durationMs / maxDur) * 60).toFixed(1)}px`}></span>{fmtDuration(t.durationMs)}
           </td>
-          <td class="r">{t.tokens ?? '—'}</td>
-          <td class="r">{t.cost ?? '—'}</td>
-          <td class="r"><span class="sc" data-tone={t.scoreTone}>{t.score ?? '—'}</span></td>
+          <td class="r">{t.tokens != null ? fmtCount(t.tokens) : '—'}</td>
+          <td class="r">{t.cost != null ? fmtCost(t.cost) : '—'}</td>
+          <td class="r"><span class="sc" data-tone={t.scoreTone}>{t.score != null ? t.score.toFixed(2) : '—'}</span></td>
           <td><span class="st" data-st={t.status}>{t.status}</span></td>
         </tr>
       {/each}

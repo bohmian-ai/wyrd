@@ -2,6 +2,7 @@
   import Drawer from './Drawer.svelte';
   import Button from './Button.svelte';
   import CodeBlock from './CodeBlock.svelte';
+  import { fmtCount } from '$lib/format';
 
   type Kind = 'agent' | 'llm' | 'tool' | 'retrieval';
   type KV = { label: string; value: string; link?: boolean };
@@ -25,7 +26,7 @@
     summary?: string;
     position?: { left: number; width: number };
     attributes: KV[];
-    tokens?: { input: string; output: string; cache: string };
+    tokens?: { input: number; output: number; cache: number };
     events?: Ev[];
     outputPreview?: string;
     onclose?: () => void;
@@ -65,9 +66,9 @@
     <div class="d-sec">
       <div class="d-sl">tokens</div>
       <div class="d-mini">
-        <div class="d-mstat"><div class="k">input</div><div class="n">{tokens.input}</div></div>
-        <div class="d-mstat"><div class="k">output</div><div class="n">{tokens.output}</div></div>
-        <div class="d-mstat"><div class="k">cache</div><div class="n">{tokens.cache}</div></div>
+        <div class="d-mstat"><div class="k">input</div><div class="n">{fmtCount(tokens.input)}</div></div>
+        <div class="d-mstat"><div class="k">output</div><div class="n">{fmtCount(tokens.output)}</div></div>
+        <div class="d-mstat"><div class="k">cache</div><div class="n">{fmtCount(tokens.cache)}</div></div>
       </div>
     </div>
   {/if}

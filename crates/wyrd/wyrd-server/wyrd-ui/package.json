@@ -7,22 +7,26 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run",
+    "tokens": "node brand/gen-theme.mjs"
   },
   "devDependencies": {
-    "@skeletonlabs/skeleton": "latest",
-    "@skeletonlabs/skeleton-svelte": "latest",
     "@sveltejs/adapter-auto": "latest",
     "@sveltejs/kit": "latest",
     "@sveltejs/vite-plugin-svelte": "latest",
     "@tailwindcss/vite": "latest",
+    "@testing-library/jest-dom": "latest",
+    "@testing-library/svelte": "latest",
     "@types/node": "latest",
     "autoprefixer": "latest",
+    "jsdom": "latest",
     "postcss": "latest",
     "svelte": "latest",
     "svelte-check": "latest",
     "tailwindcss": "latest",
     "typescript": "latest",
-    "vite": "latest"
+    "vite": "latest",
+    "vitest": "latest"
   }
 }

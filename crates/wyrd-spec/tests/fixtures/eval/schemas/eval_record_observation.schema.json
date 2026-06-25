@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "EvalRecordObservation",
-  "description": "The eval observation an instrumented agent emits at evaluation points.\n\nRides the same wire envelope as every other Vala observation (`vala_client::ObservationEnvelope`). The server resolves the eval card from `eval_ref`, validates `subject_ref` presence against the emit-plane card identity, and scores the record through the runtime engine.",
+  "description": "The eval observation an instrumented agent emits at evaluation points.\n\nRides the same wire envelope as every other Vala observation (`wyrd_spec::vala::observation::ObservationEnvelope`). The server resolves the eval card from `eval_ref`, validates `subject_ref` against the emitter's authorized card identity (the run's Target `card_ref`, authorized against the JWT principal's card scope), and scores the record through the runtime engine.",
   "type": "object",
   "required": [
     "context",
@@ -33,7 +33,7 @@
       "format": "uuid"
     },
     "run_id": {
-      "description": "Run identifier of the agent invocation that emitted the record.\n\nThe server resolves the agent / eval card identity via this id; the record does not carry a separate `agent_id`.",
+      "description": "Run identifier of the agent invocation that emitted the record.\n\nThe opaque Run anchor (`Run → Observation`). The card identity is the run's authorized `card_ref`, not resolved from this id; the record carries no separate `agent_id`.",
       "type": "string"
     },
     "session_id": {

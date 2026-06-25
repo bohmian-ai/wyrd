@@ -10676,6 +10676,7 @@ dependencies = [
  "sha2 0.10.9",
  "skald-spec",
  "thiserror 2.0.18",
+ "url",
  "utoipa",
  "uuid",
  "wyrd-error-derive",

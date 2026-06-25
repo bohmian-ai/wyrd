@@ -454,9 +454,65 @@ pub enum WyrdError {
         code = "WYRD_AUTH_400_UNSUPPORTED_GRANT_TYPE",
         status = 400,
         title = "Unsupported grant_type",
-        remediation = "Use one of the supported grants listed in `details.supported_grant_types`: `wyrd_api_key` or `urn:ietf:params:oauth:grant-type:token-exchange`."
+        remediation = "Use one of the supported grants listed in `details.supported_grant_types`."
     )]
     UnsupportedGrantType {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// OIDC callback state is missing, invalid, or replayed.
+    #[error("[WYRD_AUTH_401_INVALID_STATE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_INVALID_STATE",
+        status = 401,
+        title = "Invalid OIDC state",
+        remediation = "Restart the login flow. The callback state is single-use and must match the server-stored login state."
+    )]
+    InvalidState {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// OIDC ID token nonce did not match the stored login nonce.
+    #[error("[WYRD_AUTH_401_INVALID_NONCE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_INVALID_NONCE",
+        status = 401,
+        title = "Invalid OIDC nonce",
+        remediation = "Restart the login flow. The ID token nonce must match the server-stored login nonce."
+    )]
+    InvalidNonce {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Rotated or revoked refresh token was presented and the token family was revoked.
+    #[error("[WYRD_AUTH_401_REFRESH_REUSED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_REFRESH_REUSED",
+        status = 401,
+        title = "Refresh token reused",
+        remediation = "Re-authenticate. The refresh token family has been revoked because a rotated token was reused."
+    )]
+    RefreshReused {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Refresh token has been revoked or is no longer valid.
+    #[error("[WYRD_AUTH_401_REFRESH_REVOKED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_REFRESH_REVOKED",
+        status = 401,
+        title = "Refresh token revoked",
+        remediation = "Re-authenticate to obtain a new refresh token."
+    )]
+    RefreshRevoked {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -583,6 +639,20 @@ pub enum WyrdError {
         remediation = "Retry with backoff. Do not re-authenticate; this is an infrastructure failure, not a credential failure."
     )]
     AuthVerifyUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// OIDC discovery document is unreachable or does not match the configured issuer.
+    #[error("[WYRD_AUTH_503_DISCOVERY_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_503_DISCOVERY_UNAVAILABLE",
+        status = 503,
+        title = "OIDC discovery unavailable",
+        remediation = "Retry with backoff. Do not re-authenticate; this is an infrastructure or issuer-discovery failure."
+    )]
+    DiscoveryUnavailable {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -1974,6 +2044,10 @@ impl WyrdError {
             | Self::InvalidToken { message, details }
             | Self::BadTokenFormat { message, details }
             | Self::UnsupportedGrantType { message, details }
+            | Self::InvalidState { message, details }
+            | Self::InvalidNonce { message, details }
+            | Self::RefreshReused { message, details }
+            | Self::RefreshRevoked { message, details }
             | Self::DelegationDepthExceededIssue { message, details }
             | Self::PrincipalKindCardKindMismatch { message, details }
             | Self::InvalidCardRefVersion { message, details }
@@ -1983,6 +2057,7 @@ impl WyrdError {
             | Self::DelegationDepthExceededVerify { message, details }
             | Self::PrincipalNotFound { message, details }
             | Self::AuthVerifyUnavailable { message, details }
+            | Self::DiscoveryUnavailable { message, details }
             | Self::AuthPreviewDisabled { message, details }
             | Self::AuditUnavailable { message, details }
             | Self::AuthzRequiresDelegatedToken { message, details }
@@ -2565,6 +2640,22 @@ mod tests {
                 message: "unsupported grant_type".to_owned(),
                 details: serde_json::json!({ "supported_grant_types": ["wyrd_api_key"] }),
             },
+            WyrdError::InvalidState {
+                message: "state was missing or replayed".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::InvalidNonce {
+                message: "id token nonce mismatch".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RefreshReused {
+                message: "rotated refresh token reused".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RefreshRevoked {
+                message: "refresh token revoked".to_owned(),
+                details: serde_json::json!({}),
+            },
             WyrdError::DelegationDepthExceededIssue {
                 message: "delegation chain would exceed depth 5".to_owned(),
                 details: serde_json::json!({ "max": 5 }),
@@ -2595,6 +2686,10 @@ mod tests {
             },
             WyrdError::AuthVerifyUnavailable {
                 message: "permission resolver unavailable".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::DiscoveryUnavailable {
+                message: "oidc discovery unavailable".to_owned(),
                 details: serde_json::json!({}),
             },
             WyrdError::AuthPreviewDisabled {

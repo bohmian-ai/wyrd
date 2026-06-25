@@ -4,6 +4,10 @@ use std::fs;
 use std::path::Path;
 
 use schemars::schema_for;
+use wyrd_spec::auth::{
+    CallbackQuery, IssuerUrl, LoginInitResponse, PrincipalKind, RevokePrincipalRequest,
+    RevokePrincipalResponse, TokenRequest, TokenResponse, Url,
+};
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::card::artifact::{ArtifactSpec, FrameworkAdapterRef};
 use wyrd_spec::card::audit::AuditSpec;
@@ -128,6 +132,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<DownloadPlan>(out, golden, "download_plan")?;
     write::<WireProtocol>(out, golden, "wire_protocol")?;
     write::<VerificationGuarantee>(out, golden, "verification_guarantee")?;
+
+    // Auth contracts.
+    write::<TokenRequest>(out, golden, "auth_token_request")?;
+    write::<TokenResponse>(out, golden, "auth_token_response")?;
+    write::<Url>(out, golden, "auth_url")?;
+    write::<IssuerUrl>(out, golden, "auth_issuer_url")?;
+    write::<LoginInitResponse>(out, golden, "auth_login_init_response")?;
+    write::<CallbackQuery>(out, golden, "auth_callback_query")?;
+    write::<PrincipalKind>(out, golden, "auth_principal_kind")?;
+    write::<RevokePrincipalRequest>(out, golden, "auth_revoke_principal_request")?;
+    write::<RevokePrincipalResponse>(out, golden, "auth_revoke_principal_response")?;
 
     // Phase 4 section 16: shared security primitives.
     write::<SecretRef>(out, golden, "security_secret_ref")?;

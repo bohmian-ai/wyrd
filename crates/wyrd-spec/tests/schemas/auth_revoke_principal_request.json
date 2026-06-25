@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RevokePrincipalRequest",
+  "description": "`POST /v1/principals/{id}/revoke` body.",
+  "type": "object",
+  "required": [
+    "principal_kind",
+    "reason"
+  ],
+  "properties": {
+    "principal_kind": {
+      "description": "Required kind discriminator; principal ids are only unique with their table.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/PrincipalKind"
+        }
+      ]
+    },
+    "reason": {
+      "description": "Required audit reason for the revocation.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "PrincipalKind": {
+      "description": "Principal-kind discriminator for auth administration requests.",
+      "oneOf": [
+        {
+          "description": "Human user principal.",
+          "type": "string",
+          "enum": [
+            "user"
+          ]
+        },
+        {
+          "description": "Service principal.",
+          "type": "string",
+          "enum": [
+            "service"
+          ]
+        },
+        {
+          "description": "Agent principal.",
+          "type": "string",
+          "enum": [
+            "agent"
+          ]
+        }
+      ]
+    }
+  }
+}

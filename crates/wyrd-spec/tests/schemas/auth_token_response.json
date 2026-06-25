@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TokenResponse",
+  "description": "Response from `POST /auth/token`.",
+  "type": "object",
+  "required": [
+    "access_token",
+    "expires_at",
+    "refresh_token",
+    "token_type"
+  ],
+  "properties": {
+    "access_token": {
+      "description": "Signed Wyrd access token.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SecretBearer"
+        }
+      ]
+    },
+    "expires_at": {
+      "description": "Access-token expiry timestamp.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "refresh_token": {
+      "description": "Refresh token.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SecretBearer"
+        }
+      ]
+    },
+    "token_type": {
+      "description": "Token type.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TokenType"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "SecretBearer": {
+      "description": "Opaque secret. Redacted in logs and audit payloads.",
+      "writeOnly": true,
+      "type": "string",
+      "format": "password"
+    },
+    "TokenType": {
+      "description": "Bearer token marker.",
+      "oneOf": [
+        {
+          "description": "Bearer token.",
+          "type": "string",
+          "enum": [
+            "Bearer"
+          ]
+        }
+      ]
+    }
+  }
+}

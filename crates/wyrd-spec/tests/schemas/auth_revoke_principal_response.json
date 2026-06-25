@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RevokePrincipalResponse",
+  "description": "`POST /v1/principals/{id}/revoke` response.",
+  "type": "object",
+  "required": [
+    "principal_id",
+    "principal_kind",
+    "refresh_tokens_revoked",
+    "revoked_at"
+  ],
+  "properties": {
+    "principal_id": {
+      "description": "Revoked principal id.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "principal_kind": {
+      "description": "Revoked principal kind.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/PrincipalKind"
+        }
+      ]
+    },
+    "refresh_tokens_revoked": {
+      "description": "Number of refresh-token family rows revoked.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "revoked_at": {
+      "description": "New tokens-not-before epoch.",
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "PrincipalKind": {
+      "description": "Principal-kind discriminator for auth administration requests.",
+      "oneOf": [
+        {
+          "description": "Human user principal.",
+          "type": "string",
+          "enum": [
+            "user"
+          ]
+        },
+        {
+          "description": "Service principal.",
+          "type": "string",
+          "enum": [
+            "service"
+          ]
+        },
+        {
+          "description": "Agent principal.",
+          "type": "string",
+          "enum": [
+            "agent"
+          ]
+        }
+      ]
+    }
+  }
+}

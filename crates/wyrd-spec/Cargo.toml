@@ -23,6 +23,7 @@ blake3 = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 regex = { workspace = true }
+url = { workspace = true }
 schemars = { workspace = true }
 semver = { workspace = true }
 secrecy = { workspace = true }

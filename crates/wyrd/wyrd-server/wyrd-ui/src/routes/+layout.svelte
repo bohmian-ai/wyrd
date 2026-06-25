@@ -1,9 +1,10 @@
 <script lang="ts">
   import '../app.css';
+  import ModeProvider from '$lib/components/ModeProvider.svelte';
 
   let { children } = $props();
 </script>
 
-<main class="mx-auto max-w-5xl p-8">
+<ModeProvider>
   {@render children?.()}
-</main>
+</ModeProvider>

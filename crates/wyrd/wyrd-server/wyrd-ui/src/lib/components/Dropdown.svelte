@@ -10,11 +10,12 @@
   }: { label: string; options: Option[]; value?: string; onselect?: (value: string) => void } = $props();
 
   let open = $state(false);
-  let current = $state(value);
+  let selected = $state<string | undefined>(undefined);
+  const current = $derived(selected ?? value);
 
   function choose(o: Option): void {
     const v = o.value ?? o.label;
-    current = v;
+    selected = v;
     onselect?.(v);
     open = false;
   }

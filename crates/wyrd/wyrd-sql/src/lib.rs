@@ -249,7 +249,6 @@ mod tests {
             "src/queries/auth/role_assignments.rs",
             "src/queries/auth/api_keys.rs",
             "src/queries/auth/refresh_tokens.rs",
-            "src/queries/auth/governance_tokens.rs",
             "src/queries/auth/sql",
             "src/queries/platform/mod.rs",
             "src/queries/platform/tenant_resolver.rs",

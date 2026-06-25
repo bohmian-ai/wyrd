@@ -8,7 +8,6 @@
 //! query-file macros.
 
 pub mod api_keys;
-pub mod governance_tokens;
 pub mod refresh_tokens;
 pub mod role_assignments;
 pub mod roles;

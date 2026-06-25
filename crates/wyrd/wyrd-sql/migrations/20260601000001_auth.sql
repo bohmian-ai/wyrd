@@ -209,34 +209,3 @@ ALTER TABLE wyrd.auth_refresh_tokens FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.auth_refresh_tokens
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
--- ---------------------------------------------------------------------------
--- Governance tokens (card-bound governance grants — separate from runtime auth)
--- ---------------------------------------------------------------------------
-CREATE TABLE wyrd.auth_governance_tokens (
-    token_id            TEXT PRIMARY KEY,
-    data_tenant_id      UUID NOT NULL REFERENCES platform.tenants(data_tenant_id),
-    -- CardRef: references a registered Card by its immutable UUIDv7 UID.
-    -- A foreign key to wyrd.registry_cards will be added when that table lands.
-    card_uid            TEXT NOT NULL
-        CHECK (card_uid ~ '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$'),
-    issuer              TEXT NOT NULL,
-    issued_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expires_at          TIMESTAMPTZ NOT NULL,
-    revoked_at          TIMESTAMPTZ,
-    rotated_from        TEXT,
-    status              TEXT NOT NULL CHECK (status IN ('active','revoked','expired')),
-    workload_binding    TEXT,
-    UNIQUE (data_tenant_id, token_id),
-    FOREIGN KEY (data_tenant_id, rotated_from)
-        REFERENCES wyrd.auth_governance_tokens(data_tenant_id, token_id)
-);
-
-CREATE INDEX auth_governance_tokens_by_tenant_card
-    ON wyrd.auth_governance_tokens (data_tenant_id, card_uid);
-
-ALTER TABLE wyrd.auth_governance_tokens ENABLE ROW LEVEL SECURITY;
-ALTER TABLE wyrd.auth_governance_tokens FORCE ROW LEVEL SECURITY;
-CREATE POLICY tenant_isolation ON wyrd.auth_governance_tokens
-    USING (data_tenant_id = wyrd.current_tenant())
-    WITH CHECK (data_tenant_id = wyrd.current_tenant());

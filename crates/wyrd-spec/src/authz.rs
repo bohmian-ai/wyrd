@@ -43,9 +43,6 @@ pub enum Scope {
     /// Invoke the deploy gate.
     #[serde(rename = "gate:run")]
     GateRun,
-    /// Mint governance tokens.
-    #[serde(rename = "token:issue")]
-    TokenIssue,
     /// Read audit history and compliance reports.
     #[serde(rename = "audit:read")]
     AuditRead,
@@ -70,7 +67,6 @@ const ALL_SCOPES: &[Scope] = &[
     Scope::PolicyAuthorOrg,
     Scope::PolicyAuthorService,
     Scope::GateRun,
-    Scope::TokenIssue,
     Scope::AuditRead,
     Scope::AuditSignoff,
     Scope::ObservationRead,
@@ -97,7 +93,6 @@ impl Scope {
             Scope::PolicyAuthorOrg => "policy:author:org",
             Scope::PolicyAuthorService => "policy:author:service",
             Scope::GateRun => "gate:run",
-            Scope::TokenIssue => "token:issue",
             Scope::AuditRead => "audit:read",
             Scope::AuditSignoff => "audit:signoff",
             Scope::ObservationRead => "observation:read",
@@ -129,7 +124,6 @@ impl FromStr for Scope {
             "policy:author:org" => Scope::PolicyAuthorOrg,
             "policy:author:service" => Scope::PolicyAuthorService,
             "gate:run" => Scope::GateRun,
-            "token:issue" => Scope::TokenIssue,
             "audit:read" => Scope::AuditRead,
             "audit:signoff" => Scope::AuditSignoff,
             "observation:read" => Scope::ObservationRead,

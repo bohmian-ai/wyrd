@@ -672,7 +672,6 @@ async fn assert_auth_rls_metadata(pool: &PgPool) {
 
     let expected_tables = [
         "auth_api_keys",
-        "auth_governance_tokens",
         "auth_refresh_tokens",
         "auth_roles",
         "auth_service_account_roles",

@@ -504,7 +504,7 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Credential (API key, governance token, or refresh token) has been revoked.
+    /// Credential (API key or refresh token) has been revoked.
     #[error("[WYRD_AUTH_401_CREDENTIAL_REVOKED] {message}")]
     #[wyrd_error(
         code = "WYRD_AUTH_401_CREDENTIAL_REVOKED",

@@ -25,6 +25,16 @@ Remaining `Source` follow-up is the runtime read adapter in `vala` keyed on
 `(kind, vendor)` and the `wyrd source check` preflight; the spec, schemas, and
 card-kind tests are landed.
 
+The **governance token is removed** (doctrine #18): emit is an Auth-plane
+route, not a third plane. The JWT (`principal.card_ref`) plus `run_id` carry
+everything an emission needs. The scaffolding has been deleted — the
+`wyrd.auth_governance_tokens` table (from migration `20260601000001_auth.sql`),
+its `GovernanceTokenRow` row mirror + query slot, the `migration_pg.rs` table
+assertion, and the `Scope::TokenIssue` (`token:issue`) capability. The
+`wyrd-enterprise` `LicenseFeature::Governance` flag is retained as the
+enterprise governance-tier gate (policy + audit), not a token. No
+`WYRD_GOV_TOKEN` env var, no `wyrd gov-token` CLI.
+
 ---
 
 ## Doctrine
@@ -83,19 +93,24 @@ card-kind tests are landed.
     register as a card and reference by `CardRef`. Heavy refs (`subject_ref`,
     `dataset`, `Service.components.ref`, `Workflow.steps.target`) stay
     `CardRef`-only — identity is the point.
-18. **Auth, Policy, and Emit are three distinct planes.**
+18. **Auth and Policy are two distinct planes.** Emit is **not** a third
+    plane: a deployed service's observation/ingest writes are ordinary
+    Auth-plane routes, authorized by the same JWT and a
+    `Permission { resource, action }` like every other call. The legacy
+    per-card **governance token is removed** — the JWT's `principal.card_ref`
+    already proves which card is emitting, and `run_id` carries which action
+    emitted it, so a separate emit credential was redundant
+    double-credentialing.
     - **Auth** gates Wyrd API calls: `Permission { resource, action }` on the
       handler, stateless pubkey verify of the access token. Answers "is this
-      principal allowed to hit this Wyrd route?" The legacy `Scope` vocabulary
-      is rejected — do not introduce it in new code.
+      principal allowed to hit this Wyrd route?" This covers data-plane ingest
+      (e.g. `bifrost_record:write`) exactly like any other route. The legacy
+      `Scope` vocabulary is rejected — do not introduce it in new code.
     - **Policy** gates card states (`classify` at register-time, `gate` at
       deploy-time) and cross-service invokes (`invoke` at runtime). Runtime
       invoke evaluation is centralized at `POST /v1/authz/check`, called
       transparently by the service mesh's ext_authz filter or by the SDK
       middleware in non-mesh shops.
-    - **Emit** is the data-plane channel from a deployed service to Wyrd's
-      ingest, signed with the per-card governance token; never propagated
-      between services and never read by Policy CEL.
 
     Runtime identity is a `Principal { id: PrincipalId, kind: PrincipalKind,
     tenant_id, roles, effective_permissions }`. `PrincipalId` is a `Uuid`
@@ -279,8 +294,9 @@ rule shape; the `action` field on each rule says when it fires:
 
   - `classify` (register-time): rule derives attrs onto the card (e.g.
                                 `risk.tier = "high"`). Never blocks.
-  - `gate`     (deploy-time):   rule allows/denies governance-token issuance
-                                for the card. Blocks when Deny.
+  - `gate`     (deploy-time):   rule allows/denies the card's deploy-time
+                                credential issuance (`wyrd auth issue-key`),
+                                and thus its emit eligibility. Blocks when Deny.
   - `invoke`   (runtime, per cross-service call): evaluated by
                                 `POST /v1/authz/check`. Returns Allow/Deny to
                                 the mesh ext_authz filter or the SDK
@@ -340,7 +356,6 @@ Env vars in deployed services:
 |---|---|---|---|
 | `WYRD_API_KEY` | REQUIRED | Deploy environment's secret store (key minted by `wyrd auth issue-key <card_ref>`) | Exchanged ONCE at startup at `POST /auth/token` for short-lived JWT. SDK auto-refreshes. JWT carries the card-bound `principal` claim (kind, id, tenant, `card_ref`). |
 | `WYRD_API_URL` | REQUIRED | Static config | Wyrd server base URL. |
-| `WYRD_GOV_TOKEN` | OPTIONAL | CI writes from `wyrd gov-token issue` response | Only if the app calls `wyrd.observe(...)`. |
 
 The API key is exchanged at startup — never on the wire. The JWT — not the API
 key — is what travels on cross-service calls in the dedicated
@@ -459,8 +474,8 @@ Wyrd:
    (org-global ∪ service-local, deny-overrides).
 7. Returns `200 OK` (Allow) or `403 Forbidden` with `PolicyDecision::Deny { reason }`.
 8. Asynchronously emits one `PolicyInvokeDecision` observation per check,
-   labeled with `Wyrd-Request-Id` (signed with Wyrd internal authority —
-   no caller/callee gov-token consumed). Every allow and every deny is
+   labeled with `Wyrd-Request-Id` (emitted under Wyrd's internal authority —
+   server-authored, not caller-signed). Every allow and every deny is
    audited automatically; no developer wiring.
 
 Identity is server-verified from one signed delegated JWT. The pod cannot

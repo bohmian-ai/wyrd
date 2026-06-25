@@ -996,13 +996,14 @@ query, HTTP query) are different drivers behind one read trait; the Card schema
 never declares strategy — `vala` chooses it from the bucket and vendor, the same
 way it chooses the Drift/Eval evaluation strategy.
 
-### Bifrost — vala's internal OLAP substrate
+### Bifrost — Wyrd's OLAP warehouse
 
 `Source` is the external read side ("Wyrd reads, never writes" — Doctrine #7).
-**Bifrost** is its internal counterpart: the analytical storage substrate `vala`
-uses to record Wyrd's **own** observations (drift events, eval records, OTel /
-GenAI traces, and any future internal analytical table). It is server-internal
-`vala` state, not an external system and not a vendor.
+**Bifrost** is its Wyrd-owned counterpart: the public OLAP warehouse surface and
+analytical storage substrate `vala` uses to record Wyrd's **own** observations
+(drift events, eval records, OTel / GenAI traces, audit projections, and future
+analytical tables). It is Wyrd server state, not an external system and not a
+vendor.
 
 **Bifrost is not a Card kind, and there is no `WarehouseCard`.** It is the
 general-case storage *shape*, not a registry entry. Per Doctrine #2 (one fact,
@@ -1010,8 +1011,10 @@ one owning Kind) and Doctrine #7, internal observation storage is owned wholly b
 `vala`; nothing an author writes points at it, so it has no card identity. The
 external read-shape buckets above (`object_store`, `sql_warehouse`, …) describe
 data Wyrd *reads*; `sql_warehouse` is an external `SourceKind` and is unrelated
-to Bifrost. Do not introduce a `warehouse` noun on any internal surface — it
-would collide with the external `sql_warehouse` Source semantics.
+to Bifrost. Use `Bifrost` for Wyrd's OLAP warehouse. Do not introduce a
+`warehouse` noun on public API paths, Python modules, Card kinds, resources, or
+internal surfaces — it would collide with the external `sql_warehouse` Source
+semantics.
 
 **Everything is a Bifrost table.** One table shape underlies every internal
 analytical table, with four reserved system columns: `wyrd_event_time`,
@@ -1028,12 +1031,32 @@ analytical table, with four reserved system columns: `wyrd_event_time`,
 The substrate is Apache Iceberg-managed Parquet in object storage, with Postgres
 as the Iceberg catalog and control plane and DataFusion as the query engine —
 consistent with Doctrine #4 (Postgres is control-plane only; analytical data
-lives in object store). Implementation lives in the `vala-bifrost` engine crate.
+lives in object store). Runtime ownership stays in `vala`: the `vala-bifrost`
+engine crate owns the Iceberg/DataFusion warehouse engine, `vala-http` exposes
+HTTP routes, `vala-ingest` owns gRPC ingest, and `wyrd-spec::vala::api` owns the
+public wire contracts. Python-visible Bifrost behavior lives in the approved
+Vala Python owner crate behind its optional `python` feature.
 
-**Public surface.** Bifrost is internal vocabulary, but two surfaces are public
-and stable: the `WYRD_VALA_*_BIFROST_*` error catalog (crossing HTTP / MCP /
-Python) and the single `wyrd.bifrost` Python SDK submodule. There is no
-`wyrd.warehouse` submodule (it would collide with `sql_warehouse`).
+**Public surface.** Bifrost is a stable Wyrd public surface across HTTP, gRPC,
+Python, generated schemas, MCP/agent documentation, and stable error codes.
+The public contract includes:
+
+- HTTP table management under `/api/v1/bifrost/tables`.
+- HTTP query surfaces under `/api/v1/observations/query` and versioned query
+  job routes when enabled.
+- gRPC ingest through `wyrd.v1.BifrostIngestService`.
+- The `wyrd.bifrost` Python SDK submodule.
+- Generated `wyrd-spec::vala::api` wire types such as `BifrostTableEntry`,
+  register-table types, query request/response types, and table scope/status
+  enums.
+- The `WYRD_VALA_*_BIFROST_*` error catalog crossing HTTP, MCP, Python, and
+  generated documentation boundaries.
+
+Bifrost permissions are resource-scoped through `BifrostTable`, `BifrostRecord`,
+and `BifrostQuery`. Caller-selected `SystemShared` tables require explicit
+administrative install permission, and generic record writes must not write
+reserved or system-managed Bifrost tables. There is no `wyrd.warehouse` submodule
+and no `WarehouseCard`.
 
 ### Trigger
 Fires an Operator. A Trigger declares when (`schedule`), what to evaluate

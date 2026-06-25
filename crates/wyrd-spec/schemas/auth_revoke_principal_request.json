@@ -18,7 +18,9 @@
     },
     "reason": {
       "description": "Required audit reason for the revocation.",
-      "type": "string"
+      "type": "string",
+      "maxLength": 2048,
+      "minLength": 1
     }
   },
   "additionalProperties": false,

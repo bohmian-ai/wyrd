@@ -52,6 +52,9 @@
   },
   "additionalProperties": false,
   "definitions": {
+    "InlineSecret": {
+      "type": "string"
+    },
     "SecretRef": {
       "description": "Pointer into a Wyrd runtime secret source. Production builds support environment variables, mounted files, and external secret-manager keys.",
       "oneOf": [
@@ -113,6 +116,31 @@
               "type": "string",
               "enum": [
                 "vault"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Plaintext secret value. **Testing only.** This variant is only compiled when `cfg(any(test, feature = \"test-utils\"))`. The `wyrd_auth::resolve` function rejects this variant at runtime outside test builds.\n\nExample: `{\"source\": \"inline\", \"value\": \"supersecret\"}`.",
+          "type": "object",
+          "required": [
+            "source",
+            "value"
+          ],
+          "properties": {
+            "source": {
+              "type": "string",
+              "enum": [
+                "inline"
+              ]
+            },
+            "value": {
+              "description": "The plaintext secret value. Wrapped in [`InlineSecret`] so it is redacted in `Debug` output and never accidentally logged or hashed.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/InlineSecret"
+                }
               ]
             }
           },

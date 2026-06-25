@@ -3,5 +3,6 @@
   "title": "IssuerUrl",
   "description": "Absolute OIDC issuer URL. Trailing slashes are normalized away.",
   "type": "string",
-  "format": "uri"
+  "format": "uri",
+  "pattern": "^https://"
 }

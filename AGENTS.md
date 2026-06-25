@@ -83,7 +83,7 @@ Locked cross-cutting decisions that any contributor must honor:
   owner crates. `python/py-wyrd` is the thin PyO3 module aggregator and Python
   package surface, not the place for duplicated business logic.
 - Current approved Python owner crates are `wyrd-interfaces`, `wyrd-cards`,
-  `wyrd-utils`, `wyrd-observe`, `vala-client`, `skald-prompt`,
+  `wyrd-utils`, `wyrd-observe`, `vala-sdk`, `skald-prompt`,
   `skald-runtime`, `skald-agent`, `skald-tool`, `skald-workflow`, and
   `wyrd-testing`. `wyrd-testing`'s `python` feature exposes the
   `WyrdTestServer` harness only; it is a test-tier crate and is never
@@ -106,7 +106,7 @@ Locked cross-cutting decisions that any contributor must honor:
   orchestration, provider-specific wire handling.
 - `crates/vala/*`: observability, evaluation, drift, tracing, archival query,
   OLAP, and background data-plane behavior. Python-visible Vala client
-  behavior lives in `vala-client` behind its optional `python` feature.
+  behavior lives in `vala-sdk` behind its optional `python` feature.
 - `crates/wyrd/*`: server, CLI, MCP, application integration, UI host.
 - `python/py-wyrd`: PyO3 module root, Python package exports, generated stubs,
   Python-facing tests, and submodule aggregation.

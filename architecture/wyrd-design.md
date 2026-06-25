@@ -1034,8 +1034,8 @@ consistent with Doctrine #4 (Postgres is control-plane only; analytical data
 lives in object store). Runtime ownership stays in `vala`: the `vala-bifrost`
 engine crate owns the Iceberg/DataFusion warehouse engine, `vala-http` exposes
 HTTP routes, `vala-ingest` owns gRPC ingest, and `wyrd-spec::vala::api` owns the
-public wire contracts. Python-visible Bifrost behavior lives in the approved
-Vala Python owner crate behind its optional `python` feature.
+public wire contracts. Python-visible Bifrost behavior lives in `vala-sdk` (the
+approved Vala Python owner crate) behind its optional `python` feature.
 
 **Public surface.** Bifrost is a stable Wyrd public surface across HTTP, gRPC,
 Python, generated schemas, MCP/agent documentation, and stable error codes.

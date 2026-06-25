@@ -1,9 +1,12 @@
 //! `EvalRecordObservation` — the typed observation an instrumented agent emits
 //! at evaluation points via `run.observe.eval(record, session_id=...)`.
 //!
-//! Identity comes from the chain `run_id -> run -> card`. The emit-plane token
-//! carries the eval card reference, so the record does not carry an `agent_id`
-//! field; duplicating identity invites drift.
+//! The emitting principal comes from the verified JWT; the card the record
+//! anchors to is the run's Target `card_ref` — client-asserted and
+//! server-authorized against the principal's card scope, not resolved from
+//! `run_id` (there is no run registry). See `wyrd-design.md`, "Observation
+//! identity — Card → Run → Observation". `run_id` is the opaque Run anchor; the
+//! record carries no `agent_id`, since duplicating identity invites drift.
 //!
 //! `session_id` is explicit at emit because run-to-session is many-to-many. A
 //! batch worker may be one run serving many sessions, so session is a fact about
@@ -20,9 +23,10 @@ use super::ids::{RecordId, RunId, SessionId, SpanId, TraceId};
 /// The eval observation an instrumented agent emits at evaluation points.
 ///
 /// Rides the same wire envelope as every other Vala observation
-/// (`vala_client::ObservationEnvelope`). The server resolves the eval card from
-/// `eval_ref`, validates `subject_ref` presence against the emit-plane card
-/// identity, and scores the record through the runtime engine.
+/// (`wyrd_spec::vala::observation::ObservationEnvelope`). The server resolves
+/// the eval card from `eval_ref`, validates `subject_ref` against the emitter's
+/// authorized card identity (the run's Target `card_ref`, authorized against the
+/// JWT principal's card scope), and scores the record through the runtime engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -34,8 +38,9 @@ pub struct EvalRecordObservation {
 
     /// Run identifier of the agent invocation that emitted the record.
     ///
-    /// The server resolves the agent / eval card identity via this id; the
-    /// record does not carry a separate `agent_id`.
+    /// The opaque Run anchor (`Run → Observation`). The card identity is the
+    /// run's authorized `card_ref`, not resolved from this id; the record carries
+    /// no separate `agent_id`.
     pub run_id: RunId,
 
     /// Optional session identifier supplied explicitly at emit.

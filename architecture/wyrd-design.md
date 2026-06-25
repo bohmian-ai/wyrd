@@ -97,10 +97,12 @@ enterprise governance-tier gate (policy + audit), not a token. No
     plane: a deployed service's observation/ingest writes are ordinary
     Auth-plane routes, authorized by the same JWT and a
     `Permission { resource, action }` like every other call. The legacy
-    per-card **governance token is removed** — the JWT's `principal.card_ref`
-    already proves which card is emitting, and `run_id` carries which action
-    emitted it, so a separate emit credential was redundant
-    double-credentialing.
+    per-card **governance token is removed** — the JWT proves the principal and
+    bounds its emittable **card scope** (the principal's own card ∪ its
+    `Service.components`); the observation envelope carries the run's Target
+    `card_ref`, which the server authorizes against that scope, and `run_id`
+    carries which action emitted it. A separate emit credential was redundant —
+    see "Observation identity — Card → Run → Observation".
     - **Auth** gates Wyrd API calls: `Permission { resource, action }` on the
       handler, stateless pubkey verify of the access token. Answers "is this
       principal allowed to hit this Wyrd route?" This covers data-plane ingest
@@ -399,6 +401,72 @@ Contract:
 
 Storage tier, query API, and CEL surface (e.g. a `chain.*` binding) are
 implementation concerns deferred to the runtime stage.
+
+#### Observation identity — `Card → Run → Observation`
+
+How an observation ties to a Run and a Card, and how the server resolves it.
+The lineage spine is fixed by the concept docs — `Card → Run`
+([`run.mdx`](../docs/src/content/docs/concepts/run.mdx): every Run is bound to a
+Card version, its **Target**) and `Run → Observation`
+([`observation.mdx`](../docs/src/content/docs/concepts/observation.mdx): every
+Observation anchors to the Card version **and** Run it belongs to). This section
+states only the runtime resolution, which lives in the server, not the concept
+docs.
+
+**A principal is not a card.** A Service or Agent principal is bound to one card
+(its `card_ref`), but a Service card *nests components* — each a card in its own
+right (e.g. Model A, Model B, a Prompt; `Service.components`). `wyrd_state["a"]
+.run()` and `wyrd_state["b"].run()` execute under the **same** JWT yet target
+**different** component cards, and a Run is specific to the card that opened it.
+So the JWT alone cannot say which card a record belongs to — the run's Target
+card must be carried on the wire.
+
+Every observation row carries:
+
+| Value | Source | Grain | Means |
+|---|---|---|---|
+| `card_ref` | **client asserts the run's Target card; server authorizes it** | **per row** | the Card-version anchor — *which* card |
+| `run_id` | client-generated per `.run()`; passed through opaquely | **per row** | the Run anchor — *which* execution |
+| `tenant_id` | server-stamped from the verified JWT | per request | the tenancy boundary |
+| `wyrd_request_id` | the propagated `Wyrd-Request-Id` (minted at first sighting) | per request | the request spine — one request spans **many** runs and hops |
+
+Resolution rule: **tenant comes from the token; `card_ref` is client-asserted
+and server-authorized; `run_id` and `wyrd_request_id` pass through untouched.**
+Consequences, stated so they stop drifting:
+
+- **`card_ref` and `run_id` are per-row columns on the observation payload, not
+  request metadata.** A client-side queue batches records from different runs —
+  and different cards — before it flushes, so one sealed batch (one
+  `wyrd_batch_id`) freely mixes them. The producer is keyed by **table only**; it
+  never splits a batch by card or run. The server therefore authorizes `card_ref`
+  **per row** (every distinct card in the batch must be in the principal's scope)
+  and stamps the per-request columns (`tenant_id`, `wyrd_request_id`, timestamps,
+  `wyrd_batch_id`) across the whole batch.
+
+- **`card_ref` is authorized, not trusted.** The server checks the asserted
+  `card_ref` against the principal's **card scope** — the principal's own card
+  plus the components its Service/Agent card declares (`Service.components`). A
+  `card_ref` outside that set is rejected: a principal may not attribute records
+  to a card it does not own. The scope can be resolved from the registry at
+  ingest or carried as a claim minted into the JWT at `/auth/token` — an
+  implementation choice deferred to the runtime stage.
+- **This is not the governance token.** `card_ref` is one field in the
+  observation envelope, authorized by the existing JWT plus the Service's
+  declared component graph — not a separate per-card credential (doctrine #18).
+  The token still proves the principal; it bounds a *set* of emittable cards,
+  and the envelope selects one within it.
+- **There is no run registry.** Runs are a client-side execution record
+  ([`run.mdx`](../docs/src/content/docs/concepts/run.mdx)); the server never
+  persists a run table and never resolves `run_id` back to a card — the card is
+  the authorized `card_ref` on the row. `run_id` is an **opaque** correlation id,
+  never a composite that encodes the card.
+- **`Card → Run → Observation` is the `(card_ref, run_id)` pair on the row;** the
+  request spine is the `wyrd_request_id` label that joins many runs across hops.
+- **Subject ≠ emitter is deferred to produced kinds.** A monitor emitting Drift/
+  Eval about a card *outside* its own scope carries an explicit `subject_ref`
+  with its own authorization — distinct from the in-scope `card_ref` above. That
+  lands with `vala-drift`/`vala-eval`, against a real consumer — not on the
+  Stage-3 `Record` envelope.
 
 ### Runtime authz: `POST /v1/authz/check`
 

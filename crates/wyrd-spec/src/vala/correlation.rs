@@ -3,8 +3,9 @@
 //! Wyrd links the agent lifecycle (develop → review → deploy → observe) on three
 //! axes: **code** (repo + commit, bridged before a commit by a dev-session id),
 //! **actor** (developer principal → service principal), and **card** (uid +
-//! version). Identity is server-resolved from the emit-plane token, so a client
-//! never stamps its own card/principal. It asserts only the **code axis** —
+//! version). The principal comes from the verified JWT and the card from the
+//! run's server-authorized `card_ref`, so a client never forges its own
+//! identity. It asserts only the **code axis** —
 //! which only the local environment knows — via [`CorrelationContext`].
 //!
 //! Code context is a property of a run, not of each record, so it rides the
@@ -22,9 +23,9 @@ use crate::vala::ids::DevSessionId;
 
 /// Client-asserted code context for one run.
 ///
-/// Stamped at run start from the local environment. The server resolves card,
-/// principal, tenant, and experiment from the authenticated emit-plane context;
-/// those are never carried here.
+/// Stamped at run start from the local environment. The server stamps principal
+/// and tenant from the verified JWT, and card and experiment from the run's
+/// authorized `card_ref`; those are never carried here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct CorrelationContext {
@@ -43,8 +44,9 @@ pub struct CorrelationContext {
 /// Reserved observation-table column names for the correlation block.
 ///
 /// Split by trust boundary: the code axis is client-asserted (from
-/// [`CorrelationContext`]); the identity axis is server-stamped at ingest from
-/// the emit-plane token and run registry. `run_id` and `data_tenant_id` are
+/// [`CorrelationContext`]); the identity axis is server-stamped at ingest:
+/// principal from the verified JWT, card from the run's server-authorized
+/// `card_ref` — there is no run registry. `run_id` and `data_tenant_id` are
 /// already covered by the run envelope and Bifrost system columns respectively.
 pub struct CorrelationColumns;
 

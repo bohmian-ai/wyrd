@@ -5,8 +5,8 @@ use std::path::Path;
 
 use schemars::schema_for;
 use wyrd_spec::auth::{
-    CallbackQuery, IssuerUrl, LoginInitResponse, PrincipalKind, RevokePrincipalRequest,
-    RevokePrincipalResponse, TokenRequest, TokenResponse, Url,
+    AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, PrincipalKind,
+    RevokePrincipalRequest, RevokePrincipalResponse, TokenRequest, TokenResponse,
 };
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::card::artifact::{ArtifactSpec, FrameworkAdapterRef};
@@ -136,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Auth contracts.
     write::<TokenRequest>(out, golden, "auth_token_request")?;
     write::<TokenResponse>(out, golden, "auth_token_response")?;
-    write::<Url>(out, golden, "auth_url")?;
+    write::<AbsoluteUrl>(out, golden, "auth_url")?;
     write::<IssuerUrl>(out, golden, "auth_issuer_url")?;
     write::<LoginInitResponse>(out, golden, "auth_login_init_response")?;
     write::<CallbackQuery>(out, golden, "auth_callback_query")?;

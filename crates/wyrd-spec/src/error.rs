@@ -463,10 +463,10 @@ pub enum WyrdError {
         details: serde_json::Value,
     },
     /// OIDC callback state is missing, invalid, or replayed.
-    #[error("[WYRD_AUTH_401_INVALID_STATE] {message}")]
+    #[error("[WYRD_AUTH_400_INVALID_STATE] {message}")]
     #[wyrd_error(
-        code = "WYRD_AUTH_401_INVALID_STATE",
-        status = 401,
+        code = "WYRD_AUTH_400_INVALID_STATE",
+        status = 400,
         title = "Invalid OIDC state",
         remediation = "Restart the login flow. The callback state is single-use and must match the server-stored login state."
     )]
@@ -477,10 +477,10 @@ pub enum WyrdError {
         details: serde_json::Value,
     },
     /// OIDC ID token nonce did not match the stored login nonce.
-    #[error("[WYRD_AUTH_401_INVALID_NONCE] {message}")]
+    #[error("[WYRD_AUTH_400_INVALID_NONCE] {message}")]
     #[wyrd_error(
-        code = "WYRD_AUTH_401_INVALID_NONCE",
-        status = 401,
+        code = "WYRD_AUTH_400_INVALID_NONCE",
+        status = 400,
         title = "Invalid OIDC nonce",
         remediation = "Restart the login flow. The ID token nonce must match the server-stored login nonce."
     )]

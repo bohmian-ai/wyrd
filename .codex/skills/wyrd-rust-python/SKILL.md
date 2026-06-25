@@ -82,7 +82,7 @@ Load these references only when relevant:
   behind its optional `python` feature.
 - `crates/vala/*`: observability, evaluation, drift, tracing, archival query,
   OLAP, and background data-plane behavior. Python-visible Vala client
-  behavior lives in `vala-client` behind its optional `python` feature.
+  behavior lives in `vala-sdk` behind its optional `python` feature.
 - `crates/wyrd/*`: server, CLI, MCP, application integration, UI host,
   `wyrd-interfaces`, and `wyrd-cards`.
 - `python/py-wyrd`: thin PyO3 module aggregator, Python package exports,

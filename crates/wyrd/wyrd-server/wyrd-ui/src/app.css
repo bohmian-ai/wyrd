@@ -1,23 +1,12 @@
+@import url('https://fonts.googleapis.com/css2?family=Archivo+Black&family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
 @import 'tailwindcss';
-@import '@skeletonlabs/skeleton';
-@import '@skeletonlabs/skeleton/themes/cerberus';
-
-@theme {
-  --color-wyrd-ink: #0b0b0e;
-  --color-wyrd-paper: #f4f1e8;
-  --color-wyrd-accent: #ff5a3c;
-  --shadow-brutal: 6px 6px 0 0 var(--color-wyrd-ink);
-  --radius-brutal: 0px;
-}
-
-:root {
-  color-scheme: dark;
-}
+@import '../brand/theme.css';
 
 html,
 body {
-  min-height: 100%;
   margin: 0;
-  background: var(--color-wyrd-ink);
-  color: var(--color-wyrd-paper);
+  min-height: 100%;
+  /* dark-bg fallback to avoid a flash before ModeProvider paints the themed surface */
+  background: #0e0e0e;
+  font-family: var(--font-sans);
 }

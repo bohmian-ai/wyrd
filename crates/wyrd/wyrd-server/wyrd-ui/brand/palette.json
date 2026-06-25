@@ -1,5 +1,52 @@
 {
-  "ink": "#0b0b0e",
-  "paper": "#f4f1e8",
-  "accent": "#ff5a3c"
+  "name": "Wyrd",
+  "description": "Canonical token source for the Wyrd neobrutalist design system. Edit here, then run `pnpm tokens` to regenerate theme.css. Consumed directly by agents/A2UI; the human/visual reference is DESIGN.md + ../../../.dev/assets/wyrd-ui-source-of-truth.html.",
+  "modes": ["light", "dark"],
+  "scale": {
+    "fonts": {
+      "sans": "\"Archivo\", system-ui, sans-serif",
+      "display": "\"Archivo Black\", sans-serif",
+      "mono": "\"JetBrains Mono\", monospace"
+    },
+    "radius": "5px",
+    "shadow": { "sm": "3px", "md": "6px", "lg": "10px" }
+  },
+  "tokens": {
+    "--bg":            { "group": "surface", "light": "#f4f4f5", "dark": "#0e0e0e", "role": "page / main background" },
+    "--surface":       { "group": "surface", "light": "#ffffff", "dark": "#17171b", "role": "card / table / header surface" },
+    "--surface-2":     { "group": "surface", "light": "#ececef", "dark": "#1f1f24", "role": "insets, hover, pills, code blocks" },
+
+    "--border":        { "group": "ink", "light": "#0b0b0e", "dark": "#313139", "role": "2px ink borders (always present, never hairline)" },
+    "--shadow":        { "group": "ink", "light": "#0b0b0e", "dark": "#2a2a31", "role": "hard-offset zero-blur shadow color" },
+
+    "--text":          { "group": "text", "light": "#14141a", "dark": "#d6d6dc", "role": "body text — LOCKED for readability (~15:1 light, ~12:1 dark)" },
+    "--muted":         { "group": "text", "light": "#6b6b76", "dark": "#8a8a95", "role": "labels, metadata, secondary text" },
+
+    "--rune":          { "group": "rune", "light": "#8b5cf6", "dark": "#241b40", "role": "brand violet fill (button/chip), panel top-bar" },
+    "--rune-strong":   { "group": "rune", "light": "#7c3aed", "dark": "#a78bfa", "role": "links, selected refs, big stats, llm span kind, heat ramp" },
+    "--rune-soft":     { "group": "rune", "light": "#f1ecfd", "dark": "#241b40", "role": "selection / hover row wash, panel backgrounds" },
+    "--rune-btn":      { "group": "rune", "light": "#8b5cf6", "dark": "#a78bfa", "role": "rune button fill" },
+    "--rune-btn-ink":  { "group": "rune", "light": "#ffffff", "dark": "#0b0b0e", "role": "text on rune button" },
+
+    "--lime":          { "group": "acid", "light": "#c5f23c", "dark": "#c5f23c", "role": "acid accent / primary action fill (signal, never default text)" },
+    "--lime-ink":      { "group": "acid", "light": "#0b0b0e", "dark": "#0b0b0e", "role": "text on lime fills" },
+    "--lime-text":     { "group": "acid", "light": "#4a7a06", "dark": "#c5f23c", "role": "lime used as text on a surface (darkened on light)" },
+
+    "--client":        { "group": "line", "light": "#c5f23c", "dark": "#c5f23c", "role": "the Line — client/runtime plane fill" },
+    "--client-bar":    { "group": "line", "light": "#c5f23c", "dark": "#c5f23c", "role": "client/agent kind left-bar + indicators" },
+    "--server":        { "group": "line", "light": "#f2a23c", "dark": "#f2a23c", "role": "the Line — server/enterprise plane fill" },
+    "--server-bar":    { "group": "line", "light": "#ec8b14", "dark": "#f2a23c", "role": "server/tool kind left-bar + indicators (darkened on light)" },
+    "--control":       { "group": "line", "light": "#7cc4e8", "dark": "#6fb3d6", "role": "the Line — control/deploy plane fill" },
+    "--control-bar":   { "group": "line", "light": "#2f6f9e", "dark": "#6fb3d6", "role": "control/retrieval kind left-bar + indicators (darkened on light)" },
+
+    "--ok":            { "group": "status", "light": "#2f9e44", "dark": "#7ee081", "role": "healthy / pass / success" },
+    "--warn":          { "group": "status", "light": "#ec8b14", "dark": "#f2a23c", "role": "drift / caution / warning" },
+    "--danger":        { "group": "status", "light": "#d2402a", "dark": "#e8615a", "role": "fail / error / removed (overrides kind)" },
+
+    "--hero-bg":       { "group": "hero", "light": "#8b5cf6", "dark": "#241b40", "role": "loud hero block background" },
+    "--hero-ink":      { "group": "hero", "light": "#ffffff", "dark": "#e9e2ff", "role": "text on hero block" },
+    "--ink-on-fill":   { "group": "hero", "light": "#0b0b0e", "dark": "#0b0b0e", "role": "always-black text on bright fills" },
+
+    "--r":             { "group": "geometry", "light": "5px", "dark": "5px", "role": "radius — locked at 5px (true circles only for dots/avatars)" }
+  }
 }

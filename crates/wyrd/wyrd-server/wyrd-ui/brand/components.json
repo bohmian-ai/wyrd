@@ -1,0 +1,94 @@
+{
+  "$comment": "Machine-readable component contracts for the Wyrd design system. `status: built` entries are implemented in src/lib/components and registered in src/lib/registry.ts (parity enforced by registry.test.ts). `status: specced` entries are designed (see .dev/assets/wyrd-ui-source-of-truth.html) and built per-feature against this contract. A dynamic-layout/A2UI renderer consumes this file to compose UIs from standardized pieces.",
+  "altitudes": {
+    "quiet": "workbench default — 3px hard-offset shadow, restrained accent",
+    "raised": "drilldown panels — 6px shadow + 4px kind/status top-bar",
+    "loud": "hero / landing only — 10px shadow, tricolor rail, display type"
+  },
+  "components": {
+    "Card": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": ["--surface", "--border", "--shadow", "--muted", "--r"],
+      "props": { "variant": "quiet | raised | wide" },
+      "variants": ["quiet", "raised", "wide"],
+      "anatomy": ["head", "body"],
+      "rules": [
+        "2px border always",
+        "3px shadow quiet / 6px shadow raised",
+        "5px radius",
+        "wide spans grid-column 1 / -1"
+      ]
+    },
+    "Button": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": ["--border", "--shadow", "--surface", "--text", "--lime", "--lime-ink", "--rune-btn", "--rune-btn-ink", "--r"],
+      "props": { "variant": "primary | rune | ghost" },
+      "variants": ["primary", "rune", "ghost"],
+      "anatomy": ["label"],
+      "rules": [
+        "primary = lime fill (the one strong action)",
+        "rune = brand violet fill",
+        "ghost = surface fill, no accent",
+        "press interaction: hover lifts to 5px, active sinks to 1px"
+      ]
+    },
+    "Badge": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": ["--ok", "--warn", "--danger", "--muted", "--surface"],
+      "props": { "tone": "neutral | ok | warn | danger" },
+      "variants": ["neutral", "ok", "warn", "danger"],
+      "anatomy": ["label"],
+      "rules": [
+        "tone is a status signal, not decoration",
+        "2px border in tone color, 12% tinted fill, 4px radius"
+      ]
+    },
+    "Table": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": ["--surface", "--border", "--shadow", "--muted", "--text", "--rune-soft", "--r"],
+      "props": {},
+      "variants": [],
+      "anatomy": ["thead", "tbody"],
+      "rules": [
+        "header is white surface (not gray) relying on the 2px bottom border",
+        "selection wash uses --rune-soft (tr.sel), never lime",
+        "2px row dividers, last row borderless"
+      ]
+    },
+    "KpiTile": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": ["--muted", "--text", "--ok", "--danger"],
+      "props": { "label": "string", "value": "string | number", "delta": "string?", "trend": "up | down | flat" },
+      "variants": ["up", "down", "flat"],
+      "anatomy": ["label", "value", "delta", "spark"],
+      "rules": [
+        "delta trend up = --ok, down = --danger",
+        "min-width:0 + overflow:hidden so wide values never blow out a grid track"
+      ]
+    },
+
+    "Bars": { "status": "specced", "altitude": "quiet", "tokens": ["--border", "--text", "--muted"], "rules": ["inline SVG, bar fill from a kind/line token, value + category labels"] },
+    "Lines": { "status": "specced", "altitude": "quiet", "tokens": ["--border", "--surface", "--muted"], "rules": ["multi-series, dashed gridlines, series stroke from kind tokens (e.g. p50 blue / p95 violet / p99 red)"] },
+    "Spark": { "status": "specced", "altitude": "quiet", "tokens": ["--ok", "--danger"], "rules": ["90x24 polyline, no fill, color = trend sentiment"] },
+    "Histo": { "status": "specced", "altitude": "raised", "tokens": ["--control-bar", "--rune-strong", "--surface"], "rules": ["grouped reference (control) vs current (violet) distribution bars"] },
+    "Trend": { "status": "specced", "altitude": "raised", "tokens": ["--rune-strong", "--danger"], "rules": ["line with dashed danger threshold; points above threshold turn danger"] },
+    "Heatmap": { "status": "specced", "altitude": "quiet", "tokens": ["--rune-strong", "--surface-2"], "rules": ["intensity ramp uses violet (--rune-strong), NEVER lime — lime can't darken on white"] },
+    "Dist": { "status": "specced", "altitude": "quiet", "tokens": ["--client", "--server", "--control"], "rules": ["stacked plane distribution using the Line colors + legend"] },
+    "Tree": { "status": "specced", "altitude": "quiet", "tokens": ["--client-bar", "--server-bar", "--control-bar", "--border"], "rules": ["native details/summary, 3px kind left-bar on leaves, dashed nested guide"] },
+    "Dropdown": { "status": "specced", "altitude": "quiet", "tokens": ["--surface", "--border", "--shadow", "--rune-soft", "--rune-strong"], "rules": ["2px border menu, 3px shadow, selected option rune-soft wash + rune-strong tick"] },
+    "TraceTable": { "status": "specced", "altitude": "quiet", "tokens": ["--client-bar", "--rune-strong", "--server-bar", "--control-bar", "--ok", "--warn", "--danger"], "rules": ["op left-bar by span kind (agent=client, llm=violet, tool=server, retrieval=control); status column ok/warn/err"] },
+    "Waterfall": { "status": "specced", "altitude": "quiet", "tokens": ["--client-bar", "--rune-strong", "--server-bar", "--control-bar", "--surface", "--text"], "rules": ["ruler + positioned span bars; bar = kind border + color-mix kind tint; error overrides to danger"] },
+    "SpanPanel": { "status": "specced", "altitude": "raised", "tokens": ["--rune-strong", "--surface", "--border", "--muted"], "rules": ["raised drawer, top-bar = span kind color, kv attributes + event timeline + code preview"] },
+    "EvalPanel": { "status": "specced", "altitude": "raised", "tokens": ["--rune-strong", "--ok", "--warn", "--danger"], "rules": ["raised drawer, big score, metric bars vs threshold (ok/danger), judge rationale"] },
+    "DriftPanel": { "status": "specced", "altitude": "raised", "tokens": ["--danger", "--control-bar", "--rune-strong"], "rules": ["raised drawer, top-bar turns --danger when drifted (status overrides kind), histogram + trend"] },
+    "Shell": { "status": "specced", "altitude": "quiet", "tokens": ["--surface", "--border", "--bg"], "rules": ["212px sidebar + topbar + main grid; 3px outer border"] },
+    "Sidebar": { "status": "specced", "altitude": "quiet", "tokens": ["--surface", "--border", "--rune-soft", "--rune-strong", "--lime"], "rules": ["nav groups; active item rune-soft wash + border + 2px shadow; lime brand dot"] },
+    "Topbar": { "status": "specced", "altitude": "quiet", "tokens": ["--surface", "--border", "--surface-2", "--ok"], "rules": ["breadcrumb + search + env pill with status dot"] },
+    "Hero": { "status": "specced", "altitude": "loud", "tokens": ["--hero-bg", "--hero-ink", "--shadow", "--lime", "--client-bar", "--server-bar", "--control-bar"], "rules": ["display type, 3px border, 10px shadow, tricolor rail; landing only, never beside the workbench"] }
+  }
+}

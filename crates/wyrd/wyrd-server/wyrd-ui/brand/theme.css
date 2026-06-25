@@ -1,7 +1,136 @@
+/* GENERATED FILE — do not edit by hand.
+ * Source of truth: brand/palette.json. Regenerate with `pnpm tokens`.
+ * Token names are identical to .dev/assets/wyrd-ui-source-of-truth.html. */
+
 @theme {
-  --color-wyrd-ink: #0b0b0e;
-  --color-wyrd-paper: #f4f1e8;
-  --color-wyrd-accent: #ff5a3c;
-  --shadow-brutal: 6px 6px 0 0 var(--color-wyrd-ink);
-  --radius-brutal: 0px;
+  --font-sans: "Archivo", system-ui, sans-serif;
+  --font-display: "Archivo Black", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+  --radius-wy: 5px;
+  --shadow-wy-sm: 3px 3px 0 0 var(--shadow);
+  --shadow-wy-md: 6px 6px 0 0 var(--shadow);
+  --shadow-wy-lg: 10px 10px 0 0 var(--shadow);
+  /* mode-aware color utilities: bg-*, text-*, border-* resolve per [data-mode] */
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
+  --color-shadow: var(--shadow);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+  --color-rune: var(--rune);
+  --color-rune-strong: var(--rune-strong);
+  --color-rune-soft: var(--rune-soft);
+  --color-rune-btn: var(--rune-btn);
+  --color-rune-btn-ink: var(--rune-btn-ink);
+  --color-lime: var(--lime);
+  --color-lime-ink: var(--lime-ink);
+  --color-lime-text: var(--lime-text);
+  --color-client: var(--client);
+  --color-client-bar: var(--client-bar);
+  --color-server: var(--server);
+  --color-server-bar: var(--server-bar);
+  --color-control: var(--control);
+  --color-control-bar: var(--control-bar);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-danger: var(--danger);
+  --color-hero-bg: var(--hero-bg);
+  --color-hero-ink: var(--hero-ink);
+  --color-ink-on-fill: var(--ink-on-fill);
+}
+
+[data-mode="light"] {
+  /* surface */
+  --bg: #f4f4f5;
+  --surface: #ffffff;
+  --surface-2: #ececef;
+
+  /* ink */
+  --border: #0b0b0e;
+  --shadow: #0b0b0e;
+
+  /* text */
+  --text: #14141a;
+  --muted: #6b6b76;
+
+  /* rune */
+  --rune: #8b5cf6;
+  --rune-strong: #7c3aed;
+  --rune-soft: #f1ecfd;
+  --rune-btn: #8b5cf6;
+  --rune-btn-ink: #ffffff;
+
+  /* acid */
+  --lime: #c5f23c;
+  --lime-ink: #0b0b0e;
+  --lime-text: #4a7a06;
+
+  /* line */
+  --client: #c5f23c;
+  --client-bar: #c5f23c;
+  --server: #f2a23c;
+  --server-bar: #ec8b14;
+  --control: #7cc4e8;
+  --control-bar: #2f6f9e;
+
+  /* status */
+  --ok: #2f9e44;
+  --warn: #ec8b14;
+  --danger: #d2402a;
+
+  /* hero */
+  --hero-bg: #8b5cf6;
+  --hero-ink: #ffffff;
+  --ink-on-fill: #0b0b0e;
+
+  /* geometry */
+  --r: 5px;
+}
+[data-mode="dark"] {
+  /* surface */
+  --bg: #0e0e0e;
+  --surface: #17171b;
+  --surface-2: #1f1f24;
+
+  /* ink */
+  --border: #313139;
+  --shadow: #2a2a31;
+
+  /* text */
+  --text: #d6d6dc;
+  --muted: #8a8a95;
+
+  /* rune */
+  --rune: #241b40;
+  --rune-strong: #a78bfa;
+  --rune-soft: #241b40;
+  --rune-btn: #a78bfa;
+  --rune-btn-ink: #0b0b0e;
+
+  /* acid */
+  --lime: #c5f23c;
+  --lime-ink: #0b0b0e;
+  --lime-text: #c5f23c;
+
+  /* line */
+  --client: #c5f23c;
+  --client-bar: #c5f23c;
+  --server: #f2a23c;
+  --server-bar: #f2a23c;
+  --control: #6fb3d6;
+  --control-bar: #6fb3d6;
+
+  /* status */
+  --ok: #7ee081;
+  --warn: #f2a23c;
+  --danger: #e8615a;
+
+  /* hero */
+  --hero-bg: #241b40;
+  --hero-ink: #e9e2ff;
+  --ink-on-fill: #0b0b0e;
+
+  /* geometry */
+  --r: 5px;
 }

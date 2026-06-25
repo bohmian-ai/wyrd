@@ -179,10 +179,13 @@ pub struct CallbackQuery {
 /// URL validation failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UrlParseError {
+    /// The string is not a valid URL.
     #[error("URL failed to parse: {0}")]
     ParseFailed(String),
+    /// The URL has no authority (host) component.
     #[error("URL must have an authority (host)")]
     NoHost,
+    /// The URL scheme is not permitted by this validator.
     #[error("URL scheme '{0}' is not allowed")]
     DisallowedScheme(String),
 }

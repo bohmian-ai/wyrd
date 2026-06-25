@@ -68,6 +68,30 @@ Three discrete registers. They never blend on one screen.
 
 ---
 
+## Layout & responsiveness
+
+Wyrd is a **dense developer workbench**, designed **laptop/monitor-first** (the target user
+is on a cluster, reading traces and tables). We do **not** redesign for phones — but every
+piece must **degrade gracefully** down to a narrow viewport, never clip or overflow its frame.
+
+- **Floor: ~768px** renders *well*. Below that, surfaces **stack and scroll** — they stay
+  usable, not pretty. No separate mobile layout, no hamburger nav, no hidden content.
+- **Components are container-robust, not viewport-coupled.** A component must not assume its
+  container is wide — it's composed into cards, panels, and (later) A2UI layouts of unknown
+  width. Prefer intrinsic robustness — `flex-wrap`, `min-width: 0` so flex children can
+  shrink, `overflow-x: auto` on dense tabular content — and **container queries**
+  (`container-type: inline-size`) over viewport `@media` for component-level adaptation.
+  Reserve viewport `@media` for true page-level layout (route pages, the styleguide harness).
+- **Dense data scrolls, it doesn't crush.** Multi-column tables and the trace waterfall keep
+  their column widths and gain a horizontal scroll region rather than compressing to
+  illegibility.
+- **The app shell collapses, it doesn't disappear.** Below the floor the `Shell` stacks the
+  sidebar above the content; nothing is removed.
+- **Geometry is invariant across sizes.** 5px radius, 2px/3px borders, and the hard-offset
+  shadow dial never change with screen width — only layout flow does.
+
+---
+
 ## Color semantics — "the Line"
 
 Three plane colors encode the Wyrd architecture. Use them for identity, not decoration.

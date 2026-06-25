@@ -50,6 +50,7 @@
   );
 </script>
 
+<div class="wy-wfscroll">
 <div class="wy-wf">
   <div class="wfhead">
     <div class="lbl">span · kind</div>
@@ -81,11 +82,16 @@
     </div>
   {/each}
 </div>
+</div>
 
 <style>
+  .wy-wfscroll {
+    overflow-x: auto;
+  }
   .wy-wf {
     font-family: var(--fm);
     font-size: 10.5px;
+    min-width: 380px;
   }
   .wfhead {
     display: grid;

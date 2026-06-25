@@ -29,6 +29,7 @@
     padding: 10px 14px;
     font-family: var(--fm);
     color: var(--text);
+    flex-wrap: wrap;
   }
   .crumbs {
     display: flex;
@@ -36,6 +37,8 @@
     gap: 7px;
     font-size: 11px;
     min-width: 0;
+    flex-shrink: 1;
+    overflow: hidden;
   }
   .crumb {
     color: var(--muted);
@@ -52,6 +55,10 @@
     display: flex;
     align-items: center;
     gap: 10px;
+    min-width: 0;
+    flex: 1 1 auto;
+    justify-content: flex-end;
+    flex-wrap: wrap;
   }
   .search {
     font-family: var(--fm);
@@ -61,7 +68,8 @@
     border-radius: var(--r);
     padding: 5px 9px;
     background: var(--surface-2);
-    min-width: 180px;
+    flex: 1 1 140px;
+    min-width: 0;
   }
   .search::placeholder {
     color: var(--muted);

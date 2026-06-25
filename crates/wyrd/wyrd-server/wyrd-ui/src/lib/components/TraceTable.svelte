@@ -81,14 +81,19 @@
     border-radius: var(--r);
     background: var(--surface);
     box-shadow: 3px 3px 0 0 var(--shadow);
-    overflow: hidden;
+    overflow-x: auto;
   }
   table {
     width: 100%;
+    min-width: 560px;
     border-collapse: separate;
     border-spacing: 0;
     font-family: var(--fm);
     font-size: 11px;
+  }
+  th,
+  td {
+    white-space: nowrap;
   }
   th {
     text-align: left;

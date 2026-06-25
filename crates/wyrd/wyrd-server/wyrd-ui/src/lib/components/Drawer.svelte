@@ -33,7 +33,10 @@
 
 <style>
   .wy-drawer {
-    width: 340px;
+    /* Fill the parent up to the design width; never overflow it. A consumer (e.g. a
+       full-width mobile overlay) can widen the cap via --drawer-w. */
+    width: 100%;
+    max-width: var(--drawer-w, 340px);
     border: 2px solid var(--border);
     border-radius: var(--r);
     background: var(--surface);

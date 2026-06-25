@@ -386,4 +386,23 @@
     flex-wrap: wrap;
     align-items: flex-start;
   }
+  .panels > :global(.wy-drawer) {
+    flex: 0 1 340px;
+    min-width: 0;
+  }
+
+  /* Harness is laptop/monitor-first; below these widths it stacks rather than crushes. */
+  @media (max-width: 1024px) {
+    .cols {
+      grid-template-columns: 1fr;
+    }
+  }
+  @media (max-width: 640px) {
+    .grid {
+      grid-template-columns: 1fr;
+    }
+    .kpis {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
 </style>

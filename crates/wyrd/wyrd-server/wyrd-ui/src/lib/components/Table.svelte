@@ -14,7 +14,11 @@
     border-radius: var(--r);
     background: var(--surface);
     box-shadow: 3px 3px 0 0 var(--shadow);
-    overflow: hidden;
+    overflow-x: auto;
+  }
+  .wy-table :global(th),
+  .wy-table :global(td) {
+    white-space: nowrap;
   }
   .wy-table :global(table) {
     width: 100%;

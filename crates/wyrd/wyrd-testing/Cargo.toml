@@ -19,6 +19,7 @@ ed25519-dalek = { workspace = true, features = ["pkcs8"] }
 http = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 reqwest = { workspace = true }
+url = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

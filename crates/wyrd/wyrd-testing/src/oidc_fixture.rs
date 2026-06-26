@@ -58,14 +58,12 @@ impl OidcIssuerFixture {
             .build()
             .expect("reqwest client builds");
 
-        let discovery_url = format!(
-            "{}/.well-known/openid-configuration",
-            issuer_base.trim_end_matches('/')
-        );
-        let provider =
-            OidcProvider::discover(issuer_base.parse().expect("issuer URL parses"), &http)
+        let provider = {
+            let discover_client = reqwest::Client::new();
+            OidcProvider::discover(issuer_base.parse().expect("issuer URL parses"), discover_client)
                 .await
-                .unwrap_or_else(|e| panic!("OIDC discovery failed for {issuer_base}: {e}"));
+                .unwrap_or_else(|e| panic!("OIDC discovery failed for {issuer_base}: {e}"))
+        };
 
         let issuer = IssuerUrl::new_for_tests(issuer_base);
 
@@ -234,16 +232,6 @@ impl OidcIssuerFixture {
             .token_endpoint
             .as_ref()
             .expect("provider exposes a token endpoint");
-
-        let mut params = vec![
-            ("grant_type", "client_credentials"),
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-        ];
-        let aud_scope = format!("openid audience:{audience}");
-        if !audience.is_empty() {
-            params.push(("scope", "openid"));
-        }
 
         let resp = self
             .http

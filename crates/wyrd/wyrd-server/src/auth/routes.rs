@@ -59,7 +59,7 @@ async fn token(
             let prefix = parsed.prefix.clone();
             let exchanged = ExchangeApiKey {
                 issuing_key,
-                settings: Default::default(),
+                settings: state.token_exchange_settings.clone(),
             }
             .execute(&mut conn, SecretString::from(api_key.expose().to_owned()))
             .await;
@@ -94,7 +94,7 @@ async fn token(
                 issuing_key,
                 verifier,
                 permission_check: state.permission_check.clone(),
-                settings: Default::default(),
+                settings: state.token_exchange_settings.clone(),
             }
             .execute(
                 &mut conn,
@@ -116,7 +116,7 @@ async fn token(
             let issuing_key = state.issuing_key.clone().ok_or_else(auth_not_configured)?;
             let exchanged = RefreshTokens {
                 issuing_key,
-                settings: Default::default(),
+                settings: state.token_exchange_settings.clone(),
             }
             .execute(&mut conn, SecretString::from(secret), req_id)
             .await
@@ -140,8 +140,10 @@ async fn token(
             Ok(Json(exchanged))
         }
         TokenRequest::JwtBearer { assertion, tenant } => {
-            let exchanged = JwtBearer::default()
-                .execute(
+            let exchanged = JwtBearer {
+                settings: state.token_exchange_settings.clone(),
+            }
+            .execute(
                     &state,
                     &headers,
                     assertion.into_secret_string(),

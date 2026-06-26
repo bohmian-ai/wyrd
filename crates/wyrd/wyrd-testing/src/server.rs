@@ -15,12 +15,14 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use uuid::Uuid;
+use chrono::Duration as ChronoDuration;
 use wyrd_auth_check::{AuthzCheckRequest, AuthzCheckResponse, PolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::{
     Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
     public_key_from_pem,
 };
+use wyrd_server::auth::exchange_api_key::TokenExchangeSettings;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::{PrincipalId, RbacCheck, RoleRef};
 use wyrd_semver::VersionBlock;
@@ -81,6 +83,8 @@ pub struct WyrdTestServerBuilder {
     allow_preview_auth: bool,
     storage_settings: Option<StorageSettings>,
     storage_handle: Option<Arc<wyrd_storage::StorageHandle>>,
+    access_ttl: Option<ChronoDuration>,
+    auth_verify_settings: Option<WyrdAuthVerifySettings>,
 }
 
 impl Default for WyrdTestServerBuilder {
@@ -91,6 +95,8 @@ impl Default for WyrdTestServerBuilder {
             allow_preview_auth: true,
             storage_settings: None,
             storage_handle: None,
+            access_ttl: None,
+            auth_verify_settings: None,
         }
     }
 }
@@ -701,6 +707,28 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Override the access token TTL for all exchange paths.
+    ///
+    /// Use this in TTL-expiry journey tests to mint short-lived tokens without
+    /// waiting for the 15-minute production default. Pair with
+    /// [`Self::with_auth_verify_settings`] to reduce the clock-skew tolerance.
+    #[must_use]
+    pub fn with_access_ttl(mut self, ttl: ChronoDuration) -> Self {
+        self.access_ttl = Some(ttl);
+        self
+    }
+
+    /// Replace the token verifier settings.
+    ///
+    /// Use this to reduce `allowed_clock_skew` and `cache_ttl` to near-zero for
+    /// TTL journey tests so a real `exp` can be observed without a multi-minute
+    /// sleep.
+    #[must_use]
+    pub fn with_auth_verify_settings(mut self, settings: WyrdAuthVerifySettings) -> Self {
+        self.auth_verify_settings = Some(settings);
+        self
+    }
+
     /// Build and start an in-process server.
     ///
     /// # Errors
@@ -760,12 +788,24 @@ impl WyrdTestServerBuilder {
         let resolver = Arc::new(SqlPermissionResolver::new(Arc::new(
             fixture.app_pool().clone(),
         )));
+        let verify_settings = self
+            .auth_verify_settings
+            .unwrap_or_default();
         let verifier = Arc::new(TokenVerifier::new(
             decoding_keys,
             "wyrd",
             resolver,
-            WyrdAuthVerifySettings::default(),
+            verify_settings,
         ));
+
+        let exchange_settings = if let Some(ttl) = self.access_ttl {
+            TokenExchangeSettings {
+                access_ttl: ttl,
+                ..TokenExchangeSettings::default()
+            }
+        } else {
+            TokenExchangeSettings::default()
+        };
 
         let mut state = AppState::new(
             fixture.app_pool().clone(),
@@ -773,7 +813,8 @@ impl WyrdTestServerBuilder {
             storage,
         )
         .with_preview_auth(self.allow_preview_auth)
-        .with_auth_handles(Arc::clone(&issuing_key), Arc::clone(&verifier));
+        .with_auth_handles(Arc::clone(&issuing_key), Arc::clone(&verifier))
+        .with_token_exchange_settings(exchange_settings);
         state.permission_check = Arc::new(RbacCheck);
         state.audit_writer = self
             .audit_writer

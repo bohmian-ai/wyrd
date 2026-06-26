@@ -24,9 +24,10 @@ Options:
                                  SELECTOR may be a basename, relative path,
                                  or prefix like 05.
   --per-plan-check CMD           Per-slice check command. Repeatable.
-                                 Default: cargo fmt --all -- --check
-                                          mise run check
+                                 Must be a mise task.
+                                 Default: mise run fmt
   --final-check CMD              Final check command. Repeatable.
+                                 Must be a mise task.
                                  Default: mise run pre-pr
   --implementer-model MODEL      First-pass implementer model.
                                  Default: gpt-5.4-mini
@@ -236,6 +237,67 @@ append_file_block() {
   } >>"$out"
 }
 
+append_reference_paths() {
+  local out=$1
+  local context_file
+
+  {
+    printf '\n## Reference Paths\n\n'
+    printf 'Read these files by path only when they are relevant to the current slice:\n\n'
+    printf -- '- %s\n' 'AGENTS.md'
+    printf -- '- %s\n' 'architecture/wyrd-design.md'
+  } >>"$out"
+
+  if ((${#CONTEXT_FILES[@]} > 0)); then
+    {
+      printf '\nPlan-directory reference files available by path:\n\n'
+      for context_file in "${CONTEXT_FILES[@]}"; do
+        printf -- '- %s\n' "$(relpath "$context_file")"
+      done
+    } >>"$out"
+  fi
+}
+
+write_slice_manifest() {
+  local out=$1
+  local plan_file=$2
+  local token path
+  local paths=()
+
+  while IFS= read -r token; do
+    token=${token#./}
+    token=${token%:}
+    token=${token%,}
+    token=${token%;}
+    token=${token%.}
+    token=${token%\)}
+    token=${token%\]}
+    token=${token%\"}
+    token=${token#\"}
+    token=${token%\`}
+    token=${token#\`}
+    [[ -n "$token" ]] || continue
+    [[ "$token" == "$PLAN_DIR"* ]] && continue
+    [[ -e "$REPO_ROOT/$token" ]] || continue
+    paths+=("$token")
+  done < <(rg -o '([A-Za-z0-9_.-]+/)+[A-Za-z0-9_.@+-]+' "$plan_file" 2>/dev/null || true)
+
+  {
+    printf '\n## Slice Manifest\n\n'
+    printf 'Use this manifest to constrain repository exploration. Start with these paths and nearest tests. Broaden only when the slice cannot be implemented from this set.\n\n'
+    printf 'Current slice path: %s\n\n' "$(relpath "$plan_file")"
+    printf 'Existing repo paths explicitly mentioned by the slice:\n'
+  } >>"$out"
+
+  if ((${#paths[@]} > 0)); then
+    printf '%s\n' "${paths[@]}" | sort -u | while IFS= read -r path; do
+      printf -- '- %s\n' "$path" >>"$out"
+    done
+  else
+    printf -- '- none found; infer the smallest touch set from the slice text before reading broadly\n' >>"$out"
+  fi
+}
+
 write_shared_context() {
   local out=$1
 
@@ -248,15 +310,7 @@ write_shared_context() {
     printf 'Document code only when repo style calls for it, and document durable behavior or invariants.\n'
   } >"$out"
 
-  append_file_block "$out" "AGENTS.md" "$REPO_ROOT/AGENTS.md"
-  append_file_block "$out" "architecture/wyrd-design.md" "$REPO_ROOT/architecture/wyrd-design.md"
-
-  local context_file
-  if ((${#CONTEXT_FILES[@]} > 0)); then
-    for context_file in "${CONTEXT_FILES[@]}"; do
-      append_file_block "$out" "Plan Context" "$context_file"
-    done
-  fi
+  append_reference_paths "$out"
 
   if ((${#NOTES[@]} > 0)); then
     {
@@ -276,6 +330,7 @@ write_implementer_prompt() {
   local feedback_file=${4:-}
 
   write_shared_context "$out"
+  write_slice_manifest "$out" "$plan_file"
 
   {
     printf '\n## Role\n\n'
@@ -283,7 +338,10 @@ write_implementer_prompt() {
     printf 'You are the implementation worker for one Wyrd plan slice.\n'
     printf 'Implement exactly the current plan slice. Do not implement later slices.\n'
     printf 'Prefer the repo'\''s existing patterns. Keep edits scoped and pragmatic.\n'
-    printf 'Run narrow checks when useful, but do not run the full pre-pr gate unless the prompt asks for it.\n'
+    printf 'Do not perform broad repository exploration. Inspect the slice, the manifest paths, and nearest tests first.\n'
+    printf 'If the manifest is insufficient, use targeted rg queries for the missing symbol or owning module only.\n'
+    printf 'If the slice is blocked by a missing design decision, stop and report the blocker instead of reading unrelated modules.\n'
+    printf 'Use mise tasks for checks. Do not run the full pre-pr gate unless the prompt asks for it.\n'
     printf 'When finished, summarize changed behavior, tests/checks run, and any remaining blockers.\n'
     printf '\n## Current Plan Slice\n'
   } >>"$out"
@@ -306,6 +364,7 @@ write_reviewer_prompt() {
   local plan_file=$2
 
   write_shared_context "$out"
+  write_slice_manifest "$out" "$plan_file"
 
   {
     printf '\n## Role\n\n'
@@ -476,6 +535,17 @@ collect_plan_files() {
       CONTEXT_FILES+=("$extra")
     done
   fi
+}
+
+validate_mise_check_commands() {
+  local command_text
+
+  for command_text in "${PER_PLAN_CHECKS[@]}"; do
+    [[ "$command_text" == mise\ run\ * ]] || die "per-plan checks must use mise run: $command_text"
+  done
+  for command_text in "${FINAL_CHECKS[@]}"; do
+    [[ "$command_text" == mise\ run\ * ]] || die "final checks must use mise run: $command_text"
+  done
 }
 
 run_codex_prompt() {
@@ -725,10 +795,7 @@ if ((${#EXTRA_CONTEXT_FILES[@]} > 0)); then
 fi
 
 if ((${#PER_PLAN_CHECKS[@]} == 0)); then
-  PER_PLAN_CHECKS=(
-    "cargo fmt --all -- --check"
-    "mise run check"
-  )
+  PER_PLAN_CHECKS=("mise run fmt")
 fi
 
 if ((${#FINAL_CHECKS[@]} == 0)); then
@@ -736,6 +803,7 @@ if ((${#FINAL_CHECKS[@]} == 0)); then
 fi
 
 collect_plan_files
+validate_mise_check_commands
 ((${#PLAN_FILES[@]} > 0)) || die "no implementation plan files matched in $PLAN_DIR"
 
 if [[ "$DRY_RUN" == "1" ]]; then

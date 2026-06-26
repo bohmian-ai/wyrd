@@ -40,6 +40,10 @@ Options:
                                  Default: claude-opus-4-7
   --reviewer-effort EFFORT       Plan-conformance reviewer effort.
                                  Default: high
+  --validator-model MODEL        Finding validator and fix-plan model.
+                                 Default: claude-sonnet-4-6
+  --validator-effort EFFORT      Finding validator effort.
+                                 Default: high
   --escalation-model MODEL       Retry implementer model after failures.
                                  Default: gpt-5.5
   --escalation-effort EFFORT     Retry implementer effort after failures.
@@ -48,6 +52,8 @@ Options:
                                  Default: 2
   --fast                         Request Codex fast service tier.
   --persist-codex-sessions       Do not pass --ephemeral to codex exec.
+  --resume-current               Treat the current dirty worktree as the first
+                                 selected plan slice and start at checks/review.
   --dry-run                      Print resolved execution plan and exit.
   -h, --help                     Show this help.
 USAGE
@@ -176,6 +182,12 @@ write_review_schema() {
     },
     "commit_body": {
       "type": "string"
+    },
+    "review_dir": {
+      "type": "string"
+    },
+    "implementation_plan_path": {
+      "type": "string"
     }
   },
   "required": [
@@ -184,7 +196,9 @@ write_review_schema() {
     "findings",
     "recommended_checks",
     "commit_title",
-    "commit_body"
+    "commit_body",
+    "review_dir",
+    "implementation_plan_path"
   ]
 }
 JSON
@@ -301,10 +315,59 @@ write_slice_manifest() {
   fi
 }
 
-write_shared_context() {
-  local out=$1
+create_review_dir() {
+  local short
+  short=$(git rev-parse --short HEAD)
+  mkdir -p "$REPO_ROOT/.dev/review"
+  mktemp -d "$REPO_ROOT/.dev/review/${short}-quick-XXXXXXXX"
+}
+
+prepare_review_packet() {
+  local review_dir=$1
+  local plan_file=$2
+  local loop_index=$3
 
   {
+    printf 'Review ID: %s\n' "$(basename "$review_dir")"
+    printf 'Branch: %s\n' "$(git branch --show-current)"
+    printf 'Plan slice: %s\n' "$(relpath "$plan_file")"
+    printf 'Loop: %s\n' "$loop_index"
+    printf 'Date: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >"$review_dir/setup.log"
+
+  git status --short >"$review_dir/status.txt"
+  git diff --stat HEAD >"$review_dir/stat.txt"
+  git diff HEAD >"$review_dir/diff.patch"
+  git ls-files --others --exclude-standard >"$review_dir/untracked.txt"
+}
+
+implementation_plan_path() {
+  local review_dir=$1
+  printf '%s/implementation-plan.md' "$review_dir"
+}
+
+implementation_plan_status() {
+  local plan_file=$1
+
+  if rg -n '^Status:[[:space:]]*clean[[:space:]]*$' "$plan_file" >/dev/null; then
+    printf 'clean\n'
+    return 0
+  fi
+  if rg -n '^Status:[[:space:]]*required_changes[[:space:]]*$' "$plan_file" >/dev/null; then
+    printf 'required_changes\n'
+    return 0
+  fi
+  return 1
+}
+
+write_shared_context() {
+  local out=$1
+  local preamble=${2:-}
+
+  {
+    if [[ -n "$preamble" ]]; then
+      printf '%s\n\n' "$preamble"
+    fi
     printf '## Repository Context\n\n'
     printf 'Current branch: %s\n\n' "$(git branch --show-current)"
     printf 'Use the current branch. Do not create or switch branches.\n'
@@ -354,7 +417,8 @@ write_implementer_prompt() {
   if [[ -n "$feedback_file" ]]; then
     {
       printf '\n## Required Follow-up\n\n'
-      printf 'This is implementation loop %s. Address the feedback below and preserve all already-correct work.\n\n' "$loop_index"
+      printf 'This is implementation loop %s. Address the validated implementation plan below and preserve all already-correct work.\n' "$loop_index"
+      printf 'Treat this plan as the source of truth for immediate required changes. Do not implement optional polish or later plan slices.\n\n'
       printf '```text\n'
       cat "$feedback_file"
       printf '\n```\n'
@@ -365,39 +429,153 @@ write_implementer_prompt() {
 write_reviewer_prompt() {
   local out=$1
   local plan_file=$2
+  local review_dir=$3
+  local review_dir_rel
+  local implementation_plan_rel
 
-  write_shared_context "$out"
+  review_dir_rel=$(relpath "$review_dir")
+  implementation_plan_rel=$(relpath "$(implementation_plan_path "$review_dir")")
+
+  write_shared_context "$out" "/review-and-plan-quick"
   write_slice_manifest "$out" "$plan_file"
 
+  cat <<'TEXT' >>"$out"
+
+## Role
+
+You are the parent plan-conformance reviewer for this Wyrd implementation slice.
+Use the condensed review-and-plan-quick contract: one reviewer, full review breadth, blocker-focused severity.
+
+Do not run the full review-and-plan pipeline. Do not launch subagents. Do not edit source files.
+
+Review the current logical slice only. Validate the uncommitted working tree against the current plan slice, Wyrd repo conventions, and the runner-provided manifest.
+TEXT
+
   {
-    printf '\n## Role\n\n'
-    printf 'You are the parent plan-conformance reviewer for this Wyrd implementation slice.\n'
-    printf 'Use a condensed, modified review-and-plan review pass: security, bugs/performance, tests, maintainability/style, clean-code/SOLID, developer/agent experience, and Wyrd contract boundaries.\n'
-    printf 'Do not run the full review-and-plan pipeline. Do not create .dev/review artifacts. Do not write an implementation plan.\n'
-    printf 'Do not edit files. Inspect the current uncommitted diff, including untracked files, and validate it against the plan slice.\n'
-    printf 'Focus on deviations from the plan, missing required behavior, missing tests, Wyrd boundary violations, unnecessary scope creep, legacy vocabulary, and likely correctness issues.\n'
-    printf 'Only report findings you validate against source. A clean review with zero findings is acceptable.\n'
-    printf 'Also provide a reviewer-readable commit title and body based on the actual code change and overall plan intent.\n'
-    printf 'The commit title and body must not mention file paths, plan files, plan names, commit hashes, or automation context.\n'
-    printf '\n## Current Plan Slice\n'
+    printf '\n## Review Artifacts\n\n'
+    printf 'Use this existing review directory: `%s`\n\n' "$review_dir_rel"
+    printf 'The runner has already written the review packet:\n\n'
+    printf -- '- `%s/setup.log`\n' "$review_dir_rel"
+    printf -- '- `%s/status.txt`\n' "$review_dir_rel"
+    printf -- '- `%s/stat.txt`\n' "$review_dir_rel"
+    printf -- '- `%s/diff.patch`\n' "$review_dir_rel"
+    printf -- '- `%s/untracked.txt`\n\n' "$review_dir_rel"
+    printf 'Write these artifacts before returning JSON:\n\n'
+    printf -- '- `%s/findings.md`\n' "$review_dir_rel"
+    printf -- '- `%s`\n\n' "$implementation_plan_rel"
+    printf '`implementation-plan.md` is the actionable output type for this review and the handoff to downstream agents.\n'
+    printf 'It must contain the exact line `Status: clean` or `Status: required_changes` and enough detail for Codex to implement fixes without guessing.\n'
   } >>"$out"
+
+  cat <<'TEXT' >>"$out"
+
+## Calibration Sources
+
+Apply the same lenses and finding bar as the installed `review-and-plan-quick` skill. If you need to calibrate a borderline issue, read the copy for the active review engine; otherwise use this prompt directly.
+
+Skill roots:
+
+- Claude: `~/.claude/skills/review-and-plan-quick/SKILL.md`
+- Codex: `~/.codex/skills/review-and-plan-quick/SKILL.md`
+
+Use the full `review-and-plan` prompt files in the same skill root only as calibration, not as a workflow to execute:
+
+- `review-and-plan/review-security/review-security.md`
+- `review-and-plan/review-bugs/review-bugs.md`
+- `review-and-plan/review-tests/review-tests.md`
+- `review-and-plan/review-style/review-style.md`
+- `review-and-plan/review-clean-code/review-clean-code.md`
+- `review-and-plan/review-developer-experience/review-developer-experience.md`
+- `review-and-plan/review-frontend/review-frontend.md` when frontend files changed
+- `review-and-plan/review-wyrd-ui-contracts/review-wyrd-ui-contracts.md` when UI/API/SDK/schema/docs surfaces changed
+
+When Wyrd doctrine, contracts, APIs, SDKs, CLI, MCP, UI, docs, generated schemas, durable behavior, or public vocabulary are touched, apply `.codex/skills/review/SKILL.md` and read `docs/src/content/docs/concepts/core-doctrine.mdx` if needed.
+
+## Review Lenses
+
+Apply every relevant lens, but report only source-validated findings with a concrete failure, exploit, misuse, or maintenance path:
+
+- Plan alignment and developer/agent experience.
+- Security, compliance, tenant isolation, secrets, authn/authz, and audit.
+- Bugs, correctness, data loss, async/concurrency, transactions, resource handling, and performance.
+- Tests and verification that would catch realistic regressions.
+- Maintainability, ergonomics, idioms, local conventions, clean code, SOLID, docs, comments, and simple local design.
+- Frontend and Wyrd UI contracts when the slice changes Svelte, UI routes, request chains, schemas, SDKs, CLI, MCP, Python, docs, or API surfaces.
+- Wyrd doctrine, Wyrd-native vocabulary, server-owned durable behavior, language-agnostic contracts, and agent-first/headless surfaces.
+
+## High-Risk Calibration
+
+Raise scrutiny for auth, tenant isolation, migrations, persistence, storage, secrets, audit, destructive operations, public contracts, generated schemas, HTTP/API, CLI, MCP, Python or Rust SDKs, UI request chains, async/concurrency, dependency manifests, and crate boundaries.
+
+Always check dependency direction. Block foundational or owner crates depending on downstream support, fixture, test, UI, server, or integration crates that depend back on them. Dev-dependency cycles and type identity splits are real design issues, not test-only details.
+
+## Blocking Bar
+
+Block the slice only for:
+
+- Plan contradiction or missing required stage work.
+- Real bug, panic, data loss, security/compliance risk, tenant isolation risk, audit gap, or broken public contract.
+- Developer or agent adoption failure on a changed public or semi-public surface.
+- Missing test or verification that could let a realistic regression ship.
+- Dependency direction drift, crate-boundary drift, or architecture drift that materially raises maintenance cost or makes the API awkward to use.
+
+Do not block on broad branch-level concerns, speculative refactors, personal preferences, polish, unchanged existing debt, or findings better suited for the final full review.
+
+Every finding must include a concrete source location, one plain-English issue sentence, a realistic failure path, evidence from source or local patterns, and the exact required fix or targeted verification gate. Consolidate duplicate findings under one root cause.
+
+A clean review with zero findings is acceptable.
+
+## Current Plan Slice
+TEXT
 
   append_file_block "$out" "Plan Slice" "$plan_file"
 
-  {
-    printf '\n## Diff To Review\n\n'
-    printf 'Review the working tree produced by:\n\n'
-    printf '```bash\n'
-    printf 'git status --short\n'
-    printf 'git ls-files --others --exclude-standard\n'
-    printf 'git diff HEAD\n'
-    printf '```\n'
-    printf '\nImportant: `git diff HEAD` omits untracked files. Use `git status --short` and `git ls-files --others --exclude-standard` to identify and inspect newly created files before approving.\n'
-    printf '\nReturn only raw JSON matching this schema shape:\n\n'
-    printf '```json\n'
-    cat "$REVIEW_SCHEMA"
-    printf '\n```\n'
-  } >>"$out"
+  cat <<'TEXT' >>"$out"
+
+## Diff To Review
+
+Review the packet files and, when needed, the working tree produced by:
+
+```bash
+git status --short
+git diff --stat HEAD
+git diff HEAD
+git ls-files --others --exclude-standard
+```
+
+Important: `git diff HEAD` omits untracked files. Use `git status --short` and `git ls-files --others --exclude-standard` to identify and inspect newly created files before approving.
+
+Only run cheap targeted checks when they are required to confirm a finding. Recommended checks in the JSON must use `mise run ...` commands. If a surgical non-mise command is useful but no mise task exists, mention it in `summary` instead of `recommended_checks`.
+
+## Implementation Plan Requirements
+
+If blockers remain, `implementation-plan.md` must include numbered required changes. Each required change must include severity, source finding, files or symbols to inspect, the concrete problem, exact required implementation behavior, constraints, acceptance criteria, and verification commands.
+
+If no blockers remain, `implementation-plan.md` must say `Status: clean`, list no required changes, and summarize relevant verification.
+
+## JSON Output Contract
+
+After writing review artifacts, return only raw JSON matching the schema shape below.
+
+Use:
+
+- `status: "changes_required"` only when a critical or important blocker remains.
+- `status: "approved"` when there are no blockers. Minor findings may be included only as non-blocking notes.
+- `severity: "critical"` for exploitable security, data loss, tenant isolation breakage, broken public contract, or direct plan contradiction.
+- `severity: "important"` for any issue that should block this slice commit.
+- `severity: "minor"` only for optional cleanup that should not block the commit.
+
+Also provide a reviewer-readable commit title and body based on the actual code behavior and overall plan intent. The commit title and body must not mention file paths, plan files, plan names, commit hashes, or automation context.
+
+Set `review_dir` and `implementation_plan_path` to the exact paths provided above.
+
+```json
+TEXT
+  cat "$REVIEW_SCHEMA" >>"$out"
+  cat <<'TEXT' >>"$out"
+
+```
+TEXT
 }
 
 extract_json_object() {
@@ -435,6 +613,8 @@ validate_review_json() {
     and (.recommended_checks | type == "array")
     and (.commit_title | type == "string")
     and (.commit_body | type == "string")
+    and (.review_dir | type == "string")
+    and (.implementation_plan_path | type == "string")
   ' "$review_file" >/dev/null
 }
 
@@ -619,15 +799,127 @@ run_implementer() {
   run_codex_prompt "$prompt_file" "$jsonl_file" codex "${CODEX_ARGS[@]}"
 }
 
+write_validator_prompt() {
+  local out=$1
+  local plan_file=$2
+  local review_dir=$3
+  local review_dir_rel
+  local implementation_plan_rel
+
+  review_dir_rel=$(relpath "$review_dir")
+  implementation_plan_rel=$(relpath "$(implementation_plan_path "$review_dir")")
+
+  write_shared_context "$out"
+  write_slice_manifest "$out" "$plan_file"
+
+  {
+    printf '\n## Role\n\n'
+    printf 'You are the final validation and immediate-fix planning pass for one Wyrd implementation slice.\n'
+    printf 'Use Claude Sonnet judgment to validate the quick-review findings against source, eliminate false positives, merge duplicates, and rewrite the implementation plan.\n'
+    printf 'Do not edit source files. Only write `%s/validation.md` and update `%s`.\n\n' "$review_dir_rel" "$implementation_plan_rel"
+    printf '## Review Directory\n\n'
+    printf 'Read every relevant artifact in `%s`, including:\n\n' "$review_dir_rel"
+    printf -- '- `setup.log`\n'
+    printf -- '- `status.txt`\n'
+    printf -- '- `stat.txt`\n'
+    printf -- '- `diff.patch`\n'
+    printf -- '- `untracked.txt`\n'
+    printf -- '- `findings.md`\n'
+    printf -- '- `review-result.json`\n'
+    printf -- '- `implementation-plan.md`\n\n'
+    printf 'Read changed source files and nearest local patterns only as needed to validate or reject findings.\n'
+    printf '\n## Current Plan Slice\n'
+  } >>"$out"
+
+  append_file_block "$out" "Plan Slice" "$plan_file"
+
+  cat <<'TEXT' >>"$out"
+
+## Validation Rules
+
+Validate every blocking finding before it remains in the plan.
+
+- Keep a finding only when source evidence proves a realistic failure path, exploit path, tenant-isolation risk, public-contract break, missing required plan work, missing regression-catching test, or material maintainability issue.
+- Eliminate false positives, speculative polish, broad branch concerns, unchanged existing debt, and issues better suited for the final full review.
+- Merge duplicates under one root cause.
+- Preserve only immediate required changes for this slice.
+- Make each remaining required change implementation-ready for Codex.
+
+## Required Outputs
+
+TEXT
+
+  printf 'Write `%s/validation.md` with:\n\n' "$review_dir_rel" >>"$out"
+
+  cat <<'TEXT' >>"$out"
+
+```markdown
+# Final Validation
+
+Status: clean|required_changes
+
+## Confirmed Findings
+
+- ...
+
+## Eliminated Findings
+
+- Finding:
+  Reason eliminated:
+
+## Plan Changes
+
+- ...
+```
+
+TEXT
+
+  printf 'Rewrite `%s` as the final source of truth.\n' "$implementation_plan_rel" >>"$out"
+
+  cat <<'TEXT' >>"$out"
+
+It must contain exactly one of these top-level status lines:
+
+```markdown
+Status: clean
+```
+
+or:
+
+```markdown
+Status: required_changes
+```
+
+When status is `required_changes`, each numbered required change must include:
+
+- severity
+- source finding
+- files or symbols to inspect
+- concrete problem and failure path
+- exact required implementation behavior
+- constraints and local patterns to preserve
+- acceptance criteria
+- verification commands, preferring `mise run ...`
+
+When status is `clean`, list no required changes and summarize relevant verification.
+
+Final response should only state the review directory, validation path, implementation plan path, and final status.
+TEXT
+}
+
 run_reviewer() {
   local plan_file=$1
   local plan_run_dir=$2
   local loop_index=$3
+  local review_dir=$4
   local prompt_file="$plan_run_dir/reviewer-loop-$loop_index.prompt.md"
   local final_file="$plan_run_dir/reviewer-loop-$loop_index.json"
   local raw_file="$plan_run_dir/reviewer-loop-$loop_index.raw"
+  local plan_path
 
-  write_reviewer_prompt "$prompt_file" "$plan_file"
+  plan_path=$(implementation_plan_path "$review_dir")
+
+  write_reviewer_prompt "$prompt_file" "$plan_file" "$review_dir"
   if [[ "$REVIEWER_ENGINE" == "claude" ]]; then
     run_claude_prompt \
       "$prompt_file" \
@@ -637,15 +929,46 @@ run_reviewer() {
       --model "$REVIEWER_MODEL" \
       --effort "$REVIEWER_EFFORT" \
       --permission-mode dontAsk \
-      --tools "Bash,Read,Grep,Glob" \
+      --tools "Bash,Read,Grep,Glob,Write,Edit" \
       --output-format text
     extract_json_object "$raw_file" "$final_file"
   else
     local jsonl_file="$plan_run_dir/reviewer-loop-$loop_index.jsonl"
-    build_codex_args "$REVIEWER_MODEL" "$REVIEWER_EFFORT" "read-only" "$final_file" "$REVIEW_SCHEMA"
+    build_codex_args "$REVIEWER_MODEL" "$REVIEWER_EFFORT" "workspace-write" "$final_file" "$REVIEW_SCHEMA"
     run_codex_prompt "$prompt_file" "$jsonl_file" codex "${CODEX_ARGS[@]}"
   fi
   validate_review_json "$final_file"
+  [[ -f "$review_dir/findings.md" ]] || die "reviewer did not write findings.md in $(relpath "$review_dir")"
+  [[ -f "$plan_path" ]] || die "reviewer did not write implementation-plan.md in $(relpath "$review_dir")"
+  implementation_plan_status "$plan_path" >/dev/null || die "implementation-plan.md is missing Status: clean|required_changes"
+  cp "$final_file" "$review_dir/review-result.json"
+}
+
+run_validator() {
+  local plan_file=$1
+  local review_dir=$2
+  local plan_run_dir=$3
+  local loop_index=$4
+  local prompt_file="$plan_run_dir/validator-loop-$loop_index.prompt.md"
+  local raw_file="$plan_run_dir/validator-loop-$loop_index.raw"
+  local plan_path
+
+  plan_path=$(implementation_plan_path "$review_dir")
+  write_validator_prompt "$prompt_file" "$plan_file" "$review_dir"
+  run_claude_prompt \
+    "$prompt_file" \
+    "$raw_file" \
+    claude \
+    --print \
+    --model "$VALIDATOR_MODEL" \
+    --effort "$VALIDATOR_EFFORT" \
+    --permission-mode dontAsk \
+    --tools "Bash,Read,Grep,Glob,Write,Edit" \
+    --output-format text
+
+  [[ -f "$review_dir/validation.md" ]] || die "validator did not write validation.md in $(relpath "$review_dir")"
+  [[ -f "$plan_path" ]] || die "validator removed implementation-plan.md in $(relpath "$review_dir")"
+  implementation_plan_status "$plan_path" >/dev/null || die "validated implementation-plan.md is missing Status: clean|required_changes"
 }
 
 run_checks_for_plan() {
@@ -694,11 +1017,14 @@ REVIEWER_ENGINE="claude"
 REVIEWER_MODEL="claude-opus-4-7"
 REVIEWER_MODEL_SET=0
 REVIEWER_EFFORT="high"
+VALIDATOR_MODEL="claude-sonnet-4-6"
+VALIDATOR_EFFORT="high"
 ESCALATION_MODEL="gpt-5.5"
 ESCALATION_EFFORT="high"
 MAX_REVIEW_LOOPS=2
 FAST_MODE=0
 PERSIST_CODEX_SESSIONS=0
+RESUME_CURRENT=0
 DRY_RUN=0
 START_AT=""
 START_AFTER=""
@@ -788,6 +1114,16 @@ while (($# > 0)); do
       REVIEWER_EFFORT=$2
       shift 2
       ;;
+    --validator-model)
+      (($# >= 2)) || die "--validator-model requires a model"
+      VALIDATOR_MODEL=$2
+      shift 2
+      ;;
+    --validator-effort)
+      (($# >= 2)) || die "--validator-effort requires an effort"
+      VALIDATOR_EFFORT=$2
+      shift 2
+      ;;
     --escalation-model)
       (($# >= 2)) || die "--escalation-model requires a model"
       ESCALATION_MODEL=$2
@@ -810,6 +1146,10 @@ while (($# > 0)); do
       ;;
     --persist-codex-sessions)
       PERSIST_CODEX_SESSIONS=1
+      shift
+      ;;
+    --resume-current)
+      RESUME_CURRENT=1
       shift
       ;;
     --dry-run)
@@ -845,9 +1185,7 @@ require_command mise
 require_command jq
 require_command rg
 require_command python3
-if [[ "$REVIEWER_ENGINE" == "claude" ]]; then
-  require_command claude
-fi
+require_command claude
 
 REPO_ROOT=$(repo_root)
 [[ -n "$REPO_ROOT" ]] || die "not inside a git repository"
@@ -886,8 +1224,10 @@ if [[ "$DRY_RUN" == "1" ]]; then
   printf 'Plan directory: %s\n' "$(relpath "$PLAN_DIR")"
   printf 'Implementer: %s (%s)\n' "$IMPLEMENTER_MODEL" "$IMPLEMENTER_EFFORT"
   printf 'Reviewer: %s:%s (%s)\n' "$REVIEWER_ENGINE" "$REVIEWER_MODEL" "$REVIEWER_EFFORT"
+  printf 'Validator: claude:%s (%s)\n' "$VALIDATOR_MODEL" "$VALIDATOR_EFFORT"
   printf 'Escalation: %s (%s)\n' "$ESCALATION_MODEL" "$ESCALATION_EFFORT"
   printf 'Fast mode: %s\n' "$FAST_MODE"
+  printf 'Resume current: %s\n' "$RESUME_CURRENT"
   if [[ -n "$START_AT" ]]; then
     printf 'Start at: %s\n' "$START_AT"
   fi
@@ -921,7 +1261,11 @@ if [[ "$DRY_RUN" == "1" ]]; then
   exit 0
 fi
 
-is_clean_worktree || die "worktree must be clean before starting"
+if [[ "$RESUME_CURRENT" == "1" ]]; then
+  [[ -n "$(git status --porcelain)" ]] || die "--resume-current requires a dirty worktree"
+else
+  is_clean_worktree || die "worktree must be clean before starting"
+fi
 
 RUN_ROOT="$REPO_ROOT/.git/wyrd-plan-runner/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$RUN_ROOT"
@@ -941,6 +1285,13 @@ for plan_file in "${PLAN_FILES[@]}"; do
   feedback_file=""
   approved_review_file=""
   loop=1
+  resume_this_plan=0
+  if [[ "$RESUME_CURRENT" == "1" ]]; then
+    resume_this_plan=1
+    RESUME_CURRENT=0
+    info "resuming current worktree for plan slice: $(relpath "$plan_file")"
+  fi
+
   while ((loop <= MAX_REVIEW_LOOPS)); do
     if ((loop == 1)); then
       model=$IMPLEMENTER_MODEL
@@ -950,7 +1301,11 @@ for plan_file in "${PLAN_FILES[@]}"; do
       effort=$ESCALATION_EFFORT
     fi
 
-    run_implementer "$plan_file" "$plan_run_dir" "$loop" "$model" "$effort" "$feedback_file"
+    if [[ "$resume_this_plan" == "1" && "$loop" == "1" && -z "$feedback_file" ]]; then
+      info "skipping implementation; using existing worktree for review"
+    else
+      run_implementer "$plan_file" "$plan_run_dir" "$loop" "$model" "$effort" "$feedback_file"
+    fi
 
     check_feedback="$plan_run_dir/check-feedback-loop-$loop.txt"
     if ! run_checks_for_plan "$plan_run_dir" "$loop" "$check_feedback"; then
@@ -962,22 +1317,32 @@ for plan_file in "${PLAN_FILES[@]}"; do
       continue
     fi
 
+    review_dir=$(create_review_dir)
+    prepare_review_packet "$review_dir" "$plan_file" "$loop"
+    implementation_plan=$(implementation_plan_path "$review_dir")
+
     review_file="$plan_run_dir/reviewer-loop-$loop.json"
-    if ! run_reviewer "$plan_file" "$plan_run_dir" "$loop"; then
+    if ! run_reviewer "$plan_file" "$plan_run_dir" "$loop" "$review_dir"; then
       die "reviewer did not produce valid JSON; see $review_file"
     fi
 
-    if review_approved "$review_file"; then
+    implementation_status=$(implementation_plan_status "$implementation_plan")
+    if [[ "$implementation_status" == "clean" ]] && review_approved "$review_file"; then
       approved_review_file=$review_file
       break
     fi
 
-    review_feedback="$plan_run_dir/review-feedback-loop-$loop.txt"
-    write_review_feedback "$review_file" "$review_feedback"
-    if ((loop >= MAX_REVIEW_LOOPS)); then
-      die "review still requires changes after $loop loop(s); see $review_feedback"
+    run_validator "$plan_file" "$review_dir" "$plan_run_dir" "$loop"
+    implementation_status=$(implementation_plan_status "$implementation_plan")
+    if [[ "$implementation_status" == "clean" ]]; then
+      approved_review_file=$review_file
+      break
     fi
-    feedback_file=$review_feedback
+
+    if ((loop >= MAX_REVIEW_LOOPS)); then
+      die "review still requires changes after $loop loop(s); see $implementation_plan"
+    fi
+    feedback_file=$implementation_plan
     ((loop++))
   done
 

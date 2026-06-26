@@ -141,6 +141,48 @@ pub enum ResolveError {
     },
 }
 
+/// Check whether a principal's revocation epoch has been bumped.
+///
+/// The verifier calls this on every verify path — both cache hits and fresh
+/// verifies — so a revoked principal's cached tokens are rejected before the
+/// positive-cache early return (F11). Implementations are expected to serve
+/// the result from a short-TTL in-process cache; the verifier does not add
+/// network IO to the hot path.
+///
+/// Object-safe (returns a boxed `Future`) so `TokenVerifier<R>` can hold
+/// `Option<Arc<dyn RevocationCheck>>` without an extra type parameter.
+pub trait RevocationCheck: Send + Sync + fmt::Debug {
+    /// Return the principal's revocation epoch, if any.
+    ///
+    /// `None` means the principal has never been revoked. An access token whose
+    /// `iat < epoch` is dead.
+    fn epoch<'a>(
+        &'a self,
+        tenant: &'a DataTenantId,
+        principal: PrincipalId,
+        kind: PrincipalKindWire,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>> + Send + 'a>,
+    >;
+}
+
+/// Zero-cost no-op revocation check used when revocation is not configured.
+#[derive(Debug, Clone, Copy)]
+pub struct NoRevocation;
+
+impl RevocationCheck for NoRevocation {
+    fn epoch<'a>(
+        &'a self,
+        _tenant: &'a DataTenantId,
+        _principal: PrincipalId,
+        _kind: PrincipalKindWire,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>> + Send + 'a>,
+    > {
+        Box::pin(std::future::ready(Ok(None)))
+    }
+}
+
 /// Resolved, tenant-checked token ready to populate request context.
 #[derive(Clone, Debug)]
 pub struct VerifiedToken {
@@ -150,6 +192,8 @@ pub struct VerifiedToken {
     pub delegation_chain: Vec<DelegationStep>,
     /// JWT expiry as UTC timestamp for cache-hit lifetime checks.
     pub exp: DateTime<Utc>,
+    /// JWT issued-at as UTC timestamp, used for epoch revocation checks (F11).
+    pub iat: DateTime<Utc>,
 }
 
 /// Token verification settings.
@@ -220,6 +264,7 @@ pub struct TokenVerifier<R: PermissionResolver> {
     decoding_keys: Arc<HashMap<Kid, Arc<DecodingKey>>>,
     issuer: Arc<String>,
     resolver: Arc<R>,
+    revocation: Option<Arc<dyn RevocationCheck>>,
     cache: Cache<TokenHash, Arc<VerifiedToken>>,
     settings: Arc<WyrdAuthVerifySettings>,
     external: Option<ExternalVerify>,
@@ -249,6 +294,7 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
             decoding_keys: Arc::new(decoding_keys),
             issuer: Arc::new(issuer.into()),
             resolver,
+            revocation: None,
             cache,
             settings: Arc::new(settings),
             external: None,
@@ -265,6 +311,17 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
         trusted: Arc<TrustedIssuerRegistry>,
     ) -> Self {
         self.external = Some(ExternalVerify { jwks, trusted });
+        self
+    }
+
+    /// Attach a principal-epoch revocation resolver (F11).
+    ///
+    /// Any type implementing `RevocationCheck` is accepted. In production this
+    /// is `SqlRevocationCheck`; in tests `NoRevocation` is the default when
+    /// this method is never called.
+    #[must_use]
+    pub fn with_revocation(mut self, revocation: Arc<dyn RevocationCheck>) -> Self {
+        self.revocation = Some(revocation);
         self
     }
 
@@ -300,6 +357,23 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
                 self.cache.invalidate(&hash).await;
                 return Err(AuthError::TokenExpired);
             }
+            // F11: check revocation epoch BEFORE returning the positive cache hit.
+            // A principal revoked after this token was cached must be rejected here.
+            if let Some(ref rev) = self.revocation {
+                let kind = match &cached.principal.kind {
+                    PrincipalKind::User => PrincipalKindWire::User,
+                    PrincipalKind::Service { .. } => PrincipalKindWire::Service,
+                    PrincipalKind::Agent { .. } => PrincipalKindWire::Agent,
+                };
+                match rev.epoch(&cached.principal.tenant_id, cached.principal.id, kind).await {
+                    Ok(Some(epoch)) if cached.iat < epoch => {
+                        self.cache.invalidate(&hash).await;
+                        return Err(AuthError::Revoked);
+                    }
+                    Err(_) => {} // resolver unavailable: fail open, let the token through
+                    _ => {}
+                }
+            }
             return Ok(cached);
         }
 
@@ -327,9 +401,27 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
                 let verified = claims.into_verified(&*self.resolver).await?;
                 Ok::<_, AuthError>(Arc::new(verified))
             })
-            .await;
+            .await
+            .map_err(|error| AuthError::clone(&error))?;
 
-        result.map_err(|error| AuthError::clone(&error))
+        // Also check revocation for fresh (cache-miss) verifies.
+        if let Some(ref rev) = self.revocation {
+            let kind = match &result.principal.kind {
+                PrincipalKind::User => PrincipalKindWire::User,
+                PrincipalKind::Service { .. } => PrincipalKindWire::Service,
+                PrincipalKind::Agent { .. } => PrincipalKindWire::Agent,
+            };
+            match rev.epoch(&result.principal.tenant_id, result.principal.id, kind).await {
+                Ok(Some(epoch)) if result.iat < epoch => {
+                    self.cache.invalidate(&hash).await;
+                    return Err(AuthError::Revoked);
+                }
+                Err(_) => {} // resolver unavailable: fail open
+                _ => {}
+            }
+        }
+
+        Ok(result)
     }
 
     /// Remove a token from the cache.
@@ -628,11 +720,14 @@ impl AccessTokenClaims {
         let delegation_chain = flatten_act_chain(self.act.as_deref())?;
         let exp =
             DateTime::<Utc>::from_timestamp(self.exp as i64, 0).ok_or(AuthError::InvalidToken)?;
+        let iat =
+            DateTime::<Utc>::from_timestamp(self.iat as i64, 0).ok_or(AuthError::InvalidToken)?;
 
         Ok(VerifiedToken {
             principal,
             delegation_chain,
             exp,
+            iat,
         })
     }
 }
@@ -763,9 +858,9 @@ mod tests {
 
     use super::{
         AccessTokenClaims, ActClaim, AuthError, Kid, MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH,
-        PermissionResolver, PrincipalKindWire, ResolveError, TokenPrincipalRef, TokenVerifier,
-        VerifiedExternalIdentity, WyrdAuthVerifySettings, decode_kid, public_key_from_pem,
-        verify_eddsa, verify_eddsa_with,
+        PermissionResolver, PrincipalKindWire, ResolveError, RevocationCheck, TokenPrincipalRef,
+        TokenVerifier, VerifiedExternalIdentity, WyrdAuthVerifySettings, decode_kid,
+        public_key_from_pem, verify_eddsa, verify_eddsa_with,
     };
 
     const PRIVATE_KEY_PEM: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
@@ -1128,6 +1223,108 @@ mod tests {
             .await
             .expect("verify after principal invalidate succeeds");
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // F11: principal-epoch revocation
+    // -------------------------------------------------------------------------
+
+    #[derive(Debug)]
+    struct TestRevocation {
+        epoch: Option<DateTime<Utc>>,
+        unavailable: bool,
+    }
+
+    impl RevocationCheck for TestRevocation {
+        fn epoch<'a>(
+            &'a self,
+            _tenant: &'a DataTenantId,
+            _principal: PrincipalId,
+            _kind: PrincipalKindWire,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>> + Send + 'a>,
+        > {
+            if self.unavailable {
+                Box::pin(std::future::ready(Err(ResolveError::Unavailable(
+                    "test outage".to_owned(),
+                ))))
+            } else {
+                Box::pin(std::future::ready(Ok(self.epoch)))
+            }
+        }
+    }
+
+    fn verifier_with_revocation(
+        resolver: Arc<TestResolver>,
+        epoch: Option<DateTime<Utc>>,
+    ) -> TokenVerifier<TestResolver> {
+        let check = Arc::new(TestRevocation {
+            epoch,
+            unavailable: false,
+        });
+        verifier(resolver, WyrdAuthVerifySettings::default()).with_revocation(check)
+    }
+
+    #[tokio::test]
+    async fn revocation_epoch_rejects_cache_hit_when_iat_predates_epoch() {
+        let resolver = Arc::new(TestResolver::default());
+        let iat_unix = now() - 10;
+        let epoch = DateTime::from_timestamp(iat_unix as i64 + 1, 0)
+            .expect("static epoch is valid");
+        let verifier = verifier_with_revocation(Arc::clone(&resolver), Some(epoch));
+        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
+            now() + 3_600,
+            iat_unix,
+        )));
+
+        verifier
+            .verify(&token, &tenant_id())
+            .await
+            .expect_err("fresh verify with iat < epoch must fail");
+
+        let err = verifier.verify(&token, &tenant_id()).await;
+        assert!(
+            matches!(err, Err(AuthError::Revoked)),
+            "both fresh and cached verify must return Revoked, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn revocation_epoch_passes_when_iat_at_or_after_epoch() {
+        let resolver = Arc::new(TestResolver::default());
+        let iat_unix = now() - 5;
+        let epoch = DateTime::from_timestamp(iat_unix as i64 - 1, 0)
+            .expect("static epoch is valid");
+        let verifier = verifier_with_revocation(Arc::clone(&resolver), Some(epoch));
+        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
+            now() + 3_600,
+            iat_unix,
+        )));
+
+        verifier
+            .verify(&token, &tenant_id())
+            .await
+            .expect("token issued after epoch must pass");
+    }
+
+    #[tokio::test]
+    async fn revocation_unavailable_fails_open_and_allows_token() {
+        let resolver = Arc::new(TestResolver::default());
+        let check = Arc::new(TestRevocation {
+            epoch: None,
+            unavailable: true,
+        });
+        let verifier =
+            verifier(resolver, WyrdAuthVerifySettings::default()).with_revocation(check);
+        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
+            now() + 3_600,
+            now() - 5,
+        )));
+
+        verifier
+            .verify(&token, &tenant_id())
+            .await
+            .expect("unavailable revocation resolver must fail open");
     }
 
     #[tokio::test]

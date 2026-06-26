@@ -390,6 +390,7 @@ mod tests {
                 principal: PrincipalRef::from_principal(&caller),
             }],
             exp: chrono::Utc::now(),
+            iat: chrono::Utc::now(),
         };
         let request = wyrd_auth_check::AuthzCheckRequest {
             target: card_ref("callee"),

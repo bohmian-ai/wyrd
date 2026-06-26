@@ -31,6 +31,7 @@ uuid = { workspace = true, features = ["v4"] }
 base64 = { workspace = true }
 chrono = { workspace = true }
 jsonwebtoken = { workspace = true }
+moka = { version = "0.12", features = ["future"] }
 rand = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }

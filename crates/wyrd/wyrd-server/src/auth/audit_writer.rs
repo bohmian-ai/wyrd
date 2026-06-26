@@ -83,6 +83,7 @@ mod tests {
                 principal: PrincipalRef::from_principal(&caller),
             }],
             exp: chrono::Utc::now(),
+            iat: chrono::Utc::now(),
         };
 
         AuthzCheckContext::from_verified(

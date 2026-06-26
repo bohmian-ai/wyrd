@@ -9,6 +9,7 @@
 
 pub mod api_keys;
 pub mod refresh_tokens;
+pub mod revocation;
 pub mod role_assignments;
 pub mod roles;
 pub mod service_accounts;
@@ -34,5 +35,9 @@ pub use service_accounts::{
 pub use refresh_tokens::{
     consume_active_refresh, insert_refresh_token_rotated, refresh_by_hash, revoke_refresh,
     revoke_refresh_family,
+};
+pub use revocation::{
+    revoke_service_account_principal, revoke_user_principal, service_account_revocation_epoch,
+    user_revocation_epoch,
 };
 pub use users::{UserRow, delete_user, insert_user, user_by_email, user_by_id};

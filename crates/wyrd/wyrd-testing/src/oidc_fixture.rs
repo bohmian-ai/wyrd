@@ -224,7 +224,7 @@ impl OidcIssuerFixture {
         &self,
         client_id: &str,
         client_secret: &str,
-        audience: &str,
+        _audience: &str,
     ) -> String {
         let token_url = self
             .provider

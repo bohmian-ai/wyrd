@@ -16,6 +16,7 @@ use wyrd_telemetry::TelemetryGuard;
 use wyrd_tonic::tonic_health::server::HealthReporter;
 
 use crate::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
+use crate::auth::jwt_bearer::WorkloadBindingRegistry;
 use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::config::DeploymentProfile;
 use crate::health::ReadinessSnapshot;
@@ -66,6 +67,8 @@ pub struct AppState {
     pub token_verifier: Option<Arc<TokenVerifier<SqlPermissionResolver>>>,
     /// Trusted OIDC issuer registry for human login flow.
     pub trusted_issuer_registry: Option<Arc<TrustedIssuerRegistry>>,
+    /// Workload binding registry for jwt-bearer exchanges.
+    pub workload_binding_registry: Option<Arc<WorkloadBindingRegistry>>,
     /// Policy hook for authz-check evaluation.
     pub policy_hook: Arc<dyn PolicyHook>,
     /// Audit-fact writer for authz-check decisions.
@@ -106,6 +109,7 @@ impl AppState {
             issuing_key: None,
             token_verifier: None,
             trusted_issuer_registry: None,
+            workload_binding_registry: None,
             policy_hook: Arc::new(StubAllowPolicyHook),
             audit_writer: Arc::new(NoopAuthzAuditWriter),
             trusted_request_id_propagation: false,
@@ -147,6 +151,16 @@ impl AppState {
         trusted_issuer_registry: Arc<TrustedIssuerRegistry>,
     ) -> Self {
         self.trusted_issuer_registry = Some(trusted_issuer_registry);
+        self
+    }
+
+    /// Attach the workload binding registry.
+    #[must_use]
+    pub fn with_workload_binding_registry(
+        mut self,
+        workload_binding_registry: Arc<WorkloadBindingRegistry>,
+    ) -> Self {
+        self.workload_binding_registry = Some(workload_binding_registry);
         self
     }
 

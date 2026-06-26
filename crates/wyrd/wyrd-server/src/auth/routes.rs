@@ -15,6 +15,7 @@ use crate::auth::Caller;
 use crate::auth::callback::exchange_authorization_code;
 use crate::auth::exchange_api_key::{DelegateToken, ExchangeApiKey, map_exchange_error_to_wyrd};
 use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
+use crate::auth::jwt_bearer::JwtBearer;
 use crate::auth::login::login as login_handler;
 use crate::auth::refresh::{RefreshTokens, tenant_from_refresh_jwt};
 use crate::error::WyrdErrorResponse;
@@ -138,14 +139,17 @@ async fn token(
             .await?;
             Ok(Json(exchanged))
         }
-        TokenRequest::JwtBearer { .. } => {
-            Err(WyrdErrorResponse::from(WyrdError::UnsupportedGrantType {
-                message: "grant type not implemented".to_owned(),
-                details: serde_json::json!({
-                    "supported_grant_types": ["wyrd_api_key", "refresh_token",
-                        "urn:ietf:params:oauth:grant-type:token-exchange"]
-                }),
-            }))
+        TokenRequest::JwtBearer { assertion, tenant } => {
+            let exchanged = JwtBearer::default()
+                .execute(
+                    &state,
+                    &headers,
+                    assertion.into_secret_string(),
+                    tenant,
+                    req_id,
+                )
+                .await?;
+            Ok(Json(exchanged.into_response()))
         }
     }
 }

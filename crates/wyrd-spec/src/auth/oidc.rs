@@ -264,7 +264,6 @@ fn openapi_url_schema(
 #[cfg(test)]
 mod tests {
     use super::{AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse};
-    use crate::auth::SecretBearer;
 
     #[test]
     fn issuer_url_normalizes_trailing_slash() {

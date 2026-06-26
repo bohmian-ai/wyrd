@@ -141,6 +141,11 @@ pub enum ResolveError {
     },
 }
 
+/// Future returned by [`RevocationCheck::epoch`].
+pub type RevocationEpochFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>> + Send + 'a>,
+>;
+
 /// Check whether a principal's revocation epoch has been bumped.
 ///
 /// The verifier calls this on every verify path — both cache hits and fresh
@@ -161,13 +166,7 @@ pub trait RevocationCheck: Send + Sync + fmt::Debug {
         tenant: &'a DataTenantId,
         principal: PrincipalId,
         kind: PrincipalKindWire,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>>
-                + Send
-                + 'a,
-        >,
-    >;
+    ) -> RevocationEpochFuture<'a>;
 }
 
 /// Zero-cost no-op revocation check used when revocation is not configured.
@@ -874,8 +873,8 @@ mod tests {
     use super::{
         AccessTokenClaims, ActClaim, AuthError, Kid, MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH,
         PermissionResolver, PrincipalKindWire, ResolveError, RevocationCheck, TokenPrincipalRef,
-        TokenVerifier, VerifiedExternalIdentity, WyrdAuthVerifySettings, decode_kid,
-        public_key_from_pem, verify_eddsa, verify_eddsa_with,
+        TokenVerifier, WyrdAuthVerifySettings, decode_kid, public_key_from_pem, verify_eddsa,
+        verify_eddsa_with,
     };
 
     const PRIVATE_KEY_PEM: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
@@ -1643,7 +1642,7 @@ mod tests {
         trusted: TrustedIssuer,
         jwks: Arc<JwksCache>,
     ) -> TokenVerifier<TestResolver> {
-        let registry = Arc::new(TrustedIssuerRegistry::from_iter([trusted]));
+        let registry = Arc::new(TrustedIssuerRegistry::from_issuers([trusted]));
         verifier(resolver, WyrdAuthVerifySettings::default()).with_external(jwks, registry)
     }
 
@@ -1710,7 +1709,7 @@ mod tests {
             make_trusted_issuer(tenant_a, issuer.clone(), "aud-for-a", jwks_uri.clone());
         let trusted_b = make_trusted_issuer(tenant_b, issuer.clone(), "aud-for-b", jwks_uri);
 
-        let registry = Arc::new(TrustedIssuerRegistry::from_iter([trusted_a, trusted_b]));
+        let registry = Arc::new(TrustedIssuerRegistry::from_issuers([trusted_a, trusted_b]));
         let jwks = make_jwks_cache();
         let v = verifier(
             Arc::new(TestResolver::default()),
@@ -1738,7 +1737,7 @@ mod tests {
     #[tokio::test]
     async fn verify_external_unknown_tenant_issuer_pair_returns_invalid_token() {
         // Empty registry — the (tenant, iss) pair is not trusted.
-        let registry = Arc::new(TrustedIssuerRegistry::from_iter([]));
+        let registry = Arc::new(TrustedIssuerRegistry::from_issuers([]));
         let jwks = make_jwks_cache();
         let v = verifier(
             Arc::new(TestResolver::default()),
@@ -1837,7 +1836,7 @@ mod tests {
             ..WyrdAuthVerifySettings::default()
         };
         let trusted = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
-        let registry = Arc::new(TrustedIssuerRegistry::from_iter([trusted]));
+        let registry = Arc::new(TrustedIssuerRegistry::from_issuers([trusted]));
         let v = verifier(Arc::new(TestResolver::default()), settings)
             .with_external(make_jwks_cache(), registry);
 
@@ -1911,7 +1910,7 @@ mod tests {
         let jwks = make_jwks_cache();
         let trusted_for_old =
             make_trusted_issuer(tid, issuer.clone(), EXTERNAL_AUDIENCE, jwks_uri.clone());
-        let registry = Arc::new(TrustedIssuerRegistry::from_iter([trusted_for_old]));
+        let registry = Arc::new(TrustedIssuerRegistry::from_issuers([trusted_for_old]));
         {
             let v = verifier(
                 Arc::new(TestResolver::default()),
@@ -1930,7 +1929,7 @@ mod tests {
         // uses new_kid. The cache has the old key set; new_kid is unknown →
         // triggers one refetch → found in the new key set → success.
         let trusted_for_new = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
-        let registry2 = Arc::new(TrustedIssuerRegistry::from_iter([trusted_for_new]));
+        let registry2 = Arc::new(TrustedIssuerRegistry::from_issuers([trusted_for_new]));
         let v2 = verifier(
             Arc::new(TestResolver::default()),
             WyrdAuthVerifySettings::default(),

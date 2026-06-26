@@ -186,12 +186,8 @@ pub struct TrustedIssuerRegistry {
 
 impl TrustedIssuerRegistry {
     /// Build a registry from an iterator of trusted issuers.
-    pub fn from_iter(issuers: impl IntoIterator<Item = TrustedIssuer>) -> Self {
-        let inner = issuers
-            .into_iter()
-            .map(|ti| ((ti.tenant_id, ti.issuer.clone()), ti))
-            .collect();
-        Self { inner }
+    pub fn from_issuers(issuers: impl IntoIterator<Item = TrustedIssuer>) -> Self {
+        issuers.into_iter().collect()
     }
 
     /// Look up a trusted issuer by tenant and issuer URL.
@@ -199,6 +195,16 @@ impl TrustedIssuerRegistry {
     /// Returns `None` when the issuer is not trusted for this tenant.
     pub fn get(&self, tenant: &DataTenantId, iss: &IssuerUrl) -> Option<&TrustedIssuer> {
         self.inner.get(&(*tenant, iss.clone()))
+    }
+}
+
+impl FromIterator<TrustedIssuer> for TrustedIssuerRegistry {
+    fn from_iter<T: IntoIterator<Item = TrustedIssuer>>(issuers: T) -> Self {
+        let inner = issuers
+            .into_iter()
+            .map(|ti| ((ti.tenant_id, ti.issuer.clone()), ti))
+            .collect();
+        Self { inner }
     }
 }
 
@@ -252,7 +258,7 @@ mod tests {
         let tenant_b = tenant(TENANT_B);
         let iss = issuer(ISSUER_URL);
 
-        let registry = TrustedIssuerRegistry::from_iter([
+        let registry = TrustedIssuerRegistry::from_issuers([
             trusted_issuer(tenant_a, iss.clone(), "aud-tenant-a"),
             trusted_issuer(tenant_b, iss.clone(), "aud-tenant-b"),
         ]);
@@ -273,7 +279,7 @@ mod tests {
     fn unknown_issuer_returns_none() {
         let tenant_a = tenant(TENANT_A);
         let iss = issuer(ISSUER_URL);
-        let registry = TrustedIssuerRegistry::from_iter([trusted_issuer(tenant_a, iss, "aud")]);
+        let registry = TrustedIssuerRegistry::from_issuers([trusted_issuer(tenant_a, iss, "aud")]);
 
         let other_iss = issuer("https://other.example.com");
         assert!(
@@ -287,7 +293,7 @@ mod tests {
         let tenant_a = tenant(TENANT_A);
         let iss = issuer(ISSUER_URL);
         let registry =
-            TrustedIssuerRegistry::from_iter([trusted_issuer(tenant_a, iss.clone(), "aud")]);
+            TrustedIssuerRegistry::from_issuers([trusted_issuer(tenant_a, iss.clone(), "aud")]);
 
         assert!(
             registry.get(&tenant(TENANT_B), &iss).is_none(),

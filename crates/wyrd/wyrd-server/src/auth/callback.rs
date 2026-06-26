@@ -1059,7 +1059,7 @@ mod tests {
             Kid::new("k1").expect("kid is valid"),
             Arc::new(public_key_from_pem(PUBLIC_KEY_PEM).expect("public key parses")),
         );
-        let registry = Arc::new(TrustedIssuerRegistry::from_iter([trusted]));
+        let registry = Arc::new(TrustedIssuerRegistry::from_issuers([trusted]));
         let verifier = TokenVerifier::new(
             local_keys,
             "wyrd",

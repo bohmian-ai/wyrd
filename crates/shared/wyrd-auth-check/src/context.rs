@@ -157,6 +157,7 @@ mod tests {
                 })
                 .collect(),
             exp: chrono::Utc::now(),
+            iat: chrono::Utc::now(),
         }
     }
 

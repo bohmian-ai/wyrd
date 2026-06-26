@@ -2,9 +2,11 @@
 
 #![deny(missing_docs)]
 
+mod auth;
 mod cli;
 mod error;
 mod eval;
+mod principal;
 
 use clap::Parser;
 
@@ -33,6 +35,8 @@ async fn main() -> std::process::ExitCode {
 
 async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, WyrdCliError> {
     match cli.command {
+        Command::Auth(command) => crate::auth::dispatch(command).await,
         Command::Eval(command) => crate::eval::run::dispatch(command).await,
+        Command::Principal(command) => crate::principal::dispatch(command).await,
     }
 }

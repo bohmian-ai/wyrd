@@ -63,4 +63,10 @@ pub enum WyrdClientError {
         /// `timeout_ms`.
         timeout_ms: u64,
     },
+
+    /// The credential chain produced no usable credential. The caller must
+    /// configure at least one source (explicit token, workload provider, or
+    /// API key). Maps to `WYRD_CLIENT_401_NO_CREDENTIALS` at the public boundary.
+    #[error("no credentials available; configure WYRD_ACCESS_TOKEN or WYRD_API_KEY")]
+    NoCredentials,
 }

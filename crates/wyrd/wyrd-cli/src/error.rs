@@ -195,6 +195,36 @@ pub enum WyrdCliError {
         source: url::ParseError,
     },
 
+    /// Auth request failed (login, refresh, callback).
+    #[error("auth request failed: status={status}, detail={detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_401_AUTH_FAILED",
+        status = 401,
+        title = "Auth request failed",
+        remediation = "Check the server URL, credentials, and network connectivity."
+    )]
+    AuthFailed {
+        /// HTTP status returned by the server (0 = client-side parse failure).
+        status: u16,
+        /// Response body or client error detail.
+        detail: String,
+    },
+
+    /// Principal revoke request failed.
+    #[error("principal revoke failed: status={status}, detail={detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_500_REVOKE_FAILED",
+        status = 500,
+        title = "Principal revoke failed",
+        remediation = "Check the principal ID, kind, access token, and server connectivity."
+    )]
+    RevokeFailed {
+        /// HTTP status returned by the server.
+        status: u16,
+        /// Response body or error detail.
+        detail: String,
+    },
+
     /// Eval engine failed.
     #[error("eval engine failed: {source}")]
     #[wyrd_error(

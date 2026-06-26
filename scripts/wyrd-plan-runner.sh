@@ -374,7 +374,7 @@ write_reviewer_prompt() {
     printf 'You are the parent plan-conformance reviewer for this Wyrd implementation slice.\n'
     printf 'Use a condensed, modified review-and-plan review pass: security, bugs/performance, tests, maintainability/style, clean-code/SOLID, developer/agent experience, and Wyrd contract boundaries.\n'
     printf 'Do not run the full review-and-plan pipeline. Do not create .dev/review artifacts. Do not write an implementation plan.\n'
-    printf 'Do not edit files. Inspect the current uncommitted diff and validate it against the plan slice.\n'
+    printf 'Do not edit files. Inspect the current uncommitted diff, including untracked files, and validate it against the plan slice.\n'
     printf 'Focus on deviations from the plan, missing required behavior, missing tests, Wyrd boundary violations, unnecessary scope creep, legacy vocabulary, and likely correctness issues.\n'
     printf 'Only report findings you validate against source. A clean review with zero findings is acceptable.\n'
     printf 'Also provide a reviewer-readable commit title and body based on the actual code change and overall plan intent.\n'
@@ -386,10 +386,13 @@ write_reviewer_prompt() {
 
   {
     printf '\n## Diff To Review\n\n'
-    printf 'Review the diff produced by:\n\n'
+    printf 'Review the working tree produced by:\n\n'
     printf '```bash\n'
+    printf 'git status --short\n'
+    printf 'git ls-files --others --exclude-standard\n'
     printf 'git diff HEAD\n'
     printf '```\n'
+    printf '\nImportant: `git diff HEAD` omits untracked files. Use `git status --short` and `git ls-files --others --exclude-standard` to identify and inspect newly created files before approving.\n'
     printf '\nReturn only raw JSON matching this schema shape:\n\n'
     printf '```json\n'
     cat "$REVIEW_SCHEMA"

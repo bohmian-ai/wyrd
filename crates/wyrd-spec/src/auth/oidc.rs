@@ -104,6 +104,16 @@ impl IssuerUrl {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Build a normalized issuer URL accepting `http://` scheme.
+    ///
+    /// Only for use in test harnesses against local containers (Keycloak, Dex).
+    /// Production code must use [`IssuerUrl::new`] which enforces `https://`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_for_tests(value: impl Into<String>) -> Self {
+        let value = value.into();
+        Self(normalize_issuer(&value))
+    }
 }
 
 impl fmt::Display for IssuerUrl {

@@ -1,0 +1,119 @@
+{
+  "id": "wyrd-test",
+  "realm": "wyrd-test",
+  "enabled": true,
+  "displayName": "Wyrd Test",
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": false,
+  "defaultRoles": ["offline_access", "uma_authorization"],
+  "groups": [
+    {
+      "id": "grp-wyrd-admins",
+      "name": "wyrd-admins",
+      "path": "/wyrd-admins",
+      "subGroups": []
+    },
+    {
+      "id": "grp-wyrd-viewers",
+      "name": "wyrd-viewers",
+      "path": "/wyrd-viewers",
+      "subGroups": []
+    }
+  ],
+  "clients": [
+    {
+      "id": "wyrd-human-client",
+      "clientId": "wyrd-human",
+      "name": "Wyrd Human Login",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "authorizationServicesEnabled": false,
+      "redirectUris": [
+        "http://localhost:*",
+        "http://127.0.0.1:*"
+      ],
+      "webOrigins": ["*"],
+      "protocol": "openid-connect",
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "id": "wyrd-human-audience-mapper",
+          "name": "wyrd-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "wyrd-human",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "id": "wyrd-human-groups-mapper",
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "consentRequired": false,
+          "config": {
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "claim.name": "groups"
+          }
+        }
+      ]
+    },
+    {
+      "id": "wyrd-workload-client",
+      "clientId": "wyrd-workload",
+      "name": "Wyrd Workload",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "wyrd-workload-secret",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "authorizationServicesEnabled": false,
+      "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "id": "wyrd-workload-audience-mapper",
+          "name": "wyrd-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "wyrd-workload",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "clientScopes": [
+    {
+      "id": "openid-scope",
+      "name": "openid",
+      "description": "OpenID Connect scope",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    }
+  ],
+  "defaultDefaultClientScopes": ["openid", "profile", "email"],
+  "defaultOptionalClientScopes": ["offline_access"]
+}

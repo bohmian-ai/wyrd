@@ -32,12 +32,13 @@ tower = { workspace = true, features = ["util"] }
 uuid = { workspace = true, features = ["v4", "v7"] }
 wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
 wyrd-auth-issue = { workspace = true }
+wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-server = { workspace = true }
-wyrd-spec = { workspace = true }
+wyrd-spec = { workspace = true, features = ["test-utils"] }
 wyrd-sql = { workspace = true }
 wyrd-storage = { workspace = true }
 wyrd-utils = { workspace = true, features = ["python"], optional = true }

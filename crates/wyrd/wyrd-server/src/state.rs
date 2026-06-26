@@ -16,6 +16,7 @@ use wyrd_telemetry::TelemetryGuard;
 use wyrd_tonic::tonic_health::server::HealthReporter;
 
 use crate::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
+use crate::auth::exchange_api_key::TokenExchangeSettings;
 use crate::auth::jwt_bearer::WorkloadBindingRegistry;
 use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::config::DeploymentProfile;
@@ -89,6 +90,8 @@ pub struct AppState {
     pub readiness: Arc<ArcSwap<ReadinessSnapshot>>,
     /// Parsed CIDR allowlist for the request-id trust gate.
     pub trusted_upstreams_parsed: Arc<[IpNetwork]>,
+    /// Access/refresh token TTL settings for all exchange paths.
+    pub token_exchange_settings: TokenExchangeSettings,
 }
 
 impl AppState {
@@ -122,6 +125,7 @@ impl AppState {
             grpc_health: reporter,
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
             trusted_upstreams_parsed: Arc::from(Vec::<IpNetwork>::new()),
+            token_exchange_settings: TokenExchangeSettings::default(),
         }
     }
 
@@ -238,6 +242,13 @@ impl AppState {
     #[must_use]
     pub fn with_audit_writer(mut self, audit_writer: Arc<dyn AuthzAuditWriter>) -> Self {
         self.audit_writer = audit_writer;
+        self
+    }
+
+    /// Override access/refresh token TTL settings for all exchange paths.
+    #[must_use]
+    pub fn with_token_exchange_settings(mut self, settings: TokenExchangeSettings) -> Self {
+        self.token_exchange_settings = settings;
         self
     }
 }

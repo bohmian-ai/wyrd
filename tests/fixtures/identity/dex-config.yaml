@@ -1,0 +1,33 @@
+issuer: http://localhost:5556
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+oauth2:
+  skipApprovalScreen: true
+  responseTypes:
+    - code
+
+# Static clients for Wyrd test suite
+staticClients:
+  - id: wyrd-workload
+    secret: wyrd-workload-dex-secret
+    name: Wyrd Workload (Dex)
+    public: false
+    redirectURIs:
+      - http://localhost:8888/callback
+
+# Local password connector for testing human-login conformance
+# Users are created with well-known test password: wyrd-test
+connectors:
+  - type: local
+    id: local
+    name: Email
+    config:
+      # Users are seeded by the dex-init step in the identity:e2e task.
+      # The userDB field is populated via a generated config at task runtime;
+      # this static placeholder demonstrates the config shape only.
+      userDB: []

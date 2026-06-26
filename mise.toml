@@ -73,6 +73,94 @@ run = "cargo test --locked --doc --all-features -p wyrd-spec"
 description = "Run wyrd-error-derive tests"
 run = "cargo test -p wyrd-error-derive --all-features"
 
+[tasks."identity:e2e"]
+description = """Stand up real OIDC providers (Keycloak + Dex), seed test users via the Keycloak
+admin REST API, export env gates, run the identity e2e suite against both issuers, then tear down.
+Gated by WYRD_IDENTITY_E2E=1; skipped when the env var is unset so default local runs are fast.
+"""
+depends = ["build:postgres", "db:setup-roles", "db:migrate"]
+env = { WYRD_IDENTITY_E2E = "1", WYRD_KEYCLOAK_ISSUER = "http://localhost:8080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+run = """
+set -e
+
+# Bring up Keycloak and Dex (postgres was brought up by depends)
+docker compose up -d keycloak dex --wait
+
+# Seed Keycloak users via admin REST API (realm import only defines clients/groups)
+python3 - <<'PYEOF'
+import json, urllib.request, urllib.parse, time, sys
+
+BASE = "http://localhost:8080"
+REALM = "wyrd-test"
+
+def get_admin_token():
+    data = urllib.parse.urlencode({
+        "grant_type": "password",
+        "client_id": "admin-cli",
+        "username": "admin",
+        "password": "admin",
+    }).encode()
+    req = urllib.request.Request(
+        f"{BASE}/realms/master/protocol/openid-connect/token", data=data
+    )
+    resp = json.loads(urllib.request.urlopen(req).read())
+    return resp["access_token"]
+
+def api(method, path, body=None, token=None):
+    url = f"{BASE}/admin/realms/{REALM}{path}"
+    data = json.dumps(body).encode() if body else None
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        r = urllib.request.urlopen(req)
+        return json.loads(r.read()) if r.read() else None
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        if e.code == 409:  # already exists — idempotent
+            return None
+        raise RuntimeError(f"API {method} {path} → {e.code}: {body}") from e
+
+for attempt in range(30):
+    try:
+        token = get_admin_token()
+        break
+    except Exception:
+        time.sleep(2)
+else:
+    sys.exit("Keycloak admin API not ready after 60s")
+
+def create_user(username, email, password, group_path):
+    api("POST", "/users", {
+        "username": username,
+        "email": email,
+        "emailVerified": True,
+        "enabled": True,
+    }, token)
+    users = api("GET", f"/users?username={username}", token=token) or []
+    if not users:
+        sys.exit(f"user {username} not found after creation")
+    uid = users[0]["id"]
+    api("PUT", f"/users/{uid}/reset-password", {
+        "type": "password",
+        "temporary": False,
+        "value": password,
+    }, token)
+    groups = api("GET", f"/groups?search={group_path.lstrip('/')}", token=token) or []
+    if groups:
+        api("PUT", f"/users/{uid}/groups/{groups[0]['id']}", token=token)
+
+create_user("alice", "alice@wyrd.test", "wyrd-test", "wyrd-admins")
+create_user("bob", "bob@wyrd.test", "wyrd-test", "wyrd-viewers")
+print("Keycloak users seeded")
+PYEOF
+
+cargo test -p wyrd-server --all-features --test identity_e2e -- --nocapture --test-threads=1
+
+docker compose stop keycloak dex
+"""
+
 [tasks."build:server:oss"]
 description = "Build the OSS wyrd-server release binary"
 run = "cargo build --release --locked -p wyrd-server"

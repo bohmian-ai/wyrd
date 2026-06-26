@@ -418,9 +418,11 @@ mod tests {
         card_ref: &CardRef,
     ) -> Uuid {
         let sa_id = Uuid::new_v4();
-        insert_service_account(conn, sa_id, "service", card_ref, "test-sa", None, created_by)
-            .await
-            .expect("service account inserts");
+        insert_service_account(
+            conn, sa_id, "service", card_ref, "test-sa", None, created_by,
+        )
+        .await
+        .expect("service account inserts");
         sa_id
     }
 
@@ -519,7 +521,10 @@ mod tests {
             .execute(&mut conn, refresh_jwt, "req-reuse")
             .await;
 
-        assert!(matches!(result, Err(RefreshError::Reused)), "reuse detected: {result:?}");
+        assert!(
+            matches!(result, Err(RefreshError::Reused)),
+            "reuse detected: {result:?}"
+        );
 
         // The sibling should also be revoked.
         let sibling = refresh_by_hash(&mut conn, "hash-active-sibling")

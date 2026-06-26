@@ -1,9 +1,11 @@
 //! Authentication extractors for Wyrd HTTP handlers.
 
 pub mod audit_writer;
+pub mod callback;
 pub mod caller_extractor;
 pub mod exchange_api_key;
 pub mod issue_api_key;
+pub mod login;
 pub mod permission_resolver;
 pub mod policy_hook;
 pub mod principal_extractor;

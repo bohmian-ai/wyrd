@@ -1,18 +1,21 @@
 //! HTTP routes for auth preview surfaces.
 
-use axum::extract::{Extension, State};
+use axum::extract::{Extension, Query, State};
+use axum::http::HeaderMap;
 use axum::{Json, Router};
 use base64::Engine;
 use secrecy::SecretString;
 use uuid::Uuid;
 use wyrd_auth_verify::AccessTokenClaims;
-use wyrd_spec::auth::{IssueKeyRequest, TokenRequest, TokenResponse};
+use wyrd_spec::auth::{CallbackQuery, IssueKeyRequest, TokenRequest, TokenResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
 use crate::auth::Caller;
+use crate::auth::callback::exchange_authorization_code;
 use crate::auth::exchange_api_key::{DelegateToken, ExchangeApiKey, map_exchange_error_to_wyrd};
 use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
+use crate::auth::login::login as login_handler;
 use crate::auth::refresh::{RefreshTokens, tenant_from_refresh_jwt};
 use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
@@ -20,12 +23,15 @@ use crate::state::AppState;
 /// Build auth routes.
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/auth/login", axum::routing::get(login_handler))
+        .route("/auth/callback", axum::routing::get(callback))
         .route("/auth/token", axum::routing::post(token))
         .route("/auth/issue-key", axum::routing::post(issue_key))
 }
 
 async fn token(
     State(state): State<AppState>,
+    headers: HeaderMap,
     request_id: Option<Extension<RequestId>>,
     Json(request): Json<TokenRequest>,
 ) -> Result<Json<TokenResponse>, WyrdErrorResponse> {
@@ -117,7 +123,22 @@ async fn token(
             conn.commit().await.map_err(sql_error)?;
             Ok(Json(exchanged.into_response()))
         }
-        TokenRequest::AuthorizationCode { .. } | TokenRequest::JwtBearer { .. } => {
+        TokenRequest::AuthorizationCode {
+            code,
+            state: login_state,
+        } => {
+            let request_id = req_id.to_owned();
+            let exchanged = exchange_authorization_code(
+                &state,
+                &headers,
+                code.into_secret_string(),
+                &login_state,
+                &request_id,
+            )
+            .await?;
+            Ok(Json(exchanged))
+        }
+        TokenRequest::JwtBearer { .. } => {
             Err(WyrdErrorResponse::from(WyrdError::UnsupportedGrantType {
                 message: "grant type not implemented".to_owned(),
                 details: serde_json::json!({
@@ -127,6 +148,31 @@ async fn token(
             }))
         }
     }
+}
+
+async fn callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request_id: Option<Extension<RequestId>>,
+    Query(query): Query<CallbackQuery>,
+) -> Result<Json<TokenResponse>, WyrdErrorResponse> {
+    let request_id_str;
+    let req_id = match request_id.as_ref() {
+        Some(Extension(id)) => id.as_str(),
+        None => {
+            request_id_str = Uuid::new_v4().to_string();
+            &request_id_str
+        }
+    };
+    let exchanged = exchange_authorization_code(
+        &state,
+        &headers,
+        query.code.into_secret_string(),
+        &query.state,
+        req_id,
+    )
+    .await?;
+    Ok(Json(exchanged))
 }
 
 async fn issue_key(

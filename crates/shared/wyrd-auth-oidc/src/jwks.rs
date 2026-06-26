@@ -69,7 +69,10 @@ struct Jwk {
 
 type KeyMap = Arc<HashMap<OidcKid, Arc<DecodingKey>>>;
 
-fn decoding_key_from_jwk(jwk: &Jwk, issuer: &str) -> Result<Option<(OidcKid, Arc<DecodingKey>)>, OidcError> {
+fn decoding_key_from_jwk(
+    jwk: &Jwk,
+    issuer: &str,
+) -> Result<Option<(OidcKid, Arc<DecodingKey>)>, OidcError> {
     let kid = match &jwk.kid {
         Some(k) => OidcKid::new(k.clone()),
         // Skip keys without a kid; we cannot look them up by header kid.
@@ -147,10 +150,13 @@ async fn fetch_jwks(
         });
     }
 
-    let jwks: Jwks = response.json().await.map_err(|e| OidcError::JwksUnavailable {
-        issuer: issuer.to_owned(),
-        message: format!("JWKS JSON parse failed: {e}"),
-    })?;
+    let jwks: Jwks = response
+        .json()
+        .await
+        .map_err(|e| OidcError::JwksUnavailable {
+            issuer: issuer.to_owned(),
+            message: format!("JWKS JSON parse failed: {e}"),
+        })?;
 
     let mut map = HashMap::new();
     for jwk in &jwks.keys {
@@ -191,11 +197,12 @@ impl JwksCache {
     /// `max_issuers` bounds the number of cached issuer key sets. Entries
     /// beyond the capacity are evicted by LRU before TTL expiry.
     pub fn new(http: reqwest::Client, ttl: Duration, fetch_timeout: Duration) -> Self {
-        let inner = Cache::builder()
-            .max_capacity(256)
-            .time_to_live(ttl)
-            .build();
-        Self { inner, http, fetch_timeout }
+        let inner = Cache::builder().max_capacity(256).time_to_live(ttl).build();
+        Self {
+            inner,
+            http,
+            fetch_timeout,
+        }
     }
 
     /// Resolve a [`DecodingKey`] by `kid` for the given issuer.
@@ -227,10 +234,12 @@ impl JwksCache {
 
         let map = self.fetch_cached(issuer, jwks_uri).await?;
 
-        map.get(kid).map(Arc::clone).ok_or_else(|| OidcError::UnknownKid {
-            issuer: issuer.to_owned(),
-            kid: kid.as_str().to_owned(),
-        })
+        map.get(kid)
+            .map(Arc::clone)
+            .ok_or_else(|| OidcError::UnknownKid {
+                issuer: issuer.to_owned(),
+                kid: kid.as_str().to_owned(),
+            })
     }
 
     async fn fetch_cached(&self, issuer: &str, jwks_uri: &Url) -> Result<KeyMap, OidcError> {
@@ -470,7 +479,10 @@ mod tests {
         assert_eq!(ok_count, 10, "all concurrent tasks should resolve the key");
 
         // Exactly one HTTP request should have been made (moka coalesced the rest).
-        let received = server.received_requests().await.expect("wiremock tracks requests");
+        let received = server
+            .received_requests()
+            .await
+            .expect("wiremock tracks requests");
         assert_eq!(
             received.len(),
             1,

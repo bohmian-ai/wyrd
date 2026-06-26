@@ -254,7 +254,7 @@ impl WyrdTestEnv {
         insert_user(
             &mut conn,
             user_id,
-            &format!("{name}@test.wyrd"),
+            Some(&format!("{name}@test.wyrd")),
             "password",
             None,
         )
@@ -577,16 +577,22 @@ impl WyrdTestEnv {
     async fn ensure_fixture_admin(&self) -> Result<Uuid, WyrdTestError> {
         let id = Uuid::from_u128(0x018f0000000070008000000000000001);
         let mut conn = self.tenant_conn().await?;
-        insert_user(&mut conn, id, "fixture-admin@test.wyrd", "password", None)
-            .await
-            .or_else(|error| {
-                if is_unique_violation(&error) {
-                    Ok(())
-                } else {
-                    Err(error)
-                }
-            })
-            .map_err(sql)?;
+        insert_user(
+            &mut conn,
+            id,
+            Some("fixture-admin@test.wyrd"),
+            "password",
+            None,
+        )
+        .await
+        .or_else(|error| {
+            if is_unique_violation(&error) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(sql)?;
         conn.commit().await.map_err(sql)?;
         Ok(id)
     }

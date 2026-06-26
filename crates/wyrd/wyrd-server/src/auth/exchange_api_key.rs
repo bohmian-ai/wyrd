@@ -381,9 +381,7 @@ async fn resolve_requested_subject(
     }
 }
 
-pub(super) fn role_refs(
-    names: Vec<String>,
-) -> Result<Vec<RoleRef>, wyrd_runtime::InvalidRoleName> {
+pub(crate) fn role_refs(names: Vec<String>) -> Result<Vec<RoleRef>, wyrd_runtime::InvalidRoleName> {
     names.into_iter().map(|name| RoleRef::new(&name)).collect()
 }
 
@@ -432,7 +430,7 @@ fn act_from_chain(
     })
 }
 
-pub(super) fn token_hash(token: &str) -> String {
+pub(crate) fn token_hash(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 

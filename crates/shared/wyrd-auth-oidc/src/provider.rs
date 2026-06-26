@@ -40,7 +40,10 @@ pub struct ProviderMetadata {
     pub id_token_signing_alg_values_supported: Vec<String>,
 }
 
-fn parse_raw_metadata(raw: RawProviderMetadata, issuer_str: &str) -> Result<ProviderMetadata, OidcError> {
+fn parse_raw_metadata(
+    raw: RawProviderMetadata,
+    issuer_str: &str,
+) -> Result<ProviderMetadata, OidcError> {
     let authorization_endpoint =
         raw.authorization_endpoint
             .parse::<Url>()
@@ -58,10 +61,13 @@ fn parse_raw_metadata(raw: RawProviderMetadata, issuer_str: &str) -> Result<Prov
             })
         })
         .transpose()?;
-    let jwks_uri = raw.jwks_uri.parse::<Url>().map_err(|e| OidcError::Discovery {
-        issuer: issuer_str.to_owned(),
-        message: format!("jwks_uri is not a valid URL: {e}"),
-    })?;
+    let jwks_uri = raw
+        .jwks_uri
+        .parse::<Url>()
+        .map_err(|e| OidcError::Discovery {
+            issuer: issuer_str.to_owned(),
+            message: format!("jwks_uri is not a valid URL: {e}"),
+        })?;
     Ok(ProviderMetadata {
         issuer: raw.issuer,
         authorization_endpoint,
@@ -122,11 +128,10 @@ impl OidcProvider {
             });
         }
 
-        let raw: RawProviderMetadata =
-            response.json().await.map_err(|e| OidcError::Discovery {
-                issuer: issuer_str.clone(),
-                message: e.to_string(),
-            })?;
+        let raw: RawProviderMetadata = response.json().await.map_err(|e| OidcError::Discovery {
+            issuer: issuer_str.clone(),
+            message: e.to_string(),
+        })?;
 
         // Anti-spoofing: the metadata issuer must match the URL we requested from.
         // Both sides are normalized to strip trailing slashes so comparison is canonical.
@@ -193,10 +198,12 @@ mod tests {
 
         assert_eq!(provider.metadata.issuer, server.uri());
         assert!(provider.metadata.jwks_uri.as_str().ends_with("/jwks"));
-        assert!(provider
-            .metadata
-            .id_token_signing_alg_values_supported
-            .contains(&"RS256".to_owned()));
+        assert!(
+            provider
+                .metadata
+                .id_token_signing_alg_values_supported
+                .contains(&"RS256".to_owned())
+        );
     }
 
     #[tokio::test]

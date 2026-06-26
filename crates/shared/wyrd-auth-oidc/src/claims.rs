@@ -39,11 +39,10 @@ pub fn map_claims(
     mapping: &ClaimMapping,
     claims: &serde_json::Value,
 ) -> Result<MappedClaims, OidcError> {
-    let subject = extract_string(claims, &mapping.subject)?.ok_or_else(|| {
-        OidcError::ClaimMissing {
+    let subject =
+        extract_string(claims, &mapping.subject)?.ok_or_else(|| OidcError::ClaimMissing {
             path: mapping.subject.as_str().to_owned(),
-        }
-    })?;
+        })?;
 
     let email = mapping
         .email
@@ -56,11 +55,18 @@ pub fn map_claims(
         .and_then(|path| extract_string_array(claims, path))
         .unwrap_or_default();
 
-    Ok(MappedClaims { subject, email, groups })
+    Ok(MappedClaims {
+        subject,
+        email,
+        groups,
+    })
 }
 
 /// Navigate a dotted path in a JSON value, returning the value at the leaf.
-fn get_at_path<'a>(value: &'a serde_json::Value, path: &ClaimPath) -> Option<&'a serde_json::Value> {
+fn get_at_path<'a>(
+    value: &'a serde_json::Value,
+    path: &ClaimPath,
+) -> Option<&'a serde_json::Value> {
     let mut current = value;
     for segment in path.as_str().split('.') {
         current = current.get(segment)?;
@@ -152,8 +158,8 @@ mod tests {
     #[test]
     fn missing_subject_claim_returns_error() {
         let claims = json!({ "email": "x@x.com" });
-        let err = map_claims(&standard_mapping(), &claims)
-            .expect_err("missing sub should be an error");
+        let err =
+            map_claims(&standard_mapping(), &claims).expect_err("missing sub should be an error");
 
         assert!(
             matches!(&err, OidcError::ClaimMissing { path } if path == "sub"),
@@ -196,7 +202,11 @@ mod tests {
             email: None,
             groups: vec![],
         };
-        let MappedClaims { subject, email, groups } = mc;
+        let MappedClaims {
+            subject,
+            email,
+            groups,
+        } = mc;
         assert_eq!(subject, "u");
         assert!(email.is_none());
         assert!(groups.is_empty());
@@ -208,7 +218,11 @@ mod tests {
         // fields (id, tenant_id, kind, permissions). Assert it is purely
         // external claim data by verifying its type and field names.
         fn assert_only_external_fields(_: &MappedClaims) {}
-        let mc = MappedClaims { subject: "x".to_owned(), email: None, groups: vec![] };
+        let mc = MappedClaims {
+            subject: "x".to_owned(),
+            email: None,
+            groups: vec![],
+        };
         assert_only_external_fields(&mc);
     }
 }

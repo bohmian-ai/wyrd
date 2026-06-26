@@ -47,7 +47,10 @@ fn check_permission(caller: &AuthenticatedPrincipal) -> Result<(), WyrdErrorResp
     }))
 }
 
-async fn acquire_conn(state: &AppState, tenant: DataTenantId) -> Result<TenantConn<'_>, WyrdErrorResponse> {
+async fn acquire_conn(
+    state: &AppState,
+    tenant: DataTenantId,
+) -> Result<TenantConn<'_>, WyrdErrorResponse> {
     TenantConn::acquire(&state.pool, tenant)
         .await
         .map_err(internal_error)
@@ -64,7 +67,9 @@ async fn revoke_in_conn(
     let id_uuid = target_id.as_uuid();
 
     if user_by_id(conn, id_uuid).await.ok().flatten().is_some() {
-        revoke_user_principal(conn, id_uuid).await.map_err(internal_error)?;
+        revoke_user_principal(conn, id_uuid)
+            .await
+            .map_err(internal_error)?;
         return Ok(PrincipalKindWire::User);
     }
 

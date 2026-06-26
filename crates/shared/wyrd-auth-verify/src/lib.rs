@@ -162,7 +162,11 @@ pub trait RevocationCheck: Send + Sync + fmt::Debug {
         principal: PrincipalId,
         kind: PrincipalKindWire,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>> + Send + 'a>,
+        Box<
+            dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>>
+                + Send
+                + 'a,
+        >,
     >;
 }
 
@@ -177,7 +181,11 @@ impl RevocationCheck for NoRevocation {
         _principal: PrincipalId,
         _kind: PrincipalKindWire,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>> + Send + 'a>,
+        Box<
+            dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>>
+                + Send
+                + 'a,
+        >,
     > {
         Box::pin(std::future::ready(Ok(None)))
     }
@@ -365,7 +373,10 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
                     PrincipalKind::Service { .. } => PrincipalKindWire::Service,
                     PrincipalKind::Agent { .. } => PrincipalKindWire::Agent,
                 };
-                match rev.epoch(&cached.principal.tenant_id, cached.principal.id, kind).await {
+                match rev
+                    .epoch(&cached.principal.tenant_id, cached.principal.id, kind)
+                    .await
+                {
                     Ok(Some(epoch)) if cached.iat < epoch => {
                         self.cache.invalidate(&hash).await;
                         return Err(AuthError::Revoked);
@@ -411,7 +422,10 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
                 PrincipalKind::Service { .. } => PrincipalKindWire::Service,
                 PrincipalKind::Agent { .. } => PrincipalKindWire::Agent,
             };
-            match rev.epoch(&result.principal.tenant_id, result.principal.id, kind).await {
+            match rev
+                .epoch(&result.principal.tenant_id, result.principal.id, kind)
+                .await
+            {
                 Ok(Some(epoch)) if result.iat < epoch => {
                     self.cache.invalidate(&hash).await;
                     return Err(AuthError::Revoked);
@@ -483,7 +497,9 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
         let iss_str = {
             use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
             let payload_b64 = token.split('.').nth(1).ok_or(AuthError::BadTokenFormat)?;
-            let payload = URL_SAFE_NO_PAD.decode(payload_b64).map_err(|_| AuthError::BadTokenFormat)?;
+            let payload = URL_SAFE_NO_PAD
+                .decode(payload_b64)
+                .map_err(|_| AuthError::BadTokenFormat)?;
             let claims_value: serde_json::Value =
                 serde_json::from_slice(&payload).map_err(|_| AuthError::InvalidToken)?;
             claims_value
@@ -534,18 +550,17 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
         validation.set_audience(&[trusted.expected_audience.as_str()]);
         validation.leeway = self.settings.allowed_clock_skew.as_secs();
 
-        let raw_claims: serde_json::Value =
-            jsonwebtoken::decode(token, &decoding_key, &validation)
-                .map(|data| data.claims)
-                .map_err(|e| match e.kind() {
-                    jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
-                    jsonwebtoken::errors::ErrorKind::InvalidAudience
-                    | jsonwebtoken::errors::ErrorKind::InvalidIssuer => AuthError::InvalidToken,
-                    _ => AuthError::Jwt(e),
-                })?;
+        let raw_claims: serde_json::Value = jsonwebtoken::decode(token, &decoding_key, &validation)
+            .map(|data| data.claims)
+            .map_err(|e| match e.kind() {
+                jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
+                jsonwebtoken::errors::ErrorKind::InvalidAudience
+                | jsonwebtoken::errors::ErrorKind::InvalidIssuer => AuthError::InvalidToken,
+                _ => AuthError::Jwt(e),
+            })?;
 
-        let mapped = map_claims(&trusted.claim_mapping, &raw_claims)
-            .map_err(|_| AuthError::InvalidToken)?;
+        let mapped =
+            map_claims(&trusted.claim_mapping, &raw_claims).map_err(|_| AuthError::InvalidToken)?;
 
         Ok(VerifiedExternalIdentity {
             issuer: trusted.issuer.clone(),
@@ -1242,7 +1257,11 @@ mod tests {
             _principal: PrincipalId,
             _kind: PrincipalKindWire,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             if self.unavailable {
                 Box::pin(std::future::ready(Err(ResolveError::Unavailable(
@@ -1269,8 +1288,8 @@ mod tests {
     async fn revocation_epoch_rejects_cache_hit_when_iat_predates_epoch() {
         let resolver = Arc::new(TestResolver::default());
         let iat_unix = now() - 10;
-        let epoch = DateTime::from_timestamp(iat_unix as i64 + 1, 0)
-            .expect("static epoch is valid");
+        let epoch =
+            DateTime::from_timestamp(iat_unix as i64 + 1, 0).expect("static epoch is valid");
         let verifier = verifier_with_revocation(Arc::clone(&resolver), Some(epoch));
         let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
             now() + 3_600,
@@ -1293,8 +1312,8 @@ mod tests {
     async fn revocation_epoch_passes_when_iat_at_or_after_epoch() {
         let resolver = Arc::new(TestResolver::default());
         let iat_unix = now() - 5;
-        let epoch = DateTime::from_timestamp(iat_unix as i64 - 1, 0)
-            .expect("static epoch is valid");
+        let epoch =
+            DateTime::from_timestamp(iat_unix as i64 - 1, 0).expect("static epoch is valid");
         let verifier = verifier_with_revocation(Arc::clone(&resolver), Some(epoch));
         let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
             now() + 3_600,
@@ -1314,8 +1333,7 @@ mod tests {
             epoch: None,
             unavailable: true,
         });
-        let verifier =
-            verifier(resolver, WyrdAuthVerifySettings::default()).with_revocation(check);
+        let verifier = verifier(resolver, WyrdAuthVerifySettings::default()).with_revocation(check);
         let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
             now() + 3_600,
             now() - 5,
@@ -1613,6 +1631,8 @@ mod tests {
             client_id: "wyrd".to_owned(),
             client_auth: ClientAuth::PrivateKeyJwt,
             claim_mapping: make_claim_mapping(),
+            group_role_map: std::collections::HashMap::new(),
+            default_roles: Vec::new(),
             principal_kind: PrincipalKindPolicy::Human,
             jwks_ttl: Duration::from_secs(3600),
         }
@@ -1640,16 +1660,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let jwks_uri: url::Url =
-            format!("{}/jwks", server.uri()).parse().expect("wiremock uri is valid");
+        let jwks_uri: url::Url = format!("{}/jwks", server.uri())
+            .parse()
+            .expect("wiremock uri is valid");
         let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
         let tid = tenant_id();
         let trusted = make_trusted_issuer(tid, issuer.clone(), EXTERNAL_AUDIENCE, jwks_uri);
         let resolver = Arc::new(TestResolver::default());
         let v = with_external_issuer(Arc::clone(&resolver), trusted, make_jwks_cache());
 
-        let claims =
-            external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
+        let claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
         let token = encode_external_token(&claims, EXTERNAL_KID);
 
         let identity = v
@@ -1677,21 +1697,26 @@ mod tests {
             .mount(&server)
             .await;
 
-        let jwks_uri: url::Url =
-            format!("{}/jwks", server.uri()).parse().expect("wiremock uri is valid");
+        let jwks_uri: url::Url = format!("{}/jwks", server.uri())
+            .parse()
+            .expect("wiremock uri is valid");
         let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
         let tenant_a = tenant_id();
         let tenant_b: DataTenantId = "01890f28-7c4a-7001-98e7-4f4a3c2d1b02"
             .parse()
             .expect("static tenant id is valid");
 
-        let trusted_a = make_trusted_issuer(tenant_a, issuer.clone(), "aud-for-a", jwks_uri.clone());
+        let trusted_a =
+            make_trusted_issuer(tenant_a, issuer.clone(), "aud-for-a", jwks_uri.clone());
         let trusted_b = make_trusted_issuer(tenant_b, issuer.clone(), "aud-for-b", jwks_uri);
 
         let registry = Arc::new(TrustedIssuerRegistry::from_iter([trusted_a, trusted_b]));
         let jwks = make_jwks_cache();
-        let v = verifier(Arc::new(TestResolver::default()), WyrdAuthVerifySettings::default())
-            .with_external(jwks, registry);
+        let v = verifier(
+            Arc::new(TestResolver::default()),
+            WyrdAuthVerifySettings::default(),
+        )
+        .with_external(jwks, registry);
 
         // Token signed with aud-for-a.
         let claims_a = external_claims(EXTERNAL_ISSUER, "aud-for-a", now() + 3_600, now());
@@ -1715,8 +1740,11 @@ mod tests {
         // Empty registry — the (tenant, iss) pair is not trusted.
         let registry = Arc::new(TrustedIssuerRegistry::from_iter([]));
         let jwks = make_jwks_cache();
-        let v = verifier(Arc::new(TestResolver::default()), WyrdAuthVerifySettings::default())
-            .with_external(jwks, registry);
+        let v = verifier(
+            Arc::new(TestResolver::default()),
+            WyrdAuthVerifySettings::default(),
+        )
+        .with_external(jwks, registry);
 
         let claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
         let token = encode_external_token(&claims, EXTERNAL_KID);
@@ -1731,7 +1759,10 @@ mod tests {
     #[tokio::test]
     async fn verify_external_without_external_configured_returns_invalid_token() {
         // No with_external() call → external path is None.
-        let v = verifier(Arc::new(TestResolver::default()), WyrdAuthVerifySettings::default());
+        let v = verifier(
+            Arc::new(TestResolver::default()),
+            WyrdAuthVerifySettings::default(),
+        );
         let claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
         let token = encode_external_token(&claims, EXTERNAL_KID);
 
@@ -1742,7 +1773,10 @@ mod tests {
     #[tokio::test]
     async fn verify_external_rejects_local_issuer_token() {
         // Token with iss == local issuer ("wyrd") must go through verify(), not verify_external().
-        let v = verifier(Arc::new(TestResolver::default()), WyrdAuthVerifySettings::default());
+        let v = verifier(
+            Arc::new(TestResolver::default()),
+            WyrdAuthVerifySettings::default(),
+        );
         let claims = claims_with_times(now() + 3_600, now()); // iss: "wyrd"
         let token = encode_eddsa_with_kid(&claims);
 
@@ -1762,13 +1796,17 @@ mod tests {
             .mount(&server)
             .await;
 
-        let jwks_uri: url::Url =
-            format!("{}/jwks", server.uri()).parse().expect("wiremock uri is valid");
+        let jwks_uri: url::Url = format!("{}/jwks", server.uri())
+            .parse()
+            .expect("wiremock uri is valid");
         let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
         let tid = tenant_id();
-        let trusted =
-            make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
-        let v = with_external_issuer(Arc::new(TestResolver::default()), trusted, make_jwks_cache());
+        let trusted = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
+        let v = with_external_issuer(
+            Arc::new(TestResolver::default()),
+            trusted,
+            make_jwks_cache(),
+        );
 
         let claims = external_claims(EXTERNAL_ISSUER, "wrong-audience", now() + 3_600, now());
         let token = encode_external_token(&claims, EXTERNAL_KID);
@@ -1789,8 +1827,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let jwks_uri: url::Url =
-            format!("{}/jwks", server.uri()).parse().expect("wiremock uri is valid");
+        let jwks_uri: url::Url = format!("{}/jwks", server.uri())
+            .parse()
+            .expect("wiremock uri is valid");
         let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
         let tid = tenant_id();
         let settings = WyrdAuthVerifySettings {
@@ -1802,7 +1841,12 @@ mod tests {
         let v = verifier(Arc::new(TestResolver::default()), settings)
             .with_external(make_jwks_cache(), registry);
 
-        let claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() - 3_600, now() - 7_200);
+        let claims = external_claims(
+            EXTERNAL_ISSUER,
+            EXTERNAL_AUDIENCE,
+            now() - 3_600,
+            now() - 7_200,
+        );
         let token = encode_external_token(&claims, EXTERNAL_KID);
 
         let result = v.verify_external(&tid, &token).await;
@@ -1814,12 +1858,17 @@ mod tests {
 
     #[tokio::test]
     async fn verify_external_jwks_unreachable_returns_verify_unavailable() {
-        let jwks_uri: url::Url =
-            "http://127.0.0.1:1/jwks".parse().expect("static uri is valid");
+        let jwks_uri: url::Url = "http://127.0.0.1:1/jwks"
+            .parse()
+            .expect("static uri is valid");
         let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
         let tid = tenant_id();
         let trusted = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
-        let v = with_external_issuer(Arc::new(TestResolver::default()), trusted, make_jwks_cache());
+        let v = with_external_issuer(
+            Arc::new(TestResolver::default()),
+            trusted,
+            make_jwks_cache(),
+        );
 
         let claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
         let token = encode_external_token(&claims, EXTERNAL_KID);
@@ -1852,8 +1901,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let jwks_uri: url::Url =
-            format!("{}/jwks", server.uri()).parse().expect("wiremock uri is valid");
+        let jwks_uri: url::Url = format!("{}/jwks", server.uri())
+            .parse()
+            .expect("wiremock uri is valid");
         let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
         let tid = tenant_id();
 
@@ -1863,22 +1913,29 @@ mod tests {
             make_trusted_issuer(tid, issuer.clone(), EXTERNAL_AUDIENCE, jwks_uri.clone());
         let registry = Arc::new(TrustedIssuerRegistry::from_iter([trusted_for_old]));
         {
-            let v = verifier(Arc::new(TestResolver::default()), WyrdAuthVerifySettings::default())
-                .with_external(Arc::clone(&jwks), Arc::clone(&registry));
+            let v = verifier(
+                Arc::new(TestResolver::default()),
+                WyrdAuthVerifySettings::default(),
+            )
+            .with_external(Arc::clone(&jwks), Arc::clone(&registry));
             let old_claims =
                 external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
             let old_token = encode_external_token(&old_claims, old_kid);
-            v.verify_external(&tid, &old_token).await.expect("old kid should resolve");
+            v.verify_external(&tid, &old_token)
+                .await
+                .expect("old kid should resolve");
         }
 
         // Now create a new verifier sharing the same JWKS cache, but the token
         // uses new_kid. The cache has the old key set; new_kid is unknown →
         // triggers one refetch → found in the new key set → success.
-        let trusted_for_new =
-            make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
+        let trusted_for_new = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
         let registry2 = Arc::new(TrustedIssuerRegistry::from_iter([trusted_for_new]));
-        let v2 = verifier(Arc::new(TestResolver::default()), WyrdAuthVerifySettings::default())
-            .with_external(Arc::clone(&jwks), registry2);
+        let v2 = verifier(
+            Arc::new(TestResolver::default()),
+            WyrdAuthVerifySettings::default(),
+        )
+        .with_external(Arc::clone(&jwks), registry2);
         let new_claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
         let new_token = encode_external_token(&new_claims, new_kid);
         v2.verify_external(&tid, &new_token)

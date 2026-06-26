@@ -13,9 +13,7 @@ use wyrd_auth_verify::{PrincipalKindWire, ResolveError, RevocationCheck};
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::auth::{
-    service_account_revocation_epoch, user_revocation_epoch,
-};
+use wyrd_sql::queries::auth::{service_account_revocation_epoch, user_revocation_epoch};
 
 const EPOCH_CACHE_TTL: Duration = Duration::from_secs(5);
 const EPOCH_CACHE_MAX: u64 = 50_000;
@@ -95,8 +93,13 @@ impl RevocationCheck for SqlRevocationCheck {
         tenant: &'a DataTenantId,
         principal: PrincipalId,
         kind: PrincipalKindWire,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>> + Send + 'a>>
-    {
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>>
+                + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
             let key = EpochKey {
                 tenant: *tenant,
@@ -106,16 +109,14 @@ impl RevocationCheck for SqlRevocationCheck {
 
             self.cache
                 .try_get_with(key, async {
-                    let mut conn = TenantConn::acquire(&self.pool, *tenant).await.map_err(|e| {
-                        ResolveError::Unavailable(e.to_string())
-                    })?;
+                    let mut conn = TenantConn::acquire(&self.pool, *tenant)
+                        .await
+                        .map_err(|e| ResolveError::Unavailable(e.to_string()))?;
                     let id_uuid = principal.as_uuid();
                     let epoch = match PrincipalKindKind::from(kind) {
-                        PrincipalKindKind::User => {
-                            user_revocation_epoch(&mut conn, id_uuid).await.map_err(|e| {
-                                ResolveError::Unavailable(e.to_string())
-                            })?
-                        }
+                        PrincipalKindKind::User => user_revocation_epoch(&mut conn, id_uuid)
+                            .await
+                            .map_err(|e| ResolveError::Unavailable(e.to_string()))?,
                         PrincipalKindKind::ServiceOrAgent => {
                             service_account_revocation_epoch(&mut conn, id_uuid)
                                 .await

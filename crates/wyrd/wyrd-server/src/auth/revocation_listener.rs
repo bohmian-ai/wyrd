@@ -69,8 +69,16 @@ impl RevocationListener {
         check: Arc<SqlRevocationCheck>,
         shutdown: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
-        let listener = Self { pool, check, shutdown };
-        tokio::spawn(listener.run().instrument(tracing::info_span!("revocation_listener")))
+        let listener = Self {
+            pool,
+            check,
+            shutdown,
+        };
+        tokio::spawn(
+            listener
+                .run()
+                .instrument(tracing::info_span!("revocation_listener")),
+        )
     }
 
     async fn run(self) {

@@ -191,8 +191,7 @@ pub enum UrlParseError {
 }
 
 fn validate_absolute_url(value: &str) -> Result<(), UrlParseError> {
-    let parsed =
-        url::Url::parse(value).map_err(|e| UrlParseError::ParseFailed(e.to_string()))?;
+    let parsed = url::Url::parse(value).map_err(|e| UrlParseError::ParseFailed(e.to_string()))?;
     if !parsed.has_host() {
         return Err(UrlParseError::NoHost);
     }
@@ -203,8 +202,7 @@ fn validate_absolute_url(value: &str) -> Result<(), UrlParseError> {
 }
 
 fn validate_issuer_url(value: &str) -> Result<(), UrlParseError> {
-    let parsed =
-        url::Url::parse(value).map_err(|e| UrlParseError::ParseFailed(e.to_string()))?;
+    let parsed = url::Url::parse(value).map_err(|e| UrlParseError::ParseFailed(e.to_string()))?;
     if !parsed.has_host() {
         return Err(UrlParseError::NoHost);
     }
@@ -304,7 +302,9 @@ mod tests {
     fn url_accepts_valid_absolute_url() {
         let url = AbsoluteUrl::new("https://idp.example.com/authorize").expect("valid");
         assert_eq!(url.as_str(), "https://idp.example.com/authorize");
-        let from_str: AbsoluteUrl = "https://idp.example.com/authorize".parse().expect("FromStr");
+        let from_str: AbsoluteUrl = "https://idp.example.com/authorize"
+            .parse()
+            .expect("FromStr");
         assert_eq!(from_str, url);
     }
 
@@ -329,8 +329,14 @@ mod tests {
             state: "opaque-state".to_owned(),
         };
         let value = serde_json::to_value(&resp).unwrap();
-        assert_eq!(value["authorization_url"], "https://idp.example.com/authorize");
-        assert_eq!(serde_json::from_value::<LoginInitResponse>(value).unwrap(), resp);
+        assert_eq!(
+            value["authorization_url"],
+            "https://idp.example.com/authorize"
+        );
+        assert_eq!(
+            serde_json::from_value::<LoginInitResponse>(value).unwrap(),
+            resp
+        );
     }
 
     #[test]

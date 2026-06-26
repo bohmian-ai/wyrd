@@ -8,6 +8,7 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use wyrd_auth_check::{PolicyHook, StubAllowPolicyHook};
 use wyrd_auth_issue::IssuingKey;
+use wyrd_auth_oidc::TrustedIssuerRegistry;
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_runtime::{PermissionCheck, RbacCheck};
 use wyrd_storage::StorageHandle;
@@ -63,6 +64,8 @@ pub struct AppState {
     pub issuing_key: Option<Arc<IssuingKey>>,
     /// JWT verifier for token-exchange routes.
     pub token_verifier: Option<Arc<TokenVerifier<SqlPermissionResolver>>>,
+    /// Trusted OIDC issuer registry for human login flow.
+    pub trusted_issuer_registry: Option<Arc<TrustedIssuerRegistry>>,
     /// Policy hook for authz-check evaluation.
     pub policy_hook: Arc<dyn PolicyHook>,
     /// Audit-fact writer for authz-check decisions.
@@ -102,6 +105,7 @@ impl AppState {
             permission_check: Arc::new(RbacCheck),
             issuing_key: None,
             token_verifier: None,
+            trusted_issuer_registry: None,
             policy_hook: Arc::new(StubAllowPolicyHook),
             audit_writer: Arc::new(NoopAuthzAuditWriter),
             trusted_request_id_propagation: false,
@@ -133,6 +137,16 @@ impl AppState {
     ) -> Self {
         self.issuing_key = Some(issuing_key);
         self.token_verifier = Some(token_verifier);
+        self
+    }
+
+    /// Attach the trusted OIDC issuer registry.
+    #[must_use]
+    pub fn with_trusted_issuer_registry(
+        mut self,
+        trusted_issuer_registry: Arc<TrustedIssuerRegistry>,
+    ) -> Self {
+        self.trusted_issuer_registry = Some(trusted_issuer_registry);
         self
     }
 

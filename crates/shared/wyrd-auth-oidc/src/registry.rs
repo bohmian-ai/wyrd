@@ -114,6 +114,10 @@ pub struct TrustedIssuer {
     pub client_auth: ClientAuth,
     /// How to extract normalized claims from a verified token.
     pub claim_mapping: ClaimMapping,
+    /// Per-issuer mapping from IdP group strings to Wyrd role names.
+    pub group_role_map: HashMap<String, Vec<String>>,
+    /// Baseline Wyrd role names granted to every federated user.
+    pub default_roles: Vec<String>,
     /// Whether tokens represent humans or machine workloads.
     pub principal_kind: PrincipalKindPolicy,
     /// TTL for the JWKS key cache for this issuer.
@@ -219,7 +223,9 @@ mod tests {
         TrustedIssuer {
             tenant_id,
             issuer: issuer.clone(),
-            jwks_uri: format!("{issuer}/.well-known/keys").parse().expect("static jwks uri is valid"),
+            jwks_uri: format!("{issuer}/.well-known/keys")
+                .parse()
+                .expect("static jwks uri is valid"),
             expected_audience: audience.to_owned(),
             client_id: "wyrd".to_owned(),
             client_auth: ClientAuth::PrivateKeyJwt,
@@ -228,6 +234,8 @@ mod tests {
                 email: Some(ClaimPath::new("email")),
                 groups: Some(ClaimPath::new("realm_access.roles")),
             },
+            group_role_map: HashMap::new(),
+            default_roles: Vec::new(),
             principal_kind: PrincipalKindPolicy::Human,
             jwks_ttl: Duration::from_secs(3600),
         }
@@ -265,11 +273,7 @@ mod tests {
     fn unknown_issuer_returns_none() {
         let tenant_a = tenant(TENANT_A);
         let iss = issuer(ISSUER_URL);
-        let registry = TrustedIssuerRegistry::from_iter([trusted_issuer(
-            tenant_a,
-            iss,
-            "aud",
-        )]);
+        let registry = TrustedIssuerRegistry::from_iter([trusted_issuer(tenant_a, iss, "aud")]);
 
         let other_iss = issuer("https://other.example.com");
         assert!(
@@ -282,11 +286,8 @@ mod tests {
     fn unknown_tenant_returns_none() {
         let tenant_a = tenant(TENANT_A);
         let iss = issuer(ISSUER_URL);
-        let registry = TrustedIssuerRegistry::from_iter([trusted_issuer(
-            tenant_a,
-            iss.clone(),
-            "aud",
-        )]);
+        let registry =
+            TrustedIssuerRegistry::from_iter([trusted_issuer(tenant_a, iss.clone(), "aud")]);
 
         assert!(
             registry.get(&tenant(TENANT_B), &iss).is_none(),
@@ -305,7 +306,11 @@ mod tests {
             groups: None,
         };
         // Verify that ClaimMapping only has the expected fields by exhaustive construction.
-        let ClaimMapping { subject, email, groups } = mapping;
+        let ClaimMapping {
+            subject,
+            email,
+            groups,
+        } = mapping;
         assert_eq!(subject.as_str(), "sub");
         assert!(email.is_none());
         assert!(groups.is_none());

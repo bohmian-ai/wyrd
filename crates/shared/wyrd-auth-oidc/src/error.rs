@@ -23,7 +23,9 @@ pub enum OidcError {
     ///
     /// RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, ES512, and EdDSA
     /// are all acceptable. Symmetric-only issuers are rejected.
-    #[error("no asymmetric signing algorithm in id_token_signing_alg_values_supported for issuer {issuer}")]
+    #[error(
+        "no asymmetric signing algorithm in id_token_signing_alg_values_supported for issuer {issuer}"
+    )]
     NoAsymmetricAlg { issuer: String },
 
     /// JWKS endpoint is unreachable, returned a non-2xx status, or the response

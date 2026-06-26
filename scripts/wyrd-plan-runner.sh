@@ -34,6 +34,16 @@ Options:
                                  Default: gpt-5.4-mini
   --implementer-effort EFFORT    First-pass implementer effort.
                                  Default: medium
+  --implementer-timeout-seconds N
+                                 Maximum seconds for each implementer pass.
+                                 Default: 180
+  --manifest-model MODEL         Low-effort manifest fallback model.
+                                 Default: gpt-5.4-mini
+  --manifest-effort EFFORT       Low-effort manifest fallback effort.
+                                 Default: low
+  --manifest-min-paths N         Run manifest fallback when fewer paths are found.
+                                 Default: 4
+  --no-manifest-agent            Disable low-effort manifest fallback.
   --reviewer-engine ENGINE       Review engine: claude or codex.
                                  Default: claude
   --reviewer-model MODEL         Plan-conformance reviewer model.
@@ -204,6 +214,66 @@ write_review_schema() {
 JSON
 }
 
+write_manifest_schema() {
+  local path=$1
+  cat >"$path" <<'JSON'
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "target_paths": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "target_symbols": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "expected_new_files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "verification": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "blocker_questions": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "required": [
+    "target_paths",
+    "target_symbols",
+    "expected_new_files",
+    "verification",
+    "blocker_questions"
+  ]
+}
+JSON
+}
+
+validate_manifest_json() {
+  local manifest_file=$1
+  jq -e '
+    (.target_paths | type == "array")
+    and (.target_symbols | type == "array")
+    and (.expected_new_files | type == "array")
+    and (.verification | type == "array")
+    and (.blocker_questions | type == "array")
+  ' "$manifest_file" >/dev/null
+}
+
+manifest_target_path_count() {
+  local manifest_file=$1
+  jq '.target_paths | length' "$manifest_file"
+}
+
+manifest_blocker_question_count() {
+  local manifest_file=$1
+  jq '.blocker_questions | length' "$manifest_file"
+}
+
 build_codex_args() {
   local model=$1
   local effort=$2
@@ -275,43 +345,173 @@ append_reference_paths() {
   fi
 }
 
+generate_deterministic_manifest() {
+  local plan_file=$1
+  local manifest_file=$2
+
+  python3 - "$REPO_ROOT" "$PLAN_DIR" "$plan_file" "$manifest_file" <<'PY'
+import json
+import os
+import re
+import subprocess
+import sys
+
+repo_root, plan_dir, plan_file, manifest_file = sys.argv[1:5]
+with open(plan_file, encoding="utf-8") as handle:
+    text = handle.read()
+
+repo_files = subprocess.check_output(
+    ["git", "-C", repo_root, "ls-files"],
+    text=True,
+)
+files = [line for line in repo_files.splitlines() if line]
+file_set = set(files)
+dir_set = {os.path.dirname(path) for path in files if os.path.dirname(path)}
+
+def clean_token(token: str) -> str:
+    token = token.strip().strip("`'\"")
+    token = token.rstrip(".,;:)]}")
+    token = token.lstrip("./")
+    token = re.sub(r":\d+$", "", token)
+    return token
+
+def add_unique(items, value):
+    if value and value not in items:
+        items.append(value)
+
+target_paths = []
+target_symbols = []
+expected_new_files = []
+verification = []
+blocker_questions = []
+explicit_scope_dirs = []
+
+path_pattern = re.compile(r"(?<![\w.-])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.@+-]+(?::\d+)?")
+for match in path_pattern.findall(text):
+    token = clean_token(match)
+    if not token or token.startswith(os.path.relpath(plan_dir, repo_root)):
+        continue
+    if token in file_set or token in dir_set or os.path.exists(os.path.join(repo_root, token)):
+        add_unique(target_paths, token)
+        if token in dir_set or os.path.isdir(os.path.join(repo_root, token)):
+            add_unique(explicit_scope_dirs, token)
+        continue
+    suffix_matches = [path for path in files if path.endswith(token)]
+    for path in suffix_matches[:4]:
+        add_unique(target_paths, path)
+
+scope_dirs = [path for path in target_paths if path in dir_set or os.path.isdir(os.path.join(repo_root, path))]
+scope_dirs.extend(os.path.dirname(path) for path in target_paths if path in file_set)
+scope_dirs = [path for index, path in enumerate(scope_dirs) if path and path not in scope_dirs[:index]]
+
+basename_pattern = re.compile(r"\b[A-Za-z0-9_.-]+\.(?:rs|toml|md|sql|yaml|yml|py|svelte|ts|js)(?::\d+)?\b")
+for match in basename_pattern.findall(text):
+    name = clean_token(match)
+    if "/" in name:
+        continue
+    matches = [path for path in files if os.path.basename(path) == name]
+    preferred = []
+    for path in matches:
+        if any(path.startswith(f"{scope}/") or path == scope for scope in scope_dirs):
+            preferred.append(path)
+    if preferred:
+        selected = preferred
+    elif scope_dirs and len(matches) > 3:
+        selected = []
+    else:
+        selected = matches
+    for path in selected[:6]:
+        add_unique(target_paths, path)
+    if not matches and name.endswith(".rs"):
+        for scope in explicit_scope_dirs[:3]:
+            candidate = f"{scope.rstrip('/')}/{name}"
+            if candidate not in file_set:
+                add_unique(expected_new_files, candidate)
+
+backtick_pattern = re.compile(r"`([^`\n]{2,120})`")
+for raw in backtick_pattern.findall(text):
+    token = clean_token(raw)
+    if not token or " " in token or "/" in token or token.startswith("-"):
+        continue
+    if token.endswith((".rs", ".toml", ".md", ".sql", ".yaml", ".yml", ".py", ".svelte", ".ts", ".js")):
+        continue
+    if token in {
+        "Service", "Agent", "Principal", "CardRef", "tenant", "aud", "sub",
+        "iss", "audience", "subject", "card_ref", "wiremock",
+    }:
+        continue
+    if "-" in token or token.startswith("WYRD_"):
+        continue
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_:<>.-]*$", token):
+        add_unique(target_symbols, token)
+
+for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+\b", text):
+    add_unique(target_symbols, token)
+
+for symbol in target_symbols[:80]:
+    try:
+        output = subprocess.check_output(
+            ["rg", "-l", "--fixed-strings", "--glob", "!**/target/**", symbol, repo_root],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        if "::" in symbol or symbol.endswith("Resolver"):
+            add_unique(blocker_questions, f"No existing source match found for symbol `{symbol}`.")
+        continue
+    symbol_paths = []
+    for absolute in output.splitlines():
+        path = os.path.relpath(absolute, repo_root)
+        if path in file_set:
+            symbol_paths.append(path)
+    preferred = []
+    for path in symbol_paths:
+        if any(path.startswith(f"{scope}/") or path == scope for scope in scope_dirs):
+            preferred.append(path)
+    for path in (preferred or symbol_paths)[:4]:
+        add_unique(target_paths, path)
+
+for line in text.splitlines():
+    stripped = line.strip()
+    if stripped.startswith(("cargo ", "mise run ")):
+        add_unique(verification, stripped)
+
+if not verification:
+    verification.append("mise run fmt")
+
+manifest = {
+    "target_paths": target_paths[:60],
+    "target_symbols": target_symbols[:80],
+    "expected_new_files": expected_new_files[:20],
+    "verification": verification[:12],
+    "blocker_questions": blocker_questions[:20],
+}
+with open(manifest_file, "w", encoding="utf-8") as out:
+    json.dump(manifest, out, indent=2)
+    out.write("\n")
+PY
+}
+
 write_slice_manifest() {
   local out=$1
   local plan_file=$2
-  local token path
-  local paths=()
-
-  while IFS= read -r token; do
-    token=${token#./}
-    token=${token%:}
-    token=${token%,}
-    token=${token%;}
-    token=${token%.}
-    token=${token%\)}
-    token=${token%\]}
-    token=${token%\"}
-    token=${token#\"}
-    token=${token%\`}
-    token=${token#\`}
-    [[ -n "$token" ]] || continue
-    [[ "$token" == "$PLAN_DIR"* ]] && continue
-    [[ -e "$REPO_ROOT/$token" ]] || continue
-    paths+=("$token")
-  done < <(rg -o '([A-Za-z0-9_.-]+/)+[A-Za-z0-9_.@+-]+' "$plan_file" 2>/dev/null || true)
+  local manifest_file=${ACTIVE_MANIFEST_FILE:-}
 
   {
     printf '\n## Slice Manifest\n\n'
     printf 'Use this manifest to constrain repository exploration. Start with these paths and nearest tests. Broaden only when the slice cannot be implemented from this set.\n\n'
     printf 'Current slice path: %s\n\n' "$(relpath "$plan_file")"
-    printf 'Existing repo paths explicitly mentioned by the slice:\n'
   } >>"$out"
 
-  if ((${#paths[@]} > 0)); then
-    printf '%s\n' "${paths[@]}" | sort -u | while IFS= read -r path; do
-      printf -- '- %s\n' "$path" >>"$out"
-    done
+  if [[ -n "$manifest_file" && -f "$manifest_file" ]]; then
+    {
+      printf 'Structured manifest:\n\n'
+      printf '```json\n'
+      cat "$manifest_file"
+      printf '```\n'
+    } >>"$out"
   else
-    printf -- '- none found; infer the smallest touch set from the slice text before reading broadly\n' >>"$out"
+    printf 'Structured manifest unavailable. Infer the smallest touch set from the slice text before reading broadly.\n' >>"$out"
   fi
 }
 
@@ -404,9 +604,11 @@ write_implementer_prompt() {
     printf 'You are the implementation worker for one Wyrd plan slice.\n'
     printf 'Implement exactly the current plan slice. Do not implement later slices.\n'
     printf 'Prefer the repo'\''s existing patterns. Keep edits scoped and pragmatic.\n'
-    printf 'Do not perform broad repository exploration. Inspect the slice, the manifest paths, and nearest tests first.\n'
-    printf 'If the manifest is insufficient, use targeted rg queries for the missing symbol or owning module only.\n'
-    printf 'If the slice is blocked by a missing design decision, stop and report the blocker instead of reading unrelated modules.\n'
+    printf 'The structured manifest is your exploration boundary. Inspect the manifest paths and nearest tests first.\n'
+    printf 'Do not use codegraph, MCP exploration, or broad repository scans during implementation.\n'
+    printf 'Before the first edit, stay within this budget: read the manifest paths plus at most 6 additional files, and run at most 12 targeted shell read/search commands.\n'
+    printf 'If the manifest is insufficient, use one targeted rg query for the missing symbol or owning module, then either edit or report BLOCKED.\n'
+    printf 'If the slice needs a missing design decision, missing backend, or broader architecture work, stop and report BLOCKED instead of designing beyond the slice.\n'
     printf 'Use mise tasks for checks. Do not run the full pre-pr gate unless the prompt asks for it.\n'
     printf 'When finished, summarize changed behavior, tests/checks run, and any remaining blockers.\n'
     printf '\n## Current Plan Slice\n'
@@ -424,6 +626,88 @@ write_implementer_prompt() {
       printf '\n```\n'
     } >>"$out"
   fi
+}
+
+write_manifest_prompt() {
+  local out=$1
+  local plan_file=$2
+  local deterministic_manifest=$3
+
+  write_shared_context "$out"
+
+  cat <<'TEXT' >>"$out"
+
+## Role
+
+You are the fast manifest builder for one Wyrd plan slice.
+Return only strict JSON matching the provided schema. Do not edit files.
+Do not use codegraph, MCP exploration, or broad source reading.
+
+Your job is to convert the plan slice into a concise implementation manifest that prevents the implementer from wasting time exploring.
+
+Rules:
+
+- Prefer exact repo paths and symbols named by the plan.
+- Include existing files the implementer should inspect first.
+- Include expected new files only when the plan clearly implies them.
+- Include verification commands from the plan, preferring `mise run ...` when present.
+- Include blocker questions when the plan depends on a missing backend, missing concrete type, unresolved owner, or design choice.
+- Keep `target_paths` to the smallest useful set. Do not list whole crates when specific files are available.
+- Do not mention plan filenames, commit numbers, or automation context in any field.
+
+TEXT
+
+  append_file_block "$out" "Plan Slice" "$plan_file"
+
+  {
+    printf '\n## Deterministic Manifest Draft\n\n'
+    printf '```json\n'
+    cat "$deterministic_manifest"
+    printf '```\n'
+    printf '\n## Output Schema\n\n'
+    printf '```json\n'
+    cat "$MANIFEST_SCHEMA"
+    printf '\n```\n'
+  } >>"$out"
+}
+
+run_manifest_agent() {
+  local plan_file=$1
+  local plan_run_dir=$2
+  local deterministic_manifest=$3
+  local output_manifest=$4
+  local prompt_file="$plan_run_dir/manifest.prompt.md"
+  local final_file="$plan_run_dir/manifest.final.json"
+  local jsonl_file="$plan_run_dir/manifest.jsonl"
+
+  write_manifest_prompt "$prompt_file" "$plan_file" "$deterministic_manifest"
+  build_codex_args "$MANIFEST_MODEL" "$MANIFEST_EFFORT" "read-only" "$final_file" "$MANIFEST_SCHEMA"
+  run_codex_prompt "$prompt_file" "$jsonl_file" codex "${CODEX_ARGS[@]}"
+  validate_manifest_json "$final_file"
+  cp "$final_file" "$output_manifest"
+}
+
+prepare_slice_manifest() {
+  local plan_file=$1
+  local plan_run_dir=$2
+  local deterministic_manifest="$plan_run_dir/manifest-deterministic.json"
+  local final_manifest="$plan_run_dir/manifest.json"
+  local path_count
+  local blocker_count
+
+  generate_deterministic_manifest "$plan_file" "$deterministic_manifest"
+  validate_manifest_json "$deterministic_manifest"
+  cp "$deterministic_manifest" "$final_manifest"
+
+  path_count=$(manifest_target_path_count "$final_manifest")
+  blocker_count=$(manifest_blocker_question_count "$final_manifest")
+  if [[ "$MANIFEST_AGENT_ENABLED" == "1" && ( "$path_count" -lt "$MANIFEST_MIN_PATHS" || "$blocker_count" -gt 0 ) ]]; then
+    info "manifest fallback: deterministic manifest found $path_count target path(s), $blocker_count blocker question(s)"
+    run_manifest_agent "$plan_file" "$plan_run_dir" "$deterministic_manifest" "$final_manifest"
+    validate_manifest_json "$final_manifest"
+  fi
+
+  printf '%s\n' "$final_manifest"
 }
 
 write_reviewer_prompt() {
@@ -849,6 +1133,44 @@ run_codex_prompt() {
   "$@" <"$prompt_file" >"$jsonl_file"
 }
 
+run_codex_prompt_with_timeout() {
+  local timeout_seconds=$1
+  local prompt_file=$2
+  local jsonl_file=$3
+  shift 3
+  local pid watchdog status timeout_marker
+
+  timeout_marker="$jsonl_file.timeout"
+  rm -f "$timeout_marker"
+
+  info "codex: $(quote_cmd "$@")"
+  set +e
+  "$@" <"$prompt_file" >"$jsonl_file" &
+  pid=$!
+  (
+    sleep "$timeout_seconds"
+    if kill -0 "$pid" 2>/dev/null; then
+      printf 'codex timed out after %s seconds\n' "$timeout_seconds" >"$timeout_marker"
+      kill "$pid" 2>/dev/null || true
+      sleep 5
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  ) &
+  watchdog=$!
+
+  wait "$pid"
+  status=$?
+  kill "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  set -e
+
+  if [[ -f "$timeout_marker" ]]; then
+    cat "$timeout_marker" >&2
+    return 124
+  fi
+  return "$status"
+}
+
 run_claude_prompt() {
   local prompt_file=$1
   local raw_file=$2
@@ -871,7 +1193,22 @@ run_implementer() {
 
   write_implementer_prompt "$prompt_file" "$plan_file" "$loop_index" "$feedback_file"
   build_codex_args "$model" "$effort" "danger-full-access" "$final_file"
-  run_codex_prompt "$prompt_file" "$jsonl_file" codex "${CODEX_ARGS[@]}"
+  run_codex_prompt_with_timeout "$IMPLEMENTER_TIMEOUT_SECONDS" "$prompt_file" "$jsonl_file" codex "${CODEX_ARGS[@]}" \
+    || die "implementer failed or timed out after ${IMPLEMENTER_TIMEOUT_SECONDS}s; see $jsonl_file"
+}
+
+ensure_implementation_changed_worktree() {
+  local final_file=$1
+
+  if [[ -n "$(git status --porcelain)" ]]; then
+    return 0
+  fi
+
+  if rg -n '(^|[[:space:]])BLOCKED|(^|[[:space:]])Blocked' "$final_file" >/dev/null; then
+    die "implementer reported a blocker without changing files; see $final_file"
+  fi
+
+  die "implementer completed without changing files; see $final_file"
 }
 
 write_validator_prompt() {
@@ -1078,6 +1415,7 @@ commit_current_slice() {
   local plan_run_dir=$2
   local message_file="$plan_run_dir/commit-message.txt"
 
+  [[ -n "$(git status --porcelain)" ]] || die "cannot commit current slice because the worktree is clean"
   git add -A
   write_commit_message "$review_file" "$message_file" || die "generated commit message failed validation: $message_file"
   git commit -F "$message_file"
@@ -1088,6 +1426,11 @@ INCLUDE_REGEX='^[0-9]{2}[a-z]?[-_].*\.md$'
 EXCLUDE_REGEX='^(00.*|README)\.md$'
 IMPLEMENTER_MODEL="gpt-5.4-mini"
 IMPLEMENTER_EFFORT="medium"
+IMPLEMENTER_TIMEOUT_SECONDS=180
+MANIFEST_MODEL="gpt-5.4-mini"
+MANIFEST_EFFORT="low"
+MANIFEST_AGENT_ENABLED=1
+MANIFEST_MIN_PATHS=4
 REVIEWER_ENGINE="claude"
 REVIEWER_MODEL="claude-opus-4-7"
 REVIEWER_MODEL_SET=0
@@ -1171,6 +1514,32 @@ while (($# > 0)); do
       (($# >= 2)) || die "--implementer-effort requires an effort"
       IMPLEMENTER_EFFORT=$2
       shift 2
+      ;;
+    --implementer-timeout-seconds)
+      (($# >= 2)) || die "--implementer-timeout-seconds requires a number"
+      [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "--implementer-timeout-seconds must be a positive integer"
+      IMPLEMENTER_TIMEOUT_SECONDS=$2
+      shift 2
+      ;;
+    --manifest-model)
+      (($# >= 2)) || die "--manifest-model requires a model"
+      MANIFEST_MODEL=$2
+      shift 2
+      ;;
+    --manifest-effort)
+      (($# >= 2)) || die "--manifest-effort requires an effort"
+      MANIFEST_EFFORT=$2
+      shift 2
+      ;;
+    --manifest-min-paths)
+      (($# >= 2)) || die "--manifest-min-paths requires a number"
+      [[ "$2" =~ ^[0-9]+$ ]] || die "--manifest-min-paths must be a non-negative integer"
+      MANIFEST_MIN_PATHS=$2
+      shift 2
+      ;;
+    --no-manifest-agent)
+      MANIFEST_AGENT_ENABLED=0
+      shift
       ;;
     --reviewer-engine)
       (($# >= 2)) || die "--reviewer-engine requires an engine"
@@ -1298,6 +1667,12 @@ validate_mise_check_commands
 if [[ "$DRY_RUN" == "1" ]]; then
   printf 'Plan directory: %s\n' "$(relpath "$PLAN_DIR")"
   printf 'Implementer: %s (%s)\n' "$IMPLEMENTER_MODEL" "$IMPLEMENTER_EFFORT"
+  printf 'Implementer timeout: %ss\n' "$IMPLEMENTER_TIMEOUT_SECONDS"
+  if [[ "$MANIFEST_AGENT_ENABLED" == "1" ]]; then
+    printf 'Manifest fallback: enabled, %s (%s), min paths %s\n' "$MANIFEST_MODEL" "$MANIFEST_EFFORT" "$MANIFEST_MIN_PATHS"
+  else
+    printf 'Manifest fallback: disabled\n'
+  fi
   printf 'Reviewer: %s:%s (%s)\n' "$REVIEWER_ENGINE" "$REVIEWER_MODEL" "$REVIEWER_EFFORT"
   printf 'Validator: claude:%s (%s)\n' "$VALIDATOR_MODEL" "$VALIDATOR_EFFORT"
   printf 'Escalation: %s (%s)\n' "$ESCALATION_MODEL" "$ESCALATION_EFFORT"
@@ -1345,7 +1720,9 @@ fi
 RUN_ROOT="$REPO_ROOT/.git/wyrd-plan-runner/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$RUN_ROOT"
 REVIEW_SCHEMA="$RUN_ROOT/review-schema.json"
+MANIFEST_SCHEMA="$RUN_ROOT/manifest-schema.json"
 write_review_schema "$REVIEW_SCHEMA"
+write_manifest_schema "$MANIFEST_SCHEMA"
 
 info "run logs: $RUN_ROOT"
 
@@ -1356,6 +1733,8 @@ for plan_file in "${PLAN_FILES[@]}"; do
   mkdir -p "$plan_run_dir"
 
   info "starting plan slice: $(relpath "$plan_file")"
+  ACTIVE_MANIFEST_FILE=$(prepare_slice_manifest "$plan_file" "$plan_run_dir")
+  info "slice manifest: $(relpath "$ACTIVE_MANIFEST_FILE")"
 
   feedback_file=""
   approved_review_file=""
@@ -1380,6 +1759,7 @@ for plan_file in "${PLAN_FILES[@]}"; do
       info "skipping implementation; using existing worktree for review"
     else
       run_implementer "$plan_file" "$plan_run_dir" "$loop" "$model" "$effort" "$feedback_file"
+      ensure_implementation_changed_worktree "$plan_run_dir/implementer-loop-$loop.final.md"
     fi
 
     check_feedback="$plan_run_dir/check-feedback-loop-$loop.txt"

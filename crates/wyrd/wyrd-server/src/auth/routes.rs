@@ -13,6 +13,7 @@ use wyrd_spec::request_id::RequestId;
 use crate::auth::Caller;
 use crate::auth::exchange_api_key::{DelegateToken, ExchangeApiKey, map_exchange_error_to_wyrd};
 use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
+use crate::auth::refresh::{RefreshTokens, tenant_from_refresh_jwt};
 use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -28,6 +29,14 @@ async fn token(
     request_id: Option<Extension<RequestId>>,
     Json(request): Json<TokenRequest>,
 ) -> Result<Json<TokenResponse>, WyrdErrorResponse> {
+    let request_id_str: String;
+    let req_id = match request_id.as_ref() {
+        Some(Extension(id)) => id.as_str(),
+        None => {
+            request_id_str = Uuid::new_v4().to_string();
+            &request_id_str
+        }
+    };
     match request {
         TokenRequest::WyrdApiKey { api_key } => {
             let parsed = WyrdApiKey::parse(api_key.expose()).map_err(|_| {
@@ -74,14 +83,6 @@ async fn token(
             let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, tenant_id)
                 .await
                 .map_err(sql_error)?;
-            let request_id_buf: String;
-            let request_id = match request_id.as_ref() {
-                Some(Extension(id)) => id.as_str(),
-                None => {
-                    request_id_buf = Uuid::new_v4().to_string();
-                    &request_id_buf
-                }
-            };
             let exchanged = DelegateToken {
                 issuing_key,
                 verifier,
@@ -92,12 +93,38 @@ async fn token(
                 &mut conn,
                 SecretString::from(subject_token.expose().to_owned()),
                 requested_subject,
-                request_id,
+                req_id,
             )
             .await
             .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
             conn.commit().await.map_err(sql_error)?;
             Ok(Json(exchanged.into_response()))
+        }
+        TokenRequest::RefreshToken { refresh_token } => {
+            let secret = refresh_token.expose().to_owned();
+            let tenant_id = tenant_from_refresh_jwt(&secret)?;
+            let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, tenant_id)
+                .await
+                .map_err(sql_error)?;
+            let issuing_key = state.issuing_key.clone().ok_or_else(auth_not_configured)?;
+            let exchanged = RefreshTokens {
+                issuing_key,
+                settings: Default::default(),
+            }
+            .execute(&mut conn, SecretString::from(secret), req_id)
+            .await
+            .map_err(WyrdErrorResponse::from)?;
+            conn.commit().await.map_err(sql_error)?;
+            Ok(Json(exchanged.into_response()))
+        }
+        TokenRequest::AuthorizationCode { .. } | TokenRequest::JwtBearer { .. } => {
+            Err(WyrdErrorResponse::from(WyrdError::UnsupportedGrantType {
+                message: "grant type not implemented".to_owned(),
+                details: serde_json::json!({
+                    "supported_grant_types": ["wyrd_api_key", "refresh_token",
+                        "urn:ietf:params:oauth:grant-type:token-exchange"]
+                }),
+            }))
         }
     }
 }

@@ -7,6 +7,7 @@ pub mod issue_api_key;
 pub mod permission_resolver;
 pub mod policy_hook;
 pub mod principal_extractor;
+pub mod refresh;
 pub mod repo;
 pub mod roles;
 pub mod routes;

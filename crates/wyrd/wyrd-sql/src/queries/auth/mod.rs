@@ -31,4 +31,8 @@ pub use service_accounts::{
     insert_service_account, service_account_by_card_ref, service_account_by_id,
     touch_api_key_last_used,
 };
+pub use refresh_tokens::{
+    consume_active_refresh, insert_refresh_token_rotated, refresh_by_hash, revoke_refresh,
+    revoke_refresh_family,
+};
 pub use users::{UserRow, delete_user, insert_user, user_by_email, user_by_id};

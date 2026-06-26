@@ -6,7 +6,8 @@ usage() {
 Usage:
   scripts/wyrd-plan-runner.sh PLAN_DIR [options]
 
-Runs a Wyrd implementation plan directory sequentially with Codex subprocesses.
+Runs a Wyrd implementation plan directory sequentially with Codex implementers
+and a gated reviewer.
 
 Options:
   --context FILE                 Extra context file passed to every agent.
@@ -33,8 +34,10 @@ Options:
                                  Default: gpt-5.4-mini
   --implementer-effort EFFORT    First-pass implementer effort.
                                  Default: medium
+  --reviewer-engine ENGINE       Review engine: claude or codex.
+                                 Default: claude
   --reviewer-model MODEL         Plan-conformance reviewer model.
-                                 Default: gpt-5.5
+                                 Default: claude-opus-4-7
   --reviewer-effort EFFORT       Plan-conformance reviewer effort.
                                  Default: high
   --escalation-model MODEL       Retry implementer model after failures.
@@ -369,10 +372,11 @@ write_reviewer_prompt() {
   {
     printf '\n## Role\n\n'
     printf 'You are the parent plan-conformance reviewer for this Wyrd implementation slice.\n'
+    printf 'Use a condensed, modified review-and-plan review pass: security, bugs/performance, tests, maintainability/style, clean-code/SOLID, developer/agent experience, and Wyrd contract boundaries.\n'
+    printf 'Do not run the full review-and-plan pipeline. Do not create .dev/review artifacts. Do not write an implementation plan.\n'
     printf 'Do not edit files. Inspect the current uncommitted diff and validate it against the plan slice.\n'
     printf 'Focus on deviations from the plan, missing required behavior, missing tests, Wyrd boundary violations, unnecessary scope creep, legacy vocabulary, and likely correctness issues.\n'
-    printf 'Treat this as an initial code review to catch issues before a larger code review later on.\n'
-    printf 'Only report findings you validate against source. If the work is acceptable, approve it.\n'
+    printf 'Only report findings you validate against source. A clean review with zero findings is acceptable.\n'
     printf 'Also provide a reviewer-readable commit title and body based on the actual code change and overall plan intent.\n'
     printf 'The commit title and body must not mention file paths, plan files, plan names, commit hashes, or automation context.\n'
     printf '\n## Current Plan Slice\n'
@@ -386,8 +390,38 @@ write_reviewer_prompt() {
     printf '```bash\n'
     printf 'git diff HEAD\n'
     printf '```\n'
-    printf '\nReturn only JSON matching the provided schema.\n'
+    printf '\nReturn only raw JSON matching this schema shape:\n\n'
+    printf '```json\n'
+    cat "$REVIEW_SCHEMA"
+    printf '\n```\n'
   } >>"$out"
+}
+
+extract_json_object() {
+  local raw_file=$1
+  local json_file=$2
+
+  python3 - "$raw_file" "$json_file" <<'PY'
+import json
+import sys
+
+raw_path, out_path = sys.argv[1], sys.argv[2]
+text = open(raw_path, encoding="utf-8").read()
+decoder = json.JSONDecoder()
+for index, char in enumerate(text):
+    if char != "{":
+        continue
+    try:
+        value, end = decoder.raw_decode(text[index:])
+    except json.JSONDecodeError:
+        continue
+    with open(out_path, "w", encoding="utf-8") as out:
+        json.dump(value, out, indent=2)
+        out.write("\n")
+    break
+else:
+    raise SystemExit("no JSON object found in reviewer output")
+PY
 }
 
 validate_review_json() {
@@ -557,6 +591,15 @@ run_codex_prompt() {
   "$@" <"$prompt_file" >"$jsonl_file"
 }
 
+run_claude_prompt() {
+  local prompt_file=$1
+  local raw_file=$2
+  shift 2
+
+  info "claude: $(quote_cmd "$@")"
+  "$@" <"$prompt_file" >"$raw_file"
+}
+
 run_implementer() {
   local plan_file=$1
   local plan_run_dir=$2
@@ -579,11 +622,26 @@ run_reviewer() {
   local loop_index=$3
   local prompt_file="$plan_run_dir/reviewer-loop-$loop_index.prompt.md"
   local final_file="$plan_run_dir/reviewer-loop-$loop_index.json"
-  local jsonl_file="$plan_run_dir/reviewer-loop-$loop_index.jsonl"
+  local raw_file="$plan_run_dir/reviewer-loop-$loop_index.raw"
 
   write_reviewer_prompt "$prompt_file" "$plan_file"
-  build_codex_args "$REVIEWER_MODEL" "$REVIEWER_EFFORT" "read-only" "$final_file" "$REVIEW_SCHEMA"
-  run_codex_prompt "$prompt_file" "$jsonl_file" codex "${CODEX_ARGS[@]}"
+  if [[ "$REVIEWER_ENGINE" == "claude" ]]; then
+    run_claude_prompt \
+      "$prompt_file" \
+      "$raw_file" \
+      claude \
+      --print \
+      --model "$REVIEWER_MODEL" \
+      --effort "$REVIEWER_EFFORT" \
+      --permission-mode dontAsk \
+      --tools "Bash,Read,Grep,Glob" \
+      --output-format text
+    extract_json_object "$raw_file" "$final_file"
+  else
+    local jsonl_file="$plan_run_dir/reviewer-loop-$loop_index.jsonl"
+    build_codex_args "$REVIEWER_MODEL" "$REVIEWER_EFFORT" "read-only" "$final_file" "$REVIEW_SCHEMA"
+    run_codex_prompt "$prompt_file" "$jsonl_file" codex "${CODEX_ARGS[@]}"
+  fi
   validate_review_json "$final_file"
 }
 
@@ -629,7 +687,9 @@ INCLUDE_REGEX='^[0-9]{2}[a-z]?[-_].*\.md$'
 EXCLUDE_REGEX='^(00.*|README)\.md$'
 IMPLEMENTER_MODEL="gpt-5.4-mini"
 IMPLEMENTER_EFFORT="medium"
-REVIEWER_MODEL="gpt-5.5"
+REVIEWER_ENGINE="claude"
+REVIEWER_MODEL="claude-opus-4-7"
+REVIEWER_MODEL_SET=0
 REVIEWER_EFFORT="high"
 ESCALATION_MODEL="gpt-5.5"
 ESCALATION_EFFORT="high"
@@ -708,9 +768,16 @@ while (($# > 0)); do
       IMPLEMENTER_EFFORT=$2
       shift 2
       ;;
+    --reviewer-engine)
+      (($# >= 2)) || die "--reviewer-engine requires an engine"
+      [[ "$2" == "claude" || "$2" == "codex" ]] || die "--reviewer-engine must be claude or codex"
+      REVIEWER_ENGINE=$2
+      shift 2
+      ;;
     --reviewer-model)
       (($# >= 2)) || die "--reviewer-model requires a model"
       REVIEWER_MODEL=$2
+      REVIEWER_MODEL_SET=1
       shift 2
       ;;
     --reviewer-effort)
@@ -765,6 +832,9 @@ done
 if [[ -n "$START_AT" && -n "$START_AFTER" ]]; then
   die "--start-at and --start-after are mutually exclusive"
 fi
+if [[ "$REVIEWER_ENGINE" == "codex" && "$REVIEWER_MODEL_SET" == "0" ]]; then
+  REVIEWER_MODEL="gpt-5.5"
+fi
 
 require_command git
 require_command codex
@@ -772,6 +842,9 @@ require_command mise
 require_command jq
 require_command rg
 require_command python3
+if [[ "$REVIEWER_ENGINE" == "claude" ]]; then
+  require_command claude
+fi
 
 REPO_ROOT=$(repo_root)
 [[ -n "$REPO_ROOT" ]] || die "not inside a git repository"
@@ -809,7 +882,7 @@ validate_mise_check_commands
 if [[ "$DRY_RUN" == "1" ]]; then
   printf 'Plan directory: %s\n' "$(relpath "$PLAN_DIR")"
   printf 'Implementer: %s (%s)\n' "$IMPLEMENTER_MODEL" "$IMPLEMENTER_EFFORT"
-  printf 'Reviewer: %s (%s)\n' "$REVIEWER_MODEL" "$REVIEWER_EFFORT"
+  printf 'Reviewer: %s:%s (%s)\n' "$REVIEWER_ENGINE" "$REVIEWER_MODEL" "$REVIEWER_EFFORT"
   printf 'Escalation: %s (%s)\n' "$ESCALATION_MODEL" "$ESCALATION_EFFORT"
   printf 'Fast mode: %s\n' "$FAST_MODE"
   if [[ -n "$START_AT" ]]; then

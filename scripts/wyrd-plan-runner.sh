@@ -47,12 +47,15 @@ Options:
   --reviewer-engine ENGINE       Review engine: claude or codex.
                                  Default: claude
   --reviewer-model MODEL         Plan-conformance reviewer model.
-                                 Default: claude-opus-4-7
+                                 Default: claude-sonnet-4-6
   --reviewer-effort EFFORT       Plan-conformance reviewer effort.
                                  Default: high
-  --validator-model MODEL        Finding validator and fix-plan model.
+  --validator                    Run the second-pass finding validator after the
+                                 reviewer. Off by default; the reviewer is
+                                 authoritative.
+  --validator-model MODEL        Optional second-pass validator model.
                                  Default: claude-sonnet-4-6
-  --validator-effort EFFORT      Finding validator effort.
+  --validator-effort EFFORT      Optional second-pass validator effort.
                                  Default: high
   --escalation-model MODEL       Retry implementer model after failures.
                                  Default: gpt-5.5
@@ -330,7 +333,7 @@ append_reference_paths() {
 
   {
     printf '\n## Reference Paths\n\n'
-    printf 'Read these files by path only when they are relevant to the current slice:\n\n'
+    printf 'Read these when the slice changes the surfaces they govern (auth, tenancy, public contracts, registry, storage, crate boundaries) or when a repo convention is genuinely unclear -- otherwise skip them:\n\n'
     printf -- '- %s\n' 'AGENTS.md'
     printf -- '- %s\n' 'architecture/wyrd-design.md'
   } >>"$out"
@@ -499,7 +502,7 @@ write_slice_manifest() {
 
   {
     printf '\n## Slice Manifest\n\n'
-    printf 'Use this manifest to constrain repository exploration. Start with these paths and nearest tests. Broaden only when the slice cannot be implemented from this set.\n\n'
+    printf 'These paths are the edit boundary for this slice -- the files you may modify, and the starting point for the bounded context pass. Read the files you will edit and their nearest tests to match local patterns; do not read manifest paths you will not touch. Implement from the plan. Touch a file outside this set only if the slice genuinely cannot be implemented without it.\n\n'
     printf 'Current slice path: %s\n\n' "$(relpath "$plan_file")"
   } >>"$out"
 
@@ -602,12 +605,13 @@ write_implementer_prompt() {
     printf '\n## Role\n\n'
     printf '$wyrd-rust-python\n\n'
     printf 'You are the implementation worker for one Wyrd plan slice.\n'
+    printf 'The plan slice below is the primary source of truth. Implement from it. Do a minimal, targeted context pass before editing -- not a broad exploration, and not a full read of the manifest.\n'
     printf 'Implement exactly the current plan slice. Do not implement later slices.\n'
     printf 'Prefer the repo'\''s existing patterns. Keep edits scoped and pragmatic.\n'
-    printf 'The structured manifest is your exploration boundary. Inspect the manifest paths and nearest tests first.\n'
-    printf 'Do not use codegraph, MCP exploration, or broad repository scans during implementation.\n'
-    printf 'Before the first edit, stay within this budget: read the manifest paths plus at most 6 additional files, and run at most 12 targeted shell read/search commands.\n'
-    printf 'If the manifest is insufficient, use one targeted rg query for the missing symbol or owning module, then either edit or report BLOCKED.\n'
+    printf 'Required context pass, bounded: read AGENTS.md and architecture/wyrd-design.md only when this slice changes the surfaces they govern (auth, tenancy, public contracts, registry, storage, crate boundaries); read the specific manifest files you will edit and their nearest tests to match local patterns. The manifest is the edit boundary -- the files you may modify -- not a reading list; do not read manifest paths you will not touch.\n'
+    printf 'Do not use codegraph, MCP exploration, or broad repository scans.\n'
+    printf 'Stay within a budget of at most 8 files read and 12 targeted shell read/search commands before your first edit. Run a targeted rg lookup only when the plan or manifest does not give a symbol signature you need -- at most 3 such lookups; otherwise report BLOCKED.\n'
+    printf 'If the manifest and this required context pass are insufficient, use one more targeted rg query for the missing symbol or owning module, then either edit or report BLOCKED.\n'
     printf 'If the slice needs a missing design decision, missing backend, or broader architecture work, stop and report BLOCKED instead of designing beyond the slice.\n'
     printf 'Use mise tasks for checks. Do not run the full pre-pr gate unless the prompt asks for it.\n'
     printf 'When finished, summarize changed behavior, tests/checks run, and any remaining blockers.\n'
@@ -730,6 +734,8 @@ write_reviewer_prompt() {
 You are the parent plan-conformance reviewer for this Wyrd implementation slice.
 Use the condensed review-and-plan-quick contract: one reviewer, full review breadth, blocker-focused severity.
 
+This is a per-slice gate, not the final review. Its job is to stop a slice that is broken enough to poison the slices built on top of it: plan-conformance gaps, wrong public contracts or signatures that later slices call, crate-boundary or dependency-direction drift, and clear correctness or compile breakage. A separate deep review runs at the end of the plan; defer non-chain-poisoning depth (subtle security hardening, performance, style polish) to it rather than blocking this slice on it.
+
 Do not run the full review-and-plan pipeline. Do not launch subagents. Do not edit source files.
 
 Review the current logical slice only. Validate the uncommitted working tree against the current plan slice, Wyrd repo conventions, and the runner-provided manifest.
@@ -748,7 +754,7 @@ TEXT
     printf -- '- `%s/findings.md`\n' "$review_dir_rel"
     printf -- '- `%s`\n\n' "$implementation_plan_rel"
     printf '`implementation-plan.md` is the actionable output type for this review and the handoff to downstream agents.\n'
-    printf 'It must contain the exact line `Status: clean` or `Status: required_changes` and enough detail for Codex to implement fixes without guessing.\n'
+    printf 'The reviewer owns this plan by default. It must contain the exact line `Status: clean` or `Status: required_changes` and enough detail for Codex to implement fixes without guessing.\n'
   } >>"$out"
 
   cat <<'TEXT' >>"$out"
@@ -1432,9 +1438,10 @@ MANIFEST_EFFORT="low"
 MANIFEST_AGENT_ENABLED=1
 MANIFEST_MIN_PATHS=4
 REVIEWER_ENGINE="claude"
-REVIEWER_MODEL="claude-opus-4-7"
+REVIEWER_MODEL="claude-sonnet-4-6"
 REVIEWER_MODEL_SET=0
 REVIEWER_EFFORT="high"
+VALIDATOR_ENABLED=0
 VALIDATOR_MODEL="claude-sonnet-4-6"
 VALIDATOR_EFFORT="high"
 ESCALATION_MODEL="gpt-5.5"
@@ -1558,6 +1565,10 @@ while (($# > 0)); do
       REVIEWER_EFFORT=$2
       shift 2
       ;;
+    --validator)
+      VALIDATOR_ENABLED=1
+      shift
+      ;;
     --validator-model)
       (($# >= 2)) || die "--validator-model requires a model"
       VALIDATOR_MODEL=$2
@@ -1674,7 +1685,11 @@ if [[ "$DRY_RUN" == "1" ]]; then
     printf 'Manifest fallback: disabled\n'
   fi
   printf 'Reviewer: %s:%s (%s)\n' "$REVIEWER_ENGINE" "$REVIEWER_MODEL" "$REVIEWER_EFFORT"
-  printf 'Validator: claude:%s (%s)\n' "$VALIDATOR_MODEL" "$VALIDATOR_EFFORT"
+  if [[ "$VALIDATOR_ENABLED" == "1" ]]; then
+    printf 'Validator: enabled, claude:%s (%s)\n' "$VALIDATOR_MODEL" "$VALIDATOR_EFFORT"
+  else
+    printf 'Validator: disabled (reviewer is authoritative)\n'
+  fi
   printf 'Escalation: %s (%s)\n' "$ESCALATION_MODEL" "$ESCALATION_EFFORT"
   printf 'Fast mode: %s\n' "$FAST_MODE"
   printf 'Resume current: %s\n' "$RESUME_CURRENT"
@@ -1787,11 +1802,13 @@ for plan_file in "${PLAN_FILES[@]}"; do
       break
     fi
 
-    run_validator "$plan_file" "$review_dir" "$plan_run_dir" "$loop"
-    implementation_status=$(implementation_plan_status "$implementation_plan")
-    if [[ "$implementation_status" == "clean" ]]; then
-      approved_review_file=$review_file
-      break
+    if [[ "$VALIDATOR_ENABLED" == "1" ]]; then
+      run_validator "$plan_file" "$review_dir" "$plan_run_dir" "$loop"
+      implementation_status=$(implementation_plan_status "$implementation_plan")
+      if [[ "$implementation_status" == "clean" ]]; then
+        approved_review_file=$review_file
+        break
+      fi
     fi
 
     if ((loop >= MAX_REVIEW_LOOPS)); then

@@ -14,11 +14,13 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use wyrd_auth_oidc::{JwksCache, OidcError, OidcKid, TrustedIssuerRegistry, map_claims};
 use wyrd_runtime::{
     DelegationStep, PermissionSet, Principal, PrincipalId, PrincipalKind,
     PrincipalRef as RuntimePrincipalRef, RoleRef,
 };
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::reference::CardRef;
 
@@ -183,6 +185,35 @@ impl TokenHash {
     }
 }
 
+/// External OIDC verify path. `None` until `with_external` is called.
+#[derive(Clone)]
+struct ExternalVerify {
+    jwks: Arc<JwksCache>,
+    trusted: Arc<TrustedIssuerRegistry>,
+}
+
+/// Verified identity from an external OIDC issuer.
+///
+/// This is NOT a [`wyrd_runtime::Principal`] (R03). The server flow (commit 06
+/// for human users, commit 07 for workloads) owns constructing the `Principal`
+/// by upsert/lookup and RBAC resolution. The verifier is SQL-free and cannot
+/// perform those operations here.
+#[derive(Debug)]
+pub struct VerifiedExternalIdentity {
+    /// The trusted issuer that signed the token.
+    pub issuer: IssuerUrl,
+    /// Tenant the issuer was looked up under (the `(tenant, iss)` key).
+    pub tenant_id: DataTenantId,
+    /// Verified external subject (from `sub` or a configured claim path).
+    pub subject: String,
+    /// Optional email address; never used as the identity key.
+    pub email: Option<String>,
+    /// Groups or roles extracted from the token (RBAC resolution input).
+    pub groups: Vec<String>,
+    /// Full verified token claims for downstream assertion checks (e.g. nonce).
+    pub raw_claims: serde_json::Value,
+}
+
 /// Stateful verifier with token-hash cache and resolver-backed permission refresh.
 #[derive(Clone)]
 pub struct TokenVerifier<R: PermissionResolver> {
@@ -191,6 +222,7 @@ pub struct TokenVerifier<R: PermissionResolver> {
     resolver: Arc<R>,
     cache: Cache<TokenHash, Arc<VerifiedToken>>,
     settings: Arc<WyrdAuthVerifySettings>,
+    external: Option<ExternalVerify>,
 }
 
 impl<R: PermissionResolver + 'static> TokenVerifier<R> {
@@ -219,7 +251,21 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
             resolver,
             cache,
             settings: Arc::new(settings),
+            external: None,
         }
+    }
+
+    /// Attach an external OIDC verification path backed by a JWKS cache and
+    /// trusted-issuer registry. Until this is called, `verify_external` always
+    /// returns `AuthError::InvalidToken`.
+    #[must_use]
+    pub fn with_external(
+        mut self,
+        jwks: Arc<JwksCache>,
+        trusted: Arc<TrustedIssuerRegistry>,
+    ) -> Self {
+        self.external = Some(ExternalVerify { jwks, trusted });
+        self
     }
 
     /// Verify a bearer token for the active tenant.
@@ -305,6 +351,118 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
         for hash in hashes {
             self.cache.invalidate(&hash).await;
         }
+    }
+
+    /// Verify a token issued by a trusted external OIDC issuer.
+    ///
+    /// Returns a [`VerifiedExternalIdentity`] with the verified subject, optional
+    /// profile claims, and the raw JSON claims for downstream assertion checks
+    /// (e.g. nonce). Does **not** build a `Principal` or call the
+    /// `PermissionResolver` (R03 — the server flow owns that step).
+    ///
+    /// The lookup is keyed by `(tenant, iss)` (F02). Calling this with a
+    /// Wyrd-minted local token (i.e. `iss == self.issuer`) returns an error;
+    /// use `verify()` for those.
+    ///
+    /// # Errors
+    /// - `AuthError::InvalidToken` — unknown issuer, bad token shape, wrong
+    ///   audience, or the external path was not configured.
+    /// - `AuthError::TokenExpired` — the token's `exp` has passed.
+    /// - `AuthError::VerifyUnavailable` — the JWKS endpoint is unreachable.
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, token),
+        fields(tenant_id = %tenant),
+        err,
+    )]
+    pub async fn verify_external(
+        &self,
+        tenant: &DataTenantId,
+        token: &str,
+    ) -> Result<VerifiedExternalIdentity, AuthError> {
+        if token.len() > MAX_BEARER_TOKEN_BYTES {
+            return Err(AuthError::BadTokenFormat);
+        }
+
+        let header = decode_header(token).map_err(AuthError::from)?;
+
+        // Read the unverified `iss` from the JWT payload to look up the trusted
+        // issuer. JWTs are three base64url-no-padding parts: header.claims.sig.
+        let iss_str = {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            let payload_b64 = token.split('.').nth(1).ok_or(AuthError::BadTokenFormat)?;
+            let payload = URL_SAFE_NO_PAD.decode(payload_b64).map_err(|_| AuthError::BadTokenFormat)?;
+            let claims_value: serde_json::Value =
+                serde_json::from_slice(&payload).map_err(|_| AuthError::InvalidToken)?;
+            claims_value
+                .get("iss")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(AuthError::InvalidToken)?
+                .to_owned()
+        };
+
+        // Local tokens must go through verify(), not here.
+        if iss_str == self.issuer.as_str() {
+            return Err(AuthError::InvalidToken);
+        }
+
+        let ext = self.external.as_ref().ok_or(AuthError::InvalidToken)?;
+
+        // Parse the issuer string into the typed form for the registry lookup.
+        let iss_url = IssuerUrl::new(iss_str).map_err(|_| AuthError::InvalidToken)?;
+        let trusted = ext
+            .trusted
+            .get(tenant, &iss_url)
+            .ok_or(AuthError::InvalidToken)?;
+
+        // Reject symmetric algorithms. Only asymmetric keys appear in JWKS.
+        if matches!(
+            header.alg,
+            Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512
+        ) {
+            return Err(AuthError::InvalidToken);
+        }
+
+        // F09 — single Kid → OidcKid conversion site.
+        let kid_str = header.kid.ok_or(AuthError::InvalidToken)?;
+        let oidc_kid = OidcKid::new(kid_str);
+
+        let decoding_key = ext
+            .jwks
+            .key(trusted.issuer.as_str(), &trusted.jwks_uri, &oidc_kid)
+            .await
+            .map_err(|e| match e {
+                OidcError::JwksUnavailable { .. } => AuthError::VerifyUnavailable,
+                OidcError::UnknownKid { .. } => AuthError::InvalidToken,
+                _ => AuthError::InvalidToken,
+            })?;
+
+        let mut validation = Validation::new(header.alg);
+        validation.set_issuer(&[trusted.issuer.as_str()]);
+        validation.set_audience(&[trusted.expected_audience.as_str()]);
+        validation.leeway = self.settings.allowed_clock_skew.as_secs();
+
+        let raw_claims: serde_json::Value =
+            jsonwebtoken::decode(token, &decoding_key, &validation)
+                .map(|data| data.claims)
+                .map_err(|e| match e.kind() {
+                    jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
+                    jsonwebtoken::errors::ErrorKind::InvalidAudience
+                    | jsonwebtoken::errors::ErrorKind::InvalidIssuer => AuthError::InvalidToken,
+                    _ => AuthError::Jwt(e),
+                })?;
+
+        let mapped = map_claims(&trusted.claim_mapping, &raw_claims)
+            .map_err(|_| AuthError::InvalidToken)?;
+
+        Ok(VerifiedExternalIdentity {
+            issuer: trusted.issuer.clone(),
+            tenant_id: *tenant,
+            subject: mapped.subject,
+            email: mapped.email,
+            groups: mapped.groups,
+            raw_claims,
+        })
     }
 
     fn validation(&self) -> Validation {
@@ -588,10 +746,17 @@ mod tests {
 
     use jsonwebtoken::{Algorithm, EncodingKey, Header, Validation, encode};
     use secrecy::SecretString;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wyrd_auth_oidc::{
+        ClaimMapping, ClaimPath, ClientAuth, JwksCache, PrincipalKindPolicy, TrustedIssuer,
+        TrustedIssuerRegistry,
+    };
     use wyrd_runtime::{Permission, PermissionSet};
     use wyrd_runtime::{Principal, PrincipalId, PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::IssuerUrl;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
@@ -599,7 +764,8 @@ mod tests {
     use super::{
         AccessTokenClaims, ActClaim, AuthError, Kid, MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH,
         PermissionResolver, PrincipalKindWire, ResolveError, TokenPrincipalRef, TokenVerifier,
-        WyrdAuthVerifySettings, decode_kid, public_key_from_pem, verify_eddsa, verify_eddsa_with,
+        VerifiedExternalIdentity, WyrdAuthVerifySettings, decode_kid, public_key_from_pem,
+        verify_eddsa, verify_eddsa_with,
     };
 
     const PRIVATE_KEY_PEM: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
@@ -1179,5 +1345,347 @@ mod tests {
             .into_verified(&resolver)
             .await;
         assert!(matches!(result, Err(AuthError::PermissionsCorrupt)));
+    }
+
+    // -------------------------------------------------------------------------
+    // External verify helpers
+    // -------------------------------------------------------------------------
+
+    // Ed25519 public key x-component matching PRIVATE_KEY_PEM / PUBLIC_KEY_PEM.
+    const ED_X: &str = "WhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ-DZ8Vw";
+    const EXTERNAL_ISSUER: &str = "https://test-idp.example.com";
+    const EXTERNAL_AUDIENCE: &str = "wyrd-client-id";
+    const EXTERNAL_KID: &str = "ext-key-1";
+
+    fn ed_jwks_json(kid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "keys": [{
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "kid": kid,
+                "x": ED_X
+            }]
+        })
+    }
+
+    fn external_claims(iss: &str, aud: &str, exp: usize, iat: usize) -> serde_json::Value {
+        serde_json::json!({
+            "sub": "ext-user@idp.example.com",
+            "email": "ext@example.com",
+            "groups": ["viewer"],
+            "iss": iss,
+            "aud": aud,
+            "exp": exp,
+            "iat": iat,
+        })
+    }
+
+    fn encode_external_token(claims: &serde_json::Value, kid: &str) -> String {
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some(kid.to_owned());
+        encode(&header, claims, &private_key()).expect("external test token signs")
+    }
+
+    fn make_jwks_cache() -> Arc<JwksCache> {
+        Arc::new(JwksCache::new(
+            reqwest::Client::new(),
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        ))
+    }
+
+    fn make_claim_mapping() -> ClaimMapping {
+        ClaimMapping {
+            subject: ClaimPath::new("sub"),
+            email: Some(ClaimPath::new("email")),
+            groups: Some(ClaimPath::new("groups")),
+        }
+    }
+
+    fn make_trusted_issuer(
+        tenant_id: DataTenantId,
+        issuer: IssuerUrl,
+        audience: &str,
+        jwks_uri: url::Url,
+    ) -> TrustedIssuer {
+        TrustedIssuer {
+            tenant_id,
+            issuer: issuer.clone(),
+            jwks_uri,
+            expected_audience: audience.to_owned(),
+            client_id: "wyrd".to_owned(),
+            client_auth: ClientAuth::PrivateKeyJwt,
+            claim_mapping: make_claim_mapping(),
+            principal_kind: PrincipalKindPolicy::Human,
+            jwks_ttl: Duration::from_secs(3600),
+        }
+    }
+
+    fn with_external_issuer(
+        resolver: Arc<TestResolver>,
+        trusted: TrustedIssuer,
+        jwks: Arc<JwksCache>,
+    ) -> TokenVerifier<TestResolver> {
+        let registry = Arc::new(TrustedIssuerRegistry::from_iter([trusted]));
+        verifier(resolver, WyrdAuthVerifySettings::default()).with_external(jwks, registry)
+    }
+
+    // -------------------------------------------------------------------------
+    // External verify tests
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn verify_external_happy_path_returns_verified_identity_not_principal() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ed_jwks_json(EXTERNAL_KID)))
+            .mount(&server)
+            .await;
+
+        let jwks_uri: url::Url =
+            format!("{}/jwks", server.uri()).parse().expect("wiremock uri is valid");
+        let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
+        let tid = tenant_id();
+        let trusted = make_trusted_issuer(tid, issuer.clone(), EXTERNAL_AUDIENCE, jwks_uri);
+        let resolver = Arc::new(TestResolver::default());
+        let v = with_external_issuer(Arc::clone(&resolver), trusted, make_jwks_cache());
+
+        let claims =
+            external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
+        let token = encode_external_token(&claims, EXTERNAL_KID);
+
+        let identity = v
+            .verify_external(&tid, &token)
+            .await
+            .expect("external happy path should succeed");
+
+        assert_eq!(identity.issuer, issuer);
+        assert_eq!(identity.tenant_id, tid);
+        assert_eq!(identity.subject, "ext-user@idp.example.com");
+        assert_eq!(identity.email.as_deref(), Some("ext@example.com"));
+        assert_eq!(identity.groups, vec!["viewer"]);
+        // R03: no PermissionResolver call on the external path.
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn verify_external_tenant_isolation_wrong_audience_is_invalid_token() {
+        // Same issuer registered under two tenants with different audiences.
+        // Token signed for tenant A (aud-for-a) presented under tenant B → InvalidToken.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ed_jwks_json(EXTERNAL_KID)))
+            .mount(&server)
+            .await;
+
+        let jwks_uri: url::Url =
+            format!("{}/jwks", server.uri()).parse().expect("wiremock uri is valid");
+        let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
+        let tenant_a = tenant_id();
+        let tenant_b: DataTenantId = "01890f28-7c4a-7001-98e7-4f4a3c2d1b02"
+            .parse()
+            .expect("static tenant id is valid");
+
+        let trusted_a = make_trusted_issuer(tenant_a, issuer.clone(), "aud-for-a", jwks_uri.clone());
+        let trusted_b = make_trusted_issuer(tenant_b, issuer.clone(), "aud-for-b", jwks_uri);
+
+        let registry = Arc::new(TrustedIssuerRegistry::from_iter([trusted_a, trusted_b]));
+        let jwks = make_jwks_cache();
+        let v = verifier(Arc::new(TestResolver::default()), WyrdAuthVerifySettings::default())
+            .with_external(jwks, registry);
+
+        // Token signed with aud-for-a.
+        let claims_a = external_claims(EXTERNAL_ISSUER, "aud-for-a", now() + 3_600, now());
+        let token = encode_external_token(&claims_a, EXTERNAL_KID);
+
+        // Presented under tenant A → ok.
+        v.verify_external(&tenant_a, &token)
+            .await
+            .expect("tenant A with its own audience should succeed");
+
+        // Presented under tenant B → InvalidToken (audience mismatch).
+        let result = v.verify_external(&tenant_b, &token).await;
+        assert!(
+            matches!(result, Err(AuthError::InvalidToken)),
+            "wrong tenant presentation should be InvalidToken"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_external_unknown_tenant_issuer_pair_returns_invalid_token() {
+        // Empty registry — the (tenant, iss) pair is not trusted.
+        let registry = Arc::new(TrustedIssuerRegistry::from_iter([]));
+        let jwks = make_jwks_cache();
+        let v = verifier(Arc::new(TestResolver::default()), WyrdAuthVerifySettings::default())
+            .with_external(jwks, registry);
+
+        let claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
+        let token = encode_external_token(&claims, EXTERNAL_KID);
+
+        let result = v.verify_external(&tenant_id(), &token).await;
+        assert!(
+            matches!(result, Err(AuthError::InvalidToken)),
+            "untrusted issuer should be InvalidToken"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_external_without_external_configured_returns_invalid_token() {
+        // No with_external() call → external path is None.
+        let v = verifier(Arc::new(TestResolver::default()), WyrdAuthVerifySettings::default());
+        let claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
+        let token = encode_external_token(&claims, EXTERNAL_KID);
+
+        let result = v.verify_external(&tenant_id(), &token).await;
+        assert!(matches!(result, Err(AuthError::InvalidToken)));
+    }
+
+    #[tokio::test]
+    async fn verify_external_rejects_local_issuer_token() {
+        // Token with iss == local issuer ("wyrd") must go through verify(), not verify_external().
+        let v = verifier(Arc::new(TestResolver::default()), WyrdAuthVerifySettings::default());
+        let claims = claims_with_times(now() + 3_600, now()); // iss: "wyrd"
+        let token = encode_eddsa_with_kid(&claims);
+
+        let result = v.verify_external(&tenant_id(), &token).await;
+        assert!(
+            matches!(result, Err(AuthError::InvalidToken)),
+            "local-issuer token should be rejected by verify_external"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_external_wrong_audience_returns_invalid_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ed_jwks_json(EXTERNAL_KID)))
+            .mount(&server)
+            .await;
+
+        let jwks_uri: url::Url =
+            format!("{}/jwks", server.uri()).parse().expect("wiremock uri is valid");
+        let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
+        let tid = tenant_id();
+        let trusted =
+            make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
+        let v = with_external_issuer(Arc::new(TestResolver::default()), trusted, make_jwks_cache());
+
+        let claims = external_claims(EXTERNAL_ISSUER, "wrong-audience", now() + 3_600, now());
+        let token = encode_external_token(&claims, EXTERNAL_KID);
+
+        let result = v.verify_external(&tid, &token).await;
+        assert!(
+            matches!(result, Err(AuthError::InvalidToken)),
+            "wrong audience should be InvalidToken"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_external_expired_token_returns_token_expired() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ed_jwks_json(EXTERNAL_KID)))
+            .mount(&server)
+            .await;
+
+        let jwks_uri: url::Url =
+            format!("{}/jwks", server.uri()).parse().expect("wiremock uri is valid");
+        let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
+        let tid = tenant_id();
+        let settings = WyrdAuthVerifySettings {
+            allowed_clock_skew: Duration::ZERO,
+            ..WyrdAuthVerifySettings::default()
+        };
+        let trusted = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
+        let registry = Arc::new(TrustedIssuerRegistry::from_iter([trusted]));
+        let v = verifier(Arc::new(TestResolver::default()), settings)
+            .with_external(make_jwks_cache(), registry);
+
+        let claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() - 3_600, now() - 7_200);
+        let token = encode_external_token(&claims, EXTERNAL_KID);
+
+        let result = v.verify_external(&tid, &token).await;
+        assert!(
+            matches!(result, Err(AuthError::TokenExpired)),
+            "expired token should be TokenExpired"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_external_jwks_unreachable_returns_verify_unavailable() {
+        let jwks_uri: url::Url =
+            "http://127.0.0.1:1/jwks".parse().expect("static uri is valid");
+        let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
+        let tid = tenant_id();
+        let trusted = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
+        let v = with_external_issuer(Arc::new(TestResolver::default()), trusted, make_jwks_cache());
+
+        let claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
+        let token = encode_external_token(&claims, EXTERNAL_KID);
+
+        let result = v.verify_external(&tid, &token).await;
+        assert!(
+            matches!(result, Err(AuthError::VerifyUnavailable)),
+            "unreachable JWKS endpoint should be VerifyUnavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_external_unknown_kid_refetches_and_succeeds_after_rotation() {
+        let server = MockServer::start().await;
+        let old_kid = "old-ext-key";
+        let new_kid = "new-ext-key";
+
+        // First fetch: serve old key set.
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ed_jwks_json(old_kid)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Second fetch (refetch after unknown kid): serve new key set.
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ed_jwks_json(new_kid)))
+            .mount(&server)
+            .await;
+
+        let jwks_uri: url::Url =
+            format!("{}/jwks", server.uri()).parse().expect("wiremock uri is valid");
+        let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
+        let tid = tenant_id();
+
+        // Populate the cache with the old key set by requesting the old kid first.
+        let jwks = make_jwks_cache();
+        let trusted_for_old =
+            make_trusted_issuer(tid, issuer.clone(), EXTERNAL_AUDIENCE, jwks_uri.clone());
+        let registry = Arc::new(TrustedIssuerRegistry::from_iter([trusted_for_old]));
+        {
+            let v = verifier(Arc::new(TestResolver::default()), WyrdAuthVerifySettings::default())
+                .with_external(Arc::clone(&jwks), Arc::clone(&registry));
+            let old_claims =
+                external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
+            let old_token = encode_external_token(&old_claims, old_kid);
+            v.verify_external(&tid, &old_token).await.expect("old kid should resolve");
+        }
+
+        // Now create a new verifier sharing the same JWKS cache, but the token
+        // uses new_kid. The cache has the old key set; new_kid is unknown →
+        // triggers one refetch → found in the new key set → success.
+        let trusted_for_new =
+            make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
+        let registry2 = Arc::new(TrustedIssuerRegistry::from_iter([trusted_for_new]));
+        let v2 = verifier(Arc::new(TestResolver::default()), WyrdAuthVerifySettings::default())
+            .with_external(Arc::clone(&jwks), registry2);
+        let new_claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
+        let new_token = encode_external_token(&new_claims, new_kid);
+        v2.verify_external(&tid, &new_token)
+            .await
+            .expect("new kid should resolve after one JWKS refetch");
     }
 }

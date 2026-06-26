@@ -7,6 +7,7 @@ rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 [dependencies]
+base64 = { workspace = true }
 chrono = { workspace = true }
 jsonwebtoken = { workspace = true }
 moka = { version = "0.12", features = ["future"] }
@@ -16,9 +17,13 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
+wyrd-auth-oidc = { path = "../wyrd-auth-oidc", version = "0.0.1" }
 wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
 wyrd-runtime = { workspace = true }
 
 [dev-dependencies]
+reqwest = { workspace = true }
 tokio = { workspace = true }
+wiremock = { workspace = true }
 wyrd-semver = { path = "../wyrd-semver", version = "0.0.1" }

@@ -10408,9 +10408,11 @@ dependencies = [
 name = "wyrd-auth-verify"
 version = "0.0.1"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "jsonwebtoken 9.3.1",
  "moka",
+ "reqwest 0.12.28",
  "secrecy",
  "serde",
  "serde_json",
@@ -10418,6 +10420,9 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
+ "wiremock",
+ "wyrd-auth-oidc",
  "wyrd-runtime",
  "wyrd-semver",
  "wyrd-spec",

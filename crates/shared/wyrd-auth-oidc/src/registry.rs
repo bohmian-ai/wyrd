@@ -5,6 +5,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use secrecy::SecretString;
+use url::Url;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::reference::CardRef;
@@ -100,6 +101,10 @@ pub struct TrustedIssuer {
     pub tenant_id: DataTenantId,
     /// Normalized OIDC issuer URL.
     pub issuer: IssuerUrl,
+    /// JWKS endpoint URL for fetching signing keys. Populated from OIDC
+    /// discovery (`jwks_uri` field) or supplied directly for providers that do
+    /// not publish a discovery document.
+    pub jwks_uri: Url,
     /// The audience value (`aud` claim) expected in tokens from this issuer.
     /// Usually Wyrd's `client_id` registered at the IdP.
     pub expected_audience: String,
@@ -213,7 +218,8 @@ mod tests {
     fn trusted_issuer(tenant_id: DataTenantId, issuer: IssuerUrl, audience: &str) -> TrustedIssuer {
         TrustedIssuer {
             tenant_id,
-            issuer,
+            issuer: issuer.clone(),
+            jwks_uri: format!("{issuer}/.well-known/keys").parse().expect("static jwks uri is valid"),
             expected_audience: audience.to_owned(),
             client_id: "wyrd".to_owned(),
             client_auth: ClientAuth::PrivateKeyJwt,

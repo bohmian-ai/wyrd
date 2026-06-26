@@ -626,6 +626,81 @@ review_approved() {
   ' "$review_file" >/dev/null
 }
 
+materialize_review_artifacts_from_json() {
+  local review_file=$1
+  local review_dir=$2
+  local plan_path=$3
+  local status
+
+  cp "$review_file" "$review_dir/review-result.json"
+
+  if [[ ! -f "$review_dir/findings.md" ]]; then
+    jq -r '
+      "# Quick Review Findings\n",
+      "Review ID: " + ($ARGS.named.review_id) + "\n",
+      "Status: " + (if .status == "approved" then "clean" else "required_changes" end) + "\n",
+      "## Findings\n",
+      (if (.findings | length) == 0 then
+        "No blocking findings.\n"
+      else
+        (.findings[] |
+          "- [" + .severity + "] " + .path + ":" + ((.line // "n/a") | tostring) + " - " + .issue + "\n" +
+          "  Required change: " + .required_change + "\n")
+      end),
+      "\n## Verification Gaps\n",
+      (if (.recommended_checks | length) == 0 then
+        "None.\n"
+      else
+        (.recommended_checks[] | "- " + .)
+      end)
+    ' --arg review_id "$(basename "$review_dir")" "$review_file" >"$review_dir/findings.md"
+  fi
+
+  if [[ ! -f "$plan_path" ]]; then
+    if review_approved "$review_file"; then
+      status=clean
+    else
+      status=required_changes
+    fi
+
+    {
+      printf '# Immediate Implementation Plan\n\n'
+      printf 'Status: %s\n' "$status"
+      printf 'Review ID: %s\n\n' "$(basename "$review_dir")"
+      printf '## Summary\n\n'
+      jq -r '.summary' "$review_file"
+      printf '\n## Required Changes\n\n'
+      if [[ "$status" == "clean" ]]; then
+        printf 'None.\n'
+      else
+        jq -r '
+          [.findings[] | select(.severity == "critical" or .severity == "important")]
+          | to_entries[]
+          | "### \((.key + 1)). Address validated review finding\n\n" +
+            "Severity: \(.value.severity)\n" +
+            "Source finding: \(.value.path):\((.value.line // "n/a") | tostring)\n" +
+            "Files or symbols to inspect:\n" +
+            "- \(.value.path)\n\n" +
+            "Problem:\n\(.value.issue)\n\n" +
+            "Required implementation:\n- \(.value.required_change)\n- Preserve local Wyrd ownership boundaries and existing nearby patterns.\n- Do not implement optional polish or later plan slices.\n\n" +
+            "Acceptance criteria:\n- The source finding no longer reproduces under the reviewed behavior.\n- Relevant tests or checks cover the changed behavior.\n\n" +
+            "Verification:\n" +
+            (if ($checks | length) == 0 then "- mise run fmt" else ($checks | map("- " + .) | join("\n")) end) +
+            "\n"
+        ' --argjson checks "$(jq '.recommended_checks' "$review_file")" "$review_file"
+      fi
+      printf '\n## Verification\n\n'
+      jq -r '
+        if (.recommended_checks | length) == 0 then
+          "- mise run fmt"
+        else
+          .recommended_checks[] | "- " + .
+        end
+      ' "$review_file"
+    } >"$plan_path"
+  fi
+}
+
 write_review_feedback() {
   local review_file=$1
   local feedback_file=$2
@@ -928,7 +1003,7 @@ run_reviewer() {
       --print \
       --model "$REVIEWER_MODEL" \
       --effort "$REVIEWER_EFFORT" \
-      --permission-mode dontAsk \
+      --permission-mode bypassPermissions \
       --tools "Bash,Read,Grep,Glob,Write,Edit" \
       --output-format text
     extract_json_object "$raw_file" "$final_file"
@@ -938,10 +1013,10 @@ run_reviewer() {
     run_codex_prompt "$prompt_file" "$jsonl_file" codex "${CODEX_ARGS[@]}"
   fi
   validate_review_json "$final_file"
+  materialize_review_artifacts_from_json "$final_file" "$review_dir" "$plan_path"
   [[ -f "$review_dir/findings.md" ]] || die "reviewer did not write findings.md in $(relpath "$review_dir")"
   [[ -f "$plan_path" ]] || die "reviewer did not write implementation-plan.md in $(relpath "$review_dir")"
   implementation_plan_status "$plan_path" >/dev/null || die "implementation-plan.md is missing Status: clean|required_changes"
-  cp "$final_file" "$review_dir/review-result.json"
 }
 
 run_validator() {
@@ -962,7 +1037,7 @@ run_validator() {
     --print \
     --model "$VALIDATOR_MODEL" \
     --effort "$VALIDATOR_EFFORT" \
-    --permission-mode dontAsk \
+    --permission-mode bypassPermissions \
     --tools "Bash,Read,Grep,Glob,Write,Edit" \
     --output-format text
 

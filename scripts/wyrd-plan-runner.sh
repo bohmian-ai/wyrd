@@ -198,8 +198,8 @@ build_codex_args() {
     -C "$REPO_ROOT"
     -m "$model"
     -c "model_reasoning_effort=\"$effort\""
+    -c 'approval_policy="never"'
     --sandbox "$sandbox"
-    --ask-for-approval never
     --json
     --output-last-message "$output_file"
   )

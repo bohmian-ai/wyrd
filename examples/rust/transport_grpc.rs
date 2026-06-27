@@ -1,9 +1,9 @@
-//! Configure a Wyrd queue with the default gRPC transport.
+//! Configure the default gRPC transport for a Wyrd client.
 //!
 //! Run with:
 //!     cargo run -p wyrd-rust-examples --bin transport_grpc
 
-use wyrd_client::transport::{GrpcConfig, QueueConfig, TransportConfig};
+use wyrd_client::transport::{GrpcConfig, TransportConfig};
 use wyrd_spec::security::{SecretRef, TlsConfig};
 
 fn main() -> anyhow::Result<()> {
@@ -23,18 +23,21 @@ fn main() -> anyhow::Result<()> {
             name: "WYRD_API_KEY".to_string(),
         }),
         connect_retries: 3,
+        keepalive_interval_ms: 20_000,
+        keepalive_timeout_ms: 5_000,
+        max_message_bytes: 4 * 1024 * 1024,
     };
     grpc.validate()?;
 
-    let queue = QueueConfig {
-        transport: TransportConfig::Grpc(grpc),
-        ..QueueConfig::default()
-    };
-    queue.validate()?;
+    let transport = TransportConfig::Grpc(grpc);
+    transport.validate()?;
 
-    let json = serde_json::to_string_pretty(&queue)?;
-    let round_trip: QueueConfig = serde_json::from_str(&json)?;
-    anyhow::ensure!(round_trip == queue, "queue config did not round-trip");
+    let json = serde_json::to_string_pretty(&transport)?;
+    let round_trip: TransportConfig = serde_json::from_str(&json)?;
+    anyhow::ensure!(
+        round_trip == transport,
+        "transport config did not round-trip"
+    );
     println!("{json}");
     Ok(())
 }

@@ -34,4 +34,5 @@ wyrd-spec = { workspace = true }
 wyrd-tonic = { workspace = true, optional = true }
 
 [dev-dependencies]
+secrecy = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }

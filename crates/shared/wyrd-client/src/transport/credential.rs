@@ -32,9 +32,7 @@ pub enum ResolvedCredential {
 impl std::fmt::Debug for ResolvedCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BearerToken(_) => {
-                f.debug_tuple("BearerToken").field(&"[REDACTED]").finish()
-            }
+            Self::BearerToken(_) => f.debug_tuple("BearerToken").field(&"[REDACTED]").finish(),
             Self::WorkloadJwt { tenant, .. } => f
                 .debug_struct("WorkloadJwt")
                 .field("jwt", &"[REDACTED]")
@@ -180,9 +178,7 @@ impl CredentialChain {
                         tenant: tenant.clone(),
                     })
                 }
-                CredentialSource::ApiKey { key } => {
-                    Ok(ResolvedCredential::ApiKey(key.clone()))
-                }
+                CredentialSource::ApiKey { key } => Ok(ResolvedCredential::ApiKey(key.clone())),
             })
             .unwrap_or(Err(WyrdClientError::NoCredentials))
     }
@@ -212,10 +208,7 @@ fn read_credentials_toml_api_key() -> Option<String> {
     }
 
     let parsed: CredentialsFile = toml::from_str(&content).ok()?;
-    parsed
-        .default?
-        .api_key
-        .filter(|k| !k.is_empty())
+    parsed.default?.api_key.filter(|k| !k.is_empty())
 }
 
 #[cfg(test)]
@@ -242,7 +235,11 @@ mod tests {
         let cred = chain.resolve().expect("chain resolves");
         match cred {
             ResolvedCredential::BearerToken(t) => {
-                assert_eq!(t.expose_secret(), "access-tok", "explicit token wins over api key");
+                assert_eq!(
+                    t.expose_secret(),
+                    "access-tok",
+                    "explicit token wins over api key"
+                );
             }
             _ => panic!("expected BearerToken"),
         }
@@ -304,7 +301,11 @@ mod tests {
         let cred = chain.resolve().expect("chain resolves");
         match cred {
             ResolvedCredential::WorkloadJwt { jwt, tenant } => {
-                assert_eq!(jwt.expose_secret(), "workload.jwt.token", "workload token wins over api key");
+                assert_eq!(
+                    jwt.expose_secret(),
+                    "workload.jwt.token",
+                    "workload token wins over api key"
+                );
                 assert_eq!(tenant, "acme");
             }
             _ => panic!("expected WorkloadJwt"),
@@ -327,7 +328,11 @@ mod tests {
         let cred = chain.resolve().expect("chain resolves");
         match cred {
             ResolvedCredential::BearerToken(t) => {
-                assert_eq!(t.expose_secret(), "explicit", "explicit token wins over workload and api key");
+                assert_eq!(
+                    t.expose_secret(),
+                    "explicit",
+                    "explicit token wins over workload and api key"
+                );
             }
             _ => panic!("expected BearerToken"),
         }
@@ -379,7 +384,9 @@ mod tests {
         let cred = chain.resolve().expect("file floor resolves");
 
         // SAFETY: single-threaded test runner (--test-threads=1).
-        unsafe { std::env::remove_var("HOME"); }
+        unsafe {
+            std::env::remove_var("HOME");
+        }
         fs::remove_dir_all(&tmp).ok();
 
         match cred {

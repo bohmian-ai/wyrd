@@ -10,7 +10,7 @@ use secrecy::SecretString;
 
 use crate::error::WyrdClientError;
 use crate::transport::{
-    config::{GrpcConfig, HttpConfig, GRPC_DEFAULT_ENDPOINT, HTTP_DEFAULT_BASE_URL},
+    config::{GRPC_DEFAULT_ENDPOINT, GrpcConfig, HTTP_DEFAULT_BASE_URL, HttpConfig},
     credential::{CredentialChain, CredentialSource, ResolvedCredential},
 };
 
@@ -81,10 +81,10 @@ impl ClientConfig {
     /// after construction to make it the highest-priority credential source.
     #[must_use]
     pub fn from_env() -> Self {
-        let grpc_endpoint = std::env::var("WYRD_GRPC_URL")
-            .unwrap_or_else(|_| GRPC_DEFAULT_ENDPOINT.to_string());
-        let http_base_url = std::env::var("WYRD_SERVER_URL")
-            .unwrap_or_else(|_| HTTP_DEFAULT_BASE_URL.to_string());
+        let grpc_endpoint =
+            std::env::var("WYRD_GRPC_URL").unwrap_or_else(|_| GRPC_DEFAULT_ENDPOINT.to_string());
+        let http_base_url =
+            std::env::var("WYRD_SERVER_URL").unwrap_or_else(|_| HTTP_DEFAULT_BASE_URL.to_string());
 
         Self {
             grpc: GrpcConfig {
@@ -194,7 +194,9 @@ mod tests {
         let result = cfg.resolve_credential();
 
         // SAFETY: single-threaded test runner (--test-threads=1).
-        unsafe { std::env::remove_var("HOME"); }
+        unsafe {
+            std::env::remove_var("HOME");
+        }
 
         assert!(result.is_err(), "empty chain must return NoCredentials");
     }
@@ -212,7 +214,9 @@ mod tests {
         let cred = cfg.resolve_credential().expect("resolves from env");
 
         // SAFETY: single-threaded test runner (--test-threads=1).
-        unsafe { std::env::remove_var("WYRD_API_KEY"); }
+        unsafe {
+            std::env::remove_var("WYRD_API_KEY");
+        }
 
         match cred {
             ResolvedCredential::ApiKey(k) => {
@@ -237,7 +241,9 @@ mod tests {
         let cred = cfg.resolve_credential().expect("explicit key resolves");
 
         // SAFETY: single-threaded test runner (--test-threads=1).
-        unsafe { std::env::remove_var("WYRD_API_KEY"); }
+        unsafe {
+            std::env::remove_var("WYRD_API_KEY");
+        }
 
         match cred {
             ResolvedCredential::ApiKey(k) => {
@@ -258,7 +264,10 @@ mod tests {
 
         let debug = format!("{cfg:?}");
 
-        assert!(!debug.contains("top-secret"), "Debug must not expose the raw api_key");
+        assert!(
+            !debug.contains("top-secret"),
+            "Debug must not expose the raw api_key"
+        );
         assert!(debug.contains("REDACTED"));
     }
 }

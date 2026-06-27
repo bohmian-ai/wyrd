@@ -15,8 +15,8 @@ pub mod mock;
 
 pub use config::{GrpcConfig, HttpConfig, MockConfig, TransportConfig};
 pub use credential::{CredentialChain, CredentialSource, ResolvedCredential};
+#[cfg(feature = "transport-grpc")]
+pub use grpc::GrpcConnection;
 #[cfg(feature = "transport-http")]
 pub use http::{ArrowResponse, HttpTransport};
 pub use mock::{MockRecord, MockTransport};
-#[cfg(feature = "transport-grpc")]
-pub use grpc::GrpcConnection;

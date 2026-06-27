@@ -181,11 +181,19 @@ mod transport_behavior {
 
     impl MockResponse {
         fn ok(body: &str) -> Self {
-            Self { status: 200, body: body.to_owned(), extra_headers: vec![] }
+            Self {
+                status: 200,
+                body: body.to_owned(),
+                extra_headers: vec![],
+            }
         }
 
         fn status(status: u16, body: &str) -> Self {
-            Self { status, body: body.to_owned(), extra_headers: vec![] }
+            Self {
+                status,
+                body: body.to_owned(),
+                extra_headers: vec![],
+            }
         }
 
         fn with_header(mut self, name: &str, value: &str) -> Self {
@@ -199,9 +207,7 @@ mod transport_behavior {
         let addr = listener.local_addr().expect("addr");
         let hits = Arc::new(AtomicUsize::new(0));
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let responses = Arc::new(Mutex::new(
-            responses.into_iter().collect::<VecDeque<_>>(),
-        ));
+        let responses = Arc::new(Mutex::new(responses.into_iter().collect::<VecDeque<_>>()));
 
         let hits_clone = hits.clone();
         let captured_clone = captured.clone();
@@ -222,7 +228,11 @@ mod transport_behavior {
                     let raw = String::from_utf8_lossy(&buf[..n]).to_string();
                     captured_inner.lock().await.push(raw);
 
-                    let MockResponse { status, body, extra_headers } = responses_inner
+                    let MockResponse {
+                        status,
+                        body,
+                        extra_headers,
+                    } = responses_inner
                         .lock()
                         .await
                         .pop_front()
@@ -243,15 +253,22 @@ mod transport_behavior {
             }
         });
 
-        MockServer { base_url: format!("http://{addr}"), hits, captured, _handle: handle }
+        MockServer {
+            base_url: format!("http://{addr}"),
+            hits,
+            captured,
+            _handle: handle,
+        }
     }
 
     fn make_transport(base_url: String) -> HttpTransport {
-        let credential =
-            ResolvedCredential::BearerToken("test-bearer".to_owned().into());
+        let credential = ResolvedCredential::BearerToken("test-bearer".to_owned().into());
         let config = ClientConfig::default();
         let auth = AuthMiddleware::new(&config, credential).expect("auth builds");
-        let http_config = HttpConfig { base_url, ..HttpConfig::default() };
+        let http_config = HttpConfig {
+            base_url,
+            ..HttpConfig::default()
+        };
         HttpTransport::new(&http_config, auth).expect("transport builds")
     }
 
@@ -310,12 +327,12 @@ mod transport_behavior {
     #[tokio::test]
     async fn request_arrow_reads_bytes_and_metadata_headers() {
         let arrow_bytes = b"\x00\x01\x02\x03arrow-ipc-payload";
-        let server = spawn_mock(vec![MockResponse::ok(
-            &String::from_utf8_lossy(arrow_bytes),
-        )
-        .with_header("X-Wyrd-Schema-Fingerprint", "sha256:abc123")
-        .with_header("X-Wyrd-Row-Count", "42")
-        .with_header("content-type", "application/vnd.apache.arrow.stream")])
+        let server = spawn_mock(vec![
+            MockResponse::ok(&String::from_utf8_lossy(arrow_bytes))
+                .with_header("X-Wyrd-Schema-Fingerprint", "sha256:abc123")
+                .with_header("X-Wyrd-Row-Count", "42")
+                .with_header("content-type", "application/vnd.apache.arrow.stream"),
+        ])
         .await;
         let t = make_transport(server.base_url.clone());
 
@@ -360,18 +377,14 @@ mod transport_behavior {
         let t = make_transport(server.base_url.clone());
 
         let _: serde_json::Value = t
-            .request_json(
-                reqwest::Method::GET,
-                "/v1/ping",
-                None::<&serde_json::Value>,
-            )
+            .request_json(reqwest::Method::GET, "/v1/ping", None::<&serde_json::Value>)
             .await
             .expect("request ok");
 
         let captured = server.captured.lock().await;
         let raw = captured.first().expect("one request captured");
-        let id = extract_header(raw, "wyrd-request-id")
-            .expect("wyrd-request-id header must be present");
+        let id =
+            extract_header(raw, "wyrd-request-id").expect("wyrd-request-id header must be present");
 
         let parsed = uuid::Uuid::parse_str(&id).expect("wyrd-request-id must be a valid UUID");
         assert_eq!(
@@ -385,7 +398,10 @@ mod transport_behavior {
     async fn submit_idempotent_replays_key_across_retry() {
         let ok_body = r#"{"job_id":"123"}"#;
         let server = spawn_mock(vec![
-            MockResponse::status(503, r#"{"code":"WYRD_SPEC_500_INTERNAL","detail":"overloaded","details":{}}"#),
+            MockResponse::status(
+                503,
+                r#"{"code":"WYRD_SPEC_500_INTERNAL","detail":"overloaded","details":{}}"#,
+            ),
             MockResponse::ok(ok_body),
         ])
         .await;
@@ -405,10 +421,8 @@ mod transport_behavior {
         );
 
         let captured = server.captured.lock().await;
-        let key_first =
-            extract_header(&captured[0], "Idempotency-Key").expect("key on attempt 1");
-        let key_second =
-            extract_header(&captured[1], "Idempotency-Key").expect("key on attempt 2");
+        let key_first = extract_header(&captured[0], "Idempotency-Key").expect("key on attempt 1");
+        let key_second = extract_header(&captured[1], "Idempotency-Key").expect("key on attempt 2");
 
         assert_eq!(
             key_first, key_second,
@@ -458,11 +472,7 @@ mod transport_behavior {
         let t = make_transport(server.base_url.clone());
 
         let _: serde_json::Value = t
-            .request_json(
-                reqwest::Method::GET,
-                "/v1/ping",
-                None::<&serde_json::Value>,
-            )
+            .request_json(reqwest::Method::GET, "/v1/ping", None::<&serde_json::Value>)
             .await
             .expect("request ok");
 

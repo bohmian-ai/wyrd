@@ -120,13 +120,12 @@ impl GrpcConnection {
 /// it without repeating validation logic.
 #[cfg(feature = "transport-grpc")]
 fn build_endpoint(config: &GrpcConfig) -> Result<Endpoint, WyrdClientError> {
-    let endpoint =
-        Endpoint::from_shared(config.endpoint.clone()).map_err(|err| {
-            WyrdClientError::TransportDown {
-                transport: "grpc".to_owned(),
-                message: format!("invalid endpoint URI: {err}"),
-            }
-        })?;
+    let endpoint = Endpoint::from_shared(config.endpoint.clone()).map_err(|err| {
+        WyrdClientError::TransportDown {
+            transport: "grpc".to_owned(),
+            message: format!("invalid endpoint URI: {err}"),
+        }
+    })?;
 
     let timeout = Duration::from_millis(config.timeout_ms);
     let endpoint = endpoint.timeout(timeout).connect_timeout(timeout);

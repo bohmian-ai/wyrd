@@ -78,7 +78,13 @@ impl WyrdTestServer {
         let mutate_env = slf.mutate_env;
 
         let result: Result<
-            (crate::server::WyrdTestServer, String, String, String, String),
+            (
+                crate::server::WyrdTestServer,
+                String,
+                String,
+                String,
+                String,
+            ),
             wyrd_spec::error::WyrdError,
         > = wyrd_runtime::runtime().block_on(async {
             let srv = crate::server::WyrdTestServer::start_bound()

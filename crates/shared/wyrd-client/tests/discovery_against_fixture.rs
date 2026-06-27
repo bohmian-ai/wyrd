@@ -50,13 +50,11 @@ async fn discovery_against_fixture() {
     // Verify the shared string contract: from_env() reads the same names the
     // fixture exports.
     assert_eq!(
-        cfg.http.base_url,
-        base_url,
+        cfg.http.base_url, base_url,
         "WYRD_SERVER_URL must feed ClientConfig.http.base_url"
     );
     assert_eq!(
-        cfg.grpc.endpoint,
-        grpc_url,
+        cfg.grpc.endpoint, grpc_url,
         "WYRD_GRPC_URL must feed ClientConfig.grpc.endpoint"
     );
     assert_eq!(

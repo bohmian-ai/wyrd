@@ -73,9 +73,7 @@ impl MockTransport {
             if count == fail_at {
                 return Err(WyrdClientError::TransportDown {
                     transport: "mock".to_owned(),
-                    message: format!(
-                        "mock transport configured to fail on flush call {fail_at}"
-                    ),
+                    message: format!("mock transport configured to fail on flush call {fail_at}"),
                 });
             }
         }
@@ -91,7 +89,7 @@ impl MockTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::{MockTransport};
+    use super::MockTransport;
     use crate::error::WyrdClientError;
     use crate::transport::config::MockConfig;
 

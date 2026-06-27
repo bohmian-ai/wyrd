@@ -503,7 +503,11 @@ mod tests {
         for _ in 0..16 {
             let mw = mw.clone();
             handles.push(tokio::spawn(async move {
-                mw.bearer().await.expect("concurrent bearer ok").expose().to_owned()
+                mw.bearer()
+                    .await
+                    .expect("concurrent bearer ok")
+                    .expose()
+                    .to_owned()
             }));
         }
         for handle in handles {
@@ -595,7 +599,10 @@ mod tests {
         }
 
         let contents = std::fs::read_to_string(&path).expect("read token cache");
-        assert!(contents.contains("disk-access"), "access token must be persisted");
+        assert!(
+            contents.contains("disk-access"),
+            "access token must be persisted"
+        );
         assert!(
             !contents.contains("refresh-should-drop"),
             "refresh token must never be written to disk"
@@ -623,6 +630,10 @@ mod tests {
             .expect("middleware builds");
         let id = mw.request_id(None);
         let parsed = Uuid::parse_str(&id).expect("minted id is a valid uuid");
-        assert_eq!(parsed.get_version_num(), 7, "minted request id must be UUIDv7");
+        assert_eq!(
+            parsed.get_version_num(),
+            7,
+            "minted request id must be UUIDv7"
+        );
     }
 }

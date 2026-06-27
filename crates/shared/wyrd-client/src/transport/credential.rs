@@ -359,6 +359,8 @@ mod tests {
     fn credentials_toml_floor_resolves_api_key() {
         use std::fs;
 
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+
         let tmp = std::env::temp_dir().join(format!(
             "wyrd_cred_test_{}_{}",
             std::process::id(),
@@ -371,7 +373,7 @@ mod tests {
         )
         .unwrap();
 
-        // SAFETY: single-threaded test runner (--test-threads=1).
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
             std::env::set_var("HOME", &tmp);
             std::env::remove_var("WYRD_API_KEY");
@@ -383,7 +385,7 @@ mod tests {
         let chain = CredentialChain::from_env();
         let cred = chain.resolve().expect("file floor resolves");
 
-        // SAFETY: single-threaded test runner (--test-threads=1).
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
             std::env::remove_var("HOME");
         }

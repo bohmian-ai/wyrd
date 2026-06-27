@@ -11,3 +11,12 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod transport;
+
+/// Serializes tests that read or mutate process-global `WYRD_*`/`HOME`
+/// environment variables. `ClientConfig::from_env` and
+/// `CredentialChain::from_env` read ambient env, so env-touching tests across
+/// modules in this lib binary must hold this lock for their full duration —
+/// otherwise they race under the parallel workspace test runner. Recover from
+/// poisoning so one failing test does not cascade.
+#[cfg(test)]
+pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());

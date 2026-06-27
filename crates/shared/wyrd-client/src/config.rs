@@ -124,7 +124,8 @@ mod tests {
 
     #[test]
     fn from_env_uses_defaults_when_no_env_vars() {
-        // SAFETY: single-threaded test runner (--test-threads=1).
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
             std::env::remove_var("WYRD_GRPC_URL");
             std::env::remove_var("WYRD_SERVER_URL");
@@ -140,12 +141,13 @@ mod tests {
 
     #[test]
     fn wyrd_grpc_url_overrides_default_endpoint() {
-        // SAFETY: single-threaded test runner (--test-threads=1).
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
             std::env::set_var("WYRD_GRPC_URL", "https://grpc.example.com:443");
         }
         let cfg = ClientConfig::from_env();
-        // SAFETY: single-threaded test runner (--test-threads=1).
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
             std::env::remove_var("WYRD_GRPC_URL");
         }
@@ -155,12 +157,13 @@ mod tests {
 
     #[test]
     fn wyrd_server_url_overrides_default_base_url() {
-        // SAFETY: single-threaded test runner (--test-threads=1).
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
             std::env::set_var("WYRD_SERVER_URL", "https://api.example.com");
         }
         let cfg = ClientConfig::from_env();
-        // SAFETY: single-threaded test runner (--test-threads=1).
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
             std::env::remove_var("WYRD_SERVER_URL");
         }
@@ -170,7 +173,8 @@ mod tests {
 
     #[test]
     fn no_credentials_when_chain_empty() {
-        // SAFETY: single-threaded test runner (--test-threads=1).
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
             std::env::remove_var("WYRD_ACCESS_TOKEN");
             std::env::remove_var("WYRD_WORKLOAD_TOKEN");
@@ -183,7 +187,7 @@ mod tests {
         let cfg = ClientConfig::from_env();
         let result = cfg.resolve_credential();
 
-        // SAFETY: single-threaded test runner (--test-threads=1).
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
             std::env::remove_var("HOME");
         }
@@ -193,7 +197,8 @@ mod tests {
 
     #[test]
     fn env_api_key_resolves_when_no_explicit() {
-        // SAFETY: single-threaded test runner (--test-threads=1).
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
             std::env::set_var("WYRD_API_KEY", "env_api_key_value");
             std::env::remove_var("WYRD_ACCESS_TOKEN");
@@ -203,7 +208,7 @@ mod tests {
         let cfg = ClientConfig::from_env();
         let cred = cfg.resolve_credential().expect("resolves from env");
 
-        // SAFETY: single-threaded test runner (--test-threads=1).
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
             std::env::remove_var("WYRD_API_KEY");
         }
@@ -218,7 +223,8 @@ mod tests {
 
     #[test]
     fn explicit_api_key_beats_env_wyrd_api_key() {
-        // SAFETY: single-threaded test runner (--test-threads=1).
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
             std::env::set_var("WYRD_API_KEY", "env_key_should_lose");
             std::env::remove_var("WYRD_ACCESS_TOKEN");
@@ -230,7 +236,7 @@ mod tests {
 
         let cred = cfg.resolve_credential().expect("explicit key resolves");
 
-        // SAFETY: single-threaded test runner (--test-threads=1).
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
             std::env::remove_var("WYRD_API_KEY");
         }

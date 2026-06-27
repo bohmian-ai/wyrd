@@ -219,8 +219,12 @@ for crate in wyrd-auth-verify; do
   fi
 done
 
+# `tower-http` is intentionally absent: it is a non-optional transitive
+# dependency of `reqwest` (client-side follow-redirect), the sanctioned async
+# HTTP client for the auth exchange and HTTP transport. `axum` still flags the
+# server HTTP stack.
 forbidden_wyrd_client=$(cargo tree -p wyrd-client --all-features -e normal | \
-  rg '(^|[ ─└├])(sqlx|tokio-postgres|postgres|deltalake|datafusion|axum|tower-http|kube|aws-sdk|azure_|google-cloud|opendal|rdkafka|lapin|redis|deadpool-|vala-)' || true)
+  rg '(^|[ ─└├])(sqlx|tokio-postgres|postgres|deltalake|datafusion|axum|kube|aws-sdk|azure_|google-cloud|opendal|rdkafka|lapin|redis|deadpool-|vala-)' || true)
 if [ -n "$forbidden_wyrd_client" ]; then
   echo "FAIL: wyrd-client pulls forbidden client-tier deps:"
   echo "$forbidden_wyrd_client"

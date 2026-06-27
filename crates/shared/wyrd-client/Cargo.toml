@@ -18,16 +18,20 @@ transport-grpc = ["dep:wyrd-tonic"]
 transport-http = []
 
 [dependencies]
+chrono = { workspace = true }
+reqwest = { workspace = true }
 schemars = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 shellexpand = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 toml = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 wyrd-spec = { workspace = true }
 wyrd-tonic = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }

@@ -21,7 +21,7 @@
       ]
     },
     "connect_retries": {
-      "description": "Connection-level retry budget. The transport retries the initial connection up to this many times before surfacing an error. Per-call retry logic lives in `QueueConfig`.\n\nDefault: [`GRPC_DEFAULT_CONNECT_RETRIES`] (`3`).",
+      "description": "Connection-level retry budget. The transport retries the initial connection up to this many times before surfacing an error.\n\nDefault: [`GRPC_DEFAULT_CONNECT_RETRIES`] (`3`).",
       "type": "integer",
       "format": "uint32",
       "minimum": 0.0
@@ -29,6 +29,27 @@
     "endpoint": {
       "description": "gRPC server endpoint. Must be `http://host:port` (plaintext) or `https://host:port` (TLS). Must be non-empty.\n\nDefault: [`GRPC_DEFAULT_ENDPOINT`] (`\"http://localhost:50051\"`).",
       "type": "string"
+    },
+    "keepalive_interval_ms": {
+      "description": "HTTP/2 keepalive ping interval in milliseconds. `0` disables pings.\n\nDefault: [`GRPC_DEFAULT_KEEPALIVE_INTERVAL_MS`] (`20_000`, 20 s).",
+      "default": 20000,
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "keepalive_timeout_ms": {
+      "description": "HTTP/2 keepalive ping timeout in milliseconds. The connection is closed if the peer does not respond within this window.\n\nDefault: [`GRPC_DEFAULT_KEEPALIVE_TIMEOUT_MS`] (`5_000`, 5 s).",
+      "default": 5000,
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "max_message_bytes": {
+      "description": "Maximum gRPC message size in bytes (both encoding and decoding).\n\nDefault: [`GRPC_DEFAULT_MAX_MESSAGE_BYTES`] (`4_194_304`, 4 MiB).",
+      "default": 4194304,
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
     },
     "timeout_ms": {
       "description": "Per-call timeout in milliseconds.\n\nDefault: [`GRPC_DEFAULT_TIMEOUT_MS`] (`30_000`, 30 s).",

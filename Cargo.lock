@@ -10504,6 +10504,8 @@ dependencies = [
 name = "wyrd-client"
 version = "0.0.1"
 dependencies = [
+ "chrono",
+ "reqwest 0.12.28",
  "schemars 0.8.22",
  "secrecy",
  "serde",
@@ -10512,6 +10514,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
+ "tracing",
  "uuid",
  "wyrd-spec",
  "wyrd-tonic",

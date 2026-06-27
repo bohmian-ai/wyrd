@@ -42,15 +42,31 @@ const RESULT_SCHEMA = {
   },
 }
 
-const maxIters = args.maxIters || 3
+// The Workflow runtime delivers `args` VERBATIM. The orchestrator (an LLM following
+// the wyrd-implement SKILL) routinely serializes it to a JSON STRING in the tool
+// call. On a string, `args.tasks` is undefined and `args.tasks.map(...)` throws
+// "undefined is not an object (evaluating 'args.tasks.map')" at 0s — before any
+// agent spawns. Accept BOTH shapes so the wave can never fail on invocation form.
+const A = typeof args === 'string' ? JSON.parse(args) : (args || {})
+if (!Array.isArray(A.tasks) || A.tasks.length === 0) {
+  throw new Error(
+    'wave.js: args.tasks must be a non-empty array — got ' +
+      (typeof args === 'string'
+        ? 'a JSON string with no usable tasks (pass args as an OBJECT/array, not a stringified one)'
+        : JSON.stringify(A.tasks)) +
+      '. Invoke via the wyrd-implement orchestrator with args = { featureDir, base, tasks: [...] }.'
+  )
+}
+
+const maxIters = A.maxIters || 3
 
 function executorPrompt(t) {
   return [
-    `Implement ONE commit of the Wyrd feature at ${args.featureDir}.`,
-    `Contract: ${args.featureDir}/${t.file}. Read it fully; it is authoritative.`,
+    `Implement ONE commit of the Wyrd feature at ${A.featureDir}.`,
+    `Contract: ${A.featureDir}/${t.file}. Read it fully; it is authoritative.`,
     ``,
     `Your worktree is ALREADY CREATED at: ${t.worktree}`,
-    `It is correctly based on ${args.base} — all prerequisites (prior commits and`,
+    `It is correctly based on ${A.base} — all prerequisites (prior commits and`,
     `the feature's base-branch crates) are present. Prefix EVERY shell command with`,
     `\`cd ${t.worktree} && …\` so it runs inside the worktree. Do NOT create, switch,`,
     `or remove worktrees, do NOT git-checkout another branch, and do NOT touch the`,
@@ -90,7 +106,7 @@ function executorPrompt(t) {
 }
 
 const results = await parallel(
-  args.tasks.map((t) => () =>
+  A.tasks.map((t) => () =>
     agent(executorPrompt(t), {
       label: `impl:${t.id}`,
       phase: 'Implement',

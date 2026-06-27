@@ -73,9 +73,14 @@ filesystem/git access). One Workflow invocation per wave.
      (reuse the path if it already exists and is correctly based).
    - **Then invoke** the wave Workflow (`.claude/workflows/wave.js`) with
      `args = { featureDir, base, tasks: [<nodes with file+model+worktree+crates+seams+verify>] }` —
-     each node carrying the absolute `worktree` path you just created. Do **not**
-     rely on `isolation: 'worktree'` (it would branch from `main`; see the warning
-     above).
+     each node carrying the absolute `worktree` path you just created. Pass `args`
+     as an actual JSON **object** in the `Workflow` tool call — **never** a
+     JSON-encoded string. The runtime delivers `args` verbatim, so a stringified
+     payload arrives as a `string`, `args.tasks` is `undefined`, and the wave
+     crashes at 0s with `undefined is not an object (evaluating 'args.tasks.map')`.
+     (`wave.js` now `JSON.parse`s a string defensively, but pass an object.) Do
+     **not** rely on `isolation: 'worktree'` (it would branch from `main`; see the
+     warning above).
    - **`featureDir` MUST be the absolute primary-tree path** (e.g.
      `/…/wyrd/.dev/plan/<feature>`), not the repo-relative `.dev/plan/<feature>`.
      `.dev/` is gitignored on purpose (planning artifacts never pollute the repo),

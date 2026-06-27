@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/wyrd-client",
     "crates/wyrd/*",
     "crates/vala/*",
     "crates/skald/*",
@@ -28,7 +27,7 @@ authors = ["Thorrester <sjforrester32@gmail.com>"]
 
 [workspace.dependencies]
 wyrd-spec = { path = "crates/wyrd-spec", version = "0.0.1" }
-wyrd-client = { path = "crates/wyrd-client", version = "0.0.1" }
+wyrd-client = { path = "crates/shared/wyrd-client", version = "0.0.1" }
 skald-spec = { path = "crates/skald/skald-spec", version = "0.1.0" }
 skald-cache = { path = "crates/skald/skald-cache", version = "0.0.1" }
 skald-tool = { path = "crates/skald/skald-tool", version = "0.0.1" }
@@ -135,7 +134,10 @@ shellexpand = "3"
 ipnetwork = "0.20"
 wyrd-telemetry = { path = "crates/shared/wyrd-telemetry", version = "0.0.1" }
 arc-swap = "1.7"
-tonic = "0.12"
+# Client-safe baseline (no `transport`/`server` → no axum). `wyrd-tonic` adds the
+# client `channel`/`tls` features and gates `tonic/server` behind its `server`
+# feature. Only `wyrd-tonic` may depend on tonic (check:no-tonic-outside-wyrd-tonic).
+tonic = { version = "0.12", default-features = false, features = ["codegen", "prost"] }
 tonic-health = "0.12"
 tonic-reflection = "0.12"
 tonic-types = "0.12"

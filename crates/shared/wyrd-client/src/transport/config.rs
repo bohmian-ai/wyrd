@@ -12,6 +12,12 @@ pub const GRPC_DEFAULT_ENDPOINT: &str = "http://localhost:50051";
 pub const GRPC_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// Default connect-retry budget for [`GrpcConfig`].
 pub const GRPC_DEFAULT_CONNECT_RETRIES: u32 = 3;
+/// Default HTTP/2 keepalive ping interval (ms) for [`GrpcConfig`].
+pub const GRPC_DEFAULT_KEEPALIVE_INTERVAL_MS: u64 = 20_000;
+/// Default HTTP/2 keepalive ping timeout (ms) for [`GrpcConfig`].
+pub const GRPC_DEFAULT_KEEPALIVE_TIMEOUT_MS: u64 = 5_000;
+/// Default maximum gRPC message size in bytes for [`GrpcConfig`] (4 MiB).
+pub const GRPC_DEFAULT_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Configuration for the gRPC transport.
 ///
@@ -44,11 +50,41 @@ pub struct GrpcConfig {
     pub auth: Option<SecretRef>,
 
     /// Connection-level retry budget. The transport retries the initial
-    /// connection up to this many times before surfacing an error. Per-call
-    /// retry logic lives in `QueueConfig`.
+    /// connection up to this many times before surfacing an error.
     ///
     /// Default: [`GRPC_DEFAULT_CONNECT_RETRIES`] (`3`).
     pub connect_retries: u32,
+
+    /// HTTP/2 keepalive ping interval in milliseconds. `0` disables pings.
+    ///
+    /// Default: [`GRPC_DEFAULT_KEEPALIVE_INTERVAL_MS`] (`20_000`, 20 s).
+    #[serde(default = "default_keepalive_interval_ms")]
+    pub keepalive_interval_ms: u64,
+
+    /// HTTP/2 keepalive ping timeout in milliseconds. The connection is closed
+    /// if the peer does not respond within this window.
+    ///
+    /// Default: [`GRPC_DEFAULT_KEEPALIVE_TIMEOUT_MS`] (`5_000`, 5 s).
+    #[serde(default = "default_keepalive_timeout_ms")]
+    pub keepalive_timeout_ms: u64,
+
+    /// Maximum gRPC message size in bytes (both encoding and decoding).
+    ///
+    /// Default: [`GRPC_DEFAULT_MAX_MESSAGE_BYTES`] (`4_194_304`, 4 MiB).
+    #[serde(default = "default_max_message_bytes")]
+    pub max_message_bytes: usize,
+}
+
+fn default_keepalive_interval_ms() -> u64 {
+    GRPC_DEFAULT_KEEPALIVE_INTERVAL_MS
+}
+
+fn default_keepalive_timeout_ms() -> u64 {
+    GRPC_DEFAULT_KEEPALIVE_TIMEOUT_MS
+}
+
+fn default_max_message_bytes() -> usize {
+    GRPC_DEFAULT_MAX_MESSAGE_BYTES
 }
 
 impl Default for GrpcConfig {
@@ -59,6 +95,9 @@ impl Default for GrpcConfig {
             tls: None,
             auth: None,
             connect_retries: GRPC_DEFAULT_CONNECT_RETRIES,
+            keepalive_interval_ms: GRPC_DEFAULT_KEEPALIVE_INTERVAL_MS,
+            keepalive_timeout_ms: GRPC_DEFAULT_KEEPALIVE_TIMEOUT_MS,
+            max_message_bytes: GRPC_DEFAULT_MAX_MESSAGE_BYTES,
         }
     }
 }
@@ -185,12 +224,12 @@ pub const MOCK_DEFAULT_LABEL: &str = "default";
 ///
 /// The mock transport is always available in `wyrd-client` (no feature gate).
 /// `MockConfig::fail_on_flush` lets tests inject deterministic flush
-/// failures - a Wyrd-native addition the predecessor mock did not support.
+/// failures — a Wyrd-native addition the predecessor mock did not support.
 ///
 /// # Default
 ///
 /// `MockConfig::default()` returns `{ label: "default", fail_on_flush: None }`.
-/// The default is a working config - it does not need `validate()` and is
+/// The default is a working config — it does not need `validate()` and is
 /// safe to use directly in tests that do not care about label isolation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -200,11 +239,9 @@ pub struct MockConfig {
     /// distinct labels to isolate test scenarios running in the same process.
     pub label: String,
 
-    /// Inject a flush failure. When `Some(n)`, the `nth` call to
-    /// `Flushable::flush` returns `Err`; all other calls succeed normally.
+    /// Inject a flush failure. When `Some(n)`, the `nth` call to flush
+    /// returns `Err`; all other calls succeed normally.
     /// Counting starts from 1 (i.e. `Some(1)` fails the first flush).
-    /// `Some(0)` is treated equivalently to `None` (the counter starts at 1
-    /// after increment, so the 0th call never matches).
     /// `None` means the mock always succeeds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fail_on_flush: Option<u32>,
@@ -221,10 +258,8 @@ impl Default for MockConfig {
 
 /// Wyrd client transport selection.
 ///
-/// gRPC is the default (Steven, 2026-06-02). Variants for queue transports
-/// (Kafka, RabbitMQ, Redis) are intentionally absent in this phase; they
-/// return in a dedicated follow-on plan when consumers need queue
-/// publication.
+/// gRPC is the default. Variants for queue transports (Kafka, RabbitMQ,
+/// Redis) are intentionally absent in this phase.
 ///
 /// Wire shape: `{"transport": "grpc", "params": { ... }}`.
 ///
@@ -233,9 +268,6 @@ impl Default for MockConfig {
 /// `is_enabled()` is feature-aware natively. `Grpc` is gated on
 /// `cfg!(feature = "transport-grpc")`, `Http` on
 /// `cfg!(feature = "transport-http")`, and `Mock` is always available.
-/// `WyrdClient::new()` (PR4.0 section 22) calls this method and returns
-/// `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED { transport, required_feature }`
-/// when the selected variant is not compiled into the local build.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "transport", content = "params", rename_all = "snake_case")]
 pub enum TransportConfig {
@@ -269,9 +301,7 @@ impl TransportConfig {
     }
 
     /// Returns the Cargo feature name that gates this variant, or `None` if
-    /// the variant is always available. Used by `WyrdClient::new()` (PR4.0)
-    /// to fill the `required_feature` field of
-    /// `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED`.
+    /// the variant is always available.
     pub fn required_feature(&self) -> Option<&'static str> {
         match self {
             Self::Grpc(_) => Some("transport-grpc"),
@@ -284,13 +314,6 @@ impl TransportConfig {
     ///
     /// `Mock` is always enabled. `Grpc` is enabled when the `transport-grpc`
     /// Cargo feature is on; `Http` requires `transport-http`.
-    ///
-    /// `WyrdClient::new()` (PR4.0 section 22) calls this and returns
-    /// `Err(WyrdClientError::TransportFeatureDisabled { transport, required_feature })`
-    /// when the selected variant is compiled out, rather than panicking at
-    /// first use. Note: `WyrdClientError::TransportFeatureDisabled` is not
-    /// yet in the enum — that variant lands in PR4.0 when `WyrdClient::new()`
-    /// is implemented.
     pub fn is_enabled(&self) -> bool {
         match self {
             Self::Grpc(_) => cfg!(feature = "transport-grpc"),
@@ -309,102 +332,5 @@ impl TransportConfig {
             Self::Http(c) => c.validate(),
             Self::Mock(_) => Ok(()),
         }
-    }
-}
-
-/// Shared queue policy for all per-record queues.
-///
-/// Every per-record queue in `wyrd-client` (`PsiFeatureQueue`,
-/// `SpcFeatureQueue`, `CustomMetricQueue`, `EvalRecordQueue`,
-/// `AgentTaskQueue`, `DatasetQueue`, `ObservationQueue`, `SpanQueue`,
-/// `QueueBus`) embeds a `QueueConfig` and uses it to decide when to flush.
-///
-/// # Validation
-///
-/// Call [`QueueConfig::validate`] before passing a config to a queue
-/// constructor. The constructor in `wyrd-client` must call `validate` and
-/// propagate the error rather than panicking.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct QueueConfig {
-    /// Transport variant this queue sends to.
-    pub transport: TransportConfig,
-
-    /// Flush when the buffer reaches this row count. Must be at least 1.
-    ///
-    /// Default: `10_000` (predecessor parity).
-    pub flush_max_rows: usize,
-
-    /// Flush at most every N milliseconds regardless of buffer fill. Must be
-    /// at least 1. Default: `5_000` (predecessor parity).
-    pub flush_interval_ms: u64,
-
-    /// Bounded channel capacity from the user thread to the flush worker.
-    /// Must be at least 1. Default: `100` (predecessor parity).
-    pub channel_capacity: usize,
-
-    /// Optional drop gate. When `Some(p)`, each record is kept with
-    /// probability `p` and dropped otherwise. `p` must be in `[0.0, 1.0]`.
-    /// `None` means no sampling (all records kept).
-    ///
-    /// Predecessor behavior scattered this across per-queue types. Wyrd
-    /// lifts it to `QueueConfig` so all queues share one policy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sample_ratio: Option<f64>,
-}
-
-impl Default for QueueConfig {
-    fn default() -> Self {
-        Self {
-            transport: TransportConfig::default(),
-            flush_max_rows: 10_000,
-            flush_interval_ms: 5_000,
-            channel_capacity: 100,
-            sample_ratio: None,
-        }
-    }
-}
-
-impl QueueConfig {
-    /// Validate the config. Returns `Err` on any of:
-    ///
-    /// - `flush_max_rows < 1`
-    /// - `flush_interval_ms < 1`
-    /// - `channel_capacity < 1`
-    /// - `sample_ratio` is `Some(p)` with `p < 0.0`, `p > 1.0`, or `p` is NaN
-    ///
-    /// Note: this method does not recursively validate the embedded
-    /// `transport`. Call `transport.validate()` (or the inner
-    /// `GrpcConfig::validate` / `HttpConfig::validate`) separately before
-    /// passing to a queue constructor. Callers who skip this step may receive
-    /// `Ok(())` here but see a `TransportDown` error at connect time.
-    pub fn validate(&self) -> Result<(), WyrdClientError> {
-        if self.flush_max_rows < 1 {
-            return Err(WyrdClientError::Config {
-                field: "queue_config.flush_max_rows".to_string(),
-                reason: "must be >= 1".to_string(),
-            });
-        }
-        if self.flush_interval_ms < 1 {
-            return Err(WyrdClientError::Config {
-                field: "queue_config.flush_interval_ms".to_string(),
-                reason: "must be >= 1".to_string(),
-            });
-        }
-        if self.channel_capacity < 1 {
-            return Err(WyrdClientError::Config {
-                field: "queue_config.channel_capacity".to_string(),
-                reason: "must be >= 1".to_string(),
-            });
-        }
-        if let Some(ratio) = self.sample_ratio
-            && !(0.0..=1.0).contains(&ratio)
-        {
-            return Err(WyrdClientError::Config {
-                field: "queue_config.sample_ratio".to_string(),
-                reason: format!("must be in [0.0, 1.0], got {ratio}"),
-            });
-        }
-        Ok(())
     }
 }

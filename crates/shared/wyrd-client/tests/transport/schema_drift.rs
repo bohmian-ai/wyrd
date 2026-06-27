@@ -55,8 +55,3 @@ fn mock_config_schema_matches_golden() {
     assert_schema_matches::<MockConfig>("transport_config_mock");
 }
 
-#[test]
-fn queue_config_schema_matches_golden() {
-    use wyrd_client::transport::QueueConfig;
-    assert_schema_matches::<QueueConfig>("transport_queue_config");
-}

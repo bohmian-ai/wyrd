@@ -54,16 +54,28 @@ filesystem/git access). One Workflow invocation per wave.
    assume `main`; the base ref comes from `tasks.yaml`.
 2. Compute the next wave (pending tasks with all deps `done`). If none and any
    task is still pending, stop and report a cycle or a blocked task.
-3. **Create a worktree per wave node, at an explicit base.** Let `base` =
+3. **Reindex the parent, then create worktrees, then dispatch.** Let `base` =
    the current `impl_branch` tip (it descends from `base_branch` and includes
-   every integrated prior wave, so all prerequisites are present). For each node:
-   `git worktree add .claude/worktrees/impl-<id> <base> -b impl/<id>-<slug>`
-   (reuse the path if it already exists and is correctly based). Then invoke the
-   wave Workflow (`.claude/workflows/wave.js`) with
-   `args = { featureDir, base, tasks: [<nodes with file+model+worktree+crates+seams+verify>] }` —
-   each node carrying the absolute `worktree` path you just created. Do **not**
-   rely on `isolation: 'worktree'` (it would branch from `main`; see the warning
-   above).
+   every integrated prior wave, so all prerequisites are present).
+   - **Reindex first — before any executor makes a change.** In the **primary
+     working tree** (git's original clone dir, the first entry in
+     `git worktree list`), which step 1 / step 4 leaves checked out on `base`,
+     run the incremental `codegraph sync` (or `codegraph index -i` if no
+     `.codegraph/` exists yet). This single shared index is what every linked
+     worktree's `codegraph explore` resolves to, so syncing here makes the
+     parent's *current* symbols visible to this wave's hydration. Run this for
+     **every** wave, including the **first** — do not skip it assuming a prior
+     session left the index current; it may still reflect `main` or a stale
+     branch. Invariant: the primary tree must be on `base` when you sync.
+     `.codegraph/` stays gitignored; the index is never committed.
+   - **Then create a worktree per node, at the explicit base:**
+     `git worktree add .claude/worktrees/impl-<id> <base> -b impl/<id>-<slug>`
+     (reuse the path if it already exists and is correctly based).
+   - **Then invoke** the wave Workflow (`.claude/workflows/wave.js`) with
+     `args = { featureDir, base, tasks: [<nodes with file+model+worktree+crates+seams+verify>] }` —
+     each node carrying the absolute `worktree` path you just created. Do **not**
+     rely on `isolation: 'worktree'` (it would branch from `main`; see the warning
+     above).
 4. For each returned executor result:
    - **green:** integrate its branch into `impl_branch` in `id` order (`git merge
      --no-ff` or fast-forward; independent commits touch disjoint crates so this
@@ -72,19 +84,16 @@ filesystem/git access). One Workflow invocation per wave.
    - **not green / escalate:** see "Recovery & escalation". Leave `pending` or
      mark `blocked`; surface to the user. **Keep** the worktree — its state is the
      evidence the escalation/Opus re-dispatch and you will need to debug.
-5. **Reindex at the barrier.** Wave integration happens **in the primary working
-   tree** (git's original clone dir, e.g. `/…/wyrd`, the first entry in
-   `git worktree list` — *not* a `.claude/worktrees/` linked worktree, and
-   nothing to do with the `main` branch). After you merge the wave onto the impl
-   branch there, the primary tree is checked out at exactly the `base` the next
-   wave's worktrees will branch from. Run the incremental `codegraph sync` **in
-   that primary working tree** (`sync`, not the from-scratch `index`, so it is
-   cheap). The single `.codegraph/` index lives in the primary tree; this is what
-   every linked worktree's `codegraph explore` resolves to, so syncing here is
-   what makes the symbols this wave introduced visible to the next wave's
-   hydration. Invariant: the primary working tree must be on `base` when you
-   sync — if you ever integrate somewhere else, sync there instead.
-   `.codegraph/` stays gitignored; the index is never committed.
+5. **Integrate in the primary working tree, leaving it on the new `base`.** Wave
+   integration (the step-4 merges) happens **in the primary working tree** (git's
+   original clone dir, the first entry in `git worktree list` — *not* a
+   `.claude/worktrees/` linked worktree, and nothing to do with `main`). After
+   merging, the primary tree is checked out at exactly the `base` the next wave
+   will branch from. Do **not** reindex here — the reindex is always the
+   **pre-dispatch** step (step 3), which the next iteration runs against this new
+   `base`. Keeping the sync in one place (just before dispatch) is what
+   guarantees the parent is reindexed *before any change is made*, on every wave
+   including the first.
 6. Repeat from step 2 until all tasks are `done`.
 7. Hand off to the **test** stage (the feature-level `final_gate` in
    `tasks.yaml`) and then **review** (`review-and-plan`).
@@ -104,9 +113,10 @@ warning is expected and benign here, because seams are pre-existing symbols whos
 committed source on `base` is exactly what the executor wants. That single
 primary-tree index reflects whatever branch the **primary working tree** has
 checked out (in this pipeline, the impl branch — *not* `main`, and not
-necessarily the same `base_branch` the impl branch forked from). The between-wave
-`codegraph sync` (loop step 5) runs in the primary tree to keep that shared index
-current as the impl branch advances. Executors hydrate via the **CLI**, not the
+necessarily the same `base_branch` the impl branch forked from). The pre-dispatch
+`codegraph sync` (loop step 3, run before each wave including the first) keeps that
+shared index current on `base` as the impl branch advances, so executors always
+hydrate against the parent's symbols as of the moment before they start changing. Executors hydrate via the **CLI**, not the
 MCP tool: the `codegraph_explore` MCP tool is deferred for Workflow subagents
 (needs a ToolSearch to load), whereas `codegraph explore` is always in Bash.
 

@@ -74,6 +74,13 @@ schema change — the `auth_refresh_tokens` table already has the columns/indexe
   `insert_refresh_token_rotated` slot; leave the existing insert untouched.
 - `revoke_refresh_family` (new SQL slot) — bulk revoke by (principal_kind,
   principal_id) for the theft response.
+- `insert_audit_token_exchange` — reuse; every transition (rotated,
+  reuse_detected, not_found) writes one row to the existing `audit_token_exchange`
+  table (F08). Do not invent a new audit path.
+- `RefreshError` → `WyrdError` mapping (`impl From`): `Reused → RefreshReused`,
+  `NotFound → RefreshRevoked` (also covers expired/revoked), `Database →
+  AuthVerifyUnavailable` (503), `Issue → Internal`. Enumerate all four; the DB and
+  Issue arms are easy to miss.
 - Route owns the transaction boundary (acquire `TenantConn`, execute, commit) —
   mirrors the existing token-exchange arm.
 

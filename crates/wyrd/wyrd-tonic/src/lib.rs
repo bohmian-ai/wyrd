@@ -10,6 +10,7 @@
 pub use prost;
 pub use tonic;
 pub use tonic_health;
+pub use tonic_types;
 
 pub mod error;
 pub mod health;

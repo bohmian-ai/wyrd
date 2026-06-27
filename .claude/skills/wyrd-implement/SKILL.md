@@ -76,6 +76,14 @@ filesystem/git access). One Workflow invocation per wave.
      each node carrying the absolute `worktree` path you just created. Do **not**
      rely on `isolation: 'worktree'` (it would branch from `main`; see the warning
      above).
+   - **`featureDir` MUST be the absolute primary-tree path** (e.g.
+     `/…/wyrd/.dev/plan/<feature>`), not the repo-relative `.dev/plan/<feature>`.
+     `.dev/` is gitignored on purpose (planning artifacts never pollute the repo),
+     so the task contracts exist **only** in the primary tree's working dir — a
+     freshly-created linked worktree does not contain them. With an absolute
+     `featureDir`, each executor's `${featureDir}/${t.file}` resolves to the
+     primary-tree copy from inside any worktree; reading the contract there is
+     fine (it is read-only reference — all *writes* still happen in `t.worktree`).
 4. For each returned executor result:
    - **green:** integrate its branch into `impl_branch` in `id` order (`git merge
      --no-ff` or fast-forward; independent commits touch disjoint crates so this

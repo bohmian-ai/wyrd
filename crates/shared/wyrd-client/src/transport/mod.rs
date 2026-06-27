@@ -3,7 +3,7 @@
 //! Module map:
 //! - [`config`] — `TransportConfig`, `GrpcConfig`, `HttpConfig`, `MockConfig`.
 //! - [`credential`] — ADC-style credential resolution chain.
-//! - [`grpc`] — generic authed gRPC channel (stub; logic lands in 07).
+//! - [`grpc`] — generic authed gRPC channel (gated on `transport-grpc`).
 //! - [`http`] — async `reqwest` HTTP transport (gated on `transport-http`).
 //! - [`mock`] — in-memory loopback transport for tests.
 
@@ -18,3 +18,5 @@ pub use credential::{CredentialChain, CredentialSource, ResolvedCredential};
 #[cfg(feature = "transport-http")]
 pub use http::{ArrowResponse, HttpTransport};
 pub use mock::{MockRecord, MockTransport};
+#[cfg(feature = "transport-grpc")]
+pub use grpc::GrpcConnection;

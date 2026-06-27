@@ -72,9 +72,14 @@ pub async fn dispatch(args: RevokeArgs) -> Result<ExitCode, WyrdCliError> {
         return Err(WyrdCliError::RevokeFailed { status, detail });
     }
 
-    let result: serde_json::Value =
-        resp.json().await.map_err(|source| WyrdCliError::Http { source })?;
-    println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
+    let result: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|source| WyrdCliError::Http { source })?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result).unwrap_or_default()
+    );
     Ok(ExitCode::SUCCESS)
 }
 

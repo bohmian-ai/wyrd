@@ -75,7 +75,10 @@ pub async fn dispatch(args: LoginArgs) -> Result<ExitCode, WyrdCliError> {
         return Err(WyrdCliError::AuthFailed { status, detail });
     }
 
-    let token: TokenResponse = resp.json().await.map_err(|source| WyrdCliError::Http { source })?;
+    let token: TokenResponse = resp
+        .json()
+        .await
+        .map_err(|source| WyrdCliError::Http { source })?;
     println!("access_token:  {}", token.access_token.expose());
     println!("refresh_token: {}", token.refresh_token.expose());
     println!("expires_at:    {}", token.expires_at);

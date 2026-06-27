@@ -16,6 +16,7 @@ const CONSUME_ACTIVE_REFRESH_SQL: &str = r#"
        SET revoked_at = now(),
            revoked_reason = 'rotated'
      WHERE token_hash = $1
+       AND data_tenant_id = $2
        AND revoked_at IS NULL
        AND expires_at > now()
     RETURNING id, data_tenant_id, principal_kind, principal_id, token_hash,
@@ -27,6 +28,7 @@ const REFRESH_BY_HASH_SQL: &str = r#"
            issued_at, expires_at, rotated_from, revoked_at, revoked_reason
       FROM wyrd.auth_refresh_tokens
      WHERE token_hash = $1
+       AND data_tenant_id = $2
      LIMIT 1
 "#;
 
@@ -51,8 +53,10 @@ pub async fn consume_active_refresh(
     conn: &mut TenantConn<'_>,
     token_hash: &str,
 ) -> Result<Option<RefreshTokenRow>, sqlx::Error> {
+    let tenant_id = conn.data_tenant_id().as_uuid();
     sqlx::query_as::<_, RefreshTokenRow>(CONSUME_ACTIVE_REFRESH_SQL)
         .bind(token_hash)
+        .bind(tenant_id)
         .fetch_optional(&mut **conn.transaction())
         .await
 }
@@ -66,8 +70,10 @@ pub async fn refresh_by_hash(
     conn: &mut TenantConn<'_>,
     token_hash: &str,
 ) -> Result<Option<RefreshTokenRow>, sqlx::Error> {
+    let tenant_id = conn.data_tenant_id().as_uuid();
     sqlx::query_as::<_, RefreshTokenRow>(REFRESH_BY_HASH_SQL)
         .bind(token_hash)
+        .bind(tenant_id)
         .fetch_optional(&mut **conn.transaction())
         .await
 }
@@ -168,6 +174,7 @@ mod tests {
         assert!(CONSUME_ACTIVE_REFRESH_SQL.contains("revoked_at IS NULL"));
         assert!(CONSUME_ACTIVE_REFRESH_SQL.contains("expires_at > now()"));
         assert!(CONSUME_ACTIVE_REFRESH_SQL.contains("revoked_reason = 'rotated'"));
+        assert!(CONSUME_ACTIVE_REFRESH_SQL.contains("data_tenant_id = $2"));
         assert!(CONSUME_ACTIVE_REFRESH_SQL.contains("RETURNING"));
     }
 
@@ -175,6 +182,7 @@ mod tests {
     fn refresh_by_hash_selects_all_lifecycle_states() {
         assert!(REFRESH_BY_HASH_SQL.contains("FROM wyrd.auth_refresh_tokens"));
         assert!(REFRESH_BY_HASH_SQL.contains("token_hash = $1"));
+        assert!(REFRESH_BY_HASH_SQL.contains("data_tenant_id = $2"));
         // No revoked_at filter — finds rows in any state.
         assert!(!REFRESH_BY_HASH_SQL.contains("revoked_at IS NULL"));
         assert!(!REFRESH_BY_HASH_SQL.contains("expires_at >"));

@@ -60,9 +60,12 @@ impl OidcIssuerFixture {
 
         let provider = {
             let discover_client = reqwest::Client::new();
-            OidcProvider::discover(issuer_base.parse().expect("issuer URL parses"), discover_client)
-                .await
-                .unwrap_or_else(|e| panic!("OIDC discovery failed for {issuer_base}: {e}"))
+            OidcProvider::discover(
+                issuer_base.parse().expect("issuer URL parses"),
+                discover_client,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("OIDC discovery failed for {issuer_base}: {e}"))
         };
 
         let issuer = IssuerUrl::new_for_tests(issuer_base);
@@ -109,11 +112,7 @@ impl OidcIssuerFixture {
         state: &str,
         code_challenge: &str,
     ) -> LoginResult {
-        let authz_url = self
-            .provider
-            .metadata
-            .authorization_endpoint
-            .clone();
+        let authz_url = self.provider.metadata.authorization_endpoint.clone();
 
         let authz_url = {
             let mut u = authz_url;
@@ -151,12 +150,9 @@ impl OidcIssuerFixture {
                 req = req.header(reqwest::header::COOKIE, cookie.as_str());
             }
             let login_page = req.send().await.expect("GET login page succeeds");
-            let session_cookie_final = session_cookie
-                .or_else(|| extract_session_cookie(&login_page));
-            let body = login_page
-                .text()
-                .await
-                .expect("login page body is text");
+            let session_cookie_final =
+                session_cookie.or_else(|| extract_session_cookie(&login_page));
+            let body = login_page.text().await.expect("login page body is text");
             (body, session_cookie_final)
         } else {
             let session_cookie = extract_session_cookie(&resp);
@@ -176,7 +172,10 @@ impl OidcIssuerFixture {
         if let Some(ref c) = cookie {
             post_req = post_req.header(reqwest::header::COOKIE, c.as_str());
         }
-        let post_resp = post_req.send().await.expect("POST login credentials succeeds");
+        let post_resp = post_req
+            .send()
+            .await
+            .expect("POST login credentials succeeds");
 
         // Step 4: Follow the redirect to the redirect_uri and capture code+state
         let location = post_resp
@@ -270,7 +269,7 @@ impl OidcIssuerFixture {
         let admin = self
             .admin
             .as_ref()
-            .expect("rotate_signing_key requires Keycloak admin credentials; call with_keycloak_admin");
+            .expect("call with_keycloak_admin before rotate_signing_key");
 
         // Obtain an admin access token
         let token_url = format!(
@@ -298,10 +297,7 @@ impl OidcIssuerFixture {
             .expect("admin token present");
 
         // Trigger key rotation: create a new RSA key and activate it
-        let keys_url = format!(
-            "{}/admin/realms/{}/components",
-            admin.base_url, admin.realm
-        );
+        let keys_url = format!("{}/admin/realms/{}/components", admin.base_url, admin.realm);
         let new_key_body = serde_json::json!({
             "name": "rsa-generated-rotate",
             "providerId": "rsa-generated",

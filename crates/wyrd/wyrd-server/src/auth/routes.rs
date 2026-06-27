@@ -144,13 +144,13 @@ async fn token(
                 settings: state.token_exchange_settings.clone(),
             }
             .execute(
-                    &state,
-                    &headers,
-                    assertion.into_secret_string(),
-                    tenant,
-                    req_id,
-                )
-                .await?;
+                &state,
+                &headers,
+                assertion.into_secret_string(),
+                tenant,
+                req_id,
+            )
+            .await?;
             Ok(Json(exchanged.into_response()))
         }
     }

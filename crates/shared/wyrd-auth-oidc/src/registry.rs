@@ -25,6 +25,11 @@ pub enum ClientAuth {
     SecretPost(SecretString),
     /// Private-key JWT (RFC 7523). Key reference resolved at runtime.
     PrivateKeyJwt,
+    /// Public PKCE-only client — no client secret or assertion.
+    /// The PKCE code verifier sent in the token exchange is the sole proof
+    /// of possession. Used for browser/mobile flows where storing a secret
+    /// is not possible.
+    Public,
 }
 
 // --------------------------------------------------------------------------

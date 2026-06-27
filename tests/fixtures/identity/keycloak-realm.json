@@ -38,7 +38,8 @@
       "authorizationServicesEnabled": false,
       "redirectUris": [
         "http://localhost:*",
-        "http://127.0.0.1:*"
+        "http://127.0.0.1:*",
+        "http://test-tenant-1.wyrd.test/auth/callback"
       ],
       "webOrigins": ["*"],
       "protocol": "openid-connect",

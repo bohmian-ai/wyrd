@@ -404,6 +404,7 @@ async fn exchange_code_for_id_token(
                 details: serde_json::json!({ "client_auth": "private_key_jwt" }),
             }));
         }
+        ClientAuth::Public => {}
     }
 
     let response = request.form(&form).send().await.map_err(|error| {

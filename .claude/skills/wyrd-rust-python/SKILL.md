@@ -48,6 +48,24 @@ Before editing:
 Do not invent a new architecture until the current Wyrd boundary proves wrong
 for the user workflow.
 
+## Pipeline Role And CodeGraph Hydration
+
+This skill is the Rust/Python **implementation reference** for the build pipeline
+(`wyrd-spec → wyrd-plan → wyrd-tasks → wyrd-implement → test → review`). It is not
+itself a pipeline stage: the `wyrd-implement` executors follow this doctrine when
+they write code, and the `wyrd-plan`/`wyrd-tasks` stages consult its Ownership
+Boundaries for crate placement. When implementing from a thin task contract
+(`.dev/plan/<feature>/tasks/NN-*.md`), the contract pins decisions and names seams
+as symbols; it intentionally does **not** render code. Hydrate the seam source
+live:
+
+- Use `codegraph_explore` to load the named seams' verbatim source and call paths
+  before writing code. Do not run a manual grep/read loop and do not expect the
+  plan to contain the code — the plan names `consume_active_refresh`; CodeGraph
+  gives you its current body and callers.
+- Honor the contract's decisions, seams, and invariants exactly. If the contract
+  is wrong or under-specified, stop and report — do not improvise architecture.
+
 Load these references only when relevant:
 
 - Rust ownership, traits, async, allocation, and core API shape:

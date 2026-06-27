@@ -29,7 +29,9 @@ run = ["docker compose down --volumes", "docker compose up -d --build postgres -
 [tasks."test:rust:workspace"]
 description = "Run workspace Rust unit tests (no DB required)"
 run = """
-cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server --exclude vala-bifrost --exclude vala-sql
+cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server --exclude vala-bifrost --exclude vala-sql --exclude vala-core --exclude wyrd-client
+cargo test --locked -p wyrd-client
+cargo test --locked -p vala-core
 cargo test --locked -p vala-sql --lib
 cargo test --locked -p wyrd-server --all-features
 """
@@ -358,7 +360,15 @@ if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/skald/skald-providers/Cargo.toml' \
   --glob '!crates/skald/skald-providers/tests/**' \
   --glob '!crates/wyrd/wyrd-cli/Cargo.toml' \
-  --glob '!crates/wyrd/wyrd-cli/tests/**'; then
+  --glob '!crates/wyrd/wyrd-cli/tests/**' \
+  --glob '!crates/shared/wyrd-auth-oidc/Cargo.toml' \
+  --glob '!crates/shared/wyrd-auth-oidc/src/jwks.rs' \
+  --glob '!crates/shared/wyrd-auth-oidc/src/provider.rs' \
+  --glob '!crates/shared/wyrd-auth-verify/Cargo.toml' \
+  --glob '!crates/shared/wyrd-auth-verify/src/lib.rs' \
+  --glob '!crates/wyrd/wyrd-server/Cargo.toml' \
+  --glob '!crates/wyrd/wyrd-server/src/auth/jwt_bearer.rs' \
+  --glob '!crates/wyrd/wyrd-server/src/auth/callback.rs'; then
   echo 'mock dependency leaked outside wyrd-testing'
   exit 1
 fi

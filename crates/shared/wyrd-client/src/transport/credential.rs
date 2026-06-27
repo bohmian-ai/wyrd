@@ -5,54 +5,93 @@
 //! client startup (from env vars, explicit config, or workload metadata) and
 //! resolved before each outbound request.
 
+use secrecy::SecretString;
+
 use crate::error::WyrdClientError;
 
 /// A resolved credential ready to attach to an outbound request.
-#[derive(Debug, Clone)]
+///
+/// Secrets are held as [`SecretString`]; call `.expose_secret()` on the inner
+/// value to read them.  `Debug` is redacted — no raw key or token leaks.
+#[derive(Clone)]
 pub enum ResolvedCredential {
     /// A Wyrd access token (`Bearer <token>`).
-    BearerToken(String),
+    BearerToken(SecretString),
     /// A platform workload JWT to exchange via the `jwt_bearer` grant.
     /// Carries the raw JWT and the tenant slug for routing.
     WorkloadJwt {
         /// Raw JWT from the workload identity provider.
-        jwt: String,
+        jwt: SecretString,
         /// Tenant slug for `jwt_bearer` grant routing.
         tenant: String,
     },
     /// A Wyrd API key for the `wyrd_api_key` grant.
-    ApiKey(String),
+    ApiKey(SecretString),
+}
+
+impl std::fmt::Debug for ResolvedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BearerToken(_) => {
+                f.debug_tuple("BearerToken").field(&"[REDACTED]").finish()
+            }
+            Self::WorkloadJwt { tenant, .. } => f
+                .debug_struct("WorkloadJwt")
+                .field("jwt", &"[REDACTED]")
+                .field("tenant", tenant)
+                .finish(),
+            Self::ApiKey(_) => f.debug_tuple("ApiKey").field(&"[REDACTED]").finish(),
+        }
+    }
 }
 
 /// Source of credentials in the ADC-style resolution chain.
 ///
 /// Sources are checked in priority order (lowest index = highest priority).
 /// The first source that produces a credential wins.
-#[derive(Debug, Clone)]
+///
+/// Secrets are held as [`SecretString`].  `Debug` is redacted.
+#[derive(Clone)]
 pub enum CredentialSource {
     /// Explicitly-configured Wyrd access token.  Tier 1.
     ExplicitToken {
-        /// Raw access token string.
-        token: String,
+        /// Access token, redacted in `Debug`.
+        token: SecretString,
     },
     /// Platform workload identity token exchanged via the `jwt_bearer` grant
-    /// at call time.  Tier 2.  Used in Kubernetes pod environments where a
-    /// projected service-account token or OIDC workload token is available.
+    /// at call time.  Tier 2.
     WorkloadToken {
-        /// Raw JWT from the workload identity provider (e.g. Kubernetes SA
-        /// token, GKE Workload Identity token, or any OIDC issuer configured
-        /// as trusted in the Wyrd deployment).
-        jwt: String,
-        /// Tenant slug used to route the `jwt_bearer` exchange when the Host
-        /// header cannot encode it (e.g. gRPC or non-HTTP callers).
+        /// Raw JWT from the workload identity provider, redacted in `Debug`.
+        jwt: SecretString,
+        /// Tenant slug for `jwt_bearer` exchange routing.
         tenant: String,
     },
     /// API key floor.  Exchanged for a Wyrd access token via the
     /// `wyrd_api_key` grant at call time.  Tier 3.
     ApiKey {
-        /// Raw API key string.
-        key: String,
+        /// Raw API key, redacted in `Debug`.
+        key: SecretString,
     },
+}
+
+impl std::fmt::Debug for CredentialSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExplicitToken { .. } => f
+                .debug_struct("ExplicitToken")
+                .field("token", &"[REDACTED]")
+                .finish(),
+            Self::WorkloadToken { tenant, .. } => f
+                .debug_struct("WorkloadToken")
+                .field("jwt", &"[REDACTED]")
+                .field("tenant", tenant)
+                .finish(),
+            Self::ApiKey { .. } => f
+                .debug_struct("ApiKey")
+                .field("key", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 /// ADC-style credential resolution chain.
@@ -70,16 +109,20 @@ impl CredentialChain {
     ///
     /// - `WYRD_ACCESS_TOKEN` — tier 1
     /// - `WYRD_WORKLOAD_TOKEN` + `WYRD_TENANT` — tier 2 (workload jwt-bearer)
-    /// - `WYRD_API_KEY` — tier 3 floor
+    /// - `WYRD_API_KEY` — tier 3
+    /// - `~/.config/wyrd/credentials.toml` `[default].api_key` — file floor
     ///
-    /// Returns an empty chain when no env vars are set.
+    /// Returns an empty chain when no env vars are set and the file is absent.
+    /// A missing or unreadable `credentials.toml` is silently ignored.
     #[must_use]
     pub fn from_env() -> Self {
         let mut chain = Self::default();
         if let Ok(token) = std::env::var("WYRD_ACCESS_TOKEN")
             && !token.is_empty()
         {
-            chain.push(CredentialSource::ExplicitToken { token });
+            chain.push(CredentialSource::ExplicitToken {
+                token: SecretString::from(token),
+            });
         }
         if let (Ok(jwt), Ok(tenant)) = (
             std::env::var("WYRD_WORKLOAD_TOKEN"),
@@ -87,12 +130,22 @@ impl CredentialChain {
         ) && !jwt.is_empty()
             && !tenant.is_empty()
         {
-            chain.push(CredentialSource::WorkloadToken { jwt, tenant });
+            chain.push(CredentialSource::WorkloadToken {
+                jwt: SecretString::from(jwt),
+                tenant,
+            });
         }
         if let Ok(key) = std::env::var("WYRD_API_KEY")
             && !key.is_empty()
         {
-            chain.push(CredentialSource::ApiKey { key });
+            chain.push(CredentialSource::ApiKey {
+                key: SecretString::from(key),
+            });
+        }
+        if let Some(key) = read_credentials_toml_api_key() {
+            chain.push(CredentialSource::ApiKey {
+                key: SecretString::from(key),
+            });
         }
         chain
     }
@@ -100,6 +153,11 @@ impl CredentialChain {
     /// Append a credential source to the chain.
     pub fn push(&mut self, source: CredentialSource) {
         self.sources.push(source);
+    }
+
+    /// Append all sources from `other` to the end of this chain.
+    pub fn extend(&mut self, other: CredentialChain) {
+        self.sources.extend(other.sources);
     }
 
     /// Resolve the highest-priority credential in the chain.
@@ -122,7 +180,9 @@ impl CredentialChain {
                         tenant: tenant.clone(),
                     })
                 }
-                CredentialSource::ApiKey { key } => Ok(ResolvedCredential::ApiKey(key.clone())),
+                CredentialSource::ApiKey { key } => {
+                    Ok(ResolvedCredential::ApiKey(key.clone()))
+                }
             })
             .unwrap_or(Err(WyrdClientError::NoCredentials))
     }
@@ -134,8 +194,34 @@ impl CredentialChain {
     }
 }
 
+/// Parse `~/.config/wyrd/credentials.toml` and return `[default].api_key`.
+///
+/// Returns `None` when the file is absent, unreadable, or has no key.
+fn read_credentials_toml_api_key() -> Option<String> {
+    let expanded = shellexpand::tilde("~/.config/wyrd/credentials.toml");
+    let content = std::fs::read_to_string(expanded.as_ref()).ok()?;
+
+    #[derive(serde::Deserialize)]
+    struct CredentialsFile {
+        default: Option<DefaultProfile>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DefaultProfile {
+        api_key: Option<String>,
+    }
+
+    let parsed: CredentialsFile = toml::from_str(&content).ok()?;
+    parsed
+        .default?
+        .api_key
+        .filter(|k| !k.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
+    use secrecy::ExposeSecret;
+
     use super::{CredentialChain, CredentialSource, ResolvedCredential};
 
     #[test]
@@ -148,42 +234,51 @@ mod tests {
     fn explicit_token_tier_resolves_first() {
         let mut chain = CredentialChain::default();
         chain.push(CredentialSource::ExplicitToken {
-            token: "access-tok".to_owned(),
+            token: "access-tok".to_owned().into(),
         });
         chain.push(CredentialSource::ApiKey {
-            key: "api-key".to_owned(),
+            key: "api-key".to_owned().into(),
         });
         let cred = chain.resolve().expect("chain resolves");
-        assert!(
-            matches!(cred, ResolvedCredential::BearerToken(t) if t == "access-tok"),
-            "explicit token wins over api key"
-        );
+        match cred {
+            ResolvedCredential::BearerToken(t) => {
+                assert_eq!(t.expose_secret(), "access-tok", "explicit token wins over api key");
+            }
+            _ => panic!("expected BearerToken"),
+        }
     }
 
     #[test]
     fn api_key_resolves_when_no_token() {
         let mut chain = CredentialChain::default();
         chain.push(CredentialSource::ApiKey {
-            key: "k_abc".to_owned(),
+            key: "k_abc".to_owned().into(),
         });
         let cred = chain.resolve().expect("chain resolves");
-        assert!(
-            matches!(cred, ResolvedCredential::ApiKey(k) if k == "k_abc"),
-            "api key resolves"
-        );
+        match cred {
+            ResolvedCredential::ApiKey(k) => {
+                assert_eq!(k.expose_secret(), "k_abc", "api key resolves");
+            }
+            _ => panic!("expected ApiKey"),
+        }
     }
 
     #[test]
     fn first_source_wins_when_multiple_tokens() {
         let mut chain = CredentialChain::default();
         chain.push(CredentialSource::ExplicitToken {
-            token: "first".to_owned(),
+            token: "first".to_owned().into(),
         });
         chain.push(CredentialSource::ExplicitToken {
-            token: "second".to_owned(),
+            token: "second".to_owned().into(),
         });
         let cred = chain.resolve().expect("resolves");
-        assert!(matches!(cred, ResolvedCredential::BearerToken(t) if t == "first"));
+        match cred {
+            ResolvedCredential::BearerToken(t) => {
+                assert_eq!(t.expose_secret(), "first");
+            }
+            _ => panic!("expected BearerToken"),
+        }
     }
 
     #[test]
@@ -191,7 +286,7 @@ mod tests {
         let mut chain = CredentialChain::default();
         assert!(chain.is_empty());
         chain.push(CredentialSource::ApiKey {
-            key: "k".to_owned(),
+            key: "k".to_owned().into(),
         });
         assert!(!chain.is_empty());
     }
@@ -200,36 +295,98 @@ mod tests {
     fn workload_token_tier_resolves_before_api_key() {
         let mut chain = CredentialChain::default();
         chain.push(CredentialSource::WorkloadToken {
-            jwt: "workload.jwt.token".to_owned(),
+            jwt: "workload.jwt.token".to_owned().into(),
             tenant: "acme".to_owned(),
         });
         chain.push(CredentialSource::ApiKey {
-            key: "api-key-fallback".to_owned(),
+            key: "api-key-fallback".to_owned().into(),
         });
         let cred = chain.resolve().expect("chain resolves");
-        assert!(
-            matches!(cred, ResolvedCredential::WorkloadJwt { ref jwt, ref tenant } if jwt == "workload.jwt.token" && tenant == "acme"),
-            "workload token wins over api key"
-        );
+        match cred {
+            ResolvedCredential::WorkloadJwt { jwt, tenant } => {
+                assert_eq!(jwt.expose_secret(), "workload.jwt.token", "workload token wins over api key");
+                assert_eq!(tenant, "acme");
+            }
+            _ => panic!("expected WorkloadJwt"),
+        }
     }
 
     #[test]
     fn explicit_token_wins_over_workload_and_api_key() {
         let mut chain = CredentialChain::default();
         chain.push(CredentialSource::ExplicitToken {
-            token: "explicit".to_owned(),
+            token: "explicit".to_owned().into(),
         });
         chain.push(CredentialSource::WorkloadToken {
-            jwt: "workload.jwt".to_owned(),
+            jwt: "workload.jwt".to_owned().into(),
             tenant: "t".to_owned(),
         });
         chain.push(CredentialSource::ApiKey {
-            key: "api-key".to_owned(),
+            key: "api-key".to_owned().into(),
         });
         let cred = chain.resolve().expect("chain resolves");
-        assert!(
-            matches!(cred, ResolvedCredential::BearerToken(ref t) if t == "explicit"),
-            "explicit token wins over workload and api key"
-        );
+        match cred {
+            ResolvedCredential::BearerToken(t) => {
+                assert_eq!(t.expose_secret(), "explicit", "explicit token wins over workload and api key");
+            }
+            _ => panic!("expected BearerToken"),
+        }
+    }
+
+    #[test]
+    fn redacted_debug_does_not_leak_secrets() {
+        let mut chain = CredentialChain::default();
+        chain.push(CredentialSource::ExplicitToken {
+            token: "super-secret-token".to_owned().into(),
+        });
+        let cred = chain.resolve().expect("resolves");
+
+        let src_debug = format!("{chain:?}");
+        assert!(!src_debug.contains("super-secret-token"));
+        assert!(src_debug.contains("REDACTED"));
+
+        let cred_debug = format!("{cred:?}");
+        assert!(!cred_debug.contains("super-secret-token"));
+        assert!(cred_debug.contains("REDACTED"));
+    }
+
+    #[test]
+    fn credentials_toml_floor_resolves_api_key() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "wyrd_cred_test_{}_{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(tmp.join(".config/wyrd")).unwrap();
+        fs::write(
+            tmp.join(".config/wyrd/credentials.toml"),
+            "[default]\napi_key = \"file_floor_key\"\n",
+        )
+        .unwrap();
+
+        // SAFETY: single-threaded test runner (--test-threads=1).
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+            std::env::remove_var("WYRD_API_KEY");
+            std::env::remove_var("WYRD_ACCESS_TOKEN");
+            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
+            std::env::remove_var("WYRD_TENANT");
+        }
+
+        let chain = CredentialChain::from_env();
+        let cred = chain.resolve().expect("file floor resolves");
+
+        // SAFETY: single-threaded test runner (--test-threads=1).
+        unsafe { std::env::remove_var("HOME"); }
+        fs::remove_dir_all(&tmp).ok();
+
+        match cred {
+            ResolvedCredential::ApiKey(k) => {
+                assert_eq!(k.expose_secret(), "file_floor_key");
+            }
+            _ => panic!("expected ApiKey from credentials.toml floor"),
+        }
     }
 }

@@ -10517,6 +10517,7 @@ dependencies = [
  "tracing",
  "uuid",
  "wyrd-spec",
+ "wyrd-testing",
  "wyrd-tonic",
 ]
 

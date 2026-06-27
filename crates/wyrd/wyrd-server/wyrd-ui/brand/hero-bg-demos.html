@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mitari Hero — Background Art Directions</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=Archivo:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#d7d3c8;font-family:"Archivo",system-ui,sans-serif;color:#0b0b0e;padding:30px 26px 90px}
+  :root{--fp:"Press Start 2P",monospace;--fv:"VT323",monospace;--fs:"Archivo",sans-serif;--fm:"JetBrains Mono",monospace}
+
+  .pagehead{margin-bottom:8px}
+  .pagehead h1{font-family:var(--fp);font-size:15px;color:#0b0b0e;letter-spacing:1px}
+  .pagehead p{font-family:var(--fm);font-size:12px;color:#33312b;margin-top:10px;max-width:80ch;line-height:1.6}
+
+  section{max-width:1380px;margin:34px auto 0}
+  .shead{display:flex;align-items:baseline;gap:12px;border-left:8px solid #8b5cf6;padding:3px 0 3px 14px;margin-bottom:12px;flex-wrap:wrap}
+  .shead h2{font-family:var(--fp);font-size:13px;letter-spacing:.5px}
+  .shead .tag{font-family:var(--fm);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#6b6b76}
+  .shead .meta{font-family:var(--fm);font-size:11px;color:#33312b;margin-left:auto;max-width:62ch;text-align:right;line-height:1.5}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:1200px){.two{grid-template-columns:1fr}}
+  .modecap{font-family:var(--fm);font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;display:flex;align-items:center;gap:7px}
+  .modecap::before{content:"";width:11px;height:11px;border:2px solid #0b0b0e;border-radius:2px}
+  .modecap.d::before{background:#0b0b0e}
+
+  /* ---- token sets ---- */
+  .scene{position:relative;height:430px;border:3px solid var(--border);border-radius:7px;overflow:hidden;
+    background:var(--bg);color:var(--text);display:flex;align-items:center;justify-content:center}
+  .scene[data-mode="light"]{
+    --bg:#f4f4f5;--surface:#ffffff;--border:#0b0b0e;--shadow:#0b0b0e;--text:#14141a;--muted:#6b6b76;
+    --rune-strong:#7c3aed;--hero-bg:#8b5cf6;--hero-ink:#ffffff;--lime:#c5f23c;--lime-ink:#0b0b0e;
+    --client:#c5f23c;--server:#f2a23c;--control:#7cc4e8;--rune-btn:#8b5cf6;--rune-btn-ink:#fff;
+    --sky-top:#eceaf2;--sky-bot:#dfd7f0;--grid:#7c3aed;--star:#7c3aed;--vsky-top:#13132a;--vsky-bot:#0b0b1e}
+  .scene[data-mode="dark"]{
+    --bg:#0e0e0e;--surface:#17171b;--border:#313139;--shadow:#2a2a31;--text:#d6d6dc;--muted:#8a8a95;
+    --rune-strong:#a78bfa;--hero-bg:#241b40;--hero-ink:#e9e2ff;--lime:#c5f23c;--lime-ink:#0b0b0e;
+    --client:#c5f23c;--server:#f2a23c;--control:#6fb3d6;--rune-btn:#a78bfa;--rune-btn-ink:#0b0b0e;
+    --sky-top:#0e0e16;--sky-bot:#191033;--grid:#a78bfa;--star:#d6d6dc;--vsky-top:#0a0a16;--vsky-bot:#05050e}
+
+  .layer{position:absolute;inset:0;width:100%;height:100%}
+  .sky{position:absolute;top:0;left:0;right:0;
+    background-image:
+      repeating-linear-gradient(0deg,#0000000f 0 2px,transparent 2px 4px),
+      repeating-linear-gradient(90deg,#0000000f 0 2px,transparent 2px 4px),
+      linear-gradient(var(--sky-top),var(--sky-bot));
+    background-size:4px 4px,4px 4px,100% 100%}
+  .sun{position:absolute;left:50%;transform:translate(-50%,-72%);width:118px;height:118px;z-index:2}
+  .fuji{display:block;width:100%;height:100%}
+  .fuji .p{fill:var(--rune-strong)} .fuji .c{fill:var(--lime)}
+  .sun .fuji .p{fill:var(--rune-strong)}
+
+  /* ---- hero card (shared) ---- */
+  .herocard{position:relative;z-index:6;margin:0 0 0 7%;max-width:62%;
+    background:var(--hero-bg);color:var(--hero-ink);border:3px solid var(--border);border-radius:5px;
+    box-shadow:10px 10px 0 0 var(--shadow);padding:17px 19px}
+  .herocard .wm{font-family:var(--fp);font-size:11px;display:inline-flex;align-items:center;gap:7px;color:var(--hero-ink)}
+  .herocard .wm svg{width:15px;height:15px}
+  .herocard .t{font-family:var(--fp);font-size:clamp(13px,1.5vw,17px);line-height:1.4;text-transform:uppercase;letter-spacing:1px;margin-top:13px}
+  .herocard .tag{font-family:var(--fs);font-weight:500;font-size:12.5px;line-height:1.5;margin-top:13px;max-width:40ch;opacity:.92}
+  .herocard .ctas{margin-top:15px;display:flex;gap:9px;flex-wrap:wrap}
+  .herocard button{font-family:var(--fm);font-size:11px;font-weight:700;letter-spacing:.3px;padding:10px 15px;
+    border:2px solid var(--border);border-radius:5px;cursor:pointer;box-shadow:4px 4px 0 0 var(--shadow)}
+  .herocard .b1{background:var(--lime);color:var(--lime-ink)}
+  .herocard .b2{background:var(--rune-btn);color:var(--rune-btn-ink)}
+
+  /* ---- C world bits ---- */
+  .wsky{position:absolute;inset:0;background:var(--wsky)}
+  .scene[data-mode="light"]{--wsky:#7cc4e8} .scene[data-mode="dark"]{--wsky:#1b2a3a}
+  .ground{position:absolute;left:0;right:0;bottom:0;height:78px;
+    background-image:
+      repeating-linear-gradient(0deg,var(--border) 0 3px,transparent 3px 26px),
+      repeating-linear-gradient(90deg,var(--border) 0 3px,transparent 3px 46px),
+      linear-gradient(var(--server),var(--server));
+    border-top:3px solid var(--border)}
+  .cloud{position:absolute;display:grid;grid-template-columns:repeat(5,12px);grid-auto-rows:12px}
+  .cloud span{background:#fff;border:0}
+  .qblock{position:absolute;width:38px;height:38px;background:var(--lime);border:3px solid var(--border);border-radius:4px;
+    display:flex;align-items:center;justify-content:center;font-family:var(--fp);font-size:13px;color:var(--lime-ink);box-shadow:3px 3px 0 0 var(--shadow)}
+  .pipe{position:absolute;bottom:78px;width:46px;background:var(--lime);border:3px solid var(--border);border-radius:3px 3px 0 0}
+  .pipe::before{content:"";position:absolute;top:-14px;left:-7px;right:-7px;height:18px;background:var(--lime);border:3px solid var(--border);border-radius:4px}
+</style>
+</head>
+<body>
+<header class="pagehead">
+  <h1>MITARI HERO · BACKGROUND ART</h1>
+  <p>Four directions, each rendered light + dark with a real hero block on top. All pure CSS/SVG, zero-blur, token-driven. Pick a direction (or ask to combine layers) and I'll wire the winner into the v2 source-of-truth hero.</p>
+</header>
+
+<section>
+  <div class="shead"><h2>A · The Plane</h2><span class="tag">grid horizon</span>
+    <span class="meta">Synthwave perspective grid = Wyrd's three planes (lime/amber/blue lanes). Dither sky, fuji as a rising sun. Most on-brand.</span></div>
+  <div class="two">
+    <div><div class="modecap">light</div><div class="scene" data-mode="light" data-art="plane"></div></div>
+    <div><div class="modecap d">dark</div><div class="scene" data-mode="dark" data-art="plane"></div></div>
+  </div>
+</section>
+
+<section>
+  <div class="shead"><h2>B · Dither Dawn</h2><span class="tag">pixel skyline</span>
+    <span class="meta">Calmest, classiest. Ordered-dither sky, rune-violet stepped mountain silhouette, hard-pixel stars. Best for long viewing.</span></div>
+  <div class="two">
+    <div><div class="modecap">light</div><div class="scene" data-mode="light" data-art="dawn"></div></div>
+    <div><div class="modecap d">dark</div><div class="scene" data-mode="dark" data-art="dawn"></div></div>
+  </div>
+</section>
+
+<section>
+  <div class="shead"><h2>C · Attract World</h2><span class="tag">platformer</span>
+    <span class="meta">Most overtly game: pixel sky + clouds, brick ground, floating ?-blocks as cards, pipes as columns. Fun, but risks reading cute.</span></div>
+  <div class="two">
+    <div><div class="modecap">light</div><div class="scene" data-mode="light" data-art="world"></div></div>
+    <div><div class="modecap d">dark</div><div class="scene" data-mode="dark" data-art="world"></div></div>
+  </div>
+</section>
+
+<section>
+  <div class="shead"><h2>D · Vector Hangar</h2><span class="tag">wireframe</span>
+    <span class="meta">Edgiest / most technical. Low-poly wireframe fuji + planet over a vector grid horizon. Star Fox / Elite energy.</span></div>
+  <div class="two">
+    <div><div class="modecap">light</div><div class="scene" data-mode="light" data-art="vector"></div></div>
+    <div><div class="modecap d">dark</div><div class="scene" data-mode="dark" data-art="vector"></div></div>
+  </div>
+</section>
+
+<script>
+const FUJI = `<svg class="fuji" viewBox="0 0 100 100" aria-hidden="true"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>`;
+
+const CARD = `<div class="herocard">
+  <span class="wm">${FUJI}MITARI</span>
+  <div class="t">Mitari System</div>
+  <div class="tag">Neobrutalism for the agentic stack. One geometry. Two modes. Zero blur.</div>
+  <div class="ctas"><button class="b1">▶ PRESS START</button><button class="b2">INSERT COIN</button></div>
+</div>`;
+
+const W=620, H=430;
+const R=(seed=>()=>(seed=(seed*16807)%2147483647)/2147483647); // deterministic prng
+
+function stars(n, w, h, rnd){let s='';for(let i=0;i<n;i++){const x=(rnd()*w)|0,y=(rnd()*h)|0,sz=rnd()<.18?2:1;s+=`<rect x="${x}" y="${y}" width="${sz}" height="${sz}" fill="var(--star)"/>`;}return s;}
+
+function gridFloor(horizon,{lanes=true,stroke='var(--grid)'}={}){
+  const cx=W/2; let s='';
+  if(lanes){
+    s+=`<polygon points="${cx},${horizon} 0,${H} ${W/3},${H}" fill="var(--client)" opacity=".20"/>`;
+    s+=`<polygon points="${cx},${horizon} ${W/3},${H} ${2*W/3},${H}" fill="var(--server)" opacity=".16"/>`;
+    s+=`<polygon points="${cx},${horizon} ${2*W/3},${H} ${W},${H}" fill="var(--control)" opacity=".22"/>`;
+  }
+  for(let i=-6;i<=18;i++){const x=((i/12)*W).toFixed(0);s+=`<line x1="${cx}" y1="${horizon}" x2="${x}" y2="${H}" stroke="${stroke}" stroke-width="1.4" opacity=".55"/>`;}
+  for(let k=1;k<=11;k++){const y=(horizon+(H-horizon)*Math.pow(k/11,1.9)).toFixed(1);s+=`<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="${stroke}" stroke-width="1.4" opacity=".55"/>`;}
+  s+=`<line x1="0" y1="${horizon}" x2="${W}" y2="${horizon}" stroke="var(--border)" stroke-width="3"/>`;
+  return s;
+}
+
+function mountainRange(baseY,height,step,fill,op,rnd){
+  let pts=`0,${H} 0,${baseY}`,y=baseY;
+  for(let x=0;x<=W;x+=step){
+    y+=(rnd()<.5?-1:1)*step*(0.6+rnd());
+    y=Math.max(baseY-height,Math.min(baseY+6,y));
+    const yy=Math.round(y/step)*step;
+    pts+=` ${x},${yy} ${x+step},${yy}`;
+  }
+  pts+=` ${W},${H}`;
+  return `<polygon points="${pts}" fill="${fill}" opacity="${op}"/>`;
+}
+
+function artPlane(mode){
+  const horizon=236;
+  const rnd=R(7);
+  const sky=`<div class="sky" style="height:${horizon}px"></div>`;
+  const star=mode==='dark'?`<svg class="layer" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid slice">${stars(80,W,horizon-10,rnd)}</svg>`:'';
+  const sun=`<div class="sun" style="top:${horizon}px">${FUJI}</div>`;
+  const floor=`<svg class="layer" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${gridFloor(horizon)}</svg>`;
+  return sky+star+sun+floor;
+}
+
+function artDawn(mode){
+  const horizon=300;
+  const rnd=R(19);
+  const sky=`<div class="sky" style="height:${horizon}px"></div>`;
+  const star=mode==='dark'?`<svg class="layer" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid slice">${stars(90,W,horizon-30,rnd)}</svg>`:'';
+  const back=mountainRange(horizon-10,70,14,'var(--rune-strong)',.45,R(3));
+  const front=mountainRange(horizon+16,120,18,'var(--rune-strong)',1,R(31));
+  const band=`<rect x="0" y="${horizon+118}" width="${W}" height="${H}" fill="var(--rune-strong)"/>`;
+  const ranges=`<svg class="layer" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${back}${front}${band}<line x1="0" y1="${horizon}" x2="${W}" y2="${horizon}" stroke="var(--border)" stroke-width="2" opacity=".5"/></svg>`;
+  return sky+star+ranges;
+}
+
+function artWorld(mode){
+  const cloud=(x,y)=>`<div class="cloud" style="left:${x}px;top:${y}px">
+    <span style="grid-column:2/4;grid-row:1"></span>
+    <span style="grid-column:1/6;grid-row:2"></span>
+    <span style="grid-column:1/6;grid-row:3"></span></div>`;
+  const q=(x,y)=>`<div class="qblock" style="left:${x}px;top:${y}px">?</div>`;
+  const pipe=(x,h)=>`<div class="pipe" style="left:${x}px;height:${h}px"></div>`;
+  return `<div class="wsky"></div>
+    ${cloud(60,46)}${cloud(360,30)}${cloud(470,150)}
+    <div class="sun" style="left:200px;top:120px;transform:translate(-50%,-50%)">${FUJI}</div>
+    ${q(150,150)}${q(430,90)}
+    ${pipe(380,70)}${pipe(470,104)}
+    <div class="ground"></div>`;
+}
+
+function artVector(mode){
+  const horizon=250;
+  const rnd=R(11);
+  const sky=`<div class="sky layer" style="--sky-top:var(--vsky-top);--sky-bot:var(--vsky-bot)"></div>`;
+  const star=`<svg class="layer" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid slice">${stars(110,W,horizon,rnd)}</svg>`;
+  // wireframe planet (arc + latitude ellipses) low on horizon, right side
+  const px=440,py=horizon-6,pr=120;
+  let planet=`<circle cx="${px}" cy="${py}" r="${pr}" fill="none" stroke="var(--control)" stroke-width="2"/>`;
+  for(let i=1;i<=3;i++){planet+=`<ellipse cx="${px}" cy="${py}" rx="${pr}" ry="${pr*i/4}" fill="none" stroke="var(--control)" stroke-width="1.4" opacity=".7"/>`;}
+  planet+=`<line x1="${px-pr}" y1="${py}" x2="${px+pr}" y2="${py}" stroke="var(--control)" stroke-width="1.4" opacity=".7"/>`;
+  // low-poly wireframe fuji, left side
+  const fx=150,fy=150,sc=1.1;
+  const tri=(pts)=>`<polygon points="${pts}" fill="none" stroke="var(--rune-strong)" stroke-width="2"/>`;
+  const wf=`<g transform="translate(${fx},${fy}) scale(${sc})">
+    ${tri('0,84 18,84 -28,-78 -10,-78')}
+    ${tri('-10,-78 -28,-78 0,-20')}
+    ${tri('44,84 62,84 90,-78 72,-78')}
+    ${tri('72,-78 90,-78 64,-20')}
+    ${tri('36,-78 48,-78 48,84 36,84')}
+    <line x1="0" y1="0" x2="44" y2="0" stroke="var(--lime)" stroke-width="2"/>
+  </g>`;
+  const grid=`<svg class="layer" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${gridFloor(horizon,{lanes:false,stroke:'var(--control)'})}</svg>`;
+  const objs=`<svg class="layer" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${planet}${wf}</svg>`;
+  return sky+star+objs+grid;
+}
+
+const ART={plane:artPlane,dawn:artDawn,world:artWorld,vector:artVector};
+document.querySelectorAll('.scene').forEach(el=>{
+  const fn=ART[el.dataset.art];
+  el.innerHTML=fn(el.dataset.mode)+CARD;
+});
+</script>
+</body>
+</html>

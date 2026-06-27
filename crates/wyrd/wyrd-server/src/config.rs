@@ -2,6 +2,7 @@
 //!
 //! Load order: env overrides > TOML file > compiled defaults.
 
+use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;

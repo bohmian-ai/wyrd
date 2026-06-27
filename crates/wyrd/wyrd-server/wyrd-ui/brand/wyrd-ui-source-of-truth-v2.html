@@ -1,0 +1,942 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mitari UI — Source of Truth v2 · Arcade</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=Archivo:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:#d7d3c8;font-family:"Archivo",system-ui,sans-serif;color:#0b0b0e;padding-bottom:90px}
+
+  /* ---- v2 retro layer: pixel display + fuji emblem + zero-blur texture ----
+     Homage only. No geometry/token/shadow rule changes — pixels ARE zero-blur,
+     so the arcade skin reinforces the brutalist system instead of fighting it. */
+  :root{--fp:"Press Start 2P",monospace;--fv:"VT323",monospace}
+  .fp{font-family:var(--fp)}
+  /* the Mitari "fuji" mark — runic three-prong, rune violet + lime spine */
+  .fuji{display:block;flex:0 0 auto}
+  .fuji .p{fill:var(--rune-strong,#7c3aed)}
+  .fuji .c{fill:var(--lime,#c5f23c)}
+  /* 2x2 ordered dither — hard stops, ZERO blur (honors the no-glow rule) */
+  .dither{background-image:
+      repeating-linear-gradient(0deg,#0b0b0e12 0 2px,transparent 2px 4px),
+      repeating-linear-gradient(90deg,#0b0b0e12 0 2px,transparent 2px 4px);
+    background-size:4px 4px}
+  /* chunky 8-bit stepped corners — cabinet frames only (flat, no offset shadow) */
+  .notch{clip-path:polygon(
+      8px 0,calc(100% - 8px) 0,
+      calc(100% - 8px) 4px,calc(100% - 4px) 4px,calc(100% - 4px) 8px,100% 8px,
+      100% calc(100% - 8px),calc(100% - 4px) calc(100% - 8px),calc(100% - 4px) calc(100% - 4px),calc(100% - 8px) calc(100% - 4px),calc(100% - 8px) 100%,
+      8px 100%,8px calc(100% - 4px),4px calc(100% - 4px),4px calc(100% - 8px),0 calc(100% - 8px),
+      0 8px,4px 8px,4px 4px,8px 4px)}
+
+  /* ---- page chrome ---- */
+  .pagehead{position:sticky;top:0;z-index:200;background:#0b0b0e;color:#f4f4f5;
+    border-bottom:3px solid #c5f23c;padding:13px 28px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+  .pagehead .ph-brand{display:inline-flex;align-items:center;gap:9px}
+  .pagehead .fuji{width:20px;height:20px}
+  .pagehead .ph-wm{font-family:var(--fp);font-size:13px;color:#f4f4f5;letter-spacing:1px}
+  .pagehead .ph-sub{font-family:"JetBrains Mono",monospace;font-size:10px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:#8a8a95}
+  .pagehead .lock{font-family:"JetBrains Mono",monospace;font-size:10px;font-weight:700;letter-spacing:.5px;
+    text-transform:uppercase;padding:4px 8px;border:2px solid #8b5cf6;color:#cbb6ff;background:#241b40;border-radius:5px}
+  .pagehead nav{margin-left:auto;display:flex;gap:4px;flex-wrap:wrap}
+  .pagehead nav a{font-family:"JetBrains Mono",monospace;font-size:10.5px;font-weight:700;letter-spacing:.4px;
+    text-transform:uppercase;color:#b8b8c0;text-decoration:none;padding:5px 9px;border:2px solid #2a2a31;border-radius:5px}
+  .pagehead nav a:hover{color:#0b0b0e;background:#c5f23c;border-color:#c5f23c}
+
+  .sec{max-width:1340px;margin:46px auto;padding:0 28px;scroll-margin-top:64px}
+  .sechead{display:flex;align-items:baseline;gap:14px;border-left:8px solid #8b5cf6;padding:3px 0 3px 16px;margin-bottom:6px;flex-wrap:wrap}
+  .sechead .num{font-family:var(--fp);font-size:11px;color:#8b5cf6;align-self:center}
+  .sechead h2{font-family:var(--fp);font-size:14px;letter-spacing:.5px;line-height:1.2;align-self:center}
+  .sechead .tag{font-family:"JetBrains Mono",monospace;font-size:11px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:#7a7568}
+  .seclede{font-size:13.5px;line-height:1.6;max-width:92ch;color:#2a2822;margin:0 0 18px 16px}
+  .seclede b{color:#0b0b0e} .seclede code{font-family:"JetBrains Mono",monospace;font-size:12px;background:#fff;border:1px solid #0002;padding:1px 5px;border-radius:4px}
+
+  /* ---- principle rule cards ---- */
+  .rules{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+  .rule{background:#fff;border:2px solid #0b0b0e;border-radius:5px;box-shadow:3px 3px 0 0 #0b0b0e;padding:14px 15px}
+  .rule h3{font-family:"JetBrains Mono",monospace;font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;
+    margin-bottom:8px;display:flex;align-items:center;gap:8px}
+  .rule h3 .d{width:11px;height:11px;border-radius:3px;border:2px solid #0b0b0e}
+  .rule p{font-size:12.5px;line-height:1.55;color:#33312b}
+  .rule p b{color:#0b0b0e}
+  .rule code{font-family:"JetBrains Mono",monospace;font-size:11.5px;background:#f1ecfd;border:1px solid #0001;padding:1px 4px;border-radius:3px}
+  .rule.no{box-shadow:3px 3px 0 0 #d2402a;border-color:#d2402a}
+  .rule.no h3 .d{border-color:#d2402a;background:#d2402a}
+
+  /* ---- two-up light/dark compare ---- */
+  .compare{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+  @media(max-width:1180px){.compare{grid-template-columns:1fr}}
+  .panel-wrap{display:flex;flex-direction:column;min-width:0}
+  .panel-label{font-family:"JetBrains Mono",monospace;font-size:11px;font-weight:700;letter-spacing:1.5px;
+    text-transform:uppercase;color:#0b0b0e;margin-bottom:7px;display:flex;align-items:center;gap:8px}
+  .panel-label::before{content:"";width:11px;height:11px;border:2px solid #0b0b0e;border-radius:2px}
+  .panel-label.dark::before{background:#0b0b0e}
+
+  /* =====================================================================
+     THE LOCKED THEME SURFACE — every token Mitari UI is allowed to use.
+     Light and dark carry the SAME geometry; only palette/atmosphere differ.
+     ===================================================================== */
+  .surface{position:relative;overflow:hidden;border:3px solid var(--border);border-radius:7px;
+    background:var(--bg);color:var(--text);font-family:"Archivo",system-ui,sans-serif;font-weight:500;
+    --fm:"JetBrains Mono",monospace;--fh:"Archivo Black",sans-serif}
+  .surface[data-mode="light"]{
+    --bg:#f4f4f5;--surface:#ffffff;--surface-2:#ececef;--border:#0b0b0e;--shadow:#0b0b0e;--text:#14141a;--muted:#6b6b76;
+    --rune:#8b5cf6;--rune-strong:#7c3aed;--rune-soft:#f1ecfd;--rune-btn:#8b5cf6;--rune-btn-ink:#ffffff;
+    --hero-bg:#8b5cf6;--hero-ink:#ffffff;
+    --lime:#c5f23c;--lime-ink:#0b0b0e;--lime-text:#4a7a06;
+    --client:#c5f23c;--client-bar:#c5f23c;--server:#f2a23c;--server-bar:#ec8b14;--control:#7cc4e8;--control-bar:#2f6f9e;
+    --ok:#2f9e44;--warn:#ec8b14;--danger:#d2402a;--ink-on-fill:#0b0b0e;--r:5px;
+  }
+  .surface[data-mode="dark"]{
+    --bg:#0e0e0e;--surface:#17171b;--surface-2:#1f1f24;--border:#313139;--shadow:#2a2a31;--text:#d6d6dc;--muted:#8a8a95;
+    --rune:#241b40;--rune-strong:#a78bfa;--rune-soft:#241b40;--rune-btn:#a78bfa;--rune-btn-ink:#0b0b0e;
+    --hero-bg:#241b40;--hero-ink:#e9e2ff;
+    --lime:#c5f23c;--lime-ink:#0b0b0e;--lime-text:#c5f23c;
+    --client:#c5f23c;--client-bar:#c5f23c;--server:#f2a23c;--server-bar:#f2a23c;--control:#6fb3d6;--control-bar:#6fb3d6;
+    --ok:#7ee081;--warn:#f2a23c;--danger:#e8615a;--ink-on-fill:#0b0b0e;--r:5px;
+  }
+  .fm{font-family:var(--fm)}
+
+  /* ============ §1 PALETTE swatches ============ */
+  .board{background:var(--bg);color:var(--text);padding:18px 16px;border:3px solid var(--border);border-radius:7px}
+  .grp{margin-bottom:20px}.grp:last-child{margin-bottom:0}
+  .grp h4{font-family:var(--fm);font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;
+    color:var(--muted);margin-bottom:10px;padding-bottom:6px;border-bottom:2px dashed var(--border)}
+  .sw-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:9px}
+  .sw{border:2px solid var(--border);border-radius:5px;overflow:hidden;background:var(--surface)}
+  .sw .chip{height:40px;border-bottom:2px solid var(--border)}
+  .sw .meta{padding:5px 8px}
+  .sw .nm{font-family:var(--fm);font-size:10px;font-weight:700;color:var(--text)}
+  .sw .hx{font-family:var(--fm);font-size:9.5px;color:var(--muted);margin-top:1px}
+  .sw .us{font-size:9px;color:var(--muted);margin-top:3px;line-height:1.3}
+
+  /* ============ §2 STRUCTURE / geometry ============ */
+  .geo{padding:18px 16px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .geo .block{border:2px solid var(--border);border-radius:var(--r);background:var(--surface);padding:13px}
+  .geo .block h4{font-family:var(--fm);font-size:9.5px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;color:var(--muted);margin-bottom:11px}
+  .geo .row{display:flex;align-items:center;gap:11px;margin-bottom:10px}
+  .geo .row:last-child{margin-bottom:0}
+  .geo .row .lab{font-family:var(--fm);font-size:10px;color:var(--text);width:74px;flex:0 0 auto}
+  .shbox{width:46px;height:34px;background:var(--rune-soft);border:2px solid var(--border);border-radius:var(--r)}
+  .shbox.s1{box-shadow:3px 3px 0 0 var(--shadow)} .shbox.s2{box-shadow:6px 6px 0 0 var(--shadow)} .shbox.s3{box-shadow:10px 10px 0 0 var(--shadow)}
+  .bbox{width:46px;height:34px;background:var(--surface);border-radius:var(--r)}
+  .bbox.b2{border:2px solid var(--border)} .bbox.b3{border:3px solid var(--border)} .bbox.bd{border:2px dashed var(--border)}
+  .rbox{width:46px;height:34px;background:var(--rune-soft);border:2px solid var(--border)}
+  .barrow{display:flex;align-items:center;gap:8px;font-family:var(--fm);font-size:11px;padding:7px 9px;border-bottom:2px solid var(--border)}
+  .barrow:last-child{border-bottom:0}
+  .barrow .kd{padding-left:8px;border-left:3px solid var(--muted)}
+  .barrow .kd[data-k=client]{border-left-color:var(--client-bar)}
+  .barrow .kd[data-k=server]{border-left-color:var(--server-bar)}
+  .barrow .kd[data-k=control]{border-left-color:var(--control-bar)}
+  /* card anatomy */
+  .anat{grid-column:1 / -1;border:2px solid var(--border);border-radius:var(--r);background:var(--surface);box-shadow:3px 3px 0 0 var(--shadow);overflow:hidden}
+  .anat .ahead{padding:9px 12px;border-bottom:2px solid var(--border);background:var(--surface);
+    font-family:var(--fm);font-size:9px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between}
+  .anat .abody{padding:12px}
+  .anat .atitle{font-family:var(--fh);font-size:15px}
+  .anat .adl{display:grid;grid-template-columns:7rem 1fr;gap:5px 8px;font-family:var(--fm);font-size:11px;margin-top:11px;padding-top:11px;border-top:2px dashed var(--border)}
+  .anat .adl dt{color:var(--muted);text-transform:uppercase;font-size:9px;letter-spacing:.4px;align-self:center}
+  .anat .note{font-family:var(--fm);font-size:9px;color:var(--rune-strong);margin-top:9px}
+
+  /* ============ §3 QUIET — workbench (the default register) ============ */
+  .q-top{display:flex;align-items:center;gap:13px;padding:11px 14px;border-bottom:2px solid var(--border);background:var(--surface)}
+  .q-wm{font-family:var(--fp);font-size:11px;letter-spacing:.5px;display:inline-flex;align-items:center;gap:7px}
+  .q-wm .fuji{width:15px;height:15px}
+  .q-wm i{width:7px;height:7px;border-radius:50%;background:var(--lime);display:inline-block}
+  .q-search{font-family:var(--fm);font-size:11px;color:var(--muted);border:2px solid var(--border);border-radius:var(--r);padding:5px 9px;background:var(--surface-2)}
+  .q-nav{font-family:var(--fm);font-size:11px;color:var(--muted);margin-left:auto}.q-nav b{color:var(--text)}
+  .q-toolbar{display:flex;align-items:center;gap:7px;padding:11px 14px;flex-wrap:wrap}
+  .q-pill{font-family:var(--fm);font-size:10.5px;font-weight:700;padding:4px 9px;border-radius:var(--r);border:2px solid var(--border);color:var(--muted);background:var(--surface);cursor:pointer}
+  .q-pill.active{color:var(--text);background:var(--surface-2);box-shadow:3px 3px 0 0 var(--shadow)}
+  .q-pill[data-k=client]{border-left:4px solid var(--client-bar)}
+  .q-pill[data-k=server]{border-left:4px solid var(--server-bar)}
+  .q-pill[data-k=control]{border-left:4px solid var(--control-bar)}
+  .q-count{font-family:var(--fm);font-size:10.5px;color:var(--muted);margin-left:auto}
+  .q-grid{display:grid;grid-template-columns:1.55fr 1fr;gap:14px;padding:0 14px 16px}
+  .q-table{width:100%;border-collapse:separate;border-spacing:0;font-family:var(--fm);font-size:11.5px;
+    border:2px solid var(--border);border-radius:var(--r);overflow:hidden;background:var(--surface);box-shadow:3px 3px 0 0 var(--shadow)}
+  .q-table th{text-align:left;font-size:9px;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);font-weight:700;
+    padding:8px 9px;border-bottom:2px solid var(--border);background:var(--surface)}
+  .q-table td{padding:8px 9px;border-bottom:2px solid var(--border)}
+  .q-table tr:last-child td{border-bottom:0}
+  .q-table tr.sel td{background:var(--rune-soft)}
+  .q-ref{color:var(--text);font-weight:700}
+  .q-table tr.sel .q-ref{color:var(--rune-strong)}
+  .q-table tr.sel .q-ref::before{content:"▸ ";color:var(--rune-strong)}
+  .q-kind{display:inline-block;padding-left:8px;border-left:3px solid var(--muted);line-height:1}
+  .q-kind[data-k=client]{border-left-color:var(--client-bar)}
+  .q-kind[data-k=server]{border-left-color:var(--server-bar)}
+  .q-kind[data-k=control]{border-left-color:var(--control-bar)}
+  .q-st{font-size:9px;font-weight:700;letter-spacing:.4px;text-transform:uppercase}
+  .q-st.ok{color:var(--ok)} .q-st.warn{color:var(--warn)}
+  .q-detail{border:2px solid var(--border);border-radius:var(--r);background:var(--surface);box-shadow:3px 3px 0 0 var(--shadow);padding:12px}
+  .q-detail .h{font-family:var(--fh);font-size:14px;letter-spacing:-.2px}
+  .q-detail .sub{font-family:var(--fm);font-size:10px;color:var(--muted);margin-top:3px;letter-spacing:.3px}
+  .q-detail dl{display:grid;grid-template-columns:7rem 1fr;gap:5px 8px;font-family:var(--fm);font-size:11px;margin-top:11px;padding-top:11px;border-top:2px dashed var(--border)}
+  .q-detail dt{color:var(--muted);text-transform:uppercase;font-size:9px;letter-spacing:.4px;align-self:center}
+  .q-detail dd .q-ref{color:var(--rune-strong)}
+  .q-actions{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}
+  .q-btn{font-family:var(--fm);font-size:11px;font-weight:700;padding:8px 13px;border-radius:var(--r);border:2px solid var(--border);
+    cursor:pointer;box-shadow:3px 3px 0 0 var(--shadow);transition:transform .08s,box-shadow .08s}
+  .q-btn:hover{transform:translate(-1px,-1px);box-shadow:5px 5px 0 0 var(--shadow)}
+  .q-btn:active{transform:translate(2px,2px);box-shadow:1px 1px 0 0 var(--shadow)}
+  .q-btn.primary{background:var(--lime);color:var(--lime-ink)}
+  .q-btn.rune{background:var(--rune-btn);color:var(--rune-btn-ink)}
+  .q-btn.ghost{background:var(--surface);color:var(--text)}
+
+  /* ============ §4 ANALYTICS — data viz (quiet register) ============ */
+  .a-grid{display:grid;grid-template-columns:1fr 1fr;gap:13px;padding:14px}
+  .a-card{border:2px solid var(--border);border-radius:var(--r);background:var(--surface);box-shadow:3px 3px 0 0 var(--shadow);overflow:hidden;min-width:0}
+  .a-card.wide{grid-column:1 / -1}
+  .a-head{padding:8px 11px;border-bottom:2px solid var(--border);font-family:var(--fm);font-size:9px;font-weight:700;
+    letter-spacing:.6px;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .a-head .v{color:var(--text)}
+  .a-body{padding:12px}
+  .a-svg{display:block;width:100%;height:auto}
+  /* KPI row */
+  .a-kpis{display:grid;grid-template-columns:repeat(4,1fr)}
+  .a-kpi{padding:11px 13px;border-right:2px solid var(--border);min-width:0;overflow:hidden}
+  .a-kpi:last-child{border-right:0}
+  .a-kpi .k{font-family:var(--fm);font-size:8.5px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:var(--muted)}
+  .a-kpi .n{font-family:var(--fv);font-size:27px;line-height:.85;margin-top:7px;color:var(--text)}
+  .a-kpi .d{font-family:var(--fm);font-size:10px;font-weight:700;margin-top:5px}
+  .a-kpi .d.up{color:var(--ok)} .a-kpi .d.down{color:var(--danger)}
+  .a-kpi svg{margin-top:8px;display:block;width:100%;height:24px}
+  /* distribution bar */
+  .a-dist{display:flex;height:30px;border:2px solid var(--border);border-radius:var(--r);overflow:hidden}
+  .a-dist span{display:block;height:100%}
+  .a-dist span+span{border-left:2px solid var(--border)}
+  .a-legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:11px;font-family:var(--fm);font-size:10px;color:var(--muted)}
+  .a-legend i{display:inline-block;width:11px;height:11px;border:2px solid var(--border);border-radius:3px;margin-right:5px;vertical-align:-2px}
+  /* heatmap */
+  .a-heatwrap{border:2px solid var(--border);border-radius:var(--r);padding:6px;background:var(--surface-2)}
+  .a-heat{display:grid;grid-template-columns:repeat(12,1fr);gap:3px}
+  .a-heat span{aspect-ratio:1;border-radius:2px}
+  /* file / storage tree (real <details> dropdowns) */
+  .a-tree{font-family:var(--fm);font-size:11.5px;color:var(--text)}
+  .a-tree details{margin:0}
+  .a-tree summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:7px;padding:4px 6px;border-radius:4px}
+  .a-tree summary::-webkit-details-marker{display:none}
+  .a-tree summary::before{content:"▸";color:var(--muted);font-size:9px;width:9px;display:inline-block}
+  .a-tree details[open]>summary::before{content:"▾"}
+  .a-tree summary:hover{background:var(--surface-2)}
+  .a-tree .fold{font-weight:700}
+  .a-tree summary .meta{color:var(--muted);font-size:9.5px;margin-left:auto}
+  .a-tree .kids{padding-left:15px;border-left:2px dashed var(--border);margin-left:8px}
+  .a-tree .leaf{display:flex;align-items:center;gap:7px;padding:4px 6px 4px 8px;border-left:3px solid var(--muted);margin:2px 0}
+  .a-tree .leaf[data-k=client]{border-left-color:var(--client-bar)}
+  .a-tree .leaf[data-k=server]{border-left-color:var(--server-bar)}
+  .a-tree .leaf[data-k=control]{border-left-color:var(--control-bar)}
+  .a-tree .leaf .meta{color:var(--muted);font-size:9.5px;margin-left:auto}
+  /* dropdown / select (shown open) */
+  .a-dd{font-family:var(--fm)}
+  .a-dd .trigger{display:inline-flex;align-items:center;gap:9px;font-size:11px;font-weight:700;padding:7px 11px;
+    border:2px solid var(--border);border-radius:var(--r);background:var(--surface);box-shadow:3px 3px 0 0 var(--shadow);color:var(--text)}
+  .a-dd .trigger .car{color:var(--muted)}
+  .a-dd .menu{margin-top:9px;border:2px solid var(--border);border-radius:var(--r);background:var(--surface);
+    box-shadow:3px 3px 0 0 var(--shadow);overflow:hidden;width:210px}
+  .a-dd .opt{display:flex;align-items:center;gap:8px;padding:7px 11px;font-size:11px;border-bottom:2px solid var(--border);cursor:pointer;color:var(--text)}
+  .a-dd .opt:last-child{border-bottom:0}
+  .a-dd .opt:hover{background:var(--surface-2)}
+  .a-dd .opt.sel{background:var(--rune-soft);color:var(--rune-strong);font-weight:700}
+  .a-dd .opt .ck{margin-left:auto;color:var(--rune-strong);font-weight:700}
+  .a-dd .opt .tick{width:10px;height:10px;border-radius:2px;border:2px solid var(--border);background:var(--surface)}
+  .a-dd .opt[data-k=client] .tick{background:var(--client-bar)}
+  .a-dd .opt[data-k=server] .tick{background:var(--server-bar)}
+  .a-dd .opt[data-k=control] .tick{background:var(--control-bar)}
+
+  /* ============ §5 TRACES — observability (quiet register) ============ */
+  .tr-stack{display:flex;flex-direction:column;gap:13px;padding:14px}
+  .tr-row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:13px}
+  .tr-row2{display:grid;grid-template-columns:1fr 1fr;gap:13px}
+  /* toolbar */
+  .tr-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .tr-seg{display:flex;border:2px solid var(--border);border-radius:var(--r);overflow:hidden;box-shadow:3px 3px 0 0 var(--shadow)}
+  .tr-seg button{font-family:var(--fm);font-size:10.5px;font-weight:700;padding:5px 11px;border:0;border-right:2px solid var(--border);background:var(--surface);color:var(--muted);cursor:pointer}
+  .tr-seg button:last-child{border-right:0}
+  .tr-seg button.on{background:var(--rune-soft);color:var(--rune-strong)}
+  .tr-chip{font-family:var(--fm);font-size:10px;font-weight:700;padding:5px 9px;border:2px solid var(--border);border-radius:var(--r);background:var(--surface);color:var(--text);display:inline-flex;gap:6px;align-items:center}
+  .tr-chip .x{color:var(--muted)}
+  .tr-scope{font-family:var(--fm);font-size:10px;color:var(--muted);margin-left:auto}
+  .tr-scope b{color:var(--text)}
+  /* kpi rail */
+  .tr-kpis{display:grid;grid-template-columns:repeat(8,1fr)}
+  .tr-kpis .a-kpi .n{font-size:23px}
+  .a-kpi.warn{background:color-mix(in srgb,var(--warn) 15%,var(--surface))}
+  .a-kpi.bad{background:color-mix(in srgb,var(--danger) 16%,var(--surface))}
+  .a-kpi.spend{background:color-mix(in srgb,var(--warn) 11%,var(--surface))}
+  /* trace list + breakdown tables */
+  .tr-tbl{width:100%;border-collapse:separate;border-spacing:0;font-family:var(--fm);font-size:11px}
+  .tr-tbl th{text-align:left;font-size:8.5px;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);font-weight:700;padding:7px 9px;border-bottom:2px solid var(--border);background:var(--surface)}
+  .tr-tbl th.r,.tr-tbl td.r{text-align:right}
+  .tr-tbl td{padding:7px 9px;border-bottom:2px solid var(--border);color:var(--text)}
+  .tr-tbl tr:last-child td{border-bottom:0}
+  .tr-tbl tbody tr:hover{background:var(--surface-2)}
+  .tr-tbl tr.sel td{background:var(--rune-soft)}
+  .tr-tbl .id{font-weight:700}
+  .tr-tbl tr.sel .id{color:var(--rune-strong)}
+  .tr-tbl tr.sel .id::before{content:"▸ ";color:var(--rune-strong)}
+  .tr-tbl .op{display:inline-block;padding-left:7px;border-left:3px solid var(--muted)}
+  .tr-tbl .op[data-k=agent]{border-left-color:var(--client-bar)}
+  .tr-tbl .op[data-k=llm]{border-left-color:var(--rune-strong)}
+  .tr-tbl .op[data-k=tool]{border-left-color:var(--server-bar)}
+  .tr-tbl .op[data-k=retrieval]{border-left-color:var(--control-bar)}
+  .tr-tbl .st{font-size:8.5px;font-weight:700;letter-spacing:.4px;text-transform:uppercase}
+  .tr-tbl .st.ok{color:var(--ok)} .tr-tbl .st.err{color:var(--danger)} .tr-tbl .st.warn{color:var(--warn)}
+  .tr-mini{display:inline-block;height:9px;border:2px solid var(--border);background:var(--client-bar);border-radius:2px;vertical-align:middle;margin-right:6px}
+  .tr-sc{font-weight:700} .tr-sc.hi{color:var(--ok)} .tr-sc.mid{color:var(--text)} .tr-sc.lo{color:var(--warn)}
+  /* waterfall */
+  .tr-sum{display:flex;gap:14px;flex-wrap:wrap;font-family:var(--fm);font-size:10px;color:var(--muted);padding:10px 12px;border-bottom:2px dashed var(--border)}
+  .tr-sum b{color:var(--text)}
+  .tr-wf{font-family:var(--fm);font-size:10.5px}
+  .tr-wfhead{display:grid;grid-template-columns:180px 1fr;border-bottom:2px solid var(--border)}
+  .tr-wfhead .lbl{padding:6px 9px;font-size:8.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--muted)}
+  .tr-ruler{position:relative;height:22px;border-left:2px solid var(--border)}
+  .tr-ruler .tick{position:absolute;top:0;bottom:0;border-left:1px dashed var(--border);opacity:.45}
+  .tr-ruler .tlab{position:absolute;top:5px;font-size:8px;color:var(--muted);padding-left:4px}
+  .tr-srow{display:grid;grid-template-columns:180px 1fr;align-items:center;border-bottom:2px solid var(--border)}
+  .tr-srow:last-child{border-bottom:0}
+  .tr-srow:hover{background:var(--surface-2)}
+  .tr-sname{display:flex;align-items:center;gap:7px;padding:6px 8px;white-space:nowrap;overflow:hidden}
+  .tr-sname .kd{width:3px;height:13px;border-radius:2px;flex:0 0 auto}
+  .tr-sname .nm{overflow:hidden;text-overflow:ellipsis;color:var(--text)}
+  .tr-sname .dot{margin-left:auto;width:7px;height:7px;border-radius:50%;flex:0 0 auto}
+  .tr-track{position:relative;height:26px;border-left:2px solid var(--border)}
+  .tr-span{position:absolute;top:5px;height:16px;border-radius:3px;border:2px solid var(--k);
+    background:color-mix(in srgb,var(--k) 24%,var(--surface));display:flex;align-items:center;padding:0 5px;
+    font-size:8px;font-weight:700;color:var(--text);overflow:hidden;min-width:4px}
+  /* error-type bars */
+  .tr-eb{display:flex;flex-direction:column;gap:9px}
+  .tr-eb .r{display:grid;grid-template-columns:96px 1fr 26px;gap:9px;align-items:center;font-family:var(--fm);font-size:10px;color:var(--text)}
+  .tr-eb .bar{height:13px;border:2px solid var(--border);background:var(--danger);border-radius:2px}
+  .tr-eb .r .n{text-align:right;color:var(--muted)}
+
+  /* ============ §6 PANELS — drilldown drawers (raised) ============ */
+  .pn-stage{display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start;padding:18px}
+  .drawer{width:340px;flex:1 1 300px;max-width:360px;border:2px solid var(--border);border-radius:var(--r);background:var(--surface);
+    box-shadow:6px 6px 0 0 var(--shadow);overflow:hidden;display:flex;flex-direction:column;color:var(--text)}
+  .pn-top{height:4px;background:var(--accent)}
+  .pn-h{display:flex;align-items:center;gap:9px;padding:12px 13px;border-bottom:2px solid var(--border)}
+  .pn-h .ttl{font-family:var(--fm);font-size:13px;font-weight:700;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pn-h .chip{font-family:var(--fm);font-size:8.5px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;
+    padding:3px 7px;border:2px solid var(--accent);border-radius:4px;color:var(--accent);flex:0 0 auto}
+  .pn-h .x{margin-left:auto;width:24px;height:24px;border:2px solid var(--border);border-radius:4px;background:var(--surface);
+    display:flex;align-items:center;justify-content:center;font-family:var(--fm);font-size:12px;color:var(--muted);cursor:pointer;flex:0 0 auto}
+  .pn-sec{padding:12px 13px;border-bottom:2px dashed var(--border)}
+  .pn-sec:last-of-type{border-bottom:0}
+  .pn-sl{font-family:var(--fm);font-size:8.5px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);margin-bottom:9px}
+  .pn-kv{display:grid;grid-template-columns:6.2rem 1fr;gap:5px 9px;font-family:var(--fm);font-size:10.5px}
+  .pn-kv dt{color:var(--muted);text-transform:uppercase;font-size:8.5px;letter-spacing:.3px;align-self:center}
+  .pn-kv dd{color:var(--text);word-break:break-all}
+  .pn-kv dd .lnk{color:var(--rune-strong);font-weight:700}
+  .pn-row{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+  .pn-bdg{font-family:var(--fm);font-size:9px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;
+    border:2px solid var(--bc,var(--border));border-radius:4px;padding:3px 7px;color:var(--bc,var(--text));
+    background:color-mix(in srgb,var(--bc,var(--text)) 12%,var(--surface))}
+  .pn-bdg.ok{--bc:var(--ok)} .pn-bdg.warn{--bc:var(--warn)} .pn-bdg.danger{--bc:var(--danger)}
+  .pn-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+  .pn-big{display:flex;align-items:baseline;gap:11px}
+  .pn-big .num{font-family:var(--fv);font-size:36px;line-height:.8;color:var(--rune-strong)}
+  .pn-big .sub{font-family:var(--fm);font-size:10px;color:var(--muted)}
+  .pn-metric{display:grid;grid-template-columns:6rem 1fr 2.1rem;gap:9px;align-items:center;font-family:var(--fm);font-size:10px;margin-bottom:7px}
+  .pn-metric:last-child{margin-bottom:0}
+  .pn-metric .bar{height:11px;border:2px solid var(--border);border-radius:2px;background:var(--surface-2);overflow:hidden}
+  .pn-metric .bar i{display:block;height:100%}
+  .pn-metric .v{text-align:right;font-weight:700;color:var(--text)}
+  .pn-mini{display:flex;gap:8px}
+  .pn-mstat{flex:1;border:2px solid var(--border);border-radius:4px;background:var(--surface);padding:7px 9px}
+  .pn-mstat .k{font-family:var(--fm);font-size:8px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:var(--muted)}
+  .pn-mstat .n{font-family:var(--fm);font-size:14px;font-weight:700;color:var(--text);margin-top:3px}
+  .pn-ev{display:flex;align-items:center;gap:9px;padding:4px 0;border-left:2px solid var(--border);padding-left:11px;margin-left:3px;position:relative;font-family:var(--fm);font-size:10px}
+  .pn-ev::before{content:"";position:absolute;left:-5px;width:8px;height:8px;border-radius:50%;background:var(--rune-strong);border:2px solid var(--surface)}
+  .pn-ev .t{margin-left:auto;color:var(--muted)}
+  .pn-code{font-family:var(--fm);font-size:10px;background:var(--surface-2);border:2px solid var(--border);border-radius:4px;
+    padding:8px 9px;color:var(--text);line-height:1.5;white-space:pre-wrap;max-height:96px;overflow:hidden}
+  .pn-code .mut{color:var(--muted)}
+  .pn-pos{position:relative;height:18px;border:2px solid var(--border);border-radius:3px;background:var(--surface-2);overflow:hidden;margin-top:10px}
+  .pn-pos i{position:absolute;top:0;bottom:0;background:color-mix(in srgb,var(--rune-strong) 30%,var(--surface));border-left:2px solid var(--rune-strong);border-right:2px solid var(--rune-strong)}
+  .pn-legend{display:flex;gap:14px;margin-top:9px;font-family:var(--fm);font-size:9.5px;color:var(--muted)}
+  .pn-legend i{display:inline-block;width:10px;height:10px;border:2px solid var(--border);border-radius:2px;margin-right:5px;vertical-align:-1px}
+  .pn-svg{display:block;width:100%;height:auto}
+  .pn-f{padding:11px 13px;border-top:2px solid var(--border);display:flex;gap:8px;background:var(--surface)}
+  .pn-btn{font-family:var(--fm);font-size:10.5px;font-weight:700;padding:7px 12px;border:2px solid var(--border);border-radius:var(--r);
+    background:var(--surface);color:var(--text);box-shadow:2px 2px 0 0 var(--shadow);cursor:pointer}
+  .pn-btn.rune{background:var(--rune-btn);color:var(--rune-btn-ink)}
+  .pn-btn.lime{background:var(--lime);color:var(--lime-ink)}
+
+  /* ============ §7 LOUD — hero / landing ============ */
+  .l-bar{height:8px;background:linear-gradient(90deg,var(--client-bar) 0 33.3%,var(--server-bar) 33.3% 66.6%,var(--control-bar) 66.6% 100%)}
+  .l-pad{padding:24px 24px 28px;position:relative}
+  .l-wm{font-family:var(--fh);font-size:17px;letter-spacing:-.3px;display:inline-flex;align-items:center;gap:7px}
+  .l-wm i{width:9px;height:9px;border-radius:50%;background:var(--lime)}
+  .l-orn{float:right;font-family:var(--fm);font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--rune-strong);
+    border:2px solid var(--border);border-radius:var(--r);padding:5px 9px;box-shadow:3px 3px 0 0 var(--shadow);background:var(--surface)}
+  .l-hero{display:inline-block;font-family:var(--fp);font-size:clamp(15px,2.1vw,22px);line-height:1.35;letter-spacing:1px;
+    text-transform:uppercase;margin:18px 0 0;padding:15px 18px;border-radius:var(--r);
+    background:var(--hero-bg);color:var(--hero-ink);border:3px solid var(--border);box-shadow:10px 10px 0 0 var(--shadow)}
+  .l-tag{margin-top:19px;font-size:14px;line-height:1.55;max-width:46ch}
+  .l-tag b{color:var(--rune-strong)}
+  .l-stats{display:flex;gap:13px;margin-top:21px;flex-wrap:wrap}
+  .l-stat{border:2px solid var(--border);border-radius:var(--r);background:var(--surface);box-shadow:6px 6px 0 0 var(--shadow);padding:13px 16px;flex:1;min-width:110px}
+  .l-stat .n{font-family:var(--fv);font-size:30px;line-height:.9;color:var(--rune-strong)}
+  .l-stat .k{font-family:var(--fm);font-size:9px;font-weight:500;letter-spacing:.8px;text-transform:uppercase;color:var(--muted);margin-top:7px}
+  .l-cta{display:inline-flex;align-items:center;gap:8px;font-family:var(--fm);font-size:14px;font-weight:700;letter-spacing:.3px;
+    margin-top:24px;padding:13px 22px;border:2px solid var(--border);border-radius:var(--r);background:var(--lime);color:var(--lime-ink);
+    cursor:pointer;box-shadow:6px 6px 0 0 var(--shadow);transition:transform .1s,box-shadow .1s}
+  .l-cta:hover{transform:translate(-2px,-2px);box-shadow:9px 9px 0 0 var(--shadow)}
+  .l-cta:active{transform:translate(3px,3px);box-shadow:2px 2px 0 0 var(--shadow)}
+  .l-cta2{background:var(--rune-btn);color:var(--rune-btn-ink);margin-left:10px}
+
+  /* ============ §8 ARCADE — attract mode (exploratory retro register) ============ */
+  .arc{padding:18px 16px;display:grid;gap:16px}
+  /* cabinet frame — flat heavy border + notch + dither, no offset shadow (clip-safe) */
+  .cab{position:relative;border:3px solid var(--border);background:var(--hero-bg);color:var(--hero-ink);padding:22px 18px;text-align:center}
+  .cab .fuji{width:40px;height:40px;margin:0 auto 13px}
+  .cab .fuji .p{fill:var(--hero-ink)} /* prongs need contrast on the violet cabinet */
+  .cab .ct{font-family:var(--fp);font-size:13px;line-height:1.4;color:var(--lime)}
+  .cab .cs{font-family:var(--fv);font-size:22px;letter-spacing:1px;margin-top:9px;color:var(--hero-ink)}
+  .cab .cc{font-family:var(--fv);font-size:18px;letter-spacing:1px;margin-top:4px;color:var(--lime)}
+  /* hi-score leaderboard — locked raised table, scoreboard skin */
+  .hs{border:2px solid var(--border);border-radius:var(--r);background:var(--surface);box-shadow:6px 6px 0 0 var(--shadow);overflow:hidden}
+  .hs .hd{padding:9px 12px;border-bottom:2px solid var(--border);font-family:var(--fp);font-size:9px;color:var(--rune-strong);letter-spacing:.5px}
+  .hs table{width:100%;border-collapse:collapse}
+  .hs th{text-align:left;padding:7px 12px;border-bottom:2px solid var(--border);font-family:var(--fm);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
+  .hs th.r,.hs td.sc{text-align:right}
+  .hs td{padding:8px 12px;border-bottom:2px dashed var(--border)}
+  .hs tr:last-child td{border-bottom:0}
+  .hs .rk{font-family:var(--fp);font-size:10px;color:var(--rune-strong)}
+  .hs .pl{font-family:var(--fm);font-size:9px;font-weight:700;padding:2px 6px;border:2px solid var(--border);border-radius:var(--r)}
+  .hs .pl.p1{background:var(--lime);color:var(--lime-ink)}
+  .hs .pl.p2{background:var(--rune-btn);color:var(--rune-btn-ink)}
+  .hs .ref{font-family:var(--fm);font-size:11px;border-left:3px solid var(--client-bar);padding-left:8px;color:var(--text)}
+  .hs .ref[data-k=server]{border-left-color:var(--server-bar)}
+  .hs .ref[data-k=control]{border-left-color:var(--control-bar)}
+  .hs .sc{font-family:var(--fv);font-size:19px;color:var(--rune-strong)}
+  /* coin-op buttons — the locked button press interaction, arcade labels */
+  .coin{display:flex;gap:10px;flex-wrap:wrap}
+  .coin button{font-family:var(--fm);font-size:11px;font-weight:700;letter-spacing:.3px;padding:11px 16px;border:2px solid var(--border);border-radius:var(--r);
+    cursor:pointer;box-shadow:3px 3px 0 0 var(--shadow);transition:transform .1s,box-shadow .1s;background:var(--surface);color:var(--text)}
+  .coin button:hover{transform:translate(-2px,-2px);box-shadow:5px 5px 0 0 var(--shadow)}
+  .coin button:active{transform:translate(1px,1px);box-shadow:1px 1px 0 0 var(--shadow)}
+  .coin .primary{background:var(--lime);color:var(--lime-ink)}
+  .coin .rune{background:var(--rune-btn);color:var(--rune-btn-ink)}
+</style>
+</head>
+<body>
+
+<header class="pagehead">
+  <span class="ph-brand">
+    <svg class="fuji" viewBox="0 0 100 100" aria-hidden="true"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>
+    <span class="ph-wm">MITARI</span>
+    <span class="ph-sub">UI Source of Truth · v2</span>
+  </span>
+  <span class="lock">P1 · HI-SCORE 015340 · CR.02</span>
+  <nav>
+    <a href="#principles">Rules</a>
+    <a href="#palette">Palette</a>
+    <a href="#structure">Structure</a>
+    <a href="#quiet">Quiet</a>
+    <a href="#analytics">Data</a>
+    <a href="#traces">Traces</a>
+    <a href="#panels">Panels</a>
+    <a href="#loud">Loud</a>
+    <a href="#arcade">Arcade</a>
+  </nav>
+</header>
+
+<!-- ============ §0 PRINCIPLES ============ -->
+<section class="sec" id="principles">
+  <div class="sechead"><span class="num">00</span><h2>Rules</h2><span class="tag">non-negotiable</span></div>
+  <p class="seclede">This file is the canonical reference for Mitari UI theming, paired with <code>theme.css</code>. Same geometry in light and dark; only palette and atmosphere change. When a styling question comes up, this is the answer.</p>
+  <div class="rules">
+    <div class="rule"><h3><span class="d" style="background:#8b5cf6"></span>Geometry</h3><p><b>Radius 5px</b> on every surface and control. <b>2px ink borders</b> (3px for hero/feature containers), <b>2px dashed</b> for dividers inside cards. Borders are <b>always present</b> — never gray, hairline, or low-contrast.</p></div>
+    <div class="rule"><h3><span class="d" style="background:#8b5cf6"></span>Shadows</h3><p>Hard-offset, <b>zero blur</b> only: <code>3px</code> quiet cards, <code>6px</code> raised/stat, <code>10px</code> hero block. No blur, no glassmorphism, no soft elevation, <b>no glow</b>.</p></div>
+    <div class="rule"><h3><span class="d" style="background:#14141a"></span>Foreground · locked</h3><p>Body text is <code>#14141a</code> light (~15:1) and <code>#d6d6dc</code> dark (~12:1). Dark is a <b>calm off-white, not near-white</b> — frozen, no more retuning.</p></div>
+    <div class="rule"><h3><span class="d" style="background:#c5f23c"></span>Accent = signal</h3><p>Lime and rune are <b>signal, not decoration</b>. They mark the selected row, active filter, primary action, status, semantic left-bars — never a default text color or a wash of background.</p></div>
+    <div class="rule"><h3><span class="d" style="background:#8b5cf6"></span>Altitude</h3><p>Two registers that never bleed. <b>Quiet</b> is the workbench default — calm, 3px shadows, restrained accent. <b>Loud</b> is hero/landing only — 10px shadows, block hero, tricolor rail, big type.</p></div>
+    <div class="rule"><h3><span class="d" style="background:#f2a23c"></span>Data viz</h3><p>Charts are brutalist too: <b>2px ink frames</b>, <b>flat fills</b> (no gradients/glow), bars and ticks in <b>semantic colors</b>, axes &amp; gridlines in border ink (gridlines faint-dashed). Series read by The Line — lime/amber/blue — with rune &amp; danger for non-semantic lines. <b>Sequential/heat ramps use violet</b>, never lime (lime can't darken on white).</p></div>
+    <div class="rule"><h3><span class="d" style="background:#7c3aed"></span>Span kinds</h3><p>Trace span colors are fixed: <b>agent</b>=lime, <b>llm</b>=violet, <b>tool</b>=amber, <b>retrieval</b>=blue, <b>error</b>=red. Waterfall bars are tinted-fill + 2px kind border; status is a green/red dot. The same kind ticks key every trace table.</p></div>
+    <div class="rule"><h3><span class="d" style="background:#d2402a"></span>Detail panels</h3><p>Drilldown drawers are <b>raised altitude</b> — 6px shadow, a <b>4px kind top-bar</b>. The top-bar carries the row's kind (llm=violet, eval=rune…) <b>unless the panel is in an alert state</b> — then status wins (drifted → red). Metric bars color green/red by threshold.</p></div>
+    <div class="rule no"><h3><span class="d"></span>Never</h3><p>No 1px hairlines, no gray borders, no blurred/soft shadows, no glow or CRT scanlines, no purple card_ref column, no layered-offset CTAs. These were all tried and cut.</p></div>
+  </div>
+</section>
+
+<!-- ============ §1 PALETTE ============ -->
+<section class="sec" id="palette">
+  <div class="sechead"><span class="num">01</span><h2>Palette</h2><span class="tag">every allowed token</span></div>
+  <p class="seclede">The complete token set. Every value has a light and a dark resolution. <b>The Line</b> encodes the product: <span style="color:#4a7a06;font-weight:700">lime = client/runtime</span>, <span style="color:#b96d00;font-weight:700">amber = server/enterprise</span>, <span style="color:#2f6f9e;font-weight:700">blue = control/deploy</span>.</p>
+  <div class="compare" id="palette-cols"></div>
+</section>
+
+<!-- ============ §2 STRUCTURE ============ -->
+<section class="sec" id="structure">
+  <div class="sechead"><span class="num">02</span><h2>Structure</h2><span class="tag">geometry &amp; anatomy</span></div>
+  <p class="seclede">The physical system: the radius, the border weights, the shadow dial, the semantic left-bar, and a fully anatomized card. Same in both modes.</p>
+  <div class="compare" id="structure-cols"></div>
+</section>
+
+<!-- ============ §3 QUIET ============ -->
+<section class="sec" id="quiet">
+  <div class="sechead"><span class="num">03</span><h2>Quiet</h2><span class="tag">workbench · default</span></div>
+  <p class="seclede">The analytics surface a developer lives in for hours. 2px ink borders, one 3px shadow per card, white headers, calm fields, accent only on the selected row + active filter + status + semantic bars. <b>This is the default register</b> — registry, tables, detail, forms, settings.</p>
+  <div class="compare" id="quiet-cols"></div>
+</section>
+
+<!-- ============ §4 ANALYTICS ============ -->
+<section class="sec" id="analytics">
+  <div class="sechead"><span class="num">04</span><h2>Analytics</h2><span class="tag">data viz · workbench</span></div>
+  <p class="seclede">The workbench is fundamentally an analytics surface. These are the data primitives in the locked style: KPI tiles with sparklines, bar and line charts, a distribution bar, an activity heatmap, an expandable storage/card tree, and a dropdown filter. All flat, all 2px-framed, all token-driven — quiet register.</p>
+  <div class="compare" id="analytics-cols"></div>
+</section>
+
+<!-- ============ §5 TRACES ============ -->
+<section class="sec" id="traces">
+  <div class="sechead"><span class="num">05</span><h2>Traces</h2><span class="tag">observability · the workbench core</span></div>
+  <p class="seclede">The most important workbench surface: inspecting agent &amp; LLM execution. Scope + time-range toolbar, a dense KPI rail (requests, error rate, p50/p95/p99, spend, tokens), latency/throughput/error charts, a recent-trace list, and the signature <b>span waterfall</b> — nested spans on a shared timeline, colored by kind, with status and duration. Breakdowns by operation, model, and error type close it out. Quiet register throughout.</p>
+  <div class="compare" id="traces-cols"></div>
+</section>
+
+<!-- ============ §6 PANELS ============ -->
+<section class="sec" id="panels">
+  <div class="sechead"><span class="num">06</span><h2>Panels</h2><span class="tag">drilldown drawers</span></div>
+  <p class="seclede">The detail drawers that open when you select a row: a <b>span</b> (from the waterfall), an <b>eval record</b> (agent evaluation), and a <b>drifted feature</b> (traditional drift). Raised altitude — 6px shadow + a 4px kind top-bar — overlaying the workbench. The drift panel's top-bar is red because <b>status overrides kind when a panel is in an alert state</b>.</p>
+  <div class="compare" id="panels-cols"></div>
+</section>
+
+<!-- ============ §7 LOUD ============ -->
+<section class="sec" id="loud">
+  <div class="sechead"><span class="num">07</span><h2>Loud</h2><span class="tag">hero / landing only</span></div>
+  <p class="seclede">Top-of-page and marketing only. Block-with-shadow hero, tricolor rail, 10px/6px shadows, big display type, the solid lime CTA. It earns attention precisely because the workbench refuses to compete.</p>
+  <div class="compare" id="loud-cols"></div>
+</section>
+
+<!-- ============ §8 ARCADE ============ -->
+<section class="sec" id="arcade">
+  <div class="sechead"><span class="num">08</span><h2>Arcade</h2><span class="tag">attract mode · exploratory</span></div>
+  <p class="seclede">Mitari ≈ Atari. An <b>opt-in retro register</b> built entirely from locked primitives — a pixel display face, the runic “fuji” mark, ordered-dither texture (stepped, <b>zero-blur</b>), and notched cabinet corners. It still obeys every rule: 5px radius on real controls, 2px ink borders, hard-offset shadows, <b>no glow, no scanlines</b>. The boldness is the point — the arcade skin just makes it grin. Loud-adjacent: use for landing moments and launch screens, never beside the workbench.</p>
+  <div class="compare" id="arcade-cols"></div>
+</section>
+
+<!-- ============ templates ============ -->
+<template id="t-structure">
+  <div class="geo">
+    <div class="block"><h4>Radius · locked 5px</h4>
+      <div class="row"><span class="lab">5px</span><span class="rbox" style="border-radius:5px"></span><span class="fm" style="font-size:10px;color:var(--muted)">all surfaces &amp; controls</span></div>
+      <div class="row"><span class="lab">circle</span><span class="rbox" style="width:34px;border-radius:50%"></span><span class="fm" style="font-size:10px;color:var(--muted)">dots / avatars only</span></div>
+    </div>
+    <div class="block"><h4>Borders</h4>
+      <div class="row"><span class="lab">2px</span><span class="bbox b2"></span><span class="fm" style="font-size:10px;color:var(--muted)">normal UI</span></div>
+      <div class="row"><span class="lab">3px</span><span class="bbox b3"></span><span class="fm" style="font-size:10px;color:var(--muted)">hero / feature</span></div>
+      <div class="row"><span class="lab">2px dashed</span><span class="bbox bd"></span><span class="fm" style="font-size:10px;color:var(--muted)">in-card divider</span></div>
+    </div>
+    <div class="block"><h4>Shadow dial · 0 blur</h4>
+      <div class="row"><span class="lab">3px</span><span class="shbox s1"></span><span class="fm" style="font-size:10px;color:var(--muted)">quiet card</span></div>
+      <div class="row"><span class="lab">6px</span><span class="shbox s2"></span><span class="fm" style="font-size:10px;color:var(--muted)">raised / stat</span></div>
+      <div class="row"><span class="lab">10px</span><span class="shbox s3"></span><span class="fm" style="font-size:10px;color:var(--muted)">hero block</span></div>
+    </div>
+    <div class="block"><h4>Semantic left-bar</h4>
+      <div class="barrow"><span class="kd" data-k="client">client · runtime</span></div>
+      <div class="barrow"><span class="kd" data-k="server">server · enterprise</span></div>
+      <div class="barrow"><span class="kd" data-k="control">control · deploy</span></div>
+    </div>
+    <div class="anat">
+      <div class="ahead"><span>card header · mono label</span><span>2px border</span></div>
+      <div class="abody">
+        <div class="atitle">payments-svc</div>
+        <dl class="adl">
+          <dt>card_ref</dt><dd class="fm">svc_payments_a91</dd>
+          <dt>kind</dt><dd class="fm">Service · principal</dd>
+        </dl>
+        <div class="note">↑ 2px border · 3px shadow · 2px dashed divider · plain-ink ref</div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<template id="t-quiet">
+  <div>
+    <div class="q-top">
+      <span class="q-wm"><svg class="fuji" viewBox="0 0 100 100" aria-hidden="true"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>MITARI<i></i></span>
+      <span class="q-search">⌘K  search cards…</span>
+      <span class="q-nav"><b>registry</b> · observations · audit</span>
+    </div>
+    <div class="q-toolbar">
+      <span class="q-pill active">All</span>
+      <span class="q-pill" data-k="client">Agent</span>
+      <span class="q-pill" data-k="server">Eval</span>
+      <span class="q-pill" data-k="control">Policy</span>
+      <span class="q-count">412 cards</span>
+    </div>
+    <div class="q-grid">
+      <table class="q-table">
+        <tr><th>card_ref</th><th>kind</th><th>tenant</th><th>status</th></tr>
+        <tr class="sel"><td class="q-ref">payments-svc</td><td><span class="q-kind" data-k="server">Service</span></td><td>acme</td><td><span class="q-st ok">healthy</span></td></tr>
+        <tr><td class="q-ref">fathom-wf</td><td><span class="q-kind" data-k="client">Agent</span></td><td>acme</td><td><span class="q-st ok">healthy</span></td></tr>
+        <tr><td class="q-ref">churn-v3</td><td><span class="q-kind" data-k="server">Eval</span></td><td>acme</td><td><span class="q-st warn">drift</span></td></tr>
+        <tr><td class="q-ref">pii-gate</td><td><span class="q-kind" data-k="control">Policy</span></td><td>acme</td><td><span class="q-st ok">enforced</span></td></tr>
+        <tr><td class="q-ref">orders-tbl</td><td><span class="q-kind" data-k="client">Data</span></td><td>acme</td><td><span class="q-st ok">fresh</span></td></tr>
+      </table>
+      <div class="q-detail">
+        <div class="h">payments-svc</div>
+        <div class="sub">SERVICE · PRINCIPAL</div>
+        <dl>
+          <dt>card_ref</dt><dd class="q-ref">svc_payments_a91</dd>
+          <dt>children</dt><dd>2 model · 1 agent</dd>
+          <dt>scopes</dt><dd>bifrost_record:write</dd>
+        </dl>
+        <div class="q-actions">
+          <button class="q-btn primary">issue key</button>
+          <button class="q-btn rune">view card</button>
+          <button class="q-btn ghost">audit →</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<template id="t-loud">
+  <div>
+    <div class="l-bar"></div>
+    <div class="l-pad">
+      <span class="l-orn"><svg class="fuji" viewBox="0 0 100 100" aria-hidden="true" style="width:13px;height:13px;display:inline-block;vertical-align:-2px;margin-right:5px"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>mitari</span>
+      <span class="l-wm"><svg class="fuji" viewBox="0 0 100 100" aria-hidden="true" style="width:16px;height:16px"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>MITARI<i></i></span>
+      <div><span class="l-hero dither">MITARI SYSTEM</span></div>
+      <p class="l-tag">Neobrutalism for the agentic stack. <b>One geometry. Two modes. Zero blur.</b></p>
+      <div class="l-stats">
+        <div class="l-stat"><div class="n">24</div><div class="k">Components</div></div>
+        <div class="l-stat"><div class="n">2</div><div class="k">Modes</div></div>
+        <div class="l-stat"><div class="n">3</div><div class="k">Altitudes</div></div>
+      </div>
+      <div>
+        <button class="l-cta">▶ PRESS START</button>
+        <button class="l-cta l-cta2">INSERT COIN</button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<template id="t-arcade">
+  <div class="arc">
+    <div class="cab notch dither">
+      <svg class="fuji" viewBox="0 0 100 100" aria-hidden="true"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>
+      <div class="ct">★ INSERT COIN ★</div>
+      <div class="cs">MITARI ATTRACT MODE</div>
+      <div class="cc">PRESS START TO BUILD</div>
+    </div>
+    <div class="hs">
+      <div class="hd">HI-SCORE · WORKBENCH LEADERBOARD</div>
+      <table>
+        <tr><th>rank</th><th>player</th><th>card</th><th class="r">score</th></tr>
+        <tr><td class="rk">1ST</td><td><span class="pl p1">P1</span></td><td><span class="ref" data-k="client">fathom-wf</span></td><td class="sc">015340</td></tr>
+        <tr><td class="rk">2ND</td><td><span class="pl p2">P2</span></td><td><span class="ref" data-k="server">churn-v3</span></td><td class="sc">012880</td></tr>
+        <tr><td class="rk">3RD</td><td><span class="pl p1">P1</span></td><td><span class="ref" data-k="control">pii-gate</span></td><td class="sc">009990</td></tr>
+        <tr><td class="rk">4TH</td><td><span class="pl p2">P2</span></td><td><span class="ref" data-k="client">orders-tbl</span></td><td class="sc">007420</td></tr>
+      </table>
+    </div>
+    <div class="coin">
+      <button class="primary">▶ PRESS START</button>
+      <button class="rune">SELECT</button>
+      <button class="ghost">CREDITS</button>
+    </div>
+  </div>
+</template>
+
+<script>
+  // ---- §1 palette data (LOCKED) ----
+  const GROUPS = [
+    {t:'Neutrals — ink / paper', rows:[
+      {nm:'--paper', use:'page background', light:'#f4f4f5', dark:'#0e0e0e'},
+      {nm:'--surface', use:'cards, tables, headers', light:'#ffffff', dark:'#17171b'},
+      {nm:'--surface-2', use:'insets, pills', light:'#ececef', dark:'#1f1f24'},
+      {nm:'--border', use:'2px ink — always', light:'#0b0b0e', dark:'#313139'},
+      {nm:'--shadow', use:'hard offset, 0 blur', light:'#0b0b0e', dark:'#2a2a31'},
+      {nm:'--text', use:'body · LOCKED 15:1 / 12:1', light:'#14141a', dark:'#d6d6dc'},
+      {nm:'--muted', use:'labels, meta · LOCKED', light:'#6b6b76', dark:'#8a8a95'},
+    ]},
+    {t:'Rune — brand violet (B, locked)', rows:[
+      {nm:'--rune', use:'button / chip fill', light:'#8b5cf6', dark:'#241b40'},
+      {nm:'--rune-strong', use:'links, selected ref, big stat', light:'#7c3aed', dark:'#a78bfa'},
+      {nm:'--rune-soft', use:'selected / hover row wash', light:'#f1ecfd', dark:'#241b40'},
+    ]},
+    {t:'Acid — accent', rows:[
+      {nm:'--lime', use:'accent · active · primary btn', light:'#c5f23c', dark:'#c5f23c'},
+      {nm:'--lime-ink', use:'text on lime', light:'#0b0b0e', dark:'#0b0b0e'},
+      {nm:'--lime-text', use:'lime as text on bg', light:'#4a7a06', dark:'#c5f23c'},
+    ]},
+    {t:'The Line — semantic fill', rows:[
+      {nm:'--client', use:'Agent / Data / runtime', light:'#c5f23c', dark:'#c5f23c'},
+      {nm:'--server', use:'Eval / Service / enterprise', light:'#f2a23c', dark:'#f2a23c'},
+      {nm:'--control', use:'Policy / Audit / deploy', light:'#7cc4e8', dark:'#6fb3d6'},
+    ]},
+    {t:'The Line — bar / tick', rows:[
+      {nm:'--client-bar', use:'left-bar, table tick', light:'#c5f23c', dark:'#c5f23c'},
+      {nm:'--server-bar', use:'left-bar, table tick', light:'#ec8b14', dark:'#f2a23c'},
+      {nm:'--control-bar', use:'left-bar, table tick', light:'#2f6f9e', dark:'#6fb3d6'},
+    ]},
+    {t:'Status', rows:[
+      {nm:'--ok', use:'healthy / pass', light:'#2f9e44', dark:'#7ee081'},
+      {nm:'--warn', use:'drift / caution', light:'#ec8b14', dark:'#f2a23c'},
+      {nm:'--danger', use:'fail / removed', light:'#d2402a', dark:'#e8615a'},
+    ]},
+  ];
+
+  function paletteBoard(mode){
+    let html='';
+    for (const g of GROUPS){
+      html += `<div class="grp"><h4>${g.t}</h4><div class="sw-grid">`;
+      for (const r of g.rows){
+        const hex=r[mode];
+        html += `<div class="sw"><div class="chip" style="background:${hex}"></div>
+          <div class="meta"><div class="nm">${r.nm}</div><div class="hx">${hex}</div><div class="us">${r.use}</div></div></div>`;
+      }
+      html += `</div></div>`;
+    }
+    return html;
+  }
+
+  // ---- §4 analytics: token-driven inline SVG (colors via var() cascade) ----
+  function spark(pts, color){
+    const w=90,h=24,max=Math.max(...pts),min=Math.min(...pts),rng=(max-min)||1,step=w/(pts.length-1);
+    const d=pts.map((v,i)=>`${(i*step).toFixed(1)},${(h-2-((v-min)/rng)*(h-4)).toFixed(1)}`).join(' ');
+    return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline points="${d}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
+  }
+  function bars(data){
+    const W=300,H=148,x0=8,x1=294,yTop=14,yBase=120,max=Math.max(...data.map(d=>d.v)),n=data.length,slot=(x1-x0)/n,bw=Math.min(34,slot*0.62);
+    let s=`<svg class="a-svg" viewBox="0 0 ${W} ${H}">`;
+    s+=`<line x1="${x0}" y1="${yBase}" x2="${x1}" y2="${yBase}" stroke="var(--border)" stroke-width="2"/>`;
+    data.forEach((d,i)=>{const cx=x0+slot*i+slot/2,hh=(d.v/max)*(yBase-yTop),bx=cx-bw/2,by=yBase-hh;
+      s+=`<rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${bw.toFixed(1)}" height="${hh.toFixed(1)}" rx="2" fill="var(${d.c})" stroke="var(--border)" stroke-width="2"/>`;
+      s+=`<text x="${cx.toFixed(1)}" y="${(by-4).toFixed(1)}" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="9" font-weight="700" fill="var(--text)">${d.v}</text>`;
+      s+=`<text x="${cx.toFixed(1)}" y="${(yBase+13)}" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="8.5" fill="var(--muted)">${d.l}</text>`;});
+    return s+`</svg>`;
+  }
+  function lines(series, xl){
+    const W=300,H=148,x0=10,x1=294,yTop=12,yBot=120,max=Math.max(...series.flatMap(s=>s.pts)),rng=max||1,n=series[0].pts.length,step=(x1-x0)/(n-1),Y=v=>yBot-(v/rng)*(yBot-yTop);
+    let s=`<svg class="a-svg" viewBox="0 0 ${W} ${H}">`;
+    for(let g=0;g<=3;g++){const gy=yTop+(yBot-yTop)*g/3;s+=`<line x1="${x0}" y1="${gy.toFixed(1)}" x2="${x1}" y2="${gy.toFixed(1)}" stroke="var(--border)" stroke-opacity="0.22" stroke-width="1" stroke-dasharray="3 3"/>`;}
+    s+=`<line x1="${x0}" y1="${yBot}" x2="${x1}" y2="${yBot}" stroke="var(--border)" stroke-width="2"/>`;
+    series.forEach(se=>{const pts=se.pts.map((v,i)=>`${(x0+step*i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
+      s+=`<polyline points="${pts}" fill="none" stroke="var(${se.c})" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>`;
+      se.pts.forEach((v,i)=>{const mx=x0+step*i,my=Y(v);s+=`<rect x="${(mx-2.5).toFixed(1)}" y="${(my-2.5).toFixed(1)}" width="5" height="5" fill="var(--surface)" stroke="var(${se.c})" stroke-width="2"/>`;});});
+    xl.forEach((lab,i)=>{if(lab){const lx=x0+step*i;s+=`<text x="${lx.toFixed(1)}" y="${yBot+13}" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="8.5" fill="var(--muted)">${lab}</text>`;}});
+    return s+`</svg>`;
+  }
+  function analyticsHTML(){
+    const KPI=[
+      {k:'Observations · 24h',n:'18.4k',d:'+12%',cls:'up',c:'--rune-strong',sp:[10,12,11,14,13,16,15,18]},
+      {k:'Active cards',n:'412',d:'+5',cls:'up',c:'--rune-strong',sp:[380,388,390,393,400,405,408,412]},
+      {k:'p95 latency',n:'84ms',d:'−9ms',cls:'up',c:'--rune-strong',sp:[120,110,105,99,95,90,88,84]},
+      {k:'Policy denials',n:'27',d:'+6',cls:'down',c:'--danger',sp:[8,10,12,14,18,21,24,27]},
+    ];
+    const kpi=KPI.map(t=>`<div class="a-kpi"><div class="k">${t.k}</div><div class="n">${t.n}</div><div class="d ${t.cls}">${t.d}</div>${spark(t.sp,`var(${t.c})`)}</div>`).join('');
+    const BARS=[{l:'Agent',v:82,c:'--client-bar'},{l:'Eval',v:64,c:'--server-bar'},{l:'Policy',v:38,c:'--control-bar'},{l:'Data',v:71,c:'--client-bar'},{l:'Svc',v:55,c:'--server-bar'}];
+    const SERIES=[{c:'--rune-strong',pts:[40,52,48,63,70,66,80,76,90,84,96,108]},{c:'--danger',pts:[4,6,3,8,5,7,6,9,5,8,4,6]}];
+    const XL=['00:00','','','06:00','','','12:00','','','18:00','','now'];
+    const heat=[0,1,2,1,3,2,4,3,2,1,0,1, 1,2,3,4,3,2,1,2,3,1,0,2, 0,1,1,2,4,3,2,1,0,1,2,3, 2,3,4,3,2,1,1,0,1,2,3,4];
+    const cells=heat.map(l=>`<span style="background:color-mix(in srgb,var(--rune-strong) ${l*22}%,var(--surface-2))"></span>`).join('');
+    const dist=`<div class="a-dist"><span style="width:46%;background:var(--client-bar)"></span><span style="width:34%;background:var(--server-bar)"></span><span style="width:20%;background:var(--control-bar)"></span></div>
+      <div class="a-legend"><span><i style="background:var(--client-bar)"></i>Client 189</span><span><i style="background:var(--server-bar)"></i>Server 140</span><span><i style="background:var(--control-bar)"></i>Control 83</span></div>`;
+    const tree=`<div class="a-tree">
+      <details open><summary><span class="fold">acme/</span><span class="meta">tenant</span></summary>
+        <div class="kids">
+          <details open><summary><span class="fold">cards/</span><span class="meta">412</span></summary>
+            <div class="kids">
+              <div class="leaf" data-k="server">payments-svc<span class="meta">Service</span></div>
+              <details><summary><span class="fold">fathom-wf/</span><span class="meta">Agent</span></summary>
+                <div class="kids">
+                  <div class="leaf" data-k="client">model-a<span class="meta">Model</span></div>
+                  <div class="leaf" data-k="client">model-b<span class="meta">Model</span></div>
+                </div></details>
+              <div class="leaf" data-k="server">churn-v3<span class="meta">Eval</span></div>
+              <div class="leaf" data-k="control">pii-gate<span class="meta">Policy</span></div>
+            </div></details>
+          <details><summary><span class="fold">artifacts/</span><span class="meta">3.2 GB</span></summary><div class="kids"><div class="leaf">parquet/</div></div></details>
+          <details><summary><span class="fold">audit/</span><span class="meta">log</span></summary><div class="kids"><div class="leaf">events.jsonl</div></div></details>
+        </div></details></div>`;
+    const dd=`<div class="a-dd"><span class="trigger">kind: All <span class="car">▾</span></span>
+      <div class="menu">
+        <div class="opt sel"><span class="tick"></span>All<span class="ck">✓</span></div>
+        <div class="opt" data-k="client"><span class="tick"></span>Agent / Data</div>
+        <div class="opt" data-k="server"><span class="tick"></span>Eval / Service</div>
+        <div class="opt" data-k="control"><span class="tick"></span>Policy / Audit</div>
+      </div></div>`;
+    return `<div class="a-grid">
+      <div class="a-card wide"><div class="a-head"><span>Key metrics</span><span class="v">last 24h</span></div><div class="a-kpis">${kpi}</div></div>
+      <div class="a-card"><div class="a-head"><span>Observations by kind</span><span class="v">7d</span></div><div class="a-body">${bars(BARS)}</div></div>
+      <div class="a-card"><div class="a-head"><span>Requests vs errors</span><span class="v"><span style="color:var(--rune-strong)">■</span> req&nbsp;&nbsp;<span style="color:var(--danger)">■</span> err</span></div><div class="a-body">${lines(SERIES,XL)}</div></div>
+      <div class="a-card"><div class="a-head"><span>Cards by plane</span><span class="v">412</span></div><div class="a-body">${dist}</div></div>
+      <div class="a-card"><div class="a-head"><span>Activity</span><span class="v">12×4 wk</span></div><div class="a-body"><div class="a-heatwrap"><div class="a-heat">${cells}</div></div></div></div>
+      <div class="a-card"><div class="a-head"><span>Storage tree</span><span class="v">expandable</span></div><div class="a-body">${tree}</div></div>
+      <div class="a-card"><div class="a-head"><span>Filter dropdown</span><span class="v">open</span></div><div class="a-body">${dd}</div></div>
+    </div>`;
+  }
+
+  // ---- §5 traces / observability ----
+  function tracesHTML(){
+    const KC={agent:'--client-bar',llm:'--rune-strong',tool:'--server-bar',retrieval:'--control-bar'};
+    // toolbar
+    const toolbar=`<div class="a-card wide"><div class="a-body" style="padding:11px 13px"><div class="tr-bar">
+      <div class="tr-seg"><button>1h</button><button class="on">24h</button><button>7d</button><button>30d</button></div>
+      <span class="tr-chip">agent: fathom-wf <span class="x">▾</span></span>
+      <span class="tr-chip">model: all <span class="x">▾</span></span>
+      <span class="tr-chip">status: all <span class="x">▾</span></span>
+      <span class="tr-scope">scope <b>payments-svc</b> · acme</span>
+    </div></div></div>`;
+    // kpi rail
+    const K=[
+      {k:'Traces',n:'2,341',d:'+8%',cls:''},{k:'Err %',n:'1.8%',d:'',cls:'warn'},
+      {k:'p50',n:'240ms',d:'',cls:''},{k:'p95',n:'980ms',d:'',cls:''},{k:'p99',n:'1.84s',d:'',cls:''},
+      {k:'Spend',n:'$42.10',d:'',cls:'spend'},{k:'Tokens',n:'1.2M',d:'',cls:''},{k:'Tools',n:'18',d:'',cls:''},
+    ];
+    const kpi=`<div class="a-card wide"><div class="a-head"><span>Key metrics</span><span class="v">last 24h · 2.3k spans</span></div>
+      <div class="tr-kpis">${K.map(t=>`<div class="a-kpi ${t.cls}"><div class="k">${t.k}</div><div class="n">${t.n}</div>${t.d?`<div class="d up">${t.d}</div>`:''}</div>`).join('')}</div></div>`;
+    // charts
+    const XL=['00:00','','','06:00','','','12:00','','','18:00','','now'];
+    const LAT=[{c:'--control-bar',pts:[180,200,210,190,240,220,250,230,260,240,250,240]},
+               {c:'--rune-strong',pts:[620,700,680,820,900,860,980,920,1040,960,1010,980]},
+               {c:'--danger',pts:[1200,1300,1250,1500,1700,1600,1840,1700,1900,1780,1850,1840]}];
+    const THRU=[{l:'00',v:120,c:'--client-bar'},{l:'04',v:180,c:'--client-bar'},{l:'08',v:240,c:'--client-bar'},{l:'12',v:210,c:'--client-bar'},{l:'16',v:260,c:'--client-bar'},{l:'20',v:300,c:'--client-bar'}];
+    const ERR=[{c:'--danger',pts:[1.2,0.8,1.5,2.1,1.0,1.8,1.4,2.4,1.1,1.9,1.3,1.8]}];
+    const charts=`<div class="tr-row3">
+      <div class="a-card"><div class="a-head"><span>Latency</span><span class="v"><span style="color:var(--control-bar)">■</span>50 <span style="color:var(--rune-strong)">■</span>95 <span style="color:var(--danger)">■</span>99</span></div><div class="a-body">${lines(LAT,XL)}</div></div>
+      <div class="a-card"><div class="a-head"><span>Throughput</span><span class="v">spans/5m</span></div><div class="a-body">${bars(THRU)}</div></div>
+      <div class="a-card"><div class="a-head"><span>Error rate</span><span class="v">%</span></div><div class="a-body">${lines(ERR,XL)}</div></div>
+    </div>`;
+    // recent traces
+    const TR=[
+      {id:'tr_9f2a',op:'agent.run',k:'agent',sp:7,dur:'1.84s',w:70,tok:'3.6k',cost:'$0.041',sc:'0.92',scc:'hi',st:'ok',sel:true},
+      {id:'tr_8c1d',op:'chat.complete',k:'llm',sp:3,dur:'640ms',w:24,tok:'1.1k',cost:'$0.012',sc:'0.88',scc:'mid',st:'ok'},
+      {id:'tr_7b40',op:'agent.run',k:'agent',sp:9,dur:'2.61s',w:100,tok:'5.2k',cost:'$0.058',sc:'0.74',scc:'lo',st:'warn'},
+      {id:'tr_6a9e',op:'tool.exec',k:'tool',sp:4,dur:'410ms',w:16,tok:'0.4k',cost:'$0.003',sc:'—',scc:'mid',st:'err'},
+      {id:'tr_5f22',op:'retrieval.kb',k:'retrieval',sp:2,dur:'220ms',w:9,tok:'0.2k',cost:'$0.001',sc:'0.95',scc:'hi',st:'ok'},
+    ];
+    const list=`<div class="a-card wide"><div class="a-head"><span>Recent traces</span><span class="v">5 of 2,341</span></div>
+      <table class="tr-tbl"><thead><tr><th>trace</th><th>root op</th><th class="r">spans</th><th>duration</th><th class="r">tokens</th><th class="r">cost</th><th class="r">score</th><th>status</th></tr></thead>
+      <tbody>${TR.map(t=>`<tr class="${t.sel?'sel':''}"><td class="id">${t.id}</td><td><span class="op" data-k="${t.k}">${t.op}</span></td><td class="r">${t.sp}</td>
+        <td><span class="tr-mini" style="width:${t.w*0.5}px"></span>${t.dur}</td><td class="r">${t.tok}</td><td class="r">${t.cost}</td>
+        <td class="r"><span class="tr-sc ${t.scc}">${t.sc}</span></td><td><span class="st ${t.st}">${t.st}</span></td></tr>`).join('')}</tbody></table></div>`;
+    // waterfall
+    const TOTAL=1840;
+    const SPANS=[
+      {d:0,n:'agent.run',k:'agent',s:0,dur:1840,st:'ok'},
+      {d:1,n:'llm.plan',k:'llm',s:40,dur:480,st:'ok'},
+      {d:1,n:'tool.search',k:'tool',s:540,dur:220,st:'ok'},
+      {d:1,n:'retrieval.kb',k:'retrieval',s:560,dur:340,st:'ok'},
+      {d:1,n:'llm.synthesize',k:'llm',s:920,dur:780,st:'ok'},
+      {d:2,n:'tool.web_fetch',k:'tool',s:1020,dur:160,st:'err'},
+      {d:1,n:'agent.finalize',k:'agent',s:1720,dur:120,st:'ok'},
+    ];
+    const ruler=`<div class="tr-ruler">${[0,25,50,75,100].map(p=>`<span class="tick" style="left:${p}%"></span>`).join('')}${[[0,'0'],[25,'460'],[50,'920'],[75,'1380']].map(([p,l])=>`<span class="tlab" style="left:${p}%">${l}ms</span>`).join('')}</div>`;
+    const srows=SPANS.map(sp=>{const kc=KC[sp.k],bk=sp.st==='err'?'--danger':kc,L=(sp.s/TOTAL*100).toFixed(1),W=Math.max(0.7,sp.dur/TOTAL*100).toFixed(1),dot=sp.st==='err'?'--danger':'--ok';
+      return `<div class="tr-srow"><div class="tr-sname" style="padding-left:${sp.d*15+8}px"><span class="kd" style="background:var(${kc})"></span><span class="nm">${sp.n}</span><span class="dot" style="background:var(${dot})"></span></div>
+        <div class="tr-track"><span class="tr-span" style="left:${L}%;width:${W}%;--k:var(${bk})">${sp.dur}ms</span></div></div>`;}).join('');
+    const wf=`<div class="a-card wide"><div class="a-head"><span>Trace · tr_9f2a</span><span class="v">agent.run</span></div>
+      <div class="tr-sum"><span>total <b>1.84s</b></span><span>spans <b>7</b></span><span>tokens <b>3.6k</b></span><span>cost <b>$0.041</b></span><span>status <b style="color:var(--warn)">1 error</b></span><span>score <b>0.92</b></span></div>
+      <div class="tr-wf"><div class="tr-wfhead"><div class="lbl">span · kind</div>${ruler}</div>${srows}</div></div>`;
+    // breakdowns
+    const OPS=[['llm.synthesize','llm',1240,'780ms','2.1%',false],['llm.plan','llm',1180,'460ms','0.4%',false],['tool.search','tool',980,'210ms','1.2%',false],['retrieval.kb','retrieval',760,'320ms','0.0%',false],['tool.web_fetch','tool',540,'160ms','6.4%',true]];
+    const opTbl=`<div class="a-card"><div class="a-head"><span>Operations</span><span class="v">by spans</span></div>
+      <table class="tr-tbl"><thead><tr><th>operation</th><th class="r">spans</th><th class="r">avg</th><th class="r">err</th></tr></thead>
+      <tbody>${OPS.map(([o,k,sp,avg,err,bad])=>`<tr><td><span class="op" data-k="${k}">${o}</span></td><td class="r">${sp}</td><td class="r">${avg}</td><td class="r"${bad?' style="color:var(--danger);font-weight:700"':''}>${err}</td></tr>`).join('')}</tbody></table></div>`;
+    const MOD=[['gpt-4o',1200,'920ms','1.1%'],['claude-3.5',860,'1.10s','0.8%'],['text-embed-3',760,'80ms','0.0%']];
+    const modTbl=`<div class="a-card"><div class="a-head"><span>Models</span><span class="v">usage</span></div>
+      <table class="tr-tbl"><thead><tr><th>model</th><th class="r">spans</th><th class="r">p95</th><th class="r">err</th></tr></thead>
+      <tbody>${MOD.map(([m,sp,p,e])=>`<tr><td class="id">${m}</td><td class="r">${sp}</td><td class="r">${p}</td><td class="r">${e}</td></tr>`).join('')}</tbody></table></div>`;
+    const EB=[['RateLimit',14],['Timeout',9],['ToolError',6],['Validation',3]];
+    const ebMax=14;
+    const errCard=`<div class="a-card wide"><div class="a-head"><span>Error types</span><span class="v">32 total</span></div><div class="a-body"><div class="tr-eb">${EB.map(([n,v])=>`<div class="r"><span>${n}</span><span class="bar" style="width:${(v/ebMax*100).toFixed(0)}%"></span><span class="n">${v}</span></div>`).join('')}</div></div></div>`;
+    return `<div class="tr-stack">${toolbar}${kpi}${charts}${list}${wf}<div class="tr-row2">${opTbl}${modTbl}</div>${errCard}</div>`;
+  }
+
+  // ---- §6 panels: drift mini-charts ----
+  function histo(ref,cur){
+    const W=326,H=116,x0=8,x1=320,yTop=8,yBase=92,max=Math.max(...ref,...cur),n=ref.length,slot=(x1-x0)/n,bw=slot*0.32;
+    let s=`<svg class="pn-svg" viewBox="0 0 ${W} ${H}"><line x1="${x0}" y1="${yBase}" x2="${x1}" y2="${yBase}" stroke="var(--border)" stroke-width="2"/>`;
+    for(let i=0;i<n;i++){const cx=x0+slot*i+slot/2,rh=(ref[i]/max)*(yBase-yTop),ch=(cur[i]/max)*(yBase-yTop);
+      s+=`<rect x="${(cx-bw-1).toFixed(1)}" y="${(yBase-rh).toFixed(1)}" width="${bw.toFixed(1)}" height="${rh.toFixed(1)}" fill="color-mix(in srgb,var(--control-bar) 38%,var(--surface))" stroke="var(--control-bar)" stroke-width="2"/>`;
+      s+=`<rect x="${(cx+1).toFixed(1)}" y="${(yBase-ch).toFixed(1)}" width="${bw.toFixed(1)}" height="${ch.toFixed(1)}" fill="color-mix(in srgb,var(--rune-strong) 40%,var(--surface))" stroke="var(--rune-strong)" stroke-width="2"/>`;}
+    return s+`</svg>`;
+  }
+  function trend(pts,thr){
+    const W=326,H=104,x0=8,x1=320,yTop=10,yBot=88,max=Math.max(...pts,thr)*1.1,n=pts.length,step=(x1-x0)/(n-1),Y=v=>yBot-(v/max)*(yBot-yTop);
+    let s=`<svg class="pn-svg" viewBox="0 0 ${W} ${H}">`;const ty=Y(thr);
+    s+=`<line x1="${x0}" y1="${ty.toFixed(1)}" x2="${x1}" y2="${ty.toFixed(1)}" stroke="var(--danger)" stroke-width="2" stroke-dasharray="4 3"/>`;
+    s+=`<text x="${x1-2}" y="${(ty-4).toFixed(1)}" text-anchor="end" font-family="JetBrains Mono,monospace" font-size="8" fill="var(--danger)">thr ${thr}</text>`;
+    s+=`<line x1="${x0}" y1="${yBot}" x2="${x1}" y2="${yBot}" stroke="var(--border)" stroke-width="2"/>`;
+    const poly=pts.map((v,i)=>`${(x0+step*i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
+    s+=`<polyline points="${poly}" fill="none" stroke="var(--rune-strong)" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>`;
+    pts.forEach((v,i)=>{const mx=x0+step*i,my=Y(v),over=v>thr;s+=`<rect x="${(mx-2.5).toFixed(1)}" y="${(my-2.5).toFixed(1)}" width="5" height="5" fill="var(--surface)" stroke="var(${over?'--danger':'--rune-strong'})" stroke-width="2"/>`;});
+    return s+`</svg>`;
+  }
+  function panelsHTML(){
+    const span=`<div class="drawer" style="--accent:var(--rune-strong)">
+      <div class="pn-top"></div>
+      <div class="pn-h"><span class="ttl">llm.synthesize</span><span class="chip">LLM</span><span class="x">✕</span></div>
+      <div class="pn-sec"><div class="pn-row"><span class="pn-dot" style="background:var(--ok)"></span><span style="font-family:var(--fm);font-size:11px;font-weight:700">ok</span><span style="font-family:var(--fm);font-size:11px;color:var(--muted)">780ms · started +920ms</span></div>
+        <div class="pn-pos"><i style="left:50%;width:42.4%"></i></div></div>
+      <div class="pn-sec"><div class="pn-sl">attributes</div><dl class="pn-kv">
+        <dt>span_id</dt><dd>span_7c2a4f</dd><dt>trace_id</dt><dd><span class="lnk">tr_9f2a</span></dd><dt>parent</dt><dd>agent.run</dd>
+        <dt>model</dt><dd>gpt-4o</dd><dt>provider</dt><dd>openai</dd><dt>window</dt><dd>+920ms → +1700ms</dd></dl></div>
+      <div class="pn-sec"><div class="pn-sl">tokens</div><div class="pn-mini">
+        <div class="pn-mstat"><div class="k">input</div><div class="n">1.4k</div></div>
+        <div class="pn-mstat"><div class="k">output</div><div class="n">1.0k</div></div>
+        <div class="pn-mstat"><div class="k">cache</div><div class="n">0.2k</div></div></div></div>
+      <div class="pn-sec"><div class="pn-sl">events</div>
+        <div class="pn-ev">request.start<span class="t">+0ms</span></div>
+        <div class="pn-ev">first_token<span class="t">+240ms</span></div>
+        <div class="pn-ev">complete<span class="t">+780ms</span></div></div>
+      <div class="pn-sec"><div class="pn-sl">output preview</div>
+        <div class="pn-code"><span class="mut">"</span>Based on the retrieved policy docs, the payment falls under tier-2 review because the amount exceeds<span class="mut">…"</span></div></div>
+      <div class="pn-f"><button class="pn-btn rune">open in trace</button><button class="pn-btn">copy span_id</button></div>
+    </div>`;
+    const M=[['relevance',0.95],['correctness',0.88],['safety',1.00],['groundedness',0.79],['conciseness',0.91]],THR=0.80;
+    const metrics=M.map(([n,v])=>{const ok=v>=THR;return `<div class="pn-metric"><span>${n}</span><span class="bar"><i style="width:${(v*100).toFixed(0)}%;background:var(${ok?'--ok':'--danger'})"></i></span><span class="v" style="${ok?'':'color:var(--danger)'}">${v.toFixed(2)}</span></div>`;}).join('');
+    const ev=`<div class="drawer" style="--accent:var(--rune-strong)">
+      <div class="pn-top"></div>
+      <div class="pn-h"><span class="ttl">rec_4a91c7</span><span class="chip">fathom-wf</span><span class="x">✕</span></div>
+      <div class="pn-sec"><div class="pn-big"><span class="num">0.92</span><div><div><span class="pn-bdg ok">pass</span></div><div class="sub" style="margin-top:5px;font-family:var(--fm);font-size:10px;color:var(--muted)">judge · gpt-4o · 5 metrics</div></div></div></div>
+      <div class="pn-sec"><div class="pn-sl">metric scores · threshold ${THR.toFixed(2)}</div>${metrics}</div>
+      <div class="pn-sec"><div class="pn-sl">judge rationale</div><div class="pn-code">Response is accurate and well-grounded in context. <span class="mut">Groundedness dipped — one claim about tier-2 limits is not directly supported by the retrieved docs.</span></div></div>
+      <div class="pn-sec"><div class="pn-sl">linked trace</div><dl class="pn-kv"><dt>trace</dt><dd><span class="lnk">tr_9f2a</span> · agent.run</dd><dt>duration</dt><dd>1.84s · 7 spans</dd><dt>cost</dt><dd>$0.041</dd></dl></div>
+      <div class="pn-f"><button class="pn-btn rune">open trace</button><button class="pn-btn">re-run eval</button></div>
+    </div>`;
+    const ref=[4,10,22,30,20,10,4],cur=[2,5,12,20,28,22,12],tr=[0.08,0.10,0.12,0.15,0.14,0.19,0.22,0.24,0.21,0.25,0.26,0.27];
+    const drift=`<div class="drawer" style="--accent:var(--danger)">
+      <div class="pn-top"></div>
+      <div class="pn-h"><span class="ttl">request_amount</span><span class="chip" style="--accent:var(--server-bar)">NUMERIC</span><span class="x">✕</span></div>
+      <div class="pn-sec"><div class="pn-row"><span class="pn-bdg danger">drifted</span><span style="font-family:var(--fm);font-size:11px;color:var(--text)">PSI <b>0.27</b></span><span style="font-family:var(--fm);font-size:10px;color:var(--muted)">threshold 0.20</span></div></div>
+      <div class="pn-sec"><div class="pn-sl">distribution · reference vs current</div>${histo(ref,cur)}
+        <div class="pn-legend"><span><i style="background:color-mix(in srgb,var(--control-bar) 38%,var(--surface));border-color:var(--control-bar)"></i>reference</span><span><i style="background:color-mix(in srgb,var(--rune-strong) 40%,var(--surface));border-color:var(--rune-strong)"></i>current</span></div></div>
+      <div class="pn-sec"><div class="pn-sl">drift over time · PSI</div>${trend(tr,0.20)}</div>
+      <div class="pn-sec"><div class="pn-sl">statistics</div><dl class="pn-kv"><dt>ref mean</dt><dd>142.3</dd><dt>cur mean</dt><dd style="color:var(--danger);font-weight:700">188.7</dd><dt>ref std</dt><dd>38.1</dd><dt>cur std</dt><dd>61.4</dd><dt>samples</dt><dd>12.4k</dd></dl></div>
+      <div class="pn-f"><button class="pn-btn lime">acknowledge</button><button class="pn-btn rune">view samples</button></div>
+    </div>`;
+    return `<div class="pn-stage">${span}${ev}${drift}</div>`;
+  }
+
+  function mount(colsId, builder){
+    const cols=document.getElementById(colsId);
+    for (const mode of ['light','dark']){
+      const wrap=document.createElement('div'); wrap.className='panel-wrap';
+      const lbl=document.createElement('div'); lbl.className='panel-label'+(mode==='dark'?' dark':''); lbl.textContent=mode+' mode';
+      wrap.append(lbl, builder(mode));
+      cols.append(wrap);
+    }
+  }
+
+  // palette → .board ; others → .surface with template clone
+  mount('palette-cols', mode=>{ const b=document.createElement('div'); b.className='board'; b.dataset.mode=mode; b.innerHTML=paletteBoard(mode); return b; });
+  for (const [colsId, tpl] of [['structure-cols','t-structure'],['quiet-cols','t-quiet'],['loud-cols','t-loud'],['arcade-cols','t-arcade']]){
+    mount(colsId, mode=>{ const s=document.createElement('div'); s.className='surface'; s.dataset.mode=mode; s.innerHTML=document.getElementById(tpl).innerHTML; return s; });
+  }
+  mount('analytics-cols', mode=>{ const s=document.createElement('div'); s.className='surface'; s.dataset.mode=mode; s.innerHTML=analyticsHTML(); return s; });
+  mount('traces-cols', mode=>{ const s=document.createElement('div'); s.className='surface'; s.dataset.mode=mode; s.innerHTML=tracesHTML(); return s; });
+  mount('panels-cols', mode=>{ const s=document.createElement('div'); s.className='surface'; s.dataset.mode=mode; s.innerHTML=panelsHTML(); return s; });
+</script>
+</body>
+</html>

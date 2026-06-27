@@ -5,6 +5,16 @@ services:
       POSTGRES_DB: wyrd
       POSTGRES_USER: wyrd_migrator
       POSTGRES_PASSWORD: wyrd_migrator_pw
+    # Ephemeral test database: keep PGDATA in RAM, not the postgres:16 image's
+    # built-in anonymous volume. The anonymous volume survived `compose down`
+    # and carried a stale _sqlx_migrations ledger across runs, which broke the
+    # migration checksum gate. The long-form `type: tmpfs` mount reliably
+    # overrides the image's `VOLUME /var/lib/postgresql/data` (the short
+    # `tmpfs:` list form does not), so the DB starts clean every time and is
+    # faster (RAM-backed).
+    volumes:
+      - type: tmpfs
+        target: /var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TransportConfig",
-  "description": "Wyrd client transport selection.\n\ngRPC is the default (Steven, 2026-06-02). Variants for queue transports (Kafka, RabbitMQ, Redis) are intentionally absent in this phase; they return in a dedicated follow-on plan when consumers need queue publication.\n\nWire shape: `{\"transport\": \"grpc\", \"params\": { ... }}`.\n\n# Feature gating\n\n`is_enabled()` is feature-aware natively. `Grpc` is gated on `cfg!(feature = \"transport-grpc\")`, `Http` on `cfg!(feature = \"transport-http\")`, and `Mock` is always available. `WyrdClient::new()` (PR4.0 section 22) calls this method and returns `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED { transport, required_feature }` when the selected variant is not compiled into the local build.",
+  "description": "Wyrd client transport selection.\n\ngRPC is the default. Variants for queue transports (Kafka, RabbitMQ, Redis) are intentionally absent in this phase.\n\nWire shape: `{\"transport\": \"grpc\", \"params\": { ... }}`.\n\n# Feature gating\n\n`is_enabled()` is feature-aware natively. `Grpc` is gated on `cfg!(feature = \"transport-grpc\")`, `Http` on `cfg!(feature = \"transport-http\")`, and `Mock` is always available.",
   "oneOf": [
     {
       "description": "gRPC transport (tonic). The default transport. Gated on `transport-grpc`.",
@@ -83,7 +83,7 @@
           ]
         },
         "connect_retries": {
-          "description": "Connection-level retry budget. The transport retries the initial connection up to this many times before surfacing an error. Per-call retry logic lives in `QueueConfig`.\n\nDefault: [`GRPC_DEFAULT_CONNECT_RETRIES`] (`3`).",
+          "description": "Connection-level retry budget. The transport retries the initial connection up to this many times before surfacing an error.\n\nDefault: [`GRPC_DEFAULT_CONNECT_RETRIES`] (`3`).",
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
@@ -91,6 +91,27 @@
         "endpoint": {
           "description": "gRPC server endpoint. Must be `http://host:port` (plaintext) or `https://host:port` (TLS). Must be non-empty.\n\nDefault: [`GRPC_DEFAULT_ENDPOINT`] (`\"http://localhost:50051\"`).",
           "type": "string"
+        },
+        "keepalive_interval_ms": {
+          "description": "HTTP/2 keepalive ping interval in milliseconds. `0` disables pings.\n\nDefault: [`GRPC_DEFAULT_KEEPALIVE_INTERVAL_MS`] (`20_000`, 20 s).",
+          "default": 20000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "keepalive_timeout_ms": {
+          "description": "HTTP/2 keepalive ping timeout in milliseconds. The connection is closed if the peer does not respond within this window.\n\nDefault: [`GRPC_DEFAULT_KEEPALIVE_TIMEOUT_MS`] (`5_000`, 5 s).",
+          "default": 5000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_message_bytes": {
+          "description": "Maximum gRPC message size in bytes (both encoding and decoding).\n\nDefault: [`GRPC_DEFAULT_MAX_MESSAGE_BYTES`] (`4_194_304`, 4 MiB).",
+          "default": 4194304,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
         },
         "timeout_ms": {
           "description": "Per-call timeout in milliseconds.\n\nDefault: [`GRPC_DEFAULT_TIMEOUT_MS`] (`30_000`, 30 s).",
@@ -159,14 +180,14 @@
       "additionalProperties": false
     },
     "MockConfig": {
-      "description": "Configuration for the mock (in-memory loopback) transport.\n\nUse this transport in unit tests where you want to assert what was published without touching a network. `wyrd-client::transport::mock` records every flushed envelope into an in-memory buffer keyed by [`MockConfig::label`] and provides `mock::drain(label)` to retrieve flushed records.\n\nThe mock transport is always available in `wyrd-client` (no feature gate). `MockConfig::fail_on_flush` lets tests inject deterministic flush failures - a Wyrd-native addition the predecessor mock did not support.\n\n# Default\n\n`MockConfig::default()` returns `{ label: \"default\", fail_on_flush: None }`. The default is a working config - it does not need `validate()` and is safe to use directly in tests that do not care about label isolation.",
+      "description": "Configuration for the mock (in-memory loopback) transport.\n\nUse this transport in unit tests where you want to assert what was published without touching a network. `wyrd-client::transport::mock` records every flushed envelope into an in-memory buffer keyed by [`MockConfig::label`] and provides `mock::drain(label)` to retrieve flushed records.\n\nThe mock transport is always available in `wyrd-client` (no feature gate). `MockConfig::fail_on_flush` lets tests inject deterministic flush failures — a Wyrd-native addition the predecessor mock did not support.\n\n# Default\n\n`MockConfig::default()` returns `{ label: \"default\", fail_on_flush: None }`. The default is a working config — it does not need `validate()` and is safe to use directly in tests that do not care about label isolation.",
       "type": "object",
       "required": [
         "label"
       ],
       "properties": {
         "fail_on_flush": {
-          "description": "Inject a flush failure. When `Some(n)`, the `nth` call to `Flushable::flush` returns `Err`; all other calls succeed normally. Counting starts from 1 (i.e. `Some(1)` fails the first flush). `Some(0)` is treated equivalently to `None` (the counter starts at 1 after increment, so the 0th call never matches). `None` means the mock always succeeds.",
+          "description": "Inject a flush failure. When `Some(n)`, the `nth` call to flush returns `Err`; all other calls succeed normally. Counting starts from 1 (i.e. `Some(1)` fails the first flush). `None` means the mock always succeeds.",
           "type": [
             "integer",
             "null"

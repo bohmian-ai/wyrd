@@ -49,6 +49,11 @@ const HEADER_IDEMPOTENCY_KEY: &str = "Idempotency-Key";
 const HEADER_SCHEMA_FINGERPRINT: &str = "X-Wyrd-Schema-Fingerprint";
 #[cfg(feature = "transport-http")]
 const HEADER_ROW_COUNT: &str = "X-Wyrd-Row-Count";
+/// Wyrd access-token header. The server authenticates data-plane requests from
+/// this header only; the application's own `Authorization` header is reserved
+/// for the embedding app and is never read or written by Wyrd.
+#[cfg(feature = "transport-http")]
+const HEADER_WYRD_ACCESS_TOKEN: &str = "x-wyrd-access-token";
 
 /// Async `reqwest` HTTP transport for Wyrd read and admin paths.
 ///
@@ -102,7 +107,7 @@ impl HttpTransport {
 
     /// Send a JSON request and decode the JSON response body.
     ///
-    /// Injects `Authorization: Bearer <token>` and a minted `wyrd-request-id`
+    /// Injects `x-wyrd-access-token: Bearer <token>` and a minted `wyrd-request-id`
     /// on every attempt. Retries on `408`, `429`, `5xx`, and connect/timeout
     /// errors (up to 3 attempts with exponential backoff 100 ms → 1 s). A
     /// single `401` triggers exactly one [`AuthMiddleware::force_refresh`] and
@@ -253,7 +258,7 @@ impl HttpTransport {
             let mut req = self
                 .client
                 .request(method.clone(), url)
-                .header("Authorization", format!("Bearer {}", bearer.expose()))
+                .header(HEADER_WYRD_ACCESS_TOKEN, format!("Bearer {}", bearer.expose()))
                 .header(HEADER_REQUEST_ID, request_id);
 
             if let Some(key) = idempotency_key {

@@ -371,7 +371,7 @@
 
   /* ============ §7 LOUD — hero / landing ============ */
   .l-bar{height:8px;background:linear-gradient(90deg,var(--client-bar) 0 33.3%,var(--server-bar) 33.3% 66.6%,var(--control-bar) 66.6% 100%)}
-  .l-pad{padding:24px 24px 28px;position:relative}
+  .l-pad{padding:24px 24px 28px;position:relative;min-height:392px;overflow:hidden}
   .l-wm{font-family:var(--fh);font-size:17px;letter-spacing:-.3px;display:inline-flex;align-items:center;gap:7px}
   .l-wm i{width:9px;height:9px;border-radius:50%;background:var(--lime)}
   .l-orn{float:right;font-family:var(--fm);font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--rune-strong);
@@ -391,6 +391,23 @@
   .l-cta:hover{transform:translate(-2px,-2px);box-shadow:9px 9px 0 0 var(--shadow)}
   .l-cta:active{transform:translate(3px,3px);box-shadow:2px 2px 0 0 var(--shadow)}
   .l-cta2{background:var(--rune-btn);color:var(--rune-btn-ink);margin-left:10px}
+  /* §7 background scene — "The Plane": grid horizon = Wyrd's three planes. Zero-blur. */
+  .l-content{position:relative;z-index:1}
+  .l-scene{position:absolute;inset:0;z-index:0}
+  .surface[data-mode="light"] .l-scene{--sky-top:#edeaf4;--sky-bot:#e0d8f2;--grid:#7c3aed;--star:#7c3aed}
+  .surface[data-mode="dark"]  .l-scene{--sky-top:#0d0d15;--sky-bot:#191033;--grid:#a78bfa;--star:#d6d6dc}
+  .l-sky{position:absolute;inset:0;
+    background-image:
+      repeating-linear-gradient(0deg,#0b0b0e0f 0 2px,transparent 2px 4px),
+      repeating-linear-gradient(90deg,#0b0b0e0f 0 2px,transparent 2px 4px),
+      linear-gradient(var(--sky-top),var(--sky-bot));
+    background-size:4px 4px,4px 4px,100% 100%}
+  .l-stars{position:absolute;left:0;right:0;top:0;height:54%}
+  .l-sun{position:absolute;right:8%;top:54%;transform:translateY(-84%);width:104px;height:104px;z-index:1}
+  .l-sun .fuji{width:100%;height:100%}
+  .l-sun .fuji .p{fill:var(--rune-strong)} .l-sun .fuji .c{fill:var(--lime)}
+  .l-horizon{position:absolute;left:0;right:0;bottom:46%;height:3px;background:var(--border);z-index:2}
+  .l-grid{position:absolute;left:0;right:0;bottom:0;width:100%;height:46%;z-index:2}
 
   /* ============ §8 ARCADE — attract mode (exploratory retro register) ============ */
   .arc{padding:18px 16px;display:grid;gap:16px}
@@ -603,18 +620,27 @@
   <div>
     <div class="l-bar"></div>
     <div class="l-pad">
-      <span class="l-orn"><svg class="fuji" viewBox="0 0 100 100" aria-hidden="true" style="width:13px;height:13px;display:inline-block;vertical-align:-2px;margin-right:5px"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>mitari</span>
-      <span class="l-wm"><svg class="fuji" viewBox="0 0 100 100" aria-hidden="true" style="width:16px;height:16px"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>MITARI<i></i></span>
-      <div><span class="l-hero dither">MITARI SYSTEM</span></div>
-      <p class="l-tag">Neobrutalism for the agentic stack. <b>One geometry. Two modes. Zero blur.</b></p>
-      <div class="l-stats">
-        <div class="l-stat"><div class="n">24</div><div class="k">Components</div></div>
-        <div class="l-stat"><div class="n">2</div><div class="k">Modes</div></div>
-        <div class="l-stat"><div class="n">3</div><div class="k">Altitudes</div></div>
+      <div class="l-scene" aria-hidden="true">
+        <div class="l-sky"></div>
+        <svg class="l-stars" viewBox="0 0 600 118" preserveAspectRatio="xMidYMid slice"></svg>
+        <div class="l-sun"><svg class="fuji" viewBox="0 0 100 100"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg></div>
+        <div class="l-horizon"></div>
+        <svg class="l-grid" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
       </div>
-      <div>
-        <button class="l-cta">▶ PRESS START</button>
-        <button class="l-cta l-cta2">INSERT COIN</button>
+      <div class="l-content">
+        <span class="l-orn"><svg class="fuji" viewBox="0 0 100 100" aria-hidden="true" style="width:13px;height:13px;display:inline-block;vertical-align:-2px;margin-right:5px"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>mitari</span>
+        <span class="l-wm"><svg class="fuji" viewBox="0 0 100 100" aria-hidden="true" style="width:16px;height:16px"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>MITARI<i></i></span>
+        <div><span class="l-hero">MITARI SYSTEM</span></div>
+        <p class="l-tag">Neobrutalism for the agentic stack. <b>One geometry. Two modes. Zero blur.</b></p>
+        <div class="l-stats">
+          <div class="l-stat"><div class="n">24</div><div class="k">Components</div></div>
+          <div class="l-stat"><div class="n">2</div><div class="k">Modes</div></div>
+          <div class="l-stat"><div class="n">3</div><div class="k">Altitudes</div></div>
+        </div>
+        <div>
+          <button class="l-cta">▶ PRESS START</button>
+          <button class="l-cta l-cta2">INSERT COIN</button>
+        </div>
       </div>
     </div>
   </div>
@@ -937,6 +963,23 @@
   mount('analytics-cols', mode=>{ const s=document.createElement('div'); s.className='surface'; s.dataset.mode=mode; s.innerHTML=analyticsHTML(); return s; });
   mount('traces-cols', mode=>{ const s=document.createElement('div'); s.className='surface'; s.dataset.mode=mode; s.innerHTML=tracesHTML(); return s; });
   mount('panels-cols', mode=>{ const s=document.createElement('div'); s.className='surface'; s.dataset.mode=mode; s.innerHTML=panelsHTML(); return s; });
+
+  // §7 hero scene — "The Plane": tricolor perspective grid + starfield (dark only)
+  function heroGrid(){
+    const W=600,H=200,cx=300; let s='';
+    s+=`<polygon points="${cx},0 0,${H} ${W/3},${H}" fill="var(--client)" opacity=".20"/>`;
+    s+=`<polygon points="${cx},0 ${W/3},${H} ${2*W/3},${H}" fill="var(--server)" opacity=".15"/>`;
+    s+=`<polygon points="${cx},0 ${2*W/3},${H} ${W},${H}" fill="var(--control)" opacity=".22"/>`;
+    for (let i=-4;i<=16;i++){ const x=i*50; s+=`<line x1="${cx}" y1="0" x2="${x}" y2="${H}" stroke="var(--grid)" stroke-width="1.3" opacity=".5"/>`; }
+    [2.1,7.8,16.9,29.2,44.7,63.2,84.7,109.2,136.6,166.9,200].forEach(y=>{ s+=`<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="var(--grid)" stroke-width="1.3" opacity=".5"/>`; });
+    return s;
+  }
+  function heroStars(){ let s='',seed=97; const rnd=()=>(seed=(seed*16807)%2147483647)/2147483647;
+    for (let i=0;i<46;i++){ const x=(rnd()*600)|0,y=(rnd()*118)|0,sz=rnd()<.18?2:1; s+=`<rect x="${x}" y="${y}" width="${sz}" height="${sz}" fill="var(--star)"/>`; } return s; }
+  document.querySelectorAll('#loud-cols .surface').forEach(s=>{
+    const g=s.querySelector('.l-grid'); if (g) g.innerHTML=heroGrid();
+    const st=s.querySelector('.l-stars'); if (st && s.dataset.mode==='dark') st.innerHTML=heroStars();
+  });
 </script>
 </body>
 </html>

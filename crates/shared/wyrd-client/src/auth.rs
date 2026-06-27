@@ -80,6 +80,11 @@ pub struct AuthMiddleware {
     http_client: reqwest::Client,
     cache: Mutex<Option<CachedToken>>,
     cache_mode: TokenCacheMode,
+    /// Resolved on-disk token-cache path, computed once at construction in
+    /// [`TokenCacheMode::Disk`] mode (`None` otherwise). Resolving here — rather
+    /// than reading `~`/`HOME` on every persist — keeps the path stable and lets
+    /// tests inject a unique path without mutating the process environment.
+    cache_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for AuthMiddleware {
@@ -107,6 +112,22 @@ impl AuthMiddleware {
         config: &ClientConfig,
         credential: ResolvedCredential,
     ) -> Result<Arc<Self>, WyrdClientError> {
+        let cache_path = if config.token_cache == TokenCacheMode::Disk {
+            token_cache_path()
+        } else {
+            None
+        };
+        Self::build(config, credential, cache_path)
+    }
+
+    /// Construct from a resolved cache path. `new` resolves the production
+    /// `~/.config/wyrd/token_cache.json`; tests inject a unique path so they
+    /// never touch the process environment (and stay parallel-safe).
+    fn build(
+        config: &ClientConfig,
+        credential: ResolvedCredential,
+        cache_path: Option<PathBuf>,
+    ) -> Result<Arc<Self>, WyrdClientError> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_millis(config.http.timeout_ms))
             .build()
@@ -115,11 +136,7 @@ impl AuthMiddleware {
                 reason: err.to_string(),
             })?;
 
-        let initial = if config.token_cache == TokenCacheMode::Disk {
-            load_disk_record()
-        } else {
-            None
-        };
+        let initial = cache_path.as_deref().and_then(load_disk_record);
 
         Ok(Arc::new(Self {
             credential,
@@ -127,7 +144,19 @@ impl AuthMiddleware {
             http_client,
             cache: Mutex::new(initial),
             cache_mode: config.token_cache.clone(),
+            cache_path,
         }))
+    }
+
+    /// Test-only constructor that injects an explicit token-cache path,
+    /// avoiding any `HOME`/`~` resolution so disk-cache tests are hermetic.
+    #[cfg(test)]
+    fn new_with_cache_path(
+        config: &ClientConfig,
+        credential: ResolvedCredential,
+        cache_path: Option<PathBuf>,
+    ) -> Result<Arc<Self>, WyrdClientError> {
+        Self::build(config, credential, cache_path)
     }
 
     /// Return the current access token, exchanging or refreshing as needed.
@@ -255,8 +284,8 @@ impl AuthMiddleware {
         if self.cache_mode != TokenCacheMode::Disk {
             return;
         }
-        if let Some(path) = token_cache_path() {
-            let _ = write_disk_record(&path, entry);
+        if let Some(path) = self.cache_path.as_deref() {
+            let _ = write_disk_record(path, entry);
         }
     }
 }
@@ -283,10 +312,9 @@ fn token_cache_path() -> Option<PathBuf> {
     Some(PathBuf::from(expanded.as_ref()))
 }
 
-/// Load a non-stale token record from disk, if present. Best-effort.
-fn load_disk_record() -> Option<CachedToken> {
-    let path = token_cache_path()?;
-    let content = std::fs::read_to_string(&path).ok()?;
+/// Load a non-stale token record from the given path, if present. Best-effort.
+fn load_disk_record(path: &std::path::Path) -> Option<CachedToken> {
+    let content = std::fs::read_to_string(path).ok()?;
     let record: DiskTokenRecord = serde_json::from_str(&content).ok()?;
     let entry = CachedToken {
         access_token: record.access_token,
@@ -564,28 +592,27 @@ mod tests {
 
     #[tokio::test]
     async fn disk_cache_writes_secure_record_without_refresh_token() {
-        let home = std::env::temp_dir().join(format!(
+        // Inject a unique cache path instead of mutating the global HOME env
+        // var, so the test is hermetic and safe under the parallel workspace
+        // test runner (the production path resolves ~/.config/wyrd).
+        let dir = std::env::temp_dir().join(format!(
             "wyrd_auth_disk_{}_{}",
             std::process::id(),
             Uuid::now_v7()
         ));
-        std::fs::create_dir_all(&home).expect("temp home");
-
-        // SAFETY: single-threaded test runner (--test-threads=1).
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("token_cache.json");
 
         let mock = spawn_mock("HTTP/1.1 200 OK", token_body("disk-access", 3600)).await;
-        let mw = AuthMiddleware::new(
+        let mw = AuthMiddleware::new_with_cache_path(
             &config_for(mock.base_url.clone(), TokenCacheMode::Disk),
             api_key_credential(),
+            Some(path.clone()),
         )
         .expect("middleware builds");
 
         let _ = mw.bearer().await.expect("exchange ok");
 
-        let path = home.join(".config/wyrd/token_cache.json");
         let metadata = std::fs::metadata(&path).expect("token cache file exists");
 
         #[cfg(unix)]
@@ -608,11 +635,7 @@ mod tests {
             "refresh token must never be written to disk"
         );
 
-        // SAFETY: single-threaded test runner (--test-threads=1).
-        unsafe {
-            std::env::remove_var("HOME");
-        }
-        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

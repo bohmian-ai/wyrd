@@ -959,7 +959,7 @@ snapshot_codegen() {
   {
     test -f openapi.yaml && printf '%s\n' openapi.yaml
     find crates/wyrd-spec/schemas crates/wyrd-spec/tests/schemas -type f -name '*.json'
-    find crates/wyrd-client/schemas crates/wyrd-client/tests/schemas -type f -name '*.json'
+    find crates/shared/wyrd-client/schemas crates/shared/wyrd-client/tests/schemas -type f -name '*.json'
     find crates/vala/vala-core/schemas crates/vala/vala-core/tests/schemas -type f -name '*.json'
     find python/py-wyrd/python/wyrd -type f -name '*.pyi' \
       ! -path 'python/py-wyrd/python/wyrd/stubs/*'

@@ -14,17 +14,17 @@ path = "src/lib.rs"
 
 [features]
 default = ["transport-grpc", "transport-http"]
-transport-grpc = []
+transport-grpc = ["dep:wyrd-tonic"]
 transport-http = []
-python = ["dep:pyo3"]
 
 [dependencies]
-pyo3 = { workspace = true, optional = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
 wyrd-spec = { workspace = true }
+wyrd-tonic = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

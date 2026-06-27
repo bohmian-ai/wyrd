@@ -1,8 +1,8 @@
 //! Canonical schema generator for `wyrd-client` public types.
 //!
-//! Writes BOTH `crates/wyrd-client/schemas/<name>.json` (published snapshot)
-//! and `crates/wyrd-client/tests/schemas/<name>.json` (test golden) per
-//! type. Invoked by `mise codegen:regen`.
+//! Writes BOTH `crates/shared/wyrd-client/schemas/<name>.json` (published
+//! snapshot) and `crates/shared/wyrd-client/tests/schemas/<name>.json` (test
+//! golden) per type. Invoked by `mise codegen:regen`.
 
 use std::path::Path;
 
@@ -24,14 +24,11 @@ fn main() -> std::io::Result<()> {
     std::fs::create_dir_all(&out)?;
     std::fs::create_dir_all(&golden)?;
 
-    use wyrd_client::transport::{
-        GrpcConfig, HttpConfig, MockConfig, QueueConfig, TransportConfig,
-    };
+    use wyrd_client::transport::{GrpcConfig, HttpConfig, MockConfig, TransportConfig};
 
     write::<TransportConfig>(&out, &golden, "transport_config_enum")?;
     write::<GrpcConfig>(&out, &golden, "transport_config_grpc")?;
     write::<HttpConfig>(&out, &golden, "transport_config_http")?;
     write::<MockConfig>(&out, &golden, "transport_config_mock")?;
-    write::<QueueConfig>(&out, &golden, "transport_queue_config")?;
     Ok(())
 }

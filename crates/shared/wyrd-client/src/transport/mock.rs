@@ -69,13 +69,11 @@ impl MockTransport {
     /// the current call count.
     pub async fn drain(&self, payload: Vec<u8>) -> Result<(), WyrdClientError> {
         let count = self.flush_count.fetch_add(1, Ordering::SeqCst) + 1;
-        if let Some(fail_at) = self.fail_on_flush {
-            if count == fail_at {
-                return Err(WyrdClientError::TransportDown {
-                    transport: "mock".to_owned(),
-                    message: format!("mock transport configured to fail on flush call {fail_at}"),
-                });
-            }
+        if self.fail_on_flush == Some(count) {
+            return Err(WyrdClientError::TransportDown {
+                transport: "mock".to_owned(),
+                message: format!("mock transport configured to fail on flush call {count}"),
+            });
         }
         self.records.lock().await.push(MockRecord { payload });
         Ok(())

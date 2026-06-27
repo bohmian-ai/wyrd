@@ -275,10 +275,10 @@ mod transport_behavior {
     fn extract_header(raw: &str, name: &str) -> Option<String> {
         let lower = name.to_lowercase();
         for line in raw.lines() {
-            if let Some(pos) = line.find(':') {
-                if line[..pos].trim().to_lowercase() == lower {
-                    return Some(line[pos + 1..].trim().to_owned());
-                }
+            if let Some(pos) = line.find(':')
+                && line[..pos].trim().to_lowercase() == lower
+            {
+                return Some(line[pos + 1..].trim().to_owned());
             }
         }
         None

@@ -32,6 +32,7 @@ pub enum TokenCacheMode {
 /// Call [`ClientConfig::from_env`] to build from environment variables with
 /// defaults, then adjust fields as needed before calling
 /// [`ClientConfig::resolve_credential`].
+#[derive(Default)]
 pub struct ClientConfig {
     /// gRPC transport configuration.
     pub grpc: GrpcConfig,
@@ -55,17 +56,6 @@ impl std::fmt::Debug for ClientConfig {
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("token_cache", &self.token_cache)
             .finish()
-    }
-}
-
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self {
-            grpc: GrpcConfig::default(),
-            http: HttpConfig::default(),
-            api_key: None,
-            token_cache: TokenCacheMode::default(),
-        }
     }
 }
 
@@ -259,8 +249,10 @@ mod tests {
 
     #[test]
     fn debug_does_not_leak_api_key() {
-        let mut cfg = ClientConfig::default();
-        cfg.api_key = Some("top-secret".to_owned().into());
+        let cfg = ClientConfig {
+            api_key: Some("top-secret".to_owned().into()),
+            ..Default::default()
+        };
 
         let debug = format!("{cfg:?}");
 

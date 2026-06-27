@@ -16,9 +16,13 @@ fn env_mutex() -> &'static Mutex<()> {
 }
 
 unsafe fn restore_env(name: &str, prior: Option<String>) {
-    match prior {
-        Some(v) => std::env::set_var(name, v),
-        None => std::env::remove_var(name),
+    // SAFETY: callers hold ENV_MUTEX. Rust 2024 requires an explicit inner
+    // `unsafe` block even inside an `unsafe fn` (unsafe_op_in_unsafe_fn).
+    unsafe {
+        match prior {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        }
     }
 }
 
@@ -69,6 +73,10 @@ async fn discovery_against_fixture() {
         restore_env("WYRD_GRPC_URL", prior_grpc_url);
         restore_env("WYRD_API_KEY", prior_api_key);
     }
+
+    // Release the env lock before the await: a std MutexGuard must not be held
+    // across an await point, and shutdown does not touch the environment.
+    drop(_guard);
 
     let _ = srv.shutdown().await;
 }

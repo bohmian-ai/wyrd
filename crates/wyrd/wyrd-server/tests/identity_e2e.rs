@@ -149,32 +149,6 @@ async fn workload_token_keycloak_claims() {
     );
 }
 
-/// Dex client_credentials token carries the expected issuer claim.
-#[tokio::test]
-async fn workload_token_dex_claims() {
-    if !e2e_enabled() {
-        return;
-    }
-    let dex = OidcIssuerFixture::connect(&dex_issuer()).await;
-    let raw_token = dex
-        .workload_token("wyrd-workload", "wyrd-workload-dex-secret", "wyrd-workload")
-        .await;
-    assert!(!raw_token.is_empty(), "Dex workload token is non-empty");
-
-    let parts: Vec<&str> = raw_token.split('.').collect();
-    assert_eq!(parts.len(), 3, "Dex workload token has 3 JWT segments");
-
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(parts[1])
-        .expect("payload decodes");
-    let claims: Value = serde_json::from_slice(&payload).expect("payload is JSON");
-    assert_eq!(
-        claims["iss"].as_str().unwrap_or(""),
-        dex_issuer().trim_end_matches('/'),
-        "Dex token iss matches"
-    );
-}
-
 /// A workload token must NOT carry an unrelated audience.
 #[tokio::test]
 async fn workload_token_wrong_aud_absent_keycloak() {

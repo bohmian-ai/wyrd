@@ -11,7 +11,18 @@ oauth2:
   responseTypes:
     - code
 
-# Static clients for Wyrd test suite
+# The workload journey exchanges client_credentials against the static client below.
+# Dex requires a valid auth source to boot, so the built-in password DB is enabled and
+# seeded with one well-known test user (password: wyrd-test) for the human-login path.
+# Dex has no "local" connector type — local users come from enablePasswordDB/staticPasswords.
+enablePasswordDB: true
+staticPasswords:
+  - email: "alice@wyrd.test"
+    hash: "$2y$10$gFDA1PC55z/bXIwnlLjgbus8HD.iyk8gBE8./6ruVV4AzAMh7.7sS"
+    username: "alice"
+    userID: "dex-alice-0001"
+
+# Static clients for the Wyrd test suite.
 staticClients:
   - id: wyrd-workload
     secret: wyrd-workload-dex-secret
@@ -19,15 +30,3 @@ staticClients:
     public: false
     redirectURIs:
       - http://localhost:8888/callback
-
-# Local password connector for testing human-login conformance
-# Users are created with well-known test password: wyrd-test
-connectors:
-  - type: local
-    id: local
-    name: Email
-    config:
-      # Users are seeded by the dex-init step in the identity:e2e task.
-      # The userDB field is populated via a generated config at task runtime;
-      # this static placeholder demonstrates the config shape only.
-      userDB: []

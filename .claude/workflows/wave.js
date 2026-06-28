@@ -2,14 +2,25 @@
 //
 // The main agent computes waves from tasks.yaml and calls this once per wave,
 // passing the wave's nodes as args. Within a wave, commits are independent, so
-// every node runs in parallel in its own worktree. Between waves, the main agent
-// integrates onto the feature branch (this script has no git/filesystem access).
+// every node runs in parallel — each in a worktree the MAIN AGENT pre-created at
+// the correct base. Between waves, the main agent integrates onto the impl
+// branch (this script has no git/filesystem access).
+//
+// IMPORTANT — worktree base ref: this script does NOT use Workflow's
+// `isolation:'worktree'`. That option branches from the harness default (main),
+// ignoring our base, which would hide prerequisites that live on the feature's
+// base branch (e.g. wyrd-client-identity) and make executors rebuild the crate
+// from scratch. Instead the orchestrator runs `git worktree add <path> <base>`
+// itself — `base` = the impl-branch tip, which descends from the real base
+// branch and includes every prior wave — and passes each task its `worktree`
+// path. Executors operate INSIDE that path and never create or switch worktrees.
 //
 // args = {
 //   featureDir,            // ".dev/plan/<feature>"
-//   base,                  // branch/sha the worktrees should branch from (feature tip)
+//   base,                  // impl-branch tip the orchestrator based the worktrees on (informational)
 //   maxIters,              // sonnet iterate-to-green budget before escalation (default 3)
-//   tasks: [ { id, title, file, model, seams: [..], verify: [..] } ]
+//   tasks: [ { id, title, file, model, worktree, crates: [..], seams: [..], verify: [..] } ]
+//                          //   worktree = absolute path to the pre-created, correctly-based worktree
 // }
 
 export const meta = {
@@ -31,14 +42,36 @@ const RESULT_SCHEMA = {
   },
 }
 
-const maxIters = args.maxIters || 3
+// The Workflow runtime delivers `args` VERBATIM. The orchestrator (an LLM following
+// the wyrd-implement SKILL) routinely serializes it to a JSON STRING in the tool
+// call. On a string, `args.tasks` is undefined and `args.tasks.map(...)` throws
+// "undefined is not an object (evaluating 'args.tasks.map')" at 0s — before any
+// agent spawns. Accept BOTH shapes so the wave can never fail on invocation form.
+const A = typeof args === 'string' ? JSON.parse(args) : (args || {})
+if (!Array.isArray(A.tasks) || A.tasks.length === 0) {
+  throw new Error(
+    'wave.js: args.tasks must be a non-empty array — got ' +
+      (typeof args === 'string'
+        ? 'a JSON string with no usable tasks (pass args as an OBJECT/array, not a stringified one)'
+        : JSON.stringify(A.tasks)) +
+      '. Invoke via the wyrd-implement orchestrator with args = { featureDir, base, tasks: [...] }.'
+  )
+}
+
+const maxIters = A.maxIters || 3
 
 function executorPrompt(t) {
   return [
-    `Implement ONE commit of the Wyrd feature at ${args.featureDir}.`,
-    `Contract: ${args.featureDir}/${t.file}. Read it fully; it is authoritative.`,
-    `You run in a git worktree that has NO codegraph index of its own — that is`,
-    `expected. Hydrate from the main repo's index via the CLI (below); do not try to`,
+    `Implement ONE commit of the Wyrd feature at ${A.featureDir}.`,
+    `Contract: ${A.featureDir}/${t.file}. Read it fully; it is authoritative.`,
+    ``,
+    `Your worktree is ALREADY CREATED at: ${t.worktree}`,
+    `It is correctly based on ${A.base} — all prerequisites (prior commits and`,
+    `the feature's base-branch crates) are present. Prefix EVERY shell command with`,
+    `\`cd ${t.worktree} && …\` so it runs inside the worktree. Do NOT create, switch,`,
+    `or remove worktrees, do NOT git-checkout another branch, and do NOT touch the`,
+    `primary working tree. The worktree has NO codegraph index of its own — that is`,
+    `expected; hydrate from the primary tree's index via the CLI (below). Do not`,
     `build a picture of the codebase by reading files.`,
     ``,
     `Procedure:`,
@@ -73,12 +106,13 @@ function executorPrompt(t) {
 }
 
 const results = await parallel(
-  args.tasks.map((t) => () =>
+  A.tasks.map((t) => () =>
     agent(executorPrompt(t), {
       label: `impl:${t.id}`,
       phase: 'Implement',
       model: t.model || 'sonnet',
-      isolation: 'worktree',
+      // NO isolation:'worktree' — see header. The orchestrator pre-creates each
+      // worktree at the correct base; the executor cd's into t.worktree.
       schema: RESULT_SCHEMA,
     })
   )

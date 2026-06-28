@@ -394,8 +394,8 @@
   /* §7 background scene — "The Plane": grid horizon = Wyrd's three planes. Zero-blur. */
   .l-content{position:relative;z-index:1}
   .l-scene{position:absolute;inset:0;z-index:0}
-  .surface[data-mode="light"] .l-scene{--sky-top:#edeaf4;--sky-bot:#e0d8f2;--grid:#7c3aed;--star:#7c3aed}
-  .surface[data-mode="dark"]  .l-scene{--sky-top:#0d0d15;--sky-bot:#191033;--grid:#a78bfa;--star:#d6d6dc}
+  .surface[data-mode="light"] .l-scene{--sky-top:#edeaf4;--sky-bot:#e0d8f2;--grid:#7c3aed;--star:#7c3aed;--spr-d:#9b78e0}
+  .surface[data-mode="dark"]  .l-scene{--sky-top:#0d0d15;--sky-bot:#191033;--grid:#a78bfa;--star:#d6d6dc;--spr-d:#6f54b8}
   .l-sky{position:absolute;inset:0;
     background-image:
       repeating-linear-gradient(0deg,#0b0b0e0f 0 2px,transparent 2px 4px),
@@ -408,6 +408,21 @@
   .l-sun .fuji .p{fill:var(--rune-strong)} .l-sun .fuji .c{fill:var(--lime)}
   .l-horizon{position:absolute;left:0;right:0;bottom:46%;height:3px;background:var(--border);z-index:2}
   .l-grid{position:absolute;left:0;right:0;bottom:0;width:100%;height:46%;z-index:2}
+  /* side-profile agent patrolling The Line — pixel sprite, zero-blur, reduced-motion-safe */
+  .l-walker{position:absolute;bottom:calc(46% - 4px);left:18%;z-index:3;height:28px;pointer-events:none}
+  .l-walker .spr{display:block;height:28px;width:auto}
+  .spr-stack{position:relative}
+  .spr-b{position:absolute;inset:0;opacity:0}
+  @media (prefers-reduced-motion:no-preference){
+    .l-walker{animation:patrol 22s ease-in-out infinite}
+    .spr-flip{display:inline-block;animation:face 22s steps(1) infinite}
+    .spr-a{animation:legA .44s steps(1) infinite}
+    .spr-b{animation:legB .44s steps(1) infinite}
+  }
+  @keyframes patrol{0%{left:6%}47%{left:70%}50%{left:70%}97%{left:6%}100%{left:6%}}
+  @keyframes face{0%,49%{transform:scaleX(1)}50%,100%{transform:scaleX(-1)}}
+  @keyframes legA{0%,49%{opacity:1}50%,99%{opacity:0}}
+  @keyframes legB{0%,49%{opacity:0}50%,99%{opacity:1}}
 
   /* ============ §8 ARCADE — attract mode (exploratory retro register) ============ */
   .arc{padding:18px 16px;display:grid;gap:16px}
@@ -626,6 +641,7 @@
         <div class="l-sun"><svg class="fuji" viewBox="0 0 100 100"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg></div>
         <div class="l-horizon"></div>
         <svg class="l-grid" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
+        <div class="l-walker"><div class="spr-flip"><div class="spr-stack"><div class="spr-a"></div><div class="spr-b"></div></div></div></div>
       </div>
       <div class="l-content">
         <span class="l-orn"><svg class="fuji" viewBox="0 0 100 100" aria-hidden="true" style="width:13px;height:13px;display:inline-block;vertical-align:-2px;margin-right:5px"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>mitari</span>
@@ -976,9 +992,17 @@
   }
   function heroStars(){ let s='',seed=97; const rnd=()=>(seed=(seed*16807)%2147483647)/2147483647;
     for (let i=0;i<46;i++){ const x=(rnd()*600)|0,y=(rnd()*118)|0,sz=rnd()<.18?2:1; s+=`<rect x="${x}" y="${y}" width="${sz}" height="${sz}" fill="var(--star)"/>`; } return s; }
+  // side-profile armored agent — helmet + lime visor, backpack, forward arm-cannon, depth-shaded stride
+  const SPR_TOP=["................",".....VVVVV......","....VVVVVVV.....","....VVVVLLV.....","...DVVVVVVV.....","...DVVVVVVV.....","...DVVVVVVVVLL..","...DVVVVVVVVLL..","....VVVVVVV.....","....VVVVVV......","....VVVVVV......"];
+  const SPR_A=SPR_TOP.concat(["....VVVVVV......","...DDDVVVV......","..DD...VVV......",".DD....VVVV.....",".DD.....VVV....."]);
+  const SPR_B=SPR_TOP.concat(["....VVVVVV......","....VVVVVV......","....DDVVV.......","....DDVVV.......","...DDDVVVV......"]);
+  function spriteSVG(map){const C={'V':'var(--rune-strong)','D':'var(--spr-d)','L':'var(--lime)'}; let r=''; map.forEach((row,y)=>[...row].forEach((ch,x)=>{ if(C[ch]) r+=`<rect x="${x}" y="${y}" width="1.04" height="1.04" fill="${C[ch]}"/>`; })); return `<svg class="spr" viewBox="0 0 16 16" shape-rendering="crispEdges">${r}</svg>`;}
   document.querySelectorAll('#loud-cols .surface').forEach(s=>{
     const g=s.querySelector('.l-grid'); if (g) g.innerHTML=heroGrid();
     const st=s.querySelector('.l-stars'); if (st && s.dataset.mode==='dark') st.innerHTML=heroStars();
+    const wa=s.querySelector('.spr-a'), wb=s.querySelector('.spr-b');
+    if (wa) wa.innerHTML=spriteSVG(SPR_A);
+    if (wb) wb.innerHTML=spriteSVG(SPR_B);
   });
 </script>
 </body>

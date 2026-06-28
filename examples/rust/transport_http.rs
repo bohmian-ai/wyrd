@@ -1,9 +1,9 @@
-//! Configure a Wyrd queue with the HTTP fallback transport.
+//! Configure the HTTP fallback transport for a Wyrd client.
 //!
 //! Run with:
 //!     cargo run -p wyrd-rust-examples --bin transport_http
 
-use wyrd_client::transport::{HttpConfig, QueueConfig, TransportConfig};
+use wyrd_client::transport::{HttpConfig, TransportConfig};
 use wyrd_spec::security::{SecretRef, TlsConfig};
 
 fn main() -> anyhow::Result<()> {
@@ -19,22 +19,19 @@ fn main() -> anyhow::Result<()> {
             server_name_override: None,
             insecure_skip_verify: false,
         }),
-        auth: Some(SecretRef::Env {
-            name: "WYRD_API_KEY".to_string(),
-        }),
         compression: true,
     };
     http.validate()?;
 
-    let queue = QueueConfig {
-        transport: TransportConfig::Http(http),
-        ..QueueConfig::default()
-    };
-    queue.validate()?;
+    let transport = TransportConfig::Http(http);
+    transport.validate()?;
 
-    let json = serde_json::to_string_pretty(&queue)?;
-    let round_trip: QueueConfig = serde_json::from_str(&json)?;
-    anyhow::ensure!(round_trip == queue, "queue config did not round-trip");
+    let json = serde_json::to_string_pretty(&transport)?;
+    let round_trip: TransportConfig = serde_json::from_str(&json)?;
+    anyhow::ensure!(
+        round_trip == transport,
+        "transport config did not round-trip"
+    );
     println!("{json}");
     Ok(())
 }

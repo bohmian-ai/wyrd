@@ -34,10 +34,6 @@ name = "transport_mock"
 path = "transport_mock.rs"
 
 [[bin]]
-name = "transport_queue_policy"
-path = "transport_queue_policy.rs"
-
-[[bin]]
 name = "transport_secrets"
 path = "transport_secrets.rs"
 
@@ -77,8 +73,13 @@ path = "workflow_structured_output.rs"
 name = "workflow_with_observer"
 path = "workflow_with_observer.rs"
 
+[[bin]]
+name = "client_request"
+path = "client_request.rs"
+
 [dependencies]
 anyhow = "1"
+reqwest = { workspace = true }
 async-trait = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-stdout = { version = "0.27", features = ["trace"] }

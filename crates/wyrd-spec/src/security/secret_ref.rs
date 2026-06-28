@@ -10,13 +10,16 @@
 //!
 //! ## Schema-generation contract
 //!
-//! `SecretRef` derives `JsonSchema`. When generated WITHOUT the `test-utils`
-//! feature, the `Inline` variant is absent from the schema — this is the
-//! committed public-schema shape. Generating with `test-utils` would expose
-//! the test-only variant; the committed `examples/gen_schemas.rs` MUST NOT
-//! enable `test-utils`. See commit 8 for the schema-drift gate and the
-//! no-`test-utils` integration test that asserts `{"source":"inline"}` is
-//! rejected by serde when the variant does not exist.
+//! `SecretRef` derives `JsonSchema`. The `Inline` variant carries
+//! `#[schemars(skip)]`, so it is absent from the generated schema in EVERY
+//! build configuration — including test builds where `test-utils` is active
+//! through feature unification (e.g. a downstream crate's `wyrd-testing`
+//! dev-dependency). The committed public-schema shape therefore never contains
+//! the test-only variant, and an in-process `schema_for!` (as the schema-drift
+//! gate uses) produces the same clean shape regardless of features. See commit
+//! 8 for the schema-drift gate and the no-`test-utils` integration test that
+//! asserts `{"source":"inline"}` is rejected by serde when the variant does not
+//! exist in a production build.
 
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +82,7 @@ pub enum SecretRef {
     ///
     /// Example: `{"source": "inline", "value": "supersecret"}`.
     #[cfg(any(test, feature = "test-utils"))]
+    #[schemars(skip)]
     Inline {
         /// The plaintext secret value. Wrapped in [`InlineSecret`] so it is
         /// redacted in `Debug` output and never accidentally logged or hashed.
@@ -156,9 +160,10 @@ impl schemars::JsonSchema for InlineSecret {
     }
 
     fn json_schema(schema_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        // Opaque string. The variant is excluded from generated schema goldens
-        // because gen_schemas runs without `test-utils`; this impl exists only
-        // to satisfy the `#[derive(JsonSchema)]` on `SecretRef` in test builds.
+        // Opaque string. The `SecretRef::Inline` variant carries
+        // `#[schemars(skip)]`, so this impl is never reached during schema
+        // generation; it exists only to satisfy the `#[derive(JsonSchema)]` on
+        // `SecretRef` in test builds where the variant's field type must resolve.
         // NOTE: parameter is `schema_gen`, not `gen`, because `gen` is a
         // reserved keyword in Rust 2024 (wyrd-spec is on the 2024 edition).
         // The type path uses the `r#gen` raw identifier for the same reason —

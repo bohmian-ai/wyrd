@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HttpConfig",
+  "description": "Configuration for the HTTP transport.\n\nThe HTTP transport is a fallback for environments where gRPC is unavailable or blocked. Ingest routes are appended by the client at call time; `base_url` is the common prefix.\n\nThis config carries transport wiring only. Authentication is owned by `AuthMiddleware`, which injects the `x-wyrd-access-token` credential per call; there is no auth field here.",
+  "type": "object",
+  "properties": {
+    "base_url": {
+      "description": "Base URL for all ingest routes. Must be non-empty. Ingest routes (`/api/v1/observations`, `/api/v1/records`, etc.) are appended at call time.\n\nExample: `\"https://wyrd-ingest.example.com\"`. Default: [`HTTP_DEFAULT_BASE_URL`] (`\"http://localhost:50050\"`).",
+      "default": "http://localhost:50050",
+      "type": "string"
+    },
+    "compression": {
+      "description": "Whether to gzip-compress request bodies. Useful for high-volume payloads; the server must accept `Content-Encoding: gzip`.\n\nDefault: `false`.",
+      "default": false,
+      "type": "boolean"
+    },
+    "timeout_ms": {
+      "description": "Request timeout in milliseconds.\n\nDefault: [`HTTP_DEFAULT_TIMEOUT_MS`] (`30_000`, 30 s).",
+      "default": 30000,
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "tls": {
+      "description": "Optional TLS configuration. When `None`, the system CA pool is used and the scheme in `base_url` governs whether TLS is active.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/TlsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "SecretRef": {
+      "description": "Pointer into a Wyrd runtime secret source. Production builds support environment variables, mounted files, and external secret-manager keys.",
+      "oneOf": [
+        {
+          "description": "An environment variable name. The runtime reads `std::env::var(name)` at connect time. Conventionally `SCREAMING_SNAKE_CASE`.\n\nExample: `{\"source\": \"env\", \"name\": \"WYRD_SECRET_API_KEY\"}`.",
+          "type": "object",
+          "required": [
+            "name",
+            "source"
+          ],
+          "properties": {
+            "name": {
+              "description": "Environment variable name. Must be non-empty.",
+              "type": "string"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "env"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "An absolute path to a file on the local filesystem. Kubernetes Secret volume mounts land here.\n\nExample: `{\"source\": \"file\", \"path\": \"/var/run/secrets/wyrd/api-key\"}`.",
+          "type": "object",
+          "required": [
+            "path",
+            "source"
+          ],
+          "properties": {
+            "path": {
+              "description": "Absolute path to a file whose contents are the secret value. Must be non-empty.",
+              "type": "string"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "file"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A backend-agnostic key in an external secret manager (HashiCorp Vault, AWS Secrets Manager, Google Secret Manager). The Wyrd auth shell maps the key to the configured backend.\n\nExample: `{\"source\": \"vault\", \"key\": \"secret/data/wyrd/api-key\"}`.",
+          "type": "object",
+          "required": [
+            "key",
+            "source"
+          ],
+          "properties": {
+            "key": {
+              "description": "Backend-agnostic key path. Interpretation is backend-specific.",
+              "type": "string"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "vault"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TlsConfig": {
+      "description": "TLS configuration for a transport connection.\n\nAll certificate fields are optional; an absent field means \"use the system default / skip that verification step\". Setting `insecure_skip_verify` to `true` disables peer certificate validation and SHOULD NOT be used outside local development.",
+      "type": "object",
+      "properties": {
+        "ca_cert": {
+          "description": "PEM-encoded CA certificate bundle. When set, overrides the system CA pool for this connection.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_cert": {
+          "description": "PEM-encoded client certificate for mTLS. Must be paired with `client_key`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key": {
+          "description": "PEM-encoded client private key for mTLS. Must be paired with `client_cert`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "insecure_skip_verify": {
+          "description": "Disable peer certificate verification. Defaults to `false`.\n\n**WARNING:** setting this to `true` opens the connection to man-in-the-middle attacks. Use only in local development.",
+          "default": false,
+          "type": "boolean"
+        },
+        "server_name_override": {
+          "description": "Override the server name used in SNI and certificate verification. Useful when the server's certificate CN does not match the address in `endpoint`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

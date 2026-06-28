@@ -235,6 +235,19 @@ impl WyrdTestServer {
         }
     }
 
+    /// Return the gRPC endpoint URL when bound to a real socket.
+    ///
+    /// The harness binds a single TCP socket today; this derives the gRPC URL
+    /// from that same address so `WYRD_GRPC_URL` and `WYRD_SERVER_URL` point
+    /// to the same host:port until the harness grows a dedicated gRPC listener.
+    #[must_use]
+    pub fn grpc_url(&self) -> Option<String> {
+        match &self.mode {
+            Mode::Bound { addr, .. } => Some(format!("http://{addr}")),
+            Mode::InProcess => None,
+        }
+    }
+
     /// Return the placeholder API key (full bootstrap is complex).
     #[must_use]
     pub fn api_key(&self) -> &SecretString {

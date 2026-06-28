@@ -36,15 +36,25 @@ const NODE_SCHEMA = {
 }
 
 // args = { featureDir, nodes: [{id, title, depends_on, cratesHint}] }
-const nodes = await parallel(args.nodes.map((n) => () =>
+//
+// The Workflow runtime delivers `args` VERBATIM, and the orchestrator routinely
+// serializes it to a JSON STRING in the tool call. On a string, `args.nodes` is
+// undefined and `.map(...)` throws "undefined is not an object" at 0s — before any
+// agent spawns. Normalize so both an object and a stringified payload work.
+const A = typeof args === 'string' ? JSON.parse(args) : (args || {})
+
+// MIND THE PARENS: `await parallel(...).filter(...)` parses as
+// `await (parallel(...).filter(...))` — `.filter` runs on the *Promise*, not the
+// resolved array, and throws. Wrap the await first: `(await parallel(...)).filter`.
+const nodes = (await parallel(A.nodes.map((n) => () =>
   agent(
     `You are generating ONE thin task contract for commit ${n.id} (${n.title}) of ` +
-    `the Wyrd feature at ${args.featureDir}.\n` +
-    `1. Read ${args.featureDir}/spec.md and ${args.featureDir}/plan.md for the ` +
+    `the Wyrd feature at ${A.featureDir}.\n` +
+    `1. Read ${A.featureDir}/spec.md and ${A.featureDir}/plan.md for the ` +
     `   decisions and this commit's row in the DAG. Do NOT reopen decisions.\n` +
     `2. Use codegraph_explore to identify the seams this commit reuses or must ` +
     `   avoid. Record them as SYMBOLS, never file:line.\n` +
-    `3. Write ${args.featureDir}/tasks/${n.id}-${n.title}.md using the thin-task ` +
+    `3. Write ${A.featureDir}/tasks/${n.id}-${n.title}.md using the thin-task ` +
     `   format: goal, binding decisions, seams & invariants, approach, ` +
     `   acceptance, verify, done-when. 40-70 lines. No rendered code.\n` +
     `4. Return the tasks.yaml node fields (id, crates, seams, model, verify). ` +
@@ -56,6 +66,12 @@ const nodes = await parallel(args.nodes.map((n) => () =>
 
 return { nodes }
 ```
+
+**Invoking this Workflow:** pass `args` as an actual JSON **object** (`{ featureDir,
+nodes: [...] }`), never a JSON-encoded string. The runtime hands `args` to the
+script verbatim; a stringified payload arrives as a `string`, `args.nodes` is
+`undefined`, and the fan-out crashes at 0s. The `const A = …JSON.parse…` line above
+tolerates a string defensively, but the call site should still pass an object.
 
 The main agent then merges the returned node fields into `tasks.yaml` (preserving
 `depends_on` from the skeleton) and validates per the schema.

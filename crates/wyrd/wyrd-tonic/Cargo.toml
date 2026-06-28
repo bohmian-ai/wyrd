@@ -3,9 +3,12 @@ name = "wyrd-tonic"
 version = "0.0.1"
 edition = "2021"
 
+# tonic's default features pull `transport` → `server` → `router` → axum. We take
+# only the client-safe surface here so client-tier consumers (wyrd-client) never
+# inherit the server stack; the `server` feature below opts back into `tonic/server`.
 [dependencies]
-tonic = { workspace = true }
-tonic-health = { workspace = true }
+tonic = { workspace = true, features = ["channel", "tls", "tls-native-roots"] }
+tonic-types = { workspace = true }
 prost = { workspace = true }
 wyrd-spec = { workspace = true }
 serde_json = { workspace = true }
@@ -15,10 +18,14 @@ tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
+[dependencies.tonic-health]
+workspace = true
+optional = true
+
 [dependencies.tonic-reflection]
 workspace = true
 optional = true
 
 [features]
 default = []
-server = ["dep:tonic-reflection"]
+server = ["dep:tonic-reflection", "dep:tonic-health", "tonic/server"]

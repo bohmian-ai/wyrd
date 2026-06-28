@@ -23,43 +23,90 @@ pass straight to code+tests.
 `tasks.yaml`'s `depends_on` edges form a DAG. Compute **topological waves**: a
 wave is the set of `pending` tasks whose dependencies are all `done`.
 
-- **Within a wave:** commits are independent → run in **parallel**, each in its
-  own worktree (`isolation: 'worktree'`).
+- **Within a wave:** commits are independent → run in **parallel**, each in a
+  worktree the **main agent pre-creates at an explicit base** (see the warning
+  below). The executor `cd`s into its assigned worktree path.
 - **Between waves:** barrier. The main agent integrates the completed wave onto
-  the feature branch before the next wave starts, so the next wave's worktrees
+  the impl branch before the next wave starts, so the next wave's worktrees
   branch from code that includes its dependencies.
 
-The Workflow script owns **parallelism within a wave**. The main agent owns **git
-integration between waves** (the script has no filesystem/git access). One
-Workflow invocation per wave.
+The Workflow script owns **parallelism within a wave**. The main agent owns **all
+git — worktree creation, integration, and cleanup** (the script has no
+filesystem/git access). One Workflow invocation per wave.
+
+> **Do NOT use Workflow's `isolation: 'worktree'` for executors.** That option
+> branches the worktree from the **harness default (`main`)**, ignoring the
+> feature's actual base. When a feature's prerequisites live on a base branch
+> other than `main` (e.g. `wyrd-client`'s prereqs live on `wyrd-client-identity`,
+> never merged to `main`), an `isolation`-created worktree would be missing them
+> and the executor would "rebuild the whole crate from scratch." The orchestrator
+> therefore creates worktrees itself, at a base it controls (the impl-branch
+> tip), and `wave.js` dispatches executors into those paths. The impl-branch tip
+> descends from `base_branch` and includes every integrated wave, so all
+> prerequisites are present.
 
 ## The loop (main agent)
 
-1. Read `tasks.yaml`. Ensure the feature branch is checked out
-   (`git switch -c <feature>` from `base_branch` if new).
+1. Read `tasks.yaml`. Note its `base_branch` (where prerequisites live — e.g.
+   `wyrd-client-identity`, **not** `main`) and `impl_branch` (where the commits
+   land). In the **primary working tree**, check out `impl_branch`, creating it
+   from `base_branch` if new (`git switch -c <impl_branch> <base_branch>`). Never
+   assume `main`; the base ref comes from `tasks.yaml`.
 2. Compute the next wave (pending tasks with all deps `done`). If none and any
    task is still pending, stop and report a cycle or a blocked task.
-3. Invoke the wave Workflow (`.claude/workflows/wave.js`) with
-   `args = { featureDir, base, tasks: [<this wave's nodes with file+model+seams+verify>] }`.
+3. **Reindex the parent, then create worktrees, then dispatch.** Let `base` =
+   the current `impl_branch` tip (it descends from `base_branch` and includes
+   every integrated prior wave, so all prerequisites are present).
+   - **Reindex first — before any executor makes a change.** In the **primary
+     working tree** (git's original clone dir, the first entry in
+     `git worktree list`), which step 1 / step 4 leaves checked out on `base`,
+     run the incremental `codegraph sync` (or `codegraph index -i` if no
+     `.codegraph/` exists yet). This single shared index is what every linked
+     worktree's `codegraph explore` resolves to, so syncing here makes the
+     parent's *current* symbols visible to this wave's hydration. Run this for
+     **every** wave, including the **first** — do not skip it assuming a prior
+     session left the index current; it may still reflect `main` or a stale
+     branch. Invariant: the primary tree must be on `base` when you sync.
+     `.codegraph/` stays gitignored; the index is never committed.
+   - **Then create a worktree per node, at the explicit base:**
+     `git worktree add .claude/worktrees/impl-<id> <base> -b impl/<id>-<slug>`
+     (reuse the path if it already exists and is correctly based).
+   - **Then invoke** the wave Workflow (`.claude/workflows/wave.js`) with
+     `args = { featureDir, base, tasks: [<nodes with file+model+worktree+crates+seams+verify>] }` —
+     each node carrying the absolute `worktree` path you just created. Pass `args`
+     as an actual JSON **object** in the `Workflow` tool call — **never** a
+     JSON-encoded string. The runtime delivers `args` verbatim, so a stringified
+     payload arrives as a `string`, `args.tasks` is `undefined`, and the wave
+     crashes at 0s with `undefined is not an object (evaluating 'args.tasks.map')`.
+     (`wave.js` now `JSON.parse`s a string defensively, but pass an object.) Do
+     **not** rely on `isolation: 'worktree'` (it would branch from `main`; see the
+     warning above).
+   - **`featureDir` MUST be the absolute primary-tree path** (e.g.
+     `/…/wyrd/.dev/plan/<feature>`), not the repo-relative `.dev/plan/<feature>`.
+     `.dev/` is gitignored on purpose (planning artifacts never pollute the repo),
+     so the task contracts exist **only** in the primary tree's working dir — a
+     freshly-created linked worktree does not contain them. With an absolute
+     `featureDir`, each executor's `${featureDir}/${t.file}` resolves to the
+     primary-tree copy from inside any worktree; reading the contract there is
+     fine (it is read-only reference — all *writes* still happen in `t.worktree`).
 4. For each returned executor result:
-   - **green:** integrate its branch into the feature branch in `id` order
-     (`git merge --no-ff` or fast-forward; independent commits touch disjoint
-     crates so this is clean). Mark the task `done` in `tasks.yaml`.
+   - **green:** integrate its branch into `impl_branch` in `id` order (`git merge
+     --no-ff` or fast-forward; independent commits touch disjoint crates so this
+     is clean). Mark the task `done` in `tasks.yaml`, then remove its worktree
+     (`git worktree remove .claude/worktrees/impl-<id>`) now that it is merged.
    - **not green / escalate:** see "Recovery & escalation". Leave `pending` or
-     mark `blocked`; surface to the user.
-5. **Reindex at the barrier.** Wave integration happens **in the primary working
-   tree** (git's original clone dir, e.g. `/…/wyrd`, the first entry in
-   `git worktree list` — *not* a `.claude/worktrees/` linked worktree, and
-   nothing to do with the `main` branch). After you merge the wave onto the impl
-   branch there, the primary tree is checked out at exactly the `base` the next
-   wave's worktrees will branch from. Run the incremental `codegraph sync` **in
-   that primary working tree** (`sync`, not the from-scratch `index`, so it is
-   cheap). The single `.codegraph/` index lives in the primary tree; this is what
-   every linked worktree's `codegraph explore` resolves to, so syncing here is
-   what makes the symbols this wave introduced visible to the next wave's
-   hydration. Invariant: the primary working tree must be on `base` when you
-   sync — if you ever integrate somewhere else, sync there instead.
-   `.codegraph/` stays gitignored; the index is never committed.
+     mark `blocked`; surface to the user. **Keep** the worktree — its state is the
+     evidence the escalation/Opus re-dispatch and you will need to debug.
+5. **Integrate in the primary working tree, leaving it on the new `base`.** Wave
+   integration (the step-4 merges) happens **in the primary working tree** (git's
+   original clone dir, the first entry in `git worktree list` — *not* a
+   `.claude/worktrees/` linked worktree, and nothing to do with `main`). After
+   merging, the primary tree is checked out at exactly the `base` the next wave
+   will branch from. Do **not** reindex here — the reindex is always the
+   **pre-dispatch** step (step 3), which the next iteration runs against this new
+   `base`. Keeping the sync in one place (just before dispatch) is what
+   guarantees the parent is reindexed *before any change is made*, on every wave
+   including the first.
 6. Repeat from step 2 until all tasks are `done`.
 7. Hand off to the **test** stage (the feature-level `final_gate` in
    `tasks.yaml`) and then **review** (`review-and-plan`).
@@ -79,9 +126,10 @@ warning is expected and benign here, because seams are pre-existing symbols whos
 committed source on `base` is exactly what the executor wants. That single
 primary-tree index reflects whatever branch the **primary working tree** has
 checked out (in this pipeline, the impl branch — *not* `main`, and not
-necessarily the same `base_branch` the impl branch forked from). The between-wave
-`codegraph sync` (loop step 5) runs in the primary tree to keep that shared index
-current as the impl branch advances. Executors hydrate via the **CLI**, not the
+necessarily the same `base_branch` the impl branch forked from). The pre-dispatch
+`codegraph sync` (loop step 3, run before each wave including the first) keeps that
+shared index current on `base` as the impl branch advances, so executors always
+hydrate against the parent's symbols as of the moment before they start changing. Executors hydrate via the **CLI**, not the
 MCP tool: the `codegraph_explore` MCP tool is deferred for Workflow subagents
 (needs a ToolSearch to load), whereas `codegraph explore` is always in Bash.
 
@@ -157,3 +205,20 @@ directly when a commit's surface warrants. The test stage uses
 Assembled feature branch (all tasks `done`, gates green) → **`review-and-plan`**
 for the final fan-out review; optionally `wyrd-architecture-review` again if the
 implementation diverged from `plan.md`.
+
+**Run the review stage to its terminal artifact.** `review-and-plan` is an
+orchestrator: it is not complete until all five phases have run and
+`.dev/review/{REVIEW_ID}/implementation-plan.md` exists (preceded by `summary.md`
+and `validation.md`). Drive it straight through — do **not** stop after the
+reviewers (Phase 3) write their files.
+
+**Surface nothing until it has passed validation.** A raw reviewer finding — even
+one that looks CRITICAL — is *unvalidated* and may be a false positive. The
+validate-reviews phase exists precisely to confirm or eliminate findings against
+the actual source. Do **not** report a finding to the user, do **not** start
+investigating it, and do **not** begin implementing a fix until Phase 5 has run it
+through validation. Only **confirmed** findings, as recorded in `validation.md`
+and the `implementation-plan.md`, reach the user. Run the orchestration to its
+terminal artifact first; the validated plan is what you present, not the reviewers'
+raw output. If the user redirects mid-review, complete the owed artifacts before
+pivoting.

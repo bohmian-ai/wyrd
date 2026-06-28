@@ -230,7 +230,7 @@ pub async fn build_app_state_from_config(
 /// # Errors
 /// Returns [`ServerBootError::InvalidWorkloadBinding`] when an entry's issuer URL
 /// or card target cannot be parsed into the domain types.
-fn build_workload_bindings(
+pub fn build_workload_bindings(
     entries: &[WorkloadBindingEntry],
     tenant_id: DataTenantId,
 ) -> Result<Vec<WorkloadBinding>, ServerBootError> {

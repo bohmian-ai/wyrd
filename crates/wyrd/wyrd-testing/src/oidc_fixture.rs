@@ -103,6 +103,7 @@ impl OidcIssuerFixture {
     ///
     /// # Panics
     /// Panics when the login flow cannot be completed.
+    #[allow(clippy::too_many_arguments)]
     pub async fn human_login(
         &self,
         client_id: &str,

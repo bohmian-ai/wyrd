@@ -1,3 +1,21 @@
+# ============================================================================
+# Canonical developer loop — these are the tasks you run directly.
+# `mise tasks` lists only these; every other task is a CI shard or invariant
+# check that runs as a `pre-pr` dependency (still runnable by name, just hidden).
+#
+#   mise run check       Fast pre-commit loop: fmt --check + clippy + cargo check.
+#   mise run pre-pr      The full gate. Run this before pushing — it is the
+#                        answer to "make sure everything passes" (Rust + Python +
+#                        codegen + docs + every boundary invariant).
+#
+#   mise run test:unit   All Rust tests (workspace + storage emulators + sql).
+#   mise run test:bifrost   DataFusion/Postgres Rust tests (separate CI job).
+#   mise run py:test:unit   Python suite (builds the extension, then pytest).
+#
+#   cargo test -p <crate> <name> --all-features    Iterate on one crate/test.
+#
+# Need a hidden task? `mise run <name>` still works; `mise tasks --hidden` lists all.
+# ============================================================================
 [tools]
 node = "26.2.0"
 uv = "0.11.16"
@@ -23,6 +41,7 @@ description = "Workspace clippy with -D warnings (all features, all targets)"
 run = "cargo clippy --locked --workspace --all-features --all-targets -- -D warnings"
 
 [tasks."build:postgres"]
+hide = true
 description = "Start a clean Postgres container via docker compose and wait for it to be healthy"
 # --force-recreate --renew-anon-volumes guarantees a genuinely fresh container
 # and storage even if a healthy container is already running (otherwise `up` is a
@@ -31,6 +50,7 @@ description = "Start a clean Postgres container via docker compose and wait for 
 run = ["docker compose down --volumes --remove-orphans", "docker compose up -d --build --force-recreate --renew-anon-volumes postgres --wait"]
 
 [tasks."test:rust:workspace"]
+hide = true
 description = "Run workspace Rust unit tests (no DB required)"
 run = """
 cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server --exclude vala-bifrost --exclude vala-sql --exclude vala-core --exclude wyrd-client
@@ -68,18 +88,22 @@ docker containers, same difficulty as Postgres.
 depends = ["test:rust:workspace", "test:storage:matrix", "test:sql", "test:registry-e2e"]
 
 [tasks."test:wyrd-spec"]
+hide = true
 description = "Run wyrd-spec Rust tests"
 run = "cargo test -p wyrd-spec --all-features"
 
 [tasks."test:wyrd-spec:doc"]
+hide = true
 description = "Run wyrd-spec Rust doc tests"
 run = "cargo test --locked --doc --all-features -p wyrd-spec"
 
 [tasks."test:wyrd-error-derive"]
+hide = true
 description = "Run wyrd-error-derive tests"
 run = "cargo test -p wyrd-error-derive --all-features"
 
 [tasks."identity:e2e"]
+hide = true
 description = """Stand up real OIDC providers (Keycloak + Dex), seed test users via the Keycloak
 admin REST API, export env gates, run the identity e2e suite against both issuers, then tear down.
 Gated by WYRD_IDENTITY_E2E=1; skipped when the env var is unset so default local runs are fast.
@@ -168,22 +192,27 @@ docker compose stop keycloak dex
 """
 
 [tasks."build:server:oss"]
+hide = true
 description = "Build the OSS wyrd-server release binary"
 run = "cargo build --release --locked -p wyrd-server"
 
 [tasks."build:server:enterprise"]
+hide = true
 description = "Build the enterprise wyrd-server release binary"
 run = "cargo build --release --locked -p wyrd-server --features enterprise"
 
 [tasks."docker:build:oss"]
+hide = true
 description = "Build the OSS wyrd-server Docker image"
 run = "docker build -f docker/Dockerfile --build-arg WYRD_FLAVOR=oss -t wyrd-server:oss ."
 
 [tasks."docker:build:enterprise"]
+hide = true
 description = "Build the enterprise wyrd-server Docker image"
 run = "docker build -f docker/Dockerfile --build-arg WYRD_FLAVOR=enterprise -t wyrd-server:enterprise ."
 
 [tasks."check:docs"]
+hide = true
 description = "Build public Rust docs and doctests"
 run = """
 RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links" cargo doc --locked --no-deps --all-features \
@@ -197,10 +226,12 @@ cargo test --locked --doc --all-features \
 """
 
 [tasks."cardkind:check"]
+hide = true
 description = "Verify CardKind native count and External serde shape"
 run = "cargo test -p wyrd-spec --test cards kind:: --features server"
 
 [tasks."check:client-tier"]
+hide = true
 description = "Foundation invariants: wyrd-spec server-tier-free; shared shells pyo3+sqlx-free; Skald keeps only locked Wyrd foundation edges"
 run = """
 set -eu
@@ -276,12 +307,14 @@ fi
 """
 
 [tasks."check:registry-no-server-routes"]
+hide = true
 description = "wyrd-sql must not import axum/hyper/tower from any module (registry seam is durable, not route)"
 run = """
 rg -n 'use axum::|use hyper::|use tower::' crates/wyrd/wyrd-sql/src/ && exit 1 || exit 0
 """
 
 [tasks."check:pyo3-scope"]
+hide = true
 description = "Assert PyO3 stays out of pure contracts and Python-free shared crates"
 run = """
 set -eu
@@ -361,6 +394,7 @@ fi
 """
 
 [tasks."check:mocks-scope"]
+hide = true
 description = "Assert mock helpers stay out of production source"
 run = """
 if rg -n 'mockall|wiremock|mockito' crates \
@@ -383,6 +417,7 @@ fi
 """
 
 [tasks."check:object-store-pin"]
+hide = true
 description = "Assert single versions of object_store/datafusion/arrow/parquet across the iceberg cone (stage1+)"
 run = """
 set -e
@@ -419,44 +454,52 @@ description = "Stop local storage emulators and remove their volumes"
 run = "docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml down -v"
 
 [tasks."storage:logs"]
+hide = true
 description = "Tail local storage emulator logs"
 run = "docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml logs -f"
 
 [tasks."test:storage:local"]
+hide = true
 description = "Run wyrd-storage local backend integration tests"
 run = "cargo test -p wyrd-storage --all-features --test integration_local"
 
 [tasks."test:storage:rustfs"]
+hide = true
 description = "Run wyrd-storage S3 integration tests against the local RustFS emulator; requires storage:up"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_INTEGRATION_S3 = "1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1" }
 run = "cargo test -p wyrd-storage --all-features --test integration_rustfs -- --nocapture"
 
 [tasks."test:storage:gcs-emu"]
+hide = true
 description = "Run wyrd-storage GCS emulator integration tests; requires storage:up"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_GCS_EMULATOR_HOST = "http://localhost:4443" }
 run = "cargo test -p wyrd-storage --all-features --test integration_gcs -- --nocapture"
 
 [tasks."test:storage:azurite"]
+hide = true
 description = "Run wyrd-storage Azurite integration tests; requires storage:up"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_AZURE_EMULATOR_ENDPOINT = "http://127.0.0.1:10000" }
 run = "cargo test -p wyrd-storage --all-features --test integration_azurite -- --nocapture"
 
 [tasks."test:storage:e2e"]
+hide = true
 description = "Run server-level storage HTTP e2e tests (local single-put + S3/GCS/Azure multipart) against the docker emulators + Postgres"
 depends = ["storage:up", "build:postgres", "db:setup-roles", "db:migrate"]
 env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_INTEGRATION_S3 = "1", WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_GCS_EMULATOR_HOST = "http://localhost:4443", WYRD_AZURE_EMULATOR_ENDPOINT = "http://127.0.0.1:10000", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = "cargo test -p wyrd-server --all-features --test storage_e2e -- --nocapture --test-threads=1"
 
 [tasks."test:registry-e2e"]
+hide = true
 description = "Cards registration end-to-end against a real Postgres"
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
 env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = "cargo test --locked -p wyrd-sql --features test-e2e --test cards_e2e -- --include-ignored"
 
 [tasks."test:storage:s3:cloud"]
+hide = true
 description = "Run the StorageHandle CRUD + server multipart e2e against real AWS S3 (merge-to-main only; requires AWS creds + WYRD_STORAGE_S3_BUCKET in env)"
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
 env = { WYRD_STORAGE_CLOUD_S3 = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
@@ -466,6 +509,7 @@ cargo test -p wyrd-server --all-features --test storage_e2e s3_multipart_e2e_clo
 """
 
 [tasks."test:storage:gcs:cloud"]
+hide = true
 description = "Run the StorageHandle CRUD + server multipart e2e against real GCS (merge-to-main only; requires GCP creds + WYRD_STORAGE_GCS_BUCKET in env)"
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
 env = { WYRD_STORAGE_CLOUD_GCS = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
@@ -475,6 +519,7 @@ cargo test -p wyrd-server --all-features --test storage_e2e gcs_multipart_e2e_cl
 """
 
 [tasks."test:storage:azure:cloud"]
+hide = true
 description = "Run the StorageHandle CRUD + server multipart e2e against real Azure Blob Storage (merge-to-main only; requires Azure creds + WYRD_STORAGE_AZURE_{ACCOUNT,CONTAINER} in env)"
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
 env = { WYRD_STORAGE_CLOUD_AZURE = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
@@ -484,40 +529,48 @@ cargo test -p wyrd-server --all-features --test storage_e2e azure_multipart_e2e_
 """
 
 [tasks."test:storage:cloud:matrix"]
+hide = true
 description = "Run the full real-cloud storage matrix (S3 + GCS + Azure) — merge-to-main only"
 depends = ["test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azure:cloud"]
 
 [tasks."test:storage:matrix"]
+hide = true
 description = "Run all storage emulator integration tests (signer-tier + operator data-plane + server e2e); requires storage:up"
 depends = ["test:storage:local", "test:storage:gcs-emu", "test:storage:rustfs", "test:storage:azurite", "test:storage:handle:local", "test:storage:handle:emulators", "test:storage:e2e"]
 
 [tasks."test:storage:handle:local"]
+hide = true
 description = "Run StorageHandle CRUD tests for the local filesystem backend (no emulator needed)"
 run = "cargo test -p wyrd-storage --all-features --test handle_crud local_handle_crud -- --nocapture"
 
 [tasks."test:storage:handle:s3-emu"]
+hide = true
 description = "Run StorageHandle CRUD tests against the RustFS S3 emulator; requires storage:up"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_INTEGRATION_S3 = "1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1" }
 run = "cargo test -p wyrd-storage --all-features --test handle_crud s3_emu_handle_crud -- --nocapture"
 
 [tasks."test:storage:handle:gcs-emu"]
+hide = true
 description = "Run StorageHandle CRUD tests against the fake-gcs emulator; requires storage:up"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_GCS_EMULATOR_HOST = "http://localhost:4443" }
 run = "cargo test -p wyrd-storage --all-features --test handle_crud gcs_emu_handle_crud -- --nocapture"
 
 [tasks."test:storage:handle:azure-emu"]
+hide = true
 description = "Run StorageHandle CRUD tests against the Azurite emulator; requires storage:up"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_AZURE_EMULATOR_ENDPOINT = "http://127.0.0.1:10000", AZURE_STORAGE_ACCOUNT_KEY = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" }
 run = "cargo test -p wyrd-storage --all-features --test handle_crud azure_emu_handle_crud -- --nocapture"
 
 [tasks."test:storage:handle:emulators"]
+hide = true
 description = "Run all StorageHandle CRUD tests against cloud emulators; requires storage:up"
 depends = ["test:storage:handle:s3-emu", "test:storage:handle:gcs-emu", "test:storage:handle:azure-emu"]
 
 [tasks."check:storage:drift"]
+hide = true
 description = "Assert storage foundation guardrails against paths that exist in this workspace"
 run = """
 set -eu
@@ -640,12 +693,14 @@ fi
 """
 
 [tasks."check:registry-tx-coupling"]
+hide = true
 description = "Card registry writes must stay inside the caller's TenantConn tx; no tokio::spawn / emit_async / raw PgPool"
 run = """
 rg -n 'tokio::spawn|emit_async|sqlx::PgPool' crates/wyrd/wyrd-sql/src/queries/cards/ && exit 1 || exit 0
 """
 
 [tasks."check:registry-immutable-spec-hash"]
+hide = true
 description = "wyrd.cards trigger must raise P0001 with the cards_spec_hash_immutable constraint name"
 run = """
 rg -nF 'cards_spec_hash_immutable' crates/wyrd/wyrd-sql/migrations/*_cards.sql || exit 1
@@ -654,20 +709,24 @@ rg -nF "ERRCODE = 'P0001'"         crates/wyrd/wyrd-sql/migrations/*_cards.sql |
 """
 
 [tasks."check:registry-single-table"]
+hide = true
 description = "Single wyrd.cards table; no per-kind shadow tables"
 run = """
 if rg -n 'CREATE TABLE wyrd\\.cards_[a-z]' crates/wyrd/wyrd-sql/migrations/; then exit 1; fi
 """
 
 [tasks."check:unwrap-audit"]
+hide = true
 description = "Audit unwrap/expect calls outside tests and examples"
 run = "python scripts/check_unwrap_audit.py"
 
 [tasks."check:audit-script"]
+hide = true
 description = "Self-tests for the unwrap/expect audit script"
 run = "python scripts/tests/test_check_unwrap_audit.py"
 
 [tasks."check:error-coverage"]
+hide = true
 description = "Assert emitted Skald error codes are mapped and SQL errors have coverage"
 run = """
 set -eu
@@ -708,18 +767,22 @@ fi
 """
 
 [tasks."check:tenant-isolation"]
+hide = true
 description = "Assert SQL foundation tenant isolation and server-tier boundaries"
 run = "python scripts/check_tenant_isolation.py"
 
 [tasks."check:test-contracts"]
+hide = true
 description = "Verify Wyrd critical Rust contracts have explicit Python test markers"
 run = "python scripts/check_test_contracts.py"
 
 [tasks."check:wasm"]
+hide = true
 description = "Build wyrd-spec for wasm32"
 run = "cargo check --locked --target wasm32-unknown-unknown -p wyrd-spec --features wasm"
 
 [tasks."sqlx:prepare"]
+hide = true
 description = "Refresh committed sqlx offline query metadata"
 run = "cargo sqlx prepare --workspace"
 
@@ -736,6 +799,7 @@ depends = ["py:setup"]
 run = "uv run python scripts/run_unit_tests.py"
 
 [tasks."py:test:tensorflow"]
+hide = true
 description = "Run TensorFlow-marked Python unit tests"
 dir = "python/py-wyrd"
 depends = ["py:setup"]
@@ -747,21 +811,25 @@ dir = "python/py-wyrd"
 run = ["uv run ruff format python/wyrd tests scripts", "uv run ruff check --fix python/wyrd tests scripts"]
 
 [tasks."py:format:check"]
+hide = true
 description = "Check Wyrd Python formatting"
 dir = "python/py-wyrd"
 run = "uv run ruff format --check python/wyrd tests scripts"
 
 [tasks."py:lints"]
+hide = true
 description = "Run Wyrd Python Ruff lint checks"
 dir = "python/py-wyrd"
 run = "uv run ruff check python/wyrd tests scripts"
 
 [tasks."py:typecheck"]
+hide = true
 description = "Run ty over the generated Python stub surface"
 dir = "python/py-wyrd"
 run = "uv run ty check python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/cards/data/test_public_surface.py"
 
 [tasks."py:setup:testing"]
+hide = true
 description = "Build py-wyrd with the wyrd.testing test harness enabled"
 dir = "python/py-wyrd"
 depends = ["codegen:stubs"]
@@ -771,12 +839,14 @@ run = [
 ]
 
 [tasks."py:test:testing"]
+hide = true
 description = "Run the wyrd.testing harness pytest suite"
 dir = "python/py-wyrd"
 depends = ["py:setup:testing"]
 run = "uv run pytest -q tests/test_test_server.py"
 
 [tasks."check:py-wheel-no-testing"]
+hide = true
 description = "Assert the production py-wyrd wheel does not expose wyrd.testing"
 dir = "python/py-wyrd"
 depends = ["py:setup"]
@@ -789,56 +859,67 @@ fi
 """
 
 [tasks."examples:python:datacard"]
+hide = true
 description = "Run the local DataCard Python example"
 dir = "python/py-wyrd"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/datacard_local_workflow.py"
 
 [tasks."examples:python:workflow:openai"]
+hide = true
 description = "Run the sequential OpenAI workflow example"
 dir = "python/py-wyrd"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/workflow_openai.py"
 
 [tasks."examples:python:workflow:anthropic"]
+hide = true
 description = "Run the sequential Anthropic workflow example"
 dir = "python/py-wyrd"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/workflow_anthropic.py"
 
 [tasks."examples:python:workflow:gemini"]
+hide = true
 description = "Run the sequential Gemini workflow example"
 dir = "python/py-wyrd"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/workflow_gemini.py"
 
 [tasks."examples:python:workflow:gateway"]
+hide = true
 description = "Run the split-registry gateway workflow example"
 dir = "python/py-wyrd"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/workflow_gateway.py"
 
 [tasks."examples:rust:smoke"]
+hide = true
 description = "Run the credential-free Rust agent smoke example"
 run = "cargo run -p wyrd-rust-examples --bin agent_smoke"
 
 [tasks."examples:rust:workflow:openai"]
+hide = true
 description = "Run the sequential OpenAI workflow example (Rust)"
 run = "cargo run -p wyrd-rust-examples --bin workflow_openai"
 
 [tasks."examples:rust:workflow:anthropic"]
+hide = true
 description = "Run the sequential Anthropic workflow example (Rust)"
 run = "cargo run -p wyrd-rust-examples --bin workflow_anthropic"
 
 [tasks."examples:rust:workflow:gemini"]
+hide = true
 description = "Run the sequential Gemini workflow example (Rust)"
 run = "cargo run -p wyrd-rust-examples --bin workflow_gemini"
 
 [tasks."examples:rust:workflow:gateway"]
+hide = true
 description = "Run the split-registry gateway workflow example (Rust)"
 run = "cargo run -p wyrd-rust-examples --bin workflow_gateway"
 
 [tasks."check:examples"]
+hide = true
 description = "Build all example binaries"
 run = "cargo build -p skald-workflow --examples --all-features"
 
@@ -855,11 +936,13 @@ dir = "crates/wyrd/wyrd-server/wyrd-ui"
 run = "pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000}"
 
 [tasks."docs:install"]
+hide = true
 description = "Install docs dependencies from the lockfile"
 dir = "docs"
 run = "pnpm install --frozen-lockfile"
 
 [tasks."docs:generate"]
+hide = true
 description = "Generate docs pages from Wyrd schemas and API metadata"
 dir = "docs"
 run = """
@@ -869,16 +952,19 @@ python scripts/generate_llms_txt.py
 """
 
 [tasks."docs:check:commands"]
+hide = true
 description = "Fail public docs snippets that bypass mise"
 dir = "docs"
 run = "python scripts/check_commands.py"
 
 [tasks."docs:linkcheck"]
+hide = true
 description = "Validate local Markdown links in the docs site"
 dir = "docs"
 run = "python scripts/check_links.py"
 
 [tasks."docs:astro:check"]
+hide = true
 description = "Run Astro type and content checks for the docs site"
 dir = "docs"
 run = "pnpm astro check"
@@ -889,6 +975,7 @@ dir = "docs"
 run = "pnpm astro build"
 
 [tasks."docs:check"]
+hide = true
 description = "Docs gate: install, generate, drift check, command check, link check, Astro check, and build"
 depends = ["docs:install"]
 run = """
@@ -949,6 +1036,7 @@ test -f openapi.yaml || { echo 'openapi.yaml missing'; exit 1; }
 """
 
 [tasks."codegen:stubs"]
+hide = true
 description = "Regenerate Python type stubs"
 dir = "python/py-wyrd"
 run = """
@@ -982,6 +1070,7 @@ diff -u "$BEFORE" "$AFTER" \
 """
 
 [tasks."check:single-into-response-impl"]
+hide = true
 description = "Assert Wyrd HTTP errors flow through one server IntoResponse mapper"
 run = """
 set -eu
@@ -1007,6 +1096,7 @@ esac
 """
 
 [tasks."check:no-legacy-server-vocab"]
+hide = true
 description = "Reject legacy server vocabulary and orphan-rule violations"
 run = """
 set -e
@@ -1063,6 +1153,7 @@ test "$COUNT" -eq 1
 
 
 [tasks."check:no-tonic-outside-wyrd-tonic"]
+hide = true
 description = "Reject tonic-family dep declarations outside wyrd-tonic + workspace pins"
 run = """
 set -e
@@ -1122,6 +1213,7 @@ description = "Aggregate gate: check + codegen:check + Python package checks + d
 depends = ["check", "test:unit", "test:bifrost", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs", "check:no-legacy-server-vocab", "check:no-tonic-outside-wyrd-tonic"]
 
 [tasks."db:setup-roles"]
+hide = true
 description = """Create wyrd_app and wyrd_platform_admin roles in the target Postgres instance.
 Targets the local docker-compose Postgres by default; the docker-compose
 bootstrap user is wyrd_migrator (which owns the database).
@@ -1153,6 +1245,7 @@ env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WY
 run = "cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture"
 
 [tasks."test:sql"]
+hide = true
 description = """Run live Postgres SQL integration tests against docker-compose Postgres.
 Brings up Postgres, provisions roles, and applies migrations before running tests.
 """
@@ -1161,22 +1254,27 @@ env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WY
 run = "cargo test --locked -p wyrd-sql --all-features --test migration_pg -- --nocapture"
 
 [tasks."check:security-schema-drift"]
+hide = true
 description = "wyrd-spec::security goldens match the generator's output (no test-utils)"
 run = "cargo test --locked -p wyrd-spec --no-default-features --features server --tests security -- schema_drift"
 
 [tasks."check:security-inline-gate"]
+hide = true
 description = "Prove SecretRef::Inline is absent without `test-utils`"
 run = "cargo test --locked -p wyrd-spec --no-default-features --features server --tests security -- inline_rejected_without_test_utils"
 
 [tasks."check:transport-schema-drift"]
+hide = true
 description = "wyrd-client::transport goldens match the generator's output"
 run = "cargo test --locked -p wyrd-client --tests transport -- schema_drift"
 
 [tasks."check:alert-router-schema-drift"]
+hide = true
 description = "vala-core::alert_router goldens match the generator's output"
 run = "cargo test --locked -p vala-core --tests alert_router -- schema_drift"
 
 [tasks."dev:pg:nuke"]
+hide = true
 description = "Wipe embedded pg cache"
 run = "rm -rf ${WYRD_DEV_PG_CACHE}"
 
@@ -1194,6 +1292,7 @@ cargo bench -p vala-bifrost --features bench-bin
 """
 
 [tasks."bench:workload"]
+hide = true
 description = """vala-bifrost large-workload bench (~5 min, release) against docker-compose Postgres.
 Brings up a clean Postgres, provisions roles, and applies migrations first.
 """
@@ -1207,6 +1306,7 @@ cargo run --release -p vala-bifrost --bin bench_workload --features bench-bin --
 """
 
 [tasks."bench:check"]
+hide = true
 description = "Fail if microbenches regressed >10% vs the stage1 baseline"
 run = """
 cargo run --release -p vala-bifrost --bin bench_check --features bench-bin -- \

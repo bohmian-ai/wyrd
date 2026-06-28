@@ -31,6 +31,7 @@ use wyrd_server::auth::exchange_api_key::TokenExchangeSettings;
 use wyrd_server::auth::issue_api_key::WyrdApiKey;
 use wyrd_server::auth::jwt_bearer::WorkloadBindingRegistry;
 use wyrd_server::auth::permission_resolver::SqlPermissionResolver;
+use wyrd_server::auth::revocation_resolver::SqlRevocationCheck;
 use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::config::{IssuerEntry, WorkloadBindingEntry};
@@ -961,7 +962,11 @@ impl WyrdTestServerBuilder {
             Some(Arc::new(TrustedIssuerRegistry::from_issuers(issuers)))
         };
 
-        let verifier_base = TokenVerifier::new(decoding_keys, "wyrd", resolver, verify_settings);
+        let verifier_base = TokenVerifier::new(decoding_keys, "wyrd", resolver, verify_settings)
+            .with_revocation(Arc::new(SqlRevocationCheck::new_with_ttl(
+                Arc::new(fixture.app_pool().clone()),
+                Duration::ZERO,
+            )));
         let verifier = Arc::new(match &config_issuer_registry {
             Some(registry) => verifier_base.with_external(
                 Arc::new(JwksCache::new(

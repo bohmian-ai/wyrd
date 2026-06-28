@@ -89,7 +89,7 @@ async fn post_jwt_bearer(
     assertion: &str,
 ) -> axum::http::Response<Body> {
     let body = serde_json::json!({
-        "grant": "JwtBearer",
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
         "assertion": assertion,
         "tenant": FIXTURE_TENANT_SLUG,
     });
@@ -709,6 +709,11 @@ async fn human_oidc_login_journey() {
         .find(|(k, _)| k == "code_challenge")
         .map(|(_, v)| v.into_owned())
         .expect("authorization_url carries code_challenge");
+    let nonce = authz_url
+        .query_pairs()
+        .find(|(k, _)| k == "nonce")
+        .map(|(_, v)| v.into_owned())
+        .expect("authorization_url carries nonce");
 
     // Step 2: drive Keycloak login form as alice.
     let redirect_uri: Url = "http://test-tenant-1.wyrd.test/auth/callback"
@@ -722,6 +727,7 @@ async fn human_oidc_login_journey() {
             &redirect_uri,
             state_key,
             &code_challenge,
+            &nonce,
         )
         .await;
     assert!(

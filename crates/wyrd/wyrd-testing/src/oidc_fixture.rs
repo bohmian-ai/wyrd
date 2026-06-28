@@ -111,6 +111,7 @@ impl OidcIssuerFixture {
         redirect_uri: &Url,
         state: &str,
         code_challenge: &str,
+        nonce: &str,
     ) -> LoginResult {
         let authz_url = self.provider.metadata.authorization_endpoint.clone();
 
@@ -122,6 +123,7 @@ impl OidcIssuerFixture {
                 .append_pair("redirect_uri", redirect_uri.as_str())
                 .append_pair("scope", "openid email profile")
                 .append_pair("state", state)
+                .append_pair("nonce", nonce)
                 .append_pair("code_challenge", code_challenge)
                 .append_pair("code_challenge_method", "S256");
             u

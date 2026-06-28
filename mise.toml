@@ -145,7 +145,8 @@ def api(method, path, body=None, token=None):
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         r = urllib.request.urlopen(req)
-        return json.loads(r.read()) if r.read() else None
+        raw = r.read()
+        return json.loads(raw) if raw else None
     except urllib.error.HTTPError as e:
         body = e.read()
         if e.code == 409:  # already exists — idempotent
@@ -165,8 +166,11 @@ def create_user(username, email, password, group_path):
     api("POST", "/users", {
         "username": username,
         "email": email,
+        "firstName": username.capitalize(),
+        "lastName": "Wyrd",
         "emailVerified": True,
         "enabled": True,
+        "requiredActions": [],
     }, token)
     users = api("GET", f"/users?username={username}", token=token) or []
     if not users:
@@ -181,7 +185,7 @@ def create_user(username, email, password, group_path):
     if groups:
         api("PUT", f"/users/{uid}/groups/{groups[0]['id']}", token=token)
 
-create_user("alice", "alice@wyrd.test", "wyrd-test", "wyrd-admins")
+create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins")
 create_user("bob", "bob@wyrd.test", "wyrd-test", "wyrd-viewers")
 print("Keycloak users seeded")
 PYEOF

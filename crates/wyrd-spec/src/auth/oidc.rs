@@ -216,10 +216,22 @@ fn validate_issuer_url(value: &str) -> Result<(), UrlParseError> {
     if !parsed.has_host() {
         return Err(UrlParseError::NoHost);
     }
-    if parsed.scheme() != "https" {
-        return Err(UrlParseError::DisallowedScheme(parsed.scheme().to_owned()));
+    match parsed.scheme() {
+        "https" => Ok(()),
+        // `http` is permitted only for loopback issuers (local Keycloak/Dex
+        // e2e fixtures). Every non-loopback host stays https-only.
+        "http" if is_loopback_host(&parsed) => Ok(()),
+        scheme => Err(UrlParseError::DisallowedScheme(scheme.to_owned())),
     }
-    Ok(())
+}
+
+fn is_loopback_host(parsed: &url::Url) -> bool {
+    match parsed.host() {
+        Some(url::Host::Domain(host)) => host == "localhost",
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    }
 }
 
 fn normalize_issuer(value: &str) -> String {
@@ -273,7 +285,7 @@ fn openapi_url_schema(
 
 #[cfg(test)]
 mod tests {
-    use super::{AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse};
+    use super::{AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, UrlParseError};
 
     #[test]
     fn issuer_url_normalizes_trailing_slash() {
@@ -290,9 +302,50 @@ mod tests {
     }
 
     #[test]
+    fn issuer_url_accepts_https_any_host() {
+        assert!(IssuerUrl::new("https://idp.example.com/realms/acme").is_ok());
+        assert!(IssuerUrl::new("https://localhost:8443/realms/wyrd-test").is_ok());
+    }
+
+    #[test]
+    fn issuer_url_accepts_http_loopback() {
+        assert!(IssuerUrl::new("http://localhost:8080/realms/wyrd-test").is_ok());
+        assert!(IssuerUrl::new("http://127.0.0.1:8080/realms/wyrd-test").is_ok());
+        assert!(IssuerUrl::new("http://[::1]:8080/realms/wyrd-test").is_ok());
+    }
+
+    #[test]
+    fn issuer_url_rejects_http_non_loopback() {
+        assert!(matches!(
+            IssuerUrl::new("http://idp.example.com"),
+            Err(UrlParseError::DisallowedScheme(scheme)) if scheme == "http"
+        ));
+        assert!(matches!(
+            IssuerUrl::new("http://10.0.0.1:8080"),
+            Err(UrlParseError::DisallowedScheme(scheme)) if scheme == "http"
+        ));
+    }
+
+    #[test]
     fn issuer_url_rejects_non_https() {
         assert!(IssuerUrl::new("http://insecure.example.com").is_err());
         assert!(IssuerUrl::new("ftp://files.example.com").is_err());
+        assert!(matches!(
+            IssuerUrl::new("ftp://localhost"),
+            Err(UrlParseError::DisallowedScheme(scheme)) if scheme == "ftp"
+        ));
+    }
+
+    #[test]
+    fn issuer_url_rejects_bad_url_and_no_host() {
+        assert!(matches!(
+            IssuerUrl::new("not a url"),
+            Err(UrlParseError::ParseFailed(_))
+        ));
+        assert!(matches!(
+            IssuerUrl::new("mailto:user@example.com"),
+            Err(UrlParseError::NoHost)
+        ));
     }
 
     #[test]

@@ -4,12 +4,20 @@ use std::sync::Arc;
 
 use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
+use wyrd_auth_oidc::WorkloadBinding;
+use wyrd_semver::VersionBlock;
+use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::IssuerUrl;
+use wyrd_spec::envelope::CardKind;
+use wyrd_spec::ids::{CardName, SpaceName};
+use wyrd_spec::reference::CardRef;
 use wyrd_sql::{
     pool::{build_app_pool, build_migrator_pool, build_platform_admin_pool},
     postgres_boot::{BootError, PostgresBoot},
 };
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
+use crate::config::WorkloadBindingEntry;
 use crate::state::AppState;
 
 /// Errors raised while assembling server state.
@@ -46,6 +54,17 @@ pub enum ServerBootError {
     TenantSlugUnresolved {
         /// The slug that failed to resolve.
         slug: String,
+    },
+    /// A `[[workload_bindings]]` entry's card target could not be built into a
+    /// [`CardRef`]. This is config malformation (bad kind/name/space/version or
+    /// issuer URL), caught at boot so the server fails closed rather than
+    /// starting with a mis-built binding. It is not a card-existence check.
+    #[error("workload_bindings[{index}] is invalid: {message}")]
+    InvalidWorkloadBinding {
+        /// Index of the offending `[[workload_bindings]]` entry.
+        index: usize,
+        /// What made the entry invalid.
+        message: String,
     },
 }
 
@@ -185,7 +204,92 @@ pub async fn build_app_state_from_config(
         state = state.with_trusted_issuer_registry(Arc::new(registry));
     }
 
+    // Populate the in-memory workload binding registry from `[[workload_bindings]]`.
+    // Each entry's card target is built into a server-owned `CardRef` (F04, never
+    // from token claims) under the SAME implicit tenant the request-time
+    // `WorkloadBindingResolver::binding` lookup is keyed by, so matches hold by
+    // construction. Building the ref is not a card-existence check.
+    if !config.workload_bindings.is_empty() {
+        let slug = config.auth.tenant_slug.as_ref().ok_or_else(|| {
+            ServerBootError::TenantSlugUnresolved {
+                slug: "(unset)".to_owned(),
+            }
+        })?;
+        let tenant_id = crate::issuer_boot::resolve_implicit_tenant(&state.pool, slug).await?;
+        let bindings = build_workload_bindings(&config.workload_bindings, tenant_id)?;
+        let registry = crate::auth::jwt_bearer::WorkloadBindingRegistry::from_bindings(bindings);
+        state = state.with_workload_binding_registry(Arc::new(registry));
+    }
+
     Ok(state)
+}
+
+/// Map `[[workload_bindings]]` config entries to domain [`WorkloadBinding`]s, all
+/// bound to the resolved implicit `tenant_id` (F4).
+///
+/// # Errors
+/// Returns [`ServerBootError::InvalidWorkloadBinding`] when an entry's issuer URL
+/// or card target cannot be parsed into the domain types.
+fn build_workload_bindings(
+    entries: &[WorkloadBindingEntry],
+    tenant_id: DataTenantId,
+) -> Result<Vec<WorkloadBinding>, ServerBootError> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| build_workload_binding(index, entry, tenant_id))
+        .collect()
+}
+
+/// Build a single [`WorkloadBinding`] from a config entry under `tenant_id`.
+fn build_workload_binding(
+    index: usize,
+    entry: &WorkloadBindingEntry,
+    tenant_id: DataTenantId,
+) -> Result<WorkloadBinding, ServerBootError> {
+    let issuer = IssuerUrl::new(entry.issuer.clone()).map_err(|error| {
+        ServerBootError::InvalidWorkloadBinding {
+            index,
+            message: format!("issuer URL is not a valid https issuer: {error}"),
+        }
+    })?;
+    Ok(WorkloadBinding {
+        tenant_id,
+        issuer,
+        subject: entry.subject.clone(),
+        audience: entry.audience.clone(),
+        card_ref: build_binding_card_ref(index, entry)?,
+    })
+}
+
+/// Build the server-owned [`CardRef`] for a binding from its config card target.
+///
+/// `uid` is always `None` and no DB/existence lookup is performed (N2, F04):
+/// building the ref is not validating that the card exists.
+fn build_binding_card_ref(
+    index: usize,
+    entry: &WorkloadBindingEntry,
+) -> Result<CardRef, ServerBootError> {
+    let invalid = |message: String| ServerBootError::InvalidWorkloadBinding { index, message };
+
+    let kind = CardKind::native()
+        .into_iter()
+        .find(|kind| kind.wire_name().eq_ignore_ascii_case(&entry.kind))
+        .ok_or_else(|| invalid(format!("unknown card kind {:?}", entry.kind)))?;
+    let name = CardName::new(entry.name.clone())
+        .map_err(|error| invalid(format!("invalid card name {:?}: {error}", entry.name)))?;
+    let version = VersionBlock::parse(entry.version.clone())
+        .map_err(|error| invalid(format!("invalid card version {:?}: {error}", entry.version)))?;
+    let space = SpaceName::new(entry.space.clone())
+        .map_err(|error| invalid(format!("invalid card space {:?}: {error}", entry.space)))?;
+
+    Ok(CardRef {
+        kind,
+        name,
+        version,
+        space,
+        uid: None,
+    })
 }
 
 /// Spawn the storage sweeper if enabled and the platform admin pool is available.
@@ -237,5 +341,75 @@ mod tests {
             state.storage.backend(),
             wyrd_spec::storage::StorageBackendKind::Local
         );
+    }
+
+    fn implicit_tenant() -> DataTenantId {
+        "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
+            .parse()
+            .expect("static tenant id is valid")
+    }
+
+    fn sample_binding_entry() -> WorkloadBindingEntry {
+        WorkloadBindingEntry {
+            issuer: "https://idp.example.com".to_owned(),
+            subject: "system:serviceaccount:default/my-sa".to_owned(),
+            audience: Some("my-audience".to_owned()),
+            // Lowercase mirrors the canonical config example; the boot parse is
+            // case-insensitive against the kind wire name.
+            kind: "model".to_owned(),
+            name: "my-model".to_owned(),
+            space: "prod".to_owned(),
+            version: "1.0.0".to_owned(),
+        }
+    }
+
+    #[test]
+    fn workload_binding_binds_resolved_implicit_tenant() {
+        let tenant = implicit_tenant();
+        let bindings =
+            build_workload_bindings(&[sample_binding_entry()], tenant).expect("bindings build");
+
+        assert_eq!(bindings.len(), 1);
+        // F4: every binding carries the resolved implicit tenant, never a sentinel.
+        assert_eq!(bindings[0].tenant_id, tenant);
+        assert_ne!(bindings[0].tenant_id, DataTenantId::SYSTEM_OWNER);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workload_binding_registry_resolves_bound_and_rejects_unbound() {
+        use wyrd_auth_oidc::WorkloadBindingResolver;
+
+        let tenant = implicit_tenant();
+        let bindings =
+            build_workload_bindings(&[sample_binding_entry()], tenant).expect("bindings build");
+        let registry = crate::auth::jwt_bearer::WorkloadBindingRegistry::from_bindings(bindings);
+        let issuer = IssuerUrl::new("https://idp.example.com".to_owned()).expect("issuer url");
+
+        let card_ref = registry
+            .binding(
+                &tenant,
+                &issuer,
+                "system:serviceaccount:default/my-sa",
+                Some("my-audience"),
+            )
+            .await
+            .expect("lookup ok")
+            .expect("bound subject resolves to a card ref");
+        assert_eq!(card_ref.kind, CardKind::Model);
+        assert_eq!(card_ref.name.to_string(), "my-model");
+        assert_eq!(card_ref.version.to_string(), "1.0.0");
+        assert_eq!(card_ref.space.to_string(), "prod");
+        assert!(card_ref.uid.is_none());
+
+        let unbound = registry
+            .binding(
+                &tenant,
+                &issuer,
+                "system:serviceaccount:default/other-sa",
+                Some("my-audience"),
+            )
+            .await
+            .expect("lookup ok");
+        assert!(unbound.is_none(), "unbound subject must resolve to None");
     }
 }

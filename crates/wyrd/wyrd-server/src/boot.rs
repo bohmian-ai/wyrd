@@ -27,6 +27,26 @@ pub enum ServerBootError {
     /// Storage boot failed.
     #[error(transparent)]
     Storage(#[from] wyrd_storage::StorageError),
+    /// OIDC discovery for a configured trusted issuer was unavailable after the
+    /// bounded retry schedule. Boot fails closed rather than starting with a
+    /// silently empty registry; the message surfaces the stable
+    /// `WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` signal and names the offending issuer.
+    #[error(
+        "WYRD_AUTH_503_DISCOVERY_UNAVAILABLE: OIDC discovery failed for trusted issuer {issuer}: {message}"
+    )]
+    IssuerDiscoveryUnavailable {
+        /// The issuer URL whose discovery could not be completed.
+        issuer: String,
+        /// Underlying discovery failure detail.
+        message: String,
+    },
+    /// The configured implicit `[auth] tenant_slug` did not resolve to an active
+    /// tenant at boot. Never bind issuers/bindings to a sentinel tenant.
+    #[error("configured [auth] tenant_slug {slug:?} did not resolve to an active tenant")]
+    TenantSlugUnresolved {
+        /// The slug that failed to resolve.
+        slug: String,
+    },
 }
 
 /// Resolve database configuration, run migrations, and assemble runtime state.
@@ -134,7 +154,7 @@ pub async fn build_app_state_from_config(
         .filter_map(|cidr| cidr.parse::<ipnetwork::IpNetwork>().ok())
         .collect();
 
-    Ok(state
+    let mut state = state
         .with_deployment_profile(config.deployment_profile)
         .with_shutdown_token(shutdown)
         .with_telemetry(telemetry)
@@ -142,7 +162,30 @@ pub async fn build_app_state_from_config(
         .with_grpc_health(reporter)
         .with_trusted_upstreams_parsed(Arc::from(trusted_upstreams_parsed))
         .with_trusted_request_id_propagation(config.request_id.trust_upstream)
-        .with_preview_auth(config.auth.allow_preview))
+        .with_preview_auth(config.auth.allow_preview);
+
+    // Resolve the configured trusted issuers into the static registry. The
+    // implicit tenant is resolved through the same slug path the request
+    // handlers use, so the bound tenant matches request-time lookups by
+    // construction. Discovery failures fail boot closed.
+    if !config.trusted_issuers.is_empty() {
+        let slug = config.auth.tenant_slug.as_ref().ok_or_else(|| {
+            ServerBootError::TenantSlugUnresolved {
+                slug: "(unset)".to_owned(),
+            }
+        })?;
+        let tenant_id = crate::issuer_boot::resolve_implicit_tenant(&state.pool, slug).await?;
+        let issuers = crate::issuer_boot::ConfigFileIssuerResolver::new(
+            config.trusted_issuers.clone(),
+            tenant_id,
+        )
+        .resolve()
+        .await?;
+        let registry = wyrd_auth_oidc::TrustedIssuerRegistry::from_issuers(issuers);
+        state = state.with_trusted_issuer_registry(Arc::new(registry));
+    }
+
+    Ok(state)
 }
 
 /// Spawn the storage sweeper if enabled and the platform admin pool is available.

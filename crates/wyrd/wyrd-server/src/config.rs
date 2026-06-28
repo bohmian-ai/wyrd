@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use wyrd_spec::TenantSlug;
 use wyrd_telemetry::TelemetryConfig;
 
 /// Errors raised during configuration loading or validation.
@@ -245,6 +246,15 @@ pub struct AuthConfig {
     /// When true, auth routes that require preview-gated card registration are allowed.
     #[serde(default)]
     pub allow_preview: bool,
+    /// Slug of the implicit tenant this self-hosted deployment serves.
+    ///
+    /// Boot has no request `Host` to derive the tenant from, so the operator
+    /// declares it here (or via `WYRD_SERVER_TENANT_SLUG`). Required when any
+    /// `[[trusted_issuers]]` or `[[workload_bindings]]` entry is configured; the
+    /// slug is resolved at boot through the same `resolve_by_slug_for_app` path
+    /// the request handlers use, so the bound tenant matches request-time lookups.
+    #[serde(default)]
+    pub tenant_slug: Option<TenantSlug>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -705,6 +715,15 @@ impl WyrdServerConfig {
             self.auth.allow_preview = parse_flag(&val, "WYRD_AUTH_ALLOW_PREVIEW")?;
         }
 
+        // auth.tenant_slug
+        if let Some(val) = env_opt("WYRD_SERVER_TENANT_SLUG")? {
+            let slug = TenantSlug::new(val).map_err(|e| ConfigError::BadEnvVar {
+                key: "WYRD_SERVER_TENANT_SLUG".to_string(),
+                message: e.to_string(),
+            })?;
+            self.auth.tenant_slug = Some(slug);
+        }
+
         Ok(())
     }
 
@@ -907,6 +926,20 @@ impl WyrdServerConfig {
                     });
                 }
             }
+        }
+
+        // 18. Issuers/bindings require an explicit implicit-tenant slug. Boot
+        //     binds every issuer/binding to this tenant via the same slug path
+        //     the request handlers use; without it boot can resolve no tenant
+        //     and must fail closed, so reject the config here.
+        if (!self.trusted_issuers.is_empty() || !self.workload_bindings.is_empty())
+            && self.auth.tenant_slug.is_none()
+        {
+            return Err(ConfigError::Invalid {
+                message: "[auth] tenant_slug is required when trusted_issuers or \
+                          workload_bindings are configured"
+                    .to_string(),
+            });
         }
 
         Ok(())
@@ -1526,5 +1559,82 @@ mod tests {
             !debug.contains("super-secret-value"),
             "secret must be redacted in Debug output, got: {debug}"
         );
+    }
+
+    // ── 32. trusted_issuers present without tenant_slug → Invalid ─────────────
+
+    #[test]
+    fn issuers_without_tenant_slug_invalid() {
+        let toml = r#"
+            [[trusted_issuers]]
+            issuer = "https://idp.example.com"
+            client_id = "wyrd"
+            expected_audience = "wyrd"
+            client_auth = "public"
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        let err = cfg.validate().expect_err("missing tenant_slug must fail");
+        assert!(
+            matches!(err, ConfigError::Invalid { ref message } if message.contains("tenant_slug")),
+            "expected Invalid(tenant_slug), got {err:?}"
+        );
+    }
+
+    // ── 33. workload_bindings present without tenant_slug → Invalid ───────────
+
+    #[test]
+    fn bindings_without_tenant_slug_invalid() {
+        let toml = r#"
+            [[workload_bindings]]
+            issuer = "https://idp.example.com"
+            subject = "system:serviceaccount:default/my-sa"
+            kind = "model"
+            name = "my-model"
+            space = "prod"
+            version = "1.0.0"
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        let err = cfg.validate().expect_err("missing tenant_slug must fail");
+        assert!(
+            matches!(err, ConfigError::Invalid { ref message } if message.contains("tenant_slug")),
+            "expected Invalid(tenant_slug), got {err:?}"
+        );
+    }
+
+    // ── 34. tenant_slug present satisfies the issuer requirement ──────────────
+
+    #[test]
+    fn issuers_with_tenant_slug_valid() {
+        let toml = r#"
+            [auth]
+            tenant_slug = "acme"
+
+            [[trusted_issuers]]
+            issuer = "https://idp.example.com"
+            client_id = "wyrd"
+            expected_audience = "wyrd"
+            client_auth = "public"
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        cfg.validate().expect("tenant_slug present must validate");
+        assert_eq!(
+            cfg.auth.tenant_slug.as_ref().map(TenantSlug::as_str),
+            Some("acme")
+        );
+    }
+
+    // ── 35. WYRD_SERVER_TENANT_SLUG overrides [auth] tenant_slug ──────────────
+
+    #[test]
+    fn env_tenant_slug_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_vars([("WYRD_SERVER_TENANT_SLUG", Some("from-env"))], || {
+            let mut cfg = WyrdServerConfig::default();
+            cfg.apply_env_overrides().expect("apply succeeds");
+            assert_eq!(
+                cfg.auth.tenant_slug.as_ref().map(TenantSlug::as_str),
+                Some("from-env")
+            );
+        });
     }
 }

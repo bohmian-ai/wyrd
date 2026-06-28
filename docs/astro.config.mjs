@@ -77,6 +77,7 @@ export default defineConfig({
           items: [
             { label: "Overview", link: "/security/" },
             { label: "Identity", link: "/security/identity/" },
+            { label: "Identity configuration", link: "/security/identity-config/" },
             { label: "Roles and permissions", link: "/security/roles-and-permissions/" },
             { label: "Tokens", link: "/security/tokens/" },
             { label: "Service identity", link: "/security/service-identity/" },
@@ -142,6 +143,7 @@ export default defineConfig({
               collapsed: true,
               items: [
                 { label: "Deploy", link: "/deploy/" },
+                { label: "Deploy identity config", link: "/deploy/identity/" },
                 { label: "Migration", link: "/migration/" },
               ],
             },

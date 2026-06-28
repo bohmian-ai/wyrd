@@ -1,0 +1,288 @@
+---
+title: Identity configuration
+description: Configure trusted OIDC issuers and workload bindings for self-hosted Wyrd.
+---
+
+# Identity configuration
+
+Self-hosted Wyrd resolves all trusted issuers and workload bindings from
+`server.toml` at boot time. There is one tenant per deployment. The server
+reads the config, fetches OIDC discovery documents, and holds the result in
+memory for the lifetime of the process. No request-time resolver and no
+per-tenant database are involved in self-hosted mode.
+
+## Credential decision guide
+
+| Credential | Principal kind | When to use |
+| --- | --- | --- |
+| **API key** | Service or Agent | Deployed services and agents that need a static bootstrap secret. No IdP interaction at runtime. |
+| **Human SSO** | User | Interactive logins through any OIDC-compliant IdP (Keycloak, Okta, etc.). MFA is handled at the IdP. |
+| **Workload jwt-bearer** | Service or Agent | Kubernetes pods, SPIFFE-attested workloads, or CI runners that already hold a platform-issued OIDC JWT. No shared secret required. |
+
+## `[[trusted_issuers]]` reference
+
+Each `[[trusted_issuers]]` entry declares one OIDC provider Wyrd will trust.
+Unknown fields are rejected (`deny_unknown_fields`).
+
+| Field | Type | Required | Description |
+| --- | --- | :---: | --- |
+| `issuer` | string (URL) | yes | Normalized OIDC issuer URL. Wyrd fetches `{issuer}/.well-known/openid-configuration` at boot to discover the `jwks_uri`. |
+| `client_id` | string | yes | Wyrd's OAuth 2.0 client identifier registered at the IdP. |
+| `expected_audience` | string | yes | Expected `aud` claim value in tokens from this issuer. Typically the same as `client_id`. |
+| `client_auth` | see below | yes | How Wyrd authenticates to this IdP's token endpoint. |
+| `principal_kind` | `"human"` or `"workload"` | no | Whether tokens from this issuer represent human users or machine workloads. Default: `"human"`. |
+| `claim_mapping.subject` | string (dotted path) | no | Claim path for the external subject. Default: `"sub"`. |
+| `claim_mapping.email` | string (dotted path) | no | Claim path for an email address. Absent means no email is extracted; not an error. |
+| `claim_mapping.groups` | string (dotted path) | no | Claim path for a groups or roles array (e.g. `"realm_access.roles"` for Keycloak, `"groups"` for Okta). |
+| `group_role_map` | inline table | no | Maps IdP group strings to Wyrd role name arrays. Unmapped groups are ignored. |
+| `default_roles` | array of strings | no | Wyrd role names granted to every federated principal from this issuer, regardless of group membership. |
+| `jwks_ttl_secs` | integer | no | JWKS key-cache TTL in seconds. Absent means the server default applies. |
+
+### `client_auth` values
+
+| TOML value | Description |
+| --- | --- |
+| `"public"` | PKCE-only public client. No secret or assertion. Use for SPAs and native apps. |
+| `"private_key_jwt"` | Private-key JWT assertion (RFC 7523). Key is resolved from the server key store at runtime. |
+| `{ secret_basic = "secret" }` | HTTP Basic auth with a shared client secret (RFC 6749 §2.3.1). Secret is redacted in logs. |
+| `{ secret_post = "secret" }` | Shared client secret sent in the token-endpoint POST body (RFC 6749 §2.3.1). |
+
+Secrets passed as inline values in `server.toml` are loaded into memory as
+`SecretString` and are never printed in debug output or log lines.
+
+## `[[workload_bindings]]` reference
+
+Each `[[workload_bindings]]` entry maps a verified external subject to a
+registered Wyrd card. The server never trusts a card identity from the token
+itself; the binding is the server-side declaration.
+
+| Field | Type | Required | Description |
+| --- | --- | :---: | --- |
+| `issuer` | string (URL) | yes | OIDC issuer that signs the workload token. Must match a `[[trusted_issuers]]` entry with `principal_kind = "workload"`. |
+| `subject` | string | yes | Verified external subject claim value (e.g. a Kubernetes service-account name). |
+| `audience` | string | no | Optional audience constraint for additional lookup precision. When absent, any audience matching the issuer's `expected_audience` is accepted. |
+| `kind` | string | yes | Card kind (`"service"` or `"agent"`). |
+| `name` | string | yes | Card name. |
+| `space` | string | yes | Space that pins the card identity. |
+| `version` | string | yes | Exact card version (no version ranges). |
+
+## Working `server.toml`
+
+The following example configures two issuers — one for human SSO and one for
+workload identity — and one workload binding.
+
+```toml
+[auth]
+# Required when trusted_issuers or workload_bindings are configured.
+# Can also be set via WYRD_SERVER_TENANT_SLUG.
+tenant_slug = "acme"
+
+# ── Human SSO issuer (Keycloak) ──────────────────────────────────────────────
+
+[[trusted_issuers]]
+issuer            = "https://idp.acme.com/realms/acme"
+client_id         = "wyrd"
+expected_audience = "wyrd"
+client_auth       = { secret_post = "change-me" }
+principal_kind    = "human"
+default_roles     = ["viewer"]
+claim_mapping     = { subject = "sub", email = "email", groups = "realm_access.roles" }
+group_role_map    = { "data-science" = ["data_science"], "ml-platform" = ["admin"] }
+
+# ── Workload issuer ───────────────────────────────────────────────────────────
+
+[[trusted_issuers]]
+issuer            = "https://idp.acme.com/realms/workload"
+client_id         = "wyrd-workload"
+expected_audience = "wyrd-workload"
+client_auth       = "private_key_jwt"
+principal_kind    = "workload"
+claim_mapping     = { subject = "sub" }
+
+# ── Workload binding ──────────────────────────────────────────────────────────
+
+[[workload_bindings]]
+issuer  = "https://idp.acme.com/realms/workload"
+subject = "system:serviceaccount:ml:inference-svc"
+kind    = "service"
+name    = "inference-svc"
+space   = "prod"
+version = "1.0.0"
+```
+
+Self-hosted Wyrd is single-tenant. All entries in `[[trusted_issuers]]` and
+`[[workload_bindings]]` resolve against the single tenant declared in
+`auth.tenant_slug`.
+
+## IdP registration
+
+### Keycloak
+
+1. Open **Clients** in your realm and click **Create client**.
+2. Set **Client type** to `OpenID Connect` and **Client ID** to match `client_id`
+   in your `[[trusted_issuers]]` entry (e.g. `wyrd`).
+3. For human SSO: enable **Standard flow**. For workload or private-key-JWT
+   clients: enable **Service account roles** instead.
+4. Under **Access settings**, add the Wyrd callback URI to **Valid redirect URIs**:
+   ```text
+   https://{wyrd-host}/auth/callback
+   ```
+5. Under **Credentials**, choose the authentication method that matches
+   `client_auth`:
+   - `{ secret_post = "..." }` or `{ secret_basic = "..." }` → **Client secret**
+   - `"private_key_jwt"` → **Signed JWT** and upload Wyrd's public key
+   - `"public"` → **No authentication** with PKCE enabled
+6. Configure the groups claim. For realm roles, set
+   `claim_mapping.groups = "realm_access.roles"` in `server.toml`. Verify that
+   the **Add to ID token** and **Add to access token** options are enabled for
+   the realm roles mapper.
+7. Set `issuer` to the realm URL: `https://{keycloak-host}/realms/{realm}`.
+
+### Okta
+
+1. In the Okta admin console, go to **Applications → Create App Integration**.
+2. Choose **OIDC – OpenID Connect** with **Web Application** for human SSO.
+3. Set the **Sign-in redirect URI** to:
+   ```text
+   https://{wyrd-host}/auth/callback
+   ```
+4. Copy the **Client ID** and **Client secret** into your `[[trusted_issuers]]`
+   entry. Set `client_auth = { secret_post = "..." }`.
+5. Set `issuer` to your Okta authorization server URL:
+   `https://{org}.okta.com/oauth2/{authServerId}`.
+6. Add a **Groups claim** to the ID token and access token under **Token** →
+   customize the claim name you pass to `claim_mapping.groups` in `server.toml`.
+   For a custom claim named `groups`, set `claim_mapping.groups = "groups"`.
+7. Set `expected_audience` to match the audience your Okta authorization server
+   issues. By default this is the same as `client_id`, but custom authorization
+   servers may differ — check **API → Authorization Servers** → **Audiences**.
+
+## Credential journeys
+
+### API key
+
+An admin issues an API key for a registered Service or Agent card:
+
+```bash
+wyrd auth issue-key prod/Service/billing@1.0.0
+```
+
+The same shape works for Agent cards:
+
+```bash
+wyrd auth issue-key prod/Agent/claude-code@1.0.0
+```
+
+The plaintext key is returned once. Store it in the deployment secret store and
+redact it from logs. At runtime, exchange it for a Wyrd JWT:
+
+```http
+POST /auth/token
+Content-Type: application/json
+
+{
+  "grant_type": "wyrd_api_key",
+  "api_key": "wyrd_sk_..."
+}
+```
+
+The response carries a short-lived access JWT and a long-lived refresh token.
+Send the access JWT in `X-Wyrd-Access-Token` on subsequent API calls.
+
+Rotate by issuing a new key, redeploying the secret, then revoking the old one:
+
+```bash
+wyrd principal revoke <principal-id>
+```
+
+### Human SSO
+
+Initiate login by directing the browser or CLI to:
+
+```http
+GET /auth/login?issuer=https://idp.acme.com/realms/acme
+```
+
+Wyrd redirects the user to the IdP. After authentication, the IdP redirects to
+`/auth/callback`. Complete the code exchange:
+
+```http
+POST /auth/token
+Content-Type: application/json
+
+{
+  "grant_type": "authorization_code",
+  "code": "<code-from-callback>",
+  "state": "<state-from-callback>"
+}
+```
+
+Returns a User JWT and a refresh token. MFA is handled entirely at the IdP.
+Rotate tokens with:
+
+```bash
+wyrd auth refresh --refresh-token <token>
+```
+
+Or via the HTTP endpoint:
+
+```http
+POST /auth/token
+Content-Type: application/json
+
+{
+  "grant_type": "refresh_token",
+  "refresh_token": "<refresh-jwt>"
+}
+```
+
+### Workload jwt-bearer
+
+A workload that holds a platform-issued OIDC JWT exchanges it directly — no
+shared secret required. This is the recommended credential type for Kubernetes
+pods, SPIFFE-attested services, and CI runners.
+
+```http
+POST /auth/token
+Content-Type: application/json
+
+{
+  "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+  "assertion": "<platform-jwt>",
+  "tenant": "acme"
+}
+```
+
+The server verifies the JWT against the trusted issuer's JWKS, looks up the
+`[[workload_bindings]]` entry matching `(issuer, subject)`, and returns a
+Service or Agent JWT for the bound card.
+
+The `tenant` field is a fallback used when the request `Host` header does not
+carry a tenant slug. Set it explicitly for any client that does not send a
+tenant-scoped hostname.
+
+## Limits
+
+The following constraints are fixed in the current self-hosted release.
+
+**JWT-only verification.** All tokens are verified as JWTs. Opaque tokens and
+RFC 7662 token introspection are not supported. Configure your IdP to issue
+signed JWTs for all token types Wyrd will consume.
+
+**MFA delegated to the IdP.** Wyrd does not enforce or check MFA. If your
+security policy requires it, configure MFA at the IdP. You can gate on `amr`
+or `acr` claims in `group_role_map` mappings if your IdP includes them.
+
+**No SCIM provisioning.** Users are created on first login through the
+authorization-code flow. There is no push-based user sync or directory import.
+
+**No Single Logout (SLO).** Revoking or expiring a Wyrd session does not
+propagate to the IdP. Access tokens are invalidated by TTL expiry only.
+
+**Single-tenant boot resolution.** All issuers and bindings resolve at boot
+against the single tenant declared in `auth.tenant_slug`. Changing issuers or
+bindings requires a config-file update and server restart.
+
+**Cloud per-tenant admin API.** The `/admin/trusted-issuers` CRUD API for
+managing issuers per tenant at runtime — without a config-file redeploy — is
+coming in the cloud tier and is not available in self-hosted.

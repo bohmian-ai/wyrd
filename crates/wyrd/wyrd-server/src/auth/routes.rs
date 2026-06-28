@@ -7,11 +7,12 @@ use base64::Engine;
 use secrecy::SecretString;
 use uuid::Uuid;
 use wyrd_auth_verify::AccessTokenClaims;
+use wyrd_runtime::Permission;
 use wyrd_spec::auth::{CallbackQuery, IssueKeyRequest, TokenRequest, TokenResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
-use crate::auth::Caller;
+use crate::auth::AuthenticatedPrincipal;
 use crate::auth::callback::exchange_authorization_code;
 use crate::auth::exchange_api_key::{DelegateToken, ExchangeApiKey, map_exchange_error_to_wyrd};
 use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
@@ -182,19 +183,47 @@ async fn callback(
 }
 
 async fn issue_key(
-    State(_state): State<AppState>,
-    caller: Caller,
-    Json(_request): Json<IssueKeyRequest>,
+    State(state): State<AppState>,
+    caller: AuthenticatedPrincipal,
+    request_id: Option<Extension<RequestId>>,
+    Json(request): Json<IssueKeyRequest>,
 ) -> Result<Json<wyrd_spec::auth::IssueKeyResponse>, WyrdErrorResponse> {
-    // Full route wiring waits for the JWT middleware to expose
-    // `wyrd_runtime::Principal`. The service implementation is complete and
-    // testable; this skeletal route refuses rather than inventing a lossy
-    // conversion from the deprecated scope-based extractor.
-    let _ = (caller, IssueApiKey::default());
-    Err(WyrdErrorResponse::from(WyrdError::AuthPreviewDisabled {
-        message: "issue-key route requires runtime principal extraction".to_owned(),
-        details: serde_json::json!({ "phase": "auth-middleware" }),
-    }))
+    if !caller
+        .principal
+        .effective_permissions
+        .contains(&Permission::service_accounts_write())
+    {
+        return Err(WyrdErrorResponse::from(WyrdError::PermissionDeniedRbac {
+            message: "service_accounts:write permission required to issue API keys".to_owned(),
+            details: serde_json::json!({ "required": "service_accounts:write" }),
+        }));
+    }
+
+    let request_id_str: String;
+    let req_id = match request_id.as_ref() {
+        Some(Extension(id)) => id.as_str(),
+        None => {
+            request_id_str = Uuid::new_v4().to_string();
+            &request_id_str
+        }
+    };
+
+    let tenant = caller.principal.tenant_id;
+    let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, tenant)
+        .await
+        .map_err(sql_error)?;
+    let service = IssueApiKey::default();
+    let issued = service
+        .execute(&mut conn, request, &caller.principal)
+        .await
+        .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
+    service
+        .audit(&mut conn, &issued, &caller.principal, req_id)
+        .await
+        .map_err(|error| sql_error(wyrd_sql::SqlError::from(error)))?;
+    conn.commit().await.map_err(sql_error)?;
+
+    Ok(Json(issued.response))
 }
 
 fn auth_not_configured() -> WyrdErrorResponse {
@@ -243,12 +272,30 @@ fn bad_subject_token_format() -> WyrdErrorResponse {
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine;
-    use wyrd_auth_verify::{AccessTokenClaims, PrincipalKindWire, TokenPrincipalRef};
-    use wyrd_runtime::PrincipalId;
-    use wyrd_spec::DataTenantId;
+    use std::sync::Arc;
 
-    use super::{router, tenant_from_unverified_access_token};
+    use axum::Json;
+    use axum::extract::State;
+    use base64::Engine;
+    use sqlx::types::Json as SqlxJson;
+    use uuid::Uuid;
+    use wyrd_auth_verify::{AccessTokenClaims, PrincipalKindWire, TokenPrincipalRef};
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind};
+    use wyrd_semver::VersionBlock;
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::IssueKeyRequest;
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::error::WyrdError;
+    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::reference::CardRef;
+    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+
+    use crate::auth::AuthenticatedPrincipal;
+    use crate::state::AppState;
+    use wyrd_sql::TenantConn;
+
+    use super::{issue_key, router, tenant_from_unverified_access_token};
 
     #[test]
     fn mounts_token_and_issue_key_routes() {
@@ -308,5 +355,150 @@ mod tests {
 
         let result = tenant_from_unverified_access_token(&fake_jwt);
         assert!(result.is_err());
+    }
+
+    fn service_card_ref() -> CardRef {
+        CardRef {
+            kind: CardKind::Service,
+            name: CardName::new("issue-key-target").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("prod").expect("static space is valid"),
+            uid: None,
+        }
+    }
+
+    fn caller_with(
+        id: Uuid,
+        tenant: DataTenantId,
+        permissions: PermissionSet,
+    ) -> AuthenticatedPrincipal {
+        AuthenticatedPrincipal {
+            principal: Principal {
+                id: PrincipalId::new(id),
+                kind: PrincipalKind::User,
+                tenant_id: tenant,
+                roles: Vec::new(),
+                effective_permissions: permissions,
+            },
+        }
+    }
+
+    fn lazy_state() -> AppState {
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+
+        let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let root = tempfile::tempdir().expect("temp dir");
+        let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
+        AppState::new(
+            pool,
+            None,
+            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+        )
+    }
+
+    fn fixture_state(fixture: &PgFixture) -> AppState {
+        let storage_root = fixture.tempdir_path().join("issue-key-storage");
+        std::fs::create_dir_all(&storage_root).expect("storage root creates");
+        let signer = LocalSigner::new(storage_root).expect("local signer creates");
+        AppState::new(
+            fixture.app_pool().clone(),
+            None,
+            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+        )
+    }
+
+    async fn insert_test_user(conn: &mut TenantConn<'_>, tenant: DataTenantId) -> Uuid {
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO wyrd.auth_users (id, data_tenant_id, email, auth_type, status)
+             VALUES ($1, $2, $3, 'password', 'active')",
+        )
+        .bind(user_id)
+        .bind(tenant.as_uuid())
+        .bind(format!("test-{user_id}@example.com"))
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("test user inserts");
+        user_id
+    }
+
+    async fn insert_test_service_account(
+        conn: &mut TenantConn<'_>,
+        tenant: DataTenantId,
+        created_by: Uuid,
+        card_ref: &CardRef,
+    ) -> Uuid {
+        let sa_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO wyrd.auth_service_accounts
+                 (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref, space, name, version, status, created_by)
+             VALUES ($1, $2, 'service', 'Service', $3, $4, $5, $6, $7, 'active', $8)",
+        )
+        .bind(sa_id)
+        .bind(tenant.as_uuid())
+        .bind(Uuid::new_v4())
+        .bind(SqlxJson(card_ref.clone()))
+        .bind(card_ref.space.as_str())
+        .bind(format!("svc-{sa_id}"))
+        .bind(card_ref.version.as_str())
+        .bind(created_by)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("service account inserts");
+        sa_id
+    }
+
+    #[tokio::test]
+    async fn issue_key_without_permission_is_rbac_denied() {
+        let tenant = DataTenantId::new_v7();
+        let state = lazy_state();
+        let caller = caller_with(Uuid::new_v4(), tenant, PermissionSet::new());
+        let request = IssueKeyRequest {
+            card_ref: service_card_ref(),
+            label: None,
+            expires_in_seconds: None,
+        };
+
+        let error = issue_key(State(state), caller, None, Json(request))
+            .await
+            .expect_err("missing permission is denied");
+
+        assert!(
+            matches!(error.0, WyrdError::PermissionDeniedRbac { .. }),
+            "expected an RBAC denial, got {:?}",
+            error.0
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_key_with_permission_mints_response() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let card_ref = service_card_ref();
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let creator = insert_test_user(&mut conn, tenant).await;
+        insert_test_service_account(&mut conn, tenant, creator, &card_ref).await;
+        conn.commit().await.expect("seed commits");
+
+        let state = fixture_state(&fixture);
+        let caller = caller_with(
+            creator,
+            tenant,
+            PermissionSet::from_iter([Permission::service_accounts_write()]),
+        );
+        let request = IssueKeyRequest {
+            card_ref: card_ref.clone(),
+            label: None,
+            expires_in_seconds: None,
+        };
+
+        let response = issue_key(State(state), caller, None, Json(request))
+            .await
+            .expect("issue key succeeds");
+
+        assert_eq!(response.0.card_ref, card_ref);
+        assert!(!response.0.prefix.is_empty());
+        assert!(!response.0.key_id.is_empty());
     }
 }

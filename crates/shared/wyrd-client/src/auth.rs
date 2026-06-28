@@ -317,10 +317,7 @@ impl AuthMiddleware {
     /// POST a token request to `/auth/token`, map a non-2xx body via
     /// [`from_problem_json`] into [`AuthError::Server`], and decode the success
     /// body into a [`CachedToken`]. The shared POST/decode tail of every grant.
-    async fn post_token_request(
-        &self,
-        request: TokenRequest,
-    ) -> Result<CachedToken, AuthError> {
+    async fn post_token_request(&self, request: TokenRequest) -> Result<CachedToken, AuthError> {
         let url = format!("{}/auth/token", self.http_base_url.trim_end_matches('/'));
         let response = self
             .http_client
@@ -738,7 +735,10 @@ mod tests {
         )
         .expect("middleware builds");
 
-        let err = mw.bearer().await.expect_err("invalid tenant slug must fail");
+        let err = mw
+            .bearer()
+            .await
+            .expect_err("invalid tenant slug must fail");
         match err {
             AuthError::Client(WyrdClientError::Config { field, .. }) => {
                 assert_eq!(field, "tenant");

@@ -59,7 +59,11 @@ fn issuer_entry(issuer: &str, audience: &str, principal_kind: PrincipalKindEntry
 
 /// The Keycloak workload issuer, principal-kind Workload (jwt-bearer issuance).
 fn keycloak_workload_issuer() -> IssuerEntry {
-    issuer_entry(&keycloak_issuer(), "wyrd-workload", PrincipalKindEntry::Workload)
+    issuer_entry(
+        &keycloak_issuer(),
+        "wyrd-workload",
+        PrincipalKindEntry::Workload,
+    )
 }
 
 /// Build the server-owned `CardRef` a `[[workload_bindings]]` entry resolves to:
@@ -84,10 +88,7 @@ fn jwt_claims(jwt: &str) -> Value {
 }
 
 /// POST a jwt-bearer assertion at `/auth/token`, returning the raw HTTP response.
-async fn post_jwt_bearer(
-    srv: &WyrdTestServer,
-    assertion: &str,
-) -> axum::http::Response<Body> {
+async fn post_jwt_bearer(srv: &WyrdTestServer, assertion: &str) -> axum::http::Response<Body> {
     let body = serde_json::json!({
         "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
         "assertion": assertion,
@@ -294,7 +295,10 @@ async fn workload_token_keycloak_claims() {
             .as_array()
             .map(|a| a.iter().any(|v| v == "wyrd-workload"))
             .unwrap_or(false);
-    assert!(has_aud, "workload token aud contains 'wyrd-workload': {aud}");
+    assert!(
+        has_aud,
+        "workload token aud contains 'wyrd-workload': {aud}"
+    );
 }
 
 /// A workload token must NOT carry an unrelated audience.

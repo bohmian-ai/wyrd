@@ -954,11 +954,10 @@ impl WyrdTestServerBuilder {
         let config_issuer_registry = if self.trusted_issuer_configs.is_empty() {
             None
         } else {
-            let issuers =
-                ConfigFileIssuerResolver::new(self.trusted_issuer_configs, tenant_id)
-                    .resolve()
-                    .await
-                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            let issuers = ConfigFileIssuerResolver::new(self.trusted_issuer_configs, tenant_id)
+                .resolve()
+                .await
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             Some(Arc::new(TrustedIssuerRegistry::from_issuers(issuers)))
         };
 

@@ -1453,7 +1453,9 @@ mod tests {
             client_auth = "public"
         "#;
         let cfg = from_toml_str(toml).expect("parses ok");
-        let err = cfg.validate().expect_err("empty expected_audience must fail");
+        let err = cfg
+            .validate()
+            .expect_err("empty expected_audience must fail");
         assert!(
             matches!(err, ConfigError::Invalid { ref message } if message.contains("expected_audience")),
             "expected Invalid(expected_audience), got {err:?}"

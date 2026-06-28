@@ -116,10 +116,11 @@ async fn discover_with_retry(
     issuer: &str,
     http: &reqwest::Client,
 ) -> Result<ProviderMetadata, ServerBootError> {
-    let issuer_url = Url::parse(issuer).map_err(|e| ServerBootError::IssuerDiscoveryUnavailable {
-        issuer: issuer.to_owned(),
-        message: format!("issuer URL could not be parsed: {e}"),
-    })?;
+    let issuer_url =
+        Url::parse(issuer).map_err(|e| ServerBootError::IssuerDiscoveryUnavailable {
+            issuer: issuer.to_owned(),
+            message: format!("issuer URL could not be parsed: {e}"),
+        })?;
 
     let mut last_message = String::from("discovery did not complete");
     for attempt in 0..DISCOVERY_MAX_ATTEMPTS {
@@ -155,13 +156,12 @@ fn build_trusted_issuer(
     tenant_id: DataTenantId,
     metadata: &ProviderMetadata,
 ) -> Result<TrustedIssuer, ServerBootError> {
-    let issuer =
-        IssuerUrl::new(entry.issuer.clone()).map_err(|e| {
-            ServerBootError::IssuerDiscoveryUnavailable {
-                issuer: entry.issuer.clone(),
-                message: format!("issuer URL is not a valid https issuer: {e}"),
-            }
-        })?;
+    let issuer = IssuerUrl::new(entry.issuer.clone()).map_err(|e| {
+        ServerBootError::IssuerDiscoveryUnavailable {
+            issuer: entry.issuer.clone(),
+            message: format!("issuer URL is not a valid https issuer: {e}"),
+        }
+    })?;
 
     Ok(TrustedIssuer {
         tenant_id,
@@ -238,7 +238,11 @@ mod tests {
             authorization_endpoint: format!("{issuer}/authorize")
                 .parse()
                 .expect("authorize url is valid"),
-            token_endpoint: Some(format!("{issuer}/token").parse().expect("token url is valid")),
+            token_endpoint: Some(
+                format!("{issuer}/token")
+                    .parse()
+                    .expect("token url is valid"),
+            ),
             jwks_uri: format!("{issuer}/jwks").parse().expect("jwks url is valid"),
             id_token_signing_alg_values_supported: vec!["RS256".to_owned()],
         }

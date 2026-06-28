@@ -254,6 +254,136 @@ mod tests {
     }
 
     #[test]
+    fn workload_token_beats_env_api_key() {
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            std::env::set_var("WYRD_WORKLOAD_TOKEN", "workload-jwt");
+            std::env::set_var("WYRD_TENANT", "acme");
+            std::env::set_var("WYRD_API_KEY", "api-key-should-lose");
+            std::env::remove_var("WYRD_ACCESS_TOKEN");
+        }
+
+        let cfg = ClientConfig::from_env();
+        let cred = cfg.resolve_credential().expect("resolves from env");
+
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
+            std::env::remove_var("WYRD_TENANT");
+            std::env::remove_var("WYRD_API_KEY");
+        }
+
+        match cred {
+            ResolvedCredential::WorkloadJwt { tenant, .. } => {
+                assert_eq!(
+                    tenant, "acme",
+                    "WYRD_WORKLOAD_TOKEN must outrank WYRD_API_KEY"
+                );
+            }
+            other => panic!("expected WorkloadJwt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_access_token_beats_workload_token() {
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            std::env::set_var("WYRD_ACCESS_TOKEN", "real-access-token");
+            std::env::set_var("WYRD_WORKLOAD_TOKEN", "workload-should-lose");
+            std::env::set_var("WYRD_TENANT", "acme");
+            std::env::remove_var("WYRD_API_KEY");
+        }
+
+        let cfg = ClientConfig::from_env();
+        let cred = cfg.resolve_credential().expect("resolves from env");
+
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            std::env::remove_var("WYRD_ACCESS_TOKEN");
+            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
+            std::env::remove_var("WYRD_TENANT");
+        }
+
+        match cred {
+            ResolvedCredential::BearerToken(token) => {
+                assert_eq!(
+                    token.expose_secret(),
+                    "real-access-token",
+                    "WYRD_ACCESS_TOKEN must outrank WYRD_WORKLOAD_TOKEN"
+                );
+            }
+            other => panic!("expected BearerToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_api_key_beats_workload_token() {
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            std::env::set_var("WYRD_WORKLOAD_TOKEN", "workload-should-lose");
+            std::env::set_var("WYRD_TENANT", "acme");
+            std::env::remove_var("WYRD_ACCESS_TOKEN");
+            std::env::remove_var("WYRD_API_KEY");
+        }
+
+        let mut cfg = ClientConfig::from_env();
+        cfg.api_key = Some("explicit-key-wins".to_owned().into());
+        let cred = cfg.resolve_credential().expect("explicit key resolves");
+
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
+            std::env::remove_var("WYRD_TENANT");
+        }
+
+        match cred {
+            ResolvedCredential::ApiKey(key) => {
+                assert_eq!(
+                    key.expose_secret(),
+                    "explicit-key-wins",
+                    "an explicit api_key must outrank WYRD_WORKLOAD_TOKEN"
+                );
+            }
+            other => panic!("expected ApiKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workload_token_without_tenant_yields_no_source() {
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            std::env::set_var("WYRD_WORKLOAD_TOKEN", "workload-jwt");
+            std::env::remove_var("WYRD_TENANT");
+            std::env::set_var("WYRD_API_KEY", "api-key-fallback");
+            std::env::remove_var("WYRD_ACCESS_TOKEN");
+        }
+
+        let cfg = ClientConfig::from_env();
+        let cred = cfg.resolve_credential().expect("falls through to api key");
+
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
+            std::env::remove_var("WYRD_API_KEY");
+        }
+
+        match cred {
+            ResolvedCredential::ApiKey(key) => {
+                assert_eq!(
+                    key.expose_secret(),
+                    "api-key-fallback",
+                    "WYRD_WORKLOAD_TOKEN without WYRD_TENANT must yield no source"
+                );
+            }
+            other => panic!("expected ApiKey fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn debug_does_not_leak_api_key() {
         let cfg = ClientConfig {
             api_key: Some("top-secret".to_owned().into()),

@@ -357,7 +357,8 @@ Env vars in deployed services:
 | Env var | Required? | Source | Used for |
 |---|---|---|---|
 | `WYRD_API_KEY` | REQUIRED | Deploy environment's secret store (key minted by `wyrd auth issue-key <card_ref>`) | Exchanged ONCE at startup at `POST /auth/token` for short-lived JWT. SDK auto-refreshes. JWT carries the card-bound `principal` claim (kind, id, tenant, `card_ref`). |
-| `WYRD_API_URL` | REQUIRED | Static config | Wyrd server base URL. |
+| `WYRD_SERVER_URL` | REQUIRED | Static config | Wyrd server HTTP base URL (default `http://localhost:50050`). Read by `ClientConfig::from_env`. |
+| `WYRD_GRPC_URL` | OPTIONAL | Static config | Wyrd server gRPC endpoint (default `http://localhost:50051`). Read by `ClientConfig::from_env`. |
 
 The API key is exchanged at startup — never on the wire. The JWT — not the API
 key — is what travels on cross-service calls in the dedicated

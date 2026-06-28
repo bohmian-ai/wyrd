@@ -39,7 +39,7 @@ fn transport_config_grpc_round_trips() {
 fn transport_config_mock_round_trips() {
     let c = TransportConfig::Mock(MockConfig {
         label: "t".to_string(),
-        fail_on_flush: None,
+        fail_on_drain: None,
     });
     let s = serde_json::to_string(&c).unwrap();
     let back: TransportConfig = serde_json::from_str(&s).unwrap();
@@ -56,7 +56,6 @@ fn transport_config_name_matches_tag() {
                 base_url: "https://example.com".to_string(),
                 timeout_ms: 5_000,
                 tls: None,
-                auth: None,
                 compression: false,
             }),
         ),
@@ -64,7 +63,7 @@ fn transport_config_name_matches_tag() {
             "mock",
             TransportConfig::Mock(MockConfig {
                 label: "m".to_string(),
-                fail_on_flush: None,
+                fail_on_drain: None,
             }),
         ),
     ];
@@ -87,12 +86,11 @@ fn transport_config_all_variants_round_trip() {
             base_url: "https://example.com".to_string(),
             timeout_ms: 30_000,
             tls: None,
-            auth: None,
             compression: false,
         }),
         TransportConfig::Mock(MockConfig {
             label: "buf".to_string(),
-            fail_on_flush: Some(3),
+            fail_on_drain: Some(3),
         }),
     ];
 
@@ -107,7 +105,7 @@ fn transport_config_all_variants_round_trip() {
 fn transport_config_is_enabled_mock_always_true() {
     let m = TransportConfig::Mock(MockConfig {
         label: "m".to_string(),
-        fail_on_flush: None,
+        fail_on_drain: None,
     });
     assert!(m.is_enabled());
     assert!(m.required_feature().is_none());

@@ -205,3 +205,20 @@ directly when a commit's surface warrants. The test stage uses
 Assembled feature branch (all tasks `done`, gates green) → **`review-and-plan`**
 for the final fan-out review; optionally `wyrd-architecture-review` again if the
 implementation diverged from `plan.md`.
+
+**Run the review stage to its terminal artifact.** `review-and-plan` is an
+orchestrator: it is not complete until all five phases have run and
+`.dev/review/{REVIEW_ID}/implementation-plan.md` exists (preceded by `summary.md`
+and `validation.md`). Drive it straight through — do **not** stop after the
+reviewers (Phase 3) write their files.
+
+**Surface nothing until it has passed validation.** A raw reviewer finding — even
+one that looks CRITICAL — is *unvalidated* and may be a false positive. The
+validate-reviews phase exists precisely to confirm or eliminate findings against
+the actual source. Do **not** report a finding to the user, do **not** start
+investigating it, and do **not** begin implementing a fix until Phase 5 has run it
+through validation. Only **confirmed** findings, as recorded in `validation.md`
+and the `implementation-plan.md`, reach the user. Run the orchestration to its
+terminal artifact first; the validated plan is what you present, not the reviewers'
+raw output. If the user redirects mid-review, complete the owed artifacts before
+pivoting.

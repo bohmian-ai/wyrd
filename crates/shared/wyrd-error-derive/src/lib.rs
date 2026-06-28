@@ -21,6 +21,14 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
     let mut status_arms = Vec::new();
     let mut title_arms = Vec::new();
     let mut remediation_arms = Vec::new();
+    // Reverse code->variant reconstruction, emitted only for variants whose
+    // named fields are exactly `{ message, details }`. This is the inverse of
+    // `code()`: it lets a transport boundary rebuild the typed variant (and so
+    // its real `status()`) from a stable code, instead of collapsing every
+    // unknown code into one catch-all status. Variants with any other shape
+    // (unit, tuple, delegate, extra fields) do not qualify and fall through.
+    let mut from_code_arms = Vec::new();
+    let mut from_code_field_types: Option<(syn::Type, syn::Type)> = None;
 
     for variant in &data.variants {
         let metadata = match parse_attr(variant) {
@@ -58,6 +66,26 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
                 status_arms.push(quote! { #pattern => #status });
                 title_arms.push(quote! { #pattern => #title });
                 remediation_arms.push(quote! { #pattern => #remediation });
+
+                if let Some((message_ty, details_ty)) = message_details_fields(&variant.fields) {
+                    // Pin the param types to the first qualifying variant and
+                    // only include variants whose `message`/`details` types
+                    // match, so the generated constructor always compiles.
+                    let matches = match &from_code_field_types {
+                        Some((m, d)) => types_equal(m, message_ty) && types_equal(d, details_ty),
+                        None => {
+                            from_code_field_types = Some((message_ty.clone(), details_ty.clone()));
+                            true
+                        }
+                    };
+                    if matches {
+                        from_code_arms.push(quote! {
+                            #code => ::core::option::Option::Some(
+                                #name::#ident { message, details }
+                            )
+                        });
+                    }
+                }
             }
             ErrorMetadata::Delegate => {
                 let (pattern, binding) = match &variant.fields {
@@ -94,6 +122,30 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
         }
     }
 
+    let from_code_method = match from_code_field_types {
+        Some((message_ty, details_ty)) => quote! {
+            /// Reconstruct the typed variant for a stable Wyrd `code`.
+            ///
+            /// The inverse of [`Self::code`] for variants whose fields are
+            /// exactly `{ message, details }`. Returns `None` for any code that
+            /// has no such variant, so a caller can fall back to a catch-all
+            /// while preserving the original code. Reconstructing the typed
+            /// variant restores its real [`Self::status`] instead of collapsing
+            /// every unrecognized code onto one status.
+            pub fn from_code(
+                code: &str,
+                message: #message_ty,
+                details: #details_ty,
+            ) -> ::core::option::Option<Self> {
+                match code {
+                    #(#from_code_arms,)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+        },
+        None => quote! {},
+    };
+
     quote! {
         impl #name {
             /// Stable Wyrd error code.
@@ -123,9 +175,37 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
                     #(#remediation_arms,)*
                 }
             }
+
+            #from_code_method
         }
     }
     .into()
+}
+
+/// Return the `message` and `details` field types when `fields` is a named
+/// struct whose fields are exactly `message` and `details`, else `None`.
+fn message_details_fields(fields: &Fields) -> Option<(&syn::Type, &syn::Type)> {
+    let Fields::Named(named) = fields else {
+        return None;
+    };
+    if named.named.len() != 2 {
+        return None;
+    }
+    let mut message_ty = None;
+    let mut details_ty = None;
+    for field in &named.named {
+        match field.ident.as_ref()?.to_string().as_str() {
+            "message" => message_ty = Some(&field.ty),
+            "details" => details_ty = Some(&field.ty),
+            _ => return None,
+        }
+    }
+    Some((message_ty?, details_ty?))
+}
+
+/// Compare two types by their token representation.
+fn types_equal(left: &syn::Type, right: &syn::Type) -> bool {
+    quote!(#left).to_string() == quote!(#right).to_string()
 }
 
 enum ErrorMetadata {

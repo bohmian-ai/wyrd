@@ -1,7 +1,7 @@
 //! Wyrd client transport configuration types.
 
 use serde::{Deserialize, Serialize};
-use wyrd_spec::security::{SecretRef, TlsConfig};
+use wyrd_spec::security::TlsConfig;
 
 use crate::error::WyrdClientError;
 
@@ -24,6 +24,10 @@ pub const GRPC_DEFAULT_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 /// gRPC is the default transport for `wyrd-client`. The server-side endpoint
 /// is the Wyrd ingest gateway (`vala-ingest`, PR4.2) or any compatible
 /// tonic-based receiver.
+///
+/// This config carries transport wiring only. Authentication is owned by
+/// `AuthMiddleware`, which injects the `x-wyrd-access-token` credential per
+/// call; there is no auth field here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GrpcConfig {
@@ -43,11 +47,6 @@ pub struct GrpcConfig {
     /// pool, `http://` means plaintext).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
-
-    /// Optional bearer token or mTLS identity reference. The runtime passes
-    /// this through the gRPC `Authorization` metadata header.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<SecretRef>,
 
     /// Connection-level retry budget. The transport retries the initial
     /// connection up to this many times before surfacing an error.
@@ -93,7 +92,6 @@ impl Default for GrpcConfig {
             endpoint: GRPC_DEFAULT_ENDPOINT.to_string(),
             timeout_ms: GRPC_DEFAULT_TIMEOUT_MS,
             tls: None,
-            auth: None,
             connect_retries: GRPC_DEFAULT_CONNECT_RETRIES,
             keepalive_interval_ms: GRPC_DEFAULT_KEEPALIVE_INTERVAL_MS,
             keepalive_timeout_ms: GRPC_DEFAULT_KEEPALIVE_TIMEOUT_MS,
@@ -135,6 +133,10 @@ pub const HTTP_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// The HTTP transport is a fallback for environments where gRPC is unavailable
 /// or blocked. Ingest routes are appended by the client at call time;
 /// `base_url` is the common prefix.
+///
+/// This config carries transport wiring only. Authentication is owned by
+/// `AuthMiddleware`, which injects the `x-wyrd-access-token` credential per
+/// call; there is no auth field here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HttpConfig {
@@ -158,11 +160,6 @@ pub struct HttpConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
 
-    /// Optional authorization credential. Passed through the `Authorization`
-    /// HTTP header at request time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<SecretRef>,
-
     /// Whether to gzip-compress request bodies. Useful for high-volume
     /// payloads; the server must accept `Content-Encoding: gzip`.
     ///
@@ -185,7 +182,6 @@ impl Default for HttpConfig {
             base_url: HTTP_DEFAULT_BASE_URL.to_string(),
             timeout_ms: HTTP_DEFAULT_TIMEOUT_MS,
             tls: None,
-            auth: None,
             compression: false,
         }
     }
@@ -194,6 +190,11 @@ impl Default for HttpConfig {
 impl HttpConfig {
     /// Validate the config. Returns `Err` if `base_url` is empty or
     /// `timeout_ms` is zero.
+    ///
+    /// A plaintext `http://` URL to a non-loopback host logs a security warning
+    /// (not an error): the durable API key is POSTed to `{base_url}/auth/token`,
+    /// so a remote cleartext endpoint exposes it on the wire. Loopback hosts
+    /// (`localhost`, `127.0.0.1`, `[::1]`) are exempt for local development.
     pub fn validate(&self) -> Result<(), WyrdClientError> {
         if self.base_url.is_empty() {
             return Err(WyrdClientError::Config {
@@ -207,8 +208,36 @@ impl HttpConfig {
                 reason: "must be at least 1".to_string(),
             });
         }
+        if is_cleartext_remote(&self.base_url) {
+            tracing::warn!(
+                target: "wyrd.client.config",
+                base_url = %self.base_url,
+                "HTTP base_url uses plaintext http:// to a non-loopback host; the \
+                 durable API key will be sent in cleartext — use https:// in production"
+            );
+        }
         Ok(())
     }
+}
+
+/// Return `true` when `url` is a plaintext `http://` URL whose host is not a
+/// loopback address. Used to flag cleartext transmission of the durable key.
+fn is_cleartext_remote(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Strip an optional `:port`, but only when the authority is not a bracketed
+    // IPv6 literal whose colons would otherwise be split.
+    let host = if authority.starts_with('[') {
+        authority
+    } else {
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host)
+    };
+    !matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "[::1]:" | "::1")
+        && !host.starts_with("[::1]")
 }
 
 /// Default buffer label used by [`MockConfig::default`].
@@ -223,12 +252,12 @@ pub const MOCK_DEFAULT_LABEL: &str = "default";
 /// flushed records.
 ///
 /// The mock transport is always available in `wyrd-client` (no feature gate).
-/// `MockConfig::fail_on_flush` lets tests inject deterministic flush
+/// `MockConfig::fail_on_drain` lets tests inject deterministic drain
 /// failures — a Wyrd-native addition the predecessor mock did not support.
 ///
 /// # Default
 ///
-/// `MockConfig::default()` returns `{ label: "default", fail_on_flush: None }`.
+/// `MockConfig::default()` returns `{ label: "default", fail_on_drain: None }`.
 /// The default is a working config — it does not need `validate()` and is
 /// safe to use directly in tests that do not care about label isolation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -239,19 +268,19 @@ pub struct MockConfig {
     /// distinct labels to isolate test scenarios running in the same process.
     pub label: String,
 
-    /// Inject a flush failure. When `Some(n)`, the `nth` call to flush
+    /// Inject a drain failure. When `Some(n)`, the `nth` call to drain
     /// returns `Err`; all other calls succeed normally.
-    /// Counting starts from 1 (i.e. `Some(1)` fails the first flush).
+    /// Counting starts from 1 (i.e. `Some(1)` fails the first drain).
     /// `None` means the mock always succeeds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fail_on_flush: Option<u32>,
+    pub fail_on_drain: Option<u32>,
 }
 
 impl Default for MockConfig {
     fn default() -> Self {
         Self {
             label: MOCK_DEFAULT_LABEL.to_string(),
-            fail_on_flush: None,
+            fail_on_drain: None,
         }
     }
 }
@@ -332,5 +361,25 @@ impl TransportConfig {
             Self::Http(c) => c.validate(),
             Self::Mock(_) => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cleartext_remote;
+
+    #[test]
+    fn cleartext_remote_flags_plaintext_non_loopback() {
+        assert!(is_cleartext_remote("http://wyrd.example.com"));
+        assert!(is_cleartext_remote("http://wyrd.example.com:50050/api"));
+        assert!(is_cleartext_remote("http://10.0.0.5:8080"));
+    }
+
+    #[test]
+    fn cleartext_remote_exempts_https_and_loopback() {
+        assert!(!is_cleartext_remote("https://wyrd.example.com"));
+        assert!(!is_cleartext_remote("http://localhost:50050"));
+        assert!(!is_cleartext_remote("http://127.0.0.1:50050"));
+        assert!(!is_cleartext_remote("http://[::1]:50050"));
     }
 }

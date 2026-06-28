@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "GrpcConfig",
-  "description": "Configuration for the gRPC transport.\n\ngRPC is the default transport for `wyrd-client`. The server-side endpoint is the Wyrd ingest gateway (`vala-ingest`, PR4.2) or any compatible tonic-based receiver.",
+  "description": "Configuration for the gRPC transport.\n\ngRPC is the default transport for `wyrd-client`. The server-side endpoint is the Wyrd ingest gateway (`vala-ingest`, PR4.2) or any compatible tonic-based receiver.\n\nThis config carries transport wiring only. Authentication is owned by `AuthMiddleware`, which injects the `x-wyrd-access-token` credential per call; there is no auth field here.",
   "type": "object",
   "required": [
     "connect_retries",
@@ -9,17 +9,6 @@
     "timeout_ms"
   ],
   "properties": {
-    "auth": {
-      "description": "Optional bearer token or mTLS identity reference. The runtime passes this through the gRPC `Authorization` metadata header.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/SecretRef"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
     "connect_retries": {
       "description": "Connection-level retry budget. The transport retries the initial connection up to this many times before surfacing an error.\n\nDefault: [`GRPC_DEFAULT_CONNECT_RETRIES`] (`3`).",
       "type": "integer",

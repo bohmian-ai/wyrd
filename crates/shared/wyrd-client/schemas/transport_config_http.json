@@ -1,20 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "HttpConfig",
-  "description": "Configuration for the HTTP transport.\n\nThe HTTP transport is a fallback for environments where gRPC is unavailable or blocked. Ingest routes are appended by the client at call time; `base_url` is the common prefix.",
+  "description": "Configuration for the HTTP transport.\n\nThe HTTP transport is a fallback for environments where gRPC is unavailable or blocked. Ingest routes are appended by the client at call time; `base_url` is the common prefix.\n\nThis config carries transport wiring only. Authentication is owned by `AuthMiddleware`, which injects the `x-wyrd-access-token` credential per call; there is no auth field here.",
   "type": "object",
   "properties": {
-    "auth": {
-      "description": "Optional authorization credential. Passed through the `Authorization` HTTP header at request time.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/SecretRef"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
     "base_url": {
       "description": "Base URL for all ingest routes. Must be non-empty. Ingest routes (`/api/v1/observations`, `/api/v1/records`, etc.) are appended at call time.\n\nExample: `\"https://wyrd-ingest.example.com\"`. Default: [`HTTP_DEFAULT_BASE_URL`] (`\"http://localhost:50050\"`).",
       "default": "http://localhost:50050",

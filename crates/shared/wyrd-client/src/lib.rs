@@ -8,9 +8,13 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod auth;
+pub mod client;
 pub mod config;
 pub mod error;
 pub mod transport;
+
+#[cfg(feature = "transport-http")]
+pub use client::WyrdClient;
 
 /// Serializes tests that read or mutate process-global `WYRD_*`/`HOME`
 /// environment variables. `ClientConfig::from_env` and

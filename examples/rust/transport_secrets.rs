@@ -1,4 +1,7 @@
-//! Configure mTLS and bearer-token secret references for a Wyrd transport.
+//! Configure mTLS secret references for a Wyrd transport.
+//!
+//! Authentication is owned by `AuthMiddleware` (see `client_request`), not the
+//! transport config; this example covers the TLS identity material only.
 //!
 //! Run with:
 //!     cargo run -p wyrd-rust-examples --bin transport_secrets
@@ -21,9 +24,6 @@ fn main() -> anyhow::Result<()> {
             }),
             server_name_override: Some("ingest.internal".to_string()),
             insecure_skip_verify: false,
-        }),
-        auth: Some(SecretRef::Vault {
-            key: "secret/data/wyrd/api".to_string(),
         }),
         ..GrpcConfig::default()
     };

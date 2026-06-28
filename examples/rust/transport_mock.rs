@@ -8,7 +8,7 @@ use wyrd_client::transport::{MockConfig, TransportConfig};
 fn main() -> anyhow::Result<()> {
     let mock = MockConfig {
         label: "demo".to_string(),
-        fail_on_flush: None,
+        fail_on_drain: None,
     };
     let transport = TransportConfig::Mock(mock);
     transport.validate()?;

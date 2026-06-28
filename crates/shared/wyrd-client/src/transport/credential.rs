@@ -115,35 +115,16 @@ impl CredentialChain {
     #[must_use]
     pub fn from_env() -> Self {
         let mut chain = Self::default();
-        if let Ok(token) = std::env::var("WYRD_ACCESS_TOKEN")
-            && !token.is_empty()
+        for source in [
+            explicit_token_from_env(),
+            workload_token_from_env(),
+            api_key_from_env(),
+            api_key_from_credentials_file(),
+        ]
+        .into_iter()
+        .flatten()
         {
-            chain.push(CredentialSource::ExplicitToken {
-                token: SecretString::from(token),
-            });
-        }
-        if let (Ok(jwt), Ok(tenant)) = (
-            std::env::var("WYRD_WORKLOAD_TOKEN"),
-            std::env::var("WYRD_TENANT"),
-        ) && !jwt.is_empty()
-            && !tenant.is_empty()
-        {
-            chain.push(CredentialSource::WorkloadToken {
-                jwt: SecretString::from(jwt),
-                tenant,
-            });
-        }
-        if let Ok(key) = std::env::var("WYRD_API_KEY")
-            && !key.is_empty()
-        {
-            chain.push(CredentialSource::ApiKey {
-                key: SecretString::from(key),
-            });
-        }
-        if let Some(key) = read_credentials_toml_api_key() {
-            chain.push(CredentialSource::ApiKey {
-                key: SecretString::from(key),
-            });
+            chain.push(source);
         }
         chain
     }
@@ -183,11 +164,62 @@ impl CredentialChain {
             .unwrap_or(Err(WyrdClientError::NoCredentials))
     }
 
-    /// Returns `true` when the chain has at least one source.
+    /// Returns `true` when the chain has no sources.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.sources.is_empty()
     }
+}
+
+/// Environment-based credential sources for the ADC chain.
+/// WYRD_ACCESS_TOKEN is an actual WYRD JWT access token, which is the highest-priority source.
+fn explicit_token_from_env() -> Option<CredentialSource> {
+    let token = std::env::var("WYRD_ACCESS_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    Some(CredentialSource::ExplicitToken {
+        token: SecretString::from(token),
+    })
+}
+
+/// Environment-based credential sources for the ADC chain.
+/// WYRD_WORKLOAD_TOKEN + WYRD_TENANT is a workload identity token, which is the second-highest-priority source.
+/// Often used in cloud-native environments where the workload identity provider issues a JWT that can be exchanged for a Wyrd access token.
+fn workload_token_from_env() -> Option<CredentialSource> {
+    let jwt = std::env::var("WYRD_WORKLOAD_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    let tenant = std::env::var("WYRD_TENANT")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    Some(CredentialSource::WorkloadToken {
+        jwt: SecretString::from(jwt),
+        tenant,
+    })
+}
+
+/// Environment-based credential sources for the ADC chain.
+/// WYRD_API_KEY is a Wyrd API key, which is the third-highest-priority source.  It is exchanged for a Wyrd access token at call time.
+/// Often used in CI/CD pipelines or other environments where a long-lived API key is available.
+/// An api key is granted for all Service and Agent principals upon registration
+fn api_key_from_env() -> Option<CredentialSource> {
+    let key = std::env::var("WYRD_API_KEY")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    Some(CredentialSource::ApiKey {
+        key: SecretString::from(key),
+    })
+}
+
+/// Environment-based credential sources for the ADC chain.
+/// ~/.config/wyrd/credentials.toml is a file-based credential source, which is
+/// the lowest-priority source.  It is exchanged for a Wyrd access token at call time.
+/// This is often used in local development environments where a user has a credentials file with their API key.
+fn api_key_from_credentials_file() -> Option<CredentialSource> {
+    let key = read_credentials_toml_api_key()?;
+    Some(CredentialSource::ApiKey {
+        key: SecretString::from(key),
+    })
 }
 
 /// Parse `~/.config/wyrd/credentials.toml` and return `[default].api_key`.

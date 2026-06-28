@@ -23,14 +23,14 @@ pub struct MockRecord {
 /// In-memory loopback transport for unit tests.
 ///
 /// Constructed from a [`MockConfig`]. Drain calls are recorded in an internal
-/// buffer; `fail_on_flush` injects a [`WyrdClientError::TransportDown`] on the
+/// buffer; `fail_on_drain` injects a [`WyrdClientError::TransportDown`] on the
 /// configured call number (1-based). Use [`MockTransport::records`] to assert
 /// on what was drained.
 #[derive(Clone, Debug)]
 pub struct MockTransport {
     label: String,
-    fail_on_flush: Option<u32>,
-    flush_count: Arc<AtomicU32>,
+    fail_on_drain: Option<u32>,
+    drain_count: Arc<AtomicU32>,
     records: Arc<Mutex<Vec<MockRecord>>>,
 }
 
@@ -40,8 +40,8 @@ impl MockTransport {
     pub fn new(config: &MockConfig) -> Self {
         Self {
             label: config.label.clone(),
-            fail_on_flush: config.fail_on_flush,
-            flush_count: Arc::new(AtomicU32::new(0)),
+            fail_on_drain: config.fail_on_drain,
+            drain_count: Arc::new(AtomicU32::new(0)),
             records: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -54,25 +54,25 @@ impl MockTransport {
 
     /// Number of drain calls made (including failed ones).
     #[must_use]
-    pub fn flush_count(&self) -> u32 {
-        self.flush_count.load(Ordering::SeqCst)
+    pub fn drain_count(&self) -> u32 {
+        self.drain_count.load(Ordering::SeqCst)
     }
 
     /// Record a drain payload.
     ///
-    /// Increments the internal call counter. If `fail_on_flush` is configured
+    /// Increments the internal call counter. If `fail_on_drain` is configured
     /// and the current call number matches, returns
     /// [`WyrdClientError::TransportDown`] without recording the payload.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::TransportDown`] when `fail_on_flush` matches
+    /// Returns [`WyrdClientError::TransportDown`] when `fail_on_drain` matches
     /// the current call count.
     pub async fn drain(&self, payload: Vec<u8>) -> Result<(), WyrdClientError> {
-        let count = self.flush_count.fetch_add(1, Ordering::SeqCst) + 1;
-        if self.fail_on_flush == Some(count) {
+        let count = self.drain_count.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_on_drain == Some(count) {
             return Err(WyrdClientError::TransportDown {
                 transport: "mock".to_owned(),
-                message: format!("mock transport configured to fail on flush call {count}"),
+                message: format!("mock transport configured to fail on drain call {count}"),
             });
         }
         self.records.lock().await.push(MockRecord { payload });
@@ -94,7 +94,7 @@ mod tests {
     fn transport(fail_at: Option<u32>) -> MockTransport {
         MockTransport::new(&MockConfig {
             label: "test".to_owned(),
-            fail_on_flush: fail_at,
+            fail_on_drain: fail_at,
         })
     }
 
@@ -108,25 +108,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_count_increments_on_each_drain() {
+    async fn drain_count_increments_on_each_drain() {
         let t = transport(None);
         t.drain(vec![1]).await.expect("drain 1");
         t.drain(vec![2]).await.expect("drain 2");
-        assert_eq!(t.flush_count(), 2);
+        assert_eq!(t.drain_count(), 2);
     }
 
     #[tokio::test]
-    async fn fail_on_flush_injects_transport_down() {
+    async fn fail_on_drain_injects_transport_down() {
         let t = transport(Some(1));
         let err = t.drain(vec![]).await.expect_err("should fail on call 1");
         assert!(
             matches!(err, WyrdClientError::TransportDown { transport, .. } if transport == "mock")
         );
-        assert_eq!(t.flush_count(), 1);
+        assert_eq!(t.drain_count(), 1);
     }
 
     #[tokio::test]
-    async fn fail_on_flush_second_call() {
+    async fn fail_on_drain_second_call() {
         let t = transport(Some(2));
         t.drain(b"ok".to_vec()).await.expect("call 1 ok");
         let err = t.drain(b"fail".to_vec()).await.expect_err("call 2 fails");
@@ -140,7 +140,7 @@ mod tests {
     async fn label_matches_config() {
         let t = MockTransport::new(&MockConfig {
             label: "my-buffer".to_owned(),
-            fail_on_flush: None,
+            fail_on_drain: None,
         });
         assert_eq!(t.label(), "my-buffer");
     }

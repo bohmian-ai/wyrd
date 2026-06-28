@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -85,6 +86,9 @@ pub struct AuthMiddleware {
     /// than reading `~`/`HOME` on every persist — keeps the path stable and lets
     /// tests inject a unique path without mutating the process environment.
     cache_path: Option<PathBuf>,
+    /// Set once the first short-TTL token is observed, so the operational
+    /// warning fires at most once per middleware instance (see [`Self::exchange`]).
+    short_ttl_warned: AtomicBool,
 }
 
 impl std::fmt::Debug for AuthMiddleware {
@@ -106,8 +110,8 @@ impl AuthMiddleware {
     /// restarts.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::Config`] when the underlying `reqwest` client
-    /// cannot be constructed.
+    /// Returns [`WyrdClientError::TransportDown`] when the underlying `reqwest`
+    /// client cannot be constructed.
     pub fn new(
         config: &ClientConfig,
         credential: ResolvedCredential,
@@ -131,9 +135,9 @@ impl AuthMiddleware {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_millis(config.http.timeout_ms))
             .build()
-            .map_err(|err| WyrdClientError::Config {
-                field: "http.client".to_owned(),
-                reason: err.to_string(),
+            .map_err(|err| WyrdClientError::TransportDown {
+                transport: "http".to_owned(),
+                message: format!("failed to build HTTP client: {err}"),
             })?;
 
         let initial = cache_path.as_deref().and_then(load_disk_record);
@@ -145,6 +149,7 @@ impl AuthMiddleware {
             cache: Mutex::new(initial),
             cache_mode: config.token_cache.clone(),
             cache_path,
+            short_ttl_warned: AtomicBool::new(false),
         }))
     }
 
@@ -184,11 +189,7 @@ impl AuthMiddleware {
                 {
                     return Ok(entry.access_token.clone());
                 }
-                let entry = self.exchange(api_key).await?;
-                let bearer = entry.access_token.clone();
-                self.persist(&entry);
-                *cache = Some(entry);
-                Ok(bearer)
+                self.exchange_and_store(api_key, &mut cache).await
             }
         }
     }
@@ -210,22 +211,24 @@ impl AuthMiddleware {
             ResolvedCredential::WorkloadJwt { .. } => Err(workload_jwt_deferred()),
             ResolvedCredential::ApiKey(api_key) => {
                 let mut cache = self.cache.lock().await;
-                let entry = self.exchange(api_key).await?;
-                let bearer = entry.access_token.clone();
-                self.persist(&entry);
-                *cache = Some(entry);
-                Ok(bearer)
+                self.exchange_and_store(api_key, &mut cache).await
             }
         }
     }
 
-    /// Return the formatted `Authorization` header value (`Bearer <token>`).
-    ///
-    /// # Errors
-    /// Propagates any error from [`AuthMiddleware::bearer`].
-    pub async fn authorization_header(&self) -> Result<String, AuthError> {
-        let bearer = self.bearer().await?;
-        Ok(format!("Bearer {}", bearer.expose()))
+    /// Exchange the API key, persist the result, and replace the in-memory
+    /// cache. The shared post-exchange tail of [`AuthMiddleware::bearer`] and
+    /// [`AuthMiddleware::force_refresh`]; the caller holds the exchange gate.
+    async fn exchange_and_store(
+        &self,
+        api_key: &SecretString,
+        cache: &mut Option<CachedToken>,
+    ) -> Result<SecretBearer, AuthError> {
+        let entry = self.exchange(api_key).await?;
+        let bearer = entry.access_token.clone();
+        self.persist(&entry);
+        *cache = Some(entry);
+        Ok(bearer)
     }
 
     /// Forward an inbound `wyrd-request-id` or mint a fresh UUIDv7.
@@ -268,12 +271,35 @@ impl AuthMiddleware {
             .json::<TokenResponse>()
             .await
             .map_err(transport_down)?;
+        self.warn_if_short_ttl(token.expires_at);
         // `token.refresh_token` is intentionally dropped here: never cached,
         // never written to disk. v1 re-exchanges the durable API key instead.
         Ok(CachedToken {
             access_token: token.access_token,
             expires_at: token.expires_at,
         })
+    }
+
+    /// Warn once if the issued access TTL is below `2 × REFRESH_SKEW_SECONDS`.
+    ///
+    /// The proactive-refresh skew is a fixed [`REFRESH_SKEW_SECONDS`]. When the
+    /// server issues a token whose lifetime is under twice that, the cache is
+    /// effectively always stale and every call re-exchanges. This is a server
+    /// misconfiguration, not a client bug, so the client logs an operational
+    /// warning (once) rather than changing the documented skew.
+    fn warn_if_short_ttl(&self, expires_at: DateTime<Utc>) {
+        let ttl = expires_at - Utc::now();
+        if ttl < chrono::Duration::seconds(2 * REFRESH_SKEW_SECONDS)
+            && !self.short_ttl_warned.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                target: "wyrd.client.auth",
+                ttl_seconds = ttl.num_seconds(),
+                refresh_skew_seconds = REFRESH_SKEW_SECONDS,
+                "server-issued access TTL is below 2x the refresh skew; the token \
+                 cache will refresh on nearly every call"
+            );
+        }
     }
 
     /// Write the access token to disk in [`TokenCacheMode::Disk`] mode.
@@ -569,10 +595,18 @@ mod tests {
         let err = mw.bearer().await.expect_err("revoked key must fail");
         match err {
             AuthError::Server(wyrd) => {
-                let problem = wyrd.as_problem_json();
+                // The mapper reconstructs the typed variant for this catalog
+                // code, so it keeps its real code and 401 status rather than
+                // collapsing into the 502 catch-all.
                 assert_eq!(
-                    problem["details"]["original_code"], "WYRD_AUTH_401_API_KEY_INVALID",
+                    wyrd.code(),
+                    "WYRD_AUTH_401_API_KEY_INVALID",
                     "the revoked-key code must be preserved in the mapped WyrdError"
+                );
+                assert_eq!(
+                    wyrd.status(),
+                    401,
+                    "revoked-key status must be 401, not the 502 catch-all"
                 );
             }
             AuthError::Client(other) => panic!("expected server error, got {other:?}"),

@@ -8,7 +8,6 @@ fn http_default_values() {
     assert_eq!(h.base_url, HTTP_DEFAULT_BASE_URL);
     assert_eq!(h.timeout_ms, HTTP_DEFAULT_TIMEOUT_MS);
     assert!(h.tls.is_none());
-    assert!(h.auth.is_none());
     assert!(!h.compression);
 }
 
@@ -40,9 +39,6 @@ fn http_config_round_trips() {
         base_url: "https://wyrd-ingest.example.com".to_string(),
         timeout_ms: 10_000,
         tls: None,
-        auth: Some(SecretRef::Env {
-            name: "WYRD_API_KEY".to_string(),
-        }),
         compression: true,
     };
     let s = serde_json::to_string(&h).unwrap();
@@ -56,7 +52,6 @@ fn http_compression_false_round_trips() {
         base_url: "https://wyrd.example.com".to_string(),
         timeout_ms: 30_000,
         tls: None,
-        auth: None,
         compression: false,
     };
     let s = serde_json::to_string(&h).unwrap();
@@ -70,7 +65,6 @@ fn http_validate_rejects_empty_base_url() {
         base_url: String::new(),
         timeout_ms: 5_000,
         tls: None,
-        auth: None,
         compression: false,
     };
     let err = h.validate().unwrap_err();
@@ -83,7 +77,6 @@ fn http_validate_accepts_non_empty_base_url() {
         base_url: "https://example.com".to_string(),
         timeout_ms: 5_000,
         tls: None,
-        auth: None,
         compression: false,
     };
     assert!(h.validate().is_ok());
@@ -95,7 +88,6 @@ fn http_validate_rejects_zero_timeout() {
         base_url: "https://example.com".to_string(),
         timeout_ms: 0,
         tls: None,
-        auth: None,
         compression: false,
     };
     let err = h.validate().unwrap_err();
@@ -119,9 +111,6 @@ fn http_with_full_tls_round_trips() {
             }),
             server_name_override: Some("ingest.internal".to_string()),
             insecure_skip_verify: false,
-        }),
-        auth: Some(SecretRef::Env {
-            name: "WYRD_API_KEY".to_string(),
         }),
         compression: true,
     };
@@ -270,6 +259,31 @@ mod transport_behavior {
             ..HttpConfig::default()
         };
         HttpTransport::new(&http_config, auth).expect("transport builds")
+    }
+
+    /// Build a transport whose auth exchanges an `ApiKey` against `base_url`,
+    /// so a `401` re-exchange actually rotates the cached token (unlike the
+    /// no-op `BearerToken` path).
+    fn make_api_key_transport(base_url: String) -> HttpTransport {
+        let credential = ResolvedCredential::ApiKey("api-key-value".to_owned().into());
+        let mut config = ClientConfig::default();
+        config.http.base_url = base_url.clone();
+        let auth = AuthMiddleware::new(&config, credential).expect("auth builds");
+        let http_config = HttpConfig {
+            base_url,
+            ..HttpConfig::default()
+        };
+        HttpTransport::new(&http_config, auth).expect("transport builds")
+    }
+
+    fn token_response(access: &str) -> String {
+        serde_json::json!({
+            "access_token": access,
+            "refresh_token": "drop",
+            "token_type": "Bearer",
+            "expires_at": "2099-01-01T00:00:00Z",
+        })
+        .to_string()
     }
 
     fn extract_header(raw: &str, name: &str) -> Option<String> {
@@ -432,22 +446,22 @@ mod transport_behavior {
     }
 
     #[tokio::test]
-    async fn four_oh_one_triggers_force_refresh_and_one_retry() {
-        let token_exchange_body = r#"{"access_token":"refreshed","token_type":"Bearer","expires_at":"2099-01-01T00:00:00Z","refresh_token":"drop"}"#;
-        let _ = token_exchange_body;
-
-        // Use a BearerToken credential: force_refresh() on BearerToken is a
-        // no-op (returns the same token). We verify the retry happens by
-        // checking the hit count goes to 2.
+    async fn four_oh_one_re_exchanges_api_key_and_retries_with_fresh_token() {
+        // With an ApiKey credential the reactive 401 path must re-exchange
+        // and retry with the *new* token. Scripted exchange: the mock serves,
+        // in order, token tok-A, a 401 on the protected route, token tok-B, then
+        // 200. The retry must carry tok-B, and /auth/token must be hit twice.
         let server = spawn_mock(vec![
+            MockResponse::ok(&token_response("tok-A")),
             MockResponse::status(
                 401,
-                r#"{"code":"WYRD_SPEC_400_VALIDATION","detail":"unauthorized","details":{}}"#,
+                r#"{"code":"WYRD_AUTH_401_INVALID_TOKEN","detail":"unauthorized","details":{}}"#,
             ),
+            MockResponse::ok(&token_response("tok-B")),
             MockResponse::ok(r#"{"ok":true}"#),
         ])
         .await;
-        let t = make_transport(server.base_url.clone());
+        let t = make_api_key_transport(server.base_url.clone());
 
         let result: serde_json::Value = t
             .request_json(
@@ -456,18 +470,43 @@ mod transport_behavior {
                 None::<&serde_json::Value>,
             )
             .await
-            .expect("second attempt succeeds after force_refresh");
+            .expect("second attempt succeeds after re-exchange");
 
         assert_eq!(result["ok"], true);
         assert_eq!(
             server.hits.load(Ordering::SeqCst),
-            2,
-            "401 must trigger exactly one force_refresh + one retry"
+            4,
+            "expected: exchange, 401, re-exchange, retry"
+        );
+
+        let captured = server.captured.lock().await;
+        // captured[0] and [2] are the two /auth/token exchanges; [1] and [3] are
+        // the protected-route attempts.
+        let token_attempts = captured
+            .iter()
+            .filter(|raw| raw.contains("/auth/token"))
+            .count();
+        assert_eq!(token_attempts, 2, "/auth/token must be hit exactly twice");
+
+        let first = extract_header(&captured[1], "x-wyrd-access-token")
+            .expect("first protected attempt carries a token");
+        let retried = extract_header(&captured[3], "x-wyrd-access-token")
+            .expect("retried protected attempt carries a token");
+        assert_eq!(
+            first, "Bearer tok-A",
+            "first attempt uses the original token"
+        );
+        assert_eq!(
+            retried, "Bearer tok-B",
+            "the retry must use the re-exchanged token, not the stale one"
         );
     }
 
     #[tokio::test]
-    async fn authorization_bearer_header_is_injected() {
+    async fn wyrd_access_token_header_is_injected_not_authorization() {
+        // The Wyrd JWT must travel in `x-wyrd-access-token`
+        // (the only header the server authenticates from), and the SDK must NOT
+        // write the caller's reserved `Authorization` header.
         let server = spawn_mock(vec![MockResponse::ok("{}")]).await;
         let t = make_transport(server.base_url.clone());
 
@@ -477,11 +516,15 @@ mod transport_behavior {
             .expect("request ok");
 
         let captured = server.captured.lock().await;
-        let auth = extract_header(&captured[0], "Authorization")
-            .expect("Authorization header must be present");
+        let token = extract_header(&captured[0], "x-wyrd-access-token")
+            .expect("x-wyrd-access-token header must be present");
         assert!(
-            auth.starts_with("Bearer "),
-            "Authorization header must be 'Bearer <token>'"
+            token.starts_with("Bearer "),
+            "x-wyrd-access-token must be 'Bearer <token>', got {token:?}"
+        );
+        assert!(
+            extract_header(&captured[0], "Authorization").is_none(),
+            "the SDK must not write the caller's reserved Authorization header"
         );
     }
 }

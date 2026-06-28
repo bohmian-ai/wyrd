@@ -9,7 +9,6 @@ fn grpc_default_values() {
     assert_eq!(g.timeout_ms, 30_000);
     assert_eq!(g.connect_retries, 3);
     assert!(g.tls.is_none());
-    assert!(g.auth.is_none());
 }
 
 #[test]
@@ -31,19 +30,6 @@ fn grpc_with_tls_round_trips() {
             client_key: None,
             server_name_override: None,
             insecure_skip_verify: false,
-        }),
-        ..GrpcConfig::default()
-    };
-    let s = serde_json::to_string(&g).unwrap();
-    let back: GrpcConfig = serde_json::from_str(&s).unwrap();
-    assert_eq!(g, back);
-}
-
-#[test]
-fn grpc_with_auth_round_trips() {
-    let g = GrpcConfig {
-        auth: Some(SecretRef::Env {
-            name: "WYRD_API_KEY".to_string(),
         }),
         ..GrpcConfig::default()
     };

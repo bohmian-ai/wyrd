@@ -19,9 +19,6 @@ fn main() -> anyhow::Result<()> {
             server_name_override: None,
             insecure_skip_verify: false,
         }),
-        auth: Some(SecretRef::Env {
-            name: "WYRD_API_KEY".to_string(),
-        }),
         connect_retries: 3,
         keepalive_interval_ms: 20_000,
         keepalive_timeout_ms: 5_000,

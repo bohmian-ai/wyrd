@@ -8,6 +8,11 @@
 //! - [`HttpTransport::request_json`] — JSON in, JSON out.
 //! - [`HttpTransport::request_arrow`] — JSON in, raw Arrow IPC bytes + metadata headers out.
 //! - [`HttpTransport::submit_idempotent`] — JSON in, JSON out, one stable `Idempotency-Key`.
+//!
+//! Each helper mints a fresh origin `wyrd-request-id` per request: in v1 the
+//! client is the request origin, so there is no inbound id to forward. The
+//! forwarding seam already exists ([`AuthMiddleware::request_id`] accepts an
+//! inbound id) for a future relay caller; the helpers pass `None` today.
 
 #[cfg(feature = "transport-http")]
 use std::sync::Arc;
@@ -86,18 +91,20 @@ impl HttpTransport {
     /// decompression when `config.compression` is `true`.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::Config`] when the underlying `reqwest::Client`
-    /// cannot be constructed.
+    /// Returns [`WyrdClientError::TransportDown`] when the underlying
+    /// `reqwest::Client` cannot be constructed.
     pub fn new(config: &HttpConfig, auth: Arc<AuthMiddleware>) -> Result<Self, WyrdClientError> {
         let mut builder =
             reqwest::Client::builder().timeout(Duration::from_millis(config.timeout_ms));
         if config.compression {
             builder = builder.gzip(true);
         }
-        let client = builder.build().map_err(|err| WyrdClientError::Config {
-            field: "http.client".to_owned(),
-            reason: err.to_string(),
-        })?;
+        let client = builder
+            .build()
+            .map_err(|err| WyrdClientError::TransportDown {
+                transport: "http".to_owned(),
+                message: format!("failed to build HTTP client: {err}"),
+            })?;
         Ok(Self {
             client,
             auth,
@@ -235,12 +242,25 @@ impl HttpTransport {
     ///
     /// Policy:
     /// - Fetches a fresh bearer before each attempt.
-    /// - Retries on `408`, `429`, `5xx`, or connect/timeout transport errors,
-    ///   up to 3 total attempts with exponential backoff (100 ms, 1 s).
+    /// - **Connect** errors (the request never reached the server) always
+    ///   retry, up to 3 total attempts with exponential backoff (100 ms, 1 s).
+    /// - **Timeout** and `408`/`429`/`5xx` retry only when the request is
+    ///   *replay-safe* — an idempotent method (GET/PUT/DELETE/…) or one carrying
+    ///   an `Idempotency-Key`. A non-idempotent `request_json` POST that timed
+    ///   out or 5xx'd may already have been processed server-side, so replaying
+    ///   it could double-execute the mutation; it surfaces the error instead.
     /// - On `401`: calls `force_refresh()` exactly once and retries once more,
-    ///   not counted against the normal retry budget.
+    ///   not counted against the normal retry budget. Safe regardless of method
+    ///   because a `401` is rejected before the server acts on the request.
     /// - On non-retryable non-`2xx`: reads the problem+json body and maps it
     ///   to a [`WyrdError`].
+    ///
+    /// Note on status divergence from the gRPC transport: an HTTP transport that cannot reach
+    /// the server surfaces per-request as [`WyrdError::Internal`] (500), whereas
+    /// the gRPC transport surfaces an unreachable server at connection-establish
+    /// time as [`WyrdClientError::TransportDown`] (503). The two live on
+    /// different API surfaces (per-request send vs. one-time `connect`); the
+    /// divergence is intentional and documented in both modules.
     async fn send_with_retry(
         &self,
         method: &reqwest::Method,
@@ -249,6 +269,10 @@ impl HttpTransport {
         body: Option<&[u8]>,
         idempotency_key: Option<&str>,
     ) -> Result<reqwest::Response, WyrdError> {
+        // A request is replay-safe when re-sending it cannot double-apply a
+        // server-side effect: idempotent HTTP methods, or any request carrying
+        // a stable Idempotency-Key the server dedupes on.
+        let replay_safe = method.is_idempotent() || idempotency_key.is_some();
         let mut attempt = 0u32;
         let mut auth_retried = false;
 
@@ -258,7 +282,10 @@ impl HttpTransport {
             let mut req = self
                 .client
                 .request(method.clone(), url)
-                .header(HEADER_WYRD_ACCESS_TOKEN, format!("Bearer {}", bearer.expose()))
+                .header(
+                    HEADER_WYRD_ACCESS_TOKEN,
+                    format!("Bearer {}", bearer.expose()),
+                )
                 .header(HEADER_REQUEST_ID, request_id);
 
             if let Some(key) = idempotency_key {
@@ -274,16 +301,25 @@ impl HttpTransport {
             let result = req.send().await;
 
             match result {
-                Err(err) if err.is_connect() || err.is_timeout() => {
-                    if attempt < 2 {
-                        tokio::time::sleep(Duration::from_millis(backoff_ms(attempt))).await;
-                        attempt += 1;
-                        continue;
-                    }
-                    return Err(WyrdError::Internal {
-                        message: format!("transport error: {err}"),
-                        details: serde_json::json!({"transport": "http"}),
-                    });
+                // A connect error means the request never reached the server, so
+                // replaying it is always safe regardless of idempotency.
+                Err(err) if err.is_connect() && attempt < 2 => {
+                    tokio::time::sleep(Duration::from_millis(crate::transport::backoff_ms(
+                        attempt,
+                    )))
+                    .await;
+                    attempt += 1;
+                    continue;
+                }
+                // A timeout is ambiguous: the server may have processed the
+                // request. Only retry when replay-safe.
+                Err(err) if err.is_timeout() && replay_safe && attempt < 2 => {
+                    tokio::time::sleep(Duration::from_millis(crate::transport::backoff_ms(
+                        attempt,
+                    )))
+                    .await;
+                    attempt += 1;
+                    continue;
                 }
                 Err(err) => {
                     return Err(WyrdError::Internal {
@@ -300,8 +336,14 @@ impl HttpTransport {
                         continue;
                     }
 
-                    if (status == 408 || status == 429 || status >= 500) && attempt < 2 {
-                        tokio::time::sleep(Duration::from_millis(backoff_ms(attempt))).await;
+                    if (status == 408 || status == 429 || status >= 500)
+                        && attempt < 2
+                        && replay_safe
+                    {
+                        tokio::time::sleep(Duration::from_millis(crate::transport::backoff_ms(
+                            attempt,
+                        )))
+                        .await;
                         attempt += 1;
                         continue;
                     }
@@ -319,15 +361,6 @@ impl HttpTransport {
             }
         }
     }
-}
-
-/// Exponential backoff delay for `attempt` (0-based).
-///
-/// Delays: attempt 0 → 100 ms, attempt 1 → 1 s, attempt ≥ 2 → 5 s (cap).
-#[cfg(feature = "transport-http")]
-fn backoff_ms(attempt: u32) -> u64 {
-    const DELAYS: &[u64] = &[100, 1_000];
-    DELAYS.get(attempt as usize).copied().unwrap_or(5_000)
 }
 
 /// Serialize an optional body to JSON bytes.

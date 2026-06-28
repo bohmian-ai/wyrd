@@ -63,7 +63,7 @@
   ],
   "definitions": {
     "GrpcConfig": {
-      "description": "Configuration for the gRPC transport.\n\ngRPC is the default transport for `wyrd-client`. The server-side endpoint is the Wyrd ingest gateway (`vala-ingest`, PR4.2) or any compatible tonic-based receiver.",
+      "description": "Configuration for the gRPC transport.\n\ngRPC is the default transport for `wyrd-client`. The server-side endpoint is the Wyrd ingest gateway (`vala-ingest`, PR4.2) or any compatible tonic-based receiver.\n\nThis config carries transport wiring only. Authentication is owned by `AuthMiddleware`, which injects the `x-wyrd-access-token` credential per call; there is no auth field here.",
       "type": "object",
       "required": [
         "connect_retries",
@@ -71,17 +71,6 @@
         "timeout_ms"
       ],
       "properties": {
-        "auth": {
-          "description": "Optional bearer token or mTLS identity reference. The runtime passes this through the gRPC `Authorization` metadata header.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/SecretRef"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "connect_retries": {
           "description": "Connection-level retry budget. The transport retries the initial connection up to this many times before surfacing an error.\n\nDefault: [`GRPC_DEFAULT_CONNECT_RETRIES`] (`3`).",
           "type": "integer",
@@ -134,20 +123,9 @@
       "additionalProperties": false
     },
     "HttpConfig": {
-      "description": "Configuration for the HTTP transport.\n\nThe HTTP transport is a fallback for environments where gRPC is unavailable or blocked. Ingest routes are appended by the client at call time; `base_url` is the common prefix.",
+      "description": "Configuration for the HTTP transport.\n\nThe HTTP transport is a fallback for environments where gRPC is unavailable or blocked. Ingest routes are appended by the client at call time; `base_url` is the common prefix.\n\nThis config carries transport wiring only. Authentication is owned by `AuthMiddleware`, which injects the `x-wyrd-access-token` credential per call; there is no auth field here.",
       "type": "object",
       "properties": {
-        "auth": {
-          "description": "Optional authorization credential. Passed through the `Authorization` HTTP header at request time.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/SecretRef"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "base_url": {
           "description": "Base URL for all ingest routes. Must be non-empty. Ingest routes (`/api/v1/observations`, `/api/v1/records`, etc.) are appended at call time.\n\nExample: `\"https://wyrd-ingest.example.com\"`. Default: [`HTTP_DEFAULT_BASE_URL`] (`\"http://localhost:50050\"`).",
           "default": "http://localhost:50050",
@@ -180,14 +158,14 @@
       "additionalProperties": false
     },
     "MockConfig": {
-      "description": "Configuration for the mock (in-memory loopback) transport.\n\nUse this transport in unit tests where you want to assert what was published without touching a network. `wyrd-client::transport::mock` records every flushed envelope into an in-memory buffer keyed by [`MockConfig::label`] and provides `mock::drain(label)` to retrieve flushed records.\n\nThe mock transport is always available in `wyrd-client` (no feature gate). `MockConfig::fail_on_flush` lets tests inject deterministic flush failures — a Wyrd-native addition the predecessor mock did not support.\n\n# Default\n\n`MockConfig::default()` returns `{ label: \"default\", fail_on_flush: None }`. The default is a working config — it does not need `validate()` and is safe to use directly in tests that do not care about label isolation.",
+      "description": "Configuration for the mock (in-memory loopback) transport.\n\nUse this transport in unit tests where you want to assert what was published without touching a network. `wyrd-client::transport::mock` records every flushed envelope into an in-memory buffer keyed by [`MockConfig::label`] and provides `mock::drain(label)` to retrieve flushed records.\n\nThe mock transport is always available in `wyrd-client` (no feature gate). `MockConfig::fail_on_drain` lets tests inject deterministic drain failures — a Wyrd-native addition the predecessor mock did not support.\n\n# Default\n\n`MockConfig::default()` returns `{ label: \"default\", fail_on_drain: None }`. The default is a working config — it does not need `validate()` and is safe to use directly in tests that do not care about label isolation.",
       "type": "object",
       "required": [
         "label"
       ],
       "properties": {
-        "fail_on_flush": {
-          "description": "Inject a flush failure. When `Some(n)`, the `nth` call to flush returns `Err`; all other calls succeed normally. Counting starts from 1 (i.e. `Some(1)` fails the first flush). `None` means the mock always succeeds.",
+        "fail_on_drain": {
+          "description": "Inject a drain failure. When `Some(n)`, the `nth` call to drain returns `Err`; all other calls succeed normally. Counting starts from 1 (i.e. `Some(1)` fails the first drain). `None` means the mock always succeeds.",
           "type": [
             "integer",
             "null"

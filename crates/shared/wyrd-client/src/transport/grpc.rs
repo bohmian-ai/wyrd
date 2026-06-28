@@ -49,7 +49,14 @@ impl GrpcConnection {
     /// The connection is multiplexed — call [`channel()`][Self::channel] to
     /// hand the handle to a service client; do not redial per call. If the
     /// initial dial fails, the call is retried up to `config.connect_retries`
-    /// additional times.
+    /// additional times, with exponential backoff between attempts (the same
+    /// 100 ms → 1 s → 5 s schedule the HTTP retry loop uses).
+    ///
+    /// Status divergence from the HTTP transport: an unreachable server surfaces
+    /// here, at connection-establish time, as [`WyrdClientError::TransportDown`] (503).
+    /// The HTTP transport has no separate connect phase, so it surfaces the same
+    /// condition per-request as [`WyrdError::Internal`][wyrd_spec::error::WyrdError::Internal]
+    /// (500). The divergence is intentional and documented in both modules.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::TransportDown`] when the endpoint URI is
@@ -60,9 +67,9 @@ impl GrpcConnection {
     ) -> Result<Self, WyrdClientError> {
         let endpoint = build_endpoint(config)?;
 
-        let max_attempts = 1u32.saturating_add(config.connect_retries) as usize;
+        let max_attempts = 1u32.saturating_add(config.connect_retries);
         let mut last_err = None;
-        for _ in 0..max_attempts {
+        for attempt in 0..max_attempts {
             match endpoint.connect().await {
                 Ok(channel) => {
                     return Ok(Self {
@@ -71,7 +78,16 @@ impl GrpcConnection {
                         max_message_bytes: config.max_message_bytes,
                     });
                 }
-                Err(err) => last_err = Some(err),
+                Err(err) => {
+                    last_err = Some(err);
+                    // Back off before the next attempt, but never after the last.
+                    if attempt + 1 < max_attempts {
+                        tokio::time::sleep(Duration::from_millis(crate::transport::backoff_ms(
+                            attempt,
+                        )))
+                        .await;
+                    }
+                }
             }
         }
         Err(WyrdClientError::TransportDown {

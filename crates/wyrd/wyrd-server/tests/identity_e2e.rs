@@ -680,7 +680,10 @@ async fn service_account_issuer_full_chain() {
         .bootstrap_service("sa-chain-target", &["runtime_admin"])
         .await
         .expect("target service account bootstraps");
-    let target_card_ref = target.card_ref().expect("target carries a card_ref").clone();
+    let target_card_ref = target
+        .card_ref()
+        .expect("target carries a card_ref")
+        .clone();
 
     // POST /auth/issue-key as the admin SA.
     // The issuer principal is a service account (not a user), so `created_by`

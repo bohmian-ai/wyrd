@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-// Generates brand/theme.css from brand/palette.json (the canonical token source).
+// Generates brand/theme.css and .claude/skills/wyrd-ui/references/wyrd-theme.css from
+// brand/palette.json (the canonical token source).
 // Usage:
-//   node brand/gen-theme.mjs           regenerate brand/theme.css
-//   node brand/gen-theme.mjs --check   exit non-zero if theme.css is stale (CI / drift lock)
+//   node brand/gen-theme.mjs           regenerate both output targets
+//   node brand/gen-theme.mjs --check   exit non-zero if either target is stale (CI / drift lock)
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -10,6 +11,7 @@ import { dirname, join } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const palettePath = join(here, 'palette.json');
 const themePath = join(here, 'theme.css');
+const claudePath = join(here, '../../../../../.claude/skills/wyrd-ui/references/wyrd-theme.css');
 
 const palette = JSON.parse(readFileSync(palettePath, 'utf8'));
 const { scale, tokens, modes } = palette;
@@ -48,10 +50,14 @@ function modeBlock(mode) {
   return `[data-mode="${mode}"] {\n${lines.join('\n')}\n}`;
 }
 
-const out = [
+const banner = [
   '/* GENERATED FILE — do not edit by hand.',
   ' * Source of truth: brand/palette.json. Regenerate with `pnpm tokens`.',
-  ' * Token names are identical to ./wyrd-ui-source-of-truth.html. */',
+  ' * Token names are identical to ./wyrd-ui-source-of-truth-v2.html. */',
+].join('\n');
+
+const themeOut = [
+  banner,
   '',
   themeBlock(),
   '',
@@ -59,19 +65,39 @@ const out = [
   ''
 ].join('\n');
 
+const claudeOut = [
+  banner,
+  '',
+  ...modes.map(modeBlock),
+  ''
+].join('\n');
+
+const targets = [
+  { path: themePath, content: themeOut },
+  { path: claudePath, content: claudeOut },
+];
+
 if (process.argv.includes('--check')) {
-  let existing = '';
-  try {
-    existing = readFileSync(themePath, 'utf8');
-  } catch {
-    /* missing file → treated as stale */
+  let allOk = true;
+  for (const { path, content } of targets) {
+    let existing = '';
+    try {
+      existing = readFileSync(path, 'utf8');
+    } catch {
+      /* missing file → treated as stale */
+    }
+    if (existing !== content) {
+      console.error(`${path} is out of date with palette.json. Run \`pnpm tokens\`.`);
+      allOk = false;
+    }
   }
-  if (existing !== out) {
-    console.error('theme.css is out of date with palette.json. Run `pnpm tokens`.');
+  if (!allOk) {
     process.exit(1);
   }
-  console.log('theme.css is in sync with palette.json.');
+  console.log('All targets are in sync with palette.json.');
 } else {
-  writeFileSync(themePath, out);
-  console.log(`Wrote ${themePath}`);
+  for (const { path, content } of targets) {
+    writeFileSync(path, content);
+    console.log(`Wrote ${path}`);
+  }
 }

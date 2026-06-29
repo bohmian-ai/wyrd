@@ -144,6 +144,7 @@ export default defineConfig({
               items: [
                 { label: "Deploy", link: "/deploy/" },
                 { label: "Deploy identity config", link: "/deploy/identity/" },
+                { label: "Credential walkthrough", link: "/deploy/credentials/" },
                 { label: "Migration", link: "/migration/" },
               ],
             },

@@ -29,7 +29,9 @@ set_output() {
 set_output rust '^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|deny\.toml|mise\.toml|crates/|python/py-wyrd/Cargo\.toml|python/py-wyrd/src/)'
 set_output python '^(mise\.toml|Cargo\.toml|Cargo\.lock|crates/shared/wyrd-utils/|crates/wyrd/wyrd-cards/|crates/wyrd/wyrd-interfaces/|python/py-wyrd/|examples/python/)'
 set_output docs '^(mise\.toml|docs/|openapi\.yaml|crates/wyrd-spec/schemas/|examples/)'
-set_output ui '^(mise\.toml|crates/wyrd/wyrd-server/wyrd-ui/)'
+# ui also covers the cross-package generated token targets so the check:tokens
+# drift lock fires on a hand-edit to any of them, not just on brand/ source edits.
+set_output ui '^(mise\.toml|crates/wyrd/wyrd-server/wyrd-ui/|docs/src/styles/wyrd-tokens\.css|\.claude/skills/wyrd-ui/references/wyrd-theme\.css|\.codex/skills/wyrd-ui/references/wyrd-theme\.css)'
 set_output generated '^(mise\.toml|Cargo\.toml|Cargo\.lock|crates/wyrd-spec/|crates/wyrd/wyrd-cards/|crates/wyrd/wyrd-interfaces/|python/py-wyrd/)'
 set_output workflow '^(\.github/workflows/|\.github/scripts/)'
 

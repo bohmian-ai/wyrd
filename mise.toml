@@ -781,6 +781,12 @@ hide = true
 description = "Verify Wyrd critical Rust contracts have explicit Python test markers"
 run = "python scripts/check_test_contracts.py"
 
+[tasks."check:tokens"]
+hide = true
+description = "Assert generated theme CSS targets are in sync with palette.json (token drift lock)"
+dir = "crates/wyrd/wyrd-server/wyrd-ui"
+run = "node brand/gen-theme.mjs --check"
+
 [tasks."check:wasm"]
 hide = true
 description = "Build wyrd-spec for wasm32"
@@ -1215,7 +1221,7 @@ fi
 
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
-depends = ["check", "test:unit", "test:bifrost", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs", "check:no-legacy-server-vocab", "check:no-tonic-outside-wyrd-tonic"]
+depends = ["check", "test:unit", "test:bifrost", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:tokens", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs", "check:no-legacy-server-vocab", "check:no-tonic-outside-wyrd-tonic"]
 
 [tasks."db:setup-roles"]
 hide = true

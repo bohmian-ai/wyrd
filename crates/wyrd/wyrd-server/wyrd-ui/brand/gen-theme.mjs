@@ -14,6 +14,7 @@ const palettePath = join(here, 'palette.json');
 const themePath = join(here, 'theme.css');
 const claudePath = join(here, '../../../../../.claude/skills/wyrd-ui/references/wyrd-theme.css');
 const codexPath = join(here, '../../../../../.codex/skills/wyrd-ui/references/wyrd-theme.css');
+const docsPath = join(here, '../../../../../docs/src/styles/wyrd-tokens.css');
 
 const palette = JSON.parse(readFileSync(palettePath, 'utf8'));
 const { scale, tokens, modes } = palette;
@@ -52,6 +53,41 @@ function modeBlock(mode) {
     lines.push(`  ${name}: ${def[mode]};`);
   }
   return `[data-mode="${mode}"] {\n${lines.join('\n')}\n}`;
+}
+
+// The docs site (Starlight) has no Tailwind @theme layer and toggles modes via
+// [data-theme] (not [data-mode]). docsModeBlock emits the SAME canonical tokens
+// as modeBlock, but remaps the selector to Starlight's [data-theme="<mode>"];
+// light also covers bare :root as the no-JS default. Values are def[mode] HEX
+// verbatim — no @theme block, no --color-* aliases, no oklch.
+function docsModeBlock(mode) {
+  const selector =
+    mode === 'light'
+      ? ':root,\n:root[data-theme="light"]'
+      : `:root[data-theme="${mode}"]`;
+  const lines = [];
+  let current = null;
+  for (const [name, def] of Object.entries(tokens)) {
+    if (def.group !== current) {
+      current = def.group;
+      lines.push(`${lines.length ? '\n' : ''}  /* ${current} */`);
+    }
+    lines.push(`  ${name}: ${def[mode]};`);
+  }
+  return `${selector} {\n${lines.join('\n')}\n}`;
+}
+
+// Fonts are mode-independent and live in a plain :root block because docs has
+// no @theme to carry them; commit 05 aliases the arcade-hero font vars onto these.
+function docsFontsBlock() {
+  const lines = [];
+  lines.push('  /* fonts */');
+  lines.push(`  --font-sans: ${scale.fonts.sans};`);
+  lines.push(`  --font-display: ${scale.fonts.display};`);
+  lines.push(`  --font-mono: ${scale.fonts.mono};`);
+  lines.push(`  --font-arcade: ${scale.fonts.arcade};`);
+  lines.push(`  --font-pixel: ${scale.fonts.pixel};`);
+  return `:root {\n${lines.join('\n')}\n}`;
 }
 
 // The .codex skill ships a full Skeleton theme keyed on [data-theme='wyrd'].
@@ -242,10 +278,20 @@ const codexOut = [
   codexUtilities,
 ].join('\n');
 
+const docsOut = [
+  banner,
+  '',
+  docsFontsBlock(),
+  '',
+  ...modes.map(docsModeBlock),
+  ''
+].join('\n');
+
 const targets = [
   { path: themePath, content: themeOut },
   { path: claudePath, content: claudeOut },
   { path: codexPath, content: codexOut },
+  { path: docsPath, content: docsOut },
 ];
 
 if (process.argv.includes('--check')) {

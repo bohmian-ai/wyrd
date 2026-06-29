@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-// Generates brand/theme.css and .claude/skills/wyrd-ui/references/wyrd-theme.css from
-// brand/palette.json (the canonical token source).
+// Generates brand/theme.css, .claude/skills/wyrd-ui/references/wyrd-theme.css, and
+// .codex/skills/wyrd-ui/references/wyrd-theme.css from brand/palette.json (the
+// canonical token source).
 // Usage:
-//   node brand/gen-theme.mjs           regenerate both output targets
-//   node brand/gen-theme.mjs --check   exit non-zero if either target is stale (CI / drift lock)
+//   node brand/gen-theme.mjs           regenerate every output target
+//   node brand/gen-theme.mjs --check   exit non-zero if any target is stale (CI / drift lock)
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -12,6 +13,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const palettePath = join(here, 'palette.json');
 const themePath = join(here, 'theme.css');
 const claudePath = join(here, '../../../../../.claude/skills/wyrd-ui/references/wyrd-theme.css');
+const codexPath = join(here, '../../../../../.codex/skills/wyrd-ui/references/wyrd-theme.css');
 
 const palette = JSON.parse(readFileSync(palettePath, 'utf8'));
 const { scale, tokens, modes } = palette;
@@ -52,6 +54,164 @@ function modeBlock(mode) {
   return `[data-mode="${mode}"] {\n${lines.join('\n')}\n}`;
 }
 
+// The .codex skill ships a full Skeleton theme keyed on [data-theme='wyrd'].
+// codexBlock emits the SAME canonical tokens as modeBlock, but under the
+// Codex harness's theme-light/theme-dark selectors. Fonts are emitted here too
+// so the ported utilities below can reference var(--font-*) without redefining
+// any value by hand. INVARIANT: every value comes from palette.json — no oklch,
+// no hand-written color literal.
+function codexBlock(mode) {
+  const selector =
+    mode === 'light'
+      ? "[data-theme='wyrd'].theme-light,\n[data-theme='wyrd']:not(.theme-dark)"
+      : "[data-theme='wyrd'].theme-dark";
+  const lines = [];
+  lines.push('  /* fonts */');
+  lines.push(`  --font-sans: ${scale.fonts.sans};`);
+  lines.push(`  --font-display: ${scale.fonts.display};`);
+  lines.push(`  --font-mono: ${scale.fonts.mono};`);
+  lines.push(`  --font-arcade: ${scale.fonts.arcade};`);
+  lines.push(`  --font-pixel: ${scale.fonts.pixel};`);
+  let current = null;
+  for (const [name, def] of Object.entries(tokens)) {
+    if (def.group !== current) {
+      current = def.group;
+      lines.push(`\n  /* ${current} */`);
+    }
+    lines.push(`  ${name}: ${def[mode]};`);
+  }
+  return `${selector} {\n${lines.join('\n')}\n}`;
+}
+
+// Static brutalist utilities ported forward from the old hand-authored .codex
+// fork, re-pointed at canonical tokens (var(--*)). The Never-rule layers from
+// the old fork — .neo-glow, --neo-glow-color, .gradient-*, --retro-*, .grain,
+// CRT scanlines/vignette, phosphor text-shadow — are intentionally dropped.
+// CONTRACT: no raw hex/oklch/rgb literal may appear below; only var(--token)
+// aliases and geometry (px/rem/em).
+const codexUtilities = `/* ═══════════════════════════════════════════════════════════════════════════
+   BRUTALIST UTILITY CLASSES — ported forward, re-pointed at canonical tokens.
+   Token VALUES come from the generated blocks above (brand/palette.json).
+   The Never-rule layers (glow, gradients, CRT scanlines/vignette, phosphor
+   text-shadow) are intentionally absent.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Zero-radius enforcement — overrides every Tailwind .rounded-* in both modes. */
+[data-theme='wyrd'] .rounded,
+[data-theme='wyrd'] .rounded-none,
+[data-theme='wyrd'] .rounded-sm,
+[data-theme='wyrd'] .rounded-md,
+[data-theme='wyrd'] .rounded-lg,
+[data-theme='wyrd'] .rounded-xl,
+[data-theme='wyrd'] .rounded-2xl,
+[data-theme='wyrd'] .rounded-3xl,
+[data-theme='wyrd'] .rounded-t,
+[data-theme='wyrd'] .rounded-b,
+[data-theme='wyrd'] .rounded-l,
+[data-theme='wyrd'] .rounded-r {
+  border-radius: 0 !important;
+}
+/* Exception: true circles (avatars, status dots that should stay round). */
+[data-theme='wyrd'] .rounded-full {
+  border-radius: 9999px !important;
+}
+
+/* neo-card: canonical card surface */
+[data-theme='wyrd'] .neo-card {
+  background: var(--surface);
+  border: 2px solid var(--border);
+  box-shadow: 6px 6px 0 0 var(--shadow);
+  border-radius: 0;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+[data-theme='wyrd'] .neo-card:hover {
+  transform: translate(-2px, -2px);
+  box-shadow: 8px 8px 0 0 var(--shadow);
+}
+
+/* neo-btn: brutalist button with press-in animation */
+[data-theme='wyrd'] .neo-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem 1.1rem;
+  background: var(--rune-btn);
+  color: var(--rune-btn-ink);
+  border: 2px solid var(--border);
+  box-shadow: 3px 3px 0 0 var(--shadow);
+  border-radius: 0;
+  font-family: var(--font-sans);
+  font-weight: 700;
+  font-size: 0.875rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  user-select: none;
+  transition: transform 0.08s ease, box-shadow 0.08s ease;
+}
+[data-theme='wyrd'] .neo-btn:hover {
+  transform: translate(-1px, -1px);
+  box-shadow: 4px 4px 0 0 var(--shadow);
+}
+[data-theme='wyrd'] .neo-btn:active {
+  transform: translate(3px, 3px);
+  box-shadow: 0 0 0 0 var(--shadow);
+}
+[data-theme='wyrd'] .neo-btn--secondary {
+  background: var(--surface);
+  color: var(--text);
+}
+[data-theme='wyrd'] .neo-btn--dark {
+  background: var(--border);
+  color: var(--bg);
+}
+
+/* pixel-text: VT323 accents for IDs, version strings, timestamps */
+[data-theme='wyrd'] .pixel-text {
+  font-family: var(--font-pixel);
+  font-size: 1.4em;
+  line-height: 1;
+  letter-spacing: 0.05em;
+}
+
+/* mono-tag: uppercase JetBrains Mono pill/label (canonical pill surface) */
+[data-theme='wyrd'] .mono-tag {
+  display: inline-block;
+  padding: 3px 8px;
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  border: 2px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  border-radius: 0;
+}
+
+/* card-type pills — mapped onto The Line + canonical accents (per token role) */
+[data-theme='wyrd'] .card-tag--data       { background: var(--control);     color: var(--ink-on-fill);  border: 2px solid var(--border); }
+[data-theme='wyrd'] .card-tag--model      { background: var(--rune);        color: var(--rune-btn-ink); border: 2px solid var(--border); }
+[data-theme='wyrd'] .card-tag--experiment { background: var(--warn);        color: var(--ink-on-fill);  border: 2px solid var(--border); }
+[data-theme='wyrd'] .card-tag--prompt     { background: var(--rune-strong); color: var(--rune-btn-ink); border: 2px solid var(--border); }
+[data-theme='wyrd'] .card-tag--agent      { background: var(--client);      color: var(--ink-on-fill);  border: 2px solid var(--border); }
+[data-theme='wyrd'] .card-tag--service    { background: var(--server);      color: var(--ink-on-fill);  border: 2px solid var(--border); }
+
+/* status dots (drift/health indicators) */
+[data-theme='wyrd'] .status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  background: var(--ok);
+  border: 1.5px solid var(--border);
+  margin-right: 6px;
+  vertical-align: middle;
+  border-radius: 0;
+}
+[data-theme='wyrd'] .status-dot--warn  { background: var(--warn); }
+[data-theme='wyrd'] .status-dot--alert { background: var(--danger); }
+`;
+
 const banner = [
   '/* GENERATED FILE — do not edit by hand.',
   ' * Source of truth: brand/palette.json. Regenerate with `pnpm tokens`.',
@@ -74,9 +234,18 @@ const claudeOut = [
   ''
 ].join('\n');
 
+const codexOut = [
+  banner,
+  '',
+  ...modes.map(codexBlock),
+  '',
+  codexUtilities,
+].join('\n');
+
 const targets = [
   { path: themePath, content: themeOut },
   { path: claudePath, content: claudeOut },
+  { path: codexPath, content: codexOut },
 ];
 
 if (process.argv.includes('--check')) {

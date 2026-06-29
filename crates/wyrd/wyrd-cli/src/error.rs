@@ -225,6 +225,21 @@ pub enum WyrdCliError {
         detail: String,
     },
 
+    /// API key issuance request failed.
+    #[error("api key issuance failed: status={status}, detail={detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_500_ISSUE_KEY_FAILED",
+        status = 500,
+        title = "API key issuance failed",
+        remediation = "Check the card ref, access token, and server connectivity."
+    )]
+    IssueKeyFailed {
+        /// HTTP status returned by the server (400 for local validation failures).
+        status: u16,
+        /// Response body or error detail.
+        detail: String,
+    },
+
     /// Eval engine failed.
     #[error("eval engine failed: {source}")]
     #[wyrd_error(

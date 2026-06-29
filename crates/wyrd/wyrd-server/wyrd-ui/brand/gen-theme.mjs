@@ -22,14 +22,47 @@ const { scale, tokens, modes } = palette;
 // Skip --r in the @theme color map; it is geometry, not a color.
 const colorEntries = Object.entries(tokens).filter(([name]) => name !== '--r');
 
+// The five font custom properties, emitted identically into every target. Single
+// source so adding a font is one edit, not N hand-copied lists across the blocks.
+const FONT_KEYS = ['sans', 'display', 'mono', 'arcade', 'pixel'];
+function fontLines() {
+  return FONT_KEYS.map((k) => `  --font-${k}: ${scale.fonts[k]};`);
+}
+
+// Fail loudly on an incomplete palette instead of emitting `--token: undefined;`
+// into every target (which `--check`, svelte-check, and astro build all pass).
+function validatePalette() {
+  const errors = [];
+  if (!Array.isArray(modes) || modes.length === 0) {
+    errors.push('palette.modes must be a non-empty array');
+  }
+  for (const k of FONT_KEYS) {
+    if (!scale?.fonts?.[k]) errors.push(`scale.fonts.${k} is missing or empty`);
+  }
+  if (!scale?.radius) errors.push('scale.radius is missing');
+  for (const s of ['sm', 'md', 'lg']) {
+    if (!scale?.shadow?.[s]) errors.push(`scale.shadow.${s} is missing`);
+  }
+  for (const [name, def] of Object.entries(tokens)) {
+    for (const mode of Array.isArray(modes) ? modes : []) {
+      const v = def[mode];
+      if (v === undefined || v === null || v === '') {
+        errors.push(`token ${name} has no value for mode "${mode}"`);
+      }
+    }
+  }
+  if (errors.length) {
+    console.error('palette.json is invalid:');
+    for (const e of errors) console.error(`  - ${e}`);
+    process.exit(1);
+  }
+}
+validatePalette();
+
 function themeBlock() {
   const lines = [];
   lines.push('@theme {');
-  lines.push(`  --font-sans: ${scale.fonts.sans};`);
-  lines.push(`  --font-display: ${scale.fonts.display};`);
-  lines.push(`  --font-mono: ${scale.fonts.mono};`);
-  lines.push(`  --font-arcade: ${scale.fonts.arcade};`);
-  lines.push(`  --font-pixel: ${scale.fonts.pixel};`);
+  lines.push(...fontLines());
   lines.push(`  --radius-wy: ${scale.radius};`);
   lines.push(`  --shadow-wy-sm: ${scale.shadow.sm} ${scale.shadow.sm} 0 0 var(--shadow);`);
   lines.push(`  --shadow-wy-md: ${scale.shadow.md} ${scale.shadow.md} 0 0 var(--shadow);`);
@@ -82,11 +115,7 @@ function docsModeBlock(mode) {
 function docsFontsBlock() {
   const lines = [];
   lines.push('  /* fonts */');
-  lines.push(`  --font-sans: ${scale.fonts.sans};`);
-  lines.push(`  --font-display: ${scale.fonts.display};`);
-  lines.push(`  --font-mono: ${scale.fonts.mono};`);
-  lines.push(`  --font-arcade: ${scale.fonts.arcade};`);
-  lines.push(`  --font-pixel: ${scale.fonts.pixel};`);
+  lines.push(...fontLines());
   return `:root {\n${lines.join('\n')}\n}`;
 }
 
@@ -103,11 +132,7 @@ function codexBlock(mode) {
       : "[data-theme='wyrd'].theme-dark";
   const lines = [];
   lines.push('  /* fonts */');
-  lines.push(`  --font-sans: ${scale.fonts.sans};`);
-  lines.push(`  --font-display: ${scale.fonts.display};`);
-  lines.push(`  --font-mono: ${scale.fonts.mono};`);
-  lines.push(`  --font-arcade: ${scale.fonts.arcade};`);
-  lines.push(`  --font-pixel: ${scale.fonts.pixel};`);
+  lines.push(...fontLines());
   let current = null;
   for (const [name, def] of Object.entries(tokens)) {
     if (def.group !== current) {

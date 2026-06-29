@@ -18,7 +18,7 @@ pub struct Cli {
 /// Top-level CLI verbs.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Authenticate with a Wyrd server (login, refresh).
+    /// Authenticate with a Wyrd server (login, refresh, issue-key).
     #[command(subcommand)]
     Auth(AuthCommand),
     /// Run, manage, and compare evaluations.

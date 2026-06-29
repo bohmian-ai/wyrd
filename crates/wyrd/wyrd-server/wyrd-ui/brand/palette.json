@@ -6,7 +6,9 @@
     "fonts": {
       "sans": "\"Archivo\", system-ui, sans-serif",
       "display": "\"Archivo Black\", sans-serif",
-      "mono": "\"JetBrains Mono\", monospace"
+      "mono": "\"JetBrains Mono\", monospace",
+      "arcade": "\"Press Start 2P\", monospace",
+      "pixel": "\"VT323\", monospace"
     },
     "radius": "5px",
     "shadow": { "sm": "3px", "md": "6px", "lg": "10px" }
@@ -46,6 +48,12 @@
     "--hero-bg":       { "group": "hero", "light": "#8b5cf6", "dark": "#241b40", "role": "loud hero block background" },
     "--hero-ink":      { "group": "hero", "light": "#ffffff", "dark": "#e9e2ff", "role": "text on hero block" },
     "--ink-on-fill":   { "group": "hero", "light": "#0b0b0e", "dark": "#0b0b0e", "role": "always-black text on bright fills" },
+
+    "--sky-top":       { "group": "scene", "light": "#edeaf4", "dark": "#0d0d15", "role": "scene: upper sky gradient stop" },
+    "--sky-bot":       { "group": "scene", "light": "#e0d8f2", "dark": "#191033", "role": "scene: lower sky gradient stop" },
+    "--grid":          { "group": "scene", "light": "#7c3aed", "dark": "#a78bfa", "role": "scene: horizon grid / perspective lines" },
+    "--star":          { "group": "scene", "light": "#7c3aed", "dark": "#d6d6dc", "role": "scene: star / point-light fill" },
+    "--spr-d":         { "group": "scene", "light": "#9b78e0", "dark": "#6f54b8", "role": "scene: sprite diffuse fill" },
 
     "--r":             { "group": "geometry", "light": "5px", "dark": "5px", "role": "radius — locked at 5px (true circles only for dots/avatars)" }
   }

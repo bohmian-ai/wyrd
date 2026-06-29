@@ -6,6 +6,8 @@
   --font-sans: "Archivo", system-ui, sans-serif;
   --font-display: "Archivo Black", sans-serif;
   --font-mono: "JetBrains Mono", monospace;
+  --font-arcade: "Press Start 2P", monospace;
+  --font-pixel: "VT323", monospace;
   --radius-wy: 5px;
   --shadow-wy-sm: 3px 3px 0 0 var(--shadow);
   --shadow-wy-md: 6px 6px 0 0 var(--shadow);
@@ -38,6 +40,11 @@
   --color-hero-bg: var(--hero-bg);
   --color-hero-ink: var(--hero-ink);
   --color-ink-on-fill: var(--ink-on-fill);
+  --color-sky-top: var(--sky-top);
+  --color-sky-bot: var(--sky-bot);
+  --color-grid: var(--grid);
+  --color-star: var(--star);
+  --color-spr-d: var(--spr-d);
 }
 
 [data-mode="light"] {
@@ -83,6 +90,13 @@
   --hero-bg: #8b5cf6;
   --hero-ink: #ffffff;
   --ink-on-fill: #0b0b0e;
+
+  /* scene */
+  --sky-top: #edeaf4;
+  --sky-bot: #e0d8f2;
+  --grid: #7c3aed;
+  --star: #7c3aed;
+  --spr-d: #9b78e0;
 
   /* geometry */
   --r: 5px;
@@ -130,6 +144,13 @@
   --hero-bg: #241b40;
   --hero-ink: #e9e2ff;
   --ink-on-fill: #0b0b0e;
+
+  /* scene */
+  --sky-top: #0d0d15;
+  --sky-bot: #191033;
+  --grid: #a78bfa;
+  --star: #d6d6dc;
+  --spr-d: #6f54b8;
 
   /* geometry */
   --r: 5px;

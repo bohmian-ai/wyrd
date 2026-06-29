@@ -25,6 +25,8 @@ function themeBlock() {
   lines.push(`  --font-sans: ${scale.fonts.sans};`);
   lines.push(`  --font-display: ${scale.fonts.display};`);
   lines.push(`  --font-mono: ${scale.fonts.mono};`);
+  lines.push(`  --font-arcade: ${scale.fonts.arcade};`);
+  lines.push(`  --font-pixel: ${scale.fonts.pixel};`);
   lines.push(`  --radius-wy: ${scale.radius};`);
   lines.push(`  --shadow-wy-sm: ${scale.shadow.sm} ${scale.shadow.sm} 0 0 var(--shadow);`);
   lines.push(`  --shadow-wy-md: ${scale.shadow.md} ${scale.shadow.md} 0 0 var(--shadow);`);

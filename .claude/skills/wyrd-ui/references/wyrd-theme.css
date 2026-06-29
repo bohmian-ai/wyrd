@@ -46,6 +46,13 @@
   --hero-ink: #ffffff;
   --ink-on-fill: #0b0b0e;
 
+  /* scene */
+  --sky-top: #edeaf4;
+  --sky-bot: #e0d8f2;
+  --grid: #7c3aed;
+  --star: #7c3aed;
+  --spr-d: #9b78e0;
+
   /* geometry */
   --r: 5px;
 }
@@ -92,6 +99,13 @@
   --hero-bg: #241b40;
   --hero-ink: #e9e2ff;
   --ink-on-fill: #0b0b0e;
+
+  /* scene */
+  --sky-top: #0d0d15;
+  --sky-bot: #191033;
+  --grid: #a78bfa;
+  --star: #d6d6dc;
+  --spr-d: #6f54b8;
 
   /* geometry */
   --r: 5px;

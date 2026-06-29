@@ -521,7 +521,7 @@ button, input, select, textarea { font: inherit; }
 .sl-markdown-content dl.wyrd-defs dt[data-kind="subagent"],
 .sl-markdown-content dl.wyrd-defs dt[data-kind="skill"],
 .sl-markdown-content dl.wyrd-defs dt[data-kind="tool"],
-.sl-markdown-content dl.wyrd-defs dt[data-kind="mcp"]        { background: var(--card-agent); color: var(--color-surface-50); }
+.sl-markdown-content dl.wyrd-defs dt[data-kind="mcp"]        { background: var(--card-agent); color: var(--hero-ink); }
 .sl-markdown-content dl.wyrd-defs dt[data-kind="service"]    { background: color-mix(in oklch, var(--color-primary-500) 25%, var(--surface)); }
 
 .sl-markdown-content dl.wyrd-defs dd {
@@ -716,13 +716,13 @@ button, input, select, textarea { font: inherit; }
 
   --ah-rune-strong: var(--color-primary-700);
   --ah-hero-bg: var(--color-primary-500);
-  --ah-hero-ink: var(--color-surface-50);
+  --ah-hero-ink: var(--hero-ink);
   --ah-hero-border: var(--neo-shadow-color);
 
   --ah-lime: var(--color-secondary-500);
   --ah-lime-ink: var(--lime-ink);
   --ah-rune-btn: var(--color-primary-500);
-  --ah-rune-btn-ink: var(--color-surface-50);
+  --ah-rune-btn-ink: var(--hero-ink);
 
   /* The Plane — tricolor (client / server / control), already mode-aware */
   --ah-client: var(--card-data);

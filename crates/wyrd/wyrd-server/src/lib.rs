@@ -1,6 +1,7 @@
 //! Wyrd server boot and routing primitives.
 
 pub mod auth;
+pub mod auth_boot;
 pub mod boot;
 pub mod config;
 pub mod error;

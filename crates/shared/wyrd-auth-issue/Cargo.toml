@@ -8,6 +8,7 @@ repository = { workspace = true }
 authors = { workspace = true }
 
 [dependencies]
+ed25519-dalek = { workspace = true, features = ["pkcs8", "pem", "rand_core"] }
 jsonwebtoken = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

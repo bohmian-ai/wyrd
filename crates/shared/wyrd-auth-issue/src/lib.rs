@@ -4,6 +4,11 @@
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chrono::{DateTime, Duration, Utc};
+use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::DecodePrivateKey;
+use ed25519_dalek::pkcs8::EncodePrivateKey;
+use ed25519_dalek::pkcs8::EncodePublicKey;
+use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use jsonwebtoken::{EncodingKey, Header};
 use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng};
 use secrecy::{ExposeSecret, SecretString};
@@ -59,6 +64,9 @@ pub enum IssueError {
     /// EdDSA key loading or signing failed.
     #[error("EdDSA signing failed")]
     Signing(#[source] jsonwebtoken::errors::Error),
+    /// The public verification key could not be derived from the signing key.
+    #[error("public key derivation failed: {0}")]
+    PublicKeyDerivation(String),
     /// API-key hashing failed.
     #[error("Argon2 hashing failed")]
     Hashing(password_hash::Error),
@@ -111,6 +119,49 @@ impl IssuingKey {
             kid,
             issuer: issuer.into(),
         })
+    }
+
+    /// Derive the SPKI public-key PEM paired with this signing key.
+    ///
+    /// The Ed25519 public key is computed from the private key, so production
+    /// assembles its token verifier from a single environment-provided signing
+    /// key — the public verification key is derived here, never supplied
+    /// separately. Pass the returned PEM to
+    /// [`wyrd_auth_verify::public_key_from_pem`] to build the verifier's
+    /// decoding key.
+    ///
+    /// # Errors
+    /// Returns an error when the stored PEM cannot be parsed as a PKCS#8 Ed25519
+    /// private key or re-encoded as an SPKI public-key PEM.
+    pub fn verifying_key_pem(&self) -> Result<String, IssueError> {
+        let signing = SigningKey::from_pkcs8_pem(self.pem.expose_secret())
+            .map_err(|e| IssueError::PublicKeyDerivation(e.to_string()))?;
+        signing
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .map(|pem| pem.to_string())
+            .map_err(|e| IssueError::PublicKeyDerivation(e.to_string()))
+    }
+
+    /// Generate a fresh, random Ed25519 signing key as a PKCS#8 PEM.
+    ///
+    /// The development profile calls this to provision an *ephemeral* signing
+    /// key when none is configured, so auth works on a fresh `cargo run` without
+    /// the operator minting a key first. The key lives only for the process
+    /// lifetime — tokens it signs do not survive a restart — and must never be
+    /// used in staging or production, which provision a stable key and fail
+    /// closed without one. The returned PEM is fed through the same assembly
+    /// path as a configured key.
+    ///
+    /// # Errors
+    /// Returns an error when the generated key cannot be encoded as a PKCS#8
+    /// PEM (not expected for a freshly generated key).
+    pub fn generate_ephemeral_pem() -> Result<SecretString, IssueError> {
+        let signing = SigningKey::generate(&mut OsRng);
+        let pem = signing
+            .to_pkcs8_pem(LineEnding::LF)
+            .map_err(|e| IssueError::PublicKeyDerivation(e.to_string()))?;
+        Ok(SecretString::from(pem.to_string()))
     }
 
     /// Mint an access token for a user principal.
@@ -408,7 +459,7 @@ fn validate_principal_ref(principal: &TokenPrincipalRef) -> Result<(), IssueErro
 mod tests {
     use chrono::Duration;
     use jsonwebtoken::{Algorithm, decode_header};
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret, SecretString};
     use wyrd_auth_verify::{
         AccessTokenClaims, ActClaim, PrincipalKindWire, RefreshTokenClaims, TokenPrincipalRef,
         decode_kid, public_key_from_pem, verify_eddsa,
@@ -720,6 +771,58 @@ mod tests {
     #[test]
     fn no_sqlx_in_crate() {
         assert_no_sqlx_in_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+    }
+
+    #[test]
+    fn verifying_key_pem_derives_a_key_that_verifies_issued_tokens() {
+        let key = issuing_key();
+        let derived_pem = key.verifying_key_pem().expect("public key derives");
+        let decoding =
+            public_key_from_pem(derived_pem.as_bytes()).expect("derived public key loads");
+
+        let token = key
+            .issue_user_access_token(
+                user_principal(),
+                vec![role("runtime_admin")],
+                Duration::minutes(5),
+            )
+            .expect("token issues");
+        let claims = verify_eddsa::<AccessTokenClaims>(&token, &decoding, Some("wyrd"))
+            .expect("token verifies against the derived public key");
+
+        assert_eq!(claims.principal.kind, PrincipalKindWire::User);
+    }
+
+    #[test]
+    fn generated_ephemeral_key_mints_tokens_verifiable_by_its_derived_key() {
+        let pem = IssuingKey::generate_ephemeral_pem().expect("ephemeral key generates");
+        let key = IssuingKey::from_ed_pem(pem, Kid::new("k1").expect("kid is valid"), "wyrd")
+            .expect("generated key loads as a signing key");
+        let decoding = public_key_from_pem(
+            key.verifying_key_pem()
+                .expect("public key derives")
+                .as_bytes(),
+        )
+        .expect("derived public key loads");
+
+        let token = key
+            .issue_user_access_token(
+                user_principal(),
+                vec![role("runtime_admin")],
+                Duration::minutes(5),
+            )
+            .expect("token issues");
+        let claims = verify_eddsa::<AccessTokenClaims>(&token, &decoding, Some("wyrd"))
+            .expect("token verifies against the generated key's derived public key");
+
+        assert_eq!(claims.principal.kind, PrincipalKindWire::User);
+    }
+
+    #[test]
+    fn generated_ephemeral_keys_are_distinct() {
+        let a = IssuingKey::generate_ephemeral_pem().expect("first key generates");
+        let b = IssuingKey::generate_ephemeral_pem().expect("second key generates");
+        assert_ne!(a.expose_secret(), b.expose_secret());
     }
 
     #[test]

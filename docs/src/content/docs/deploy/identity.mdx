@@ -41,6 +41,60 @@ principal_kind    = "human"
 The `tenant_slug` can also be supplied via the environment variable
 `WYRD_SERVER_TENANT_SLUG`, which overrides any value in `server.toml`.
 
+## Signing key
+
+Wyrd mints its own access tokens after verifying a caller's IdP token. Those
+Wyrd tokens are signed with an Ed25519 private key you provision. **In a
+production deployment this key is required — the server fails to start without
+it.** The matching public verification key is derived from the private key at
+boot, so there is no separate public key to configure.
+
+Provide the key (PKCS#8 PEM, Ed25519) through one of two environment variables:
+
+1. `WYRD_SIGNING_KEY_FILE` — path to a file holding the PEM (primary).
+2. `WYRD_SIGNING_KEY_PEM` — the PEM inline (fallback).
+
+The file form is preferred: a mounted Kubernetes `Secret` keeps the PEM out of
+the process environment and `env` dumps. Setting **both** variables is a
+configuration error and the server will refuse to start.
+
+```yaml
+volumes:
+  - name: wyrd-signing-key
+    secret:
+      secretName: wyrd-signing-key
+containers:
+  - name: wyrd
+    env:
+      - name: WYRD_SIGNING_KEY_FILE
+        value: /etc/wyrd/signing-key/key.pem
+    volumeMounts:
+      - name: wyrd-signing-key
+        mountPath: /etc/wyrd/signing-key
+        readOnly: true
+```
+
+Generate a key with:
+
+```bash
+openssl genpkey -algorithm ed25519 -out signing-key.pem
+```
+
+Auth works the same way in every environment; only how the key is supplied
+differs. The environment is selected by `APP_ENV` (`development`, `staging`, or
+`production`). `staging` and `production` both run the hardened production
+profile.
+
+- **`staging` / `production`:** you must provision a stable signing key. The
+  server **fails to start** without one. Use a stable key here so issued tokens
+  survive restarts and verify across replicas.
+- **`development`:** if no key is configured, the server **generates an
+  ephemeral key at boot** so auth works on a fresh local run with no setup. That
+  key lives only for the process lifetime — tokens do not survive a restart, and
+  it is single-process only — so it must never be used in staging or production.
+  Set `WYRD_SIGNING_KEY_FILE` or `WYRD_SIGNING_KEY_PEM` locally when you need
+  tokens to persist across restarts.
+
 ## Secret handling
 
 Do not put raw client secrets in `server.toml` in production. The options
@@ -85,7 +139,9 @@ write the rendered config to `/etc/wyrd/server.toml` at pod startup.
 
 If the OIDC discovery endpoint is unreachable at boot, the server will fail
 to start. Ensure the IdP is reachable from the pod's network before the
-server process launches.
+server process launches. When `APP_ENV` is `staging` or `production`, the
+server also fails to start if no signing key is configured (see
+[Signing key](#signing-key)).
 
 ## Config file reference
 

@@ -40,6 +40,15 @@ pub enum ConfigError {
         /// The missing path.
         path: PathBuf,
     },
+    /// The signing-key file named by `WYRD_SIGNING_KEY_FILE` could not be read.
+    #[error("signing-key file at {path} could not be read")]
+    ReadSigningKey {
+        /// Path that failed to read.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
     /// An environment variable is set but contains no value.
     #[error("environment variable {key} is set but empty")]
     EmptyEnvVar {
@@ -255,6 +264,15 @@ pub struct AuthConfig {
     /// the request handlers use, so the bound tenant matches request-time lookups.
     #[serde(default)]
     pub tenant_slug: Option<TenantSlug>,
+    /// Wyrd's own Ed25519 signing key PEM, used to mint and verify Wyrd JWTs.
+    ///
+    /// Env-injected only — never read from the TOML file. Loaded at config time
+    /// from `WYRD_SIGNING_KEY_FILE` (path to a mounted secret; primary) or
+    /// `WYRD_SIGNING_KEY_PEM` (inline PEM; fallback). The paired public key is
+    /// derived from this private key at boot, so no public key is configured
+    /// separately. `None` when unset; production boot fails closed without it.
+    #[serde(skip)]
+    pub signing_key: Option<SecretString>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -545,15 +563,19 @@ impl WyrdServerConfig {
     /// Unset variables are silently skipped. Empty variables produce
     /// [`ConfigError::EmptyEnvVar`].
     fn apply_env_overrides(&mut self) -> Result<(), ConfigError> {
-        // deployment_profile
-        if let Some(val) = env_opt("WYRD_DEPLOYMENT_PROFILE")? {
+        // deployment_profile (APP_ENV: development | staging | production).
+        // staging and production both select the hardened production profile, so
+        // both fail closed without a signing key; only development is lenient.
+        if let Some(val) = env_opt("APP_ENV")? {
             self.deployment_profile = match val.as_str() {
                 "development" => DeploymentProfile::Development,
-                "production" => DeploymentProfile::Production,
+                "staging" | "production" => DeploymentProfile::Production,
                 _ => {
                     return Err(ConfigError::BadEnvVar {
-                        key: "WYRD_DEPLOYMENT_PROFILE".to_string(),
-                        message: format!("expected 'development' or 'production', got {val:?}"),
+                        key: "APP_ENV".to_string(),
+                        message: format!(
+                            "expected 'development', 'staging', or 'production', got {val:?}"
+                        ),
                     });
                 }
             };
@@ -723,6 +745,11 @@ impl WyrdServerConfig {
                 message: e.to_string(),
             })?;
             self.auth.tenant_slug = Some(slug);
+        }
+
+        // auth.signing_key (WYRD_SIGNING_KEY_FILE primary, WYRD_SIGNING_KEY_PEM fallback)
+        if let Some(key) = load_signing_key()? {
+            self.auth.signing_key = Some(key);
         }
 
         Ok(())
@@ -967,6 +994,33 @@ fn env_opt(key: &str) -> Result<Option<String>, ConfigError> {
     }
 }
 
+/// Load Wyrd's own signing-key PEM from the environment.
+///
+/// `WYRD_SIGNING_KEY_FILE` (a path to a mounted secret) is the primary source;
+/// `WYRD_SIGNING_KEY_PEM` (inline PEM) is the fallback. The file form is
+/// preferred because a k8s Secret volume keeps the PEM out of the process
+/// environment and `env` dumps. Setting both is a configuration error.
+fn load_signing_key() -> Result<Option<SecretString>, ConfigError> {
+    let file = env_opt("WYRD_SIGNING_KEY_FILE")?;
+    let inline = env_opt("WYRD_SIGNING_KEY_PEM")?;
+    match (file, inline) {
+        (Some(_), Some(_)) => Err(ConfigError::ConflictingEnvVars {
+            keys: vec![
+                "WYRD_SIGNING_KEY_FILE".to_string(),
+                "WYRD_SIGNING_KEY_PEM".to_string(),
+            ],
+        }),
+        (Some(path), None) => {
+            let path = PathBuf::from(path);
+            let pem = std::fs::read_to_string(&path)
+                .map_err(|source| ConfigError::ReadSigningKey { path, source })?;
+            Ok(Some(SecretString::from(pem)))
+        }
+        (None, Some(pem)) => Ok(Some(SecretString::from(pem))),
+        (None, None) => Ok(None),
+    }
+}
+
 /// Parse a boolean flag from a `0`/`1` string.
 fn parse_flag(val: &str, key: &str) -> Result<bool, ConfigError> {
     match val {
@@ -1200,19 +1254,33 @@ mod tests {
         );
     }
 
-    // ── 12. Bad deployment profile env var → BadEnvVar ───────────────────────
+    // ── 12. Bad APP_ENV value → BadEnvVar ────────────────────────────────────
 
     #[test]
-    fn bad_deployment_profile_env_var() {
+    fn bad_app_env_value() {
         let _guard = ENV_LOCK.lock().unwrap();
-        temp_env::with_vars([("WYRD_DEPLOYMENT_PROFILE", Some("staging"))], || {
+        temp_env::with_vars([("APP_ENV", Some("qa"))], || {
             let mut cfg = WyrdServerConfig::default();
             let err = cfg
                 .apply_env_overrides()
                 .expect_err("bad profile must error");
             assert!(
-                matches!(err, ConfigError::BadEnvVar { ref key, .. } if key == "WYRD_DEPLOYMENT_PROFILE"),
+                matches!(err, ConfigError::BadEnvVar { ref key, .. } if key == "APP_ENV"),
                 "expected BadEnvVar, got {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn app_env_staging_selects_hardened_production_profile() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_vars([("APP_ENV", Some("staging"))], || {
+            let mut cfg = WyrdServerConfig::default();
+            cfg.apply_env_overrides()
+                .expect("staging is a valid APP_ENV");
+            assert!(
+                cfg.deployment_profile.is_production(),
+                "staging must map to the hardened production profile"
             );
         });
     }

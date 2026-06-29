@@ -35,6 +35,11 @@ pub enum ServerBootError {
     /// Storage boot failed.
     #[error(transparent)]
     Storage(#[from] wyrd_storage::StorageError),
+    /// Wyrd's own signing key could not be loaded or its public key derived.
+    /// Boot fails closed: without a usable signing key the server cannot mint or
+    /// verify Wyrd JWTs.
+    #[error("WYRD_SIGNING_KEY is invalid: {0}")]
+    SigningKey(String),
     /// OIDC discovery for a configured trusted issuer was unavailable after the
     /// bounded retry schedule. Boot fails closed rather than starting with a
     /// silently empty registry; the message surfaces the stable
@@ -200,8 +205,12 @@ pub async fn build_app_state_from_config(
         };
 
     // Resolve the configured trusted issuers into the static registry. Discovery
-    // failures fail boot closed.
-    if !config.trusted_issuers.is_empty() {
+    // failures fail boot closed. The resolved registry is also handed to the
+    // token verifier below so its external (foreign-OIDC) path can exchange
+    // federated tokens.
+    let trusted_issuer_registry = if config.trusted_issuers.is_empty() {
+        None
+    } else {
         let tenant_id =
             implicit_tenant.expect("implicit tenant resolved when trusted issuers are configured");
         let issuers = crate::issuer_boot::ConfigFileIssuerResolver::new(
@@ -210,8 +219,48 @@ pub async fn build_app_state_from_config(
         )
         .resolve()
         .await?;
-        let registry = wyrd_auth_oidc::TrustedIssuerRegistry::from_issuers(issuers);
-        state = state.with_trusted_issuer_registry(Arc::new(registry));
+        let registry = Arc::new(wyrd_auth_oidc::TrustedIssuerRegistry::from_issuers(issuers));
+        state = state.with_trusted_issuer_registry(Arc::clone(&registry));
+        Some(registry)
+    };
+
+    // Install Wyrd's own auth handles (issuing key + token verifier). A server
+    // without a signing key cannot mint or verify Wyrd JWTs, so auth is the same
+    // working experience across environments: a production profile (staging and
+    // production) fails boot closed when no key is provisioned; development mints
+    // an ephemeral key so auth works on a fresh local run. The verifier's
+    // external path is wired to the trusted-issuer registry resolved above.
+    match config.auth.signing_key.as_ref() {
+        Some(signing_key) => {
+            let (issuing_key, verifier) = crate::auth_boot::build_auth_handles(
+                signing_key,
+                &state.pool,
+                trusted_issuer_registry.as_ref(),
+            )?;
+            state = state.with_auth_handles(issuing_key, verifier);
+        }
+        None if config.deployment_profile.is_production() => {
+            return Err(ServerBootError::SigningKey(
+                "no signing key configured (set WYRD_SIGNING_KEY_FILE or WYRD_SIGNING_KEY_PEM)"
+                    .to_owned(),
+            ));
+        }
+        None => {
+            let ephemeral = wyrd_auth_issue::IssuingKey::generate_ephemeral_pem()
+                .map_err(|error| ServerBootError::SigningKey(error.to_string()))?;
+            tracing::warn!(
+                "APP_ENV=development and no signing key configured; generated an EPHEMERAL \
+                 signing key so auth works locally. Tokens will not survive a restart and this \
+                 key must never be used in staging or production. Set WYRD_SIGNING_KEY_FILE to \
+                 provision a stable key."
+            );
+            let (issuing_key, verifier) = crate::auth_boot::build_auth_handles(
+                &ephemeral,
+                &state.pool,
+                trusted_issuer_registry.as_ref(),
+            )?;
+            state = state.with_auth_handles(issuing_key, verifier);
+        }
     }
 
     // Populate the in-memory workload binding registry from `[[workload_bindings]]`.

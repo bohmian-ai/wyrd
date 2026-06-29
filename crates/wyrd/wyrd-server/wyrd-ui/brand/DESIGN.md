@@ -4,7 +4,7 @@ The rules every Wyrd UI piece obeys. This is the prose source of truth; it pairs
 
 - **`palette.json`** — canonical tokens (machine-readable; generates `theme.css`).
 - **`components.json`** — per-component contracts (machine-readable; consumed by A2UI/agents).
-- **`./wyrd-ui-source-of-truth.html`** — the rendered visual reference.
+- **`./wyrd-ui-source-of-truth-v2.html`** — the rendered visual reference.
 
 There are two consumers and **one** set of standardized pieces: the SvelteKit workbench
 (imports components from `src/lib/components`) and an eventual dynamic-layout / A2UI renderer

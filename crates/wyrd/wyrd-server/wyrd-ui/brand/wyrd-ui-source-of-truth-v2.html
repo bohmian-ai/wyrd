@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mitari UI — Source of Truth v2 · Arcade</title>
+<title>Wyrd — Source of Truth v2 · Arcade</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=Archivo:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
@@ -17,7 +17,7 @@
      so the arcade skin reinforces the brutalist system instead of fighting it. */
   :root{--fp:"Press Start 2P",monospace;--fv:"VT323",monospace}
   .fp{font-family:var(--fp)}
-  /* the Mitari "fuji" mark — runic three-prong, rune violet + lime spine */
+  /* the Wyrd "fuji" mark — runic three-prong, rune violet + lime spine */
   .fuji{display:block;flex:0 0 auto}
   .fuji .p{fill:var(--rune-strong,#7c3aed)}
   .fuji .c{fill:var(--lime,#c5f23c)}
@@ -78,7 +78,7 @@
   .panel-label.dark::before{background:#0b0b0e}
 
   /* =====================================================================
-     THE LOCKED THEME SURFACE — every token Mitari UI is allowed to use.
+     THE LOCKED THEME SURFACE — every token Wyrd is allowed to use.
      Light and dark carry the SAME geometry; only palette/atmosphere differ.
      ===================================================================== */
   .surface{position:relative;overflow:hidden;border:3px solid var(--border);border-radius:7px;
@@ -464,7 +464,7 @@
 <header class="pagehead">
   <span class="ph-brand">
     <svg class="fuji" viewBox="0 0 100 100" aria-hidden="true"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>
-    <span class="ph-wm">MITARI</span>
+    <span class="ph-wm">WYRD</span>
     <span class="ph-sub">UI Source of Truth · v2</span>
   </span>
   <span class="lock">P1 · HI-SCORE 015340 · CR.02</span>
@@ -484,7 +484,7 @@
 <!-- ============ §0 PRINCIPLES ============ -->
 <section class="sec" id="principles">
   <div class="sechead"><span class="num">00</span><h2>Rules</h2><span class="tag">non-negotiable</span></div>
-  <p class="seclede">This file is the canonical reference for Mitari UI theming, paired with <code>theme.css</code>. Same geometry in light and dark; only palette and atmosphere change. When a styling question comes up, this is the answer.</p>
+  <p class="seclede">This file is the canonical reference for Wyrd theming, paired with <code>theme.css</code>. Same geometry in light and dark; only palette and atmosphere change. When a styling question comes up, this is the answer.</p>
   <div class="rules">
     <div class="rule"><h3><span class="d" style="background:#8b5cf6"></span>Geometry</h3><p><b>Radius 5px</b> on every surface and control. <b>2px ink borders</b> (3px for hero/feature containers), <b>2px dashed</b> for dividers inside cards. Borders are <b>always present</b> — never gray, hairline, or low-contrast.</p></div>
     <div class="rule"><h3><span class="d" style="background:#8b5cf6"></span>Shadows</h3><p>Hard-offset, <b>zero blur</b> only: <code>3px</code> quiet cards, <code>6px</code> raised/stat, <code>10px</code> hero block. No blur, no glassmorphism, no soft elevation, <b>no glow</b>.</p></div>
@@ -550,7 +550,7 @@
 <!-- ============ §8 ARCADE ============ -->
 <section class="sec" id="arcade">
   <div class="sechead"><span class="num">08</span><h2>Arcade</h2><span class="tag">attract mode · exploratory</span></div>
-  <p class="seclede">Mitari ≈ Atari. An <b>opt-in retro register</b> built entirely from locked primitives — a pixel display face, the runic “fuji” mark, ordered-dither texture (stepped, <b>zero-blur</b>), and notched cabinet corners. It still obeys every rule: 5px radius on real controls, 2px ink borders, hard-offset shadows, <b>no glow, no scanlines</b>. The boldness is the point — the arcade skin just makes it grin. Loud-adjacent: use for landing moments and launch screens, never beside the workbench.</p>
+  <p class="seclede">An <b>opt-in retro register</b> built entirely from locked primitives — a pixel display face, the runic “fuji” mark, ordered-dither texture (stepped, <b>zero-blur</b>), and notched cabinet corners. It still obeys every rule: 5px radius on real controls, 2px ink borders, hard-offset shadows, <b>no glow, no scanlines</b>. The boldness is the point — the arcade skin just makes it grin. Loud-adjacent: use for landing moments and launch screens, never beside the workbench.</p>
   <div class="compare" id="arcade-cols"></div>
 </section>
 
@@ -593,7 +593,7 @@
 <template id="t-quiet">
   <div>
     <div class="q-top">
-      <span class="q-wm"><svg class="fuji" viewBox="0 0 100 100" aria-hidden="true"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>MITARI<i></i></span>
+      <span class="q-wm"><svg class="fuji" viewBox="0 0 100 100" aria-hidden="true"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>WYRD<i></i></span>
       <span class="q-search">⌘K  search cards…</span>
       <span class="q-nav"><b>registry</b> · observations · audit</span>
     </div>
@@ -644,9 +644,9 @@
         <div class="l-walker"><div class="spr-flip"><div class="spr-stack"><div class="spr-a"></div><div class="spr-b"></div></div></div></div>
       </div>
       <div class="l-content">
-        <span class="l-orn"><svg class="fuji" viewBox="0 0 100 100" aria-hidden="true" style="width:13px;height:13px;display:inline-block;vertical-align:-2px;margin-right:5px"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>mitari</span>
-        <span class="l-wm"><svg class="fuji" viewBox="0 0 100 100" aria-hidden="true" style="width:16px;height:16px"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>MITARI<i></i></span>
-        <div><span class="l-hero">MITARI SYSTEM</span></div>
+        <span class="l-orn"><svg class="fuji" viewBox="0 0 100 100" aria-hidden="true" style="width:13px;height:13px;display:inline-block;vertical-align:-2px;margin-right:5px"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>wyrd</span>
+        <span class="l-wm"><svg class="fuji" viewBox="0 0 100 100" aria-hidden="true" style="width:16px;height:16px"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>WYRD<i></i></span>
+        <div><span class="l-hero">WYRD SYSTEM</span></div>
         <p class="l-tag">Neobrutalism for the agentic stack. <b>One geometry. Two modes. Zero blur.</b></p>
         <div class="l-stats">
           <div class="l-stat"><div class="n">24</div><div class="k">Components</div></div>
@@ -667,7 +667,7 @@
     <div class="cab notch dither">
       <svg class="fuji" viewBox="0 0 100 100" aria-hidden="true"><path class="p" d="M42 92 L30 92 L6 8 L22 8 Z"/><path class="p" d="M58 92 L70 92 L94 8 L78 8 Z"/><path class="c" d="M44 8 h12 v84 h-12 z"/></svg>
       <div class="ct">★ INSERT COIN ★</div>
-      <div class="cs">MITARI ATTRACT MODE</div>
+      <div class="cs">WYRD ATTRACT MODE</div>
       <div class="cc">PRESS START TO BUILD</div>
     </div>
     <div class="hs">

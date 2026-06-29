@@ -161,20 +161,44 @@ Self-hosted Wyrd is single-tenant. All entries in `[[trusted_issuers]]` and
 
 ### API key
 
-An admin issues an API key for a registered Service or Agent card:
+An admin holding `service_accounts:write` issues an API key for a registered
+Service or Agent card. The call is authenticated with the admin's access JWT and
+audited in the same transaction that mints the key:
 
-```bash
-wyrd auth issue-key prod/Service/billing@1.0.0
+```http
+POST /auth/issue-key
+Content-Type: application/json
+X-Wyrd-Access-Token: <admin-access-jwt>
+
+{
+  "card_ref": {
+    "kind": "service",
+    "name": "billing",
+    "version": "1.0.0",
+    "space": "prod"
+  },
+  "expires_in_seconds": 7776000
+}
 ```
 
-The same shape works for Agent cards:
+The same shape works for an Agent card — set `"kind": "agent"`. Only Service and
+Agent cards back a workload principal; any other kind is rejected.
 
-```bash
-wyrd auth issue-key prod/Agent/claude-code@1.0.0
+The plaintext key is returned once, alongside its `key_id` and `prefix`:
+
+```json
+{
+  "key_id": "...",
+  "key": "wyrd_sk_...",
+  "prefix": "wyrd_sk_...",
+  "card_ref": { "kind": "service", "name": "billing", "version": "1.0.0", "space": "prod" },
+  "created_at": "...",
+  "expires_at": "..."
+}
 ```
 
-The plaintext key is returned once. Store it in the deployment secret store and
-redact it from logs. At runtime, exchange it for a Wyrd JWT:
+Store the key in the deployment secret store and redact it from logs. At runtime,
+exchange it for a Wyrd JWT:
 
 ```http
 POST /auth/token
@@ -189,7 +213,11 @@ Content-Type: application/json
 The response carries a short-lived access JWT and a long-lived refresh token.
 Send the access JWT in `X-Wyrd-Access-Token` on subsequent API calls.
 
-Rotate by issuing a new key, redeploying the secret, then revoking the old one:
+**Rotation.** Issue a new key, redeploy it alongside the existing one, and let
+the old key lapse at its TTL (`expires_in_seconds`). Overlapping the two keys
+means no request fails mid-rotation. Reserve principal revocation for a
+compromised credential — it is immediate and severs every credential the
+principal holds:
 
 ```bash
 wyrd principal revoke <principal-id>
@@ -203,8 +231,12 @@ Initiate login by directing the browser or CLI to:
 GET /auth/login?issuer=https://idp.acme.com/realms/acme
 ```
 
-Wyrd redirects the user to the IdP. After authentication, the IdP redirects to
-`/auth/callback`. Complete the code exchange:
+Wyrd redirects the user to the IdP. After authentication, the IdP redirects the
+browser to `/auth/callback?code=...&state=...`, and that endpoint completes the
+code exchange and returns a User JWT and refresh token directly — no second call.
+
+A programmatic client that captures the `code` and `state` out of band (instead
+of following the browser redirect) completes the exchange itself:
 
 ```http
 POST /auth/token
@@ -217,7 +249,9 @@ Content-Type: application/json
 }
 ```
 
-Returns a User JWT and a refresh token. MFA is handled entirely at the IdP.
+Use one path or the other — the authorization code is single-use, so calling
+`/auth/token` after the browser already hit `/auth/callback` will fail. MFA is
+handled entirely at the IdP.
 Rotate tokens with:
 
 ```bash

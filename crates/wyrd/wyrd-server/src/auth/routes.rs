@@ -7,7 +7,6 @@ use base64::Engine;
 use secrecy::SecretString;
 use uuid::Uuid;
 use wyrd_auth_verify::AccessTokenClaims;
-use wyrd_runtime::Permission;
 use wyrd_spec::auth::{CallbackQuery, IssueKeyRequest, TokenRequest, TokenResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
@@ -188,16 +187,7 @@ async fn issue_key(
     request_id: Option<Extension<RequestId>>,
     Json(request): Json<IssueKeyRequest>,
 ) -> Result<Json<wyrd_spec::auth::IssueKeyResponse>, WyrdErrorResponse> {
-    if !caller
-        .principal
-        .effective_permissions
-        .contains(&Permission::service_accounts_write())
-    {
-        return Err(WyrdErrorResponse::from(WyrdError::PermissionDeniedRbac {
-            message: "service_accounts:write permission required to issue API keys".to_owned(),
-            details: serde_json::json!({ "required": "service_accounts:write" }),
-        }));
-    }
+    crate::auth::require_service_accounts_write(&caller.principal, "issue API keys")?;
 
     let request_id_str: String;
     let req_id = match request_id.as_ref() {
@@ -293,6 +283,9 @@ mod tests {
 
     use crate::auth::AuthenticatedPrincipal;
     use crate::state::AppState;
+    use axum::Extension;
+    use sqlx::Row;
+    use wyrd_spec::request_id::RequestId;
     use wyrd_sql::TenantConn;
 
     use super::{issue_key, router, tenant_from_unverified_access_token};
@@ -478,7 +471,7 @@ mod tests {
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let creator = insert_test_user(&mut conn, tenant).await;
-        insert_test_service_account(&mut conn, tenant, creator, &card_ref).await;
+        let sa_id = insert_test_service_account(&mut conn, tenant, creator, &card_ref).await;
         conn.commit().await.expect("seed commits");
 
         let state = fixture_state(&fixture);
@@ -493,12 +486,47 @@ mod tests {
             expires_in_seconds: None,
         };
 
-        let response = issue_key(State(state), caller, None, Json(request))
-            .await
-            .expect("issue key succeeds");
+        let request_id = RequestId::parse("01890f28-7c4a-7cc3-98e7-4f4a3c2d1bff")
+            .expect("static request id is valid");
+        let expected_request_id = request_id.as_str().to_owned();
+
+        let response = issue_key(
+            State(state),
+            caller,
+            Some(Extension(request_id)),
+            Json(request),
+        )
+        .await
+        .expect("issue key succeeds");
 
         assert_eq!(response.0.card_ref, card_ref);
         assert!(!response.0.prefix.is_empty());
         assert!(!response.0.key_id.is_empty());
+
+        let mut verify_conn = fixture.tenant_conn().await.expect("verify conn opens");
+        let row = sqlx::query(
+            "SELECT issuer_principal_id, target_sa_id, request_id, data_tenant_id
+             FROM wyrd.audit_credential_issuance
+             WHERE data_tenant_id = $1",
+        )
+        .bind(tenant.as_uuid())
+        .fetch_one(&mut **verify_conn.transaction())
+        .await
+        .expect("audit row was written");
+
+        let audit_actor: Uuid = row.get("issuer_principal_id");
+        let audit_target: Uuid = row.get("target_sa_id");
+        let audit_request_id: String = row.get("request_id");
+        let audit_tenant: Uuid = row.get("data_tenant_id");
+        assert_eq!(audit_actor, creator, "audit records the issuing actor");
+        assert_eq!(
+            audit_target, sa_id,
+            "audit records the target service account"
+        );
+        assert_eq!(audit_tenant, tenant.as_uuid(), "audit is tenant-scoped");
+        assert_eq!(
+            audit_request_id, expected_request_id,
+            "audit records the request id"
+        );
     }
 }

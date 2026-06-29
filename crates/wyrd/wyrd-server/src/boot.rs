@@ -183,17 +183,27 @@ pub async fn build_app_state_from_config(
         .with_trusted_request_id_propagation(config.request_id.trust_upstream)
         .with_preview_auth(config.auth.allow_preview);
 
-    // Resolve the configured trusted issuers into the static registry. The
-    // implicit tenant is resolved through the same slug path the request
-    // handlers use, so the bound tenant matches request-time lookups by
-    // construction. Discovery failures fail boot closed.
+    // Resolve the implicit tenant once for both the trusted-issuer and
+    // workload-binding registries. Both resolve through the same slug path the
+    // request handlers use, so the bound tenant matches request-time lookups by
+    // construction.
+    let implicit_tenant =
+        if config.trusted_issuers.is_empty() && config.workload_bindings.is_empty() {
+            None
+        } else {
+            let slug = config.auth.tenant_slug.as_ref().ok_or_else(|| {
+                ServerBootError::TenantSlugUnresolved {
+                    slug: "(unset)".to_owned(),
+                }
+            })?;
+            Some(crate::issuer_boot::resolve_implicit_tenant(&state.pool, slug).await?)
+        };
+
+    // Resolve the configured trusted issuers into the static registry. Discovery
+    // failures fail boot closed.
     if !config.trusted_issuers.is_empty() {
-        let slug = config.auth.tenant_slug.as_ref().ok_or_else(|| {
-            ServerBootError::TenantSlugUnresolved {
-                slug: "(unset)".to_owned(),
-            }
-        })?;
-        let tenant_id = crate::issuer_boot::resolve_implicit_tenant(&state.pool, slug).await?;
+        let tenant_id =
+            implicit_tenant.expect("implicit tenant resolved when trusted issuers are configured");
         let issuers = crate::issuer_boot::ConfigFileIssuerResolver::new(
             config.trusted_issuers.clone(),
             tenant_id,
@@ -210,12 +220,8 @@ pub async fn build_app_state_from_config(
     // `WorkloadBindingResolver::binding` lookup is keyed by, so matches hold by
     // construction. Building the ref is not a card-existence check.
     if !config.workload_bindings.is_empty() {
-        let slug = config.auth.tenant_slug.as_ref().ok_or_else(|| {
-            ServerBootError::TenantSlugUnresolved {
-                slug: "(unset)".to_owned(),
-            }
-        })?;
-        let tenant_id = crate::issuer_boot::resolve_implicit_tenant(&state.pool, slug).await?;
+        let tenant_id = implicit_tenant
+            .expect("implicit tenant resolved when workload bindings are configured");
         let bindings = build_workload_bindings(&config.workload_bindings, tenant_id)?;
         let registry = crate::auth::jwt_bearer::WorkloadBindingRegistry::from_bindings(bindings);
         state = state.with_workload_binding_registry(Arc::new(registry));
@@ -276,6 +282,14 @@ fn build_binding_card_ref(
         .into_iter()
         .find(|kind| kind.wire_name().eq_ignore_ascii_case(&entry.kind))
         .ok_or_else(|| invalid(format!("unknown card kind {:?}", entry.kind)))?;
+    // Only Service and Agent cards back a workload principal; any other kind
+    // parses but never resolves at jwt-bearer exchange. Fail fast at boot.
+    if !matches!(kind, CardKind::Service | CardKind::Agent) {
+        return Err(invalid(format!(
+            "workload binding card kind must be \"service\" or \"agent\", got {:?}",
+            entry.kind
+        )));
+    }
     let name = CardName::new(entry.name.clone())
         .map_err(|error| invalid(format!("invalid card name {:?}: {error}", entry.name)))?;
     let version = VersionBlock::parse(entry.version.clone())
@@ -356,7 +370,7 @@ mod tests {
             audience: Some("my-audience".to_owned()),
             // Lowercase mirrors the canonical config example; the boot parse is
             // case-insensitive against the kind wire name.
-            kind: "model".to_owned(),
+            kind: "service".to_owned(),
             name: "my-model".to_owned(),
             space: "prod".to_owned(),
             version: "1.0.0".to_owned(),
@@ -395,7 +409,7 @@ mod tests {
             .await
             .expect("lookup ok")
             .expect("bound subject resolves to a card ref");
-        assert_eq!(card_ref.kind, CardKind::Model);
+        assert_eq!(card_ref.kind, CardKind::Service);
         assert_eq!(card_ref.name.to_string(), "my-model");
         assert_eq!(card_ref.version.to_string(), "1.0.0");
         assert_eq!(card_ref.space.to_string(), "prod");
@@ -411,5 +425,20 @@ mod tests {
             .await
             .expect("lookup ok");
         assert!(unbound.is_none(), "unbound subject must resolve to None");
+    }
+
+    #[test]
+    fn workload_binding_rejects_non_service_or_agent_kind() {
+        let tenant = implicit_tenant();
+        let mut entry = sample_binding_entry();
+        entry.kind = "model".to_owned();
+
+        let error = build_workload_bindings(&[entry], tenant)
+            .expect_err("a model-kind binding must be rejected at boot");
+
+        assert!(
+            matches!(error, ServerBootError::InvalidWorkloadBinding { .. }),
+            "expected InvalidWorkloadBinding, got {error:?}"
+        );
     }
 }

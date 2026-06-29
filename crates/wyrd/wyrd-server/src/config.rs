@@ -369,7 +369,8 @@ pub struct WorkloadBindingEntry {
     pub subject: String,
     /// Optional audience constraint for additional lookup precision.
     pub audience: Option<String>,
-    /// Card kind (`model`, `data`, `pipeline`, `prompt`, or `audit`).
+    /// Card kind backing the workload principal — `service` or `agent`. Any
+    /// other kind is rejected at boot (it can never resolve a principal).
     pub kind: String,
     /// Card name.
     pub name: String,
@@ -1299,7 +1300,7 @@ mod tests {
             issuer = "https://idp.example.com"
             subject = "system:serviceaccount:default/my-sa"
             audience = "my-audience"
-            kind = "model"
+            kind = "service"
             name = "my-model"
             space = "prod"
             version = "1.0.0"
@@ -1310,7 +1311,7 @@ mod tests {
         assert_eq!(binding.issuer, "https://idp.example.com");
         assert_eq!(binding.subject, "system:serviceaccount:default/my-sa");
         assert_eq!(binding.audience.as_deref(), Some("my-audience"));
-        assert_eq!(binding.kind, "model");
+        assert_eq!(binding.kind, "service");
         assert_eq!(binding.name, "my-model");
         assert_eq!(binding.space, "prod");
         assert_eq!(binding.version, "1.0.0");

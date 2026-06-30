@@ -16,6 +16,9 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     wyrd_cards::register(py, m)?;
     register_submodule(py, "wyrd._wyrd.cards", &m.getattr("cards")?.cast_into()?)?;
+
+    wyrd_config::register(py, m)?;
+    register_submodule(py, "wyrd._wyrd.config", &m.getattr("config")?.cast_into()?)?;
     register_submodule(
         py,
         "wyrd._wyrd.cards.data",

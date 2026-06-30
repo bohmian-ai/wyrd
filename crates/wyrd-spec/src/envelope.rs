@@ -332,7 +332,7 @@ pub struct Status {
 }
 
 /// Native Wyrd Card kind plus forward-compatible external catch-all.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub enum CardKind {
     /// Data Card.

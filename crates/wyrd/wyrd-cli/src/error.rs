@@ -225,6 +225,21 @@ pub enum WyrdCliError {
         detail: String,
     },
 
+    /// Admin operation failed (trusted-issuer or workload-binding management).
+    #[error("admin operation failed: status={status}, detail={detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_500_ADMIN_FAILED",
+        status = 500,
+        title = "Admin operation failed",
+        remediation = "Check the request parameters, access token, and server connectivity."
+    )]
+    AdminFailed {
+        /// HTTP status returned by the server (400 for local validation failures).
+        status: u16,
+        /// Response body or error detail.
+        detail: String,
+    },
+
     /// API key issuance request failed.
     #[error("api key issuance failed: status={status}, detail={detail}")]
     #[wyrd_error(

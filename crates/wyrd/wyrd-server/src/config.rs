@@ -2,12 +2,15 @@
 //!
 //! Load order: env overrides > TOML file > compiled defaults.
 
+use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use wyrd_spec::TenantSlug;
 use wyrd_telemetry::TelemetryConfig;
 
 /// Errors raised during configuration loading or validation.
@@ -36,6 +39,15 @@ pub enum ConfigError {
     MissingExplicitTomlPath {
         /// The missing path.
         path: PathBuf,
+    },
+    /// The signing-key file named by `WYRD_SIGNING_KEY_FILE` could not be read.
+    #[error("signing-key file at {path} could not be read")]
+    ReadSigningKey {
+        /// Path that failed to read.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
     },
     /// An environment variable is set but contains no value.
     #[error("environment variable {key} is set but empty")]
@@ -132,6 +144,12 @@ pub struct WyrdServerConfig {
     /// Authentication gate configuration.
     #[serde(default)]
     pub auth: AuthConfig,
+    /// Trusted OIDC issuers for this deployment.
+    #[serde(default)]
+    pub trusted_issuers: Vec<IssuerEntry>,
+    /// Workload identity bindings for this deployment.
+    #[serde(default)]
+    pub workload_bindings: Vec<WorkloadBindingEntry>,
 }
 
 /// HTTP server bind configuration.
@@ -237,6 +255,147 @@ pub struct AuthConfig {
     /// When true, auth routes that require preview-gated card registration are allowed.
     #[serde(default)]
     pub allow_preview: bool,
+    /// Slug of the implicit tenant this self-hosted deployment serves.
+    ///
+    /// Boot has no request `Host` to derive the tenant from, so the operator
+    /// declares it here (or via `WYRD_SERVER_TENANT_SLUG`). Required when any
+    /// `[[trusted_issuers]]` or `[[workload_bindings]]` entry is configured; the
+    /// slug is resolved at boot through the same `resolve_by_slug_for_app` path
+    /// the request handlers use, so the bound tenant matches request-time lookups.
+    #[serde(default)]
+    pub tenant_slug: Option<TenantSlug>,
+    /// Wyrd's own Ed25519 signing key PEM, used to mint and verify Wyrd JWTs.
+    ///
+    /// Env-injected only — never read from the TOML file. Loaded at config time
+    /// from `WYRD_SIGNING_KEY_FILE` (path to a mounted secret; primary) or
+    /// `WYRD_SIGNING_KEY_PEM` (inline PEM; fallback). The paired public key is
+    /// derived from this private key at boot, so no public key is configured
+    /// separately. `None` when unset; production boot fails closed without it.
+    #[serde(skip)]
+    pub signing_key: Option<SecretString>,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Trusted-issuer and workload-binding config DTOs
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// How this deployment authenticates to an OIDC provider's token endpoint.
+///
+/// Maps 1:1 to `wyrd_auth_oidc::ClientAuth`. Boot converts this DTO and moves
+/// secret values into the domain type. Secret-bearing variants store a redacted
+/// [`SecretString`]; the value is never shown in `Debug` output.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuthEntry {
+    /// HTTP Basic auth with a shared client secret (RFC 6749 §2.3.1).
+    SecretBasic(SecretString),
+    /// Secret sent in the token-endpoint POST body (RFC 6749 §2.3.1).
+    SecretPost(SecretString),
+    /// Private-key JWT client assertion (RFC 7523).
+    PrivateKeyJwt,
+    /// Public PKCE-only client — no client secret or assertion.
+    Public,
+}
+
+/// Whether tokens from an issuer represent human users or machine workloads.
+///
+/// Maps 1:1 to `wyrd_auth_oidc::PrincipalKindPolicy`.
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalKindEntry {
+    /// Token represents a human user.
+    #[default]
+    Human,
+    /// Token represents a machine workload.
+    Workload,
+}
+
+/// Dotted claim paths for extracting normalized claims from verified tokens.
+///
+/// `subject` defaults to `"sub"`. No path-format validation is performed here;
+/// boot wraps these strings via `wyrd_auth_oidc::ClaimPath::new`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimMappingEntry {
+    /// Claim path for the external subject. Defaults to `"sub"`.
+    #[serde(default = "ClaimMappingEntry::default_subject")]
+    pub subject: String,
+    /// Optional claim path for an email address.
+    pub email: Option<String>,
+    /// Optional claim path for a groups/roles array (e.g. `realm_access.roles`).
+    pub groups: Option<String>,
+}
+
+impl ClaimMappingEntry {
+    fn default_subject() -> String {
+        "sub".to_string()
+    }
+}
+
+impl Default for ClaimMappingEntry {
+    fn default() -> Self {
+        Self {
+            subject: Self::default_subject(),
+            email: None,
+            groups: None,
+        }
+    }
+}
+
+/// Config DTO for one `[[trusted_issuers]]` entry.
+///
+/// Maps to `wyrd_auth_oidc::TrustedIssuer` minus boot-derived fields
+/// (`jwks_uri`, `tenant_id`). Boot commit 02 converts this DTO and fills those
+/// fields via OIDC discovery.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuerEntry {
+    /// OIDC issuer URL (normalized by boot; must be non-empty).
+    pub issuer: String,
+    /// Wyrd's OAuth 2.0 `client_id` at this IdP.
+    pub client_id: String,
+    /// Expected `aud` claim value in tokens from this issuer.
+    pub expected_audience: String,
+    /// How Wyrd authenticates to this IdP's token endpoint.
+    pub client_auth: ClientAuthEntry,
+    /// Claim path mapping. Defaults to `{ subject = "sub" }`.
+    #[serde(default)]
+    pub claim_mapping: ClaimMappingEntry,
+    /// Per-issuer map from IdP group strings to Wyrd role names.
+    #[serde(default)]
+    pub group_role_map: HashMap<String, Vec<String>>,
+    /// Baseline Wyrd role names granted to every federated user from this issuer.
+    #[serde(default)]
+    pub default_roles: Vec<String>,
+    /// Whether tokens from this issuer represent human users or machine workloads.
+    #[serde(default)]
+    pub principal_kind: PrincipalKindEntry,
+    /// JWKS key-cache TTL in seconds. `None` means boot applies its default.
+    pub jwks_ttl_secs: Option<u64>,
+}
+
+/// Config DTO for one `[[workload_bindings]]` entry.
+///
+/// Maps to `wyrd_auth_oidc::WorkloadBinding` minus boot-derived fields
+/// (`tenant_id`, resolved `card_ref`). Boot commit 03 converts this DTO.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadBindingEntry {
+    /// OIDC issuer URL of the issuer that signs tokens for this workload.
+    pub issuer: String,
+    /// Verified external subject claim value (e.g. a Kubernetes service account).
+    pub subject: String,
+    /// Optional audience constraint for additional lookup precision.
+    pub audience: Option<String>,
+    /// Card kind backing the workload principal — `service` or `agent`. Any
+    /// other kind is rejected at boot (it can never resolve a principal).
+    pub kind: String,
+    /// Card name.
+    pub name: String,
+    /// Space that pins the card identity.
+    pub space: String,
+    /// Exact card version (no version range).
+    pub version: String,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -404,15 +563,19 @@ impl WyrdServerConfig {
     /// Unset variables are silently skipped. Empty variables produce
     /// [`ConfigError::EmptyEnvVar`].
     fn apply_env_overrides(&mut self) -> Result<(), ConfigError> {
-        // deployment_profile
-        if let Some(val) = env_opt("WYRD_DEPLOYMENT_PROFILE")? {
+        // deployment_profile (APP_ENV: development | staging | production).
+        // staging and production both select the hardened production profile, so
+        // both fail closed without a signing key; only development is lenient.
+        if let Some(val) = env_opt("APP_ENV")? {
             self.deployment_profile = match val.as_str() {
                 "development" => DeploymentProfile::Development,
-                "production" => DeploymentProfile::Production,
+                "staging" | "production" => DeploymentProfile::Production,
                 _ => {
                     return Err(ConfigError::BadEnvVar {
-                        key: "WYRD_DEPLOYMENT_PROFILE".to_string(),
-                        message: format!("expected 'development' or 'production', got {val:?}"),
+                        key: "APP_ENV".to_string(),
+                        message: format!(
+                            "expected 'development', 'staging', or 'production', got {val:?}"
+                        ),
                     });
                 }
             };
@@ -575,6 +738,20 @@ impl WyrdServerConfig {
             self.auth.allow_preview = parse_flag(&val, "WYRD_AUTH_ALLOW_PREVIEW")?;
         }
 
+        // auth.tenant_slug
+        if let Some(val) = env_opt("WYRD_SERVER_TENANT_SLUG")? {
+            let slug = TenantSlug::new(val).map_err(|e| ConfigError::BadEnvVar {
+                key: "WYRD_SERVER_TENANT_SLUG".to_string(),
+                message: e.to_string(),
+            })?;
+            self.auth.tenant_slug = Some(slug);
+        }
+
+        // auth.signing_key (WYRD_SIGNING_KEY_FILE primary, WYRD_SIGNING_KEY_PEM fallback)
+        if let Some(key) = load_signing_key()? {
+            self.auth.signing_key = Some(key);
+        }
+
         Ok(())
     }
 
@@ -727,6 +904,72 @@ impl WyrdServerConfig {
             });
         }
 
+        // 16. Each trusted_issuers entry must have non-empty required fields and
+        //     coherent client_auth (secret present iff secret_basic/secret_post).
+        for (idx, issuer) in self.trusted_issuers.iter().enumerate() {
+            let loc = |field: &str| format!("trusted_issuers[{idx}].{field}");
+
+            if issuer.issuer.is_empty() {
+                return Err(ConfigError::Invalid {
+                    message: format!("{} must not be empty", loc("issuer")),
+                });
+            }
+            if issuer.client_id.is_empty() {
+                return Err(ConfigError::Invalid {
+                    message: format!("{} must not be empty", loc("client_id")),
+                });
+            }
+            if issuer.expected_audience.is_empty() {
+                return Err(ConfigError::Invalid {
+                    message: format!("{} must not be empty", loc("expected_audience")),
+                });
+            }
+            match &issuer.client_auth {
+                ClientAuthEntry::SecretBasic(s) | ClientAuthEntry::SecretPost(s) => {
+                    if s.expose_secret().is_empty() {
+                        return Err(ConfigError::Invalid {
+                            message: format!("{} secret must not be empty", loc("client_auth")),
+                        });
+                    }
+                }
+                ClientAuthEntry::PrivateKeyJwt | ClientAuthEntry::Public => {}
+            }
+        }
+
+        // 17. Each workload_bindings entry must have all card-target fields non-empty.
+        for (idx, binding) in self.workload_bindings.iter().enumerate() {
+            let loc = |field: &str| format!("workload_bindings[{idx}].{field}");
+
+            for (field, value) in [
+                ("issuer", binding.issuer.as_str()),
+                ("subject", binding.subject.as_str()),
+                ("kind", binding.kind.as_str()),
+                ("name", binding.name.as_str()),
+                ("space", binding.space.as_str()),
+                ("version", binding.version.as_str()),
+            ] {
+                if value.is_empty() {
+                    return Err(ConfigError::Invalid {
+                        message: format!("{} must not be empty", loc(field)),
+                    });
+                }
+            }
+        }
+
+        // 18. Issuers/bindings require an explicit implicit-tenant slug. Boot
+        //     binds every issuer/binding to this tenant via the same slug path
+        //     the request handlers use; without it boot can resolve no tenant
+        //     and must fail closed, so reject the config here.
+        if (!self.trusted_issuers.is_empty() || !self.workload_bindings.is_empty())
+            && self.auth.tenant_slug.is_none()
+        {
+            return Err(ConfigError::Invalid {
+                message: "[auth] tenant_slug is required when trusted_issuers or \
+                          workload_bindings are configured"
+                    .to_string(),
+            });
+        }
+
         Ok(())
     }
 }
@@ -748,6 +991,33 @@ fn env_opt(key: &str) -> Result<Option<String>, ConfigError> {
             key: key.to_string(),
             message: "value is not valid UTF-8".to_string(),
         }),
+    }
+}
+
+/// Load Wyrd's own signing-key PEM from the environment.
+///
+/// `WYRD_SIGNING_KEY_FILE` (a path to a mounted secret) is the primary source;
+/// `WYRD_SIGNING_KEY_PEM` (inline PEM) is the fallback. The file form is
+/// preferred because a k8s Secret volume keeps the PEM out of the process
+/// environment and `env` dumps. Setting both is a configuration error.
+fn load_signing_key() -> Result<Option<SecretString>, ConfigError> {
+    let file = env_opt("WYRD_SIGNING_KEY_FILE")?;
+    let inline = env_opt("WYRD_SIGNING_KEY_PEM")?;
+    match (file, inline) {
+        (Some(_), Some(_)) => Err(ConfigError::ConflictingEnvVars {
+            keys: vec![
+                "WYRD_SIGNING_KEY_FILE".to_string(),
+                "WYRD_SIGNING_KEY_PEM".to_string(),
+            ],
+        }),
+        (Some(path), None) => {
+            let path = PathBuf::from(path);
+            let pem = std::fs::read_to_string(&path)
+                .map_err(|source| ConfigError::ReadSigningKey { path, source })?;
+            Ok(Some(SecretString::from(pem)))
+        }
+        (None, Some(pem)) => Ok(Some(SecretString::from(pem))),
+        (None, None) => Ok(None),
     }
 }
 
@@ -984,19 +1254,33 @@ mod tests {
         );
     }
 
-    // ── 12. Bad deployment profile env var → BadEnvVar ───────────────────────
+    // ── 12. Bad APP_ENV value → BadEnvVar ────────────────────────────────────
 
     #[test]
-    fn bad_deployment_profile_env_var() {
+    fn bad_app_env_value() {
         let _guard = ENV_LOCK.lock().unwrap();
-        temp_env::with_vars([("WYRD_DEPLOYMENT_PROFILE", Some("staging"))], || {
+        temp_env::with_vars([("APP_ENV", Some("qa"))], || {
             let mut cfg = WyrdServerConfig::default();
             let err = cfg
                 .apply_env_overrides()
                 .expect_err("bad profile must error");
             assert!(
-                matches!(err, ConfigError::BadEnvVar { ref key, .. } if key == "WYRD_DEPLOYMENT_PROFILE"),
+                matches!(err, ConfigError::BadEnvVar { ref key, .. } if key == "APP_ENV"),
                 "expected BadEnvVar, got {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn app_env_staging_selects_hardened_production_profile() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_vars([("APP_ENV", Some("staging"))], || {
+            let mut cfg = WyrdServerConfig::default();
+            cfg.apply_env_overrides()
+                .expect("staging is a valid APP_ENV");
+            assert!(
+                cfg.deployment_profile.is_production(),
+                "staging must map to the hardened production profile"
             );
         });
     }
@@ -1030,5 +1314,398 @@ mod tests {
             .expect("endpoint with path must be valid");
         validate_otlp_endpoint("grpc://localhost:4317").expect("grpc endpoint must be valid");
         validate_otlp_endpoint("https://otel.example.com").expect("https endpoint must be valid");
+    }
+
+    // ── 16. Absent trusted_issuers defaults to empty ──────────────────────────
+
+    #[test]
+    fn trusted_issuers_absent_defaults_to_empty() {
+        let cfg = WyrdServerConfig::default();
+        assert!(cfg.trusted_issuers.is_empty());
+    }
+
+    // ── 17. Absent workload_bindings defaults to empty ────────────────────────
+
+    #[test]
+    fn workload_bindings_absent_defaults_to_empty() {
+        let cfg = WyrdServerConfig::default();
+        assert!(cfg.workload_bindings.is_empty());
+    }
+
+    // ── 18. Populated [[trusted_issuers]] round-trips through TOML ───────────
+
+    #[test]
+    fn trusted_issuer_toml_round_trip() {
+        let toml = r#"
+            [[trusted_issuers]]
+            issuer = "https://idp.example.com/realms/acme"
+            client_id = "wyrd-client"
+            expected_audience = "wyrd-client"
+            client_auth = { secret_post = "my-secret" }
+            principal_kind = "human"
+            claim_mapping = { subject = "sub", email = "email", groups = "realm_access.roles" }
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        assert_eq!(cfg.trusted_issuers.len(), 1);
+        let entry = &cfg.trusted_issuers[0];
+        assert_eq!(entry.issuer, "https://idp.example.com/realms/acme");
+        assert_eq!(entry.client_id, "wyrd-client");
+        assert_eq!(entry.expected_audience, "wyrd-client");
+        assert_eq!(entry.claim_mapping.subject, "sub");
+        assert_eq!(entry.claim_mapping.email.as_deref(), Some("email"));
+        assert_eq!(
+            entry.claim_mapping.groups.as_deref(),
+            Some("realm_access.roles")
+        );
+    }
+
+    // ── 19. Populated [[workload_bindings]] round-trips through TOML ─────────
+
+    #[test]
+    fn workload_binding_toml_round_trip() {
+        let toml = r#"
+            [[workload_bindings]]
+            issuer = "https://idp.example.com"
+            subject = "system:serviceaccount:default/my-sa"
+            audience = "my-audience"
+            kind = "service"
+            name = "my-model"
+            space = "prod"
+            version = "1.0.0"
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        assert_eq!(cfg.workload_bindings.len(), 1);
+        let binding = &cfg.workload_bindings[0];
+        assert_eq!(binding.issuer, "https://idp.example.com");
+        assert_eq!(binding.subject, "system:serviceaccount:default/my-sa");
+        assert_eq!(binding.audience.as_deref(), Some("my-audience"));
+        assert_eq!(binding.kind, "service");
+        assert_eq!(binding.name, "my-model");
+        assert_eq!(binding.space, "prod");
+        assert_eq!(binding.version, "1.0.0");
+    }
+
+    // ── 20. Unknown field in issuer entry rejected ────────────────────────────
+
+    #[test]
+    fn issuer_entry_unknown_field_rejected() {
+        let toml = r#"
+            [[trusted_issuers]]
+            issuer = "https://idp.example.com"
+            client_id = "wyrd"
+            expected_audience = "wyrd"
+            client_auth = "public"
+            unknown_field = "oops"
+        "#;
+        let err = from_toml_str(toml).expect_err("unknown field must fail");
+        assert!(
+            matches!(err, ConfigError::ParseToml { .. }),
+            "expected ParseToml, got {err:?}"
+        );
+    }
+
+    // ── 21. Unknown field in binding entry rejected ───────────────────────────
+
+    #[test]
+    fn workload_binding_entry_unknown_field_rejected() {
+        let toml = r#"
+            [[workload_bindings]]
+            issuer = "https://idp.example.com"
+            subject = "system:serviceaccount:ns/sa"
+            kind = "model"
+            name = "my-model"
+            space = "prod"
+            version = "1.0.0"
+            extra_field = "bad"
+        "#;
+        let err = from_toml_str(toml).expect_err("unknown field must fail");
+        assert!(
+            matches!(err, ConfigError::ParseToml { .. }),
+            "expected ParseToml, got {err:?}"
+        );
+    }
+
+    // ── 22. ClientAuthEntry variants all parse correctly ─────────────────────
+
+    #[test]
+    fn client_auth_variants_parse() {
+        let cases = [
+            (r#"client_auth = "public""#, "public"),
+            (r#"client_auth = "private_key_jwt""#, "private_key_jwt"),
+            (r#"client_auth = { secret_post = "s" }"#, "secret_post"),
+            (r#"client_auth = { secret_basic = "s" }"#, "secret_basic"),
+        ];
+        for (auth_str, label) in cases {
+            let toml = format!(
+                r#"
+                    [[trusted_issuers]]
+                    issuer = "https://idp.example.com"
+                    client_id = "wyrd"
+                    expected_audience = "wyrd"
+                    {auth_str}
+                "#
+            );
+            let cfg = from_toml_str(&toml)
+                .unwrap_or_else(|e| panic!("{label} variant must parse: {e:?}"));
+            assert_eq!(cfg.trusted_issuers.len(), 1, "{label}");
+        }
+    }
+
+    // ── 23. PrincipalKindEntry variants parse correctly ───────────────────────
+
+    #[test]
+    fn principal_kind_variants_parse() {
+        for kind in ["human", "workload"] {
+            let toml = format!(
+                r#"
+                    [[trusted_issuers]]
+                    issuer = "https://idp.example.com"
+                    client_id = "wyrd"
+                    expected_audience = "wyrd"
+                    client_auth = "public"
+                    principal_kind = "{kind}"
+                "#
+            );
+            let cfg = from_toml_str(&toml)
+                .unwrap_or_else(|e| panic!("principal_kind = {kind:?} must parse: {e:?}"));
+            assert_eq!(cfg.trusted_issuers.len(), 1);
+        }
+    }
+
+    // ── 24. Empty issuer URL → Invalid ───────────────────────────────────────
+
+    #[test]
+    fn issuer_entry_empty_issuer_invalid() {
+        let toml = r#"
+            [[trusted_issuers]]
+            issuer = ""
+            client_id = "wyrd"
+            expected_audience = "wyrd"
+            client_auth = "public"
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        let err = cfg.validate().expect_err("empty issuer must fail");
+        assert!(
+            matches!(err, ConfigError::Invalid { ref message } if message.contains("issuer")),
+            "expected Invalid(issuer), got {err:?}"
+        );
+    }
+
+    // ── 25. Empty client_id → Invalid ────────────────────────────────────────
+
+    #[test]
+    fn issuer_entry_empty_client_id_invalid() {
+        let toml = r#"
+            [[trusted_issuers]]
+            issuer = "https://idp.example.com"
+            client_id = ""
+            expected_audience = "wyrd"
+            client_auth = "public"
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        let err = cfg.validate().expect_err("empty client_id must fail");
+        assert!(
+            matches!(err, ConfigError::Invalid { ref message } if message.contains("client_id")),
+            "expected Invalid(client_id), got {err:?}"
+        );
+    }
+
+    // ── 26. Empty expected_audience → Invalid ─────────────────────────────────
+
+    #[test]
+    fn issuer_entry_empty_expected_audience_invalid() {
+        let toml = r#"
+            [[trusted_issuers]]
+            issuer = "https://idp.example.com"
+            client_id = "wyrd"
+            expected_audience = ""
+            client_auth = "public"
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        let err = cfg
+            .validate()
+            .expect_err("empty expected_audience must fail");
+        assert!(
+            matches!(err, ConfigError::Invalid { ref message } if message.contains("expected_audience")),
+            "expected Invalid(expected_audience), got {err:?}"
+        );
+    }
+
+    // ── 27. Empty secret in secret_post → Invalid ─────────────────────────────
+
+    #[test]
+    fn issuer_entry_empty_secret_post_invalid() {
+        let toml = r#"
+            [[trusted_issuers]]
+            issuer = "https://idp.example.com"
+            client_id = "wyrd"
+            expected_audience = "wyrd"
+            client_auth = { secret_post = "" }
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        let err = cfg.validate().expect_err("empty secret must fail");
+        assert!(
+            matches!(err, ConfigError::Invalid { ref message } if message.contains("client_auth")),
+            "expected Invalid(client_auth), got {err:?}"
+        );
+    }
+
+    // ── 28. Empty issuer in workload binding → Invalid ────────────────────────
+
+    #[test]
+    fn binding_entry_empty_issuer_invalid() {
+        let toml = r#"
+            [[workload_bindings]]
+            issuer = ""
+            subject = "system:serviceaccount:default/my-sa"
+            kind = "model"
+            name = "my-model"
+            space = "prod"
+            version = "1.0.0"
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        let err = cfg.validate().expect_err("empty binding issuer must fail");
+        assert!(
+            matches!(err, ConfigError::Invalid { ref message } if message.contains("issuer")),
+            "expected Invalid(issuer), got {err:?}"
+        );
+    }
+
+    // ── 29. Empty subject in workload binding → Invalid ───────────────────────
+
+    #[test]
+    fn binding_entry_empty_subject_invalid() {
+        let toml = r#"
+            [[workload_bindings]]
+            issuer = "https://idp.example.com"
+            subject = ""
+            kind = "model"
+            name = "my-model"
+            space = "prod"
+            version = "1.0.0"
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        let err = cfg.validate().expect_err("empty subject must fail");
+        assert!(
+            matches!(err, ConfigError::Invalid { ref message } if message.contains("subject")),
+            "expected Invalid(subject), got {err:?}"
+        );
+    }
+
+    // ── 30. Empty card-target field in workload binding → Invalid ─────────────
+
+    #[test]
+    fn binding_entry_empty_version_invalid() {
+        let toml = r#"
+            [[workload_bindings]]
+            issuer = "https://idp.example.com"
+            subject = "system:serviceaccount:default/my-sa"
+            kind = "model"
+            name = "my-model"
+            space = "prod"
+            version = ""
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        let err = cfg.validate().expect_err("empty version must fail");
+        assert!(
+            matches!(err, ConfigError::Invalid { ref message } if message.contains("version")),
+            "expected Invalid(version), got {err:?}"
+        );
+    }
+
+    // ── 31. Client secret never appears in Debug output ───────────────────────
+
+    #[test]
+    fn client_secret_not_in_debug_output() {
+        let toml = r#"
+            [[trusted_issuers]]
+            issuer = "https://idp.example.com"
+            client_id = "wyrd"
+            expected_audience = "wyrd"
+            client_auth = { secret_post = "super-secret-value" }
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("super-secret-value"),
+            "secret must be redacted in Debug output, got: {debug}"
+        );
+    }
+
+    // ── 32. trusted_issuers present without tenant_slug → Invalid ─────────────
+
+    #[test]
+    fn issuers_without_tenant_slug_invalid() {
+        let toml = r#"
+            [[trusted_issuers]]
+            issuer = "https://idp.example.com"
+            client_id = "wyrd"
+            expected_audience = "wyrd"
+            client_auth = "public"
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        let err = cfg.validate().expect_err("missing tenant_slug must fail");
+        assert!(
+            matches!(err, ConfigError::Invalid { ref message } if message.contains("tenant_slug")),
+            "expected Invalid(tenant_slug), got {err:?}"
+        );
+    }
+
+    // ── 33. workload_bindings present without tenant_slug → Invalid ───────────
+
+    #[test]
+    fn bindings_without_tenant_slug_invalid() {
+        let toml = r#"
+            [[workload_bindings]]
+            issuer = "https://idp.example.com"
+            subject = "system:serviceaccount:default/my-sa"
+            kind = "model"
+            name = "my-model"
+            space = "prod"
+            version = "1.0.0"
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        let err = cfg.validate().expect_err("missing tenant_slug must fail");
+        assert!(
+            matches!(err, ConfigError::Invalid { ref message } if message.contains("tenant_slug")),
+            "expected Invalid(tenant_slug), got {err:?}"
+        );
+    }
+
+    // ── 34. tenant_slug present satisfies the issuer requirement ──────────────
+
+    #[test]
+    fn issuers_with_tenant_slug_valid() {
+        let toml = r#"
+            [auth]
+            tenant_slug = "acme"
+
+            [[trusted_issuers]]
+            issuer = "https://idp.example.com"
+            client_id = "wyrd"
+            expected_audience = "wyrd"
+            client_auth = "public"
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        cfg.validate().expect("tenant_slug present must validate");
+        assert_eq!(
+            cfg.auth.tenant_slug.as_ref().map(TenantSlug::as_str),
+            Some("acme")
+        );
+    }
+
+    // ── 35. WYRD_SERVER_TENANT_SLUG overrides [auth] tenant_slug ──────────────
+
+    #[test]
+    fn env_tenant_slug_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_vars([("WYRD_SERVER_TENANT_SLUG", Some("from-env"))], || {
+            let mut cfg = WyrdServerConfig::default();
+            cfg.apply_env_overrides().expect("apply succeeds");
+            assert_eq!(
+                cfg.auth.tenant_slug.as_ref().map(TenantSlug::as_str),
+                Some("from-env")
+            );
+        });
     }
 }

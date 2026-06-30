@@ -18,7 +18,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 use wyrd_auth_check::{AuthzCheckRequest, AuthzCheckResponse, PolicyHook};
 use wyrd_auth_issue::IssuingKey;
-use wyrd_auth_oidc::{TrustedIssuer, TrustedIssuerRegistry};
+use wyrd_auth_oidc::{JwksCache, TrustedIssuer, TrustedIssuerRegistry};
 use wyrd_auth_verify::{
     Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
     public_key_from_pem,
@@ -31,7 +31,11 @@ use wyrd_server::auth::exchange_api_key::TokenExchangeSettings;
 use wyrd_server::auth::issue_api_key::WyrdApiKey;
 use wyrd_server::auth::jwt_bearer::WorkloadBindingRegistry;
 use wyrd_server::auth::permission_resolver::SqlPermissionResolver;
+use wyrd_server::auth::revocation_resolver::SqlRevocationCheck;
 use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
+use wyrd_server::boot::build_workload_bindings;
+use wyrd_server::config::{IssuerEntry, WorkloadBindingEntry};
+use wyrd_server::issuer_boot::ConfigFileIssuerResolver;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
@@ -89,6 +93,8 @@ pub struct WyrdTestServerBuilder {
     auth_verify_settings: Option<WyrdAuthVerifySettings>,
     trusted_issuer_registry: Option<Arc<TrustedIssuerRegistry>>,
     workload_binding_registry: Option<Arc<WorkloadBindingRegistry>>,
+    trusted_issuer_configs: Vec<IssuerEntry>,
+    workload_binding_configs: Vec<WorkloadBindingEntry>,
 }
 
 impl Default for WyrdTestServerBuilder {
@@ -103,6 +109,8 @@ impl Default for WyrdTestServerBuilder {
             auth_verify_settings: None,
             trusted_issuer_registry: None,
             workload_binding_registry: None,
+            trusted_issuer_configs: Vec::new(),
+            workload_binding_configs: Vec::new(),
         }
     }
 }
@@ -576,6 +584,58 @@ impl WyrdTestServer {
         })
     }
 
+    /// Seed a Service/Agent principal whose `card_ref` matches `card_ref` exactly.
+    ///
+    /// Workload bindings resolve to a server-owned `CardRef` with `uid = None`
+    /// (boot's `build_workload_bindings`), and the jwt-bearer exchange looks the
+    /// principal up by exact JSONB `card_ref` equality. The role-bearing
+    /// `bootstrap_service` helper mints a random `uid`, so it can never match a
+    /// binding. This seeds a principal under the binding's exact `card_ref` so a
+    /// config-driven workload journey resolves to a real account.
+    ///
+    /// # Errors
+    /// Returns an error when the card kind is not Service/Agent, or SQL fails.
+    pub async fn seed_card_principal(
+        &self,
+        card_ref: &CardRef,
+        roles: &[&str],
+    ) -> Result<PrincipalId, WyrdTestServerError> {
+        let principal_kind = match &card_ref.kind {
+            CardKind::Service => "service",
+            CardKind::Agent => "agent",
+            other => {
+                return Err(WyrdTestServerError::Unsupported(format!(
+                    "seed_card_principal requires a Service or Agent card_ref, got {other:?}"
+                )));
+            }
+        };
+        let principal_id = Uuid::now_v7();
+        let creator_id = self.ensure_fixture_admin().await?;
+        let mut conn = self.tenant_conn().await?;
+        insert_service_account(
+            &mut conn,
+            principal_id,
+            principal_kind,
+            card_ref,
+            card_ref.name.as_str(),
+            None,
+            creator_id,
+        )
+        .await
+        .map_err(sql)?;
+        for role in roles {
+            grant_role(
+                &mut conn,
+                principal_id,
+                PrincipalTable::ServiceAccount,
+                role,
+            )
+            .await?;
+        }
+        conn.commit().await.map_err(sql)?;
+        Ok(PrincipalId::new(principal_id))
+    }
+
     async fn bootstrap_machine(
         &self,
         name: &str,
@@ -801,6 +861,30 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Boot trusted OIDC issuers from `[[trusted_issuers]]` config DTOs.
+    ///
+    /// At [`Self::start_in_process`] these run through the production
+    /// [`ConfigFileIssuerResolver`] + per-issuer OIDC discovery, building the
+    /// [`TrustedIssuerRegistry`] (and the verifier's external path) exactly the
+    /// way a self-hosted deployment boots. Every entry binds to the fixture's
+    /// implicit `DataTenantId`. Boot fails closed if discovery is unreachable.
+    #[must_use]
+    pub fn with_trusted_issuer_configs(mut self, configs: Vec<IssuerEntry>) -> Self {
+        self.trusted_issuer_configs = configs;
+        self
+    }
+
+    /// Boot workload bindings from `[[workload_bindings]]` config DTOs.
+    ///
+    /// At [`Self::start_in_process`] these run through the production
+    /// [`build_workload_bindings`] boot path into the [`WorkloadBindingRegistry`],
+    /// each bound to the fixture's implicit `DataTenantId`.
+    #[must_use]
+    pub fn with_workload_binding_configs(mut self, configs: Vec<WorkloadBindingEntry>) -> Self {
+        self.workload_binding_configs = configs;
+        self
+    }
+
     /// Build and start an in-process server.
     ///
     /// # Errors
@@ -861,12 +945,38 @@ impl WyrdTestServerBuilder {
             fixture.app_pool().clone(),
         )));
         let verify_settings = self.auth_verify_settings.unwrap_or_default();
-        let verifier = Arc::new(TokenVerifier::new(
-            decoding_keys,
-            "wyrd",
-            resolver,
-            verify_settings,
-        ));
+
+        // Config-driven boot: resolve `[[trusted_issuers]]` through the real
+        // ConfigFileIssuerResolver + per-issuer OIDC discovery, bound to the
+        // fixture's implicit tenant. Done before the verifier is built so the
+        // verifier's external (foreign-OIDC) path can be wired to the resolved
+        // registry — the same shape the callback and jwt-bearer routes require.
+        let config_issuer_registry = if self.trusted_issuer_configs.is_empty() {
+            None
+        } else {
+            let issuers = ConfigFileIssuerResolver::new(self.trusted_issuer_configs, tenant_id)
+                .resolve()
+                .await
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            Some(Arc::new(TrustedIssuerRegistry::from_issuers(issuers)))
+        };
+
+        let verifier_base = TokenVerifier::new(decoding_keys, "wyrd", resolver, verify_settings)
+            .with_revocation(Arc::new(SqlRevocationCheck::new_with_ttl(
+                Arc::new(fixture.app_pool().clone()),
+                Duration::ZERO,
+            )));
+        let verifier = Arc::new(match &config_issuer_registry {
+            Some(registry) => verifier_base.with_external(
+                Arc::new(JwksCache::new(
+                    reqwest::Client::new(),
+                    Duration::from_secs(300),
+                    Duration::from_secs(5),
+                )),
+                Arc::clone(registry),
+            ),
+            None => verifier_base,
+        });
 
         let exchange_settings = if let Some(ttl) = self.access_ttl {
             TokenExchangeSettings {
@@ -897,6 +1007,16 @@ impl WyrdTestServerBuilder {
         }
         if let Some(registry) = self.workload_binding_registry {
             state = state.with_workload_binding_registry(registry);
+        }
+        if let Some(registry) = config_issuer_registry {
+            state = state.with_trusted_issuer_registry(registry);
+        }
+        if !self.workload_binding_configs.is_empty() {
+            let bindings = build_workload_bindings(&self.workload_binding_configs, tenant_id)
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            state = state.with_workload_binding_registry(Arc::new(
+                WorkloadBindingRegistry::from_bindings(bindings),
+            ));
         }
         let router = build_router(state.clone());
 

@@ -3303,6 +3303,7 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
  "serde",
  "sha2 0.10.9",
  "subtle",
@@ -7608,6 +7609,7 @@ version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
 dependencies = [
+ "serde",
  "zeroize",
 ]
 
@@ -10395,6 +10397,7 @@ version = "0.0.1"
 dependencies = [
  "argon2",
  "chrono",
+ "ed25519-dalek",
  "jsonwebtoken 9.3.1",
  "password-hash",
  "secrecy",

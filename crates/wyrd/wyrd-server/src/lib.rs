@@ -1,11 +1,13 @@
 //! Wyrd server boot and routing primitives.
 
 pub mod auth;
+pub mod auth_boot;
 pub mod boot;
 pub mod config;
 pub mod error;
 pub mod grpc;
 pub mod health;
+pub mod issuer_boot;
 pub mod middleware;
 pub mod router;
 pub mod routes;

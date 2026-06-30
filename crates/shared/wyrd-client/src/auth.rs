@@ -7,9 +7,10 @@
 //! reactively (via [`AuthMiddleware::force_refresh`] after a `401`). Concurrent
 //! callers single-flight one exchange instead of stampeding.
 //!
-//! v1 re-exchanges only the [`ResolvedCredential::ApiKey`] arm. A directly
-//! supplied [`ResolvedCredential::BearerToken`] is passed through as-is, and the
-//! [`ResolvedCredential::WorkloadJwt`] arm is deferred to v2.
+//! Both durable-secret arms — [`ResolvedCredential::ApiKey`] and
+//! [`ResolvedCredential::WorkloadJwt`] — exchange their secret for a short-lived
+//! access token through the *same* cache and single-flight gate. A directly
+//! supplied [`ResolvedCredential::BearerToken`] is passed through as-is.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,6 +25,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::TenantSlug;
 
 use crate::config::{ClientConfig, TokenCacheMode};
 use crate::error::{WyrdClientError, from_problem_json};
@@ -171,17 +173,28 @@ impl AuthMiddleware {
     /// re-reads under the gate (so N racing callers cause exactly one
     /// `/auth/token` round-trip), and exchanges the API key once. A
     /// [`ResolvedCredential::BearerToken`] is returned directly without
-    /// exchange. The [`ResolvedCredential::WorkloadJwt`] arm is deferred to v2.
+    /// exchange. A [`ResolvedCredential::WorkloadJwt`] follows the same
+    /// cache/single-flight path as the API key, exchanging the ambient OIDC
+    /// assertion via the `jwt-bearer` grant.
     ///
     /// # Errors
-    /// Returns [`AuthError::Client`] on transport failure or an unsupported
-    /// credential, or [`AuthError::Server`] when the server rejects the key.
+    /// Returns [`AuthError::Client`] on transport failure or an invalid tenant
+    /// slug, or [`AuthError::Server`] when the server rejects the credential.
     pub async fn bearer(&self) -> Result<SecretBearer, AuthError> {
         match &self.credential {
             ResolvedCredential::BearerToken(token) => {
                 Ok(SecretBearer::new(token.expose_secret().to_owned()))
             }
-            ResolvedCredential::WorkloadJwt { .. } => Err(workload_jwt_deferred()),
+            ResolvedCredential::WorkloadJwt { jwt, tenant } => {
+                let mut cache = self.cache.lock().await;
+                if let Some(entry) = cache.as_ref()
+                    && !entry.is_stale()
+                {
+                    return Ok(entry.access_token.clone());
+                }
+                self.exchange_workload_and_store(jwt, tenant, &mut cache)
+                    .await
+            }
             ResolvedCredential::ApiKey(api_key) => {
                 let mut cache = self.cache.lock().await;
                 if let Some(entry) = cache.as_ref()
@@ -208,7 +221,11 @@ impl AuthMiddleware {
             ResolvedCredential::BearerToken(token) => {
                 Ok(SecretBearer::new(token.expose_secret().to_owned()))
             }
-            ResolvedCredential::WorkloadJwt { .. } => Err(workload_jwt_deferred()),
+            ResolvedCredential::WorkloadJwt { jwt, tenant } => {
+                let mut cache = self.cache.lock().await;
+                self.exchange_workload_and_store(jwt, tenant, &mut cache)
+                    .await
+            }
             ResolvedCredential::ApiKey(api_key) => {
                 let mut cache = self.cache.lock().await;
                 self.exchange_and_store(api_key, &mut cache).await
@@ -225,10 +242,31 @@ impl AuthMiddleware {
         cache: &mut Option<CachedToken>,
     ) -> Result<SecretBearer, AuthError> {
         let entry = self.exchange(api_key).await?;
+        Ok(self.store(entry, cache))
+    }
+
+    /// Exchange the workload JWT, persist the result, and replace the in-memory
+    /// cache. The [`ResolvedCredential::WorkloadJwt`] analogue of
+    /// [`AuthMiddleware::exchange_and_store`]; the caller holds the exchange gate
+    /// and both credentials share the one cache.
+    async fn exchange_workload_and_store(
+        &self,
+        jwt: &SecretString,
+        tenant: &str,
+        cache: &mut Option<CachedToken>,
+    ) -> Result<SecretBearer, AuthError> {
+        let entry = self.exchange_workload(jwt, tenant).await?;
+        Ok(self.store(entry, cache))
+    }
+
+    /// Persist a freshly exchanged token and replace the in-memory cache,
+    /// returning the access bearer. The shared cache-write tail of both the
+    /// API-key and workload exchange paths.
+    fn store(&self, entry: CachedToken, cache: &mut Option<CachedToken>) -> SecretBearer {
         let bearer = entry.access_token.clone();
         self.persist(&entry);
         *cache = Some(entry);
-        Ok(bearer)
+        bearer
     }
 
     /// Forward an inbound `wyrd-request-id` or mint a fresh UUIDv7.
@@ -247,10 +285,40 @@ impl AuthMiddleware {
 
     /// Exchange the API key for an access token at `/auth/token`.
     async fn exchange(&self, api_key: &SecretString) -> Result<CachedToken, AuthError> {
-        let url = format!("{}/auth/token", self.http_base_url.trim_end_matches('/'));
         let request = TokenRequest::WyrdApiKey {
             api_key: SecretBearer::new(api_key.expose_secret().to_owned()),
         };
+        self.post_token_request(request).await
+    }
+
+    /// Exchange the workload OIDC assertion for an access token at `/auth/token`
+    /// via the `jwt-bearer` grant.
+    ///
+    /// The tenant slug is validated client-side first: an invalid slug is a
+    /// client-local [`WyrdClientError::Config`] surfaced before any network call.
+    async fn exchange_workload(
+        &self,
+        jwt: &SecretString,
+        tenant: &str,
+    ) -> Result<CachedToken, AuthError> {
+        let tenant = TenantSlug::new(tenant.to_owned()).map_err(|err| {
+            AuthError::Client(WyrdClientError::Config {
+                field: "tenant".to_owned(),
+                reason: format!("invalid workload tenant slug: {err}"),
+            })
+        })?;
+        let request = TokenRequest::JwtBearer {
+            assertion: SecretBearer::new(jwt.expose_secret().to_owned()),
+            tenant: Some(tenant),
+        };
+        self.post_token_request(request).await
+    }
+
+    /// POST a token request to `/auth/token`, map a non-2xx body via
+    /// [`from_problem_json`] into [`AuthError::Server`], and decode the success
+    /// body into a [`CachedToken`]. The shared POST/decode tail of every grant.
+    async fn post_token_request(&self, request: TokenRequest) -> Result<CachedToken, AuthError> {
+        let url = format!("{}/auth/token", self.http_base_url.trim_end_matches('/'));
         let response = self
             .http_client
             .post(&url)
@@ -273,7 +341,7 @@ impl AuthMiddleware {
             .map_err(transport_down)?;
         self.warn_if_short_ttl(token.expires_at);
         // `token.refresh_token` is intentionally dropped here: never cached,
-        // never written to disk. v1 re-exchanges the durable API key instead.
+        // never written to disk. The durable secret is re-exchanged instead.
         Ok(CachedToken {
             access_token: token.access_token,
             expires_at: token.expires_at,
@@ -314,14 +382,6 @@ impl AuthMiddleware {
             let _ = write_disk_record(path, entry);
         }
     }
-}
-
-/// Build the deferred-credential error for the v2-only workload JWT arm.
-fn workload_jwt_deferred() -> AuthError {
-    AuthError::Client(WyrdClientError::Config {
-        field: "credential".to_owned(),
-        reason: "workload JWT exchange is deferred to v2".to_owned(),
-    })
 }
 
 /// Map a `reqwest` transport error to [`WyrdClientError::TransportDown`].
@@ -395,6 +455,7 @@ mod tests {
 
     use super::{AuthError, AuthMiddleware, CachedToken};
     use crate::config::{ClientConfig, TokenCacheMode};
+    use crate::error::WyrdClientError;
     use crate::transport::credential::ResolvedCredential;
     use wyrd_spec::auth::SecretBearer;
 
@@ -456,6 +517,13 @@ mod tests {
 
     fn api_key_credential() -> ResolvedCredential {
         ResolvedCredential::ApiKey("api-key-value".to_owned().into())
+    }
+
+    fn workload_jwt_credential(tenant: &str) -> ResolvedCredential {
+        ResolvedCredential::WorkloadJwt {
+            jwt: "workload-oidc-assertion".to_owned().into(),
+            tenant: tenant.to_owned(),
+        }
     }
 
     #[tokio::test]
@@ -609,6 +677,105 @@ mod tests {
                     "revoked-key status must be 401, not the 502 catch-all"
                 );
             }
+            AuthError::Client(other) => panic!("expected server error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn workload_exchange_caches_and_serves_from_shared_cache() {
+        let mock = spawn_mock("HTTP/1.1 200 OK", token_body("workload-access", 3600)).await;
+        let mw = AuthMiddleware::new(
+            &config_for(mock.base_url.clone(), TokenCacheMode::InMemory),
+            workload_jwt_credential("acme"),
+        )
+        .expect("middleware builds");
+
+        let bearer = mw.bearer().await.expect("workload exchange succeeds");
+        assert_eq!(bearer.expose(), "workload-access");
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
+
+        // Second call is served from the same cache the API-key path uses.
+        let again = mw.bearer().await.expect("cached");
+        assert_eq!(again.expose(), "workload-access");
+        assert_eq!(
+            mock.hits.load(Ordering::SeqCst),
+            1,
+            "a fresh workload token must be served from cache, not re-exchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn workload_force_refresh_re_exchanges_once() {
+        let mock = spawn_mock("HTTP/1.1 200 OK", token_body("workload-1", 3600)).await;
+        let mw = AuthMiddleware::new(
+            &config_for(mock.base_url.clone(), TokenCacheMode::InMemory),
+            workload_jwt_credential("acme"),
+        )
+        .expect("middleware builds");
+
+        let _ = mw.bearer().await.expect("first workload exchange");
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
+        let _ = mw
+            .force_refresh()
+            .await
+            .expect("forced workload re-exchange");
+        assert_eq!(
+            mock.hits.load(Ordering::SeqCst),
+            2,
+            "force_refresh must perform exactly one additional workload exchange"
+        );
+    }
+
+    #[tokio::test]
+    async fn workload_invalid_tenant_slug_is_client_error_preflight() {
+        let mock = spawn_mock("HTTP/1.1 200 OK", token_body("never-issued", 3600)).await;
+        let mw = AuthMiddleware::new(
+            &config_for(mock.base_url.clone(), TokenCacheMode::InMemory),
+            workload_jwt_credential("INVALID SLUG!"),
+        )
+        .expect("middleware builds");
+
+        let err = mw
+            .bearer()
+            .await
+            .expect_err("invalid tenant slug must fail");
+        match err {
+            AuthError::Client(WyrdClientError::Config { field, .. }) => {
+                assert_eq!(field, "tenant");
+            }
+            other => panic!("expected client-local config error, got {other:?}"),
+        }
+        assert_eq!(
+            mock.hits.load(Ordering::SeqCst),
+            0,
+            "an invalid tenant slug must be rejected before any network call"
+        );
+    }
+
+    #[tokio::test]
+    async fn workload_server_rejection_maps_to_server_error() {
+        let body = serde_json::json!({
+            "type": "https://wyrd.dev/problems/WYRD_AUTH_401_INVALID_TOKEN",
+            "title": "Token rejected",
+            "status": 401,
+            "code": "WYRD_AUTH_401_INVALID_TOKEN",
+            "detail": "workload assertion rejected",
+            "details": {},
+        })
+        .to_string();
+        let mock = spawn_mock("HTTP/1.1 401 Unauthorized", body).await;
+        let mw = AuthMiddleware::new(
+            &config_for(mock.base_url.clone(), TokenCacheMode::InMemory),
+            workload_jwt_credential("acme"),
+        )
+        .expect("middleware builds");
+
+        let err = mw
+            .bearer()
+            .await
+            .expect_err("server rejection of workload assertion must fail");
+        match err {
+            AuthError::Server(_) => {}
             AuthError::Client(other) => panic!("expected server error, got {other:?}"),
         }
     }

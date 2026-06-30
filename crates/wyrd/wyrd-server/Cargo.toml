@@ -33,7 +33,7 @@ chrono = { workspace = true }
 jsonwebtoken = { workspace = true }
 moka = { version = "0.12", features = ["future"] }
 rand = { workspace = true }
-secrecy = { workspace = true }
+secrecy = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -53,6 +53,7 @@ tower-http = { workspace = true, features = ["trace", "catch-panic"] }
 tower_governor = { workspace = true }
 http-body-util = "0.1"
 wyrd-spec = { workspace = true }
+wyrd-semver = { workspace = true }
 wyrd-storage = { workspace = true }
 wyrd-enterprise = { path = "../wyrd-enterprise", version = "0.0.1", optional = true }
 
@@ -65,6 +66,5 @@ tempfile = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
-wyrd-semver = { workspace = true }
 wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
 wyrd-testing = { path = "../wyrd-testing", version = "0.0.1" }

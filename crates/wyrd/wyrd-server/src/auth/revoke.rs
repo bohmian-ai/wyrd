@@ -2,11 +2,12 @@
 
 use axum::extract::{Path, State};
 use wyrd_auth_verify::PrincipalKindWire;
-use wyrd_runtime::{Permission, PrincipalId};
+use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 
 use crate::auth::AuthenticatedPrincipal;
+use crate::auth::require_service_accounts_write;
 use crate::auth::revocation_listener::notify_principal_revoked;
 use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
@@ -22,7 +23,7 @@ pub async fn revoke_principal(
 ) -> Result<(), WyrdErrorResponse> {
     let tenant = caller.principal.tenant_id;
 
-    check_permission(&caller)?;
+    require_service_accounts_write(&caller.principal, "revoke principals")?;
 
     let mut conn = acquire_conn(&state, tenant).await?;
     let kind = revoke_in_conn(&mut conn, target_id, tenant).await?;
@@ -31,20 +32,6 @@ pub async fn revoke_principal(
     fan_out_notify(&state, tenant, kind, target_id).await;
 
     Ok(())
-}
-
-fn check_permission(caller: &AuthenticatedPrincipal) -> Result<(), WyrdErrorResponse> {
-    if caller
-        .principal
-        .effective_permissions
-        .contains(&Permission::service_accounts_write())
-    {
-        return Ok(());
-    }
-    Err(WyrdErrorResponse::from(WyrdError::PermissionDeniedRbac {
-        message: "service_accounts:write permission required to revoke principals".to_owned(),
-        details: serde_json::json!({ "required": "service_accounts:write" }),
-    }))
 }
 
 async fn acquire_conn(

@@ -65,9 +65,20 @@ impl SqlRevocationCheck {
     /// Construct a new check backed by the Wyrd app pool.
     #[must_use]
     pub fn new(pool: Arc<PgPool>) -> Self {
+        Self::new_with_ttl(pool, EPOCH_CACHE_TTL)
+    }
+
+    /// Construct a check with an explicit epoch-cache TTL.
+    ///
+    /// Production uses [`SqlRevocationCheck::new`] (a 5-second TTL bounded by the
+    /// `PgListener` invalidator). In-process tests have no NOTIFY listener, so
+    /// they pass `Duration::ZERO` to read the revocation epoch fresh on every
+    /// verify and observe a revocation deterministically within the test window.
+    #[must_use]
+    pub fn new_with_ttl(pool: Arc<PgPool>, ttl: Duration) -> Self {
         let cache = Cache::builder()
             .max_capacity(EPOCH_CACHE_MAX)
-            .time_to_live(EPOCH_CACHE_TTL)
+            .time_to_live(ttl)
             .build();
         Self { pool, cache }
     }

@@ -36,12 +36,21 @@ services:
       - ./tests/fixtures/identity/keycloak-realm.json:/opt/keycloak/data/import/keycloak-realm.json:ro
     ports:
       - "8080:8080"
+    # The Keycloak 24 image (UBI-micro) ships no curl or wget, so the old
+    # `curl -sf .../health/ready` probe could never run and `docker compose up
+    # --wait` always reported the container unhealthy — the identity e2e gate
+    # aborted before any test ran. bash + /dev/tcp is present and checks real
+    # readiness: /health/ready returns 200 only once realm import has completed.
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health/ready || exit 1"]
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/localhost/8080 && printf "GET /health/ready HTTP/1.0\r\n\r\n" >&3 && grep -q "200 OK" <&3'
       interval: 5s
       timeout: 5s
-      retries: 30
-      start_period: 20s
+      retries: 40
+      start_period: 30s
 
   dex:
     image: ghcr.io/dexidp/dex:v2.38.0

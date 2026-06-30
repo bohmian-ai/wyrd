@@ -1,0 +1,26 @@
+---
+title: Observe
+description: Read metrics, drift signals, and audit trails from card-governed components.
+pillar: wyrd
+group: Observe
+order: 1
+---
+
+# Observe
+
+<Aside title="Reserved — coming when DriftCard ships" data-variant="not">
+
+Observe recipes will be added as the DriftCard and audit runtime contracts ship.
+The `DriftCard` and `AuditCard` specs are authored; the runtime implementation is
+not yet available.
+
+</Aside>
+
+Observe capability covers:
+
+- Reading drift signals for a registered model or prompt
+- Querying the audit trail for a card or run
+- Streaming observability events from Skald agents
+
+These how-to pages will be added alongside the DriftCard runtime. Track progress
+in [Roadmap](/roadmap/).

@@ -1,0 +1,23 @@
+---
+title: Tutorials
+description: Step-by-step walkthroughs from zero to your first registered card.
+pillar: wyrd
+group: Tutorials
+order: 1
+---
+
+# Tutorials
+
+End-to-end walkthroughs. Each tutorial starts from a clean state and walks you
+through a complete task, explaining every step.
+
+## Available tutorials
+
+- [Your first card](/tutorials/first-card/) — create a DataCard from a pandas
+  DataFrame, save it locally, and register it to a running server.
+
+## What you'll need
+
+- py-wyrd installed ([Setup](/setup/install/))
+- A running server (local or remote)
+- Python 3.10+, pandas

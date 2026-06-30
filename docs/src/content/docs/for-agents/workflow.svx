@@ -1,0 +1,87 @@
+---
+title: Agent workflow
+description: A copyable end-to-end workflow for agents that need to declare and register Wyrd cards.
+pillar: wyrd
+group: For Agents
+order: 2
+---
+
+# Agent workflow
+
+This page gives you a literal, copyable workflow for registering cards from an
+agent. Every step is deterministic and idempotent.
+
+## Prerequisites
+
+- `WYRD_SERVER_URL` set in the environment
+- py-wyrd installed
+
+## Workflow
+
+### 1. Check if the card already exists
+
+```python
+import wyrd
+
+existing = wyrd.cards.get("my-dataset", version="0.1.0")
+if existing is not None:
+    # Already registered; read it and continue.
+    card = existing
+else:
+    # Not registered; proceed to step 2.
+    pass
+```
+
+### 2. Build the card spec
+
+Use the appropriate card class for the kind:
+
+```python
+from wyrd.data import DataCard, PandasInterface
+import pandas as pd
+
+df = pd.DataFrame({"col_a": [1, 2, 3]})
+interface = PandasInterface.from_dataframe(df)
+
+card = DataCard(
+    name="my-dataset",
+    version="0.1.0",
+    spec=interface.to_spec(),
+)
+```
+
+### 3. Register
+
+```python
+wyrd.cards.register(card)
+```
+
+Registration is idempotent: if the same identity and spec already exist, this
+is a no-op. If the same identity exists with a different spec, the server
+returns `WYRD_REG_409_SPEC_DRIFT`.
+
+### 4. Handle errors
+
+```python
+from wyrd.errors import WyrdError
+
+try:
+    wyrd.cards.register(card)
+except WyrdError as e:
+    if e.code == "WYRD_REG_409_SPEC_DRIFT":
+        # Spec changed at same version — bump the version.
+        raise
+    raise
+```
+
+Always preserve `e.code`, `e.detail`, and `e.context` in any error you surface.
+Never collapse them into prose.
+
+## Error codes
+
+See the [Errors reference](/api/errors/) for the full catalog.
+
+## Related
+
+- [For Agents](/for-agents/) — rules and stable paths.
+- [Declare a Data card](/how-to/declare/data/) — the declare recipe.

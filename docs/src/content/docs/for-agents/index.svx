@@ -1,0 +1,40 @@
+---
+title: For Agents
+description: Stable paths, a copyable workflow, and the rules agents must follow when reading and updating Wyrd.
+pillar: wyrd
+group: For Agents
+order: 1
+---
+
+# For Agents
+
+This section is written for AI agents that use Wyrd as a tool — reading cards,
+registering new ones, querying relationships, and acting on errors.
+
+## Rules
+
+1. **Preserve structured errors.** Never collapse a Wyrd error into prose. Keep
+   all fields (`code`, `type`, `detail`, `remediation`, `context`).
+2. **Use `code` for branching.** `title` and `detail` are for humans. `code` is
+   the stable machine-readable key.
+3. **Keep names stable.** A card's `(space, name, version)` identity is
+   immutable after registration. Don't generate random names.
+4. **Register, don't re-author.** If a card already exists for the component,
+   read it with `wyrd.cards.get(...)` rather than recreating it.
+5. **Declare before you run.** Register the model and prompt cards before
+   running an agent loop so the run record can reference them.
+
+## Stable paths
+
+| Resource | URL |
+| --- | --- |
+| Cards catalog | `GET /api/v1/cards` |
+| Card by identity | `GET /api/v1/cards/{space}/{name}/{version}` |
+| Register | `POST /api/v1/cards` |
+| Relationships | `GET /api/v1/cards/{space}/{name}/{version}/relationships` |
+| Health | `GET /health` |
+
+## Pages
+
+- [Agent workflow](/for-agents/workflow/) — a copyable end-to-end workflow for
+  agents that need to declare and register cards.

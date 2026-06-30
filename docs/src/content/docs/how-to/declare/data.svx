@@ -1,0 +1,57 @@
+---
+title: Declare a Data card
+description: Author and register a DataCard from Python.
+pillar: wyrd
+group: Declare
+order: 4
+---
+
+# Declare a Data card
+
+## Prerequisites
+
+- py-wyrd installed and `WYRD_SERVER_URL` set
+- A running server, pandas
+
+## Recipe
+
+```python
+import pandas as pd
+from wyrd.data import DataCard, PandasInterface
+
+# 1. Infer the interface from a DataFrame
+df = pd.DataFrame({
+    "user_id": ["u1", "u2", "u3"],
+    "churn_score": [0.12, 0.87, 0.45],
+    "label": [0, 1, 0],
+})
+interface = PandasInterface.from_dataframe(df)
+
+# 2. Build the card
+card = DataCard(
+    name="churn-scores-2024q4",
+    version="0.1.0",
+    spec=interface.to_spec(),
+)
+
+# 3. Optionally save locally
+card.save()
+
+# 4. Register
+import wyrd
+wyrd.cards.register(card)
+```
+
+## Notes
+
+- `PandasInterface.from_dataframe` infers column types, row count, and basic
+  statistics. You can override any field in the returned spec.
+- `card.save()` writes `.wyrd/<space>/<name>/<version>/card.json` locally. This
+  step is optional before registration.
+- Registration is idempotent on identity; re-registering the same (name, version)
+  with the same spec is a no-op.
+
+## Reference
+
+- [Data card spec](/cards/data/) — generated field-level documentation.
+- [Cards overview](/cards/) — every kind and status.

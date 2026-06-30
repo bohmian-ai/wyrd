@@ -1,0 +1,74 @@
+---
+title: Your first card
+description: Create a DataCard from a pandas DataFrame, save it locally, and register it to a running server.
+pillar: wyrd
+group: Tutorials
+order: 2
+---
+
+# Your first card
+
+This tutorial walks you through the complete lifecycle of a Wyrd card — from
+authoring in Python to registering it on a server.
+
+## What you'll build
+
+A `DataCard` describing a small pandas DataFrame. By the end, the card is
+registered and queryable over HTTP and MCP.
+
+## 1. Create the card
+
+```python
+import pandas as pd
+from wyrd.data import DataCard, PandasInterface
+
+df = pd.DataFrame({"feature_a": [1.0, 2.0, 3.0], "label": [0, 1, 0]})
+interface = PandasInterface.from_dataframe(df)
+
+card = DataCard(
+    name="tutorial-dataset",
+    version="0.1.0",
+    spec=interface.to_spec(),
+)
+```
+
+## 2. Save locally
+
+```python
+card.save()
+```
+
+This writes `card.json` (the envelope) and any local data files to
+`.wyrd/<space>/<name>/<version>/` in your working directory.
+
+## 3. Register
+
+```python
+import wyrd
+
+wyrd.cards.register(card)
+```
+
+The server validates the spec against the JSON Schema for `Data`, assigns it a
+durable identity, and returns the registered card envelope.
+
+## 4. Verify
+
+```python
+result = wyrd.cards.get("tutorial-dataset", version="0.1.0")
+print(result.metadata.name, result.metadata.version)
+```
+
+## What happened
+
+1. `DataCard(...)` authored the typed envelope locally — nothing left your machine.
+2. `card.save()` wrote the local card layout.
+3. `wyrd.cards.register(card)` sent the envelope to the server. The server
+   validated the spec, stored it, and made it queryable.
+4. `wyrd.cards.get(...)` read it back from the registry.
+
+## Next
+
+- [Declare a Data card](/how-to/declare/data/) — the recipe version, without the
+  step-by-step explanation.
+- [Cards overview](/cards/) — every kind and its status.

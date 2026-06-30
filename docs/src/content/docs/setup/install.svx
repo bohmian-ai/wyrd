@@ -1,0 +1,57 @@
+---
+title: Install
+description: Install py-wyrd, verify the SDK, and run the connection health check.
+pillar: wyrd
+group: Setup
+order: 2
+---
+
+# Install
+
+## Install py-wyrd
+
+```bash
+pip install py-wyrd
+```
+
+Or with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv add py-wyrd
+```
+
+## Verify
+
+```python
+import wyrd
+print(wyrd.__version__)
+```
+
+## Configure the registry URL
+
+Set the server base URL before registering or reading cards:
+
+```bash
+export WYRD_SERVER_URL=http://localhost:8080
+```
+
+Or pass it directly to the client:
+
+```python
+import wyrd
+
+client = wyrd.Client(base_url="http://localhost:8080")
+```
+
+## Run a local registry
+
+The quickest path to a local registry is the Docker Compose stack in the repo
+root. See [Run the server](/server/) for full configuration options.
+
+```bash
+docker compose up -d
+```
+
+## Next
+
+- [Your first card](/tutorials/first-card/) — create and register a DataCard.

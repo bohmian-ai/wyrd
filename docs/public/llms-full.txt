@@ -27,6 +27,7 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 
 - [Build an Agent Workflow](https://mitari-ai.github.io/wyrd/guides/build-a-workflow/): Author a workflow from Python, YAML, or Rust, then run and instrument it.
 - [Build an Agent](https://mitari-ai.github.io/wyrd/guides/build-an-agent/): Build a Wyrd Agent: prompt, tools, callbacks, session memory, and run config. Python and Rust side-by-side.
+- [Component fixture](https://mitari-ai.github.io/wyrd/guides/component-fixture/): Authoring fixture — every auto-injected component verified with no per-page imports.
 - [DataCard local workflow](https://mitari-ai.github.io/wyrd/guides/data-card-local-workflow/): Create a DataCard, save it locally, load it back, and inspect the local files.
 
 ## Agents
@@ -50,6 +51,7 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 
 ## API reference
 
+- [API reference](https://mitari-ai.github.io/wyrd/api/): Error catalog, OpenAPI summary, and JSON Schema inventory — all generated from source.
 - [Errors](https://mitari-ai.github.io/wyrd/api/errors/): Error handling guidance for Wyrd API clients and agents.
 - [OpenAPI](https://mitari-ai.github.io/wyrd/api/openapi/): Generated summary of the Wyrd OpenAPI contract.
 - [Schemas](https://mitari-ai.github.io/wyrd/api/schemas/): Generated inventory of Wyrd JSON Schemas.
@@ -57,6 +59,46 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 ## Roadmap
 
 - [Roadmap](https://mitari-ai.github.io/wyrd/roadmap/): What is specified or in progress but not yet runnable — stated honestly.
+
+## Concepts
+
+- [Concepts](https://mitari-ai.github.io/wyrd/concepts/): The Card/Spec/Run/Observation ontology — the four nouns everything else builds on.
+- [Card](https://mitari-ai.github.io/wyrd/concepts/card/): The typed, versioned envelope for one AI system component — its outer shape, lifecycle, and identity rules.
+
+## Fathom
+
+- [Fathom](https://mitari-ai.github.io/wyrd/fathom/): Runtime evidence for AI systems — leakage detection, eval as evidence, drift versus spec, and audit. Coming soon.
+
+## For Agents
+
+- [For Agents](https://mitari-ai.github.io/wyrd/for-agents/): Stable paths, a copyable workflow, and the rules agents must follow when reading and updating Wyrd.
+- [Agent workflow](https://mitari-ai.github.io/wyrd/for-agents/workflow/): A copyable end-to-end workflow for agents that need to declare and register Wyrd cards.
+
+## How To
+
+- [How-to](https://mitari-ai.github.io/wyrd/how-to/): Goal-oriented recipes for declaring, evaluating, observing, and operating Wyrd components.
+- [Declare](https://mitari-ai.github.io/wyrd/how-to/declare/): Author and register Wyrd cards — recipes for the three shipped kinds.
+- [Declare a Data card](https://mitari-ai.github.io/wyrd/how-to/declare/data/): Author and register a DataCard from Python.
+- [Declare a Model card](https://mitari-ai.github.io/wyrd/how-to/declare/model/): Author and register a ModelCard from Python.
+- [Declare a Prompt card](https://mitari-ai.github.io/wyrd/how-to/declare/prompt/): Author and register a PromptCard from Python in four steps.
+- [Evaluate](https://mitari-ai.github.io/wyrd/how-to/evaluate/): Score agent runs and models against Wyrd eval definitions.
+- [Observe](https://mitari-ai.github.io/wyrd/how-to/observe/): Read metrics, drift signals, and audit trails from card-governed components.
+- [Operate](https://mitari-ai.github.io/wyrd/how-to/operate/): Run, restart, and manage card-governed components in production.
+
+## Overview
+
+- [Overview](https://mitari-ai.github.io/wyrd/overview/): Wyrd — the typed control layer for AI system components.
+- [What Wyrd solves](https://mitari-ai.github.io/wyrd/overview/about/): The coordination problem cards fix, and the components Wyrd governs.
+
+## Setup
+
+- [Setup](https://mitari-ai.github.io/wyrd/setup/): Install the Wyrd Python SDK and configure your environment.
+- [Install](https://mitari-ai.github.io/wyrd/setup/install/): Install py-wyrd, verify the SDK, and run the connection health check.
+
+## Tutorials
+
+- [Tutorials](https://mitari-ai.github.io/wyrd/tutorials/): Step-by-step walkthroughs from zero to your first registered card.
+- [Your first card](https://mitari-ai.github.io/wyrd/tutorials/first-card/): Create a DataCard from a pandas DataFrame, save it locally, and register it to a running server.
 
 ## Card schemas
 

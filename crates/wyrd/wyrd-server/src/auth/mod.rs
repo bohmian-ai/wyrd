@@ -1,5 +1,6 @@
 //! Authentication extractors for Wyrd HTTP handlers.
 
+pub mod admin;
 pub mod audit_writer;
 pub mod callback;
 pub mod caller_extractor;

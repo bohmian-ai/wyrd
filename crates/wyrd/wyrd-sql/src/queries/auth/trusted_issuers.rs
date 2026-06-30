@@ -48,6 +48,28 @@ const TRUSTED_ISSUER_EXISTS_SQL: &str = r#"
     )
 "#;
 
+const INSERT_TRUSTED_ISSUER_SQL: &str = r#"
+    INSERT INTO wyrd.auth_trusted_issuers (
+        data_tenant_id, issuer_url, jwks_uri, expected_audience, client_id,
+        client_auth, claim_mapping, group_role_map, default_roles,
+        principal_kind, jwks_ttl_secs, client_secret_enc
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+"#;
+
+const TRUSTED_ISSUER_BY_URL_SQL: &str = r#"
+    SELECT data_tenant_id, issuer_url, jwks_uri, expected_audience, client_id,
+           client_auth, claim_mapping, group_role_map, default_roles,
+           principal_kind, jwks_ttl_secs, client_secret_enc,
+           created_at, updated_at
+      FROM wyrd.auth_trusted_issuers
+     WHERE issuer_url = $1
+"#;
+
+const DELETE_TRUSTED_ISSUER_SQL: &str = r#"
+    DELETE FROM wyrd.auth_trusted_issuers
+     WHERE issuer_url = $1
+"#;
+
 /// Owned column values for an upsert into `wyrd.auth_trusted_issuers`.
 ///
 /// `data_tenant_id` is bound from the [`TenantConn`], never from this struct, so
@@ -125,6 +147,78 @@ pub async fn upsert_trusted_issuer(
         .map(|_| ())
 }
 
+/// Insert a trusted issuer for the current tenant, failing on conflict.
+///
+/// Unlike [`upsert_trusted_issuer`] this is a plain `INSERT`: a duplicate
+/// `(data_tenant_id, issuer_url)` raises a unique-violation (`23505`) so the
+/// admin CRUD path can map it to a `409` conflict rather than silently
+/// overwriting an existing issuer. `data_tenant_id` is bound from the
+/// [`TenantConn`]; the write targets the bound tenant only.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the insert (unique violation on a
+/// duplicate issuer, or any other database error).
+pub async fn insert_trusted_issuer(
+    conn: &mut TenantConn<'_>,
+    issuer: &TrustedIssuerWrite,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(INSERT_TRUSTED_ISSUER_SQL)
+        .bind(conn.data_tenant_id().as_uuid())
+        .bind(&issuer.issuer_url)
+        .bind(&issuer.jwks_uri)
+        .bind(&issuer.expected_audience)
+        .bind(&issuer.client_id)
+        .bind(&issuer.client_auth)
+        .bind(&issuer.claim_mapping)
+        .bind(&issuer.group_role_map)
+        .bind(&issuer.default_roles)
+        .bind(&issuer.principal_kind)
+        .bind(issuer.jwks_ttl_secs)
+        .bind(issuer.client_secret_enc.as_deref())
+        .execute(&mut **conn.transaction())
+        .await
+        .map(|_| ())
+}
+
+/// Fetch one trusted issuer row by URL for the current tenant.
+///
+/// RLS on `TenantConn` scopes the lookup to the bound tenant. Returns `None`
+/// when no issuer with that URL exists for the tenant. `client_secret_enc` is
+/// returned byte-for-byte; callers must not trim or text-decode it.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the query.
+pub async fn trusted_issuer_by_url(
+    conn: &mut TenantConn<'_>,
+    issuer_url: &str,
+) -> Result<Option<TrustedIssuerRow>, sqlx::Error> {
+    sqlx::query_as::<_, TrustedIssuerRow>(TRUSTED_ISSUER_BY_URL_SQL)
+        .bind(issuer_url)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+}
+
+/// Delete a trusted issuer by URL for the current tenant.
+///
+/// Returns the number of rows removed: `0` means no such issuer existed for the
+/// tenant (the admin path maps this to `404`). A delete blocked by a live
+/// workload binding raises a foreign-key violation (`23503`, `ON DELETE
+/// RESTRICT` from migration 02), which the admin path maps to `409`.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the delete (including the FK
+/// restrict when bindings still reference the issuer).
+pub async fn delete_trusted_issuer(
+    conn: &mut TenantConn<'_>,
+    issuer_url: &str,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(DELETE_TRUSTED_ISSUER_SQL)
+        .bind(issuer_url)
+        .execute(&mut **conn.transaction())
+        .await
+        .map(|result| result.rows_affected())
+}
+
 /// Report whether a trusted issuer row exists for the current tenant.
 ///
 /// Used by the boot seeder to keep an unreachable IdP non-fatal on restart when
@@ -145,8 +239,26 @@ pub async fn trusted_issuer_exists(
 #[cfg(test)]
 mod tests {
     use super::{
+        DELETE_TRUSTED_ISSUER_SQL, INSERT_TRUSTED_ISSUER_SQL, TRUSTED_ISSUER_BY_URL_SQL,
         TRUSTED_ISSUER_EXISTS_SQL, TRUSTED_ISSUERS_FOR_TENANT_SQL, UPSERT_TRUSTED_ISSUER_SQL,
     };
+
+    #[test]
+    fn plain_insert_has_no_on_conflict_clause() {
+        // A duplicate must raise 23505, not silently upsert.
+        assert!(INSERT_TRUSTED_ISSUER_SQL.contains("INSERT INTO wyrd.auth_trusted_issuers"));
+        assert!(!INSERT_TRUSTED_ISSUER_SQL.contains("ON CONFLICT"));
+    }
+
+    #[test]
+    fn delete_and_get_are_scoped_by_issuer_url_only() {
+        // RLS supplies the tenant predicate; the statement keys on issuer_url.
+        assert!(DELETE_TRUSTED_ISSUER_SQL.contains("DELETE FROM wyrd.auth_trusted_issuers"));
+        assert!(DELETE_TRUSTED_ISSUER_SQL.contains("issuer_url = $1"));
+        assert!(!DELETE_TRUSTED_ISSUER_SQL.contains("data_tenant_id ="));
+        assert!(TRUSTED_ISSUER_BY_URL_SQL.contains("client_secret_enc"));
+        assert!(TRUSTED_ISSUER_BY_URL_SQL.contains("issuer_url = $1"));
+    }
 
     #[test]
     fn upsert_targets_composite_key_and_overwrites_columns() {

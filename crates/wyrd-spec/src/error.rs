@@ -630,6 +630,34 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Tenant-admin create conflicted with an existing row or a live reference.
+    #[error("[WYRD_AUTH_409_ADMIN_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_409_ADMIN_CONFLICT",
+        status = 409,
+        title = "Admin resource already exists or is still referenced",
+        remediation = "A trusted issuer or workload binding with this key already exists, or the issuer still has live bindings. Use a distinct key, or delete the bindings first (or with --cascade)."
+    )]
+    AdminConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Tenant-admin get/delete targeted a row absent from the tenant.
+    #[error("[WYRD_AUTH_404_ADMIN_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_404_ADMIN_NOT_FOUND",
+        status = 404,
+        title = "Admin resource not found in tenant",
+        remediation = "Confirm the issuer URL (and subject for bindings) and that the resource exists in the current tenant."
+    )]
+    AdminNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Auth verification backend is transiently unavailable.
     #[error("[WYRD_AUTH_503_VERIFY_UNAVAILABLE] {message}")]
     #[wyrd_error(
@@ -2111,6 +2139,8 @@ impl WyrdError {
             | Self::InvalidCardRef { message, details }
             | Self::DelegationDepthExceededVerify { message, details }
             | Self::PrincipalNotFound { message, details }
+            | Self::AdminConflict { message, details }
+            | Self::AdminNotFound { message, details }
             | Self::AuthVerifyUnavailable { message, details }
             | Self::DiscoveryUnavailable { message, details }
             | Self::AuthPreviewDisabled { message, details }

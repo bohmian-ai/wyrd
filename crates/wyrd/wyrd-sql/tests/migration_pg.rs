@@ -14,12 +14,19 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::storage::{StorageBackendKind, UploadId, WireProtocol};
 use wyrd_sql::pool::build_app_pool;
 use wyrd_sql::queries::auth::{
-    insert_user, trusted_issuers_for_tenant, upsert_user_identity, user_by_email, user_by_id,
-    user_id_by_identity, workload_binding_by_subject,
+    TrustedIssuerWrite, WorkloadBindingWrite, delete_trusted_issuer, delete_workload_binding,
+    delete_workload_bindings_for_issuer, insert_user, trusted_issuer_by_url,
+    trusted_issuers_for_tenant, upsert_user_identity, user_by_email, user_by_id,
+    user_id_by_identity, workload_binding_by_key, workload_binding_by_subject,
 };
+// `insert_trusted_issuer`/`insert_workload_binding` are referenced by full path
+// in `cloud_issuer_crud_write_path_conflict_and_cascade` because this test module
+// already defines local helpers of the same name with different signatures.
+use wyrd_sql::queries::auth::insert_trusted_issuer as insert_trusted_issuer_query;
+use wyrd_sql::queries::auth::insert_workload_binding as insert_workload_binding_query;
 use wyrd_sql::queries::platform::audit_log::{StorageAuditEvent, write_storage_event};
 use wyrd_sql::queries::storage;
-use wyrd_sql::{SqlStore, TenantConn};
+use wyrd_sql::{SqlError, SqlStore, TenantConn};
 
 #[tokio::test]
 async fn migrations_apply_and_are_idempotent() {
@@ -1115,6 +1122,180 @@ async fn cloud_issuer_read_path_roundtrips_and_rls() {
     sqlx::query("DELETE FROM platform.tenants WHERE data_tenant_id IN ($1, $2)")
         .bind(tenant_a.as_uuid())
         .bind(tenant_b.as_uuid())
+        .execute(store.pool())
+        .await
+        .expect("tenant cleanup succeeds");
+}
+
+#[tokio::test]
+async fn cloud_issuer_crud_write_path_conflict_and_cascade() {
+    let Some(migrator_url) = database_url() else {
+        return;
+    };
+    let Some(app_url) = app_database_url() else {
+        return;
+    };
+
+    let store = SqlStore::connect(&migrator_url, 2)
+        .await
+        .expect("migrator connects");
+    store.migrate().await.expect("migrations apply");
+    let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
+
+    let tenant = DataTenantId::new_v7();
+    let suffix = tenant.as_uuid().to_string();
+    let issuer_url = format!("https://crud-idp.example.com/{suffix}");
+    let subject = format!("svc-sub-{suffix}");
+    // Representative AES-GCM bytes (12-byte nonce + 16-byte ciphertext).
+    let secret_bytes: Vec<u8> = (40u8..68).collect();
+
+    insert_tenant(store.pool(), tenant, &format!("crud-{suffix}")).await;
+
+    let issuer_write = TrustedIssuerWrite {
+        issuer_url: issuer_url.clone(),
+        jwks_uri: format!("{issuer_url}/jwks"),
+        expected_audience: "wyrd-api".to_owned(),
+        client_id: "wyrd-client".to_owned(),
+        client_auth: "SecretBasic".to_owned(),
+        claim_mapping: serde_json::json!({ "subject": "sub" }),
+        group_role_map: serde_json::json!({}),
+        default_roles: serde_json::json!([]),
+        principal_kind: "Workload".to_owned(),
+        jwks_ttl_secs: 3600,
+        client_secret_enc: Some(secret_bytes.clone()),
+    };
+    let binding_write = WorkloadBindingWrite {
+        issuer_url: issuer_url.clone(),
+        subject: subject.clone(),
+        audience: None,
+        card_ref: serde_json::json!({
+            "kind": "Service",
+            "name": "svc",
+            "version": "1.0.0",
+            "space": "prod"
+        }),
+    };
+
+    // Insert persists, and the encrypted-secret bytes round-trip verbatim.
+    {
+        let mut conn = TenantConn::acquire(&app_pool, tenant)
+            .await
+            .expect("conn acquired");
+        insert_trusted_issuer_query(&mut conn, &issuer_write)
+            .await
+            .expect("issuer inserts");
+        conn.commit().await.expect("insert commits");
+
+        let mut conn = TenantConn::acquire(&app_pool, tenant)
+            .await
+            .expect("conn acquired");
+        let row = trusted_issuer_by_url(&mut conn, &issuer_url)
+            .await
+            .expect("get query succeeds")
+            .expect("issuer exists");
+        assert_eq!(
+            row.client_secret_enc.as_deref(),
+            Some(secret_bytes.as_slice())
+        );
+        assert_eq!(row.client_auth, "SecretBasic");
+    }
+
+    // A duplicate insert raises a unique violation, not a silent upsert.
+    {
+        let mut conn = TenantConn::acquire(&app_pool, tenant)
+            .await
+            .expect("conn acquired");
+        let error = insert_trusted_issuer_query(&mut conn, &issuer_write)
+            .await
+            .expect_err("duplicate issuer must conflict");
+        assert!(matches!(
+            SqlError::from(error),
+            SqlError::UniqueViolation { .. }
+        ));
+    }
+
+    // Insert a binding; a duplicate binding also conflicts.
+    {
+        let mut conn = TenantConn::acquire(&app_pool, tenant)
+            .await
+            .expect("conn acquired");
+        insert_workload_binding_query(&mut conn, &binding_write)
+            .await
+            .expect("binding inserts");
+        conn.commit().await.expect("binding commits");
+
+        let mut conn = TenantConn::acquire(&app_pool, tenant)
+            .await
+            .expect("conn acquired");
+        let error = insert_workload_binding_query(&mut conn, &binding_write)
+            .await
+            .expect_err("duplicate binding must conflict");
+        assert!(matches!(
+            SqlError::from(error),
+            SqlError::UniqueViolation { .. }
+        ));
+    }
+
+    // Deleting the issuer while a binding references it fails closed (FK restrict).
+    {
+        let mut conn = TenantConn::acquire(&app_pool, tenant)
+            .await
+            .expect("conn acquired");
+        let error = delete_trusted_issuer(&mut conn, &issuer_url)
+            .await
+            .expect_err("issuer delete blocked by live binding");
+        assert!(matches!(
+            SqlError::from(error),
+            SqlError::FkViolation { .. }
+        ));
+    }
+
+    // Deleting a non-existent binding removes zero rows.
+    {
+        let mut conn = TenantConn::acquire(&app_pool, tenant)
+            .await
+            .expect("conn acquired");
+        let removed = delete_workload_binding(&mut conn, &issuer_url, "no-such-subject")
+            .await
+            .expect("delete query succeeds");
+        assert_eq!(removed, 0);
+        conn.commit().await.expect("commit");
+    }
+
+    // Cascade: remove the bindings, then the issuer; both are gone.
+    {
+        let mut conn = TenantConn::acquire(&app_pool, tenant)
+            .await
+            .expect("conn acquired");
+        let bindings_removed = delete_workload_bindings_for_issuer(&mut conn, &issuer_url)
+            .await
+            .expect("cascade binding delete succeeds");
+        assert_eq!(bindings_removed, 1);
+        let issuer_removed = delete_trusted_issuer(&mut conn, &issuer_url)
+            .await
+            .expect("issuer delete succeeds");
+        assert_eq!(issuer_removed, 1);
+        conn.commit().await.expect("cascade commits");
+
+        let mut conn = TenantConn::acquire(&app_pool, tenant)
+            .await
+            .expect("conn acquired");
+        assert!(
+            trusted_issuer_by_url(&mut conn, &issuer_url)
+                .await
+                .expect("get succeeds")
+                .is_none()
+        );
+        assert!(
+            workload_binding_by_key(&mut conn, &issuer_url, &subject)
+                .await
+                .expect("get succeeds")
+                .is_none()
+        );
+    }
+
+    sqlx::query("DELETE FROM platform.tenants WHERE data_tenant_id = $1")
+        .bind(tenant.as_uuid())
         .execute(store.pool())
         .await
         .expect("tenant cleanup succeeds");

@@ -36,7 +36,6 @@ skald-runtime = { path = "crates/skald/skald-runtime", version = "0.0.1" }
 skald-prompt = { path = "crates/skald/skald-prompt", version = "0.0.1" }
 skald-agent = { path = "crates/skald/skald-agent", version = "0.0.1" }
 skald-workflow = { path = "crates/skald/skald-workflow", version = "0.0.1" }
-vala-client = { path = "crates/vala/vala-client", version = "0.0.1" }
 vala-core = { path = "crates/vala/vala-core", version = "0.0.1" }
 vala-drift = { path = "crates/vala/vala-drift", version = "0.0.1" }
 vala-eval = { path = "crates/vala/vala-eval", version = "0.0.1" }

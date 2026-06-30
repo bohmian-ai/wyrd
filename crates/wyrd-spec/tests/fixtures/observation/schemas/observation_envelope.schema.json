@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ObservationEnvelope",
+  "description": "Envelope carried on every observation from an agent run.\n\n`card_ref` is required; `run_id` is optional and omitted from the wire when absent. On the C1 ingest wire both fields travel as per-row Arrow correlation columns alongside the columnar payload.",
+  "type": "object",
+  "required": [
+    "card_ref"
+  ],
+  "properties": {
+    "card_ref": {
+      "description": "Card that produced this observation.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardRef"
+        }
+      ]
+    },
+    "run_id": {
+      "description": "Run identifier grouping all observations from one agent invocation.\n\nOptional; omitted from the wire when not present. On the C1 ingest wire this travels as a per-row Arrow correlation column.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "CardKind": {
+      "title": "CardKind",
+      "description": "Wyrd Card kind.",
+      "type": "string",
+      "enum": [
+        "Data",
+        "Model",
+        "Experiment",
+        "Prompt",
+        "Agent",
+        "Workflow",
+        "Eval",
+        "Drift",
+        "Service",
+        "Policy",
+        "Mcp",
+        "Audit",
+        "Artifact",
+        "Trigger",
+        "Operator",
+        "Source"
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardRef": {
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "space",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Referenced Card kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "Referenced Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "space": {
+          "description": "Space pinning identity together with `name` and `version`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Optional resolved UID.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Exact referenced Card version.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VersionBlock"
+            }
+          ]
+        }
+      }
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "VersionBlock": {
+      "description": "Semver-compatible version string.",
+      "type": "string"
+    }
+  }
+}

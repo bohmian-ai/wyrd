@@ -50,11 +50,6 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&providers)?;
     register_submodule(py, "wyrd._wyrd.providers", &providers)?;
 
-    let eval = PyModule::new(py, "eval")?;
-    vala_client::python::python_register(&eval)?;
-    m.add_submodule(&eval)?;
-    register_submodule(py, "wyrd._wyrd.eval", &eval)?;
-
     wyrd_observe::python::python_register(m)?;
 
     #[cfg(feature = "testing")]

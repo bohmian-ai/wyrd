@@ -247,6 +247,41 @@ then run codegen.
 
 ## 11. Testing Workflow
 
+### Test Taxonomy (priority order)
+
+Wyrd has three test tiers. They are ranked — higher tiers prove the product
+works; lower tiers prove a part works. A lower tier never substitutes for a
+missing higher one.
+
+1. **User-journey tests — the primary contract, highest priority.** Drive the
+   real SDK against a real server (`WyrdTestServer` + embedded Postgres) along a
+   complete user/agent path, client → server → client, no in-process engine
+   fixtures. For a data surface the journey is instantiate → write →
+   shutdown/flush → read; for an agent surface it is discover → act → observe.
+   A journey is not done at the happy path: it covers the **edge** flows (lazy
+   vs eager instantiation, schema fingerprint conflict, backpressure/drain) and
+   the **negative** flows a real caller hits (under-privileged token →
+   rejection, non-SELECT or oversized query → floor rejection, write to an
+   unregistered table, replayed batch → no double-write). Cover every
+   user-facing surface the capability ships — Python and Rust SDK, and the
+   MCP/HTTP path when the capability is agent-facing. Journeys run in a gated
+   lane (`integration` pytest marker; Rust `e2e`/`#[ignore]`) so the fast lane
+   stays credential- and server-free.
+2. **Integration tests — supporting.** Exercise one subsystem against its real
+   dependency (a handler against Postgres, the ingest service against the
+   writer) without standing up the full client→server journey. Use them to pin
+   a seam contract precisely where a full journey would be noisy.
+3. **Unit tests — supporting.** A single function or type in isolation, IO-free,
+   credential-free, in the fast lane. Use them for pure logic, error/`WyrdError`
+   mapping, and negative branches that are cleaner to force in-process than
+   end-to-end (e.g. an injected audit-append failure → fail-closed refusal).
+
+Rule: every new user/agent-facing capability ships a user-journey test. Pushing
+a user-observable behavior — especially a negative flow — down to a unit test
+*only* is a coverage gap to flag in review, not a substitute. A negative flow
+may stay unit-only when driving it end-to-end is materially harder and the
+behavior has no cross-boundary state (record the reason).
+
 ### Pre-PR Gate (mirrors GitHub CI)
 
 Run these before pushing. They are the same commands CI runs — no surprises on PR.

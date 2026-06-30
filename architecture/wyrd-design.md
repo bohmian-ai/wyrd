@@ -155,6 +155,19 @@ enterprise governance-tier gate (policy + audit), not a token. No
 
     Heavy cards (Model, Data, Experiment) accept `ref:` only — identity is
     required for lineage. See §"Light-card reference forms" for loader rules.
+20. **User journeys are the primary test contract.** A capability is not done
+    until a real user/agent path proves it end-to-end — client → server →
+    client, against a real server (`WyrdTestServer` + embedded Postgres), not a
+    mock. The journey is the unit of correctness: for a data surface,
+    instantiate → write → shutdown/flush → read; for an agent/MCP surface,
+    discover → act → observe. Unit and integration tests support journeys by
+    isolating a seam or a branch that is awkward to drive end-to-end; they never
+    substitute for the journey. Each journey covers the happy path **and** the
+    edge/negative flows a real caller actually hits — re-register with a
+    conflicting schema, an under-privileged token, a rejected query, a replayed
+    batch. A bug that only appears when state crosses a module boundary is
+    exactly what a journey catches and an isolated test misses. See AGENTS.md
+    §11 for the tier definitions and gates.
 
 ---
 

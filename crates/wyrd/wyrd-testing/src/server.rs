@@ -50,6 +50,7 @@ use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     grant_role_to_service_account, grant_role_to_user, insert_api_key, insert_service_account,
     insert_user, revoke_role_from_service_account, revoke_role_from_user, role_by_name,
+    trusted_issuer_by_url, workload_binding_by_subject,
 };
 use wyrd_storage::{BackendConfig, StorageSettings};
 
@@ -374,6 +375,98 @@ impl WyrdTestServer {
             .await
     }
 
+    /// Bootstrap a Service principal under an explicit tenant.
+    ///
+    /// The tenant-scoped analogue of [`Self::bootstrap_service`]: the service
+    /// account and its API key are written through the supplied tenant's
+    /// [`TenantConn`], and the generated key carries that tenant in its prefix
+    /// so [`Self::exchange_api_key`] resolves the same tenant. Multi-tenant
+    /// tests use this to mint a per-tenant admin that authors through the CLI.
+    ///
+    /// # Errors
+    /// Returns an error when SQL writes or API-key hashing fail.
+    pub async fn bootstrap_service_in_tenant(
+        &self,
+        tenant_id: DataTenantId,
+        name: &str,
+        roles: &[&str],
+    ) -> Result<Bootstrap, WyrdTestServerError> {
+        self.bootstrap_machine_in_tenant(tenant_id, name, roles, CardKind::Service, "service")
+            .await
+    }
+
+    /// Provision a second active tenant: seed its row and built-in roles.
+    ///
+    /// The fixture seeds one tenant at boot; the same-issuer-two-tenant
+    /// isolation test calls this to stand up tenant B so a subject bound only in
+    /// tenant A fails closed in B. Returns the new tenant's isolation key.
+    ///
+    /// # Errors
+    /// Returns an error when the tenant insert or role seed fails.
+    pub async fn seed_tenant(&self, slug: &str) -> Result<DataTenantId, WyrdTestServerError> {
+        let tenant_id = self
+            .inner
+            .fixture
+            .seed_additional_tenant(slug)
+            .await
+            .map_err(sql)?;
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
+        seed_builtin_roles_for_tenant(&mut conn, tenant_id)
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        conn.commit().await.map_err(sql)?;
+        Ok(tenant_id)
+    }
+
+    /// Return the raw `client_secret_enc` ciphertext for a trusted issuer.
+    ///
+    /// Opens a [`TenantConn`] on the supplied tenant and reads the stored
+    /// column byte-for-byte (never text-decoded), so the journey can assert the
+    /// sealing key wrote ciphertext at rest rather than plaintext. Returns
+    /// `None` when no issuer with that URL exists for the tenant, and `None`
+    /// when the issuer stores no secret (public client).
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub async fn trusted_issuer_secret_ciphertext(
+        &self,
+        tenant_id: DataTenantId,
+        issuer_url: &str,
+    ) -> Result<Option<Vec<u8>>, WyrdTestServerError> {
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
+        let row = trusted_issuer_by_url(&mut conn, issuer_url)
+            .await
+            .map_err(sql)?;
+        conn.commit().await.map_err(sql)?;
+        Ok(row.and_then(|row| row.client_secret_enc))
+    }
+
+    /// Report whether a workload binding is visible under a tenant's RLS scope.
+    ///
+    /// Opens a [`TenantConn`] bound to `tenant_id` and runs the production
+    /// `workload_binding_by_subject` lookup. The same-issuer-two-tenant
+    /// isolation test calls this once per tenant to prove storage-level RLS: a
+    /// binding authored only in tenant A is `true` under A's connection and
+    /// `false` under B's, with no shared filter — two genuinely independent
+    /// tenant-scoped reads.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub async fn workload_binding_exists(
+        &self,
+        tenant_id: DataTenantId,
+        issuer: &str,
+        subject: &str,
+        audience: Option<&str>,
+    ) -> Result<bool, WyrdTestServerError> {
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
+        let row = workload_binding_by_subject(&mut conn, issuer, subject, audience)
+            .await
+            .map_err(sql)?;
+        conn.commit().await.map_err(sql)?;
+        Ok(row.is_some())
+    }
+
     /// Bootstrap an Agent principal through fixture SQL.
     ///
     /// # Errors
@@ -571,6 +664,25 @@ impl WyrdTestServer {
         card_ref: &CardRef,
         roles: &[&str],
     ) -> Result<PrincipalId, WyrdTestServerError> {
+        self.seed_card_principal_in_tenant(self.data_tenant_id(), card_ref, roles)
+            .await
+    }
+
+    /// Seed a Service/Agent principal under an explicit tenant.
+    ///
+    /// The tenant-scoped analogue of [`Self::seed_card_principal`]: the same
+    /// exact-`card_ref` seed, written through the supplied tenant's
+    /// [`TenantConn`]. Multi-tenant isolation tests use this to seed a bound
+    /// workload only in tenant A.
+    ///
+    /// # Errors
+    /// Returns an error when the card kind is not Service/Agent, or SQL fails.
+    pub async fn seed_card_principal_in_tenant(
+        &self,
+        tenant_id: DataTenantId,
+        card_ref: &CardRef,
+        roles: &[&str],
+    ) -> Result<PrincipalId, WyrdTestServerError> {
         let principal_kind = match &card_ref.kind {
             CardKind::Service => "service",
             CardKind::Agent => "agent",
@@ -581,8 +693,8 @@ impl WyrdTestServer {
             }
         };
         let principal_id = Uuid::now_v7();
-        let creator_id = self.ensure_fixture_admin().await?;
-        let mut conn = self.tenant_conn().await?;
+        let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
         insert_service_account(
             &mut conn,
             principal_id,
@@ -614,17 +726,35 @@ impl WyrdTestServer {
         card_kind: CardKind,
         principal_kind: &'static str,
     ) -> Result<Bootstrap, WyrdTestServerError> {
+        self.bootstrap_machine_in_tenant(
+            self.data_tenant_id(),
+            name,
+            roles,
+            card_kind,
+            principal_kind,
+        )
+        .await
+    }
+
+    async fn bootstrap_machine_in_tenant(
+        &self,
+        tenant_id: DataTenantId,
+        name: &str,
+        roles: &[&str],
+        card_kind: CardKind,
+        principal_kind: &'static str,
+    ) -> Result<Bootstrap, WyrdTestServerError> {
         let principal_id = Uuid::now_v7();
-        let creator_id = self.ensure_fixture_admin().await?;
+        let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
         let card_ref = card_ref(card_kind, name)?;
-        let api_key = WyrdApiKey::generate(self.data_tenant_id());
+        let api_key = WyrdApiKey::generate(tenant_id);
         let raw = api_key.secret.clone();
         let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
             .await
             .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
             .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
 
-        let mut conn = self.tenant_conn().await?;
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
         insert_service_account(
             &mut conn,
             principal_id,
@@ -665,31 +795,48 @@ impl WyrdTestServer {
         })
     }
 
-    async fn ensure_fixture_admin(&self) -> Result<Uuid, WyrdTestServerError> {
-        let id = Uuid::from_u128(0x018f0000000070008000000000000001);
-        let mut conn = self.tenant_conn().await?;
-        insert_user(
-            &mut conn,
-            id,
-            Some("fixture-admin@test.wyrd"),
-            "password",
-            None,
-        )
-        .await
-        .or_else(|error| {
-            if is_unique_violation(&error) {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        })
-        .map_err(sql)?;
+    async fn ensure_fixture_admin_for(
+        &self,
+        tenant_id: DataTenantId,
+    ) -> Result<Uuid, WyrdTestServerError> {
+        let id = fixture_admin_id(tenant_id);
+        let email = format!("fixture-admin-{}@test.wyrd", id.simple());
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
+        insert_user(&mut conn, id, Some(&email), "password", None)
+            .await
+            .or_else(|error| {
+                if is_unique_violation(&error) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(sql)?;
         conn.commit().await.map_err(sql)?;
         Ok(id)
     }
 
     async fn tenant_conn(&self) -> Result<TenantConn<'_>, WyrdTestServerError> {
         self.inner.fixture.tenant_conn().await.map_err(sql)
+    }
+
+    /// Open a tenant-scoped transaction bound to an explicit tenant.
+    ///
+    /// The RLS handle the isolation test drives directly: two distinct calls
+    /// yield two independent [`TenantConn`]s scoped to different
+    /// `data_tenant_id`s on the shared `wyrd_app` pool.
+    ///
+    /// # Errors
+    /// Returns an error when acquiring or binding the transaction fails.
+    pub async fn tenant_conn_for(
+        &self,
+        tenant_id: DataTenantId,
+    ) -> Result<TenantConn<'_>, WyrdTestServerError> {
+        self.inner
+            .fixture
+            .tenant_conn_for(tenant_id)
+            .await
+            .map_err(sql)
     }
 
     async fn raw_call(
@@ -1079,6 +1226,16 @@ async fn lookup_role_id(
         .map_err(sql)?
         .map(|row| row.id)
         .ok_or_else(|| WyrdTestServerError::Sql(format!("role not found: {role}")))
+}
+
+/// Deterministic per-tenant fixture-admin user id.
+///
+/// XORing a fixed base with the tenant key yields a stable, distinct id per
+/// tenant, so each tenant's `auth_users` creator row is independent under RLS
+/// and repeated `ensure_fixture_admin_for` calls stay idempotent.
+fn fixture_admin_id(tenant_id: DataTenantId) -> Uuid {
+    const BASE: u128 = 0x018f_0000_0000_7000_8000_0000_0000_0001;
+    Uuid::from_u128(BASE ^ tenant_id.as_uuid().as_u128())
 }
 
 fn role_refs(roles: &[&str]) -> Result<Vec<RoleRef>, WyrdTestServerError> {

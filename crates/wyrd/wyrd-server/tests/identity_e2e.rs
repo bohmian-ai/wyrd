@@ -12,6 +12,14 @@ use url::Url;
 use wyrd_auth_check::AuthzCheckRequest;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
+use wyrd_cli::auth::trusted_issuer::{self, AddArgs as TrustedIssuerAddArgs, TrustedIssuerCommand};
+use wyrd_cli::auth::workload_binding::{
+    self, AddArgs as WorkloadBindingAddArgs, WorkloadBindingCommand,
+};
+use wyrd_client::auth::AuthMiddleware;
+use wyrd_client::config::{ClientConfig, TokenCacheMode};
+use wyrd_client::transport::config::HttpConfig;
+use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_semver::VersionBlock;
 use wyrd_server::config::{
     ClaimMappingEntry, ClientAuthEntry, IssuerEntry, PrincipalKindEntry, WorkloadBindingEntry,
@@ -89,12 +97,25 @@ fn jwt_claims(jwt: &str) -> Value {
     serde_json::from_slice(&bytes).expect("payload is JSON")
 }
 
-/// POST a jwt-bearer assertion at `/auth/token`, returning the raw HTTP response.
+/// POST a jwt-bearer assertion at `/auth/token` for the fixture tenant.
 async fn post_jwt_bearer(srv: &WyrdTestServer, assertion: &str) -> axum::http::Response<Body> {
+    post_jwt_bearer_for_tenant(srv, assertion, FIXTURE_TENANT_SLUG).await
+}
+
+/// POST a jwt-bearer assertion at `/auth/token` routed to an explicit tenant.
+///
+/// The host carries no tenant subdomain, so the route resolves the tenant from
+/// the body `tenant` slug. The isolation test drives the same assertion at two
+/// distinct tenant slugs to prove binding resolution is tenant-scoped.
+async fn post_jwt_bearer_for_tenant(
+    srv: &WyrdTestServer,
+    assertion: &str,
+    tenant: &str,
+) -> axum::http::Response<Body> {
     let body = serde_json::json!({
         "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
         "assertion": assertion,
-        "tenant": FIXTURE_TENANT_SLUG,
+        "tenant": tenant,
     });
     srv.oneshot(
         Request::builder()
@@ -874,6 +895,365 @@ async fn human_oidc_login_journey() {
 
     // Step 4: human token reaches a real authenticated /v1 200 via delegation.
     assert_v1_authz_check_ok(&srv, access_token, "human-sso").await;
+}
+
+// ─── Federated cloud journey: CLI-authored issuer + binding ───────────────────
+
+/// Drive the full federated workload credential lifecycle through the REAL
+/// operator path — `wyrd auth trusted-issuer add` and `wyrd auth
+/// workload-binding add` over HTTP into `/admin` → Postgres — then exchange a
+/// live Keycloak assertion and reach `/v1`:
+///   1. an admin SA (`runtime_admin`) mints the access token the CLI presents,
+///   2. the trusted issuer is authored via the CLI with a `SecretPost` client
+///      secret, which must be sealed to ciphertext at rest (never plaintext),
+///   3. the `(issuer, subject)` binding is authored via the CLI, resolving to a
+///      server-owned Service card a principal is seeded under,
+///   4. `POST /auth/token {jwt-bearer}` exchanges the Keycloak assertion → 200,
+///   5. the exchanged Service token reaches a real `/v1/authz/check` 200,
+///   6. the production `wyrd-client` middleware caches one exchange, reuses the
+///      cached token while fresh, and re-exchanges on `force_refresh`.
+///
+/// Unlike the config-driven `workload_jwt_bearer_journey_keycloak`, every trust
+/// record here is authored post-boot through the CLI the operator runs, proving
+/// the `PgIssuerResolver`/`PgWorkloadBindingResolver` serve runtime-authored
+/// rows immediately.
+#[tokio::test]
+async fn federated_cloud_journey_cli_authored_keycloak() {
+    if !e2e_enabled() {
+        return;
+    }
+
+    // Real socket: the `wyrd auth` CLI authors through HTTP against `/admin`.
+    let srv = WyrdTestServerBuilder::default()
+        .start_bound()
+        .await
+        .expect("bound server starts");
+    let server_url: Url = srv
+        .base_url()
+        .expect("bound server exposes a base URL")
+        .parse()
+        .expect("base URL parses");
+
+    // Foreign OIDC assertion from Keycloak; bind it to its real subject.
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+    let assertion = keycloak
+        .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
+        .await;
+    let subject = jwt_claims(&assertion)["sub"]
+        .as_str()
+        .expect("workload token carries a subject")
+        .to_owned();
+
+    // Admin SA holding runtime_admin → access token used as the CLI bearer.
+    let admin = srv
+        .bootstrap_service("cloud-journey-admin", &["runtime_admin"])
+        .await
+        .expect("admin service account bootstraps");
+    let admin_token = srv
+        .exchange_api_key(admin.api_key().expect("admin has api key"))
+        .await
+        .expect("admin api key exchange succeeds");
+
+    // The server-owned card the binding resolves to; seed its principal.
+    let card_ref = binding_card_ref(CardKind::Service, "cloud-journey-sa", "prod");
+    srv.seed_card_principal(&card_ref, &["runtime_admin"])
+        .await
+        .expect("workload principal seeds");
+
+    // Author the trusted issuer THROUGH the real CLI verb, with a SecretPost
+    // client secret that must round-trip to ciphertext at rest.
+    let client_secret = "cli-authored-issuer-secret";
+    trusted_issuer::dispatch(TrustedIssuerCommand::Add(TrustedIssuerAddArgs {
+        issuer: keycloak_issuer(),
+        expected_audience: "wyrd-workload".to_owned(),
+        client_id: "wyrd-workload".to_owned(),
+        client_auth: "SecretPost".to_owned(),
+        client_secret: Some(client_secret.to_owned()),
+        claim_subject: "sub".to_owned(),
+        principal_kind: "Workload".to_owned(),
+        jwks_ttl_secs: Some(300),
+        server: server_url.clone(),
+        token: admin_token.clone(),
+    }))
+    .await
+    .expect("CLI trusted-issuer add succeeds");
+
+    // Author the workload binding THROUGH the real CLI verb.
+    workload_binding::dispatch(WorkloadBindingCommand::Add(WorkloadBindingAddArgs {
+        issuer: keycloak_issuer(),
+        subject: subject.clone(),
+        audience: Some("wyrd-workload".to_owned()),
+        card: card_ref.to_string(),
+        server: server_url.clone(),
+        token: admin_token.clone(),
+    }))
+    .await
+    .expect("CLI workload-binding add succeeds");
+
+    // Ciphertext-at-rest: the stored secret is sealed, never the plaintext.
+    let ciphertext = srv
+        .trusted_issuer_secret_ciphertext(srv.data_tenant_id(), &keycloak_issuer())
+        .await
+        .expect("ciphertext read succeeds")
+        .expect("CLI-authored issuer stores a sealed client secret");
+    assert!(
+        !ciphertext.is_empty(),
+        "stored client secret ciphertext is non-empty"
+    );
+    assert_ne!(
+        ciphertext.as_slice(),
+        client_secret.as_bytes(),
+        "stored client secret is sealed ciphertext, not plaintext"
+    );
+
+    // jwt-bearer exchange against the CLI-authored issuer+binding → 200.
+    let resp = post_jwt_bearer(&srv, &assertion).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "CLI-authored workload jwt-bearer exchange returns 200: {}",
+        resp.status()
+    );
+    let bytes = to_bytes(resp.into_body(), 65_536)
+        .await
+        .expect("token body reads");
+    let token_body: Value = serde_json::from_slice(&bytes).expect("token response is JSON");
+    let wyrd_token = token_body["access_token"]
+        .as_str()
+        .expect("access_token present");
+
+    // Terminal: the exchanged Service token reaches a real /v1/authz/check 200.
+    assert_v1_authz_check_ok(&srv, wyrd_token, "cloud-journey").await;
+
+    // Client lifecycle: the production wyrd-client middleware caches one
+    // exchange, reuses it while fresh, and re-exchanges on force_refresh.
+    assert_client_workload_lifecycle(&srv, &assertion).await;
+
+    srv.shutdown().await.expect("server shuts down cleanly");
+}
+
+/// Assert the production `wyrd-client` workload-credential lifecycle end-to-end
+/// against the live bound server: one cached exchange, reuse while fresh, and a
+/// fresh re-exchange on `force_refresh` — the exact path a workload's transport
+/// drives at startup and on a reactive `401`.
+async fn assert_client_workload_lifecycle(srv: &WyrdTestServer, assertion: &str) {
+    // Connect via `localhost` (not the bound `127.0.0.1`): the workload
+    // exchange resolves the tenant from the request host first, and an IP host
+    // is misread as a subdomain; a single-label `localhost` host yields no host
+    // tenant, so the route falls back to the body `tenant` slug the
+    // `WorkloadJwt` credential carries — the path this credential exists to
+    // drive. Both names reach the same loopback listener.
+    let base_url = srv
+        .base_url()
+        .expect("bound server exposes a base URL")
+        .replace("127.0.0.1", "localhost");
+    let config = ClientConfig {
+        http: HttpConfig {
+            base_url,
+            ..HttpConfig::default()
+        },
+        token_cache: TokenCacheMode::InMemory,
+        ..ClientConfig::default()
+    };
+
+    let middleware = AuthMiddleware::new(
+        &config,
+        ResolvedCredential::WorkloadJwt {
+            jwt: SecretString::from(assertion.to_owned()),
+            tenant: FIXTURE_TENANT_SLUG.to_owned(),
+        },
+    )
+    .expect("workload auth middleware builds");
+
+    // First bearer() exchanges the assertion once; the second returns the
+    // cached token unchanged (a single /auth/token round-trip while fresh).
+    let first = middleware
+        .bearer()
+        .await
+        .expect("first workload exchange succeeds");
+    let second = middleware.bearer().await.expect("cached bearer succeeds");
+    assert_eq!(
+        first.expose(),
+        second.expose(),
+        "cached workload token is reused while fresh (single exchange)"
+    );
+
+    // force_refresh re-exchanges, yielding a fresh, well-formed Wyrd token.
+    let refreshed = middleware
+        .force_refresh()
+        .await
+        .expect("force_refresh re-exchanges the assertion");
+    assert!(
+        !refreshed.expose().is_empty(),
+        "refreshed token is non-empty"
+    );
+    assert_eq!(
+        refreshed.expose().split('.').count(),
+        3,
+        "refreshed token is a 3-segment JWT"
+    );
+
+    // The exchanged token is a real Wyrd access token usable on /v1.
+    assert_v1_authz_check_ok(srv, refreshed.expose(), "cloud-journey-client").await;
+}
+
+// ─── Same-issuer two-tenant isolation ─────────────────────────────────────────
+
+/// Prove RLS-scoped binding isolation: the SAME issuer URL authored in two
+/// tenants, with a subject bound only in tenant A, resolves in A and fails
+/// closed in B.
+///   1. tenant A is the fixture tenant; tenant B is provisioned fresh,
+///   2. per-tenant `runtime_admin` admins each author the same issuer via the
+///      real CLI (so the issuer is trusted in BOTH tenants),
+///   3. the `(issuer, subject)` binding is authored via the CLI only in A, and
+///      its principal is seeded only in A,
+///   4. a storage cross-check drives TWO distinct `TenantConn`s (RLS, not a
+///      shared filter): the binding is visible under A, invisible under B,
+///   5. the same Keycloak assertion resolves at tenant A's slug → 200, and at
+///      tenant B's slug fails closed with `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND`
+///      (issuer trusted, binding absent).
+#[tokio::test]
+async fn same_issuer_two_tenant_isolation_keycloak() {
+    if !e2e_enabled() {
+        return;
+    }
+
+    let srv = WyrdTestServerBuilder::default()
+        .start_bound()
+        .await
+        .expect("bound server starts");
+    let server_url: Url = srv
+        .base_url()
+        .expect("bound server exposes a base URL")
+        .parse()
+        .expect("base URL parses");
+
+    // Tenant A is the fixture tenant; tenant B is provisioned fresh.
+    const TENANT_A_SLUG: &str = FIXTURE_TENANT_SLUG;
+    const TENANT_B_SLUG: &str = "test-tenant-2";
+    let tenant_a = srv.data_tenant_id();
+    let tenant_b = srv
+        .seed_tenant(TENANT_B_SLUG)
+        .await
+        .expect("tenant B provisions");
+
+    // The foreign assertion both tenants independently present.
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+    let assertion = keycloak
+        .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
+        .await;
+    let subject = jwt_claims(&assertion)["sub"]
+        .as_str()
+        .expect("workload token carries a subject")
+        .to_owned();
+
+    // Per-tenant runtime_admin admins, each minted under its own tenant so its
+    // access token authors into that tenant.
+    let admin_a = srv
+        .bootstrap_service_in_tenant(tenant_a, "iso-admin-a", &["runtime_admin"])
+        .await
+        .expect("tenant A admin bootstraps");
+    let admin_token_a = srv
+        .exchange_api_key(admin_a.api_key().expect("admin A has api key"))
+        .await
+        .expect("admin A api key exchange succeeds");
+    let admin_b = srv
+        .bootstrap_service_in_tenant(tenant_b, "iso-admin-b", &["runtime_admin"])
+        .await
+        .expect("tenant B admin bootstraps");
+    let admin_token_b = srv
+        .exchange_api_key(admin_b.api_key().expect("admin B has api key"))
+        .await
+        .expect("admin B api key exchange succeeds");
+
+    // Author the SAME issuer URL in BOTH tenants via the real CLI.
+    for token in [&admin_token_a, &admin_token_b] {
+        trusted_issuer::dispatch(TrustedIssuerCommand::Add(TrustedIssuerAddArgs {
+            issuer: keycloak_issuer(),
+            expected_audience: "wyrd-workload".to_owned(),
+            client_id: "wyrd-workload".to_owned(),
+            client_auth: "Public".to_owned(),
+            client_secret: None,
+            claim_subject: "sub".to_owned(),
+            principal_kind: "Workload".to_owned(),
+            jwks_ttl_secs: Some(300),
+            server: server_url.clone(),
+            token: token.clone(),
+        }))
+        .await
+        .expect("CLI trusted-issuer add succeeds");
+    }
+
+    // Bind the subject ONLY in tenant A (CLI), and seed its principal in A only.
+    let card_ref = binding_card_ref(CardKind::Service, "iso-sa", "prod");
+    workload_binding::dispatch(WorkloadBindingCommand::Add(WorkloadBindingAddArgs {
+        issuer: keycloak_issuer(),
+        subject: subject.clone(),
+        audience: Some("wyrd-workload".to_owned()),
+        card: card_ref.to_string(),
+        server: server_url.clone(),
+        token: admin_token_a.clone(),
+    }))
+    .await
+    .expect("CLI workload-binding add (tenant A) succeeds");
+    srv.seed_card_principal_in_tenant(tenant_a, &card_ref, &["runtime_admin"])
+        .await
+        .expect("tenant A workload principal seeds");
+
+    // Storage cross-check via TWO distinct tenant connections (RLS, not a
+    // shared filter): the binding is visible under A, absent under B.
+    assert!(
+        srv.workload_binding_exists(
+            tenant_a,
+            &keycloak_issuer(),
+            &subject,
+            Some("wyrd-workload")
+        )
+        .await
+        .expect("tenant A binding lookup succeeds"),
+        "binding is visible under tenant A's RLS scope"
+    );
+    assert!(
+        !srv.workload_binding_exists(
+            tenant_b,
+            &keycloak_issuer(),
+            &subject,
+            Some("wyrd-workload")
+        )
+        .await
+        .expect("tenant B binding lookup succeeds"),
+        "binding is invisible under tenant B's RLS scope"
+    );
+
+    // Resolve at tenant A's slug → 200.
+    let resp_a = post_jwt_bearer_for_tenant(&srv, &assertion, TENANT_A_SLUG).await;
+    assert_eq!(
+        resp_a.status(),
+        StatusCode::OK,
+        "tenant A resolves the bound subject: {}",
+        resp_a.status()
+    );
+
+    // The SAME subject token at tenant B's slug fails closed (issuer trusted,
+    // binding absent under B).
+    let resp_b = post_jwt_bearer_for_tenant(&srv, &assertion, TENANT_B_SLUG).await;
+    assert_eq!(
+        resp_b.status(),
+        StatusCode::NOT_FOUND,
+        "tenant B fails closed for the unbound subject: {}",
+        resp_b.status()
+    );
+    let bytes = to_bytes(resp_b.into_body(), 65_536)
+        .await
+        .expect("body reads");
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    assert_eq!(
+        response_code(&body),
+        "WYRD_AUTH_404_PRINCIPAL_NOT_FOUND",
+        "tenant B returns principal-not-found; body={body}"
+    );
+
+    srv.shutdown().await.expect("server shuts down cleanly");
 }
 
 // ─── Conformance: server route error codes ────────────────────────────────────

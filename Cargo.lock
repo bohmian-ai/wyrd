@@ -10756,6 +10756,8 @@ dependencies = [
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
+ "wyrd-cli",
+ "wyrd-client",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
  "wyrd-enterprise",

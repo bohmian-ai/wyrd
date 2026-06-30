@@ -70,3 +70,5 @@ wiremock = { workspace = true }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
 wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
 wyrd-testing = { path = "../wyrd-testing", version = "0.0.1" }
+wyrd-cli = { path = "../wyrd-cli", version = "0.0.1" }
+wyrd-client = { path = "../../shared/wyrd-client", version = "0.0.1" }

@@ -93,7 +93,7 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
 
     let url = args
         .server
-        .join("/admin/workload-bindings")
+        .join("/v1/admin/workload-bindings")
         .map_err(|source| WyrdCliError::UrlJoin { source })?;
 
     let body = serde_json::to_string(&CreateWorkloadBindingRequest {
@@ -107,10 +107,7 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
     let resp = reqwest::Client::new()
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", args.token),
-        )
+        .header("x-wyrd-access-token", format!("Bearer {}", args.token))
         .body(body)
         .send()
         .await
@@ -140,13 +137,12 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
 async fn list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
     let url = args
         .server
-        .join("/admin/workload-bindings")
+        .join("/v1/admin/workload-bindings")
         .map_err(|source| WyrdCliError::UrlJoin { source })?;
 
-    let mut builder = reqwest::Client::new().get(url).header(
-        reqwest::header::AUTHORIZATION,
-        format!("Bearer {}", args.token),
-    );
+    let mut builder = reqwest::Client::new()
+        .get(url)
+        .header("x-wyrd-access-token", format!("Bearer {}", args.token));
 
     if let Some(ref issuer) = args.issuer {
         builder = builder.query(&[("issuer", issuer.as_str())]);
@@ -181,7 +177,7 @@ async fn list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
 async fn rm(args: RmArgs) -> Result<ExitCode, WyrdCliError> {
     let url = args
         .server
-        .join("/admin/workload-bindings")
+        .join("/v1/admin/workload-bindings")
         .map_err(|source| WyrdCliError::UrlJoin { source })?;
 
     let resp = reqwest::Client::new()
@@ -190,10 +186,7 @@ async fn rm(args: RmArgs) -> Result<ExitCode, WyrdCliError> {
             ("issuer", args.issuer.as_str()),
             ("subject", args.subject.as_str()),
         ])
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", args.token),
-        )
+        .header("x-wyrd-access-token", format!("Bearer {}", args.token))
         .send()
         .await
         .map_err(|source| WyrdCliError::Http { source })?;

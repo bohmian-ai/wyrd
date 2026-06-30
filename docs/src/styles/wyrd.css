@@ -32,6 +32,9 @@
 /* ---- canonical tokens (generated from palette.json; switches on [data-theme]) ---- */
 @import "./wyrd-tokens.css";
 
+/* ---- arcade-brutalist primitives (shadow scale, radius, borders, notch, dither, plane, fuji) ---- */
+@import "./wyrd-primitives.css";
+
 /* ============================================================================
    2 · Page chrome — sidebar (Quiet register = JetBrains Mono)
    ============================================================================ */

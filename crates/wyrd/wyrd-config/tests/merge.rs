@@ -23,6 +23,7 @@ fn fresh_meta(name: &str) -> Metadata {
         annotations: BTreeMap::default(),
         spec_hash: None,
         artifact_hash: None,
+        origin: None,
     }
 }
 
@@ -210,6 +211,7 @@ fn merge_version_is_never_touched() {
             annotations: BTreeMap::default(),
             spec_hash: None,
             artifact_hash: None,
+            origin: None,
         };
         apply_defaults(&mut meta, &CardKind::Model, &cfg);
         assert_eq!(meta.version, version);

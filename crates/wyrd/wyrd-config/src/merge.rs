@@ -40,6 +40,7 @@ use crate::config::{KindOverride, WyrdConfig};
 ///     annotations: Default::default(),
 ///     spec_hash: None,
 ///     artifact_hash: None,
+///     origin: None,
 /// };
 /// apply_defaults(&mut meta, &CardKind::Model, &cfg);
 /// assert_eq!(meta.space.as_ref().map(|s| s.as_str()), Some("prod"));
@@ -118,6 +119,7 @@ mod tests {
             annotations: BTreeMap::default(),
             spec_hash: None,
             artifact_hash: None,
+            origin: None,
         }
     }
 

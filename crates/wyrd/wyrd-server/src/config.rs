@@ -49,6 +49,15 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// The sealing-key file named by `WYRD_SEALING_KEY_FILE` could not be read.
+    #[error("sealing-key file at {path} could not be read")]
+    ReadSealingKey {
+        /// Path that failed to read.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
     /// An environment variable is set but contains no value.
     #[error("environment variable {key} is set but empty")]
     EmptyEnvVar {
@@ -273,6 +282,15 @@ pub struct AuthConfig {
     /// separately. `None` when unset; production boot fails closed without it.
     #[serde(skip)]
     pub signing_key: Option<SecretString>,
+    /// Base64-encoded 32-byte AES-256-GCM sealing key for issuer client secrets.
+    ///
+    /// Env-injected only — never read from the TOML file. Loaded at config time
+    /// from `WYRD_SEALING_KEY_FILE` (path to a mounted secret; primary) or
+    /// `WYRD_SEALING_KEY_BASE64` (inline base64; fallback). Boot decodes this to
+    /// a 32-byte key. `None` when unset; boot fails closed if any seeded issuer
+    /// carries a client secret without a sealing key configured.
+    #[serde(skip)]
+    pub sealing_key: Option<SecretString>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -752,6 +770,11 @@ impl WyrdServerConfig {
             self.auth.signing_key = Some(key);
         }
 
+        // auth.sealing_key (WYRD_SEALING_KEY_FILE primary, WYRD_SEALING_KEY_BASE64 fallback)
+        if let Some(key) = load_sealing_key()? {
+            self.auth.sealing_key = Some(key);
+        }
+
         Ok(())
     }
 
@@ -1017,6 +1040,34 @@ fn load_signing_key() -> Result<Option<SecretString>, ConfigError> {
             Ok(Some(SecretString::from(pem)))
         }
         (None, Some(pem)) => Ok(Some(SecretString::from(pem))),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Load the base64-encoded issuer sealing key from the environment.
+///
+/// `WYRD_SEALING_KEY_FILE` (a path to a mounted secret) is the primary source;
+/// `WYRD_SEALING_KEY_BASE64` (inline base64) is the fallback. The file form is
+/// preferred for the same reason as the signing key. Setting both is a
+/// configuration error. Surrounding whitespace (e.g. a trailing newline in a
+/// mounted secret file) is trimmed; boot decodes the base64 to a 32-byte key.
+fn load_sealing_key() -> Result<Option<SecretString>, ConfigError> {
+    let file = env_opt("WYRD_SEALING_KEY_FILE")?;
+    let inline = env_opt("WYRD_SEALING_KEY_BASE64")?;
+    match (file, inline) {
+        (Some(_), Some(_)) => Err(ConfigError::ConflictingEnvVars {
+            keys: vec![
+                "WYRD_SEALING_KEY_FILE".to_string(),
+                "WYRD_SEALING_KEY_BASE64".to_string(),
+            ],
+        }),
+        (Some(path), None) => {
+            let path = PathBuf::from(path);
+            let encoded = std::fs::read_to_string(&path)
+                .map_err(|source| ConfigError::ReadSealingKey { path, source })?;
+            Ok(Some(SecretString::from(encoded.trim().to_owned())))
+        }
+        (None, Some(encoded)) => Ok(Some(SecretString::from(encoded.trim().to_owned()))),
         (None, None) => Ok(None),
     }
 }

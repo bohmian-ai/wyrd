@@ -12,7 +12,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use url::Url;
-use wyrd_auth_oidc::{OidcProvider, TrustedIssuer};
+use wyrd_auth_oidc::{IssuerConfigResolver, OidcProvider, TrustedIssuer};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{AbsoluteUrl, IssuerUrl, LoginInitResponse};
 use wyrd_spec::error::WyrdError;
@@ -107,15 +107,15 @@ pub async fn login(
     Query(query): Query<LoginQuery>,
 ) -> Result<Response, WyrdErrorResponse> {
     let tenant_id = resolve_login_tenant(&state, &headers).await?;
-    let trusted = trusted_issuer(&state, tenant_id, &query.issuer)?;
-    let provider = discover_provider(trusted).await?;
+    let trusted = trusted_issuer(&state, tenant_id, &query.issuer).await?;
+    let provider = discover_provider(&trusted).await?;
     let redirect_uri = callback_redirect_uri(&headers)?;
     let state_key = auth_state_key();
     let code_verifier = pkce_verifier();
     let nonce = auth_nonce();
     let authz_url = build_authorization_url(
         &provider,
-        trusted,
+        &trusted,
         &redirect_uri,
         &state_key,
         code_verifier.expose_secret(),
@@ -231,19 +231,34 @@ async fn resolve_tenant_slug(
         .map_err(sql_error)
 }
 
-fn trusted_issuer<'a>(
-    state: &'a AppState,
+async fn trusted_issuer(
+    state: &AppState,
     tenant_id: DataTenantId,
     issuer: &IssuerUrl,
-) -> Result<&'a TrustedIssuer, WyrdErrorResponse> {
-    let registry = state.trusted_issuer_registry.as_ref().ok_or_else(|| {
+) -> Result<TrustedIssuer, WyrdErrorResponse> {
+    let resolver = state.trusted_issuer_resolver.as_ref().ok_or_else(|| {
         WyrdErrorResponse::from(WyrdError::Internal {
-            message: "trusted issuer registry is not configured".to_owned(),
+            message: "trusted issuer resolver is not configured".to_owned(),
             details: serde_json::json!({}),
         })
     })?;
-    registry
-        .get(&tenant_id, issuer)
+    let issuers = resolver
+        .trusted_issuers(&tenant_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                error = %error,
+                tenant_id = %tenant_id,
+                "trusted issuer resolution failed"
+            );
+            WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
+                message: "trusted issuer resolution unavailable".to_owned(),
+                details: serde_json::json!({ "retry_after_seconds": 1 }),
+            })
+        })?;
+    issuers
+        .into_iter()
+        .find(|candidate| candidate.issuer == *issuer)
         .ok_or_else(|| invalid_token("issuer is not trusted for the resolved tenant"))
 }
 

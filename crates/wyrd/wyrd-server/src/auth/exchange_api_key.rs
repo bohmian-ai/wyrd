@@ -23,6 +23,7 @@ use wyrd_sql::queries::auth::{
 
 use crate::auth::issue_api_key::{WyrdApiKey, principal_kind_for_card};
 use crate::auth::permission_resolver::SqlPermissionResolver;
+use crate::auth::pg_resolvers::PgIssuerResolver;
 
 /// Token exchange settings.
 #[derive(Debug, Clone)]
@@ -65,7 +66,7 @@ pub struct DelegateToken {
     /// JWT issuing key.
     pub issuing_key: Arc<IssuingKey>,
     /// JWT verifier.
-    pub verifier: Arc<TokenVerifier<SqlPermissionResolver>>,
+    pub verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
     /// Permission checker.
     pub permission_check: Arc<dyn PermissionCheck>,
     /// Settings.

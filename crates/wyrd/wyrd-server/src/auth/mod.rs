@@ -8,6 +8,7 @@ pub mod issue_api_key;
 pub mod jwt_bearer;
 pub mod login;
 pub mod permission_resolver;
+pub mod pg_resolvers;
 pub mod policy_hook;
 pub mod principal_extractor;
 pub mod refresh;

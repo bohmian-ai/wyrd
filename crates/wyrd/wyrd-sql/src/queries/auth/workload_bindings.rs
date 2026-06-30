@@ -4,6 +4,8 @@
 //! isolation via `data_tenant_id = wyrd.current_tenant()`.
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
+use serde_json::Value;
+
 use crate::TenantConn;
 use crate::row_types::auth::WorkloadBindingRow;
 
@@ -17,6 +19,32 @@ const WORKLOAD_BINDING_BY_SUBJECT_SQL: &str = r#"
      ORDER BY CASE WHEN audience IS NOT NULL THEN 0 ELSE 1 END
      LIMIT 1
 "#;
+
+const UPSERT_WORKLOAD_BINDING_SQL: &str = r#"
+    INSERT INTO wyrd.auth_workload_bindings (
+        data_tenant_id, issuer_url, subject, audience, card_ref
+    ) VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (data_tenant_id, issuer_url, subject) DO UPDATE SET
+        audience = EXCLUDED.audience,
+        card_ref = EXCLUDED.card_ref,
+        updated_at = now()
+"#;
+
+/// Owned column values for an upsert into `wyrd.auth_workload_bindings`.
+///
+/// `data_tenant_id` is bound from the [`TenantConn`], never from this struct.
+/// `card_ref` is a pre-encoded structured JSONB `serde_json::Value`.
+#[derive(Debug, Clone)]
+pub struct WorkloadBindingWrite {
+    /// OIDC issuer URL (FK composite with `data_tenant_id`).
+    pub issuer_url: String,
+    /// Token subject claim that identifies this workload.
+    pub subject: String,
+    /// Optional audience override; `None` acts as a wildcard fallback.
+    pub audience: Option<String>,
+    /// Structured Card reference serialized to JSONB.
+    pub card_ref: Value,
+}
 
 /// Look up a workload binding for the given `(issuer, subject)` pair.
 ///
@@ -41,9 +69,45 @@ pub async fn workload_binding_by_subject(
         .await
 }
 
+/// Insert or update a workload binding for the current tenant.
+///
+/// `data_tenant_id` is taken from the bound [`TenantConn`]. On
+/// `(data_tenant_id, issuer_url, subject)` conflict the audience and card
+/// reference are overwritten so re-seeding from config is idempotent. The
+/// referenced trusted issuer row must already exist (FK `ON DELETE RESTRICT`).
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the upsert (including FK
+/// violations when the issuer has not been seeded first).
+pub async fn upsert_workload_binding(
+    conn: &mut TenantConn<'_>,
+    binding: &WorkloadBindingWrite,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(UPSERT_WORKLOAD_BINDING_SQL)
+        .bind(conn.data_tenant_id().as_uuid())
+        .bind(&binding.issuer_url)
+        .bind(&binding.subject)
+        .bind(&binding.audience)
+        .bind(&binding.card_ref)
+        .execute(&mut **conn.transaction())
+        .await
+        .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::WORKLOAD_BINDING_BY_SUBJECT_SQL;
+    use super::{UPSERT_WORKLOAD_BINDING_SQL, WORKLOAD_BINDING_BY_SUBJECT_SQL};
+
+    #[test]
+    fn upsert_targets_composite_key_and_overwrites_columns() {
+        assert!(UPSERT_WORKLOAD_BINDING_SQL.contains("INSERT INTO wyrd.auth_workload_bindings"));
+        assert!(
+            UPSERT_WORKLOAD_BINDING_SQL
+                .contains("ON CONFLICT (data_tenant_id, issuer_url, subject)")
+        );
+        assert!(UPSERT_WORKLOAD_BINDING_SQL.contains("card_ref = EXCLUDED.card_ref"));
+        assert!(UPSERT_WORKLOAD_BINDING_SQL.contains("audience = EXCLUDED.audience"));
+    }
 
     #[test]
     fn workload_binding_by_subject_prefers_audience_specific_row() {

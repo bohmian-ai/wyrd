@@ -10,6 +10,7 @@ use secrecy::SecretString;
 use serde_json::Value;
 use url::Url;
 use wyrd_auth_check::AuthzCheckRequest;
+use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_semver::VersionBlock;
 use wyrd_server::config::{
@@ -231,14 +232,19 @@ async fn assert_config_driven_trust_layer(issuer: &str, audience: &str) {
         .expect("server boots through config-driven issuer discovery");
 
     let tenant_id = srv.data_tenant_id();
-    let registry = srv
+    let resolver = srv
         .state()
-        .trusted_issuer_registry
+        .trusted_issuer_resolver
         .as_ref()
-        .expect("config seam populated the trusted-issuer registry");
+        .expect("config seam populated the trusted-issuer resolver");
     let key = IssuerUrl::new(issuer.to_owned()).expect("issuer URL is a valid issuer");
-    let entry = registry
-        .get(&tenant_id, &key)
+    let issuers = resolver
+        .trusted_issuers(&tenant_id)
+        .await
+        .expect("issuer resolution from Postgres succeeds");
+    let entry = issuers
+        .iter()
+        .find(|candidate| candidate.issuer == key)
         .expect("issuer resolves under the implicit tenant (F02 keying)");
     assert!(
         entry.jwks_uri.as_str().starts_with("http"),

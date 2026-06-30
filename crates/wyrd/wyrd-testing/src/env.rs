@@ -24,6 +24,7 @@ use wyrd_semver::VersionBlock;
 use wyrd_server::auth::audit_writer::NoopAuthzAuditWriter;
 use wyrd_server::auth::issue_api_key::WyrdApiKey;
 use wyrd_server::auth::permission_resolver::SqlPermissionResolver;
+use wyrd_server::auth::pg_resolvers::PgIssuerResolver;
 use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
@@ -53,7 +54,7 @@ struct WyrdTestEnvInner {
     storage_root: tempfile::TempDir,
     state: AppState,
     router: axum::Router,
-    verifier: Arc<TokenVerifier<SqlPermissionResolver>>,
+    verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
     issuing_key: Arc<IssuingKey>,
 }
 

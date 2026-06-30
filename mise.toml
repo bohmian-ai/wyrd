@@ -974,6 +974,12 @@ description = "Validate local Markdown links in the docs site"
 dir = "docs"
 run = "python scripts/check_links.py"
 
+[tasks."docs:a11y"]
+hide = true
+description = "A11y gate: landmarks, heading order, WCAG AA contrast, keyboard controls over prerendered build"
+dir = "docs"
+run = "python scripts/check_a11y.py"
+
 [tasks."docs:svelte:check"]
 hide = true
 description = "Run svelte-check type and content checks for the docs site"

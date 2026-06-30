@@ -1,6 +1,9 @@
 ---
 title: Data
 description: Generated reference for the Wyrd Data card spec.
+pillar: wyrd
+group: cards
+order: 1
 ---
 
 # Data

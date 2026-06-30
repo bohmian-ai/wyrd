@@ -6,6 +6,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use base64::Engine as _;
 use chrono::Duration as ChronoDuration;
+use secrecy::SecretString;
 use serde_json::Value;
 use url::Url;
 use wyrd_auth_check::AuthzCheckRequest;
@@ -14,7 +15,7 @@ use wyrd_semver::VersionBlock;
 use wyrd_server::config::{
     ClaimMappingEntry, ClientAuthEntry, IssuerEntry, PrincipalKindEntry, WorkloadBindingEntry,
 };
-use wyrd_spec::auth::IssuerUrl;
+use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse, IssuerUrl};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
@@ -636,6 +637,99 @@ async fn revocation_requires_admin_permission() {
         "non-admin revoke attempt returns 403: {}",
         resp.status()
     );
+}
+
+// ─── Service-account issuer full chain ────────────────────────────────────────
+
+/// Full-chain API-key journey with a **service-account** issuer:
+///   1. Admin SA (`runtime_admin`) bootstrapped via harness SQL.
+///   2. Target SA bootstrapped via harness SQL (the key is issued for this card).
+///   3. Admin key → `POST /auth/token` → access token.
+///   4. `POST /auth/issue-key` authenticated as the admin SA; `created_by` is the
+///      SA's `service_account.id` — the direct assertion that the relaxed FK
+///      (commit 01) accepts a non-user issuer (pre-migration this would 500).
+///   5. Issued key → `POST /auth/token` → access token.
+///   6. `assert_v1_authz_check_ok` → `/v1/authz/check 200`.
+#[tokio::test]
+async fn service_account_issuer_full_chain() {
+    if !e2e_enabled() {
+        return;
+    }
+
+    let srv = WyrdTestServerBuilder::default()
+        .start_in_process()
+        .await
+        .expect("test server starts");
+
+    // Admin service account: holds runtime_admin so it has key-issuance permission.
+    let admin = srv
+        .bootstrap_service("sa-chain-admin", &["runtime_admin"])
+        .await
+        .expect("admin service account bootstraps");
+    let admin_key = admin.api_key().expect("admin has api key").clone();
+
+    // Exchange admin API key → access token (principal is the SA, not a user).
+    let admin_token = srv
+        .exchange_api_key(&admin_key)
+        .await
+        .expect("admin api key exchange succeeds");
+
+    // Target service card: the card a key will be issued for.
+    // Holds runtime_admin so the issued token can later delegate to the terminal.
+    let target = srv
+        .bootstrap_service("sa-chain-target", &["runtime_admin"])
+        .await
+        .expect("target service account bootstraps");
+    let target_card_ref = target
+        .card_ref()
+        .expect("target carries a card_ref")
+        .clone();
+
+    // POST /auth/issue-key as the admin SA.
+    // The issuer principal is a service account (not a user), so `created_by`
+    // must resolve to `service_account.id` — the FK-relaxation path from commit 01.
+    let issue_req = IssueKeyRequest {
+        card_ref: target_card_ref,
+        label: Some("sa-chain".to_owned()),
+        expires_in_seconds: None,
+    };
+    let issue_resp = srv
+        .oneshot_authenticated(
+            &admin_token,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/issue-key")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&issue_req).expect("issue-key request serializes"),
+                ))
+                .expect("issue-key request builds"),
+        )
+        .await
+        .expect("issue-key call completes");
+    assert_eq!(
+        issue_resp.status(),
+        StatusCode::OK,
+        "service-account issuer: issue-key returns 200, got {}",
+        issue_resp.status()
+    );
+    let issue_bytes = to_bytes(issue_resp.into_body(), 65_536)
+        .await
+        .expect("issue-key body reads");
+    let issue_body: IssueKeyResponse =
+        serde_json::from_slice(&issue_bytes).expect("issue-key response is valid JSON");
+    assert!(!issue_body.key_id.is_empty(), "issued key has a key_id");
+
+    // Exchange the issued key → access token.
+    let issued_secret = SecretString::from(issue_body.key.expose().to_owned());
+    let issued_token = srv
+        .exchange_api_key(&issued_secret)
+        .await
+        .expect("issued key exchange succeeds");
+
+    // Terminal: /v1/authz/check 200 — proves the issued token is valid and the
+    // full chain succeeds with a service-account issuer.
+    assert_v1_authz_check_ok(&srv, &issued_token, "sa-chain").await;
 }
 
 // ─── Human OIDC login journey (Keycloak) ──────────────────────────────────────

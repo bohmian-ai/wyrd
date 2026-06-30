@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod auth_boot;
 pub mod boot;
+pub mod bootstrap;
 pub mod config;
 pub mod error;
 pub mod grpc;

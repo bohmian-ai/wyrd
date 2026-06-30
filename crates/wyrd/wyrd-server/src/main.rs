@@ -1,12 +1,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use clap::{Parser, Subcommand};
+use secrecy::ExposeSecret;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use wyrd_tonic::tonic_health::server::health_reporter;
 
 use wyrd_server::boot::production_guards;
+use wyrd_server::bootstrap::bootstrap_admin_key;
 use wyrd_server::grpc::{
     GrpcError, GrpcRouterConfig, NoopInterceptor, build_grpc_router, drive_health_status,
     publish_initial_health, serve_grpc,
@@ -16,14 +19,44 @@ use wyrd_server::shutdown::{await_drain, signal_watcher};
 use wyrd_server::{
     WyrdServerConfig, build_app_state_from_config, build_router, spawn_storage_sweeper,
 };
+use wyrd_spec::TenantSlug;
+use wyrd_sql::pool::build_app_pool;
+use wyrd_sql::postgres_boot::PostgresBoot;
 use wyrd_telemetry::{TelemetryGuard, init as init_telemetry};
 
 const EX_CONFIG: i32 = 78;
 const EX_SOFTWARE: i32 = 70;
 
+/// Wyrd control-plane server.
+#[derive(Debug, Parser)]
+#[command(name = "wyrd-server", version, about = "Wyrd control-plane server")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Operator subcommands. The absent arm runs the server.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Mint the first admin API key for a fresh deployment.
+    BootstrapKey {
+        /// Tenant slug to bootstrap.
+        #[arg(long)]
+        tenant: String,
+    },
+}
+
 #[tokio::main]
 async fn main() {
-    let exit_code = match run().await {
+    // Parse the CLI before any telemetry/serve init so the serve path on the
+    // `None` arm stays byte-for-byte today's `run()`.
+    let cli = Cli::parse();
+    let result = match cli.command {
+        None => run().await,
+        Some(Command::BootstrapKey { tenant }) => bootstrap_key(&tenant).await,
+    };
+
+    let exit_code = match result {
         Ok(()) => 0,
         Err(BootExit::Config(err)) => {
             eprintln!("wyrd-server: config error: {err}");
@@ -35,6 +68,31 @@ async fn main() {
         }
     };
     std::process::exit(exit_code);
+}
+
+/// Mint and print the first admin API key for `tenant`.
+///
+/// Builds only the runtime `wyrd_app` pool — never telemetry, storage,
+/// listeners, or `AppState` — runs the issuance chain in one transaction, then
+/// prints the plaintext key once to stdout.
+async fn bootstrap_key(tenant: &str) -> Result<(), BootExit> {
+    let _config = WyrdServerConfig::load().map_err(|e| BootExit::Config(Box::new(e)))?;
+    let slug = TenantSlug::new(tenant).map_err(|e| BootExit::Config(Box::new(e)))?;
+
+    let boot = PostgresBoot::from_env()
+        .await
+        .map_err(|e| BootExit::Other(Box::new(e)))?;
+    let dsns = boot.dsns().map_err(|e| BootExit::Other(Box::new(e)))?;
+    let pool = build_app_pool(dsns.app.expose_secret())
+        .await
+        .map_err(|e| BootExit::Other(Box::new(e)))?;
+
+    let key = bootstrap_admin_key(&pool, &slug)
+        .await
+        .map_err(|e| BootExit::Other(Box::new(e)))?;
+
+    println!("{}", key.expose());
+    Ok(())
 }
 
 enum BootExit {

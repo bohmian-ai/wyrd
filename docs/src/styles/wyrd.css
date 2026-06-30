@@ -1,14 +1,12 @@
 /* ============================================================================
-   Wyrd docs theme — rebuilt from scratch on the source of truth.
+   Wyrd docs theme — built on the source of truth.
 
    The ONLY inputs to this file are:
      - brand/palette.json  → src/styles/wyrd-tokens.css   (every color/font/geometry value)
      - brand/wyrd-ui-source-of-truth-v2.html              (every component recipe)
 
-   Mechanism: our tokens are wired into Starlight's render layer through the
-   handful of --sl-* inlets Starlight reads (Token→--sl-* bridge). Every --sl-*
-   value is var(--our-token); there are NO Starlight preset colors or fonts, and
-   NO hand-picked hex anywhere below — only tokens, SoT geometry, and SoT recipes.
+   Mechanism: themeable values are CSS custom properties from wyrd-tokens.css.
+   No raw hex outside wyrd-tokens.css; only tokens, SoT geometry, and SoT recipes.
 
    SoT geometry (locked): 5px radius (--r) on surfaces/controls, 7px on large
    containers, 50% circles only for dots/avatars; 2px ink borders (3px hero),
@@ -16,6 +14,9 @@
    register (§3) is the docs model: JetBrains Mono chrome, Archivo Black titles,
    Archivo prose, Press Start 2P wordmark, VT323 numerals. No glow/CRT/hairlines.
    ============================================================================ */
+
+/* ---- Tailwind v4 (base/preflight) — ahead of tokens so generated props win ---- */
+@import "tailwindcss";
 
 /* ---- fonts (the five SoT roles) ---- */
 @import "@fontsource/archivo/500.css";
@@ -31,52 +32,9 @@
 /* ---- canonical tokens (generated from palette.json; switches on [data-theme]) ---- */
 @import "./wyrd-tokens.css";
 
-/* NOTE (Phase B): the former "Token → --sl-* bridge" section was removed — it
-   only fed Starlight's render layer, which no longer exists. The sections below
-   are arcade/brand recipes kept verbatim for Phase C to re-home onto the
-   SvelteKit doc shell; their Starlight-scoped selectors (.sl-markdown-content,
-   .header, .sidebar-content, starlight-*) are inert until then. */
-
 /* ============================================================================
-   2 · Page chrome — header, sidebar, TOC, search (Quiet register = JetBrains Mono)
+   2 · Page chrome — sidebar (Quiet register = JetBrains Mono)
    ============================================================================ */
-
-/* header bar — SoT .pagehead: ink/black bar with a 3px lime bottom border */
-.header {
-  border-bottom: 3px solid var(--client-bar);
-  background: var(--border);
-}
-
-/* The brand wordmark is owned by the SiteTitle override
-   (src/components/overrides/SiteTitle.astro). */
-
-/* header chrome on the dark bar — social/nav links, the sidebar toggle, and the
-   theme select all take --hero-ink so they read on ink in both modes. Nav links
-   get the SoT lime hover-fill (.pagehead nav a:hover: ink text on lime). */
-.header .social-icons a,
-starlight-menu-button button,
-starlight-theme-select > label {
-  color: var(--hero-ink);
-}
-.header .social-icons a {
-  border-radius: var(--r);
-  transition: color 0.08s, background 0.08s;
-}
-.header .social-icons a:hover {
-  color: var(--lime-ink);
-  background: var(--client-bar);
-}
-
-/* The search field is owned by the Search override
-   (src/components/overrides/Search.astro). */
-
-/* theme picker — mono chrome, small. The OPEN list is the macOS-native select
-   popup (OS-drawn); sizing the control is what scales it where the OS honors it. */
-starlight-theme-select select,
-starlight-theme-select option {
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
-}
 
 /* sidebar — mono chrome, selected row = rune-soft wash + rune-strong ref (SoT .q-table tr.sel) */
 .sidebar-content {
@@ -103,30 +61,10 @@ starlight-theme-select option {
   color: var(--muted);
 }
 
-/* right-hand table of contents — mono, current item in rune-strong */
-starlight-toc a {
-  font-family: var(--font-mono);
-  font-size: 0.76rem;
-  color: var(--muted);
-}
-starlight-toc a[aria-current="true"] {
-  color: var(--rune-strong);
-  font-weight: 700;
-}
-.right-sidebar h2,
-mobile-starlight-toc .toggle {
-  font-family: var(--font-mono);
-  font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-
 /* ============================================================================
    3 · Content — headings (Archivo Black), prose (Archivo), dividers
    ============================================================================ */
-.sl-markdown-content :is(h1, h2, h3, h4, h5, h6) {
+.doc-content :is(h1, h2, h3, h4, h5, h6) {
   font-family: var(--font-display);
   font-weight: 400;
   color: var(--text);
@@ -137,7 +75,7 @@ mobile-starlight-toc .toggle {
    tall caps stay legible; long headings wrap inside the padded bar via
    overflow-wrap rather than overflowing the content column. h3 keeps a lighter
    rune accent so the hierarchy below h2 stays legible; h4–h6 are untouched. */
-.sl-markdown-content h2 {
+.doc-content h2 {
   font-family: var(--font-arcade);
   font-size: 0.95rem;
   line-height: 1.5;
@@ -146,20 +84,20 @@ mobile-starlight-toc .toggle {
   padding-left: 16px;
   overflow-wrap: anywhere;
 }
-.sl-markdown-content h3 {
+.doc-content h3 {
   border-left: 4px solid var(--rune-strong);
   padding-left: 12px;
   overflow-wrap: anywhere;
 }
 
 /* in-card divider weight (SoT §0): 2px dashed ink */
-.sl-markdown-content hr {
+.doc-content hr {
   border: 0;
   border-top: 2px dashed var(--border);
 }
 
 /* blockquote — semantic left-bar in rune (SoT signal accent on the Line) */
-.sl-markdown-content blockquote {
+.doc-content blockquote {
   border-left: 4px solid var(--rune-strong);
   background: var(--surface-2);
   border-radius: 0 var(--r) var(--r) 0;
@@ -169,11 +107,9 @@ mobile-starlight-toc .toggle {
 
 /* ============================================================================
    4 · Code — inline chip (SoT .rule code) + blocks (SoT .pn-code, JetBrains Mono)
-   Block frame geometry/background is driven through Expressive Code's own
-   styleOverrides in astro.config.mjs (2px border, var(--r) radius, surface-2 bg)
-   so corners clip cleanly — no nested-element radius hacks.
+   Block frame: 2px border, var(--r) radius, surface-2 bg.
    ============================================================================ */
-.sl-markdown-content code:not(:where(pre *)) {
+.doc-content code:not(:where(pre *)) {
   font-family: var(--font-mono);
   font-size: 0.85em;
   background: var(--rune-soft);
@@ -186,7 +122,7 @@ mobile-starlight-toc .toggle {
 /* Markdown fences are highlighted by the shared Shiki dual-theme highlighter
    (svelte.config.js) and emit a bare <pre class="shiki">. Give it the brutalist
    block frame: 2px ink border, 5px radius, 3px hard shadow. */
-.sl-markdown-content pre.shiki {
+.doc-content pre.shiki {
   margin: 1.25rem 0;
   padding: 12px 14px;
   border: 2px solid var(--border);
@@ -218,7 +154,7 @@ mobile-starlight-toc .toggle {
    than crushing its columns or forcing page-level overflow (DESIGN.md: dense
    data scrolls, it doesn't crush).
    ============================================================================ */
-.sl-markdown-content .table-scroll {
+.doc-content .table-scroll {
   width: fit-content;
   max-width: 100%;
   overflow-x: auto;
@@ -228,14 +164,14 @@ mobile-starlight-toc .toggle {
   box-shadow: 3px 3px 0 0 var(--shadow);
   background: var(--surface);
 }
-.sl-markdown-content table {
+.doc-content table {
   font-family: var(--font-mono);
   font-size: 0.8rem;
   border-collapse: separate;
   border-spacing: 0;
   background: var(--surface);
 }
-.sl-markdown-content th {
+.doc-content th {
   text-align: left;
   font-size: 0.72rem;
   font-weight: 700;
@@ -246,15 +182,15 @@ mobile-starlight-toc .toggle {
   padding: 8px 10px;
   border-bottom: 2px solid var(--border);
 }
-.sl-markdown-content td {
+.doc-content td {
   padding: 8px 10px;
   border-bottom: 2px solid var(--border);
   color: var(--text);
 }
-.sl-markdown-content tr:last-child td {
+.doc-content tr:last-child td {
   border-bottom: 0;
 }
-.sl-markdown-content tbody tr:hover {
+.doc-content tbody tr:hover {
   background: var(--surface-2);
 }
 
@@ -264,29 +200,29 @@ mobile-starlight-toc .toggle {
    ============================================================================ */
 /* Asides and cards are genuine "panel" callouts — they sit on the RAISED rung
    (6px hard offset), one step above the quiet-3px default surfaces around them. */
-.starlight-aside,
-.sl-markdown-content .card {
+.wyrd-aside,
+.doc-content .card {
   border: 2px solid var(--border);
   border-radius: var(--r);
   background: var(--surface);
   box-shadow: 6px 6px 0 0 var(--shadow);
 }
-.starlight-aside {
+.wyrd-aside {
   border-left-width: 6px;
 }
-.starlight-aside--note {
+.wyrd-aside--note {
   border-left-color: var(--rune-strong);
 }
-.starlight-aside--tip {
+.wyrd-aside--tip {
   border-left-color: var(--ok);
 }
-.starlight-aside--caution {
+.wyrd-aside--caution {
   border-left-color: var(--warn);
 }
-.starlight-aside--danger {
+.wyrd-aside--danger {
   border-left-color: var(--danger);
 }
-.starlight-aside__title {
+.wyrd-aside__title {
   font-family: var(--font-mono);
   font-weight: 700;
   letter-spacing: 0.04em;
@@ -294,19 +230,18 @@ mobile-starlight-toc .toggle {
 }
 /* rule-card asides: status reads in the title too, not just the left-bar
    (SoT signal rule — status is state). Caution = --warn, danger = --danger. */
-.starlight-aside--caution .starlight-aside__title {
+.wyrd-aside--caution .wyrd-aside__title {
   color: var(--warn);
 }
-.starlight-aside--danger .starlight-aside__title {
+.wyrd-aside--danger .wyrd-aside__title {
   color: var(--danger);
 }
-.sl-markdown-content .card .title {
+.doc-content .card .title {
   font-family: var(--font-display);
 }
 
 /* ============================================================================
-   7 · Pagination is owned by the Pagination override
-   (src/components/overrides/Pagination.astro) — "PREV / NEXT LEVEL" cards.
+   7 · Pagination — "PREV / NEXT LEVEL" cards.
    ============================================================================ */
 
 /* ============================================================================
@@ -919,10 +854,10 @@ mobile-starlight-toc .toggle {
    chips (e.g. `WYRD_CLIENT_400_CONFIG_INVALID`) break instead of overflowing
    the content column. `break-word` only breaks when a token can't fit, so the
    desktop reading rhythm is unchanged. */
-.sl-markdown-content {
+.doc-content {
   overflow-wrap: break-word;
 }
-.sl-markdown-content code:not(:where(pre *)) {
+.doc-content code:not(:where(pre *)) {
   overflow-wrap: break-word;
 }
 
@@ -931,7 +866,7 @@ mobile-starlight-toc .toggle {
      rather than crushing. The wrapper is capped at the content width and owns
      the scroll; the table holds a comfortable floor so 4-column catalogs stay
      readable while the page itself never gains a horizontal scrollbar. */
-  .sl-markdown-content table {
+  .doc-content table {
     min-width: 34rem;
   }
 

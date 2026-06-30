@@ -17,7 +17,7 @@
 
     (async () => {
       await tick();
-      const article = document.querySelector('.sl-markdown-content');
+      const article = document.querySelector('.doc-content');
       if (!article) {
         heads = [];
         return;

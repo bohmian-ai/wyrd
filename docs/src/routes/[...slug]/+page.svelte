@@ -17,7 +17,7 @@
 </svelte:head>
 
 {#if Content}
-  <article class="sl-markdown-content">
+  <article class="doc-content">
     <Content />
   </article>
 {/if}

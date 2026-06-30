@@ -11,6 +11,6 @@
   <meta name="description" content="Developer and agent documentation for Wyrd." />
 </svelte:head>
 
-<article class="sl-markdown-content">
+<article class="doc-content">
   <HomeContent />
 </article>

@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
 
-  // Brutalist callout. Reuses the brand-correct `.starlight-aside` recipe already
+  // Brutalist callout. Uses the brand-correct `.wyrd-aside` recipe already
   // defined in src/styles/wyrd.css (2px border, 5px radius, hard-offset shadow,
   // semantic left-bar by type — all token-driven, no hardcoded hex). The legacy
   // content authored `<Aside title=… data-variant="wyrd|not">`; `data-variant`
@@ -26,29 +26,29 @@
   );
 </script>
 
-<aside class={`starlight-aside starlight-aside--${resolvedType}`} {...rest}>
+<aside class={`wyrd-aside wyrd-aside--${resolvedType}`} {...rest}>
   {#if title}
-    <p class="starlight-aside__title">{title}</p>
+    <p class="wyrd-aside__title">{title}</p>
   {/if}
-  <div class="starlight-aside__content">
+  <div class="wyrd-aside__content">
     {@render children?.()}
   </div>
 </aside>
 
 <style>
   /* Padding only — color/border/radius/shadow come from the global recipe. */
-  .starlight-aside {
+  .wyrd-aside {
     padding: 14px 16px;
     margin: 1.5rem 0;
   }
-  .starlight-aside__title {
+  .wyrd-aside__title {
     margin: 0 0 0.5rem;
     font-size: 0.78rem;
   }
-  .starlight-aside__content :global(:first-child) {
+  .wyrd-aside__content :global(:first-child) {
     margin-top: 0;
   }
-  .starlight-aside__content :global(:last-child) {
+  .wyrd-aside__content :global(:last-child) {
     margin-bottom: 0;
   }
 </style>

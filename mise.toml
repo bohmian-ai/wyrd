@@ -974,7 +974,7 @@ description = "Validate local Markdown links in the docs site"
 dir = "docs"
 run = "python scripts/check_links.py"
 
-[tasks."docs:astro:check"]
+[tasks."docs:svelte:check"]
 hide = true
 description = "Run svelte-check type and content checks for the docs site"
 dir = "docs"
@@ -987,14 +987,14 @@ run = "pnpm build"
 
 [tasks."docs:check"]
 hide = true
-description = "Docs gate: install, generate, drift check, command check, link check, Astro check, and build"
+description = "Docs gate: install, generate, drift check, command check, link check, svelte-check, and build"
 depends = ["docs:install"]
 run = """
 mise run docs:generate
 git diff --exit-code -- docs/src/content/docs/cards/ docs/src/content/docs/api/ || (echo "Generated docs are out of date. Run 'mise run docs:generate' and commit the result." && exit 1)
 mise run docs:check:commands
 mise run docs:linkcheck
-mise run docs:astro:check
+mise run docs:svelte:check
 mise run docs:build
 """
 

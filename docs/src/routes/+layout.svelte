@@ -27,17 +27,11 @@
   // Error pages (404, etc.) render full-width without sidebar or TOC.
   const isError = $derived(page.error !== null);
 
-  // Mock routes (design-direction previews) render bare — their own Frame owns chrome.
-  const isMock = $derived(page.url.pathname.includes('/mocks'));
-
   onMount(initLang);
   // close the mobile nav drawer on navigation
   afterNavigate(() => (menuOpen = false));
 </script>
 
-{#if isMock}
-  {@render children()}
-{:else}
 <a class="skip-link" href="#doc-main">Skip to content</a>
 
 <header class="doc-header" data-pagefind-ignore>
@@ -80,7 +74,6 @@
       <Toc />
     </aside>
   </div>
-{/if}
 {/if}
 
 <style>

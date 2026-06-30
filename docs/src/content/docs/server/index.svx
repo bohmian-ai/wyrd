@@ -3,10 +3,6 @@ title: Run the server
 description: Stand up wyrd-server against Postgres and object storage — local dev and production.
 ---
 
-<script>
-  import Aside from '$lib/components/Aside.svelte';
-</script>
-
 # Run the server
 
 `wyrd-server` is the registry: it stores cards, versions them, validates specs,

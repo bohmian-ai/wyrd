@@ -6,10 +6,6 @@ group: Cards
 order: 1
 ---
 
-<script>
-  import Aside from '$lib/components/Aside.svelte';
-</script>
-
 # Cards overview
 
 A **card** is the typed, versioned envelope Wyrd uses for every component it

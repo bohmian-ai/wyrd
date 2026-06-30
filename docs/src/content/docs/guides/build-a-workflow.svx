@@ -3,12 +3,6 @@ title: Build an Agent Workflow
 description: Author a workflow from Python, YAML, or Rust, then run and instrument it.
 ---
 
-<script>
-  import LangTabs from '$lib/components/LangTabs.svelte';
-  import LangTab from '$lib/components/LangTab.svelte';
-  import CodeFromFile from '$lib/components/CodeFromFile.svelte';
-</script>
-
 # Build an Agent Workflow
 
 A Workflow is a directed acyclic graph of Agent invocations. Use `Workflow.sequential` for linear pipelines, `Workflow.parallel` when steps can run at the same time, or `add` and `add_after` for custom shapes.

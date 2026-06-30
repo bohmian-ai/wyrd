@@ -3,10 +3,6 @@ title: What is Wyrd
 description: The typed control layer for the components of an AI system — cards, a registry, and the Skald runtime.
 ---
 
-<script>
-  import Aside from '$lib/components/Aside.svelte';
-</script>
-
 # What is Wyrd
 
 <Aside title="In one sentence" data-variant="wyrd">

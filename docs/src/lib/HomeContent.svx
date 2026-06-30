@@ -1,7 +1,6 @@
 <script>
   import WyrdArcadeHero from '$lib/components/WyrdArcadeHero.svelte';
   import WyrdLevelMap from '$lib/components/WyrdLevelMap.svelte';
-  import CardTileGrid from '$lib/components/CardTileGrid.svelte';
 </script>
 
 <WyrdArcadeHero

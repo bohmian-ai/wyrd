@@ -3,10 +3,6 @@ title: Roadmap
 description: What is specified or in progress but not yet runnable — stated honestly.
 ---
 
-<script>
-  import Aside from '$lib/components/Aside.svelte';
-</script>
-
 # Roadmap
 
 Wyrd is pre-release. The docs cover what runs today; this page covers what is

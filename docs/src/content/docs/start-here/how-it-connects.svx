@@ -4,7 +4,6 @@ description: The card system, the registry, and the Skald runtime — and how a 
 ---
 
 <script>
-  import Aside from '$lib/components/Aside.svelte';
   import WyrdConceptsDiagram from '$lib/components/WyrdConceptsDiagram.svelte';
 </script>
 

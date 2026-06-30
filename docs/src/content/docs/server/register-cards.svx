@@ -3,10 +3,6 @@ title: Register cards to a server
 description: How a local card becomes a durable, versioned record in the registry.
 ---
 
-<script>
-  import Aside from '$lib/components/Aside.svelte';
-</script>
-
 # Register cards to a server
 
 Authoring a card locally (`DataCard.save(path)`) writes files on your machine. It

@@ -330,7 +330,9 @@ fi
 
 if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/shared \
   --glob '!crates/shared/wyrd-utils/**' \
-  --glob '!crates/shared/wyrd-observe/**'; then
+  --glob '!crates/shared/wyrd-observe/**' \
+  --glob '!crates/shared/wyrd-client/Cargo.toml' \
+  --glob '!crates/shared/wyrd-client/src/python.rs'; then
   echo 'PyO3 scope violation detected in Python-free shared crates'
   exit 1
 fi

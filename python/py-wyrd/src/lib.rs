@@ -55,6 +55,11 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&eval)?;
     register_submodule(py, "wyrd._wyrd.eval", &eval)?;
 
+    let client = PyModule::new(py, "client")?;
+    wyrd_client::python::python_register(&client)?;
+    m.add_submodule(&client)?;
+    register_submodule(py, "wyrd._wyrd.client", &client)?;
+
     wyrd_observe::python::python_register(m)?;
 
     #[cfg(feature = "testing")]

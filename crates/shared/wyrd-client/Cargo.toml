@@ -16,6 +16,18 @@ path = "src/lib.rs"
 default = ["transport-grpc", "transport-http"]
 transport-grpc = ["dep:wyrd-tonic"]
 transport-http = []
+# PyO3 boundary for the tenant-admin SDK surface. Owned here (the client crate),
+# never in wyrd-spec / wyrd-auth-oidc; the async admin calls block on a Tokio
+# runtime, so the runtime drivers are pulled in alongside pyo3.
+python = [
+    "dep:pyo3",
+    "dep:wyrd-utils",
+    "wyrd-utils/python",
+    "transport-http",
+    "tokio/rt",
+    "tokio/net",
+    "tokio/time",
+]
 
 [dependencies]
 chrono = { workspace = true }
@@ -29,11 +41,17 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 toml = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 wyrd-spec = { workspace = true }
 wyrd-tonic = { workspace = true, optional = true }
 
+pyo3 = { workspace = true, optional = true }
+wyrd-utils = { workspace = true, optional = true }
+
 [dev-dependencies]
 secrecy = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
+wiremock = { workspace = true }
+wyrd-semver = { workspace = true }
 wyrd-testing = { workspace = true }

@@ -16,6 +16,6 @@ export const load: PageLoad = ({ params }) => {
   }
   return {
     slug,
-    metadata: entry.metadata ?? {}
+    metadata: entry.metadata
   };
 };

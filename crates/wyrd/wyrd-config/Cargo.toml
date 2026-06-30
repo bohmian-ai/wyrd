@@ -1,0 +1,28 @@
+[package]
+name = "wyrd-config"
+version = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+
+[features]
+default = []
+python = ["dep:pyo3", "dep:wyrd-utils", "dep:wyrd-interfaces"]
+
+[dependencies]
+wyrd-spec        = { workspace = true }
+wyrd-semver      = { workspace = true }
+serde            = { workspace = true, features = ["derive"] }
+serde_json       = { workspace = true }
+toml             = { workspace = true }
+thiserror        = { workspace = true }
+tracing          = { workspace = true }
+pyo3             = { workspace = true, optional = true }
+wyrd-utils       = { workspace = true, optional = true, features = ["python"] }
+wyrd-interfaces  = { workspace = true, optional = true, features = ["python"] }
+
+[dev-dependencies]
+tempfile     = { workspace = true }
+serial_test  = { workspace = true }
+
+[lints]
+workspace = true

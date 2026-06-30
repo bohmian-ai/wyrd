@@ -2011,6 +2011,61 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+
+    // --- WYRD_CFG_* — workspace config (wyrd.toml) ---
+    /// `wyrd.toml` failed TOML syntax parsing or file IO.
+    ///
+    /// `details` JSON: `{ "path": <absolute path or "<cwd>">, "source":
+    /// "toml" | "io" }`.
+    #[error("[WYRD_CFG_400_INVALID_TOML] {message}")]
+    #[wyrd_error(
+        code = "WYRD_CFG_400_INVALID_TOML",
+        status = 400,
+        title = "wyrd.toml failed TOML syntax parse",
+        remediation = "Check the TOML syntax in your wyrd.toml file, or the file path if the read itself failed."
+    )]
+    CfgInvalidToml {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload (`{ path, source }`).
+        details: serde_json::Value,
+    },
+
+    /// `wyrd.toml` deserialized but failed the typed schema (unknown
+    /// field, invalid validated newtype value, lowercase `[kind.x]`,
+    /// unknown `CardKind`, etc.).
+    ///
+    /// `details` JSON: `{ "path": <abs>, "serde_message": <raw> }`.
+    #[error("[WYRD_CFG_400_SCHEMA_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_CFG_400_SCHEMA_MISMATCH",
+        status = 400,
+        title = "wyrd.toml schema mismatch",
+        remediation = "Compare the file against the documented wyrd.toml schema in architecture/wyrd-design.md."
+    )]
+    CfgSchemaMismatch {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload (`{ path, serde_message }`).
+        details: serde_json::Value,
+    },
+
+    /// `name` set under `[defaults]` or any `[kind.<X>]` table.
+    ///
+    /// `details` JSON: `{ "table": "[defaults]" | "[kind.Model]" | … }`.
+    #[error("[WYRD_CFG_400_NAME_DEFAULT_REJECTED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_CFG_400_NAME_DEFAULT_REJECTED",
+        status = 400,
+        title = "wyrd.toml cannot default `name`",
+        remediation = "Remove the `name` key from [defaults] or [kind.<X>]. Every card must author its own name."
+    )]
+    CfgNameDefaultRejected {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload (`{ table }`).
+        details: serde_json::Value,
+    },
 }
 
 impl WyrdError {
@@ -2135,6 +2190,9 @@ impl WyrdError {
             | Self::WorkflowDuplicateStepId { message, details }
             | Self::WorkflowMissingDependency { message, details }
             | Self::WorkflowCycle { message, details }
+            | Self::CfgInvalidToml { message, details }
+            | Self::CfgSchemaMismatch { message, details }
+            | Self::CfgNameDefaultRejected { message, details }
             | Self::RegistryInvalidCardSpec { message, details }
             | Self::RegistryInvalidVersionBlock { message, details }
             | Self::RegistrySpecTooLarge { message, details }
@@ -2729,5 +2787,53 @@ mod tests {
                 details: serde_json::json!({}),
             },
         ]
+    }
+}
+
+#[cfg(test)]
+mod wyrd_cfg_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn wyrd_cfg_400_invalid_toml_round_trip() {
+        let e = WyrdError::CfgInvalidToml {
+            message: "expected `=` after key".into(),
+            details: json!({ "path": "/tmp/wyrd.toml", "source": "toml" }),
+        };
+        let json_str = serde_json::to_string(&e).unwrap();
+        let back: WyrdError = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(back.code(), "WYRD_CFG_400_INVALID_TOML");
+        assert_eq!(back.status(), 400);
+        assert!(!back.remediation().is_empty());
+    }
+
+    #[test]
+    fn wyrd_cfg_400_schema_mismatch_round_trip() {
+        let e = WyrdError::CfgSchemaMismatch {
+            message: "unknown field `defaut`".into(),
+            details: json!({
+                "path": "/tmp/wyrd.toml",
+                "serde_message": "unknown field `defaut`, expected one of …",
+            }),
+        };
+        let json_str = serde_json::to_string(&e).unwrap();
+        let back: WyrdError = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(back.code(), "WYRD_CFG_400_SCHEMA_MISMATCH");
+        assert_eq!(back.status(), 400);
+        assert!(!back.remediation().is_empty());
+    }
+
+    #[test]
+    fn wyrd_cfg_400_name_default_rejected_round_trip() {
+        let e = WyrdError::CfgNameDefaultRejected {
+            message: "`name` may not be defaulted; remove from table `[defaults]`".into(),
+            details: json!({ "table": "[defaults]" }),
+        };
+        let json_str = serde_json::to_string(&e).unwrap();
+        let back: WyrdError = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(back.code(), "WYRD_CFG_400_NAME_DEFAULT_REJECTED");
+        assert_eq!(back.status(), 400);
+        assert!(!back.remediation().is_empty());
     }
 }

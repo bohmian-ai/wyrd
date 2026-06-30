@@ -12,6 +12,7 @@ ROOT_OUTPUT_FILE = PACKAGE_DIR / "_wyrd.pyi"
 PUBLIC_MODULE_STUBS = {
     "agent.pyi": PACKAGE_DIR / "agent" / "__init__.pyi",
     "cards.pyi": PACKAGE_DIR / "cards" / "__init__.pyi",
+    "config.pyi": PACKAGE_DIR / "config" / "__init__.pyi",
     "data.pyi": PACKAGE_DIR / "data" / "__init__.pyi",
     "eval.pyi": PACKAGE_DIR / "eval" / "__init__.pyi",
     "model.pyi": PACKAGE_DIR / "model" / "__init__.pyi",
@@ -84,6 +85,9 @@ def source_text(filename: str) -> str:
 def rewrite_public_imports(filename: str, content: str) -> str:
     """Rewrite source-stub imports for generated package-local stubs."""
     replacements = {
+        "config.pyi": {
+            "from .cards import CardKind": "from ..cards import CardKind",
+        },
         "agent.pyi": {
             "from collections.abc import Callable, Mapping, Sequence": (
                 "from collections.abc import Callable, Mapping, Sequence"

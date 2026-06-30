@@ -35,6 +35,17 @@
 /* ---- arcade-brutalist primitives (shadow scale, radius, borders, notch, dither, plane, fuji) ---- */
 @import "./wyrd-primitives.css";
 
+/* ---- Fixed cabinet surface (always-dark marquee/footer chrome, both themes) ----
+   These are NOT in wyrd-tokens.css (they don't switch on [data-theme]) because
+   the Mitari marquee and footer are always-dark brand chrome regardless of user
+   theme. Components reference var(--cab-*); this is the single definition site. */
+:root {
+  --cab: #0b0b0e;
+  --cab-ink: #f4f4f5;
+  --cab-dim: #8a8a95;
+  --cab-line: #26262d;
+}
+
 /* ============================================================================
    2 · Page chrome — sidebar (Quiet register = JetBrains Mono)
    ============================================================================ */

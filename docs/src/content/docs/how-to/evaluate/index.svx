@@ -1,0 +1,26 @@
+---
+title: Evaluate
+description: Score agent runs and models against Wyrd eval definitions.
+pillar: wyrd
+group: Evaluate
+order: 1
+---
+
+# Evaluate
+
+<Aside title="Reserved — coming when EvalCard ships" data-variant="not">
+
+Evaluate recipes will be added as the EvalCard runtime contract ships. The
+`EvalCard` spec is authored and the JSON Schema is checked in; the runtime
+implementation is not yet available.
+
+</Aside>
+
+Evaluate capability covers:
+
+- Scoring agent runs against task definitions in CI
+- Comparing model outputs against collected production records
+- Running `wyrd eval` from the CLI
+
+These how-to pages will be added alongside the EvalCard runtime. Track progress
+in [Roadmap](/roadmap/).

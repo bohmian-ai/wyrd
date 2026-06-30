@@ -16,16 +16,21 @@ export type NavGroup = { label: string; kind?: string; items: NavItem[] };
 // Groups not listed appear after all configured groups, sorted alphabetically.
 // Entries within each group are sorted by `order` ASC, then by slug for a
 // deterministic tiebreak so builds are reproducible.
+// Diátaxis 7-section IA + How-to capability sub-groups. Groups not listed
+// here appear after all configured groups, sorted alphabetically.
 export const GROUP_ORDER: readonly string[] = [
   'Overview',
-  'Start here',
-  'Cards',
-  'Server & auth',
-  'Agents & workflows',
-  'Evaluation',
-  'Reference',
-  'For agents',
-  'Roadmap'
+  'Setup',
+  'Tutorials',
+  'How-to',
+  'Declare',
+  'Evaluate',
+  'Observe',
+  'Operate',
+  'Concepts',
+  'cards',
+  'api',
+  'For Agents',
 ];
 
 // Convert a content slug to a base-free nav path. Empty slug → root '/';

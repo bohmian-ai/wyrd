@@ -1,0 +1,56 @@
+---
+title: Declare a Prompt card
+description: Author and register a PromptCard from Python in four steps.
+pillar: wyrd
+group: Declare
+order: 2
+---
+
+# Declare a Prompt card
+
+## Prerequisites
+
+- py-wyrd installed and `WYRD_SERVER_URL` set
+- A running server
+
+## Recipe
+
+```python
+from wyrd.prompt import Prompt, PromptCard
+
+# 1. Author the prompt spec
+prompt = Prompt(
+    name="summarise-document",
+    version="0.1.0",
+    template="Summarise the following document in {max_words} words or fewer:\n\n{document}",
+    input_variables=["document", "max_words"],
+)
+
+# 2. Build the card
+card = PromptCard(
+    name="summarise-document",
+    version="0.1.0",
+    spec=prompt.to_spec(),
+)
+
+# 3. Optionally save locally
+card.save()
+
+# 4. Register
+import wyrd
+wyrd.cards.register(card)
+```
+
+## Notes
+
+- Keep `name` stable — downstream agents, policies, and audits refer to it by
+  identity.
+- `version` follows semver. The server rejects a changed spec at the same
+  version.
+- `template` is the versioned content. Put operational rules in the spec rather
+  than in free-form notes.
+
+## Reference
+
+- [Prompt card spec](/cards/prompt/) — generated field-level documentation.
+- [Cards overview](/cards/) — every kind and status.

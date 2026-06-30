@@ -1,0 +1,41 @@
+---
+title: Overview
+description: Wyrd — the typed control layer for AI system components.
+pillar: wyrd
+group: Overview
+order: 1
+---
+
+# Overview
+
+Wyrd is the declarative layer that sits between the ML engineers who build AI
+components and the systems that run, version, and observe them. You describe
+your models, data, prompts, and agents as **cards** — typed, versioned envelopes
+checked into the registry. The Skald runtime executes the agentic ones.
+
+## The short version
+
+1. **Author** a card in Python — a `DataCard`, `ModelCard`, or `PromptCard`.
+2. **Register** it: `wyrd.cards.register(card)` sends it to a running server.
+3. **Refer** from other cards via `CardRef` — the server derives the lineage
+   graph automatically.
+4. **Run** — Skald agents and workflows resolve cards from the registry at
+   runtime; the prompt you registered is the prompt that runs.
+
+<Aside title="What ships today" data-variant="wyrd">
+
+Three card kinds are fully implemented and tested: **Data**, **Model**, and
+**Prompt**. The other thirteen kinds are reserved IA structure — their contracts
+are specified but not yet runnable. See [Cards overview](/cards/) for status.
+
+</Aside>
+
+## Sections
+
+- [Setup](/setup/) — install py-wyrd and verify your environment.
+- [Tutorials](/tutorials/) — step-by-step walkthroughs from zero to your first registered card.
+- [How-to](/how-to/) — goal-oriented recipes: declare, evaluate, observe, operate.
+- [Concepts](/concepts/) — the card/spec/run/observation ontology.
+- [Cards reference](/cards/) — generated field-level documentation for every card kind.
+- [API reference](/api/) — error catalog, OpenAPI summary, JSON Schema inventory.
+- [For Agents](/for-agents/) — stable paths, a copyable workflow, and the rules agents must follow.

@@ -1,0 +1,28 @@
+---
+title: Concepts
+description: The Card/Spec/Run/Observation ontology — the four nouns everything else builds on.
+pillar: wyrd
+group: Concepts
+order: 1
+---
+
+# Concepts
+
+Wyrd has a small vocabulary. Four nouns cover the whole system:
+
+| Noun | What it is |
+| --- | --- |
+| **Card** | The typed, versioned envelope for one AI system component. |
+| **Spec** | The kind-specific payload inside a card. One JSON Schema per `kind`. |
+| **Run** | An execution record: the agent or workflow that ran, the inputs, the outputs, and the trace. |
+| **Observation** | A derived record — drift signal, eval score, or audit entry — attached to a card or run. |
+
+## How they relate
+
+A `Card` carries a `Spec`. A `Spec` can hold `CardRef`s to other cards — the
+server derives the lineage graph from them. A `Run` records what executed and
+which cards drove it. `Observations` annotate cards and runs with evidence.
+
+## Pages
+
+- [Card](/concepts/card/) — the envelope, the spec, and the lifecycle.

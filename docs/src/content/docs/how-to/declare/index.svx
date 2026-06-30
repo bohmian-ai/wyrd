@@ -1,0 +1,28 @@
+---
+title: Declare
+description: Author and register Wyrd cards — recipes for the three shipped kinds.
+pillar: wyrd
+group: Declare
+order: 1
+---
+
+# Declare
+
+Author a card locally and register it to the server with
+`wyrd.cards.register(card)`. Registration is idempotent on identity; the server
+rejects a changed spec at the same version.
+
+## Shipped kinds
+
+- [Declare a Prompt card](/how-to/declare/prompt/)
+- [Declare a Model card](/how-to/declare/model/)
+- [Declare a Data card](/how-to/declare/data/)
+
+## Reserved kinds
+
+The other thirteen card kinds (Agent, Service, Workflow, Eval, Experiment,
+Drift, Audit, Policy, Trigger, Mcp, Operator, Artifact, Source) have authored
+contracts and JSON Schemas, but their runtime implementation is not shipped yet.
+How-to pages for these kinds will be added as each kind's contract ships.
+
+See [Cards overview](/cards/) for the full catalog and shipping status.

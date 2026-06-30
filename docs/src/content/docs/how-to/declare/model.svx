@@ -1,0 +1,68 @@
+---
+title: Declare a Model card
+description: Author and register a ModelCard from Python.
+pillar: wyrd
+group: Declare
+order: 3
+---
+
+# Declare a Model card
+
+## Prerequisites
+
+- py-wyrd installed and `WYRD_SERVER_URL` set
+- A running server
+
+## Recipe
+
+```python
+from wyrd.model import ModelCard
+
+# 1. Build the card
+card = ModelCard(
+    name="churn-classifier",
+    version="1.0.0",
+    spec={
+        "provider": "openai",
+        "model_id": "gpt-4o-mini",
+        "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}},
+        "output_schema": {"type": "object", "properties": {"label": {"type": "string"}}},
+    },
+)
+
+# 2. Optionally save locally
+card.save()
+
+# 3. Register
+import wyrd
+wyrd.cards.register(card)
+```
+
+## Add a data dependency
+
+Reference the training dataset by CardRef so the registry can derive lineage:
+
+```python
+from wyrd.spec import CardRef
+
+card = ModelCard(
+    name="churn-classifier",
+    version="1.0.0",
+    spec={
+        "provider": "openai",
+        "model_id": "gpt-4o-mini",
+        "training_data": CardRef(name="churn-dataset", version="0.3.0").to_dict(),
+    },
+)
+```
+
+## Notes
+
+- Keep `name` stable across versions.
+- Put operational rules (rate limits, cost, latency SLA) in the spec rather
+  than in free-form annotations.
+
+## Reference
+
+- [Model card spec](/cards/model/) — generated field-level documentation.
+- [Cards overview](/cards/) — every kind and status.

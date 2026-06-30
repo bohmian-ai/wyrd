@@ -113,6 +113,6 @@ other trips reuse. Every transition writes an audit row.
 Note what's gone vs. the original: the SQL bodies, the full Rust signatures, the
 `exchange_api_key.rs:435` line refs, the inline algorithm pseudocode. Note what's
 kept and sharpened: every decision, every seam **with its invariant**, the race
-argument. That is exactly the surface `wyrd-architecture-review` reasons about —
+argument. That is exactly the surface `wyrd-architecture-reviewer` reasons about —
 and the executor pulls the real `consume_active_refresh` / `token_hash` /
 `issue_for_subject` source from CodeGraph when it writes the code.

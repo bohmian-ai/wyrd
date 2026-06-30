@@ -203,7 +203,7 @@ directly when a commit's surface warrants. The test stage uses
 ## Hand-Off
 
 Assembled feature branch (all tasks `done`, gates green) → **`review-and-plan`**
-for the final fan-out review; optionally `wyrd-architecture-review` again if the
+for the final fan-out review; optionally `wyrd-architecture-reviewer` again if the
 implementation diverged from `plan.md`.
 
 **Run the review stage to its terminal artifact.** `review-and-plan` is an

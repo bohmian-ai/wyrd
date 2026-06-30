@@ -1,4 +1,4 @@
-<script module>
+<script context="module">
   // Re-export the full component set so every .svx/.md page can use them without
   // per-page import blocks. MDsveX merges this module scope into the compiled
   // markdown file, putting all names in scope for content authors.

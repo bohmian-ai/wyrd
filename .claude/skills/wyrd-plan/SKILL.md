@@ -1,6 +1,6 @@
 ---
 name: wyrd-plan
-description: Stage 2 of the Wyrd build pipeline. Turns an approved spec.md into plan.md — the dependency-ordered commit DAG in the 00-overview format — plus a tasks.yaml skeleton. Use when the user says /plan, after a spec passes architecture review (gate 1), or when sequencing a feature into commits. Stop at the DAG: name commits, decisions, crates, and dependencies; do NOT pre-render per-commit implementations (that is wyrd-tasks). Routes to wyrd-architecture-review (gate 2).
+description: Stage 2 of the Wyrd build pipeline. Turns an approved spec.md into plan.md — the dependency-ordered commit DAG in the 00-overview format — plus a tasks.yaml skeleton. Use when the user says /plan, after a spec passes architecture review (gate 1), or when sequencing a feature into commits. Stop at the DAG: name commits, decisions, crates, and dependencies; do NOT pre-render per-commit implementations (that is wyrd-tasks). Routes to wyrd-architecture-reviewer skill (gate 2).
 ---
 
 # Wyrd Plan
@@ -21,7 +21,7 @@ from CodeGraph at build time. (Canonical doctrine: `wyrd-tasks`.)
 
 ## When To Use
 
-- `/plan`, or after `spec.md` passes `wyrd-architecture-review` (gate 1).
+- `/plan`, or after `spec.md` passes `wyrd-architecture-reviewer` (gate 1).
 - Sequencing a feature into commits, defining the dependency order, deciding what
   can run in parallel.
 
@@ -48,7 +48,7 @@ from CodeGraph at build time. (Canonical doctrine: `wyrd-tasks`.)
 5. Write `plan.md` in the format below to `.dev/plan/<feature>/plan.md`.
 6. Emit the `tasks.yaml` **skeleton**: one node per commit with `id`, `title`,
    `depends_on`, and a `cratesHint`. `wyrd-tasks` fills the rest.
-7. **Gate 2.** Hand `plan.md` to `wyrd-architecture-review` **at full-sweep
+7. **Gate 2.** Hand `plan.md` to `wyrd-architecture-reviewer` **at full-sweep
    depth** (it runs with CodeGraph and verifies the commit seams against real
    source). Tell it "full sweep" explicitly and do not pre-narrow it to a short
    focus list. The DAG is where sequencing, commit-ownership, and missing-edge
@@ -135,7 +135,7 @@ Before handing off:
   consequences.
 - No commit is expanded into rendered code; no `file.rs:line`.
 - `tasks.yaml` skeleton matches the DAG exactly.
-- `wyrd-architecture-review` (gate 2) has run on `plan.md` and findings are
+- `wyrd-architecture-reviewer` (gate 2) has run on `plan.md` and findings are
   resolved.
 
 ## Hand-Off

@@ -9,9 +9,17 @@
 //! single-pin discipline.
 pub use prost;
 pub use tonic;
+pub use tonic_types;
+
+#[cfg(feature = "server")]
 pub use tonic_health;
 
 pub mod error;
+
+// `health` impls `tonic::server::NamedService`, which only exists under tonic's
+// `server` feature — keep the module (and its re-export) behind `server` so the
+// client path stays axum-free.
+#[cfg(feature = "server")]
 pub mod health;
 
 #[cfg(feature = "server")]

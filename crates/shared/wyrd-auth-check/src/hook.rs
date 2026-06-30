@@ -142,6 +142,7 @@ mod test_helpers {
                 principal: PrincipalRef::from_principal(&caller),
             }],
             exp: chrono::Utc::now(),
+            iat: chrono::Utc::now(),
         };
         let request = AuthzCheckRequest {
             target: card_ref("callee"),

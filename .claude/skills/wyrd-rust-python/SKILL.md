@@ -48,26 +48,46 @@ Before editing:
 Do not invent a new architecture until the current Wyrd boundary proves wrong
 for the user workflow.
 
-Load these references only when relevant:
+## Pipeline Role And CodeGraph Hydration
+
+This skill is the Rust/Python **implementation reference** for the build pipeline
+(`wyrd-spec → wyrd-plan → wyrd-tasks → wyrd-implement → test → review`). It is not
+itself a pipeline stage: the `wyrd-implement` executors follow this doctrine when
+they write code, and the `wyrd-plan`/`wyrd-tasks` stages consult its Ownership
+Boundaries for crate placement. When implementing from a thin task contract
+(`.dev/plan/<feature>/tasks/NN-*.md`), the contract pins decisions and names seams
+as symbols; it intentionally does **not** render code. Hydrate the seam source
+live:
+
+- Use `codegraph_explore` to load the named seams' verbatim source and call paths
+  before writing code. Do not run a manual grep/read loop and do not expect the
+  plan to contain the code — the plan names `consume_active_refresh`; CodeGraph
+  gives you its current body and callers.
+- Honor the contract's decisions, seams, and invariants exactly. If the contract
+  is wrong or under-specified, stop and report — do not improvise architecture.
+
+Load these references from the shared doctrine library
+(`.claude/references/`, indexed in `.claude/references/README.md`) only when
+relevant:
 
 - Rust ownership, traits, async, allocation, and core API shape:
-  `references/rust-core.md`
+  `.claude/references/rust-python/rust-core.md`
 - Crate boundaries, server/client contracts, storage, registry, runtime,
   telemetry, provider, and observability ownership:
-  `references/architecture.md`
+  `.claude/references/architecture/patterns.md`
 - PyO3 classes, GIL rules, Python object lifetimes, and boundary conversion:
-  `references/pyo3-boundaries.md`
+  `.claude/references/rust-python/pyo3-boundaries.md`
 - Wyrd error codes, Rust errors, Python exceptions, and HTTP problem payloads:
-  `references/errors.md`
+  `.claude/references/rust-python/errors.md`
 - Python exports, generated stubs, package layout, and cross-language API
-  checks: `references/python-api-and-stubs.md`
+  checks: `.claude/references/rust-python/python-api-and-stubs.md`
 - Test selection, linting, codegen, and completion checks:
-  `references/testing-workflows.md`
+  `.claude/references/rust-python/testing-workflows.md`
 - Agent-facing contracts, MCP, structured validation, and harness behavior:
-  `references/agent-harness.md`
+  `.claude/references/rust-python/agent-harness.md`
 - Vala OLAP warehouse, Bifrost, Apache Iceberg, DataFusion, object-store
   analytical storage, Iceberg catalogs, and Parquet query/write paths:
-  `references/iceberg-bifrost.md`
+  `.claude/references/domain/iceberg-bifrost.md`
 
 ## Ownership Boundaries
 

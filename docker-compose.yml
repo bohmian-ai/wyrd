@@ -5,6 +5,16 @@ services:
       POSTGRES_DB: wyrd
       POSTGRES_USER: wyrd_migrator
       POSTGRES_PASSWORD: wyrd_migrator_pw
+    # Ephemeral test database: keep PGDATA in RAM, not the postgres:16 image's
+    # built-in anonymous volume. The anonymous volume survived `compose down`
+    # and carried a stale _sqlx_migrations ledger across runs, which broke the
+    # migration checksum gate. The long-form `type: tmpfs` mount reliably
+    # overrides the image's `VOLUME /var/lib/postgresql/data` (the short
+    # `tmpfs:` list form does not), so the DB starts clean every time and is
+    # faster (RAM-backed).
+    volumes:
+      - type: tmpfs
+        target: /var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
@@ -12,3 +22,37 @@ services:
       interval: 2s
       timeout: 3s
       retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.1
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "false"
+      KC_LOG_LEVEL: WARN
+    volumes:
+      - ./tests/fixtures/identity/keycloak-realm.json:/opt/keycloak/data/import/keycloak-realm.json:ro
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health/ready || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  dex:
+    image: ghcr.io/dexidp/dex:v2.38.0
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ./tests/fixtures/identity/dex-config.yaml:/etc/dex/config.yaml:ro
+    ports:
+      - "5556:5556"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5556/healthz 2>/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s

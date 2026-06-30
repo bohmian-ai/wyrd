@@ -8,6 +8,7 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use wyrd_auth_check::{PolicyHook, StubAllowPolicyHook};
 use wyrd_auth_issue::IssuingKey;
+use wyrd_auth_oidc::TrustedIssuerRegistry;
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_runtime::{PermissionCheck, RbacCheck};
 use wyrd_storage::StorageHandle;
@@ -15,6 +16,8 @@ use wyrd_telemetry::TelemetryGuard;
 use wyrd_tonic::tonic_health::server::HealthReporter;
 
 use crate::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
+use crate::auth::exchange_api_key::TokenExchangeSettings;
+use crate::auth::jwt_bearer::WorkloadBindingRegistry;
 use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::config::DeploymentProfile;
 use crate::health::ReadinessSnapshot;
@@ -63,6 +66,10 @@ pub struct AppState {
     pub issuing_key: Option<Arc<IssuingKey>>,
     /// JWT verifier for token-exchange routes.
     pub token_verifier: Option<Arc<TokenVerifier<SqlPermissionResolver>>>,
+    /// Trusted OIDC issuer registry for human login flow.
+    pub trusted_issuer_registry: Option<Arc<TrustedIssuerRegistry>>,
+    /// Workload binding registry for jwt-bearer exchanges.
+    pub workload_binding_registry: Option<Arc<WorkloadBindingRegistry>>,
     /// Policy hook for authz-check evaluation.
     pub policy_hook: Arc<dyn PolicyHook>,
     /// Audit-fact writer for authz-check decisions.
@@ -83,6 +90,8 @@ pub struct AppState {
     pub readiness: Arc<ArcSwap<ReadinessSnapshot>>,
     /// Parsed CIDR allowlist for the request-id trust gate.
     pub trusted_upstreams_parsed: Arc<[IpNetwork]>,
+    /// Access/refresh token TTL settings for all exchange paths.
+    pub token_exchange_settings: TokenExchangeSettings,
 }
 
 impl AppState {
@@ -102,6 +111,8 @@ impl AppState {
             permission_check: Arc::new(RbacCheck),
             issuing_key: None,
             token_verifier: None,
+            trusted_issuer_registry: None,
+            workload_binding_registry: None,
             policy_hook: Arc::new(StubAllowPolicyHook),
             audit_writer: Arc::new(NoopAuthzAuditWriter),
             trusted_request_id_propagation: false,
@@ -114,6 +125,7 @@ impl AppState {
             grpc_health: reporter,
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
             trusted_upstreams_parsed: Arc::from(Vec::<IpNetwork>::new()),
+            token_exchange_settings: TokenExchangeSettings::default(),
         }
     }
 
@@ -133,6 +145,26 @@ impl AppState {
     ) -> Self {
         self.issuing_key = Some(issuing_key);
         self.token_verifier = Some(token_verifier);
+        self
+    }
+
+    /// Attach the trusted OIDC issuer registry.
+    #[must_use]
+    pub fn with_trusted_issuer_registry(
+        mut self,
+        trusted_issuer_registry: Arc<TrustedIssuerRegistry>,
+    ) -> Self {
+        self.trusted_issuer_registry = Some(trusted_issuer_registry);
+        self
+    }
+
+    /// Attach the workload binding registry.
+    #[must_use]
+    pub fn with_workload_binding_registry(
+        mut self,
+        workload_binding_registry: Arc<WorkloadBindingRegistry>,
+    ) -> Self {
+        self.workload_binding_registry = Some(workload_binding_registry);
         self
     }
 
@@ -210,6 +242,13 @@ impl AppState {
     #[must_use]
     pub fn with_audit_writer(mut self, audit_writer: Arc<dyn AuthzAuditWriter>) -> Self {
         self.audit_writer = audit_writer;
+        self
+    }
+
+    /// Override access/refresh token TTL settings for all exchange paths.
+    #[must_use]
+    pub fn with_token_exchange_settings(mut self, settings: TokenExchangeSettings) -> Self {
+        self.token_exchange_settings = settings;
         self
     }
 }
@@ -390,6 +429,7 @@ mod tests {
                 principal: PrincipalRef::from_principal(&caller),
             }],
             exp: chrono::Utc::now(),
+            iat: chrono::Utc::now(),
         };
         let request = wyrd_auth_check::AuthzCheckRequest {
             target: card_ref("callee"),

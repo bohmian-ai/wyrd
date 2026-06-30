@@ -31,6 +31,7 @@ uuid = { workspace = true, features = ["v4"] }
 base64 = { workspace = true }
 chrono = { workspace = true }
 jsonwebtoken = { workspace = true }
+moka = { version = "0.12", features = ["future"] }
 rand = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
@@ -39,9 +40,11 @@ sha2 = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+reqwest = { workspace = true }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
 wyrd-runtime = { workspace = true }
 wyrd-auth-issue = { workspace = true }
+wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-auth-check = { workspace = true }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1", features = ["embedded-postgres"] }
@@ -60,6 +63,7 @@ wyrd-storage = { workspace = true, features = ["emulator"] }
 temp-env = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true, features = ["util"] }
+wiremock = { workspace = true }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
 wyrd-semver = { workspace = true }
 wyrd-auth-check = { workspace = true, features = ["test-helpers"] }

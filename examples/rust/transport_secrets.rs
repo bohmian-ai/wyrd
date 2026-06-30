@@ -1,15 +1,17 @@
-//! Configure mTLS and bearer-token secret references for a Wyrd transport.
+//! Configure mTLS secret references for a Wyrd transport.
+//!
+//! Authentication is owned by `AuthMiddleware` (see `client_request`), not the
+//! transport config; this example covers the TLS identity material only.
 //!
 //! Run with:
 //!     cargo run -p wyrd-rust-examples --bin transport_secrets
 
-use wyrd_client::transport::{GrpcConfig, QueueConfig, TransportConfig};
+use wyrd_client::transport::{GrpcConfig, TransportConfig};
 use wyrd_spec::security::{SecretRef, TlsConfig};
 
 fn main() -> anyhow::Result<()> {
     let grpc = GrpcConfig {
         endpoint: "https://wyrd-ingest.internal:50051".to_string(),
-        timeout_ms: 30_000,
         tls: Some(TlsConfig {
             ca_cert: Some(SecretRef::File {
                 path: "/var/run/secrets/wyrd/ca.pem".to_string(),
@@ -23,22 +25,19 @@ fn main() -> anyhow::Result<()> {
             server_name_override: Some("ingest.internal".to_string()),
             insecure_skip_verify: false,
         }),
-        auth: Some(SecretRef::Vault {
-            key: "secret/data/wyrd/api".to_string(),
-        }),
-        connect_retries: 3,
+        ..GrpcConfig::default()
     };
     grpc.validate()?;
 
-    let queue = QueueConfig {
-        transport: TransportConfig::Grpc(grpc),
-        ..QueueConfig::default()
-    };
-    queue.validate()?;
+    let transport = TransportConfig::Grpc(grpc);
+    transport.validate()?;
 
-    let json = serde_json::to_string_pretty(&queue)?;
-    let round_trip: QueueConfig = serde_json::from_str(&json)?;
-    anyhow::ensure!(round_trip == queue, "queue config did not round-trip");
+    let json = serde_json::to_string_pretty(&transport)?;
+    let round_trip: TransportConfig = serde_json::from_str(&json)?;
+    anyhow::ensure!(
+        round_trip == transport,
+        "transport config did not round-trip"
+    );
     println!("{json}");
     Ok(())
 }

@@ -12,6 +12,9 @@ use std::time::Duration;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::{StorageBackendKind, UploadId, WireProtocol};
 use wyrd_sql::pool::build_app_pool;
+use wyrd_sql::queries::auth::{
+    insert_user, upsert_user_identity, user_by_email, user_by_id, user_id_by_identity,
+};
 use wyrd_sql::queries::platform::audit_log::{StorageAuditEvent, write_storage_event};
 use wyrd_sql::queries::storage;
 use wyrd_sql::{SqlStore, TenantConn};
@@ -41,6 +44,8 @@ async fn migrations_apply_and_are_idempotent() {
     assert_regclass_exists(pool, "platform.users", true).await;
     assert_regclass_exists(pool, "platform.audit_log", true).await;
     assert_regclass_exists(pool, "wyrd.auth_users", true).await;
+    assert_regclass_exists(pool, "wyrd.auth_user_identities", true).await;
+    assert_regclass_exists(pool, "wyrd.auth_login_state", true).await;
     assert_regclass_exists(pool, "wyrd.auth_refresh_tokens", true).await;
 
     assert_platform_resolver_shape(pool).await;
@@ -125,6 +130,153 @@ async fn duplicate_refresh_token_hash_rejected_within_tenant_only() {
         .expect("same token_hash under a different tenant inserts");
 
     cleanup_refresh_token_test_rows(pool, tenant_a, tenant_b)
+        .await
+        .expect("test rows clean up");
+}
+
+#[tokio::test]
+async fn nullable_oidc_user_email_roundtrips() {
+    let Some(migrator_url) = database_url() else {
+        return;
+    };
+    let Some(app_url) = app_database_url() else {
+        return;
+    };
+
+    let store = SqlStore::connect(&migrator_url, 2)
+        .await
+        .expect("migrator connects");
+    assert_required_roles(store.pool()).await;
+    store.migrate().await.expect("migrations apply");
+    let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
+
+    let tenant = DataTenantId::new_v7();
+    let suffix = tenant.as_uuid().to_string();
+    let user_id = Uuid::now_v7();
+    insert_tenant(store.pool(), tenant, &format!("oidc-user-{suffix}")).await;
+
+    let mut conn = TenantConn::acquire(&app_pool, tenant)
+        .await
+        .expect("tenant conn acquired");
+    insert_user(&mut conn, user_id, None, "oidc", None)
+        .await
+        .expect("null email user inserts");
+    conn.commit().await.expect("insert commits");
+
+    let mut conn = TenantConn::acquire(&app_pool, tenant)
+        .await
+        .expect("tenant conn acquired");
+    let row = user_by_id(&mut conn, user_id)
+        .await
+        .expect("user lookup succeeds")
+        .expect("user exists");
+    assert!(row.email.is_none());
+
+    let mut conn = TenantConn::acquire(&app_pool, tenant)
+        .await
+        .expect("tenant conn acquired");
+    sqlx::query(
+        "UPDATE wyrd.auth_users
+            SET email = $1
+          WHERE data_tenant_id = wyrd.current_tenant()
+            AND id = $2",
+    )
+    .bind("present@example.com")
+    .bind(user_id)
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("user email updates");
+    conn.commit().await.expect("update commits");
+
+    let mut conn = TenantConn::acquire(&app_pool, tenant)
+        .await
+        .expect("tenant conn acquired");
+    let row = user_by_email(&mut conn, "present@example.com")
+        .await
+        .expect("email lookup succeeds")
+        .expect("row exists");
+    assert_eq!(row.id, user_id);
+    assert_eq!(row.email.as_deref(), Some("present@example.com"));
+
+    cleanup_auth_test_rows(store.pool(), &[tenant])
+        .await
+        .expect("test rows clean up");
+}
+
+#[tokio::test]
+async fn federated_identity_roundtrips_and_rejects_cross_tenant_user_id() {
+    let Some(migrator_url) = database_url() else {
+        return;
+    };
+    let Some(app_url) = app_database_url() else {
+        return;
+    };
+
+    let store = SqlStore::connect(&migrator_url, 2)
+        .await
+        .expect("migrator connects");
+    assert_required_roles(store.pool()).await;
+    store.migrate().await.expect("migrations apply");
+    let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
+
+    let tenant_a = DataTenantId::new_v7();
+    let tenant_b = DataTenantId::new_v7();
+    let suffix = tenant_a.as_uuid().to_string();
+    let user_a = Uuid::now_v7();
+    let user_b = Uuid::now_v7();
+    let issuer = "https://idp.example.com/realms/acme";
+
+    insert_tenant(store.pool(), tenant_a, &format!("id-a-{suffix}")).await;
+    insert_tenant(store.pool(), tenant_b, &format!("id-b-{suffix}")).await;
+
+    let mut conn = TenantConn::acquire(&app_pool, tenant_a)
+        .await
+        .expect("tenant A conn acquired");
+    insert_user(
+        &mut conn,
+        user_a,
+        Some("tenant-a@example.com"),
+        "oidc",
+        None,
+    )
+    .await
+    .expect("tenant A user inserts");
+    upsert_user_identity(&mut conn, issuer, "sub-a", user_a)
+        .await
+        .expect("identity upserts");
+    conn.commit().await.expect("tenant A commit succeeds");
+
+    let mut conn = TenantConn::acquire(&app_pool, tenant_a)
+        .await
+        .expect("tenant A conn acquired");
+    let looked_up = user_id_by_identity(&mut conn, issuer, "sub-a")
+        .await
+        .expect("identity lookup succeeds");
+    assert_eq!(looked_up, Some(user_a));
+
+    let mut conn = TenantConn::acquire(&app_pool, tenant_b)
+        .await
+        .expect("tenant B conn acquired");
+    insert_user(
+        &mut conn,
+        user_b,
+        Some("tenant-b@example.com"),
+        "oidc",
+        None,
+    )
+    .await
+    .expect("tenant B user inserts");
+    conn.commit().await.expect("tenant B commit succeeds");
+
+    let mut conn = TenantConn::acquire(&app_pool, tenant_a)
+        .await
+        .expect("tenant A conn acquired");
+    let error = upsert_user_identity(&mut conn, issuer, "sub-foreign", user_b)
+        .await
+        .expect_err("cross-tenant user id should fail");
+    assert!(matches!(error, sqlx::Error::Database(_)));
+
+    cleanup_auth_test_rows(store.pool(), &[tenant_a, tenant_b])
         .await
         .expect("test rows clean up");
 }
@@ -672,10 +824,12 @@ async fn assert_auth_rls_metadata(pool: &PgPool) {
 
     let expected_tables = [
         "auth_api_keys",
+        "auth_login_state",
         "auth_refresh_tokens",
         "auth_roles",
         "auth_service_account_roles",
         "auth_service_accounts",
+        "auth_user_identities",
         "auth_user_roles",
         "auth_users",
     ];
@@ -759,6 +913,31 @@ async fn cleanup_refresh_token_test_rows(
     sqlx::query("DELETE FROM platform.tenants WHERE data_tenant_id IN ($1, $2)")
         .bind(tenant_a.as_uuid())
         .bind(tenant_b.as_uuid())
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+async fn cleanup_auth_test_rows(
+    pool: &PgPool,
+    tenants: &[DataTenantId],
+) -> Result<(), sqlx::Error> {
+    let tenant_ids = tenants
+        .iter()
+        .map(|tenant| tenant.as_uuid())
+        .collect::<Vec<_>>();
+
+    sqlx::query("DELETE FROM wyrd.auth_user_identities WHERE data_tenant_id = ANY($1)")
+        .bind(&tenant_ids)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM wyrd.auth_users WHERE data_tenant_id = ANY($1)")
+        .bind(&tenant_ids)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM platform.tenants WHERE data_tenant_id = ANY($1)")
+        .bind(&tenant_ids)
         .execute(pool)
         .await?;
 

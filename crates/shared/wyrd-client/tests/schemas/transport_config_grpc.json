@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GrpcConfig",
+  "description": "Configuration for the gRPC transport.\n\ngRPC is the default transport for `wyrd-client`. The server-side endpoint is the Wyrd ingest gateway (`vala-ingest`, PR4.2) or any compatible tonic-based receiver.\n\nThis config carries transport wiring only. Authentication is owned by `AuthMiddleware`, which injects the `x-wyrd-access-token` credential per call; there is no auth field here.",
+  "type": "object",
+  "required": [
+    "connect_retries",
+    "endpoint",
+    "timeout_ms"
+  ],
+  "properties": {
+    "connect_retries": {
+      "description": "Connection-level retry budget. The transport retries the initial connection up to this many times before surfacing an error.\n\nDefault: [`GRPC_DEFAULT_CONNECT_RETRIES`] (`3`).",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "endpoint": {
+      "description": "gRPC server endpoint. Must be `http://host:port` (plaintext) or `https://host:port` (TLS). Must be non-empty.\n\nDefault: [`GRPC_DEFAULT_ENDPOINT`] (`\"http://localhost:50051\"`).",
+      "type": "string"
+    },
+    "keepalive_interval_ms": {
+      "description": "HTTP/2 keepalive ping interval in milliseconds. `0` disables pings.\n\nDefault: [`GRPC_DEFAULT_KEEPALIVE_INTERVAL_MS`] (`20_000`, 20 s).",
+      "default": 20000,
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "keepalive_timeout_ms": {
+      "description": "HTTP/2 keepalive ping timeout in milliseconds. The connection is closed if the peer does not respond within this window.\n\nDefault: [`GRPC_DEFAULT_KEEPALIVE_TIMEOUT_MS`] (`5_000`, 5 s).",
+      "default": 5000,
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "max_message_bytes": {
+      "description": "Maximum gRPC message size in bytes (both encoding and decoding).\n\nDefault: [`GRPC_DEFAULT_MAX_MESSAGE_BYTES`] (`4_194_304`, 4 MiB).",
+      "default": 4194304,
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    },
+    "timeout_ms": {
+      "description": "Per-call timeout in milliseconds.\n\nDefault: [`GRPC_DEFAULT_TIMEOUT_MS`] (`30_000`, 30 s).",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "tls": {
+      "description": "Optional TLS configuration. When `None`, connections use the scheme in `endpoint` to decide TLS (`https://` implies TLS with the system CA pool, `http://` means plaintext).",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/TlsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "SecretRef": {
+      "description": "Pointer into a Wyrd runtime secret source. Production builds support environment variables, mounted files, and external secret-manager keys.",
+      "oneOf": [
+        {
+          "description": "An environment variable name. The runtime reads `std::env::var(name)` at connect time. Conventionally `SCREAMING_SNAKE_CASE`.\n\nExample: `{\"source\": \"env\", \"name\": \"WYRD_SECRET_API_KEY\"}`.",
+          "type": "object",
+          "required": [
+            "name",
+            "source"
+          ],
+          "properties": {
+            "name": {
+              "description": "Environment variable name. Must be non-empty.",
+              "type": "string"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "env"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "An absolute path to a file on the local filesystem. Kubernetes Secret volume mounts land here.\n\nExample: `{\"source\": \"file\", \"path\": \"/var/run/secrets/wyrd/api-key\"}`.",
+          "type": "object",
+          "required": [
+            "path",
+            "source"
+          ],
+          "properties": {
+            "path": {
+              "description": "Absolute path to a file whose contents are the secret value. Must be non-empty.",
+              "type": "string"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "file"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A backend-agnostic key in an external secret manager (HashiCorp Vault, AWS Secrets Manager, Google Secret Manager). The Wyrd auth shell maps the key to the configured backend.\n\nExample: `{\"source\": \"vault\", \"key\": \"secret/data/wyrd/api-key\"}`.",
+          "type": "object",
+          "required": [
+            "key",
+            "source"
+          ],
+          "properties": {
+            "key": {
+              "description": "Backend-agnostic key path. Interpretation is backend-specific.",
+              "type": "string"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "vault"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TlsConfig": {
+      "description": "TLS configuration for a transport connection.\n\nAll certificate fields are optional; an absent field means \"use the system default / skip that verification step\". Setting `insecure_skip_verify` to `true` disables peer certificate validation and SHOULD NOT be used outside local development.",
+      "type": "object",
+      "properties": {
+        "ca_cert": {
+          "description": "PEM-encoded CA certificate bundle. When set, overrides the system CA pool for this connection.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_cert": {
+          "description": "PEM-encoded client certificate for mTLS. Must be paired with `client_key`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key": {
+          "description": "PEM-encoded client private key for mTLS. Must be paired with `client_cert`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "insecure_skip_verify": {
+          "description": "Disable peer certificate verification. Defaults to `false`.\n\n**WARNING:** setting this to `true` opens the connection to man-in-the-middle attacks. Use only in local development.",
+          "default": false,
+          "type": "boolean"
+        },
+        "server_name_override": {
+          "description": "Override the server name used in SNI and certificate verification. Useful when the server's certificate CN does not match the address in `endpoint`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

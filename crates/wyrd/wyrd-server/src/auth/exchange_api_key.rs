@@ -294,7 +294,7 @@ impl DelegateToken {
     }
 }
 
-async fn issue_for_subject(
+pub(super) async fn issue_for_subject(
     conn: &mut TenantConn<'_>,
     issuing_key: &IssuingKey,
     settings: &TokenExchangeSettings,
@@ -347,7 +347,7 @@ async fn issue_for_subject(
 }
 
 #[derive(Debug, thiserror::Error)]
-enum IssueOrSqlError {
+pub(super) enum IssueOrSqlError {
     #[error("issue")]
     Issue(#[from] IssueError),
     #[error("db")]
@@ -381,11 +381,11 @@ async fn resolve_requested_subject(
     }
 }
 
-fn role_refs(names: Vec<String>) -> Result<Vec<RoleRef>, wyrd_runtime::InvalidRoleName> {
+pub(crate) fn role_refs(names: Vec<String>) -> Result<Vec<RoleRef>, wyrd_runtime::InvalidRoleName> {
     names.into_iter().map(|name| RoleRef::new(&name)).collect()
 }
 
-fn principal_kind_wire(value: &str) -> Option<PrincipalKindWire> {
+pub(super) fn principal_kind_wire(value: &str) -> Option<PrincipalKindWire> {
     match value {
         "service" => Some(PrincipalKindWire::Service),
         "agent" => Some(PrincipalKindWire::Agent),
@@ -430,7 +430,7 @@ fn act_from_chain(
     })
 }
 
-fn token_hash(token: &str) -> String {
+pub(crate) fn token_hash(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 

@@ -1,33 +1,49 @@
 //! HTTP routes for auth preview surfaces.
 
-use axum::extract::{Extension, State};
+use axum::extract::{Extension, Query, State};
+use axum::http::HeaderMap;
 use axum::{Json, Router};
 use base64::Engine;
 use secrecy::SecretString;
 use uuid::Uuid;
 use wyrd_auth_verify::AccessTokenClaims;
-use wyrd_spec::auth::{IssueKeyRequest, TokenRequest, TokenResponse};
+use wyrd_spec::auth::{CallbackQuery, IssueKeyRequest, TokenRequest, TokenResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
 use crate::auth::Caller;
+use crate::auth::callback::exchange_authorization_code;
 use crate::auth::exchange_api_key::{DelegateToken, ExchangeApiKey, map_exchange_error_to_wyrd};
 use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
+use crate::auth::jwt_bearer::JwtBearer;
+use crate::auth::login::login as login_handler;
+use crate::auth::refresh::{RefreshTokens, tenant_from_refresh_jwt};
 use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Build auth routes.
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/auth/login", axum::routing::get(login_handler))
+        .route("/auth/callback", axum::routing::get(callback))
         .route("/auth/token", axum::routing::post(token))
         .route("/auth/issue-key", axum::routing::post(issue_key))
 }
 
 async fn token(
     State(state): State<AppState>,
+    headers: HeaderMap,
     request_id: Option<Extension<RequestId>>,
     Json(request): Json<TokenRequest>,
 ) -> Result<Json<TokenResponse>, WyrdErrorResponse> {
+    let request_id_str: String;
+    let req_id = match request_id.as_ref() {
+        Some(Extension(id)) => id.as_str(),
+        None => {
+            request_id_str = Uuid::new_v4().to_string();
+            &request_id_str
+        }
+    };
     match request {
         TokenRequest::WyrdApiKey { api_key } => {
             let parsed = WyrdApiKey::parse(api_key.expose()).map_err(|_| {
@@ -43,7 +59,7 @@ async fn token(
             let prefix = parsed.prefix.clone();
             let exchanged = ExchangeApiKey {
                 issuing_key,
-                settings: Default::default(),
+                settings: state.token_exchange_settings.clone(),
             }
             .execute(&mut conn, SecretString::from(api_key.expose().to_owned()))
             .await;
@@ -74,32 +90,95 @@ async fn token(
             let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, tenant_id)
                 .await
                 .map_err(sql_error)?;
-            let request_id_buf: String;
-            let request_id = match request_id.as_ref() {
-                Some(Extension(id)) => id.as_str(),
-                None => {
-                    request_id_buf = Uuid::new_v4().to_string();
-                    &request_id_buf
-                }
-            };
             let exchanged = DelegateToken {
                 issuing_key,
                 verifier,
                 permission_check: state.permission_check.clone(),
-                settings: Default::default(),
+                settings: state.token_exchange_settings.clone(),
             }
             .execute(
                 &mut conn,
                 SecretString::from(subject_token.expose().to_owned()),
                 requested_subject,
-                request_id,
+                req_id,
             )
             .await
             .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
             conn.commit().await.map_err(sql_error)?;
             Ok(Json(exchanged.into_response()))
         }
+        TokenRequest::RefreshToken { refresh_token } => {
+            let secret = refresh_token.expose().to_owned();
+            let tenant_id = tenant_from_refresh_jwt(&secret)?;
+            let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, tenant_id)
+                .await
+                .map_err(sql_error)?;
+            let issuing_key = state.issuing_key.clone().ok_or_else(auth_not_configured)?;
+            let exchanged = RefreshTokens {
+                issuing_key,
+                settings: state.token_exchange_settings.clone(),
+            }
+            .execute(&mut conn, SecretString::from(secret), req_id)
+            .await
+            .map_err(WyrdErrorResponse::from)?;
+            conn.commit().await.map_err(sql_error)?;
+            Ok(Json(exchanged.into_response()))
+        }
+        TokenRequest::AuthorizationCode {
+            code,
+            state: login_state,
+        } => {
+            let request_id = req_id.to_owned();
+            let exchanged = exchange_authorization_code(
+                &state,
+                &headers,
+                code.into_secret_string(),
+                &login_state,
+                &request_id,
+            )
+            .await?;
+            Ok(Json(exchanged))
+        }
+        TokenRequest::JwtBearer { assertion, tenant } => {
+            let exchanged = JwtBearer {
+                settings: state.token_exchange_settings.clone(),
+            }
+            .execute(
+                &state,
+                &headers,
+                assertion.into_secret_string(),
+                tenant,
+                req_id,
+            )
+            .await?;
+            Ok(Json(exchanged.into_response()))
+        }
     }
+}
+
+async fn callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request_id: Option<Extension<RequestId>>,
+    Query(query): Query<CallbackQuery>,
+) -> Result<Json<TokenResponse>, WyrdErrorResponse> {
+    let request_id_str;
+    let req_id = match request_id.as_ref() {
+        Some(Extension(id)) => id.as_str(),
+        None => {
+            request_id_str = Uuid::new_v4().to_string();
+            &request_id_str
+        }
+    };
+    let exchanged = exchange_authorization_code(
+        &state,
+        &headers,
+        query.code.into_secret_string(),
+        &query.state,
+        req_id,
+    )
+    .await?;
+    Ok(Json(exchanged))
 }
 
 async fn issue_key(

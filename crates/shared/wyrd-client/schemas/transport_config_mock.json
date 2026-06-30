@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MockConfig",
+  "description": "Configuration for the mock (in-memory loopback) transport.\n\nUse this transport in unit tests where you want to assert what was published without touching a network. `wyrd-client::transport::mock` records every flushed envelope into an in-memory buffer keyed by [`MockConfig::label`] and provides `mock::drain(label)` to retrieve flushed records.\n\nThe mock transport is always available in `wyrd-client` (no feature gate). `MockConfig::fail_on_drain` lets tests inject deterministic drain failures — a Wyrd-native addition the predecessor mock did not support.\n\n# Default\n\n`MockConfig::default()` returns `{ label: \"default\", fail_on_drain: None }`. The default is a working config — it does not need `validate()` and is safe to use directly in tests that do not care about label isolation.",
+  "type": "object",
+  "required": [
+    "label"
+  ],
+  "properties": {
+    "fail_on_drain": {
+      "description": "Inject a drain failure. When `Some(n)`, the `nth` call to drain returns `Err`; all other calls succeed normally. Counting starts from 1 (i.e. `Some(1)` fails the first drain). `None` means the mock always succeeds.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "label": {
+      "description": "Buffer label. Multiple `MockConfig` instances with the same label share the same in-memory buffer in `wyrd-client::transport::mock`. Use distinct labels to isolate test scenarios running in the same process.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

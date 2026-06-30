@@ -15,8 +15,8 @@ pub struct UserRow {
     /// User id.
     pub id: Uuid,
     /// Email address.
-    pub email: String,
-    /// Auth type: `password`, `oauth_google`, or `oauth_github`.
+    pub email: Option<String>,
+    /// Auth type: `password` or `oidc`.
     pub auth_type: String,
     /// Status: `active`, `suspended`, or `deleted`.
     pub status: String,
@@ -36,7 +36,7 @@ pub struct UserRow {
 pub async fn insert_user(
     conn: &mut TenantConn<'_>,
     id: Uuid,
-    email: &str,
+    email: Option<&str>,
     auth_type: &str,
     password_hash: Option<&str>,
 ) -> Result<(), sqlx::Error> {
@@ -137,6 +137,7 @@ mod tests {
         assert!(INSERT_USER_SQL.contains("data_tenant_id"));
         assert!(INSERT_USER_SQL.contains("'active'"));
         assert!(INSERT_USER_SQL.contains("password_hash"));
+        assert!(INSERT_USER_SQL.contains("email"));
     }
 
     #[test]

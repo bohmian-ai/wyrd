@@ -4,6 +4,7 @@ use std::sync::{Mutex, OnceLock};
 
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
+use secrecy::ExposeSecret;
 use wyrd_utils::py::wyrd_error_to_py_err;
 
 static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -13,22 +14,28 @@ fn env_mutex() -> &'static Mutex<()> {
 }
 
 struct EnvSnapshot {
-    api_url: Option<String>,
+    server_url: Option<String>,
+    grpc_url: Option<String>,
     api_key: Option<String>,
 }
 
 impl EnvSnapshot {
     fn capture() -> Self {
         Self {
-            api_url: std::env::var("WYRD_API_URL").ok(),
+            server_url: std::env::var("WYRD_SERVER_URL").ok(),
+            grpc_url: std::env::var("WYRD_GRPC_URL").ok(),
             api_key: std::env::var("WYRD_API_KEY").ok(),
         }
     }
 
     fn restore(self) {
-        match self.api_url {
-            Some(v) => unsafe { std::env::set_var("WYRD_API_URL", &v) },
-            None => unsafe { std::env::remove_var("WYRD_API_URL") },
+        match self.server_url {
+            Some(v) => unsafe { std::env::set_var("WYRD_SERVER_URL", &v) },
+            None => unsafe { std::env::remove_var("WYRD_SERVER_URL") },
+        }
+        match self.grpc_url {
+            Some(v) => unsafe { std::env::set_var("WYRD_GRPC_URL", &v) },
+            None => unsafe { std::env::remove_var("WYRD_GRPC_URL") },
         }
         match self.api_key {
             Some(v) => unsafe { std::env::set_var("WYRD_API_KEY", &v) },
@@ -71,29 +78,40 @@ impl WyrdTestServer {
         let mutate_env = slf.mutate_env;
 
         let result: Result<
-            (crate::server::WyrdTestServer, String, String),
+            (
+                crate::server::WyrdTestServer,
+                String,
+                String,
+                String,
+                String,
+            ),
             wyrd_spec::error::WyrdError,
         > = wyrd_runtime::runtime().block_on(async {
             let srv = crate::server::WyrdTestServer::start_bound()
                 .await
                 .map_err(wyrd_spec::error::WyrdError::from)?;
             let base_url = srv.base_url().unwrap_or("").to_owned();
+            let grpc_url = srv.grpc_url().unwrap_or_default();
+            let api_key = srv.api_key().expose_secret().to_owned();
             let tenant_id = srv.data_tenant_id().to_string();
-            Ok((srv, base_url, tenant_id))
+            Ok((srv, base_url, grpc_url, api_key, tenant_id))
         });
 
-        let (srv, base_url, tenant_id) = result.map_err(wyrd_error_to_py_err)?;
+        let (srv, base_url, grpc_url, api_key, tenant_id) = result.map_err(wyrd_error_to_py_err)?;
 
         if mutate_env {
             let _guard = env_mutex().lock().unwrap_or_else(|p| p.into_inner());
             let snapshot = EnvSnapshot::capture();
             unsafe {
-                std::env::set_var("WYRD_API_URL", &base_url);
+                std::env::set_var("WYRD_SERVER_URL", &base_url);
+                std::env::set_var("WYRD_GRPC_URL", &grpc_url);
+                std::env::set_var("WYRD_API_KEY", &api_key);
             }
             slf.env_snapshot = Some(snapshot);
         }
 
         slf.base_url = Some(base_url);
+        slf.api_key = Some(api_key);
         slf.tenant_id = Some(tenant_id);
         slf.server = Some(srv);
         Ok(slf)

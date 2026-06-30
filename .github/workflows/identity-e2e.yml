@@ -1,0 +1,63 @@
+name: identity-e2e
+
+# Runs real OIDC providers (Keycloak + Dex) and asserts the full identity
+# journey suite: discovery, human login, workload jwt-bearer, TTL, revocation,
+# key rotation, and multi-tenant isolation.
+#
+# Runs on every PR and main-branch push. No credentials required — all providers
+# are local containers. Hosted-provider tests (Okta, Entra, Auth0) run only on
+# nightly, gated by WYRD_IDENTITY_EXTERNAL=1 and repo secrets.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  MISE_LOCKED: "true"
+
+jobs:
+  identity-e2e:
+    name: identity e2e (keycloak + dex)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Use GNU BFD linker on Linux
+        shell: bash
+        run: |
+          command -v cc
+          command -v ld.bfd
+          rustflags="${RUSTFLAGS:-}"
+          rustflags="${rustflags:+$rustflags }-C linker-features=-lld -C link-arg=-fuse-ld=bfd"
+          {
+            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc"
+            echo "RUSTFLAGS=$rustflags"
+          } >> "$GITHUB_ENV"
+
+      - name: Run identity e2e suite
+        run: mise run identity:e2e

@@ -10,7 +10,7 @@ pub struct UserRow {
     /// Tenant isolation UUID as stored by Postgres.
     pub data_tenant_id: Uuid,
     /// User email address.
-    pub email: String,
+    pub email: Option<String>,
     /// Optional password hash for password-backed users.
     pub password_hash: Option<String>,
     /// Authentication source.

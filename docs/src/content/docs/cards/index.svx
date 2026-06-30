@@ -1,6 +1,9 @@
 ---
 title: Cards overview
 description: The card envelope, how registration works, and a catalog of every card kind with its status.
+pillar: wyrd
+group: Cards
+order: 1
 ---
 
 <script>

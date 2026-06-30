@@ -1,9 +1,9 @@
 <script lang="ts">
   import { base } from '$app/paths';
   import { page } from '$app/state';
-  import { siblings } from '$lib/nav';
+  import { siblings } from '$lib/derived-nav';
 
-  // Prev/next derived from the flattened nav.ts order ("PREV / NEXT LEVEL").
+  // Prev/next derived from the frontmatter-driven nav order ("PREV / NEXT LEVEL").
   const pair = $derived(siblings(page.url.pathname));
 </script>
 

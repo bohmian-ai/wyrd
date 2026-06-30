@@ -15,7 +15,7 @@ pub enum TrustedIssuerCommand {
     Add(AddArgs),
     /// List trusted OIDC issuers (GET /admin/trusted-issuers).
     List(ListArgs),
-    /// Remove a trusted OIDC issuer (DELETE /admin/trusted-issuers/{issuer}).
+    /// Remove a trusted OIDC issuer (DELETE /admin/trusted-issuers?issuer=&cascade=).
     Rm(RmArgs),
 }
 
@@ -187,22 +187,20 @@ async fn list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
 }
 
 async fn rm(args: RmArgs) -> Result<ExitCode, WyrdCliError> {
-    let mut url = args
+    let url = args
         .server
         .join("/admin/trusted-issuers")
         .map_err(|source| WyrdCliError::UrlJoin { source })?;
 
-    // push() percent-encodes the segment, safely handling the issuer URL's special chars
-    url.path_segments_mut()
-        .expect("server URL is a valid HTTP/S base")
-        .push(&args.issuer);
-
-    if args.cascade {
-        url.query_pairs_mut().append_pair("cascade", "true");
-    }
-
+    // The server addresses the issuer by query, not a path segment: the route is
+    // the bare collection path and DeleteIssuerQuery reads ?issuer=&cascade=.
+    let cascade = args.cascade.to_string();
     let resp = reqwest::Client::new()
         .delete(url)
+        .query(&[
+            ("issuer", args.issuer.as_str()),
+            ("cascade", cascade.as_str()),
+        ])
         .header(
             reqwest::header::AUTHORIZATION,
             format!("Bearer {}", args.token),

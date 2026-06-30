@@ -37,7 +37,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_sql::queries::auth::{
     TrustedIssuerWrite, WorkloadBindingWrite, delete_trusted_issuer, delete_workload_binding,
     delete_workload_bindings_for_issuer, insert_trusted_issuer, insert_workload_binding,
-    trusted_issuer_by_url, workload_binding_by_key,
+    trusted_issuers_for_tenant, workload_bindings_for_tenant,
 };
 use wyrd_sql::row_types::auth::{TrustedIssuerRow, WorkloadBindingRow};
 use wyrd_sql::{SqlError, TenantConn};
@@ -56,13 +56,13 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/admin/trusted-issuers",
             post(create_trusted_issuer)
-                .get(get_trusted_issuer)
+                .get(list_trusted_issuers)
                 .delete(delete_trusted_issuer_route),
         )
         .route(
             "/admin/workload-bindings",
             post(create_workload_binding)
-                .get(get_workload_binding)
+                .get(list_workload_bindings)
                 .delete(delete_workload_binding_route),
         )
 }
@@ -174,12 +174,6 @@ fn workload_binding_view_from_row(
     })
 }
 
-/// Query for addressing one issuer.
-#[derive(Debug, Deserialize)]
-struct IssuerQuery {
-    issuer: String,
-}
-
 /// Query for deleting one issuer, with the cascade flag.
 #[derive(Debug, Deserialize)]
 struct DeleteIssuerQuery {
@@ -193,6 +187,16 @@ struct DeleteIssuerQuery {
 struct BindingQuery {
     issuer: String,
     subject: String,
+}
+
+/// Optional exact-match filters for the workload-binding list. Both default to
+/// `None`, which lists every binding for the caller's tenant.
+#[derive(Debug, Default, Deserialize)]
+struct BindingFilter {
+    #[serde(default)]
+    issuer: Option<String>,
+    #[serde(default)]
+    subject: Option<String>,
 }
 
 // --------------------------------------------------------------------------
@@ -240,22 +244,20 @@ async fn create_trusted_issuer(
     Ok(Json(trusted_issuer_view_from_write(&write)))
 }
 
-async fn get_trusted_issuer(
+async fn list_trusted_issuers(
     State(state): State<AppState>,
     caller: AuthenticatedPrincipal,
-    Query(query): Query<IssuerQuery>,
-) -> Result<Json<TrustedIssuerView>, WyrdErrorResponse> {
+) -> Result<Json<Vec<TrustedIssuerView>>, WyrdErrorResponse> {
     crate::auth::require_service_accounts_write(&caller.principal, "read trusted issuers")?;
 
-    let issuer = normalize_issuer(&query.issuer);
     let mut conn = acquire_conn(&state, &caller).await?;
-    let row = trusted_issuer_by_url(&mut conn, &issuer)
+    let rows = trusted_issuers_for_tenant(&mut conn)
         .await
-        .map_err(sql_unavailable)?
-        .ok_or_else(|| issuer_not_found(&issuer))?;
+        .map_err(sql_unavailable)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
-    Ok(Json(trusted_issuer_view_from_row(row)))
+    let views = rows.into_iter().map(trusted_issuer_view_from_row).collect();
+    Ok(Json(views))
 }
 
 async fn delete_trusted_issuer_route(
@@ -317,22 +319,28 @@ async fn create_workload_binding(
     Ok(Json(workload_binding_view_from_write(&write)))
 }
 
-async fn get_workload_binding(
+async fn list_workload_bindings(
     State(state): State<AppState>,
     caller: AuthenticatedPrincipal,
-    Query(query): Query<BindingQuery>,
-) -> Result<Json<WorkloadBindingView>, WyrdErrorResponse> {
+    Query(filter): Query<BindingFilter>,
+) -> Result<Json<Vec<WorkloadBindingView>>, WyrdErrorResponse> {
     crate::auth::require_service_accounts_write(&caller.principal, "read workload bindings")?;
 
-    let issuer = normalize_issuer(&query.issuer);
+    // Normalize the issuer filter to the stored form so a trailing slash does
+    // not silently miss; the subject is matched verbatim.
+    let issuer = filter.issuer.as_deref().map(normalize_issuer);
     let mut conn = acquire_conn(&state, &caller).await?;
-    let row = workload_binding_by_key(&mut conn, &issuer, &query.subject)
-        .await
-        .map_err(sql_unavailable)?
-        .ok_or_else(|| binding_not_found(&issuer, &query.subject))?;
+    let rows =
+        workload_bindings_for_tenant(&mut conn, issuer.as_deref(), filter.subject.as_deref())
+            .await
+            .map_err(sql_unavailable)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
-    Ok(Json(workload_binding_view_from_row(row)?))
+    let views = rows
+        .into_iter()
+        .map(workload_binding_view_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(views))
 }
 
 async fn delete_workload_binding_route(
@@ -688,21 +696,17 @@ mod tests {
             other => panic!("expected SecretPost, got {other:?}"),
         }
 
-        // GET returns the redacted view.
-        let got = get_trusted_issuer(
-            State(state),
-            writer(tenant),
-            Query(IssuerQuery {
-                issuer: issuer.as_str().to_owned(),
-            }),
-        )
-        .await
-        .expect("get succeeds")
-        .0;
-        let got_body = serde_json::to_value(&got).expect("view serializes");
+        // LIST returns the redacted view.
+        let listed = list_trusted_issuers(State(state), writer(tenant))
+            .await
+            .expect("list succeeds")
+            .0;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].issuer, issuer.as_str());
+        let listed_body = serde_json::to_value(&listed).expect("views serialize");
         assert!(
-            !got_body.to_string().contains(SECRET),
-            "GET response must not echo the plaintext secret"
+            !listed_body.to_string().contains(SECRET),
+            "list response must not echo the plaintext secret"
         );
     }
 
@@ -733,21 +737,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_and_delete_missing_issuer_is_not_found() {
+    async fn list_is_empty_and_delete_missing_issuer_is_not_found() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let state = test_state(&fixture).await;
 
-        let get_err = get_trusted_issuer(
-            State(state.clone()),
-            writer(tenant),
-            Query(IssuerQuery {
-                issuer: SEEDED_ISSUER.to_owned(),
-            }),
-        )
-        .await
-        .expect_err("missing issuer get is not found");
-        assert!(matches!(get_err.0, WyrdError::AdminNotFound { .. }));
+        // An empty tenant lists no issuers — absence is an empty Vec, not a 404.
+        let listed = list_trusted_issuers(State(state.clone()), writer(tenant))
+            .await
+            .expect("list succeeds on an empty tenant")
+            .0;
+        assert!(listed.is_empty());
 
         let delete_err = delete_trusted_issuer_route(
             State(state),
@@ -840,19 +840,20 @@ mod tests {
                 .expect_err("duplicate binding must conflict");
         assert!(matches!(conflict.0, WyrdError::AdminConflict { .. }));
 
-        // GET resolves the binding.
-        let got = get_workload_binding(
+        // LIST with the issuer filter resolves the binding.
+        let listed = list_workload_bindings(
             State(state.clone()),
             writer(tenant),
-            Query(BindingQuery {
-                issuer: SEEDED_ISSUER.to_owned(),
-                subject: subject.to_owned(),
+            Query(BindingFilter {
+                issuer: Some(SEEDED_ISSUER.to_owned()),
+                subject: None,
             }),
         )
         .await
-        .expect("binding get succeeds")
+        .expect("binding list succeeds")
         .0;
-        assert_eq!(got.subject, subject);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].subject, subject);
 
         // DELETE removes it; a second delete is not found.
         let status = delete_workload_binding_route(
@@ -878,5 +879,46 @@ mod tests {
         .await
         .expect_err("deleting an absent binding is not found");
         assert!(matches!(missing.0, WyrdError::AdminNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn list_returns_every_issuer_for_the_tenant() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let state = test_state(&fixture).await;
+
+        // Seed two distinct issuers directly; the list must return both, proving
+        // GET is a tenant-scoped collection read, not a single-resource get.
+        for url in ["https://idp-a.example.com", "https://idp-b.example.com"] {
+            let trusted = TrustedIssuer {
+                tenant_id: tenant,
+                issuer: IssuerUrl::new(url).expect("issuer is valid"),
+                jwks_uri: format!("{url}/jwks").parse().expect("jwks uri"),
+                expected_audience: "wyrd-api".to_owned(),
+                client_id: "wyrd-client".to_owned(),
+                client_auth: ClientAuth::PrivateKeyJwt,
+                claim_mapping: ClaimMapping {
+                    subject: ClaimPath::new("sub"),
+                    email: None,
+                    groups: None,
+                },
+                group_role_map: HashMap::new(),
+                default_roles: Vec::new(),
+                principal_kind: PrincipalKindPolicy::Workload,
+                jwks_ttl: Duration::from_secs(3600),
+            };
+            let write = issuer_write_from_trusted(&trusted, None).expect("issuer encodes");
+            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+            upsert_trusted_issuer(&mut conn, &write)
+                .await
+                .expect("issuer upsert");
+            conn.commit().await.expect("issuer seed commits");
+        }
+
+        let listed = list_trusted_issuers(State(state), writer(tenant))
+            .await
+            .expect("list succeeds")
+            .0;
+        assert_eq!(listed.len(), 2);
     }
 }

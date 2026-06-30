@@ -54,5 +54,5 @@ pub use users::{UserRow, delete_user, insert_user, user_by_email, user_by_id};
 pub use workload_bindings::{
     WorkloadBindingWrite, delete_workload_binding, delete_workload_bindings_for_issuer,
     insert_workload_binding, upsert_workload_binding, workload_binding_by_key,
-    workload_binding_by_subject,
+    workload_binding_by_subject, workload_bindings_for_tenant,
 };

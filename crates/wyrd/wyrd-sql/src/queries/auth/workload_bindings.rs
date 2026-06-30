@@ -44,6 +44,15 @@ const WORKLOAD_BINDING_BY_KEY_SQL: &str = r#"
        AND subject = $2
 "#;
 
+const WORKLOAD_BINDINGS_FOR_TENANT_SQL: &str = r#"
+    SELECT data_tenant_id, issuer_url, subject, audience, card_ref,
+           created_at, updated_at
+      FROM wyrd.auth_workload_bindings
+     WHERE ($1::text IS NULL OR issuer_url = $1)
+       AND ($2::text IS NULL OR subject = $2)
+     ORDER BY issuer_url, subject
+"#;
+
 const DELETE_WORKLOAD_BINDING_SQL: &str = r#"
     DELETE FROM wyrd.auth_workload_bindings
      WHERE issuer_url = $1
@@ -91,6 +100,27 @@ pub async fn workload_binding_by_subject(
         .bind(subject)
         .bind(audience)
         .fetch_optional(&mut **conn.transaction())
+        .await
+}
+
+/// Return workload binding rows for the current tenant, newest filter wins.
+///
+/// `issuer` and `subject` are optional exact-match filters: a `None` filter
+/// matches every row (the `$N::text IS NULL OR ...` guard). RLS on `TenantConn`
+/// scopes the result to the bound tenant; an empty `Vec` means the tenant has no
+/// matching bindings and is not an error.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the query.
+pub async fn workload_bindings_for_tenant(
+    conn: &mut TenantConn<'_>,
+    issuer: Option<&str>,
+    subject: Option<&str>,
+) -> Result<Vec<WorkloadBindingRow>, sqlx::Error> {
+    sqlx::query_as::<_, WorkloadBindingRow>(WORKLOAD_BINDINGS_FOR_TENANT_SQL)
+        .bind(issuer)
+        .bind(subject)
+        .fetch_all(&mut **conn.transaction())
         .await
 }
 
@@ -210,8 +240,16 @@ mod tests {
     use super::{
         DELETE_WORKLOAD_BINDING_SQL, DELETE_WORKLOAD_BINDINGS_FOR_ISSUER_SQL,
         INSERT_WORKLOAD_BINDING_SQL, UPSERT_WORKLOAD_BINDING_SQL, WORKLOAD_BINDING_BY_KEY_SQL,
-        WORKLOAD_BINDING_BY_SUBJECT_SQL,
+        WORKLOAD_BINDING_BY_SUBJECT_SQL, WORKLOAD_BINDINGS_FOR_TENANT_SQL,
     };
+
+    #[test]
+    fn list_filters_are_optional_via_null_guard() {
+        // Each filter is an exact match only when bound; a NULL bind matches all.
+        assert!(WORKLOAD_BINDINGS_FOR_TENANT_SQL.contains("$1::text IS NULL OR issuer_url = $1"));
+        assert!(WORKLOAD_BINDINGS_FOR_TENANT_SQL.contains("$2::text IS NULL OR subject = $2"));
+        assert!(WORKLOAD_BINDINGS_FOR_TENANT_SQL.contains("ORDER BY issuer_url, subject"));
+    }
 
     #[test]
     fn plain_insert_has_no_on_conflict_clause() {

@@ -40,7 +40,7 @@
 {:else}
 <a class="skip-link" href="#doc-main">Skip to content</a>
 
-<header class="doc-header">
+<header class="doc-header" data-pagefind-ignore>
   <a class="brand" href={`${base}/`} aria-label="Wyrd docs home">
     <WyrdMark size={22} />
     <span class="brand-name">WYRD</span>
@@ -69,14 +69,14 @@
   </main>
 {:else}
   <div class="doc-shell">
-    <aside id="doc-side" class="doc-side" class:open={menuOpen}>
+    <aside id="doc-side" class="doc-side" class:open={menuOpen} data-pagefind-ignore>
       <Sidebar />
     </aside>
     <main id="doc-main" class="doc-main">
       {@render children()}
       <Pagination />
     </main>
-    <aside class="doc-toc">
+    <aside class="doc-toc" data-pagefind-ignore>
       <Toc />
     </aside>
   </div>

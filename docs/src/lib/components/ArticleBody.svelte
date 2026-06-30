@@ -6,6 +6,6 @@
   let { children }: { children?: import('svelte').Snippet } = $props();
 </script>
 
-<article class="doc-content">
+<article class="doc-content" data-pagefind-body>
   {@render children?.()}
 </article>

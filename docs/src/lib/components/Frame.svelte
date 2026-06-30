@@ -10,6 +10,7 @@
 
   import WyrdMark from './WyrdMark.svelte';
   import ThemeToggle from './ThemeToggle.svelte';
+  import Search from './Search.svelte';
 
   let {
     product = 'wyrd',
@@ -27,7 +28,7 @@
 </script>
 
 <div class="frame">
-  <header class="marquee">
+  <header class="marquee" data-pagefind-ignore>
     <a class="brand" href="/">
       <WyrdMark size={22} />
       <span class="wm">MITARI</span>
@@ -50,9 +51,7 @@
     </nav>
 
     <div class="right">
-      <span class="search" role="searchbox" tabindex="0">
-        Search docs… <span class="k">⌘K</span>
-      </span>
+      <Search />
       <ThemeToggle />
       <a
         class="iconbtn"
@@ -83,7 +82,7 @@
     </div>
   </header>
 
-  <div class="drawer" class:open={drawer} role="navigation" aria-label="Mobile navigation">
+  <div class="drawer" class:open={drawer} role="navigation" aria-label="Mobile navigation" data-pagefind-ignore>
     <a href="/" onclick={closeDrawer}>Wyrd · Start here</a>
     <a href="/concepts/" onclick={closeDrawer}>Concepts</a>
     <a href="/guides/" onclick={closeDrawer}>Guides</a>
@@ -94,7 +93,7 @@
 
   <div class="content">{@render children?.()}</div>
 
-  <footer class="foot">
+  <footer class="foot" data-pagefind-ignore>
     <div class="foot-in">
       <div>
         <div class="fb"><WyrdMark size={22} /><span class="wm">MITARI</span></div>
@@ -230,28 +229,6 @@
     align-items: center;
     gap: 9px;
   }
-  .search {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--cab-dim);
-    background: var(--cab-line);
-    border: 2px solid var(--cab-line);
-    border-radius: var(--r);
-    padding: 6px 10px;
-    min-width: 168px;
-    cursor: text;
-  }
-  .search .k {
-    margin-left: auto;
-    font-size: 9px;
-    font-weight: 700;
-    border: 2px solid var(--cab-line);
-    border-radius: 3px;
-    padding: 1px 5px;
-  }
   .iconbtn {
     display: inline-flex;
     align-items: center;
@@ -381,8 +358,7 @@
 
   /* ---- Responsive ---- */
   @media (max-width: 820px) {
-    .switch,
-    .search {
+    .switch {
       display: none;
     }
     .menu {

@@ -24,6 +24,9 @@
     page.url.pathname === `${base}/` || page.url.pathname === base || page.url.pathname === '/'
   );
 
+  // Error pages (404, etc.) render full-width without sidebar or TOC.
+  const isError = $derived(page.error !== null);
+
   // Mock routes (design-direction previews) render bare — their own Frame owns chrome.
   const isMock = $derived(page.url.pathname.includes('/mocks'));
 
@@ -46,7 +49,7 @@
   <div class="header-right">
     <Search />
     <ThemeToggle />
-    {#if !isHome}
+    {#if !isHome && !isError}
       <button
         class="menu-toggle"
         type="button"
@@ -60,7 +63,7 @@
   </div>
 </header>
 
-{#if isHome}
+{#if isHome || isError}
   <main id="doc-main" class="doc-home">
     {@render children()}
   </main>

@@ -10,6 +10,7 @@ use sqlx::PgPool;
 use sqlx::types::Uuid;
 use std::time::Duration;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::reference::CardRef;
 use wyrd_spec::storage::{StorageBackendKind, UploadId, WireProtocol};
 use wyrd_sql::pool::build_app_pool;
 use wyrd_sql::queries::auth::{
@@ -47,6 +48,8 @@ async fn migrations_apply_and_are_idempotent() {
     assert_regclass_exists(pool, "wyrd.auth_user_identities", true).await;
     assert_regclass_exists(pool, "wyrd.auth_login_state", true).await;
     assert_regclass_exists(pool, "wyrd.auth_refresh_tokens", true).await;
+    assert_regclass_exists(pool, "wyrd.auth_trusted_issuers", true).await;
+    assert_regclass_exists(pool, "wyrd.auth_workload_bindings", true).await;
 
     assert_platform_resolver_shape(pool).await;
     assert_current_tenant_parallel_restricted(pool).await;
@@ -676,6 +679,339 @@ async fn storage_admin_queries_find_and_abort_expired_uploads() {
         .expect("storage admin test rows clean up");
 }
 
+// ---------------------------------------------------------------------------
+// Cloud-issuer behavioral contract tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cloud_issuer_unique_constraints_exist() {
+    let Some(url) = database_url() else {
+        return;
+    };
+
+    let store = SqlStore::connect(&url, 2)
+        .await
+        .expect("connects to postgres");
+    assert_required_roles(store.pool()).await;
+    store.migrate().await.expect("migrations apply");
+
+    let pool = store.pool();
+
+    let trusted_issuers_unique: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (
+            SELECT 1 FROM pg_indexes
+            WHERE schemaname = 'wyrd'
+              AND tablename  = 'auth_trusted_issuers'
+              AND indexdef LIKE '%UNIQUE%'
+              AND indexdef LIKE '%data_tenant_id%'
+              AND indexdef LIKE '%issuer_url%'
+        )",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("index query succeeds");
+
+    assert!(
+        trusted_issuers_unique.0,
+        "auth_trusted_issuers must have a unique index on (data_tenant_id, issuer_url)"
+    );
+
+    let workload_bindings_unique: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (
+            SELECT 1 FROM pg_indexes
+            WHERE schemaname = 'wyrd'
+              AND tablename  = 'auth_workload_bindings'
+              AND indexdef LIKE '%UNIQUE%'
+              AND indexdef LIKE '%data_tenant_id%'
+              AND indexdef LIKE '%issuer_url%'
+              AND indexdef LIKE '%subject%'
+        )",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("index query succeeds");
+
+    assert!(
+        workload_bindings_unique.0,
+        "auth_workload_bindings must have a unique index on (data_tenant_id, issuer_url, subject)"
+    );
+}
+
+#[tokio::test]
+async fn cloud_issuer_fk_rejects_delete_with_live_binding() {
+    let Some(url) = database_url() else {
+        return;
+    };
+
+    let store = SqlStore::connect(&url, 2)
+        .await
+        .expect("connects to postgres");
+    assert_required_roles(store.pool()).await;
+    store.migrate().await.expect("migrations apply");
+
+    let pool = store.pool();
+    let tenant = DataTenantId::new_v7();
+    let suffix = tenant.as_uuid().to_string();
+    let issuer_url = format!("https://idp.example.com/fk-test-{suffix}");
+
+    insert_tenant(pool, tenant, &format!("fk-test-{suffix}")).await;
+    insert_trusted_issuer(pool, tenant, &issuer_url).await;
+    insert_workload_binding(
+        pool,
+        tenant,
+        &issuer_url,
+        "system:serviceaccount:default:wyrd",
+        &serde_json::json!({
+            "kind": "Service",
+            "name": "billing",
+            "version": "1.0.0",
+            "space": "prod"
+        }),
+    )
+    .await;
+
+    // Attempt to delete the referenced issuer — must be rejected by the FK.
+    let result = sqlx::query(
+        "DELETE FROM wyrd.auth_trusted_issuers
+          WHERE data_tenant_id = $1 AND issuer_url = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(&issuer_url)
+    .execute(pool)
+    .await;
+
+    assert!(
+        matches!(result, Err(sqlx::Error::Database(_))),
+        "deleting an issuer with live workload bindings must fail with an FK violation: {result:?}"
+    );
+
+    // Cleanup: bindings first, then issuers, then tenants.
+    sqlx::query("DELETE FROM wyrd.auth_workload_bindings WHERE data_tenant_id = $1")
+        .bind(tenant.as_uuid())
+        .execute(pool)
+        .await
+        .expect("binding cleanup succeeds");
+    sqlx::query("DELETE FROM wyrd.auth_trusted_issuers WHERE data_tenant_id = $1")
+        .bind(tenant.as_uuid())
+        .execute(pool)
+        .await
+        .expect("issuer cleanup succeeds");
+    sqlx::query("DELETE FROM platform.tenants WHERE data_tenant_id = $1")
+        .bind(tenant.as_uuid())
+        .execute(pool)
+        .await
+        .expect("tenant cleanup succeeds");
+}
+
+#[tokio::test]
+async fn cloud_issuer_card_ref_jsonb_round_trips() {
+    let Some(url) = database_url() else {
+        return;
+    };
+
+    let store = SqlStore::connect(&url, 2)
+        .await
+        .expect("connects to postgres");
+    assert_required_roles(store.pool()).await;
+    store.migrate().await.expect("migrations apply");
+
+    let pool = store.pool();
+    let tenant = DataTenantId::new_v7();
+    let suffix = tenant.as_uuid().to_string();
+    let issuer_url = format!("https://idp.example.com/card-ref-test-{suffix}");
+    let subject = format!("system:sa:{suffix}");
+
+    insert_tenant(pool, tenant, &format!("card-ref-{suffix}")).await;
+    insert_trusted_issuer(pool, tenant, &issuer_url).await;
+
+    // CardRef with all five fields (kind serializes to its wire name).
+    let card_ref_json = serde_json::json!({
+        "kind": "Service",
+        "name": "billing-service",
+        "version": "1.0.0",
+        "space": "prod",
+        "uid": "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
+    });
+
+    insert_workload_binding(pool, tenant, &issuer_url, &subject, &card_ref_json).await;
+
+    let row: (serde_json::Value,) = sqlx::query_as(
+        "SELECT card_ref FROM wyrd.auth_workload_bindings
+          WHERE data_tenant_id = $1 AND issuer_url = $2 AND subject = $3",
+    )
+    .bind(tenant.as_uuid())
+    .bind(&issuer_url)
+    .bind(&subject)
+    .fetch_one(pool)
+    .await
+    .expect("card_ref select succeeds");
+
+    assert_eq!(
+        row.0, card_ref_json,
+        "card_ref JSONB must round-trip through Postgres without loss"
+    );
+
+    // Prove the stored JSON is valid for CardRef deserialization via serde.
+    let card_ref: CardRef = serde_json::from_value(row.0)
+        .expect("stored card_ref JSONB must deserialize to a valid CardRef");
+    assert_eq!(card_ref.kind.wire_name(), "Service");
+    assert_eq!(card_ref.name.to_string(), "billing-service");
+    assert_eq!(card_ref.version.to_string(), "1.0.0");
+    assert_eq!(card_ref.space.to_string(), "prod");
+    assert!(card_ref.uid.is_some(), "uid must survive the round-trip");
+
+    // Cleanup.
+    sqlx::query("DELETE FROM wyrd.auth_workload_bindings WHERE data_tenant_id = $1")
+        .bind(tenant.as_uuid())
+        .execute(pool)
+        .await
+        .expect("binding cleanup succeeds");
+    sqlx::query("DELETE FROM wyrd.auth_trusted_issuers WHERE data_tenant_id = $1")
+        .bind(tenant.as_uuid())
+        .execute(pool)
+        .await
+        .expect("issuer cleanup succeeds");
+    sqlx::query("DELETE FROM platform.tenants WHERE data_tenant_id = $1")
+        .bind(tenant.as_uuid())
+        .execute(pool)
+        .await
+        .expect("tenant cleanup succeeds");
+}
+
+#[tokio::test]
+async fn cloud_issuer_cross_tenant_rls_and_unique_constraints() {
+    let Some(migrator_url) = database_url() else {
+        return;
+    };
+    let Some(app_url) = app_database_url() else {
+        return;
+    };
+
+    let store = SqlStore::connect(&migrator_url, 2)
+        .await
+        .expect("migrator connects");
+    assert_required_roles(store.pool()).await;
+    store.migrate().await.expect("migrations apply");
+
+    let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
+
+    let tenant_a = DataTenantId::new_v7();
+    let tenant_b = DataTenantId::new_v7();
+    let suffix = tenant_a.as_uuid().to_string();
+    let issuer_url = format!("https://shared-idp.example.com/{suffix}");
+
+    insert_tenant(store.pool(), tenant_a, &format!("ci-a-{suffix}")).await;
+    insert_tenant(store.pool(), tenant_b, &format!("ci-b-{suffix}")).await;
+
+    // Insert issuer for tenant A via migrator pool (bypasses RLS).
+    insert_trusted_issuer(store.pool(), tenant_a, &issuer_url).await;
+
+    // Tenant B must see zero rows — RLS filters out tenant A's issuers.
+    {
+        let mut conn = TenantConn::acquire(&app_pool, tenant_b)
+            .await
+            .expect("tenant_b conn acquired");
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM wyrd.auth_trusted_issuers")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("count query succeeds");
+        assert_eq!(
+            count.0, 0,
+            "tenant_b must see zero trusted issuers seeded for tenant_a"
+        );
+    }
+
+    // Tenant A must see its own issuer.
+    {
+        let mut conn = TenantConn::acquire(&app_pool, tenant_a)
+            .await
+            .expect("tenant_a conn acquired");
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM wyrd.auth_trusted_issuers")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("count query succeeds");
+        assert_eq!(count.0, 1, "tenant_a must see its own trusted issuer");
+    }
+
+    // Same issuer_url is insertable under tenant B (cross-tenant isolation).
+    insert_trusted_issuer(store.pool(), tenant_b, &issuer_url).await;
+
+    // Duplicate (data_tenant_id, issuer_url) within tenant A must be rejected.
+    let duplicate = insert_trusted_issuer_result(store.pool(), tenant_a, &issuer_url).await;
+    assert!(
+        duplicate.is_err(),
+        "duplicate (data_tenant_id, issuer_url) within the same tenant must be rejected"
+    );
+
+    // Cleanup.
+    sqlx::query("DELETE FROM wyrd.auth_trusted_issuers WHERE data_tenant_id IN ($1, $2)")
+        .bind(tenant_a.as_uuid())
+        .bind(tenant_b.as_uuid())
+        .execute(store.pool())
+        .await
+        .expect("issuer cleanup succeeds");
+    sqlx::query("DELETE FROM platform.tenants WHERE data_tenant_id IN ($1, $2)")
+        .bind(tenant_a.as_uuid())
+        .bind(tenant_b.as_uuid())
+        .execute(store.pool())
+        .await
+        .expect("tenant cleanup succeeds");
+}
+
+async fn insert_trusted_issuer(pool: &PgPool, data_tenant_id: DataTenantId, issuer_url: &str) {
+    insert_trusted_issuer_result(pool, data_tenant_id, issuer_url)
+        .await
+        .expect("trusted issuer inserts");
+}
+
+async fn insert_trusted_issuer_result(
+    pool: &PgPool,
+    data_tenant_id: DataTenantId,
+    issuer_url: &str,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO wyrd.auth_trusted_issuers
+             (data_tenant_id, issuer_url, jwks_uri, expected_audience, client_id,
+              client_auth, claim_mapping, group_role_map, default_roles,
+              principal_kind, jwks_ttl_secs)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+    )
+    .bind(data_tenant_id.as_uuid())
+    .bind(issuer_url)
+    .bind(format!("{issuer_url}/.well-known/jwks.json"))
+    .bind("wyrd-test-audience")
+    .bind("wyrd-test-client")
+    .bind("PrivateKeyJwt")
+    .bind(serde_json::json!({"subject": "sub"}))
+    .bind(serde_json::json!({}))
+    .bind(serde_json::json!([]))
+    .bind("Workload")
+    .bind(3600_i64)
+    .execute(pool)
+    .await
+}
+
+async fn insert_workload_binding(
+    pool: &PgPool,
+    data_tenant_id: DataTenantId,
+    issuer_url: &str,
+    subject: &str,
+    card_ref: &serde_json::Value,
+) {
+    sqlx::query(
+        "INSERT INTO wyrd.auth_workload_bindings
+             (data_tenant_id, issuer_url, subject, card_ref)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(data_tenant_id.as_uuid())
+    .bind(issuer_url)
+    .bind(subject)
+    .bind(card_ref)
+    .execute(pool)
+    .await
+    .expect("workload binding inserts");
+}
+
 fn database_url() -> Option<String> {
     let app_url = std::env::var("WYRD_DATABASE_URL").ok()?;
     let migrator_password = std::env::var("WYRD_DATABASE_MIGRATOR_PASSWORD").ok()?;
@@ -829,9 +1165,11 @@ async fn assert_auth_rls_metadata(pool: &PgPool) {
         "auth_roles",
         "auth_service_account_roles",
         "auth_service_accounts",
+        "auth_trusted_issuers",
         "auth_user_identities",
         "auth_user_roles",
         "auth_users",
+        "auth_workload_bindings",
     ];
 
     assert_eq!(

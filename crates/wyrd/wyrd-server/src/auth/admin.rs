@@ -16,7 +16,6 @@
 //! deferred to the audit→Vala/Iceberg consolidation rather than a per-feature
 //! Postgres table (the `revoke_principal` precedent writes no audit row either).
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use axum::Json;
@@ -25,15 +24,16 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use secrecy::SecretString;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Deserialize;
 use wyrd_auth_oidc::{
     ClaimMapping, ClaimPath, ClientAuth, OidcProvider, PrincipalKindPolicy, TrustedIssuer,
     WorkloadBinding,
 };
-use wyrd_spec::auth::IssuerUrl;
+use wyrd_spec::auth::{
+    ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
+    IssuerUrl, PrincipalKindPayload, TrustedIssuerView, WorkloadBindingView,
+};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::reference::CardRef;
 use wyrd_sql::queries::auth::{
     TrustedIssuerWrite, WorkloadBindingWrite, delete_trusted_issuer, delete_workload_binding,
     delete_workload_bindings_for_issuer, insert_trusted_issuer, insert_workload_binding,
@@ -68,181 +68,110 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
 }
 
 // --------------------------------------------------------------------------
-// Request / response payloads
+// Wire-DTO conversions
+//
+// The request/response DTOs themselves live in `wyrd_spec::auth::admin`. The
+// orphan rule forbids `impl From<wyrd_auth_oidc::_> for wyrd_spec::_` here
+// (neither type is local to this crate), so every mapping to or from the
+// domain and row types is a free function below.
 // --------------------------------------------------------------------------
 
-/// Serde mirror of [`ClaimMapping`], whose [`ClaimPath`] is not (de)serializable.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClaimMappingPayload {
-    subject: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    email: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    groups: Option<String>,
-}
-
-impl ClaimMappingPayload {
-    fn into_domain(self) -> ClaimMapping {
-        ClaimMapping {
-            subject: ClaimPath::new(self.subject),
-            email: self.email.map(ClaimPath::new),
-            groups: self.groups.map(ClaimPath::new),
-        }
+/// Build the domain [`ClaimMapping`] from its serde mirror; [`ClaimPath`] is
+/// not directly (de)serializable.
+fn claim_mapping_into_domain(payload: ClaimMappingPayload) -> ClaimMapping {
+    ClaimMapping {
+        subject: ClaimPath::new(payload.subject),
+        email: payload.email.map(ClaimPath::new),
+        groups: payload.groups.map(ClaimPath::new),
     }
 }
 
-/// How Wyrd authenticates to the IdP token endpoint, as authored by the admin.
-#[derive(Debug, Clone, Copy, Deserialize)]
-enum ClientAuthKind {
-    SecretBasic,
-    SecretPost,
-    PrivateKeyJwt,
-    Public,
-}
-
-/// Whether the issuer's tokens represent humans or machine workloads.
-#[derive(Debug, Clone, Copy, Deserialize)]
-enum PrincipalKindPayload {
-    Human,
-    Workload,
-}
-
-impl From<PrincipalKindPayload> for PrincipalKindPolicy {
-    fn from(value: PrincipalKindPayload) -> Self {
-        match value {
-            PrincipalKindPayload::Human => PrincipalKindPolicy::Human,
-            PrincipalKindPayload::Workload => PrincipalKindPolicy::Workload,
-        }
+/// Map the authored principal kind to the domain policy.
+fn principal_kind_policy(payload: PrincipalKindPayload) -> PrincipalKindPolicy {
+    match payload {
+        PrincipalKindPayload::Human => PrincipalKindPolicy::Human,
+        PrincipalKindPayload::Workload => PrincipalKindPolicy::Workload,
     }
 }
 
-/// `POST /admin/trusted-issuers` body.
-#[derive(Debug, Deserialize)]
-struct CreateTrustedIssuerRequest {
-    issuer: IssuerUrl,
-    expected_audience: String,
-    client_id: String,
-    client_auth: ClientAuthKind,
-    #[serde(default)]
-    client_secret: Option<String>,
-    claim_mapping: ClaimMappingPayload,
-    #[serde(default)]
-    group_role_map: HashMap<String, Vec<String>>,
-    #[serde(default)]
-    default_roles: Vec<String>,
-    principal_kind: PrincipalKindPayload,
-    #[serde(default)]
-    jwks_ttl_secs: Option<u64>,
-}
-
-impl CreateTrustedIssuerRequest {
-    /// Build the domain [`ClientAuth`], requiring a secret for the secret-bearing
-    /// variants. A missing secret on `SecretBasic`/`SecretPost` is a client error.
-    fn client_auth(&self) -> Result<ClientAuth, WyrdErrorResponse> {
-        match self.client_auth {
-            ClientAuthKind::SecretBasic => Ok(ClientAuth::SecretBasic(self.required_secret()?)),
-            ClientAuthKind::SecretPost => Ok(ClientAuth::SecretPost(self.required_secret()?)),
-            ClientAuthKind::PrivateKeyJwt => Ok(ClientAuth::PrivateKeyJwt),
-            ClientAuthKind::Public => Ok(ClientAuth::Public),
-        }
-    }
-
-    fn required_secret(&self) -> Result<SecretString, WyrdErrorResponse> {
-        match self.client_secret.as_deref() {
-            Some(secret) if !secret.is_empty() => Ok(SecretString::from(secret.to_owned())),
-            _ => Err(WyrdErrorResponse::from(WyrdError::MissingRequiredField {
-                message: "client_secret is required for SecretBasic and SecretPost client auth"
-                    .to_owned(),
-                details: serde_json::json!({ "field": "client_secret" }),
-            })),
-        }
+/// Build the domain [`ClientAuth`], requiring a secret for the secret-bearing
+/// variants. A missing secret on `SecretBasic`/`SecretPost` is a client error.
+fn request_client_auth(
+    request: &CreateTrustedIssuerRequest,
+) -> Result<ClientAuth, WyrdErrorResponse> {
+    match request.client_auth {
+        ClientAuthKind::SecretBasic => Ok(ClientAuth::SecretBasic(required_secret(request)?)),
+        ClientAuthKind::SecretPost => Ok(ClientAuth::SecretPost(required_secret(request)?)),
+        ClientAuthKind::PrivateKeyJwt => Ok(ClientAuth::PrivateKeyJwt),
+        ClientAuthKind::Public => Ok(ClientAuth::Public),
     }
 }
 
-/// Redacted issuer projection. Never carries the client secret.
-#[derive(Debug, Serialize)]
-struct TrustedIssuerView {
-    issuer: String,
-    jwks_uri: String,
-    expected_audience: String,
-    client_id: String,
-    client_auth: String,
-    principal_kind: String,
-    jwks_ttl_secs: i64,
-    claim_mapping: Value,
-    group_role_map: Value,
-    default_roles: Value,
-}
-
-impl TrustedIssuerView {
-    fn from_write(write: &TrustedIssuerWrite) -> Self {
-        Self {
-            issuer: write.issuer_url.clone(),
-            jwks_uri: write.jwks_uri.clone(),
-            expected_audience: write.expected_audience.clone(),
-            client_id: write.client_id.clone(),
-            client_auth: write.client_auth.clone(),
-            principal_kind: write.principal_kind.clone(),
-            jwks_ttl_secs: write.jwks_ttl_secs,
-            claim_mapping: write.claim_mapping.clone(),
-            group_role_map: write.group_role_map.clone(),
-            default_roles: write.default_roles.clone(),
-        }
-    }
-
-    fn from_row(row: TrustedIssuerRow) -> Self {
-        Self {
-            issuer: row.issuer_url,
-            jwks_uri: row.jwks_uri,
-            expected_audience: row.expected_audience,
-            client_id: row.client_id,
-            client_auth: row.client_auth,
-            principal_kind: row.principal_kind,
-            jwks_ttl_secs: row.jwks_ttl_secs,
-            claim_mapping: row.claim_mapping,
-            group_role_map: row.group_role_map,
-            default_roles: row.default_roles,
-        }
+fn required_secret(
+    request: &CreateTrustedIssuerRequest,
+) -> Result<SecretString, WyrdErrorResponse> {
+    match request.client_secret.as_deref() {
+        Some(secret) if !secret.is_empty() => Ok(SecretString::from(secret.to_owned())),
+        _ => Err(WyrdErrorResponse::from(WyrdError::MissingRequiredField {
+            message: "client_secret is required for SecretBasic and SecretPost client auth"
+                .to_owned(),
+            details: serde_json::json!({ "field": "client_secret" }),
+        })),
     }
 }
 
-/// `POST /admin/workload-bindings` body.
-#[derive(Debug, Deserialize)]
-struct CreateWorkloadBindingRequest {
-    issuer: IssuerUrl,
-    subject: String,
-    #[serde(default)]
-    audience: Option<String>,
-    card_ref: CardRef,
+/// Redacted issuer projection from a write row. Never carries the client secret.
+fn trusted_issuer_view_from_write(write: &TrustedIssuerWrite) -> TrustedIssuerView {
+    TrustedIssuerView {
+        issuer: write.issuer_url.clone(),
+        jwks_uri: write.jwks_uri.clone(),
+        expected_audience: write.expected_audience.clone(),
+        client_id: write.client_id.clone(),
+        client_auth: write.client_auth.clone(),
+        principal_kind: write.principal_kind.clone(),
+        jwks_ttl_secs: write.jwks_ttl_secs,
+        claim_mapping: write.claim_mapping.clone(),
+        group_role_map: write.group_role_map.clone(),
+        default_roles: write.default_roles.clone(),
+    }
 }
 
-/// Workload-binding projection.
-#[derive(Debug, Serialize)]
-struct WorkloadBindingView {
-    issuer: String,
-    subject: String,
-    audience: Option<String>,
-    card_ref: Value,
+/// Redacted issuer projection from a stored row.
+fn trusted_issuer_view_from_row(row: TrustedIssuerRow) -> TrustedIssuerView {
+    TrustedIssuerView {
+        issuer: row.issuer_url,
+        jwks_uri: row.jwks_uri,
+        expected_audience: row.expected_audience,
+        client_id: row.client_id,
+        client_auth: row.client_auth,
+        principal_kind: row.principal_kind,
+        jwks_ttl_secs: row.jwks_ttl_secs,
+        claim_mapping: row.claim_mapping,
+        group_role_map: row.group_role_map,
+        default_roles: row.default_roles,
+    }
 }
 
-impl WorkloadBindingView {
-    fn from_write(write: &WorkloadBindingWrite) -> Self {
-        Self {
-            issuer: write.issuer_url.clone(),
-            subject: write.subject.clone(),
-            audience: write.audience.clone(),
-            card_ref: write.card_ref.clone(),
-        }
+/// Workload-binding projection from a write row.
+fn workload_binding_view_from_write(write: &WorkloadBindingWrite) -> WorkloadBindingView {
+    WorkloadBindingView {
+        issuer: write.issuer_url.clone(),
+        subject: write.subject.clone(),
+        audience: write.audience.clone(),
+        card_ref: write.card_ref.clone(),
     }
+}
 
-    fn from_row(row: WorkloadBindingRow) -> Result<Self, WyrdErrorResponse> {
-        Ok(Self {
-            issuer: row.issuer_url,
-            subject: row.subject,
-            audience: row.audience,
-            card_ref: serde_json::to_value(row.card_ref).map_err(internal_error)?,
-        })
-    }
+/// Workload-binding projection from a stored row.
+fn workload_binding_view_from_row(
+    row: WorkloadBindingRow,
+) -> Result<WorkloadBindingView, WyrdErrorResponse> {
+    Ok(WorkloadBindingView {
+        issuer: row.issuer_url,
+        subject: row.subject,
+        audience: row.audience,
+        card_ref: serde_json::to_value(row.card_ref).map_err(internal_error)?,
+    })
 }
 
 /// Query for addressing one issuer.
@@ -287,11 +216,11 @@ async fn create_trusted_issuer(
         jwks_uri,
         expected_audience: request.expected_audience.clone(),
         client_id: request.client_id.clone(),
-        client_auth: request.client_auth()?,
-        claim_mapping: request.claim_mapping.clone().into_domain(),
+        client_auth: request_client_auth(&request)?,
+        claim_mapping: claim_mapping_into_domain(request.claim_mapping.clone()),
         group_role_map: request.group_role_map.clone(),
         default_roles: request.default_roles.clone(),
-        principal_kind: request.principal_kind.into(),
+        principal_kind: principal_kind_policy(request.principal_kind),
         jwks_ttl: request
             .jwks_ttl_secs
             .map_or(DEFAULT_JWKS_TTL, Duration::from_secs),
@@ -308,7 +237,7 @@ async fn create_trusted_issuer(
         .map_err(map_write_error)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
-    Ok(Json(TrustedIssuerView::from_write(&write)))
+    Ok(Json(trusted_issuer_view_from_write(&write)))
 }
 
 async fn get_trusted_issuer(
@@ -326,7 +255,7 @@ async fn get_trusted_issuer(
         .ok_or_else(|| issuer_not_found(&issuer))?;
     conn.commit().await.map_err(sql_unavailable)?;
 
-    Ok(Json(TrustedIssuerView::from_row(row)))
+    Ok(Json(trusted_issuer_view_from_row(row)))
 }
 
 async fn delete_trusted_issuer_route(
@@ -385,7 +314,7 @@ async fn create_workload_binding(
         .map_err(map_write_error)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
-    Ok(Json(WorkloadBindingView::from_write(&write)))
+    Ok(Json(workload_binding_view_from_write(&write)))
 }
 
 async fn get_workload_binding(
@@ -403,7 +332,7 @@ async fn get_workload_binding(
         .ok_or_else(|| binding_not_found(&issuer, &query.subject))?;
     conn.commit().await.map_err(sql_unavailable)?;
 
-    Ok(Json(WorkloadBindingView::from_row(row)?))
+    Ok(Json(workload_binding_view_from_row(row)?))
 }
 
 async fn delete_workload_binding_route(

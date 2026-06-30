@@ -145,6 +145,18 @@ Routing:
     - `full sweep`: continue past blockers and report every legitimate,
       materially separate finding found in the reviewed artifact.
 
+    **Default depth by context.** When you are invoked as a **pipeline gate** —
+    reviewing a `spec.md` (Gate 1) or a `plan.md` / commit DAG (Gate 2) — default
+    to **full sweep** even if the caller hands you a focus list. A focus list at a
+    gate is a hint about what matters most, *not* a scope cap; widen past it and
+    report every materially-separate finding. These artifacts are prose, so a
+    miss is cheap to fix now and expensive once it reaches code — exhaustiveness
+    is the whole point of the gate. Use `blocker-only` only when the caller
+    explicitly wants a fast go/no-go (e.g. a pre-spec "is this doctrine-legal?"
+    check), and `requested scope` only when the caller names a single surface and
+    says not to look wider. If a focus list and a gate context conflict, the gate
+    wins: sweep.
+
 ## Full Sweep Mode
 
 Use full sweep mode when the target is a plan folder or multi-file proposal

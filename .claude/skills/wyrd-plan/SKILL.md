@@ -48,9 +48,13 @@ from CodeGraph at build time. (Canonical doctrine: `wyrd-tasks`.)
 5. Write `plan.md` in the format below to `.dev/plan/<feature>/plan.md`.
 6. Emit the `tasks.yaml` **skeleton**: one node per commit with `id`, `title`,
    `depends_on`, and a `cratesHint`. `wyrd-tasks` fills the rest.
-7. **Gate 2.** Hand `plan.md` to `wyrd-architecture-review` (it runs with
-   CodeGraph and verifies the commit seams against real source). Resolve findings
-   before tasks.
+7. **Gate 2.** Hand `plan.md` to `wyrd-architecture-review` **at full-sweep
+   depth** (it runs with CodeGraph and verifies the commit seams against real
+   source). Tell it "full sweep" explicitly and do not pre-narrow it to a short
+   focus list. The DAG is where sequencing, commit-ownership, and missing-edge
+   errors hide — they only become visible once work is sliced into commits, and
+   they are cheap to fix as plan text but expensive once discovered mid-build.
+   Resolve findings before tasks.
 
 ## References
 

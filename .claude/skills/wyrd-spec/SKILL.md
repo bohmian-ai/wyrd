@@ -52,9 +52,15 @@ grep/read loop.
    one-paragraph rationale. These decisions are the load-bearing output — the
    plan, tasks, and arch review all hang off them.
 4. **Write** `spec.md` to `.dev/plan/<feature>/spec.md`.
-5. **Gate 1.** Hand `spec.md` to `wyrd-architecture-review`. Resolve findings
-   (loop with `wyrd-plan-interviewer` if a decision reopens) before moving to
-   `wyrd-plan`.
+5. **Gate 1.** Hand `spec.md` to `wyrd-architecture-review` **at full-sweep
+   depth** — explicitly tell it "full sweep: continue past blockers, report every
+   materially-separate finding," and do **not** hand it a pre-narrowed focus list
+   (a short focus list silently scopes it to blocker-only). The spec is where
+   decisions get *locked*; a missed finding here propagates through plan → tasks →
+   code, and it is cheapest to fix as prose. Blocker-only is a false economy at a
+   pipeline gate — reserve it for a fast pre-spec "is this even doctrine-legal?"
+   gut-check, never as the Gate-1 pass. Resolve findings (loop with
+   `wyrd-plan-interviewer` if a decision reopens) before moving to `wyrd-plan`.
 
 ## References
 

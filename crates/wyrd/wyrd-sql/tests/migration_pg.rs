@@ -14,7 +14,8 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::storage::{StorageBackendKind, UploadId, WireProtocol};
 use wyrd_sql::pool::build_app_pool;
 use wyrd_sql::queries::auth::{
-    insert_user, upsert_user_identity, user_by_email, user_by_id, user_id_by_identity,
+    insert_user, trusted_issuers_for_tenant, upsert_user_identity, user_by_email, user_by_id,
+    user_id_by_identity, workload_binding_by_subject,
 };
 use wyrd_sql::queries::platform::audit_log::{StorageAuditEvent, write_storage_event};
 use wyrd_sql::queries::storage;
@@ -956,6 +957,197 @@ async fn cloud_issuer_cross_tenant_rls_and_unique_constraints() {
         .execute(store.pool())
         .await
         .expect("tenant cleanup succeeds");
+}
+
+#[tokio::test]
+async fn cloud_issuer_read_path_roundtrips_and_rls() {
+    let Some(migrator_url) = database_url() else {
+        return;
+    };
+    let Some(app_url) = app_database_url() else {
+        return;
+    };
+
+    let store = SqlStore::connect(&migrator_url, 2)
+        .await
+        .expect("migrator connects");
+    assert_required_roles(store.pool()).await;
+    store.migrate().await.expect("migrations apply");
+
+    let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
+
+    let tenant_a = DataTenantId::new_v7();
+    let tenant_b = DataTenantId::new_v7();
+    let suffix = tenant_a.as_uuid().to_string();
+    let issuer_url = format!("https://human-idp.example.com/{suffix}");
+    let subject = format!("user-sub-{suffix}");
+
+    // 12-byte nonce + 16-byte ciphertext (representative AES-GCM bytes).
+    let secret_bytes: Vec<u8> = (0u8..28).collect();
+
+    let card_ref_json = serde_json::json!({
+        "kind": "Service",
+        "name": "svc",
+        "version": "1.0.0",
+        "space": "prod"
+    });
+
+    insert_tenant(store.pool(), tenant_a, &format!("rp-a-{suffix}")).await;
+    insert_tenant(store.pool(), tenant_b, &format!("rp-b-{suffix}")).await;
+
+    // Insert a Human issuer with populated group_role_map and client_secret_enc.
+    insert_human_issuer_with_secret(store.pool(), tenant_a, &issuer_url, &secret_bytes).await;
+    insert_workload_binding(
+        store.pool(),
+        tenant_a,
+        &issuer_url,
+        &subject,
+        &card_ref_json,
+    )
+    .await;
+
+    // Read back under TenantConn(A) and assert every column round-trips.
+    {
+        let mut conn = TenantConn::acquire(&app_pool, tenant_a)
+            .await
+            .expect("tenant_a conn acquired");
+
+        let issuers = trusted_issuers_for_tenant(&mut conn)
+            .await
+            .expect("issuer query succeeds");
+        assert_eq!(issuers.len(), 1, "tenant_a must see exactly its own issuer");
+
+        let row = &issuers[0];
+        assert_eq!(row.issuer_url, issuer_url);
+        assert_eq!(row.jwks_uri, format!("{issuer_url}/.well-known/jwks.json"));
+        assert_eq!(row.expected_audience, "audience-test");
+        assert_eq!(row.client_id, "client-id-test");
+        assert_eq!(row.client_auth, "SecretBasic");
+        assert_eq!(row.principal_kind, "Human");
+        assert_eq!(row.jwks_ttl_secs, 300);
+        assert_eq!(
+            row.client_secret_enc.as_deref(),
+            Some(secret_bytes.as_slice()),
+            "client_secret_enc bytes must be identical — no decode or trim"
+        );
+
+        // group_role_map must survive round-trip (Human issuer column).
+        let group_map = row
+            .group_role_map
+            .as_object()
+            .expect("group_role_map is a JSON object");
+        assert!(
+            group_map.contains_key("admins"),
+            "group_role_map must retain 'admins' key"
+        );
+        let admins = group_map["admins"].as_array().expect("admins is array");
+        assert_eq!(admins.len(), 1);
+        assert_eq!(admins[0], "admin-role");
+
+        // default_roles round-trip.
+        let default_roles = row
+            .default_roles
+            .as_array()
+            .expect("default_roles is a JSON array");
+        assert_eq!(default_roles.len(), 1);
+        assert_eq!(default_roles[0], "default-role");
+
+        // Binding lookup — NULL audience falls back to the NULL-audience row.
+        let binding = workload_binding_by_subject(&mut conn, &issuer_url, &subject, None)
+            .await
+            .expect("binding query succeeds")
+            .expect("binding must exist for tenant_a");
+        assert_eq!(binding.issuer_url, issuer_url);
+        assert_eq!(binding.subject, subject);
+        assert!(binding.audience.is_none());
+        let card_ref = &binding.card_ref;
+        assert_eq!(card_ref.kind.wire_name(), "Service");
+        assert_eq!(card_ref.name.to_string(), "svc");
+        assert_eq!(card_ref.version.to_string(), "1.0.0");
+        assert_eq!(card_ref.space.to_string(), "prod");
+    }
+
+    // Seed the same issuer_url under tenant B.
+    insert_trusted_issuer(store.pool(), tenant_b, &issuer_url).await;
+
+    // Tenant A's read must still see exactly 1 issuer (its own) — not B's.
+    {
+        let mut conn = TenantConn::acquire(&app_pool, tenant_a)
+            .await
+            .expect("tenant_a conn acquired");
+        let issuers = trusted_issuers_for_tenant(&mut conn)
+            .await
+            .expect("issuer query succeeds");
+        assert_eq!(
+            issuers.len(),
+            1,
+            "tenant_a must still see exactly 1 issuer after tenant_b's row is added"
+        );
+    }
+
+    // Tenant B's binding lookup for tenant A's subject must return None (RLS).
+    {
+        let mut conn = TenantConn::acquire(&app_pool, tenant_b)
+            .await
+            .expect("tenant_b conn acquired");
+        let binding = workload_binding_by_subject(&mut conn, &issuer_url, &subject, None)
+            .await
+            .expect("binding query succeeds");
+        assert!(
+            binding.is_none(),
+            "tenant_b must not see tenant_a's workload binding"
+        );
+    }
+
+    // Cleanup: bindings first (FK), then issuers, then tenants.
+    sqlx::query("DELETE FROM wyrd.auth_workload_bindings WHERE data_tenant_id IN ($1, $2)")
+        .bind(tenant_a.as_uuid())
+        .bind(tenant_b.as_uuid())
+        .execute(store.pool())
+        .await
+        .expect("binding cleanup succeeds");
+    sqlx::query("DELETE FROM wyrd.auth_trusted_issuers WHERE data_tenant_id IN ($1, $2)")
+        .bind(tenant_a.as_uuid())
+        .bind(tenant_b.as_uuid())
+        .execute(store.pool())
+        .await
+        .expect("issuer cleanup succeeds");
+    sqlx::query("DELETE FROM platform.tenants WHERE data_tenant_id IN ($1, $2)")
+        .bind(tenant_a.as_uuid())
+        .bind(tenant_b.as_uuid())
+        .execute(store.pool())
+        .await
+        .expect("tenant cleanup succeeds");
+}
+
+async fn insert_human_issuer_with_secret(
+    pool: &PgPool,
+    data_tenant_id: DataTenantId,
+    issuer_url: &str,
+    client_secret_enc: &[u8],
+) {
+    sqlx::query(
+        "INSERT INTO wyrd.auth_trusted_issuers
+             (data_tenant_id, issuer_url, jwks_uri, expected_audience, client_id,
+              client_auth, claim_mapping, group_role_map, default_roles,
+              principal_kind, jwks_ttl_secs, client_secret_enc)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+    )
+    .bind(data_tenant_id.as_uuid())
+    .bind(issuer_url)
+    .bind(format!("{issuer_url}/.well-known/jwks.json"))
+    .bind("audience-test")
+    .bind("client-id-test")
+    .bind("SecretBasic")
+    .bind(serde_json::json!({"subject": "sub", "email": "email", "groups": "groups"}))
+    .bind(serde_json::json!({"admins": ["admin-role"], "viewers": ["viewer-role"]}))
+    .bind(serde_json::json!(["default-role"]))
+    .bind("Human")
+    .bind(300_i64)
+    .bind(client_secret_enc)
+    .execute(pool)
+    .await
+    .expect("human issuer with secret inserts");
 }
 
 async fn insert_trusted_issuer(pool: &PgPool, data_tenant_id: DataTenantId, issuer_url: &str) {

@@ -1,21 +1,13 @@
-// TODO(auth-wiring): remove when JWT verifier lands
-// DEPRECATED(auth-wiring): x-wyrd-data-tenant-id will be removed when tenant comes from JWT claims.
-
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use wyrd_runtime::Principal;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::authz::Principal;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::error::WyrdErrorResponse;
-
-/// Header used only by the skeleton stub until auth claims carry tenant data.
-///
-/// Expects a DataTenantId (UUIDv7) value. Temporary — will be removed when
-/// tenant isolation comes from verified JWT claims.
-pub const STUB_TENANT_HEADER: &str = "x-wyrd-data-tenant-id";
+use crate::state::AppState;
 
 /// Authenticated caller context used by tenant-scoped service code.
 #[derive(Debug, Clone)]
@@ -28,10 +20,13 @@ pub struct Caller {
     pub request_id: RequestId,
 }
 
-impl<S: Send + Sync> FromRequestParts<S> for Caller {
+impl FromRequestParts<AppState> for Caller {
     type Rejection = WyrdErrorResponse;
 
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         let principal = AuthenticatedPrincipal::from_request_parts(parts, state)
             .await?
             .principal;
@@ -41,10 +36,9 @@ impl<S: Send + Sync> FromRequestParts<S> for Caller {
             .cloned()
             .ok_or_else(missing_request_id)
             .map_err(WyrdErrorResponse::from)?;
-        let data_tenant_id = stub_tenant_id(parts).map_err(WyrdErrorResponse::from)?;
 
         Ok(Self {
-            data_tenant_id,
+            data_tenant_id: principal.tenant_id,
             principal,
             request_id,
         })
@@ -58,33 +52,101 @@ fn missing_request_id() -> WyrdError {
     }
 }
 
-#[cfg(feature = "stub-auth")]
-fn stub_tenant_id(parts: &Parts) -> Result<DataTenantId, WyrdError> {
-    let Some(header) = parts.headers.get(STUB_TENANT_HEADER) else {
-        return Err(WyrdError::InvalidToken {
-            message: format!("missing required header: {STUB_TENANT_HEADER}"),
-            details: serde_json::json!({ "header": STUB_TENANT_HEADER }),
-        });
+#[cfg(test)]
+mod tests {
+    use axum::extract::FromRequestParts;
+    use axum::http::Request;
+    use std::sync::Arc;
+    use std::time::Duration as StdDuration;
+    use wyrd_auth_issue::IssuingKey;
+    use wyrd_auth_verify::{
+        Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
+        public_key_from_pem,
     };
-    let value = header.to_str().map_err(|_| WyrdError::InvalidToken {
-        message: "tenant claim is not valid UTF-8".to_owned(),
-        details: serde_json::json!({ "header": STUB_TENANT_HEADER }),
-    })?;
-    value
-        .parse::<DataTenantId>()
-        .map_err(|error| WyrdError::InvalidToken {
-            message: "tenant claim is not a valid DataTenantId".to_owned(),
-            details: serde_json::json!({
-                "header": STUB_TENANT_HEADER,
-                "source": error.to_string(),
-            }),
-        })
-}
+    use wyrd_runtime::PrincipalId;
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::request_id::RequestId;
 
-#[cfg(not(feature = "stub-auth"))]
-fn stub_tenant_id(_parts: &Parts) -> Result<DataTenantId, WyrdError> {
-    Err(WyrdError::InvalidToken {
-        message: "auth not configured: enable the stub-auth feature in non-production builds, or wire the JWT verifier".to_owned(),
-        details: serde_json::json!({}),
-    })
+    use crate::auth::Caller;
+    use crate::auth::permission_resolver::SqlPermissionResolver;
+
+    const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
+    const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
+
+    #[tokio::test]
+    async fn caller_data_tenant_id_sourced_from_principal() {
+        let tenant = DataTenantId::new_v7();
+        let state = test_state();
+        let token = mint_test_user_jwt(&state, tenant);
+        let mut parts = Request::builder()
+            .uri("/v1/cards/upload/init")
+            .header("x-wyrd-access-token", format!("Bearer {token}"))
+            .body(())
+            .expect("request builds")
+            .into_parts()
+            .0;
+        parts.extensions.insert(
+            RequestId::parse(&uuid::Uuid::now_v7().to_string()).expect("request id parses"),
+        );
+
+        let caller = Caller::from_request_parts(&mut parts, &state)
+            .await
+            .expect("caller extracts");
+
+        assert_eq!(caller.data_tenant_id, tenant);
+        assert_eq!(caller.principal.tenant_id, tenant);
+    }
+
+    fn test_state() -> crate::state::AppState {
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        use std::collections::HashMap;
+        use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+
+        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let root = tempfile::tempdir().expect("temp dir");
+        let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
+        let issuing_key = Arc::new(
+            IssuingKey::from_ed_pem(
+                secrecy::SecretString::from(PRIVATE_KEY_PEM),
+                Kid::new("k1").expect("kid is valid"),
+                "wyrd",
+            )
+            .expect("test issuing key loads"),
+        );
+        let mut keys = HashMap::new();
+        keys.insert(
+            Kid::new("k1").expect("kid is valid"),
+            Arc::new(public_key_from_pem(PUBLIC_KEY_PEM).expect("public key loads")),
+        );
+        let verifier = Arc::new(TokenVerifier::new(
+            keys,
+            "wyrd",
+            Arc::new(SqlPermissionResolver::new(Arc::new(app_pool.clone()))),
+            WyrdAuthVerifySettings {
+                allowed_clock_skew: StdDuration::ZERO,
+                ..WyrdAuthVerifySettings::default()
+            },
+        ));
+        crate::state::AppState::new(
+            app_pool,
+            None,
+            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+        )
+        .with_auth_handles(issuing_key, verifier)
+    }
+
+    fn mint_test_user_jwt(state: &crate::state::AppState, tenant: DataTenantId) -> String {
+        let principal = TokenPrincipalRef {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: PrincipalKindWire::User,
+            tenant_id: tenant,
+            card_ref: None,
+        };
+        state
+            .issuing_key
+            .as_ref()
+            .expect("test state has issuing key")
+            .issue_user_access_token(principal, vec![], chrono::Duration::minutes(5))
+            .expect("test jwt mints")
+    }
 }

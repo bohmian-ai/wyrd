@@ -10,19 +10,23 @@
 
 #![deny(missing_docs)]
 
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 
 pub mod queries;
 pub mod row_types;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use wyrd_sql::{TenantConn, error::SqlError};
 
 /// Tenant-scoped Vala observability schema owned by `vala-sql`.
 pub const OBSERVABILITY_SCHEMA: &str = "vala";
+/// Iceberg JDBC catalog schema owned by `vala-sql` migrations.
+pub const ICEBERG_CATALOG_SCHEMA: &str = "iceberg_catalog";
 /// Schemas whose migration lifecycle is owned by `vala-sql`.
-pub const OWNED_SCHEMAS: &[&str] = &[OBSERVABILITY_SCHEMA];
+pub const OWNED_SCHEMAS: &[&str] = &[OBSERVABILITY_SCHEMA, ICEBERG_CATALOG_SCHEMA];
 /// Search path used only by the boot migrator connection.
-pub const MIGRATION_SEARCH_PATH: &str = "vala, public";
+pub const MIGRATION_SEARCH_PATH: &str = "vala, iceberg_catalog, public";
 
 /// Apply embedded Vala SQL migrations against a boot-only migrator pool.
 ///
@@ -38,14 +42,37 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
     let mut conn = migrator_pool.acquire().await.map_err(SqlError::Connect)?;
 
     let result: Result<(), SqlError> = async {
-        sqlx::query("CREATE SCHEMA IF NOT EXISTS vala")
+        for schema in OWNED_SCHEMAS {
+            sqlx::query(AssertSqlSafe(format!(
+                "CREATE SCHEMA IF NOT EXISTS {schema}"
+            )))
             .execute(&mut *conn)
             .await
             .map_err(SqlError::Connect)?;
-        sqlx::query("SET search_path TO vala, public")
-            .execute(&mut *conn)
-            .await
-            .map_err(SqlError::Connect)?;
+        }
+        // Pre-commit schema grants before migrations start. PostgreSQL 17
+        // enforces that the new owner has CREATE on a function's schema during
+        // ALTER FUNCTION OWNER. Within-transaction grants are not visible to the
+        // ACL cache at that point, so we commit them here before sqlx::migrate!.
+        sqlx::query(
+            "DO $$ BEGIN
+                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vala_recovery_owner') THEN
+                     GRANT USAGE, CREATE ON SCHEMA vala TO vala_recovery_owner;
+                 END IF;
+                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vala_recovery') THEN
+                     GRANT USAGE ON SCHEMA vala TO vala_recovery;
+                 END IF;
+             END $$",
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(SqlError::Connect)?;
+        sqlx::query(AssertSqlSafe(format!(
+            "SET search_path TO {MIGRATION_SEARCH_PATH}"
+        )))
+        .execute(&mut *conn)
+        .await
+        .map_err(SqlError::Connect)?;
         sqlx::migrate!("./migrations")
             .run(&mut *conn)
             .await
@@ -72,8 +99,9 @@ mod tests {
 
     #[test]
     fn schema_ownership_is_explicit() {
-        assert_eq!(OWNED_SCHEMAS, &["vala"]);
-        assert_eq!(MIGRATION_SEARCH_PATH, "vala, public");
+        assert_eq!(OWNED_SCHEMAS, &["vala", "iceberg_catalog"]);
+        assert_eq!(MIGRATION_SEARCH_PATH, "vala, iceberg_catalog, public");
+        assert!(OWNED_SCHEMAS.contains(&"iceberg_catalog"));
         assert!(!OWNED_SCHEMAS.contains(&"platform"));
         assert!(!OWNED_SCHEMAS.contains(&"wyrd"));
         assert!(!OWNED_SCHEMAS.contains(&"skald"));
@@ -112,7 +140,11 @@ mod tests {
                     .lines()
                     .map(str::trim_start)
                     .filter(|line| line.starts_with("CREATE TABLE "))
-                    .filter(|line| !line.starts_with("CREATE TABLE vala."))
+                    .filter(|line| {
+                        !OWNED_SCHEMAS
+                            .iter()
+                            .any(|schema| line.starts_with(&format!("CREATE TABLE {schema}.")))
+                    })
                     .map(str::to_owned)
                     .collect::<Vec<_>>()
             })
@@ -120,7 +152,7 @@ mod tests {
 
         assert!(
             unexpected.is_empty(),
-            "CREATE TABLE statements must target vala.*: {unexpected:?}"
+            "CREATE TABLE statements must target an owned schema: {unexpected:?}"
         );
     }
 
@@ -203,6 +235,10 @@ mod tests {
             .into_iter()
             .filter_map(|path| {
                 let body = fs::read_to_string(&path).expect("Vala query file is readable");
+                // diagnostics-gated modules are explicitly tenant-free by design.
+                if body.contains("#![cfg(feature = \"diagnostics\")]") {
+                    return None;
+                }
                 let checked = without_line_comments(&body);
                 (checked.contains("&PgPool")
                     || checked.contains("PgPool,")
@@ -229,7 +265,7 @@ mod tests {
                 let checked = without_line_comments(&body).to_ascii_uppercase();
                 let has_transaction_control = ["BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT"]
                     .into_iter()
-                    .any(|keyword| checked.contains(keyword));
+                    .any(|keyword| contains_sql_keyword(&checked, keyword));
                 has_transaction_control.then_some(path)
             })
             .collect::<Vec<_>>();
@@ -357,5 +393,22 @@ mod tests {
 
     fn production_source(source: &str) -> &str {
         source.split("\n#[cfg(test)]").next().unwrap_or(source)
+    }
+
+    fn contains_sql_keyword(text: &str, keyword: &str) -> bool {
+        let mut start = 0;
+        while let Some(pos) = text[start..].find(keyword) {
+            let abs = start + pos;
+            let before_ok =
+                abs == 0 || !matches!(text.as_bytes()[abs - 1], b'A'..=b'Z' | b'0'..=b'9' | b'_');
+            let end = abs + keyword.len();
+            let after_ok = end >= text.len()
+                || !matches!(text.as_bytes()[end], b'A'..=b'Z' | b'0'..=b'9' | b'_');
+            if before_ok && after_ok {
+                return true;
+            }
+            start = abs + 1;
+        }
+        false
     }
 }

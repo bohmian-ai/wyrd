@@ -9,21 +9,26 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod actor;
+pub mod api_version;
+pub mod auth;
 pub mod authz;
 pub mod card;
 pub mod envelope;
 pub mod error;
 pub mod format;
 pub mod ids;
+pub mod intel;
 pub mod metadata;
+pub mod origin;
 pub mod redaction;
 pub mod reference;
 pub mod request_id;
 pub mod run;
 pub mod schema;
+pub mod security;
 pub mod storage;
 pub mod trace;
-pub mod version;
+pub mod vala;
 
 pub use authz::{Principal, Role, Scope};
 pub use card::agent::{AgentCard, AgentCardError, AgentRunConfigSpec, AgentSpec};
@@ -43,10 +48,15 @@ pub use card::workflow::{
     WorkflowAction, WorkflowCard, WorkflowCardError, WorkflowRetryPolicy, WorkflowSpec,
     WorkflowStep, WorkflowValidationError,
 };
-pub use ids::{ColumnName, DataTenantId, QueryName, RoleName, SplitName, TenantSlug};
+pub use ids::{ColumnName, DataTenantId, QueryName, RoleName, SplitName, TenantSlug, uuid7};
+pub use intel::{Evidence, Lineage, TimeRange};
 pub use metadata::{
     AnnotationKey, AnnotationValue, Annotations, CardMetadata, LabelKey, LabelValue, Labels,
     MetadataError,
 };
+pub use origin::{CommitSha, Origin, OriginValidationError};
 pub use reference::AgentRef;
+#[cfg(any(test, feature = "test-utils"))]
+pub use security::InlineSecret;
+pub use security::{SecretRef, SecretRefError, TlsConfig};
 pub use skald_spec::{MessageNum, Prompt, ProviderRequest, ProviderResponse, ResponseType};

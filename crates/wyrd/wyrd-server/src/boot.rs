@@ -1,6 +1,9 @@
 //! Server boot sequence for SQL-backed Wyrd runtime state.
 
+use std::sync::Arc;
+
 use secrecy::ExposeSecret;
+use tokio_util::sync::CancellationToken;
 use wyrd_sql::{
     pool::{build_app_pool, build_migrator_pool, build_platform_admin_pool},
     postgres_boot::{BootError, PostgresBoot},
@@ -84,10 +87,94 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
     Ok(AppState::new(pool, platform_admin_pool, storage))
 }
 
+/// Emit pre-telemetry warnings for relaxed config that is still safe to run.
+///
+/// Production-profile rejection lives in `WyrdServerConfig::validate()` and runs
+/// before this function. By the time we reach `production_guards`, any violating
+/// production config has already returned `ConfigError::Invalid`. This function
+/// only surfaces development-profile warnings for the same signals so an operator
+/// running a relaxed dev profile sees them on stderr.
+pub fn production_guards(config: &crate::config::WyrdServerConfig) {
+    if config.deployment_profile.is_production() {
+        return;
+    }
+    if config.request_id.trust_upstream && config.request_id.trusted_upstreams.is_empty() {
+        tracing::warn!("request_id.trust_upstream=true with no trusted_upstreams configured");
+    }
+    if config.grpc.reflection_enabled {
+        tracing::warn!("grpc.reflection_enabled=true in development profile");
+    }
+    if config.auth.allow_preview {
+        tracing::warn!("auth.allow_preview=true in development profile");
+    }
+}
+
+/// Assemble runtime state from a resolved `WyrdServerConfig`.
+///
+/// This is the primary boot entry point from `main.rs` once the config is
+/// loaded. It runs the postgres boot, migrations, and pool phases, then chains
+/// the `with_*` builder calls to attach config-derived fields.
+///
+/// # Errors
+/// Returns [`ServerBootError`] when database boot, migration, pool construction,
+/// or CIDR parsing fails.
+pub async fn build_app_state_from_config(
+    config: &crate::config::WyrdServerConfig,
+    shutdown: CancellationToken,
+    telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
+    reporter: wyrd_tonic::tonic_health::server::HealthReporter,
+) -> Result<AppState, ServerBootError> {
+    let boot = PostgresBoot::from_env().await?;
+    let state = build_app_state_from_boot(&boot).await?;
+
+    let trusted_upstreams_parsed: Vec<ipnetwork::IpNetwork> = config
+        .request_id
+        .trusted_upstreams
+        .iter()
+        .filter_map(|cidr| cidr.parse::<ipnetwork::IpNetwork>().ok())
+        .collect();
+
+    Ok(state
+        .with_deployment_profile(config.deployment_profile)
+        .with_shutdown_token(shutdown)
+        .with_telemetry(telemetry)
+        .with_limits(config.limits.into_state())
+        .with_grpc_health(reporter)
+        .with_trusted_upstreams_parsed(Arc::from(trusted_upstreams_parsed))
+        .with_trusted_request_id_propagation(config.request_id.trust_upstream)
+        .with_preview_auth(config.auth.allow_preview))
+}
+
+/// Spawn the storage sweeper if enabled and the platform admin pool is available.
+///
+/// Returns `None` when the sweeper is disabled or the platform admin pool is absent.
+///
+/// # Errors
+/// Returns [`wyrd_storage::StorageError`] when the sweeper config cannot be read
+/// from the process environment.
+pub fn spawn_storage_sweeper(
+    state: &AppState,
+    shutdown: CancellationToken,
+) -> Result<Option<tokio::task::JoinHandle<()>>, wyrd_storage::StorageError> {
+    let cfg = wyrd_storage::sweeper::SweeperConfig::from_env()?;
+    if !cfg.enabled {
+        tracing::info!("storage sweeper disabled via WYRD_STORAGE_SWEEPER_ENABLED=false");
+        return Ok(None);
+    }
+
+    let Some(admin_pool) = state.platform_admin_pool.clone() else {
+        tracing::warn!("storage sweeper skipped because platform admin pool is unavailable");
+        return Ok(None);
+    };
+
+    let sweeper =
+        wyrd_storage::sweeper::Sweeper::new(Arc::clone(&state.storage), admin_pool, cfg, shutdown);
+    Ok(Some(tokio::spawn(async move { sweeper.run().await })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object_store::local::LocalFileSystem;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -99,12 +186,7 @@ mod tests {
         let platform_admin_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let root = tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-        let object_store =
-            Arc::new(LocalFileSystem::new_with_prefix(root.path()).expect("local object store"));
-        let storage = Arc::new(StorageHandle::new(
-            BackendSigner::Local(signer),
-            object_store,
-        ));
+        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
         let state = AppState::new(app_pool, Some(platform_admin_pool), storage);
 
         assert!(state.platform_admin_pool.is_some());

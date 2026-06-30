@@ -12,12 +12,19 @@ behavior = ["dep:axum", "dep:tower", "dep:tower-http"]
 
 [dependencies]
 axum = { workspace = true, optional = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
 tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
-uuid = { workspace = true, features = ["std", "v7"] }
+uuid = { workspace = true, features = ["std", "v5", "v7"] }
 wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1.49", default-features = false, features = ["rt"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+wyrd-semver = { path = "../wyrd-semver", version = "0.0.1" }

@@ -1,6 +1,6 @@
 # Wyrd
 
-The AI layer: the managed control plane for every AI capability a company runs.
+The AI Operational Layer: the managed control plane for every AI capability a company runs.
 
 > Pre-1.0.
 
@@ -11,7 +11,6 @@ mise install
 mise run dev:full
 # UI: http://localhost:3000
 # wyrd-server: http://localhost:8080/healthz
-# wyrd-observability-server: http://localhost:8090/healthz
 ```
 
 ## Layout

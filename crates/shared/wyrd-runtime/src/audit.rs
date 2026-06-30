@@ -23,9 +23,9 @@ pub struct AuditEnvelopeSeed {
 
 /// Prepared audit envelope draft.
 ///
-/// Phase 1 does not emit or persist audit events. The draft gives later server
-/// phases one typed handoff point for request, trace, actor, and redaction
-/// context.
+/// This crate does not emit or persist audit events. The draft is the typed
+/// handoff point that downstream server code consumes when assembling request,
+/// trace, actor, and redaction context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEnvelopeDraft {
     /// Operation name, such as `card.register`.

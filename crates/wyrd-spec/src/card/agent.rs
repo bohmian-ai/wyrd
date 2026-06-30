@@ -5,12 +5,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;
 use thiserror::Error;
 
+use crate::api_version::ApiVersion;
 use crate::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
 use crate::error::WyrdError;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
 use crate::reference::{CardRef, PromptRef};
-use crate::version::{ApiVersion, VersionBlock};
+use wyrd_semver::VersionBlock;
 
 /// Pure-serde mirror of the Skald agent run configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -83,13 +84,15 @@ impl AgentCard {
             kind: CardKind::Agent,
             metadata: EnvelopeMetadata {
                 name: card_name("metadata.name", &self.name)?,
-                version: version_block("metadata.version", &self.version)?,
+                version: Some(version_block("metadata.version", &self.version)?.into()),
+                bump: None,
                 space: Some(space_name(&self.space)?),
                 uid: optional_card_uid(&self.uid)?,
                 labels: self.labels.clone(),
                 annotations: self.annotations.clone(),
                 spec_hash: None,
                 artifact_hash: None,
+                origin: None,
             },
             spec: Spec::Agent(self.spec.clone()),
             relationships: Relationships::default(),
@@ -129,7 +132,13 @@ impl AgentCard {
                 .as_ref()
                 .map_or_else(|| "default".to_owned(), ToString::to_string),
             name: card.metadata.name.to_string(),
-            version: card.metadata.version.to_string(),
+            version: card
+                .metadata
+                .resolved_pin()
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    AgentCardError::validation("Agent Card envelope missing resolved version pin")
+                })?,
             uid: card
                 .metadata
                 .uid

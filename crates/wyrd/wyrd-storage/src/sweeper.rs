@@ -12,7 +12,7 @@ use sqlx::pool::PoolConnection;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::{StorageBackendKind, WireProtocol};
@@ -97,7 +97,7 @@ pub struct Sweeper {
     handle: Arc<StorageHandle>,
     admin_pool: PgPool,
     cfg: SweeperConfig,
-    shutdown: watch::Receiver<bool>,
+    shutdown: CancellationToken,
 }
 
 impl Sweeper {
@@ -107,7 +107,7 @@ impl Sweeper {
         handle: Arc<StorageHandle>,
         admin_pool: PgPool,
         cfg: SweeperConfig,
-        shutdown: watch::Receiver<bool>,
+        shutdown: CancellationToken,
     ) -> Self {
         Self {
             handle,
@@ -118,7 +118,7 @@ impl Sweeper {
     }
 
     /// Run the sweeper loop until shutdown is signaled.
-    pub async fn run(mut self) {
+    pub async fn run(self) {
         if !self.cfg.enabled {
             tracing::info!("storage sweeper disabled");
             return;
@@ -142,11 +142,9 @@ impl Sweeper {
                         tracing::error!(error = %error, "storage sweeper tick failed");
                     }
                 }
-                changed = self.shutdown.changed() => {
-                    if changed.is_err() || *self.shutdown.borrow() {
-                        tracing::info!("storage sweeper shutting down");
-                        return;
-                    }
+                () = self.shutdown.cancelled() => {
+                    tracing::info!("storage sweeper shutting down");
+                    return;
                 }
             }
         }

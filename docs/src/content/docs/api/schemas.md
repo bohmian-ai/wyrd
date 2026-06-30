@@ -53,6 +53,8 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 | `crates/wyrd-spec/schemas/run_ref.json` | RunRef |
 | `crates/wyrd-spec/schemas/sample_input.json` | SampleInput |
 | `crates/wyrd-spec/schemas/sample_input_kind.json` | SampleInputKind |
+| `crates/wyrd-spec/schemas/security_secret_ref.json` | SecretRef |
+| `crates/wyrd-spec/schemas/security_tls_config.json` | TlsConfig |
 | `crates/wyrd-spec/schemas/service_lock.json` | ServiceLock |
 | `crates/wyrd-spec/schemas/service_runtime.json` | ServiceRuntime |
 | `crates/wyrd-spec/schemas/service_runtime_kind.json` | ServiceRuntimeKind |

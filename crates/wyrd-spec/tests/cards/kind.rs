@@ -43,7 +43,7 @@ fn external_card_kind_wire_shape_is_string() {
 }
 
 #[test]
-fn card_kind_schema_is_string_enum_with_all_kinds() {
+fn card_kind_schema_is_string_enum_with_registrable_kinds() {
     let schema = schemars::schema_for!(CardKind);
     let value = serde_json::to_value(schema).unwrap();
     let enum_values = value["enum"].as_array().expect("enum schema");
@@ -51,11 +51,14 @@ fn card_kind_schema_is_string_enum_with_all_kinds() {
     assert!(enum_values.contains(&json!("Trigger")));
     assert!(enum_values.contains(&json!("Operator")));
     assert!(enum_values.contains(&json!("Source")));
-    assert!(enum_values.contains(&json!("External")));
+    assert!(
+        !enum_values.contains(&json!("External")),
+        "External must not appear in the registrable schema"
+    );
     assert!(!enum_values.contains(&json!("Tool")));
     assert!(!enum_values.contains(&json!("Skill")));
     assert!(!enum_values.contains(&json!("SubAgent")));
-    assert_eq!(enum_values.len(), 17);
+    assert_eq!(enum_values.len(), 16);
 }
 
 proptest! {

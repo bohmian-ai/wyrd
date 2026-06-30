@@ -26,7 +26,7 @@ pub struct Prompt {
     /// prompts this is always `None` — the class is bound at the Agent level.
     /// Only present under the `python` feature.
     #[cfg(feature = "python")]
-    pub(crate) py_output_cls: Option<pyo3::Py<pyo3::PyAny>>,
+    pub(crate) py_output_cls: Option<Arc<pyo3::Py<pyo3::PyAny>>>,
 }
 
 impl PartialEq for Prompt {
@@ -76,7 +76,7 @@ impl Prompt {
 
     /// Return the retained Python output class, if one was passed at construction.
     #[cfg(feature = "python")]
-    pub fn output_cls(&self) -> Option<&pyo3::Py<pyo3::PyAny>> {
+    pub fn output_cls(&self) -> Option<&Arc<pyo3::Py<pyo3::PyAny>>> {
         self.py_output_cls.as_ref()
     }
 
@@ -1362,10 +1362,15 @@ fn response_format_from_py(
     Ok(Some(ResponseFormat::json_schema("response", schema)?))
 }
 
+/// `(response_format, retained_pydantic_class)` produced by `output_from_py`.
+///
+/// The class is `Some` only when the caller passed a Pydantic `BaseModel`
+/// subclass and we need to retain it for structured-output instantiation.
 #[cfg(feature = "python")]
-fn output_from_py(
-    value: Option<&Bound<'_, PyAny>>,
-) -> CardPyResult<(Option<ResponseFormat>, Option<pyo3::Py<pyo3::PyAny>>)> {
+type OutputFromPy = (Option<ResponseFormat>, Option<Arc<pyo3::Py<pyo3::PyAny>>>);
+
+#[cfg(feature = "python")]
+fn output_from_py(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<OutputFromPy> {
     let Some(value) = value.filter(|v| !v.is_none()) else {
         return Ok((None, None));
     };
@@ -1387,7 +1392,7 @@ fn output_from_py(
             .and_then(|n| n.extract::<String>())
             .unwrap_or_else(|_| "structured_output".to_owned());
         let fmt = ResponseFormat::json_schema(name, schema)?;
-        return Ok((Some(fmt), Some(value.clone().unbind())));
+        return Ok((Some(fmt), Some(Arc::new(value.clone().unbind()))));
     }
 
     // dict input — raw JSON Schema or dict[str, type].

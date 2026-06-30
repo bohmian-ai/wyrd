@@ -1,0 +1,580 @@
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
+
+use arrow::array::RecordBatch;
+use iceberg::spec::DataFile;
+use iceberg::table::Table;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter;
+use iceberg_catalog_sql::SqlCatalog;
+use sqlx::PgPool;
+use sqlx::types::Uuid;
+use wyrd_spec::ids::DataTenantId;
+
+use crate::error::BifrostError;
+use crate::types::TableUid;
+use crate::writer::file_writer::bifrost_writer_properties;
+
+/// Stable engine-instance identity stamped into `writer_owner` on every
+/// precommit row. A fresh `Uuid::new_v4()` per process start means two pods
+/// never share an owner, so fencing-token collisions are impossible.
+pub(crate) static WRITER_INSTANCE: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
+
+/// Writer lease TTL in seconds. The guarded renewal before `fast_append`
+/// must succeed within this window after the previous stamp. Configurable
+/// in a later stage; 30 s is safe for current workloads.
+const WRITER_LEASE_SECS: i64 = 30;
+
+/// Fault-injection points for test-only commit path overrides.
+///
+/// Gated to test and bench builds; must never be reachable in production.
+#[cfg(any(test, feature = "testing", feature = "bench-bin"))]
+#[derive(Clone, Debug)]
+pub enum Lease {
+    Expired,
+    RenewedFuture,
+    Normal,
+}
+
+#[cfg(any(test, feature = "testing", feature = "bench-bin"))]
+#[derive(Clone, Debug)]
+pub enum FaultPoint {
+    /// Insert precommit row + lease, optionally expire the lease, then fail
+    /// before writing Parquet.
+    AfterPreCommitRow { lease: Lease },
+    /// Write files + commit to Iceberg successfully, then fail before
+    /// `finalize_committed` (simulates crash between Iceberg commit and SQL finalize).
+    AfterIcebergCommit,
+    /// Write files, then fail before `renew_writer_fence` / `commit_to_iceberg`.
+    BeforeIcebergCommit,
+    /// Renew lease, expire it manually (to let recovery claim), then proceed
+    /// to `fast_append` so `finalize_committed` matches zero rows.
+    AfterRenewBeforeAppend,
+}
+
+/// Phase 1 outcome of [`claim_batch`].
+enum Phase1 {
+    Replay { snapshot_id: i64 },
+    Fresh { owner: Uuid, fencing_token: i64 },
+}
+
+/// Execute one 2PC commit of `batches` under `batch_id` for `table`.
+///
+/// Two phases, each with a clear short-circuit:
+/// 1. [`claim_batch`] inspects the prior 2PC anchor. An already-committed batch
+///    replays its recorded snapshot with no write — returning `(snapshot, None)`
+///    so the caller keeps its current table ref. A prior failure (`failed`),
+///    in-flight precommit, or already-aborted row is rejected. Aborted rows
+///    return `CommitConflict` — the `batch_id` must not be reused.
+/// 2. [`write_and_finalize`] writes Parquet, fast-appends to Iceberg, and records
+///    the terminal FSM transition (`committed`, or `failed` on write error).
+///
+/// On a fresh write the returned [`Table`] is the post-append snapshot the caller
+/// must adopt for its next commit; on replay it is `None`. Registry invalidation
+/// (epoch bump + cache eviction) is the caller's responsibility after success.
+///
+/// # Errors
+/// Returns [`BifrostError`] when the control-plane txn, Parquet write, or Iceberg
+/// append fails, or when the `batch_id` collides with a failed/in-flight anchor.
+pub async fn run_commit(
+    pool: &PgPool,
+    catalog: &SqlCatalog,
+    table: &Table,
+    table_uid: &TableUid,
+    batches: Vec<RecordBatch>,
+    batch_id: [u8; 16],
+    tenant: DataTenantId,
+) -> Result<(i64, Option<Table>), BifrostError> {
+    let table_fqn = table.identifier().to_string();
+
+    let phase1 = claim_batch(pool, table_uid, &batch_id, tenant, &table_fqn).await?;
+
+    match phase1 {
+        Phase1::Replay { snapshot_id } => Ok((snapshot_id, None)),
+        Phase1::Fresh {
+            owner,
+            fencing_token,
+        } => {
+            let (snapshot_id, updated_table) = write_and_finalize(
+                pool,
+                catalog,
+                table,
+                table_uid,
+                batches,
+                &batch_id,
+                tenant,
+                owner,
+                fencing_token,
+            )
+            .await?;
+            Ok((snapshot_id, Some(updated_table)))
+        }
+    }
+}
+
+/// Phase 1 of [`run_commit`]: dispatch on the prior 2PC anchor, then claim the
+/// batch for a fresh write and record the initial writer lease.
+///
+/// - [`Phase1::Replay`] — the batch already committed; the caller must replay.
+/// - [`Phase1::Fresh`] — no prior anchor; a `precommit` row + writer lease has
+///   been written and the caller should proceed with the write.
+/// - `Err(..)` — collision with a prior failure, in-flight precommit, or aborted row.
+///
+/// # Errors
+/// Returns [`BifrostError::Sql`] on control-plane failure,
+/// [`BifrostError::MetadataMismatch`] when a `committed` row has a NULL
+/// `snapshot_id`, or the collision errors above.
+async fn claim_batch(
+    pool: &PgPool,
+    table_uid: &TableUid,
+    batch_id: &[u8; 16],
+    tenant: DataTenantId,
+    table_fqn: &str,
+) -> Result<Phase1, BifrostError> {
+    let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
+        .await
+        .map_err(BifrostError::Sql)?;
+
+    let existing = vala_sql::queries::olap_catalog::lookup_idempotent(
+        &mut conn,
+        table_uid.as_bytes(),
+        batch_id,
+    )
+    .await
+    .map_err(BifrostError::Sql)?;
+
+    match existing {
+        Some(row) if row.state == "committed" => {
+            conn.commit().await.map_err(BifrostError::Sql)?;
+            let snapshot_id = row.snapshot_id.ok_or_else(|| {
+                BifrostError::MetadataMismatch(format!(
+                    "committed olap_commits row for {table_fqn} has NULL snapshot_id"
+                ))
+            })?;
+            Ok(Phase1::Replay { snapshot_id })
+        }
+        Some(row) if row.state == "failed" => {
+            conn.commit().await.map_err(BifrostError::Sql)?;
+            Err(BifrostError::DuplicateFailedBatch(
+                uuid::Uuid::from_bytes(*batch_id).to_string(),
+            ))
+        }
+        Some(_) => {
+            // Covers in-flight precommit, aborted (dead terminal — batch_id must not be
+            // reused), and any future non-committed state.
+            conn.commit().await.map_err(BifrostError::Sql)?;
+            Err(BifrostError::CommitConflict(table_fqn.to_string()))
+        }
+        None => {
+            vala_sql::queries::olap_catalog::precommit(&mut conn, table_uid.as_bytes(), batch_id)
+                .await
+                .map_err(BifrostError::Sql)?;
+
+            let owner = *WRITER_INSTANCE;
+            let fencing_token =
+                vala_sql::queries::olap_catalog::mint_writer_fencing_token(&mut conn)
+                    .await
+                    .map_err(BifrostError::Sql)?;
+            vala_sql::queries::olap_catalog::record_writer_lease(
+                &mut conn,
+                table_uid.as_bytes(),
+                batch_id,
+                owner,
+                fencing_token,
+                WRITER_LEASE_SECS,
+            )
+            .await
+            .map_err(BifrostError::Sql)?;
+
+            conn.commit().await.map_err(BifrostError::Sql)?;
+            Ok(Phase1::Fresh {
+                owner,
+                fencing_token,
+            })
+        }
+    }
+}
+
+/// Phase 2 of [`run_commit`]: write the claimed `batches` and record the terminal
+/// FSM transition.
+///
+/// Writes Parquet and fast-appends to Iceberg. The guarded lease renewal
+/// (`renew_writer_fence`) immediately before `fast_append` ensures an expired
+/// or recovery-claimed lease fails closed — the writer cannot append after its
+/// fence is lost. On success the anchor moves to `committed` with the discovered
+/// snapshot id and the post-append [`Table`] is returned. On write failure the
+/// anchor moves to `failed` (best-effort).
+///
+/// # Errors
+/// Returns the underlying [`BifrostError`] from the Parquet write or Iceberg
+/// append, or [`BifrostError::Sql`] when the `committed` finalize fails.
+#[allow(clippy::too_many_arguments)]
+async fn write_and_finalize(
+    pool: &PgPool,
+    catalog: &SqlCatalog,
+    table: &Table,
+    table_uid: &TableUid,
+    batches: Vec<RecordBatch>,
+    batch_id: &[u8; 16],
+    tenant: DataTenantId,
+    owner: Uuid,
+    fencing_token: i64,
+) -> Result<(i64, Table), BifrostError> {
+    let files = match write_batches(table, batches).await {
+        Err(e) => {
+            let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
+                .await
+                .map_err(BifrostError::Sql)?;
+            let _ = vala_sql::queries::olap_catalog::finalize_failed(
+                &mut conn,
+                table_uid.as_bytes(),
+                batch_id,
+                "WYRD_VALA_500_BIFROST_INTERNAL",
+                &e.to_string(),
+                owner,
+                fencing_token,
+            )
+            .await;
+            let _ = conn.commit().await;
+            return Err(e);
+        }
+        Ok(files) => files,
+    };
+
+    // Guarded lease renewal: proves the fence is still held before the Iceberg
+    // append. Fails closed on expired lease (writer_lease_expires_at <= now())
+    // or when recovery has claimed the row (recovery_fencing_token IS NOT NULL).
+    let held = {
+        let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
+            .await
+            .map_err(BifrostError::Sql)?;
+        let held = vala_sql::queries::olap_catalog::renew_writer_fence(
+            &mut conn,
+            table_uid.as_bytes(),
+            batch_id,
+            owner,
+            fencing_token,
+            WRITER_LEASE_SECS,
+        )
+        .await
+        .map_err(BifrostError::Sql)?;
+        conn.commit().await.map_err(BifrostError::Sql)?;
+        held
+    };
+
+    if !held {
+        // Best-effort delete the just-written files to avoid orphaned Parquet.
+        for file in &files {
+            let _ = table.file_io().delete(file.file_path()).await;
+        }
+        return Err(BifrostError::CommitConflict(
+            "writer fence lost before iceberg append".to_string(),
+        ));
+    }
+
+    let (snapshot_id, updated_table) = commit_to_iceberg(catalog, table, files, batch_id).await?;
+
+    let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
+        .await
+        .map_err(BifrostError::Sql)?;
+
+    let finalized = vala_sql::queries::olap_catalog::finalize_committed(
+        &mut conn,
+        table_uid.as_bytes(),
+        batch_id,
+        snapshot_id,
+        owner,
+        fencing_token,
+    )
+    .await
+    .map_err(BifrostError::Sql)?;
+
+    conn.commit().await.map_err(BifrostError::Sql)?;
+
+    if !finalized {
+        // Fence was lost AFTER the append (the bounded post-append residual).
+        // Record the audit row; best-effort rollback is not available in this
+        // iceberg-rust version, so rolled_back is always false here.
+        let mut audit_conn = vala_sql::TenantConn::acquire(pool, tenant)
+            .await
+            .map_err(BifrostError::Sql)?;
+        let _ = vala_sql::queries::olap_catalog::record_fence_loss_after_append(
+            &mut audit_conn,
+            table_uid.as_bytes(),
+            batch_id,
+            owner,
+            fencing_token,
+            snapshot_id,
+            false,
+            None,
+        )
+        .await;
+        let _ = audit_conn.commit().await;
+        tracing::warn!(
+            snapshot_id,
+            "writer fence lost after iceberg append; snapshot may be orphaned"
+        );
+        return Err(BifrostError::CommitConflict(
+            "writer fence lost after iceberg append".to_string(),
+        ));
+    }
+
+    Ok((snapshot_id, updated_table))
+}
+
+/// Write `batches` to Parquet data files under `table`, returning the resulting
+/// [`DataFile`] descriptors for the Iceberg append.
+///
+/// Casts each batch to the authoritative Arrow schema derived from the table's
+/// Iceberg schema (which carries the `PARQUET:field_id` metadata and exact column
+/// types the Iceberg writer requires) before writing.
+///
+/// # Errors
+/// Returns [`BifrostError`] when schema derivation, a column cast, or the
+/// underlying Iceberg/Parquet write fails.
+async fn write_batches(
+    table: &Table,
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<DataFile>, BifrostError> {
+    let file_io = table.file_io().clone();
+    let table_metadata = table.metadata();
+    let iceberg_schema = table_metadata.current_schema().clone();
+
+    // The Iceberg writer requires:
+    // 1. Arrow field metadata contains `PARQUET:field_id` so the NaN visitor
+    //    can match fields by ID (FieldMatchMode::Id).
+    // 2. Column types exactly match the Iceberg-derived Arrow schema (e.g.
+    //    timestamps must use "+00:00" not "UTC").
+    //
+    // We derive the authoritative typed Arrow schema from the Iceberg schema
+    // (which carries both constraints), then cast each batch's columns to
+    // that schema before writing.
+    let typed_schema = Arc::new(
+        iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).map_err(BifrostError::Iceberg)?,
+    );
+
+    let location_gen =
+        DefaultLocationGenerator::new(table_metadata).map_err(BifrostError::Iceberg)?;
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "bifrost".to_string(),
+        Some(uuid::Uuid::now_v7().simple().to_string()),
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+
+    let writer_props = bifrost_writer_properties();
+    let parquet_builder = ParquetWriterBuilder::new(writer_props, iceberg_schema);
+
+    let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        file_io,
+        location_gen,
+        file_name_gen,
+    );
+
+    let data_file_builder = DataFileWriterBuilder::new(rolling_builder);
+    let mut writer = UnpartitionedWriter::new(data_file_builder);
+
+    for batch in batches {
+        let cast_columns: Vec<arrow::array::ArrayRef> = batch
+            .columns()
+            .iter()
+            .zip(typed_schema.fields().iter())
+            .map(|(col, field)| {
+                arrow::compute::cast(col, field.data_type()).map_err(|e| {
+                    BifrostError::Internal(format!("cast column {}: {e}", field.name()))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let typed = RecordBatch::try_new(typed_schema.clone(), cast_columns)
+            .map_err(|e| BifrostError::Internal(format!("retype batch: {e}")))?;
+        writer.write(typed).await.map_err(BifrostError::Iceberg)?;
+    }
+
+    writer.close().await.map_err(BifrostError::Iceberg)
+}
+
+/// Fast-append `data_files` to `table` as a single Iceberg transaction.
+///
+/// Stamps `wyrd_batch_id` in snapshot summary properties so the recovery
+/// oracle can identify which snapshot corresponds to which batch. Returns
+/// the new snapshot id alongside the updated [`Table`].
+///
+/// # Errors
+/// Returns [`BifrostError::Iceberg`] when the transaction build or commit fails.
+async fn commit_to_iceberg(
+    catalog: &SqlCatalog,
+    table: &Table,
+    data_files: Vec<DataFile>,
+    batch_id: &[u8; 16],
+) -> Result<(i64, Table), BifrostError> {
+    let mut props = HashMap::new();
+    props.insert(
+        "wyrd_batch_id".to_string(),
+        uuid::Uuid::from_bytes(*batch_id).simple().to_string(),
+    );
+
+    let tx = Transaction::new(table);
+    let action = tx
+        .fast_append()
+        .set_snapshot_properties(props)
+        .add_data_files(data_files);
+    let tx = action.apply(tx).map_err(BifrostError::Iceberg)?;
+    let committed = tx.commit(catalog).await.map_err(BifrostError::Iceberg)?;
+    let snapshot_id = committed.metadata().current_snapshot_id().unwrap_or(0);
+    Ok((snapshot_id, committed))
+}
+
+// ── Test/bench fault injection ───────────────────────────────────────────────
+
+#[cfg(any(test, feature = "testing", feature = "bench-bin"))]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn run_commit_with_fault(
+    pool: &PgPool,
+    catalog: &SqlCatalog,
+    table: &Table,
+    table_uid: &TableUid,
+    batches: Vec<RecordBatch>,
+    batch_id: [u8; 16],
+    tenant: DataTenantId,
+    fault: FaultPoint,
+) -> Result<(i64, Option<Table>), BifrostError> {
+    let table_fqn = table.identifier().to_string();
+    let phase1 = claim_batch(pool, table_uid, &batch_id, tenant, &table_fqn).await?;
+    let (owner, fencing_token) = match phase1 {
+        Phase1::Replay { snapshot_id } => return Ok((snapshot_id, None)),
+        Phase1::Fresh {
+            owner,
+            fencing_token,
+        } => (owner, fencing_token),
+    };
+
+    match fault {
+        FaultPoint::AfterPreCommitRow { lease } => {
+            if matches!(lease, Lease::Expired) {
+                // Force the lease to expired so recovery can claim the row.
+                sqlx::query(
+                    "UPDATE vala.olap_commits \
+                     SET writer_lease_expires_at = now() - interval '1 second' \
+                     WHERE table_uid = $1 AND batch_id = $2",
+                )
+                .bind(table_uid.as_bytes().as_slice())
+                .bind(batch_id.as_slice())
+                .execute(pool)
+                .await
+                .map_err(|e| BifrostError::Sql(vala_sql::SqlError::from(e)))?;
+            }
+            Err(BifrostError::Internal("fault: AfterPreCommitRow".into()))
+        }
+
+        FaultPoint::AfterIcebergCommit => {
+            // Write files and commit to Iceberg, but skip finalize_committed.
+            let files = write_batches(table, batches).await?;
+            let (snapshot_id, updated_table) =
+                commit_to_iceberg(catalog, table, files, &batch_id).await?;
+            // Intentionally NOT calling finalize_committed — simulates crash.
+            Err(BifrostError::Internal(format!(
+                "fault: AfterIcebergCommit (snapshot {snapshot_id} committed but not finalized); \
+                 table_updated={:?}",
+                updated_table.metadata().current_snapshot_id()
+            )))
+        }
+
+        FaultPoint::BeforeIcebergCommit => {
+            // Write files, expire the lease, then fail before renewal.
+            let _files = write_batches(table, batches).await?;
+            sqlx::query(
+                "UPDATE vala.olap_commits \
+                 SET writer_lease_expires_at = now() - interval '1 second' \
+                 WHERE table_uid = $1 AND batch_id = $2",
+            )
+            .bind(table_uid.as_bytes().as_slice())
+            .bind(batch_id.as_slice())
+            .execute(pool)
+            .await
+            .map_err(|e| BifrostError::Sql(vala_sql::SqlError::from(e)))?;
+            Err(BifrostError::Internal("fault: BeforeIcebergCommit".into()))
+        }
+
+        FaultPoint::AfterRenewBeforeAppend => {
+            // Write files, renew the lease (succeeds), then expire it manually
+            // (simulates a stop-the-world pause longer than the TTL after the
+            // renewal). The caller then runs recovery + resumes commit.
+            let files = write_batches(table, batches).await?;
+            let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
+                .await
+                .map_err(BifrostError::Sql)?;
+            vala_sql::queries::olap_catalog::renew_writer_fence(
+                &mut conn,
+                table_uid.as_bytes(),
+                &batch_id,
+                owner,
+                fencing_token,
+                WRITER_LEASE_SECS,
+            )
+            .await
+            .map_err(BifrostError::Sql)?;
+            conn.commit().await.map_err(BifrostError::Sql)?;
+
+            // Expire the freshly-renewed lease so recovery can claim it.
+            sqlx::query(
+                "UPDATE vala.olap_commits \
+                 SET writer_lease_expires_at = now() - interval '1 second' \
+                 WHERE table_uid = $1 AND batch_id = $2",
+            )
+            .bind(table_uid.as_bytes().as_slice())
+            .bind(batch_id.as_slice())
+            .execute(pool)
+            .await
+            .map_err(|e| BifrostError::Sql(vala_sql::SqlError::from(e)))?;
+
+            // Now proceed to the Iceberg commit (recovery_fencing_token may be
+            // set by the time this runs if recovery claimed the row).
+            let (snapshot_id, updated_table) =
+                commit_to_iceberg(catalog, table, files, &batch_id).await?;
+
+            // finalize_committed will fail (return false) if recovery claimed us.
+            let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
+                .await
+                .map_err(BifrostError::Sql)?;
+            let finalized = vala_sql::queries::olap_catalog::finalize_committed(
+                &mut conn2,
+                table_uid.as_bytes(),
+                &batch_id,
+                snapshot_id,
+                owner,
+                fencing_token,
+            )
+            .await
+            .map_err(BifrostError::Sql)?;
+            conn2.commit().await.map_err(BifrostError::Sql)?;
+
+            if !finalized {
+                let mut audit = vala_sql::TenantConn::acquire(pool, tenant)
+                    .await
+                    .map_err(BifrostError::Sql)?;
+                let _ = vala_sql::queries::olap_catalog::record_fence_loss_after_append(
+                    &mut audit,
+                    table_uid.as_bytes(),
+                    &batch_id,
+                    owner,
+                    fencing_token,
+                    snapshot_id,
+                    false,
+                    None,
+                )
+                .await;
+                let _ = audit.commit().await;
+                return Err(BifrostError::CommitConflict(
+                    "fault: AfterRenewBeforeAppend — fence lost after append".into(),
+                ));
+            }
+            Ok((snapshot_id, Some(updated_table)))
+        }
+    }
+}

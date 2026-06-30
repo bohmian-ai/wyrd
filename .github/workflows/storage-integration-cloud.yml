@@ -1,9 +1,11 @@
 name: storage-integration-cloud
 
-# Runs credentialed storage e2e tests against real S3, GCS, and Azure Blob.
-# Emulators cannot verify: S3 ChecksumType::FullObject SHA-256 server-side
-# computation, real IAM/role assumption, GCS workload-identity signed URLs,
-# Azure user-delegation SAS, and provider-specific error shapes.
+# Runs credentialed storage tests against real S3, GCS, and Azure Blob: the
+# StorageHandle data-plane CRUD suite (read/write/list/delete) plus the server
+# HTTP multipart e2e.
+# Emulators cannot verify: real IAM/role assumption, GCS workload-identity
+# signed URLs, Azure user-delegation SAS, virtual-host vs path-style addressing
+# against real endpoints, and provider-specific error shapes.
 #
 # Triggers on main-branch pushes and a weekly Monday cron. Never runs on PRs
 # from forks (credential exposure risk).
@@ -32,7 +34,10 @@ on:
 #   AZURE_CLOUD_SUBSCRIPTION_ID — Azure subscription ID
 #   AZURE_CLOUD_ACCOUNT_NAME    — Azure storage account name
 #   AZURE_CLOUD_CONTAINER_NAME  — Azure blob container name
-#   WYRD_DATABASE_URL_MIGRATOR  — Postgres migrator DSN for e2e test tenant setup
+#
+# Postgres for the server e2e is provisioned locally by the mise task chain
+# (build:postgres → db:setup-roles → db:migrate), so no database secret is
+# required.
 
 permissions:
   contents: read
@@ -58,12 +63,10 @@ jobs:
           role-to-assume: ${{ secrets.AWS_CLOUD_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_CLOUD_REGION }}
 
-      - name: Run S3 cloud e2e tests
+      - name: Run S3 cloud tests
         env:
-          WYRD_STORAGE_BACKEND: s3
           WYRD_STORAGE_S3_BUCKET: ${{ secrets.AWS_CLOUD_BUCKET_NAME }}
           WYRD_STORAGE_S3_REGION: ${{ secrets.AWS_CLOUD_REGION }}
-          WYRD_DATABASE_URL_MIGRATOR: ${{ secrets.WYRD_DATABASE_URL_MIGRATOR }}
         run: mise run test:storage:s3:cloud
 
   gcs-cloud:
@@ -83,11 +86,9 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_CLOUD_WORKLOAD_IDENTITY }}
           service_account: ${{ secrets.GCP_CLOUD_SERVICE_ACCOUNT }}
 
-      - name: Run GCS cloud e2e tests
+      - name: Run GCS cloud tests
         env:
-          WYRD_STORAGE_BACKEND: gcs
           WYRD_STORAGE_GCS_BUCKET: ${{ secrets.GCP_CLOUD_BUCKET_NAME }}
-          WYRD_DATABASE_URL_MIGRATOR: ${{ secrets.WYRD_DATABASE_URL_MIGRATOR }}
         run: mise run test:storage:gcs:cloud
 
   azure-cloud:
@@ -108,10 +109,8 @@ jobs:
           tenant-id: ${{ secrets.AZURE_CLOUD_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_CLOUD_SUBSCRIPTION_ID }}
 
-      - name: Run Azure cloud e2e tests
+      - name: Run Azure cloud tests
         env:
-          WYRD_STORAGE_BACKEND: azure
           WYRD_STORAGE_AZURE_ACCOUNT: ${{ secrets.AZURE_CLOUD_ACCOUNT_NAME }}
           WYRD_STORAGE_AZURE_CONTAINER: ${{ secrets.AZURE_CLOUD_CONTAINER_NAME }}
-          WYRD_DATABASE_URL_MIGRATOR: ${{ secrets.WYRD_DATABASE_URL_MIGRATOR }}
         run: mise run test:storage:azure:cloud

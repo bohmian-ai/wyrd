@@ -1,0 +1,216 @@
+---
+title: "Scenarios and records"
+description: "Two modes for getting evidence into the eval engine: online records from production and scenario-based CI runs."
+---
+
+The eval engine processes one thing: a JSON observation and a task DAG. How that observation arrives is the mode decision.
+
+**Online (production):** Your agent emits `EvalRecordObservation` records during inference. Records reach the server asynchronously via the ingest route. The eval worker picks them up, scores them, and stores results. No impact on application latency.
+
+**Scenario (CI / testing):** You define test cases as `EvalScenario` objects in a file. The server drives multi-turn conversations, your agent responds to each turn, and the server scores the completed interaction.
+
+Both modes use the same task engine. Define your tasks once; they work in both contexts.
+
+## Online records
+
+An `EvalRecordObservation` is what your agent emits at evaluation points during inference.
+
+```json
+{
+  "record_id": "018f5f54-0000-7000-8000-000000000001",
+  "run_id": "018f5f54-0000-7000-8000-000000000002",
+  "eval_ref": {
+    "kind": "Eval",
+    "name": "support-eval",
+    "version": "1.0.0"
+  },
+  "context": {
+    "query": "How do I reset my password?",
+    "response": "Go to Settings > Security > Reset Password.",
+    "tool_calls": [{"name": "search", "args": {"q": "reset password"}}],
+    "score": 4.5
+  },
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "span_id": "00f067aa0ba902b7",
+  "created_at": "2026-06-11T12:00:00Z"
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `record_id` | Yes | UUIDv7. The server deduplicates on this value — safe to retry. |
+| `run_id` | Yes | The agent invocation. The server resolves the agent identity from this. |
+| `eval_ref` | Yes | Which Eval card to score against. |
+| `context` | Yes | Freeform JSON. Your tasks read from it via `context_path` (JSONPath). |
+| `trace_id` / `span_id` | No | Required only when the Eval card includes `TraceAssertionTask`. |
+| `session_id` | No | Explicit session identifier. One run can serve multiple sessions. |
+
+The `context` shape is entirely up to you. Put whatever your tasks need: model output, query, tool calls, intermediate scores, metadata. The engine extracts values using the `context_path` JSONPath expressions declared in your tasks.
+
+### Sampling
+
+Set `spec.sampling` to control what fraction of production records the engine evaluates.
+
+```yaml
+spec:
+  sampling:
+    kind: ratio
+    ratio: 0.1   # evaluate 10% of records
+```
+
+```yaml
+spec:
+  sampling:
+    kind: every_nth
+    n: 100        # evaluate every 100th record
+```
+
+```yaml
+spec:
+  sampling:
+    kind: deterministic_by_hash
+    key_path: "$.session_id"
+    modulus: 10
+    bucket: 3     # consistent per session_id
+```
+
+Sampling happens at the ingest boundary before the eval worker runs.
+
+### Trace correlation
+
+Set `trace_id` and `span_id` when your Eval card includes a `TraceAssertionTask`. The eval worker waits until the corresponding span commits to analytical storage before running trace tasks. Records without a `trace_id` against an Eval card with trace tasks fail immediately with `failed(EvalRequiresTrace)`.
+
+Skip trace fields when your tasks only need the record context.
+
+## Scenarios
+
+A scenario is a single test case: an initial query, optional scripted user turns, termination logic, and passenger-view tasks that run against the agent's final response.
+
+```yaml
+- id: refund_status
+  initial_query: "Where is my refund for order 12345?"
+  expected_outcome: "The agent explains how to check refund status using the order number."
+  max_turns: 4
+  termination_signal: "[DONE]"
+  predefined_turns:
+    - "The order was placed two weeks ago."
+  tasks:
+    - id: mentions_order
+      operator: contains
+      expected: "12345"
+    - id: provides_steps
+      operator: has_length_greater_than
+      expected: 50
+```
+
+Scenarios live in a JSON, YAML, or JSONL file referenced by `--scenarios` when running the CLI, or loaded server-side from the Eval card's `dataset` reference.
+
+| Field | Description |
+|---|---|
+| `id` | Unique within the collection. |
+| `initial_query` | First user message. |
+| `expected_outcome` | Natural-language description of the intended outcome. Used by the server-simulated user persona. |
+| `max_turns` | Hard cap on completed agent turns (max 256). |
+| `termination_signal` | String that, when present in an agent response, ends the scenario early. |
+| `predefined_turns` | Scripted user turns consumed in order after the initial query. |
+| `tasks` | Passenger-view tasks evaluated against the final agent response. These are `ScenarioTask` objects, not `EvalTask` — they do not appear in the `EvalSpec` task map. |
+
+### Mechanic vs. passenger
+
+During a scenario run, the engine evaluates two views:
+
+**Mechanic view** — `EvalTask` definitions from the `EvalSpec` run against each `EvalRecordObservation` emitted by the agent during turns. This is your inside view: tool calls, intermediate scores, span health.
+
+**Passenger view** — `ScenarioTask` definitions from the scenario definition run against the agent's final response. This is your outside view: did the agent answer correctly?
+
+A scenario passes only if both views pass. A scenario where the final response looks right but mechanic tasks failed is a `scenario_passed: false` result.
+
+### EvalRecord evidence from scenarios
+
+During the scenario turn loop, your agent submits records alongside its response:
+
+```json
+{
+  "scenario_id": "refund_status",
+  "turn": 0,
+  "response": "I can help with that. Order 12345 is in transit.",
+  "records": [
+    {
+      "record_id": "018f5f54-0000-7000-8000-000000000001",
+      "run_id": "018f5f54-0000-7000-8000-000000000002",
+      "eval_ref": {"kind": "Eval", "name": "support-eval", "version": "1.0.0"},
+      "context": {
+        "query": "Where is my refund for order 12345?",
+        "response": "I can help with that. Order 12345 is in transit.",
+        "tool_calls": [{"name": "order_lookup", "args": {"order_id": "12345"}}]
+      },
+      "created_at": "2026-06-11T12:00:00Z"
+    }
+  ]
+}
+```
+
+These records accumulate across all turns of the scenario. At `ScenarioComplete`, the server scores them all together through the task DAG.
+
+## The turn protocol
+
+The server drives scenarios through a pull loop. Your client — CLI, Python SDK, or HTTP — keeps calling `/next` until `RunComplete`.
+
+```
+POST /api/v1/eval/runs
+  → { run_id, lease_token }
+
+loop:
+  POST /api/v1/eval/runs/{run_id}/next
+    → TurnDirective
+
+  on agent_turn:
+    run your agent with { message, history }
+    POST /api/v1/eval/runs/{run_id}/agent-turn
+      body: { scenario_id, turn, response, records }
+
+  on user_turn_needed (client mode):
+    generate next user message
+    POST /api/v1/eval/runs/{run_id}/user-turn
+      body: { scenario_id, turn, message }
+
+  on scenario_complete:
+    server has scored the scenario; ask for next directive
+
+  on run_complete:
+    done
+```
+
+The server owns all state: turn cursor, conversation history, termination detection, scoring, and aggregation. The client owns only the agent callback.
+
+### Simulated user modes
+
+| Mode | Who generates non-scripted user turns |
+|---|---|
+| `server` | Server runs a persona through a Skald judge call |
+| `client` | Your code supplies the next message |
+
+Scripted `predefined_turns` are always consumed first, regardless of mode. Mode only matters when the scripted turns are exhausted and the scenario has not yet terminated.
+
+### Per-run lease auth
+
+Every request after `POST /runs` requires `Authorization: Bearer <lease_token>`. The server issues one lease per run and validates it on every transition. Mismatched lease returns 403; missing lease returns 401.
+
+## Conversation history
+
+Each `TurnDirective` carries the full conversation history up to that point as `ConversationTurn[]`. The history is bounded by `MAX_HISTORY_TURNS` (512 entries — two per completed turn: one user push and one agent push).
+
+```json
+{
+  "kind": "agent_turn",
+  "scenario_id": "refund_status",
+  "turn": 1,
+  "message": "The order was placed two weeks ago.",
+  "history": [
+    {"role": "user", "content": "Where is my refund for order 12345?"},
+    {"role": "agent", "content": "I can help. Order 12345 shows as in transit."}
+  ]
+}
+```
+
+Wire roles are lowercase (`user`, `agent`). The Python SDK exposes them as `"User"` and `"Agent"` in `ConversationTurn`.

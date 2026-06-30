@@ -72,6 +72,20 @@ export default defineConfig({
           ],
         },
         {
+          label: "Security",
+          collapsed: true,
+          items: [
+            { label: "Overview", link: "/security/" },
+            { label: "Identity", link: "/security/identity/" },
+            { label: "Roles and permissions", link: "/security/roles-and-permissions/" },
+            { label: "Tokens", link: "/security/tokens/" },
+            { label: "Service identity", link: "/security/service-identity/" },
+            { label: "Delegation", link: "/security/delegation/" },
+            { label: "Operations", link: "/security/operations/" },
+            { label: "Threat model", link: "/security/threat-model/" },
+          ],
+        },
+        {
           label: "Card reference",
           collapsed: true,
           items: [
@@ -107,6 +121,20 @@ export default defineConfig({
                 { label: "Lock and install a service", link: "/guides/lock-install-service/" },
                 { label: "Policy and audit", link: "/policy-audit/" },
                 { label: "Observability", link: "/observability/" },
+                {
+                  label: "Evaluation",
+                  collapsed: true,
+                  items: [
+                    { label: "Overview", link: "/evaluation/" },
+                    { label: "EvalCard and tasks", link: "/evaluation/eval-card-and-tasks/" },
+                    { label: "Scenarios and records", link: "/evaluation/scenarios-and-records/" },
+                    { label: "Running evals", link: "/evaluation/running-evals/" },
+                    { label: "Results and comparison", link: "/evaluation/results-and-comparison/" },
+                    { label: "Python SDK", link: "/evaluation/python-sdk/" },
+                    { label: "Comparison", link: "/evaluation/comparison/" },
+                    { label: "Discussion", link: "/evaluation/discussion/" },
+                  ],
+                },
               ],
             },
             {
@@ -136,6 +164,19 @@ export default defineConfig({
             { label: "Error remediation", link: "/agents/error-remediation/" },
             { label: "CLI and MCP", link: "/cli-mcp/" },
             { label: "Python SDK", link: "/python/" },
+          ],
+        },
+        {
+          label: "Transports",
+          collapsed: false,
+          items: [
+            { label: "Overview", link: "/transports/" },
+            { label: "gRPC", link: "/transports/grpc/" },
+            { label: "HTTP", link: "/transports/http/" },
+            { label: "Mock", link: "/transports/mock/" },
+            { label: "Queue policy", link: "/transports/queue-policy/" },
+            { label: "Secrets and TLS", link: "/transports/secrets-and-tls/" },
+            { label: "Troubleshooting", link: "/transports/troubleshooting/" },
           ],
         },
         {

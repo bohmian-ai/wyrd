@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/wyrd-client",
     "crates/wyrd/*",
     "crates/vala/*",
     "crates/skald/*",
@@ -9,11 +10,12 @@ members = [
     "examples/rust",
     "python/py-wyrd",
 ]
+exclude = []
 default-members = [
     "crates/wyrd/wyrd-server",
     "crates/wyrd/wyrd-cli",
     "crates/wyrd/wyrd-mcp",
-    "crates/vala/wyrd-observability-server",
+    "crates/vala/vala-http",
 ]
 
 [workspace.package]
@@ -26,6 +28,7 @@ authors = ["Thorrester <sjforrester32@gmail.com>"]
 
 [workspace.dependencies]
 wyrd-spec = { path = "crates/wyrd-spec", version = "0.0.1" }
+wyrd-client = { path = "crates/wyrd-client", version = "0.0.1" }
 skald-spec = { path = "crates/skald/skald-spec", version = "0.1.0" }
 skald-cache = { path = "crates/skald/skald-cache", version = "0.0.1" }
 skald-tool = { path = "crates/skald/skald-tool", version = "0.0.1" }
@@ -35,20 +38,38 @@ skald-prompt = { path = "crates/skald/skald-prompt", version = "0.0.1" }
 skald-agent = { path = "crates/skald/skald-agent", version = "0.0.1" }
 skald-workflow = { path = "crates/skald/skald-workflow", version = "0.0.1" }
 vala-client = { path = "crates/vala/vala-client", version = "0.0.1" }
+vala-core = { path = "crates/vala/vala-core", version = "0.0.1" }
+vala-drift = { path = "crates/vala/vala-drift", version = "0.0.1" }
+vala-eval = { path = "crates/vala/vala-eval", version = "0.0.1" }
+vala-http = { path = "crates/vala/vala-http", version = "0.0.1" }
 wyrd-observe = { path = "crates/shared/wyrd-observe", version = "0.0.1" }
 wyrd-utils = { path = "crates/shared/wyrd-utils", version = "0.0.1" }
+wyrd-version = { path = "crates/shared/wyrd-version", version = "0.0.1" }
 wyrd-test-contract-macros = { path = "crates/shared/wyrd-test-contract-macros", version = "0.0.1" }
+wyrd-error-derive = { path = "crates/shared/wyrd-error-derive", version = "0.0.1" }
 wyrd-interfaces = { path = "crates/wyrd/wyrd-interfaces", version = "0.0.1" }
 wyrd-cards = { path = "crates/wyrd/wyrd-cards", version = "0.0.1" }
 wyrd-runtime = { path = "crates/shared/wyrd-runtime", version = "0.0.1" }
+wyrd-auth-issue = { path = "crates/shared/wyrd-auth-issue", version = "0.0.1" }
 wyrd-auth-verify = { path = "crates/shared/wyrd-auth-verify", version = "0.0.1" }
+wyrd-auth-check = { path = "crates/shared/wyrd-auth-check", version = "0.0.1" }
+wyrd-dev-fixtures = { path = "crates/shared/wyrd-dev-fixtures", version = "0.0.1" }
+wyrd-sql = { path = "crates/wyrd/wyrd-sql", version = "0.0.1" }
 wyrd-storage = { path = "crates/wyrd/wyrd-storage", version = "0.0.1" }
+wyrd-server = { path = "crates/wyrd/wyrd-server", version = "0.0.1" }
+wyrd-testing = { path = "crates/wyrd/wyrd-testing", version = "0.0.1" }
+wyrd-tonic = { path = "crates/wyrd/wyrd-tonic", version = "0.0.1" }
+wyrd-semver = { path = "crates/shared/wyrd-semver", version = "0.0.1" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "stream"] }
+clap = { version = "4", features = ["derive", "env"] }
+ed25519-dalek = { version = "2.2", features = ["pkcs8"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "stream", "blocking"] }
 axum = "0.8"
+http = "1"
 serde = { version = "1", features = ["derive"] }
+serde_jcs = "0.1"
 serde_json = "1"
 serde_yaml = "0.9"
 jsonschema = { version = "0.18", default-features = false }
@@ -56,10 +77,13 @@ schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 thiserror = "2.0"
 base64 = "0.22"
+blake3 = "1"
 insta = { version = "1.43", features = ["json"] }
 wiremock = "0.6"
 temp-env = "0.3"
+tempfile = "3"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+dashmap = "6.1"
 flate2 = "1.*"
 zstd = "0.13"
 walkdir = "2.*"
@@ -73,8 +97,10 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 password-hash = { version = "0.5", features = ["getrandom"] }
 secrecy = "0.10"
+subtle = "2.6"
 zeroize = "1"
 governor = "0.10"
+tower_governor = { version = "0.8", features = ["axum"] }
 rand = "0.9"
 pg-embed = { version = "1.0.0", default-features = false, features = ["rt_tokio"] }
 url = "2"
@@ -86,16 +112,32 @@ quote = "1"
 proc-macro2 = "1"
 jsonwebtoken = "9"
 sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "macros", "migrate", "chrono", "uuid", "json"] }
-tempfile = "3"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace", "catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+paste = "1"
 time = "0.3"
+ulid = "1"
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+arrow = "58"
+arrow-array = "58"
+arrow-schema = "58"
+statrs = "0.18"
+jsonpath-rust = "0.7"
+tracing-opentelemetry = "0.28"
 pyo3 = { version = "0.28", features = ["abi3-py310", "chrono", "py-clone"] }
+toml = "0.8"
+shellexpand = "3"
+ipnetwork = "0.20"
+wyrd-telemetry = { path = "crates/shared/wyrd-telemetry", version = "0.0.1" }
+arc-swap = "1.7"
+tonic = "0.12"
+tonic-health = "0.12"
+tonic-reflection = "0.12"
+prost = "0.13"
 
 # Cloud SDKs are server-tier only.
 aws-sdk-s3 = "=1.75.0"
@@ -107,11 +149,22 @@ azure_core = "0.21.0"
 azure_identity = "0.21.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
-# Keep object_store, datafusion, and deltalake aligned; see
-# .dev/plan/foundations/04-storage/10a-datafusion-deltalake-pin.md.
-object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
-datafusion = "=54.0.0"
-deltalake = { version = "=0.32.4", features = ["s3", "gcs", "azure"] }
+# opendal 0.57 pinned as the wyrd-storage substrate (stage0) and the future
+# iceberg-storage-opendal substrate (stage1). reqwest-rustls-tls is mandatory:
+# default-features=false drops it, leaving an HTTP-only client that fails all
+# cloud HTTPS requests.
+opendal = { version = "0.57", default-features = false, features = [
+  "services-fs", "services-s3", "services-gcs", "services-azblob",
+  "reqwest-rustls-tls",
+] }
+# =53.1.0 matches the iceberg-rust arrow-58 line; git-pinned until iceberg 0.10 publishes.
+datafusion = "=53.1.0"
+parquet = "58"
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "b4c73df" }
+# sqlx 0.8.1 is a hard dep in this crate — there is no sqlx feature flag to add.
+iceberg-catalog-sql = { git = "https://github.com/apache/iceberg-rust", rev = "b4c73df" }
+iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "b4c73df" }
+iceberg-storage-opendal = { git = "https://github.com/apache/iceberg-rust", rev = "b4c73df", features = ["opendal-s3", "opendal-gcs", "opendal-azdls", "opendal-fs", "opendal-memory"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

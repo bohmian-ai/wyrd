@@ -80,7 +80,13 @@ def properties(schema: dict) -> list[tuple[str, str, str]]:
             if not isinstance(detail, dict):
                 rows.append((name, "object", "yes" if name in required else "no"))
                 continue
-            rows.append((name, scalar_type(detail.get("type")), "yes" if name in required else "no"))
+            rows.append(
+                (
+                    name,
+                    scalar_type(detail.get("type")),
+                    "yes" if name in required else "no",
+                )
+            )
     return rows
 
 
@@ -152,14 +158,19 @@ RELATED_NOTES = {
 
 
 def intro_dl(slug: str, schema: dict) -> str:
-    kind_attr = f' data-kind="{slug}"' if CARD_KIND_GROUPS.get(slug) != "neutral" else ""
+    kind_attr = (
+        f' data-kind="{slug}"' if CARD_KIND_GROUPS.get(slug) != "neutral" else ""
+    )
     rows = properties(schema)
     required = [r for r in rows if r[2] == "yes"]
     optional_count = len(rows) - len(required)
-    required_str = ", ".join(f"<code>{name}</code>" for name, *_ in required[:4]) or "none required"
+    required_str = (
+        ", ".join(f"<code>{name}</code>" for name, *_ in required[:4])
+        or "none required"
+    )
     return (
         f'<dl class="wyrd-defs">'
-        f'<dt{kind_attr}>{title_for(slug)}</dt>'
+        f"<dt{kind_attr}>{title_for(slug)}</dt>"
         f"<dd>{PURPOSES[slug]}</dd>"
         f"<dt>Required</dt>"
         f"<dd>{required_str}</dd>"
@@ -201,7 +212,9 @@ def render(slug: str, schema_file: str) -> str:
     if rows:
         lines.extend(["| Field | Type | Required |", "| --- | --- | --- |"])
         for name, field_type, required in rows:
-            lines.append(f"| `{md_escape(name)}` | `{md_escape(field_type)}` | {required} |")
+            lines.append(
+                f"| `{md_escape(name)}` | `{md_escape(field_type)}` | {required} |"
+            )
     else:
         lines.append("This schema does not expose top-level fields yet.")
 

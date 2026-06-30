@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AbsoluteUrl",
+  "description": "Absolute URL with a scheme and authority.",
+  "type": "string",
+  "format": "uri",
+  "pattern": "^https?://"
+}

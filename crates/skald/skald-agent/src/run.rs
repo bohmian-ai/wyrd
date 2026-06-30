@@ -195,7 +195,7 @@ pub struct AgentRun {
     /// class bound at the Agent level, or when no class was passed.
     #[serde(skip)]
     #[cfg(feature = "python")]
-    pub parsed: Option<pyo3::Py<pyo3::PyAny>>,
+    pub parsed: Option<Arc<pyo3::Py<pyo3::PyAny>>>,
 }
 
 #[cfg(feature = "python")]
@@ -300,7 +300,7 @@ impl AgentRun {
     ///     Any | None: Typed model instance, or None when no class was declared.
     #[getter]
     pub fn parsed(&self, py: pyo3::Python<'_>) -> Option<pyo3::Py<pyo3::PyAny>> {
-        self.parsed.as_ref().map(|p| p.clone_ref(py))
+        self.parsed.as_ref().map(|p| p.as_ref().clone_ref(py))
     }
 
     /// Return the final provider response as a typed wrapper, if the run reached one.

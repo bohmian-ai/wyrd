@@ -1,6 +1,7 @@
 use std::time::Duration;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::storage::{UploadPlan, WireProtocol};
+use wyrd_spec::storage::{StorageBackendKind, UploadPlan, WireProtocol};
+use wyrd_storage::error::{LocalError, StorageError};
 use wyrd_storage::{BackendSigner, CompletePayload, LocalSigner, UploadPlanReplayInput};
 
 #[tokio::test]
@@ -18,15 +19,6 @@ async fn local_signer_round_trips_single_put_contract() {
     let head = signer.head(&path).await.expect("head local object");
     assert_eq!(head.size_bytes, 10);
     assert_eq!(head.sse_marker.as_deref(), Some("none"));
-
-    signer
-        .verify_sha256(
-            &path,
-            &wyrd_storage::sha::bytes_sha256(b"hello wyrd"),
-            &head,
-        )
-        .await
-        .expect("verify sha");
 
     let plan = signer
         .presign_single_put(&path, head.size_bytes, Duration::from_mins(1))
@@ -84,4 +76,47 @@ fn storage_path(tenant: DataTenantId) -> wyrd_storage::ValidatedPath {
     let card_uid = uuid::Uuid::now_v7();
     let full = wyrd_storage::tenant_path::build(tenant, &card_uid.to_string(), "matrix/object.bin");
     wyrd_storage::tenant_path::validate(&full, tenant).expect("tenant path")
+}
+
+#[tokio::test]
+async fn local_head_on_missing_returns_not_found() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
+    let tenant = DataTenantId::new_v7();
+    let path = storage_path(tenant);
+
+    let result = signer.head(&path).await;
+    match result {
+        Err(StorageError::Local(LocalError::NotFound { .. })) => {}
+        other => panic!("local head on missing must return typed Local::NotFound, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn local_capability_mismatch_is_typed_for_non_local_protocols() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
+    let tenant = DataTenantId::new_v7();
+    let path = storage_path(tenant);
+
+    let input = UploadPlanReplayInput {
+        wire_protocol: WireProtocol::S3MultipartV1,
+        backend_upload_id: None,
+        part_count_planned: 1,
+        part_size_bytes: 10,
+        block_count_planned: None,
+    };
+    let result = signer
+        .remint_plan(&path, &input, Duration::from_mins(1))
+        .await;
+    match result {
+        Err(StorageError::BackendCapabilityMismatch { signer, op }) => {
+            assert_eq!(signer, StorageBackendKind::Local);
+            assert_eq!(op, "remint_plan");
+        }
+        other => panic!(
+            "Local remint_plan with non-Local protocol must return BackendCapabilityMismatch, \
+             got: {other:?}"
+        ),
+    }
 }

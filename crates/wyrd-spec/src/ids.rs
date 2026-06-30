@@ -71,6 +71,28 @@ id_type!(
 );
 id_type!(CardName, "Human-visible Card name.", validate_token);
 id_type!(CardUid, "Resolved immutable Card UID.", validate_uuid7);
+
+impl CardUid {
+    /// Build a [`CardUid`] from a UUIDv7 value.
+    ///
+    /// The UUID must be version 7; any other version returns [`IdError::InvalidUuid7`].
+    ///
+    /// # Errors
+    /// Returns [`IdError`] when the UUID is not version 7.
+    pub fn from_uuid(uuid: uuid::Uuid) -> Result<Self, IdError> {
+        Self::new(uuid.to_string())
+    }
+
+    /// Parse the underlying string back to a [`uuid::Uuid`].
+    ///
+    /// # Panics
+    /// Never: the constructor guarantees the string is a valid UUID.
+    #[must_use]
+    pub fn as_uuid(&self) -> uuid::Uuid {
+        uuid::Uuid::parse_str(self.as_str()).expect("CardUid was validated at construction")
+    }
+}
+
 id_type!(
     ProfileName,
     "Named execution or configuration profile.",
@@ -90,6 +112,11 @@ id_type!(
 id_type!(ArtifactKey, "Artifact storage key.", validate_token);
 id_type!(RoleName, "RBAC role identifier.", validate_token);
 id_type!(ColumnName, "DataCard column name.", validate_card_token);
+id_type!(
+    FeatureName,
+    "Feature column name referenced by a DriftCard signal.",
+    validate_card_token
+);
 id_type!(SplitName, "DataCard split label.", validate_card_token);
 id_type!(QueryName, "DataCard SQL query key.", validate_card_token);
 id_type!(
@@ -107,6 +134,10 @@ id_type!(
 pub struct DataTenantId(uuid::Uuid);
 
 impl DataTenantId {
+    /// Nil-UUID sentinel that bypasses the v7 validator and represents Wyrd's
+    /// system-owned tables (SystemShared OLAP namespace, catalog bootstrap, etc.).
+    pub const SYSTEM_OWNER: DataTenantId = DataTenantId(uuid::Uuid::nil());
+
     /// Generate a UUIDv7-backed tenant isolation key.
     #[must_use]
     pub fn new_v7() -> Self {
@@ -169,6 +200,12 @@ impl<'de> Deserialize<'de> for DataTenantId {
         let value = uuid::Uuid::deserialize(deserializer)?;
         Self::new(value).map_err(serde::de::Error::custom)
     }
+}
+
+/// Generate a UUIDv7 string for Wyrd-owned identifiers.
+#[must_use]
+pub fn uuid7() -> String {
+    uuid::Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext)).to_string()
 }
 
 fn validate_token(value: &str) -> Result<(), IdError> {

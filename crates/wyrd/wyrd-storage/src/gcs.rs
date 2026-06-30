@@ -164,26 +164,7 @@ impl GcsSigner {
             size_bytes,
             sse_marker: object.kms_key_name,
             content_type: object.content_type,
-            sha256_b64: None,
         })
-    }
-
-    /// GCS SHA-256 verification is client-declared.
-    ///
-    /// `gcloud-storage` v1.3.0 exposes only MD5 and `CRC32c` from object
-    /// metadata — no SHA-256 field. Downloading the object to compute SHA-256
-    /// violates the no-bytes-on-server invariant and causes OOM for large
-    /// artifacts. GCS backend is therefore `VerificationGuarantee::ClientDeclared`;
-    /// the client-declared hash is recorded at init time and trusted at complete.
-    /// Revisit if a future SDK version exposes `sha256_hash` in the Object struct.
-    #[allow(clippy::unused_async)]
-    pub async fn verify_sha256(
-        &self,
-        _path: &ValidatedPath,
-        _expected: &str,
-        _head_hint: &HeadInfo,
-    ) -> Result<(), StorageError> {
-        Ok(())
     }
 
     /// Re-mint a GCS upload plan.

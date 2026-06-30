@@ -7,6 +7,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use wyrd_interfaces::error::CardPyResult;
+use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::model::{
     CustomMeta as CustomModelMeta, ModelInterface as RustModelInterface,
     ModelSignature as RustModelSignature, ModelSpec, SampleInput as RustSampleInput, TaskType,
@@ -15,7 +16,6 @@ use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::ApiVersion;
 
 #[cfg(feature = "python")]
 use {
@@ -633,7 +633,15 @@ impl ModelCard {
                     .as_ref()
                     .map_or_else(|| "default".to_string(), ToString::to_string),
                 name: envelope.metadata.name.to_string(),
-                version: envelope.metadata.version.to_string(),
+                version: envelope
+                    .metadata
+                    .resolved_pin()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| {
+                        WyrdPyError::model_validation(
+                            "ModelCard envelope missing resolved version pin",
+                        )
+                    })?,
                 uid: envelope
                     .metadata
                     .uid

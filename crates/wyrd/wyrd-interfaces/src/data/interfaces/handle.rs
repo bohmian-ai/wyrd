@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
@@ -81,55 +82,55 @@ impl DataInterfaceHandle {
     pub fn from_raw(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<Self> {
         match dtype::detect_data_source(py, data)? {
             DataSourceKind::Pandas => Ok(Self::Pandas(PandasInterface {
-                data: Some(data.clone().unbind()),
+                data: Some(Arc::new(data.clone().unbind())),
                 compression: "snappy".to_string(),
             })),
             DataSourceKind::Polars => Ok(Self::Polars(PolarsInterface {
-                data: Some(data.clone().unbind()),
+                data: Some(Arc::new(data.clone().unbind())),
                 compression: "snappy".to_string(),
             })),
             DataSourceKind::Arrow => Ok(Self::Arrow(ArrowInterface {
-                data: Some(data.clone().unbind()),
+                data: Some(Arc::new(data.clone().unbind())),
                 format: "parquet".to_string(),
             })),
             DataSourceKind::ParquetPath => Ok(Self::Parquet(ParquetInterface {
-                data: Some(data.clone().unbind()),
+                data: Some(Arc::new(data.clone().unbind())),
                 compression: "snappy".to_string(),
                 row_group_size: None,
             })),
             DataSourceKind::Numpy => Ok(Self::Numpy(NumpyInterface {
-                data: Some(data.clone().unbind()),
+                data: Some(Arc::new(data.clone().unbind())),
                 dtype: None,
                 shape: None,
                 format: "npy".to_string(),
             })),
             DataSourceKind::Torch => Ok(Self::Torch(TorchInterface {
-                data: Some(data.clone().unbind()),
+                data: Some(Arc::new(data.clone().unbind())),
                 save_format: "safetensors".to_string(),
             })),
             DataSourceKind::Sql => Ok(Self::Sql(SqlInterface {
-                data: Some(data.clone().unbind()),
+                data: Some(Arc::new(data.clone().unbind())),
                 dialect: "sql".to_string(),
                 connection_hint: None,
             })),
             DataSourceKind::JsonlPath => Ok(Self::Jsonl(JsonlInterface {
-                data: Some(data.clone().unbind()),
+                data: Some(Arc::new(data.clone().unbind())),
                 compression: dtype::jsonl_compression_from_path(data)?,
                 lines_per_file: None,
             })),
             DataSourceKind::ImageDirectory => Ok(Self::Image(ImageInterface {
-                data: Some(data.clone().unbind()),
+                data: Some(Arc::new(data.clone().unbind())),
                 format: "mixed".to_string(),
                 color_mode: "rgb".to_string(),
                 manifest_ref: None,
             })),
             DataSourceKind::TextDirectory => Ok(Self::Text(TextInterface {
-                data: Some(data.clone().unbind()),
+                data: Some(Arc::new(data.clone().unbind())),
                 encoding: "utf-8".to_string(),
                 manifest_ref: None,
             })),
             DataSourceKind::Huggingface => Ok(Self::Huggingface(HuggingfaceInterface {
-                data: Some(data.clone().unbind()),
+                data: Some(Arc::new(data.clone().unbind())),
                 dataset_id: huggingface_dataset_id(data)?,
                 revision: huggingface_optional_attr(data, &["revision"]),
                 split: huggingface_optional_attr(data, &["split"]),
@@ -184,7 +185,7 @@ impl DataInterfaceHandle {
     }
 
     /// Take the held Python source object, if one exists.
-    pub fn take_source(&mut self) -> Option<Py<PyAny>> {
+    pub fn take_source(&mut self) -> Option<Arc<Py<PyAny>>> {
         match self {
             Self::Pandas(value) => value.data.take(),
             Self::Polars(value) => value.data.take(),
@@ -204,17 +205,17 @@ impl DataInterfaceHandle {
     /// Borrow the held Python source object, if one exists.
     pub fn source_ref(&self) -> Option<&Py<PyAny>> {
         match self {
-            Self::Pandas(value) => value.data.as_ref(),
-            Self::Polars(value) => value.data.as_ref(),
-            Self::Arrow(value) => value.data.as_ref(),
-            Self::Parquet(value) => value.data.as_ref(),
-            Self::Numpy(value) => value.data.as_ref(),
-            Self::Torch(value) => value.data.as_ref(),
-            Self::Sql(value) => value.data.as_ref(),
-            Self::Jsonl(value) => value.data.as_ref(),
-            Self::Image(value) => value.data.as_ref(),
-            Self::Text(value) => value.data.as_ref(),
-            Self::Huggingface(value) => value.data.as_ref(),
+            Self::Pandas(value) => value.data.as_deref(),
+            Self::Polars(value) => value.data.as_deref(),
+            Self::Arrow(value) => value.data.as_deref(),
+            Self::Parquet(value) => value.data.as_deref(),
+            Self::Numpy(value) => value.data.as_deref(),
+            Self::Torch(value) => value.data.as_deref(),
+            Self::Sql(value) => value.data.as_deref(),
+            Self::Jsonl(value) => value.data.as_deref(),
+            Self::Image(value) => value.data.as_deref(),
+            Self::Text(value) => value.data.as_deref(),
+            Self::Huggingface(value) => value.data.as_deref(),
             Self::Subclass(_) => None,
         }
     }

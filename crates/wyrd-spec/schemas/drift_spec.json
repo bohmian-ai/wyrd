@@ -1,46 +1,39 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "DriftSpec",
-  "description": "Reusable drift-monitor definition.",
+  "description": "DriftCard spec body.",
   "type": "object",
   "required": [
-    "method"
+    "condition",
+    "method",
+    "signal",
+    "subject_ref"
   ],
   "properties": {
-    "baseline_ref": {
-      "description": "Baseline data reference.",
-      "anyOf": [
+    "condition": {
+      "description": "When a sample becomes an emittable observation.",
+      "allOf": [
         {
-          "$ref": "#/definitions/CardRef"
-        },
-        {
-          "type": "null"
+          "$ref": "#/definitions/DriftCondition"
         }
       ]
     },
     "description": {
-      "description": "Drift description.",
+      "description": "Free-text description authored on the card.",
       "type": [
         "string",
         "null"
       ]
     },
     "details": {
-      "description": "Free-form details.",
+      "description": "Free-form non-secret authoring metadata.",
       "type": "object",
       "additionalProperties": {
         "$ref": "#/definitions/NonSecretValue"
       }
     },
-    "features": {
-      "description": "Feature names.",
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
     "method": {
-      "description": "Drift method.",
+      "description": "Drift detection method. Drives which `DriftProfile` variant is allowed.",
       "allOf": [
         {
           "$ref": "#/definitions/DriftMethod"
@@ -48,7 +41,7 @@
       ]
     },
     "profile": {
-      "description": "Method-specific profile.",
+      "description": "Method-specific math configuration. Required for `Psi | Spc | Custom`, forbidden for `External`.",
       "anyOf": [
         {
           "$ref": "#/definitions/DriftProfile"
@@ -58,52 +51,24 @@
         }
       ]
     },
-    "target_refs": {
-      "description": "Target data/model/service references.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/CardRef"
-      }
+    "signal": {
+      "description": "How the measurement enters the monitor.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/DriftSignal"
+        }
+      ]
     },
-    "thresholds": {
-      "description": "Thresholds by metric.",
-      "type": "object",
-      "additionalProperties": {
-        "type": "number",
-        "format": "double"
-      }
+    "subject_ref": {
+      "description": "Singular subject of the monitor: the entity drift is observed against. Allowed `subject_ref.kind`: `Model | Agent | Service | Data`.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardRef"
+        }
+      ]
     }
   },
   "definitions": {
-    "AgentEvalProfile": {
-      "description": "Agent evaluation drift profile fields.",
-      "type": "object",
-      "required": [
-        "task"
-      ],
-      "properties": {
-        "alert_threshold": {
-          "description": "Alert threshold.",
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "sample_ratio": {
-          "description": "Sample ratio.",
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "task": {
-          "description": "Evaluation task.",
-          "type": "string"
-        }
-      }
-    },
     "CardKind": {
       "title": "CardKind",
       "description": "Wyrd Card kind.",
@@ -124,8 +89,7 @@
         "Artifact",
         "Trigger",
         "Operator",
-        "Source",
-        "External"
+        "Source"
       ]
     },
     "CardName": {
@@ -191,69 +155,121 @@
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
-    "CustomProfile": {
-      "description": "Custom drift profile fields.",
-      "type": "object",
-      "required": [
-        "metric"
-      ],
-      "properties": {
-        "alert_threshold": {
-          "description": "Alert threshold.",
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "metric": {
-          "description": "Metric name.",
-          "type": "string"
-        },
-        "sample_size": {
-          "description": "Sample size.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint",
-          "minimum": 0.0
-        }
-      }
-    },
-    "DriftMethod": {
-      "description": "Supported drift monitor method.",
+    "DriftCondition": {
+      "description": "Fire condition for a drift observation.",
       "oneOf": [
         {
-          "description": "Statistical process-control drift.",
-          "type": "string",
-          "enum": [
-            "Spc"
-          ]
+          "description": "The method's profile decides, such as PSI threshold or SPC zone.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "Statistical"
+              ]
+            }
+          }
         },
         {
-          "description": "Population stability index drift.",
+          "description": "Fires when sample > limit.",
+          "type": "object",
+          "required": [
+            "kind",
+            "limit"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "Above"
+              ]
+            },
+            "limit": {
+              "description": "Upper exclusive limit.",
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "Fires when sample < limit.",
+          "type": "object",
+          "required": [
+            "kind",
+            "limit"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "Below"
+              ]
+            },
+            "limit": {
+              "description": "Lower exclusive limit.",
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "Fires when sample < lower or sample > upper.",
+          "type": "object",
+          "required": [
+            "kind",
+            "lower",
+            "upper"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "Outside"
+              ]
+            },
+            "lower": {
+              "description": "Lower exclusive bound.",
+              "type": "number",
+              "format": "double"
+            },
+            "upper": {
+              "description": "Upper exclusive bound.",
+              "type": "number",
+              "format": "double"
+            }
+          }
+        }
+      ]
+    },
+    "DriftMethod": {
+      "description": "Drift detection method.\n\n`Agent` is intentionally absent in v1. It can return only after the signal vocabulary, profile, and scoring algorithm are locked in `wyrd-design.md`.",
+      "oneOf": [
+        {
+          "description": "Population Stability Index over a baseline distribution.",
           "type": "string",
           "enum": [
             "Psi"
           ]
         },
         {
-          "description": "Custom metric drift.",
+          "description": "Statistical Process Control over a baseline distribution or scalar stream.",
+          "type": "string",
+          "enum": [
+            "Spc"
+          ]
+        },
+        {
+          "description": "User-defined metric with an author-supplied baseline value.",
           "type": "string",
           "enum": [
             "Custom"
           ]
         },
         {
-          "description": "Agent evaluation drift.",
-          "type": "string",
-          "enum": [
-            "Agent"
-          ]
-        },
-        {
-          "description": "External drift method.",
+          "description": "Drift method defined externally, with no Vala-side fit or score.",
           "type": "string",
           "enum": [
             "External"
@@ -262,85 +278,230 @@
       ]
     },
     "DriftProfile": {
-      "description": "Drift profile configuration.",
+      "description": "Method-specific math configuration. Config only; fitted state lives in `vala-drift::baseline`, never here.",
       "oneOf": [
         {
-          "description": "SPC profile.",
+          "description": "PSI profile configuration.",
           "type": "object",
           "required": [
-            "config",
-            "type"
+            "binning_strategy",
+            "kind",
+            "threshold"
           ],
           "properties": {
-            "config": {
-              "$ref": "#/definitions/SpcProfile"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "Spc"
+            "binning_strategy": {
+              "description": "Binning strategy applied to numeric features.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/PsiBinningStrategy"
+                }
               ]
-            }
-          }
-        },
-        {
-          "description": "PSI profile.",
-          "type": "object",
-          "required": [
-            "config",
-            "type"
-          ],
-          "properties": {
-            "config": {
-              "$ref": "#/definitions/PsiProfile"
             },
-            "type": {
+            "categorical_features": {
+              "description": "Features treated as categorical regardless of dtype.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/FeatureName"
+              }
+            },
+            "kind": {
               "type": "string",
               "enum": [
                 "Psi"
               ]
-            }
-          }
-        },
-        {
-          "description": "Custom profile.",
-          "type": "object",
-          "required": [
-            "config",
-            "type"
-          ],
-          "properties": {
-            "config": {
-              "$ref": "#/definitions/CustomProfile"
             },
-            "type": {
-              "type": "string",
-              "enum": [
-                "Custom"
+            "threshold": {
+              "description": "PSI threshold strategy.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/PsiThreshold"
+                }
               ]
             }
           }
         },
         {
-          "description": "Agent profile.",
+          "description": "SPC profile configuration.",
           "type": "object",
           "required": [
-            "config",
-            "type"
+            "alert_threshold",
+            "kind",
+            "sample_size",
+            "weco_rule"
           ],
           "properties": {
-            "config": {
-              "$ref": "#/definitions/AgentEvalProfile"
+            "alert_threshold": {
+              "description": "Lowest zone that should produce a Drift verdict.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SpcAlertThreshold"
+                }
+              ]
             },
-            "type": {
+            "kind": {
               "type": "string",
               "enum": [
-                "Agent"
+                "Spc"
+              ]
+            },
+            "sample_size": {
+              "description": "Sample chunk size for baseline computation. `0` means adaptive default.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "weco_rule": {
+              "description": "WECO rule configuration.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SpcWecoRule"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "Custom profile configuration.",
+          "type": "object",
+          "required": [
+            "alert_threshold",
+            "baseline_value",
+            "kind",
+            "metric_name"
+          ],
+          "properties": {
+            "alert_threshold": {
+              "description": "Threshold on `|mean(target) - baseline_value|` that triggers drift.",
+              "type": "number",
+              "format": "double"
+            },
+            "baseline_value": {
+              "description": "Author-supplied baseline value.",
+              "type": "number",
+              "format": "double"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "Custom"
+              ]
+            },
+            "metric_name": {
+              "description": "Column or metric name read from the target record batch.",
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "DriftSignal": {
+      "description": "How measurements enter the drift monitor.",
+      "oneOf": [
+        {
+          "description": "PSI or SPC over a baseline dataset.",
+          "type": "object",
+          "required": [
+            "baseline_ref",
+            "features",
+            "kind"
+          ],
+          "properties": {
+            "baseline_ref": {
+              "description": "Data card carrying the baseline artifact.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            },
+            "features": {
+              "description": "Columns of the baseline DataCard that participate in the monitor.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/FeatureName"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "Distribution"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Named scalar emitted by the subject's runtime.",
+          "type": "object",
+          "required": [
+            "kind",
+            "name"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "Metric"
+              ]
+            },
+            "name": {
+              "description": "Metric name, such as `p99_latency_ms`, `mae`, or `tokens_per_call`.",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Score stream produced by an Eval card.",
+          "type": "object",
+          "required": [
+            "eval_ref",
+            "kind"
+          ],
+          "properties": {
+            "eval_ref": {
+              "description": "Eval card whose score stream this drift consumes.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "EvalScore"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Measurement from an external system, such as Prometheus or OTel.",
+          "type": "object",
+          "required": [
+            "kind",
+            "source_ref"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "External"
+              ]
+            },
+            "source_ref": {
+              "description": "Source card describing where to read the external measurement.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
               ]
             }
           }
         }
       ]
+    },
+    "FeatureName": {
+      "description": "Feature column name referenced by a DriftCard signal.",
+      "type": "string"
     },
     "NonSecretValue": {
       "description": "Non-secret JSON-like configuration value.",
@@ -449,65 +610,170 @@
         }
       ]
     },
-    "PsiProfile": {
-      "description": "PSI profile fields.",
-      "type": "object",
-      "properties": {
-        "alert_threshold": {
-          "description": "Alert threshold.",
-          "type": [
-            "number",
-            "null"
+    "PsiBinningStrategy": {
+      "description": "PSI numeric binning strategy.",
+      "oneOf": [
+        {
+          "description": "Equal-width bins across the baseline column range.",
+          "type": "object",
+          "required": [
+            "kind",
+            "n_bins"
           ],
-          "format": "double"
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "EqualWidth"
+              ]
+            },
+            "n_bins": {
+              "description": "Number of bins.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
         },
-        "binning_strategy": {
-          "description": "Numeric binning strategy.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "categorical_features": {
-          "description": "Categorical feature names.",
-          "type": "array",
-          "items": {
-            "type": "string"
+        {
+          "description": "Quantile bins from sorted baseline values.",
+          "type": "object",
+          "required": [
+            "kind",
+            "n_bins"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "Quantile"
+              ]
+            },
+            "n_bins": {
+              "description": "Number of bins.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
           }
         }
-      }
+      ]
+    },
+    "PsiThreshold": {
+      "description": "PSI alert threshold strategy.",
+      "oneOf": [
+        {
+          "description": "Chi-square approximation threshold.",
+          "type": "object",
+          "required": [
+            "alpha",
+            "kind"
+          ],
+          "properties": {
+            "alpha": {
+              "description": "Significance level.",
+              "type": "number",
+              "format": "double"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "ChiSquare"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Normal approximation threshold.",
+          "type": "object",
+          "required": [
+            "alpha",
+            "kind"
+          ],
+          "properties": {
+            "alpha": {
+              "description": "Significance level.",
+              "type": "number",
+              "format": "double"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "Normal"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Static threshold value.",
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "Fixed"
+              ]
+            },
+            "value": {
+              "description": "Fixed PSI threshold.",
+              "type": "number",
+              "format": "double"
+            }
+          }
+        }
+      ]
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
     },
-    "SpcProfile": {
-      "description": "SPC profile fields.",
+    "SpcAlertThreshold": {
+      "description": "SPC alert threshold: the lowest zone that produces a Drift verdict.",
+      "oneOf": [
+        {
+          "description": "Zone 1.",
+          "type": "string",
+          "enum": [
+            "Zone1"
+          ]
+        },
+        {
+          "description": "Zone 2.",
+          "type": "string",
+          "enum": [
+            "Zone2"
+          ]
+        },
+        {
+          "description": "Zone 3.",
+          "type": "string",
+          "enum": [
+            "Zone3"
+          ]
+        },
+        {
+          "description": "Zone 4.",
+          "type": "string",
+          "enum": [
+            "Zone4"
+          ]
+        }
+      ]
+    },
+    "SpcWecoRule": {
+      "description": "WECO rule string config.",
       "type": "object",
+      "required": [
+        "rule_string"
+      ],
       "properties": {
-        "alert_threshold": {
-          "description": "Alert threshold.",
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "feature_map": {
-          "description": "Feature map.",
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          }
-        },
-        "sample_size": {
-          "description": "Sample size.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint",
-          "minimum": 0.0
+        "rule_string": {
+          "description": "Eight whitespace-separated positive `u32`s. Default: `\"8 16 4 8 2 4 1 1\"`.",
+          "type": "string"
         }
       }
     },

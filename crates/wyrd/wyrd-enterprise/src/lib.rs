@@ -12,7 +12,7 @@ const LICENSE_PUBLIC_KEY_PEM: &[u8] = include_bytes!("../keys/license-pub.pem");
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LicenseFeature {
-    /// Governance token issuance and validation.
+    /// Enterprise governance tier: org-global policy authoring and audit/compliance.
     Governance,
     /// Future feature flags deserialize here without breaking existing licenses.
     #[serde(other)]

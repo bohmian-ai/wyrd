@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoginInitResponse",
+  "description": "`GET /auth/login` response.",
+  "type": "object",
+  "required": [
+    "authorization_url",
+    "state"
+  ],
+  "properties": {
+    "authorization_url": {
+      "description": "Authorization URL used as the redirect target.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/AbsoluteUrl"
+        }
+      ]
+    },
+    "state": {
+      "description": "Opaque login state echoed for SDK correlation.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "AbsoluteUrl": {
+      "description": "Absolute URL with a scheme and authority.",
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https?://"
+    }
+  }
+}

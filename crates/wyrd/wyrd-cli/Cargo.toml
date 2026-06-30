@@ -6,6 +6,35 @@ license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
+publish = false
+description = "Wyrd command-line interface."
+
 [[bin]]
 name = "wyrd"
 path = "src/main.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+vala-eval = { workspace = true, features = ["orchestrator"] }
+wyrd-error-derive = { workspace = true }
+wyrd-semver = { workspace = true }
+wyrd-spec = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+axum = { workspace = true }
+predicates = "3"
+tempfile = { workspace = true }
+uuid = { workspace = true }
+vala-http = { workspace = true }
+wiremock = { workspace = true }

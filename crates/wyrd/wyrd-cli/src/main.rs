@@ -1,1 +1,38 @@
-fn main() {}
+//! `wyrd` command-line entry point.
+
+#![deny(missing_docs)]
+
+mod cli;
+mod error;
+mod eval;
+
+use clap::Parser;
+
+use crate::cli::{Cli, Command};
+use crate::error::WyrdCliError;
+
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    let cli = Cli::parse();
+    match dispatch(cli).await {
+        Ok(code) => code,
+        Err(error) => {
+            crate::eval::output::print_cli_error(&error);
+            std::process::ExitCode::from(error.exit_code())
+        }
+    }
+}
+
+async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, WyrdCliError> {
+    match cli.command {
+        Command::Eval(command) => crate::eval::run::dispatch(command).await,
+    }
+}

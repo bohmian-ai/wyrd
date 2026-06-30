@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use wyrd_semver::VersionBlock;
 use wyrd_spec::card::data::{
     ColValue, DataInterface, DataSchema, DataSpec, DataSplit, DataStats, PandasMeta,
     ParquetCompression, SplitStrategy,
@@ -8,7 +9,6 @@ use wyrd_spec::card::{FieldSpec, Inequality};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, ColumnName, SpaceName, SplitName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::VersionBlock;
 
 fn col(name: &str) -> ColumnName {
     ColumnName::new(name).unwrap()

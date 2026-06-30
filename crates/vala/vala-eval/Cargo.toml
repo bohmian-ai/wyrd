@@ -1,0 +1,54 @@
+[package]
+name = "vala-eval"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "In-memory eval engine: DAG-stage execution, operator runtime, scoring, aggregation, and comparison over the wyrd-spec eval contract."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+orchestrator = [
+    "dep:skald-agent",
+    "dep:skald-prompt",
+    "dep:skald-runtime",
+    "tokio/sync",
+    "tokio/time",
+    "tokio/macros",
+]
+
+[dependencies]
+arrow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+jsonpath-rust = { workspace = true }
+regex = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+skald-agent = { workspace = true, optional = true }
+skald-prompt = { workspace = true, optional = true }
+skald-runtime = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+wyrd-error-derive = { workspace = true }
+wyrd-spec = { workspace = true }
+wyrd-utils = { workspace = true }
+
+[dev-dependencies]
+wyrd-semver = { workspace = true }
+serde_json = { workspace = true }
+skald-providers = { workspace = true }
+skald-spec = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "test-util"] }

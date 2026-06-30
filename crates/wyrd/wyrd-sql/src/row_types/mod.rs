@@ -4,7 +4,9 @@
 //! live in their owning crates and consuming crates translate at the boundary.
 
 pub mod auth;
+pub mod cards;
 pub mod platform;
 
 pub use auth::*;
+pub use cards::*;
 pub use platform::*;

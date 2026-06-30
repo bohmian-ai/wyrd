@@ -32,6 +32,16 @@ PLATFORM_EXECUTOR_ALLOWLIST = {
     "crates/wyrd/wyrd-sql/src/queries/platform/audit_log.rs",
 }
 
+# Vala query modules that are intentionally tenant-free (M6/M12). These query
+# the global `iceberg_catalog` JDBC catalog — a single cross-tenant namespace,
+# gated behind the `diagnostics` feature — not tenant-scoped `vala.*` data. They
+# take a raw pool by design: the request-path role is revoked from the schema,
+# so isolation is a DB-role boundary, not RLS. Treated like wyrd's platform/
+# admin modules — must take PgPool/Transaction, must not touch tenant schemas.
+VALA_CATALOG_ALLOWLIST = {
+    "crates/vala/vala-sql/src/queries/iceberg_catalog.rs",
+}
+
 RAW_QUERY_ALLOWLIST_MARKERS = [
     "Dynamic query is intentional",
     "raw-query grep allowlist",
@@ -120,7 +130,7 @@ def check_migration_drift(failures: list[str]) -> None:
     for path in sorted(VALA_SQL_MIGRATIONS.glob("*.sql")):
         sql = path.read_text()
         for schema in table_schemas(sql):
-            if schema != "vala":
+            if schema not in {"vala", "iceberg_catalog"}:
                 failures.append(f"{rel(path)}: CREATE TABLE uses non-Vala schema {schema}")
 
     migration_text = "\n".join(path.read_text() for path in sql_migration_files())
@@ -169,7 +179,7 @@ def check_query_modules(failures: list[str]) -> None:
 def check_wyrd_query_modules(failures: list[str]) -> None:
     for path in rust_files(WYRD_QUERIES):
         relative = rel(path)
-        body = path.read_text()
+        body = production_source(path.read_text())
         code = strip_line_comments(body)
         is_platform = "/platform/" in relative
         is_admin = "/storage/admin/" in relative
@@ -196,8 +206,16 @@ def check_wyrd_query_modules(failures: list[str]) -> None:
 def check_vala_query_modules(failures: list[str]) -> None:
     for path in rust_files(VALA_QUERIES):
         relative = rel(path)
-        body = path.read_text()
+        body = production_source(path.read_text())
         code = strip_line_comments(body)
+
+        if relative in VALA_CATALOG_ALLOWLIST:
+            if references_tenant_schema(code):
+                failures.append(f"{relative}: catalog query module must not reference tenant schema")
+            if has_public_async_fn(code) and not has_platform_executor(code):
+                failures.append(f"{relative}: catalog public async fn must take PgPool or Transaction")
+            continue
+
         check_tenant_query_file(relative, body, code, failures)
 
 
@@ -224,7 +242,7 @@ def check_tenant_query_file(relative: str, body: str, code: str, failures: list[
 def check_server_pool_usage(failures: list[str]) -> None:
     for path in rust_files(WYRD_SERVER):
         relative = rel(path)
-        code = strip_line_comments(path.read_text())
+        code = strip_line_comments(production_source(path.read_text()))
         if is_server_pool_allowlisted(relative):
             continue
         if "platform_admin_pool" in code:
@@ -248,12 +266,14 @@ def check_sql_source_hygiene(failures: list[str]) -> None:
                 failures.append(f"{rel(path)}: {label}")
 
     for path in rust_files(WYRD_QUERIES):
-        code = strip_line_comments(path.read_text())
-        if re.search(r"sqlx::query\s*\(", code) and not has_raw_query_marker(path.read_text()):
+        text = production_source(path.read_text())
+        code = strip_line_comments(text)
+        if re.search(r"sqlx::query\s*\(", code) and not has_raw_query_marker(text):
             failures.append(f"{rel(path)}: use query macros or document the runtime query exception")
     for path in rust_files(VALA_QUERIES):
-        code = strip_line_comments(path.read_text())
-        if re.search(r"sqlx::query\s*\(", code) and not has_raw_query_marker(path.read_text()):
+        text = production_source(path.read_text())
+        code = strip_line_comments(text)
+        if re.search(r"sqlx::query\s*\(", code) and not has_raw_query_marker(text):
             failures.append(f"{rel(path)}: use query macros or document the runtime query exception")
 
     for crate in CLIENT_TIER_CRATES:
@@ -335,6 +355,11 @@ def normalize_sql(sql: str) -> str:
 
 def strip_line_comments(text: str) -> str:
     return "\n".join(line.split("//", 1)[0] for line in text.splitlines())
+
+
+def production_source(text: str) -> str:
+    """Return text with the in-file `#[cfg(test)] mod ...` block removed."""
+    return text.split("\n#[cfg(test)]", 1)[0]
 
 
 def strip_sql_line_comments(text: str) -> str:

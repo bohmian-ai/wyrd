@@ -52,6 +52,29 @@ All Wyrd errors follow RFC 9457 Problem Details with Wyrd extensions. A policy-d
 - When `remediation` is present, include it verbatim in any human-readable output or escalation.
 - Keep retries bounded and tied to idempotent operations only. Check the `code` before retrying.
 - Preserve `request_id` and `trace_id` in any escalation or support request.
+- For `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED`, the
+  `context.required_feature` names the Cargo feature that would
+  re-enable the transport. The remediation is a build-time fix, not a
+  retry path. Note: this error code is not yet emitted — it lands in
+  PR4.0 when `WyrdClient::new()` is implemented.
+- For `WYRD_CLIENT_400_CONFIG_INVALID`, the `context.field` and
+  `context.reason` name the offending config field and the rule it
+  failed. Fix the field on the config object and reconstruct the
+  client. Not a retry path.
+- For `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE`, the `context.transport`
+  names the wire transport that rejected the body. The remediation is
+  to lower `QueueConfig.flush_max_rows` so the next batched body fits
+  under the server's request size limit. Records remain buffered;
+  re-flush after the config change.
+- For `WYRD_CLIENT_503_TRANSPORT_DOWN`, the `context.transport` names
+  the unavailable transport. Buffered records remain in the queue;
+  retry the flush after the underlying network or server health
+  recovers. Apply exponential backoff between retries.
+- For `WYRD_CLIENT_504_FLUSH_TIMEOUT`, the `context.transport` and
+  `context.timeout_ms` describe the deadline that fired. Buffered
+  records remain queued. Retry once; if the timeout persists, raise the
+  per-call timeout (`GrpcConfig.timeout_ms` / `HttpConfig.timeout_ms`)
+  or investigate server latency.
 
 ## What agents must not do
 
@@ -67,6 +90,23 @@ Policy and audit denials are decisions, not transport errors. A `403` with `code
 The `code` and `detail` identify the failing policy. The `context` map contains the card, run, or operation that triggered it (for example, `card_id`, `policy_name`, `operation`). An agent must not retry a policy denial without first satisfying the stated condition in `remediation`.
 
 Audit failures follow the same shape. If a write is rejected because an audit record could not be committed, the `code` will identify the audit step and `remediation` will describe what the agent or operator needs to resolve before retrying.
+
+## Authorization errors
+
+Use the Wyrd `code` value, not HTTP status alone:
+
+| Code | Agent action |
+| --- | --- |
+| `WYRD_AUTH_503_VERIFY_UNAVAILABLE` | Back off and retry the same operation. Do not re-authenticate; the credential was not rejected. |
+| `WYRD_PERMISSION_500_ROLE_CORRUPT` | Do not retry. Surface the failure to a workspace admin; the stored role permission JSON must be fixed. |
+| `WYRD_AUTH_401_INVALID_CARD_REF` | Re-issue the Service or Agent credential with `wyrd auth issue-key`. |
+| `WYRD_AUTH_401_DELEGATION_DEPTH_EXCEEDED` | Do not retry. Contact the issuer; the token came from a non-conforming source. |
+| `WYRD_AUTH_400_UNSUPPORTED_GRANT_TYPE` | Check the Wyrd version and exact `grant_type` value. |
+| `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND` | Verify the requested subject is a registered Service or Agent CardRef in the current tenant. User impersonation is not supported in this version. |
+| `WYRD_AUTH_401_API_KEY_INVALID` | Do not retry with the same key. Rotate credentials via `wyrd auth issue-key` and update the deployment secret store. |
+| `WYRD_AUTHZ_403_REQUIRES_DELEGATED_TOKEN` | Do not retry. The presented token is a direct token; re-authenticate using the delegation flow (`POST /auth/token` with `grant_type: urn:ietf:params:oauth:grant-type:token-exchange`). |
+| `WYRD_AUTH_503_PREVIEW_DISABLED` | Do not retry. This route is not active in the current deploy. Contact the platform operator. |
+| `WYRD_PERMISSION_403_DENIED_RBAC` | Do not retry. The caller lacks the required RBAC permission. Request the required role from a workspace admin. |
 
 ## Retry behavior
 

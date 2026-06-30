@@ -1,0 +1,239 @@
+---
+title: "Running evals"
+description: "Three ways to run an EvalCard: local agent driving, record replay, and server protocol."
+---
+
+Three ways to run eval, depending on what you have and what you want.
+
+| Mode | Command | Use when |
+|---|---|---|
+| Local agent-driving | `wyrd eval run --local --agent-url URL` | You want to run scenarios end-to-end with a live agent on your machine |
+| Record replay | `wyrd eval run --local --records FILE` | You have captured `EvalRecordObservation` rows and want to score them |
+| Server protocol | `wyrd eval run --server URL --agent-url URL` | You have a running `wyrd-server` and want the server to own run state |
+
+All three modes load an Eval card with `--eval`. Local and server modes also need `--scenarios`. Record replay loads JSONL records directly.
+
+## Local agent-driving
+
+Run scenarios against a local agent process.
+
+```bash
+wyrd eval run \
+  --eval eval-cards/support-eval.yaml \
+  --scenarios data/scenarios/support-smoke.json \
+  --local \
+  --agent-url http://127.0.0.1:9000/agent \
+  --out .wyrd/eval/latest
+```
+
+Your agent endpoint must accept POST requests in this shape:
+
+```json
+{
+  "message": "Where is my refund for order 12345?",
+  "history": [
+    {"role": "user", "content": "Where is my refund for order 12345?"}
+  ],
+  "scenario_id": "refund_status",
+  "turn": 0
+}
+```
+
+And respond with:
+
+```json
+{
+  "response": "I can help. Let me look up order 12345.",
+  "records": [
+    {
+      "record_id": "018f5f54-0000-7000-8000-000000000001",
+      "run_id": "018f5f54-0000-7000-8000-000000000002",
+      "eval_ref": {"kind": "Eval", "name": "support-eval", "version": "1.0.0"},
+      "context": {
+        "query": "Where is my refund for order 12345?",
+        "response": "I can help. Let me look up order 12345.",
+        "tool_calls": [{"name": "order_lookup", "args": {"order_id": "12345"}}]
+      },
+      "created_at": "2026-06-11T12:00:00Z"
+    }
+  ]
+}
+```
+
+`records` is optional. Omit it when your scenario only uses passenger-view tasks (scenario-level assertions against the final response).
+
+What happens:
+
+1. CLI loads the Eval card and validates the task DAG.
+2. CLI loads scenarios from the file.
+3. `EmbeddedOrchestrator` opens run state in-process.
+4. For each scenario turn, CLI POSTs to `--agent-url`.
+5. Agent response and records return to the orchestrator.
+6. On scenario completion, orchestrator scores records through the task DAG.
+7. After all scenarios, aggregation produces `EvalResults`.
+8. CLI writes `results.json` (and `comparison.json` if `--baseline` was supplied).
+9. Pass gate applies. Failed gate exits with code `2`.
+
+### With judge tasks
+
+Add `--judge-mock` to avoid real LLM calls during development or credential-free CI:
+
+```bash
+wyrd eval run \
+  --eval eval-cards/support-eval.yaml \
+  --scenarios data/scenarios/support-smoke.json \
+  --local \
+  --agent-url http://127.0.0.1:9000/agent \
+  --judge-mock
+```
+
+`MockJudgeInvoker` always returns a passing verdict. Use it to verify your task DAG and assertion logic before wiring real judge providers.
+
+Remove `--judge-mock` when you want real semantic evaluation.
+
+### Simulated user mode
+
+```bash
+wyrd eval run \
+  --local \
+  --eval eval-cards/support-eval.yaml \
+  --scenarios data/scenarios/multi-turn.json \
+  --agent-url http://127.0.0.1:9000/agent \
+  --simulated-user server
+```
+
+`--simulated-user server` uses the server-side persona for non-scripted user turns. `--simulated-user client` requires `--simulated-user-script` pointing at a callable Python script.
+
+## Record replay
+
+Score pre-captured records without running a live agent.
+
+```bash
+wyrd eval run \
+  --eval eval-cards/support-eval.yaml \
+  --local \
+  --records captures/2026-06-11.jsonl \
+  --baseline baselines/support-eval@1.0.0.json \
+  --out .wyrd/eval/replay
+```
+
+The JSONL file contains one `EvalRecordObservation` per line:
+
+```jsonl
+{"record_id":"018f5f54-0000-7000-8000-000000000001","run_id":"018f5f54-0000-7000-8000-000000000002","eval_ref":{"kind":"Eval","name":"support-eval","version":"1.0.0"},"context":{"query":"reset password","response":"Go to Settings > Security.","score":4.5},"created_at":"2026-06-11T12:00:00Z"}
+{"record_id":"018f5f54-0000-7000-8000-000000000003","run_id":"018f5f54-0000-7000-8000-000000000002","eval_ref":{"kind":"Eval","name":"support-eval","version":"1.0.0"},"context":{"query":"cancel subscription","response":"You can cancel in Account > Subscription.","score":4.0},"created_at":"2026-06-11T12:00:01Z"}
+```
+
+Record replay has no orchestrator and no scenario context. All records are treated as a single synthetic scenario. Passenger-view scenario tasks do not run.
+
+Use this for:
+- CI replay against a fixed capture from a prior run
+- Scoring exported production records
+- Fast iteration when you already have records and just changed the task DAG
+
+## Server protocol
+
+Connect to a running `wyrd-server` and drive the run from the CLI.
+
+```bash
+wyrd eval run \
+  --server http://wyrd.internal:8080 \
+  --eval eval-cards/support-eval.yaml \
+  --scenarios data/scenarios/support-smoke.json \
+  --agent-url http://127.0.0.1:9000/agent
+```
+
+What happens:
+
+1. CLI POSTs `POST /api/v1/eval/runs` with `{eval_ref, simulated_user}`.
+2. Server returns `{run_id, lease_token}`.
+3. CLI loops on `POST /api/v1/eval/runs/{run_id}/next` with the bearer lease.
+4. On `agent_turn`, CLI calls `--agent-url`.
+5. CLI POSTs response and records to `/runs/{run_id}/agent-turn`.
+6. On `scenario_complete`, server has scored; CLI asks for the next directive.
+7. On `run_complete`, CLI exits.
+
+Server protocol mode v1 does not fetch results back to the CLI. `EvalResults` remain server-side. Use local mode when you need `results.json` artifacts locally.
+
+## Python SDK
+
+Drive a server protocol run from Python.
+
+```python
+from wyrd.eval import run_eval
+
+def my_agent(message: str, history: list) -> str:
+    # your agent logic here
+    return f"Response to: {message}"
+
+summary = run_eval(
+    server_url="http://wyrd.internal:8080",
+    eval_ref="my-team/support-eval@1.0.0",
+    agent_fn=my_agent,
+)
+print(summary["run_id"])
+```
+
+Return a dict from `agent_fn` when your agent emits eval records:
+
+```python
+from wyrd.eval import run_eval
+
+def my_agent(message: str, history: list) -> dict:
+    response = call_your_agent(message, history)
+    record = {
+        "record_id": new_record_id(),
+        "run_id": current_run_id(),
+        "eval_ref": {"kind": "Eval", "name": "support-eval", "version": "1.0.0"},
+        "context": {
+            "query": message,
+            "response": response.text,
+            "score": response.confidence,
+        },
+        "created_at": utc_now(),
+    }
+    return {"response": response.text, "records": [record]}
+
+summary = run_eval(
+    server_url="http://wyrd.internal:8080",
+    eval_ref="my-team/support-eval@1.0.0",
+    agent_fn=my_agent,
+    simulated_user="server",
+)
+```
+
+See [Python SDK](/evaluation/python-sdk/) for the full signature and error reference.
+
+## Baselines and comparison
+
+```bash
+wyrd eval run \
+  --local \
+  --eval eval-cards/support-eval.yaml \
+  --scenarios data/scenarios/support-smoke.json \
+  --agent-url http://127.0.0.1:9000/agent \
+  --baseline baselines/support-eval@1.0.0.json \
+  --out .wyrd/eval/$(date +%Y%m%d)
+```
+
+When `--baseline` is supplied, the CLI writes `comparison.json` alongside `results.json`. The comparison report shows regressions, improvements, stable passes, and stable failures by subject and task.
+
+To update a baseline:
+
+```bash
+# Review results.json first.
+# Only promote a run to baseline when it represents the new accepted bar.
+cp .wyrd/eval/20260611/results.json baselines/support-eval@1.0.0.json
+```
+
+See [Results and comparison](/evaluation/results-and-comparison/) for the full report layout.
+
+## Exit codes
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Run completed. Pass gate satisfied (or no pass gate declared). |
+| `1` | Run failed. Engine error, load error, or transport failure. |
+| `2` | Run completed. Pass gate declared and failed. Only emitted when `--fail-on-gate` is enabled (the default for local flows). |
+
+Server protocol runs always exit `0` on `RunComplete` — v1 has no results-fetch route to check the gate against.

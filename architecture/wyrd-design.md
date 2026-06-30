@@ -25,6 +25,16 @@ Remaining `Source` follow-up is the runtime read adapter in `vala` keyed on
 `(kind, vendor)` and the `wyrd source check` preflight; the spec, schemas, and
 card-kind tests are landed.
 
+The **governance token is removed** (doctrine #18): emit is an Auth-plane
+route, not a third plane. The JWT (`principal.card_ref`) plus `run_id` carry
+everything an emission needs. The scaffolding has been deleted — the
+`wyrd.auth_governance_tokens` table (from migration `20260601000001_auth.sql`),
+its `GovernanceTokenRow` row mirror + query slot, the `migration_pg.rs` table
+assertion, and the `Scope::TokenIssue` (`token:issue`) capability. The
+`wyrd-enterprise` `LicenseFeature::Governance` flag is retained as the
+enterprise governance-tier gate (policy + audit), not a token. No
+`WYRD_GOV_TOKEN` env var, no `wyrd gov-token` CLI.
+
 ---
 
 ## Doctrine
@@ -77,25 +87,32 @@ card-kind tests are landed.
 17. **Light cards may inline in place of a `CardRef`.** Wherever a `CardRef`
     points at a light card and the inline target has no need for cross-spec
     identity, the parent spec MAY embed the full definition instead. Today
-    `Agent.prompt` and `EvalTask::Judge.prompt` accept `PromptRef = CardRef |
-    Inline`. Inline definitions have no card identity, are not registered
+    `Agent.prompt` accepts `PromptRef = CardRef | Inline`. Inline definitions
+    have no card identity, are not registered
     standalone, and cannot be referenced from outside their parent. To reuse,
     register as a card and reference by `CardRef`. Heavy refs (`subject_ref`,
-    `dataset_ref`, `Service.components.ref`, `Workflow.steps.target`) stay
+    `dataset`, `Service.components.ref`, `Workflow.steps.target`) stay
     `CardRef`-only — identity is the point.
-18. **Auth, Policy, and Emit are three distinct planes.**
+18. **Auth and Policy are two distinct planes.** Emit is **not** a third
+    plane: a deployed service's observation/ingest writes are ordinary
+    Auth-plane routes, authorized by the same JWT and a
+    `Permission { resource, action }` like every other call. The legacy
+    per-card **governance token is removed** — the JWT proves the principal and
+    bounds its emittable **card scope** (the principal's own card ∪ its
+    `Service.components`); the observation envelope carries the run's Target
+    `card_ref`, which the server authorizes against that scope, and `run_id`
+    carries which action emitted it. A separate emit credential was redundant —
+    see "Observation identity — Card → Run → Observation".
     - **Auth** gates Wyrd API calls: `Permission { resource, action }` on the
       handler, stateless pubkey verify of the access token. Answers "is this
-      principal allowed to hit this Wyrd route?" The legacy `Scope` vocabulary
-      is rejected — do not introduce it in new code.
+      principal allowed to hit this Wyrd route?" This covers data-plane ingest
+      (e.g. `bifrost_record:write`) exactly like any other route. The legacy
+      `Scope` vocabulary is rejected — do not introduce it in new code.
     - **Policy** gates card states (`classify` at register-time, `gate` at
       deploy-time) and cross-service invokes (`invoke` at runtime). Runtime
       invoke evaluation is centralized at `POST /v1/authz/check`, called
       transparently by the service mesh's ext_authz filter or by the SDK
       middleware in non-mesh shops.
-    - **Emit** is the data-plane channel from a deployed service to Wyrd's
-      ingest, signed with the per-card governance token; never propagated
-      between services and never read by Policy CEL.
 
     Runtime identity is a `Principal { id: PrincipalId, kind: PrincipalKind,
     tenant_id, roles, effective_permissions }`. `PrincipalId` is a `Uuid`
@@ -279,8 +296,9 @@ rule shape; the `action` field on each rule says when it fires:
 
   - `classify` (register-time): rule derives attrs onto the card (e.g.
                                 `risk.tier = "high"`). Never blocks.
-  - `gate`     (deploy-time):   rule allows/denies governance-token issuance
-                                for the card. Blocks when Deny.
+  - `gate`     (deploy-time):   rule allows/denies the card's deploy-time
+                                credential issuance (`wyrd auth issue-key`),
+                                and thus its emit eligibility. Blocks when Deny.
   - `invoke`   (runtime, per cross-service call): evaluated by
                                 `POST /v1/authz/check`. Returns Allow/Deny to
                                 the mesh ext_authz filter or the SDK
@@ -340,7 +358,6 @@ Env vars in deployed services:
 |---|---|---|---|
 | `WYRD_API_KEY` | REQUIRED | Deploy environment's secret store (key minted by `wyrd auth issue-key <card_ref>`) | Exchanged ONCE at startup at `POST /auth/token` for short-lived JWT. SDK auto-refreshes. JWT carries the card-bound `principal` claim (kind, id, tenant, `card_ref`). |
 | `WYRD_API_URL` | REQUIRED | Static config | Wyrd server base URL. |
-| `WYRD_GOV_TOKEN` | OPTIONAL | CI writes from `wyrd gov-token issue` response | Only if the app calls `wyrd.observe(...)`. |
 
 The API key is exchanged at startup — never on the wire. The JWT — not the API
 key — is what travels on cross-service calls in the dedicated
@@ -384,6 +401,72 @@ Contract:
 
 Storage tier, query API, and CEL surface (e.g. a `chain.*` binding) are
 implementation concerns deferred to the runtime stage.
+
+#### Observation identity — `Card → Run → Observation`
+
+How an observation ties to a Run and a Card, and how the server resolves it.
+The lineage spine is fixed by the concept docs — `Card → Run`
+([`run.mdx`](../docs/src/content/docs/concepts/run.mdx): every Run is bound to a
+Card version, its **Target**) and `Run → Observation`
+([`observation.mdx`](../docs/src/content/docs/concepts/observation.mdx): every
+Observation anchors to the Card version **and** Run it belongs to). This section
+states only the runtime resolution, which lives in the server, not the concept
+docs.
+
+**A principal is not a card.** A Service or Agent principal is bound to one card
+(its `card_ref`), but a Service card *nests components* — each a card in its own
+right (e.g. Model A, Model B, a Prompt; `Service.components`). `wyrd_state["a"]
+.run()` and `wyrd_state["b"].run()` execute under the **same** JWT yet target
+**different** component cards, and a Run is specific to the card that opened it.
+So the JWT alone cannot say which card a record belongs to — the run's Target
+card must be carried on the wire.
+
+Every observation row carries:
+
+| Value | Source | Grain | Means |
+|---|---|---|---|
+| `card_ref` | **client asserts the run's Target card; server authorizes it** | **per row** | the Card-version anchor — *which* card |
+| `run_id` | client-generated per `.run()`; passed through opaquely | **per row** | the Run anchor — *which* execution |
+| `tenant_id` | server-stamped from the verified JWT | per request | the tenancy boundary |
+| `wyrd_request_id` | the propagated `Wyrd-Request-Id` (minted at first sighting) | per request | the request spine — one request spans **many** runs and hops |
+
+Resolution rule: **tenant comes from the token; `card_ref` is client-asserted
+and server-authorized; `run_id` and `wyrd_request_id` pass through untouched.**
+Consequences, stated so they stop drifting:
+
+- **`card_ref` and `run_id` are per-row columns on the observation payload, not
+  request metadata.** A client-side queue batches records from different runs —
+  and different cards — before it flushes, so one sealed batch (one
+  `wyrd_batch_id`) freely mixes them. The producer is keyed by **table only**; it
+  never splits a batch by card or run. The server therefore authorizes `card_ref`
+  **per row** (every distinct card in the batch must be in the principal's scope)
+  and stamps the per-request columns (`tenant_id`, `wyrd_request_id`, timestamps,
+  `wyrd_batch_id`) across the whole batch.
+
+- **`card_ref` is authorized, not trusted.** The server checks the asserted
+  `card_ref` against the principal's **card scope** — the principal's own card
+  plus the components its Service/Agent card declares (`Service.components`). A
+  `card_ref` outside that set is rejected: a principal may not attribute records
+  to a card it does not own. The scope can be resolved from the registry at
+  ingest or carried as a claim minted into the JWT at `/auth/token` — an
+  implementation choice deferred to the runtime stage.
+- **This is not the governance token.** `card_ref` is one field in the
+  observation envelope, authorized by the existing JWT plus the Service's
+  declared component graph — not a separate per-card credential (doctrine #18).
+  The token still proves the principal; it bounds a *set* of emittable cards,
+  and the envelope selects one within it.
+- **There is no run registry.** Runs are a client-side execution record
+  ([`run.mdx`](../docs/src/content/docs/concepts/run.mdx)); the server never
+  persists a run table and never resolves `run_id` back to a card — the card is
+  the authorized `card_ref` on the row. `run_id` is an **opaque** correlation id,
+  never a composite that encodes the card.
+- **`Card → Run → Observation` is the `(card_ref, run_id)` pair on the row;** the
+  request spine is the `wyrd_request_id` label that joins many runs across hops.
+- **Subject ≠ emitter is deferred to produced kinds.** A monitor emitting Drift/
+  Eval about a card *outside* its own scope carries an explicit `subject_ref`
+  with its own authorization — distinct from the in-scope `card_ref` above. That
+  lands with `vala-drift`/`vala-eval`, against a real consumer — not on the
+  Stage-3 `Record` envelope.
 
 ### Runtime authz: `POST /v1/authz/check`
 
@@ -459,8 +542,8 @@ Wyrd:
    (org-global ∪ service-local, deny-overrides).
 7. Returns `200 OK` (Allow) or `403 Forbidden` with `PolicyDecision::Deny { reason }`.
 8. Asynchronously emits one `PolicyInvokeDecision` observation per check,
-   labeled with `Wyrd-Request-Id` (signed with Wyrd internal authority —
-   no caller/callee gov-token consumed). Every allow and every deny is
+   labeled with `Wyrd-Request-Id` (emitted under Wyrd's internal authority —
+   server-authored, not caller-signed). Every allow and every deny is
    audited automatically; no developer wiring.
 
 Identity is server-verified from one signed delegated JWT. The pod cannot
@@ -619,8 +702,8 @@ typed refs is a versioned breaking change that adds variants.
 | `Subject`   | `Drift.subject_ref`, `Eval.subject_ref`                           |
 | `Component` | `Service.components[].ref`, `Workflow.steps[].target`             |
 | `Artifact`  | `Data.card_refs[]`, `Model.card_refs[]`                   |
-| `Prompt`    | `Agent.prompt`, `Eval.tasks[].Judge.prompt`                       |
-| `Dataset`   | `Eval.dataset_ref`                                                |
+| `Prompt`    | `Agent.prompt`, `Eval.tasks[].LlmJudge.judge_ref`                 |
+| `Dataset`   | `Eval.dataset`                                                    |
 | `Source`    | `Eval.source_ref`, `Drift.signal.External.source_ref`             |
 | `Baseline`  | `Drift.signal.Distribution.baseline_ref`                          |
 | `Trigger`   | `Trigger.source.drift_ref \| eval_ref`                            |
@@ -750,55 +833,71 @@ authoring; the card stores resolved bounds):
 ### Eval
 Behavioral assessment workflow for a single subject. Envelope is orthogonal:
 **what** is judged (`subject_ref`), **how** (`tasks` DAG), **where to read its
-observations from** (`source_ref`), and an optional **offline driver**
-(`dataset_ref`). No scheduling, no dispatch, no fire condition — fire lives on
-`Drift` with `DriftSignal::EvalScore`. Lifted from Scouter's
-`AgentEvalProfile`; collapses the parallel `EvalType`+`EvalProfile` enums into
-a single typed task workflow.
+observations from** (`source_ref`, deferred), and an optional **offline
+driver** (`dataset`). No scheduling, no dispatch, no fire condition — fire
+lives on `Drift` with `DriftSignal::EvalScore`. Eval is a single typed task
+workflow, not a parallel mode/profile split.
 ```yaml
 spec:
   description?: string
   subject_ref: CardRef           # → Agent | Workflow | Service | Model — WHAT is judged
   tasks: [EvalTask]              # evaluation workflow — DAG via depends_on
-  dataset_ref?: CardRef          # → Data — offline scenario driver
-  source_ref?: CardRef           # → Source — WHERE Wyrd reads observations
+  dataset?: DatasetRef           # → Data — offline scenario driver
+  source_ref?: CardRef           # DEFERRED — landing in §Eval online-mode commit; not implemented
+  sampling?: EvalSampling
+  pass_gate?: EvalPassGate
+  context_capture?: EvalContextCapture
+  workflow?: Workflow
   governance?: Governance
   details: { string: NonSecretValue }
 ```
 
+The typed-id grammar (`TaskId`, `ScenarioId`, `JsonPath`, `SessionId`,
+`RecordId`, `TraceId`, `SpanId`) lives in `wyrd-spec::vala::eval::ids` and
+`wyrd-spec::vala::ids`. `EvalStatus` (`Pending | AwaitingTrace | Processing |
+Completed | Failed | DeadLettered`) lives in
+`wyrd-spec::vala::eval::status`.
+
 **Three modes the same shape supports** (no `eval_mode` discriminator; presence
 of refs is the mode):
 
-| `dataset_ref` | `source_ref` | Runtime behavior |
+| `dataset` | `source_ref` | Runtime behavior |
 |---------------|--------------|------------------|
 | set           | unset        | Offline batch. Engine invokes `subject_ref` against the Data card's scenario rows, captures traces inline. |
-| unset         | set          | Online / archived. Engine reads the user's sink, filters records by subject identity, samples records into the task workflow. |
-| set           | set          | Same tasks, both modes — Scouter's "define once, reuse everywhere." Offline gate and online monitor share one task definition. |
+| unset         | set          | Online / archived (deferred — DESIGN §13). Engine reads the user's sink, filters records by subject identity, samples records into the task workflow. |
+| set           | set          | Same tasks, both modes (online deferred — DESIGN §13). Offline gate and online monitor share one task definition. |
 | unset         | unset        | Online over `vala`'s default observation archive. |
 
 **Directional flow.** All three refs are `CardRef`s authored on `Eval`; nothing
 points back. At runtime: engine resolves `subject_ref` (identity filter),
-resolves `source_ref` (read location), opens the Source, queries records,
-feeds them into the `tasks` workflow, aggregates per-task pass/fail into a
-score stream consumed downstream by a `Drift` card with
+resolves `source_ref` (read location, deferred — see DESIGN.md §13), opens the
+Source, queries records, feeds them into the `tasks` workflow, aggregates
+per-task pass/fail into a score stream consumed downstream by a `Drift` card with
 `DriftSignal::EvalScore`.
 
-`EvalTask` is a closed tagged union (lift of Scouter's four task types). Each
-variant carries `id: string`, optional `depends_on: [string]` (DAG edges), and
-`condition: bool` (conditional gate — short-circuit downstream when this fails):
+`EvalTask` is a closed tagged union. Every variant carries `id: TaskId`,
+`depends_on: Vec<TaskId>`, and `condition: Option<EvalCondition>`.
+`EvalCondition` supports AND/OR chaining bounded at depth 16.
 
 | Variant          | Variant-specific carries                                                                          | Use |
 |------------------|---------------------------------------------------------------------------------------------------|-----|
 | `Assertion`      | `context_path?: string`, `operator: ComparisonOperator`, `expected: ParameterValue`, `description?: string` | Deterministic check on a dot-path into a record |
-| `Judge`          | `prompt: PromptRef` (`CardRef` → Prompt OR inline `PromptSpec`), `operator: ComparisonOperator`, `threshold: ParameterValue` | LLM judge: one Prompt per task, judge score compared to threshold |
-| `TraceAssertion` | `span_property: string`, `operator: ComparisonOperator`, `expected: ParameterValue`               | OTel span property (tokens, duration_ms, retry_count, …) read via `source_ref` |
-| `AgentAssertion` | `check: AgentCheckKind`, `expected: ParameterValue`                                               | Tool-call / response-shape check (`tool_called` \| `tool_args` \| `response_format` \| `step_count`) read via `source_ref` |
+| `LlmJudge` (`llm_judge`) | `judge_ref: CardRef` (→ Prompt card), `operator: ComparisonOperator`, `expected: ParameterValue`, `max_retries: u32` | LLM judge: one Prompt card per task, judge response compared to expected value |
+| `TraceAssertion` | `span_selector: JsonPath`, `operator: ComparisonOperator`, `expected: ParameterValue`             | OTel span selector (tokens, duration_ms, retry_count, etc.) read via `source_ref` (deferred — see DESIGN.md §13) |
+| `AgentAssertion` | `workflow_field_path: JsonPath`, `operator: ComparisonOperator`, `expected: ParameterValue`       | Tool-call / response-shape check read via `source_ref` (deferred — see DESIGN.md §13) |
 
-`ComparisonOperator` is a closed enum:
-`eq | neq | gt | gte | lt | lte | contains | matches | exists`.
+`ComparisonOperator` is a frozen 56-variant catalog (12 numeric, 15 string,
+14 collection, 9 type, 6 tolerance / advanced). Parameterless variants
+serialize as scalar `snake_case`; parameterized variants as `kind`-tagged
+objects. Canonical source:
+`crates/wyrd-spec/src/vala/eval/operator.rs:62-264`. The locked collection /
+type / tolerance families are required to keep authors out of LLM-judge calls
+for deterministic checks ("agent only used allowed tools" → `IsSubset`, "no
+duplicate tool calls" → `UniqueValues`, "score within 10% of baseline" →
+`WithinPctTolerance`, "output is valid JSON" → `IsJson`).
 
 `EvalScenario` is the row shape carried by a `Data` card bound to
-`dataset_ref` (not an Eval field — scenarios and datasets are the same noun):
+`dataset` (not an Eval field — scenarios and datasets are the same noun):
 ```yaml
 - id: string
   initial_query: string
@@ -807,14 +906,17 @@ variant carries `id: string`, optional `depends_on: [string]` (DAG edges), and
   termination_signal?: string
   max_turns?: u32
   expected_outcome?: string
-  tasks?: [EvalTask]               # scenario-local tasks (passenger view: final response)
-  metadata?: { string: NonSecretValue }
+  tasks?: [ScenarioTask]           # scenario-local tasks (passenger view: final response)
 ```
+
+`ScenarioTask` is narrower than `EvalTask` — `id`, `operator`, `expected`,
+optional `condition` — because scenario evaluation operates on `{response,
+expected_outcome}` and is always evaluated together (no DAG).
 
 Scenario-local `tasks` are the **passenger view** (judged against the agent's
 final response for that scenario); top-level `Eval.tasks` are the **mechanic
-view** (judged against intermediate sub-agent records / spans / tool calls).
-Both run in one pass — Scouter's scenario-vs-workflow split lifted intact.
+view** (judged against intermediate workflow records / spans / tool calls).
+Both run in one pass.
 
 ### Source
 Read-side reference to an external data system. **Wyrd reads, never writes.**
@@ -893,6 +995,68 @@ source:
 query, HTTP query) are different drivers behind one read trait; the Card schema
 never declares strategy — `vala` chooses it from the bucket and vendor, the same
 way it chooses the Drift/Eval evaluation strategy.
+
+### Bifrost — Wyrd's OLAP warehouse
+
+`Source` is the external read side ("Wyrd reads, never writes" — Doctrine #7).
+**Bifrost** is its Wyrd-owned counterpart: the public OLAP warehouse surface and
+analytical storage substrate `vala` uses to record Wyrd's **own** observations
+(drift events, eval records, OTel / GenAI traces, audit projections, and future
+analytical tables). It is Wyrd server state, not an external system and not a
+vendor.
+
+**Bifrost is not a Card kind, and there is no `WarehouseCard`.** It is the
+general-case storage *shape*, not a registry entry. Per Doctrine #2 (one fact,
+one owning Kind) and Doctrine #7, internal observation storage is owned wholly by
+`vala`; nothing an author writes points at it, so it has no card identity. The
+external read-shape buckets above (`object_store`, `sql_warehouse`, …) describe
+data Wyrd *reads*; `sql_warehouse` is an external `SourceKind` and is unrelated
+to Bifrost. Use `Bifrost` for Wyrd's OLAP warehouse. Do not introduce a
+`warehouse` noun on public API paths, Python modules, Card kinds, resources, or
+internal surfaces — it would collide with the external `sql_warehouse` Source
+semantics.
+
+**Everything is a Bifrost table.** One table shape underlies every internal
+analytical table, with four reserved system columns: `wyrd_event_time`,
+`wyrd_ingested_at`, `wyrd_batch_id`, and `data_tenant_id`. Each table carries a
+`scope`:
+
+- **TenantOwned** — one physical table per tenant; isolation is structural
+  (per-tenant Iceberg namespace / path). No `data_tenant_id` column.
+- **SystemShared** — one physical table shared across tenants (used for
+  high-tenant-count, low-per-tenant-volume data where one table per tenant would
+  fragment into millions of small files); rows carry `data_tenant_id` and tenant
+  isolation is enforced on read from the authenticated principal's tenant.
+
+The substrate is Apache Iceberg-managed Parquet in object storage, with Postgres
+as the Iceberg catalog and control plane and DataFusion as the query engine —
+consistent with Doctrine #4 (Postgres is control-plane only; analytical data
+lives in object store). Runtime ownership stays in `vala`: the `vala-bifrost`
+engine crate owns the Iceberg/DataFusion warehouse engine, `vala-http` exposes
+HTTP routes, `vala-ingest` owns gRPC ingest, and `wyrd-spec::vala::api` owns the
+public wire contracts. Python-visible Bifrost behavior lives in `vala-sdk` (the
+approved Vala Python owner crate) behind its optional `python` feature.
+
+**Public surface.** Bifrost is a stable Wyrd public surface across HTTP, gRPC,
+Python, generated schemas, MCP/agent documentation, and stable error codes.
+The public contract includes:
+
+- HTTP table management under `/api/v1/bifrost/tables`.
+- HTTP query surfaces under `/api/v1/observations/query` and versioned query
+  job routes when enabled.
+- gRPC ingest through `wyrd.v1.BifrostIngestService`.
+- The `wyrd.bifrost` Python SDK submodule.
+- Generated `wyrd-spec::vala::api` wire types such as `BifrostTableEntry`,
+  register-table types, query request/response types, and table scope/status
+  enums.
+- The `WYRD_VALA_*_BIFROST_*` error catalog crossing HTTP, MCP, Python, and
+  generated documentation boundaries.
+
+Bifrost permissions are resource-scoped through `BifrostTable`, `BifrostRecord`,
+and `BifrostQuery`. Caller-selected `SystemShared` tables require explicit
+administrative install permission, and generic record writes must not write
+reserved or system-managed Bifrost tables. There is no `wyrd.warehouse` submodule
+and no `WarehouseCard`.
 
 ### Trigger
 Fires an Operator. A Trigger declares when (`schedule`), what to evaluate
@@ -989,18 +1153,17 @@ Exact field schema for each context lives in OpenAPI.
 
 Two complementary mechanisms — `wyrd apply -f file.yaml` reads + registers in
 one move, and a `PromptRef` may be inlined where its own identity isn't
-needed. Together they support the single-file Scouter/opsml-style workflow
-without breaking Rule 1 ("cards are independent registry entries").
+needed.
 
 ### Pre-registration matrix (Rule 16)
 
 | Kind | Must pre-register? | Why |
 |------|---------------------|-----|
 | `Model`        | **Yes** | Carries weight artifacts; lineage anchor. |
-| `Data`         | **Yes** (unless used purely as inline eval scenarios, which v1 does not support — `dataset_ref` is `CardRef`-only) | Carries dataset bytes; lineage anchor. |
+| `Data`         | **Yes** (unless used purely as inline eval scenarios, which v1 does not support — `dataset` is `DatasetRef`-only) | Carries dataset bytes; lineage anchor. |
 | `Experiment`   | **Yes** | Carries run history. |
 | `Artifact`     | **Yes** (typically derived from heavy cards) | Pointer to durable bytes. |
-| `Prompt`       | Optional | Light. Inlineable as `PromptRef` inside `Agent.prompt` / `EvalTask::Judge.prompt`. |
+| `Prompt`       | Optional | Light. Inlineable as `PromptRef` inside `Agent.prompt`; referenced by `EvalTask::LlmJudge.judge_ref`. |
 | `Agent`        | Optional | Light. Spec-only; `apply` registers it. No v1 field accepts inline `AgentRef` (see Q11). |
 | `Eval`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Workflow`, `Audit`, `Service` | Optional | Light. Spec-only; `apply` registers each card as it's read. |
 
@@ -1060,7 +1223,7 @@ components:
 
 Same three-key shape applies anywhere a light card is referenced —
 `Service.components[].ref`, `Trigger.target`, `Workflow.steps[].target`,
-`Agent.prompt`, `EvalTask::Judge.prompt`, etc.
+`Agent.prompt`, `EvalTask::LlmJudge.judge_ref`, etc.
 
 ### Path resolution rules (loader contract)
 
@@ -1094,13 +1257,13 @@ ergonomic they expect from JSON-Schema `$ref` / OpenAPI external-file imports.
 
 | Card    | Refs that authored on it             | Refs that point at it          |
 |---------|--------------------------------------|--------------------------------|
-| Data    | `card_refs`, `splits`            | `Drift.signal.baseline_ref`, `Eval.dataset_ref`, `Experiment.target_refs` |
+| Data    | `card_refs`, `splits`            | `Drift.signal.baseline_ref`, `Eval.dataset`, `Experiment.target_refs` |
 | Model   | `card_refs`                      | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, `Experiment.target_refs` |
 | Agent   | `prompt`, `tool_names`               | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, Agent prompts (sub-agent calls) |
 | Workflow| `steps.*.target`                     | `Eval.subject_ref`, `Service.components.ref`, `Operator.action.workflow_ref` |
 | Mcp     | `server_name`, `transport`, `scopes` | `Service.components.ref` |
 | Drift   | `subject_ref`, `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `Trigger.source.drift_ref`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
-| Eval    | `subject_ref`, `dataset_ref`, `source_ref`, `tasks[].Judge.prompt` (PromptRef) | `Drift.signal.eval_ref`, `Trigger.source.eval_ref` |
+| Eval    | `subject_ref`, `dataset`, `source_ref` (deferred), `tasks[].LlmJudge.judge_ref` (Prompt card ref) | `Drift.signal.eval_ref`, `Trigger.source.eval_ref` |
 | Audit   | `subject_refs`, `query` (roots), `lineage` (nodes), `investigator` (Agent variant) | — |
 | Service | `components[].ref`                   | `Drift.subject_ref` (service-level), `Eval.subject_ref` |
 | Policy  | `rules`                              | `Service.components.ref`, `Operator.pre_invoke`, `Operator.post_invoke` |
@@ -1175,6 +1338,6 @@ services/ops-copilot/
 8. **Closed.** `Eval` does not carry its own `signal` decomposition. Eval IS
     the signal — its per-task pass/fail aggregates into a score stream
     consumed downstream by `Drift` with `DriftSignal::EvalScore`. The input
-    edges (`dataset_ref` vs `source_ref`) are two optional `CardRef`s, not a
-    tagged enum: presence is the mode (offline driver, online sink, both, or
-    neither → vala default archive).
+    edges (`dataset` vs `source_ref`) are optional refs, not a tagged enum:
+    presence is the mode (offline driver, online sink, both, or neither →
+    vala default archive).

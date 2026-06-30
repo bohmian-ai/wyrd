@@ -168,25 +168,6 @@ impl BackendSigner {
         }
     }
 
-    /// Verify SHA-256 for a stored object.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Sha256Mismatch`] when verification fails, or a
-    /// backend error when the object cannot be read.
-    pub async fn verify_sha256(
-        &self,
-        path: &ValidatedPath,
-        expected: &str,
-        head_hint: &HeadInfo,
-    ) -> Result<(), StorageError> {
-        match self {
-            Self::Local(signer) => signer.verify_sha256(path, expected, head_hint).await,
-            Self::S3(signer) => signer.verify_sha256(path, expected, head_hint),
-            Self::Gcs(signer) => signer.verify_sha256(path, expected, head_hint).await,
-            Self::Azure(signer) => signer.verify_sha256(path, expected, head_hint).await,
-        }
-    }
-
     /// Abort a multipart upload.
     ///
     /// # Errors
@@ -312,8 +293,6 @@ pub struct HeadInfo {
     pub sse_marker: Option<String>,
     /// Stored content type when known.
     pub content_type: Option<String>,
-    /// Trusted backend-supplied base64 SHA-256 when available.
-    pub sha256_b64: Option<String>,
 }
 
 /// Non-bearer data needed to re-mint an upload plan.
@@ -335,16 +314,4 @@ pub struct UploadPlanReplayInput {
 #[must_use]
 pub(crate) fn ttl_secs(ttl: Duration) -> u32 {
     u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX)
-}
-
-/// Compare an expected SHA against an actual SHA.
-pub(crate) fn check_sha(expected: &str, actual: String) -> Result<(), StorageError> {
-    if expected == actual {
-        Ok(())
-    } else {
-        Err(StorageError::Sha256Mismatch {
-            expected: expected.to_owned(),
-            actual,
-        })
-    }
 }

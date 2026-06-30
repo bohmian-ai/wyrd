@@ -1028,8 +1028,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "Source",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -4257,8 +4256,7 @@ Schema source: crates/wyrd-spec/schemas/artifact_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "Source",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -4577,8 +4575,7 @@ Schema source: crates/wyrd-spec/schemas/audit_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "Source",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -4875,8 +4872,7 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "Source",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -6186,8 +6182,7 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "Source",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -6761,8 +6756,7 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "Source",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -7530,8 +7524,7 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "Source",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -8140,8 +8133,7 @@ Schema source: crates/wyrd-spec/schemas/mcp_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "Source",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -8404,8 +8396,7 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "Source",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -9510,8 +9501,7 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "Source",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -14072,8 +14062,7 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "Source",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -14574,8 +14563,7 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "Source",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"
@@ -15955,8 +15943,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
         "Artifact",
         "Trigger",
         "Operator",
-        "Source",
-        "External"
+        "Source"
       ],
       "title": "CardKind",
       "type": "string"

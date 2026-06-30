@@ -83,8 +83,11 @@ Locked cross-cutting decisions that any contributor must honor:
   owner crates. `python/py-wyrd` is the thin PyO3 module aggregator and Python
   package surface, not the place for duplicated business logic.
 - Current approved Python owner crates are `wyrd-interfaces`, `wyrd-cards`,
-  `wyrd-utils`, `wyrd-observe`, `vala-client`, `skald-prompt`,
-  `skald-runtime`, `skald-agent`, `skald-tool`, and `skald-workflow`.
+  `wyrd-utils`, `wyrd-observe`, `vala-sdk`, `skald-prompt`,
+  `skald-runtime`, `skald-agent`, `skald-tool`, `skald-workflow`, and
+  `wyrd-testing`. `wyrd-testing`'s `python` feature exposes the
+  `WyrdTestServer` harness only; it is a test-tier crate and is never
+  enabled on production Python wheels.
 - Client-tier crates do not depend on `sqlx`, cloud SDKs, `datafusion`, or
   `deltalake`.
 - Vala and Skald do not depend on each other directly.
@@ -103,7 +106,7 @@ Locked cross-cutting decisions that any contributor must honor:
   orchestration, provider-specific wire handling.
 - `crates/vala/*`: observability, evaluation, drift, tracing, archival query,
   OLAP, and background data-plane behavior. Python-visible Vala client
-  behavior lives in `vala-client` behind its optional `python` feature.
+  behavior lives in `vala-sdk` behind its optional `python` feature.
 - `crates/wyrd/*`: server, CLI, MCP, application integration, UI host.
 - `python/py-wyrd`: PyO3 module root, Python package exports, generated stubs,
   Python-facing tests, and submodule aggregation.
@@ -244,44 +247,41 @@ then run codegen.
 
 ## 11. Testing Workflow
 
-Narrowest meaningful verification while iterating:
+### Pre-PR Gate (mirrors GitHub CI)
+
+Run these before pushing. They are the same commands CI runs — no surprises on PR.
 
 ```bash
+mise run pre-pr        # Rust + Python: all tests, format, lints, boundary checks, codegen
+mise run docs:check    # only if you changed docs/ (Starlight site)
+```
+
+`mise run pre-pr` covers:
+- Rust: format, clippy, all tests (`test:unit` — unit + SQL + storage emulators), codegen drift, boundary gates
+- Python: format, lints, type check, unit tests, examples
+
+Excludes real cloud storage integration tests (`test:storage:*:cloud`). Those run against live infrastructure separately.
+
+### Quick Iteration
+
+While working on a specific area:
+
+```bash
+# Rust only
 cargo test -p <crate> <test_name> --all-features -- --nocapture --test-threads=1
+mise run test:unit     # all Rust tests including SQL and storage emulators
+
+# Python only
+mise run py:test:unit  # all Python tests
 ```
 
-Repo tasks before completion:
+### Targeted Checks
 
 ```bash
-mise run fmt
-mise run lints
-mise run test:unit
-mise run check
-mise run codegen:check
-mise run pre-pr
-```
-
-Python-visible Rust changes:
-
-```bash
-mise run py:setup
-mise run py:test:unit
-```
-
-Contract or generated artifact changes:
-
-```bash
-mise run codegen:check
-```
-
-Foundation boundary changes:
-
-```bash
-mise run check:client-tier
-mise run check:pyo3-scope
-mise run check:mocks-scope
-mise run check:unwrap-audit
-mise run check:wasm
+mise run codegen:check              # generated contract drift
+mise run check:client-tier          # client-tier boundary
+mise run check:pyo3-scope           # PyO3 boundary
+mise run check:unwrap-audit         # unwrap/expect audit
 ```
 
 ## 12. Completion Standard

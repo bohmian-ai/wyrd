@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvalRecordObservation",
+  "description": "The eval observation an instrumented agent emits at evaluation points.\n\nRides the same wire envelope as every other Vala observation (`wyrd_spec::vala::observation::ObservationEnvelope`). The server resolves the eval card from `eval_ref`, validates `subject_ref` against the emitter's authorized card identity (the run's Target `card_ref`, authorized against the JWT principal's card scope), and scores the record through the runtime engine.",
+  "type": "object",
+  "required": [
+    "context",
+    "created_at",
+    "eval_ref",
+    "record_id",
+    "run_id"
+  ],
+  "properties": {
+    "context": {
+      "description": "JSON payload the eval tasks assert against.\n\nThe shape is task-driven (`JsonPath` extraction). The eval runtime applies the spec's `context_capture` policy when storing extracted values into `AssertionResult.actual`."
+    },
+    "created_at": {
+      "description": "Wall-clock emission time.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "eval_ref": {
+      "description": "Reference to the Eval card this record feeds.\n\nPer the D8 presence rule, the registry rejects online observations targeting an Eval card whose `subject_ref` is unset, so this field is meaningful only against cards that declared a subject.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardRef"
+        }
+      ]
+    },
+    "record_id": {
+      "description": "Client-generated UUIDv7-compatible record identity.\n\nStable across retries; the server deduplicates on this value.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "run_id": {
+      "description": "Run identifier of the agent invocation that emitted the record.\n\nThe opaque Run anchor (`Run → Observation`). The card identity is the run's authorized `card_ref`, not resolved from this id; the record carries no separate `agent_id`.",
+      "type": "string"
+    },
+    "session_id": {
+      "description": "Optional session identifier supplied explicitly at emit.\n\nRun-to-session is many-to-many. The SDK surface is `run.observe.eval(record, session_id=...)`. When the agent has no session concept, pass `None`.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "span_id": {
+      "description": "Span identifier within `trace_id`. Required when `trace_id` is set.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SpanId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "trace_id": {
+      "description": "Trace identifier of the active span at emit time.\n\nPopulated by the SDK from the active OTel span only when the Eval card has trace tasks. Otherwise `None`; the eval pipeline never awaits a trace it does not need.\n\nCarried as a record field, not a propagation mechanism. Span tagging uses span attributes (`wyrd.run_id`, `wyrd.eval.scenario_id` in local mode). Cross-service ancestry uses the `Wyrd-Request-Id` HTTP header carried as a label. The source of truth for span attributes and label propagation is `architecture/v1/00-foundations/tracing.md`.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/TraceId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "CardKind": {
+      "title": "CardKind",
+      "description": "Wyrd Card kind.",
+      "type": "string",
+      "enum": [
+        "Data",
+        "Model",
+        "Experiment",
+        "Prompt",
+        "Agent",
+        "Workflow",
+        "Eval",
+        "Drift",
+        "Service",
+        "Policy",
+        "Mcp",
+        "Audit",
+        "Artifact",
+        "Trigger",
+        "Operator",
+        "Source"
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardRef": {
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "space",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Referenced Card kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "Referenced Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "space": {
+          "description": "Space pinning identity together with `name` and `version`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Optional resolved UID.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Exact referenced Card version.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VersionBlock"
+            }
+          ]
+        }
+      }
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "SpanId": {
+      "type": "string",
+      "maxLength": 16,
+      "minLength": 16,
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "TraceId": {
+      "type": "string",
+      "maxLength": 32,
+      "minLength": 32,
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "VersionBlock": {
+      "description": "Semver-compatible version string.",
+      "type": "string"
+    }
+  }
+}

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use sqlx::types::Uuid;
 use tokio_util::io::ReaderStream;
 use tracing::instrument;
-use wyrd_spec::authz::Scope;
+use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::error::storage::WyrdStorageError;
 use wyrd_spec::ids::IdempotencyKey;
@@ -69,7 +69,12 @@ pub async fn upload_init(
     let body_sha = sha256_canonical_json(&body);
     let backend = state.storage.backend();
     let validated = validated_tenant_path(&caller, &body)?;
-    let planned = plan_upload(body.expected_size_bytes, backend).map_err(|_| {
+    let planned = plan_upload(
+        body.expected_size_bytes,
+        backend,
+        state.storage.multipart_threshold_bytes(),
+    )
+    .map_err(|_| {
         map_storage_error(StorageError::ArtifactTooLarge {
             actual: body.expected_size_bytes,
             limit: MAX_OBJECT_SIZE_BYTES,
@@ -354,32 +359,6 @@ pub async fn upload_complete(
         }
     };
     verify_object_head(state, &caller, upload_uuid, &validated, &row, &head).await?;
-
-    if let Err(error) = state
-        .storage
-        .signer()
-        .verify_sha256(&validated, &row.expected_sha256, &head)
-        .await
-    {
-        let error = map_storage_error(error);
-        let error_code = error.code().to_owned();
-        let status_code = i32::from(error.status());
-        mark_failed_best_effort(
-            state,
-            &caller,
-            upload_uuid,
-            &validated,
-            row.backend,
-            FailureContext {
-                operation: UploadAuditOperation::UploadComplete,
-                reason: "sha_mismatch",
-                status_code,
-                error_code: Some(&error_code),
-            },
-        )
-        .await;
-        return Err(error);
-    }
 
     let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
         .await
@@ -705,22 +684,24 @@ fn extract_idempotency_key(headers: &HeaderMap) -> Result<Option<IdempotencyKey>
 }
 
 fn authorize_card_write(caller: &Caller) -> Result<(), WyrdError> {
-    if caller.principal.has_scope(Scope::CardWrite) {
+    let required = Permission::card_write();
+    if caller.principal.effective_permissions.contains(&required) {
         return Ok(());
     }
-    Err(WyrdError::InsufficientScope {
-        message: "caller lacks required scope card:write".to_owned(),
-        details: serde_json::json!({ "required": Scope::CardWrite.as_str() }),
+    Err(WyrdError::PermissionDeniedRbac {
+        message: "caller lacks required permission card:write".to_owned(),
+        details: serde_json::json!({ "required": required }),
     })
 }
 
 fn authorize_card_read(caller: &Caller) -> Result<(), WyrdError> {
-    if caller.principal.has_scope(Scope::CardRead) {
+    let required = Permission::card_read();
+    if caller.principal.effective_permissions.contains(&required) {
         return Ok(());
     }
-    Err(WyrdError::InsufficientScope {
-        message: "caller lacks required scope card:read".to_owned(),
-        details: serde_json::json!({ "required": Scope::CardRead.as_str() }),
+    Err(WyrdError::PermissionDeniedRbac {
+        message: "caller lacks required permission card:read".to_owned(),
+        details: serde_json::json!({ "required": required }),
     })
 }
 
@@ -1210,7 +1191,9 @@ pub fn map_sql_error(error: wyrd_sql::SqlError) -> WyrdError {
         | wyrd_sql::SqlError::FkViolation { .. }
         | wyrd_sql::SqlError::CheckViolation { .. }
         | wyrd_sql::SqlError::Conflict { .. } => conflict_error(&message, details),
-        wyrd_sql::SqlError::RlsDenied { .. } => WyrdError::PermissionDenied { message, details },
+        wyrd_sql::SqlError::RlsDenied { .. } => {
+            WyrdError::PermissionDeniedRbac { message, details }
+        }
         wyrd_sql::SqlError::Connect(_)
         | wyrd_sql::SqlError::Migrate(_)
         | wyrd_sql::SqlError::MigrateChecksum { .. }
@@ -1218,7 +1201,8 @@ pub fn map_sql_error(error: wyrd_sql::SqlError) -> WyrdError {
         | wyrd_sql::SqlError::InvariantViolation { .. }
         | wyrd_sql::SqlError::TxFailed(_)
         | wyrd_sql::SqlError::InsufficientPrivilege { .. }
-        | wyrd_sql::SqlError::InvalidDataTenantId(_) => {
+        | wyrd_sql::SqlError::InvalidDataTenantId(_)
+        | wyrd_sql::SqlError::TriggerException { .. } => {
             tracing::error!(
                 error = %message,
                 source_code = code,
@@ -1269,11 +1253,9 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-    use std::collections::BTreeSet;
     use std::sync::Arc;
+    use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::actor::Actor;
-    use wyrd_spec::authz::Principal;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::storage::SinglePutComplete;
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
@@ -1361,6 +1343,7 @@ mod tests {
             require_encryption: false,
             presign_ttl: Duration::from_secs(600),
             part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test/".to_owned()),
         })
         .await
@@ -1422,6 +1405,7 @@ mod tests {
             require_encryption: false,
             presign_ttl: Duration::from_secs(900),
             part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test/".to_owned()),
         })
         .await
@@ -1460,6 +1444,7 @@ mod tests {
             require_encryption: false,
             presign_ttl: Duration::from_secs(900),
             part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test".to_owned()),
         })
         .await
@@ -1502,7 +1487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_local_blob_requires_card_read_scope() {
+    async fn download_local_blob_requires_card_read_permission() {
         let root = tempfile::tempdir().expect("temp dir");
         let storage = StorageHandle::from_settings(StorageSettings {
             backend: BackendConfig::Local {
@@ -1511,6 +1496,7 @@ mod tests {
             require_encryption: false,
             presign_ttl: Duration::from_secs(900),
             part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test".to_owned()),
         })
         .await
@@ -1520,7 +1506,7 @@ mod tests {
             None,
             Arc::clone(&storage),
         );
-        let caller = caller_with_scopes(BTreeSet::new());
+        let caller = caller_with_permissions([]);
         let path = tenant_path::build(
             caller.data_tenant_id,
             "018f0000-0000-7000-8000-000000000000",
@@ -1529,13 +1515,13 @@ mod tests {
 
         let error = download_local_blob(&state, caller, path)
             .await
-            .expect_err("missing scope should fail");
+            .expect_err("missing permission should fail");
 
         assert_eq!(error.status(), 403);
     }
 
     #[tokio::test]
-    async fn upload_local_blob_requires_card_write_scope() {
+    async fn upload_local_blob_requires_card_write_permission() {
         let root = tempfile::tempdir().expect("temp dir");
         let storage = StorageHandle::from_settings(StorageSettings {
             backend: BackendConfig::Local {
@@ -1544,6 +1530,7 @@ mod tests {
             require_encryption: false,
             presign_ttl: Duration::from_secs(900),
             part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test".to_owned()),
         })
         .await
@@ -1553,7 +1540,7 @@ mod tests {
             None,
             Arc::clone(&storage),
         );
-        let caller = caller_with_scopes(BTreeSet::new());
+        let caller = caller_with_permissions([]);
         let path = tenant_path::build(
             caller.data_tenant_id,
             "018f0000-0000-7000-8000-000000000000",
@@ -1562,7 +1549,7 @@ mod tests {
 
         let error = upload_local_blob(&state, caller, path, Bytes::from_static(b"data"))
             .await
-            .expect_err("missing scope should fail");
+            .expect_err("missing permission should fail");
 
         assert_eq!(error.status(), 403);
     }
@@ -1629,20 +1616,21 @@ mod tests {
     }
 
     fn read_caller() -> Caller {
-        caller_with_scopes(BTreeSet::from([Scope::CardRead]))
+        caller_with_permissions([Permission::card_read()])
     }
 
-    fn caller_with_scopes(scopes: BTreeSet<Scope>) -> Caller {
+    fn caller_with_permissions(permissions: impl IntoIterator<Item = Permission>) -> Caller {
+        let tenant = DataTenantId::new_v7();
         Caller {
-            data_tenant_id: DataTenantId::new_v7(),
+            data_tenant_id: tenant,
             principal: Principal::new(
-                Actor::Service {
-                    name: "test-service".to_owned(),
-                    client_id: "test-service".to_owned(),
-                },
-                scopes,
+                PrincipalId::new(uuid::Uuid::now_v7()),
+                PrincipalKind::User,
+                tenant,
+                vec![],
+                PermissionSet::from_iter(permissions),
             ),
-            request_id: RequestId::parse("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
+            request_id: RequestId::parse(&uuid::Uuid::now_v7().to_string())
                 .expect("request id parses"),
         }
     }

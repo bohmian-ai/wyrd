@@ -17,3 +17,17 @@ CREATE ROLE wyrd_platform_admin
     LOGIN
     BYPASSRLS
     PASSWORD 'REPLACE_WITH_WYRD_PLATFORM_ADMIN_PASSWORD';
+
+CREATE ROLE wyrd_catalog
+    NOLOGIN;
+
+CREATE ROLE wyrd_catalog_app
+    LOGIN
+    PASSWORD 'REPLACE_WITH_WYRD_CATALOG_APP_PASSWORD';
+
+GRANT wyrd_catalog TO wyrd_catalog_app;
+GRANT wyrd_catalog TO wyrd_migrator;
+
+CREATE ROLE vala_recovery_owner NOLOGIN BYPASSRLS;
+CREATE ROLE vala_recovery LOGIN PASSWORD 'REPLACE_WITH_VALA_RECOVERY_PASSWORD';
+GRANT vala_recovery_owner TO wyrd_migrator;

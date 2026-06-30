@@ -43,3 +43,4 @@ postgres-data/
 
 # Git worktrees
 .worktrees/
+crates/vala/vala-bifrost/benches/reports/*.json

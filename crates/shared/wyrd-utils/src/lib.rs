@@ -41,11 +41,7 @@ pub enum WyrdUtilsError {
     UnsupportedPath(PathBuf),
 }
 
-/// Generate a UUIDv7 string.
-#[must_use]
-pub fn uuid7() -> String {
-    uuid::Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext)).to_string()
-}
+pub use wyrd_spec::uuid7;
 
 /// Parse and normalize a semantic version.
 ///

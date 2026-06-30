@@ -9,14 +9,22 @@ authors = { workspace = true }
 
 [features]
 embedded-postgres = ["dep:pg-embed", "dep:rand", "dep:urlencoding"]
+test-e2e = []
+testing = []
 
 [dependencies]
+chrono = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+ulid = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+wyrd-runtime = { workspace = true }
+wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
 
 [dependencies.pg-embed]
@@ -32,4 +40,7 @@ workspace = true
 optional = true
 
 [dev-dependencies]
+paste = { workspace = true }
+sqlx = { workspace = true, features = ["postgres", "uuid", "json"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+url = { workspace = true }

@@ -3,7 +3,12 @@
 use axum::body::Body;
 use axum::http::{StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
+use wyrd_auth_verify::{AuthError, MAX_DELEGATION_DEPTH};
+use wyrd_runtime::PermissionDenyReason;
 use wyrd_spec::error::WyrdError;
+
+use crate::auth::roles::RoleAdminError;
+use crate::auth::seed::SeedError;
 
 /// Server-owned response wrapper for public Wyrd errors.
 ///
@@ -25,6 +30,30 @@ impl From<WyrdErrorResponse> for WyrdError {
     }
 }
 
+impl From<AuthError> for WyrdErrorResponse {
+    fn from(error: AuthError) -> Self {
+        Self(auth_error_to_wyrd(error))
+    }
+}
+
+impl From<PermissionDenyReason> for WyrdErrorResponse {
+    fn from(reason: PermissionDenyReason) -> Self {
+        Self(permission_deny_reason_to_wyrd(reason))
+    }
+}
+
+impl From<RoleAdminError> for WyrdErrorResponse {
+    fn from(error: RoleAdminError) -> Self {
+        Self(role_admin_error_to_wyrd(error))
+    }
+}
+
+impl From<SeedError> for WyrdErrorResponse {
+    fn from(error: SeedError) -> Self {
+        Self(seed_error_to_wyrd(error))
+    }
+}
+
 impl IntoResponse for WyrdErrorResponse {
     fn into_response(self) -> Response {
         wyrd_error_response(self.0)
@@ -34,14 +63,93 @@ impl IntoResponse for WyrdErrorResponse {
 /// Render a Wyrd error as an RFC 9457 problem+json response.
 #[must_use]
 pub fn wyrd_error_response(error: WyrdError) -> Response {
+    wyrd_error_response_from_parts(error, None)
+}
+
+/// Render a Wyrd error as problem+json, optionally inserting the request id
+/// into the `instance` field and the `wyrd-request-id` response header.
+#[must_use]
+pub fn wyrd_error_response_from_parts(
+    error: WyrdError,
+    request_id: Option<&wyrd_spec::request_id::RequestId>,
+) -> Response {
     let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    match serde_json::to_vec(&error.as_problem_json()) {
-        Ok(body) => response_with_body(status, body),
+    let mut body = error.as_problem_json();
+    if let (serde_json::Value::Object(map), Some(id)) = (&mut body, request_id) {
+        map.insert(
+            "instance".to_owned(),
+            serde_json::Value::String(format!("urn:wyrd:request:{}", id.as_str())),
+        );
+    }
+    let retry_after = matches!(error, WyrdError::AuthVerifyUnavailable { .. });
+    match serde_json::to_vec(&body) {
+        Ok(bytes) => {
+            let mut response = response_with_body(status, bytes);
+            if retry_after {
+                response.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static("1"),
+                );
+            }
+            if let Some(id) = request_id
+                && let Ok(val) = axum::http::HeaderValue::from_str(id.as_str())
+            {
+                response.headers_mut().insert(
+                    axum::http::header::HeaderName::from_static(
+                        crate::middleware::request_id::REQUEST_ID_HEADER,
+                    ),
+                    val,
+                );
+            }
+            response
+        }
         Err(_) => response_with_body(
             StatusCode::INTERNAL_SERVER_ERROR,
             br#"{"type":"https://wyrd.dev/problems/WYRD_SPEC_500_INTERNAL","title":"Internal error","status":500,"detail":"failed to serialize Wyrd error response","code":"WYRD_SPEC_500_INTERNAL","details":{},"remediation":"Retry later or inspect server logs using the request ID."}"#.to_vec(),
         ),
     }
+}
+
+/// Adapter for `HandleErrorLayer`: converts tower `BoxError` into a Wyrd
+/// problem+json response.
+///
+/// Maps:
+/// - `tower::timeout::error::Elapsed` → 504 `WYRD_SERVER_504_REQUEST_TIMEOUT`
+/// - `tower::load_shed::error::Overloaded` → 503 `WYRD_SERVER_503_SERVICE_UNAVAILABLE`
+/// - Unknown → 500 `WYRD_SPEC_500_INTERNAL`
+pub async fn map_tower_error_to_wyrd(error: tower::BoxError) -> Response {
+    if error.is::<tower::timeout::error::Elapsed>() {
+        return wyrd_error_response(WyrdError::RequestTimeout {
+            message: "request exceeded the configured handler timeout".to_owned(),
+            details: serde_json::json!({}),
+        });
+    }
+    if error.is::<tower::load_shed::error::Overloaded>() {
+        return wyrd_error_response(WyrdError::ServiceUnavailable {
+            message: "server is at capacity; retry with backoff".to_owned(),
+            details: serde_json::json!({}),
+        });
+    }
+    tracing::error!(
+        tower_error_class = "unknown",
+        "unexpected tower BoxError in HandleErrorLayer"
+    );
+    wyrd_error_response(WyrdError::Internal {
+        message: "internal server error".to_owned(),
+        details: serde_json::json!({}),
+    })
+}
+
+/// Panic handler for `CatchPanicLayer::custom`.
+///
+/// Returns a fixed 500 problem+json body. The panic payload is never logged or
+/// echoed to the caller.
+pub fn wyrd_panic_response(_panic_info: Box<dyn std::any::Any + Send>) -> Response {
+    tracing::error!(panic.class = "handler", "handler panicked; returning 500");
+    wyrd_error_response(WyrdError::Internal {
+        message: "internal server error".to_owned(),
+        details: serde_json::json!({}),
+    })
 }
 
 fn response_with_body(status: StatusCode, body: Vec<u8>) -> Response {
@@ -52,4 +160,154 @@ fn response_with_body(status: StatusCode, body: Vec<u8>) -> Response {
         axum::http::HeaderValue::from_static("application/problem+json"),
     );
     response
+}
+
+/// Convert auth verifier failures into stable public Wyrd errors.
+#[must_use]
+pub fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
+    match error {
+        AuthError::Jwt(error) => jwt_error_to_wyrd(error),
+        AuthError::InvalidToken => invalid_token("token rejected", serde_json::json!({})),
+        AuthError::TokenExpired => WyrdError::TokenExpired {
+            message: "token expired".to_owned(),
+            details: serde_json::json!({}),
+        },
+        AuthError::InvalidCardRef => WyrdError::InvalidCardRef {
+            message: "non-user token card_ref claim is absent or malformed".to_owned(),
+            details: serde_json::json!({}),
+        },
+        AuthError::DelegationDepthExceeded => WyrdError::DelegationDepthExceededVerify {
+            message: format!(
+                "delegation chain exceeds MAX_DELEGATION_DEPTH={MAX_DELEGATION_DEPTH}"
+            ),
+            details: serde_json::json!({ "max": MAX_DELEGATION_DEPTH }),
+        },
+        AuthError::Revoked => WyrdError::CredentialRevoked {
+            message: "credential revoked".to_owned(),
+            details: serde_json::json!({}),
+        },
+        AuthError::BadTokenFormat => bad_token_format("authorization header malformed"),
+        AuthError::VerifyUnavailable => WyrdError::AuthVerifyUnavailable {
+            message: "auth verify backend unavailable".to_owned(),
+            details: serde_json::json!({ "retry_after_seconds": 1 }),
+        },
+        AuthError::PermissionsCorrupt => WyrdError::RoleCorrupt {
+            message: "stored role permissions failed to decode".to_owned(),
+            details: serde_json::json!({}),
+        },
+    }
+}
+
+fn jwt_error_to_wyrd(error: jsonwebtoken::errors::Error) -> WyrdError {
+    use jsonwebtoken::errors::ErrorKind;
+
+    // The specific JWT failure kind is a low-noise oracle for token structure
+    // probing. Log it internally; do not surface it on the public wire.
+    tracing::debug!(jwt_error = ?error.kind(), "JWT validation failed");
+
+    match error.kind() {
+        ErrorKind::ExpiredSignature => WyrdError::TokenExpired {
+            message: "token expired".to_owned(),
+            details: serde_json::json!({}),
+        },
+        ErrorKind::Base64(_) | ErrorKind::Json(_) | ErrorKind::Utf8(_) => {
+            bad_token_format("token payload is malformed")
+        }
+        ErrorKind::InvalidSignature
+        | ErrorKind::InvalidIssuer
+        | ErrorKind::InvalidSubject
+        | ErrorKind::InvalidAudience
+        | ErrorKind::InvalidAlgorithm
+        | ErrorKind::InvalidAlgorithmName => invalid_token(
+            "bearer token signature, issuer, subject, audience, or algorithm invalid",
+            serde_json::json!({}),
+        ),
+        _ => invalid_token("bearer token rejected", serde_json::json!({})),
+    }
+}
+
+/// Convert an RBAC denial into a stable public Wyrd error.
+#[must_use]
+pub fn permission_deny_reason_to_wyrd(reason: PermissionDenyReason) -> WyrdError {
+    match reason {
+        PermissionDenyReason::Rbac {
+            required,
+            principal,
+        } => {
+            let resource = format!("{:?}", required.resource);
+            let action = format!("{:?}", required.action);
+            WyrdError::PermissionDeniedRbac {
+                message: format!("principal {principal} lacks {resource}/{action}"),
+                details: serde_json::json!({
+                    "required": required,
+                    "principal": principal.to_string(),
+                }),
+            }
+        }
+    }
+}
+
+/// Convert role-admin errors at the handler boundary.
+#[must_use]
+pub fn role_admin_error_to_wyrd(error: RoleAdminError) -> WyrdError {
+    match error {
+        RoleAdminError::CannotDeleteBuiltin => WyrdError::PermissionDeniedRbac {
+            message: "builtin roles cannot be deleted".to_owned(),
+            details: serde_json::json!({ "resource": "roles", "action": "delete" }),
+        },
+        RoleAdminError::NotFound => WyrdError::NotFound {
+            message: "role not found".to_owned(),
+            details: serde_json::json!({ "resource": "role" }),
+        },
+        RoleAdminError::Database(error) => sqlx_error_to_wyrd(error),
+    }
+}
+
+/// Convert seed errors at the handler boundary.
+#[must_use]
+pub fn seed_error_to_wyrd(error: SeedError) -> WyrdError {
+    match error {
+        SeedError::Database(error) => sqlx_error_to_wyrd(error),
+        SeedError::Serialize(error) => WyrdError::Internal {
+            message: "builtin role permissions failed to serialize".to_owned(),
+            details: serde_json::json!({ "source": error.to_string() }),
+        },
+    }
+}
+
+/// Convert SQLx database errors that have public auth/RBAC contract meaning.
+#[must_use]
+pub fn sqlx_error_to_wyrd(error: sqlx::Error) -> WyrdError {
+    if let sqlx::Error::Database(db_error) = &error
+        && db_error.code().as_deref() == Some("23514")
+        && db_error.constraint() == Some("auth_builtin_role_immutable_name")
+    {
+        return WyrdError::BuiltinRoleImmutableName {
+            message: "builtin role names are immutable".to_owned(),
+            details: serde_json::json!({
+                "sqlstate": "23514",
+                "constraint": "auth_builtin_role_immutable_name",
+            }),
+        };
+    }
+
+    tracing::warn!(error = %error, "database operation failed");
+    WyrdError::Internal {
+        message: "database operation failed".to_owned(),
+        details: serde_json::json!({}),
+    }
+}
+
+fn bad_token_format(message: &str) -> WyrdError {
+    WyrdError::BadTokenFormat {
+        message: message.to_owned(),
+        details: serde_json::json!({}),
+    }
+}
+
+fn invalid_token(message: &str, details: serde_json::Value) -> WyrdError {
+    WyrdError::InvalidToken {
+        message: message.to_owned(),
+        details,
+    }
 }

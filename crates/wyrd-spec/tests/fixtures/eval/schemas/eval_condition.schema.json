@@ -1,0 +1,645 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvalCondition",
+  "description": "A typed predicate evaluated against one JSON value extracted from workflow context or scenario payload.\n\nTo chain conditions, set both [`EvalCondition::combinator`] and [`EvalCondition::subsequent`]. The whole chain is evaluated left-to-right with `AND` short-circuit on false and `OR` short-circuit on true.",
+  "type": "object",
+  "required": [
+    "expected",
+    "operator",
+    "path"
+  ],
+  "properties": {
+    "combinator": {
+      "description": "Optional combinator for chaining.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ConditionCombinator"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "expected": {
+      "description": "Right-hand side of the comparison."
+    },
+    "operator": {
+      "description": "Comparison applied to `(value-at-path, expected)`.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ComparisonOperator"
+        }
+      ]
+    },
+    "path": {
+      "description": "JSONPath into the workflow context or scenario payload.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/JsonPath"
+        }
+      ]
+    },
+    "subsequent": {
+      "description": "Next link in the chain.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/EvalCondition"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "ComparisonOperator": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ParameterlessComparisonOperatorSchema"
+        },
+        {
+          "$ref": "#/definitions/ParameterizedComparisonOperator"
+        }
+      ]
+    },
+    "ConditionCombinator": {
+      "description": "Logical combinator between two adjacent [`EvalCondition`] nodes.",
+      "oneOf": [
+        {
+          "description": "`lhs AND rhs`, short-circuiting on false.",
+          "type": "string",
+          "enum": [
+            "and"
+          ]
+        },
+        {
+          "description": "`lhs OR rhs`, short-circuiting on true.",
+          "type": "string",
+          "enum": [
+            "or"
+          ]
+        }
+      ]
+    },
+    "DivergenceMetric": {
+      "description": "Probability-divergence metric used by [`ComparisonOperator::DivergenceLessThan`].",
+      "oneOf": [
+        {
+          "description": "Kullback-Leibler divergence.",
+          "type": "string",
+          "enum": [
+            "kl"
+          ]
+        },
+        {
+          "description": "Jensen-Shannon divergence.",
+          "type": "string",
+          "enum": [
+            "js"
+          ]
+        },
+        {
+          "description": "Wasserstein distance.",
+          "type": "string",
+          "enum": [
+            "wasserstein"
+          ]
+        }
+      ]
+    },
+    "EvalCondition": {
+      "description": "A typed predicate evaluated against one JSON value extracted from workflow context or scenario payload.\n\nTo chain conditions, set both [`EvalCondition::combinator`] and [`EvalCondition::subsequent`]. The whole chain is evaluated left-to-right with `AND` short-circuit on false and `OR` short-circuit on true.",
+      "type": "object",
+      "required": [
+        "expected",
+        "operator",
+        "path"
+      ],
+      "properties": {
+        "combinator": {
+          "description": "Optional combinator for chaining.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ConditionCombinator"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expected": {
+          "description": "Right-hand side of the comparison."
+        },
+        "operator": {
+          "description": "Comparison applied to `(value-at-path, expected)`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ComparisonOperator"
+            }
+          ]
+        },
+        "path": {
+          "description": "JSONPath into the workflow context or scenario payload.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/JsonPath"
+            }
+          ]
+        },
+        "subsequent": {
+          "description": "Next link in the chain.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EvalCondition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "JsonPath": {
+      "type": "string",
+      "maxLength": 1024,
+      "minLength": 1,
+      "pattern": "^\\$.*$"
+    },
+    "JsonValueType": {
+      "description": "JSON value-type set used by [`ComparisonOperator::IsType`].",
+      "oneOf": [
+        {
+          "description": "JSON null.",
+          "type": "string",
+          "enum": [
+            "null"
+          ]
+        },
+        {
+          "description": "JSON boolean.",
+          "type": "string",
+          "enum": [
+            "bool"
+          ]
+        },
+        {
+          "description": "JSON number.",
+          "type": "string",
+          "enum": [
+            "number"
+          ]
+        },
+        {
+          "description": "JSON string.",
+          "type": "string",
+          "enum": [
+            "string"
+          ]
+        },
+        {
+          "description": "JSON array.",
+          "type": "string",
+          "enum": [
+            "array"
+          ]
+        },
+        {
+          "description": "JSON object.",
+          "type": "string",
+          "enum": [
+            "object"
+          ]
+        }
+      ]
+    },
+    "ParameterizedComparisonOperator": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "inclusive",
+            "kind",
+            "max",
+            "min"
+          ],
+          "properties": {
+            "inclusive": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "in_range"
+              ]
+            },
+            "max": {
+              "type": "number",
+              "format": "double"
+            },
+            "min": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "inclusive",
+            "kind",
+            "max",
+            "min"
+          ],
+          "properties": {
+            "inclusive": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "not_in_range"
+              ]
+            },
+            "max": {
+              "type": "number",
+              "format": "double"
+            },
+            "min": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "tolerance"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "approximately_equals"
+              ]
+            },
+            "tolerance": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "pattern"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "matches_regex"
+              ]
+            },
+            "pattern": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "pattern"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "not_matches_regex"
+              ]
+            },
+            "pattern": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "min"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "has_min_length"
+              ]
+            },
+            "min": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "max"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "has_max_length"
+              ]
+            },
+            "max": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "expected",
+            "kind"
+          ],
+          "properties": {
+            "expected": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "length"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "min"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "length_greater_than"
+              ]
+            },
+            "min": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "max"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "length_less_than"
+              ]
+            },
+            "max": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "expected",
+            "kind"
+          ],
+          "properties": {
+            "expected": {
+              "$ref": "#/definitions/JsonValueType"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "is_type"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "tolerance"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "within_abs_tolerance"
+              ]
+            },
+            "tolerance": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "pct"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "within_pct_tolerance"
+              ]
+            },
+            "pct": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "mean",
+            "sigma",
+            "std_dev"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "within_std_dev"
+              ]
+            },
+            "mean": {
+              "type": "number",
+              "format": "double"
+            },
+            "sigma": {
+              "type": "number",
+              "format": "double"
+            },
+            "std_dev": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "lower_pct",
+            "upper_pct"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "between_percentiles"
+              ]
+            },
+            "lower_pct": {
+              "type": "number",
+              "format": "double"
+            },
+            "upper_pct": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "metric",
+            "threshold"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "divergence_less_than"
+              ]
+            },
+            "metric": {
+              "$ref": "#/definitions/DivergenceMetric"
+            },
+            "threshold": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "threshold"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "cosine_similarity_at_least"
+              ]
+            },
+            "threshold": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ParameterlessComparisonOperatorSchema": {
+      "type": "string",
+      "enum": [
+        "equals",
+        "not_equals",
+        "greater_than",
+        "greater_than_or_equals",
+        "less_than",
+        "less_than_or_equals",
+        "is_positive",
+        "is_negative",
+        "is_zero",
+        "contains",
+        "not_contains",
+        "contains_ignore_case",
+        "starts_with",
+        "ends_with",
+        "is_email",
+        "is_url",
+        "is_uuid",
+        "is_ipv4",
+        "is_ipv6",
+        "is_json",
+        "in",
+        "not_in",
+        "is_subset",
+        "is_superset",
+        "is_disjoint",
+        "all_of",
+        "any_of",
+        "none_of",
+        "is_empty",
+        "is_non_empty",
+        "unique_values",
+        "is_truthy",
+        "is_falsy",
+        "is_null",
+        "is_not_null",
+        "is_string",
+        "is_number",
+        "is_boolean",
+        "is_object"
+      ]
+    }
+  }
+}

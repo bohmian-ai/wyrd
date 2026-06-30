@@ -10,8 +10,27 @@ use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::BlobServiceClient;
 #[cfg(any(test, feature = "emulator"))]
 use azure_storage_blobs::prelude::ClientBuilder;
-use object_store::azure::{MicrosoftAzure, MicrosoftAzureBuilder};
+use opendal::services;
+#[cfg(any(test, feature = "emulator"))]
 use wyrd_spec::storage::StorageBackendKind;
+
+pub(crate) fn azblob_service(cfg: &AzureConfig) -> services::Azblob {
+    let endpoint = cfg
+        .endpoint_url
+        .clone()
+        .unwrap_or_else(|| format!("https://{}.blob.core.windows.net", cfg.account));
+    let b = services::Azblob::default()
+        .account_name(&cfg.account)
+        .container(&cfg.container)
+        .endpoint(&endpoint);
+    #[cfg(any(test, feature = "emulator"))]
+    let b = if let Ok(key) = std::env::var("AZURE_STORAGE_ACCOUNT_KEY") {
+        b.account_key(&key)
+    } else {
+        b
+    };
+    b
+}
 
 /// Build the Azure signer from Azure's default credential chain.
 ///
@@ -87,17 +106,25 @@ fn parse_azurite_endpoint(endpoint: &str) -> Result<(String, u16), ()> {
     Ok((host.to_owned(), port))
 }
 
-/// Build the shared Azure object-store substrate.
-///
-/// # Errors
-/// Returns an error when the object-store builder rejects configuration.
-pub fn build_object_store(config: &AzureConfig) -> Result<MicrosoftAzure, StorageError> {
-    let builder = MicrosoftAzureBuilder::from_env()
-        .with_account(config.account.clone())
-        .with_container_name(config.container.clone());
-    builder.build().map_err(|source| StorageError::Backend {
-        backend: StorageBackendKind::Azure,
-        op: "build_object_store",
-        message: source.to_string(),
-    })
+#[cfg(test)]
+mod tests {
+    use super::parse_azurite_endpoint;
+
+    #[test]
+    fn parses_default_endpoint() {
+        let (host, port) =
+            parse_azurite_endpoint("http://127.0.0.1:10000").expect("valid azurite endpoint");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 10000);
+    }
+
+    #[test]
+    fn rejects_https() {
+        assert!(parse_azurite_endpoint("https://127.0.0.1:10000").is_err());
+    }
+
+    #[test]
+    fn rejects_missing_port() {
+        assert!(parse_azurite_endpoint("http://127.0.0.1").is_err());
+    }
 }

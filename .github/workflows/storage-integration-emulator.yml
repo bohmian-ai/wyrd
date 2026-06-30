@@ -1,0 +1,72 @@
+name: storage-integration-emulator
+
+# Runs the full storage test surface against the local docker emulators
+# (RustFS / fake-gcs-server / Azurite) on every PR and main-branch push that
+# touches storage code. This is the "any CI" lane: signer-tier integration
+# tests, the StorageHandle data-plane CRUD suite (read/write/list/delete), and
+# the server HTTP multipart e2e — the same set of tests for local, S3, GCS, and
+# Azure.
+#
+# The credentialed real-cloud matrix lives in storage-integration-cloud.yml and
+# runs only on merge-to-main.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  MISE_LOCKED: "true"
+
+jobs:
+  emulator-matrix:
+    name: storage emulator matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Use GNU BFD linker on Linux
+        shell: bash
+        run: |
+          command -v cc
+          command -v ld.bfd
+          rustflags="${RUSTFLAGS:-}"
+          rustflags="${rustflags:+$rustflags }-C linker-features=-lld -C link-arg=-fuse-ld=bfd"
+          {
+            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc"
+            echo "RUSTFLAGS=$rustflags"
+          } >> "$GITHUB_ENV"
+
+      - name: Start storage emulators
+        run: mise run storage:up
+
+      - name: Run storage emulator matrix
+        run: mise run test:storage:matrix
+
+      - name: Stop storage emulators
+        if: always()
+        run: mise run storage:down

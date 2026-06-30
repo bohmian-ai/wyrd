@@ -1,0 +1,988 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvalTask",
+  "description": "One task in an `EvalSpec` DAG. Adjacently-tagged on the wire by `\"kind\"`; the inner record fields live alongside.",
+  "oneOf": [
+    {
+      "description": "Programmatic assertion against the workflow context.",
+      "type": "object",
+      "required": [
+        "expected",
+        "id",
+        "kind",
+        "operator"
+      ],
+      "properties": {
+        "condition": {
+          "description": "Optional gate evaluated before the task runs.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EvalCondition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "context_path": {
+          "description": "Path to the single value to assert against.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/JsonPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "depends_on": {
+          "description": "IDs of upstream tasks that must complete before this task runs.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TaskId"
+          }
+        },
+        "expected": {
+          "description": "Right-hand side of the comparison."
+        },
+        "id": {
+          "description": "Unique identifier within the enclosing eval task map.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TaskId"
+            }
+          ]
+        },
+        "item_context_path": {
+          "description": "Path to an array the runtime iterates and asserts per item.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/JsonPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "assertion"
+          ]
+        },
+        "operator": {
+          "description": "Comparison applied to the observed value and expected value.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ComparisonOperator"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "LLM-as-judge evaluation via a `Prompt` card.",
+      "type": "object",
+      "required": [
+        "expected",
+        "id",
+        "judge_ref",
+        "kind",
+        "operator"
+      ],
+      "properties": {
+        "condition": {
+          "description": "Optional gate evaluated before the task runs.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EvalCondition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "context_path": {
+          "description": "Optional JSONPath selecting the context passed to the judge.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/JsonPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "depends_on": {
+          "description": "IDs of upstream tasks that must complete before this task runs.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TaskId"
+          }
+        },
+        "expected": {
+          "description": "Right-hand side of the comparison."
+        },
+        "id": {
+          "description": "Unique identifier within the enclosing eval task map.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TaskId"
+            }
+          ]
+        },
+        "judge_ref": {
+          "description": "Reference to a `Prompt` card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "llm_judge"
+          ]
+        },
+        "max_retries": {
+          "description": "Maximum retries on transient runtime failures.",
+          "default": 2,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "operator": {
+          "description": "Comparison applied to the judge response and expected value.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ComparisonOperator"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Assertion over the assembled OTel trace document.",
+      "type": "object",
+      "required": [
+        "expected",
+        "id",
+        "kind",
+        "operator",
+        "span_selector"
+      ],
+      "properties": {
+        "condition": {
+          "description": "Optional gate evaluated before the task runs.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EvalCondition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "depends_on": {
+          "description": "IDs of upstream tasks that must complete before this task runs.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TaskId"
+          }
+        },
+        "expected": {
+          "description": "Right-hand side of the comparison."
+        },
+        "id": {
+          "description": "Unique identifier within the enclosing eval task map.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TaskId"
+            }
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "trace_assertion"
+          ]
+        },
+        "operator": {
+          "description": "Comparison applied to the selected trace value and expected value.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ComparisonOperator"
+            }
+          ]
+        },
+        "span_selector": {
+          "description": "JSONPath into the assembled trace document.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/JsonPath"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Assertion over the assembled GenAI workflow envelope.",
+      "type": "object",
+      "required": [
+        "expected",
+        "id",
+        "kind",
+        "operator",
+        "workflow_field_path"
+      ],
+      "properties": {
+        "condition": {
+          "description": "Optional gate evaluated before the task runs.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EvalCondition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "depends_on": {
+          "description": "IDs of upstream tasks that must complete before this task runs.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TaskId"
+          }
+        },
+        "expected": {
+          "description": "Right-hand side of the comparison."
+        },
+        "id": {
+          "description": "Unique identifier within the enclosing eval task map.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TaskId"
+            }
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "agent_assertion"
+          ]
+        },
+        "operator": {
+          "description": "Comparison applied to the selected workflow value and expected value.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ComparisonOperator"
+            }
+          ]
+        },
+        "workflow_field_path": {
+          "description": "JSONPath into the GenAI workflow envelope.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/JsonPath"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "definitions": {
+    "CardKind": {
+      "title": "CardKind",
+      "description": "Wyrd Card kind.",
+      "type": "string",
+      "enum": [
+        "Data",
+        "Model",
+        "Experiment",
+        "Prompt",
+        "Agent",
+        "Workflow",
+        "Eval",
+        "Drift",
+        "Service",
+        "Policy",
+        "Mcp",
+        "Audit",
+        "Artifact",
+        "Trigger",
+        "Operator",
+        "Source"
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardRef": {
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "space",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Referenced Card kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "Referenced Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "space": {
+          "description": "Space pinning identity together with `name` and `version`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Optional resolved UID.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Exact referenced Card version.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VersionBlock"
+            }
+          ]
+        }
+      }
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "ComparisonOperator": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ParameterlessComparisonOperatorSchema"
+        },
+        {
+          "$ref": "#/definitions/ParameterizedComparisonOperator"
+        }
+      ]
+    },
+    "ConditionCombinator": {
+      "description": "Logical combinator between two adjacent [`EvalCondition`] nodes.",
+      "oneOf": [
+        {
+          "description": "`lhs AND rhs`, short-circuiting on false.",
+          "type": "string",
+          "enum": [
+            "and"
+          ]
+        },
+        {
+          "description": "`lhs OR rhs`, short-circuiting on true.",
+          "type": "string",
+          "enum": [
+            "or"
+          ]
+        }
+      ]
+    },
+    "DivergenceMetric": {
+      "description": "Probability-divergence metric used by [`ComparisonOperator::DivergenceLessThan`].",
+      "oneOf": [
+        {
+          "description": "Kullback-Leibler divergence.",
+          "type": "string",
+          "enum": [
+            "kl"
+          ]
+        },
+        {
+          "description": "Jensen-Shannon divergence.",
+          "type": "string",
+          "enum": [
+            "js"
+          ]
+        },
+        {
+          "description": "Wasserstein distance.",
+          "type": "string",
+          "enum": [
+            "wasserstein"
+          ]
+        }
+      ]
+    },
+    "EvalCondition": {
+      "description": "A typed predicate evaluated against one JSON value extracted from workflow context or scenario payload.\n\nTo chain conditions, set both [`EvalCondition::combinator`] and [`EvalCondition::subsequent`]. The whole chain is evaluated left-to-right with `AND` short-circuit on false and `OR` short-circuit on true.",
+      "type": "object",
+      "required": [
+        "expected",
+        "operator",
+        "path"
+      ],
+      "properties": {
+        "combinator": {
+          "description": "Optional combinator for chaining.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ConditionCombinator"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expected": {
+          "description": "Right-hand side of the comparison."
+        },
+        "operator": {
+          "description": "Comparison applied to `(value-at-path, expected)`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ComparisonOperator"
+            }
+          ]
+        },
+        "path": {
+          "description": "JSONPath into the workflow context or scenario payload.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/JsonPath"
+            }
+          ]
+        },
+        "subsequent": {
+          "description": "Next link in the chain.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EvalCondition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "JsonPath": {
+      "type": "string",
+      "maxLength": 1024,
+      "minLength": 1,
+      "pattern": "^\\$.*$"
+    },
+    "JsonValueType": {
+      "description": "JSON value-type set used by [`ComparisonOperator::IsType`].",
+      "oneOf": [
+        {
+          "description": "JSON null.",
+          "type": "string",
+          "enum": [
+            "null"
+          ]
+        },
+        {
+          "description": "JSON boolean.",
+          "type": "string",
+          "enum": [
+            "bool"
+          ]
+        },
+        {
+          "description": "JSON number.",
+          "type": "string",
+          "enum": [
+            "number"
+          ]
+        },
+        {
+          "description": "JSON string.",
+          "type": "string",
+          "enum": [
+            "string"
+          ]
+        },
+        {
+          "description": "JSON array.",
+          "type": "string",
+          "enum": [
+            "array"
+          ]
+        },
+        {
+          "description": "JSON object.",
+          "type": "string",
+          "enum": [
+            "object"
+          ]
+        }
+      ]
+    },
+    "ParameterizedComparisonOperator": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "inclusive",
+            "kind",
+            "max",
+            "min"
+          ],
+          "properties": {
+            "inclusive": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "in_range"
+              ]
+            },
+            "max": {
+              "type": "number",
+              "format": "double"
+            },
+            "min": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "inclusive",
+            "kind",
+            "max",
+            "min"
+          ],
+          "properties": {
+            "inclusive": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "not_in_range"
+              ]
+            },
+            "max": {
+              "type": "number",
+              "format": "double"
+            },
+            "min": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "tolerance"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "approximately_equals"
+              ]
+            },
+            "tolerance": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "pattern"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "matches_regex"
+              ]
+            },
+            "pattern": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "pattern"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "not_matches_regex"
+              ]
+            },
+            "pattern": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "min"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "has_min_length"
+              ]
+            },
+            "min": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "max"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "has_max_length"
+              ]
+            },
+            "max": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "expected",
+            "kind"
+          ],
+          "properties": {
+            "expected": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "length"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "min"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "length_greater_than"
+              ]
+            },
+            "min": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "max"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "length_less_than"
+              ]
+            },
+            "max": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "expected",
+            "kind"
+          ],
+          "properties": {
+            "expected": {
+              "$ref": "#/definitions/JsonValueType"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "is_type"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "tolerance"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "within_abs_tolerance"
+              ]
+            },
+            "tolerance": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "pct"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "within_pct_tolerance"
+              ]
+            },
+            "pct": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "mean",
+            "sigma",
+            "std_dev"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "within_std_dev"
+              ]
+            },
+            "mean": {
+              "type": "number",
+              "format": "double"
+            },
+            "sigma": {
+              "type": "number",
+              "format": "double"
+            },
+            "std_dev": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "lower_pct",
+            "upper_pct"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "between_percentiles"
+              ]
+            },
+            "lower_pct": {
+              "type": "number",
+              "format": "double"
+            },
+            "upper_pct": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "metric",
+            "threshold"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "divergence_less_than"
+              ]
+            },
+            "metric": {
+              "$ref": "#/definitions/DivergenceMetric"
+            },
+            "threshold": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "threshold"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "cosine_similarity_at_least"
+              ]
+            },
+            "threshold": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ParameterlessComparisonOperatorSchema": {
+      "type": "string",
+      "enum": [
+        "equals",
+        "not_equals",
+        "greater_than",
+        "greater_than_or_equals",
+        "less_than",
+        "less_than_or_equals",
+        "is_positive",
+        "is_negative",
+        "is_zero",
+        "contains",
+        "not_contains",
+        "contains_ignore_case",
+        "starts_with",
+        "ends_with",
+        "is_email",
+        "is_url",
+        "is_uuid",
+        "is_ipv4",
+        "is_ipv6",
+        "is_json",
+        "in",
+        "not_in",
+        "is_subset",
+        "is_superset",
+        "is_disjoint",
+        "all_of",
+        "any_of",
+        "none_of",
+        "is_empty",
+        "is_non_empty",
+        "unique_values",
+        "is_truthy",
+        "is_falsy",
+        "is_null",
+        "is_not_null",
+        "is_string",
+        "is_number",
+        "is_boolean",
+        "is_object"
+      ]
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "TaskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]*$"
+    },
+    "VersionBlock": {
+      "description": "Semver-compatible version string.",
+      "type": "string"
+    }
+  }
+}

@@ -41,6 +41,25 @@ Use `Py<T>` for objects that must outlive the current GIL-bound scope.
 
 Never hold `Bound<'py, T>` across `.await`.
 
+## Constructor Naming
+
+Name the `#[new]` method `fn __new__`, not `fn new`. PyO3 generates the Python
+`__new__` slot from the `#[new]` attribute regardless of the Rust fn name, so the
+name is cosmetic — but Wyrd standardizes on `__new__` so the Rust source mirrors
+the Python surface it exposes. prior implementation uses `fn new` (its PyO3 predated separate
+`__init__` support); Wyrd diverges deliberately. Every Wyrd `#[new]` carries an
+explicit `#[pyo3(signature = (...))]`. Builder-only pyclasses (e.g. `Split`,
+constructed solely via `#[staticmethod]`) take no `#[new]`.
+
+```rust
+#[new]
+#[pyo3(signature = (*, data=None, compression="snappy"))]
+fn __new__(data: Option<Py<PyAny>>, compression: &str) -> (Self, DataInterface) { ... }
+```
+
+A subclassable base uses the `__new__` + `__init__` initializer pair (PyO3 0.28),
+not prior implementation's abstract-`#[new]`-that-raises workaround.
+
 ## Conversion Pattern
 
 Good boundary shape:

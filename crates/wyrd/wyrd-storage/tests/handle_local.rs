@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use wyrd_spec::DataTenantId;
 use wyrd_storage::{BackendSigner, StorageHandle};
 
 const ENV_KEYS: &[&str] = &[
@@ -23,68 +22,6 @@ async fn builds_local_handle_from_settings() {
     assert_eq!(handle.presign_ttl_secs(), 600);
     assert_eq!(handle.default_part_size_bytes(), 16 * 1024 * 1024);
     assert_eq!(handle.public_base_url(), Some("https://wyrd.test"));
-    let store_a = handle.object_store();
-    let store_b = handle.object_store();
-    assert!(Arc::ptr_eq(&store_a, &store_b));
-}
-
-#[tokio::test]
-async fn object_store_for_accepts_local_tenant_uri() {
-    let (handle, _root) = Box::pin(local_handle()).await;
-    let tenant = DataTenantId::new_v7();
-    let uri = format!(
-        "file://localhost/{tenant}/cards/{}/x.parquet",
-        uuid::Uuid::now_v7()
-    );
-
-    let store = handle
-        .object_store_for(&uri, tenant)
-        .expect("tenant uri should resolve to shared object store");
-
-    assert!(Arc::ptr_eq(&store, &handle.object_store()));
-}
-
-#[tokio::test]
-async fn object_store_for_rejects_foreign_tenant_uri() {
-    let (handle, _root) = Box::pin(local_handle()).await;
-    let caller = DataTenantId::new_v7();
-    let foreign = DataTenantId::new_v7();
-    let uri = format!(
-        "file://localhost/{foreign}/cards/{}/x.parquet",
-        uuid::Uuid::now_v7()
-    );
-
-    let Err(error) = handle.object_store_for(&uri, caller) else {
-        panic!("foreign tenant uri should be rejected");
-    };
-
-    assert!(matches!(
-        error,
-        wyrd_storage::StorageError::TenantPrefixForeign { .. }
-    ));
-}
-
-#[tokio::test]
-async fn object_store_for_returns_shared_arc_for_same_tenant() {
-    let (handle, _root) = Box::pin(local_handle()).await;
-    let tenant = DataTenantId::new_v7();
-    let uri_a = format!(
-        "file://localhost/{tenant}/cards/{}/a.parquet",
-        uuid::Uuid::now_v7()
-    );
-    let uri_b = format!(
-        "file://localhost/{tenant}/cards/{}/b.parquet",
-        uuid::Uuid::now_v7()
-    );
-
-    let store_a = handle
-        .object_store_for(&uri_a, tenant)
-        .expect("first tenant uri should resolve");
-    let store_b = handle
-        .object_store_for(&uri_b, tenant)
-        .expect("second tenant uri should resolve");
-
-    assert!(Arc::ptr_eq(&store_a, &store_b));
 }
 
 async fn local_handle() -> (Arc<StorageHandle>, tempfile::TempDir) {

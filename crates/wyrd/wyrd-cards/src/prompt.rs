@@ -7,12 +7,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wyrd_interfaces::error::CardPyResult;
+use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::prompt::{PromptRef as NativePromptRef, PromptSpec};
-use wyrd_spec::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
+use wyrd_spec::envelope::{
+    Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec, SpecHash,
+};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::ApiVersion;
 
 use crate::identity::{card_name, optional_card_uid, space_name, validation_error, version_block};
 
@@ -162,12 +164,18 @@ impl PromptCard {
     /// Returns a Wyrd error when `PromptSpec` validation or identity validation
     /// fails.
     pub fn to_card(&self) -> Result<Card, WyrdError> {
-        let spec = self.to_prompt_spec_from_metadata()?;
+        let spec = Spec::Prompt(self.to_prompt_spec_from_metadata()?);
+        let spec_hash = spec.canonical_hash().map_err(|e| {
+            validation_error(
+                "PromptCard spec failed canonicalization",
+                json!({ "source": e.to_string() }),
+            )
+        })?;
         Ok(Card {
             api_version: ApiVersion::v1(),
             kind: CardKind::Prompt,
-            metadata: self.to_envelope_metadata(&spec)?,
-            spec: Spec::Prompt(spec),
+            metadata: self.to_envelope_metadata(spec_hash)?,
+            spec,
             relationships: Relationships::default(),
             status: None,
         })
@@ -216,7 +224,16 @@ impl PromptCard {
                 .as_ref()
                 .map_or_else(|| "default".to_owned(), ToString::to_string),
             name: card.metadata.name.to_string(),
-            version: card.metadata.version.to_string(),
+            version: card
+                .metadata
+                .resolved_pin()
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    validation_error(
+                        "PromptCard envelope missing resolved version pin",
+                        serde_json::Value::Null,
+                    )
+                })?,
             uid: card
                 .metadata
                 .uid
@@ -235,16 +252,18 @@ impl PromptCard {
         })
     }
 
-    fn to_envelope_metadata(&self, spec: &PromptSpec) -> Result<EnvelopeMetadata, WyrdError> {
+    fn to_envelope_metadata(&self, spec_hash: SpecHash) -> Result<EnvelopeMetadata, WyrdError> {
         Ok(EnvelopeMetadata {
             name: card_name("name", &self.name)?,
-            version: version_block(&self.version)?,
+            version: Some(version_block(&self.version)?.into()),
+            bump: None,
             space: Some(space_name(&self.space)?),
             uid: optional_card_uid(&self.uid)?,
             labels: self.labels.clone(),
             annotations: self.annotations.clone(),
-            spec_hash: Some(spec.content_hash()),
+            spec_hash: Some(spec_hash),
             artifact_hash: None,
+            origin: None,
         })
     }
 }

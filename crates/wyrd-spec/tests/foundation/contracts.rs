@@ -1,8 +1,8 @@
+use wyrd_semver::{VersionBlock, VersionBump, VersionRange};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, DataTenantId, SpaceName, TenantSlug};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::trace::TraceContext;
-use wyrd_spec::version::{VersionBlock, VersionBump, VersionRange};
 
 #[test]
 fn ids_enforce_type_specific_canonical_forms() {
@@ -71,16 +71,8 @@ fn traceparent_validation_is_w3c_canonical() {
 #[test]
 fn version_helpers_match_bump_and_sort() {
     let range = VersionRange::parse("^1.2").unwrap();
-    assert!(
-        range
-            .matches(&VersionBlock::parse("1.4.0").unwrap())
-            .unwrap()
-    );
-    assert!(
-        !range
-            .matches(&VersionBlock::parse("2.0.0").unwrap())
-            .unwrap()
-    );
+    assert!(range.matches(&VersionBlock::parse("1.4.0").unwrap()));
+    assert!(!range.matches(&VersionBlock::parse("2.0.0").unwrap()));
 
     let version = VersionBlock::parse("1.2.3").unwrap();
     assert_eq!(version.bump(VersionBump::Minor).unwrap().as_str(), "1.3.0");
@@ -89,7 +81,7 @@ fn version_helpers_match_bump_and_sort() {
         VersionBlock::parse("1.10.0").unwrap(),
         VersionBlock::parse("1.2.0").unwrap(),
     ];
-    VersionBlock::sort_versions(&mut versions).unwrap();
+    VersionBlock::sort_versions(&mut versions);
     assert_eq!(versions[0].as_str(), "1.2.0");
 }
 

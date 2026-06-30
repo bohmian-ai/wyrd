@@ -89,6 +89,9 @@ Optional framework packages must be installed before using their interface. If
 an interface cannot import or validate its framework object, Wyrd raises a
 structured `WyrdError` with a remediation message.
 
+`wyrd.eval` drives eval runs on a Wyrd server from Python. See
+[Evaluation → Python SDK](/evaluation/python-sdk/).
+
 ## Labels and annotations
 
 Pass labels and annotations to the `DataCard` constructor:
@@ -145,6 +148,12 @@ restored.load(path)
 
 Override `from_metadata(cls, metadata)` when your subclass needs serialized
 metadata to reconstruct configuration before `load(path)`.
+
+## Configure transports
+
+`wyrd-client` ships observations and records to a Wyrd server through a
+transport. See [Transports](/transports/) for the configuration surface:
+gRPC (default), HTTP, Mock, queue policy, and credential management.
 
 ## Common failures
 

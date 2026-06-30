@@ -144,14 +144,14 @@ impl_to_spec!(
     |value: &NumpyInterface, py| {
         let dtype = if let Some(dtype) = value.dtype.clone() {
             dtype
-        } else if let Some(inferred) = dtype::numpy_dtype(py, value.data.as_ref()) {
+        } else if let Some(inferred) = dtype::numpy_dtype(py, value.data.as_deref()) {
             inferred?
         } else {
             "unknown".to_string()
         };
         let shape = if let Some(shape) = value.shape.clone() {
             shape
-        } else if let Some(inferred) = dtype::numpy_shape(py, value.data.as_ref()) {
+        } else if let Some(inferred) = dtype::numpy_shape(py, value.data.as_deref()) {
             inferred?
         } else {
             Vec::new()

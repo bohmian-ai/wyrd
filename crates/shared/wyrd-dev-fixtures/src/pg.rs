@@ -198,6 +198,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::PgFixture;
+    use wyrd_spec::DataTenantId;
     use wyrd_sql::tenant_conn::CURRENT_TENANT_GUC;
 
     #[tokio::test]
@@ -308,10 +309,15 @@ mod tests {
     }
 
     async fn assert_single_tenant(fixture: &PgFixture) {
-        let count: (i64,) = sqlx::query_as("SELECT count(*) FROM platform.tenants")
-            .fetch_one(fixture.platform_admin_pool())
-            .await
-            .expect("tenant count query succeeds");
+        // vala_sql's olap_minimal migration seeds the reserved system-owner
+        // sentinel tenant (nil UUID), so the fixture's own seeded tenant is the
+        // only non-system row.
+        let count: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM platform.tenants WHERE data_tenant_id <> $1")
+                .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
+                .fetch_one(fixture.platform_admin_pool())
+                .await
+                .expect("tenant count query succeeds");
 
         assert_eq!(count.0, 1);
     }

@@ -7,9 +7,21 @@ use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
 pub mod audit;
+pub mod builtin_roles;
 pub mod otel;
+pub mod permission;
+pub mod permission_check;
+pub mod principal;
 pub mod redaction;
+pub mod request_context;
 pub mod request_id;
+
+pub use permission::{Action, Permission, PermissionSet, Resource};
+pub use permission_check::{PermissionCheck, PermissionDenyReason, PermissionVerdict, RbacCheck};
+pub use principal::{
+    InvalidRoleName, Principal, PrincipalId, PrincipalKind, PrincipalRef, RoleRef,
+};
+pub use request_context::{DelegationStep, RequestContext, TraceParent};
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 

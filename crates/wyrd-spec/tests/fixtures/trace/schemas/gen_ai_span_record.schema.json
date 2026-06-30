@@ -1,0 +1,600 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GenAiSpanRecord",
+  "description": "OTel GenAI semantic-convention span projection.",
+  "type": "object",
+  "required": [
+    "data_tenant_id",
+    "duration_ms",
+    "end_time",
+    "operation_name",
+    "provider_name",
+    "request_model",
+    "resource",
+    "span_id",
+    "start_time",
+    "status",
+    "trace_id"
+  ],
+  "properties": {
+    "agent_description": {
+      "description": "`gen_ai.agent.description`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agent_id": {
+      "description": "`gen_ai.agent.id`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agent_name": {
+      "description": "`gen_ai.agent.name`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agent_version": {
+      "description": "`gen_ai.agent.version`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "conversation_id": {
+      "description": "`gen_ai.conversation.id` - stable conversation identifier across turns.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "data_source_id": {
+      "description": "`gen_ai.data_source.id`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "data_tenant_id": {
+      "description": "Tenant partition key.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "duration_ms": {
+      "description": "Query convenience field equal to `(end_time - start_time)` in milliseconds.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "embeddings_dimension_count": {
+      "description": "`gen_ai.embeddings.dimension.count`.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "end_time": {
+      "description": "Span end time. Same as `SpanRecord.end_time`.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "error_type": {
+      "description": "`error.type` - provider-side error classification. This is a general OTel semantic-convention key, without a `gen_ai.` prefix.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "eval_results": {
+      "description": "Extracted `gen_ai.evaluation.result` events on the source span.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/GenAiEvalResult"
+      }
+    },
+    "extra": {
+      "description": "Any `gen_ai.*` attribute on the source span that does not have a dedicated typed column above.",
+      "default": {},
+      "type": "object",
+      "additionalProperties": true
+    },
+    "input_messages": {
+      "description": "`gen_ai.input.messages` - full input message history. This field is opt-in and redactable at producer or ingest boundaries."
+    },
+    "openai_api_type": {
+      "description": "`gen_ai.openai.api.type`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "openai_service_tier": {
+      "description": "`gen_ai.openai.service_tier`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "operation_name": {
+      "description": "`gen_ai.operation.name` - operation such as `chat`, `generate_content`, `embeddings`, `execute_tool`, `invoke_agent`, or `retrieval`.",
+      "type": "string"
+    },
+    "output_messages": {
+      "description": "`gen_ai.output.messages` - generated output messages. This field is opt-in and redactable at producer or ingest boundaries."
+    },
+    "output_type": {
+      "description": "`gen_ai.output.type` - output modality such as `text`, `json`, `image`, or `speech`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parent_span_id": {
+      "description": "Parent span id. `None` for root spans.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SpanId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "prompt_name": {
+      "description": "`gen_ai.prompt.name`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provider_name": {
+      "description": "`gen_ai.provider.name` - provider identifier.\n\nRequired per current OTel GenAI semantic conventions; non-empty values are enforced by [`GenAiSpanRecord::validate`].",
+      "type": "string"
+    },
+    "request_choice_count": {
+      "description": "`gen_ai.request.choice.count`.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "request_encoding_formats": {
+      "description": "`gen_ai.request.encoding_formats` - embeddings-specific encoding formats.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "request_frequency_penalty": {
+      "description": "`gen_ai.request.frequency_penalty`.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "request_max_tokens": {
+      "description": "`gen_ai.request.max_tokens`.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "request_model": {
+      "description": "`gen_ai.request.model` - model the producer requested.",
+      "type": "string"
+    },
+    "request_presence_penalty": {
+      "description": "`gen_ai.request.presence_penalty`.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "request_seed": {
+      "description": "`gen_ai.request.seed`.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "request_stop_sequences": {
+      "description": "`gen_ai.request.stop_sequences`.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "request_stream": {
+      "description": "`gen_ai.request.stream`.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "request_temperature": {
+      "description": "`gen_ai.request.temperature`.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "request_top_k": {
+      "description": "`gen_ai.request.top_k`.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "request_top_p": {
+      "description": "`gen_ai.request.top_p`.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "resource": {
+      "description": "Resource of the producer. Same as `SpanRecord.resource`.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Resource"
+        }
+      ]
+    },
+    "response_finish_reasons": {
+      "description": "`gen_ai.response.finish_reasons` - per-choice finish reasons.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "response_id": {
+      "description": "`gen_ai.response.id` - provider-side response identifier.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "response_model": {
+      "description": "`gen_ai.response.model` - model the provider responded with.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "response_time_to_first_chunk_seconds": {
+      "description": "`gen_ai.response.time_to_first_chunk` - streaming time to first chunk, in seconds per OTel semantic conventions.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "retrieval_documents": {
+      "description": "`gen_ai.retrieval.documents` - retrieval set passed to the model."
+    },
+    "retrieval_query_text": {
+      "description": "`gen_ai.retrieval.query.text` - retrieval query string.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "server_address": {
+      "description": "`server.address` - provider endpoint host. This is a general OTel semantic-convention key, without a `gen_ai.` prefix.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "server_port": {
+      "description": "`server.port` - provider endpoint port. This is a general OTel semantic-convention key, without a `gen_ai.` prefix.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint16",
+      "minimum": 0.0
+    },
+    "span_id": {
+      "description": "8-byte span id. Same as `SpanRecord.span_id`.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SpanId"
+        }
+      ]
+    },
+    "start_time": {
+      "description": "Span start time. Same as `SpanRecord.start_time`.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "description": "Span status. Same as `SpanRecord.status`.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SpanStatus"
+        }
+      ]
+    },
+    "system_instructions": {
+      "description": "`gen_ai.system_instructions` - system-prompt content."
+    },
+    "tool_call_arguments": {
+      "description": "`gen_ai.tool.call.arguments` - tool-call argument payload."
+    },
+    "tool_call_id": {
+      "description": "`gen_ai.tool.call.id`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_call_result": {
+      "description": "`gen_ai.tool.call.result` - tool-call result payload."
+    },
+    "tool_definitions": {
+      "description": "`gen_ai.tool.definitions` - tool schemas supplied to the model."
+    },
+    "tool_description": {
+      "description": "`gen_ai.tool.description`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_name": {
+      "description": "`gen_ai.tool.name`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_type": {
+      "description": "`gen_ai.tool.type`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "trace_id": {
+      "description": "16-byte trace id. Same as `SpanRecord.trace_id`.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TraceId"
+        }
+      ]
+    },
+    "usage_cache_creation_input_tokens": {
+      "description": "`gen_ai.usage.cache_creation.input_tokens` - cache creation input tokens.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "usage_cache_read_input_tokens": {
+      "description": "`gen_ai.usage.cache_read.input_tokens` - cache hit input tokens.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "usage_input_tokens": {
+      "description": "`gen_ai.usage.input_tokens`.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "usage_output_tokens": {
+      "description": "`gen_ai.usage.output_tokens`.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "usage_reasoning_output_tokens": {
+      "description": "`gen_ai.usage.reasoning.output_tokens` - model-internal reasoning output tokens.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "workflow_name": {
+      "description": "`gen_ai.workflow.name`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "GenAiEvalResult": {
+      "description": "One evaluation result sourced from a `gen_ai.evaluation.result` event on the parent GenAI span.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "explanation": {
+          "description": "`gen_ai.evaluation.explanation` - optional human-readable explanation.\n\nThe explanation is length-bounded at 4096 characters.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "`gen_ai.evaluation.name` - required free-form identifier of the evaluation, such as `\"factuality\"`, `\"safety\"`, or `\"toxicity\"`.",
+          "type": "string"
+        },
+        "response_id": {
+          "description": "`gen_ai.response.id` - optional link to the model response that was evaluated.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "score_label": {
+          "description": "`gen_ai.evaluation.score.label` - optional categorical label, such as `\"pass\"`, `\"fail\"`, or `\"borderline\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "score_value": {
+          "description": "`gen_ai.evaluation.score.value` - optional finite numeric score.\n\nNaN and infinite values are rejected by [`GenAiEvalResult::validate`].",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Resource": {
+      "description": "OTel-canonical resource projection.\n\nFields:\n\n- `service_name` -- required OTel `service.name` semantic-convention attribute. Empty values are rejected; non-empty values are capped at 256 characters. - `service_namespace` -- optional OTel `service.namespace`. - `service_version` -- optional OTel `service.version`. - `service_instance_id` -- optional OTel `service.instance.id`. - `attributes` -- every other OTel resource attribute the producer emitted, such as `host.name`, `k8s.pod.uid`, `telemetry.sdk.name`, or `process.pid`.",
+      "type": "object",
+      "required": [
+        "service_name"
+      ],
+      "properties": {
+        "attributes": {
+          "description": "Remaining OTel resource attributes, such as `host.*`, `k8s.*`, and `cloud.*`.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": true
+        },
+        "service_instance_id": {
+          "description": "`service.instance.id`, when emitted by the producer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "service_name": {
+          "description": "`service.name`, required by OTel semantic conventions.",
+          "type": "string"
+        },
+        "service_namespace": {
+          "description": "`service.namespace`, when emitted by the producer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "service_version": {
+          "description": "`service.version`, when emitted by the producer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "SpanId": {
+      "type": "string",
+      "maxLength": 16,
+      "minLength": 16,
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "SpanStatus": {
+      "description": "OTel canonical span status. (Proto: `Span.Status`.)",
+      "oneOf": [
+        {
+          "description": "No status set; OTel default.",
+          "type": "object",
+          "required": [
+            "code"
+          ],
+          "properties": {
+            "code": {
+              "type": "string",
+              "enum": [
+                "unset"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Operation completed successfully.",
+          "type": "object",
+          "required": [
+            "code"
+          ],
+          "properties": {
+            "code": {
+              "type": "string",
+              "enum": [
+                "ok"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Operation failed with an optional human-readable description.",
+          "type": "object",
+          "required": [
+            "code"
+          ],
+          "properties": {
+            "code": {
+              "type": "string",
+              "enum": [
+                "error"
+              ]
+            },
+            "description": {
+              "description": "Optional status description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TraceId": {
+      "type": "string",
+      "maxLength": 32,
+      "minLength": 32,
+      "pattern": "^[0-9a-f]{32}$"
+    }
+  }
+}

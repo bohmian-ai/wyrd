@@ -322,20 +322,6 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Caller is authenticated but lacks permission.
-    #[error("[WYRD_SPEC_403_PERMISSION_DENIED] {message}")]
-    #[wyrd_error(
-        code = "WYRD_SPEC_403_PERMISSION_DENIED",
-        status = 403,
-        title = "Permission denied",
-        remediation = "Check the caller scopes, actor identity, and policy decision."
-    )]
-    PermissionDenied {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
     /// Unexpected internal failure.
     #[error("[WYRD_SPEC_500_INTERNAL] {message}")]
     #[wyrd_error(
@@ -373,6 +359,34 @@ pub enum WyrdError {
         remediation = "Retry with a longer timeout or reduce the request scope."
     )]
     Timeout {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Vala eval task graph failed DAG validation (cycle, self-loop, or missing dependency).
+    #[error("[WYRD_VALA_400_TASK_DAG_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_TASK_DAG_INVALID",
+        status = 400,
+        title = "Eval task DAG validation failed",
+        remediation = "Remove cycles, self-dependencies, or references to missing eval tasks."
+    )]
+    ValaTaskDagInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Vala eval contract referenced a CardRef kind outside its allowlist.
+    #[error("[WYRD_VALA_400_EVAL_REF_KIND_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_EVAL_REF_KIND_MISMATCH",
+        status = 400,
+        title = "Eval reference kind mismatch",
+        remediation = "Use the required CardRef kind for the eval field being validated."
+    )]
+    ValaEvalRefKindMismatch {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -420,21 +434,133 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Caller is authenticated but the resolved scopes do not cover the action.
-    #[error("[WYRD_AUTH_403_INSUFFICIENT_SCOPE] {message}")]
+    /// Authorization header shape is malformed.
+    #[error("[WYRD_AUTH_400_BAD_TOKEN_FORMAT] {message}")]
     #[wyrd_error(
-        code = "WYRD_AUTH_403_INSUFFICIENT_SCOPE",
-        status = 403,
-        title = "Insufficient scope",
-        remediation = "Request a role that grants the required scope for this action."
+        code = "WYRD_AUTH_400_BAD_TOKEN_FORMAT",
+        status = 400,
+        title = "Authorization header malformed",
+        remediation = "Use `Authorization: Bearer <token>` with a single Bearer credential."
     )]
-    InsufficientScope {
+    BadTokenFormat {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Credential (API key, governance token, or refresh token) has been revoked.
+    /// Auth token request used an unsupported grant type.
+    #[error("[WYRD_AUTH_400_UNSUPPORTED_GRANT_TYPE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_UNSUPPORTED_GRANT_TYPE",
+        status = 400,
+        title = "Unsupported grant_type",
+        remediation = "Use one of the supported grants listed in `details.supported_grant_types`."
+    )]
+    UnsupportedGrantType {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// OIDC callback state is missing, invalid, or replayed.
+    #[error("[WYRD_AUTH_400_INVALID_STATE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_INVALID_STATE",
+        status = 400,
+        title = "Invalid OIDC state",
+        remediation = "Restart the login flow. The callback state is single-use and must match the server-stored login state."
+    )]
+    InvalidState {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// OIDC ID token nonce did not match the stored login nonce.
+    #[error("[WYRD_AUTH_400_INVALID_NONCE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_INVALID_NONCE",
+        status = 400,
+        title = "Invalid OIDC nonce",
+        remediation = "Restart the login flow. The ID token nonce must match the server-stored login nonce."
+    )]
+    InvalidNonce {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Rotated or revoked refresh token was presented and the token family was revoked.
+    #[error("[WYRD_AUTH_401_REFRESH_REUSED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_REFRESH_REUSED",
+        status = 401,
+        title = "Refresh token reused",
+        remediation = "Re-authenticate. The refresh token family has been revoked because a rotated token was reused."
+    )]
+    RefreshReused {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Refresh token has been revoked or is no longer valid.
+    #[error("[WYRD_AUTH_401_REFRESH_REVOKED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_REFRESH_REVOKED",
+        status = 401,
+        title = "Refresh token revoked",
+        remediation = "Re-authenticate to obtain a new refresh token."
+    )]
+    RefreshRevoked {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Token exchange would produce a delegation chain deeper than supported.
+    #[error("[WYRD_AUTH_400_DELEGATION_DEPTH_EXCEEDED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_DELEGATION_DEPTH_EXCEEDED",
+        status = 400,
+        title = "Delegation chain exceeds maximum depth",
+        remediation = "Reduce the delegation chain; the caller's existing `act` chain plus the requested hop must be at most 5 layers."
+    )]
+    DelegationDepthExceededIssue {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// CardRef kind cannot back a non-human principal.
+    #[error("[WYRD_AUTH_400_PRINCIPAL_KIND_CARD_KIND_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_PRINCIPAL_KIND_CARD_KIND_MISMATCH",
+        status = 400,
+        title = "CardRef cannot be bound to a non-human principal",
+        remediation = "Only Service and Agent cards bind to non-human principals. Re-issue the request with a `card_ref` referencing a Service or Agent card."
+    )]
+    PrincipalKindCardKindMismatch {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Non-human principal CardRef version was not exact.
+    #[error("[WYRD_AUTH_400_INVALID_CARD_REF_VERSION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_INVALID_CARD_REF_VERSION",
+        status = 400,
+        title = "Non-human principal CardRef.version must be an exact Pin",
+        remediation = "Re-issue the request with `card_ref.version` set to an exact `Pin`, for example `1.2.3`; version requirements are rejected for card-bound principals."
+    )]
+    InvalidCardRefVersion {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Credential (API key or refresh token) has been revoked.
     #[error("[WYRD_AUTH_401_CREDENTIAL_REVOKED] {message}")]
     #[wyrd_error(
         code = "WYRD_AUTH_401_CREDENTIAL_REVOKED",
@@ -443,6 +569,384 @@ pub enum WyrdError {
         remediation = "The credential was explicitly revoked. Re-authenticate or request a new credential."
     )]
     CredentialRevoked {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// API key credential could not be accepted.
+    #[error("[WYRD_AUTH_401_API_KEY_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_API_KEY_INVALID",
+        status = 401,
+        title = "API key not found, revoked, or hash mismatch",
+        remediation = "Re-issue a key with `wyrd auth issue-key <card_ref>` and update the deployment secret."
+    )]
+    ApiKeyInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Card-bound token claim is absent or malformed.
+    #[error("[WYRD_AUTH_401_INVALID_CARD_REF] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_INVALID_CARD_REF",
+        status = 401,
+        title = "Non-User token card_ref claim absent or malformed",
+        remediation = "Re-issue the token via `POST /auth/token`; ensure the bound non-human principal has a valid structured card_ref."
+    )]
+    InvalidCardRef {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Presented token carries a delegation chain deeper than supported.
+    #[error("[WYRD_AUTH_401_DELEGATION_DEPTH_EXCEEDED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_DELEGATION_DEPTH_EXCEEDED",
+        status = 401,
+        title = "Delegation chain in token exceeds maximum depth",
+        remediation = "The presented JWT's `act` chain exceeds the verifier's maximum delegation depth. Re-issue from a shorter chain."
+    )]
+    DelegationDepthExceededVerify {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Requested delegated principal was not found in the tenant.
+    #[error("[WYRD_AUTH_404_PRINCIPAL_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_404_PRINCIPAL_NOT_FOUND",
+        status = 404,
+        title = "Requested principal not found in tenant",
+        remediation = "Verify the `requested_subject` is a Service or Agent principal in the current tenant. Delegation to User principals is not supported in this Wyrd version."
+    )]
+    PrincipalNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Auth verification backend is transiently unavailable.
+    #[error("[WYRD_AUTH_503_VERIFY_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_503_VERIFY_UNAVAILABLE",
+        status = 503,
+        title = "Auth verify backend unavailable",
+        remediation = "Retry with backoff. Do not re-authenticate; this is an infrastructure failure, not a credential failure."
+    )]
+    AuthVerifyUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// OIDC discovery document is unreachable or does not match the configured issuer.
+    #[error("[WYRD_AUTH_503_DISCOVERY_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_503_DISCOVERY_UNAVAILABLE",
+        status = 503,
+        title = "OIDC discovery unavailable",
+        remediation = "Retry with backoff. Do not re-authenticate; this is an infrastructure or issuer-discovery failure."
+    )]
+    DiscoveryUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Auth preview routes are disabled on this deploy.
+    #[error("[WYRD_AUTH_503_PREVIEW_DISABLED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_503_PREVIEW_DISABLED",
+        status = 503,
+        title = "Auth preview disabled",
+        remediation = "This Wyrd deploy disables preview auth routes until the Card-Registry principal projection ships. Do not retry."
+    )]
+    AuthPreviewDisabled {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Credential issuance audit insert failed.
+    #[error("[WYRD_AUDIT_503_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUDIT_503_UNAVAILABLE",
+        status = 503,
+        title = "Credential audit unavailable",
+        remediation = "Credential plaintext cannot be returned without a durable audit row. Inspect existing keys, revoke duplicates, and re-issue after audit is restored."
+    )]
+    AuditUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Authz check was called without a delegated token.
+    #[error("[WYRD_AUTHZ_403_REQUIRES_DELEGATED_TOKEN] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTHZ_403_REQUIRES_DELEGATED_TOKEN",
+        status = 403,
+        title = "authz check requires a delegated token",
+        remediation = "Call `/v1/authz/check` with a delegated Service or Agent token that includes a card_ref and non-empty act chain."
+    )]
+    AuthzRequiresDelegatedToken {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Required request field is missing.
+    #[error("[WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD",
+        status = 400,
+        title = "Required request field is missing",
+        remediation = "Include the named field in the request; see the route's OpenAPI schema for the full required set."
+    )]
+    MissingRequiredField {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Authz check policy evaluation denied the request.
+    #[error("[WYRD_AUTHZ_403_POLICY_DENIED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTHZ_403_POLICY_DENIED",
+        status = 403,
+        title = "Policy denied request",
+        remediation = "Inspect the policy denial reason and update the calling service, target service, or policy configuration before retrying."
+    )]
+    PolicyDenied {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Authentication is required before a permission check can run.
+    #[error("[WYRD_PERMISSION_401_UNAUTHENTICATED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PERMISSION_401_UNAUTHENTICATED",
+        status = 401,
+        title = "Authentication required",
+        remediation = "Send a valid `Authorization: Bearer <token>` header before invoking permission-protected routes."
+    )]
+    PermissionUnauthenticated {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Caller is authenticated but lacks the required RBAC permission.
+    #[error("[WYRD_PERMISSION_403_DENIED_RBAC] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PERMISSION_403_DENIED_RBAC",
+        status = 403,
+        title = "Permission denied (RBAC)",
+        remediation = "Request the required role from a workspace admin."
+    )]
+    PermissionDeniedRbac {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Durable role permissions JSONB no longer decodes.
+    #[error("[WYRD_PERMISSION_500_ROLE_CORRUPT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_PERMISSION_500_ROLE_CORRUPT",
+        status = 500,
+        title = "Role row's permissions JSONB is corrupt",
+        remediation = "Inspect the offending row in `wyrd.auth_roles`; restore or rewrite the permissions JSONB with a valid permission array. This is not retryable."
+    )]
+    RoleCorrupt {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Builtin role names are immutable.
+    #[error("[WYRD_RBAC_409_BUILTIN_ROLE_IMMUTABLE_NAME] {message}")]
+    #[wyrd_error(
+        code = "WYRD_RBAC_409_BUILTIN_ROLE_IMMUTABLE_NAME",
+        status = 409,
+        title = "Builtin role names are immutable",
+        remediation = "Builtin role names are durable identifiers used by JWT role resolution and re-seeding. Create a replacement role instead of renaming a builtin role."
+    )]
+    BuiltinRoleImmutableName {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Card spec failed type-driven deserialization.
+    #[error("[WYRD_REG_400_INVALID_CARD_SPEC] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_400_INVALID_CARD_SPEC",
+        status = 400,
+        title = "Card spec failed type-driven deserialization",
+        remediation = "Verify the kind/spec field combination matches the documented Wyrd v1 schema for that kind."
+    )]
+    RegistryInvalidCardSpec {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Service and Agent cards require a Pin version, not a Requirement.
+    #[error("[WYRD_REG_400_INVALID_VERSION_BLOCK] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_400_INVALID_VERSION_BLOCK",
+        status = 400,
+        title = "Service and Agent cards require a Pin version, not a Requirement",
+        remediation = "Set `metadata.version` to an exact semver (e.g. `\"1.0.0\"`), not a range expression (e.g. `\"^1\"`)."
+    )]
+    RegistryInvalidVersionBlock {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Card spec exceeds MAX_SPEC_BYTES (256 KiB).
+    #[error("[WYRD_REG_400_SPEC_TOO_LARGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_400_SPEC_TOO_LARGE",
+        status = 400,
+        title = "Card spec exceeds MAX_SPEC_BYTES (256 KiB)",
+        remediation = "Reduce the spec size or split into multiple cards. If artifacts are inlined, move them to an Artifact card with object_store backing."
+    )]
+    RegistrySpecTooLarge {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// `metadata.version` is required.
+    #[error("[WYRD_REG_400_VERSION_REQUIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_400_VERSION_REQUIRED",
+        status = 400,
+        title = "`metadata.version` is required",
+        remediation = "Add `metadata.version` to the card envelope. v1 does not auto-assign a next-patch version."
+    )]
+    RegistryVersionRequired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// List `limit` is zero or exceeds the per-tenant cap.
+    #[error("[WYRD_REG_400_LIST_LIMIT_OUT_OF_RANGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_400_LIST_LIMIT_OUT_OF_RANGE",
+        status = 400,
+        title = "List `limit` is zero or exceeds the per-tenant cap",
+        remediation = "Pass a `limit` in `1..=LIST_LIMIT_MAX` (currently 200)."
+    )]
+    RegistryListLimitOutOfRange {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// `card_ref.uid` was populated for a registry lookup that resolves by (space, name, version).
+    #[error("[WYRD_REG_400_CARD_REF_UID_NOT_RESOLVABLE_HERE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_400_CARD_REF_UID_NOT_RESOLVABLE_HERE",
+        status = 400,
+        title = "`card_ref.uid` was populated for a registry lookup that resolves by (space, name, version)",
+        remediation = "Submit the request with `card_ref.uid = None`; the registry resolves by identity tuple. Use `get_card_by_uid` if you have a `card_uid`."
+    )]
+    RegistryCardRefUidNotResolvableHere {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// `card_ref.version` is a Requirement; this endpoint accepts a Pin.
+    #[error("[WYRD_REG_400_REQUIREMENT_NOT_RESOLVABLE_HERE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_400_REQUIREMENT_NOT_RESOLVABLE_HERE",
+        status = 400,
+        title = "`card_ref.version` is a Requirement; this endpoint accepts a Pin",
+        remediation = "Resolve the Requirement to a Pin via the future `resolve_card_ref` endpoint, or pass a Pin directly."
+    )]
+    RegistryRequirementNotResolvableHere {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// No card matches the supplied identity.
+    #[error("[WYRD_REG_404_CARD_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_404_CARD_NOT_FOUND",
+        status = 404,
+        title = "No card matches the supplied identity",
+        remediation = "Check (space, kind, name, version) or the `card_uid` is correct and the card is registered in the current tenant."
+    )]
+    RegistryCardNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Defense-in-depth: an existing card with the same identity has a different uid.
+    #[error("[WYRD_REG_500_VERSION_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_500_VERSION_CONFLICT",
+        status = 500,
+        title = "Card uid mismatch for same identity",
+        remediation = "Internal invariant violation; report with the request id and audit_id."
+    )]
+    RegistryVersionConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Re-apply with the same identity but a different spec_hash; same-version cards are immutable.
+    #[error("[WYRD_REG_409_SPEC_DRIFT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_409_SPEC_DRIFT",
+        status = 409,
+        title = "Re-apply with the same identity but a different spec_hash; same-version cards are immutable",
+        remediation = "Bump `metadata.version` to publish a new spec, or revert your spec to match the registered version."
+    )]
+    RegistrySpecDrift {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Transient Postgres or RLS misconfiguration; retry with backoff.
+    #[error("[WYRD_REG_503_REGISTRY_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REG_503_REGISTRY_UNAVAILABLE",
+        status = 503,
+        title = "Transient Postgres or RLS misconfiguration; retry with backoff",
+        remediation = "Retry with exponential backoff (60s cap). If persistent, check Postgres connectivity, the tenant row, and the RLS role bindings."
+    )]
+    RegistryUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The backing Service or Agent card has been soft-deleted.
+    #[error("[WYRD_AUTH_403_PRINCIPAL_ORPHANED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_403_PRINCIPAL_ORPHANED",
+        status = 403,
+        title = "The backing Service or Agent card has been soft-deleted",
+        remediation = "Re-register the card or use a different principal to obtain a token."
+    )]
+    PrincipalOrphaned {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -541,6 +1045,48 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// DriftCard validation failed.
+    #[error("[WYRD_DRIFT_400_VALIDATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_DRIFT_400_VALIDATION",
+        status = 400,
+        title = "DriftCard validation failed",
+        remediation = "Fix the DriftCard envelope, profile, condition, or signal fields."
+    )]
+    DriftValidation {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A DriftCard signal variant is not compatible with the requested method.
+    #[error("[WYRD_DRIFT_400_SIGNAL_METHOD_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_DRIFT_400_SIGNAL_METHOD_MISMATCH",
+        status = 400,
+        title = "DriftCard signal/method mismatch",
+        remediation = "Use a signal variant supported by the chosen DriftMethod (see DriftSpec docs)."
+    )]
+    DriftSignalMethodMismatch {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A DriftCard method that requires a profile was registered without one.
+    #[error("[WYRD_DRIFT_400_PROFILE_REQUIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_DRIFT_400_PROFILE_REQUIRED",
+        status = 400,
+        title = "DriftCard profile required",
+        remediation = "Attach the method-matching DriftProfile (PsiProfile, SpcProfile, or CustomProfile)."
+    )]
+    DriftProfileRequired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Python model input could not be classified as a supported ModelCard interface.
     #[error("[WYRD_MODEL_400_UNKNOWN_MODEL_TYPE] {message}")]
     #[wyrd_error(
@@ -564,6 +1110,20 @@ pub enum WyrdError {
         remediation = "Fix Source card connection coordinates or auth env-var names and retry."
     )]
     SourceValidation {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Card code-origin provenance failed validation.
+    #[error("[WYRD_ORIGIN_400_VALIDATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_ORIGIN_400_VALIDATION",
+        status = 400,
+        title = "Card origin validation failed",
+        remediation = "Provide a non-empty repo and a 7-40 character lowercase hex commit; omit empty path values."
+    )]
+    OriginValidation {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -1353,6 +1913,104 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Server is not ready to serve requests.
+    #[error("[WYRD_SERVER_503_NOT_READY] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SERVER_503_NOT_READY",
+        status = 503,
+        title = "Server not ready",
+        remediation = "Wait for readiness probes to recover; check the `details.checks` object for the failing component and reason code."
+    )]
+    ServerNotReady {
+        /// Human-readable error message.
+        message: String,
+        /// Structured probe detail payload.
+        details: serde_json::Value,
+    },
+    /// Server is shedding load to protect in-flight requests.
+    #[error("[WYRD_SERVER_503_SERVICE_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SERVER_503_SERVICE_UNAVAILABLE",
+        status = 503,
+        title = "Service unavailable",
+        remediation = "Retry with exponential backoff; the server is shedding load to protect inflight requests."
+    )]
+    ServiceUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Server's per-request timeout was exceeded.
+    #[error("[WYRD_SERVER_504_REQUEST_TIMEOUT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SERVER_504_REQUEST_TIMEOUT",
+        status = 504,
+        title = "Request timeout",
+        remediation = "Reduce the request size or split the operation; the server's per-request timeout was exceeded."
+    )]
+    RequestTimeout {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Request body exceeds the configured size limit.
+    #[error("[WYRD_SPEC_413_PAYLOAD_TOO_LARGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_413_PAYLOAD_TOO_LARGE",
+        status = 413,
+        title = "Payload too large",
+        remediation = "Reduce the request body size and retry."
+    )]
+    PayloadTooLarge {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Test harness failed to start.
+    #[error("[WYRD_TESTING_500_HARNESS_START] {message}")]
+    #[wyrd_error(
+        code = "WYRD_TESTING_500_HARNESS_START",
+        status = 500,
+        title = "Test harness failed to start",
+        remediation = "Check the test fixture logs"
+    )]
+    HarnessStart {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Test harness failed to bind listener.
+    #[error("[WYRD_TESTING_500_HARNESS_BOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_TESTING_500_HARNESS_BOUND",
+        status = 500,
+        title = "Test harness failed to bind listener",
+        remediation = "Check the port availability"
+    )]
+    HarnessBound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Test harness failed to bootstrap default principal.
+    #[error("[WYRD_TESTING_500_HARNESS_BOOTSTRAP] {message}")]
+    #[wyrd_error(
+        code = "WYRD_TESTING_500_HARNESS_BOOTSTRAP",
+        status = 500,
+        title = "Test harness failed to bootstrap default principal",
+        remediation = "Check the role configuration"
+    )]
+    HarnessBootstrap {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
 }
 
 impl WyrdError {
@@ -1376,22 +2034,50 @@ impl WyrdError {
             Self::Validation { message, details }
             | Self::NotFound { message, details }
             | Self::Conflict { message, details }
-            | Self::PermissionDenied { message, details }
             | Self::Internal { message, details }
             | Self::UpstreamFailure { message, details }
             | Self::Timeout { message, details }
+            | Self::ValaTaskDagInvalid { message, details }
+            | Self::ValaEvalRefKindMismatch { message, details }
             | Self::Unauthenticated { message, details }
             | Self::TokenExpired { message, details }
             | Self::InvalidToken { message, details }
-            | Self::InsufficientScope { message, details }
+            | Self::BadTokenFormat { message, details }
+            | Self::UnsupportedGrantType { message, details }
+            | Self::InvalidState { message, details }
+            | Self::InvalidNonce { message, details }
+            | Self::RefreshReused { message, details }
+            | Self::RefreshRevoked { message, details }
+            | Self::DelegationDepthExceededIssue { message, details }
+            | Self::PrincipalKindCardKindMismatch { message, details }
+            | Self::InvalidCardRefVersion { message, details }
             | Self::CredentialRevoked { message, details }
+            | Self::ApiKeyInvalid { message, details }
+            | Self::InvalidCardRef { message, details }
+            | Self::DelegationDepthExceededVerify { message, details }
+            | Self::PrincipalNotFound { message, details }
+            | Self::AuthVerifyUnavailable { message, details }
+            | Self::DiscoveryUnavailable { message, details }
+            | Self::AuthPreviewDisabled { message, details }
+            | Self::AuditUnavailable { message, details }
+            | Self::AuthzRequiresDelegatedToken { message, details }
+            | Self::MissingRequiredField { message, details }
+            | Self::PolicyDenied { message, details }
+            | Self::PermissionUnauthenticated { message, details }
+            | Self::PermissionDeniedRbac { message, details }
+            | Self::RoleCorrupt { message, details }
+            | Self::BuiltinRoleImmutableName { message, details }
             | Self::SourceValidation { message, details }
+            | Self::OriginValidation { message, details }
             | Self::DataValidation { message, details }
             | Self::DataUnknownDataType { message, details }
             | Self::DataInvalidSplitRule { message, details }
             | Self::DataTargetColumnUnknown { message, details }
             | Self::DataInvalidInterfaceOption { message, details }
             | Self::DataInterfaceMetadataRequired { message, details }
+            | Self::DriftValidation { message, details }
+            | Self::DriftSignalMethodMismatch { message, details }
+            | Self::DriftProfileRequired { message, details }
             | Self::ModelUnknownModelType { message, details }
             | Self::ModelValidation { message, details }
             | Self::ModelMissingSignature { message, details }
@@ -1448,7 +2134,26 @@ impl WyrdError {
             | Self::WorkflowMissingVersion { message, details }
             | Self::WorkflowDuplicateStepId { message, details }
             | Self::WorkflowMissingDependency { message, details }
-            | Self::WorkflowCycle { message, details } => {
+            | Self::WorkflowCycle { message, details }
+            | Self::RegistryInvalidCardSpec { message, details }
+            | Self::RegistryInvalidVersionBlock { message, details }
+            | Self::RegistrySpecTooLarge { message, details }
+            | Self::RegistryVersionRequired { message, details }
+            | Self::RegistryListLimitOutOfRange { message, details }
+            | Self::RegistryCardRefUidNotResolvableHere { message, details }
+            | Self::RegistryRequirementNotResolvableHere { message, details }
+            | Self::RegistryCardNotFound { message, details }
+            | Self::RegistryVersionConflict { message, details }
+            | Self::RegistrySpecDrift { message, details }
+            | Self::RegistryUnavailable { message, details }
+            | Self::PrincipalOrphaned { message, details }
+            | Self::ServerNotReady { message, details }
+            | Self::ServiceUnavailable { message, details }
+            | Self::RequestTimeout { message, details }
+            | Self::PayloadTooLarge { message, details }
+            | Self::HarnessStart { message, details }
+            | Self::HarnessBound { message, details }
+            | Self::HarnessBootstrap { message, details } => {
                 (Cow::Borrowed(message.as_str()), details.clone())
             }
             Self::Storage { error } => (
@@ -1464,6 +2169,144 @@ impl WyrdError {
         Self::Internal {
             message,
             details: serde_json::json!({ "skald_code": code }),
+        }
+    }
+
+    /// Construct [`WyrdError::Internal`].
+    #[must_use]
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal {
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryInvalidCardSpec`].
+    #[must_use]
+    pub fn registry_invalid_card_spec(message: impl Into<String>) -> Self {
+        Self::RegistryInvalidCardSpec {
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryInvalidVersionBlock`].
+    #[must_use]
+    pub fn registry_invalid_version_block(message: impl Into<String>) -> Self {
+        Self::RegistryInvalidVersionBlock {
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistrySpecTooLarge`].
+    #[must_use]
+    pub fn registry_spec_too_large(actual: usize, limit: usize) -> Self {
+        Self::RegistrySpecTooLarge {
+            message: format!("spec is {actual} bytes, exceeds {limit} byte limit"),
+            details: serde_json::json!({ "actual": actual, "limit": limit }),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryVersionRequired`].
+    #[must_use]
+    pub fn registry_version_required(message: impl Into<String>) -> Self {
+        Self::RegistryVersionRequired {
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryCardNotFound`].
+    #[must_use]
+    pub fn registry_card_not_found(message: impl Into<String>) -> Self {
+        Self::RegistryCardNotFound {
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistrySpecDrift`].
+    #[must_use]
+    pub fn registry_spec_drift(
+        card_uid: impl Into<String>,
+        stored_hash: impl Into<String>,
+        submitted_hash: impl Into<String>,
+    ) -> Self {
+        let stored = stored_hash.into();
+        let submitted = submitted_hash.into();
+        let uid = card_uid.into();
+        Self::RegistrySpecDrift {
+            message: format!(
+                "spec hash mismatch for card {uid}: stored {stored}, submitted {submitted}"
+            ),
+            details: serde_json::json!({
+                "stored_hash": stored,
+                "submitted_hash": submitted,
+            }),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryUnavailable`].
+    #[must_use]
+    pub fn registry_unavailable(message: impl Into<String>) -> Self {
+        Self::RegistryUnavailable {
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryListLimitOutOfRange`].
+    #[must_use]
+    pub fn registry_list_limit_out_of_range(limit: u32, max: u32) -> Self {
+        Self::RegistryListLimitOutOfRange {
+            message: format!("limit {limit} is out of range 1..={max}"),
+            details: serde_json::json!({ "limit": limit, "max": max }),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryCardRefUidNotResolvableHere`].
+    #[must_use]
+    pub fn registry_card_ref_uid_not_resolvable_here(message: impl Into<String>) -> Self {
+        Self::RegistryCardRefUidNotResolvableHere {
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Construct [`WyrdError::RegistryRequirementNotResolvableHere`].
+    #[must_use]
+    pub fn registry_requirement_not_resolvable_here(message: impl Into<String>) -> Self {
+        Self::RegistryRequirementNotResolvableHere {
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Convert an [`crate::ids::IdError`] to a [`WyrdError`] (registry context).
+    #[must_use]
+    pub fn from_card_uid_error(e: crate::ids::IdError) -> Self {
+        Self::Internal {
+            message: format!("card_uid construction failed: {e}"),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Convert a [`crate::envelope::SpecCanonicalizationError`] to [`WyrdError`].
+    #[must_use]
+    pub fn from_spec_canonicalization(e: crate::envelope::SpecCanonicalizationError) -> Self {
+        Self::RegistryInvalidCardSpec {
+            message: format!("spec canonicalization failed: {e}"),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// Convert a spec serialization [`serde_json::Error`] to [`WyrdError`].
+    #[must_use]
+    pub fn from_spec_serialization(e: serde_json::Error) -> Self {
+        Self::Internal {
+            message: format!("spec serialization failed: {e}"),
+            details: serde_json::json!({}),
         }
     }
 }
@@ -1621,13 +2464,68 @@ mod tests {
 
     #[test]
     fn auth_variants_serde_tag() {
-        let error = WyrdError::InsufficientScope {
-            message: "card:write is required".to_owned(),
-            details: serde_json::json!({ "required": "card:write" }),
+        let error = WyrdError::PermissionDeniedRbac {
+            message: "card write is required".to_owned(),
+            details: serde_json::json!({ "required": { "resource": "cards", "action": "write" } }),
         };
         let value = serde_json::to_value(error).expect("auth error serializes");
 
-        assert_eq!(value["kind"], "insufficient_scope");
+        assert_eq!(value["kind"], "permission_denied_rbac");
+    }
+
+    #[test]
+    fn permission_rbac_problem_json_carries_required() {
+        let error = WyrdError::PermissionDeniedRbac {
+            message: "principal lacks cards/write".to_owned(),
+            details: serde_json::json!({
+                "required": { "resource": "cards", "action": "write" },
+                "principal": "018f5f1f-0000-7000-8000-000000000001",
+            }),
+        };
+        let problem = error.as_problem_json();
+
+        assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(problem["status"], 403);
+        assert_eq!(problem["title"], "Permission denied (RBAC)");
+        assert_eq!(problem["details"]["required"]["resource"], "cards");
+        assert_eq!(problem["details"]["required"]["action"], "write");
+    }
+
+    #[test]
+    fn api_key_invalid_remediation_names_issue_key() {
+        let error = WyrdError::ApiKeyInvalid {
+            message: "api key rejected".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let problem = error.as_problem_json();
+
+        assert_eq!(problem["code"], "WYRD_AUTH_401_API_KEY_INVALID");
+        assert!(
+            problem["remediation"]
+                .as_str()
+                .expect("remediation is string")
+                .contains("wyrd auth issue-key")
+        );
+    }
+
+    #[test]
+    fn invalid_card_ref_version_is_distinct_from_verifier_code() {
+        let issuer_error = WyrdError::InvalidCardRefVersion {
+            message: "card_ref.version was a requirement".to_owned(),
+            details: serde_json::json!({ "got": "^1" }),
+        };
+        let verifier_error = WyrdError::InvalidCardRef {
+            message: "card_ref claim missing".to_owned(),
+            details: serde_json::json!({}),
+        };
+
+        assert_eq!(
+            issuer_error.code(),
+            "WYRD_AUTH_400_INVALID_CARD_REF_VERSION"
+        );
+        assert_eq!(issuer_error.status(), 400);
+        assert_eq!(verifier_error.code(), "WYRD_AUTH_401_INVALID_CARD_REF");
+        assert_eq!(verifier_error.status(), 401);
     }
 
     #[test]
@@ -1720,8 +2618,8 @@ mod tests {
         assert_eq!(value["kind"], "credential_revoked");
     }
 
-    fn auth_errors() -> [WyrdError; 5] {
-        [
+    fn auth_errors() -> Vec<WyrdError> {
+        vec![
             WyrdError::Unauthenticated {
                 message: "missing bearer token".to_owned(),
                 details: serde_json::json!({}),
@@ -1734,12 +2632,100 @@ mod tests {
                 message: "token rejected".to_owned(),
                 details: serde_json::json!({}),
             },
-            WyrdError::InsufficientScope {
-                message: "scope missing".to_owned(),
+            WyrdError::BadTokenFormat {
+                message: "authorization header malformed".to_owned(),
                 details: serde_json::json!({}),
+            },
+            WyrdError::UnsupportedGrantType {
+                message: "unsupported grant_type".to_owned(),
+                details: serde_json::json!({ "supported_grant_types": ["wyrd_api_key"] }),
+            },
+            WyrdError::InvalidState {
+                message: "state was missing or replayed".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::InvalidNonce {
+                message: "id token nonce mismatch".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RefreshReused {
+                message: "rotated refresh token reused".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RefreshRevoked {
+                message: "refresh token revoked".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::DelegationDepthExceededIssue {
+                message: "delegation chain would exceed depth 5".to_owned(),
+                details: serde_json::json!({ "max": 5 }),
+            },
+            WyrdError::PrincipalKindCardKindMismatch {
+                message: "model cards cannot back service accounts".to_owned(),
+                details: serde_json::json!({ "card_kind": "model" }),
+            },
+            WyrdError::InvalidCardRefVersion {
+                message: "card_ref.version must be pinned".to_owned(),
+                details: serde_json::json!({ "got": "^1" }),
+            },
+            WyrdError::ApiKeyInvalid {
+                message: "api key rejected".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::InvalidCardRef {
+                message: "card_ref missing".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::DelegationDepthExceededVerify {
+                message: "delegation chain exceeds depth 5".to_owned(),
+                details: serde_json::json!({ "depth": 6, "max": 5 }),
+            },
+            WyrdError::PrincipalNotFound {
+                message: "requested subject not found".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::AuthVerifyUnavailable {
+                message: "permission resolver unavailable".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::DiscoveryUnavailable {
+                message: "oidc discovery unavailable".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::AuthPreviewDisabled {
+                message: "auth preview disabled".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::AuditUnavailable {
+                message: "credential audit unavailable".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::AuthzRequiresDelegatedToken {
+                message: "delegated token required".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::PermissionUnauthenticated {
+                message: "permission check requires authentication".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::PermissionDeniedRbac {
+                message: "permission missing".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RoleCorrupt {
+                message: "role permissions failed to decode".to_owned(),
+                details: serde_json::json!({ "role": "bad_role" }),
+            },
+            WyrdError::BuiltinRoleImmutableName {
+                message: "builtin role name cannot change".to_owned(),
+                details: serde_json::json!({ "constraint": "auth_builtin_role_immutable_name" }),
             },
             WyrdError::CredentialRevoked {
                 message: "credential revoked".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::PrincipalOrphaned {
+                message: "backing card deleted".to_owned(),
                 details: serde_json::json!({}),
             },
         ]

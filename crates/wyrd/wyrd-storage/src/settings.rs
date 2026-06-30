@@ -30,6 +30,8 @@ pub struct StorageSettings {
     pub presign_ttl: Duration,
     /// Default multipart part size.
     pub part_size_bytes: u64,
+    /// Object size at or above which cloud backends switch to multipart upload.
+    pub multipart_threshold_bytes: u64,
     /// Public server base URL used by local-mode routes.
     pub public_base_url: Option<String>,
 }
@@ -81,6 +83,8 @@ pub struct S3Config {
 pub struct GcsConfig {
     /// Bucket name without a `gs://` prefix.
     pub bucket: String,
+    /// Optional endpoint URL for GCS-compatible backends or emulators.
+    pub endpoint_url: Option<String>,
 }
 
 /// Azure storage settings.
@@ -90,6 +94,8 @@ pub struct AzureConfig {
     pub account: String,
     /// Blob container name.
     pub container: String,
+    /// Optional endpoint URL for Azure-compatible backends or emulators.
+    pub endpoint_url: Option<String>,
 }
 
 /// Parse process environment into typed storage settings.
@@ -112,10 +118,12 @@ pub fn from_env() -> Result<StorageSettings, StorageError> {
         }),
         "gcs" => BackendConfig::Gcs(GcsConfig {
             bucket: env_required("WYRD_STORAGE_GCS_BUCKET")?,
+            endpoint_url: env_optional("WYRD_STORAGE_GCS_ENDPOINT_URL")?,
         }),
         "azure" => BackendConfig::Azure(AzureConfig {
             account: env_required("WYRD_STORAGE_AZURE_ACCOUNT")?,
             container: env_required("WYRD_STORAGE_AZURE_CONTAINER")?,
+            endpoint_url: env_optional("WYRD_STORAGE_AZURE_ENDPOINT_URL")?,
         }),
         other => {
             return config_err(
@@ -147,6 +155,12 @@ pub fn from_env() -> Result<StorageSettings, StorageError> {
             ConfigParseError::PartSizeNotMiBAligned(part_size_bytes),
         );
     }
+    let multipart_threshold_bytes = parse_u64_clamped(
+        "WYRD_STORAGE_MULTIPART_THRESHOLD_BYTES",
+        crate::plan::MULTIPART_THRESHOLD_BYTES,
+        crate::plan::MIN_PART_SIZE_BYTES,
+        crate::plan::MAX_OBJECT_SIZE_BYTES,
+    )?;
 
     let public_base_url = env_optional("WYRD_PUBLIC_BASE_URL")?;
     if matches!(backend, BackendConfig::Local { .. }) && public_base_url.is_none() {
@@ -161,6 +175,7 @@ pub fn from_env() -> Result<StorageSettings, StorageError> {
         require_encryption,
         presign_ttl: Duration::from_secs(u64::from(presign_ttl_secs)),
         part_size_bytes,
+        multipart_threshold_bytes,
         public_base_url,
     })
 }

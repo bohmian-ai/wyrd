@@ -1,7 +1,7 @@
 //! AWS S3 backend signer shell.
 
 use crate::error::{S3Error, StorageError};
-use crate::signer::{HeadInfo, MultipartInit, UploadPlanReplayInput, check_sha, ttl_secs};
+use crate::signer::{HeadInfo, MultipartInit, UploadPlanReplayInput, ttl_secs};
 use crate::tenant_path::ValidatedPath;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
@@ -91,8 +91,6 @@ impl S3Signer {
             .create_multipart_upload()
             .bucket(&self.bucket)
             .key(path.full.as_str())
-            .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
-            .checksum_type(aws_sdk_s3::types::ChecksumType::FullObject)
             .send()
             .await
             .map_err(|err| s3_sdk("init_multipart", err))?;
@@ -144,8 +142,12 @@ impl S3Signer {
 
     /// Complete an S3 multipart upload.
     ///
-    /// Passes `expected_sha256` as `x-amz-checksum-sha256` so S3 verifies the
-    /// full-object checksum server-side and rejects the complete on mismatch.
+    /// The storage layer does not enforce checksum policy. `expected_sha256` is
+    /// retained on the call signature so the rest of the system continues to
+    /// thread it through (request → DB), but it is not pushed into the S3 API:
+    /// the upload was initiated without a server-side checksum algorithm, so the
+    /// matching `x-amz-checksum-sha256` on complete would be rejected. Any
+    /// integrity verification a caller wants belongs above the storage layer.
     ///
     /// # Errors
     /// Returns a typed backend error when completion fails or a part number is
@@ -155,7 +157,7 @@ impl S3Signer {
         path: &ValidatedPath,
         backend_upload_id: &str,
         parts: &[S3CompletedPart],
-        expected_sha256: &str,
+        _expected_sha256: &str,
     ) -> Result<(), StorageError> {
         let completed_parts = parts
             .iter()
@@ -182,7 +184,6 @@ impl S3Signer {
             .key(path.full.as_str())
             .upload_id(backend_upload_id)
             .multipart_upload(completed)
-            .checksum_sha256(expected_sha256)
             .send()
             .await
             .map_err(|err| s3_sdk("complete_multipart", err))?;
@@ -253,44 +254,10 @@ impl S3Signer {
         };
         Ok(HeadInfo {
             size_bytes,
-            sha256_b64: output.checksum_sha256().map(ToOwned::to_owned),
             content_type: output.content_type().map(ToOwned::to_owned),
             sse_marker: output
                 .server_side_encryption()
                 .map(|value| value.as_str().to_owned()),
-        })
-    }
-
-    /// Verify SHA-256 using the full-object checksum stored by S3.
-    ///
-    /// The streaming fallback is intentionally unreachable after enabling
-    /// `ChecksumType::FullObject` in `init_multipart`. If `sha256_b64` is
-    /// absent it means the object was not uploaded with full-object checksum
-    /// tracking; treat that as an invariant violation rather than silently
-    /// reading bytes back from S3.
-    ///
-    /// # Errors
-    /// Returns SHA mismatch or a backend invariant error when the checksum is
-    /// absent from the HEAD response.
-    pub fn verify_sha256(
-        &self,
-        path: &ValidatedPath,
-        expected: &str,
-        head_hint: &HeadInfo,
-    ) -> Result<(), StorageError> {
-        if let Some(actual) = &head_hint.sha256_b64 {
-            return check_sha(expected, actual.clone());
-        }
-        tracing::error!(
-            path = %path.full,
-            "S3 full-object SHA-256 checksum missing from HEAD; upload may have bypassed checksum tracking"
-        );
-        Err(StorageError::Backend {
-            backend: StorageBackendKind::S3,
-            op: "verify_sha256",
-            message:
-                "S3 full-object SHA-256 checksum absent; cannot verify without reading object bytes"
-                    .to_owned(),
         })
     }
 

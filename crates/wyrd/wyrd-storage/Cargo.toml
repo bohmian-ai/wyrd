@@ -13,11 +13,15 @@ path = "src/lib.rs"
 
 [features]
 emulator = []
+iceberg = ["dep:iceberg-storage-opendal", "dep:iceberg"]
 
 [dependencies]
+iceberg              = { workspace = true, optional = true }
+iceberg-storage-opendal = { workspace = true, optional = true }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1" }
 wyrd-spec = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
+tokio-util = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -32,7 +36,7 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 regex = { workspace = true }
 secrecy = { workspace = true }
-object_store = { workspace = true }
+opendal = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 aws-config = { workspace = true }
 aws-types = { workspace = true }
@@ -47,6 +51,7 @@ azure_storage_blobs = { workspace = true }
 tempfile = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
+wyrd-testing = { path = "../wyrd-testing", version = "0.0.1" }
 
 [[test]]
 name = "integration_gcs"
@@ -54,6 +59,10 @@ required-features = ["emulator"]
 
 [[test]]
 name = "integration_azurite"
+required-features = ["emulator"]
+
+[[test]]
+name = "handle_crud"
 required-features = ["emulator"]
 
 [lints]

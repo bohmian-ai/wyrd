@@ -2,8 +2,8 @@
 //!
 //! Skipped automatically when env vars are unset so the default test suite
 //! remains credential-free. Run with:
-//!   WYRD_DATABASE_URL_MIGRATOR=postgres://wyrd_migrator:<pw>@localhost/wyrd \
 //!   WYRD_DATABASE_URL=postgres://wyrd_app:<pw>@localhost/wyrd \
+//!   WYRD_DATABASE_MIGRATOR_PASSWORD=<migrator_pw> \
 //!   cargo test -p wyrd-sql --all-features --test migration_pg
 
 use sqlx::PgPool;
@@ -97,30 +97,30 @@ async fn duplicate_refresh_token_hash_rejected_within_tenant_only() {
     let tenant_a = DataTenantId::new_v7();
     let tenant_b = DataTenantId::new_v7();
     let suffix = tenant_a.to_string();
-    let user_a = format!("test-user-a-{suffix}");
-    let user_b = format!("test-user-b-{suffix}");
-    let token_a = format!("test-token-a-{suffix}");
-    let token_b = format!("test-token-b-{suffix}");
-    let token_c = format!("test-token-c-{suffix}");
+    let user_a = Uuid::now_v7();
+    let user_b = Uuid::now_v7();
+    let token_a = Uuid::now_v7();
+    let token_b = Uuid::now_v7();
+    let token_c = Uuid::now_v7();
     let token_hash = format!("hash-collision-{suffix}");
 
     insert_tenant(pool, tenant_a, &format!("test-a-{suffix}")).await;
     insert_tenant(pool, tenant_b, &format!("test-b-{suffix}")).await;
-    insert_auth_user(pool, tenant_a, &user_a, "a").await;
-    insert_auth_user(pool, tenant_b, &user_b, "b").await;
+    insert_auth_user(pool, tenant_a, user_a, "a").await;
+    insert_auth_user(pool, tenant_b, user_b, "b").await;
 
-    insert_refresh_token(pool, tenant_a, &token_a, &user_a, &token_hash)
+    insert_refresh_token(pool, tenant_a, token_a, user_a, &token_hash)
         .await
         .expect("first same-tenant token inserts");
 
     let duplicate_same_tenant =
-        insert_refresh_token(pool, tenant_a, &token_b, &user_a, &token_hash).await;
+        insert_refresh_token(pool, tenant_a, token_b, user_a, &token_hash).await;
     assert!(
         duplicate_same_tenant.is_err(),
         "duplicate token_hash in the same tenant must be rejected"
     );
 
-    insert_refresh_token(pool, tenant_b, &token_c, &user_b, &token_hash)
+    insert_refresh_token(pool, tenant_b, token_c, user_b, &token_hash)
         .await
         .expect("same token_hash under a different tenant inserts");
 
@@ -223,11 +223,11 @@ async fn cross_tenant_rls_filters_row_by_tenant() {
     let tenant_a = DataTenantId::new_v7();
     let tenant_b = DataTenantId::new_v7();
     let suffix = tenant_a.as_uuid().to_string();
-    let user_id = format!("rls-user-{suffix}");
+    let user_id = Uuid::now_v7();
 
     insert_tenant(store.pool(), tenant_a, &format!("rls-a-{suffix}")).await;
     insert_tenant(store.pool(), tenant_b, &format!("rls-b-{suffix}")).await;
-    insert_auth_user(store.pool(), tenant_a, &user_id, "rls").await;
+    insert_auth_user(store.pool(), tenant_a, user_id, "rls").await;
 
     {
         let mut conn = TenantConn::acquire(&app_pool, tenant_b)
@@ -525,7 +525,12 @@ async fn storage_admin_queries_find_and_abort_expired_uploads() {
 }
 
 fn database_url() -> Option<String> {
-    std::env::var("WYRD_DATABASE_URL_MIGRATOR").ok()
+    let app_url = std::env::var("WYRD_DATABASE_URL").ok()?;
+    let migrator_password = std::env::var("WYRD_DATABASE_MIGRATOR_PASSWORD").ok()?;
+    let mut url = url::Url::parse(&app_url).ok()?;
+    url.set_username("wyrd_migrator").ok()?;
+    url.set_password(Some(&migrator_password)).ok()?;
+    Some(url.into())
 }
 
 fn app_database_url() -> Option<String> {
@@ -609,9 +614,21 @@ async fn assert_platform_resolver_shape(pool: &PgPool) {
         "platform.resolve_tenant_by_slug must pin search_path to pg_catalog, platform"
     );
 
+    // PUBLIC is a pseudo-role and cannot be passed to has_function_privilege
+    // (it errors with `role "PUBLIC" does not exist`). Inspect pg_proc.proacl
+    // directly: aclexplode emits grantee = 0 for the PUBLIC grant entry.
     let privileges: (bool, bool, bool) = sqlx::query_as(
         "SELECT
-             has_function_privilege('PUBLIC', 'platform.resolve_tenant_by_slug(text)', 'EXECUTE'),
+             EXISTS (
+                 SELECT 1
+                 FROM pg_proc p
+                 JOIN pg_namespace n ON n.oid = p.pronamespace
+                 CROSS JOIN LATERAL aclexplode(p.proacl) a
+                 WHERE n.nspname = 'platform'
+                   AND p.proname = 'resolve_tenant_by_slug'
+                   AND a.grantee = 0
+                   AND a.privilege_type = 'EXECUTE'
+             ),
              has_function_privilege('wyrd_app', 'platform.resolve_tenant_by_slug(text)', 'EXECUTE'),
              has_function_privilege('wyrd_platform_admin', 'platform.resolve_tenant_by_slug(text)', 'EXECUTE')",
     )
@@ -655,7 +672,6 @@ async fn assert_auth_rls_metadata(pool: &PgPool) {
 
     let expected_tables = [
         "auth_api_keys",
-        "auth_governance_tokens",
         "auth_refresh_tokens",
         "auth_roles",
         "auth_service_account_roles",
@@ -692,14 +708,14 @@ async fn insert_tenant(pool: &PgPool, data_tenant_id: DataTenantId, slug: &str) 
     .expect("tenant inserts");
 }
 
-async fn insert_auth_user(pool: &PgPool, data_tenant_id: DataTenantId, id: &str, email_tag: &str) {
+async fn insert_auth_user(pool: &PgPool, data_tenant_id: DataTenantId, id: Uuid, email_tag: &str) {
     sqlx::query(
         "INSERT INTO wyrd.auth_users (id, data_tenant_id, email, auth_type, status)
          VALUES ($1, $2, $3, 'password', 'active')",
     )
     .bind(id)
     .bind(data_tenant_id.as_uuid())
-    .bind(format!("{id}-{email_tag}@example.com"))
+    .bind(format!("{}-{email_tag}@example.com", id.simple()))
     .execute(pool)
     .await
     .expect("auth user inserts");
@@ -708,18 +724,18 @@ async fn insert_auth_user(pool: &PgPool, data_tenant_id: DataTenantId, id: &str,
 async fn insert_refresh_token(
     pool: &PgPool,
     data_tenant_id: DataTenantId,
-    id: &str,
-    user_id: &str,
+    id: Uuid,
+    principal_id: Uuid,
     token_hash: &str,
 ) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
     sqlx::query(
         "INSERT INTO wyrd.auth_refresh_tokens
-             (id, data_tenant_id, user_id, token_hash, expires_at)
-         VALUES ($1, $2, $3, $4, now() + interval '1 day')",
+             (id, data_tenant_id, principal_kind, principal_id, token_hash, expires_at)
+         VALUES ($1, $2, 'user', $3, $4, now() + interval '1 day')",
     )
     .bind(id)
     .bind(data_tenant_id.as_uuid())
-    .bind(user_id)
+    .bind(principal_id)
     .bind(token_hash)
     .execute(pool)
     .await

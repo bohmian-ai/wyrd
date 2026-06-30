@@ -16,18 +16,26 @@ use pg_embed::postgres::{PgEmbed, PgSettings};
 use rand::distr::{Alphanumeric, SampleString};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::AssertSqlSafe;
+use url::Url;
 
 use crate::pool::build_pool;
-use role_bootstrap::{WYRD_DATABASE, role_bootstrap_sql};
+use role_bootstrap::{
+    WYRD_APP_ROLE, WYRD_DATABASE, WYRD_MIGRATOR_ROLE, WYRD_PLATFORM_ADMIN_ROLE, role_bootstrap_sql,
+};
 
 pub use crate::pool::PoolConfig;
 
-/// Runtime application DSN environment variable.
+/// Canonical Wyrd database URL. Carries the `wyrd_app` userinfo; migrator and
+/// platform-admin DSNs are synthesized at boot by swapping userinfo with the
+/// per-role passwords below.
 pub const APP_DSN_ENV: &str = "WYRD_DATABASE_URL";
-/// Boot-only migrator DSN environment variable.
-pub const MIGRATOR_DSN_ENV: &str = "WYRD_DATABASE_URL_MIGRATOR";
-/// Optional cross-tenant platform-admin DSN environment variable.
-pub const PLATFORM_ADMIN_DSN_ENV: &str = "WYRD_DATABASE_URL_PLATFORM_ADMIN";
+/// `wyrd_migrator` password for external Postgres. Required alongside
+/// `WYRD_DATABASE_URL` whenever Wyrd applies migrations against external
+/// Postgres.
+pub const MIGRATOR_PASSWORD_ENV: &str = "WYRD_DATABASE_MIGRATOR_PASSWORD";
+/// Optional `wyrd_platform_admin` password for external Postgres. Required
+/// when the audited cross-tenant platform-admin surface is enabled.
+pub const PLATFORM_ADMIN_PASSWORD_ENV: &str = "WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD";
 
 const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
 const HOME_ENV: &str = "HOME";
@@ -41,11 +49,15 @@ const WYRD_CONFIG_END: &str = "# END WYRD EMBEDDED CONFIG";
 pub enum BootError {
     /// DSN environment variables were partially configured.
     #[error(
-        "mixed database DSN configuration: set both WYRD_DATABASE_URL and \
-         WYRD_DATABASE_URL_MIGRATOR for external Postgres, optionally set \
-         WYRD_DATABASE_URL_PLATFORM_ADMIN, or leave all three unset for embedded mode"
+        "mixed database configuration: set WYRD_DATABASE_URL with \
+         WYRD_DATABASE_MIGRATOR_PASSWORD (and optionally \
+         WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD) for external Postgres, or \
+         leave all three unset for embedded mode"
     )]
     MixedDsnConfig,
+    /// The canonical `WYRD_DATABASE_URL` could not be parsed.
+    #[error("invalid WYRD_DATABASE_URL: {0}")]
+    InvalidDatabaseUrl(#[source] url::ParseError),
     /// Embedded Postgres startup failed.
     #[error("embedded Postgres startup failed")]
     Embedded(#[source] pg_embed::pg_errors::Error),
@@ -121,22 +133,28 @@ impl fmt::Debug for PostgresBoot {
 }
 
 impl PostgresBoot {
-    /// Resolve Postgres boot mode from Wyrd database DSN environment variables.
+    /// Resolve Postgres boot mode from Wyrd database environment variables.
     ///
-    /// External mode requires `WYRD_DATABASE_URL` and
-    /// `WYRD_DATABASE_URL_MIGRATOR`; `WYRD_DATABASE_URL_PLATFORM_ADMIN` is
-    /// optional. All three unset starts embedded Postgres, provisions roles,
-    /// and derives the three role DSNs from the managed instance.
+    /// External mode requires `WYRD_DATABASE_URL` (the `wyrd_app` DSN) and
+    /// `WYRD_DATABASE_MIGRATOR_PASSWORD`; `WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD`
+    /// is optional. The migrator and platform-admin DSNs are synthesized from
+    /// the canonical URL by swapping the userinfo segment to the matching role
+    /// name and password. All three unset starts embedded Postgres, provisions
+    /// roles, and derives the three role DSNs from the managed instance.
     ///
     /// # Errors
-    /// Returns [`BootError::MixedDsnConfig`] for partial or incoherent DSN
-    /// configuration. Returns embedded startup or filesystem errors when
-    /// embedded mode is selected and the managed instance cannot be started.
+    /// Returns [`BootError::MixedDsnConfig`] for partial or incoherent
+    /// configuration. Returns [`BootError::InvalidDatabaseUrl`] when the
+    /// canonical URL cannot be parsed. Returns embedded startup or filesystem
+    /// errors when embedded mode is selected and the managed instance cannot
+    /// be started.
     pub async fn from_env() -> Result<Self, BootError> {
         Self::from_optional_dsns(
             env::var(APP_DSN_ENV).ok(),
-            env::var(MIGRATOR_DSN_ENV).ok(),
-            env::var(PLATFORM_ADMIN_DSN_ENV).ok(),
+            env::var(MIGRATOR_PASSWORD_ENV).ok().map(SecretString::from),
+            env::var(PLATFORM_ADMIN_PASSWORD_ENV)
+                .ok()
+                .map(SecretString::from),
         )
         .await
     }
@@ -175,19 +193,40 @@ impl PostgresBoot {
 
     async fn from_optional_dsns(
         app: Option<String>,
-        migrator: Option<String>,
-        platform_admin: Option<String>,
+        migrator_password: Option<SecretString>,
+        platform_admin_password: Option<SecretString>,
     ) -> Result<Self, BootError> {
-        match (app, migrator, platform_admin) {
-            (Some(app_dsn), Some(migrator_dsn), platform_admin_dsn) => Ok(Self::External {
-                app_dsn: SecretString::from(app_dsn),
-                migrator_dsn: SecretString::from(migrator_dsn),
-                platform_admin_dsn: platform_admin_dsn.map(SecretString::from),
-            }),
+        match (app, migrator_password, platform_admin_password) {
+            (Some(app_url), Some(migrator_pw), platform_admin_pw) => {
+                let base = Url::parse(&app_url).map_err(BootError::InvalidDatabaseUrl)?;
+                let migrator_dsn = role_dsn(&base, WYRD_MIGRATOR_ROLE, &migrator_pw);
+                let platform_admin_dsn = platform_admin_pw
+                    .as_ref()
+                    .map(|pw| role_dsn(&base, WYRD_PLATFORM_ADMIN_ROLE, pw))
+                    .map(SecretString::from);
+                Ok(Self::External {
+                    app_dsn: SecretString::from(app_url),
+                    migrator_dsn: SecretString::from(migrator_dsn),
+                    platform_admin_dsn,
+                })
+            }
             (None, None, None) => Self::embedded(EmbeddedConfig::default()).await,
             _ => Err(BootError::MixedDsnConfig),
         }
     }
+}
+
+/// Synthesize a role DSN by replacing the userinfo of `base` with `role` and
+/// `password`. Host, port, database, and query string are preserved. The role
+/// name comes from the schema-side constants in `role_bootstrap`, not from
+/// operator configuration.
+fn role_dsn(base: &Url, role: &str, password: &SecretString) -> String {
+    let mut dsn = base.clone();
+    dsn.set_username(role)
+        .expect("role name is URL-safe ASCII per role_bootstrap constants");
+    dsn.set_password(Some(password.expose_secret()))
+        .expect("password is URL-safe via set_password percent-encoding");
+    dsn.into()
 }
 
 /// Handle for a managed embedded Postgres instance.
@@ -258,19 +297,19 @@ impl EmbeddedPgHandle {
     /// Return embedded-mode DSNs.
     pub fn resolved_dsns(&self) -> Result<ResolvedDsns, BootError> {
         let app = embedded_dsn(
-            role_bootstrap::WYRD_APP_ROLE,
+            WYRD_APP_ROLE,
             self.credentials.app.expose_secret(),
             self.port,
             WYRD_DATABASE,
         );
         let migrator = embedded_dsn(
-            role_bootstrap::WYRD_MIGRATOR_ROLE,
+            WYRD_MIGRATOR_ROLE,
             self.credentials.migrator.expose_secret(),
             self.port,
             WYRD_DATABASE,
         );
         let platform_admin = embedded_dsn(
-            role_bootstrap::WYRD_PLATFORM_ADMIN_ROLE,
+            WYRD_PLATFORM_ADMIN_ROLE,
             self.credentials.platform_admin.expose_secret(),
             self.port,
             WYRD_DATABASE,
@@ -366,6 +405,10 @@ pub struct EmbeddedDataDirs {
     pub app_secret: PathBuf,
     /// Persisted `wyrd_platform_admin` password path.
     pub platform_admin_secret: PathBuf,
+    /// Persisted `wyrd_catalog_app` password path.
+    pub catalog_app_secret: PathBuf,
+    /// Persisted `vala_recovery` password path.
+    pub recovery_secret: PathBuf,
 }
 
 impl EmbeddedDataDirs {
@@ -378,6 +421,8 @@ impl EmbeddedDataDirs {
             migrator_secret: role_credentials.join("wyrd_migrator.secret"),
             app_secret: role_credentials.join("wyrd_app.secret"),
             platform_admin_secret: role_credentials.join("wyrd_platform_admin.secret"),
+            catalog_app_secret: role_credentials.join("wyrd_catalog_app.secret"),
+            recovery_secret: role_credentials.join("vala_recovery.secret"),
             role_credentials,
             root,
         }
@@ -389,6 +434,8 @@ pub(crate) struct EmbeddedRoleCredentials {
     pub(crate) migrator: SecretString,
     pub(crate) app: SecretString,
     pub(crate) platform_admin: SecretString,
+    pub(crate) catalog_app: SecretString,
+    pub(crate) recovery: SecretString,
 }
 
 impl EmbeddedRoleCredentials {
@@ -409,6 +456,8 @@ impl EmbeddedRoleCredentials {
             migrator: read_or_create_secret(&dirs.migrator_secret)?,
             app: read_or_create_secret(&dirs.app_secret)?,
             platform_admin: read_or_create_secret(&dirs.platform_admin_secret)?,
+            catalog_app: read_or_create_secret(&dirs.catalog_app_secret)?,
+            recovery: read_or_create_secret(&dirs.recovery_secret)?,
         })
     }
 }
@@ -612,67 +661,70 @@ mod tests {
     use secrecy::ExposeSecret;
 
     use super::{
-        APP_DSN_ENV, BootError, EmbeddedConfig, EmbeddedRoleCredentials, MIGRATOR_DSN_ENV,
-        PLATFORM_ADMIN_DSN_ENV, PostgresBoot, write_embedded_postgres_config,
+        APP_DSN_ENV, BootError, EmbeddedConfig, EmbeddedRoleCredentials, MIGRATOR_PASSWORD_ENV,
+        PLATFORM_ADMIN_PASSWORD_ENV, PostgresBoot, SecretString, write_embedded_postgres_config,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    const APP_DSN: &str = "postgres://wyrd_app:app-secret@localhost/wyrd";
-    const MIGRATOR_DSN: &str = "postgres://wyrd_migrator:migrator-secret@localhost/wyrd";
-    const ADMIN_DSN: &str = "postgres://wyrd_platform_admin:admin-secret@localhost/wyrd";
+    const APP_URL: &str = "postgres://wyrd_app:app-secret@localhost/wyrd";
+    const MIGRATOR_PW: &str = "migrator-secret";
+    const ADMIN_PW: &str = "admin-secret";
+    const EXPECTED_MIGRATOR_DSN: &str = "postgres://wyrd_migrator:migrator-secret@localhost/wyrd";
+    const EXPECTED_ADMIN_DSN: &str = "postgres://wyrd_platform_admin:admin-secret@localhost/wyrd";
 
     #[tokio::test]
-    async fn external_with_app_and_migrator_allows_dedicated_mode() {
+    async fn external_with_app_and_migrator_password_allows_dedicated_mode() {
         let boot = PostgresBoot::from_optional_dsns(
-            Some(APP_DSN.to_owned()),
-            Some(MIGRATOR_DSN.to_owned()),
+            Some(APP_URL.to_owned()),
+            Some(SecretString::from(MIGRATOR_PW.to_owned())),
             None,
         )
         .await
         .expect("external boot resolves");
         let dsns = boot.dsns().expect("external dsns resolve");
 
-        assert_eq!(dsns.app.expose_secret(), APP_DSN);
-        assert_eq!(dsns.migrator.expose_secret(), MIGRATOR_DSN);
+        assert_eq!(dsns.app.expose_secret(), APP_URL);
+        assert_eq!(dsns.migrator.expose_secret(), EXPECTED_MIGRATOR_DSN);
         assert!(dsns.platform_admin.is_none());
     }
 
     #[tokio::test]
-    async fn external_with_all_three_dsns_resolves() {
+    async fn external_with_all_three_inputs_resolves() {
         let boot = PostgresBoot::from_optional_dsns(
-            Some(APP_DSN.to_owned()),
-            Some(MIGRATOR_DSN.to_owned()),
-            Some(ADMIN_DSN.to_owned()),
+            Some(APP_URL.to_owned()),
+            Some(SecretString::from(MIGRATOR_PW.to_owned())),
+            Some(SecretString::from(ADMIN_PW.to_owned())),
         )
         .await
         .expect("external boot resolves");
         let dsns = boot.dsns().expect("external dsns resolve");
 
-        assert_eq!(dsns.app.expose_secret(), APP_DSN);
-        assert_eq!(dsns.migrator.expose_secret(), MIGRATOR_DSN);
+        assert_eq!(dsns.app.expose_secret(), APP_URL);
+        assert_eq!(dsns.migrator.expose_secret(), EXPECTED_MIGRATOR_DSN);
         assert_eq!(
             dsns.platform_admin
                 .as_ref()
                 .expect("admin dsn resolves")
                 .expose_secret(),
-            ADMIN_DSN
+            EXPECTED_ADMIN_DSN
         );
     }
 
     #[tokio::test]
-    async fn mixed_dsn_presence_is_rejected() {
-        for (app, migrator, admin) in [
-            (Some(APP_DSN), None, None),
-            (None, Some(MIGRATOR_DSN), None),
-            (Some(APP_DSN), None, Some(ADMIN_DSN)),
-            (None, Some(MIGRATOR_DSN), Some(ADMIN_DSN)),
-            (None, None, Some(ADMIN_DSN)),
-        ] {
+    async fn mixed_inputs_are_rejected() {
+        let cases: [(Option<&str>, Option<&str>, Option<&str>); 5] = [
+            (Some(APP_URL), None, None),
+            (None, Some(MIGRATOR_PW), None),
+            (Some(APP_URL), None, Some(ADMIN_PW)),
+            (None, Some(MIGRATOR_PW), Some(ADMIN_PW)),
+            (None, None, Some(ADMIN_PW)),
+        ];
+        for (app, migrator, admin) in cases {
             let result = PostgresBoot::from_optional_dsns(
                 app.map(str::to_owned),
-                migrator.map(str::to_owned),
-                admin.map(str::to_owned),
+                migrator.map(|pw| SecretString::from(pw.to_owned())),
+                admin.map(|pw| SecretString::from(pw.to_owned())),
             )
             .await;
 
@@ -680,12 +732,50 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn invalid_database_url_returns_typed_error() {
+        let result = PostgresBoot::from_optional_dsns(
+            Some("not-a-url".to_owned()),
+            Some(SecretString::from(MIGRATOR_PW.to_owned())),
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(BootError::InvalidDatabaseUrl(_))));
+    }
+
+    #[tokio::test]
+    async fn synthesized_dsns_preserve_host_port_and_database() {
+        let boot = PostgresBoot::from_optional_dsns(
+            Some(
+                "postgres://wyrd_app:app-pw@db.example.com:6543/wyrd_prod?sslmode=require"
+                    .to_owned(),
+            ),
+            Some(SecretString::from(MIGRATOR_PW.to_owned())),
+            Some(SecretString::from(ADMIN_PW.to_owned())),
+        )
+        .await
+        .expect("external boot resolves");
+        let dsns = boot.dsns().expect("external dsns resolve");
+
+        assert_eq!(
+            dsns.migrator.expose_secret(),
+            "postgres://wyrd_migrator:migrator-secret@db.example.com:6543/wyrd_prod?sslmode=require"
+        );
+        assert_eq!(
+            dsns.platform_admin
+                .as_ref()
+                .expect("admin dsn resolves")
+                .expose_secret(),
+            "postgres://wyrd_platform_admin:admin-secret@db.example.com:6543/wyrd_prod?sslmode=require"
+        );
+    }
+
     #[test]
     fn debug_output_redacts_secret_dsns() {
         let boot = PostgresBoot::External {
-            app_dsn: APP_DSN.to_owned().into(),
-            migrator_dsn: MIGRATOR_DSN.to_owned().into(),
-            platform_admin_dsn: Some(ADMIN_DSN.to_owned().into()),
+            app_dsn: APP_URL.to_owned().into(),
+            migrator_dsn: EXPECTED_MIGRATOR_DSN.to_owned().into(),
+            platform_admin_dsn: Some(EXPECTED_ADMIN_DSN.to_owned().into()),
         };
         let rendered = format!("{boot:?}");
 
@@ -805,13 +895,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn from_env_uses_wyrd_database_url_names() {
+    async fn from_env_uses_wyrd_database_url_and_password_names() {
         let previous = {
             let _guard = ENV_LOCK.lock().expect("env lock is not poisoned");
-            let previous = snapshot_env(&[APP_DSN_ENV, MIGRATOR_DSN_ENV, PLATFORM_ADMIN_DSN_ENV]);
-            set_env(APP_DSN_ENV, Some(APP_DSN));
-            set_env(MIGRATOR_DSN_ENV, Some(MIGRATOR_DSN));
-            set_env(PLATFORM_ADMIN_DSN_ENV, None);
+            let previous = snapshot_env(&[
+                APP_DSN_ENV,
+                MIGRATOR_PASSWORD_ENV,
+                PLATFORM_ADMIN_PASSWORD_ENV,
+            ]);
+            set_env(APP_DSN_ENV, Some(APP_URL));
+            set_env(MIGRATOR_PASSWORD_ENV, Some(MIGRATOR_PW));
+            set_env(PLATFORM_ADMIN_PASSWORD_ENV, None);
             previous
         };
         // current_thread flavor: from_env() reads env vars before its first await,
@@ -825,7 +919,9 @@ mod tests {
             restore_env(previous);
         }
 
-        assert!(matches!(boot, PostgresBoot::External { .. }));
+        let dsns = boot.dsns().expect("external dsns resolve");
+        assert_eq!(dsns.app.expose_secret(), APP_URL);
+        assert_eq!(dsns.migrator.expose_secret(), EXPECTED_MIGRATOR_DSN);
     }
 
     use std::path::PathBuf;

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
+use wyrd_semver::VersionBlock;
 use wyrd_spec::card::data::{
     ArrowFormat, ArrowMeta, ColValue, ColorMode, CustomDataMeta, DataInterface, DataSchema,
     DataSpec, DataSplit, DataStats, HuggingfaceMeta, ImageFormat, ImageMeta, JsonlCompression,
@@ -10,7 +11,6 @@ use wyrd_spec::card::{FieldSpec, Inequality};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, ColumnName, QueryName, SpaceName, SplitName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::version::VersionBlock;
 
 fn col(name: &str) -> ColumnName {
     ColumnName::new(name).unwrap()

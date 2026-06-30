@@ -1,18 +1,35 @@
 ---
 name: wyrd-rust-python
-description: Repo-local Wyrd skill for Rust core, Python bindings, PyO3, maturin, cards, specs, registry, storage, server/client contracts, telemetry, provider runtime, observability, evaluation, CLI, MCP, generated stubs, and cross-language tests. Use before editing non-UI Wyrd Rust or Python code, especially code under crates/, python/py-wyrd, schemas, OpenAPI generation, or Python-visible APIs. Do not use for Svelte UI work; use wyrd-ui instead.
+description: Repo-local Wyrd skill for Rust core, Python bindings, PyO3, maturin, cards, specs, registry, storage, server/client contracts, telemetry, provider runtime, observability, evaluation, Vala OLAP warehouse, Bifrost, Apache Iceberg, DataFusion, object-store analytical storage, CLI, MCP, generated stubs, and cross-language tests. Use before editing non-UI Wyrd Rust or Python code, especially code under crates/, python/py-wyrd, schemas, OpenAPI generation, Python-visible APIs, or Vala warehouse/OLAP/Iceberg implementation. Do not use for Svelte UI work; use wyrd-ui instead.
 ---
 
 # Wyrd Rust/Python
 
 Use this skill before touching Rust, Python, PyO3, server, client, card/spec,
-registry, storage, runtime, telemetry, provider, observability, evaluation, CLI,
-MCP, codegen, or cross-language behavior in Wyrd.
+registry, storage, runtime, telemetry, provider, observability, evaluation,
+Vala OLAP warehouse, Bifrost, Iceberg, DataFusion, CLI, MCP, codegen, or
+cross-language behavior in Wyrd.
 
 This skill is Wyrd-native. Do not paste legacy names, package names, route
 prefixes, module names, compatibility shims, or migration shorthand into this
 repository. If a prior implementation pattern is useful, reproduce the pattern
 in Wyrd vocabulary and Wyrd paths only.
+
+## Output Style
+
+Write for a human maintainer who needs the decision quickly.
+
+- Be succinct and direct. Prefer short sentences over dense architecture prose.
+- Lead with the concrete issue, change, or result before explaining context.
+- Use Wyrd doctrine terms when they matter, but do not stack abstractions.
+- Name files, crates, commands, and verification gates explicitly.
+- Avoid metaphor, invented labels, and broad summary language such as
+  "surface alignment" when a specific boundary, type, route, or test can be
+  named.
+- If a rule is subtle, explain it in one plain paragraph and then give the
+  action to take.
+- For implementation summaries, report what changed and what was verified.
+  Do not restate the whole doctrine unless the user asked for it.
 
 ## First Pass
 
@@ -48,6 +65,9 @@ Load these references only when relevant:
   `references/testing-workflows.md`
 - Agent-facing contracts, MCP, structured validation, and harness behavior:
   `references/agent-harness.md`
+- Vala OLAP warehouse, Bifrost, Apache Iceberg, DataFusion, object-store
+  analytical storage, Iceberg catalogs, and Parquet query/write paths:
+  `references/iceberg-bifrost.md`
 
 ## Ownership Boundaries
 
@@ -62,7 +82,7 @@ Load these references only when relevant:
   behind its optional `python` feature.
 - `crates/vala/*`: observability, evaluation, drift, tracing, archival query,
   OLAP, and background data-plane behavior. Python-visible Vala client
-  behavior lives in `vala-client` behind its optional `python` feature.
+  behavior lives in `vala-sdk` behind its optional `python` feature.
 - `crates/wyrd/*`: server, CLI, MCP, application integration, UI host,
   `wyrd-interfaces`, and `wyrd-cards`.
 - `python/py-wyrd`: thin PyO3 module aggregator, Python package exports,

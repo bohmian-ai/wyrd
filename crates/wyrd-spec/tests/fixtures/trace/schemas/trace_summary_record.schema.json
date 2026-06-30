@@ -1,0 +1,305 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TraceSummaryRecord",
+  "description": "Per-trace rollup. One row per `(data_tenant_id, trace_id, bucket_time)`.",
+  "type": "object",
+  "required": [
+    "bucket_time",
+    "data_tenant_id",
+    "duration_ms",
+    "end_time",
+    "error_count",
+    "resource",
+    "root_status",
+    "span_count",
+    "start_time",
+    "trace_id"
+  ],
+  "properties": {
+    "bucket_time": {
+      "description": "Floor-bucketed time the trace started in.\n\nBacks the catalog's `trace_bounds_lookup` index for `trace_summaries`. Not a partition key — partitioning is the hidden Iceberg `day(wyrd_event_time)` transform. Default bucket width is 1 minute; callers must floor `start_time` to the bucket boundary before constructing.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "data_tenant_id": {
+      "description": "Tenant partition key.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "duration_ms": {
+      "description": "`(end_time - start_time).num_milliseconds() as u64`.\n\nConsistency is asserted by [`TraceSummaryRecord::validate`].",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "end_time": {
+      "description": "Latest `end_time` across all spans in the trace.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "error_count": {
+      "description": "Span count with [`SpanStatus::Error`]. Must be less than or equal to `span_count`.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "resource": {
+      "description": "Resource of the root span.\n\nFor multi-root traces, this is the resource selected by the downstream rollup computation.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Resource"
+        }
+      ]
+    },
+    "root_kind": {
+      "description": "Root span kind, when a single root exists.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SpanKind"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "root_name": {
+      "description": "Root span name, when a single root exists.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "root_scope": {
+      "description": "Root span's instrumentation scope.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/InstrumentationScope"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "root_span_id": {
+      "description": "Root span id, when a single root exists.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SpanId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "root_status": {
+      "description": "Root span status.\n\nDefaults to [`SpanStatus::Unset`] when no root is identifiable; otherwise mirrors the root span's status.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SpanStatus"
+        }
+      ]
+    },
+    "span_count": {
+      "description": "Total span count in the trace.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "start_time": {
+      "description": "Earliest `start_time` across all spans in the trace.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "trace_id": {
+      "description": "16-byte trace id.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TraceId"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "InstrumentationScope": {
+      "description": "OTel-canonical instrumentation scope.\n\nFields:\n\n- `name` -- instrumentation library name, such as `wyrd-tracing` or `opentelemetry-instrumentation-requests`. - `version` -- optional library version string. - `attributes` -- rare scope-level attributes.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "attributes": {
+          "description": "Scope-level attribute bag.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": true
+        },
+        "name": {
+          "description": "Instrumentation library name.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Instrumentation library version, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Resource": {
+      "description": "OTel-canonical resource projection.\n\nFields:\n\n- `service_name` -- required OTel `service.name` semantic-convention attribute. Empty values are rejected; non-empty values are capped at 256 characters. - `service_namespace` -- optional OTel `service.namespace`. - `service_version` -- optional OTel `service.version`. - `service_instance_id` -- optional OTel `service.instance.id`. - `attributes` -- every other OTel resource attribute the producer emitted, such as `host.name`, `k8s.pod.uid`, `telemetry.sdk.name`, or `process.pid`.",
+      "type": "object",
+      "required": [
+        "service_name"
+      ],
+      "properties": {
+        "attributes": {
+          "description": "Remaining OTel resource attributes, such as `host.*`, `k8s.*`, and `cloud.*`.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": true
+        },
+        "service_instance_id": {
+          "description": "`service.instance.id`, when emitted by the producer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "service_name": {
+          "description": "`service.name`, required by OTel semantic conventions.",
+          "type": "string"
+        },
+        "service_namespace": {
+          "description": "`service.namespace`, when emitted by the producer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "service_version": {
+          "description": "`service.version`, when emitted by the producer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "SpanId": {
+      "type": "string",
+      "maxLength": 16,
+      "minLength": 16,
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "SpanKind": {
+      "description": "OTel canonical span kind. (Proto: `Span.SpanKind`.)",
+      "oneOf": [
+        {
+          "description": "Default internal operation inside the service.",
+          "type": "string",
+          "enum": [
+            "internal"
+          ]
+        },
+        {
+          "description": "Inbound RPC or HTTP handler.",
+          "type": "string",
+          "enum": [
+            "server"
+          ]
+        },
+        {
+          "description": "Outbound RPC or HTTP call.",
+          "type": "string",
+          "enum": [
+            "client"
+          ]
+        },
+        {
+          "description": "Asynchronous message producer.",
+          "type": "string",
+          "enum": [
+            "producer"
+          ]
+        },
+        {
+          "description": "Asynchronous message consumer.",
+          "type": "string",
+          "enum": [
+            "consumer"
+          ]
+        }
+      ]
+    },
+    "SpanStatus": {
+      "description": "OTel canonical span status. (Proto: `Span.Status`.)",
+      "oneOf": [
+        {
+          "description": "No status set; OTel default.",
+          "type": "object",
+          "required": [
+            "code"
+          ],
+          "properties": {
+            "code": {
+              "type": "string",
+              "enum": [
+                "unset"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Operation completed successfully.",
+          "type": "object",
+          "required": [
+            "code"
+          ],
+          "properties": {
+            "code": {
+              "type": "string",
+              "enum": [
+                "ok"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Operation failed with an optional human-readable description.",
+          "type": "object",
+          "required": [
+            "code"
+          ],
+          "properties": {
+            "code": {
+              "type": "string",
+              "enum": [
+                "error"
+              ]
+            },
+            "description": {
+              "description": "Optional status description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TraceId": {
+      "type": "string",
+      "maxLength": 32,
+      "minLength": 32,
+      "pattern": "^[0-9a-f]{32}$"
+    }
+  }
+}

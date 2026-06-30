@@ -3,10 +3,43 @@
 use crate::error::StorageError;
 use crate::gcs::GcsSigner;
 use crate::settings::GcsConfig;
-use base64::Engine;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use gcloud_storage::client::{Client, ClientConfig};
-use object_store::gcp::{GoogleCloudStorage, GoogleCloudStorageBuilder};
-use wyrd_spec::storage::StorageBackendKind;
+use opendal::services;
+
+fn credential_for_gcs() -> Option<String> {
+    if let Ok(b64) = std::env::var("GOOGLE_ACCOUNT_JSON_BASE64") {
+        // Pass the base64 string through verbatim — opendal calls from_base64 internally.
+        // Do NOT decode here.
+        Some(b64)
+    } else if let Ok(json) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS_JSON") {
+        Some(STANDARD.encode(&json))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn gcs_service(cfg: &GcsConfig) -> services::Gcs {
+    let mut b = services::Gcs::default().bucket(&cfg.bucket);
+    let mut has_credential = false;
+    if let Some(cred) = credential_for_gcs() {
+        b = b.credential(&cred);
+        has_credential = true;
+    } else if let Ok(path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
+        b = b.credential_path(&path);
+        has_credential = true;
+    }
+    // else: opendal's default chain = full ADC (env SA path, gcloud well-known file,
+    // GCE/GKE metadata server, Workload Identity, WIF external_account).
+    if let Some(endpoint) = &cfg.endpoint_url {
+        b = b.endpoint(endpoint);
+        // Anonymous GCS-compatible emulators (fake-gcs) reject signed requests.
+        if !has_credential {
+            b = b.skip_signature();
+        }
+    }
+    b
+}
 
 /// Build the GCS signer using the Wyrd credential cascade.
 ///
@@ -35,39 +68,6 @@ pub async fn build_signer(config: &GcsConfig) -> Result<GcsSigner, StorageError>
         })?;
 
     Ok(GcsSigner::new(client, config.bucket.clone()))
-}
-
-/// Build the shared GCS object-store substrate.
-///
-/// # Errors
-/// Returns an error when the object-store builder rejects configuration.
-pub fn build_object_store(config: &GcsConfig) -> Result<GoogleCloudStorage, StorageError> {
-    let mut builder = GoogleCloudStorageBuilder::from_env().with_bucket_name(config.bucket.clone());
-    if let Ok(raw) = std::env::var("GOOGLE_ACCOUNT_JSON_BASE64") {
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(raw)
-            .map_err(|source| StorageError::Backend {
-                backend: StorageBackendKind::Gcs,
-                op: "build_object_store",
-                message: source.to_string(),
-            })?;
-        let key = String::from_utf8(decoded).map_err(|source| StorageError::Backend {
-            backend: StorageBackendKind::Gcs,
-            op: "build_object_store",
-            message: source.to_string(),
-        })?;
-        builder = builder.with_service_account_key(key);
-    } else if let Ok(raw) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS_JSON") {
-        builder = builder.with_service_account_key(raw);
-    } else if let Ok(path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
-        builder = builder.with_application_credentials(path);
-    }
-
-    builder.build().map_err(|source| StorageError::Backend {
-        backend: StorageBackendKind::Gcs,
-        op: "build_object_store",
-        message: source.to_string(),
-    })
 }
 
 /// Build a GCS signer pointed at a local emulator endpoint.
@@ -109,12 +109,42 @@ async fn build_client_config() -> Result<ClientConfig, gcloud_auth::error::Error
         let credentials = CredentialsFile::new_from_str(json.as_str()).await?;
         return ClientConfig::default().with_credentials(credentials).await;
     }
-    if std::env::var("GOOGLE_APPLICATION_CREDENTIALS_JSON").is_ok()
-        || std::env::var("GOOGLE_APPLICATION_CREDENTIALS").is_ok()
-    {
+    if let Ok(json) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS_JSON") {
+        let credentials = CredentialsFile::new_from_str(&json).await?;
+        return ClientConfig::default().with_credentials(credentials).await;
+    }
+    if std::env::var("GOOGLE_APPLICATION_CREDENTIALS").is_ok() {
         let credentials = CredentialsFile::new().await?;
         return ClientConfig::default().with_credentials(credentials).await;
     }
 
     ClientConfig::default().with_auth().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn b64_env_passed_through_verbatim() {
+        let encoded = STANDARD.encode(b"{\"type\":\"service_account\"}");
+        let vars: Vec<(&str, Option<&str>)> = vec![
+            ("GOOGLE_ACCOUNT_JSON_BASE64", Some(&encoded)),
+            ("GOOGLE_APPLICATION_CREDENTIALS_JSON", None),
+        ];
+        let got = temp_env::with_vars(vars, credential_for_gcs);
+        assert_eq!(got.expect("b64 var should produce Some"), encoded);
+    }
+
+    #[test]
+    fn json_env_encoded_before_passing() {
+        let raw = r#"{"type":"service_account"}"#;
+        let expected = STANDARD.encode(raw);
+        let vars: Vec<(&str, Option<&str>)> = vec![
+            ("GOOGLE_ACCOUNT_JSON_BASE64", None),
+            ("GOOGLE_APPLICATION_CREDENTIALS_JSON", Some(raw)),
+        ];
+        let got = temp_env::with_vars(vars, credential_for_gcs);
+        assert_eq!(got.expect("json var should produce Some"), expected);
+    }
 }

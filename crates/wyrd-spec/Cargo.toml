@@ -13,26 +13,35 @@ path = "src/lib.rs"
 
 [features]
 default = []
-server = ["dep:utoipa"]
+server = ["dep:utoipa", "wyrd-semver/server"]
+test-utils = []
 wasm = ["uuid/js"]
 
 [dependencies]
+base64 = { workspace = true }
+blake3 = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 regex = { workspace = true }
+url = { workspace = true }
 schemars = { workspace = true }
 semver = { workspace = true }
+secrecy = { workspace = true }
 skald-spec = { workspace = true, features = ["schemars"] }
 serde = { workspace = true }
+serde_jcs = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-thiserror = { workspace = true }
+petgraph = { version = "0.6", default-features = false, features = ["graphmap"] }
 utoipa = { workspace = true, optional = true }
-uuid = { workspace = true, features = ["std", "v7"] }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["std", "v7", "js"] }
 sha2 = { workspace = true }
-wyrd-error-derive = { path = "../shared/wyrd-error-derive", version = "0.0.1" }
+wyrd-error-derive = { workspace = true }
+wyrd-semver = { workspace = true }
 
 [dev-dependencies]
+pretty_assertions = "1"
 proptest = { workspace = true }
 [[example]]
 name = "gen_schemas"

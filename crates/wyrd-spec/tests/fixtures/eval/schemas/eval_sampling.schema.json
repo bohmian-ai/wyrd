@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvalSampling",
+  "description": "Sampling policy applied at the record-ingest boundary.\n\n`vala-eval` enforces the policy when records are admitted for evaluation.",
+  "oneOf": [
+    {
+      "description": "Probabilistic selection.",
+      "type": "object",
+      "required": [
+        "kind",
+        "ratio"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "ratio"
+          ]
+        },
+        "ratio": {
+          "description": "Selection ratio in `[0.0, 1.0]`.",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Deterministic 1-in-N selection by hashing a stable key path.",
+      "type": "object",
+      "required": [
+        "bucket",
+        "key_path",
+        "kind",
+        "modulus"
+      ],
+      "properties": {
+        "bucket": {
+          "description": "Selected bucket. Must be less than `modulus`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "key_path": {
+          "description": "JSONPath selecting the stable key to hash.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/JsonPath"
+            }
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "deterministic_by_hash"
+          ]
+        },
+        "modulus": {
+          "description": "Positive modulus for bucket assignment.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Every Nth record.",
+      "type": "object",
+      "required": [
+        "kind",
+        "n"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "every_nth"
+          ]
+        },
+        "n": {
+          "description": "Positive interval. Must be at least 1.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "definitions": {
+    "JsonPath": {
+      "type": "string",
+      "maxLength": 1024,
+      "minLength": 1,
+      "pattern": "^\\$.*$"
+    }
+  }
+}

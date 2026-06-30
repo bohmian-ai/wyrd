@@ -11,8 +11,14 @@ use {
     pyo3::prelude::*,
     pyo3::types::PyDict,
     std::path::PathBuf,
+    std::sync::Arc,
     wyrd_utils::py::module_version,
 };
+
+#[cfg(feature = "python")]
+fn shared_py(value: Option<Py<PyAny>>) -> Option<Arc<Py<PyAny>>> {
+    value.map(Arc::new)
+}
 
 macro_rules! model_interface_struct {
     ($(#[$meta:meta])+ $name:ident { $($field:ident : $field_ty:ty),+ $(,)? }) => {
@@ -33,8 +39,8 @@ model_interface_struct!(
     pyclass(module = "wyrd.model", name = "SklearnInterface", extends = ModelInterface)
 )]
 SklearnInterface {
-    model: Option<Py<PyAny>>,
-    preprocessor: Option<Py<PyAny>>,
+    model: Option<Arc<Py<PyAny>>>,
+    preprocessor: Option<Arc<Py<PyAny>>>,
     framework_version: String,
     model_subtype: Option<String>,
 });
@@ -46,8 +52,8 @@ model_interface_struct!(
     pyclass(module = "wyrd.model", name = "XgboostInterface", extends = ModelInterface)
 )]
 XgboostInterface {
-    model: Option<Py<PyAny>>,
-    preprocessor: Option<Py<PyAny>>,
+    model: Option<Arc<Py<PyAny>>>,
+    preprocessor: Option<Arc<Py<PyAny>>>,
     framework_version: String,
     model_subtype: Option<String>,
 });
@@ -59,8 +65,8 @@ model_interface_struct!(
     pyclass(module = "wyrd.model", name = "LightgbmInterface", extends = ModelInterface)
 )]
 LightgbmInterface {
-    model: Option<Py<PyAny>>,
-    preprocessor: Option<Py<PyAny>>,
+    model: Option<Arc<Py<PyAny>>>,
+    preprocessor: Option<Arc<Py<PyAny>>>,
     framework_version: String,
     model_subtype: Option<String>,
 });
@@ -72,8 +78,8 @@ model_interface_struct!(
     pyclass(module = "wyrd.model", name = "CatboostInterface", extends = ModelInterface)
 )]
 CatboostInterface {
-    model: Option<Py<PyAny>>,
-    preprocessor: Option<Py<PyAny>>,
+    model: Option<Arc<Py<PyAny>>>,
+    preprocessor: Option<Arc<Py<PyAny>>>,
     framework_version: String,
     model_subtype: Option<String>,
 });
@@ -85,8 +91,8 @@ model_interface_struct!(
     pyclass(module = "wyrd.model", name = "TorchInterface", extends = ModelInterface)
 )]
 TorchInterface {
-    model: Option<Py<PyAny>>,
-    preprocessor: Option<Py<PyAny>>,
+    model: Option<Arc<Py<PyAny>>>,
+    preprocessor: Option<Arc<Py<PyAny>>>,
     framework_version: String,
     model_subtype: Option<String>,
     save_format: TorchSaveFormat,
@@ -99,9 +105,9 @@ model_interface_struct!(
     pyclass(module = "wyrd.model", name = "LightningInterface", extends = ModelInterface)
 )]
 LightningInterface {
-    model: Option<Py<PyAny>>,
-    trainer: Option<Py<PyAny>>,
-    preprocessor: Option<Py<PyAny>>,
+    model: Option<Arc<Py<PyAny>>>,
+    trainer: Option<Arc<Py<PyAny>>>,
+    preprocessor: Option<Arc<Py<PyAny>>>,
     framework_version: String,
     model_subtype: Option<String>,
 });
@@ -113,8 +119,8 @@ model_interface_struct!(
     pyclass(module = "wyrd.model", name = "TensorflowInterface", extends = ModelInterface)
 )]
 TensorflowInterface {
-    model: Option<Py<PyAny>>,
-    preprocessor: Option<Py<PyAny>>,
+    model: Option<Arc<Py<PyAny>>>,
+    preprocessor: Option<Arc<Py<PyAny>>>,
     framework_version: String,
     model_subtype: Option<String>,
     save_format: TfSaveFormat,
@@ -127,8 +133,8 @@ model_interface_struct!(
     pyclass(module = "wyrd.model", name = "HuggingfaceInterface", extends = ModelInterface)
 )]
 HuggingfaceInterface {
-    model: Option<Py<PyAny>>,
-    processor: Option<Py<PyAny>>,
+    model: Option<Arc<Py<PyAny>>>,
+    processor: Option<Arc<Py<PyAny>>>,
     framework_version: String,
     model_subtype: Option<String>,
     hf_task: HuggingFaceTask,
@@ -199,8 +205,8 @@ impl_model_interface_methods!(SklearnInterface {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
-                model,
-                preprocessor,
+                model: shared_py(model),
+                preprocessor: shared_py(preprocessor),
                 framework_version: package_version(py, "scikit-learn")?,
             },
             ModelInterface::marker("Sklearn"),
@@ -221,8 +227,8 @@ impl_model_interface_methods!(XgboostInterface {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
-                model,
-                preprocessor,
+                model: shared_py(model),
+                preprocessor: shared_py(preprocessor),
                 framework_version: package_version(py, "xgboost")?,
             },
             ModelInterface::marker("Xgboost"),
@@ -243,8 +249,8 @@ impl_model_interface_methods!(LightgbmInterface {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
-                model,
-                preprocessor,
+                model: shared_py(model),
+                preprocessor: shared_py(preprocessor),
                 framework_version: package_version(py, "lightgbm")?,
             },
             ModelInterface::marker("Lightgbm"),
@@ -265,8 +271,8 @@ impl_model_interface_methods!(CatboostInterface {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
-                model,
-                preprocessor,
+                model: shared_py(model),
+                preprocessor: shared_py(preprocessor),
                 framework_version: package_version(py, "catboost")?,
             },
             ModelInterface::marker("Catboost"),
@@ -288,8 +294,8 @@ impl_model_interface_methods!(TorchInterface {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
-                model,
-                preprocessor,
+                model: shared_py(model),
+                preprocessor: shared_py(preprocessor),
                 framework_version: package_version(py, "torch")?,
                 save_format: parse_torch_save_format(save_format)?,
             },
@@ -318,9 +324,9 @@ impl_model_interface_methods!(LightningInterface {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
-                model,
-                trainer,
-                preprocessor,
+                model: shared_py(model),
+                trainer: shared_py(trainer),
+                preprocessor: shared_py(preprocessor),
                 framework_version: package_version(py, "pytorch-lightning")?,
             },
             ModelInterface::marker("Lightning"),
@@ -342,8 +348,8 @@ impl_model_interface_methods!(TensorflowInterface {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
-                model,
-                preprocessor,
+                model: shared_py(model),
+                preprocessor: shared_py(preprocessor),
                 framework_version: package_version(py, "tensorflow")?,
                 save_format: parse_tf_save_format(save_format)?,
             },
@@ -374,8 +380,8 @@ impl_model_interface_methods!(HuggingfaceInterface {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
-                model,
-                processor,
+                model: shared_py(model),
+                processor: shared_py(processor),
                 framework_version: package_version(py, "transformers")?,
                 hf_task: parse_huggingface_task(hf_task)?,
                 repo_id,

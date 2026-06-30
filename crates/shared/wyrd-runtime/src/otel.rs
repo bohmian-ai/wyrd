@@ -29,11 +29,11 @@ pub fn prepare_span(name: impl Into<String>, trace_context: Option<TraceContext>
 
 /// Install the runtime telemetry shell.
 ///
-/// Phase 1 does not attach an SDK. The function preserves the server-boundary
-/// shape that later phases fill with concrete wiring.
+/// No-op today. The signature reserves the server-boundary shape so concrete
+/// SDK wiring can land without churning call sites.
 pub fn install(_config: TelemetryConfig) {}
 
 /// Attach an incoming trace context to the current runtime span.
 ///
-/// Phase 1 keeps this as a no-op shell.
+/// No-op today; reserved for SDK integration.
 pub fn attach(_context: &TraceContext) {}

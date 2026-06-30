@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvalPassGate",
+  "description": "Workflow-level pass criterion.\n\nSelects how [`AssertionResult`] rows roll up into the workflow's `pass / fail` outcome. Thresholds are in `[0.0, 1.0]`; out-of-range values are rejected by [`EvalPassGate::validate`].",
+  "oneOf": [
+    {
+      "description": "Pass iff `(passed_tasks / total_tasks) >= threshold`.",
+      "type": "object",
+      "required": [
+        "kind",
+        "threshold"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "overall_pass_rate"
+          ]
+        },
+        "threshold": {
+          "description": "Minimum accepted overall pass rate in `[0.0, 1.0]`.",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Pass iff the minimum per-task pass rate across **all** tasks meets the threshold.\n\nComputed as `min(pass_rate per task across all subjects)`. A task that never appears scores 0.0. This is task-level, not judge-type-level — `LlmJudge` and other task types all contribute equally.",
+      "type": "object",
+      "required": [
+        "kind",
+        "threshold"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "per_judge_pass_rate"
+          ]
+        },
+        "threshold": {
+          "description": "Minimum accepted per-task pass rate in `[0.0, 1.0]`.",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Pass iff every task passes.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "all_pass"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

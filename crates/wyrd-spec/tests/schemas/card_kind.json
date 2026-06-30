@@ -19,7 +19,6 @@
     "Artifact",
     "Trigger",
     "Operator",
-    "Source",
-    "External"
+    "Source"
   ]
 }

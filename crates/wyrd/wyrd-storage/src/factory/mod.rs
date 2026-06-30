@@ -1,15 +1,18 @@
-//! Backend SDK and object-store construction.
+//! Backend SDK and opendal operator construction.
 
 pub mod azure;
 pub mod gcs;
+/// Iceberg `StorageFactory` builder wired to the active backend configuration.
+#[cfg(feature = "iceberg")]
+pub mod iceberg_factory;
 pub mod local;
 pub mod s3;
 
 use crate::error::StorageError;
 use crate::settings::BackendConfig;
 use crate::signer::BackendSigner;
-use object_store::ObjectStore;
-use std::sync::Arc;
+use opendal::Operator;
+use wyrd_spec::storage::StorageBackendKind;
 
 /// Build the active backend signer.
 ///
@@ -28,16 +31,69 @@ pub async fn build_signer(backend: &BackendConfig) -> Result<BackendSigner, Stor
     }
 }
 
-/// Build the single process-level object store for the selected backend.
+fn finish_op<B: opendal::Builder>(
+    builder: B,
+    backend: StorageBackendKind,
+) -> Result<Operator, StorageError> {
+    Ok(Operator::new(builder)
+        .map_err(|e| StorageError::Backend {
+            backend,
+            op: "build_operator",
+            message: e.to_string(),
+        })?
+        .finish())
+}
+
+/// Build the opendal `Operator` for the selected backend.
 ///
 /// # Errors
-/// Returns a storage error when object-store construction fails.
-pub fn build_object_store(backend: &BackendConfig) -> Result<Arc<dyn ObjectStore>, StorageError> {
-    let store: Arc<dyn ObjectStore> = match backend {
-        BackendConfig::Local { root } => Arc::new(local::build_object_store(root)?),
-        BackendConfig::S3(config) => Arc::new(s3::build_object_store(config)?),
-        BackendConfig::Gcs(config) => Arc::new(gcs::build_object_store(config)?),
-        BackendConfig::Azure(config) => Arc::new(azure::build_object_store(config)?),
-    };
-    Ok(store)
+/// Returns a storage error when operator construction fails.
+pub fn build_operator(backend: &BackendConfig) -> Result<Operator, StorageError> {
+    match backend {
+        BackendConfig::Local { root } => {
+            finish_op(local::fs_service(root), StorageBackendKind::Local)
+        }
+        BackendConfig::S3(c) => finish_op(s3::s3_service(c), StorageBackendKind::S3),
+        BackendConfig::Gcs(c) => finish_op(gcs::gcs_service(c), StorageBackendKind::Gcs),
+        BackendConfig::Azure(c) => finish_op(azure::azblob_service(c), StorageBackendKind::Azure),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opendal::ErrorKind;
+
+    #[tokio::test]
+    async fn fs_operator_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = BackendConfig::Local {
+            root: dir.path().to_path_buf(),
+        };
+        let op = build_operator(&backend).expect("build local operator");
+
+        op.write("probe.txt", b"hello" as &[u8])
+            .await
+            .expect("write");
+        let meta = op.stat("probe.txt").await.expect("stat");
+        assert_eq!(meta.content_length(), 5);
+        let buf = op.read("probe.txt").await.expect("read");
+        assert_eq!(buf.to_bytes().as_ref(), b"hello");
+        op.delete("probe.txt").await.expect("delete");
+    }
+
+    #[tokio::test]
+    async fn fs_stat_missing_is_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = BackendConfig::Local {
+            root: dir.path().to_path_buf(),
+        };
+        let op = build_operator(&backend).expect("build local operator");
+
+        let err = op
+            .stat("does-not-exist.txt")
+            .await
+            .expect_err("should be NotFound");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
 }

@@ -37,34 +37,52 @@ HOME = (
     "The typed control layer for AI systems: cards, a registry, and the Skald runtime.",
 )
 
-# Section directories in the order they appear in the site nav. Any content
-# directory not listed here is appended afterwards in alphabetical order so a
-# new section never silently drops out of llms.txt.
+# Section directories in the order they appear in the site nav. Ordered to
+# match the locked 7-section Diátaxis IA (Decision 8 from commit 09):
+# Overview / Setup / Tutorials / How-to / Concepts / Reference / For Agents.
+# Any content directory not listed here is appended afterwards in alphabetical
+# order so a new section never silently drops out of llms.txt.
 SECTION_ORDER = [
-    "start-here",
+    "overview",
+    "setup",
+    "tutorials",
+    "how-to",
+    "concepts",
     "cards",
+    "api",
+    "for-agents",
+    # Legacy sections that predate the Diátaxis IA; kept in SECTION_ORDER so
+    # they appear in a stable position rather than being sorted alphabetically.
+    "start-here",
     "skald",
     "guides",
     "agents",
     "evaluation",
     "server",
     "python",
-    "api",
     "roadmap",
+    "fathom",
 ]
 
 SECTION_TITLES = {
     "": "Home",
-    "start-here": "Start here",
+    "overview": "Overview",
+    "setup": "Setup",
+    "tutorials": "Tutorials",
+    "how-to": "How-to guides",
+    "concepts": "Concepts",
     "cards": "Cards",
+    "api": "API reference",
+    "for-agents": "For Agents",
+    "start-here": "Start here",
     "skald": "Skald runtime",
     "guides": "Guides",
     "agents": "Agents",
     "evaluation": "Evaluation",
     "server": "Server",
     "python": "Python",
-    "api": "API reference",
     "roadmap": "Roadmap",
+    "fathom": "Fathom",
 }
 
 # Card kinds that ship a dedicated reference page under /cards/. Every other

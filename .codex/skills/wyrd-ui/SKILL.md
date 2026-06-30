@@ -58,9 +58,9 @@ Use `border-radius: 0` for Wyrd UI surfaces and controls. Do not add inline radi
 Use solid, zero-blur shadows:
 
 ```css
-box-shadow: 3px 3px 0 0 var(--neo-shadow-color);
-box-shadow: 6px 6px 0 0 var(--neo-shadow-color);
-box-shadow: 10px 10px 0 0 var(--neo-shadow-color);
+box-shadow: 3px 3px 0 0 var(--shadow);
+box-shadow: 6px 6px 0 0 var(--shadow);
+box-shadow: 10px 10px 0 0 var(--shadow);
 ```
 
 Do not use blurred shadows, glassmorphism, soft elevation, or `filter: drop-shadow(...)`.
@@ -80,6 +80,20 @@ For any styling or visual change, read:
 - `references/wyrd-light-mode-style-guide.md`
 - `references/wyrd-dark-mode-style-guide.md`
 - `references/wyrd-theme.css`
+
+`references/wyrd-theme.css` is a **generated artifact**, not a hand-authored
+file. Its color/token layer (the `[data-theme='wyrd'].theme-light` /
+`.theme-dark` blocks) is emitted from `crates/wyrd/wyrd-server/wyrd-ui/brand/palette.json`
+by `brand/gen-theme.mjs`; the brutalist utility classes below the token blocks
+(`.neo-card`, `.neo-btn`, `.mono-tag`, `.pixel-text`, `.card-tag--*`,
+`.status-dot*`, and the zero-radius overrides) are ported forward and reference
+those canonical tokens via `var(--*)`. Do not edit it by hand — change
+`palette.json` (for token values) or the `codexUtilities` block in
+`gen-theme.mjs` (for the utilities), then run `pnpm tokens`. A CI drift lock
+(`gen-theme.mjs --check`) fails if the file diverges from the palette. The old
+oklch fork — glow (`.neo-glow`, `--neo-glow-color`), gradient helpers,
+`--retro-*`, `.grain`, and the CRT scanline/vignette/phosphor `text-shadow`
+layers — has been removed; do not reintroduce it (it violates the Never rules).
 
 Also inspect the current app files:
 

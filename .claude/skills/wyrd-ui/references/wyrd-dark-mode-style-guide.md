@@ -1,7 +1,7 @@
 # Wyrd Dark Mode Style Guide — Flat Near-Black
 
 **Canonical source:** the app's `brand/` directory (`DESIGN.md` + `palette.json`) and
-`crates/wyrd/wyrd-server/wyrd-ui/brand/wyrd-ui-source-of-truth.html`. This is a portable summary; `brand/` wins on any
+`crates/wyrd/wyrd-server/wyrd-ui/brand/wyrd-ui-source-of-truth-v2.html`. This is a portable summary; `brand/` wins on any
 disagreement.
 
 Dark mode is the **same brutalist system on darker surfaces** — identical geometry (5px

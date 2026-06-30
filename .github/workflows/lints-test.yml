@@ -384,6 +384,9 @@ jobs:
           pnpm exec svelte-kit sync
           pnpm exec vite --version
 
+      - name: Token drift lock
+        run: mise run check:tokens
+
   ci-complete:
     name: ci complete
     needs: [changes, matrix-plan, rust, rust-bifrost, rust-gates, codegen, python, docs, ui]

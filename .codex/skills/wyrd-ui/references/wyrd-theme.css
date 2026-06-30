@@ -1,615 +1,139 @@
-/* ═══════════════════════════════════════════════════════════════════════════
+/* GENERATED FILE — do not edit by hand.
+ * Source of truth: brand/palette.json. Regenerate with `pnpm tokens`.
+ * Token names are identical to ./wyrd-ui-source-of-truth-v2.html. */
 
-   Wyrd Theme — managing the fate of AI
-
-   Brutalist aesthetic across BOTH modes:
-   ─ Zero rounded corners (carved, not curved)
-   ─ Hard-offset solid shadows in both modes (no blur, ever)
-   ─ Thick borders (2-3px)
-   ─ Press-in button interactions
-   ─ Semantic card-type colors retained in dark mode (muted, not collapsed)
-
-   Light : Brutalist parchment + rune-purple accents (#0a0a0a borders/shadows)
-   Dark  : Brutalist phosphor terminal (dim phosphor-green borders/shadows
-           with CRT scanlines, vignette, text bloom)
-
-   Token surface includes color scales, retro effects, glow tokens, and
-   brutalist geometry utilities so Wyrd components can stay theme-aware.
-
-   Selector: [data-theme='wyrd']
-
-   ═══════════════════════════════════════════════════════════════════════════ */
-
-
-/* ─── Light theme (default) ─────────────────────────────────────────────── */
 [data-theme='wyrd'].theme-light,
 [data-theme='wyrd']:not(.theme-dark) {
-  --text-scaling: 1.067;
-  --base-font-color: 10 10 10;
-  --base-font-color-dark: 245 245 245;
-  --base-font-family: 'Archivo', 'Inter', system-ui, sans-serif;
-  --base-font-size: inherit;
-  --base-line-height: 1.45;
-  --base-font-weight: 500;
-  --base-font-style: inherit;
-  --base-letter-spacing: 0em;
+  /* fonts */
+  --font-sans: "Archivo", system-ui, sans-serif;
+  --font-display: "Archivo Black", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+  --font-arcade: "Press Start 2P", monospace;
+  --font-pixel: "VT323", monospace;
 
-  --heading-font-color: inherit;
-  --heading-font-color-dark: inherit;
-  --heading-font-family: 'Archivo Black', 'Archivo', system-ui, sans-serif;
-  --heading-font-weight: 900;
-  --heading-font-style: normal;
-  --heading-letter-spacing: -0.02em;
+  /* surface */
+  --bg: #f4f4f5;
+  --surface: #ffffff;
+  --surface-2: #ececef;
 
-  --mono-font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
-  --pixel-font-family: 'VT323', 'JetBrains Mono', ui-monospace, monospace;
+  /* ink */
+  --border: #0b0b0e;
+  --shadow: #0b0b0e;
 
-  --anchor-font-color: var(--color-primary-700);
-  --anchor-font-color-dark: var(--color-primary-500);
-  --anchor-font-family: inherit;
-  --anchor-font-size: inherit;
-  --anchor-line-height: inherit;
-  --anchor-font-weight: 600;
-  --anchor-font-style: inherit;
-  --anchor-letter-spacing: inherit;
-  --anchor-text-decoration: underline;
-  --anchor-text-decoration-hover: underline;
-  --anchor-text-decoration-active: none;
-  --anchor-text-decoration-focus: none;
+  /* text */
+  --text: #14141a;
+  --muted: #6b6b76;
 
-  /* ── Geometry: BRUTALIST ── */
-  --spacing: 0.25rem;
-  --radius-base: 0;
-  --radius-container: 0;
-  --default-border-width: 2px;
-  --default-divide-width: 2px;
-  --default-ring-width: 3px;
+  /* rune */
+  --rune: #8b5cf6;
+  --rune-strong: #7c3aed;
+  --rune-soft: #f1ecfd;
+  --rune-btn: #8b5cf6;
+  --rune-btn-ink: #ffffff;
 
-  --body-background-color: var(--color-surface-500);
-  --body-background-color-dark: var(--color-surface-950);
+  /* acid */
+  --lime: #c5f23c;
+  --lime-ink: #0b0b0e;
+  --lime-text: #4a7a06;
 
-  /* ── Primary: Rune Purple (the Y) ── */
-  --color-primary-50:  oklch(100%   0     none);
-  --color-primary-100: oklch(93.86% 0.03  299.6deg);
-  --color-primary-200: oklch(87.64% 0.06  297.52deg);
-  --color-primary-300: oklch(81.64% 0.08  296.73deg);
-  --color-primary-400: oklch(75.43% 0.12  295.41deg);
-  --color-primary-500: oklch(69.32% 0.15  294.6deg);
-  --color-primary-600: oklch(61.99% 0.14  292.64deg);
-  --color-primary-700: oklch(54.41% 0.1395 290.504);
-  --color-primary-800: oklch(46.73% 0.14  288.29deg);
-  --color-primary-900: oklch(38.72% 0.14  284.86deg);
-  --color-primary-950: oklch(30.7%  0.14  279.76deg);
-  --color-primary-contrast-dark: var(--color-primary-950);
-  --color-primary-contrast-light: var(--color-primary-50);
-  --color-primary-contrast-50:  var(--color-primary-contrast-dark);
-  --color-primary-contrast-100: var(--color-primary-contrast-dark);
-  --color-primary-contrast-200: var(--color-primary-contrast-dark);
-  --color-primary-contrast-300: var(--color-primary-contrast-dark);
-  --color-primary-contrast-400: var(--color-primary-contrast-dark);
-  --color-primary-contrast-500: var(--color-primary-contrast-light);
-  --color-primary-contrast-600: var(--color-primary-contrast-light);
-  --color-primary-contrast-700: var(--color-primary-contrast-light);
-  --color-primary-contrast-800: var(--color-primary-contrast-light);
-  --color-primary-contrast-900: var(--color-primary-contrast-light);
-  --color-primary-contrast-950: var(--color-primary-contrast-light);
+  /* line */
+  --client: #c5f23c;
+  --client-bar: #c5f23c;
+  --server: #f2a23c;
+  --server-bar: #ec8b14;
+  --control: #7cc4e8;
+  --control-bar: #2f6f9e;
 
-  /* ── Secondary: Moss Green (DataCard) ── */
-  --color-secondary-50:  oklch(97.99% 0.03 196.62deg);
-  --color-secondary-100: oklch(93.99% 0.05 173.3deg);
-  --color-secondary-200: oklch(90.03% 0.08 164.54deg);
-  --color-secondary-300: oklch(86.05% 0.1  160.39deg);
-  --color-secondary-400: oklch(82.37% 0.13 156.92deg);
-  --color-secondary-500: oklch(78.955% 0.14997 153.915);
-  --color-secondary-600: oklch(71.83% 0.15 153.14deg);
-  --color-secondary-700: oklch(64.6%  0.14 152.1deg);
-  --color-secondary-800: oklch(56.97% 0.14 151.29deg);
-  --color-secondary-900: oklch(49.43% 0.13 149.62deg);
-  --color-secondary-950: oklch(41.7%  0.12 147.6deg);
-  --color-secondary-contrast-dark: var(--color-secondary-950);
-  --color-secondary-contrast-light: var(--color-secondary-50);
-  --color-secondary-contrast-50:  var(--color-secondary-contrast-dark);
-  --color-secondary-contrast-100: var(--color-secondary-contrast-dark);
-  --color-secondary-contrast-200: var(--color-secondary-contrast-dark);
-  --color-secondary-contrast-300: var(--color-secondary-contrast-dark);
-  --color-secondary-contrast-400: var(--color-secondary-contrast-dark);
-  --color-secondary-contrast-500: var(--color-secondary-contrast-dark);
-  --color-secondary-contrast-600: var(--color-secondary-contrast-dark);
-  --color-secondary-contrast-700: var(--color-secondary-contrast-dark);
-  --color-secondary-contrast-800: var(--color-secondary-contrast-light);
-  --color-secondary-contrast-900: var(--color-secondary-contrast-light);
-  --color-secondary-contrast-950: var(--color-secondary-contrast-light);
+  /* status */
+  --ok: #2f9e44;
+  --warn: #ec8b14;
+  --danger: #d2402a;
 
-  /* ── Tertiary: Ink Blue (PromptCard) ── */
-  --color-tertiary-50:  oklch(100%   0    none);
-  --color-tertiary-100: oklch(94.79% 0.02 264.49deg);
-  --color-tertiary-200: oklch(89.54% 0.04 263.66deg);
-  --color-tertiary-300: oklch(84.39% 0.06 264.62deg);
-  --color-tertiary-400: oklch(79.13% 0.08 263.93deg);
-  --color-tertiary-500: oklch(73.95% 0.11 263.6deg);
-  --color-tertiary-600: oklch(66.53% 0.11 260.54deg);
-  --color-tertiary-700: oklch(58.94% 0.11 257.4deg);
-  --color-tertiary-800: oklch(51%    0.11 255.32deg);
-  --color-tertiary-900: oklch(43.2%  0.11 253.57deg);
-  --color-tertiary-950: oklch(35.46% 0.11 253.79deg);
-  --color-tertiary-contrast-dark: var(--color-tertiary-950);
-  --color-tertiary-contrast-light: var(--color-tertiary-50);
-  --color-tertiary-contrast-50:  var(--color-tertiary-contrast-dark);
-  --color-tertiary-contrast-100: var(--color-tertiary-contrast-dark);
-  --color-tertiary-contrast-200: var(--color-tertiary-contrast-dark);
-  --color-tertiary-contrast-300: var(--color-tertiary-contrast-dark);
-  --color-tertiary-contrast-400: var(--color-tertiary-contrast-dark);
-  --color-tertiary-contrast-500: var(--color-tertiary-contrast-dark);
-  --color-tertiary-contrast-600: var(--color-tertiary-contrast-dark);
-  --color-tertiary-contrast-700: var(--color-tertiary-contrast-light);
-  --color-tertiary-contrast-800: var(--color-tertiary-contrast-light);
-  --color-tertiary-contrast-900: var(--color-tertiary-contrast-light);
-  --color-tertiary-contrast-950: var(--color-tertiary-contrast-light);
+  /* hero */
+  --hero-bg: #8b5cf6;
+  --hero-ink: #ffffff;
+  --ink-on-fill: #0b0b0e;
 
-  /* ── Success, Warning, Error: standard semantic scales ── */
-  --color-success-50:  oklch(98.97% 0.05 107.31deg);
-  --color-success-100: oklch(97.05% 0.08 102.01deg);
-  --color-success-200: oklch(95.11% 0.1  99.78deg);
-  --color-success-300: oklch(93.31% 0.12 97.86deg);
-  --color-success-400: oklch(91.51% 0.14 96.67deg);
-  --color-success-500: oklch(89.86% 0.15 95.04deg);
-  --color-success-600: oklch(82.48% 0.14 95.03deg);
-  --color-success-700: oklch(75.05% 0.14 95.97deg);
-  --color-success-800: oklch(67.33% 0.13 95.83deg);
-  --color-success-900: oklch(59.52% 0.12 96.76deg);
-  --color-success-950: oklch(51.33% 0.11 96.24deg);
-  --color-success-contrast-dark: var(--color-success-950);
-  --color-success-contrast-light: var(--color-success-50);
-  --color-success-contrast-50:  var(--color-success-contrast-dark);
-  --color-success-contrast-100: var(--color-success-contrast-dark);
-  --color-success-contrast-200: var(--color-success-contrast-dark);
-  --color-success-contrast-300: var(--color-success-contrast-dark);
-  --color-success-contrast-400: var(--color-success-contrast-dark);
-  --color-success-contrast-500: var(--color-success-contrast-dark);
-  --color-success-contrast-600: var(--color-success-contrast-dark);
-  --color-success-contrast-700: var(--color-success-contrast-dark);
-  --color-success-contrast-800: var(--color-success-contrast-light);
-  --color-success-contrast-900: var(--color-success-contrast-light);
-  --color-success-contrast-950: var(--color-success-contrast-light);
+  /* scene */
+  --sky-top: #edeaf4;
+  --sky-bot: #e0d8f2;
+  --grid: #7c3aed;
+  --star: #7c3aed;
+  --spr-d: #9b78e0;
 
-  --color-warning-50:  oklch(99.02% 0.05 107.26deg);
-  --color-warning-100: oklch(95.45% 0.06 93.7deg);
-  --color-warning-200: oklch(91.73% 0.08 83.94deg);
-  --color-warning-300: oklch(88.22% 0.1  78.32deg);
-  --color-warning-400: oklch(84.68% 0.11 72.87deg);
-  --color-warning-500: oklch(81.47% 0.13 68.75deg);
-  --color-warning-600: oklch(74%    0.12 68.45deg);
-  --color-warning-700: oklch(66.67% 0.12 68.25deg);
-  --color-warning-800: oklch(58.85% 0.11 67.06deg);
-  --color-warning-900: oklch(51.13% 0.11 65.69deg);
-  --color-warning-950: oklch(42.82% 0.1  62.8deg);
-  --color-warning-contrast-dark: var(--color-warning-950);
-  --color-warning-contrast-light: var(--color-warning-50);
-  --color-warning-contrast-50:  var(--color-warning-contrast-dark);
-  --color-warning-contrast-100: var(--color-warning-contrast-dark);
-  --color-warning-contrast-200: var(--color-warning-contrast-dark);
-  --color-warning-contrast-300: var(--color-warning-contrast-dark);
-  --color-warning-contrast-400: var(--color-warning-contrast-dark);
-  --color-warning-contrast-500: var(--color-warning-contrast-dark);
-  --color-warning-contrast-600: var(--color-warning-contrast-dark);
-  --color-warning-contrast-700: var(--color-warning-contrast-dark);
-  --color-warning-contrast-800: var(--color-warning-contrast-light);
-  --color-warning-contrast-900: var(--color-warning-contrast-light);
-  --color-warning-contrast-950: var(--color-warning-contrast-light);
-
-  --color-error-50:  oklch(89.86% 0.05 26.86deg);
-  --color-error-100: oklch(90.84% 0.04 16.21deg);
-  --color-error-200: oklch(84.73% 0.08 23.52deg);
-  --color-error-300: oklch(79.71% 0.12 21.92deg);
-  --color-error-400: oklch(75.25% 0.15 22.22deg);
-  --color-error-500: oklch(71.16% 0.18 22.84deg);
-  --color-error-600: oklch(63.96% 0.18 23.5deg);
-  --color-error-700: oklch(56.57% 0.17 24.08deg);
-  --color-error-800: oklch(49.46% 0.17 24.94deg);
-  --color-error-900: oklch(42.18% 0.16 26.39deg);
-  --color-error-950: oklch(35.13% 0.14 28.29deg);
-  --color-error-contrast-dark: var(--color-error-950);
-  --color-error-contrast-light: var(--color-error-50);
-  --color-error-contrast-50:  var(--color-error-contrast-dark);
-  --color-error-contrast-100: var(--color-error-contrast-dark);
-  --color-error-contrast-200: var(--color-error-contrast-dark);
-  --color-error-contrast-300: var(--color-error-contrast-dark);
-  --color-error-contrast-400: var(--color-error-contrast-dark);
-  --color-error-contrast-500: var(--color-error-contrast-dark);
-  --color-error-contrast-600: var(--color-error-contrast-light);
-  --color-error-contrast-700: var(--color-error-contrast-light);
-  --color-error-contrast-800: var(--color-error-contrast-light);
-  --color-error-contrast-900: var(--color-error-contrast-light);
-  --color-error-contrast-950: var(--color-error-contrast-light);
-
-  /* ── Surface: parchment (warm neutral, slightly off-white) ── */
-  --color-surface-50:  oklch(100%   0    none);
-  --color-surface-100: oklch(99.43% 0    287.34deg);
-  --color-surface-200: oklch(98.84% 0    287.33deg);
-  --color-surface-300: oklch(98.34% 0    309.08deg);
-  --color-surface-400: oklch(97.75% 0    309.07deg);
-  --color-surface-500: oklch(97.18% 0    301.83deg);
-  --color-surface-600: oklch(89.89% 0    309deg);
-  --color-surface-700: oklch(82.2%  0    301.74deg);
-  --color-surface-800: oklch(74.58% 0    308.87deg);
-  --color-surface-900: oklch(66.5%  0    301.64deg);
-  --color-surface-950: oklch(58.44% 0    308.74deg);
-  --color-surface-contrast-dark: var(--color-surface-950);
-  --color-surface-contrast-light: var(--color-surface-50);
-  --color-surface-contrast-50:  var(--color-surface-contrast-dark);
-  --color-surface-contrast-100: var(--color-surface-contrast-dark);
-  --color-surface-contrast-200: var(--color-surface-contrast-dark);
-  --color-surface-contrast-300: var(--color-surface-contrast-dark);
-  --color-surface-contrast-400: var(--color-surface-contrast-dark);
-  --color-surface-contrast-500: var(--color-surface-contrast-dark);
-  --color-surface-contrast-600: var(--color-surface-contrast-dark);
-  --color-surface-contrast-700: var(--color-surface-contrast-dark);
-  --color-surface-contrast-800: var(--color-surface-contrast-dark);
-  --color-surface-contrast-900: var(--color-surface-contrast-dark);
-  --color-surface-contrast-950: var(--color-surface-contrast-light);
-
-  /* ── Card-type semantic colors (one per card type) ── */
-  --card-data:       var(--color-secondary-500);   /* moss green */
-  --card-model:      var(--color-primary-500);     /* rune purple */
-  --card-experiment: var(--color-warning-500);     /* warning gold */
-  --card-prompt:     var(--color-tertiary-500);    /* ink blue */
-  --card-agent:      oklch(10% 0 0);               /* black */
-  --card-service:    var(--color-surface-50);      /* white */
-
-  /* ── Grid background ── */
-  --grid-bg: #E3DFF2;
-  --grid-line: #CECBDB;
-  --grid-alt-bg: #f8f8f8;
-
-  /* ── Chart colors ── */
-  --chart-text-color: rgb(10, 10, 10);
-  --chart-grid-color: rgba(10, 10, 10, 0.1);
-  --chart-axis-color: rgb(10, 10, 10);
-  --chart-tooltip-bg: rgba(255, 255, 255, 1);
-  --chart-tooltip-border: rgb(10, 10, 10);
-  --chart-tooltip-text: rgb(10, 10, 10);
-  --chart-series-1: rgba(138, 109, 240, 1);
-  --chart-series-2: rgba(95, 214, 141, 1);
-  --chart-series-3: rgba(135, 170, 240, 1);
-  --chart-series-4: rgba(253, 220, 90, 1);
-  --chart-series-5: rgba(249, 178, 94, 1);
-  --chart-series-6: rgba(254, 108, 107, 1);
-  --chart-trace-success: rgba(95, 214, 141, 1);
-  --chart-trace-error: rgba(254, 108, 107, 1);
-  --chart-zoom-border: rgb(138, 109, 240);
-  --chart-zoom-bg: rgba(138, 109, 240, 0.25);
-
-  /* ── Brutalist shadow + neo-glow tokens ── */
-  --neo-shadow-color: rgb(10 10 10);
-  --neo-shadow-offset-sm: 3px;
-  --neo-shadow-offset: 6px;
-  --neo-shadow-offset-lg: 10px;
-  --neo-glow-color: oklch(82% 0.20 295deg / 0.55);
-
-  /* ── Retro gradients (hero backgrounds only — never UI surfaces) ── */
-  --retro-primary-from: oklch(88% 0.18 302deg);
-  --retro-primary-mid:  oklch(84% 0.22 295deg);
-  --retro-primary-to:   oklch(79% 0.20 288deg);
-
-  --retro-secondary-from: oklch(90% 0.14 190deg);
-  --retro-secondary-mid:  oklch(86% 0.18 182deg);
-  --retro-secondary-to:   oklch(82% 0.20 174deg);
-
-  --retro-tertiary-from: oklch(89% 0.16 265deg);
-  --retro-tertiary-mid:  oklch(85% 0.19 258deg);
-  --retro-tertiary-to:   oklch(80% 0.21 252deg);
-
-  --retro-success-from: oklch(90% 0.18 125deg);
-  --retro-success-mid:  oklch(86% 0.22 112deg);
-  --retro-success-to:   oklch(81% 0.24 100deg);
-
-  --retro-warning-from: oklch(92% 0.14 80deg);
-  --retro-warning-mid:  oklch(88% 0.18 70deg);
-  --retro-warning-to:   oklch(83% 0.20 60deg);
-
-  --retro-error-base: oklch(95.798% 0.01325 28.451);
-  --retro-error-from: oklch(92% 0.15 25deg);
-  --retro-error-mid:  oklch(83% 0.22 18deg);
-  --retro-error-to:   oklch(72% 0.24 12deg);
-
-  --retro-orange-from: oklch(96.697% 0.01554 42.084);
-  --retro-orange-to:   oklch(63.473% 0.19743 38.716);
+  /* geometry */
+  --r: 5px;
 }
-
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   Dark Theme — Brutalist Phosphor Terminal
-   Same brutalism as light mode: zero corners, hard-offset shadows, 2px borders.
-   Different palette: phosphor green on near-black. CRT atmosphere overlays.
-   ═══════════════════════════════════════════════════════════════════════════ */
 [data-theme='wyrd'].theme-dark {
-  --text-scaling: 1.067;
-  --base-font-color: 141 219 159;
-  --base-font-color-dark: 141 219 159;
-  /* Dark mode: font swaps to JetBrains Mono for the terminal-monitor read */
-  --base-font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
-  --base-font-size: inherit;
-  --base-line-height: 1.55;
-  --base-font-weight: 500;
-  --base-font-style: inherit;
-  --base-letter-spacing: 0em;
+  /* fonts */
+  --font-sans: "Archivo", system-ui, sans-serif;
+  --font-display: "Archivo Black", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+  --font-arcade: "Press Start 2P", monospace;
+  --font-pixel: "VT323", monospace;
 
-  --heading-font-color: inherit;
-  --heading-font-color-dark: inherit;
-  --heading-font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
-  --heading-font-weight: 700;
-  --heading-font-style: normal;
-  --heading-letter-spacing: 0.01em;
+  /* surface */
+  --bg: #0e0e0e;
+  --surface: #17171b;
+  --surface-2: #1f1f24;
 
-  --mono-font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
-  --pixel-font-family: 'VT323', 'JetBrains Mono', ui-monospace, monospace;
+  /* ink */
+  --border: #313139;
+  --shadow: #2a2a31;
 
-  --anchor-font-color: var(--color-primary-700);
-  --anchor-font-color-dark: var(--color-primary-700);
+  /* text */
+  --text: #d6d6dc;
+  --muted: #8a8a95;
 
-  /* ── Geometry: same brutalist constraints as light ── */
-  --spacing: 0.25rem;
-  --radius-base: 0;
-  --radius-container: 0;
-  --default-border-width: 2px;
-  --default-divide-width: 2px;
-  --default-ring-width: 3px;
+  /* rune */
+  --rune: #241b40;
+  --rune-strong: #a78bfa;
+  --rune-soft: #241b40;
+  --rune-btn: #a78bfa;
+  --rune-btn-ink: #0b0b0e;
 
-  --body-background-color: var(--color-surface-950);
-  --body-background-color-dark: var(--color-surface-950);
+  /* acid */
+  --lime: #c5f23c;
+  --lime-ink: #0b0b0e;
+  --lime-text: #c5f23c;
 
-  /* ── Primary: Phosphor Green ── */
-  --color-primary-50:  oklch(10% 0.01 150);
-  --color-primary-100: oklch(20% 0.01 150);
-  --color-primary-200: oklch(24% 0.05 150);
-  --color-primary-300: oklch(28% 0.06 150);
-  --color-primary-400: oklch(36% 0.09 148);
-  --color-primary-500: oklch(45% 0.11 150);
-  --color-primary-600: oklch(55% 0.13 150);
-  --color-primary-700: oklch(65% 0.14 150);
-  --color-primary-800: oklch(75% 0.15 150);
-  --color-primary-900: oklch(80% 0.14 152);
-  --color-primary-950: oklch(83% 0.15 150);
-  --color-primary-contrast-dark: var(--color-primary-50);
-  --color-primary-contrast-light: var(--color-primary-950);
-  --color-primary-contrast-50:  var(--color-primary-contrast-light);
-  --color-primary-contrast-100: var(--color-primary-contrast-light);
-  --color-primary-contrast-200: var(--color-primary-contrast-light);
-  --color-primary-contrast-300: var(--color-primary-contrast-light);
-  --color-primary-contrast-400: var(--color-primary-contrast-light);
-  --color-primary-contrast-500: var(--color-primary-contrast-light);
-  --color-primary-contrast-600: var(--color-primary-contrast-dark);
-  --color-primary-contrast-700: var(--color-primary-contrast-dark);
-  --color-primary-contrast-800: var(--color-primary-contrast-dark);
-  --color-primary-contrast-900: var(--color-primary-contrast-dark);
-  --color-primary-contrast-950: var(--color-primary-contrast-dark);
+  /* line */
+  --client: #c5f23c;
+  --client-bar: #c5f23c;
+  --server: #f2a23c;
+  --server-bar: #f2a23c;
+  --control: #6fb3d6;
+  --control-bar: #6fb3d6;
 
-  /* ── Secondary: cooler green sibling ── */
-  --color-secondary-50:  oklch(10% 0.01 155);
-  --color-secondary-100: oklch(20% 0.04 155);
-  --color-secondary-200: oklch(20% 0.04 155);
-  --color-secondary-300: oklch(28% 0.06 155);
-  --color-secondary-400: oklch(36% 0.09 155);
-  --color-secondary-500: oklch(45% 0.11 155);
-  --color-secondary-600: oklch(55% 0.13 155);
-  --color-secondary-700: oklch(65% 0.14 155);
-  --color-secondary-800: oklch(75% 0.15 155);
-  --color-secondary-900: oklch(80% 0.14 155);
-  --color-secondary-950: oklch(83% 0.13 155);
-  --color-secondary-contrast-dark: var(--color-secondary-50);
-  --color-secondary-contrast-light: var(--color-secondary-950);
-  --color-secondary-contrast-50:  var(--color-secondary-contrast-light);
-  --color-secondary-contrast-100: var(--color-secondary-contrast-light);
-  --color-secondary-contrast-200: var(--color-secondary-contrast-light);
-  --color-secondary-contrast-300: var(--color-secondary-contrast-light);
-  --color-secondary-contrast-400: var(--color-secondary-contrast-light);
-  --color-secondary-contrast-500: var(--color-secondary-contrast-light);
-  --color-secondary-contrast-600: var(--color-secondary-contrast-dark);
-  --color-secondary-contrast-700: var(--color-secondary-contrast-dark);
-  --color-secondary-contrast-800: var(--color-secondary-contrast-dark);
-  --color-secondary-contrast-900: var(--color-secondary-contrast-dark);
-  --color-secondary-contrast-950: var(--color-secondary-contrast-dark);
+  /* status */
+  --ok: #7ee081;
+  --warn: #f2a23c;
+  --danger: #e8615a;
 
-  /* ── Tertiary: muted CRT blue ── */
-  --color-tertiary-50:  oklch(10% 0.01  265);
-  --color-tertiary-100: oklch(14% 0.015 265);
-  --color-tertiary-200: oklch(20% 0.02  265);
-  --color-tertiary-300: oklch(28% 0.025 265);
-  --color-tertiary-400: oklch(35% 0.03  265);
-  --color-tertiary-500: oklch(50% 0.06  265);
-  --color-tertiary-600: oklch(55% 0.07  265);
-  --color-tertiary-700: oklch(62% 0.08  265);
-  --color-tertiary-800: oklch(68% 0.08  265);
-  --color-tertiary-900: oklch(72% 0.07  265);
-  --color-tertiary-950: oklch(76% 0.06  265);
-  --color-tertiary-contrast-dark: var(--color-tertiary-50);
-  --color-tertiary-contrast-light: var(--color-tertiary-950);
-  --color-tertiary-contrast-50:  var(--color-tertiary-contrast-light);
-  --color-tertiary-contrast-100: var(--color-tertiary-contrast-light);
-  --color-tertiary-contrast-200: var(--color-tertiary-contrast-light);
-  --color-tertiary-contrast-300: var(--color-tertiary-contrast-light);
-  --color-tertiary-contrast-400: var(--color-tertiary-contrast-light);
-  --color-tertiary-contrast-500: var(--color-tertiary-contrast-light);
-  --color-tertiary-contrast-600: var(--color-tertiary-contrast-dark);
-  --color-tertiary-contrast-700: var(--color-tertiary-contrast-dark);
-  --color-tertiary-contrast-800: var(--color-tertiary-contrast-dark);
-  --color-tertiary-contrast-900: var(--color-tertiary-contrast-dark);
-  --color-tertiary-contrast-950: var(--color-tertiary-contrast-dark);
+  /* hero */
+  --hero-bg: #241b40;
+  --hero-ink: #e9e2ff;
+  --ink-on-fill: #0b0b0e;
 
-  --color-success-50:  oklch(10% 0.01 148);
-  --color-success-100: oklch(14% 0.02 148);
-  --color-success-200: oklch(20% 0.04 148);
-  --color-success-300: oklch(28% 0.07 148);
-  --color-success-400: oklch(36% 0.09 148);
-  --color-success-500: oklch(45% 0.11 148);
-  --color-success-600: oklch(55% 0.13 148);
-  --color-success-700: oklch(65% 0.14 148);
-  --color-success-800: oklch(75% 0.15 148);
-  --color-success-900: oklch(80% 0.14 148);
-  --color-success-950: oklch(83% 0.13 148);
-  --color-success-contrast-dark: var(--color-success-50);
-  --color-success-contrast-light: var(--color-success-950);
-  --color-success-contrast-50:  var(--color-success-contrast-light);
-  --color-success-contrast-100: var(--color-success-contrast-light);
-  --color-success-contrast-200: var(--color-success-contrast-light);
-  --color-success-contrast-300: var(--color-success-contrast-light);
-  --color-success-contrast-400: var(--color-success-contrast-light);
-  --color-success-contrast-500: var(--color-success-contrast-light);
-  --color-success-contrast-600: var(--color-success-contrast-dark);
-  --color-success-contrast-700: var(--color-success-contrast-dark);
-  --color-success-contrast-800: var(--color-success-contrast-dark);
-  --color-success-contrast-900: var(--color-success-contrast-dark);
-  --color-success-contrast-950: var(--color-success-contrast-dark);
+  /* scene */
+  --sky-top: #0d0d15;
+  --sky-bot: #191033;
+  --grid: #a78bfa;
+  --star: #d6d6dc;
+  --spr-d: #6f54b8;
 
-  --color-warning-50:  oklch(10% 0.01 75);
-  --color-warning-100: oklch(14% 0.02 75);
-  --color-warning-200: oklch(20% 0.04 72);
-  --color-warning-300: oklch(28% 0.06 70);
-  --color-warning-400: oklch(36% 0.08 68);
-  --color-warning-500: oklch(55% 0.12 65);
-  --color-warning-600: oklch(62% 0.14 63);
-  --color-warning-700: oklch(68% 0.14 60);
-  --color-warning-800: oklch(73% 0.13 58);
-  --color-warning-900: oklch(78% 0.11 55);
-  --color-warning-950: oklch(82% 0.09 52);
-  --color-warning-contrast-dark: var(--color-warning-50);
-  --color-warning-contrast-light: var(--color-warning-950);
-  --color-warning-contrast-50:  var(--color-warning-contrast-light);
-  --color-warning-contrast-100: var(--color-warning-contrast-light);
-  --color-warning-contrast-200: var(--color-warning-contrast-light);
-  --color-warning-contrast-300: var(--color-warning-contrast-light);
-  --color-warning-contrast-400: var(--color-warning-contrast-light);
-  --color-warning-contrast-500: var(--color-warning-contrast-light);
-  --color-warning-contrast-600: var(--color-warning-contrast-dark);
-  --color-warning-contrast-700: var(--color-warning-contrast-dark);
-  --color-warning-contrast-800: var(--color-warning-contrast-dark);
-  --color-warning-contrast-900: var(--color-warning-contrast-dark);
-  --color-warning-contrast-950: var(--color-warning-contrast-dark);
-
-  --color-error-50:  oklch(10% 0.01 20);
-  --color-error-100: oklch(14% 0.03 20);
-  --color-error-200: oklch(20% 0.05 18);
-  --color-error-300: oklch(28% 0.08 17);
-  --color-error-400: oklch(36% 0.10 16);
-  --color-error-500: oklch(55% 0.16 15);
-  --color-error-600: oklch(60% 0.16 14);
-  --color-error-700: oklch(65% 0.14 14);
-  --color-error-800: oklch(70% 0.13 13);
-  --color-error-900: oklch(74% 0.12 12);
-  --color-error-950: oklch(80% 0.10 11);
-  --color-error-contrast-dark: var(--color-error-50);
-  --color-error-contrast-light: var(--color-error-950);
-  --color-error-contrast-50:  var(--color-error-contrast-light);
-  --color-error-contrast-100: var(--color-error-contrast-light);
-  --color-error-contrast-200: var(--color-error-contrast-light);
-  --color-error-contrast-300: var(--color-error-contrast-light);
-  --color-error-contrast-400: var(--color-error-contrast-light);
-  --color-error-contrast-500: var(--color-error-contrast-dark);
-  --color-error-contrast-600: var(--color-error-contrast-dark);
-  --color-error-contrast-700: var(--color-error-contrast-dark);
-  --color-error-contrast-800: var(--color-error-contrast-dark);
-  --color-error-contrast-900: var(--color-error-contrast-dark);
-  --color-error-contrast-950: var(--color-error-contrast-dark);
-
-  /* ── Surface: deep CRT black with subtle green hue ── */
-  --color-surface-50:  oklch(15%  0.004 150);
-  --color-surface-100: oklch(13%  0.003 150);
-  --color-surface-200: oklch(10%  0.003 150);
-  --color-surface-300: oklch(18%  0.004 150);
-  --color-surface-400: oklch(8.5% 0.003 150);
-  --color-surface-500: oklch(8%   0.003 150);
-  --color-surface-600: oklch(7.5% 0.003 150);
-  --color-surface-700: oklch(7%   0.003 150);
-  --color-surface-800: oklch(6.5% 0.003 150);
-  --color-surface-900: oklch(6%   0.003 150);
-  --color-surface-950: oklch(5.5% 0.003 150);
-  --color-surface-contrast-dark: var(--color-surface-50);
-  --color-surface-contrast-light: var(--color-surface-950);
-  --color-surface-contrast-50:  var(--color-surface-contrast-light);
-  --color-surface-contrast-100: var(--color-surface-contrast-light);
-  --color-surface-contrast-200: var(--color-surface-contrast-light);
-  --color-surface-contrast-300: var(--color-surface-contrast-light);
-  --color-surface-contrast-400: var(--color-surface-contrast-light);
-  --color-surface-contrast-500: var(--color-surface-contrast-dark);
-  --color-surface-contrast-600: var(--color-surface-contrast-dark);
-  --color-surface-contrast-700: var(--color-surface-contrast-dark);
-  --color-surface-contrast-800: var(--color-surface-contrast-dark);
-  --color-surface-contrast-900: var(--color-surface-contrast-dark);
-  --color-surface-contrast-950: var(--color-surface-contrast-dark);
-
-  /* ── Card-type semantic colors retained (muted dark variants) ── */
-  --card-data:       oklch(45% 0.11 155);   /* dim moss */
-  --card-model:      oklch(45% 0.11 150);   /* dim phosphor */
-  --card-experiment: oklch(50% 0.10 68);    /* dim CRT amber */
-  --card-prompt:     oklch(50% 0.06 265);   /* dim CRT blue */
-  --card-agent:      oklch(5.5% 0.003 150); /* deepest black */
-  --card-service:    oklch(76% 0.10 150);   /* phosphor light */
-
-  /* ── Brutalist shadow color: dim phosphor green (NOT pure black) ── */
-  --neo-shadow-color: oklch(50% 0.10 150 / 0.75);
-  --neo-shadow-offset-sm: 3px;
-  --neo-shadow-offset: 6px;
-  --neo-shadow-offset-lg: 10px;
-  --neo-glow-color: oklch(65% 0.14 150 / 0.3);
-
-  /* ── Retro gradients: near-invisible (atmospheric only) ── */
-  --retro-primary-from: oklch(16% 0.01 150);
-  --retro-primary-mid:  oklch(12% 0.007 150);
-  --retro-primary-to:   oklch(8% 0.004 150);
-
-  --retro-secondary-from: oklch(16% 0.01 155);
-  --retro-secondary-mid:  oklch(12% 0.007 155);
-  --retro-secondary-to:   oklch(8% 0.004 155);
-
-  --retro-tertiary-from: oklch(16% 0.02 265);
-  --retro-tertiary-mid:  oklch(12% 0.015 265);
-  --retro-tertiary-to:   oklch(8% 0.01 265);
-
-  --retro-success-from: oklch(16% 0.01 148);
-  --retro-success-mid:  oklch(12% 0.007 148);
-  --retro-success-to:   oklch(8% 0.004 148);
-
-  --retro-warning-from: oklch(16% 0.02 75);
-  --retro-warning-mid:  oklch(12% 0.015 72);
-  --retro-warning-to:   oklch(8% 0.01 70);
-
-  --retro-error-base: oklch(8% 0.01 15);
-  --retro-error-from: oklch(16% 0.03 15);
-  --retro-error-mid:  oklch(12% 0.02 13);
-  --retro-error-to:   oklch(8% 0.01 11);
-
-  --retro-orange-from: oklch(8% 0.01 45);
-  --retro-orange-to:   oklch(16% 0.03 40);
-
-  /* ── Grid: subtle phosphor grid ── */
-  --grid-bg: oklch(5.5% 0.004 150);
-  --grid-line: oklch(65% 0.14 150 / 0.06);
-  --grid-alt-bg: oklch(7% 0.006 150);
-
-  /* ── Chart colors ── */
-  --chart-text-color: oklch(82% 0.14 152);
-  --chart-grid-color: oklch(65% 0.14 150 / 0.12);
-  --chart-axis-color: oklch(65% 0.12 150);
-  --chart-tooltip-bg: oklch(8% 0.01 150);
-  --chart-tooltip-border: oklch(50% 0.10 150 / 0.3);
-  --chart-tooltip-text: oklch(82% 0.14 152);
-  --chart-series-1: oklch(75% 0.15 150);
-  --chart-series-2: oklch(70% 0.12 80);
-  --chart-series-3: oklch(70% 0.12 195);
-  --chart-series-4: oklch(75% 0.14 148);
-  --chart-series-5: oklch(60% 0.10 150);
-  --chart-series-6: oklch(55% 0.12 15);
-  --chart-trace-success: oklch(75% 0.15 150);
-  --chart-trace-error: oklch(55% 0.12 15);
-  --chart-zoom-border: oklch(65% 0.14 150);
-  --chart-zoom-bg: oklch(65% 0.14 150 / 0.2);
+  /* geometry */
+  --r: 5px;
 }
 
-
 /* ═══════════════════════════════════════════════════════════════════════════
-   GLOBAL RADIUS ENFORCEMENT — zero corners in both modes
-   Overrides every Tailwind .rounded-* utility to keep the aesthetic consistent.
+   BRUTALIST UTILITY CLASSES — ported forward, re-pointed at canonical tokens.
+   Token VALUES come from the generated blocks above (brand/palette.json).
+   The Never-rule layers (glow, gradients, CRT scanlines/vignette, phosphor
+   text-shadow) are intentionally absent.
    ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Zero-radius enforcement — overrides every Tailwind .rounded-* in both modes. */
 [data-theme='wyrd'] .rounded,
 [data-theme='wyrd'] .rounded-none,
 [data-theme='wyrd'] .rounded-sm,
@@ -624,41 +148,22 @@
 [data-theme='wyrd'] .rounded-r {
   border-radius: 0 !important;
 }
-/* Exception: actual circles (avatars, status dots that should stay round) */
+/* Exception: true circles (avatars, status dots that should stay round). */
 [data-theme='wyrd'] .rounded-full {
   border-radius: 9999px !important;
 }
 
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   GRADIENT UTILITY CLASSES (compat with existing markup)
-   ═══════════════════════════════════════════════════════════════════════════ */
-[data-theme='wyrd'] .gradient-primary   { background: linear-gradient(135deg, var(--retro-primary-from)   0%, var(--retro-primary-mid)   48%, var(--retro-primary-to)   100%); }
-[data-theme='wyrd'] .gradient-secondary { background: linear-gradient(135deg, var(--retro-secondary-from) 0%, var(--retro-secondary-mid) 52%, var(--retro-secondary-to) 100%); }
-[data-theme='wyrd'] .gradient-tertiary  { background: linear-gradient(135deg, var(--retro-tertiary-from)  0%, var(--retro-tertiary-mid)  50%, var(--retro-tertiary-to)  100%); }
-[data-theme='wyrd'] .gradient-success   { background: linear-gradient(135deg, var(--retro-success-from)   0%, var(--retro-success-mid)   50%, var(--retro-success-to)   100%); }
-[data-theme='wyrd'] .gradient-warning   { background: linear-gradient(135deg, var(--retro-warning-from)   0%, var(--retro-warning-mid)   52%, var(--retro-warning-to)   100%); }
-[data-theme='wyrd'] .gradient-error     { background: linear-gradient(135deg, var(--retro-error-from)     0%, var(--retro-error-mid)     50%, var(--retro-error-to)     100%); }
-
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   NEOBRUTALISM UTILITIES — core component classes
-   ═══════════════════════════════════════════════════════════════════════════ */
-
 /* neo-card: canonical card surface */
 [data-theme='wyrd'] .neo-card {
-  background: var(--color-surface-50);
-  border: 2px solid var(--neo-shadow-color);
-  box-shadow: var(--neo-shadow-offset) var(--neo-shadow-offset) 0 0 var(--neo-shadow-color);
+  background: var(--surface);
+  border: 2px solid var(--border);
+  box-shadow: 6px 6px 0 0 var(--shadow);
   border-radius: 0;
   transition: transform 0.12s ease, box-shadow 0.12s ease;
 }
 [data-theme='wyrd'] .neo-card:hover {
   transform: translate(-2px, -2px);
-  box-shadow: calc(var(--neo-shadow-offset) + 2px) calc(var(--neo-shadow-offset) + 2px) 0 0 var(--neo-shadow-color);
-}
-[data-theme='wyrd'].theme-dark .neo-card {
-  background: oklch(10% 0.004 150);
+  box-shadow: 8px 8px 0 0 var(--shadow);
 }
 
 /* neo-btn: brutalist button with press-in animation */
@@ -667,12 +172,12 @@
   align-items: center;
   justify-content: center;
   padding: 0.5rem 1.1rem;
-  background: var(--color-primary-500);
-  color: var(--color-primary-contrast-500);
-  border: 2px solid var(--neo-shadow-color);
-  box-shadow: var(--neo-shadow-offset-sm) var(--neo-shadow-offset-sm) 0 0 var(--neo-shadow-color);
+  background: var(--rune-btn);
+  color: var(--rune-btn-ink);
+  border: 2px solid var(--border);
+  box-shadow: 3px 3px 0 0 var(--shadow);
   border-radius: 0;
-  font-family: var(--base-font-family);
+  font-family: var(--font-sans);
   font-weight: 700;
   font-size: 0.875rem;
   letter-spacing: 0.06em;
@@ -683,331 +188,62 @@
 }
 [data-theme='wyrd'] .neo-btn:hover {
   transform: translate(-1px, -1px);
-  box-shadow: calc(var(--neo-shadow-offset-sm) + 1px) calc(var(--neo-shadow-offset-sm) + 1px) 0 0 var(--neo-shadow-color);
+  box-shadow: 4px 4px 0 0 var(--shadow);
 }
 [data-theme='wyrd'] .neo-btn:active {
-  transform: translate(var(--neo-shadow-offset-sm), var(--neo-shadow-offset-sm));
-  box-shadow: 0 0 0 0 var(--neo-shadow-color);
+  transform: translate(3px, 3px);
+  box-shadow: 0 0 0 0 var(--shadow);
 }
 [data-theme='wyrd'] .neo-btn--secondary {
-  background: var(--color-surface-50);
-  color: var(--color-surface-contrast-50);
+  background: var(--surface);
+  color: var(--text);
 }
 [data-theme='wyrd'] .neo-btn--dark {
-  background: var(--neo-shadow-color);
-  color: var(--color-surface-50);
-}
-
-/* neo-glow: bordered + glowing accent (brand highlight) */
-[data-theme='wyrd'] .neo-glow {
-  position: relative;
-  box-shadow:
-    0 0 0 2px var(--neo-shadow-color),
-    3px 3px 0 0 var(--neo-shadow-color),
-    0 0 12px 2px var(--neo-glow-color);
-}
-[data-theme='wyrd'].theme-dark .neo-glow {
-  box-shadow:
-    0 0 0 2px var(--neo-shadow-color),
-    3px 3px 0 0 var(--neo-shadow-color),
-    0 0 12px 2px var(--neo-glow-color);
-}
-[data-theme='wyrd'] .neo-glow::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border: 2px solid rgba(255 255 255 / 0.25);
-  mix-blend-mode: overlay;
-  pointer-events: none;
+  background: var(--border);
+  color: var(--bg);
 }
 
 /* pixel-text: VT323 accents for IDs, version strings, timestamps */
 [data-theme='wyrd'] .pixel-text {
-  font-family: var(--pixel-font-family);
+  font-family: var(--font-pixel);
   font-size: 1.4em;
   line-height: 1;
   letter-spacing: 0.05em;
 }
-[data-theme='wyrd'].theme-dark .pixel-text {
-  text-shadow: 0 0 6px oklch(65% 0.14 150 / 0.6);
-}
 
-/* mono-tag: uppercase JBM pill/label */
+/* mono-tag: uppercase JetBrains Mono pill/label (canonical pill surface) */
 [data-theme='wyrd'] .mono-tag {
   display: inline-block;
   padding: 3px 8px;
-  font-family: var(--mono-font-family);
+  font-family: var(--font-mono);
   font-size: 0.625rem;
   font-weight: 700;
   letter-spacing: 0.2em;
   text-transform: uppercase;
-  border: 2px solid var(--neo-shadow-color);
-  background: var(--neo-shadow-color);
-  color: var(--color-surface-50);
+  border: 2px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
   border-radius: 0;
 }
 
-/* card-type pills (one class per card type) */
-[data-theme='wyrd'] .card-tag--data       { background: var(--card-data);       color: rgb(10 10 10); border-color: var(--neo-shadow-color); }
-[data-theme='wyrd'] .card-tag--model      { background: var(--card-model);      color: #fff;          border-color: var(--neo-shadow-color); }
-[data-theme='wyrd'] .card-tag--experiment { background: var(--card-experiment); color: rgb(10 10 10); border-color: var(--neo-shadow-color); }
-[data-theme='wyrd'] .card-tag--prompt     { background: var(--card-prompt);     color: #fff;          border-color: var(--neo-shadow-color); }
-[data-theme='wyrd'] .card-tag--agent      { background: var(--card-agent);      color: var(--color-surface-50); border-color: var(--neo-shadow-color); }
-[data-theme='wyrd'] .card-tag--service    { background: var(--card-service);    color: rgb(10 10 10); border-color: var(--neo-shadow-color); }
-
-[data-theme='wyrd'].theme-dark .card-tag--data,
-[data-theme='wyrd'].theme-dark .card-tag--model,
-[data-theme='wyrd'].theme-dark .card-tag--experiment,
-[data-theme='wyrd'].theme-dark .card-tag--prompt,
-[data-theme='wyrd'].theme-dark .card-tag--service { color: oklch(85% 0.10 150); }
-[data-theme='wyrd'].theme-dark .card-tag--agent   { color: oklch(82% 0.14 152); }
+/* card-type pills — mapped onto The Line + canonical accents (per token role) */
+[data-theme='wyrd'] .card-tag--data       { background: var(--control);     color: var(--ink-on-fill);  border: 2px solid var(--border); }
+[data-theme='wyrd'] .card-tag--model      { background: var(--rune);        color: var(--rune-btn-ink); border: 2px solid var(--border); }
+[data-theme='wyrd'] .card-tag--experiment { background: var(--warn);        color: var(--ink-on-fill);  border: 2px solid var(--border); }
+[data-theme='wyrd'] .card-tag--prompt     { background: var(--rune-strong); color: var(--rune-btn-ink); border: 2px solid var(--border); }
+[data-theme='wyrd'] .card-tag--agent      { background: var(--client);      color: var(--ink-on-fill);  border: 2px solid var(--border); }
+[data-theme='wyrd'] .card-tag--service    { background: var(--server);      color: var(--ink-on-fill);  border: 2px solid var(--border); }
 
 /* status dots (drift/health indicators) */
 [data-theme='wyrd'] .status-dot {
   display: inline-block;
   width: 8px;
   height: 8px;
-  background: var(--color-secondary-500);
-  border: 1.5px solid var(--neo-shadow-color);
+  background: var(--ok);
+  border: 1.5px solid var(--border);
   margin-right: 6px;
   vertical-align: middle;
   border-radius: 0;
 }
-[data-theme='wyrd'] .status-dot--warn  { background: var(--color-warning-500); }
-[data-theme='wyrd'] .status-dot--alert { background: var(--color-error-500); }
-[data-theme='wyrd'].theme-dark .status-dot       { box-shadow: 0 0 4px oklch(75% 0.15 150 / 0.6); }
-[data-theme='wyrd'].theme-dark .status-dot--warn { box-shadow: 0 0 4px oklch(68% 0.14 60 / 0.6); }
-[data-theme='wyrd'].theme-dark .status-dot--alert{ box-shadow: 0 0 4px oklch(65% 0.14 14 / 0.6); }
-
-/* Grain texture (compat) */
-[data-theme='wyrd'] .grain { position: relative; }
-[data-theme='wyrd'] .grain::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background:
-    repeating-radial-gradient(circle at 30% 30%, rgba(0 0 0 / 0.08) 0 1px, transparent 1px 3px),
-    repeating-linear-gradient(45deg, rgba(255 255 255 / 0.07) 0 2px, transparent 2px 4px);
-  mix-blend-mode: soft-light;
-  opacity: .55;
-  filter: contrast(120%) brightness(105%);
-}
-
-/* warn-color utility (compat) */
-[data-theme='wyrd'] .warn-color {
-  background-color: var(--retro-orange-from);
-  border: 2px solid var(--retro-orange-to);
-  color: var(--retro-orange-to);
-}
-
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   AUTH PAGES — dark mode form contrast fixes
-   ═══════════════════════════════════════════════════════════════════════════ */
-[data-theme='wyrd'].theme-dark form p,
-[data-theme='wyrd'].theme-dark form label { color: var(--color-primary-950) !important; }
-[data-theme='wyrd'].theme-dark form input {
-  color: var(--color-primary-950) !important;
-  background-color: var(--color-surface-100) !important;
-}
-[data-theme='wyrd'].theme-dark form input::placeholder {
-  color: var(--color-primary-700) !important;
-  opacity: 1 !important;
-}
-[data-theme='wyrd'].theme-dark form a { color: var(--color-primary-700) !important; }
-
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   DARK MODE OVERRIDES — Tailwind utility remapping
-   These compensate for utility classes (black/white/gray-*) that don't
-   naturally adapt to the phosphor palette.
-   ═══════════════════════════════════════════════════════════════════════════ */
-
-/* Navbar: dark charcoal strip in dark mode */
-[data-theme='wyrd'].theme-dark nav.bg-primary-700,
-[data-theme='wyrd'].theme-dark .bg-primary-700 { background-color: oklch(15% 0.01 150); }
-[data-theme='wyrd'].theme-dark nav .bg-surface-50 { background-color: oklch(10% 0.008 150); }
-
-/* Borders: black borders in markup resolve to brutalist 2px phosphor */
-[data-theme='wyrd'].theme-dark .border-black,
-[data-theme='wyrd'].theme-dark .border-b-black,
-[data-theme='wyrd'].theme-dark .border-t-black,
-[data-theme='wyrd'].theme-dark .border-l-black,
-[data-theme='wyrd'].theme-dark .border-r-black { border-color: oklch(50% 0.10 150 / 0.7); }
-[data-theme='wyrd'].theme-dark .border-2.border-black,
-[data-theme='wyrd'].theme-dark .border-3.border-black,
-[data-theme='wyrd'].theme-dark .border-4.border-black { border-color: oklch(55% 0.11 150 / 0.8); }
-[data-theme='wyrd'].theme-dark .border-black\/10 { border-color: oklch(35% 0.05 150 / 0.25); }
-
-/* Text */
-[data-theme='wyrd'].theme-dark .text-black        { color: oklch(82% 0.14 152); }
-[data-theme='wyrd'].theme-dark .text-black\/60    { color: oklch(70% 0.10 150 / 0.75); }
-[data-theme='wyrd'].theme-dark .text-black\/80    { color: oklch(78% 0.12 150 / 0.9); }
-[data-theme='wyrd'].theme-dark .text-white        { color: oklch(82% 0.14 152); }
-[data-theme='wyrd'].theme-dark .text-gray-600     { color: oklch(65% 0.10 150); }
-[data-theme='wyrd'].theme-dark .text-gray-700     { color: oklch(70% 0.11 150); }
-[data-theme='wyrd'].theme-dark .text-gray-800     { color: oklch(75% 0.12 150); }
-[data-theme='wyrd'].theme-dark .text-gray-900     { color: oklch(80% 0.13 150); }
-[data-theme='wyrd'].theme-dark .text-slate-400    { color: oklch(55% 0.07 150); }
-[data-theme='wyrd'].theme-dark .text-slate-500    { color: oklch(65% 0.10 150); }
-[data-theme='wyrd'].theme-dark .text-slate-600    { color: oklch(65% 0.09 150); }
-[data-theme='wyrd'].theme-dark .text-slate-700    { color: oklch(70% 0.09 150); }
-[data-theme='wyrd'].theme-dark .text-primary-800  { color: oklch(75% 0.15 150); }
-[data-theme='wyrd'].theme-dark .text-primary-900  { color: oklch(78% 0.14 150); }
-[data-theme='wyrd'].theme-dark .text-primary-950  { color: oklch(80% 0.14 150); }
-
-/* Backgrounds */
-[data-theme='wyrd'].theme-dark .bg-white            { background-color: oklch(8% 0.003 150); }
-[data-theme='wyrd'].theme-dark .bg-gray-50,
-[data-theme='wyrd'].theme-dark .hover\:bg-gray-50:hover  { background-color: oklch(14% 0.003 150); }
-[data-theme='wyrd'].theme-dark .bg-gray-100,
-[data-theme='wyrd'].theme-dark .hover\:bg-gray-100:hover { background-color: oklch(16% 0.003 150); }
-[data-theme='wyrd'].theme-dark .bg-gray-200,
-[data-theme='wyrd'].theme-dark .hover\:bg-gray-200:hover { background-color: oklch(20% 0.008 150); }
-[data-theme='wyrd'].theme-dark .bg-gray-300         { background-color: oklch(30% 0.015 150); }
-[data-theme='wyrd'].theme-dark .bg-gray-400         { background-color: oklch(30% 0.015 150); }
-[data-theme='wyrd'].theme-dark .hover\:bg-primary-50:hover  { background-color: oklch(12% 0.008 150); }
-[data-theme='wyrd'].theme-dark .hover\:bg-primary-100:hover { background-color: oklch(15% 0.012 150); }
-[data-theme='wyrd'].theme-dark .hover\:bg-primary-200:hover { background-color: oklch(18% 0.015 150); }
-[data-theme='wyrd'].theme-dark .hover\:bg-slate-50:hover    { background-color: oklch(14% 0.003 150); }
-[data-theme='wyrd'].theme-dark .bg-black            { background-color: oklch(40% 0.04 150); }
-[data-theme='wyrd'].theme-dark .bg-slate-100        { background-color: oklch(12% 0.003 150); }
-[data-theme='wyrd'].theme-dark .bg-slate-200        { background-color: oklch(14% 0.003 150); }
-[data-theme='wyrd'].theme-dark .bg-slate-300        { background-color: oklch(18% 0.008 150); }
-[data-theme='wyrd'].theme-dark .bg-slate-700        { background-color: oklch(10% 0.004 150); }
-[data-theme='wyrd'].theme-dark .bg-slate-900        { background-color: oklch(8% 0.003 150); }
-
-/* Filled badges/buttons: keep filled in dark mode (brutalism = visible blocks) */
-[data-theme='wyrd'].theme-dark .bg-primary-500 {
-  background-color: oklch(36% 0.09 148);
-  border-color: oklch(55% 0.11 150 / 0.8);
-}
-[data-theme='wyrd'].theme-dark .bg-primary-500:hover  { background-color: oklch(42% 0.10 148); }
-[data-theme='wyrd'].theme-dark .bg-secondary-500 {
-  background-color: oklch(36% 0.09 155);
-  border-color: oklch(55% 0.11 155 / 0.8);
-}
-[data-theme='wyrd'].theme-dark .bg-secondary-500:hover { background-color: oklch(42% 0.10 155); }
-[data-theme='wyrd'].theme-dark .bg-success-300 {
-  background-color: oklch(32% 0.07 148);
-  border-color: oklch(50% 0.10 148 / 0.7);
-}
-
-/* Title banner (text on phosphor field, with bloom) */
-[data-theme='wyrd'].theme-dark .bg-primary-500.text-white {
-  background-color: oklch(14% 0.012 150);
-  border-color: oklch(55% 0.10 150 / 0.7);
-  color: oklch(87% 0.16 150);
-  text-shadow: 0 0 10px oklch(75% 0.10 150 / 0.4);
-}
-
-/* Dividers: thin terminal rules in dark, thick black in light */
-[data-theme='wyrd'].theme-dark .h-2.bg-primary-800 {
-  height: 2px;
-  background-color: oklch(55% 0.10 150 / 0.5);
-}
-
-/* Nav active state: brighter underline, regular weight */
-[data-theme='wyrd'].theme-dark nav a.active {
-  font-weight: 400;
-  letter-spacing: 0.02em;
-}
-[data-theme='wyrd'].theme-dark nav a:hover,
-[data-theme='wyrd'].theme-dark nav a:focus,
-[data-theme='wyrd'].theme-dark nav a.active {
-  text-decoration-color: oklch(75% 0.15 150);
-}
-
-/* Stat card / outlined containers */
-[data-theme='wyrd'].theme-dark .border-primary-700 { border-color: oklch(55% 0.10 150 / 0.6); }
-
-/* Error: outlined block in dark */
-[data-theme='wyrd'].theme-dark .bg-error-500 {
-  background-color: oklch(20% 0.05 18);
-  border: 2px solid oklch(65% 0.14 14 / 0.7);
-}
-
-/* Textarea */
-[data-theme='wyrd'].theme-dark textarea {
-  background-color: oklch(8% 0.01 150);
-  color: oklch(82% 0.14 152);
-  border-color: oklch(50% 0.10 150 / 0.6);
-}
-
-/* Sidebar hover outlines */
-[data-theme='wyrd'].theme-dark nav button.border:hover { border-color: oklch(65% 0.13 150 / 0.7); }
-[data-theme='wyrd'].theme-dark nav .ms-6 button:hover {
-  outline: 2px solid oklch(65% 0.13 150 / 0.7);
-  outline-offset: -2px;
-}
-
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   CRT EFFECTS — phosphor bloom, scanlines, vignette
-   Dark mode atmosphere. Respects prefers-reduced-motion.
-   ═══════════════════════════════════════════════════════════════════════════ */
-
-/* Scanlines */
-[data-theme='wyrd'].theme-dark::after {
-  content: "";
-  position: fixed;
-  inset: 0;
-  background: repeating-linear-gradient(
-    0deg,
-    transparent,
-    transparent 2px,
-    rgba(0, 0, 0, 0.06) 2px,
-    rgba(0, 0, 0, 0.06) 4px
-  );
-  z-index: 100;
-  pointer-events: none;
-}
-
-/* Vignette */
-[data-theme='wyrd'].theme-dark::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  background: radial-gradient(
-    ellipse at center,
-    transparent 60%,
-    rgba(0, 0, 0, 0.25) 100%
-  );
-  z-index: 99;
-  pointer-events: none;
-}
-
-/* Text bloom */
-[data-theme='wyrd'].theme-dark {
-  text-shadow: 0 0 1px oklch(75% 0.08 150 / 0.12);
-}
-[data-theme='wyrd'].theme-dark input,
-[data-theme='wyrd'].theme-dark textarea,
-[data-theme='wyrd'].theme-dark select,
-[data-theme='wyrd'].theme-dark pre,
-[data-theme='wyrd'].theme-dark code,
-[data-theme='wyrd'].theme-dark .shiki,
-[data-theme='wyrd'].theme-dark .shiki code,
-[data-theme='wyrd'].theme-dark .cm-editor,
-[data-theme='wyrd'].theme-dark .hljs,
-[data-theme='wyrd'].theme-dark .markdown-body pre,
-[data-theme='wyrd'].theme-dark .markdown-body code { text-shadow: none; }
-
-@media (prefers-reduced-motion: reduce) {
-  [data-theme='wyrd'].theme-dark::after,
-  [data-theme='wyrd'].theme-dark::before { display: none; }
-  [data-theme='wyrd'].theme-dark { text-shadow: none; }
-}
-
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   APPENDIX
-
-   This file is the source of truth for the Wyrd visual system. Add new
-   component-specific rules here only when they are shared by multiple
-   components or define a reusable token/utility.
-
-   For new rules, scope to [data-theme='wyrd'] when the behavior depends on
-   theme tokens, and update colors to match the light and dark style guides.
-   ═══════════════════════════════════════════════════════════════════════════ */
+[data-theme='wyrd'] .status-dot--warn  { background: var(--warn); }
+[data-theme='wyrd'] .status-dot--alert { background: var(--danger); }

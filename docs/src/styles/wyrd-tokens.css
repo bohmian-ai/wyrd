@@ -2,52 +2,17 @@
  * Source of truth: brand/palette.json. Regenerate with `pnpm tokens`.
  * Token names are identical to ./wyrd-ui-source-of-truth-v2.html. */
 
-@theme {
+:root {
+  /* fonts */
   --font-sans: "Archivo", system-ui, sans-serif;
   --font-display: "Archivo Black", sans-serif;
   --font-mono: "JetBrains Mono", monospace;
   --font-arcade: "Press Start 2P", monospace;
   --font-pixel: "VT323", monospace;
-  --radius-wy: 5px;
-  --shadow-wy-sm: 3px 3px 0 0 var(--shadow);
-  --shadow-wy-md: 6px 6px 0 0 var(--shadow);
-  --shadow-wy-lg: 10px 10px 0 0 var(--shadow);
-  /* mode-aware color utilities: bg-*, text-*, border-* resolve per [data-mode] */
-  --color-bg: var(--bg);
-  --color-surface: var(--surface);
-  --color-surface-2: var(--surface-2);
-  --color-border: var(--border);
-  --color-shadow: var(--shadow);
-  --color-text: var(--text);
-  --color-muted: var(--muted);
-  --color-rune: var(--rune);
-  --color-rune-strong: var(--rune-strong);
-  --color-rune-soft: var(--rune-soft);
-  --color-rune-btn: var(--rune-btn);
-  --color-rune-btn-ink: var(--rune-btn-ink);
-  --color-lime: var(--lime);
-  --color-lime-ink: var(--lime-ink);
-  --color-lime-text: var(--lime-text);
-  --color-client: var(--client);
-  --color-client-bar: var(--client-bar);
-  --color-server: var(--server);
-  --color-server-bar: var(--server-bar);
-  --color-control: var(--control);
-  --color-control-bar: var(--control-bar);
-  --color-ok: var(--ok);
-  --color-warn: var(--warn);
-  --color-danger: var(--danger);
-  --color-hero-bg: var(--hero-bg);
-  --color-hero-ink: var(--hero-ink);
-  --color-ink-on-fill: var(--ink-on-fill);
-  --color-sky-top: var(--sky-top);
-  --color-sky-bot: var(--sky-bot);
-  --color-grid: var(--grid);
-  --color-star: var(--star);
-  --color-spr-d: var(--spr-d);
 }
 
-[data-mode="light"] {
+:root,
+:root[data-theme="light"] {
   /* surface */
   --bg: #f4f4f5;
   --surface: #ffffff;
@@ -101,7 +66,7 @@
   /* geometry */
   --r: 5px;
 }
-[data-mode="dark"] {
+:root[data-theme="dark"] {
   /* surface */
   --bg: #0e0e0e;
   --surface: #17171b;

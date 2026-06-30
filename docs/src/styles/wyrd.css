@@ -6,6 +6,8 @@
 @import "@fontsource/jetbrains-mono/500.css";
 @import "@fontsource/jetbrains-mono/700.css";
 @import "@fontsource/vt323";
+@import "@fontsource/press-start-2p";
+@import "./wyrd-tokens.css";
 
 /*
   Wyrd docs theme.
@@ -13,68 +15,74 @@
   Design rule: brutalist signature lives in 3 places only.
     1. H1 purple block-with-shadow on every page.
     2. Homepage hero + 18-tile card-kind grid.
-    3. Dark mode is a phosphor CRT terminal (scanlines, vignette, JetBrains Mono).
+    3. Dark mode is the v2 deep-violet/neutral palette (violet rune, The Line accents).
 
   Everything else stays quiet. No inline-code shadows, no dt shadows,
   no table-cell chip inheritance, no purple chrome on the header.
 
-  Source of truth for tokens: .dev/migration/plans/migration/ui/assets/theme/wyrd-theme.css
+  Token source of truth: brand/palette.json — regenerated into wyrd-tokens.css.
+  Bridge vars below alias those canonical tokens; do not hand-edit color values here.
 */
 
-:root,
-:root[data-theme="light"] {
-  --base-font-family: "Archivo", "Inter", system-ui, sans-serif;
-  --heading-font-family: "Archivo Black", "Archivo", system-ui, sans-serif;
-  --mono-font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
-  --pixel-font-family: "VT323", "JetBrains Mono", ui-monospace, monospace;
+:root {
+  /* ----- Fonts ----- */
+  --base-font-family: var(--font-sans);
+  --heading-font-family: var(--font-display);
+  --mono-font-family: var(--font-mono);
+  --pixel-font-family: var(--font-pixel);
+  --arcade-font-family: var(--font-arcade);
 
+  /* ----- Geometry ----- */
   --radius-base: 0;
   --radius-container: 0;
   --default-border-width: 2px;
   --default-divide-width: 2px;
   --default-ring-width: 3px;
 
-  --color-primary-100: oklch(93.86% 0.03 299.6deg);
-  --color-primary-300: oklch(81.64% 0.08 296.73deg);
-  --color-primary-500: oklch(69.32% 0.15 294.6deg);
-  --color-primary-700: oklch(54.41% 0.1395 290.504);
-  --color-primary-900: oklch(38.72% 0.14 284.86deg);
-  --color-primary-950: oklch(30.7% 0.14 279.76deg);
+  /* ----- Surface bridge (--color-surface-* → canonical) ----- */
+  --color-surface-50: var(--surface);
+  --color-surface-100: var(--surface);
+  --color-surface-200: var(--surface-2);
+  --color-surface-300: var(--surface-2);
+  --color-surface-500: var(--surface);
+  --color-surface-700: var(--surface-2);
+  --color-surface-950: var(--bg);
 
-  --color-secondary-100: oklch(93.99% 0.05 173.3deg);
-  --color-secondary-500: oklch(78.955% 0.14997 153.915);
-  --color-tertiary-100: oklch(94.79% 0.02 264.49deg);
-  --color-tertiary-500: oklch(73.95% 0.11 263.6deg);
-  --color-warning-100: oklch(95.45% 0.06 93.7deg);
-  --color-warning-500: oklch(81.47% 0.13 68.75deg);
-  --color-error-100: oklch(90.84% 0.04 16.21deg);
-  --color-error-500: oklch(71.16% 0.18 22.84deg);
+  /* ----- Primary / rune bridge ----- */
+  --color-primary-100: var(--rune-soft);
+  --color-primary-300: var(--rune-soft);
+  --color-primary-500: var(--rune);
+  --color-primary-700: var(--rune-strong);
+  --color-primary-900: var(--rune-strong);
+  --color-primary-950: var(--rune-strong);
 
-  --color-surface-50: oklch(100% 0 none);
-  --color-surface-100: oklch(99.43% 0 287.34deg);
-  --color-surface-200: oklch(96.5% 0.003 287deg);
-  --color-surface-300: oklch(92% 0.004 287deg);
-  --color-surface-500: oklch(98% 0 301.83deg);
-  --color-surface-700: oklch(82.2% 0 301.74deg);
-  --color-surface-950: oklch(58.44% 0 308.74deg);
+  /* ----- Secondary / tertiary / warning / error bridge ----- */
+  --color-secondary-100: var(--rune-soft);
+  --color-secondary-500: var(--lime);
+  --color-tertiary-100: var(--surface-2);
+  --color-tertiary-500: var(--control);
+  --color-warning-100: var(--surface-2);
+  --color-warning-500: var(--server);
+  --color-error-100: var(--surface-2);
+  --color-error-500: var(--danger);
 
-  --card-data: var(--color-secondary-500);
-  --card-model: var(--color-primary-500);
-  --card-experiment: var(--color-warning-500);
-  --card-prompt: var(--color-tertiary-500);
-  --card-agent: oklch(10% 0 0);
-  --card-service: var(--color-surface-50);
+  /* ----- Card-kind accents onto The Line ----- */
+  --card-data: var(--client);
+  --card-model: var(--rune-strong);
+  --card-experiment: var(--server);
+  --card-prompt: var(--control);
+  --card-agent: var(--border);
+  --card-service: var(--rune-soft);
 
-  --neo-shadow-color: rgb(10 10 10);
+  /* ----- Neo-brutalist shadow ----- */
+  --neo-shadow-color: var(--border);
   --neo-shadow-offset-sm: 3px;
   --neo-shadow-offset: 6px;
   --neo-shadow-offset-lg: 10px;
-  --neo-glow-color: oklch(82% 0.2 295deg / 0.55);
 
+  /* ----- Starlight overrides ----- */
   --sl-font: var(--base-font-family);
   --sl-font-mono: var(--mono-font-family);
-
-  /* Tighter scale. Pydantic-ish density. */
   --sl-content-width: 60rem;
   --sl-sidebar-width: 14rem;
   --sl-text-base: 0.875rem;
@@ -84,86 +92,23 @@
   --sl-text-h2: 1.2rem;
   --sl-text-h3: 1.025rem;
   --sl-text-h4: 0.95rem;
-
-  --sl-color-accent-low: var(--color-primary-100);
-  --sl-color-accent: var(--color-primary-700);
-  --sl-color-accent-high: var(--color-primary-950);
-  --sl-color-white: rgb(10 10 10);
-  --sl-color-gray-1: rgb(10 10 10);
-  --sl-color-gray-2: rgb(28 26 32);
-  --sl-color-gray-3: rgb(80 74 96);
-  --sl-color-gray-4: rgb(120 113 138);
-  --sl-color-gray-5: rgb(170 162 186);
-  --sl-color-gray-6: var(--color-surface-200);
-  --sl-color-black: var(--color-surface-50);
-  --sl-color-bg: var(--color-surface-50);
-  --sl-color-bg-nav: var(--color-surface-50);
-  --sl-color-bg-sidebar: var(--color-surface-50);
-  --sl-color-hairline: var(--color-surface-300);
-  --sl-color-text: rgb(10 10 10);
-  --sl-color-text-accent: var(--color-primary-700);
-}
-
-:root[data-theme="dark"] {
-  --base-font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
-  --heading-font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
-  --mono-font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
-  --pixel-font-family: "VT323", "JetBrains Mono", ui-monospace, monospace;
-
-  --color-primary-100: oklch(20% 0.01 150);
-  --color-primary-300: oklch(28% 0.06 150);
-  --color-primary-500: oklch(45% 0.11 150);
-  --color-primary-700: oklch(65% 0.14 150);
-  --color-primary-900: oklch(80% 0.14 152);
-  --color-primary-950: oklch(83% 0.15 150);
-
-  --color-secondary-100: oklch(20% 0.04 155);
-  --color-secondary-500: oklch(45% 0.11 155);
-  --color-tertiary-100: oklch(14% 0.015 265);
-  --color-tertiary-500: oklch(50% 0.06 265);
-  --color-warning-100: oklch(14% 0.02 75);
-  --color-warning-500: oklch(55% 0.12 65);
-  --color-error-100: oklch(14% 0.03 20);
-  --color-error-500: oklch(55% 0.16 15);
-
-  --color-surface-50: oklch(15% 0.004 150);
-  --color-surface-100: oklch(13% 0.003 150);
-  --color-surface-200: oklch(10% 0.003 150);
-  --color-surface-300: oklch(18% 0.005 150);
-  --color-surface-500: oklch(8% 0.003 150);
-  --color-surface-700: oklch(7% 0.003 150);
-  --color-surface-950: oklch(5.5% 0.003 150);
-
-  --card-data: oklch(45% 0.11 155);
-  --card-model: oklch(45% 0.11 150);
-  --card-experiment: oklch(50% 0.1 68);
-  --card-prompt: oklch(50% 0.06 265);
-  --card-agent: oklch(5.5% 0.003 150);
-  --card-service: oklch(76% 0.1 150);
-
-  --neo-shadow-color: oklch(50% 0.1 150 / 0.75);
-  --neo-shadow-offset-sm: 3px;
-  --neo-shadow-offset: 6px;
-  --neo-shadow-offset-lg: 10px;
-  --neo-glow-color: oklch(65% 0.14 150 / 0.3);
-
-  --sl-color-accent-low: var(--color-primary-100);
-  --sl-color-accent: var(--color-primary-700);
-  --sl-color-accent-high: var(--color-primary-950);
-  --sl-color-white: oklch(82% 0.14 152);
-  --sl-color-gray-1: oklch(82% 0.14 152);
-  --sl-color-gray-2: oklch(75% 0.15 150);
-  --sl-color-gray-3: oklch(60% 0.1 150);
-  --sl-color-gray-4: oklch(45% 0.08 150);
-  --sl-color-gray-5: oklch(28% 0.05 150);
-  --sl-color-gray-6: var(--color-surface-200);
-  --sl-color-black: var(--color-surface-950);
-  --sl-color-bg: var(--color-surface-950);
-  --sl-color-bg-nav: var(--color-surface-950);
-  --sl-color-bg-sidebar: var(--color-surface-950);
-  --sl-color-hairline: oklch(50% 0.1 150 / 0.4);
-  --sl-color-text: oklch(82% 0.14 152);
-  --sl-color-text-accent: oklch(75% 0.15 150);
+  --sl-color-accent-low: var(--rune-soft);
+  --sl-color-accent: var(--rune-strong);
+  --sl-color-accent-high: var(--rune-strong);
+  --sl-color-white: var(--text);
+  --sl-color-gray-1: var(--text);
+  --sl-color-gray-2: var(--text);
+  --sl-color-gray-3: var(--muted);
+  --sl-color-gray-4: var(--muted);
+  --sl-color-gray-5: var(--muted);
+  --sl-color-gray-6: var(--surface-2);
+  --sl-color-black: var(--surface);
+  --sl-color-bg: var(--bg);
+  --sl-color-bg-nav: var(--bg);
+  --sl-color-bg-sidebar: var(--bg);
+  --sl-color-hairline: var(--surface-2);
+  --sl-color-text: var(--text);
+  --sl-color-text-accent: var(--rune-strong);
 }
 
 * { border-radius: 0 !important; }
@@ -173,8 +118,8 @@ html { background: var(--sl-color-bg); }
 body {
   background-color: var(--sl-color-bg);
   background-image:
-    linear-gradient(to right, oklch(0% 0 0 / 0.035) 1px, transparent 1px),
-    linear-gradient(to bottom, oklch(0% 0 0 / 0.035) 1px, transparent 1px);
+    linear-gradient(to right, color-mix(in srgb, var(--border) 4%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in srgb, var(--border) 4%, transparent) 1px, transparent 1px);
   background-size: 32px 32px;
   color: var(--sl-color-text);
   font-family: var(--base-font-family);
@@ -190,39 +135,6 @@ body {
   margin-inline: 0 !important;
   max-width: var(--sl-content-width);
   padding-inline: 1.25rem;
-}
-
-/* CRT atmosphere — dark mode only. */
-:root[data-theme="dark"] body {
-  background:
-    repeating-linear-gradient(90deg, transparent 0 31px, oklch(65% 0.14 150 / 0.035) 31px 33px),
-    repeating-linear-gradient(0deg, transparent 0 31px, oklch(65% 0.14 150 / 0.03) 31px 33px),
-    var(--color-surface-950);
-  text-shadow: 0 0 1px oklch(75% 0.08 150 / 0.12);
-}
-
-:root[data-theme="dark"] body::before,
-:root[data-theme="dark"] body::after {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-}
-
-:root[data-theme="dark"] body::before {
-  z-index: 99;
-  background: radial-gradient(ellipse at center, transparent 60%, rgba(0, 0, 0, 0.25) 100%);
-}
-
-:root[data-theme="dark"] body::after {
-  z-index: 100;
-  background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0, 0, 0, 0.06) 2px, rgba(0, 0, 0, 0.06) 4px);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  :root[data-theme="dark"] body::before,
-  :root[data-theme="dark"] body::after { display: none; }
-  :root[data-theme="dark"] body { text-shadow: none; }
 }
 
 /* ---------- Links ---------- */
@@ -277,7 +189,6 @@ button, input, select, textarea { font: inherit; }
 :root[data-theme="dark"] .site-title {
   font-weight: 700;
   letter-spacing: 0.01em;
-  text-shadow: 0 0 6px oklch(75% 0.1 150 / 0.25);
 }
 
 /* Compact search button — kill the wide bordered input look. */
@@ -410,7 +321,6 @@ button, input, select, textarea { font: inherit; }
 :root[data-theme="dark"] .sl-markdown-content h3,
 :root[data-theme="dark"] .sl-markdown-content h4 {
   letter-spacing: 0.01em;
-  text-shadow: 0 0 8px oklch(75% 0.1 150 / 0.3);
 }
 
 /* H1: the signature. Purple block + 6px shadow. ONLY on the page H1. */
@@ -431,9 +341,9 @@ button, input, select, textarea { font: inherit; }
 
 :root[data-theme="dark"] .content-panel:first-of-type h1,
 :root[data-theme="dark"] .sl-markdown-content h1 {
-  background: oklch(14% 0.012 150);
-  color: oklch(87% 0.16 150);
-  border-color: oklch(55% 0.1 150 / 0.8);
+  background: var(--hero-bg);
+  color: var(--hero-ink);
+  border-color: var(--border);
 }
 
 /* H2/H3: quiet. No top border, no left border. Just weight + spacing. */
@@ -487,7 +397,6 @@ button, input, select, textarea { font: inherit; }
 :root[data-theme="dark"] .sl-markdown-content code:not(:where(pre *)) {
   background: var(--color-surface-200);
   color: var(--sl-color-text);
-  text-shadow: none;
 }
 
 /* Code blocks: brutalist frame. */
@@ -506,7 +415,6 @@ button, input, select, textarea { font: inherit; }
 :root[data-theme="dark"] .expressive-code .frame pre {
   background: var(--color-surface-200) !important;
   color: var(--sl-color-text) !important;
-  text-shadow: none;
 }
 
 .expressive-code .frame.is-terminal::before,
@@ -588,7 +496,7 @@ button, input, select, textarea { font: inherit; }
   color: var(--sl-color-text);
   padding: 0.2rem 0.55rem;
   border: 2px solid var(--neo-shadow-color);
-  background: var(--color-surface-0, #fff);
+  background: var(--surface);
   box-shadow: 2px 2px 0 0 var(--neo-shadow-color);
   border-radius: 0;
   align-self: start;
@@ -603,18 +511,18 @@ button, input, select, textarea { font: inherit; }
   background: var(--color-surface-100);
 }
 
-.sl-markdown-content dl.wyrd-defs dt[data-kind="data"]       { background: color-mix(in oklch, var(--card-data) 22%, var(--color-surface-0, #fff)); }
-.sl-markdown-content dl.wyrd-defs dt[data-kind="model"]      { background: color-mix(in oklch, var(--card-model) 22%, var(--color-surface-0, #fff)); }
+.sl-markdown-content dl.wyrd-defs dt[data-kind="data"]       { background: color-mix(in oklch, var(--card-data) 22%, var(--surface)); }
+.sl-markdown-content dl.wyrd-defs dt[data-kind="model"]      { background: color-mix(in oklch, var(--card-model) 22%, var(--surface)); }
 .sl-markdown-content dl.wyrd-defs dt[data-kind="experiment"],
 .sl-markdown-content dl.wyrd-defs dt[data-kind="drift"],
-.sl-markdown-content dl.wyrd-defs dt[data-kind="eval"]       { background: color-mix(in oklch, var(--card-experiment) 22%, var(--color-surface-0, #fff)); }
-.sl-markdown-content dl.wyrd-defs dt[data-kind="prompt"]     { background: color-mix(in oklch, var(--card-prompt) 22%, var(--color-surface-0, #fff)); }
+.sl-markdown-content dl.wyrd-defs dt[data-kind="eval"]       { background: color-mix(in oklch, var(--card-experiment) 22%, var(--surface)); }
+.sl-markdown-content dl.wyrd-defs dt[data-kind="prompt"]     { background: color-mix(in oklch, var(--card-prompt) 22%, var(--surface)); }
 .sl-markdown-content dl.wyrd-defs dt[data-kind="agent"],
 .sl-markdown-content dl.wyrd-defs dt[data-kind="subagent"],
 .sl-markdown-content dl.wyrd-defs dt[data-kind="skill"],
 .sl-markdown-content dl.wyrd-defs dt[data-kind="tool"],
-.sl-markdown-content dl.wyrd-defs dt[data-kind="mcp"]        { background: var(--card-agent); color: var(--color-surface-50); }
-.sl-markdown-content dl.wyrd-defs dt[data-kind="service"]    { background: color-mix(in oklch, var(--color-primary-500) 25%, var(--color-surface-0, #fff)); }
+.sl-markdown-content dl.wyrd-defs dt[data-kind="mcp"]        { background: var(--card-agent); color: var(--hero-ink); }
+.sl-markdown-content dl.wyrd-defs dt[data-kind="service"]    { background: color-mix(in oklch, var(--color-primary-500) 25%, var(--surface)); }
 
 .sl-markdown-content dl.wyrd-defs dd {
   margin: 0;
@@ -705,9 +613,9 @@ button, input, select, textarea { font: inherit; }
 }
 
 :root[data-theme="dark"] .wyrd-phase-gate__badge {
-  background: oklch(14% 0.012 150);
-  color: oklch(87% 0.16 150);
-  border: 1px solid oklch(55% 0.1 150 / 0.8);
+  background: var(--hero-bg);
+  color: var(--hero-ink);
+  border-color: var(--border);
 }
 
 .wyrd-phase-gate code {
@@ -767,9 +675,9 @@ button, input, select, textarea { font: inherit; }
 }
 
 :root[data-theme="dark"] .wyrd-hero__title {
-  background: oklch(14% 0.012 150);
-  color: oklch(87% 0.16 150);
-  border-color: oklch(55% 0.1 150 / 0.8);
+  background: var(--hero-bg);
+  color: var(--hero-ink);
+  border-color: var(--border);
 }
 
 .wyrd-hero__tagline {
@@ -789,6 +697,261 @@ button, input, select, textarea { font: inherit; }
   max-width: 38rem;
   line-height: 1.55;
 }
+
+/* ---------- Homepage: arcade hero (v2 "The Plane" synthwave scene) ----------
+   Structure ported from brand/wyrd-ui-source-of-truth-v2.html (§7 LOUD).
+   Scene and font tokens come from wyrd-tokens.css (brand/palette.json). */
+.wyrd-arcade-hero {
+  --ah-fp: var(--font-arcade);
+  --ah-fv: var(--font-pixel);
+  --ah-fm: var(--mono-font-family);
+  --ah-fh: var(--heading-font-family);
+
+  --ah-r: 4px;
+  --ah-border: var(--neo-shadow-color);
+  --ah-shadow: var(--neo-shadow-color);
+  --ah-surface: var(--color-surface-50);
+  --ah-text: var(--sl-color-text);
+  --ah-muted: var(--sl-color-gray-3);
+
+  --ah-rune-strong: var(--color-primary-700);
+  --ah-hero-bg: var(--color-primary-500);
+  --ah-hero-ink: var(--hero-ink);
+  --ah-hero-border: var(--neo-shadow-color);
+
+  --ah-lime: var(--color-secondary-500);
+  --ah-lime-ink: var(--lime-ink);
+  --ah-rune-btn: var(--color-primary-500);
+  --ah-rune-btn-ink: var(--hero-ink);
+
+  /* The Plane — tricolor (client / server / control), already mode-aware */
+  --ah-client: var(--card-data);
+  --ah-server: var(--card-experiment);
+  --ah-control: var(--card-prompt);
+
+  display: block;
+  margin: 1.25rem 0 2.5rem;
+  border: var(--default-border-width) solid var(--ah-border);
+  background: var(--ah-surface);
+  box-shadow: var(--neo-shadow-offset-lg) var(--neo-shadow-offset-lg) 0 0 var(--ah-shadow);
+}
+
+.wyrd-arcade-hero .l-bar {
+  height: 8px;
+  background: linear-gradient(
+    90deg,
+    var(--ah-client) 0 33.3%,
+    var(--ah-server) 33.3% 66.6%,
+    var(--ah-control) 66.6% 100%
+  );
+}
+
+.wyrd-arcade-hero .l-pad {
+  padding: 24px 24px 28px;
+  position: relative;
+  min-height: 392px;
+  overflow: hidden;
+}
+
+.wyrd-arcade-hero .l-wm {
+  font-family: var(--ah-fh);
+  font-size: 17px;
+  letter-spacing: -0.3px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  text-transform: uppercase;
+}
+.wyrd-arcade-hero .l-wm i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--ah-lime);
+}
+
+.wyrd-arcade-hero .l-orn {
+  float: right;
+  font-family: var(--ah-fm);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: var(--ah-rune-strong);
+  border: var(--default-border-width) solid var(--ah-border);
+  border-radius: var(--ah-r);
+  padding: 5px 9px;
+  box-shadow: 3px 3px 0 0 var(--ah-shadow);
+  background: var(--ah-surface);
+}
+
+.wyrd-arcade-hero .l-hero {
+  display: inline-block;
+  font-family: var(--ah-fp);
+  font-size: clamp(15px, 2.1vw, 22px);
+  line-height: 1.35;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin: 18px 0 0;
+  padding: 15px 18px;
+  border-radius: var(--ah-r);
+  background: var(--ah-hero-bg);
+  color: var(--ah-hero-ink);
+  border: 3px solid var(--ah-hero-border);
+  box-shadow: 10px 10px 0 0 var(--ah-shadow);
+}
+
+.wyrd-arcade-hero .l-tag {
+  margin-top: 19px;
+  font-family: var(--ah-fm);
+  font-size: 14px;
+  line-height: 1.55;
+  max-width: 46ch;
+  color: var(--ah-text);
+}
+.wyrd-arcade-hero .l-tag b { color: var(--ah-rune-strong); }
+
+.wyrd-arcade-hero .l-stats {
+  display: flex;
+  gap: 13px;
+  margin-top: 21px;
+  flex-wrap: wrap;
+}
+.wyrd-arcade-hero .l-stat {
+  border: var(--default-border-width) solid var(--ah-border);
+  border-radius: var(--ah-r);
+  background: var(--ah-surface);
+  box-shadow: 6px 6px 0 0 var(--ah-shadow);
+  padding: 13px 16px;
+  flex: 1;
+  min-width: 110px;
+}
+.wyrd-arcade-hero .l-stat .n {
+  font-family: var(--ah-fv);
+  font-size: 30px;
+  line-height: 0.9;
+  color: var(--ah-rune-strong);
+}
+.wyrd-arcade-hero .l-stat .k {
+  font-family: var(--ah-fm);
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--ah-muted);
+  margin-top: 7px;
+}
+
+.wyrd-arcade-hero .l-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--ah-fm);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  margin-top: 24px;
+  padding: 13px 22px;
+  border: var(--default-border-width) solid var(--ah-border);
+  border-radius: var(--ah-r);
+  background: var(--ah-lime);
+  color: var(--ah-lime-ink);
+  cursor: pointer;
+  text-decoration: none;
+  box-shadow: 6px 6px 0 0 var(--ah-shadow);
+  transition: transform 0.1s, box-shadow 0.1s;
+}
+.wyrd-arcade-hero .l-cta:hover {
+  transform: translate(-2px, -2px);
+  box-shadow: 9px 9px 0 0 var(--ah-shadow);
+}
+.wyrd-arcade-hero .l-cta:active {
+  transform: translate(3px, 3px);
+  box-shadow: 2px 2px 0 0 var(--ah-shadow);
+}
+.wyrd-arcade-hero .l-cta2 {
+  background: var(--ah-rune-btn);
+  color: var(--ah-rune-btn-ink);
+  margin-left: 10px;
+}
+
+/* background scene — "The Plane": grid horizon = Wyrd's three planes. Zero-blur.
+   Scene/font tokens (--grid, --star, --spr-d, --sky-top, --sky-bot, --rune-strong,
+   --lime, --client, --server, --control) cascade from wyrd-tokens.css. */
+.wyrd-arcade-hero .l-content { position: relative; z-index: 1; }
+.wyrd-arcade-hero .l-scene {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+.wyrd-arcade-hero .l-sky {
+  position: absolute;
+  inset: 0;
+  background-image:
+    repeating-linear-gradient(0deg, color-mix(in srgb, var(--border) 6%, transparent) 0 2px, transparent 2px 4px),
+    repeating-linear-gradient(90deg, color-mix(in srgb, var(--border) 6%, transparent) 0 2px, transparent 2px 4px),
+    linear-gradient(var(--sky-top), var(--sky-bot));
+  background-size: 4px 4px, 4px 4px, 100% 100%;
+}
+.wyrd-arcade-hero .l-stars {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 54%;
+  opacity: 0;
+}
+:root[data-theme="dark"] .wyrd-arcade-hero .l-stars { opacity: 1; }
+.wyrd-arcade-hero .l-sun {
+  position: absolute;
+  right: 8%;
+  top: 54%;
+  transform: translateY(-84%);
+  width: 104px;
+  height: 104px;
+  z-index: 1;
+}
+.wyrd-arcade-hero .l-sun .fuji { width: 100%; height: 100%; }
+.wyrd-arcade-hero .l-sun .fuji .p { fill: var(--ah-rune-strong); }
+.wyrd-arcade-hero .l-sun .fuji .c { fill: var(--ah-lime); }
+.wyrd-arcade-hero .l-horizon {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 46%;
+  height: 3px;
+  background: var(--ah-border);
+  z-index: 2;
+}
+.wyrd-arcade-hero .l-grid {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  width: 100%;
+  height: 46%;
+  z-index: 2;
+}
+/* side-profile agent patrolling The Line — pixel sprite, zero-blur, reduced-motion-safe */
+.wyrd-arcade-hero .l-walker {
+  position: absolute;
+  bottom: calc(46% - 4px);
+  left: 18%;
+  z-index: 3;
+  height: 28px;
+  pointer-events: none;
+}
+.wyrd-arcade-hero .l-walker .spr { display: block; height: 28px; width: auto; }
+.wyrd-arcade-hero .spr-stack { position: relative; }
+.wyrd-arcade-hero .spr-b { position: absolute; inset: 0; opacity: 0; }
+@media (prefers-reduced-motion: no-preference) {
+  .wyrd-arcade-hero .l-walker { animation: wyrd-patrol 22s ease-in-out infinite; }
+  .wyrd-arcade-hero .spr-flip { display: inline-block; animation: wyrd-face 22s steps(1) infinite; }
+  .wyrd-arcade-hero .spr-a { animation: wyrd-legA 0.44s steps(1) infinite; }
+  .wyrd-arcade-hero .spr-b { animation: wyrd-legB 0.44s steps(1) infinite; }
+}
+@keyframes wyrd-patrol { 0% { left: 6%; } 47% { left: 70%; } 50% { left: 70%; } 97% { left: 6%; } 100% { left: 6%; } }
+@keyframes wyrd-face { 0%, 49% { transform: scaleX(1); } 50%, 100% { transform: scaleX(-1); } }
+@keyframes wyrd-legA { 0%, 49% { opacity: 1; } 50%, 99% { opacity: 0; } }
+@keyframes wyrd-legB { 0%, 49% { opacity: 0; } 50%, 99% { opacity: 1; } }
 
 /* Stat row */
 .wyrd-stats {
@@ -814,8 +977,7 @@ button, input, select, textarea { font: inherit; }
 }
 
 :root[data-theme="dark"] .wyrd-stats strong {
-  color: oklch(75% 0.15 150);
-  text-shadow: 0 0 6px oklch(75% 0.1 150 / 0.35);
+  color: var(--rune-strong);
 }
 
 .wyrd-stats span {
@@ -846,7 +1008,7 @@ button, input, select, textarea { font: inherit; }
   padding: 0.65rem 0.7rem;
   border: 2px solid var(--neo-shadow-color);
   border-left-width: 6px;
-  background: var(--color-surface-0, #fff);
+  background: var(--surface);
   box-shadow: var(--neo-shadow-offset-sm) var(--neo-shadow-offset-sm) 0 0 var(--neo-shadow-color);
   color: var(--sl-color-text);
   font-family: var(--base-font-family);
@@ -914,7 +1076,7 @@ button, input, select, textarea { font: inherit; }
 :root[data-theme="dark"] .wyrd-diagram .node-fill { fill: var(--color-surface-200); }
 
 .wyrd-diagram .node-fill-accent { fill: var(--color-primary-500); }
-:root[data-theme="dark"] .wyrd-diagram .node-fill-accent { fill: oklch(14% 0.012 150); }
+:root[data-theme="dark"] .wyrd-diagram .node-fill-accent { fill: var(--hero-bg); }
 
 .wyrd-diagram .node-stroke { stroke: var(--neo-shadow-color); stroke-width: 2; fill: none; }
 .wyrd-diagram .node-shadow { fill: var(--neo-shadow-color); }
@@ -927,7 +1089,7 @@ button, input, select, textarea { font: inherit; }
 }
 
 .wyrd-diagram .node-text-on-accent { fill: var(--color-surface-50); }
-:root[data-theme="dark"] .wyrd-diagram .node-text-on-accent { fill: oklch(87% 0.16 150); }
+:root[data-theme="dark"] .wyrd-diagram .node-text-on-accent { fill: var(--hero-ink); }
 
 .wyrd-diagram .node-sub {
   font-family: var(--mono-font-family);
@@ -937,7 +1099,7 @@ button, input, select, textarea { font: inherit; }
   text-anchor: middle;
 }
 .wyrd-diagram .node-sub-on-accent { fill: var(--color-surface-50); opacity: 0.85; }
-:root[data-theme="dark"] .wyrd-diagram .node-sub-on-accent { fill: oklch(87% 0.16 150); }
+:root[data-theme="dark"] .wyrd-diagram .node-sub-on-accent { fill: var(--hero-ink); }
 
 .wyrd-diagram .arrow {
   stroke: var(--neo-shadow-color);

@@ -2,37 +2,63 @@
 
 > Wyrd is the declarative AI layer for developers, engineers, and agents. A standardized ecosystem for models, data, prompts, agents, workflows, evals, policies, audits, services, sources, and observations. Runtime tools resolve through tool registries; execution stays in the user runtime.
 
-## Concepts
+## Home
 
-- [Cards](https://wyrd.ai/concepts/card/): The durable, versioned envelope for one thing Wyrd governs.
-- [Specs](https://wyrd.ai/concepts/spec/): The typed payload inside a Card. One schema per kind.
-- [Runs](https://wyrd.ai/concepts/run/): The record of an execution tied to a specific Card version.
-- [Observations](https://wyrd.ai/concepts/observation/): Structured behavioral signals attached to a Run.
-- [Policies](https://wyrd.ai/concepts/policy-card/): Decision rules evaluated when Cards are written or Runs are created.
-- [Audit](https://wyrd.ai/concepts/audit/): Immutable entries describing who or what made a decision.
-- [Lineage](https://wyrd.ai/concepts/lineage/): The typed graph that connects Cards to Cards, and Cards to Runs to Observations.
-- [Services](https://wyrd.ai/concepts/service-card/): The Card kind that packages a deployable AI surface.
+- [Wyrd](https://mitari-ai.github.io/wyrd/): The typed control layer for AI systems: cards, a registry, and the Skald runtime.
 
-## Card kinds
+## Start here
 
-- [AgentCard](https://wyrd.ai/cards/agent/): Declare an agent that Wyrd can describe, govern, evaluate, install references for, and observe. Execution stays in the user or framework runtime.
-- [ArtifactCard](https://wyrd.ai/cards/artifact/): Track an immutable artifact that belongs to a card, run, or service release.
-- [AuditCard](https://wyrd.ai/cards/audit/): Represent a reviewable event or decision that needs durable provenance.
-- [DataCard](https://wyrd.ai/cards/data/): Describe a dataset, feature table, document set, or other data dependency.
-- [DriftCard](https://wyrd.ai/cards/drift/): Describe the drift contract Wyrd uses to watch behavior over time.
-- [EvalCard](https://wyrd.ai/cards/eval/): Define an evaluation suite, scoring rule, or acceptance check.
-- [ExperimentCard](https://wyrd.ai/cards/experiment/): Group work-in-progress runs and candidate changes under a single intent.
-- [MCPCard](https://wyrd.ai/cards/mcp/): Describe an MCP surface that tools and agents can discover consistently.
-- [ModelCard](https://wyrd.ai/cards/model/): Describe a model artifact, its interface, and the context needed to use it safely.
-- [OperatorCard](https://wyrd.ai/cards/operator/): Describe an operator that performs bounded work inside a workflow or service.
-- [PolicyCard](https://wyrd.ai/cards/policy/): Capture rules that decide whether a card, run, or action is allowed.
-- [PromptCard](https://wyrd.ai/cards/prompt/): Version prompt content and the contract around its inputs and outputs.
-- [ServiceCard](https://wyrd.ai/cards/service/): Describe a deployable service and the runtime rules Wyrd can lock.
-- [SourceCard](https://wyrd.ai/cards/source/): Declare where Wyrd reads external observations, archived runs, or object-store evidence.
-- [TriggerCard](https://wyrd.ai/cards/trigger/): Describe an event source that can start a workflow or service action.
-- [WorkflowCard](https://wyrd.ai/cards/workflow/): Describe a coordinated sequence of operators, tools, agents, or services.
+- [How it connects](https://mitari-ai.github.io/wyrd/start-here/how-it-connects/): The card system, the registry, and the Skald runtime — and how a component flows through them.
+- [Quickstart](https://mitari-ai.github.io/wyrd/start-here/quickstart/): Run the local DataCard workflow from the Wyrd repo.
+- [What is Wyrd](https://mitari-ai.github.io/wyrd/start-here/what-is-wyrd/): The typed control layer for the components of an AI system — cards, a registry, and the Skald runtime.
+
+## Cards
+
+- [Cards overview](https://mitari-ai.github.io/wyrd/cards/): The card envelope, how registration works, and a catalog of every card kind with its status.
+- [Data](https://mitari-ai.github.io/wyrd/cards/data/): Generated reference for the Wyrd Data card spec.
+- [Model](https://mitari-ai.github.io/wyrd/cards/model/): Generated reference for the Wyrd Model card spec.
+- [Prompt](https://mitari-ai.github.io/wyrd/cards/prompt/): Generated reference for the Wyrd Prompt card spec.
+
+## Skald runtime
+
+- [Agents & workflows](https://mitari-ai.github.io/wyrd/skald/): Skald — Wyrd's runtime for defining agents and workflows once and running them from Python or Rust.
+
+## Guides
+
+- [Build an Agent Workflow](https://mitari-ai.github.io/wyrd/guides/build-a-workflow/): Author a workflow from Python, YAML, or Rust, then run and instrument it.
+- [Build an Agent](https://mitari-ai.github.io/wyrd/guides/build-an-agent/): Build a Wyrd Agent: prompt, tools, callbacks, session memory, and run config. Python and Rust side-by-side.
+- [DataCard local workflow](https://mitari-ai.github.io/wyrd/guides/data-card-local-workflow/): Create a DataCard, save it locally, load it back, and inspect the local files.
+
+## Agents
+
+- [For agents](https://mitari-ai.github.io/wyrd/agents/): How an agent should read and update Wyrd — stable paths, a copyable workflow, and the rules.
+- [Error remediation](https://mitari-ai.github.io/wyrd/agents/error-remediation/): How agents should handle Wyrd errors.
+
+## Evaluation
+
+- [Evaluate agents](https://mitari-ai.github.io/wyrd/evaluation/): Score agent runs against the same task definitions in CI and against collected production records, with run_eval and the wyrd eval CLI.
+
+## Server
+
+- [Run the server](https://mitari-ai.github.io/wyrd/server/): Stand up wyrd-server against Postgres and object storage — local dev and production.
+- [Authentication](https://mitari-ai.github.io/wyrd/server/auth/): API keys, Wyrd JWTs, and OIDC federation — how callers prove who they are.
+- [Register cards to a server](https://mitari-ai.github.io/wyrd/server/register-cards/): How a local card becomes a durable, versioned record in the registry.
+
+## Python
+
+- [Python](https://mitari-ai.github.io/wyrd/python/): Public Python imports and local DataCard behavior.
+
+## API reference
+
+- [Errors](https://mitari-ai.github.io/wyrd/api/errors/): Error handling guidance for Wyrd API clients and agents.
+- [OpenAPI](https://mitari-ai.github.io/wyrd/api/openapi/): Generated summary of the Wyrd OpenAPI contract.
+- [Schemas](https://mitari-ai.github.io/wyrd/api/schemas/): Generated inventory of Wyrd JSON Schemas.
+
+## Roadmap
+
+- [Roadmap](https://mitari-ai.github.io/wyrd/roadmap/): What is specified or in progress but not yet runnable — stated honestly.
 
 ## Machine-readable schemas
 
-- [llms-full.txt](https://wyrd.ai/llms-full.txt): current schema inventory plus doctrine notes.
+- [llms-full.txt](https://mitari-ai.github.io/wyrd/llms-full.txt): every card JSON Schema plus this page index.
 - JSON Schemas: see `crates/wyrd-spec/schemas/` in the wyrd repository. `architecture/wyrd-design.md` remains the design authority while schemas are reconciled.

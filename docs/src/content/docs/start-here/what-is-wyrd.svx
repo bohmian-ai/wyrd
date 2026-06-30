@@ -1,0 +1,111 @@
+---
+title: What is Wyrd
+description: The typed control layer for the components of an AI system — cards, a registry, and the Skald runtime.
+---
+
+<script>
+  import Aside from '$lib/components/Aside.svelte';
+</script>
+
+# What is Wyrd
+
+<Aside title="In one sentence" data-variant="wyrd">
+
+Wyrd gives every part of an AI system — a dataset, a model, a prompt, an agent —
+one typed, versioned record called a **Card**, stores those cards in a
+**registry**, and runs agents and workflows on the **Skald** runtime.
+
+</Aside>
+
+## The problem
+
+A real AI system is a pile of loosely related parts: a dataset somewhere, a model
+artifact in object storage, a prompt pasted into a notebook, an agent wired up in
+application code, an eval that ran once. Each lives in a different tool with a
+different shape, and nothing ties them together. When the model changes, the eval
+that should have re-run doesn't, the prompt drifts, and no record connects the
+three.
+
+Wyrd makes each of those parts a **Card** — a typed, versioned declaration with a
+stable shape — and keeps the connections between them explicit instead of implied.
+
+## When to reach for Wyrd
+
+- You want one versioned record for a dataset, model, or prompt instead of a
+  filename convention and a wiki page.
+- You are building agents or multi-step workflows and want them defined once and
+  runnable from both Python and Rust.
+- You want the relationships between components — this model was trained on that
+  data, this agent uses that prompt — to be inspectable, not tribal knowledge.
+- You want a registry that an **agent** can read and write through MCP, HTTP, or
+  the CLI, not just a UI a human clicks.
+
+If you only need to stash a single file, Wyrd is more than you need. It earns its
+place when components have to stay connected over time.
+
+## The model in one screen
+
+Four ideas, in order:
+
+1. **Card** — the durable, versioned envelope for one component. Every card shares
+   the same outer shape: `apiVersion`, `metadata`, `kind`, `spec`,
+   `relationships`, `status`.
+2. **Spec** — the typed payload inside a card. `kind` selects the schema, so a
+   `Data` card carries a `DataSpec` and a `Model` card carries a `ModelSpec`.
+3. **Registry** — the server that stores cards, versions them, derives the
+   relationship graph, and serves them over HTTP, MCP, and the CLI.
+4. **Skald** — Wyrd's agent runtime. It runs the agents and workflows you declare,
+   in Python or Rust, against the model providers you configure.
+
+```yaml
+apiVersion: wyrd/v1
+metadata:
+  space: default
+  name: customer-churn
+  version: "0.1.0"
+  labels:
+    domain: customer
+kind: Data
+spec:
+  interface:
+    kind: Pandas
+relationships: []
+status: null
+```
+
+One envelope across every kind means one inventory, one way to reference a
+component (`CardRef`), one relationship graph, and one set of generated, agent-
+readable contracts. A client never has to guess which shape a component uses
+before it can read or validate it.
+
+## What runs today
+
+Wyrd is pre-release. Three card kinds are runnable end to end, the server and auth
+stack are real, and the Skald runtime ships with full Python/Rust parity:
+
+- **Cards** — author, save, load, and register `Data`, `Model`, and `Prompt`
+  cards from Python.
+- **Server & registry** — run `wyrd-server` against Postgres and object storage;
+  upload and download cards over HTTP with API-key or OIDC-federated auth.
+- **Skald** — define agents and workflows once and run them from Python or Rust
+  against OpenAI, Anthropic, Gemini, Vertex, or a mock provider.
+- **Evaluation** — score agents with `run_eval` and the `wyrd eval` CLI.
+
+The card *model* defines more kinds than are runnable yet. The
+[Cards overview](/cards/) shows every kind with an honest status badge, and the
+[Roadmap](/roadmap/) covers what is specified but not yet wired.
+
+## Where execution lives
+
+Wyrd records, versions, links, and serves card declarations. Skald runs agents and
+workflows. Everything else — training jobs, your inference servers, your
+notebooks, your containers — stays in your runtime. Wyrd is the control layer
+beside those systems, not a replacement for them.
+
+## Next
+
+- [How it connects](/start-here/how-it-connects/) — the card system, the registry,
+  and Skald in one diagram.
+- [Install & quickstart](/start-here/quickstart/) — install `py-wyrd` and run your
+  first card.
+- [Cards overview](/cards/) — every card kind and its status.

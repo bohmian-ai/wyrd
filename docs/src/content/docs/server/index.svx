@@ -1,0 +1,119 @@
+---
+title: Run the server
+description: Stand up wyrd-server against Postgres and object storage — local dev and production.
+---
+
+<script>
+  import Aside from '$lib/components/Aside.svelte';
+</script>
+
+# Run the server
+
+`wyrd-server` is the registry: it stores cards, versions them, validates specs,
+holds artifact bytes, and serves everything over HTTP, MCP, and the CLI. It needs
+two things — a **Postgres** database and a **storage** backend — and is configured
+entirely through environment variables.
+
+This page has two tracks. Start with **Local dev** to get a server running on your
+machine in a minute; read **Production** when you deploy.
+
+## Local dev
+
+In local mode the server manages everything for you: it starts an embedded
+Postgres, provisions roles, runs migrations, and writes artifacts to the local
+filesystem.
+
+Leave all three `WYRD_DATABASE_*` variables unset to get embedded Postgres, and
+point storage at a local directory:
+
+```bash
+export WYRD_STORAGE_BACKEND=local
+export WYRD_STORAGE_LOCAL_ROOT=/absolute/path/to/wyrd-data   # must exist
+export WYRD_PUBLIC_BASE_URL=http://localhost:8080
+
+wyrd-server
+```
+
+That is the whole local setup. The server boots embedded Postgres, runs
+migrations, builds its runtime pools, and starts serving.
+
+<Aside title="First credential" data-variant="wyrd">
+
+A fresh server has no principals. Mint the first credential before you make
+authenticated calls — see [Authentication](/server/auth/) for issuing and
+exchanging keys.
+
+</Aside>
+
+## Production
+
+In production you bring your own Postgres and a cloud object store. Nothing else
+about the binary changes.
+
+### Postgres
+
+Wyrd uses **one database and three login roles** — `wyrd_app` (RLS-bound runtime
+queries), `wyrd_migrator` (boot-only DDL), and `wyrd_platform_admin` (optional
+background sweepers and audited cross-tenant routes). The role names are a schema
+contract baked into the migrations; they cannot be renamed per deploy.
+
+You provide one canonical URL carrying the `wyrd_app` userinfo plus the per-role
+passwords. The server synthesizes the migrator and platform-admin DSNs at boot by
+swapping the userinfo.
+
+| Variable | Required | Role |
+|---|:---:|---|
+| `WYRD_DATABASE_URL` | yes | `wyrd_app` — full `postgres://user:pass@host:port/db` DSN |
+| `WYRD_DATABASE_MIGRATOR_PASSWORD` | yes | `wyrd_migrator` — boot migrations only |
+| `WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD` | no | `wyrd_platform_admin` — sweepers + audited routes |
+
+Configuration is all-or-nothing: set the URL **and** the migrator password (and
+optionally the platform-admin password) for external Postgres, or leave all three
+unset for embedded mode. Partial configuration is rejected (`MixedDsnConfig`).
+
+Infrastructure must provision the roles before the server starts. Run
+`crates/wyrd/wyrd-sql/bootstrap/roles.sql` as a cluster superuser, substituting the
+`REPLACE_WITH_*_PASSWORD` placeholders from your secret store. The migration path
+validates that the roles exist with the expected `BYPASSRLS` posture and fails
+early if bootstrap is incomplete. Pool tuning (`WYRD_DB_MAX_CONNECTIONS`,
+`WYRD_DB_MIN_CONNECTIONS`, acquire/idle/lifetime timeouts) defaults sensibly; tune
+per role with `_MIGRATOR` / `_PLATFORM_ADMIN` suffixes.
+
+### Storage
+
+Set `WYRD_STORAGE_BACKEND` to one of `local`, `s3`, `gcs`, or `azure`. The server
+refuses to start without it. The client tier carries zero cloud SDKs — every
+presign and upload completion runs server-side.
+
+| Backend | Key variables |
+|---|---|
+| `s3` | `WYRD_STORAGE_S3_BUCKET`, optional `WYRD_STORAGE_S3_REGION`, `WYRD_STORAGE_S3_ENDPOINT_URL`, `WYRD_STORAGE_S3_FORCE_PATH_STYLE` |
+| `gcs` | `WYRD_STORAGE_GCS_BUCKET` |
+| `azure` | `WYRD_STORAGE_AZURE_ACCOUNT`, `WYRD_STORAGE_AZURE_CONTAINER` |
+| `local` | `WYRD_STORAGE_LOCAL_ROOT`, `WYRD_PUBLIC_BASE_URL` |
+
+Credentials are **never** raw keys in config. Each cloud backend resolves them
+through its provider's standard chain, so the same binary works under IAM roles,
+GKE Workload Identity, or AKS Managed Identity with no code change. On Kubernetes,
+prefer IRSA (S3), Workload Identity (GCS), or Managed Identity (Azure) over
+long-lived secrets.
+
+Set `WYRD_STORAGE_REQUIRE_ENCRYPTION=true` on cloud backends to reject uploads
+whose objects are not encrypted at rest. Tune presign TTL and multipart part size
+with `WYRD_STORAGE_PRESIGN_TTL_SECS` and `WYRD_STORAGE_PART_SIZE_BYTES` (raise the
+part size for very large model artifacts).
+
+### Boot order
+
+On start, the server resolves env (or starts embedded Postgres), builds the
+migrator pool, runs `wyrd-sql` then `vala-sql` migrations, closes the migrator
+pool, builds the runtime pools, and begins serving with graceful shutdown. The
+migrator DSN must connect directly to Postgres — do not route migrations through
+transaction-mode PgBouncer.
+
+## Next
+
+- [Authentication](/server/auth/) — mint and exchange credentials.
+- [Register cards to a server](/server/register-cards/) — upload a card.
+- [Roadmap](/roadmap/) — gRPC card services and dedicated card reads are not yet
+  exposed.

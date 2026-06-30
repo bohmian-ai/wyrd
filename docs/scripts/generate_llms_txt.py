@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Generate /llms.txt and /llms-full.txt for the Wyrd docs site.
 
-Both files live in docs/public/ so Astro serves them at the site root.
+Both files live in docs/public/ so the static site serves them under the
+deploy base (GitHub Pages project subpath /wyrd/).
 
-llms.txt           - compact index for agents (links + one-line purposes).
-llms-full.txt      - full schema dump per card kind, plus concept summaries.
+llms.txt       - compact index for agents (links + one-line purposes). The
+                 page list is derived from the content actually on disk so it
+                 can never advertise a route the build does not serve.
+llms-full.txt  - full JSON Schema dump per card kind, plus the same page index.
 """
 
 from __future__ import annotations
@@ -16,9 +19,58 @@ from pathlib import Path
 DOCS_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = DOCS_ROOT.parent
 SCHEMA_DIR = REPO_ROOT / "crates" / "wyrd-spec" / "schemas"
+CONTENT_DIR = DOCS_ROOT / "src" / "content" / "docs"
 PUBLIC_DIR = DOCS_ROOT / "public"
 
-SITE = "https://wyrd.ai"
+# Production origin for the docs site. Pages deploys to the project subpath
+# /wyrd/ under the org's github.io domain. BASE must always match
+# svelte.config.js `paths.base` so emitted URLs do not 404 on Pages.
+ORIGIN = "https://mitari-ai.github.io"
+BASE = "/wyrd"
+SITE = f"{ORIGIN}{BASE}"
+
+# The home route is served by src/routes/+page.svelte, not by a content file,
+# so it is described here explicitly.
+HOME = (
+    "",
+    "Wyrd",
+    "The typed control layer for AI systems: cards, a registry, and the Skald runtime.",
+)
+
+# Section directories in the order they appear in the site nav. Any content
+# directory not listed here is appended afterwards in alphabetical order so a
+# new section never silently drops out of llms.txt.
+SECTION_ORDER = [
+    "start-here",
+    "cards",
+    "skald",
+    "guides",
+    "agents",
+    "evaluation",
+    "server",
+    "python",
+    "api",
+    "roadmap",
+]
+
+SECTION_TITLES = {
+    "": "Home",
+    "start-here": "Start here",
+    "cards": "Cards",
+    "skald": "Skald runtime",
+    "guides": "Guides",
+    "agents": "Agents",
+    "evaluation": "Evaluation",
+    "server": "Server",
+    "python": "Python",
+    "api": "API reference",
+    "roadmap": "Roadmap",
+}
+
+# Card kinds that ship a dedicated reference page under /cards/. Every other
+# kind appears only as a row in the catalog table on /cards/, so its schema in
+# llms-full.txt links to that catalog rather than a route that does not exist.
+CARDS_WITH_PAGES = {"data", "model", "prompt"}
 
 CARD_SPECS = {
     "agent": "agent_spec.json",
@@ -52,28 +104,108 @@ PURPOSES = {
     "policy": "Capture rules that decide whether a card, run, or action is allowed.",
     "prompt": "Version prompt content and the contract around its inputs and outputs.",
     "service": "Describe a deployable service and the runtime rules Wyrd can lock.",
-    "source": "Declare where Wyrd reads external observations, archived runs, or object-store evidence.",
     "trigger": "Describe an event source that can start a workflow or service action.",
     "workflow": "Describe a coordinated sequence of operators, tools, agents, or services.",
 }
 
-DESIGN_ONLY_CARDS = {
-    "source": {
-        "url": f"{SITE}/cards/source/",
-        "schema": "SourceSpec is design-authoritative in architecture/wyrd-design.md and pending in wyrd-spec.",
-    }
-}
 
-CONCEPTS = [
-    ("card", "Cards", "The durable, versioned envelope for one thing Wyrd governs."),
-    ("spec", "Specs", "The typed payload inside a Card. One schema per kind."),
-    ("run", "Runs", "The record of an execution tied to a specific Card version."),
-    ("observation", "Observations", "Structured behavioral signals attached to a Run."),
-    ("policy-card", "Policies", "Decision rules evaluated when Cards are written or Runs are created."),
-    ("audit", "Audit", "Immutable entries describing who or what made a decision."),
-    ("lineage", "Lineage", "The typed graph that connects Cards to Cards, and Cards to Runs to Observations."),
-    ("service-card", "Services", "The Card kind that packages a deployable AI surface."),
-]
+def slug_for(path: Path) -> str:
+    """Mirror docs/src/lib/content.ts toSlug() so URLs match served routes."""
+    rel = path.relative_to(CONTENT_DIR).as_posix()
+    rel = rel.rsplit(".", 1)[0]
+    if rel == "index":
+        return ""
+    if rel.endswith("/index"):
+        return rel[: -len("/index")]
+    return rel
+
+
+def read_frontmatter(path: Path) -> tuple[str, str]:
+    """Return (title, description) from a leading `---` YAML front-matter block.
+
+    A minimal line parser keeps the generator free of a YAML dependency in the
+    docs build environment.
+    """
+    text = path.read_text(encoding="utf-8")
+    title = ""
+    description = ""
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        block = text[3:end] if end != -1 else ""
+        for line in block.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("title:"):
+                title = _unquote(stripped[len("title:") :].strip())
+            elif stripped.startswith("description:"):
+                description = _unquote(stripped[len("description:") :].strip())
+    if not title:
+        title = slug_for(path).rsplit("/", 1)[-1] or path.stem
+    return title, description
+
+
+def _unquote(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
+
+
+def collect_pages() -> list[tuple[str, str, str, str]]:
+    """Scan the content tree and return (section, slug, title, description).
+
+    The home route is injected first; every other entry is a real file on
+    disk, so the list always matches what the build prerenders.
+    """
+    pages: list[tuple[str, str, str, str]] = [("", HOME[0], HOME[1], HOME[2])]
+    for path in sorted(CONTENT_DIR.rglob("*")):
+        if path.suffix not in {".svx", ".md"}:
+            continue
+        slug = slug_for(path)
+        section = slug.split("/", 1)[0] if slug else ""
+        title, description = read_frontmatter(path)
+        pages.append((section, slug, title, description))
+    return pages
+
+
+def grouped_pages(
+    pages: list[tuple[str, str, str, str]],
+) -> list[tuple[str, list[tuple[str, str, str, str]]]]:
+    sections: dict[str, list[tuple[str, str, str, str]]] = {}
+    for entry in pages:
+        sections.setdefault(entry[0], []).append(entry)
+    ordered = [s for s in SECTION_ORDER if s in sections]
+    extras = sorted(s for s in sections if s and s not in SECTION_ORDER)
+    result: list[tuple[str, list[tuple[str, str, str, str]]]] = []
+    # Home first.
+    if "" in sections:
+        result.append(("", sections[""]))
+    for section in ordered + extras:
+        result.append((section, sorted(sections[section], key=lambda e: e[1])))
+    return result
+
+
+def url_for(slug: str) -> str:
+    return f"{SITE}/" if not slug else f"{SITE}/{slug}/"
+
+
+def render_pages_index() -> list[str]:
+    lines: list[str] = []
+    for section, entries in grouped_pages(collect_pages()):
+        heading = SECTION_TITLES.get(section, section.replace("-", " ").title())
+        lines += [f"## {heading}", ""]
+        for _section, slug, title, description in entries:
+            suffix = f": {description}" if description else ""
+            lines.append(f"- [{title}]({url_for(slug)}){suffix}")
+        lines.append("")
+    return lines
+
+
+def card_url(slug: str) -> str:
+    return f"{SITE}/cards/{slug}/" if slug in CARDS_WITH_PAGES else f"{SITE}/cards/"
+
+
+def load_schema(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def title_for(slug: str) -> str:
@@ -82,30 +214,18 @@ def title_for(slug: str) -> str:
     return slug.title()
 
 
-def load_schema(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
 def render_llms_txt() -> str:
     lines = [
         "# Wyrd",
         "",
         "> Wyrd is the declarative AI layer for developers, engineers, and agents. A standardized ecosystem for models, data, prompts, agents, workflows, evals, policies, audits, services, sources, and observations. Runtime tools resolve through tool registries; execution stays in the user runtime.",
         "",
-        "## Concepts",
-        "",
     ]
-    for slug, title, purpose in CONCEPTS:
-        lines.append(f"- [{title}]({SITE}/concepts/{slug}/): {purpose}")
-    lines += ["", "## Card kinds", ""]
-    for slug in sorted([*CARD_SPECS, *DESIGN_ONLY_CARDS]):
-        lines.append(f"- [{title_for(slug)}Card]({SITE}/cards/{slug}/): {PURPOSES[slug]}")
+    lines += render_pages_index()
     lines += [
-        "",
         "## Machine-readable schemas",
         "",
-        f"- [llms-full.txt]({SITE}/llms-full.txt): current schema inventory plus doctrine notes.",
+        f"- [llms-full.txt]({SITE}/llms-full.txt): every card JSON Schema plus this page index.",
         "- JSON Schemas: see `crates/wyrd-spec/schemas/` in the wyrd repository. `architecture/wyrd-design.md` remains the design authority while schemas are reconciled.",
         "",
     ]
@@ -116,34 +236,25 @@ def render_llms_full() -> str:
     lines = [
         "# Wyrd — full machine-readable reference",
         "",
-        "Generated from `crates/wyrd-spec/schemas/`. `architecture/wyrd-design.md` is the design authority; this schema dump may include implementation drift while `wyrd-spec` is reconciled.",
+        "Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architecture/wyrd-design.md` is the design authority; this schema dump may include implementation drift while `wyrd-spec` is reconciled.",
         "",
     ]
+    lines += render_pages_index()
+    lines += ["## Card schemas", ""]
     for slug, schema_file in sorted(CARD_SPECS.items()):
         title = title_for(slug)
         schema = load_schema(SCHEMA_DIR / schema_file)
         lines += [
-            f"## {title}Card",
+            f"### {title}Card",
             "",
             PURPOSES[slug],
             "",
-            f"URL: {SITE}/cards/{slug}/",
+            f"URL: {card_url(slug)}",
             f"Schema source: crates/wyrd-spec/schemas/{schema_file}",
             "",
             "```json",
             json.dumps(schema, indent=2, sort_keys=True),
             "```",
-            "",
-        ]
-    for slug, meta in sorted(DESIGN_ONLY_CARDS.items()):
-        title = title_for(slug)
-        lines += [
-            f"## {title}Card",
-            "",
-            PURPOSES[slug],
-            "",
-            f"URL: {meta['url']}",
-            meta["schema"],
             "",
         ]
     return "\n".join(lines)

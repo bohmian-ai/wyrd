@@ -1,0 +1,76 @@
+---
+title: For agents
+description: How an agent should read and update Wyrd — stable paths, a copyable workflow, and the rules.
+---
+
+# For agents
+
+Treat Wyrd as a system of explicit contracts. Before changing behavior, find the
+card, schema, task, test, and docs page that describe the surface you are
+touching. Agent-facing pages favor inputs, outputs, constraints, and remediation
+over narrative.
+
+## Stable public paths
+
+Use public package surfaces in examples, tests, and generated code:
+
+```python
+from wyrd.data import DataCard, DataInterface, PandasInterface
+```
+
+Do not import private native-extension modules directly. They are implementation
+details behind the public Python package.
+
+## Copyable workflow
+
+Run the DataCard example from a Wyrd checkout:
+
+```bash
+mise run py:setup
+mise run examples:python:datacard
+```
+
+Expected output is shown in the [quickstart](/start-here/quickstart/). The same
+workflow is explained step by step in the
+[DataCard local workflow](/guides/data-card-local-workflow/).
+
+## Agent checklist
+
+- Prefer generated schema docs when you need the exact field shape:
+  [Data card spec](/cards/data/) and [schema reference](/api/schemas/).
+- Use the [error reference](/api/errors/) when reporting Wyrd error codes, and
+  preserve exact error messages and operation context.
+- Prefer `mise run ...` tasks when you need to verify work.
+- Use `labels` for short indexed classification fields and `annotations` for
+  descriptive metadata.
+- Update public docs when a change touches a public concept, command, API route,
+  or generated artifact.
+
+## Agent identity
+
+Agent runtimes authenticate as `PrincipalKind::Agent { card_ref }`. The
+`card_ref` binds the runtime credential to the registered Agent card, and
+delegated tokens preserve the caller chain for audit. See
+[Authentication](/server/auth/) for principal kinds and the token flows.
+
+## Never do this
+
+- Do not import private native-extension modules directly.
+- Do not invent private card shapes.
+- Do not write `tags`; Wyrd's public metadata contract uses `labels` and
+  `annotations`.
+- Do not add or call a card instance `register()` method. Registration is
+  server-owned — see [Register cards](/server/register-cards/).
+- Do not create one-off artifact wrapper types. Durable artifact metadata is
+  `ArtifactCard`, linked with `CardRef`.
+
+## Good handoffs
+
+A useful handoff names the changed surface, the verification task that passed,
+and any known gap that still needs later work.
+
+## Read next
+
+- [Error remediation](/agents/error-remediation/) — resolve Wyrd error codes.
+- [How it connects](/start-here/how-it-connects/) — the model in one screen.
+- [For agents · llms.txt](/llms-full.txt) — the full machine-readable corpus.

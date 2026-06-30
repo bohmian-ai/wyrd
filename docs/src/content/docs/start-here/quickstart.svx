@@ -1,0 +1,57 @@
+---
+title: Quickstart
+description: Run the local DataCard workflow from the Wyrd repo.
+---
+
+# Quickstart
+
+This quickstart runs the current Python DataCard path. It creates a DataCard
+from a pandas DataFrame, writes the local card layout, loads it back, and prints
+deterministic output.
+
+## Prerequisites
+
+Run from a Wyrd checkout:
+
+```bash
+mise run py:setup
+```
+
+Expected result: the Python development environment under `python/py-wyrd` is
+installed, including pandas and the local Wyrd extension.
+
+## Run the example
+
+```bash
+mise run examples:python:datacard
+```
+
+Expected output:
+
+```text
+saved_card_json: true
+saved_data_file: data/data.parquet
+loaded_rows: 3
+loaded_columns: customer_id,churned,segment
+labels: domain=customer,stage=example
+annotation_source: examples/python/datacard_local_workflow.py
+```
+
+## What happened
+
+The script uses public imports only:
+
+```python
+from wyrd.data import DataCard, PandasInterface
+```
+
+`DataCard.save(path)` writes local files. It does not register the card, upload
+artifacts, or create an `ArtifactCard`. Registry and client surfaces own durable
+registration; storage owns durable bytes.
+
+Read next:
+
+- [DataCard local workflow](/guides/data-card-local-workflow/)
+- [Python SDK](/python/)
+- [Data card reference](/cards/data/)
+- [Run the server](/server/)

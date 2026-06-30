@@ -3,26 +3,35 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@10.23.0",
+  "packageManager": "pnpm@11.4.0",
   "scripts": {
-    "dev": "astro dev",
-    "build": "astro build",
-    "check": "astro check",
-    "preview": "astro preview"
+    "dev": "vite dev",
+    "build": "vite build && pagefind --site build",
+    "preview": "vite preview",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
   },
   "dependencies": {
-    "@astrojs/check": "^0.9.9",
-    "@astrojs/starlight": "^0.39.2",
-    "@fontsource/archivo": "^5.2.8",
-    "@fontsource/archivo-black": "^5.2.8",
-    "@fontsource/jetbrains-mono": "^5.2.8",
-    "@fontsource/vt323": "^5.2.7",
-    "astro": "^6.3.6",
-    "sharp": "^0.34.5",
-    "typescript": "^6.0.3"
+    "@fontsource/archivo": "5.2.8",
+    "@fontsource/archivo-black": "5.2.8",
+    "@fontsource/jetbrains-mono": "5.2.8",
+    "@fontsource/press-start-2p": "5.2.7",
+    "@fontsource/vt323": "5.2.7"
   },
   "devDependencies": {
-    "astro-mermaid": "^2.0.2",
-    "mermaid": "^11.15.0"
+    "@sveltejs/adapter-static": "3.0.10",
+    "@sveltejs/kit": "2.60.1",
+    "@sveltejs/vite-plugin-svelte": "7.1.2",
+    "@tailwindcss/vite": "4.3.0",
+    "@types/node": "25.8.0",
+    "mdsvex": "0.12.7",
+    "pagefind": "1.5.2",
+    "rehype-autolink-headings": "7.1.0",
+    "rehype-slug": "6.0.0",
+    "shiki": "4.3.0",
+    "svelte": "5.55.7",
+    "svelte-check": "4.4.8",
+    "tailwindcss": "4.3.0",
+    "typescript": "6.0.3",
+    "vite": "8.0.13"
   }
 }

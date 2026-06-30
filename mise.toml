@@ -976,14 +976,14 @@ run = "python scripts/check_links.py"
 
 [tasks."docs:astro:check"]
 hide = true
-description = "Run Astro type and content checks for the docs site"
+description = "Run svelte-check type and content checks for the docs site"
 dir = "docs"
-run = "pnpm astro check"
+run = "pnpm check"
 
 [tasks."docs:build"]
-description = "Build the Starlight docs site"
+description = "Build the SvelteKit docs site"
 dir = "docs"
-run = "pnpm astro build"
+run = "pnpm build"
 
 [tasks."docs:check"]
 hide = true
@@ -999,10 +999,10 @@ mise run docs:build
 """
 
 [tasks."docs:dev"]
-description = "Run the Starlight docs dev server on :4321"
+description = "Run the SvelteKit docs dev server on :4321"
 depends = ["docs:install", "docs:generate"]
 dir = "docs"
-run = "pnpm astro dev --host 0.0.0.0 --port ${WYRD_DOCS_PORT:-4321}"
+run = "pnpm dev --host 0.0.0.0 --port ${WYRD_DOCS_PORT:-4321}"
 
 [tasks."dev:both"]
 description = "Run wyrd-server (:8080) and UI (:3000) in parallel"

@@ -1,0 +1,167 @@
+---
+title: Python
+description: Public Python imports and local DataCard behavior.
+---
+
+# Python
+
+The Python package exposes Wyrd through public `wyrd` package paths. Import
+from those paths in notebooks, services, tests, docs, and agent-generated code.
+
+```python
+from wyrd.data import DataCard, DataInterface, DataStats, PandasInterface
+```
+
+Do not import private native-extension modules directly. They are implementation
+details behind the public package.
+
+## Local DataCard workflow
+
+Use `DataCard` when you want a local holder that can infer Data spec metadata,
+materialize local files, and load them back later.
+
+```python
+from pathlib import Path
+
+import pandas as pd
+from wyrd.data import DataCard, PandasInterface
+
+path = Path("customer_churn_card")
+data = pd.DataFrame(
+    {
+        "customer_id": [1001, 1002, 1003],
+        "churned": [False, True, False],
+        "segment": ["team", "enterprise", "team"],
+    }
+)
+
+card = DataCard(
+    PandasInterface(data=data),
+    name="customer-churn",
+    version="0.1.0",
+    labels={"domain": "customer", "stage": "example"},
+    annotations={"example.com/source": "python docs"},
+)
+
+card.save(path)
+
+restored = DataCard.model_validate_json((path / "card.json").read_text())
+restored.load(path)
+
+assert len(restored.data) == 3
+```
+
+`save(path)` is local filesystem materialization only. It writes interface
+artifacts and `card.json`. It does not register the card, upload bytes, or
+create an `ArtifactCard`.
+
+Registry and client surfaces own durable registration orchestration. Storage
+owns durable bytes. A durable artifact is represented by `ArtifactCard` and
+linked with `CardRef`.
+
+## Built-in interfaces
+
+Built-in interfaces are Python-visible wrappers around the Data card contract.
+The common constructor shape is:
+
+```python
+card = DataCard(PandasInterface(data=dataframe))
+card.save(path)
+```
+
+Current Data interfaces are exported from `wyrd.data`:
+
+| Interface | Typical input |
+| --- | --- |
+| `PandasInterface` | `pandas.DataFrame` |
+| `PolarsInterface` | `polars.DataFrame` |
+| `ArrowInterface` | `pyarrow.Table` |
+| `NumpyInterface` | `numpy.ndarray` |
+| `TorchInterface` | `torch.Tensor` |
+| `ParquetInterface` | Parquet path or dataframe-like source |
+| `JsonlInterface` | list of JSON records or JSONL path |
+| `ImageInterface` | image dataset path or manifest |
+| `TextInterface` | text path or manifest |
+| `SqlInterface` | SQL query dictionary |
+| `HuggingfaceInterface` | local dataset object or pinned dataset metadata |
+
+Optional framework packages must be installed before using their interface. If
+an interface cannot import or validate its framework object, Wyrd raises a
+structured `WyrdError` with a remediation message.
+
+`wyrd.eval` drives eval runs on a Wyrd server from Python. See
+[Evaluate agents](/evaluation/).
+
+## Labels and annotations
+
+Pass labels and annotations to the `DataCard` constructor:
+
+```python
+card = DataCard(
+    PandasInterface(data=dataframe),
+    labels={"domain": "customer", "stage": "training"},
+    annotations={"example.com/source": "warehouse.customer_churn"},
+)
+```
+
+Labels are short indexed classification fields. Annotations are longer
+descriptive metadata. Do not put secrets in either field. Wyrd validates keys,
+value length, reserved prefixes, and common secret-looking values.
+
+## Custom data interfaces
+
+Subclass `DataInterface` when Wyrd does not ship the local materialization
+layout you need. The subclass owns Python-side save and load behavior. Durable
+metadata still serializes through the Wyrd Card contract.
+
+```python
+import json
+from hashlib import sha256
+
+from wyrd.data import DataInterface, DataStats
+
+
+class JsonInterface(DataInterface):
+    def __init__(self, data=None):
+        super().__init__()
+        self.data = data
+
+    def save(self, path, save_kwargs=None):
+        output = path / "data" / "custom" / "data.json"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(self.data).encode("utf-8")
+        output.write_bytes(payload)
+        return DataStats(byte_count=len(payload), sha256=sha256(payload).hexdigest())
+
+    def load(self, path, load_kwargs=None):
+        input_path = path / "data" / "custom" / "data.json"
+        self.data = json.loads(input_path.read_text())
+```
+
+When rehydrating a serialized card that used a custom Python subclass, pass the
+class so Wyrd can rebuild the live interface before loading data:
+
+```python
+restored = DataCard.model_validate_json(card_json, interface=JsonInterface)
+restored.load(path)
+```
+
+Override `from_metadata(cls, metadata)` when your subclass needs serialized
+metadata to reconstruct configuration before `load(path)`.
+
+## Common failures
+
+| Failure | Fix |
+| --- | --- |
+| Invalid label or annotation key | Use lowercase DNS-style prefixes when needed, avoid spaces, and do not use reserved Wyrd prefixes for user metadata. |
+| Secret-looking label or annotation value | Move secrets to a secret manager. Card metadata is not a secret store. |
+| Unsupported interface option | Use the allowed option values in the interface docstring or generated stub. For example, compression options are validated before save. |
+| Missing framework dependency | Install the framework used by the interface, then rerun `mise run py:setup` if working from the repo. |
+| Private import usage | Replace private extension imports with public imports from `wyrd` or `wyrd.data`. |
+
+Read next:
+
+- [DataCard local workflow](/guides/data-card-local-workflow/)
+- [Data card reference](/cards/data/)
+- [Schema reference](/api/schemas/)
+- [How it connects](/start-here/how-it-connects/)

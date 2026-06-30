@@ -1,0 +1,124 @@
+---
+title: Build an Agent Workflow
+description: Author a workflow from Python, YAML, or Rust, then run and instrument it.
+---
+
+<script>
+  import LangTabs from '$lib/components/LangTabs.svelte';
+  import LangTab from '$lib/components/LangTab.svelte';
+  import CodeFromFile from '$lib/components/CodeFromFile.svelte';
+</script>
+
+# Build an Agent Workflow
+
+A Workflow is a directed acyclic graph of Agent invocations. Use `Workflow.sequential` for linear pipelines, `Workflow.parallel` when steps can run at the same time, or `add` and `add_after` for custom shapes.
+
+## Author
+
+<LangTabs>
+<LangTab lang="python">
+
+<CodeFromFile file="python/py-wyrd/examples/from_builder.py" lang="python" />
+
+</LangTab>
+<LangTab lang="rust">
+
+<CodeFromFile file="examples/rust/workflow_from_builder.rs" lang="rust" />
+
+</LangTab>
+</LangTabs>
+
+You can also author the same workflow as YAML and load it back:
+
+<CodeFromFile file="examples/rust/workflows/research.yaml" lang="yaml" title="research.yaml" />
+
+```python
+from wyrd import Workflow
+wf = Workflow.load("research.yaml")
+```
+
+## Run
+
+```python
+run = wf.run({"topic": "the Rust borrow checker"})
+print(run.parameters)
+print(run.final_output)
+```
+
+String input is available as `${input}`. Mapping input exposes each key as a template variable. Structured output from upstream steps accumulates in `WorkflowRun.parameters` and can feed downstream prompts.
+
+## Save And Load
+
+```python
+wf.save("research.yaml")
+loaded = Workflow.load("research.yaml")
+assert Workflow.from_yaml(wf.to_yaml()).to_yaml() == wf.to_yaml()
+```
+
+Observers are not serialized. Reattach them after `load`.
+
+## Custom DAG
+
+```python
+wf = Workflow(name="pipeline")
+wf.add(research_agent)
+wf.add_after(analysis_agent, after=research_agent)
+wf.add_after(summary_agent, after=research_agent)
+wf.add_after(final_agent, after=[analysis_agent, summary_agent])
+```
+
+## Parallel
+
+Use `parallel` when steps do not depend on each other. Use `add_after` to fan back in.
+
+<LangTabs>
+<LangTab lang="python">
+
+<CodeFromFile file="python/py-wyrd/examples/parallel.py" lang="python" />
+
+</LangTab>
+<LangTab lang="rust">
+
+<CodeFromFile file="examples/rust/workflow_parallel.rs" lang="rust" />
+
+</LangTab>
+</LangTabs>
+
+## Observe
+
+Observers attach to workflows. Attach one to capture lifecycle events, spans, and
+structured output across every step of the run.
+
+<LangTabs>
+<LangTab lang="python">
+
+<CodeFromFile file="python/py-wyrd/examples/with_observer.py" lang="python" />
+
+</LangTab>
+<LangTab lang="rust">
+
+<CodeFromFile file="examples/rust/workflow_with_observer.rs" lang="rust" />
+
+</LangTab>
+</LangTabs>
+
+## Typed Callback Wire
+
+```python
+from wyrd import Agent, Prompt, ProviderRequest, ProviderResponse
+
+def log_prompt(request: ProviderRequest) -> None:
+    print(request.openai().model)
+
+def log_response(response: ProviderResponse) -> None:
+    usage = response.openai().usage
+    if usage:
+        print(usage.total_tokens)
+
+agent = Agent(
+    name="researcher",
+    prompt=Prompt(provider="openai", model="gpt-4o", messages=["Research: ${topic}"]),
+    before_model_callback=log_prompt,
+    after_model_callback=log_response,
+)
+```

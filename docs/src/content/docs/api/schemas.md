@@ -13,6 +13,15 @@ These schemas are generated from the Wyrd spec crate and checked into the reposi
 | `crates/wyrd-spec/schemas/agent_spec.json` | AgentSpec |
 | `crates/wyrd-spec/schemas/artifact_spec.json` | ArtifactSpec |
 | `crates/wyrd-spec/schemas/audit_spec.json` | AuditSpec |
+| `crates/wyrd-spec/schemas/auth_callback_query.json` | CallbackQuery |
+| `crates/wyrd-spec/schemas/auth_issuer_url.json` | IssuerUrl |
+| `crates/wyrd-spec/schemas/auth_login_init_response.json` | LoginInitResponse |
+| `crates/wyrd-spec/schemas/auth_principal_kind.json` | PrincipalKind |
+| `crates/wyrd-spec/schemas/auth_revoke_principal_request.json` | RevokePrincipalRequest |
+| `crates/wyrd-spec/schemas/auth_revoke_principal_response.json` | RevokePrincipalResponse |
+| `crates/wyrd-spec/schemas/auth_token_request.json` | TokenRequest |
+| `crates/wyrd-spec/schemas/auth_token_response.json` | TokenResponse |
+| `crates/wyrd-spec/schemas/auth_url.json` | AbsoluteUrl |
 | `crates/wyrd-spec/schemas/card.json` | Card |
 | `crates/wyrd-spec/schemas/card_kind.json` | CardKind |
 | `crates/wyrd-spec/schemas/card_ref.json` | CardRef |

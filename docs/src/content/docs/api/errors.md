@@ -7,17 +7,16 @@ description: Error handling guidance for Wyrd API clients and agents.
 
 Wyrd returns errors as structured RFC 7807 Problem Details objects. Agents and SDK clients must preserve the full structure and must not collapse errors into prose.
 
+This page is the generated error catalog. For how an agent should act on these errors, see [Error remediation](/agents/error-remediation/).
+
 ## Client transport codes
 
 | Code | Status | Title | Remediation |
 |---|---:|---|---|
-| `WYRD_CLIENT_400_CONFIG_INVALID` | 400 | Client transport configuration failed validation | [Transports troubleshooting](/transports/troubleshooting/#config-validation) |
-| `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED` | 400 | Selected transport variant is not compiled into this build (**not yet emitted**; lands in PR4.0) | [Transports troubleshooting](/transports/troubleshooting/#feature-disabled) |
-| `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE` | 413 | Flush body exceeded the server's accepted payload size | [Transports troubleshooting](/transports/troubleshooting/#payload-too-large) |
-| `WYRD_CLIENT_503_TRANSPORT_DOWN` | 503 | Client transport is unavailable | [Transports troubleshooting](/transports/troubleshooting/#transport-down) |
-| `WYRD_CLIENT_504_FLUSH_TIMEOUT` | 504 | Flush exceeded per-call timeout | [Transports troubleshooting](/transports/troubleshooting/#flush-timeout) |
+| `WYRD_CLIENT_400_CONFIG_INVALID` | 400 | Client transport configuration failed validation | Fix the `details.field` named on the error, then reconstruct the client. Not a retry path. |
+| `WYRD_CLIENT_401_NO_CREDENTIALS` | 401 | Credential chain produced no usable credential | Set `WYRD_ACCESS_TOKEN`, `WYRD_WORKLOAD_TOKEN`+`WYRD_TENANT`, or `WYRD_API_KEY`. Not a retry path. |
+| `WYRD_CLIENT_503_TRANSPORT_DOWN` | 503 | Client transport is unavailable | Retry with backoff once the network or server health recovers. |
 
-See [Error Codes](/reference/errors/) for the current catalog.
 ## Error fields
 
 | Field | Description |
@@ -41,10 +40,6 @@ See [Error Codes](/reference/errors/) for the current catalog.
 - Keep retries bounded and tied to idempotent operations.
 - Link remediation steps to the card or run that caused the error.
 
-## Catalog
-
-The full Wyrd error catalog is not emitted as a standalone generated file yet. The Skald runtime codes below are seed tables for that generator.
-
 ## Skald agent codes
 
 | Code | Status | When |
@@ -65,7 +60,25 @@ The full Wyrd error catalog is not emitted as a standalone generated file yet. T
 | `WYRD_WORKFLOW_422_CYCLE` | 422 | The workflow DAG contains a cycle. |
 | `WYRD_WORKFLOW_422_MISSING_DEPENDENCY` | 422 | A step depends on an id that does not exist. |
 | `WYRD_WORKFLOW_422_DUPLICATE_STEP_ID` | 422 | Two steps share the same id. |
+| `WYRD_WORKFLOW_422_MISSING_NAME` | 422 | `save` or `to_card` was called on an anonymous workflow. |
 | `WYRD_WORKFLOW_422_MISSING_PARAMETER` | 422 | A prompt placeholder exists in neither workflow input nor upstream parameters. |
+
+## Prompt and CLI authoring codes
+
+| Code | Status | When |
+| --- | --- | --- |
+| `WYRD_AGENT_422_STRUCTURED_DECODE` | 422 | Response text is not valid JSON when `Prompt.output` is set. |
+| `WYRD_PROMPT_422_PYDANTIC_REQUIRED` | 422 | Pydantic is required for class-based `Prompt(output=Model)` schemas. |
+| `WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA` | 422 | The `Prompt(output=...)` dict cannot be reduced to JSON Schema. |
+| `WYRD_PROMPT_400_PROVIDER_MISMATCH` | 400 | A provider accessor was called on a different provider's response. |
+| `WYRD_CLI_400_CARD_EXTENSION_UNSUPPORTED` | 400 | A card file extension is not `.json`, `.yaml`, or `.yml`. |
+| `WYRD_CLI_500_IO` | 500 | Filesystem IO failed during a CLI operation. |
+
+## Registry codes
+
+| Code | Status | When |
+| --- | --- | --- |
+| `WYRD_REG_409_SPEC_DRIFT` | 409 | Re-apply with the same identity but a different `spec_hash`; same-version cards are immutable. |
 
 ## Eval protocol codes
 

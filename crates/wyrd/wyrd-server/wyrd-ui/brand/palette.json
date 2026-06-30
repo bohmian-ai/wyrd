@@ -32,7 +32,7 @@
 
     "--lime":          { "group": "acid", "light": "#c5f23c", "dark": "#c5f23c", "role": "acid accent / primary action fill (signal, never default text)" },
     "--lime-ink":      { "group": "acid", "light": "#0b0b0e", "dark": "#0b0b0e", "role": "text on lime fills" },
-    "--lime-text":     { "group": "acid", "light": "#4a7a06", "dark": "#c5f23c", "role": "lime used as text on a surface (darkened on light)" },
+    "--lime-text":     { "group": "acid", "light": "#7c3aed", "dark": "#c5f23c", "role": "accent text on a surface: lime on dark, rune-strong violet on light (per SoT, lime is a fill on light, never text)" },
 
     "--client":        { "group": "line", "light": "#c5f23c", "dark": "#c5f23c", "role": "the Line — client/runtime plane fill" },
     "--client-bar":    { "group": "line", "light": "#c5f23c", "dark": "#c5f23c", "role": "client/agent kind left-bar + indicators" },

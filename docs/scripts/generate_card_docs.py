@@ -13,22 +13,13 @@ REPO_ROOT = DOCS_ROOT.parent
 SCHEMA_DIR = REPO_ROOT / "crates" / "wyrd-spec" / "schemas"
 OUT_DIR = DOCS_ROOT / "src" / "content" / "docs" / "cards"
 
+# Only the three shipped card kinds get a generated reference page. The full
+# catalog of all kinds (with shipped/spec-only status) is the hand-authored
+# table in cards/index.mdx; spec-only kinds do not get standalone prose pages.
 CARD_SPECS = {
-    "agent": "agent_spec.json",
-    "artifact": "artifact_spec.json",
-    "audit": "audit_spec.json",
     "data": "data_spec.json",
-    "drift": "drift_spec.json",
-    "eval": "eval_spec.json",
-    "experiment": "experiment_spec.json",
-    "mcp": "mcp_spec.json",
     "model": "model_spec.json",
-    "operator": "operator_spec.json",
-    "policy": "policy_spec.json",
     "prompt": "prompt_spec.json",
-    "service": "service_spec.json",
-    "trigger": "trigger_spec.json",
-    "workflow": "workflow_spec.json",
 }
 
 PURPOSES = {
@@ -221,10 +212,9 @@ def render(slug: str, schema_file: str) -> str:
     lifecycle = LIFECYCLE_NOTES.get(
         slug,
         [
-            phase_gate(
-                "5a",
-                f"Write, version, transition, and retire flows for {title}Cards land in Phase 5a.",
-            )
+            f"`{title}Card` is a shipped holder: author it locally, then register it to a",
+            "server. Registration is idempotent on identity and rejects a changed spec at",
+            "the same version. See [Register cards](/server/register-cards/).",
         ],
     )
 
@@ -233,10 +223,9 @@ def render(slug: str, schema_file: str) -> str:
             "",
             "## Shape",
             "",
-            phase_gate(
-                "5a",
-                f"Copy-pasteable YAML for a {title}Card lands with the Card write path in Phase 5a. The JSON Schema at <code>{source}</code> is the current source of truth.",
-            ),
+            f"The `card.json` envelope wraps this spec under `kind: {title}`. For a runnable "
+            f"authoring walkthrough, see the [Python SDK](/python/). The JSON Schema at "
+            f"`{source}` is the field-level source of truth.",
             "",
             "## Lifecycle",
             "",
@@ -250,7 +239,7 @@ def render(slug: str, schema_file: str) -> str:
             "",
             "## Related",
             "",
-            f"- [Concepts overview](/concepts/) — where {title} fits in the seven primitives.",
+            f"- [How it connects](/start-here/how-it-connects/) — where {title} fits in the card model.",
         ]
     )
     if related_note := RELATED_NOTES.get(slug):
@@ -267,7 +256,8 @@ def render(slug: str, schema_file: str) -> str:
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     for slug, schema_file in CARD_SPECS.items():
-        if (OUT_DIR / f"{slug}.mdx").exists():
+        # Never clobber a hand-authored page for a kind (none exist today).
+        if (OUT_DIR / f"{slug}.svx").exists() or (OUT_DIR / f"{slug}.mdx").exists():
             continue
         (OUT_DIR / f"{slug}.md").write_text(render(slug, schema_file), encoding="utf-8")
 

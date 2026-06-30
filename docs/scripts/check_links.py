@@ -17,20 +17,29 @@ IMAGE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 EXTERNAL_SCHEMES = {"http", "https", "mailto", "tel"}
 
 
+PAGE_SUFFIXES = {".svx", ".md", ".mdx"}
+
+
 def markdown_pages() -> list[Path]:
-    return sorted(path for path in CONTENT_ROOT.rglob("*") if path.suffix in {".md", ".mdx"})
+    return sorted(path for path in CONTENT_ROOT.rglob("*") if path.suffix in PAGE_SUFFIXES)
+
+
+def route_candidates(route: str) -> list[Path]:
+    route = route.strip("/")
+    if not route:
+        return [CONTENT_ROOT / "index.svx", CONTENT_ROOT / "index.md", CONTENT_ROOT / "index.mdx"]
+    return [
+        CONTENT_ROOT / route / "index.svx",
+        CONTENT_ROOT / route / "index.md",
+        CONTENT_ROOT / route / "index.mdx",
+        CONTENT_ROOT / (route + ".svx"),
+        CONTENT_ROOT / (route + ".md"),
+        CONTENT_ROOT / (route + ".mdx"),
+    ]
 
 
 def route_to_file(route: str) -> Path | None:
-    route = route.strip("/")
-    if not route:
-        return CONTENT_ROOT / "index.mdx"
-    candidates = [
-        CONTENT_ROOT / route / "index.mdx",
-        CONTENT_ROOT / route / "index.md",
-        CONTENT_ROOT / (route + ".mdx"),
-        CONTENT_ROOT / (route + ".md"),
-    ]
+    candidates = route_candidates(route)
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -53,24 +62,19 @@ def local_target_exists(source: Path, raw_target: str) -> bool:
         public_file = PUBLIC_ROOT / path.lstrip("/")
         if public_file.exists():
             return True
-        route = path.strip("/")
-        candidates = [
-            CONTENT_ROOT / route / "index.mdx",
-            CONTENT_ROOT / route / "index.md",
-            CONTENT_ROOT / (route + ".mdx"),
-            CONTENT_ROOT / (route + ".md"),
-        ]
-        return any(c.exists() for c in candidates)
+        return any(c.exists() for c in route_candidates(path.strip("/")))
 
     candidate = (source.parent / path).resolve()
     if candidate.exists():
         return True
     if candidate.suffix == "":
         return (
-            (candidate / "index.mdx").exists()
+            (candidate / "index.svx").exists()
             or (candidate / "index.md").exists()
-            or candidate.with_suffix(".mdx").exists()
+            or (candidate / "index.mdx").exists()
+            or candidate.with_suffix(".svx").exists()
             or candidate.with_suffix(".md").exists()
+            or candidate.with_suffix(".mdx").exists()
         )
     return False
 

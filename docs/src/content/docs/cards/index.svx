@@ -1,0 +1,86 @@
+---
+title: Cards overview
+description: The card envelope, how registration works, and a catalog of every card kind with its status.
+---
+
+<script>
+  import Aside from '$lib/components/Aside.svelte';
+</script>
+
+# Cards overview
+
+A **card** is the typed, versioned envelope Wyrd uses for every component it
+governs. Every kind shares the same outer shape; the `spec` carries the fields
+specific to that kind.
+
+<Aside title="The envelope" data-variant="wyrd">
+
+`apiVersion` · `metadata` (space, name, version, labels, annotations) · `kind` ·
+`spec` · `relationships` · `status`. The `kind` selects which typed spec and
+schema apply.
+
+</Aside>
+
+```yaml
+apiVersion: wyrd/v1
+metadata:
+  space: default
+  name: customer-churn
+  version: "0.1.0"
+  labels:
+    domain: customer
+kind: Data
+spec:
+  interface:
+    kind: Pandas
+relationships: []
+status: null
+```
+
+## From local holder to registered card
+
+A card object is a **local holder** first. In Python, `DataCard.save(path)` writes
+local files and `card.json`; `DataCard.load(path)` hydrates them back. That local
+workflow does **not** register anything.
+
+Durable registration is a separate, server-owned step: you upload the card, the
+registry versions it, validates the spec, stores any bytes, and derives the
+relationship graph from the card's `CardRef`s. See
+[Register cards to a server](/server/register-cards/).
+
+## Catalog
+
+The card *model* defines 16 native kinds plus `External`. Three are runnable end to
+end today; the rest are specified — their schemas and validation exist — but have
+no holder, Python surface, or runnable example yet. Status is shown honestly so the
+model's breadth is visible without implying more than ships.
+
+| Kind | What it is | Status |
+|---|---|---|
+| **Data** | A dataset with a typed interface, schema, and byte stats. | ✅ Shipped |
+| **Model** | A model artifact with its interface and metadata. | ✅ Shipped |
+| **Prompt** | Prompt content with a typed input/output contract. | ✅ Shipped |
+| Agent | A declared agent — the runnable thing lives in the [Skald runtime](/skald/). | ◷ Spec only |
+| Workflow | A declared multi-step workflow; runnable form is in [Skald](/skald/). | ◷ Spec only |
+| Artifact | Durable artifact-metadata record that specs link to via `CardRef`. | ◷ Spec only |
+| Eval | An evaluation rubric bound to a card version. | ◷ Spec only |
+| Experiment | A grouping of runs and their measured outcomes. | ◷ Spec only |
+| Drift | A drift-monitoring declaration over a data or model card. | ◷ Spec only |
+| Policy | A declared rule that decides whether an action is allowed. | ◷ Spec only |
+| Audit | Declared audit scope, requirements, or an evidence package. | ◷ Spec only |
+| Service | A deployable bundle of declared behavior with a bill of materials. | ◷ Spec only |
+| Operator | A declared operational unit within a service. | ◷ Spec only |
+| Source | A declared upstream data or artifact source. | ◷ Spec only |
+| Trigger | A declared condition that initiates an action. | ◷ Spec only |
+| MCP | A declared MCP tool or server surface. | ◷ Spec only |
+| External | An escape hatch for components Wyrd references but does not own. | ◷ Spec only |
+
+For the generated, field-by-field schema of every kind, see the
+[Schema reference](/api/schemas/). For what the spec-only kinds need before they
+ship, see the [Roadmap](/roadmap/).
+
+## The shipped cards
+
+- [Data card](/cards/data/) — save, load, and register a dataset from Python.
+- [Model card](/cards/model/) — register a model artifact with its interface.
+- [Prompt card](/cards/prompt/) — author prompts that flow into Skald agents.

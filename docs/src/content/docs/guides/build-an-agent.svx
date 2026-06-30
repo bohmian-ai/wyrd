@@ -1,0 +1,151 @@
+---
+title: Build an Agent
+description: "Build a Wyrd Agent: prompt, tools, callbacks, session memory, and run config. Python and Rust side-by-side."
+---
+
+<script>
+  import LangTabs from '$lib/components/LangTabs.svelte';
+  import LangTab from '$lib/components/LangTab.svelte';
+  import CodeFromFile from '$lib/components/CodeFromFile.svelte';
+</script>
+
+# Build an Agent
+
+An Agent runs a bounded loop over a Prompt with tools, callbacks, and session memory. Provider and model live on the Prompt; the Agent owns execution policy. Observers attach to Workflows, not Agents.
+
+## Minimal Agent
+
+<LangTabs>
+<LangTab lang="python">
+
+<CodeFromFile file="python/py-wyrd/examples/agent_smoke.py" lang="python" />
+
+</LangTab>
+<LangTab lang="rust">
+
+<CodeFromFile file="examples/rust/agent_smoke.rs" lang="rust" />
+
+</LangTab>
+</LangTabs>
+
+## Tools
+
+Tools are runtime-local callables. Python uses the `@tool` decorator. Rust uses `ToolDef::function(...)` or an `AgentTool` implementation. `agent.as_tool()` delegates a bounded Agent run to a parent Agent.
+
+<LangTabs>
+<LangTab lang="python">
+
+<CodeFromFile file="examples/python/workflow_anthropic.py" lang="python" range="5-10" title="workflow_anthropic.py" />
+
+</LangTab>
+<LangTab lang="rust">
+
+<CodeFromFile file="examples/rust/workflow_anthropic.rs" lang="rust" range="9-40" title="workflow_anthropic.rs" />
+
+</LangTab>
+</LangTabs>
+
+## Callbacks
+
+Callbacks mutate inline behavior. They can replace a request, transform a response, or abort. Observers watch lifecycle events and ignore return values. Agent hooks include `before_agent_callback`, `after_agent_callback`, `before_model_callback`, `after_model_callback`, `before_tool_callback`, and `after_tool_callback`. `before_model_callback` receives `ProviderRequest`; `after_model_callback` receives `ProviderResponse`.
+
+<LangTabs>
+<LangTab lang="python">
+
+<CodeFromFile file="python/py-wyrd/examples/structured_pipeline.py" lang="python" range="3-20" title="structured_pipeline.py" />
+
+</LangTab>
+<LangTab lang="rust">
+
+```rust
+use std::sync::Arc;
+use skald_agent::{AfterModelFn, AgentContext, BeforeModelFn, CallbackOutcome};
+use skald_spec::{ProviderRequest, ProviderResponse};
+
+let before: BeforeModelFn = Arc::new(|_ctx: &AgentContext, request: &ProviderRequest| {
+    tracing::debug!(?request, "provider request");
+    CallbackOutcome::Continue
+});
+let after: AfterModelFn = Arc::new(|_ctx: &AgentContext, response: &ProviderResponse| {
+    tracing::debug!(?response, "provider response");
+    CallbackOutcome::Continue
+});
+let agent = Agent::new(prompt).before_model(before).after_model(after);
+```
+
+</LangTab>
+</LangTabs>
+
+## Session Memory
+
+Session memory stores conversation turns by `session_id`. Supply the backend on the Agent, then pass the id for each run that should share history.
+
+<LangTabs>
+<LangTab lang="python">
+
+```python
+agent = Agent(name="support", prompt=prompt, session=memory)
+first = agent.run("Hello", session_id="case-123")
+second = agent.run("Continue", session_id="case-123")
+```
+
+</LangTab>
+<LangTab lang="rust">
+
+```rust
+let agent = Agent::new(prompt).with_session(memory);
+let providers = skald_runtime::default_registry();
+let first = agent.run("Hello").await?;
+let second = agent
+    .run_with(providers.as_ref(), Some(SessionId::new("case-123")), "Continue")
+    .await?;
+```
+
+</LangTab>
+</LangTabs>
+
+## AgentRun Fields
+
+| Field | Meaning |
+|---|---|
+| `output` | Final assistant text. |
+| `finish_reason` | Terminal reason for the bounded loop. |
+| `iterations` | Number of model-loop iterations. |
+| `tokens_in` | Provider input tokens when reported. |
+| `tokens_out` | Provider output tokens when reported. |
+| `conversation` | Conversation transcript captured during the run. |
+| `error` | Structured Wyrd error when the run ended with failure. |
+| `structured_output` | JSON object parsed from declared structured output. |
+| `parsed` | Python typed object when `output_type` was supplied. |
+| `provider_response` | Typed provider response wrapper from the terminal model call. |
+
+Use this guide as the run-reading guide. The [Agent schema](/api/schemas/) stays focused on fields.
+
+## Tool Delegation: `agent.as_tool()`
+
+Use `agent.as_tool()` when a parent Agent should call another Agent through the tool loop.
+
+<LangTabs>
+<LangTab lang="python">
+
+```python
+researcher_tool = researcher.as_tool(description="Research a topic.")
+writer = Agent(name="writer", prompt=writer_prompt, tools=[researcher_tool])
+```
+
+</LangTab>
+<LangTab lang="rust">
+
+```rust
+let delegate = AgentDelegateTool::from_agent(agent, providers);
+let parent = Agent::new(prompt).with_tool(delegate);
+```
+
+</LangTab>
+</LangTabs>
+
+## See Also
+
+- [Build a Workflow](/guides/build-a-workflow/)
+- [Agents & workflows](/skald/)
+- [Schema reference](/api/schemas/)

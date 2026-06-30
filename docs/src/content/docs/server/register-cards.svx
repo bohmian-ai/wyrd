@@ -1,0 +1,72 @@
+---
+title: Register cards to a server
+description: How a local card becomes a durable, versioned record in the registry.
+---
+
+<script>
+  import Aside from '$lib/components/Aside.svelte';
+</script>
+
+# Register cards to a server
+
+Authoring a card locally (`DataCard.save(path)`) writes files on your machine. It
+does **not** register anything. Registration is a separate, server-owned step: the
+registry assigns the card a durable identity, versions it, validates the spec,
+stores any artifact bytes, and derives the relationship graph.
+
+<Aside title="What registration is" data-variant="wyrd">
+
+One idempotent server-side pipeline keyed on `(kind, space, name, version)`.
+Re-registering an identical card is a no-op; re-registering a *different* spec
+under the same identity is rejected as drift.
+
+</Aside>
+
+## The pipeline
+
+`register_card` runs inside a tenant-scoped transaction on the registry:
+
+1. **Validate the boundary** — `apiVersion` is `wyrd/v1`, `space` is present, and
+   `metadata.version` is an explicit semver pin (version *ranges* are not yet
+   resolved).
+2. **Canonicalize + hash** the spec to a `spec_hash`; reject specs over the size
+   limit.
+3. **Insert** into `wyrd.cards` with `ON CONFLICT (tenant, kind, space, name,
+   version) DO NOTHING`.
+   - On conflict, the existing row's `spec_hash` is compared. Identical → an
+     idempotent no-op. Different → a drift error.
+4. **Derive a principal** — if the card is a `Service` or `Agent` spec, the
+   registry upserts a card-bound service account (the identity that card will
+   later authenticate as).
+5. **Audit** — a registration row is written in the same transaction.
+
+The result is `Created` (with a new `principal_id` for Service/Agent cards) or an
+idempotent no-op.
+
+## How you call it today
+
+The registry write is reached over the **HTTP** surface. Artifact bytes go through
+the storage multipart flow (`upload/init` → part URLs → `upload/complete`, all
+presigned and verified server-side); the card record is registered through the same
+authenticated API. All calls carry your access JWT in `X-Wyrd-Access-Token` — see
+[Authentication](/server/auth/).
+
+<Aside title="Not yet shipped" data-variant="not">
+
+First-class **CLI and Python `register` helpers** are not in the current release —
+registration goes through the HTTP API directly. gRPC card services and a dedicated
+card-read REST endpoint are also pending. Track these on the [Roadmap](/roadmap/).
+
+</Aside>
+
+## Before you register
+
+- The card `name` is stable and readable.
+- `kind` matches the asset.
+- Runtime dependencies are `CardRef`s, not prose.
+- `metadata.version` is a concrete pin.
+
+## Next
+
+- [Cards overview](/cards/) — the catalog and the envelope.
+- [Schema reference](/api/schemas/) — the field-level spec contract.

@@ -1,0 +1,145 @@
+---
+title: Authentication
+description: API keys, Wyrd JWTs, and OIDC federation — how callers prove who they are.
+---
+
+<script>
+  import Aside from '$lib/components/Aside.svelte';
+</script>
+
+# Authentication
+
+Every request to Wyrd authenticates as a **principal** — a typed caller with a
+UUID and a kind: `User`, `Service { card_ref }`, or `Agent { card_ref }`. Service
+and Agent principals are **bound to a registered card**, so calls from deployed
+services and autonomous agents attribute to durable records, not to anonymous
+keys.
+
+Runtime calls carry a Bearer JWT in the **`X-Wyrd-Access-Token`** header. Wyrd does
+not read the application-owned `Authorization` header for its own identity.
+
+<Aside title="The shape of every credential flow" data-variant="wyrd">
+
+**Issue** a long-lived bootstrap credential once → **exchange** it at
+`POST /auth/token` for a short-lived access JWT (+ refresh token) → **authorize**
+every subsequent call with that access JWT.
+
+</Aside>
+
+## Three ways to authenticate
+
+| Credential | Principal | Use it for |
+|---|---|---|
+| **API key** | Service / Agent | Deployed services and agents that hold a static bootstrap secret. |
+| **Human SSO** | User | Interactive logins through any OIDC IdP (Keycloak, Okta, …). |
+| **Workload jwt-bearer** | Service / Agent | K8s pods, SPIFFE workloads, or CI runners that already hold a platform-issued OIDC JWT — no shared secret. |
+
+Default TTLs: access token **15 min**, refresh token **30 days** (single-use
+rotation for Service/Agent), API key **365 days**. Access tokens are EdDSA JWTs;
+revocation is TTL-bounded in the current release.
+
+## API key (services & agents)
+
+An admin holding `service_accounts:write` issues a key for a registered Service or
+Agent card. The plaintext key is returned **once** — store it in your secret store.
+
+```bash
+wyrd auth issue-key prod/Service/billing@1.0.0
+```
+
+The canonical CardRef text is `{space}/{kind}/{name}@{version}[#{uid}]`; the same
+command shape works for an `Agent` card. At runtime, the workload exchanges the key
+for tokens:
+
+```http
+POST /auth/token
+Content-Type: application/json
+
+{ "grant_type": "wyrd_api_key", "api_key": "wyrd_sk_..." }
+```
+
+The response carries `access_token`, `refresh_token`, `token_type`, and
+`expires_at`. Send the access token in `X-Wyrd-Access-Token` on every call. The
+bound `card_ref` lives inside the JWT claim, not on the wire envelope.
+
+**Rotation.** Issue a new key, redeploy it alongside the old one, and let the old
+key lapse at its TTL — no request fails mid-rotation. Reserve
+`wyrd principal revoke <principal-id>` for a compromised credential; it is
+immediate and severs every credential the principal holds.
+
+## Human SSO (OIDC)
+
+Direct the user to `GET /auth/login?issuer=<issuer>`. Wyrd redirects to the IdP;
+after login the IdP returns to `/auth/callback?code=...&state=...`, which completes
+the exchange and returns a User JWT and refresh token. A programmatic client that
+captures `code`/`state` out of band can complete the exchange itself with
+`grant_type: authorization_code`. The authorization code is single-use — use one
+path or the other. MFA is handled entirely at the IdP.
+
+## Workload jwt-bearer (federation)
+
+A workload that already holds a platform-issued OIDC JWT exchanges it directly:
+
+```http
+POST /auth/token
+Content-Type: application/json
+
+{
+  "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+  "assertion": "<platform-jwt>",
+  "tenant": "acme"
+}
+```
+
+The server verifies the JWT against the trusted issuer's JWKS, looks up the
+`[[workload_bindings]]` entry matching `(issuer, subject)`, and returns a Service or
+Agent JWT for the bound card. This is the recommended credential for Kubernetes,
+SPIFFE, and CI — no shared secret leaves the platform.
+
+## Configuring OIDC
+
+Self-hosted Wyrd resolves trusted issuers and workload bindings from `server.toml`
+at boot (single tenant per deployment). Each `[[trusted_issuers]]` entry declares
+one provider; each `[[workload_bindings]]` entry maps a verified external subject
+to a registered card — **the server never trusts a card identity from the token
+itself**.
+
+```toml
+[auth]
+tenant_slug = "acme"
+
+[[trusted_issuers]]
+issuer            = "https://idp.acme.com/realms/acme"
+client_id         = "wyrd"
+expected_audience = "wyrd"
+client_auth       = { secret_post = "change-me" }
+principal_kind    = "human"
+default_roles     = ["viewer"]
+claim_mapping     = { subject = "sub", email = "email", groups = "realm_access.roles" }
+group_role_map    = { "data-science" = ["data_science"], "ml-platform" = ["admin"] }
+
+[[workload_bindings]]
+issuer  = "https://idp.acme.com/realms/workload"
+subject = "system:serviceaccount:ml:inference-svc"
+kind    = "service"
+name    = "inference-svc"
+space   = "prod"
+version = "1.0.0"
+```
+
+`client_auth` accepts `"public"` (PKCE), `"private_key_jwt"`, or an inline
+`{ secret_basic = "…" }` / `{ secret_post = "…" }`; secrets load as `SecretString`
+and never print. Issuer and binding changes require a config edit and restart.
+
+## Current limits
+
+All tokens are verified as **JWTs** — opaque tokens and RFC 7662 introspection are
+not supported. MFA, SCIM provisioning, and Single Logout are delegated to or out of
+scope for the IdP. User refresh-token rotation and the RFC 8693 token-exchange
+(act-as delegation) grant are not enabled in the current release — see the
+[Roadmap](/roadmap/).
+
+## Next
+
+- [Register cards to a server](/server/register-cards/)
+- [Run the server](/server/) — where these endpoints live.

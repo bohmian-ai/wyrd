@@ -1,6 +1,9 @@
 ---
 title: Errors
 description: Error handling guidance for Wyrd API clients and agents.
+pillar: wyrd
+group: api
+order: 1
 ---
 
 # Errors

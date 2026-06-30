@@ -1,6 +1,9 @@
 ---
 title: Prompt
 description: Generated reference for the Wyrd Prompt card spec.
+pillar: wyrd
+group: cards
+order: 3
 ---
 
 # Prompt

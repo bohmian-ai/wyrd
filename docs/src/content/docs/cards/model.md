@@ -1,6 +1,9 @@
 ---
 title: Model
 description: Generated reference for the Wyrd Model card spec.
+pillar: wyrd
+group: cards
+order: 2
 ---
 
 # Model

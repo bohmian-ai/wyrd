@@ -171,7 +171,7 @@ def intro_dl(slug: str, schema: dict) -> str:
     )
 
 
-def render(slug: str, schema_file: str) -> str:
+def render(slug: str, schema_file: str, order: int) -> str:
     schema_path = SCHEMA_DIR / schema_file
     title = title_for(slug)
     schema = load_schema(schema_path)
@@ -182,6 +182,9 @@ def render(slug: str, schema_file: str) -> str:
         "---",
         f"title: {title}",
         f"description: Generated reference for the Wyrd {title} card spec.",
+        "pillar: wyrd",
+        "group: cards",
+        f"order: {order}",
         "---",
         "",
         f"# {title}",
@@ -255,11 +258,11 @@ def render(slug: str, schema_file: str) -> str:
 
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    for slug, schema_file in CARD_SPECS.items():
+    for order, (slug, schema_file) in enumerate(CARD_SPECS.items(), start=1):
         # Never clobber a hand-authored page for a kind (none exist today).
         if (OUT_DIR / f"{slug}.svx").exists() or (OUT_DIR / f"{slug}.mdx").exists():
             continue
-        (OUT_DIR / f"{slug}.md").write_text(render(slug, schema_file), encoding="utf-8")
+        (OUT_DIR / f"{slug}.md").write_text(render(slug, schema_file, order), encoding="utf-8")
 
 
 if __name__ == "__main__":

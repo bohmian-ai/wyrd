@@ -210,7 +210,8 @@ implementation diverged from `plan.md`.
 orchestrator: it is not complete until all five phases have run and
 `.dev/review/{REVIEW_ID}/implementation-plan.md` exists (preceded by `summary.md`
 and `validation.md`). Drive it straight through — do **not** stop after the
-reviewers (Phase 3) write their files.
+reviewers (Phase 3) write their files. `review-and-plan` should be run on the entire
+feature's changes and compared against the parent it was branched from.
 
 **Surface nothing until it has passed validation.** A raw reviewer finding — even
 one that looks CRITICAL — is *unvalidated* and may be a false positive. The

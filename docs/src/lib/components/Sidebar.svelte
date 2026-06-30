@@ -1,7 +1,7 @@
 <script lang="ts">
   import { base } from '$app/paths';
   import { page } from '$app/state';
-  import { nav, stripBase, type NavGroup } from '$lib/nav';
+  import { nav, stripBase, type NavGroup } from '$lib/derived-nav';
 
   // The doc-shell sidebar: nav.ts groups with the "Line" group rule (a colored
   // bar per group kind), collapsible groups, and active-state from the router.

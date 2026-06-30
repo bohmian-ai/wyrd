@@ -3,10 +3,6 @@ title: "Evaluate agents"
 description: "Score agent runs against the same task definitions in CI and against collected production records, with run_eval and the wyrd eval CLI."
 ---
 
-<script>
-  import Aside from '$lib/components/Aside.svelte';
-</script>
-
 Model evaluation compares an output to a label. Agent evaluation is harder: the
 final response is one artifact of a process that also includes tool calls,
 multi-turn dialogue, and intermediate scores that matter independently of

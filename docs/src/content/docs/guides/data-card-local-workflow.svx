@@ -3,10 +3,6 @@ title: DataCard local workflow
 description: Create a DataCard, save it locally, load it back, and inspect the local files.
 ---
 
-<script>
-  import CodeFromFile from '$lib/components/CodeFromFile.svelte';
-</script>
-
 # DataCard local workflow
 
 Use a `DataCard` when Python code has local data and needs a Wyrd Data card

@@ -3,10 +3,6 @@ title: Agents & workflows
 description: Skald — Wyrd's runtime for defining agents and workflows once and running them from Python or Rust.
 ---
 
-<script>
-  import Aside from '$lib/components/Aside.svelte';
-</script>
-
 # Agents & workflows
 
 **Skald** is Wyrd's agent runtime. Where cards *describe* components, Skald *runs*

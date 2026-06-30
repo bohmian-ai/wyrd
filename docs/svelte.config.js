@@ -3,6 +3,10 @@ import { mdsvex, escapeSvelte } from 'mdsvex';
 import { createHighlighter } from 'shiki';
 import rehypeSlug from 'rehype-slug';
 import rehypeAutolinkHeadings from 'rehype-autolink-headings';
+import { fileURLToPath } from 'url';
+import path from 'path';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Single source of truth for the GitHub Pages project subpath. Used both for
 // SvelteKit's `paths.base` and the rehype link rewriter below, so markdown
@@ -96,6 +100,7 @@ const highlighter = await createHighlighter({
 /** @type {import('mdsvex').MdsvexOptions} */
 const mdsvexOptions = {
   extensions: ['.svx', '.md'],
+  layout: path.join(__dirname, 'src/lib/mdsvex/Layout.svelte'),
   highlight: {
     highlighter: async (code, lang = 'text') => {
       const themes = { light: 'github-light', dark: 'github-dark' };
@@ -105,7 +110,11 @@ const mdsvexOptions = {
       } catch {
         html = highlighter.codeToHtml(code, { lang: 'text', themes });
       }
-      return `{@html \`${escapeSvelte(html)}\`}`;
+      // Wrap with CodeBlock (auto-injected via layout) to add copy-to-clipboard.
+      // escapeSvelte'd html means backticks/braces inside Shiki output don't
+      // break the template literal; CodeBlock renders {@html html} verbatim so
+      // dual-theme inline --shiki-dark props survive intact.
+      return `<CodeBlock html={\`${escapeSvelte(html)}\`} />`;
     }
   },
   rehypePlugins: [

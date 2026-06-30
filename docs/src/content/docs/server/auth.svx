@@ -3,10 +3,6 @@ title: Authentication
 description: API keys, Wyrd JWTs, and OIDC federation — how callers prove who they are.
 ---
 
-<script>
-  import Aside from '$lib/components/Aside.svelte';
-</script>
-
 # Authentication
 
 Every request to Wyrd authenticates as a **principal** — a typed caller with a

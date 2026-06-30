@@ -51,6 +51,7 @@ use wyrd_spec::vala::eval::{
     EvalScenarioCollection, EvalSpec, EvalTask, ExecutionPlan, SimulatedUserMode,
     SimulatedUserTurn, TurnDirective, UserTurnSubmission,
 };
+use wyrd_spec::vala::observation::{ObservationEnvelope, ObservationKind, RecordObservation};
 use wyrd_spec::vala::trace::{
     AttributeValue, GenAiEvalResult, GenAiSpanRecord, InstrumentationScope, Resource, SpanEvent,
     SpanKind, SpanLink, SpanRecord, SpanStatus, TraceSummaryRecord,
@@ -181,6 +182,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_fixture::<GenAiSpanRecord>(trace_fixtures, "gen_ai_span_record")?;
     write_fixture::<GenAiEvalResult>(trace_fixtures, "gen_ai_eval_result")?;
     write_fixture::<AttributeValue>(trace_fixtures, "attribute_value")?;
+
+    let obs_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/observation/schemas");
+    fs::create_dir_all(obs_fixtures)?;
+    write_fixture::<ObservationEnvelope>(obs_fixtures, "observation_envelope")?;
+    write_fixture::<ObservationKind>(obs_fixtures, "observation_kind")?;
+    write_fixture::<RecordObservation>(obs_fixtures, "record_observation")?;
     Ok(())
 }
 

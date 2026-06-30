@@ -11,6 +11,8 @@
 //! no IO, no async, no PyO3. See
 //! `architecture/v1/06-crates/wyrd-spec.md` and AGENTS.md §9.
 
+/// Public Bifrost wire contracts — table management, query, and ingest types.
+pub mod api;
 /// Observation correlation: the code axis carried on a run and the reserved
 /// correlation column names.
 pub mod correlation;
@@ -18,6 +20,9 @@ pub mod correlation;
 pub mod error;
 pub mod eval;
 pub mod ids;
+/// Observation forward contract — envelope, closed kind taxonomy, and record
+/// descriptor for the Vala ingest surface.
+pub mod observation;
 /// Reserved system column names and the [`SystemColumnSet`] descriptor.
 pub mod system_columns;
 pub mod trace;

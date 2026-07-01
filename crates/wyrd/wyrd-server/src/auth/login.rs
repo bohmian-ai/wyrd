@@ -12,7 +12,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use url::Url;
-use wyrd_auth_oidc::{IssuerConfigResolver, OidcProvider, TrustedIssuer};
+use wyrd_auth_oidc::{OidcProvider, TrustedIssuer};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{AbsoluteUrl, IssuerUrl, LoginInitResponse};
 use wyrd_spec::error::WyrdError;
@@ -107,7 +107,7 @@ pub async fn login(
     Query(query): Query<LoginQuery>,
 ) -> Result<Response, WyrdErrorResponse> {
     let tenant_id = resolve_login_tenant(&state, &headers).await?;
-    let trusted = trusted_issuer(&state, tenant_id, &query.issuer).await?;
+    let trusted = crate::auth::trusted_issuer(&state, tenant_id, &query.issuer).await?;
     let provider = discover_provider(&trusted).await?;
     let redirect_uri = callback_redirect_uri(&headers)?;
     let state_key = auth_state_key();
@@ -229,37 +229,6 @@ async fn resolve_tenant_slug(
     wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app(pool, slug)
         .await
         .map_err(sql_error)
-}
-
-async fn trusted_issuer(
-    state: &AppState,
-    tenant_id: DataTenantId,
-    issuer: &IssuerUrl,
-) -> Result<TrustedIssuer, WyrdErrorResponse> {
-    let resolver = state.trusted_issuer_resolver.as_ref().ok_or_else(|| {
-        WyrdErrorResponse::from(WyrdError::Internal {
-            message: "trusted issuer resolver is not configured".to_owned(),
-            details: serde_json::json!({}),
-        })
-    })?;
-    let issuers = resolver
-        .trusted_issuers(&tenant_id)
-        .await
-        .map_err(|error| {
-            tracing::warn!(
-                error = %error,
-                tenant_id = %tenant_id,
-                "trusted issuer resolution failed"
-            );
-            WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
-                message: "trusted issuer resolution unavailable".to_owned(),
-                details: serde_json::json!({ "retry_after_seconds": 1 }),
-            })
-        })?;
-    issuers
-        .into_iter()
-        .find(|candidate| candidate.issuer == *issuer)
-        .ok_or_else(|| invalid_token("issuer is not trusted for the resolved tenant"))
 }
 
 async fn discover_provider(trusted: &TrustedIssuer) -> Result<Url, WyrdErrorResponse> {

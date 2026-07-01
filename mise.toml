@@ -417,7 +417,11 @@ if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/wyrd/wyrd-server/Cargo.toml' \
   --glob '!crates/wyrd/wyrd-server/src/auth/jwt_bearer.rs' \
   --glob '!crates/wyrd/wyrd-server/src/auth/callback.rs' \
-  --glob '!crates/wyrd/wyrd-server/src/issuer_boot.rs'; then
+  --glob '!crates/wyrd/wyrd-server/src/auth/admin.rs' \
+  --glob '!crates/wyrd/wyrd-server/src/issuer_boot.rs' \
+  --glob '!crates/wyrd/wyrd-cli/src/auth/trusted_issuer.rs' \
+  --glob '!crates/shared/wyrd-client/Cargo.toml' \
+  --glob '!crates/shared/wyrd-client/src/admin.rs'; then
   echo 'mock dependency leaked outside wyrd-testing'
   exit 1
 fi

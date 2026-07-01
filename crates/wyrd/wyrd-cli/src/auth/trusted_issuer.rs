@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
@@ -12,7 +14,7 @@ use crate::error::WyrdCliError;
 #[derive(Debug, Subcommand)]
 pub enum TrustedIssuerCommand {
     /// Register a trusted OIDC issuer (POST /v1/admin/trusted-issuers).
-    Add(AddArgs),
+    Add(Box<AddArgs>),
     /// List trusted OIDC issuers (GET /v1/admin/trusted-issuers).
     List(ListArgs),
     /// Remove a trusted OIDC issuer (DELETE /v1/admin/trusted-issuers?issuer=&cascade=).
@@ -33,12 +35,31 @@ pub struct AddArgs {
     /// How Wyrd authenticates to the issuer (SecretBasic, SecretPost, PrivateKeyJwt, Public).
     #[arg(long, value_name = "METHOD")]
     pub client_auth: String,
-    /// Client secret (required for SecretBasic and SecretPost).
+    /// Client secret (required for SecretBasic and SecretPost). Prefer
+    /// --client-secret-file or WYRD_ISSUER_CLIENT_SECRET to keep the secret out
+    /// of shell history and the process argument list.
     #[arg(long, value_name = "SECRET")]
     pub client_secret: Option<String>,
+    /// Read the client secret from a file (trailing newline trimmed). Mutually
+    /// exclusive with --client-secret.
+    #[arg(long, value_name = "PATH", conflicts_with = "client_secret")]
+    pub client_secret_file: Option<PathBuf>,
     /// Claim path that yields the principal subject.
     #[arg(long, value_name = "CLAIM")]
     pub claim_subject: String,
+    /// Optional claim path that yields the principal email.
+    #[arg(long, value_name = "CLAIM")]
+    pub claim_email: Option<String>,
+    /// Optional claim path that yields the principal groups.
+    #[arg(long, value_name = "CLAIM")]
+    pub claim_groups: Option<String>,
+    /// Role granted to every principal from this issuer. Repeatable.
+    #[arg(long = "default-role", value_name = "ROLE")]
+    pub default_roles: Vec<String>,
+    /// Map an issuer group to a Wyrd role, as `group=role`. Repeatable; the same
+    /// group may be given multiple times to grant multiple roles.
+    #[arg(long = "group-role", value_name = "GROUP=ROLE")]
+    pub group_roles: Vec<String>,
     /// Whether tokens represent humans or machine workloads (Human, Workload).
     #[arg(long, value_name = "KIND")]
     pub principal_kind: String,
@@ -81,7 +102,7 @@ pub struct RmArgs {
 
 pub async fn dispatch(command: TrustedIssuerCommand) -> Result<ExitCode, WyrdCliError> {
     match command {
-        TrustedIssuerCommand::Add(args) => add(args).await,
+        TrustedIssuerCommand::Add(args) => add(*args).await,
         TrustedIssuerCommand::List(args) => list(args).await,
         TrustedIssuerCommand::Rm(args) => rm(args).await,
     }
@@ -94,6 +115,8 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
     })?;
     let client_auth = parse_client_auth(&args.client_auth)?;
     let principal_kind = parse_principal_kind(&args.principal_kind)?;
+    let client_secret = resolve_client_secret(args.client_secret, args.client_secret_file)?;
+    let group_role_map = parse_group_roles(&args.group_roles)?;
 
     let url = args
         .server
@@ -105,14 +128,14 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
         expected_audience: args.expected_audience,
         client_id: args.client_id,
         client_auth,
-        client_secret: args.client_secret,
+        client_secret,
         claim_mapping: ClaimMappingPayload {
             subject: args.claim_subject,
-            email: None,
-            groups: None,
+            email: args.claim_email,
+            groups: args.claim_groups,
         },
-        group_role_map: Default::default(),
-        default_roles: Default::default(),
+        group_role_map,
+        default_roles: args.default_roles,
         principal_kind,
         jwks_ttl_secs: args.jwks_ttl_secs,
     })
@@ -234,6 +257,67 @@ fn parse_principal_kind(value: &str) -> Result<PrincipalKindPayload, WyrdCliErro
             detail: format!("unknown --principal-kind {other:?}; expected Human or Workload"),
         }),
     }
+}
+
+/// Resolve the client secret from the flag, a file, or the environment.
+///
+/// `--client-secret-file` and `--client-secret` are mutually exclusive at the
+/// clap layer, so at most one of `inline`/`file` is set. The file path wins when
+/// present; otherwise the inline flag; otherwise `WYRD_ISSUER_CLIENT_SECRET`.
+/// Keeping the secret in a file or env var avoids leaking it into shell history
+/// and the process argument list.
+fn resolve_client_secret(
+    inline: Option<String>,
+    file: Option<PathBuf>,
+) -> Result<Option<String>, WyrdCliError> {
+    if let Some(path) = file {
+        let raw = std::fs::read_to_string(&path).map_err(|error| WyrdCliError::AdminFailed {
+            status: 400,
+            detail: format!(
+                "cannot read --client-secret-file {}: {error}",
+                path.display()
+            ),
+        })?;
+        return Ok(Some(raw.trim_end_matches(['\n', '\r']).to_owned()));
+    }
+    if let Some(secret) = inline {
+        return Ok(Some(secret));
+    }
+    match std::env::var("WYRD_ISSUER_CLIENT_SECRET") {
+        Ok(secret) => Ok(Some(secret)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(WyrdCliError::AdminFailed {
+            status: 400,
+            detail: "WYRD_ISSUER_CLIENT_SECRET is not valid UTF-8".to_owned(),
+        }),
+    }
+}
+
+/// Fold repeated `group=role` flags into the issuer group → Wyrd roles map.
+///
+/// A group may appear more than once to grant multiple roles; the roles
+/// accumulate in flag order. Each entry must contain exactly one `=` with a
+/// non-empty group and role.
+fn parse_group_roles(entries: &[String]) -> Result<HashMap<String, Vec<String>>, WyrdCliError> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in entries {
+        let (group, role) = entry
+            .split_once('=')
+            .ok_or_else(|| WyrdCliError::AdminFailed {
+                status: 400,
+                detail: format!("invalid --group-role {entry:?}; expected group=role"),
+            })?;
+        if group.is_empty() || role.is_empty() {
+            return Err(WyrdCliError::AdminFailed {
+                status: 400,
+                detail: format!("invalid --group-role {entry:?}; group and role must be non-empty"),
+            });
+        }
+        map.entry(group.to_owned())
+            .or_default()
+            .push(role.to_owned());
+    }
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -432,5 +516,171 @@ mod tests {
     fn principal_kind_parse_rejects_unknown() {
         use super::parse_principal_kind;
         assert!(parse_principal_kind("Robot").is_err());
+    }
+
+    #[test]
+    fn add_rejects_client_secret_and_file_together() {
+        let parsed = Cli::try_parse_from([
+            "wyrd",
+            "add",
+            "--issuer",
+            "https://idp.example.com",
+            "--expected-audience",
+            "wyrd",
+            "--client-id",
+            "myapp",
+            "--client-auth",
+            "SecretPost",
+            "--client-secret",
+            "s3cr3t",
+            "--client-secret-file",
+            "/tmp/secret",
+            "--claim-subject",
+            "sub",
+            "--principal-kind",
+            "Workload",
+            "--server",
+            "https://acme.wyrd.cloud",
+            "--token",
+            "tok",
+        ]);
+        assert!(
+            parsed.is_err(),
+            "--client-secret and --client-secret-file must conflict"
+        );
+    }
+
+    #[test]
+    fn add_accepts_role_group_and_claim_flags() {
+        let parsed = Cli::try_parse_from([
+            "wyrd",
+            "add",
+            "--issuer",
+            "https://idp.example.com",
+            "--expected-audience",
+            "wyrd",
+            "--client-id",
+            "myapp",
+            "--client-auth",
+            "Public",
+            "--claim-subject",
+            "sub",
+            "--claim-email",
+            "email",
+            "--claim-groups",
+            "groups",
+            "--default-role",
+            "reader",
+            "--default-role",
+            "writer",
+            "--group-role",
+            "dev=reader",
+            "--group-role",
+            "dev=writer",
+            "--group-role",
+            "ops=admin",
+            "--principal-kind",
+            "Human",
+            "--server",
+            "https://acme.wyrd.cloud",
+            "--token",
+            "tok",
+        ]);
+        assert!(parsed.is_ok(), "parse failed: {parsed:?}");
+        match parsed.unwrap().command {
+            TrustedIssuerCommand::Add(args) => {
+                assert_eq!(args.claim_email.as_deref(), Some("email"));
+                assert_eq!(args.claim_groups.as_deref(), Some("groups"));
+                assert_eq!(args.default_roles, vec!["reader", "writer"]);
+                let map = super::parse_group_roles(&args.group_roles).expect("group roles parse");
+                assert_eq!(map["dev"], vec!["reader", "writer"]);
+                assert_eq!(map["ops"], vec!["admin"]);
+            }
+            _ => panic!("expected Add"),
+        }
+    }
+
+    #[test]
+    fn group_roles_reject_missing_equals() {
+        assert!(super::parse_group_roles(&["devreader".to_owned()]).is_err());
+        assert!(super::parse_group_roles(&["=reader".to_owned()]).is_err());
+        assert!(super::parse_group_roles(&["dev=".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn resolve_client_secret_prefers_inline_then_reads_file() {
+        use super::resolve_client_secret;
+
+        assert_eq!(
+            resolve_client_secret(Some("inline".to_owned()), None).expect("inline resolves"),
+            Some("inline".to_owned())
+        );
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("wyrd-cli-secret-{}", std::process::id()));
+        std::fs::write(&path, "file-secret\n").expect("write temp secret");
+        let resolved =
+            resolve_client_secret(None, Some(path.clone())).expect("file secret resolves");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(resolved, Some("file-secret".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn add_posts_secret_and_role_flags_in_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/admin/trusted-issuers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": "https://idp.example.com",
+                "jwks_uri": "https://idp.example.com/jwks",
+                "expected_audience": "wyrd",
+                "client_id": "myapp",
+                "client_auth": "SecretPost",
+                "principal_kind": "Workload",
+                "jwks_ttl_secs": 3600,
+                "claim_mapping": { "subject": "sub" },
+                "group_role_map": { "dev": ["reader"] },
+                "default_roles": ["reader"]
+            })))
+            .mount(&server)
+            .await;
+
+        let args = super::AddArgs {
+            issuer: "https://idp.example.com".to_owned(),
+            expected_audience: "wyrd".to_owned(),
+            client_id: "myapp".to_owned(),
+            client_auth: "SecretPost".to_owned(),
+            client_secret: Some("s3cr3t".to_owned()),
+            client_secret_file: None,
+            claim_subject: "sub".to_owned(),
+            claim_email: None,
+            claim_groups: None,
+            default_roles: vec!["reader".to_owned()],
+            group_roles: vec!["dev=reader".to_owned()],
+            principal_kind: "Workload".to_owned(),
+            jwks_ttl_secs: None,
+            server: server.uri().parse().expect("mock uri parses"),
+            token: "tok".to_owned(),
+        };
+
+        super::add(args).await.expect("add dispatch succeeds");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(requests.len(), 1, "exactly one POST expected");
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("body is JSON");
+        assert_eq!(body["client_secret"], "s3cr3t");
+        assert_eq!(body["client_auth"], "SecretPost");
+        assert_eq!(body["default_roles"], serde_json::json!(["reader"]));
+        assert_eq!(body["group_role_map"]["dev"], serde_json::json!(["reader"]));
+        // The admin token is presented on the wire.
+        let auth = requests[0]
+            .headers
+            .get("x-wyrd-access-token")
+            .expect("access token header present");
+        assert_eq!(auth, "Bearer tok");
     }
 }

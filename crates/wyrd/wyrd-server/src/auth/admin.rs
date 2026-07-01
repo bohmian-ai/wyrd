@@ -1,8 +1,8 @@
 //! Tenant-admin CRUD for trusted OIDC issuers and workload bindings.
 //!
 //! These routes are the authoring control plane for the cloud-issuer trust
-//! store: `POST/GET/DELETE /admin/trusted-issuers` and
-//! `/admin/workload-bindings`. Every mutation is permission-gated
+//! store: `POST/GET/DELETE /v1/admin/trusted-issuers` and
+//! `/v1/admin/workload-bindings`. Every mutation is permission-gated
 //! (`service_accounts:write`) and writes through a [`TenantConn`] on the
 //! `wyrd_app` RLS pool, so Postgres row-level security is the load-bearing
 //! tenant boundary — no per-query tenant filtering.
@@ -313,7 +313,7 @@ async fn create_workload_binding(
     let mut conn = acquire_conn(&state, &caller).await?;
     insert_workload_binding(&mut conn, &write)
         .await
-        .map_err(map_write_error)?;
+        .map_err(|error| map_binding_write_error(error, &binding.issuer))?;
     conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(Json(workload_binding_view_from_write(&write)))
@@ -407,12 +407,45 @@ fn normalize_issuer(value: &str) -> String {
 
 /// Map a write-path SQLx error to an admin response.
 ///
-/// A unique violation (duplicate create) and an FK violation (delete blocked by
-/// a live binding, or a binding referencing a missing issuer) are both `409`
-/// conflicts. Anything else is a backend-unavailable `503`.
+/// A unique violation (duplicate create) and an FK violation (deleting an issuer
+/// that still has live bindings, `ON DELETE RESTRICT`) are both `409` conflicts.
+/// Anything else is a backend-unavailable `503`.
+///
+/// The binding-insert path does not use this mapper: there an FK violation means
+/// the referenced issuer is missing, which is a `404`, not a conflict. See
+/// [`map_binding_write_error`].
 fn map_write_error(error: sqlx::Error) -> WyrdErrorResponse {
     match SqlError::from(error) {
         SqlError::UniqueViolation { constraint } | SqlError::FkViolation { constraint } => {
+            WyrdErrorResponse::from(WyrdError::AdminConflict {
+                message: format!("admin mutation conflicted on constraint {constraint}"),
+                details: serde_json::json!({ "constraint": constraint }),
+            })
+        }
+        other => sql_unavailable(other),
+    }
+}
+
+/// Map a workload-binding insert error to an admin response.
+///
+/// The two shared composite-FK constraints (`auth_workload_bindings` →
+/// `auth_trusted_issuers`) report the same constraint name whether they fire on
+/// a binding insert or on a blocked issuer delete, so the constraint name cannot
+/// distinguish them; the call site can. On insert the only reachable FK
+/// violation is a reference to a trusted issuer that is not registered in this
+/// tenant (the `platform.tenants` FK is unreachable under the RLS `WITH CHECK`),
+/// so it maps to a `404` [`WyrdError::AdminNotFound`] rather than a conflict. A
+/// unique violation is still a duplicate-binding `409`.
+fn map_binding_write_error(error: sqlx::Error, issuer: &IssuerUrl) -> WyrdErrorResponse {
+    match SqlError::from(error) {
+        SqlError::FkViolation { .. } => WyrdErrorResponse::from(WyrdError::AdminNotFound {
+            message: format!(
+                "trusted issuer {} is not registered in this tenant; create it first",
+                issuer.as_str()
+            ),
+            details: serde_json::json!({ "issuer": issuer.as_str() }),
+        }),
+        SqlError::UniqueViolation { constraint } => {
             WyrdErrorResponse::from(WyrdError::AdminConflict {
                 message: format!("admin mutation conflicted on constraint {constraint}"),
                 details: serde_json::json!({ "constraint": constraint }),
@@ -879,6 +912,31 @@ mod tests {
         .await
         .expect_err("deleting an absent binding is not found");
         assert!(matches!(missing.0, WyrdError::AdminNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_binding_for_unknown_issuer_is_not_found() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let state = test_state(&fixture).await;
+        // Deliberately do NOT seed the issuer: the binding's composite FK to
+        // auth_trusted_issuers has no target row.
+        let issuer = IssuerUrl::new(SEEDED_ISSUER).expect("issuer is valid");
+
+        let error = create_workload_binding(
+            State(state),
+            writer(tenant),
+            Json(CreateWorkloadBindingRequest {
+                issuer,
+                subject: "system:serviceaccount:default/sa".to_owned(),
+                audience: None,
+                card_ref: sample_card_ref(),
+            }),
+        )
+        .await
+        .expect_err("binding create against a missing issuer must be not-found");
+        // The FK violation is a missing referenced issuer (404), not a conflict.
+        assert!(matches!(error.0, WyrdError::AdminNotFound { .. }));
     }
 
     #[tokio::test]

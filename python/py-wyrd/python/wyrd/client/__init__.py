@@ -2,7 +2,7 @@
 
 Ergonomic wrapper over the native ``_WyrdClient``. Exposes the
 ``client.admin.trusted_issuers`` and ``client.admin.workload_bindings``
-namespaces, each round-tripping plain JSON dicts to the ``/admin/*`` routes.
+namespaces, each round-tripping plain JSON dicts to the ``/v1/admin/*`` routes.
 Conflicts and missing records surface as ``WyrdError`` carrying the server's
 structured codes (``WYRD_AUTH_409_ADMIN_CONFLICT`` /
 ``WYRD_AUTH_404_ADMIN_NOT_FOUND``). ``trusted_issuers.create`` sends the client
@@ -135,7 +135,7 @@ class _Admin:
 
 
 class WyrdClient:
-    """Tenant-admin SDK client over the Wyrd ``/admin/*`` HTTP surface."""
+    """Tenant-admin SDK client over the Wyrd ``/v1/admin/*`` HTTP surface."""
 
     def __init__(self, base_url: str | None = None, api_key: str | None = None) -> None:
         self._native = _WyrdClient(base_url, api_key)

@@ -1,7 +1,10 @@
 //! Query slots for `wyrd.auth_workload_bindings`.
 //!
 //! All functions take `&mut TenantConn<'_>`. Postgres RLS enforces tenant
-//! isolation via `data_tenant_id = wyrd.current_tenant()`.
+//! isolation via `data_tenant_id = wyrd.current_tenant()`; the read and delete
+//! statements additionally carry that predicate explicitly as defense in depth,
+//! so a query can never match a row outside the bound tenant even if RLS were
+//! misconfigured. Writes bind `data_tenant_id` from the [`TenantConn`].
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use serde_json::Value;
@@ -13,7 +16,8 @@ const WORKLOAD_BINDING_BY_SUBJECT_SQL: &str = r#"
     SELECT data_tenant_id, issuer_url, subject, audience, card_ref,
            created_at, updated_at
       FROM wyrd.auth_workload_bindings
-     WHERE issuer_url = $1
+     WHERE data_tenant_id = wyrd.current_tenant()
+       AND issuer_url = $1
        AND subject = $2
        AND (audience = $3 OR audience IS NULL)
      ORDER BY CASE WHEN audience IS NOT NULL THEN 0 ELSE 1 END
@@ -40,7 +44,8 @@ const WORKLOAD_BINDING_BY_KEY_SQL: &str = r#"
     SELECT data_tenant_id, issuer_url, subject, audience, card_ref,
            created_at, updated_at
       FROM wyrd.auth_workload_bindings
-     WHERE issuer_url = $1
+     WHERE data_tenant_id = wyrd.current_tenant()
+       AND issuer_url = $1
        AND subject = $2
 "#;
 
@@ -48,20 +53,23 @@ const WORKLOAD_BINDINGS_FOR_TENANT_SQL: &str = r#"
     SELECT data_tenant_id, issuer_url, subject, audience, card_ref,
            created_at, updated_at
       FROM wyrd.auth_workload_bindings
-     WHERE ($1::text IS NULL OR issuer_url = $1)
+     WHERE data_tenant_id = wyrd.current_tenant()
+       AND ($1::text IS NULL OR issuer_url = $1)
        AND ($2::text IS NULL OR subject = $2)
      ORDER BY issuer_url, subject
 "#;
 
 const DELETE_WORKLOAD_BINDING_SQL: &str = r#"
     DELETE FROM wyrd.auth_workload_bindings
-     WHERE issuer_url = $1
+     WHERE data_tenant_id = wyrd.current_tenant()
+       AND issuer_url = $1
        AND subject = $2
 "#;
 
 const DELETE_WORKLOAD_BINDINGS_FOR_ISSUER_SQL: &str = r#"
     DELETE FROM wyrd.auth_workload_bindings
-     WHERE issuer_url = $1
+     WHERE data_tenant_id = wyrd.current_tenant()
+       AND issuer_url = $1
 "#;
 
 /// Owned column values for an upsert into `wyrd.auth_workload_bindings`.
@@ -281,6 +289,21 @@ mod tests {
         );
         assert!(UPSERT_WORKLOAD_BINDING_SQL.contains("card_ref = EXCLUDED.card_ref"));
         assert!(UPSERT_WORKLOAD_BINDING_SQL.contains("audience = EXCLUDED.audience"));
+    }
+
+    #[test]
+    fn read_and_delete_statements_carry_explicit_tenant_predicate() {
+        // Defense in depth on top of RLS: every filtering statement anchors on
+        // the current tenant so a row outside the bound tenant can never match.
+        for sql in [
+            WORKLOAD_BINDING_BY_SUBJECT_SQL,
+            WORKLOAD_BINDING_BY_KEY_SQL,
+            WORKLOAD_BINDINGS_FOR_TENANT_SQL,
+            DELETE_WORKLOAD_BINDING_SQL,
+            DELETE_WORKLOAD_BINDINGS_FOR_ISSUER_SQL,
+        ] {
+            assert!(sql.contains("data_tenant_id = wyrd.current_tenant()"));
+        }
     }
 
     #[test]

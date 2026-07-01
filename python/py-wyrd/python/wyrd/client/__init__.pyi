@@ -110,7 +110,7 @@ class _Admin:
     workload_bindings: _WorkloadBindings
 
 class WyrdClient:
-    """Tenant-admin SDK client over the Wyrd ``/admin/*`` HTTP surface."""
+    """Tenant-admin SDK client over the Wyrd ``/v1/admin/*`` HTTP surface."""
 
     admin: _Admin
 

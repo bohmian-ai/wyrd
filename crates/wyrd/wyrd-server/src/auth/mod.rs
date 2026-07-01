@@ -26,8 +26,61 @@ pub use caller_extractor::Caller;
 pub use principal_extractor::AuthenticatedPrincipal;
 
 use crate::error::WyrdErrorResponse;
+use crate::state::AppState;
+use wyrd_auth_oidc::{IssuerConfigResolver, TrustedIssuer};
 use wyrd_runtime::{Permission, Principal};
+use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::error::WyrdError;
+
+/// Resolve the tenant's trusted issuer matching `issuer`, failing closed.
+///
+/// Single owner of the "is this issuer trusted for this tenant" decision shared
+/// by the human login, OIDC callback, and workload jwt-bearer paths. Consolidating
+/// it keeps the fail-closed error mapping from drifting across those entry points.
+///
+/// # Errors
+/// - [`WyrdError::Internal`] when no issuer resolver is configured (server
+///   misconfiguration).
+/// - [`WyrdError::AuthVerifyUnavailable`] when the resolver cannot reach its
+///   backing store (fail closed on outage, not a silent untrusted result).
+/// - [`WyrdError::InvalidToken`] when the issuer is not trusted for this tenant
+///   (untrusted or cross-tenant).
+pub(crate) async fn trusted_issuer(
+    state: &AppState,
+    tenant_id: DataTenantId,
+    issuer: &IssuerUrl,
+) -> Result<TrustedIssuer, WyrdErrorResponse> {
+    let resolver = state.trusted_issuer_resolver.as_ref().ok_or_else(|| {
+        WyrdErrorResponse::from(WyrdError::Internal {
+            message: "trusted issuer resolver is not configured".to_owned(),
+            details: serde_json::json!({}),
+        })
+    })?;
+    let issuers = resolver
+        .trusted_issuers(&tenant_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                error = %error,
+                tenant_id = %tenant_id,
+                "trusted issuer resolution failed"
+            );
+            WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
+                message: "trusted issuer resolution unavailable".to_owned(),
+                details: serde_json::json!({ "retry_after_seconds": 1 }),
+            })
+        })?;
+    issuers
+        .into_iter()
+        .find(|candidate| candidate.issuer == *issuer)
+        .ok_or_else(|| {
+            WyrdErrorResponse::from(WyrdError::InvalidToken {
+                message: "issuer is not trusted for the resolved tenant".to_owned(),
+                details: serde_json::json!({}),
+            })
+        })
+}
 
 /// Require `service_accounts:write` on `principal`.
 ///

@@ -8,7 +8,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
-use wyrd_auth_oidc::{ClientAuth, IssuerConfigResolver, OidcProvider, TrustedIssuer};
+use wyrd_auth_oidc::{ClientAuth, OidcProvider, TrustedIssuer};
 use wyrd_auth_verify::PrincipalKindWire;
 use wyrd_auth_verify::TokenPrincipalRef;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
@@ -77,7 +77,7 @@ pub async fn exchange_authorization_code(
         };
         let issuer = wyrd_spec::auth::IssuerUrl::new(login_state.issuer.clone())
             .map_err(|_| invalid_token("stored issuer URL is invalid"))?;
-        let trusted = trusted_issuer(state, tenant_id, &issuer).await?;
+        let trusted = crate::auth::trusted_issuer(state, tenant_id, &issuer).await?;
         let provider = discover_provider(&trusted).await?;
         let id_token = exchange_code_for_id_token(&provider, &trusted, &login_state, code).await?;
         finish_authorization_code_exchange(
@@ -314,37 +314,6 @@ fn audit_error_tag(error: &WyrdError) -> &'static str {
         WyrdError::RoleCorrupt { .. } => "RoleCorrupt",
         _ => "WyrdError",
     }
-}
-
-async fn trusted_issuer(
-    state: &AppState,
-    tenant_id: wyrd_spec::DataTenantId,
-    issuer: &wyrd_spec::auth::IssuerUrl,
-) -> Result<TrustedIssuer, WyrdErrorResponse> {
-    let resolver = state.trusted_issuer_resolver.as_ref().ok_or_else(|| {
-        WyrdErrorResponse::from(WyrdError::Internal {
-            message: "trusted issuer resolver is not configured".to_owned(),
-            details: serde_json::json!({}),
-        })
-    })?;
-    let issuers = resolver
-        .trusted_issuers(&tenant_id)
-        .await
-        .map_err(|error| {
-            tracing::warn!(
-                error = %error,
-                tenant_id = %tenant_id,
-                "trusted issuer resolution failed"
-            );
-            WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
-                message: "trusted issuer resolution unavailable".to_owned(),
-                details: serde_json::json!({ "retry_after_seconds": 1 }),
-            })
-        })?;
-    issuers
-        .into_iter()
-        .find(|candidate| candidate.issuer == *issuer)
-        .ok_or_else(|| invalid_token("issuer is not trusted for the resolved tenant"))
 }
 
 fn tenant_slug_from_host(headers: &HeaderMap) -> Option<wyrd_spec::ids::TenantSlug> {

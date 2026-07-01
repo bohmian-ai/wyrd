@@ -963,18 +963,23 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
     // Author the trusted issuer THROUGH the real CLI verb, with a SecretPost
     // client secret that must round-trip to ciphertext at rest.
     let client_secret = "cli-authored-issuer-secret";
-    trusted_issuer::dispatch(TrustedIssuerCommand::Add(TrustedIssuerAddArgs {
+    trusted_issuer::dispatch(TrustedIssuerCommand::Add(Box::new(TrustedIssuerAddArgs {
         issuer: keycloak_issuer(),
         expected_audience: "wyrd-workload".to_owned(),
         client_id: "wyrd-workload".to_owned(),
         client_auth: "SecretPost".to_owned(),
         client_secret: Some(client_secret.to_owned()),
+        client_secret_file: None,
         claim_subject: "sub".to_owned(),
+        claim_email: None,
+        claim_groups: None,
+        default_roles: Vec::new(),
+        group_roles: Vec::new(),
         principal_kind: "Workload".to_owned(),
         jwks_ttl_secs: Some(300),
         server: server_url.clone(),
         token: admin_token.clone(),
-    }))
+    })))
     .await
     .expect("CLI trusted-issuer add succeeds");
 
@@ -1168,18 +1173,23 @@ async fn same_issuer_two_tenant_isolation_keycloak() {
 
     // Author the SAME issuer URL in BOTH tenants via the real CLI.
     for token in [&admin_token_a, &admin_token_b] {
-        trusted_issuer::dispatch(TrustedIssuerCommand::Add(TrustedIssuerAddArgs {
+        trusted_issuer::dispatch(TrustedIssuerCommand::Add(Box::new(TrustedIssuerAddArgs {
             issuer: keycloak_issuer(),
             expected_audience: "wyrd-workload".to_owned(),
             client_id: "wyrd-workload".to_owned(),
             client_auth: "Public".to_owned(),
             client_secret: None,
+            client_secret_file: None,
             claim_subject: "sub".to_owned(),
+            claim_email: None,
+            claim_groups: None,
+            default_roles: Vec::new(),
+            group_roles: Vec::new(),
             principal_kind: "Workload".to_owned(),
             jwks_ttl_secs: Some(300),
             server: server_url.clone(),
             token: token.clone(),
-        }))
+        })))
         .await
         .expect("CLI trusted-issuer add succeeds");
     }

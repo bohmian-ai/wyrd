@@ -5,9 +5,7 @@ use chrono::{Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use uuid::Uuid;
-use wyrd_auth_oidc::{
-    IssuerConfigResolver, PrincipalKindPolicy, TrustedIssuer, WorkloadBindingResolver,
-};
+use wyrd_auth_oidc::{PrincipalKindPolicy, WorkloadBindingResolver};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::error::WyrdError;
@@ -54,8 +52,7 @@ impl JwtBearer {
                 .verify_external(&tenant_id, assertion.expose_secret())
                 .await
                 .map_err(WyrdErrorResponse::from)?;
-            let trusted = trusted_issuer(state, tenant_id, &verified.issuer).await?;
-            if trusted.principal_kind != PrincipalKindPolicy::Workload {
+            if verified.principal_kind != PrincipalKindPolicy::Workload {
                 return Err(invalid_token(
                     "issuer is not configured for workload identity",
                 ));
@@ -69,7 +66,7 @@ impl JwtBearer {
                     &tenant_id,
                     &verified.issuer,
                     &verified.subject,
-                    Some(trusted.expected_audience.as_str()),
+                    Some(verified.expected_audience.as_str()),
                 )
                 .await
                 .map_err(|error| {
@@ -272,35 +269,6 @@ fn tenant_slug_from_host(headers: &HeaderMap) -> Option<TenantSlug> {
         return None;
     }
     TenantSlug::new(first.to_owned()).ok()
-}
-
-async fn trusted_issuer(
-    state: &AppState,
-    tenant_id: DataTenantId,
-    issuer: &IssuerUrl,
-) -> Result<TrustedIssuer, WyrdErrorResponse> {
-    let resolver = state
-        .trusted_issuer_resolver
-        .as_ref()
-        .ok_or_else(auth_not_configured)?;
-    let issuers = resolver
-        .trusted_issuers(&tenant_id)
-        .await
-        .map_err(|error| {
-            tracing::warn!(
-                error = %error,
-                tenant_id = %tenant_id,
-                "trusted issuer resolution failed"
-            );
-            WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
-                message: "trusted issuer resolution unavailable".to_owned(),
-                details: json!({ "retry_after_seconds": 1 }),
-            })
-        })?;
-    issuers
-        .into_iter()
-        .find(|candidate| candidate.issuer == *issuer)
-        .ok_or_else(|| invalid_token("issuer is not trusted for the resolved tenant"))
 }
 
 fn principal_not_found(subject: &str, issuer: &IssuerUrl) -> WyrdErrorResponse {

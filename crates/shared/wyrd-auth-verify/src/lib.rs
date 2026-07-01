@@ -14,7 +14,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use wyrd_auth_oidc::{IssuerConfigResolver, JwksCache, OidcError, OidcKid, map_claims};
+use wyrd_auth_oidc::{
+    IssuerConfigResolver, JwksCache, OidcError, OidcKid, PrincipalKindPolicy, map_claims,
+};
 use wyrd_runtime::{
     DelegationStep, PermissionSet, Principal, PrincipalId, PrincipalKind,
     PrincipalRef as RuntimePrincipalRef, RoleRef,
@@ -272,6 +274,12 @@ pub struct VerifiedExternalIdentity {
     pub email: Option<String>,
     /// Groups or roles extracted from the token (RBAC resolution input).
     pub groups: Vec<String>,
+    /// Whether the matched issuer represents human users or machine workloads.
+    /// Carried out of the trust resolution so callers need not re-resolve it.
+    pub principal_kind: PrincipalKindPolicy,
+    /// The audience the matched issuer expects, used as the workload binding
+    /// audience constraint without a second issuer resolution.
+    pub expected_audience: String,
     /// Full verified token claims for downstream assertion checks (e.g. nonce).
     pub raw_claims: serde_json::Value,
 }
@@ -600,6 +608,8 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
             subject: mapped.subject,
             email: mapped.email,
             groups: mapped.groups,
+            principal_kind: trusted.principal_kind,
+            expected_audience: trusted.expected_audience.clone(),
             raw_claims,
         })
     }

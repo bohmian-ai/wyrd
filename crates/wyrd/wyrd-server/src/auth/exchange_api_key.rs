@@ -989,4 +989,77 @@ mod tests {
 
         assert!(matches!(result, Err(DelegateError::PermissionDenied)));
     }
+
+    #[tokio::test]
+    async fn delegation_issues_no_refresh_token() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+
+        // Seed the per-tenant builtin roles so the resolver maps the delegator's
+        // `runtime_admin` role claim to `delegation_issue`, and insert the target
+        // Service principal the exchange resolves by card_ref.
+        let target_card_ref = CardRef {
+            kind: CardKind::Service,
+            name: CardName::new("delegation-target").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("prod").expect("static space is valid"),
+            uid: None,
+        };
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        seed_builtin_roles_for_tenant(&mut conn, tenant)
+            .await
+            .expect("builtin roles seed");
+        let creator = insert_test_user(&mut conn, tenant).await;
+        insert_test_service_account(&mut conn, tenant, creator, &target_card_ref).await;
+        conn.commit().await.expect("seed commits");
+
+        let issuing_key = test_issuing_key();
+        let subject_token = issuing_key
+            .issue_service_access_token(
+                PrincipalId::new(Uuid::new_v4()),
+                tenant,
+                test_service_card_ref(),
+                vec![RoleRef::new("runtime_admin").expect("role name is valid")],
+                Duration::minutes(15),
+            )
+            .expect("subject token issues");
+
+        let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
+        let mut decoding_keys = HashMap::new();
+        decoding_keys.insert(Kid::new("k1").expect("kid is valid"), Arc::new(public_key));
+        let verifier = Arc::new(TokenVerifier::new(
+            decoding_keys,
+            "wyrd",
+            Arc::new(SqlPermissionResolver::new(Arc::new(
+                fixture.app_pool().clone(),
+            ))),
+            WyrdAuthVerifySettings::default(),
+        ));
+
+        let delegate = DelegateToken {
+            issuing_key,
+            verifier,
+            permission_check: Arc::new(RbacCheck),
+            settings: TokenExchangeSettings::default(),
+        };
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let exchanged = delegate
+            .execute(
+                &mut conn,
+                SecretString::from(subject_token),
+                RequestedSubject::CardRef {
+                    card_ref: target_card_ref,
+                },
+                "req-delegation-no-refresh",
+            )
+            .await
+            .expect("delegation succeeds");
+
+        assert!(
+            exchanged.refresh_token.is_none(),
+            "delegated token-exchange must not issue a refresh token"
+        );
+        assert_eq!(exchanged.token_type, wyrd_spec::auth::TokenType::Bearer);
+    }
 }

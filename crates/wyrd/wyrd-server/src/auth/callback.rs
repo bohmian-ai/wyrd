@@ -767,7 +767,14 @@ mod tests {
 
         assert_eq!(response.token_type, TokenType::Bearer);
         assert!(!response.access_token.expose().is_empty());
-        assert!(!response.refresh_token.expose().is_empty());
+        assert!(
+            !response
+                .refresh_token
+                .as_ref()
+                .expect("human OIDC login issues a refresh token")
+                .expose()
+                .is_empty()
+        );
         assert_ne!(audit_principal_id, Uuid::nil());
         assert_eq!(refresh_token_count(&fixture, audit_principal_id).await, 1);
         let audit = audit_rows(&fixture).await;

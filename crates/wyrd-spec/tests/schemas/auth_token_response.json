@@ -6,7 +6,6 @@
   "required": [
     "access_token",
     "expires_at",
-    "refresh_token",
     "token_type"
   ],
   "properties": {
@@ -24,10 +23,13 @@
       "format": "date-time"
     },
     "refresh_token": {
-      "description": "Refresh token.",
-      "allOf": [
+      "description": "Refresh token. Present only for grants that issue one: human OIDC login (`authorization_code`), API-key exchange (`wyrd_api_key`), and refresh rotation (`refresh_token`). Absent for the workload `jwt-bearer` and `token-exchange` (delegation) grants, whose clients re-present their durable credential to obtain a fresh access token instead of holding a long-lived refresh secret.",
+      "anyOf": [
         {
           "$ref": "#/definitions/SecretBearer"
+        },
+        {
+          "type": "null"
         }
       ]
     },

@@ -2,7 +2,7 @@
 //!
 //! [`AdminClient`] is a thin typed projection of the server's tenant-admin
 //! routes for trusted OIDC issuers and workload bindings
-//! (`POST/GET/DELETE /admin/trusted-issuers` and `/admin/workload-bindings`).
+//! (`POST/GET/DELETE /v1/admin/trusted-issuers` and `/v1/admin/workload-bindings`).
 //! Every method delegates to [`WyrdClient::request_json`], so it rides the one
 //! shared auth/token/retry path the façade already owns — there is no second
 //! request or credential path here. The tenant is implicit in the authenticated
@@ -24,8 +24,8 @@ use wyrd_spec::error::WyrdError;
 
 use crate::client::WyrdClient;
 
-const TRUSTED_ISSUERS_PATH: &str = "/admin/trusted-issuers";
-const WORKLOAD_BINDINGS_PATH: &str = "/admin/workload-bindings";
+const TRUSTED_ISSUERS_PATH: &str = "/v1/admin/trusted-issuers";
+const WORKLOAD_BINDINGS_PATH: &str = "/v1/admin/workload-bindings";
 
 /// Tenant-admin CRUD client riding the shared [`WyrdClient`] auth path.
 #[derive(Debug, Clone)]
@@ -40,7 +40,7 @@ impl AdminClient {
         Self { client }
     }
 
-    /// Register a trusted OIDC issuer (`POST /admin/trusted-issuers`).
+    /// Register a trusted OIDC issuer (`POST /v1/admin/trusted-issuers`).
     ///
     /// The plaintext client secret travels in the request body; the redacted
     /// [`TrustedIssuerView`] returned never carries it back.
@@ -58,7 +58,7 @@ impl AdminClient {
     }
 
     /// List every trusted OIDC issuer for the caller's tenant
-    /// (`GET /admin/trusted-issuers`).
+    /// (`GET /v1/admin/trusted-issuers`).
     ///
     /// # Errors
     /// Non-2xx responses map through the server's structured error catalog.
@@ -69,7 +69,7 @@ impl AdminClient {
     }
 
     /// Remove a trusted OIDC issuer addressed by query string
-    /// (`DELETE /admin/trusted-issuers?issuer=&cascade=`).
+    /// (`DELETE /v1/admin/trusted-issuers?issuer=&cascade=`).
     ///
     /// `cascade` removes referencing workload bindings first so the delete is not
     /// blocked by the FK restriction.
@@ -92,7 +92,7 @@ impl AdminClient {
         Ok(())
     }
 
-    /// Register a workload binding (`POST /admin/workload-bindings`).
+    /// Register a workload binding (`POST /v1/admin/workload-bindings`).
     ///
     /// # Errors
     /// A duplicate `(issuer, subject)` surfaces as [`WyrdError::AdminConflict`].
@@ -106,7 +106,7 @@ impl AdminClient {
     }
 
     /// List workload bindings for the caller's tenant, optionally filtered by
-    /// exact issuer and/or subject (`GET /admin/workload-bindings?issuer=&subject=`).
+    /// exact issuer and/or subject (`GET /v1/admin/workload-bindings?issuer=&subject=`).
     ///
     /// # Errors
     /// Non-2xx responses map through the server's structured error catalog.
@@ -134,7 +134,7 @@ impl AdminClient {
     }
 
     /// Remove a workload binding addressed by query string
-    /// (`DELETE /admin/workload-bindings?issuer=&subject=`).
+    /// (`DELETE /v1/admin/workload-bindings?issuer=&subject=`).
     ///
     /// # Errors
     /// A missing binding surfaces as [`WyrdError::AdminNotFound`].
@@ -240,7 +240,7 @@ mod tests {
     async fn create_sends_secret_in_body_and_redacted_view_has_none() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/admin/trusted-issuers"))
+            .and(path("/v1/admin/trusted-issuers"))
             .respond_with(ResponseTemplate::new(200).set_body_json(issuer_view_json()))
             .mount(&server)
             .await;
@@ -269,7 +269,7 @@ mod tests {
     async fn list_deserializes_a_vec() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/admin/trusted-issuers"))
+            .and(path("/v1/admin/trusted-issuers"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!([issuer_view_json()])),
             )
@@ -286,7 +286,7 @@ mod tests {
     async fn delete_sends_query_params_and_tolerates_204() {
         let server = MockServer::start().await;
         Mock::given(method("DELETE"))
-            .and(path("/admin/trusted-issuers"))
+            .and(path("/v1/admin/trusted-issuers"))
             .and(query_param("issuer", "https://idp.example.com"))
             .and(query_param("cascade", "true"))
             .respond_with(ResponseTemplate::new(204))
@@ -304,7 +304,7 @@ mod tests {
     async fn conflict_surfaces_admin_conflict_code() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/admin/trusted-issuers"))
+            .and(path("/v1/admin/trusted-issuers"))
             .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
                 "code": "WYRD_AUTH_409_ADMIN_CONFLICT",
                 "title": "admin conflict",
@@ -330,7 +330,7 @@ mod tests {
     async fn not_found_surfaces_admin_not_found_code() {
         let server = MockServer::start().await;
         Mock::given(method("DELETE"))
-            .and(path("/admin/trusted-issuers"))
+            .and(path("/v1/admin/trusted-issuers"))
             .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
                 "code": "WYRD_AUTH_404_ADMIN_NOT_FOUND",
                 "title": "admin not found",
@@ -369,12 +369,12 @@ mod tests {
             "card_ref": serde_json::to_value(&card_ref).expect("card_ref"),
         });
         Mock::given(method("POST"))
-            .and(path("/admin/workload-bindings"))
+            .and(path("/v1/admin/workload-bindings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(binding_view))
             .mount(&server)
             .await;
         Mock::given(method("DELETE"))
-            .and(path("/admin/workload-bindings"))
+            .and(path("/v1/admin/workload-bindings"))
             .and(query_param("issuer", "https://idp.example.com"))
             .and(query_param("subject", "system:serviceaccount:default/sa"))
             .respond_with(ResponseTemplate::new(204))

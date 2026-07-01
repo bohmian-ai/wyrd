@@ -11,11 +11,11 @@ use crate::error::WyrdCliError;
 
 #[derive(Debug, Subcommand)]
 pub enum TrustedIssuerCommand {
-    /// Register a trusted OIDC issuer (POST /admin/trusted-issuers).
+    /// Register a trusted OIDC issuer (POST /v1/admin/trusted-issuers).
     Add(AddArgs),
-    /// List trusted OIDC issuers (GET /admin/trusted-issuers).
+    /// List trusted OIDC issuers (GET /v1/admin/trusted-issuers).
     List(ListArgs),
-    /// Remove a trusted OIDC issuer (DELETE /admin/trusted-issuers?issuer=&cascade=).
+    /// Remove a trusted OIDC issuer (DELETE /v1/admin/trusted-issuers?issuer=&cascade=).
     Rm(RmArgs),
 }
 

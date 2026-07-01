@@ -122,7 +122,7 @@ def _start(mock: _AdminMock) -> tuple[WyrdClient, _AdminMock]:
 
 def test_create_trusted_issuer_sends_secret_and_returns_redacted_view():
     mock = _AdminMock()
-    mock.route("POST", "/admin/trusted-issuers", 200, _trusted_issuer_view())
+    mock.route("POST", "/v1/admin/trusted-issuers", 200, _trusted_issuer_view())
     client, mock = _start(mock)
     try:
         view = client.admin.trusted_issuers.create(_trusted_issuer_request())
@@ -138,7 +138,7 @@ def test_create_trusted_issuer_sends_secret_and_returns_redacted_view():
 
 def test_list_trusted_issuers_returns_views():
     mock = _AdminMock()
-    mock.route("GET", "/admin/trusted-issuers", 200, [_trusted_issuer_view()])
+    mock.route("GET", "/v1/admin/trusted-issuers", 200, [_trusted_issuer_view()])
     client, mock = _start(mock)
     try:
         views = client.admin.trusted_issuers.list()
@@ -151,7 +151,7 @@ def test_list_trusted_issuers_returns_views():
 
 def test_delete_trusted_issuer_sends_issuer_and_cascade_query():
     mock = _AdminMock()
-    mock.route("DELETE", "/admin/trusted-issuers", 204, None)
+    mock.route("DELETE", "/v1/admin/trusted-issuers", 204, None)
     client, mock = _start(mock)
     try:
         result = client.admin.trusted_issuers.delete("https://idp.example.com/", cascade=True)
@@ -168,7 +168,7 @@ def test_create_conflict_surfaces_admin_conflict_code():
     mock = _AdminMock()
     mock.route(
         "POST",
-        "/admin/trusted-issuers",
+        "/v1/admin/trusted-issuers",
         409,
         {"code": "WYRD_AUTH_409_ADMIN_CONFLICT", "detail": "issuer already exists"},
     )
@@ -186,7 +186,7 @@ def test_delete_missing_binding_surfaces_admin_not_found_code():
     mock = _AdminMock()
     mock.route(
         "DELETE",
-        "/admin/workload-bindings",
+        "/v1/admin/workload-bindings",
         404,
         {"code": "WYRD_AUTH_404_ADMIN_NOT_FOUND", "detail": "binding not found"},
     )
@@ -213,8 +213,8 @@ def test_workload_binding_create_and_list_round_trip():
         },
     }
     mock = _AdminMock()
-    mock.route("POST", "/admin/workload-bindings", 200, view)
-    mock.route("GET", "/admin/workload-bindings", 200, [view])
+    mock.route("POST", "/v1/admin/workload-bindings", 200, view)
+    mock.route("GET", "/v1/admin/workload-bindings", 200, [view])
     client, mock = _start(mock)
     try:
         created = client.admin.workload_bindings.create(

@@ -1,7 +1,7 @@
 //! Tenant-admin CRUD contracts for trusted OIDC issuers and workload bindings.
 //!
 //! These are the public HTTP request/response shapes for
-//! `POST/GET/DELETE /admin/trusted-issuers` and `/admin/workload-bindings`.
+//! `POST/GET/DELETE /v1/admin/trusted-issuers` and `/v1/admin/workload-bindings`.
 //! They are plain data: every mapping to or from the server-side domain and
 //! row types lives in `wyrd-server`, so this module stays pure contract and is
 //! reusable by the CLI and SDK without depending on the server.
@@ -54,7 +54,7 @@ pub enum PrincipalKindPayload {
     Workload,
 }
 
-/// `POST /admin/trusted-issuers` body.
+/// `POST /v1/admin/trusted-issuers` body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -112,7 +112,7 @@ pub struct TrustedIssuerView {
     pub default_roles: Value,
 }
 
-/// `POST /admin/workload-bindings` body.
+/// `POST /v1/admin/workload-bindings` body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]

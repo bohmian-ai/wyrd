@@ -9,11 +9,11 @@ use crate::error::WyrdCliError;
 
 #[derive(Debug, Subcommand)]
 pub enum WorkloadBindingCommand {
-    /// Create a workload binding (POST /admin/workload-bindings).
+    /// Create a workload binding (POST /v1/admin/workload-bindings).
     Add(AddArgs),
-    /// List workload bindings (GET /admin/workload-bindings).
+    /// List workload bindings (GET /v1/admin/workload-bindings).
     List(ListArgs),
-    /// Remove a workload binding (DELETE /admin/workload-bindings).
+    /// Remove a workload binding (DELETE /v1/admin/workload-bindings).
     Rm(RmArgs),
 }
 

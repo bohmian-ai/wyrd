@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::reference::CardRef;
 
-pub use wyrd_spec::auth::PrincipalKind;
+pub use wyrd_spec::auth::{PrincipalId, PrincipalKind};
 
 use crate::permission::PermissionSet;
 
@@ -24,39 +24,6 @@ pub struct Principal {
     pub roles: Vec<RoleRef>,
     /// Permissions resolved from roles at verify time.
     pub effective_permissions: PermissionSet,
-}
-
-/// Stable principal identifier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PrincipalId(uuid::Uuid);
-
-impl PrincipalId {
-    /// Build from a UUID.
-    #[must_use]
-    pub const fn new(uuid: uuid::Uuid) -> Self {
-        Self(uuid)
-    }
-
-    /// Borrow the underlying UUID.
-    #[must_use]
-    pub const fn as_uuid(&self) -> uuid::Uuid {
-        self.0
-    }
-}
-
-impl fmt::Display for PrincipalId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl FromStr for PrincipalId {
-    type Err = uuid::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        uuid::Uuid::parse_str(value).map(Self)
-    }
 }
 
 /// Reference to a role by name.

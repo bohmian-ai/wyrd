@@ -17,8 +17,8 @@ use wyrd_sql::queries::auth::{
 };
 
 use crate::auth::exchange_api_key::{
-    ExchangeError, ExchangedToken, RefreshPolicy, TokenExchangeSettings, issue_for_subject,
-    role_refs,
+    ExchangeError, ExchangedToken, IssueSubject, RefreshPolicy, TokenExchangeSettings,
+    issue_for_subject, role_refs,
 };
 use crate::auth::issue_api_key::principal_kind_for_card;
 use crate::error::WyrdErrorResponse;
@@ -107,10 +107,12 @@ impl JwtBearer {
                 &mut conn,
                 issuing_key,
                 &self.settings,
-                row.id,
-                &row.principal_kind,
-                row.card_ref.0.clone(),
-                roles,
+                IssueSubject {
+                    principal_id: row.id,
+                    principal_kind: row.principal_kind.clone(),
+                    card_ref: row.card_ref.0.clone(),
+                    roles,
+                },
                 RefreshPolicy::Skip,
             )
             .await

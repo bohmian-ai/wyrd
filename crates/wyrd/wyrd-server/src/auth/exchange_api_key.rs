@@ -127,6 +127,18 @@ pub(super) enum RefreshPolicy {
     Skip,
 }
 
+/// The service/agent principal a token is being issued for.
+pub(super) struct IssueSubject {
+    /// Stable principal id.
+    pub principal_id: Uuid,
+    /// Principal kind: `"service"` or `"agent"`.
+    pub principal_kind: String,
+    /// Principal card reference embedded in the access token.
+    pub card_ref: CardRef,
+    /// Effective roles embedded in the access token.
+    pub roles: Vec<RoleRef>,
+}
+
 /// API-key exchange failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ExchangeError {
@@ -218,10 +230,12 @@ impl ExchangeApiKey {
             conn,
             &self.issuing_key,
             &self.settings,
-            row.principal_id,
-            &row.principal_kind,
-            row.card_ref.0,
-            roles,
+            IssueSubject {
+                principal_id: row.principal_id,
+                principal_kind: row.principal_kind,
+                card_ref: row.card_ref.0,
+                roles,
+            },
             RefreshPolicy::Mint,
         )
         .await
@@ -307,14 +321,17 @@ pub(super) async fn issue_for_subject(
     conn: &mut TenantConn<'_>,
     issuing_key: &IssuingKey,
     settings: &TokenExchangeSettings,
-    principal_id: Uuid,
-    principal_kind: &str,
-    card_ref: CardRef,
-    roles: Vec<RoleRef>,
+    subject: IssueSubject,
     refresh: RefreshPolicy,
 ) -> Result<ExchangedToken, IssueOrSqlError> {
+    let IssueSubject {
+        principal_id,
+        principal_kind,
+        card_ref,
+        roles,
+    } = subject;
     let id = PrincipalId::new(principal_id);
-    let access_token = match principal_kind {
+    let access_token = match principal_kind.as_str() {
         "service" => issuing_key.issue_service_access_token(
             id,
             conn.data_tenant_id(),
@@ -334,7 +351,7 @@ pub(super) async fn issue_for_subject(
     let refresh_token = match refresh {
         RefreshPolicy::Mint => {
             let token = issuing_key.issue_refresh_token(
-                principal_kind_wire(principal_kind).ok_or(IssueError::InvalidPrincipalKind)?,
+                principal_kind_wire(&principal_kind).ok_or(IssueError::InvalidPrincipalKind)?,
                 id,
                 conn.data_tenant_id(),
                 settings.refresh_ttl,
@@ -342,7 +359,7 @@ pub(super) async fn issue_for_subject(
             insert_refresh_token(
                 conn,
                 Uuid::new_v4(),
-                principal_kind,
+                &principal_kind,
                 principal_id,
                 &token_hash(&token),
                 Utc::now() + settings.refresh_ttl,

@@ -8,7 +8,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wyrd_auth_issue::{DelegationCaller, IssueError, IssuingKey};
-use wyrd_auth_verify::{ActClaim, AuthError, PrincipalKindWire, TokenPrincipalRef, TokenVerifier};
+use wyrd_auth_verify::{ActClaim, AuthError, PrincipalKindTag, TokenPrincipalRef, TokenVerifier};
 use wyrd_runtime::{Permission, PermissionCheck, PrincipalId, PrincipalKind, RoleRef};
 use wyrd_spec::auth::{RequestedSubject, SecretBearer, TokenResponse, TokenType};
 use wyrd_spec::envelope::CardKind;
@@ -258,7 +258,7 @@ impl DelegateToken {
             self.settings.access_ttl,
         )?;
         let refresh_token = self.issuing_key.issue_refresh_token(
-            principal_kind_wire(&row.principal_kind).ok_or(DelegateError::SubjectNotFound)?,
+            principal_kind_tag(&row.principal_kind).ok_or(DelegateError::SubjectNotFound)?,
             PrincipalId::new(row.id),
             conn.data_tenant_id(),
             self.settings.refresh_ttl,
@@ -322,7 +322,7 @@ pub(super) async fn issue_for_subject(
         _ => return Err(IssueOrSqlError::Issue(IssueError::InvalidPrincipalKind)),
     };
     let refresh_token = issuing_key.issue_refresh_token(
-        principal_kind_wire(principal_kind).ok_or(IssueError::InvalidPrincipalKind)?,
+        principal_kind_tag(principal_kind).ok_or(IssueError::InvalidPrincipalKind)?,
         id,
         conn.data_tenant_id(),
         settings.refresh_ttl,
@@ -385,10 +385,10 @@ pub(crate) fn role_refs(names: Vec<String>) -> Result<Vec<RoleRef>, wyrd_runtime
     names.into_iter().map(|name| RoleRef::new(&name)).collect()
 }
 
-pub(super) fn principal_kind_wire(value: &str) -> Option<PrincipalKindWire> {
+pub(super) fn principal_kind_tag(value: &str) -> Option<PrincipalKindTag> {
     match value {
-        "service" => Some(PrincipalKindWire::Service),
-        "agent" => Some(PrincipalKindWire::Agent),
+        "service" => Some(PrincipalKindTag::Service),
+        "agent" => Some(PrincipalKindTag::Agent),
         _ => None,
     }
 }
@@ -411,9 +411,8 @@ fn principal_ref(
 ) -> Option<TokenPrincipalRef> {
     Some(TokenPrincipalRef {
         id: PrincipalId::new(id),
-        kind: principal_kind_wire(kind)?,
+        kind: runtime_principal_kind(kind, card_ref)?,
         tenant_id,
-        card_ref: Some(card_ref),
     })
 }
 

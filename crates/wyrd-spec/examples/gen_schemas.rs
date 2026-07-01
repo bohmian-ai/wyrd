@@ -5,7 +5,7 @@ use std::path::Path;
 
 use schemars::schema_for;
 use wyrd_spec::auth::{
-    AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, PrincipalKind,
+    AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, PrincipalKindTag,
     RevokePrincipalRequest, RevokePrincipalResponse, TokenRequest, TokenResponse,
 };
 use wyrd_spec::card::agent::AgentSpec;
@@ -141,7 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<IssuerUrl>(out, golden, "auth_issuer_url")?;
     write::<LoginInitResponse>(out, golden, "auth_login_init_response")?;
     write::<CallbackQuery>(out, golden, "auth_callback_query")?;
-    write::<PrincipalKind>(out, golden, "auth_principal_kind")?;
+    write::<PrincipalKindTag>(out, golden, "auth_principal_kind")?;
     write::<RevokePrincipalRequest>(out, golden, "auth_revoke_principal_request")?;
     write::<RevokePrincipalResponse>(out, golden, "auth_revoke_principal_response")?;
 

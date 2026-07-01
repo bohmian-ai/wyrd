@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 use wyrd_auth_oidc::{ClientAuth, OidcProvider, TrustedIssuer};
-use wyrd_auth_verify::PrincipalKindWire;
+use wyrd_auth_verify::PrincipalKindTag;
 use wyrd_auth_verify::TokenPrincipalRef;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
 use wyrd_spec::DataTenantId;
@@ -197,7 +197,7 @@ async fn issue_and_record_user_session(
         .map_err(issue_error)?;
     let refresh_token = issuing_key
         .issue_refresh_token(
-            PrincipalKindWire::User,
+            PrincipalKindTag::User,
             PrincipalId::new(principal_id),
             tenant_id,
             REFRESH_TTL,

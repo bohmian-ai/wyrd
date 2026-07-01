@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::reference::CardRef;
 
+pub use wyrd_spec::auth::PrincipalKind;
+
 use crate::permission::PermissionSet;
 
 /// The authenticated identity behind a request.
@@ -22,24 +24,6 @@ pub struct Principal {
     pub roles: Vec<RoleRef>,
     /// Permissions resolved from roles at verify time.
     pub effective_permissions: PermissionSet,
-}
-
-/// Kind of authenticated identity.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
-pub enum PrincipalKind {
-    /// Human user identity.
-    User,
-    /// Card-bound service identity.
-    Service {
-        /// Bound Service card.
-        card_ref: CardRef,
-    },
-    /// Card-bound agent identity.
-    Agent {
-        /// Bound Agent card.
-        card_ref: CardRef,
-    },
 }
 
 /// Stable principal identifier.
@@ -145,12 +129,7 @@ impl Principal {
     /// Returns the card ref for service and agent principals.
     #[must_use]
     pub fn card_ref(&self) -> Option<&CardRef> {
-        match &self.kind {
-            PrincipalKind::Service { card_ref } | PrincipalKind::Agent { card_ref } => {
-                Some(card_ref)
-            }
-            PrincipalKind::User => None,
-        }
+        self.kind.card_ref()
     }
 }
 
@@ -177,12 +156,7 @@ impl PrincipalRef {
     /// Returns the card ref for service and agent principals.
     #[must_use]
     pub fn card_ref(&self) -> Option<&CardRef> {
-        match &self.kind {
-            PrincipalKind::Service { card_ref } | PrincipalKind::Agent { card_ref } => {
-                Some(card_ref)
-            }
-            PrincipalKind::User => None,
-        }
+        self.kind.card_ref()
     }
 }
 

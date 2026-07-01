@@ -16,13 +16,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wyrd_auth_oidc::{JwksCache, OidcError, OidcKid, TrustedIssuerRegistry, map_claims};
 use wyrd_runtime::{
-    DelegationStep, PermissionSet, Principal, PrincipalId, PrincipalKind,
+    DelegationStep, PermissionSet, Principal, PrincipalId,
     PrincipalRef as RuntimePrincipalRef, RoleRef,
 };
+pub use wyrd_runtime::PrincipalKind;
 use wyrd_spec::DataTenantId;
+pub use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::auth::IssuerUrl;
-use wyrd_spec::envelope::CardKind;
-use wyrd_spec::reference::CardRef;
 
 /// Hard cap on RFC 8693 delegation depth.
 pub const MAX_DELEGATION_DEPTH: usize = 5;
@@ -165,7 +165,7 @@ pub trait RevocationCheck: Send + Sync + fmt::Debug {
         &'a self,
         tenant: &'a DataTenantId,
         principal: PrincipalId,
-        kind: PrincipalKindWire,
+        kind: PrincipalKindTag,
     ) -> RevocationEpochFuture<'a>;
 }
 
@@ -178,7 +178,7 @@ impl RevocationCheck for NoRevocation {
         &'a self,
         _tenant: &'a DataTenantId,
         _principal: PrincipalId,
-        _kind: PrincipalKindWire,
+        _kind: PrincipalKindTag,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>>
@@ -367,11 +367,7 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
             // F11: check revocation epoch BEFORE returning the positive cache hit.
             // A principal revoked after this token was cached must be rejected here.
             if let Some(ref rev) = self.revocation {
-                let kind = match &cached.principal.kind {
-                    PrincipalKind::User => PrincipalKindWire::User,
-                    PrincipalKind::Service { .. } => PrincipalKindWire::Service,
-                    PrincipalKind::Agent { .. } => PrincipalKindWire::Agent,
-                };
+                let kind = cached.principal.kind.tag();
                 match rev
                     .epoch(&cached.principal.tenant_id, cached.principal.id, kind)
                     .await
@@ -416,11 +412,7 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
 
         // Also check revocation for fresh (cache-miss) verifies.
         if let Some(ref rev) = self.revocation {
-            let kind = match &result.principal.kind {
-                PrincipalKind::User => PrincipalKindWire::User,
-                PrincipalKind::Service { .. } => PrincipalKindWire::Service,
-                PrincipalKind::Agent { .. } => PrincipalKindWire::Agent,
-            };
+            let kind = result.principal.kind.tag();
             match rev
                 .epoch(&result.principal.tenant_id, result.principal.id, kind)
                 .await
@@ -629,25 +621,10 @@ pub struct ActClaim {
 pub struct TokenPrincipalRef {
     /// Stable principal id.
     pub id: PrincipalId,
-    /// Principal kind without inline runtime payloads.
-    pub kind: PrincipalKindWire,
+    /// Principal kind, carrying the bound card (nested) for Service and Agent.
+    pub kind: PrincipalKind,
     /// Tenant isolation key.
     pub tenant_id: DataTenantId,
-    /// Bound card reference for Service and Agent principals.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub card_ref: Option<CardRef>,
-}
-
-/// Principal kind discriminant used in token claims.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrincipalKindWire {
-    /// Human user identity.
-    User,
-    /// Card-bound service identity.
-    Service,
-    /// Card-bound agent identity.
-    Agent,
 }
 
 /// Refresh-token claims for any principal kind.
@@ -656,8 +633,8 @@ pub enum PrincipalKindWire {
 pub struct RefreshTokenClaims {
     /// Subject id, equal to `principal_id`.
     pub sub: String,
-    /// Principal kind.
-    pub principal_kind: PrincipalKindWire,
+    /// Principal kind discriminator (card-free; refresh tokens do not embed the card).
+    pub principal_kind: PrincipalKindTag,
     /// Stable principal id.
     pub principal_id: PrincipalId,
     /// Tenant isolation key.
@@ -676,31 +653,18 @@ impl From<(&RuntimePrincipalRef, DataTenantId)> for TokenPrincipalRef {
     fn from((ref_, tenant_id): (&RuntimePrincipalRef, DataTenantId)) -> Self {
         Self {
             id: ref_.id,
-            kind: match &ref_.kind {
-                PrincipalKind::User => PrincipalKindWire::User,
-                PrincipalKind::Service { .. } => PrincipalKindWire::Service,
-                PrincipalKind::Agent { .. } => PrincipalKindWire::Agent,
-            },
+            kind: ref_.kind.clone(),
             tenant_id,
-            card_ref: ref_.card_ref().cloned(),
         }
     }
 }
 
 impl From<&Principal> for TokenPrincipalRef {
     fn from(principal: &Principal) -> Self {
-        let (kind, card_ref) = match &principal.kind {
-            PrincipalKind::User => (PrincipalKindWire::User, None),
-            PrincipalKind::Service { card_ref } => {
-                (PrincipalKindWire::Service, Some(card_ref.clone()))
-            }
-            PrincipalKind::Agent { card_ref } => (PrincipalKindWire::Agent, Some(card_ref.clone())),
-        };
         Self {
             id: principal.id,
-            kind,
+            kind: principal.kind.clone(),
             tenant_id: principal.tenant_id,
-            card_ref,
         }
     }
 }
@@ -715,8 +679,11 @@ impl AccessTokenClaims {
         &self,
         resolver: &R,
     ) -> Result<VerifiedToken, AuthError> {
-        let kind =
-            wire_kind_into_principal_kind(self.principal.kind, self.principal.card_ref.as_ref())?;
+        self.principal
+            .kind
+            .validate_card_kind()
+            .map_err(|_| AuthError::InvalidCardRef)?;
+        let kind = self.principal.kind.clone();
         let effective_permissions = resolver
             .resolve(&self.principal.tenant_id, &self.roles)
             .await
@@ -746,41 +713,21 @@ impl AccessTokenClaims {
     }
 }
 
-fn wire_kind_into_principal_kind(
-    wire: PrincipalKindWire,
-    card_ref: Option<&CardRef>,
-) -> Result<PrincipalKind, AuthError> {
-    match (wire, card_ref) {
-        (PrincipalKindWire::User, Some(_)) => Err(AuthError::InvalidCardRef),
-        (PrincipalKindWire::User, None) => Ok(PrincipalKind::User),
-        (PrincipalKindWire::Service, Some(card_ref)) if card_ref.kind == CardKind::Service => {
-            Ok(PrincipalKind::Service {
-                card_ref: card_ref.clone(),
-            })
-        }
-        (PrincipalKindWire::Agent, Some(card_ref)) if card_ref.kind == CardKind::Agent => {
-            Ok(PrincipalKind::Agent {
-                card_ref: card_ref.clone(),
-            })
-        }
-        (PrincipalKindWire::Service | PrincipalKindWire::Agent, _) => {
-            Err(AuthError::InvalidCardRef)
-        }
-    }
-}
-
 fn flatten_act_chain(mut act: Option<&ActClaim>) -> Result<Vec<DelegationStep>, AuthError> {
     let mut out = Vec::new();
     while let Some(layer) = act {
         if out.len() >= MAX_DELEGATION_DEPTH {
             return Err(AuthError::DelegationDepthExceeded);
         }
-        let kind =
-            wire_kind_into_principal_kind(layer.principal.kind, layer.principal.card_ref.as_ref())?;
+        layer
+            .principal
+            .kind
+            .validate_card_kind()
+            .map_err(|_| AuthError::InvalidCardRef)?;
         out.push(DelegationStep {
             principal: RuntimePrincipalRef {
                 id: layer.principal.id,
-                kind,
+                kind: layer.principal.kind.clone(),
             },
         });
         act = layer.act.as_deref();
@@ -865,14 +812,14 @@ mod tests {
     use wyrd_runtime::{Principal, PrincipalId, PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::IssuerUrl;
+    use wyrd_spec::auth::{IssuerUrl, PrincipalKindTag};
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
 
     use super::{
         AccessTokenClaims, ActClaim, AuthError, Kid, MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH,
-        PermissionResolver, PrincipalKindWire, ResolveError, RevocationCheck, TokenPrincipalRef,
+        PermissionResolver, ResolveError, RevocationCheck, TokenPrincipalRef,
         TokenVerifier, WyrdAuthVerifySettings, decode_kid, public_key_from_pem, verify_eddsa,
         verify_eddsa_with,
     };
@@ -909,9 +856,8 @@ mod tests {
         let projected = TokenPrincipalRef::from(&principal);
 
         assert_eq!(projected.id, principal.id);
-        assert_eq!(projected.kind, PrincipalKindWire::Service);
+        assert_eq!(projected.kind, PrincipalKind::Service { card_ref });
         assert_eq!(projected.tenant_id, principal.tenant_id);
-        assert_eq!(projected.card_ref, Some(card_ref));
     }
 
     #[test]
@@ -1013,37 +959,22 @@ mod tests {
         assert_eq!(verified.delegation_chain.len(), 2);
         assert_eq!(
             verified.delegation_chain[0].principal.card_ref(),
-            initiator.card_ref.as_ref()
+            initiator.kind.card_ref()
         );
         assert_eq!(
             verified.delegation_chain[1].principal.card_ref(),
-            immediate.card_ref.as_ref()
+            immediate.kind.card_ref()
         );
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn into_verified_rejects_non_user_without_card_ref() {
-        let claims = AccessTokenClaims {
-            principal: TokenPrincipalRef {
-                kind: PrincipalKindWire::Service,
-                card_ref: None,
-                ..user_ref()
-            },
-            ..claims_with_times(now() + 3_600, now())
-        };
-
-        let result = claims.into_verified(&TestResolver::default()).await;
-
-        assert!(matches!(result, Err(AuthError::InvalidCardRef)));
     }
 
     #[tokio::test]
     async fn into_verified_rejects_card_ref_kind_mismatch() {
         let claims = AccessTokenClaims {
             principal: TokenPrincipalRef {
-                kind: PrincipalKindWire::Agent,
-                card_ref: Some(card_ref(CardKind::Service)),
+                kind: PrincipalKind::Agent {
+                    card_ref: card_ref(CardKind::Service),
+                },
                 ..user_ref()
             },
             ..claims_with_times(now() + 3_600, now())
@@ -1059,8 +990,9 @@ mod tests {
         let card_ref = card_ref(CardKind::Agent);
         let claims = AccessTokenClaims {
             principal: TokenPrincipalRef {
-                kind: PrincipalKindWire::Agent,
-                card_ref: Some(card_ref.clone()),
+                kind: PrincipalKind::Agent {
+                    card_ref: card_ref.clone(),
+                },
                 ..user_ref()
             },
             ..claims_with_times(now() + 3_600, now())
@@ -1254,7 +1186,7 @@ mod tests {
             &'a self,
             _tenant: &'a DataTenantId,
             _principal: PrincipalId,
-            _kind: PrincipalKindWire,
+            _kind: PrincipalKindTag,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>>
@@ -1365,9 +1297,8 @@ mod tests {
             sub: principal_id().to_string(),
             principal: TokenPrincipalRef {
                 id: principal_id(),
-                kind: PrincipalKindWire::User,
+                kind: PrincipalKind::User,
                 tenant_id: tenant_id(),
-                card_ref: None,
             },
             roles: vec![role()],
             act: None,
@@ -1424,18 +1355,18 @@ mod tests {
     fn user_ref() -> TokenPrincipalRef {
         TokenPrincipalRef {
             id: principal_id(),
-            kind: PrincipalKindWire::User,
+            kind: PrincipalKind::User,
             tenant_id: tenant_id(),
-            card_ref: None,
         }
     }
 
     fn service_ref(name: &str) -> TokenPrincipalRef {
         TokenPrincipalRef {
             id: principal_id(),
-            kind: PrincipalKindWire::Service,
+            kind: PrincipalKind::Service {
+                card_ref: named_card_ref(CardKind::Service, name),
+            },
             tenant_id: tenant_id(),
-            card_ref: Some(named_card_ref(CardKind::Service, name)),
         }
     }
 

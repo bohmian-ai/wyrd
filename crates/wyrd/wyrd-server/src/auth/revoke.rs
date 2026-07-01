@@ -1,7 +1,7 @@
 //! `POST /v1/principals/{id}/revoke` — bump `tokens_not_before` to now().
 
 use axum::extract::{Path, State};
-use wyrd_auth_verify::PrincipalKindWire;
+use wyrd_auth_verify::PrincipalKindTag;
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
@@ -50,14 +50,14 @@ async fn revoke_in_conn(
     conn: &mut TenantConn<'_>,
     target_id: PrincipalId,
     tenant: DataTenantId,
-) -> Result<PrincipalKindWire, WyrdErrorResponse> {
+) -> Result<PrincipalKindTag, WyrdErrorResponse> {
     let id_uuid = target_id.as_uuid();
 
     if user_by_id(conn, id_uuid).await.ok().flatten().is_some() {
         revoke_user_principal(conn, id_uuid)
             .await
             .map_err(internal_error)?;
-        return Ok(PrincipalKindWire::User);
+        return Ok(PrincipalKindTag::User);
     }
 
     if let Some(row) = service_account_by_id(conn, id_uuid).await.ok().flatten() {
@@ -65,9 +65,9 @@ async fn revoke_in_conn(
             .await
             .map_err(internal_error)?;
         let kind = if row.principal_kind == "agent" {
-            PrincipalKindWire::Agent
+            PrincipalKindTag::Agent
         } else {
-            PrincipalKindWire::Service
+            PrincipalKindTag::Service
         };
         return Ok(kind);
     }
@@ -86,7 +86,7 @@ async fn commit_conn(conn: TenantConn<'_>) -> Result<(), WyrdErrorResponse> {
 async fn fan_out_notify(
     state: &AppState,
     tenant: DataTenantId,
-    kind: PrincipalKindWire,
+    kind: PrincipalKindTag,
     id: PrincipalId,
 ) {
     if let Err(e) = notify_principal_revoked(&state.pool, tenant, kind, id).await {

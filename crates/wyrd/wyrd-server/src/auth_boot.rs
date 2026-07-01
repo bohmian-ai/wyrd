@@ -93,7 +93,7 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use wyrd_auth_verify::{
-        AccessTokenClaims, PrincipalKindWire, TokenPrincipalRef, decode_kid, verify_eddsa,
+        AccessTokenClaims, PrincipalKind, TokenPrincipalRef, decode_kid, verify_eddsa,
     };
     use wyrd_runtime::{PrincipalId, RoleRef};
     use wyrd_spec::DataTenantId;
@@ -109,11 +109,10 @@ mod tests {
             id: "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00"
                 .parse::<PrincipalId>()
                 .expect("static principal id is valid"),
-            kind: PrincipalKindWire::User,
+            kind: PrincipalKind::User,
             tenant_id: "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
                 .parse::<DataTenantId>()
                 .expect("static tenant id is valid"),
-            card_ref: None,
         }
     }
 
@@ -147,7 +146,7 @@ mod tests {
         let claims = verify_eddsa::<AccessTokenClaims>(&token, &decoding, Some(WYRD_ISSUER))
             .expect("minted token verifies against the assembler's derived key and issuer");
 
-        assert_eq!(claims.principal.kind, PrincipalKindWire::User);
+        assert_eq!(claims.principal.kind, PrincipalKind::User);
         assert_eq!(claims.iss, WYRD_ISSUER);
     }
 

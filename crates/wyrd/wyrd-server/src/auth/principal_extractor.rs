@@ -189,9 +189,8 @@ mod tests {
     ) -> String {
         let principal = TokenPrincipalRef {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: wyrd_auth_verify::PrincipalKindWire::User,
+            kind: wyrd_auth_verify::PrincipalKind::User,
             tenant_id: tenant,
-            card_ref: None,
         };
         state
             .issuing_key

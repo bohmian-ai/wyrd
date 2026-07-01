@@ -20,7 +20,7 @@ use wyrd_auth_check::{AuthzCheckRequest, AuthzCheckResponse, PolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_oidc::{JwksCache, TrustedIssuer, TrustedIssuerRegistry};
 use wyrd_auth_verify::{
-    Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
+    Kid, PrincipalKind, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
     public_key_from_pem,
 };
 use wyrd_dev_fixtures::pg::PgFixture;
@@ -375,9 +375,8 @@ impl WyrdTestServer {
 
         let principal = TokenPrincipalRef {
             id: PrincipalId::new(user_id),
-            kind: PrincipalKindWire::User,
+            kind: PrincipalKind::User,
             tenant_id: self.data_tenant_id(),
-            card_ref: None,
         };
         let jwt = self
             .inner

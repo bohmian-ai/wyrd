@@ -20,7 +20,7 @@ use wyrd_sql::queries::auth::{
 };
 
 use crate::auth::exchange_api_key::{
-    ExchangedToken, IssueOrSqlError, TokenExchangeSettings, principal_kind_wire, role_refs,
+    ExchangedToken, IssueOrSqlError, TokenExchangeSettings, principal_kind_tag, role_refs,
     token_hash,
 };
 use crate::error::WyrdErrorResponse;
@@ -256,7 +256,7 @@ impl RefreshTokens {
             _ => return Err(RefreshError::Issue(IssueError::InvalidPrincipalKind)),
         };
 
-        let kind_wire = principal_kind_wire(principal_kind)
+        let kind_wire = principal_kind_tag(principal_kind)
             .ok_or(RefreshError::Issue(IssueError::InvalidPrincipalKind))?;
 
         let refresh_token = self.issuing_key.issue_refresh_token(
@@ -332,7 +332,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use uuid::Uuid;
     use wyrd_auth_issue::IssuingKey;
-    use wyrd_auth_verify::{Kid, PrincipalKindWire};
+    use wyrd_auth_verify::{Kid, PrincipalKindTag};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::PrincipalId;
     use wyrd_semver::VersionBlock;
@@ -382,7 +382,7 @@ mod tests {
 
     fn issue_refresh_jwt(
         key: &IssuingKey,
-        principal_kind: PrincipalKindWire,
+        principal_kind: PrincipalKindTag,
         principal_id: Uuid,
         tenant_id: DataTenantId,
     ) -> SecretString {
@@ -455,7 +455,7 @@ mod tests {
         let user_id = insert_test_user(&mut conn, tenant).await;
         let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
 
-        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindWire::Service, sa_id, tenant);
+        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
         let original_hash = hash_of(&refresh_jwt);
         seed_active_refresh(&mut conn, "service", sa_id, &original_hash).await;
 
@@ -494,7 +494,7 @@ mod tests {
         let user_id = insert_test_user(&mut conn, tenant).await;
         let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
 
-        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindWire::Service, sa_id, tenant);
+        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
         let stale_hash = hash_of(&refresh_jwt);
 
         // Insert the token as already-revoked (simulates a previously rotated token).
@@ -551,7 +551,7 @@ mod tests {
         let user_id = insert_test_user(&mut setup_conn, tenant).await;
         let sa_id = insert_test_service_account(&mut setup_conn, user_id, &card_ref).await;
 
-        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindWire::Service, sa_id, tenant);
+        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
         let original_hash = hash_of(&refresh_jwt);
         seed_active_refresh(&mut setup_conn, "service", sa_id, &original_hash).await;
         setup_conn.commit().await.expect("setup commits");
@@ -601,7 +601,7 @@ mod tests {
 
         // A valid JWT that has never been inserted in the DB.
         let refresh_jwt =
-            issue_refresh_jwt(&key, PrincipalKindWire::Service, Uuid::new_v4(), tenant);
+            issue_refresh_jwt(&key, PrincipalKindTag::Service, Uuid::new_v4(), tenant);
 
         let result = refresh_service()
             .execute(&mut conn, refresh_jwt, "req-not-found")
@@ -621,7 +621,7 @@ mod tests {
         let user_id = insert_test_user(&mut conn, tenant).await;
         let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
 
-        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindWire::Service, sa_id, tenant);
+        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
         let hash = hash_of(&refresh_jwt);
 
         // Insert with expires_at in the past and no revoked_at.
@@ -664,7 +664,7 @@ mod tests {
         let user_id = insert_test_user(&mut conn, tenant).await;
         let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
 
-        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindWire::Service, sa_id, tenant);
+        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
         let hash = hash_of(&refresh_jwt);
         seed_active_refresh(&mut conn, "service", sa_id, &hash).await;
 
@@ -696,7 +696,7 @@ mod tests {
         let principal_id = Uuid::new_v4();
         let jwt = key
             .issue_refresh_token(
-                PrincipalKindWire::Service,
+                PrincipalKindTag::Service,
                 PrincipalId::new(principal_id),
                 tenant_id,
                 Duration::days(30),
@@ -707,7 +707,7 @@ mod tests {
 
         assert_eq!(claims.tenant_id, tenant_id);
         assert_eq!(claims.principal_id.as_uuid(), principal_id);
-        assert_eq!(claims.principal_kind, PrincipalKindWire::Service);
+        assert_eq!(claims.principal_kind, PrincipalKindTag::Service);
     }
 
     #[test]
@@ -724,7 +724,7 @@ mod tests {
             .expect("static tenant id");
         let jwt = key
             .issue_refresh_token(
-                PrincipalKindWire::Service,
+                PrincipalKindTag::Service,
                 PrincipalId::new(Uuid::new_v4()),
                 tenant_id,
                 Duration::days(30),

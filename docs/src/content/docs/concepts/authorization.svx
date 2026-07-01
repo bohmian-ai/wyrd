@@ -1,0 +1,102 @@
+---
+title: Authorization
+description: How Wyrd resolves permissions from token role claims and how the PolicyHook authz extension gates the /v1/authz/check endpoint.
+pillar: wyrd
+group: Concepts
+order: 7
+---
+
+# Authorization
+
+Wyrd has two authorization layers: RBAC resolves what a principal's roles
+permit, and the `PolicyHook` extension gates the `/v1/authz/check` endpoint for
+agent delegation. Both layers run on every authz-check request, in that order.
+
+## RBAC
+
+A `Permission` is `resource:action`. Roles carry a JSONB set of permissions;
+role claims are embedded in the token at issuance and resolved against the
+database at verify time.
+
+The resolution path:
+1. Token carries a list of role names in its claims.
+2. On verify, `SqlPermissionResolver.roles_by_name` fetches the permission sets
+   for those role names from the tenant's role table.
+3. `effective_permissions` merges the sets. Wildcard (`resource:*`) and
+   `AnyOf` subsumption are applied — a role with `cards:*` subsumes `cards:read`,
+   `cards:write`, etc.
+
+<DataTable
+  columns={[
+    { header: 'Built-in role', role: 'name' },
+    { header: 'Key permissions' }
+  ]}
+  rows={[
+    ['admin', 'All resources and actions (*)'],
+    ['writer', 'cards:write, cards:read, service_accounts:write'],
+    ['reader', 'cards:read'],
+    ['agent', 'cards:read, observations:write, evals:write'],
+    ['runtime_admin', 'service_accounts:write, delegation:issue']
+  ]}
+/>
+
+Built-in roles are seeded per tenant at tenant creation. Custom roles can be
+added via the admin API.
+
+## Two "kind" concepts
+
+Two distinct "kind" fields appear in auth that are easy to confuse:
+
+<DataTable
+  columns={[
+    { header: 'Field', role: 'name' },
+    { header: 'Type' },
+    { header: 'What it means' }
+  ]}
+  rows={[
+    ['PrincipalKind', 'User | Service { card_ref } | Agent { card_ref }', 'The identity of the token holder — who is acting.'],
+    ['PrincipalKindPolicy', 'Human | Workload', 'Per-issuer config — whether an OIDC issuer is for human login or machine workloads.']
+  ]}
+/>
+
+`PrincipalKind` is encoded in the token and resolved on every verify.
+`PrincipalKindPolicy` is checked once during token issuance to ensure a
+workload assertion is not used for human login and vice versa.
+
+## Authz extension (PolicyHook)
+
+The `PolicyHook` trait is the policy-plane seam. It lets an operator or
+embedding application plug in custom policy evaluation before Wyrd's built-in
+RBAC runs.
+
+`POST /v1/authz/check` is the endpoint. Only **delegated** tokens reach it —
+tokens issued via `token-exchange` that carry a non-empty `act` (delegation)
+chain. Direct Service or User tokens are rejected with a `403`.
+
+The evaluation order:
+
+1. Server verifies the token and checks it is a delegated Service or Agent
+   token.
+2. Server builds an `AuthzCheckContext` from the verified token, request body,
+   and delegation chain.
+3. **`policy_hook.evaluate()`** runs first. The hook returns `Allow`,
+   `Deny(reason)`, or `Abstain` (pass to next layer).
+4. If the hook allows (or abstains), RBAC `permission_check` runs second,
+   checking the token's `effective_permissions` against the requested
+   `resource:action`.
+5. Both layers must pass. A `Deny` at either layer returns `403`.
+
+<Aside title="Production requirement">
+
+`StubAllowPolicyHook` is the default implementation — it allows everything.
+Wyrd refuses to boot in production with the stub in place
+(`StubAllowInProduction` error). You must provide a real `PolicyHook`
+implementation before deploying.
+
+</Aside>
+
+## Related
+
+- [Authentication](/concepts/authentication/) — how tokens are issued.
+- [Cloud identity](/concepts/cloud-identity/) — trusted issuers and workload
+  bindings that feed into authentication.

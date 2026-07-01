@@ -100,6 +100,10 @@ impl PgFixture {
 
     /// Seed an additional active tenant row and return its isolation key.
     ///
+    /// **Test-only fixture — never runs on a real server boot.** This method is
+    /// only available behind the `pg` feature, which is a dev-dependency of
+    /// `wyrd-server` and is never compiled into a production binary.
+    ///
     /// The fixture seeds one tenant at boot; multi-tenant isolation tests call
     /// this to provision a second tenant so two distinct [`TenantConn`] handles
     /// can prove RLS scoping. The row is written through the

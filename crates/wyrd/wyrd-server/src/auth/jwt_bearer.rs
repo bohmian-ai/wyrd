@@ -6,6 +6,8 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use uuid::Uuid;
 use wyrd_auth_oidc::{PrincipalKindPolicy, WorkloadBindingResolver};
+use wyrd_auth_verify::VerifiedExternalIdentity;
+use wyrd_runtime::RoleRef;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::error::WyrdError;
@@ -13,7 +15,8 @@ use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::reference::CardRef;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    insert_audit_token_exchange, list_service_account_roles, service_account_by_card_ref,
+    ServiceAccountPrincipalRow, insert_audit_token_exchange, list_service_account_roles,
+    service_account_by_card_ref,
 };
 
 use crate::auth::exchange_api_key::{
@@ -45,91 +48,17 @@ impl JwtBearer {
         let tenant_id = resolve_workload_tenant(state, headers, tenant).await?;
         let mut audit_principal_id = Uuid::nil();
         let result = async {
-            let verifier = state
-                .token_verifier
-                .as_ref()
-                .ok_or_else(auth_not_configured)?;
-            let verified = verifier
-                .verify_external(&tenant_id, assertion.expose_secret())
-                .await
-                .map_err(WyrdErrorResponse::from)?;
-            if verified.principal_kind != PrincipalKindPolicy::Workload {
-                return Err(invalid_token(
-                    "issuer is not configured for workload identity",
-                ));
-            }
-            let binding_resolver = state
-                .workload_binding_resolver
-                .as_ref()
-                .ok_or_else(auth_not_configured)?;
-            let card_ref = binding_resolver
-                .binding(
-                    &tenant_id,
-                    &verified.issuer,
-                    &verified.subject,
-                    Some(verified.expected_audience.as_str()),
-                )
-                .await
-                .map_err(|error| {
-                    tracing::warn!(
-                        error = %error,
-                        tenant_id = %tenant_id,
-                        issuer = %verified.issuer,
-                        subject = %verified.subject,
-                        "workload binding lookup failed"
-                    );
-                    WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
-                        message: "workload binding lookup unavailable".to_owned(),
-                        details: json!({ "retry_after_seconds": 1 }),
-                    })
-                })?
-                .ok_or_else(|| principal_not_found(&verified.subject, &verified.issuer))?;
-            let principal_kind = principal_kind_for_card(&card_ref)
-                .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
-
+            let verified =
+                verify_workload_assertion(state, tenant_id, assertion.expose_secret()).await?;
+            let card_ref = resolve_workload_binding(state, tenant_id, &verified).await?;
             let mut conn = TenantConn::acquire(&state.pool, tenant_id)
                 .await
                 .map_err(sql_error)?;
-            let row = service_account_by_card_ref(&mut conn, principal_kind, &card_ref)
-                .await
-                .map_err(sql_error)?
-                .ok_or_else(|| principal_not_found_for_card_ref(&card_ref))?;
+            let (row, roles) = load_service_account_subject(&mut conn, &card_ref).await?;
             audit_principal_id = row.id;
-
-            let roles = role_refs(
-                list_service_account_roles(&mut conn, row.id)
-                    .await
-                    .map_err(sql_error)?,
-            )
-            .map_err(|_| internal_error("failed to issue workload token"))?;
-            let issuing_key = state.issuing_key.as_ref().ok_or_else(auth_not_configured)?;
-            let exchanged = issue_for_subject(
-                &mut conn,
-                issuing_key,
-                &self.settings,
-                IssueSubject {
-                    principal_id: row.id,
-                    principal_kind: row.principal_kind.clone(),
-                    card_ref: row.card_ref.0.clone(),
-                    roles,
-                },
-                RefreshPolicy::Skip,
-            )
-            .await
-            .map_err(|error| workload_exchange_error(ExchangeError::from(error)))?;
-            insert_audit_token_exchange(
-                &mut conn,
-                Uuid::new_v4(),
-                row.id,
-                row.id,
-                json!([]),
-                request_id,
-                Utc::now() + self.settings.access_ttl,
-            )
-            .await
-            .map_err(sql_error)?;
+            let exchanged =
+                issue_and_audit(&mut conn, state, &self.settings, &row, roles, request_id).await?;
             conn.commit().await.map_err(sql_error)?;
-
             Ok(exchanged)
         }
         .await;
@@ -143,6 +72,116 @@ impl JwtBearer {
             }
         }
     }
+}
+
+async fn verify_workload_assertion(
+    state: &AppState,
+    tenant_id: DataTenantId,
+    assertion: &str,
+) -> Result<VerifiedExternalIdentity, WyrdErrorResponse> {
+    let verifier = state
+        .token_verifier
+        .as_ref()
+        .ok_or_else(auth_not_configured)?;
+    let verified = verifier
+        .verify_external(&tenant_id, assertion)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
+    if verified.principal_kind != PrincipalKindPolicy::Workload {
+        return Err(invalid_token(
+            "issuer is not configured for workload identity",
+        ));
+    }
+    Ok(verified)
+}
+
+async fn resolve_workload_binding(
+    state: &AppState,
+    tenant_id: DataTenantId,
+    verified: &VerifiedExternalIdentity,
+) -> Result<CardRef, WyrdErrorResponse> {
+    let binding_resolver = state
+        .workload_binding_resolver
+        .as_ref()
+        .ok_or_else(auth_not_configured)?;
+    binding_resolver
+        .binding(
+            &tenant_id,
+            &verified.issuer,
+            &verified.subject,
+            Some(verified.expected_audience.as_str()),
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                error = %error,
+                tenant_id = %tenant_id,
+                issuer = %verified.issuer,
+                subject = %verified.subject,
+                "workload binding lookup failed"
+            );
+            WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
+                message: "workload binding lookup unavailable".to_owned(),
+                details: json!({ "retry_after_seconds": 1 }),
+            })
+        })?
+        .ok_or_else(|| principal_not_found(&verified.subject, &verified.issuer))
+}
+
+async fn load_service_account_subject(
+    conn: &mut TenantConn<'_>,
+    card_ref: &CardRef,
+) -> Result<(ServiceAccountPrincipalRow, Vec<RoleRef>), WyrdErrorResponse> {
+    let principal_kind = principal_kind_for_card(card_ref)
+        .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
+    let row = service_account_by_card_ref(conn, principal_kind, card_ref)
+        .await
+        .map_err(sql_error)?
+        .ok_or_else(|| principal_not_found_for_card_ref(card_ref))?;
+    let roles = role_refs(
+        list_service_account_roles(conn, row.id)
+            .await
+            .map_err(sql_error)?,
+    )
+    .map_err(|_| internal_error("failed to issue workload token"))?;
+    Ok((row, roles))
+}
+
+async fn issue_and_audit(
+    conn: &mut TenantConn<'_>,
+    state: &AppState,
+    settings: &TokenExchangeSettings,
+    row: &ServiceAccountPrincipalRow,
+    roles: Vec<RoleRef>,
+    request_id: &str,
+) -> Result<ExchangedToken, WyrdErrorResponse> {
+    let issuing_key = state.issuing_key.as_ref().ok_or_else(auth_not_configured)?;
+    let exchanged = issue_for_subject(
+        conn,
+        issuing_key,
+        settings,
+        IssueSubject {
+            principal_id: row.id,
+            principal_kind: row.principal_kind.clone(),
+            card_ref: row.card_ref.0.clone(),
+            roles,
+        },
+        RefreshPolicy::Skip,
+    )
+    .await
+    .map_err(|error| workload_exchange_error(ExchangeError::from(error)))?;
+    insert_audit_token_exchange(
+        conn,
+        Uuid::new_v4(),
+        row.id,
+        row.id,
+        json!([]),
+        request_id,
+        Utc::now() + settings.access_ttl,
+    )
+    .await
+    .map_err(sql_error)?;
+    Ok(exchanged)
 }
 
 fn workload_exchange_error(

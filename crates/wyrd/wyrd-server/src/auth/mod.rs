@@ -35,9 +35,12 @@ use wyrd_spec::error::WyrdError;
 
 /// Resolve the tenant's trusted issuer matching `issuer`, failing closed.
 ///
-/// Single owner of the "is this issuer trusted for this tenant" decision shared
-/// by the human login, OIDC callback, and workload jwt-bearer paths. Consolidating
-/// it keeps the fail-closed error mapping from drifting across those entry points.
+/// Single owner of the "is this issuer trusted for this tenant" decision used
+/// by the human login and OIDC callback paths. The workload jwt-bearer path does
+/// **not** call this fn — it drives its own `verify_external` call and then resolves
+/// the workload binding directly via `WorkloadBindingResolver`; it never needs a
+/// `TrustedIssuer` domain value. Consolidating the login/callback decision here
+/// keeps the fail-closed error mapping from drifting across those entry points.
 ///
 /// # Errors
 /// - [`WyrdError::Internal`] when no issuer resolver is configured (server

@@ -107,6 +107,9 @@ fn request_client_auth(
     }
 }
 
+/// Extract a non-empty `client_secret` from the create request, or fail with a
+/// `400` [`WyrdError::MissingRequiredField`]. Called only for the secret-bearing
+/// client-auth variants (`SecretBasic`/`SecretPost`).
 fn required_secret(
     request: &CreateTrustedIssuerRequest,
 ) -> Result<SecretString, WyrdErrorResponse> {
@@ -203,6 +206,14 @@ struct BindingFilter {
 // Handlers — trusted issuers
 // --------------------------------------------------------------------------
 
+/// `POST /v1/admin/trusted-issuers` — register a trusted OIDC issuer for the
+/// caller's tenant.
+///
+/// Gated on `service_accounts:write`. Resolves OIDC discovery once to fill
+/// `jwks_uri`, encrypts any client secret with the process sealing key before
+/// insert (fails closed if a secret is supplied without a key), and writes
+/// through the RLS `TenantConn`. Returns the redacted [`TrustedIssuerView`]
+/// (never the secret).
 async fn create_trusted_issuer(
     State(state): State<AppState>,
     caller: AuthenticatedPrincipal,
@@ -244,6 +255,9 @@ async fn create_trusted_issuer(
     Ok(Json(trusted_issuer_view_from_write(&write)))
 }
 
+/// `GET /v1/admin/trusted-issuers` — list the caller tenant's trusted issuers as
+/// redacted [`TrustedIssuerView`]s. Gated on `service_accounts:write`; no
+/// discovery or secret ever leaves the store.
 async fn list_trusted_issuers(
     State(state): State<AppState>,
     caller: AuthenticatedPrincipal,
@@ -260,6 +274,12 @@ async fn list_trusted_issuers(
     Ok(Json(views))
 }
 
+/// `DELETE /v1/admin/trusted-issuers?issuer=&cascade=` — remove one issuer.
+///
+/// Gated on `service_accounts:write`. With `cascade=true` the referencing
+/// workload bindings are deleted first so the FK `ON DELETE RESTRICT` does not
+/// block the issuer delete; without it, a live binding fails the delete closed
+/// (`409`). A missing issuer is a `404`. Returns `204 No Content`.
 async fn delete_trusted_issuer_route(
     State(state): State<AppState>,
     caller: AuthenticatedPrincipal,
@@ -294,6 +314,12 @@ async fn delete_trusted_issuer_route(
 // Handlers — workload bindings
 // --------------------------------------------------------------------------
 
+/// `POST /v1/admin/workload-bindings` — bind a workload identity
+/// `(issuer, subject, audience)` to a server-owned `CardRef`.
+///
+/// Gated on `service_accounts:write`. The referenced issuer must already be
+/// registered in this tenant; an FK violation maps to a `404` (create the issuer
+/// first), a duplicate binding to a `409`. Writes through the RLS `TenantConn`.
 async fn create_workload_binding(
     State(state): State<AppState>,
     caller: AuthenticatedPrincipal,
@@ -319,6 +345,10 @@ async fn create_workload_binding(
     Ok(Json(workload_binding_view_from_write(&write)))
 }
 
+/// `GET /v1/admin/workload-bindings?issuer=&subject=` — list the caller tenant's
+/// workload bindings, optionally filtered by exact issuer and/or subject. Gated
+/// on `service_accounts:write`. The issuer filter is normalized to the stored
+/// form so a trailing slash does not silently miss.
 async fn list_workload_bindings(
     State(state): State<AppState>,
     caller: AuthenticatedPrincipal,
@@ -343,6 +373,9 @@ async fn list_workload_bindings(
     Ok(Json(views))
 }
 
+/// `DELETE /v1/admin/workload-bindings?issuer=&subject=` — remove one binding
+/// addressed by `(issuer, subject)`. Gated on `service_accounts:write`. A missing
+/// binding is a `404`. Returns `204 No Content`.
 async fn delete_workload_binding_route(
     State(state): State<AppState>,
     caller: AuthenticatedPrincipal,
@@ -367,6 +400,9 @@ async fn delete_workload_binding_route(
 // Shared helpers
 // --------------------------------------------------------------------------
 
+/// Acquire an RLS [`TenantConn`] scoped to the caller's tenant, mapping an
+/// acquisition failure to a `503`. Every admin handler mutates/reads through this
+/// so Postgres row-level security is the load-bearing tenant boundary.
 async fn acquire_conn<'a>(
     state: &'a AppState,
     caller: &AuthenticatedPrincipal,
@@ -455,6 +491,9 @@ fn map_binding_write_error(error: sqlx::Error, issuer: &IssuerUrl) -> WyrdErrorR
     }
 }
 
+/// Map a client-secret sealing failure to an admin response. A missing sealing
+/// key is a fail-closed `503` (never persist plaintext); an encrypt/serialize
+/// failure is a `500`.
 fn seal_error(error: crate::auth::pg_resolvers::IssuerSealError) -> WyrdErrorResponse {
     use crate::auth::pg_resolvers::IssuerSealError;
     match error {
@@ -470,6 +509,7 @@ fn seal_error(error: crate::auth::pg_resolvers::IssuerSealError) -> WyrdErrorRes
     }
 }
 
+/// `404` for a delete that matched no issuer in the caller's tenant.
 fn issuer_not_found(issuer: &str) -> WyrdErrorResponse {
     WyrdErrorResponse::from(WyrdError::AdminNotFound {
         message: format!("trusted issuer {issuer} not found in tenant"),
@@ -477,6 +517,8 @@ fn issuer_not_found(issuer: &str) -> WyrdErrorResponse {
     })
 }
 
+/// `404` for a delete that matched no binding for `(issuer, subject)` in the
+/// caller's tenant.
 fn binding_not_found(issuer: &str, subject: &str) -> WyrdErrorResponse {
     WyrdErrorResponse::from(WyrdError::AdminNotFound {
         message: format!(
@@ -486,6 +528,8 @@ fn binding_not_found(issuer: &str, subject: &str) -> WyrdErrorResponse {
     })
 }
 
+/// Map any backing-store failure to a fail-closed `503` and log the cause. Admin
+/// paths never surface the raw SQL error to the client.
 fn sql_unavailable(error: impl std::fmt::Display) -> WyrdErrorResponse {
     tracing::warn!(error = %error, "admin db unavailable");
     WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
@@ -494,6 +538,8 @@ fn sql_unavailable(error: impl std::fmt::Display) -> WyrdErrorResponse {
     })
 }
 
+/// Map an unexpected server-side failure (serialization, encryption internals)
+/// to a `500`.
 fn internal_error(error: impl std::fmt::Display) -> WyrdErrorResponse {
     WyrdErrorResponse::from(WyrdError::Internal {
         message: error.to_string(),

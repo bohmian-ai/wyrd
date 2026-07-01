@@ -1,0 +1,155 @@
+---
+title: Cloud identity
+description: Trusted OIDC issuers and workload bindings — setup, admin CRUD, TOML seeding, and the sealing key.
+pillar: wyrd
+group: Concepts
+order: 8
+---
+
+# Cloud identity
+
+Cloud identity lets machine workloads — Kubernetes service accounts, SPIFFE
+JWTs, GCP Workload Identity, GitHub Actions — authenticate to Wyrd without a
+stored secret. The server holds two kinds of data:
+
+- **Trusted issuers** — OIDC issuers whose JWTs Wyrd will verify. Each issuer
+  is scoped to one tenant and carries a `principal_kind` of `Workload` (for
+  machines) or `Human` (for human OIDC login).
+- **Workload bindings** — server-owned mappings from
+  `(issuer, subject, audience) → CardRef`. The binding tells Wyrd which
+  Service or Agent principal a given workload assertion represents.
+
+## Admin CRUD
+
+Both resources have REST CRUD routes under `/v1/admin/`. All routes require a
+token with the `service_accounts:write` permission and apply tenant isolation
+via RLS.
+
+<DataTable
+  columns={[
+    { header: 'Route', role: 'name' },
+    { header: 'Method' },
+    { header: 'Action' }
+  ]}
+  rows={[
+    ['/v1/admin/trusted-issuers', 'POST', 'Register a new trusted issuer. OIDC discovery runs at create time to populate jwks_uri.'],
+    ['/v1/admin/trusted-issuers', 'GET', 'List trusted issuers (client secrets are redacted in responses).'],
+    ['/v1/admin/trusted-issuers', 'DELETE', 'Remove a trusted issuer. ?cascade=true also removes its workload bindings.'],
+    ['/v1/admin/workload-bindings', 'POST', 'Bind (issuer, subject, audience) to a CardRef.'],
+    ['/v1/admin/workload-bindings', 'GET', 'List bindings, optionally filtered by ?issuer= and ?subject=.'],
+    ['/v1/admin/workload-bindings', 'DELETE', 'Remove a binding by (issuer, subject).']
+  ]}
+/>
+
+## TOML seed config (self-hosted)
+
+Self-hosted deployments can seed trusted issuers and workload bindings at boot
+via TOML instead of the admin API. These entries are applied once on startup
+and do not replace entries created via the API.
+
+```toml
+[[trusted_issuers]]
+issuer    = "https://token.actions.githubusercontent.com"
+client_id = "wyrd-staging"
+audience  = "wyrd-staging"
+principal_kind = "workload"
+
+[trusted_issuers.claim_mapping]
+subject = "sub"
+
+[[workload_bindings]]
+issuer   = "https://token.actions.githubusercontent.com"
+subject  = "repo:acme/deploy:ref:refs/heads/main"
+audience = "wyrd-staging"
+card_ref = { kind = "service", name = "deploy-svc", version = "1.0.0", space = "prod" }
+```
+
+Issuer fields:
+
+<DataTable
+  columns={[
+    { header: 'Field', role: 'name' },
+    { header: 'Required' },
+    { header: 'Description' }
+  ]}
+  rows={[
+    ['issuer', 'Yes', 'OIDC issuer URL. Must match the iss claim in tokens.'],
+    ['client_id', 'Yes', 'OAuth2 client id used when calling the IdP token endpoint.'],
+    ['audience', 'Yes', 'Expected aud claim in tokens from this issuer.'],
+    ['principal_kind', 'Yes', '"workload" or "human".'],
+    ['claim_mapping.subject', 'Yes', 'JWT claim path for the subject identity (typically "sub").'],
+    ['claim_mapping.email', 'No', 'JWT claim path for email (human issuers only).'],
+    ['claim_mapping.groups', 'No', 'JWT claim path for group membership (human issuers only).'],
+    ['client_secret', 'No', 'Client secret for the IdP token endpoint. Encrypted at rest with the sealing key.'],
+    ['group_role_map', 'No', 'Map from group name to list of Wyrd role names (human issuers only).']
+  ]}
+/>
+
+## Sealing key
+
+OIDC client secrets are encrypted at rest using AES-256-GCM. The server never
+stores a plaintext client secret in a column.
+
+Set one of these environment variables before boot:
+
+- `WYRD_SEALING_KEY_FILE` — path to a file containing a base64-encoded 32-byte
+  key (primary, recommended for Kubernetes secret mounts).
+- `WYRD_SEALING_KEY_BASE64` — inline base64-encoded 32-byte key (fallback).
+
+Generate a key:
+
+```bash
+openssl rand -base64 32
+```
+
+The server fails closed: if any seeded issuer carries a `client_secret` and no
+sealing key is configured, boot aborts with `ServerBootError::SealingKey`.
+Issuers that use `PrivateKeyJwt` client authentication (no secret) do not
+require the sealing key.
+
+<Aside title="Single-key limitation" type="caution">
+
+The current implementation uses one static process-wide key with no key-id
+column. Live rotation without downtime is not yet supported.
+
+**If the key leaks:**
+
+1. Rotate the client secret at each affected IdP.
+2. Re-register the issuers via `POST /v1/admin/trusted-issuers` with the new
+   secrets (this re-seals them under the current key).
+3. Replace `WYRD_SEALING_KEY_FILE` / `WYRD_SEALING_KEY_BASE64` with a new
+   32-byte key and restart. Existing `client_secret_enc` rows now encrypt the
+   old (already-rotated) secrets and are harmless.
+
+Key-id versioning, keyring support, KMS-backed key-encryption keys, and AAD
+binding are tracked in [issue #72](https://github.com/mitari-ai/wyrd/issues/72).
+
+</Aside>
+
+## Workload identity setup
+
+To authenticate a Kubernetes service account to Wyrd:
+
+1. Register the cluster's OIDC issuer as a trusted issuer
+   (`principal_kind = "workload"`, `audience = <your-audience>`).
+2. Create a workload binding: map the service account's `sub` claim
+   (e.g. `system:serviceaccount:default:my-svc`) and your audience to the
+   `CardRef` of the Service principal in Wyrd.
+3. Mount the projected service account token into the pod
+   (`audience: <your-audience>`).
+4. The workload calls `POST /auth/token` with
+   `grant_type: urn:ietf:params:oauth:grant-type:jwt-bearer` and the projected
+   token as the `assertion`.
+5. Wyrd verifies the token, resolves the binding, loads the principal and its
+   roles, and returns an access token. No secret is stored in the pod.
+
+The same pattern works for GCP Workload Identity, GitHub Actions OIDC, and any
+platform that issues OIDC JWTs — register the platform's issuer URL and bind
+its subject claims to Wyrd card refs.
+
+## Related
+
+- [Authentication](/concepts/authentication/) — the full workload jwt-bearer
+  token exchange flow.
+- [Authorization](/concepts/authorization/) — how roles resolve from the token
+  after authentication.

@@ -301,6 +301,11 @@ pub async fn build_app_state_from_config(
 /// Returns `Ok(None)` when no sealing key is configured. Boot fails closed with
 /// [`ServerBootError::SealingKey`] when the key is set but is not valid base64
 /// or does not decode to exactly 32 bytes.
+///
+/// **Single-key model:** this function produces one static process-wide key. There
+/// is no key-id column, no keyring, and no live rotation path. See `config.rs`
+/// `AuthConfig::sealing_key` for the manual rotation runbook. Key-id versioning,
+/// keyring support, KMS-backed KEK, and AAD binding are tracked in issue #72.
 fn build_sealing_key(
     config: &crate::config::WyrdServerConfig,
 ) -> Result<Option<Arc<SecretKey>>, ServerBootError> {

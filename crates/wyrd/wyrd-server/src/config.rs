@@ -289,6 +289,13 @@ pub struct AuthConfig {
     /// `WYRD_SEALING_KEY_BASE64` (inline base64; fallback). Boot decodes this to
     /// a 32-byte key. `None` when unset; boot fails closed if any seeded issuer
     /// carries a client secret without a sealing key configured.
+    ///
+    /// **Single-key limitation:** there is currently no key-id column or keyring.
+    /// All rows are encrypted under this one key; live rotation without downtime
+    /// is not yet supported. If the key leaks: (1) rotate the client secrets at
+    /// the IdP, (2) re-register the issuers with the new secrets, (3) rotate this
+    /// env var. The existing `client_secret_enc` rows then encrypt stale secrets
+    /// and are harmless. Tracked in issue #72.
     #[serde(skip)]
     pub sealing_key: Option<SecretString>,
 }

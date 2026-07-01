@@ -3,6 +3,7 @@
 pub mod audit_writer;
 pub mod callback;
 pub mod caller_extractor;
+pub mod card_scope;
 pub mod exchange_api_key;
 pub mod issue_api_key;
 pub mod jwt_bearer;

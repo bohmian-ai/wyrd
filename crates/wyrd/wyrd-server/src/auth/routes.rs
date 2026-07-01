@@ -311,6 +311,7 @@ mod tests {
                 tenant_id,
             },
             roles: vec![],
+            card_scope: wyrd_runtime::CardScope::default(),
             act: None,
             exp: 9_999_999_999,
             iat: 0,
@@ -371,6 +372,7 @@ mod tests {
                 tenant_id: tenant,
                 roles: Vec::new(),
                 effective_permissions: permissions,
+                card_scope: wyrd_runtime::CardScope::default(),
             },
         }
     }

@@ -1,5 +1,6 @@
 //! Authentication request and response contracts.
 
+mod card_scope;
 mod issue_key;
 mod oidc;
 mod principal_id;
@@ -8,6 +9,7 @@ mod revoke;
 mod secret_bearer;
 mod token;
 
+pub use card_scope::CardScope;
 pub use issue_key::{IssueKeyRequest, IssueKeyResponse};
 pub use oidc::{AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, UrlParseError};
 pub use principal_id::PrincipalId;

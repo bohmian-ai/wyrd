@@ -19,7 +19,7 @@ pub mod request_id;
 pub use permission::{Action, Permission, PermissionSet, Resource};
 pub use permission_check::{PermissionCheck, PermissionDenyReason, PermissionVerdict, RbacCheck};
 pub use principal::{
-    InvalidRoleName, Principal, PrincipalId, PrincipalKind, PrincipalRef, RoleRef,
+    CardScope, InvalidRoleName, Principal, PrincipalId, PrincipalKind, PrincipalRef, RoleRef,
 };
 pub use request_context::{DelegationStep, RequestContext, TraceParent};
 

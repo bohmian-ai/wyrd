@@ -160,5 +160,6 @@ fn bootstrap_operator_principal(data_tenant_id: DataTenantId) -> Principal {
         data_tenant_id,
         Vec::new(),
         PermissionSet::new(),
+        wyrd_runtime::CardScope::default(),
     )
 }

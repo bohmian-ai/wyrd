@@ -19,6 +19,7 @@ use wyrd_auth_verify::{
 };
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::CardScope;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::reference::CardRef;
 
@@ -190,7 +191,14 @@ impl IssuingKey {
             return Err(IssueError::InvalidPrincipalKind);
         }
         validate_principal_ref(&principal)?;
-        self.issue_access_token_with_claims(principal.id.to_string(), principal, roles, None, ttl)
+        self.issue_access_token_with_claims(
+            principal.id.to_string(),
+            principal,
+            roles,
+            CardScope::default(),
+            None,
+            ttl,
+        )
     }
 
     /// Mint an access token for a Service principal.
@@ -214,6 +222,7 @@ impl IssuingKey {
         tenant_id: DataTenantId,
         card_ref: CardRef,
         roles: Vec<RoleRef>,
+        card_scope: CardScope,
         ttl: Duration,
     ) -> Result<String, IssueError> {
         if card_ref.kind != CardKind::Service {
@@ -224,7 +233,7 @@ impl IssuingKey {
             kind: PrincipalKind::Service { card_ref },
             tenant_id,
         };
-        self.issue_access_token_with_claims(sa_id.to_string(), principal, roles, None, ttl)
+        self.issue_access_token_with_claims(sa_id.to_string(), principal, roles, card_scope, None, ttl)
     }
 
     /// Mint an access token for an Agent principal.
@@ -248,6 +257,7 @@ impl IssuingKey {
         tenant_id: DataTenantId,
         card_ref: CardRef,
         roles: Vec<RoleRef>,
+        card_scope: CardScope,
         ttl: Duration,
     ) -> Result<String, IssueError> {
         if card_ref.kind != CardKind::Agent {
@@ -258,7 +268,7 @@ impl IssuingKey {
             kind: PrincipalKind::Agent { card_ref },
             tenant_id,
         };
-        self.issue_access_token_with_claims(agent_id.to_string(), principal, roles, None, ttl)
+        self.issue_access_token_with_claims(agent_id.to_string(), principal, roles, card_scope, None, ttl)
     }
 
     /// Mint a delegated access token via RFC 8693 token exchange.
@@ -282,6 +292,7 @@ impl IssuingKey {
         caller: &DelegationCaller,
         requested_subject: TokenPrincipalRef,
         requested_roles: Vec<RoleRef>,
+        card_scope: CardScope,
         ttl: Duration,
     ) -> Result<String, IssueError> {
         validate_principal_ref(&requested_subject)?;
@@ -303,6 +314,7 @@ impl IssuingKey {
             caller.sub.clone(),
             requested_subject,
             requested_roles,
+            card_scope,
             act,
             ttl,
         )
@@ -352,6 +364,7 @@ impl IssuingKey {
         sub: String,
         principal: TokenPrincipalRef,
         roles: Vec<RoleRef>,
+        card_scope: CardScope,
         act: Option<Box<ActClaim>>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
@@ -362,6 +375,7 @@ impl IssuingKey {
             sub,
             principal,
             roles,
+            card_scope,
             act,
             exp,
             iat,
@@ -458,6 +472,7 @@ mod tests {
     use wyrd_runtime::{PrincipalId, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::CardScope;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
@@ -501,6 +516,7 @@ mod tests {
                 tenant_id(),
                 card_ref.clone(),
                 vec![role("service")],
+                CardScope::default(),
                 Duration::minutes(5),
             )
             .expect("token issues");
@@ -511,12 +527,53 @@ mod tests {
     }
 
     #[test]
+    fn issue_service_access_token_embeds_card_scope_claim() {
+        let card_ref = card_ref(CardKind::Service);
+        let component = {
+            let mut other = card_ref.clone();
+            other.name = CardName::new("shipping").expect("static name is valid");
+            other
+        };
+        let scope = CardScope::new([card_ref.clone(), component.clone()]);
+        let token = issuing_key()
+            .issue_service_access_token(
+                principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02"),
+                tenant_id(),
+                card_ref.clone(),
+                vec![role("service")],
+                scope.clone(),
+                Duration::minutes(5),
+            )
+            .expect("token issues");
+        let claims = verify_access_token(&token);
+
+        assert_eq!(claims.card_scope, scope);
+        assert!(claims.card_scope.contains(&card_ref));
+        assert!(claims.card_scope.contains(&component));
+    }
+
+    #[test]
+    fn issue_user_access_token_carries_empty_card_scope() {
+        let token = issuing_key()
+            .issue_user_access_token(
+                user_principal(),
+                vec![role("runtime_admin")],
+                Duration::minutes(5),
+            )
+            .expect("token issues");
+        let claims = verify_access_token(&token);
+
+        assert!(claims.card_scope.is_empty());
+    }
+
+    #[test]
     fn issue_service_access_token_rejects_agent_card_ref() {
         let result = issuing_key().issue_service_access_token(
             principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02"),
             tenant_id(),
             card_ref(CardKind::Agent),
             vec![role("service")],
+            CardScope::default(),
             Duration::minutes(5),
         );
 
@@ -532,6 +589,7 @@ mod tests {
                 tenant_id(),
                 card_ref.clone(),
                 vec![role("agent")],
+                CardScope::default(),
                 Duration::minutes(5),
             )
             .expect("token issues");
@@ -548,6 +606,7 @@ mod tests {
             tenant_id(),
             card_ref(CardKind::Service),
             vec![role("agent")],
+            CardScope::default(),
             Duration::minutes(5),
         );
 
@@ -628,6 +687,7 @@ mod tests {
                 &caller,
                 agent_principal(),
                 vec![role("agent")],
+                CardScope::default(),
                 Duration::minutes(5),
             )
             .expect("delegated token issues");
@@ -659,6 +719,7 @@ mod tests {
             &caller,
             agent_principal(),
             vec![role("agent")],
+            CardScope::default(),
             Duration::minutes(5),
         );
 
@@ -682,6 +743,7 @@ mod tests {
             &caller,
             agent_principal(),
             vec![role("agent")],
+            CardScope::default(),
             Duration::minutes(5),
         );
 

@@ -220,6 +220,9 @@ fn workload_exchange_error(
                 details: json!({}),
             })
         }
+        crate::auth::exchange_api_key::ExchangeError::CardScope(error) => {
+            WyrdErrorResponse::from(error)
+        }
         crate::auth::exchange_api_key::ExchangeError::NotFound
         | crate::auth::exchange_api_key::ExchangeError::AccountDisabled
         | crate::auth::exchange_api_key::ExchangeError::HashMismatch

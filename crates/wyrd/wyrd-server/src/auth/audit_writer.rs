@@ -108,6 +108,7 @@ mod tests {
             tenant_id,
             roles: Vec::new(),
             effective_permissions: PermissionSet::new(),
+            card_scope: wyrd_runtime::CardScope::default(),
         }
     }
 

@@ -51,6 +51,19 @@ pub enum BifrostError {
     )]
     TenantBindingMissing,
 
+    /// The client-supplied `card_ref` is not within the authenticated
+    /// principal's card scope, so the tagged write is refused.
+    #[wyrd_error(
+        code = "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+        status = 403,
+        title = "card_ref outside principal card scope",
+        remediation = "Supply a card_ref the authenticated principal is authorized to tag, or add the target card to the Service card's components."
+    )]
+    CardScopeDenied {
+        /// Canonical string form of the card reference that was refused.
+        card_ref: String,
+    },
+
     /// The requested Bifrost table does not exist in the catalog.
     #[wyrd_error(
         code = "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",

@@ -7,18 +7,12 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 #![allow(clippy::module_name_repetitions)]
 
-#[cfg(feature = "transport-http")]
-pub mod admin;
 pub mod auth;
 pub mod client;
 pub mod config;
 pub mod error;
-#[cfg(feature = "python")]
-pub mod python;
 pub mod transport;
 
-#[cfg(feature = "transport-http")]
-pub use admin::AdminClient;
 #[cfg(feature = "transport-http")]
 pub use client::WyrdClient;
 

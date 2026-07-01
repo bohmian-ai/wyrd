@@ -6570,7 +6570,6 @@ dependencies = [
  "skald-workflow",
  "vala-client",
  "wyrd-cards",
- "wyrd-client",
  "wyrd-config",
  "wyrd-observe",
  "wyrd-testing",
@@ -10535,7 +10534,6 @@ name = "wyrd-client"
 version = "0.0.1"
 dependencies = [
  "chrono",
- "pyo3",
  "reqwest 0.12.28",
  "schemars 0.8.22",
  "secrecy",
@@ -10546,14 +10544,10 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "url",
  "uuid",
- "wiremock",
- "wyrd-semver",
  "wyrd-spec",
  "wyrd-testing",
  "wyrd-tonic",
- "wyrd-utils",
 ]
 
 [[package]]

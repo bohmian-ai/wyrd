@@ -12,7 +12,6 @@ ROOT_OUTPUT_FILE = PACKAGE_DIR / "_wyrd.pyi"
 PUBLIC_MODULE_STUBS = {
     "agent.pyi": PACKAGE_DIR / "agent" / "__init__.pyi",
     "cards.pyi": PACKAGE_DIR / "cards" / "__init__.pyi",
-    "client.pyi": PACKAGE_DIR / "client" / "__init__.pyi",
     "config.pyi": PACKAGE_DIR / "config" / "__init__.pyi",
     "data.pyi": PACKAGE_DIR / "data" / "__init__.pyi",
     "eval.pyi": PACKAGE_DIR / "eval" / "__init__.pyi",

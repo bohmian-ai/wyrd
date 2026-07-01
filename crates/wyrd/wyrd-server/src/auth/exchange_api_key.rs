@@ -86,8 +86,10 @@ impl std::fmt::Debug for DelegateToken {
 pub struct ExchangedToken {
     /// Access token.
     pub access_token: SecretString,
-    /// Refresh token.
-    pub refresh_token: SecretString,
+    /// Refresh token. `None` for grants that do not issue one (workload
+    /// `jwt-bearer` and `token-exchange` delegation), whose callers hold a
+    /// durable credential they can re-present for a fresh access token.
+    pub refresh_token: Option<SecretString>,
     /// Token type.
     pub token_type: TokenType,
     /// Access token expiry.
@@ -100,11 +102,29 @@ impl ExchangedToken {
     pub fn into_response(self) -> TokenResponse {
         TokenResponse {
             access_token: SecretBearer::new(self.access_token.expose_secret().to_owned()),
-            refresh_token: SecretBearer::new(self.refresh_token.expose_secret().to_owned()),
+            refresh_token: self
+                .refresh_token
+                .map(|token| SecretBearer::new(token.expose_secret().to_owned())),
             token_type: self.token_type,
             expires_at: self.expires_at,
         }
     }
+}
+
+/// Whether a token-issuing path mints a refresh token alongside the access
+/// token.
+///
+/// Refresh tokens exist to spare a credential holder from re-proving identity.
+/// A human OIDC session and an API key benefit from that. A workload with a
+/// platform-attested assertion, or a short-lived delegated principal, do not:
+/// they can re-present their durable credential, so issuing a long-lived
+/// refresh secret only widens the leak surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RefreshPolicy {
+    /// Issue and persist a refresh token (API-key exchange, human login).
+    Mint,
+    /// Access token only; no refresh token is issued or stored.
+    Skip,
 }
 
 /// API-key exchange failure.
@@ -202,6 +222,7 @@ impl ExchangeApiKey {
             &row.principal_kind,
             row.card_ref.0,
             roles,
+            RefreshPolicy::Mint,
         )
         .await
         .map_err(ExchangeError::from)
@@ -258,23 +279,10 @@ impl DelegateToken {
             roles.clone(),
             self.settings.access_ttl,
         )?;
-        let refresh_token = self.issuing_key.issue_refresh_token(
-            principal_kind_wire(&row.principal_kind).ok_or(DelegateError::SubjectNotFound)?,
-            PrincipalId::new(row.id),
-            conn.data_tenant_id(),
-            self.settings.refresh_ttl,
-        )?;
+        // Delegated tokens are short-lived and non-refreshable by design
+        // (RFC 8693). The caller re-delegates when the access token expires, so
+        // no refresh token is issued or persisted for the delegated principal.
         let expires_at = Utc::now() + self.settings.access_ttl;
-        let refresh_expires_at = Utc::now() + self.settings.refresh_ttl;
-        insert_refresh_token(
-            conn,
-            Uuid::new_v4(),
-            &row.principal_kind,
-            row.id,
-            &token_hash(&refresh_token),
-            refresh_expires_at,
-        )
-        .await?;
         insert_audit_token_exchange(
             conn,
             Uuid::new_v4(),
@@ -288,7 +296,7 @@ impl DelegateToken {
 
         Ok(ExchangedToken {
             access_token: SecretString::from(access_token),
-            refresh_token: SecretString::from(refresh_token),
+            refresh_token: None,
             token_type: TokenType::Bearer,
             expires_at,
         })
@@ -303,6 +311,7 @@ pub(super) async fn issue_for_subject(
     principal_kind: &str,
     card_ref: CardRef,
     roles: Vec<RoleRef>,
+    refresh: RefreshPolicy,
 ) -> Result<ExchangedToken, IssueOrSqlError> {
     let id = PrincipalId::new(principal_id);
     let access_token = match principal_kind {
@@ -322,26 +331,32 @@ pub(super) async fn issue_for_subject(
         )?,
         _ => return Err(IssueOrSqlError::Issue(IssueError::InvalidPrincipalKind)),
     };
-    let refresh_token = issuing_key.issue_refresh_token(
-        principal_kind_wire(principal_kind).ok_or(IssueError::InvalidPrincipalKind)?,
-        id,
-        conn.data_tenant_id(),
-        settings.refresh_ttl,
-    )?;
+    let refresh_token = match refresh {
+        RefreshPolicy::Mint => {
+            let token = issuing_key.issue_refresh_token(
+                principal_kind_wire(principal_kind).ok_or(IssueError::InvalidPrincipalKind)?,
+                id,
+                conn.data_tenant_id(),
+                settings.refresh_ttl,
+            )?;
+            insert_refresh_token(
+                conn,
+                Uuid::new_v4(),
+                principal_kind,
+                principal_id,
+                &token_hash(&token),
+                Utc::now() + settings.refresh_ttl,
+            )
+            .await?;
+            Some(SecretString::from(token))
+        }
+        RefreshPolicy::Skip => None,
+    };
     let expires_at = Utc::now() + settings.access_ttl;
-    insert_refresh_token(
-        conn,
-        Uuid::new_v4(),
-        principal_kind,
-        principal_id,
-        &token_hash(&refresh_token),
-        Utc::now() + settings.refresh_ttl,
-    )
-    .await?;
 
     Ok(ExchangedToken {
         access_token: SecretString::from(access_token),
-        refresh_token: SecretString::from(refresh_token),
+        refresh_token,
         token_type: TokenType::Bearer,
         expires_at,
     })
@@ -555,7 +570,7 @@ mod tests {
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
     use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_runtime::{PrincipalId, RbacCheck};
+    use wyrd_runtime::{PrincipalId, RbacCheck, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::RequestedSubject;
@@ -571,6 +586,7 @@ mod tests {
     };
     use crate::auth::issue_api_key::WyrdApiKey;
     use crate::auth::permission_resolver::SqlPermissionResolver;
+    use crate::auth::seed::seed_builtin_roles_for_tenant;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";

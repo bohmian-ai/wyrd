@@ -229,7 +229,7 @@ async fn issue_and_record_user_session(
 
     Ok(ExchangedToken {
         access_token: SecretString::from(access_token),
-        refresh_token: SecretString::from(refresh_token),
+        refresh_token: Some(SecretString::from(refresh_token)),
         token_type: TokenType::Bearer,
         expires_at,
     })

@@ -46,7 +46,9 @@ pub async fn dispatch(args: RefreshArgs) -> Result<ExitCode, WyrdCliError> {
         .await
         .map_err(|source| WyrdCliError::Http { source })?;
     println!("access_token:  {}", token.access_token.expose());
-    println!("refresh_token: {}", token.refresh_token.expose());
+    if let Some(refresh_token) = &token.refresh_token {
+        println!("refresh_token: {}", refresh_token.expose());
+    }
     println!("expires_at:    {}", token.expires_at);
     Ok(ExitCode::SUCCESS)
 }

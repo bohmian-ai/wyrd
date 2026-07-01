@@ -17,7 +17,8 @@ use wyrd_sql::queries::auth::{
 };
 
 use crate::auth::exchange_api_key::{
-    ExchangeError, ExchangedToken, TokenExchangeSettings, issue_for_subject, role_refs,
+    ExchangeError, ExchangedToken, RefreshPolicy, TokenExchangeSettings, issue_for_subject,
+    role_refs,
 };
 use crate::auth::issue_api_key::principal_kind_for_card;
 use crate::error::WyrdErrorResponse;
@@ -110,6 +111,7 @@ impl JwtBearer {
                 &row.principal_kind,
                 row.card_ref.0.clone(),
                 roles,
+                RefreshPolicy::Skip,
             )
             .await
             .map_err(|error| workload_exchange_error(ExchangeError::from(error)))?;
@@ -423,6 +425,10 @@ mod tests {
         ));
         assert_eq!(role_names(&verified.principal.roles), set_of(&[role_name]));
         assert_eq!(exchanged.token_type, TokenType::Bearer);
+        assert!(
+            exchanged.refresh_token.is_none(),
+            "workload jwt-bearer grant must not issue a refresh token"
+        );
 
         let rows = audit_rows(&fixture, tenant).await;
         assert_eq!(rows.len(), 1);
@@ -770,6 +776,10 @@ mod tests {
         conn.commit().await.expect("api-key exchange commits");
 
         assert_eq!(exchanged.token_type, TokenType::Bearer);
+        assert!(
+            exchanged.refresh_token.is_some(),
+            "api-key exchange must still issue a refresh token"
+        );
     }
 
     async fn test_state(fixture: &PgFixture) -> AppState {

@@ -5317,6 +5317,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "multimap"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
+
+[[package]]
 name = "murmur3"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6513,6 +6519,26 @@ checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
 dependencies = [
  "bytes",
  "prost-derive",
+]
+
+[[package]]
+name = "prost-build"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
+dependencies = [
+ "heck",
+ "itertools 0.14.0",
+ "log",
+ "multimap",
+ "once_cell",
+ "petgraph 0.6.5",
+ "prettyplease",
+ "prost",
+ "prost-types",
+ "regex",
+ "syn",
+ "tempfile",
 ]
 
 [[package]]
@@ -9172,6 +9198,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tonic-build"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9557ce109ea773b399c9b9e5dca39294110b74f1f342cb347a80d1fce8c26a11"
+dependencies = [
+ "prettyplease",
+ "proc-macro2",
+ "prost-build",
+ "prost-types",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "tonic-health"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9749,6 +9789,27 @@ dependencies = [
  "wyrd-observe",
  "wyrd-semver",
  "wyrd-spec",
+]
+
+[[package]]
+name = "vala-ingest"
+version = "0.0.1"
+dependencies = [
+ "arrow",
+ "secrecy",
+ "sqlx 0.9.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "vala-bifrost",
+ "vala-sql",
+ "wyrd-auth-verify",
+ "wyrd-runtime",
+ "wyrd-spec",
+ "wyrd-storage",
+ "wyrd-tonic",
 ]
 
 [[package]]
@@ -10446,6 +10507,7 @@ version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "http 1.4.2",
  "jsonwebtoken 9.3.1",
  "moka",
  "reqwest 0.12.28",
@@ -10911,6 +10973,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tonic 0.12.3",
+ "tonic-build",
  "tonic-health",
  "tonic-reflection",
  "tonic-types",

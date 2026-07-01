@@ -30,6 +30,35 @@ pub const MAX_DELEGATION_DEPTH: usize = 5;
 /// Hard cap on a raw bearer token before verifier-side decoding.
 pub const MAX_BEARER_TOKEN_BYTES: usize = 8 * 1024;
 
+/// Canonical HTTP/gRPC metadata header carrying the Wyrd access token.
+///
+/// Shared by the HTTP `AuthenticatedPrincipal` extractor and the gRPC ingest
+/// interceptor so both auth paths read the bearer from the same header
+/// (`x-wyrd-access-token`).
+pub const WYRD_ACCESS_TOKEN_HEADER: http::HeaderName =
+    http::HeaderName::from_static("x-wyrd-access-token");
+
+/// Read the expected tenant from an **unverified** Wyrd access token.
+///
+/// Decodes only the JWT payload (segment 2) to learn which tenant's verifier the
+/// caller expects — the signature is checked afterwards by
+/// [`TokenVerifier::verify`] against that tenant. This is a routing hint, never a
+/// trust decision.
+///
+/// # Errors
+/// Returns [`AuthError::BadTokenFormat`] when the token is not a compact JWT or
+/// the payload is not decodable claims.
+pub fn tenant_from_unverified_access_token(token: &str) -> Result<DataTenantId, AuthError> {
+    use base64::Engine;
+    let payload = token.split('.').nth(1).ok_or(AuthError::BadTokenFormat)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| AuthError::BadTokenFormat)?;
+    let claims: AccessTokenClaims =
+        serde_json::from_slice(&bytes).map_err(|_| AuthError::BadTokenFormat)?;
+    Ok(claims.principal.tenant_id)
+}
+
 /// Validated JWT key identifier.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Kid(String);

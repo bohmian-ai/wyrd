@@ -1,0 +1,25 @@
+syntax = "proto3";
+package wyrd.v1;
+
+// One typed service per observation type. Bifrost ingest only in Stage 3;
+// drift / agent-trace / otel / eval get their own typed services later.
+service BifrostIngestService {
+  // Client-streaming: the client streams N frames, the server commits them as
+  // ONE 2PC batch and returns the row count. The whole stream is one logical
+  // batch (one Iceberg snapshot, one durable idempotency key).
+  rpc InsertBatch(stream InsertBatchRequest) returns (InsertBatchResponse);
+}
+
+message InsertBatchRequest {
+  string table         = 1;   // fqn "namespace.name"; set on the FIRST frame, must match on the rest
+  bytes  arrow_ipc     = 2;   // Arrow IPC stream frame — published self-describing spec, not a private enum
+  bytes  wyrd_batch_id = 3;   // 16 bytes (UUIDv7); idempotency key for THIS commit; set on the first frame
+}
+// NOTE: the proto deliberately carries ONLY table/arrow_ipc/wyrd_batch_id.
+// `card_ref` and `run_id` are PER-ROW correlation COLUMNS inside `arrow_ipc`,
+// not proto fields — one stream mixes many cards/runs, so they cannot be
+// stream- or frame-grain metadata.
+
+message InsertBatchResponse {
+  uint64 rows_accepted = 1;   // total rows committed; a deduplicated replay returns the prior count
+}

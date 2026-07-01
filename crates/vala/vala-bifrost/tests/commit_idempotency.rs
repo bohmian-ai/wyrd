@@ -112,7 +112,7 @@ async fn idempotent_replay_committed_returns_prior_snapshot(pool: PgPool) {
     let fx = setup(pool).await;
 
     let mut c = conn(&fx).await;
-    vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID)
+    vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID, "system", "system")
         .await
         .unwrap();
     // Stamp owner + token within the same conn to avoid row-lock deadlock.
@@ -146,6 +146,8 @@ async fn idempotent_replay_committed_returns_prior_snapshot(pool: PgPool) {
         &fx.table_uid,
         Vec::new(),
         BATCH_ID,
+        "system",
+        "system",
         fx.tenant,
     )
     .await
@@ -163,7 +165,7 @@ async fn committed_row_with_null_snapshot_is_metadata_mismatch(pool: PgPool) {
     let fx = setup(pool).await;
 
     let mut c = conn(&fx).await;
-    vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID)
+    vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID, "system", "system")
         .await
         .unwrap();
     // Force the corruption case: committed state with snapshot_id left NULL.
@@ -185,6 +187,8 @@ async fn committed_row_with_null_snapshot_is_metadata_mismatch(pool: PgPool) {
         &fx.table_uid,
         Vec::new(),
         BATCH_ID,
+        "system",
+        "system",
         fx.tenant,
     )
     .await
@@ -201,7 +205,7 @@ async fn duplicate_failed_batch_returns_error(pool: PgPool) {
     let fx = setup(pool).await;
 
     let mut c = conn(&fx).await;
-    vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID)
+    vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID, "system", "system")
         .await
         .unwrap();
     // Stamp owner + token within the same conn to avoid row-lock deadlock.
@@ -236,6 +240,8 @@ async fn duplicate_failed_batch_returns_error(pool: PgPool) {
         &fx.table_uid,
         Vec::new(),
         BATCH_ID,
+        "system",
+        "system",
         fx.tenant,
     )
     .await
@@ -252,7 +258,7 @@ async fn in_flight_precommit_returns_commit_conflict(pool: PgPool) {
     let fx = setup(pool).await;
 
     let mut c = conn(&fx).await;
-    vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID)
+    vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID, "system", "system")
         .await
         .unwrap();
     c.commit().await.unwrap();
@@ -264,6 +270,8 @@ async fn in_flight_precommit_returns_commit_conflict(pool: PgPool) {
         &fx.table_uid,
         Vec::new(),
         BATCH_ID,
+        "system",
+        "system",
         fx.tenant,
     )
     .await

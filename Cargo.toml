@@ -36,7 +36,10 @@ skald-runtime = { path = "crates/skald/skald-runtime", version = "0.0.1" }
 skald-prompt = { path = "crates/skald/skald-prompt", version = "0.0.1" }
 skald-agent = { path = "crates/skald/skald-agent", version = "0.0.1" }
 skald-workflow = { path = "crates/skald/skald-workflow", version = "0.0.1" }
+vala-bifrost = { path = "crates/vala/vala-bifrost", version = "0.0.1" }
+vala-sql = { path = "crates/vala/vala-sql", version = "0.0.1" }
 vala-core = { path = "crates/vala/vala-core", version = "0.0.1" }
+vala-ingest = { path = "crates/vala/vala-ingest", version = "0.0.1" }
 vala-drift = { path = "crates/vala/vala-drift", version = "0.0.1" }
 vala-eval = { path = "crates/vala/vala-eval", version = "0.0.1" }
 vala-http = { path = "crates/vala/vala-http", version = "0.0.1" }
@@ -142,6 +145,7 @@ tonic = { version = "0.12", default-features = false, features = ["codegen", "pr
 tonic-health = "0.12"
 tonic-reflection = "0.12"
 tonic-types = "0.12"
+tonic-build = "0.12"
 prost = "0.13"
 
 # Cloud SDKs are server-tier only.

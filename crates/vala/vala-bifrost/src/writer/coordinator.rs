@@ -15,7 +15,7 @@ use crate::registry::Registry;
 use crate::types::{TableScope, TableUid};
 use crate::writer::buffer::AppendBuffer;
 use crate::writer::commit::run_commit;
-use crate::writer::{TableWriterHandle, WriteCmd};
+use crate::writer::{BifrostWriteContext, TableWriterHandle, WriteCmd};
 
 struct CommitActor {
     receiver: mpsc::Receiver<WriteCmd>,
@@ -56,8 +56,8 @@ impl CommitActor {
                 WriteCmd::Write(batch, reply) => {
                     let _ = reply.send(self.accept(batch));
                 }
-                WriteCmd::Flush(reply) => {
-                    let result = self.flush().await;
+                WriteCmd::Flush(ctx, reply) => {
+                    let result = self.flush(*ctx).await;
                     let _ = reply.send(result);
                 }
             }
@@ -83,13 +83,13 @@ impl CommitActor {
     /// Stamp every buffered batch with the system columns and commit them as one
     /// 2PC transaction. On any failure the drained batches are restored to the
     /// buffer so the caller can retry. An empty buffer is a no-op returning `0`.
-    async fn flush(&mut self) -> Result<i64, BifrostError> {
+    async fn flush(&mut self, ctx: BifrostWriteContext) -> Result<i64, BifrostError> {
         if self.buffer.is_empty() {
             return Ok(0);
         }
 
         let batches = self.buffer.drain();
-        let batch_id = *uuid::Uuid::now_v7().as_bytes();
+        let batch_id = ctx.batch_id;
         let ingested_at_us = now_micros();
         let stamp_tenant = self.scope.stamp_tenant(self.data_tenant);
 
@@ -113,6 +113,8 @@ impl CommitActor {
             &self.table_uid,
             stamped,
             batch_id,
+            &ctx.origin,
+            &ctx.actor,
             self.scope.control_bind(self.data_tenant),
         )
         .await

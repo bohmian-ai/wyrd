@@ -299,6 +299,7 @@ fn mint_service_jwt(state: &AppState, tenant: DataTenantId, name: &str) -> Strin
             tenant,
             card_ref(CardKind::Service, name),
             Vec::new(),
+            wyrd_runtime::CardScope::default(),
             Duration::minutes(5),
         )
         .expect("service jwt mints")
@@ -332,6 +333,7 @@ fn mint_delegated_service_jwt(state: &AppState, tenant: DataTenantId) -> String 
             },
             requested,
             Vec::<RoleRef>::new(),
+            wyrd_runtime::CardScope::default(),
             Duration::minutes(5),
         )
         .expect("delegated jwt mints")

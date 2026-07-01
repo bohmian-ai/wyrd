@@ -1,5 +1,5 @@
 use wyrd_auth_check::guard::{GuardOutcome, GuardReason, guard_reason};
-use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
+use wyrd_runtime::{CardScope, PermissionSet, Principal, PrincipalId, PrincipalKind};
 use wyrd_semver::VersionBlock;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::envelope::CardKind;
@@ -23,6 +23,7 @@ fn principal(kind: PrincipalKind) -> Principal {
         tenant_id: DataTenantId::new_v7(),
         roles: Vec::new(),
         effective_permissions: PermissionSet::new(),
+        card_scope: CardScope::default(),
     }
 }
 

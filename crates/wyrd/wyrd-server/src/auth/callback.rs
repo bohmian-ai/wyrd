@@ -187,6 +187,8 @@ async fn issue_and_record_user_session(
         tenant_id,
         roles.clone(),
         PermissionSet::default(),
+        // User principals carry no bound card, so they cannot tag writes.
+        wyrd_runtime::CardScope::default(),
     );
     let access_token = issuing_key
         .issue_user_access_token(

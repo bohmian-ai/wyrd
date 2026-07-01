@@ -19,6 +19,7 @@ use wyrd_sql::queries::auth::{
     list_service_account_roles, refresh_by_hash, revoke_refresh_family, service_account_by_id,
 };
 
+use crate::auth::card_scope::resolve_card_scope;
 use crate::auth::exchange_api_key::{
     ExchangedToken, IssueOrSqlError, TokenExchangeSettings, principal_kind_tag, role_refs,
     token_hash,
@@ -48,12 +49,16 @@ pub enum RefreshError {
     /// Token issue failed.
     #[error("token issue error")]
     Issue(#[from] IssueError),
+    /// Card-scope resolution failed; fail closed rather than re-mint an unknown scope.
+    #[error("card scope resolution failed")]
+    CardScope(WyrdError),
 }
 
 impl From<IssueOrSqlError> for RefreshError {
     fn from(error: IssueOrSqlError) -> Self {
         match error {
             IssueOrSqlError::Issue(e) => Self::Issue(e),
+            IssueOrSqlError::CardScope(e) => Self::CardScope(e),
             IssueOrSqlError::Database(e) => Self::Database(e),
         }
     }
@@ -78,6 +83,7 @@ impl From<RefreshError> for WyrdError {
                 message: "token issue failed during refresh rotation".to_owned(),
                 details: json!({}),
             },
+            RefreshError::CardScope(error) => error,
         }
     }
 }
@@ -238,12 +244,19 @@ impl RefreshTokens {
         let tenant_id = conn.data_tenant_id();
         let card_ref = sa.card_ref.0;
 
+        // Re-resolve the card scope on every rotation so a proactive refresh
+        // never regresses to an empty-scope token (INVARIANT).
+        let card_scope = resolve_card_scope(conn, principal_kind, &card_ref)
+            .await
+            .map_err(RefreshError::CardScope)?;
+
         let access_token = match principal_kind {
             "service" => self.issuing_key.issue_service_access_token(
                 pid,
                 tenant_id,
                 card_ref,
                 roles,
+                card_scope,
                 self.settings.access_ttl,
             )?,
             "agent" => self.issuing_key.issue_agent_access_token(
@@ -251,6 +264,7 @@ impl RefreshTokens {
                 tenant_id,
                 card_ref,
                 roles,
+                card_scope,
                 self.settings.access_ttl,
             )?,
             _ => return Err(RefreshError::Issue(IssueError::InvalidPrincipalKind)),
@@ -330,9 +344,12 @@ mod tests {
     use chrono::{Duration, Utc};
     use secrecy::{ExposeSecret, SecretString};
     use sha2::{Digest, Sha256};
+    use sqlx::types::Json;
     use uuid::Uuid;
     use wyrd_auth_issue::IssuingKey;
-    use wyrd_auth_verify::{Kid, PrincipalKindTag};
+    use wyrd_auth_verify::{
+        AccessTokenClaims, Kid, PrincipalKindTag, public_key_from_pem, verify_eddsa,
+    };
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::PrincipalId;
     use wyrd_semver::VersionBlock;
@@ -347,6 +364,7 @@ mod tests {
     use crate::auth::exchange_api_key::TokenExchangeSettings;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
+    const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
 
     fn test_issuing_key() -> Arc<IssuingKey> {
         Arc::new(
@@ -426,6 +444,45 @@ mod tests {
         sa_id
     }
 
+    async fn insert_service_card(
+        conn: &mut TenantConn<'_>,
+        tenant: DataTenantId,
+        card_ref: &CardRef,
+        components: &[CardRef],
+    ) {
+        use wyrd_spec::card::service::{ServiceComponent, ServiceSpec};
+        let spec = ServiceSpec {
+            components: components
+                .iter()
+                .enumerate()
+                .map(|(index, component)| ServiceComponent {
+                    alias: format!("component-{index}"),
+                    card_ref: component.clone(),
+                    source: None,
+                    config: Default::default(),
+                    credential_refs: Vec::new(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        sqlx::query(
+            "INSERT INTO wyrd.cards
+                 (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant.as_uuid())
+        .bind(card_ref.kind.wire_name())
+        .bind(card_ref.space.as_str())
+        .bind(card_ref.name.as_str())
+        .bind(card_ref.version.as_str())
+        .bind(Json(spec))
+        .bind("test-service-spec-hash")
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("service card inserts");
+    }
+
     async fn seed_active_refresh(
         conn: &mut TenantConn<'_>,
         principal_kind: &str,
@@ -453,6 +510,7 @@ mod tests {
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
+        insert_service_card(&mut conn, tenant, &card_ref, &[]).await;
         let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
@@ -483,6 +541,54 @@ mod tests {
         assert!(new_row.revoked_at.is_none(), "new token is active");
     }
 
+    fn component_card_ref() -> CardRef {
+        CardRef {
+            kind: CardKind::Model,
+            name: CardName::new("shared-model").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("prod").expect("static space is valid"),
+            uid: None,
+        }
+    }
+
+    fn decode_access(token: &SecretString) -> AccessTokenClaims {
+        let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
+        verify_eddsa::<AccessTokenClaims>(token.expose_secret(), &public_key, Some("wyrd"))
+            .expect("access token verifies")
+    }
+
+    #[tokio::test]
+    async fn refresh_card_scope_matches_initial_resolution() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let key = test_issuing_key();
+        let card_ref = service_card_ref();
+        let component = component_card_ref();
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        insert_service_card(&mut conn, tenant, &card_ref, &[component.clone()]).await;
+        let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
+
+        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
+        seed_active_refresh(&mut conn, "service", sa_id, &hash_of(&refresh_jwt)).await;
+
+        let exchanged = refresh_service()
+            .execute(&mut conn, refresh_jwt, "req-refresh-scope")
+            .await
+            .expect("rotation succeeds");
+        let claims = decode_access(&exchanged.access_token);
+
+        // The re-minted token carries the full resolved scope (own ∪ components),
+        // never an empty-scope regression.
+        assert!(claims.card_scope.contains(&card_ref), "own card is in scope");
+        assert!(
+            claims.card_scope.contains(&component),
+            "component card is in scope"
+        );
+        assert_eq!(claims.card_scope.len(), 2);
+    }
+
     #[tokio::test]
     async fn reuse_detection_revokes_family() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -492,6 +598,7 @@ mod tests {
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
+        insert_service_card(&mut conn, tenant, &card_ref, &[]).await;
         let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
@@ -549,6 +656,7 @@ mod tests {
 
         let mut setup_conn = fixture.tenant_conn().await.expect("setup conn opens");
         let user_id = insert_test_user(&mut setup_conn, tenant).await;
+        insert_service_card(&mut setup_conn, tenant, &card_ref, &[]).await;
         let sa_id = insert_test_service_account(&mut setup_conn, user_id, &card_ref).await;
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
@@ -619,6 +727,7 @@ mod tests {
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
+        insert_service_card(&mut conn, tenant, &card_ref, &[]).await;
         let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
@@ -662,6 +771,7 @@ mod tests {
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
+        insert_service_card(&mut conn, tenant, &card_ref, &[]).await;
         let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);

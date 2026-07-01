@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::reference::CardRef;
 
-pub use wyrd_spec::auth::{PrincipalId, PrincipalKind};
+pub use wyrd_spec::auth::{CardScope, PrincipalId, PrincipalKind};
 
 use crate::permission::PermissionSet;
 
@@ -24,6 +24,9 @@ pub struct Principal {
     pub roles: Vec<RoleRef>,
     /// Permissions resolved from roles at verify time.
     pub effective_permissions: PermissionSet,
+    /// Cards this principal is authorized to tag data with, resolved at token
+    /// issue and carried on the verified token. Empty for User principals.
+    pub card_scope: CardScope,
 }
 
 /// Reference to a role by name.
@@ -83,6 +86,7 @@ impl Principal {
         tenant_id: DataTenantId,
         roles: Vec<RoleRef>,
         effective_permissions: PermissionSet,
+        card_scope: CardScope,
     ) -> Self {
         Self {
             id,
@@ -90,7 +94,14 @@ impl Principal {
             tenant_id,
             roles,
             effective_permissions,
+            card_scope,
         }
+    }
+
+    /// Returns the cards this principal is authorized to tag data with.
+    #[must_use]
+    pub fn card_scope(&self) -> &CardScope {
+        &self.card_scope
     }
 
     /// Returns the card ref for service and agent principals.
@@ -129,7 +140,7 @@ impl PrincipalRef {
 
 #[cfg(test)]
 mod tests {
-    use super::{Principal, PrincipalId, PrincipalKind, PrincipalRef, RoleRef};
+    use super::{CardScope, Principal, PrincipalId, PrincipalKind, PrincipalRef, RoleRef};
     use crate::permission::{Permission, PermissionSet};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
@@ -179,6 +190,7 @@ mod tests {
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
             roles: vec![RoleRef::new("agent").expect("static role is valid")],
             effective_permissions: PermissionSet::from_iter([Permission::card_read()]),
+            card_scope: CardScope::default(),
         };
 
         assert_eq!(principal.card_ref(), Some(&card_ref));
@@ -195,6 +207,7 @@ mod tests {
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
             roles: vec![RoleRef::new("agent").expect("static role is valid")],
             effective_permissions: PermissionSet::new(),
+            card_scope: CardScope::default(),
         };
 
         let principal_ref = PrincipalRef::from_principal(&principal);

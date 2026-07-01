@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wyrd_auth_oidc::{JwksCache, OidcError, OidcKid, TrustedIssuerRegistry, map_claims};
 use wyrd_runtime::{
-    DelegationStep, PermissionSet, Principal, PrincipalId,
+    CardScope, DelegationStep, PermissionSet, Principal, PrincipalId,
     PrincipalRef as RuntimePrincipalRef, RoleRef,
 };
 pub use wyrd_runtime::PrincipalKind;
@@ -589,6 +589,10 @@ pub struct AccessTokenClaims {
     pub principal: TokenPrincipalRef,
     /// Roles assigned to the current actor at issue time.
     pub roles: Vec<RoleRef>,
+    /// Cards the actor is authorized to tag data with, resolved at issue time.
+    /// Absent (empty) for User principals and pre-scope tokens.
+    #[serde(default, skip_serializing_if = "CardScope::is_empty")]
+    pub card_scope: CardScope,
     /// RFC 8693 actor chain for delegated tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub act: Option<Box<ActClaim>>,
@@ -697,6 +701,7 @@ impl AccessTokenClaims {
             self.principal.tenant_id,
             self.roles.clone(),
             effective_permissions,
+            self.card_scope.clone(),
         );
         let delegation_chain = flatten_act_chain(self.act.as_deref())?;
         let exp =
@@ -808,7 +813,7 @@ mod tests {
         ClaimMapping, ClaimPath, ClientAuth, JwksCache, PrincipalKindPolicy, TrustedIssuer,
         TrustedIssuerRegistry,
     };
-    use wyrd_runtime::{Permission, PermissionSet};
+    use wyrd_runtime::{CardScope, Permission, PermissionSet};
     use wyrd_runtime::{Principal, PrincipalId, PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
@@ -851,6 +856,7 @@ mod tests {
             tenant_id(),
             vec![role()],
             wyrd_runtime::PermissionSet::new(),
+            CardScope::default(),
         );
 
         let projected = TokenPrincipalRef::from(&principal);
@@ -966,6 +972,37 @@ mod tests {
             immediate.kind.card_ref()
         );
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn card_scope_claim_round_trips_onto_verified_principal() {
+        let member = named_card_ref(CardKind::Service, "billing");
+        let scope = CardScope::new([member.clone()]);
+        let claims = AccessTokenClaims {
+            principal: service_ref("current"),
+            card_scope: scope.clone(),
+            ..claims_with_times(now() + 3_600, now())
+        };
+        let token = encode_eddsa(&claims);
+        let decoded: AccessTokenClaims =
+            verify_eddsa(&token, &public_key(), Some("wyrd")).expect("token verifies");
+        assert_eq!(decoded.card_scope, scope);
+
+        let verified = decoded
+            .into_verified(&TestResolver::default())
+            .await
+            .expect("claims convert");
+        assert!(verified.principal.card_scope().contains(&member));
+    }
+
+    #[tokio::test]
+    async fn card_scope_absent_claim_is_empty_scope() {
+        let claims = claims_with_times(now() + 3_600, now());
+        let verified = claims
+            .into_verified(&TestResolver::default())
+            .await
+            .expect("claims convert");
+        assert!(verified.principal.card_scope().is_empty());
     }
 
     #[tokio::test]
@@ -1301,6 +1338,7 @@ mod tests {
                 tenant_id: tenant_id(),
             },
             roles: vec![role()],
+            card_scope: CardScope::default(),
             act: None,
             exp,
             iat,

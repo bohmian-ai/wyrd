@@ -21,6 +21,7 @@ use wyrd_sql::queries::auth::{
     touch_api_key_last_used,
 };
 
+use crate::auth::card_scope::resolve_card_scope;
 use crate::auth::issue_api_key::{WyrdApiKey, principal_kind_for_card};
 use crate::auth::permission_resolver::SqlPermissionResolver;
 
@@ -130,6 +131,9 @@ pub enum ExchangeError {
     /// Role name from SQL was invalid.
     #[error("role name is invalid")]
     InvalidRole,
+    /// Card-scope resolution failed; fail closed rather than mint an unknown scope.
+    #[error("card scope resolution failed")]
+    CardScope(WyrdError),
     /// Database operation failed.
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
@@ -153,6 +157,9 @@ pub enum DelegateError {
     /// Role name from SQL was invalid.
     #[error("role name is invalid")]
     InvalidRole,
+    /// Card-scope resolution failed; fail closed rather than mint an unknown scope.
+    #[error("card scope resolution failed")]
+    CardScope(WyrdError),
     /// Database operation failed.
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
@@ -251,10 +258,18 @@ impl DelegateToken {
             row.card_ref.0.clone(),
         )
         .ok_or(DelegateError::SubjectNotFound)?;
+        // Delegated tokens tag only cards BOTH the delegating caller and the
+        // acting callee are authorized for (the fail-safe intersection). The
+        // caller's own scope already rides their verified token.
+        let callee_scope = resolve_card_scope(conn, &row.principal_kind, &row.card_ref.0)
+            .await
+            .map_err(DelegateError::CardScope)?;
+        let card_scope = verified.principal.card_scope().intersection(&callee_scope);
         let access_token = self.issuing_key.issue_delegated_access_token(
             &caller,
             requested_ref,
             roles.clone(),
+            card_scope,
             self.settings.access_ttl,
         )?;
         let refresh_token = self.issuing_key.issue_refresh_token(
@@ -304,12 +319,16 @@ pub(super) async fn issue_for_subject(
     roles: Vec<RoleRef>,
 ) -> Result<ExchangedToken, IssueOrSqlError> {
     let id = PrincipalId::new(principal_id);
+    let card_scope = resolve_card_scope(conn, principal_kind, &card_ref)
+        .await
+        .map_err(IssueOrSqlError::CardScope)?;
     let access_token = match principal_kind {
         "service" => issuing_key.issue_service_access_token(
             id,
             conn.data_tenant_id(),
             card_ref.clone(),
             roles.clone(),
+            card_scope,
             settings.access_ttl,
         )?,
         "agent" => issuing_key.issue_agent_access_token(
@@ -317,6 +336,7 @@ pub(super) async fn issue_for_subject(
             conn.data_tenant_id(),
             card_ref.clone(),
             roles.clone(),
+            card_scope,
             settings.access_ttl,
         )?,
         _ => return Err(IssueOrSqlError::Issue(IssueError::InvalidPrincipalKind)),
@@ -350,6 +370,8 @@ pub(super) async fn issue_for_subject(
 pub(super) enum IssueOrSqlError {
     #[error("issue")]
     Issue(#[from] IssueError),
+    #[error("card scope")]
+    CardScope(WyrdError),
     #[error("db")]
     Database(#[from] sqlx::Error),
 }
@@ -358,6 +380,7 @@ impl From<IssueOrSqlError> for ExchangeError {
     fn from(error: IssueOrSqlError) -> Self {
         match error {
             IssueOrSqlError::Issue(error) => Self::Issue(error),
+            IssueOrSqlError::CardScope(error) => Self::CardScope(error),
             IssueOrSqlError::Database(error) => Self::Database(error),
         }
     }
@@ -503,6 +526,7 @@ pub async fn map_exchange_error_to_wyrd(
                 details: json!({}),
             }
         }
+        ExchangeError::CardScope(error) => error,
         ExchangeError::Database(_) => WyrdError::AuthVerifyUnavailable {
             message: "auth backend unavailable".to_owned(),
             details: json!({ "retry_after_seconds": 1 }),
@@ -532,6 +556,7 @@ impl From<DelegateError> for WyrdError {
                 message: "failed to issue delegated token".to_owned(),
                 details: json!({}),
             },
+            DelegateError::CardScope(error) => error,
             DelegateError::Database(_) => WyrdError::AuthVerifyUnavailable {
                 message: "auth backend unavailable".to_owned(),
                 details: json!({ "retry_after_seconds": 1 }),
@@ -547,13 +572,18 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::{Duration, Utc};
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret, SecretString};
     use sqlx::types::Json;
     use uuid::Uuid;
     use wyrd_auth_issue::IssuingKey;
-    use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
+    use wyrd_auth_verify::{
+        AccessTokenClaims, Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
+        verify_eddsa,
+    };
     use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_runtime::{PrincipalId, RbacCheck};
+    use wyrd_runtime::{
+        CardScope, Permission, PermissionCheck, PermissionVerdict, Principal, PrincipalId, RbacCheck,
+    };
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::RequestedSubject;
@@ -934,6 +964,7 @@ mod tests {
                 tenant,
                 test_service_card_ref(),
                 vec![],
+                wyrd_runtime::CardScope::default(),
                 Duration::minutes(15),
             )
             .expect("subject token issues");
@@ -970,5 +1001,235 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(DelegateError::PermissionDenied)));
+    }
+
+    fn component_card_ref() -> CardRef {
+        CardRef {
+            kind: CardKind::Model,
+            name: CardName::new("shared-model").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("prod").expect("static space is valid"),
+            uid: None,
+        }
+    }
+
+    fn callee_service_card_ref() -> CardRef {
+        CardRef {
+            kind: CardKind::Service,
+            name: CardName::new("callee-service").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("prod").expect("static space is valid"),
+            uid: None,
+        }
+    }
+
+    async fn insert_service_card(
+        conn: &mut TenantConn<'_>,
+        tenant: DataTenantId,
+        card_ref: &CardRef,
+        components: &[CardRef],
+    ) {
+        use wyrd_spec::card::service::{ServiceComponent, ServiceSpec};
+        let spec = ServiceSpec {
+            components: components
+                .iter()
+                .enumerate()
+                .map(|(index, component)| ServiceComponent {
+                    alias: format!("component-{index}"),
+                    card_ref: component.clone(),
+                    source: None,
+                    config: Default::default(),
+                    credential_refs: Vec::new(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        sqlx::query(
+            "INSERT INTO wyrd.cards
+                 (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant.as_uuid())
+        .bind(card_ref.kind.wire_name())
+        .bind(card_ref.space.as_str())
+        .bind(card_ref.name.as_str())
+        .bind(card_ref.version.as_str())
+        .bind(Json(spec))
+        .bind("test-service-spec-hash")
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("service card inserts");
+    }
+
+    async fn insert_valid_api_key(
+        conn: &mut TenantConn<'_>,
+        tenant: DataTenantId,
+        sa_id: Uuid,
+        created_by: Uuid,
+        prefix: &str,
+        key_hash: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO wyrd.auth_api_keys
+                 (id, data_tenant_id, sa_id, prefix, key_hash, created_by, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, now() + interval '365 days')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(tenant.as_uuid())
+        .bind(sa_id)
+        .bind(prefix)
+        .bind(key_hash)
+        .bind(created_by)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("api key inserts");
+    }
+
+    fn decode_access(token: &SecretString) -> AccessTokenClaims {
+        let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
+        verify_eddsa::<AccessTokenClaims>(token.expose_secret(), &public_key, Some("wyrd"))
+            .expect("access token verifies")
+    }
+
+    /// Permission check stub that authorizes every request, isolating the
+    /// card-scope intersection from RBAC role seeding.
+    #[derive(Debug)]
+    struct AllowAllCheck;
+
+    impl PermissionCheck for AllowAllCheck {
+        fn check(&self, _: &Principal, _: &Permission) -> PermissionVerdict {
+            PermissionVerdict::Allow
+        }
+    }
+
+    fn delegate_service(fixture: &PgFixture) -> DelegateToken {
+        let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
+        let mut decoding_keys = HashMap::new();
+        decoding_keys.insert(Kid::new("k1").expect("kid is valid"), Arc::new(public_key));
+        let verifier = Arc::new(TokenVerifier::new(
+            decoding_keys,
+            "wyrd",
+            Arc::new(SqlPermissionResolver::new(Arc::new(fixture.app_pool().clone()))),
+            WyrdAuthVerifySettings::default(),
+        ));
+        DelegateToken {
+            issuing_key: test_issuing_key(),
+            verifier,
+            permission_check: Arc::new(AllowAllCheck),
+            settings: TokenExchangeSettings::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_card_scope_carries_components_union_own() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let own = test_service_card_ref();
+        let component = component_card_ref();
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        insert_service_card(&mut conn, tenant, &own, &[component.clone()]).await;
+        let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &own).await;
+
+        let api_key = WyrdApiKey::generate(tenant);
+        let key_hash = wyrd_auth_issue::hash_api_key(&api_key.secret).expect("api key hashes");
+        insert_valid_api_key(&mut conn, tenant, sa_id, user_id, &api_key.prefix, &key_hash).await;
+
+        let exchanged = exchange_service()
+            .execute(&mut conn, api_key.secret)
+            .await
+            .expect("exchange succeeds");
+        let claims = decode_access(&exchanged.access_token);
+
+        assert!(claims.card_scope.contains(&own), "own card is in scope");
+        assert!(
+            claims.card_scope.contains(&component),
+            "component card is in scope"
+        );
+        assert_eq!(claims.card_scope.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn exchange_card_scope_fails_closed_when_service_card_missing() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let own = test_service_card_ref();
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        // Deliberately do NOT register the Service card → scope cannot resolve.
+        let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &own).await;
+
+        let api_key = WyrdApiKey::generate(tenant);
+        let key_hash = wyrd_auth_issue::hash_api_key(&api_key.secret).expect("api key hashes");
+        insert_valid_api_key(&mut conn, tenant, sa_id, user_id, &api_key.prefix, &key_hash).await;
+
+        let result = exchange_service().execute(&mut conn, api_key.secret).await;
+
+        assert!(
+            matches!(result, Err(ExchangeError::CardScope(_))),
+            "mint fails closed on missing service card: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_card_scope_intersection_of_caller_and_callee() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let shared = component_card_ref();
+        let caller_only = CardRef {
+            kind: CardKind::Model,
+            name: CardName::new("caller-only-model").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("prod").expect("static space is valid"),
+            uid: None,
+        };
+        let callee_card = callee_service_card_ref();
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        // Callee: a Service card whose scope is {shared} ∪ {callee own}.
+        insert_service_card(&mut conn, tenant, &callee_card, &[shared.clone()]).await;
+        insert_test_service_account(&mut conn, tenant, user_id, &callee_card).await;
+
+        // Caller token carries a scope of {shared, caller_only}. Intersection
+        // with the callee scope {shared, callee_own} must be {shared}.
+        let caller_scope = CardScope::new([shared.clone(), caller_only.clone()]);
+        let subject_token = test_issuing_key()
+            .issue_service_access_token(
+                PrincipalId::new(Uuid::new_v4()),
+                tenant,
+                test_service_card_ref(),
+                vec![],
+                caller_scope,
+                Duration::minutes(15),
+            )
+            .expect("subject token issues");
+
+        let exchanged = delegate_service(&fixture)
+            .execute(
+                &mut conn,
+                SecretString::from(subject_token),
+                RequestedSubject::CardRef {
+                    card_ref: callee_card.clone(),
+                },
+                "test-delegated-scope",
+            )
+            .await
+            .expect("delegation succeeds");
+        let claims = decode_access(&exchanged.access_token);
+
+        assert!(claims.card_scope.contains(&shared), "shared card survives");
+        assert!(
+            !claims.card_scope.contains(&caller_only),
+            "caller-only card is excluded by callee scope"
+        );
+        assert!(
+            !claims.card_scope.contains(&callee_card),
+            "callee-own card is excluded by caller scope"
+        );
+        assert_eq!(claims.card_scope.len(), 1);
     }
 }

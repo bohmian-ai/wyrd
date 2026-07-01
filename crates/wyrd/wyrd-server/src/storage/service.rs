@@ -1629,6 +1629,7 @@ mod tests {
                 tenant,
                 vec![],
                 PermissionSet::from_iter(permissions),
+                wyrd_runtime::CardScope::default(),
             ),
             request_id: RequestId::parse(&uuid::Uuid::now_v7().to_string())
                 .expect("request id parses"),

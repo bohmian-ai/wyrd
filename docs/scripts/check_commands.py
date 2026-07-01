@@ -21,7 +21,7 @@ def paths() -> list[Path]:
         if root.is_file():
             result.append(root)
         elif root.exists():
-            result.extend(sorted(path for path in root.rglob("*") if path.suffix in {".md", ".mdx"}))
+            result.extend(sorted(path for path in root.rglob("*") if path.suffix in {".svx", ".md", ".mdx"}))
     return result
 
 

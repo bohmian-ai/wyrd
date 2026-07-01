@@ -1,13 +1,16 @@
 ---
 title: Model
 description: Generated reference for the Wyrd Model card spec.
+pillar: wyrd
+group: Reference
+order: 12
 ---
 
 # Model
 
 Describe a model artifact, its interface, and the context needed to use it safely.
 
-<dl class="wyrd-defs"><dt data-kind="model">Model</dt><dd>Describe a model artifact, its interface, and the context needed to use it safely.</dd><dt>Required</dt><dd><code>interface</code>, <code>signature</code>, <code>task_type</code></dd><dt>Optional</dt><dd>2 additional spec fields — see table below.</dd></dl>
+<CardSummary kind={"model"} title={"Model"} purpose={"Describe a model artifact, its interface, and the context needed to use it safely."} required={["interface", "signature", "task_type"]} optionalCount={2} />
 
 This page is generated from the checked-in JSON Schema. Edit the Rust spec, run the schema generator, then run `mise run docs:generate` to refresh this page.
 
@@ -27,11 +30,13 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 
 ## Shape
 
-<aside class="wyrd-phase-gate"><span class="wyrd-phase-gate__badge">Phase 5a</span>Copy-pasteable YAML for a ModelCard lands with the Card write path in Phase 5a. The JSON Schema at <code>crates/wyrd-spec/schemas/model_spec.json</code> is the current source of truth.</aside>
+The `card.json` envelope wraps this spec under `kind: Model`. For a runnable authoring walkthrough, see [Your first card](/tutorials/first-card/). The JSON Schema at `crates/wyrd-spec/schemas/model_spec.json` is the field-level source of truth.
 
 ## Lifecycle
 
-<aside class="wyrd-phase-gate"><span class="wyrd-phase-gate__badge">Phase 5a</span>Write, version, transition, and retire flows for ModelCards land in Phase 5a.</aside>
+`ModelCard` is a shipped holder: author it locally, then register it to a
+server. Registration is idempotent on identity and rejects a changed spec at
+the same version. See [Declare a card](/how-to/declare/).
 
 ## Authoring notes
 
@@ -41,5 +46,5 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 
 ## Related
 
-- [Concepts overview](/concepts/) — where Model fits in the seven primitives.
+- [Card](/concepts/card/) — where Model fits in the card model.
 - [Card reference index](/cards/) — every kind in one place.

@@ -362,6 +362,9 @@ jobs:
       - name: Check docs
         run: mise run docs:check
 
+      - name: docs:a11y — landmarks, heading order, contrast, keyboard controls
+        run: mise run docs:a11y
+
   ui:
     name: ui
     needs: changes

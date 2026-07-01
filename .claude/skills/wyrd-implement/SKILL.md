@@ -203,14 +203,15 @@ directly when a commit's surface warrants. The test stage uses
 ## Hand-Off
 
 Assembled feature branch (all tasks `done`, gates green) → **`review-and-plan`**
-for the final fan-out review; optionally `wyrd-architecture-review` again if the
+for the final fan-out review; optionally `wyrd-architecture-reviewer` again if the
 implementation diverged from `plan.md`.
 
 **Run the review stage to its terminal artifact.** `review-and-plan` is an
 orchestrator: it is not complete until all five phases have run and
 `.dev/review/{REVIEW_ID}/implementation-plan.md` exists (preceded by `summary.md`
 and `validation.md`). Drive it straight through — do **not** stop after the
-reviewers (Phase 3) write their files.
+reviewers (Phase 3) write their files. `review-and-plan` should be run on the entire
+feature's changes and compared against the parent it was branched from.
 
 **Surface nothing until it has passed validation.** A raw reviewer finding — even
 one that looks CRITICAL — is *unvalidated* and may be a false positive. The

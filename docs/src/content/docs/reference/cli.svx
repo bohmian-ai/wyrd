@@ -1,0 +1,162 @@
+---
+title: CLI
+description: The wyrd binary — auth, eval, and principal commands, with every flag and environment variable.
+pillar: wyrd
+group: Reference
+order: 2
+---
+
+# CLI
+
+Reference for the `wyrd` binary. It has three command groups: `auth`, `eval`, and
+`principal`. The binary is built from the repo — see [Get started](/get-started/).
+
+Every server-facing command reads `--server` from `WYRD_SERVER_URL` when the flag
+is omitted. Admin commands read the bearer token from `WYRD_ACCESS_TOKEN`.
+
+## wyrd auth
+
+Authenticate with a Wyrd server and manage credentials.
+
+### auth login
+
+Initiate an OIDC login flow and exchange the callback code for a Wyrd access
+token. Prints a URL to open in your browser.
+
+```bash
+wyrd auth login --server https://acme.wyrd.cloud --issuer https://id.acme.com
+```
+
+<DataTable
+  columns={[
+    { header: 'Flag', role: 'name' },
+    { header: 'Required' },
+    { header: 'Env' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.'],
+    ['--issuer', 'yes', '—', 'Trusted OIDC issuer URL registered with this tenant.']
+  ]}
+/>
+
+### auth refresh
+
+Rotate a Wyrd refresh token and print the new access and refresh tokens.
+
+```bash
+wyrd auth refresh --server https://acme.wyrd.cloud --refresh-token "$TOKEN"
+```
+
+<DataTable
+  columns={[
+    { header: 'Flag', role: 'name' },
+    { header: 'Required' },
+    { header: 'Env' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.'],
+    ['--refresh-token', 'yes', 'WYRD_REFRESH_TOKEN', 'Refresh token to rotate.']
+  ]}
+/>
+
+### auth issue-key
+
+Issue an API key bound to a card ref (`POST /auth/issue-key`). Requires an admin
+access token.
+
+```bash
+wyrd auth issue-key \
+  --kind service --name checkout --version 1.0.0 --space prod \
+  --server https://acme.wyrd.cloud --token "$WYRD_ACCESS_TOKEN"
+```
+
+<DataTable
+  columns={[
+    { header: 'Flag', role: 'name' },
+    { header: 'Required' },
+    { header: 'Env' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['--kind', 'yes', '—', 'Card kind the key is bound to (e.g. service, agent).'],
+    ['--name', 'yes', '—', 'Card name.'],
+    ['--version', 'yes', '—', 'Card version (e.g. 1.0.0).'],
+    ['--space', 'yes', '—', 'Card space.'],
+    ['--label', 'no', '—', 'Label stored with the key row.'],
+    ['--expires-in-seconds', 'no', '—', 'TTL override in seconds.'],
+    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.'],
+    ['--token', 'yes', 'WYRD_ACCESS_TOKEN', 'Bearer access token with admin privileges.']
+  ]}
+/>
+
+## wyrd eval run
+
+Execute an Eval card. There are two source modes, and exactly one is required:
+
+- **Live** — drive a running server against an agent endpoint: `--server` with
+  `--agent-url`.
+- **Local records** — score pre-collected observations: `--records`.
+
+```bash
+# Live run against an agent
+wyrd eval run --eval ./eval.yaml \
+  --server https://acme.wyrd.cloud --agent-url http://localhost:8080
+
+# Offline scoring of recorded rows
+wyrd eval run --eval ./eval.yaml --records ./observations.jsonl
+```
+
+<DataTable
+  columns={[
+    { header: 'Flag', role: 'name' },
+    { header: 'Default' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['--eval', '(required)', 'Eval card filesystem path (JSON or YAML).'],
+    ['--server', '—', 'Drive a remote server protocol router. Requires --agent-url.'],
+    ['--agent-url', '—', 'Agent endpoint URL. Conflicts with --records.'],
+    ['--records', '—', 'JSONL of pre-collected EvalRecordObservation rows. Conflicts with --server/--agent-url.'],
+    ['--judge-mock', 'false', 'Deterministic judge — all LLM judge tasks return passed: true. Required if the spec has LLM judges and no provider is configured.'],
+    ['--simulated-user', 'server', 'Who supplies unscripted user turns: server or client.'],
+    ['--simulated-user-script', '—', 'JSONL of client-supplied user turns. Required when --simulated-user client.'],
+    ['--baseline', '—', 'Baseline EvalResults JSON for comparison.'],
+    ['--out', '—', 'Directory for local output artifacts (env WYRD_EVAL_OUT).'],
+    ['--agent-timeout-secs', '60', 'Agent HTTP timeout in seconds.'],
+    ['--fail-on-gate', 'true', 'Exit non-zero when the local pass gate fails.']
+  ]}
+/>
+
+## wyrd principal revoke
+
+Revoke a principal's credentials immediately. Requires an admin access token. The
+principal ID is positional; `--kind` is required because IDs are unique only
+within a kind.
+
+```bash
+wyrd principal revoke 3f9a...uuid --kind service --reason "key leaked" \
+  --server https://acme.wyrd.cloud --token "$WYRD_ACCESS_TOKEN"
+```
+
+<DataTable
+  columns={[
+    { header: 'Argument', role: 'name' },
+    { header: 'Required' },
+    { header: 'Env' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['<id>', 'yes', '—', 'Principal ID (UUID) to revoke.'],
+    ['--kind', 'yes', '—', 'Principal kind: user, service, or agent.'],
+    ['--reason', 'yes', '—', 'Audit reason for the revocation.'],
+    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.'],
+    ['--token', 'yes', 'WYRD_ACCESS_TOKEN', 'Bearer access token with admin privileges.']
+  ]}
+/>
+
+## Related
+
+- [Reference](/reference/) — cards, API, and schemas.
+- [For agents](/for-agents/) — the machine-readable surface and stable paths.

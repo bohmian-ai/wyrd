@@ -1,0 +1,111 @@
+---
+title: Where Wyrd fits
+description: Wyrd's position in the AI stack, the Mitari platform, the lifecycle loop, and what Wyrd is deliberately not.
+pillar: wyrd
+group: Overview
+order: 2
+---
+
+# Where Wyrd fits
+
+Wyrd sits between the people and agents who build AI components and the systems
+that run, version, and govern them. It is not a training framework, not an
+application runtime, and not a cloud platform. It is the typed layer that records
+what those systems declare and observes what they do.
+
+## The narrow waist
+
+An AI stack has many tools above and below any given layer: data platforms,
+training frameworks, serving infra, agent frameworks, eval harnesses. They do not
+share a vocabulary. Wyrd is the **narrow waist** — one typed envelope (the Card)
+that every layer can produce and every layer can read.
+
+A dataset produced by a feature pipeline, a model from a training job, and a
+prompt from a repo all become the same shape once registered. The tools above and
+below Wyrd stay diverse; the contract between them is uniform. That is what makes
+lineage, policy, and observation possible across tools that were never designed
+to interoperate.
+
+## Mitari, Wyrd, and Fathom
+
+**Mitari** is the platform. It has two layers:
+
+<DataTable
+  columns={[
+    { header: 'Layer', role: 'name' },
+    { header: 'What it is' },
+    { header: 'Model' }
+  ]}
+  rows={[
+    ['Wyrd', 'The open-core substrate — the typed envelope, registry, lineage, and Skald runtime. The narrow waist of the AI stack.', 'Open core'],
+    ['Fathom', 'The enterprise intelligence layer. It reads Wyrd’s typed model and turns runtime behavior into evidence — leakage, eval, drift, and audit.', 'Enterprise']
+  ]}
+/>
+
+The division is deliberate: **Wyrd captures every stage; Fathom reasons across all
+of it.** Wyrd's job is to make behavior recordable and typed. Fathom's job is to
+verify that behavior against what each component declared — to turn opinion into
+evidence that no single point tool can see.
+
+<Aside title="Fathom is not shipped yet" data-variant="not">
+
+Fathom is the enterprise layer of the Mitari platform and is not yet available.
+This documentation covers Wyrd, the open-core substrate. Fathom is described here
+only to explain where Wyrd fits.
+
+</Aside>
+
+## The lifecycle loop
+
+Wyrd is built for a loop, not a one-shot pipeline:
+
+```text
+Develop → Deploy → Observe → Diagnose → (fix back to code) → Develop
+```
+
+- **Develop** — build and connect typed components on Wyrd. Traces and
+  experiments stream in.
+- **Deploy** — models, services, and agents ship as declared cards with a
+  versioned spec.
+- **Observe** — runtime behavior is recorded as runs and observations, measured
+  against what each card declared.
+- **Diagnose** — the intelligence layer isolates a failure, proves the cause, and
+  returns a fix as code.
+
+Keep this loop distinct from two other axes that use similar words:
+
+- The **per-card journey** — Author → Register → Refer → Run — is how one card
+  moves through the system.
+- The card **`status.phase`** — local → registered → active → deprecated — is one
+  card's lifecycle state.
+
+They are three different things. Do not merge them.
+
+## What Wyrd is not
+
+Wyrd records, validates, governs, links, installs, observes, and exposes AI
+components. It does not run them.
+
+<DataTable
+  columns={[
+    { header: 'Wyrd owns', role: 'name' },
+    { header: 'Your code owns' }
+  ]}
+  rows={[
+    ['The registry, lineage graph, and card contracts', 'Inference loops and training loops'],
+    ['Policy evaluation and audit records', 'App servers and agent processes'],
+    ['Runs, observations, and drift signals', 'Deployment mechanics'],
+    ['The typed surfaces (HTTP, SDK, CLI, MCP)', 'The business logic inside a run']
+  ]}
+/>
+
+Runtime results that persist become runs, observations, artifact cards,
+relationships, audit records, or status updates — through service-owned paths, not
+by writing runtime objects into specs. Your process stays yours; Wyrd is the
+observation and governance layer around it.
+
+## Related
+
+- [Overview](/overview/) — what Wyrd is and the coordination problem.
+- [Architecture](/concepts/architecture/) — the three products: Wyrd, Skald, Vala.
+- [Doctrine](/concepts/doctrine/) — the design doctrine these boundaries come from.

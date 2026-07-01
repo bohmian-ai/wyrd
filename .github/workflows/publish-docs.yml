@@ -1,0 +1,86 @@
+name: publish-docs
+
+# Builds the SvelteKit static docs site and deploys it to GitHub Pages.
+#
+# The site is served from the project subpath https://mitari-ai.github.io/wyrd/.
+# `paths.base = '/wyrd'` in docs/svelte.config.js prefixes every asset and link
+# so the static output is correct under that subpath. There is no custom domain
+# / CNAME — do not add one without also changing paths.base and the llms.txt
+# origin constant (docs/scripts/generate_llms_txt.py).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      # Generators read JSON schemas from wyrd-spec, so schema edits can change
+      # the generated card/api pages and llms.txt.
+      - crates/wyrd-spec/schemas/**
+      - .github/workflows/publish-docs.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deploy at a time; cancel superseded in-flight runs cleanly.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  MISE_LOCKED: "true"
+
+jobs:
+  build:
+    name: build docs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Toolchain (node, pnpm) comes from mise.toml — do not pin here.
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Install docs dependencies
+        run: mise run docs:install
+
+      # Regenerate schema-derived pages and llms.txt so the deployed site is
+      # never stale relative to the schemas at this commit.
+      - name: Generate docs
+        run: mise run docs:generate
+
+      - name: Build docs
+        run: mise run docs:build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/build
+
+  deploy:
+    name: deploy docs
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

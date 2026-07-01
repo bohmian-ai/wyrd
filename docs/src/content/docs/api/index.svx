@@ -1,0 +1,18 @@
+---
+title: API reference
+description: Error catalog, OpenAPI summary, and JSON Schema inventory — all generated from source.
+pillar: wyrd
+group: Reference
+order: 20
+---
+
+# API reference
+
+All pages in this section are generated from repository source. Run
+`mise run docs:generate` to refresh them after a schema or spec change.
+
+## Pages
+
+- [Errors](/api/errors/) — structured error codes, fields, and agent handling rules.
+- [OpenAPI](/api/openapi/) — summary of the Wyrd HTTP API contract.
+- [Schemas](/api/schemas/) — inventory of all checked-in JSON Schemas.

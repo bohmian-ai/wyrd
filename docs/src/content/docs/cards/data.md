@@ -1,13 +1,16 @@
 ---
 title: Data
 description: Generated reference for the Wyrd Data card spec.
+pillar: wyrd
+group: Reference
+order: 11
 ---
 
 # Data
 
 Describe a dataset, feature table, document set, or other data dependency.
 
-<dl class="wyrd-defs"><dt data-kind="data">Data</dt><dd>Describe a dataset, feature table, document set, or other data dependency.</dd><dt>Required</dt><dd><code>interface</code>, <code>schema</code>, <code>stats</code></dd><dt>Optional</dt><dd>4 additional spec fields — see table below.</dd></dl>
+<CardSummary kind={"data"} title={"Data"} purpose={"Describe a dataset, feature table, document set, or other data dependency."} required={["interface", "schema", "stats"]} optionalCount={4} />
 
 This page is generated from the checked-in JSON Schema. Edit the Rust spec, run the schema generator, then run `mise run docs:generate` to refresh this page.
 
@@ -29,11 +32,13 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 
 ## Shape
 
-<aside class="wyrd-phase-gate"><span class="wyrd-phase-gate__badge">Phase 5a</span>Copy-pasteable YAML for a DataCard lands with the Card write path in Phase 5a. The JSON Schema at <code>crates/wyrd-spec/schemas/data_spec.json</code> is the current source of truth.</aside>
+The `card.json` envelope wraps this spec under `kind: Data`. For a runnable authoring walkthrough, see [Your first card](/tutorials/first-card/). The JSON Schema at `crates/wyrd-spec/schemas/data_spec.json` is the field-level source of truth.
 
 ## Lifecycle
 
-<aside class="wyrd-phase-gate"><span class="wyrd-phase-gate__badge">Phase 5a</span>Write, version, transition, and retire flows for DataCards land in Phase 5a.</aside>
+`DataCard` is a shipped holder: author it locally, then register it to a
+server. Registration is idempotent on identity and rejects a changed spec at
+the same version. See [Declare a card](/how-to/declare/).
 
 ## Authoring notes
 
@@ -43,5 +48,5 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 
 ## Related
 
-- [Concepts overview](/concepts/) — where Data fits in the seven primitives.
+- [Card](/concepts/card/) — where Data fits in the card model.
 - [Card reference index](/cards/) — every kind in one place.

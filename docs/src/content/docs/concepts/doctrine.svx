@@ -1,0 +1,88 @@
+---
+title: Doctrine
+description: The design doctrine behind Wyrd's nouns, layers, services, and public surfaces.
+pillar: wyrd
+group: Concepts
+order: 4
+---
+
+# Doctrine
+
+Wyrd's doctrine is the set of rules that keep the system coherent as it grows. It
+is the "why" behind the object model. The protocol spec
+(`architecture/wyrd-design.md`) is the authority on the "what" and wins on any
+conflict; this page is the public summary for developers and agents.
+
+## One object model, no skipped layers
+
+Wyrd is built around declared intent, organized into five layers. Each layer only
+operates on the one below it.
+
+<DataTable
+  columns={[
+    { header: 'Layer', role: 'name' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['Core nouns', 'The durable concepts every other layer uses: Card, Spec, Run, Observation.'],
+    ['Card kinds', 'Domain specializations of Card. The kind changes the spec, not the ontology.'],
+    ['Foundations', 'The envelope, metadata, CardRef, relationship, status, and version.'],
+    ['Services', 'Registry, storage, lineage, policy, install, audit, observability, evaluation, drift, runtime.'],
+    ['Surfaces', 'HTTP, SDK, CLI, UI, MCP, IDE integrations, and generated docs.']
+  ]}
+/>
+
+A service operates on foundations. A surface exposes a service. A card kind
+specializes `Card`. Runtime details stay behind the contract that explains them.
+
+## The four nouns come first
+
+```text
+Cards declare.       Specs define.        CardRefs connect.
+Relationships explain.   Status tracks lifecycle.
+Runs record execution.   Observations record measured facts.
+Policy governs decisions.   Audit records accountability.
+```
+
+Everything new should first try to fit as a card kind, a spec field, a
+relationship, a run, or an observation. You add a new noun only when those shapes
+cannot express the concept without lying. This is why there is no `Tool`, `Skill`,
+or `SubAgent` card kind: a tool is a runtime name, sub-agency is an Agent
+referencing an Agent, and neither needs a new noun.
+
+## Relationships are derived, never authored
+
+Authors write `CardRef` values inside specs. The server derives relationships from
+them, and lineage reads those relationships. Users never maintain a parallel
+lineage graph. If you find yourself hand-editing edges, the model is being
+bypassed.
+
+## Surfaces project one contract
+
+The SDK, HTTP API, CLI, UI, generated schemas, and MCP tools all project the same
+card contract. A surface may add an ergonomic shortcut, but it does not invent new
+shapes, rename durable fields, or expose server-internal state. What you declare in
+Python is recognizable in the HTTP payload, the stored card, the generated schema,
+and the MCP tool input.
+
+## The implementation rule
+
+Every implementation preserves these invariants:
+
+- contracts are typed
+- specs are declarative
+- CardRefs are explicit
+- relationships are derived
+- artifacts are cards
+- registration is centralized
+- runtime behavior stays out of durable specs
+- public surfaces use Wyrd vocabulary
+
+A plan that violates one of these needs a named exception and a reason strong
+enough to survive review.
+
+## Related
+
+- [Concepts](/concepts/) — the four-noun ontology.
+- [Card](/concepts/card/) — the envelope the doctrine describes.
+- [Architecture](/concepts/architecture/) — how the doctrine maps to three products.

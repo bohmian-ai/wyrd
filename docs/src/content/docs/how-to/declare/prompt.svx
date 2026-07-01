@@ -1,0 +1,58 @@
+---
+title: Declare a Prompt card
+description: Author a PromptCard from a Prompt and save it locally.
+pillar: wyrd
+group: How-to
+order: 11
+---
+
+# Declare a Prompt card
+
+## Prerequisites
+
+- Wyrd set up from a repo checkout ([Get started](/get-started/))
+
+## Recipe
+
+```python
+from pathlib import Path
+
+from wyrd import Prompt
+from wyrd.prompt import PromptCard
+
+prompt = Prompt(
+    provider="openai",
+    model="gpt-4o-mini",
+    messages=["Summarise the following document in {max_words} words:\n\n{document}"],
+)
+
+card = PromptCard(
+    prompt,
+    name="summarise-document",
+    version="0.1.0",
+)
+
+card.save(Path("./summarise-prompt"))
+```
+
+The first positional argument is a `Prompt` — the provider, model, and messages
+live on it. The `PromptCard` wraps it with identity (`name`, `version`, and a
+`space` that defaults to `default`).
+
+`card.save(path)` writes the local card layout. Registration to a server is the
+HTTP route `POST /api/v1/cards` (see [Declare a Data card](/how-to/declare/data/)
+for the request shape); there is no Python registry client yet.
+
+## Notes
+
+- Keep `name` stable — downstream agents, policies, and audits refer to it by
+  identity.
+- `version` follows semver. The server rejects a changed spec at the same version.
+- Provider settings can be pinned with the `model_settings` argument to
+  `PromptCard`.
+
+## Reference
+
+- [Prompt card spec](/cards/prompt/) — generated field-level documentation.
+- [Build an agent](/how-to/build-an-agent/) — run a registered prompt on Skald.
+- [Cards](/cards/) — every kind and status.

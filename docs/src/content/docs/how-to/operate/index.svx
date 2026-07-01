@@ -2,8 +2,8 @@
 title: Operate
 description: Run, restart, and manage card-governed components in production.
 pillar: wyrd
-group: Operate
-order: 1
+group: How-to
+order: 32
 ---
 
 # Operate
@@ -22,5 +22,5 @@ Operate capability covers:
 - Triggering workflows from `TriggerCard` definitions
 - Managing operator lifecycle within a workflow
 
-These how-to pages will be added alongside the ServiceCard runtime. Track
-progress in [Roadmap](/roadmap/).
+These how-to pages will be added alongside the ServiceCard runtime. See what
+runs today in the [Overview](/overview/).

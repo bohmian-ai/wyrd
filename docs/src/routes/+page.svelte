@@ -25,7 +25,7 @@
         <span class="f">Fathom</span> reads that graph to verify how they behave.
       </p>
       <div class="hero-cta">
-        <a class="btn btn-lime" href={`${base}/start-here/quickstart/`}>▶ Quickstart</a>
+        <a class="btn btn-lime" href={`${base}/get-started/`}>▶ Get started</a>
         <a class="btn btn-ghost" href={`${base}/concepts/`}>Explore concepts</a>
       </div>
     </div>
@@ -64,13 +64,13 @@
 <section class="sec center">
   <div class="wrap">
     <div class="sec-head">
-      <div class="sec-eye">START WHERE YOU ARE</div>
-      <h2 class="title">Four ways into the <em>docs</em>.</h2>
+      <div class="sec-eye">CHOOSE YOUR OWN ADVENTURE!!!</div>
+      <h2 class="title">Four paths await <em>you</em>.</h2>
     </div>
     <div class="grid3" style="text-align:left;margin-top:8px">
-      <a class="card" href={`${base}/start-here/quickstart/`}>
-        <div class="ct"><span class="d client"></span>Quickstart</div>
-        <p>Install Wyrd, register your first Card, and read it back in under five minutes.</p>
+      <a class="card" href={`${base}/get-started/`}>
+        <div class="ct"><span class="d client"></span>Agentic Development</div>
+        <p>Install Wyrd, use your harness of choice to create and optimize a model iteratively. Declare a service and deploy</p>
         <div class="meta">Start here →</div>
       </a>
       <a class="card" href={`${base}/concepts/`}>
@@ -78,7 +78,7 @@
         <p>Cards, the shared envelope, Specs, Runs, Observations, and the registry graph.</p>
         <div class="meta">Learn the model →</div>
       </a>
-      <a class="card" href={`${base}/api/`}>
+      <a class="card" href={`${base}/reference/`}>
         <div class="ct"><span class="d control"></span>Reference</div>
         <p>Schemas, stable error codes, CLI verbs, and MCP tools — the literal contract.</p>
         <div class="meta">Look it up →</div>

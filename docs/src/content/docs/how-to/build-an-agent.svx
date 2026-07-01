@@ -2,6 +2,8 @@
 pillar: wyrd
 title: Build an Agent
 description: "Build a Wyrd Agent: prompt, tools, callbacks, session memory, and run config. Python and Rust side-by-side."
+group: How-to
+order: 20
 ---
 
 # Build an Agent
@@ -141,6 +143,6 @@ let parent = Agent::new(prompt).with_tool(delegate);
 
 ## See Also
 
-- [Build a Workflow](/guides/build-a-workflow/)
-- [Agents & workflows](/skald/)
+- [Build a Workflow](/how-to/build-a-workflow/)
+- [Architecture](/concepts/architecture/) — where Skald fits.
 - [Schema reference](/api/schemas/)

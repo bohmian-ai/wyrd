@@ -2,8 +2,8 @@
 title: Evaluate
 description: Score agent runs and models against Wyrd eval definitions.
 pillar: wyrd
-group: Evaluate
-order: 1
+group: How-to
+order: 30
 ---
 
 # Evaluate
@@ -22,5 +22,5 @@ Evaluate capability covers:
 - Comparing model outputs against collected production records
 - Running `wyrd eval` from the CLI
 
-These how-to pages will be added alongside the EvalCard runtime. Track progress
-in [Roadmap](/roadmap/).
+These how-to pages will be added alongside the EvalCard runtime. See what runs
+today in the [Overview](/overview/).

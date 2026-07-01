@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Direction A doc sidebar (`.side`): each nav group is a collapsible
+  // Direction A doc sidebar: each nav group is a collapsible
   // `<details class="grp">` whose `<summary class="gh">` carries the colored
   // `.b` kind bar + label, followed by `<a>` item links (active one marked
   // `.on`). Native `<details>` keeps this zero-runtime and keyboard-accessible;
@@ -28,7 +28,7 @@
   }
 </script>
 
-<nav class="side" aria-label="Documentation">
+<nav aria-label="Documentation">
   {#each nav as g (g.label)}
     <details class="grp" open={hasActive(g.items)}>
       <summary class="gh"><span class={`b ${g.kind}`}></span>{g.label}</summary>

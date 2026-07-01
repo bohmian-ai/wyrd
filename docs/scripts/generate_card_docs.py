@@ -150,7 +150,7 @@ def render(slug: str, schema_file: str, order: int) -> str:
         f"title: {title}",
         f"description: Generated reference for the Wyrd {title} card spec.",
         "pillar: wyrd",
-        "group: cards",
+        "group: Reference",
         f"order: {order}",
         "---",
         "",
@@ -184,7 +184,7 @@ def render(slug: str, schema_file: str, order: int) -> str:
         [
             f"`{title}Card` is a shipped holder: author it locally, then register it to a",
             "server. Registration is idempotent on identity and rejects a changed spec at",
-            "the same version. See [Register cards](/server/register-cards/).",
+            "the same version. See [Declare a card](/how-to/declare/).",
         ],
     )
 
@@ -194,7 +194,7 @@ def render(slug: str, schema_file: str, order: int) -> str:
             "## Shape",
             "",
             f"The `card.json` envelope wraps this spec under `kind: {title}`. For a runnable "
-            f"authoring walkthrough, see the [Python SDK](/python/). The JSON Schema at "
+            f"authoring walkthrough, see [Your first card](/tutorials/first-card/). The JSON Schema at "
             f"`{source}` is the field-level source of truth.",
             "",
             "## Lifecycle",
@@ -209,7 +209,7 @@ def render(slug: str, schema_file: str, order: int) -> str:
             "",
             "## Related",
             "",
-            f"- [How it connects](/start-here/how-it-connects/) — where {title} fits in the card model.",
+            f"- [Card](/concepts/card/) — where {title} fits in the card model.",
         ]
     )
     if related_note := RELATED_NOTES.get(slug):
@@ -225,7 +225,7 @@ def render(slug: str, schema_file: str, order: int) -> str:
 
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    for order, (slug, schema_file) in enumerate(CARD_SPECS.items(), start=1):
+    for order, (slug, schema_file) in enumerate(CARD_SPECS.items(), start=11):
         # Never clobber a hand-authored page for a kind (none exist today).
         if (OUT_DIR / f"{slug}.svx").exists() or (OUT_DIR / f"{slug}.mdx").exists():
             continue

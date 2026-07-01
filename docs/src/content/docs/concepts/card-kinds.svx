@@ -1,0 +1,143 @@
+---
+title: Card kinds
+description: The 16 native card kinds plus External, grouped by domain, with what each declares and its shipping status.
+pillar: wyrd
+group: Concepts
+order: 3
+---
+
+# Card kinds
+
+A `kind` selects the spec schema a card carries. The envelope is always the same;
+the kind changes the payload, not the ontology. The v1 doctrine defines 16 native
+kinds plus `External` for forward compatibility.
+
+<Aside title="Three kinds run end-to-end" data-variant="wyrd">
+
+**Data**, **Model**, and **Prompt** are shipped: authored in Python, validated,
+saved, and — for Prompt — resolved by the Skald runtime. Every other kind has an
+authored spec and JSON Schema but no runtime behind it yet. The tables below mark
+each one. See [Cards](/cards/) for per-field reference on the shipped kinds.
+
+</Aside>
+
+## Data plane
+
+<DataTable
+  columns={[
+    { header: 'Kind', role: 'name' },
+    { header: 'Declares' },
+    { header: 'Status' }
+  ]}
+  rows={[
+    ['Data', 'A dataset — schema, interface, and local layout.', { text: 'Shipped', badge: 'ok' }],
+    ['Model', 'A trained model and its artifacts.', { text: 'Shipped', badge: 'ok' }],
+    ['Artifact', 'A produced file or blob output.', { text: 'Spec-only', badge: 'warn' }],
+    ['Experiment', 'A training or evaluation run record.', { text: 'Spec-only', badge: 'warn' }]
+  ]}
+/>
+
+## Agent plane
+
+<DataTable
+  columns={[
+    { header: 'Kind', role: 'name' },
+    { header: 'Declares' },
+    { header: 'Status' }
+  ]}
+  rows={[
+    ['Prompt', 'A versioned prompt with its provider and model.', { text: 'Shipped', badge: 'ok' }],
+    ['Agent', 'A bounded tool-using loop over a Prompt.', { text: 'Spec-only', badge: 'warn' }],
+    ['Workflow', 'An orchestration of agents and steps.', { text: 'Spec-only', badge: 'warn' }],
+    ['Mcp', 'A reference to an MCP tool server.', { text: 'Spec-only', badge: 'warn' }]
+  ]}
+/>
+
+<Aside title="Agents and workflows run today — as runtime objects" data-variant="not">
+
+Skald executes agents and workflows at runtime over registered Prompts (see
+[Build an agent](/how-to/build-an-agent/)). The `Agent` and `Workflow` **card
+kinds** — declaring one as a registered, versioned card — are spec-only for now.
+
+</Aside>
+
+## Composition
+
+<DataTable
+  columns={[
+    { header: 'Kind', role: 'name' },
+    { header: 'Declares' },
+    { header: 'Status' }
+  ]}
+  rows={[
+    ['Service', 'A deployable composition of cards.', { text: 'Spec-only', badge: 'warn' }]
+  ]}
+/>
+
+## Governance
+
+<DataTable
+  columns={[
+    { header: 'Kind', role: 'name' },
+    { header: 'Declares' },
+    { header: 'Status' }
+  ]}
+  rows={[
+    ['Policy', 'CEL rules evaluated at register, deploy, and invoke time.', { text: 'Spec-only', badge: 'warn' }],
+    ['Audit', 'An accountability record of a governed decision.', { text: 'Spec-only', badge: 'warn' }]
+  ]}
+/>
+
+## Observability
+
+<DataTable
+  columns={[
+    { header: 'Kind', role: 'name' },
+    { header: 'Declares' },
+    { header: 'Status' }
+  ]}
+  rows={[
+    ['Drift', 'A drift monitor over a model or prompt.', { text: 'Spec-only', badge: 'warn' }],
+    ['Eval', 'An evaluation definition.', { text: 'Spec-only', badge: 'warn' }],
+    ['Source', 'A reference to external data Wyrd reads.', { text: 'Spec-only', badge: 'warn' }]
+  ]}
+/>
+
+## Reaction
+
+<DataTable
+  columns={[
+    { header: 'Kind', role: 'name' },
+    { header: 'Declares' },
+    { header: 'Status' }
+  ]}
+  rows={[
+    ['Trigger', 'An event that starts declared work.', { text: 'Spec-only', badge: 'warn' }],
+    ['Operator', 'A reactive operator within a workflow.', { text: 'Spec-only', badge: 'warn' }]
+  ]}
+/>
+
+## External
+
+`External` is the forward-compatibility escape hatch: a typed placeholder for a
+component Wyrd does not natively model as a kind. It exists so a card graph can
+reference something outside the 16 native kinds without inventing a private shape.
+Spec-only.
+
+## Not card kinds
+
+Some concepts deliberately are **not** kinds:
+
+- **Tools** are runtime names resolved by Skald's tool registry, not cards.
+- **Sub-agency** is an Agent referencing another Agent — a relationship, not a
+  `SubAgent` kind.
+- **Skills** are not a v1 card kind.
+
+Adding a new noun is a last resort. A concept should first try to fit as a card
+kind, a spec field, a relationship, a run, or an observation. See
+[Doctrine](/concepts/doctrine/).
+
+## Related
+
+- [Card](/concepts/card/) — the shared envelope every kind uses.
+- [Cards](/cards/) — generated per-field reference for the shipped kinds.

@@ -23,12 +23,13 @@ BUILD_DIR = DOCS_ROOT / "build"
 TOKENS_CSS = DOCS_ROOT / "src" / "styles" / "wyrd-tokens.css"
 WCAG_AA = 4.5
 
-# Fail-closed floor on a truncated prerender. The site emits 44 real doc pages;
-# a masked prerender failure (a content page throwing at render) silently drops
-# pages and omits index.html while the build still exits 0. Asserting index.html
-# plus a page floor turns that regression class into a hard a11y-gate failure
-# instead of a vacuously-green run over whatever HTML survived.
-MIN_REAL_PAGES = 40
+# Fail-closed floor on a truncated prerender. The site emits 33 real doc content
+# pages (the home and Fathom splashes are full-bleed archetypes, exempt from the
+# doc-shell contract below). A masked prerender failure (a content page throwing
+# at render) silently drops pages and omits index.html while the build still exits
+# 0. Asserting index.html plus a page floor turns that regression class into a hard
+# a11y-gate failure instead of a vacuously-green run over whatever HTML survived.
+MIN_REAL_PAGES = 33
 
 
 # ─── WCAG contrast helpers ────────────────────────────────────────────────────
@@ -186,8 +187,12 @@ def check_page(path: Path) -> list[str]:
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-_SKIP_FILES = frozenset({"404.html"})
-_SKIP_DIRS = frozenset({"mocks", "pagefind", "_app"})
+# The home splash (root index.html) and the Fathom teaser are full-bleed holding
+# pages with no doc shell — no <main>, splash heading structure. They are exempt
+# from the doc-shell a11y contract, like 404.html. index.html existence is still
+# asserted separately in main() as a prerender-truncation guard.
+_SKIP_FILES = frozenset({"404.html", "index.html"})
+_SKIP_DIRS = frozenset({"mocks", "pagefind", "_app", "fathom"})
 
 
 def _real_pages() -> list[Path]:

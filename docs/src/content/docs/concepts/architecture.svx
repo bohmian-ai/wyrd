@@ -1,0 +1,66 @@
+---
+title: Architecture
+description: The three products Wyrd ships from one source tree — control plane, runtime, and data plane — over one shared spec crate.
+pillar: wyrd
+group: Concepts
+order: 5
+---
+
+# Architecture
+
+Wyrd ships three products from one source tree. `wyrd-spec` is the shared Rust
+crate that defines every wire type; each product depends on it, and none owns it.
+That single shared crate is what keeps the contract identical across the HTTP API,
+SDK, CLI, MCP tools, and generated schemas — what you declare in Python is
+recognizable in every other surface.
+
+## The three products
+
+<DataTable
+  columns={[
+    { header: 'Product', role: 'name' },
+    { header: 'Plane' },
+    { header: 'Domain' }
+  ]}
+  rows={[
+    ['Wyrd', 'Control plane', 'Registry, lineage, policy, auth, install, audit.'],
+    ['Skald', 'Runtime', 'LLM providers, prompt execution, tool registry, agent runtime, workflows.'],
+    ['Vala', 'Data plane', 'Observations, drift evaluation, agent eval, and the Bifrost OLAP warehouse.']
+  ]}
+/>
+
+- **Wyrd** is the control plane. It stores and validates cards, derives
+  relationships from `CardRef`s, enforces policy, and records audit. It is the
+  authority on what exists and how it connects.
+- **Skald** is the runtime. It executes the agentic kinds — resolving a registered
+  Prompt, running an Agent's bounded loop, orchestrating a Workflow. Providers and
+  models live on the Prompt; execution policy lives on the Agent.
+- **Vala** is the data plane. It records runs and observations in the Bifrost OLAP
+  store, evaluates drift, and reads external data through `Source` cards.
+
+## Services compose foundations
+
+Services do not invent private shapes. Each one operates on the same foundations —
+the envelope, `CardRef`, relationships, status, and version:
+
+- **Registry** stores and validates cards, derives relationships, and manages
+  version and space isolation.
+- **Lineage** reads those derived relationships to answer provenance queries.
+- **Policy** evaluates CEL rules at three points: register-time (classify),
+  deploy-time (gate), and runtime (invoke).
+- **Observability / Bifrost** records runs and observations; external data enters
+  through `Source` cards rather than a bespoke connector.
+
+## One contract, many surfaces
+
+The SDK, HTTP API, CLI, UI, generated schemas, and MCP tools all project the same
+card contract. All contracts live on the API wire, which makes Wyrd
+language-agnostic: a surface can add an ergonomic shortcut, but it cannot rename a
+durable field, invent a new shape, or expose server-internal state.
+
+## Related
+
+- [Doctrine](/concepts/doctrine/) — the rules these boundaries follow.
+- [Where Wyrd fits](/overview/where-wyrd-fits/) — the runtime boundary and what
+  Wyrd is deliberately not.
+- [Build an agent](/how-to/build-an-agent/) — Skald's runtime, hands on.

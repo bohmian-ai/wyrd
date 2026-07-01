@@ -2,8 +2,8 @@
 title: Prompt
 description: Generated reference for the Wyrd Prompt card spec.
 pillar: wyrd
-group: cards
-order: 3
+group: Reference
+order: 13
 ---
 
 # Prompt
@@ -31,13 +31,13 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 
 ## Shape
 
-The `card.json` envelope wraps this spec under `kind: Prompt`. For a runnable authoring walkthrough, see the [Python SDK](/python/). The JSON Schema at `crates/wyrd-spec/schemas/prompt_spec.json` is the field-level source of truth.
+The `card.json` envelope wraps this spec under `kind: Prompt`. For a runnable authoring walkthrough, see [Your first card](/tutorials/first-card/). The JSON Schema at `crates/wyrd-spec/schemas/prompt_spec.json` is the field-level source of truth.
 
 ## Lifecycle
 
 `PromptCard` is a shipped holder: author it locally, then register it to a
 server. Registration is idempotent on identity and rejects a changed spec at
-the same version. See [Register cards](/server/register-cards/).
+the same version. See [Declare a card](/how-to/declare/).
 
 ## Authoring notes
 
@@ -47,5 +47,5 @@ the same version. See [Register cards](/server/register-cards/).
 
 ## Related
 
-- [How it connects](/start-here/how-it-connects/) — where Prompt fits in the card model.
+- [Card](/concepts/card/) — where Prompt fits in the card model.
 - [Card reference index](/cards/) — every kind in one place.

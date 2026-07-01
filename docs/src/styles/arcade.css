@@ -715,7 +715,8 @@
 .mk .side {
   border-right: 2px solid var(--border);
   background: var(--surface);
-  align-self: start;
+}
+.mk .side > nav {
   position: sticky;
   top: 57px;
   max-height: calc(100vh - 57px);

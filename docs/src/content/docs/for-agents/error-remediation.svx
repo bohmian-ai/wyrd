@@ -2,6 +2,8 @@
 pillar: wyrd
 title: Error remediation
 description: How agents should handle Wyrd errors.
+group: For Agents
+order: 3
 ---
 
 # Error remediation

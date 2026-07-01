@@ -16,7 +16,7 @@
   import Toc from '$lib/components/Toc.svelte';
   import Pagination from '$lib/components/Pagination.svelte';
 
-  const GITHUB_URL = 'https://github.com/wyrd-ai/wyrd';
+  const GITHUB_URL = 'https://github.com/mitari-ai/wyrd';
 
   let { children } = $props();
 
@@ -68,7 +68,7 @@
     </nav>
     <div class="right">
       <Search />
-      <button class="iconbtn" aria-label="Toggle theme" onclick={toggle}>
+      <button class="iconbtn theme-toggle" aria-label="Toggle theme" onclick={toggle}>
         {#if theme === 'dark'}
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
             <circle cx="12" cy="12" r="4.5" />
@@ -88,9 +88,10 @@
         >
       </a>
       <button
-        class="iconbtn menu"
+        class="iconbtn menu nav-drawer"
         aria-label="Menu"
         aria-expanded={drawer}
+        aria-controls="nav-drawer"
         onclick={() => (drawer = !drawer)}
       >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
@@ -100,11 +101,12 @@
     </div>
   </header>
 
-  <nav class={`drawer ${drawer ? 'open' : ''}`} aria-label="Sections">
-    <a href={`${base}/start-here/what-is-wyrd/`}>Wyrd · Start here</a>
+  <nav id="nav-drawer" class={`drawer ${drawer ? 'open' : ''}`} aria-label="Sections">
+    <a href={`${base}/overview/`}>Overview</a>
+    <a href={`${base}/get-started/`}>Get started</a>
     <a href={`${base}/concepts/`}>Concepts</a>
-    <a href={`${base}/guides/`}>Guides</a>
-    <a href={`${base}/api/`}>Reference</a>
+    <a href={`${base}/how-to/`}>How-to</a>
+    <a href={`${base}/reference/`}>Reference</a>
     <a href={`${base}/for-agents/`}>For agents</a>
     <a href={`${base}/fathom/`}>Fathom · coming soon</a>
   </nav>
@@ -137,9 +139,9 @@
       <div class="fcols">
         <div class="fcol">
           <span class="ch">WYRD</span>
-          <a href={`${base}/start-here/quickstart/`}>Quickstart</a>
+          <a href={`${base}/get-started/`}>Get started</a>
           <a href={`${base}/concepts/`}>Concepts</a>
-          <a href={`${base}/api/`}>Reference</a>
+          <a href={`${base}/reference/`}>Reference</a>
           <a href={`${base}/for-agents/`}>For agents</a>
         </div>
         <div class="fcol">
@@ -150,7 +152,7 @@
         <div class="fcol">
           <span class="ch">PROJECT</span>
           <a href={GITHUB_URL} rel="noreferrer" target="_blank">GitHub</a>
-          <a href={`${base}/roadmap/`}>Roadmap</a>
+          <a href={`${base}/overview/`}>Overview</a>
           <a href={`${base}/llms.txt`}>llms.txt</a>
         </div>
       </div>

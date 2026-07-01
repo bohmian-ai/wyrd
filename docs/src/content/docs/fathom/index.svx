@@ -1,7 +1,17 @@
 ---
 title: Fathom
-description: Runtime evidence for AI systems — leakage detection, eval as evidence, drift versus spec, and audit. Coming soon.
+description: The enterprise intelligence layer that reads Wyrd's typed model and turns behavior into evidence. Coming soon.
 pillar: fathom
 ---
 
 # Fathom
+
+Fathom is the enterprise intelligence layer of the Mitari platform. Where
+[Wyrd](/overview/) is the open-core substrate — the typed model, registry, and
+lineage — Fathom reads that model to verify how your AI systems behave: leakage
+detection, eval as evidence, drift versus spec, and audit.
+
+**Wyrd captures every stage; Fathom reasons across all of it.**
+
+Fathom is not yet released. For how the two pillars fit together, see
+[Where Wyrd fits](/overview/where-wyrd-fits/).

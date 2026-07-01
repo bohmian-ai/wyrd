@@ -1,16 +1,24 @@
 ---
 title: Declare
-description: Author and register Wyrd cards — recipes for the three shipped kinds.
+description: Author Wyrd cards in Python and save them locally — recipes for the three shipped kinds.
 pillar: wyrd
-group: Declare
-order: 1
+group: How-to
+order: 10
 ---
 
 # Declare
 
-Author a card locally and register it to the server with
-`wyrd.cards.register(card)`. Registration is idempotent on identity; the server
-rejects a changed spec at the same version.
+Author a card in Python and write it to disk. Each card class owns its local
+`save`/`load`; the card envelope on disk is what you register.
+
+<Aside title="Registration is the HTTP API today" data-variant="not">
+
+The Python package authors and saves cards locally. It does not ship a registry
+client yet — registration is the HTTP route `POST /api/v1/cards` (see
+[For agents](/for-agents/) for the stable paths). These recipes cover the shipped
+authoring surface; each notes where the server step picks up.
+
+</Aside>
 
 ## Shipped kinds
 
@@ -25,4 +33,4 @@ Drift, Audit, Policy, Trigger, Mcp, Operator, Artifact, Source) have authored
 contracts and JSON Schemas, but their runtime implementation is not shipped yet.
 How-to pages for these kinds will be added as each kind's contract ships.
 
-See [Cards overview](/cards/) for the full catalog and shipping status.
+See [Cards](/cards/) for the full catalog and shipping status.

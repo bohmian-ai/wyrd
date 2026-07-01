@@ -11,6 +11,11 @@ order: 1
 Goal-oriented recipes. Each how-to answers one question: "how do I do X with
 Wyrd?" Skip the explanation; go straight to the code.
 
+## Build on Skald
+
+- [Build an Agent](/how-to/build-an-agent/) — a bounded loop over a Prompt with tools, callbacks, and session memory.
+- [Build a Workflow](/how-to/build-a-workflow/) — a DAG of Agent invocations, authored in Python, YAML, or Rust.
+
 ## Capability domains
 
 - [Declare](/how-to/declare/) — author and register cards.
@@ -20,8 +25,8 @@ Wyrd?" Skip the explanation; go straight to the code.
 
 <Aside title="What ships today" data-variant="wyrd">
 
-Declare recipes are available for the three shipped card kinds: Prompt, Model,
-and Data. Evaluate, Observe, and Operate recipes follow as those capability
-contracts ship.
+Agent and Workflow recipes run on the Skald runtime today. Declare recipes are
+available for the three shipped card kinds: Prompt, Model, and Data. Evaluate,
+Observe, and Operate recipes follow as those capability contracts ship.
 
 </Aside>

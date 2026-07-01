@@ -2,15 +2,15 @@
 title: Errors
 description: Error handling guidance for Wyrd API clients and agents.
 pillar: wyrd
-group: api
-order: 1
+group: Reference
+order: 21
 ---
 
 # Errors
 
-Wyrd returns errors as structured RFC 7807 Problem Details objects. Agents and SDK clients must preserve the full structure and must not collapse errors into prose.
+Wyrd returns errors as structured RFC 9457 Problem Details objects (`application/problem+json`). Agents and SDK clients must preserve the full structure and must not collapse errors into prose.
 
-This page is the generated error catalog. For how an agent should act on these errors, see [Error remediation](/agents/error-remediation/).
+This page is the generated error catalog. For how an agent should act on these errors, see [Error remediation](/for-agents/error-remediation/).
 
 ## Client transport codes
 

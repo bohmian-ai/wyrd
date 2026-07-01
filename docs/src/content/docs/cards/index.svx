@@ -2,8 +2,8 @@
 title: Cards overview
 description: The card envelope, how registration works, and a catalog of every card kind with its status.
 pillar: wyrd
-group: cards
-order: 1
+group: Reference
+order: 10
 ---
 
 # Cards overview
@@ -45,7 +45,7 @@ workflow does **not** register anything.
 Durable registration is a separate, server-owned step: you upload the card, the
 registry versions it, validates the spec, stores any bytes, and derives the
 relationship graph from the card's `CardRef`s. See
-[Register cards to a server](/server/register-cards/).
+[Declare a card](/how-to/declare/).
 
 ## Catalog
 
@@ -59,8 +59,8 @@ model's breadth is visible without implying more than ships.
 | **Data** | A dataset with a typed interface, schema, and byte stats. | ✅ Shipped |
 | **Model** | A model artifact with its interface and metadata. | ✅ Shipped |
 | **Prompt** | Prompt content with a typed input/output contract. | ✅ Shipped |
-| Agent | A declared agent — the runnable thing lives in the [Skald runtime](/skald/). | ◷ Spec only |
-| Workflow | A declared multi-step workflow; runnable form is in [Skald](/skald/). | ◷ Spec only |
+| Agent | A declared agent — the runnable thing lives in the [Skald runtime](/concepts/architecture/). | ◷ Spec only |
+| Workflow | A declared multi-step workflow; runnable form is in [Skald](/concepts/architecture/). | ◷ Spec only |
 | Artifact | Durable artifact-metadata record that specs link to via `CardRef`. | ◷ Spec only |
 | Eval | An evaluation rubric bound to a card version. | ◷ Spec only |
 | Experiment | A grouping of runs and their measured outcomes. | ◷ Spec only |
@@ -76,7 +76,7 @@ model's breadth is visible without implying more than ships.
 
 For the generated, field-by-field schema of every kind, see the
 [Schema reference](/api/schemas/). For what the spec-only kinds need before they
-ship, see the [Roadmap](/roadmap/).
+ship, see the [Overview](/overview/).
 
 ## The shipped cards
 

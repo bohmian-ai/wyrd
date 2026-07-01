@@ -43,7 +43,7 @@ fields. The author supplies four; the server owns two.
   rows={[
     ['apiVersion', 'string', 'author', { text: 'Always <code>wyrd/v1</code>.', html: true }],
     ['metadata', 'Metadata', 'author', { text: '<code>space</code>, <code>name</code>, <code>version</code>, <code>labels</code>, <code>annotations</code>.', html: true }],
-    ['kind', 'string', 'author', 'Selects the spec schema — Data, Model, Prompt, and 13 spec-only kinds.'],
+    ['kind', 'string', 'author', 'Selects the spec schema — 16 native kinds (Data, Model, Prompt, and 13 spec-only) plus External.'],
     ['spec', 'object', 'author', 'Kind-specific payload. Content-hashed for idempotency.'],
     ['relationships', 'Edge[]', { text: 'server', badge: 'warn' }, { text: 'Derived from the <code>CardRef</code>s in <code>spec</code>. Never authored.', html: true }],
     ['status', 'Status', { text: 'server', badge: 'warn' }, { text: 'Managed lifecycle state (<code>phase</code>).', html: true }]
@@ -59,8 +59,9 @@ a spec, bump the version.
 ## The spec
 
 `spec` is the typed payload for the card's `kind`. The `kind` field selects
-which JSON Schema applies. Only the three shipped kinds (Data, Model, Prompt)
-have a runnable implementation today; the other thirteen have authored specs and
+which JSON Schema applies. The doctrine defines 16 native kinds plus `External`.
+Only the three shipped kinds (Data, Model, Prompt) have a runnable implementation
+today; the other thirteen native kinds and `External` have authored specs and
 schemas but no runtime.
 
 ## Lifecycle
@@ -82,13 +83,22 @@ The server derives **relationships** from CardRefs — the directed lineage grap
 You never hand-maintain the graph.
 
 ```python
-from wyrd.spec import CardRef
+from wyrd.cards import CardRef
 
-# Inside a ModelCard spec:
-training_data = CardRef(name="churn-dataset", version="0.3.0")
+# A typed pointer to another card's identity:
+training_data = CardRef(
+    kind="Data",
+    name="churn-dataset",
+    version="0.3.0",
+    space="default",
+)
 ```
+
+`kind`, `name`, `version`, and `space` are all required — a `CardRef` names a
+specific card's identity. The server reads the CardRefs embedded in a spec and
+derives the relationship edges from them.
 
 ## Related
 
 - [Cards overview](/cards/) — every kind, its spec, and shipping status.
-- [What Wyrd solves](/overview/about/) — why cards exist.
+- [Overview](/overview/) — why cards exist.

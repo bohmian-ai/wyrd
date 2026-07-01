@@ -1,6 +1,6 @@
 ---
 title: Overview
-description: Wyrd — the typed control layer for AI system components.
+description: What Wyrd is, the coordination problem it solves, and what runs today.
 pillar: wyrd
 group: Overview
 order: 1
@@ -8,34 +8,71 @@ order: 1
 
 # Overview
 
-Wyrd is the declarative layer that sits between the ML engineers who build AI
-components and the systems that run, version, and observe them. You describe
-your models, data, prompts, and agents as **cards** — typed, versioned envelopes
-checked into the registry. The Skald runtime executes the agentic ones.
+Wyrd is the AI layer for human and agentic work. It makes AI work declarative,
+connectable, inspectable, reproducible, and operable.
 
-## The short version
+Concretely: Wyrd gives every component of an AI system — dataset, model, prompt,
+agent — **one typed, versioned record called a Card**. A **registry** stores those
+cards and links them into a lineage graph. The **Skald** runtime executes the
+agentic ones. What you declared is what runs, and every link between components
+is derived, not hand-maintained.
+
+## The coordination problem
+
+An AI system is not one artifact. It is a dataset, the model trained on it, the
+prompt that calls the model, the agent that runs the prompt, and the workflow
+that orchestrates the agents. Each of these usually lives in a different tool with
+a different format: a feature store, a model registry, a prompt file in a repo, a
+YAML config, a notebook.
+
+Nothing types the boundaries between them, so nothing can answer basic questions:
+
+- Which dataset trained the model this prompt calls?
+- If I change this prompt, what agents depend on it?
+- Is the prompt running in production the one that was reviewed?
+
+Every team rebuilds this connective tissue by hand — naming conventions, wiki
+pages, tribal knowledge — and it rots. Wyrd's premise is that the connective
+tissue should be typed and derived, not documented.
+
+## How Wyrd answers it
+
+You describe the things that matter as cards. Wyrd records the descriptions,
+validates them, links them, and tracks what happens. The loop is four verbs:
 
 1. **Author** a card in Python — a `DataCard`, `ModelCard`, or `PromptCard`.
-2. **Register** it: `wyrd.cards.register(card)` sends it to a running server.
-3. **Refer** from other cards via `CardRef` — the server derives the lineage
-   graph automatically.
-4. **Run** — Skald agents and workflows resolve cards from the registry at
-   runtime; the prompt you registered is the prompt that runs.
+2. **Register** it: the server validates the spec and stores it under an
+   immutable `(space, name, version)` identity. Registration is the HTTP API
+   today — the Python package authors and saves cards locally.
+3. **Refer** to other cards with a `CardRef`. The server derives the lineage
+   graph from those refs — you never author edges directly.
+4. **Run** — Skald resolves cards from the registry at execution time. The prompt
+   you registered is the prompt that runs.
 
-<Aside title="What ships today" data-variant="wyrd">
+Every card, of every kind, shares one envelope: `apiVersion`, `metadata`, `kind`,
+`spec`, `relationships`, `status`. The `kind` selects the spec schema; everything
+else is constant. That single shape is what makes the whole system inspectable
+from one contract. See [Card](/concepts/card/) for the envelope in detail.
 
-Three card kinds are fully implemented and tested: **Data**, **Model**, and
-**Prompt**. The other thirteen kinds are reserved IA structure — their contracts
-are specified but not yet runnable. See [Cards overview](/cards/) for status.
+## What runs today
+
+<Aside title="Three kinds run end-to-end" data-variant="wyrd">
+
+**Data**, **Model**, and **Prompt** are fully implemented: authored in Python,
+validated, registered, referenced, and resolvable at runtime. **Skald** runs
+agents and workflows over registered prompts today.
+
+The other thirteen kinds plus `External` are reserved structure — their specs and
+schemas are authored, but there is no runtime behind them yet. Every page that
+references a reserved kind says so. See [Cards](/cards/) for per-kind status.
 
 </Aside>
 
-## Sections
+## Where to go next
 
-- [Setup](/setup/) — install py-wyrd and verify your environment.
-- [Tutorials](/tutorials/) — step-by-step walkthroughs from zero to your first registered card.
-- [How-to](/how-to/) — goal-oriented recipes: declare, evaluate, observe, operate.
-- [Concepts](/concepts/) — the card/spec/run/observation ontology.
-- [Cards reference](/cards/) — generated field-level documentation for every card kind.
-- [API reference](/api/) — error catalog, OpenAPI summary, JSON Schema inventory.
-- [For Agents](/for-agents/) — stable paths, a copyable workflow, and the rules agents must follow.
+- [Get started](/get-started/) — install Wyrd and register your first card.
+- [Where Wyrd fits](/overview/where-wyrd-fits/) — the AI-stack position, the
+  Mitari platform, and what Wyrd is deliberately not.
+- [Concepts](/concepts/) — the Card / Spec / Run / Observation ontology.
+- [For agents](/for-agents/) — stable paths, a copyable workflow, and the rules
+  agents follow.

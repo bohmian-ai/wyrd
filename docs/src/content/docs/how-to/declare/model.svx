@@ -1,68 +1,79 @@
 ---
 title: Declare a Model card
-description: Author and register a ModelCard from Python.
+description: Author a ModelCard from a trained model and save it locally.
 pillar: wyrd
-group: Declare
-order: 3
+group: How-to
+order: 12
 ---
 
 # Declare a Model card
 
 ## Prerequisites
 
-- py-wyrd installed and `WYRD_SERVER_URL` set
-- A running server
+- Wyrd set up from a repo checkout ([Get started](/get-started/))
+- scikit-learn
 
 ## Recipe
 
 ```python
-from wyrd.model import ModelCard
+from pathlib import Path
 
-# 1. Build the card
-card = ModelCard(
-    name="churn-classifier",
-    version="1.0.0",
-    spec={
-        "provider": "openai",
-        "model_id": "gpt-4o-mini",
-        "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}},
-        "output_schema": {"type": "object", "properties": {"label": {"type": "string"}}},
-    },
-)
+from sklearn.linear_model import LogisticRegression
+from wyrd.data import FieldSpec
+from wyrd.model import ModelCard, ModelCardMetadata, ModelSignature, SklearnInterface
 
-# 2. Optionally save locally
-card.save()
-
-# 3. Register
-import wyrd
-wyrd.cards.register(card)
-```
-
-## Add a data dependency
-
-Reference the training dataset by CardRef so the registry can derive lineage:
-
-```python
-from wyrd.spec import CardRef
+model = LogisticRegression().fit(features, labels)
 
 card = ModelCard(
+    SklearnInterface(model=model),
     name="churn-classifier",
     version="1.0.0",
-    spec={
-        "provider": "openai",
-        "model_id": "gpt-4o-mini",
-        "training_data": CardRef(name="churn-dataset", version="0.3.0").to_dict(),
-    },
+    metadata=ModelCardMetadata(
+        task_type="binary_classification",
+        signature=ModelSignature(
+            [FieldSpec("features", "float64")],
+            [FieldSpec("label", "int64")],
+        ),
+    ),
 )
+
+card.save(Path("./churn-model"))
 ```
+
+The first positional argument is a model interface — `SklearnInterface`,
+`XgboostInterface`, `TorchInterface`, and the other framework interfaces each own
+the loader for their format. Pass a trained model via `model=`; the interface
+records how to persist and reload it. `name` and `version` set identity; `space`
+defaults to `default`.
+
+`card.save(path)` writes `card.json` (the envelope) and the serialized model
+artifact under `path`. `save` requires a live model — an interface with no model
+attached raises `WYRD_MODEL_400_VALIDATION`.
+
+## Register
+
+The saved `card.json` is the envelope you register over HTTP:
+
+```bash
+curl -X POST "$WYRD_SERVER_URL/api/v1/cards" \
+  -H "Authorization: Bearer $WYRD_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data @churn-model/card.json
+```
+
+There is no Python registry client yet. See [Declare a Data card](/how-to/declare/data/)
+for the request shape and idempotency rules.
 
 ## Notes
 
 - Keep `name` stable across versions.
-- Put operational rules (rate limits, cost, latency SLA) in the spec rather
-  than in free-form annotations.
+- The `ModelSignature` pins the input and output field schema — it is how
+  downstream cards and evals validate what the model consumes and produces.
+- Supported interfaces: Sklearn, Xgboost, Lightgbm, Catboost, Torch, Lightning,
+  Tensorflow, Huggingface, and Custom.
 
 ## Reference
 
 - [Model card spec](/cards/model/) — generated field-level documentation.
-- [Cards overview](/cards/) — every kind and status.
+- [Card](/concepts/card/) — the envelope, identity, and CardRef lineage.
+- [Cards](/cards/) — every kind and status.

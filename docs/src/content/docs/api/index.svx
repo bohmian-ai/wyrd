@@ -2,8 +2,8 @@
 title: API reference
 description: Error catalog, OpenAPI summary, and JSON Schema inventory — all generated from source.
 pillar: wyrd
-group: api
-order: 0
+group: Reference
+order: 20
 ---
 
 # API reference

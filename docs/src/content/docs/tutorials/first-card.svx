@@ -1,6 +1,6 @@
 ---
 title: Your first card
-description: Create a DataCard from a pandas DataFrame, save it locally, and register it to a running server.
+description: Build a DataCard from a pandas DataFrame, save it to disk, and load it back — the one runnable card workflow today.
 pillar: wyrd
 group: Tutorials
 order: 2
@@ -8,67 +8,106 @@ order: 2
 
 # Your first card
 
-This tutorial walks you through the complete lifecycle of a Wyrd card — from
-authoring in Python to registering it on a server.
+This tutorial builds a `DataCard` from a pandas DataFrame, writes it to disk, and
+reads it back. It is the exact example that ships in the repo, explained step by
+step. No server is involved: `save` and `load` operate on the local filesystem
+only.
 
-## What you'll build
+<Aside title="Before you start" data-variant="wyrd">
 
-A `DataCard` describing a small pandas DataFrame. By the end, the card is
-registered and queryable over HTTP and MCP.
+Set up the repo first — see [Get started](/get-started/). You can run the whole
+thing with `mise run examples:python:datacard`; this page explains what it does.
 
-## 1. Create the card
+</Aside>
+
+## The full example
+
+<CodeFromFile file="examples/python/datacard_local_workflow.py" lang="python" />
+
+Run it:
+
+```bash
+mise run examples:python:datacard
+```
+
+```text
+saved_card_json: true
+saved_data_file: data/data.parquet
+loaded_rows: 3
+loaded_columns: customer_id,churned,segment
+labels: domain=customer,stage=example
+annotation_source: examples/python/datacard_local_workflow.py
+```
+
+## Step by step
+
+### 1. Build the card
 
 ```python
-import pandas as pd
-from wyrd.data import DataCard, PandasInterface
-
-df = pd.DataFrame({"feature_a": [1.0, 2.0, 3.0], "label": [0, 1, 0]})
-interface = PandasInterface.from_dataframe(df)
-
 card = DataCard(
-    name="tutorial-dataset",
+    PandasInterface(data=data),
+    name="customer-churn",
     version="0.1.0",
-    spec=interface.to_spec(),
+    labels={"domain": "customer", "stage": "example"},
+    annotations={"example.com/source": "examples/python/datacard_local_workflow.py"},
 )
 ```
 
-## 2. Save locally
+The first positional argument is a **data interface** — `PandasInterface` owns the
+local save/load behavior for a DataFrame. `name` and `version` set the card's
+identity; `space` defaults to `default`, so this card's identity is
+`(default, customer-churn, 0.1.0)`.
+
+`labels` are indexed classification fields you filter on. `annotations` are
+descriptive metadata that travels with the card but is not indexed. Both are part
+of the card envelope — see [Card](/concepts/card/).
+
+### 2. Save to disk
 
 ```python
-card.save()
+card.save(path)
 ```
 
-This writes `card.json` (the envelope) and any local data files to
-`.wyrd/<space>/<name>/<version>/` in your working directory.
+`save` takes a directory path and writes the local card layout there:
+`card.json` (the envelope) plus a `data/` directory holding the serialized
+DataFrame (`data.parquet`). Nothing leaves your machine.
 
-## 3. Register
+### 3. Load it back
 
 ```python
-import wyrd
-
-wyrd.cards.register(card)
+restored = DataCard.model_validate_json((path / "card.json").read_text())
+restored.load(path)
 ```
 
-The server validates the spec against the JSON Schema for `Data`, assigns it a
-durable identity, and returns the registered card envelope.
+`model_validate_json` reconstructs the card envelope from `card.json`. At that
+point the metadata is populated but the data is not — `load(path)` reads the
+DataFrame back from the `data/` directory into `restored.data`.
 
-## 4. Verify
+### 4. Read what you saved
 
 ```python
-result = wyrd.cards.get("tutorial-dataset", version="0.1.0")
-print(result.metadata.name, result.metadata.version)
+restored.data          # the DataFrame, 3 rows
+restored.labels        # {"domain": "customer", "stage": "example"}
+restored.annotations   # {"example.com/source": "..."}
 ```
 
-## What happened
+The restored card carries the same identity, labels, annotations, and data the
+original declared.
 
-1. `DataCard(...)` authored the typed envelope locally — nothing left your machine.
-2. `card.save()` wrote the local card layout.
-3. `wyrd.cards.register(card)` sent the envelope to the server. The server
-   validated the spec, stored it, and made it queryable.
-4. `wyrd.cards.get(...)` read it back from the registry.
+## What ships and what doesn't
+
+<Aside title="Registration is not on the Python surface yet" data-variant="not">
+
+`DataCard.save` and `.load` are local-only by design; the card object does not
+talk to a server. Registering a card to a registry — so it gets a durable
+server-side identity and joins the lineage graph — belongs to the registry and
+client APIs, which are not yet exposed in the Python package. This tutorial
+covers the shipped local workflow.
+
+</Aside>
 
 ## Next
 
-- [Declare a Data card](/how-to/declare/data/) — the recipe version, without the
-  step-by-step explanation.
-- [Cards overview](/cards/) — every kind and its status.
+- [Declare a Data card](/how-to/declare/data/) — the recipe form of this workflow.
+- [Card](/concepts/card/) — the envelope, identity rules, and `CardRef`s.
+- [Cards](/cards/) — every kind and its shipping status.

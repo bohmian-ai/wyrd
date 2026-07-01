@@ -1,56 +1,58 @@
 ---
 title: Declare a Prompt card
-description: Author and register a PromptCard from Python in four steps.
+description: Author a PromptCard from a Prompt and save it locally.
 pillar: wyrd
-group: Declare
-order: 2
+group: How-to
+order: 11
 ---
 
 # Declare a Prompt card
 
 ## Prerequisites
 
-- py-wyrd installed and `WYRD_SERVER_URL` set
-- A running server
+- Wyrd set up from a repo checkout ([Get started](/get-started/))
 
 ## Recipe
 
 ```python
-from wyrd.prompt import Prompt, PromptCard
+from pathlib import Path
 
-# 1. Author the prompt spec
+from wyrd import Prompt
+from wyrd.prompt import PromptCard
+
 prompt = Prompt(
-    name="summarise-document",
-    version="0.1.0",
-    template="Summarise the following document in {max_words} words or fewer:\n\n{document}",
-    input_variables=["document", "max_words"],
+    provider="openai",
+    model="gpt-4o-mini",
+    messages=["Summarise the following document in {max_words} words:\n\n{document}"],
 )
 
-# 2. Build the card
 card = PromptCard(
+    prompt,
     name="summarise-document",
     version="0.1.0",
-    spec=prompt.to_spec(),
 )
 
-# 3. Optionally save locally
-card.save()
-
-# 4. Register
-import wyrd
-wyrd.cards.register(card)
+card.save(Path("./summarise-prompt"))
 ```
+
+The first positional argument is a `Prompt` — the provider, model, and messages
+live on it. The `PromptCard` wraps it with identity (`name`, `version`, and a
+`space` that defaults to `default`).
+
+`card.save(path)` writes the local card layout. Registration to a server is the
+HTTP route `POST /api/v1/cards` (see [Declare a Data card](/how-to/declare/data/)
+for the request shape); there is no Python registry client yet.
 
 ## Notes
 
 - Keep `name` stable — downstream agents, policies, and audits refer to it by
   identity.
-- `version` follows semver. The server rejects a changed spec at the same
-  version.
-- `template` is the versioned content. Put operational rules in the spec rather
-  than in free-form notes.
+- `version` follows semver. The server rejects a changed spec at the same version.
+- Provider settings can be pinned with the `model_settings` argument to
+  `PromptCard`.
 
 ## Reference
 
 - [Prompt card spec](/cards/prompt/) — generated field-level documentation.
-- [Cards overview](/cards/) — every kind and status.
+- [Build an agent](/how-to/build-an-agent/) — run a registered prompt on Skald.
+- [Cards](/cards/) — every kind and status.

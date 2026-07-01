@@ -18,6 +18,5 @@ through a complete task, explaining every step.
 
 ## What you'll need
 
-- py-wyrd installed ([Setup](/setup/install/))
-- A running server (local or remote)
+- Wyrd set up from a repo checkout ([Get Started](/get-started/))
 - Python 3.10+, pandas

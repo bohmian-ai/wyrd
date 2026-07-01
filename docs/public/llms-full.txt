@@ -8,26 +8,23 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 
 ## Overview
 
-- [Overview](https://mitari-ai.github.io/wyrd/overview/): Wyrd — the typed control layer for AI system components.
-- [What Wyrd solves](https://mitari-ai.github.io/wyrd/overview/about/): The coordination problem cards fix, and the components Wyrd governs.
-
-## Setup
-
-- [Setup](https://mitari-ai.github.io/wyrd/setup/): Install the Wyrd Python SDK and configure your environment.
-- [Install](https://mitari-ai.github.io/wyrd/setup/install/): Install py-wyrd, verify the SDK, and run the connection health check.
+- [Overview](https://mitari-ai.github.io/wyrd/overview/): What Wyrd is, the coordination problem it solves, and what runs today.
+- [Where Wyrd fits](https://mitari-ai.github.io/wyrd/overview/where-wyrd-fits/): Wyrd's position in the AI stack, the Mitari platform, the lifecycle loop, and what Wyrd is deliberately not.
 
 ## Tutorials
 
 - [Tutorials](https://mitari-ai.github.io/wyrd/tutorials/): Step-by-step walkthroughs from zero to your first registered card.
-- [Your first card](https://mitari-ai.github.io/wyrd/tutorials/first-card/): Create a DataCard from a pandas DataFrame, save it locally, and register it to a running server.
+- [Your first card](https://mitari-ai.github.io/wyrd/tutorials/first-card/): Build a DataCard from a pandas DataFrame, save it to disk, and load it back — the one runnable card workflow today.
 
 ## How-to guides
 
 - [How-to](https://mitari-ai.github.io/wyrd/how-to/): Goal-oriented recipes for declaring, evaluating, observing, and operating Wyrd components.
-- [Declare](https://mitari-ai.github.io/wyrd/how-to/declare/): Author and register Wyrd cards — recipes for the three shipped kinds.
-- [Declare a Data card](https://mitari-ai.github.io/wyrd/how-to/declare/data/): Author and register a DataCard from Python.
-- [Declare a Model card](https://mitari-ai.github.io/wyrd/how-to/declare/model/): Author and register a ModelCard from Python.
-- [Declare a Prompt card](https://mitari-ai.github.io/wyrd/how-to/declare/prompt/): Author and register a PromptCard from Python in four steps.
+- [Build an Agent Workflow](https://mitari-ai.github.io/wyrd/how-to/build-a-workflow/): Author a workflow from Python, YAML, or Rust, then run and instrument it.
+- [Build an Agent](https://mitari-ai.github.io/wyrd/how-to/build-an-agent/): Build a Wyrd Agent: prompt, tools, callbacks, session memory, and run config. Python and Rust side-by-side.
+- [Declare](https://mitari-ai.github.io/wyrd/how-to/declare/): Author Wyrd cards in Python and save them locally — recipes for the three shipped kinds.
+- [Declare a Data card](https://mitari-ai.github.io/wyrd/how-to/declare/data/): Author a DataCard from a pandas DataFrame and save it locally.
+- [Declare a Model card](https://mitari-ai.github.io/wyrd/how-to/declare/model/): Author a ModelCard from a trained model and save it locally.
+- [Declare a Prompt card](https://mitari-ai.github.io/wyrd/how-to/declare/prompt/): Author a PromptCard from a Prompt and save it locally.
 - [Evaluate](https://mitari-ai.github.io/wyrd/how-to/evaluate/): Score agent runs and models against Wyrd eval definitions.
 - [Observe](https://mitari-ai.github.io/wyrd/how-to/observe/): Read metrics, drift signals, and audit trails from card-governed components.
 - [Operate](https://mitari-ai.github.io/wyrd/how-to/operate/): Run, restart, and manage card-governed components in production.
@@ -35,7 +32,10 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 ## Concepts
 
 - [Concepts](https://mitari-ai.github.io/wyrd/concepts/): The Card/Spec/Run/Observation ontology — the four nouns everything else builds on.
+- [Architecture](https://mitari-ai.github.io/wyrd/concepts/architecture/): The three products Wyrd ships from one source tree — control plane, runtime, and data plane — over one shared spec crate.
 - [Card](https://mitari-ai.github.io/wyrd/concepts/card/): The typed, versioned envelope for one AI system component — its outer shape, lifecycle, and identity rules.
+- [Card kinds](https://mitari-ai.github.io/wyrd/concepts/card-kinds/): The 16 native card kinds plus External, grouped by domain, with what each declares and its shipping status.
+- [Doctrine](https://mitari-ai.github.io/wyrd/concepts/doctrine/): The design doctrine behind Wyrd's nouns, layers, services, and public surfaces.
 
 ## Cards
 
@@ -54,47 +54,17 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 ## For Agents
 
 - [For Agents](https://mitari-ai.github.io/wyrd/for-agents/): Machine-readable surface, stable API paths, and the rules agents must follow when reading and updating Wyrd.
-- [Agent workflow](https://mitari-ai.github.io/wyrd/for-agents/workflow/): A copyable end-to-end workflow for agents that need to declare and register Wyrd cards.
+- [Error remediation](https://mitari-ai.github.io/wyrd/for-agents/error-remediation/): How agents should handle Wyrd errors.
+- [Agent workflow](https://mitari-ai.github.io/wyrd/for-agents/workflow/): A copyable end-to-end workflow for agents that declare cards and register them over HTTP.
 
-## Start here
+## Get Started
 
-- [How it connects](https://mitari-ai.github.io/wyrd/start-here/how-it-connects/): The card system, the registry, and the Skald runtime — and how a component flows through them.
-- [Quickstart](https://mitari-ai.github.io/wyrd/start-here/quickstart/): Run the local DataCard workflow from the Wyrd repo.
-- [What is Wyrd](https://mitari-ai.github.io/wyrd/start-here/what-is-wyrd/): The typed control layer for the components of an AI system — cards, a registry, and the Skald runtime.
+- [Get Started](https://mitari-ai.github.io/wyrd/get-started/): Install Wyrd from the repo and run the DataCard example end to end.
 
-## Skald runtime
+## Reference
 
-- [Agents & workflows](https://mitari-ai.github.io/wyrd/skald/): Skald — Wyrd's runtime for defining agents and workflows once and running them from Python or Rust.
-
-## Guides
-
-- [Build an Agent Workflow](https://mitari-ai.github.io/wyrd/guides/build-a-workflow/): Author a workflow from Python, YAML, or Rust, then run and instrument it.
-- [Build an Agent](https://mitari-ai.github.io/wyrd/guides/build-an-agent/): Build a Wyrd Agent: prompt, tools, callbacks, session memory, and run config. Python and Rust side-by-side.
-- [Component fixture](https://mitari-ai.github.io/wyrd/guides/component-fixture/): Authoring fixture — every auto-injected component verified with no per-page imports.
-- [DataCard local workflow](https://mitari-ai.github.io/wyrd/guides/data-card-local-workflow/): Create a DataCard, save it locally, load it back, and inspect the local files.
-
-## Agents
-
-- [For agents](https://mitari-ai.github.io/wyrd/agents/): How an agent should read and update Wyrd — stable paths, a copyable workflow, and the rules.
-- [Error remediation](https://mitari-ai.github.io/wyrd/agents/error-remediation/): How agents should handle Wyrd errors.
-
-## Evaluation
-
-- [Evaluate agents](https://mitari-ai.github.io/wyrd/evaluation/): Score agent runs against the same task definitions in CI and against collected production records, with run_eval and the wyrd eval CLI.
-
-## Server
-
-- [Run the server](https://mitari-ai.github.io/wyrd/server/): Stand up wyrd-server against Postgres and object storage — local dev and production.
-- [Authentication](https://mitari-ai.github.io/wyrd/server/auth/): API keys, Wyrd JWTs, and OIDC federation — how callers prove who they are.
-- [Register cards to a server](https://mitari-ai.github.io/wyrd/server/register-cards/): How a local card becomes a durable, versioned record in the registry.
-
-## Python
-
-- [Python](https://mitari-ai.github.io/wyrd/python/): Public Python imports and local DataCard behavior.
-
-## Roadmap
-
-- [Roadmap](https://mitari-ai.github.io/wyrd/roadmap/): What is specified or in progress but not yet runnable — stated honestly.
+- [Reference](https://mitari-ai.github.io/wyrd/reference/): The literal contract — CLI verbs, card schemas, error codes, and the API surface.
+- [CLI](https://mitari-ai.github.io/wyrd/reference/cli/): The wyrd binary — auth, eval, and principal commands, with every flag and environment variable.
 
 ## Card schemas
 

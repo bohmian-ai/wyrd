@@ -26,3 +26,6 @@ which cards drove it. `Observations` annotate cards and runs with evidence.
 ## Pages
 
 - [Card](/concepts/card/) — the envelope, the spec, and the lifecycle.
+- [Card kinds](/concepts/card-kinds/) — the 16 kinds plus External, by domain, with status.
+- [Doctrine](/concepts/doctrine/) — the design rules behind the object model.
+- [Architecture](/concepts/architecture/) — the three products that ship the model.

@@ -2,8 +2,8 @@
 title: Schemas
 description: Generated inventory of Wyrd JSON Schemas.
 pillar: wyrd
-group: api
-order: 3
+group: Reference
+order: 23
 ---
 
 # Schemas

@@ -16,20 +16,18 @@ export type NavGroup = { label: string; kind?: string; items: NavItem[] };
 // Groups not listed appear after all configured groups, sorted alphabetically.
 // Entries within each group are sorted by `order` ASC, then by slug for a
 // deterministic tiebreak so builds are reproducible.
-// Diátaxis 7-section IA + How-to capability sub-groups. Groups not listed
-// here appear after all configured groups, sorted alphabetically.
+// Diátaxis IA. Groups not listed here appear after all configured groups,
+// sorted alphabetically. How-to recipes are flattened into one 'How-to' group
+// (ordered by per-entry `order`) rather than split into capability sub-groups.
+// The generated card/api pages emit `group: Reference` directly, so they fold
+// into the single Reference section by their per-entry `order`.
 export const GROUP_ORDER: readonly string[] = [
   'Overview',
-  'Setup',
+  'Get Started',
   'Tutorials',
   'How-to',
-  'Declare',
-  'Evaluate',
-  'Observe',
-  'Operate',
   'Concepts',
-  'cards',
-  'api',
+  'Reference',
   'For Agents',
 ];
 

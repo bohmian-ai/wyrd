@@ -1,4 +1,5 @@
 ---
+pillar: wyrd
 title: DataCard local workflow
 description: Create a DataCard, save it locally, load it back, and inspect the local files.
 ---

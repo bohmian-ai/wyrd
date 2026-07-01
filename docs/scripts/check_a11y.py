@@ -23,6 +23,13 @@ BUILD_DIR = DOCS_ROOT / "build"
 TOKENS_CSS = DOCS_ROOT / "src" / "styles" / "wyrd-tokens.css"
 WCAG_AA = 4.5
 
+# Fail-closed floor on a truncated prerender. The site emits 44 real doc pages;
+# a masked prerender failure (a content page throwing at render) silently drops
+# pages and omits index.html while the build still exits 0. Asserting index.html
+# plus a page floor turns that regression class into a hard a11y-gate failure
+# instead of a vacuously-green run over whatever HTML survived.
+MIN_REAL_PAGES = 40
+
 
 # ─── WCAG contrast helpers ────────────────────────────────────────────────────
 
@@ -204,6 +211,15 @@ def main() -> int:
 
     failures: list[str] = []
 
+    # Fail-closed on a truncated prerender: the home route must be emitted and
+    # the page count must clear the floor. A masked render failure drops pages
+    # and omits index.html while exiting 0; assert both before any a11y check so
+    # the gate cannot pass vacuously over a partial build.
+    if not (BUILD_DIR / "index.html").exists():
+        failures.append(
+            "build/index.html missing — prerender truncated (home route did not emit)"
+        )
+
     if not TOKENS_CSS.exists():
         failures.append(f"wyrd-tokens.css not found at {TOKENS_CSS}")
     else:
@@ -212,6 +228,11 @@ def main() -> int:
     pages = _real_pages()
     if not pages:
         failures.append("No HTML pages found in docs/build (run docs:build first)")
+    elif len(pages) < MIN_REAL_PAGES:
+        failures.append(
+            f"Only {len(pages)} doc pages emitted, expected >= {MIN_REAL_PAGES} "
+            "— prerender truncated (pages silently dropped)"
+        )
     for page in pages:
         failures.extend(check_page(page))
 

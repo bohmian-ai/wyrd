@@ -1,4 +1,5 @@
 ---
+pillar: wyrd
 title: Error remediation
 description: How agents should handle Wyrd errors.
 ---

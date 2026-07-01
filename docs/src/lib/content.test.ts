@@ -13,9 +13,7 @@ describe('toSlug', () => {
 
   it('strips .md and .svx extensions from non-index paths', () => {
     expect(toSlug('/src/content/docs/cards/data.md')).toBe('cards/data');
-    expect(toSlug('/src/content/docs/start-here/quickstart.svx')).toBe(
-      'start-here/quickstart'
-    );
+    expect(toSlug('/src/content/docs/start-here/quickstart.svx')).toBe('start-here/quickstart');
   });
 
   it('maps nested paths preserving hierarchy', () => {
@@ -29,46 +27,77 @@ describe('toSlug', () => {
 describe('validateFrontmatter', () => {
   it('returns typed DocMetadata for a valid frontmatter object', () => {
     const result = validateFrontmatter('/src/content/docs/test.md', {
-      title: 'Hello World',
+      title: '  Hello World  ',
       description: 'A test page',
       pillar: 'wyrd',
+      group: 'Concepts',
       order: 1,
       draft: false
     });
-    expect(result.title).toBe('Hello World');
-    expect(result.description).toBe('A test page');
-    expect(result.pillar).toBe('wyrd');
-    expect(result.order).toBe(1);
-    expect(result.draft).toBe(false);
+    expect(result).toEqual({
+      title: 'Hello World',
+      description: 'A test page',
+      pillar: 'wyrd',
+      group: 'Concepts',
+      order: 1,
+      draft: false
+    });
   });
 
   it('throws for a file with no title field, naming the path', () => {
-    expect(() =>
-      validateFrontmatter('/src/content/docs/missing-title.md', {})
-    ).toThrow(/missing-title\.md/);
+    expect(() => validateFrontmatter('/src/content/docs/missing-title.md', { pillar: 'wyrd' })).toThrow(
+      /missing-title\.md/
+    );
   });
 
   it('throws for a file with an empty title, naming the path', () => {
     expect(() =>
-      validateFrontmatter('/src/content/docs/empty-title.svx', { title: '   ' })
+      validateFrontmatter('/src/content/docs/empty-title.svx', { title: '   ', pillar: 'wyrd' })
     ).toThrow(/empty-title\.svx/);
   });
 
   it('throws for null frontmatter, naming the path', () => {
+    expect(() => validateFrontmatter('/src/content/docs/null-fm.md', null)).toThrow(/null-fm\.md/);
+  });
+
+  // pillar is fail-closed: it gates sidebar inclusion and the llms.txt agent
+  // index, so a missing/invalid pillar is a hard build error, not a silent omit.
+  it('throws naming the path when pillar is missing', () => {
+    expect(() => validateFrontmatter('/src/content/docs/no-pillar.md', { title: 'X' })).toThrow(
+      /no-pillar\.md/
+    );
+  });
+
+  it('throws when pillar is not one of wyrd, fathom, shared', () => {
     expect(() =>
-      validateFrontmatter('/src/content/docs/null-fm.md', null)
-    ).toThrow(/null-fm\.md/);
+      validateFrontmatter('/src/content/docs/bad-pillar.md', { title: 'X', pillar: 'platform' })
+    ).toThrow(/wyrd, fathom, shared/);
+  });
+
+  it('accepts the fathom and shared pillars', () => {
+    expect(
+      validateFrontmatter('/src/content/docs/f.md', { title: 'X', pillar: 'fathom' }).pillar
+    ).toBe('fathom');
+    expect(
+      validateFrontmatter('/src/content/docs/s.md', { title: 'X', pillar: 'shared' }).pillar
+    ).toBe('shared');
   });
 
   it('omits optional fields not present in raw frontmatter', () => {
     const result = validateFrontmatter('/src/content/docs/minimal.md', {
-      title: 'Minimal'
+      title: 'Minimal',
+      pillar: 'wyrd'
     });
-    expect(result.title).toBe('Minimal');
-    expect(result.description).toBeUndefined();
-    expect(result.pillar).toBeUndefined();
-    expect(result.group).toBeUndefined();
-    expect(result.order).toBeUndefined();
-    expect(result.draft).toBeUndefined();
+    expect(result).toEqual({ title: 'Minimal', pillar: 'wyrd' });
+  });
+
+  it('drops optional fields of the wrong type instead of forwarding them', () => {
+    const result = validateFrontmatter('/src/content/docs/typed.md', {
+      title: 'X',
+      pillar: 'wyrd',
+      order: '3',
+      draft: 'true'
+    });
+    expect(result).toEqual({ title: 'X', pillar: 'wyrd' });
   });
 });

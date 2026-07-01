@@ -96,10 +96,6 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 
 - [Roadmap](https://mitari-ai.github.io/wyrd/roadmap/): What is specified or in progress but not yet runnable — stated honestly.
 
-## Fathom
-
-- [Fathom](https://mitari-ai.github.io/wyrd/fathom/): Runtime evidence for AI systems — leakage detection, eval as evidence, drift versus spec, and audit. Coming soon.
-
 ## Card schemas
 
 ### AgentCard

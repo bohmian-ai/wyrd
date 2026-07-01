@@ -1,4 +1,5 @@
 ---
+pillar: wyrd
 title: Build an Agent Workflow
 description: Author a workflow from Python, YAML, or Rust, then run and instrument it.
 ---

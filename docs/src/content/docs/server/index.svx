@@ -1,4 +1,5 @@
 ---
+pillar: wyrd
 title: Run the server
 description: Stand up wyrd-server against Postgres and object storage — local dev and production.
 ---

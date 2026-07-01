@@ -22,7 +22,7 @@
     <div class="nf-coin">INSERT COIN TO CONTINUE</div>
     <nav class="nf-cta" aria-label="Recovery links">
       <a class="nf-btn nf-btn-lime" href="{base}/">▶ Back to start</a>
-      <a class="nf-btn nf-btn-ghost" href="{base}/api/schemas/">Search the docs</a>
+      <a class="nf-btn nf-btn-ghost" href="{base}/start-here/what-is-wyrd/">Browse the docs</a>
     </nav>
   </div>
 </section>

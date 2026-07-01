@@ -96,10 +96,6 @@
 
 - [Roadmap](https://mitari-ai.github.io/wyrd/roadmap/): What is specified or in progress but not yet runnable — stated honestly.
 
-## Fathom
-
-- [Fathom](https://mitari-ai.github.io/wyrd/fathom/): Runtime evidence for AI systems — leakage detection, eval as evidence, drift versus spec, and audit. Coming soon.
-
 ## Machine-readable schemas
 
 - [llms-full.txt](https://mitari-ai.github.io/wyrd/llms-full.txt): every card JSON Schema plus this page index.

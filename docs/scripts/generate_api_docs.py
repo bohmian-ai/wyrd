@@ -87,6 +87,23 @@ def render_openapi() -> str:
 
 def render_schemas() -> str:
     schema_files = sorted(SCHEMA_DIR.glob("*.json"))
+    schema_dir = SCHEMA_DIR.relative_to(REPO_ROOT)
+    # Emit data rows (filename + type title); the shared DataTable component owns
+    # the presentation. The directory prefix is stated once in the intro, so rows
+    # carry only the filename.
+    columns = [
+        {"header": "Schema", "role": "name"},
+        {"header": "Title", "role": "type"},
+    ]
+    rows = []
+    for schema_path in schema_files:
+        try:
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            schema = {}
+        title = schema.get("title") or schema_path.stem
+        rows.append([schema_path.name, str(title)])
+
     lines = [
         "---",
         "title: Schemas",
@@ -98,22 +115,11 @@ def render_schemas() -> str:
         "",
         "# Schemas",
         "",
-        "These schemas are generated from the Wyrd spec crate and checked into the repository for clients, docs, and agents. `architecture/wyrd-design.md` remains the design authority; this inventory may include implementation drift while contracts are being reconciled.",
+        f"These schemas are generated from the Wyrd spec crate and checked into the repository under `{schema_dir}/` for clients, docs, and agents. `architecture/wyrd-design.md` remains the design authority; this inventory may include implementation drift while contracts are being reconciled.",
         "",
-        "| Schema | Title |",
-        "| --- | --- |",
+        f"<DataTable columns={{{json.dumps(columns)}}} rows={{{json.dumps(rows)}}} />",
+        "",
     ]
-
-    for schema_path in schema_files:
-        try:
-            schema = json.loads(schema_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            schema = {}
-        title = schema.get("title") or schema_path.stem
-        rel = schema_path.relative_to(REPO_ROOT)
-        lines.append(f"| `{md_escape(str(rel))}` | {md_escape(str(title))} |")
-
-    lines.append("")
     return "\n".join(lines)
 
 

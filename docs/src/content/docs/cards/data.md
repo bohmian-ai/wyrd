@@ -10,7 +10,7 @@ order: 1
 
 Describe a dataset, feature table, document set, or other data dependency.
 
-<dl class="wyrd-defs"><dt data-kind="data">Data</dt><dd>Describe a dataset, feature table, document set, or other data dependency.</dd><dt>Required</dt><dd><code>interface</code>, <code>schema</code>, <code>stats</code></dd><dt>Optional</dt><dd>4 additional spec fields — see table below.</dd></dl>
+<CardSummary kind={"data"} title={"Data"} purpose={"Describe a dataset, feature table, document set, or other data dependency."} required={["interface", "schema", "stats"]} optionalCount={4} />
 
 This page is generated from the checked-in JSON Schema. Edit the Rust spec, run the schema generator, then run `mise run docs:generate` to refresh this page.
 

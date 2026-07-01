@@ -1,7 +1,7 @@
 <!--
   Brutalist SVG of the Wyrd concept model. Geometry: hard-shadowed boxes, 2.5px
   borders, 3px arrows. All colors flow through the global `.wyrd-diagram` token
-  rules in src/styles/wyrd.css, so light/dark both work.
+  rules in src/styles/arcade.css, so light/dark both work.
 -->
 <svg
   class="wyrd-diagram"

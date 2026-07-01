@@ -10,7 +10,7 @@ order: 3
 
 Version prompt content and the contract around its inputs and outputs.
 
-<dl class="wyrd-defs"><dt data-kind="prompt">Prompt</dt><dd>Version prompt content and the contract around its inputs and outputs.</dd><dt>Required</dt><dd><code>model</code>, <code>request</code></dd><dt>Optional</dt><dd>4 additional spec fields — see table below.</dd></dl>
+<CardSummary kind={"prompt"} title={"Prompt"} purpose={"Version prompt content and the contract around its inputs and outputs."} required={["model", "request"]} optionalCount={4} />
 
 This page is generated from the checked-in JSON Schema. Edit the Rust spec, run the schema generator, then run `mise run docs:generate` to refresh this page.
 

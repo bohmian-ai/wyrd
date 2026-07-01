@@ -1,4 +1,5 @@
 ---
+pillar: wyrd
 title: Component fixture
 description: Authoring fixture — every auto-injected component verified with no per-page imports.
 ---

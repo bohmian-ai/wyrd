@@ -1,236 +1,159 @@
 <script lang="ts">
-  // The single chrome host: header (wordmark, search, theme), sidebar nav, the
-  // content column with prev/next pagination, and a right-rail TOC. Global CSS
-  // chain (wyrd.css → wyrd-tokens.css + fonts) is imported once here.
-  import '../styles/wyrd.css';
+  // The single chrome host (Direction A "Arcade Cabinet"): the always-dark
+  // marquee (Mitari wordmark, Wyrd/Fathom switch, search, theme, GitHub), the
+  // mobile drawer, the doc shell (sidebar / content + pagination / TOC), and the
+  // cabinet footer. The whole app is wrapped in `.mk a` so the global arcade
+  // theme (arcade.css → wyrd-tokens.css + fonts) styles everything by class.
+  import '../styles/arcade.css';
   import { onMount } from 'svelte';
   import { afterNavigate } from '$app/navigation';
   import { base } from '$app/paths';
   import { page } from '$app/state';
   import { initLang } from '$lib/lang.svelte';
-  import WyrdMark from '$lib/components/WyrdMark.svelte';
-  import ThemeToggle from '$lib/components/ThemeToggle.svelte';
+  import Fuji from '$lib/components/Fuji.svelte';
   import Search from '$lib/components/Search.svelte';
   import Sidebar from '$lib/components/Sidebar.svelte';
   import Toc from '$lib/components/Toc.svelte';
   import Pagination from '$lib/components/Pagination.svelte';
 
+  const GITHUB_URL = 'https://github.com/wyrd-ai/wyrd';
+
   let { children } = $props();
 
-  let menuOpen = $state(false);
+  let theme = $state<'light' | 'dark'>('dark');
+  let drawer = $state(false);
 
-  // The home route is full-width "splash": no sidebar, no TOC, no pagination.
-  const isHome = $derived(
-    page.url.pathname === `${base}/` || page.url.pathname === base || page.url.pathname === '/'
-  );
-
-  // Error pages (404, etc.) render full-width without sidebar or TOC.
+  // The home route and error pages render full-width "splash" — no doc shell.
+  // The Fathom teaser archetype is also a full-bleed holding page.
+  const isHome = $derived(page.route.id === '/');
   const isError = $derived(page.error !== null);
+  const isFathom = $derived(page.data?.archetype === 'fathom');
+  const isFullWidth = $derived(isHome || isError || isFathom);
 
-  onMount(initLang);
-  // close the mobile nav drawer on navigation
-  afterNavigate(() => (menuOpen = false));
+  // Active product for the marquee switch.
+  const product = $derived(isFathom ? 'fathom' : 'wyrd');
+
+  onMount(() => {
+    initLang();
+    const t = document.documentElement.dataset.theme;
+    theme = t === 'light' ? 'light' : 'dark';
+  });
+
+  // close the mobile drawer on navigation
+  afterNavigate(() => (drawer = false));
+
+  function toggle(): void {
+    theme = theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = theme;
+    try {
+      localStorage.setItem('wyrd:theme', theme);
+    } catch {
+      /* ignore */
+    }
+  }
 </script>
 
-<a class="skip-link" href="#doc-main">Skip to content</a>
-
-<header class="doc-header" data-pagefind-ignore>
-  <a class="brand" href={`${base}/`} aria-label="Wyrd docs home">
-    <WyrdMark size={22} />
-    <span class="brand-name">WYRD</span>
-    <span class="brand-tag">docs</span>
-  </a>
-  <div class="header-right">
-    <Search />
-    <ThemeToggle />
-    {#if !isHome && !isError}
-      <button
-        class="menu-toggle"
-        type="button"
-        aria-expanded={menuOpen}
-        aria-controls="doc-side"
-        onclick={() => (menuOpen = !menuOpen)}
-      >
-        {menuOpen ? 'Close' : 'Menu'}
+<div class="mk a">
+  <header class="marquee" data-pagefind-ignore>
+    <a class="brand" href={`${base}/`} aria-label="Mitari docs home">
+      <Fuji size={22} />
+      <span class="wm">MITARI</span>
+      <span class="co">docs</span>
+    </a>
+    <nav class="switch" aria-label="Product">
+      <a href={`${base}/`} data-k="wyrd" class={product === 'wyrd' ? 'on' : ''}>Wyrd</a>
+      <a href={`${base}/fathom/`} data-k="fathom" class={product === 'fathom' ? 'on' : ''}>
+        Fathom <span class="soon">soon</span>
+      </a>
+    </nav>
+    <div class="right">
+      <Search />
+      <button class="iconbtn" aria-label="Toggle theme" onclick={toggle}>
+        {#if theme === 'dark'}
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <circle cx="12" cy="12" r="4.5" />
+            <path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M19 5l-1.5 1.5M6.5 17.5 5 19" />
+          </svg>
+        {:else}
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z" />
+          </svg>
+        {/if}
       </button>
+      <a class="iconbtn" href={GITHUB_URL} aria-label="GitHub" rel="noreferrer" target="_blank">
+        <svg viewBox="0 0 24 24" fill="currentColor"
+          ><path
+            d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.1-1.47-1.1-1.47-.9-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.53 2.36 1.09 2.94.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.02a9.5 9.5 0 0 1 5 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.38.2 2.4.1 2.65.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.69-4.57 4.94.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0 0 12 2z"
+          /></svg
+        >
+      </a>
+      <button
+        class="iconbtn menu"
+        aria-label="Menu"
+        aria-expanded={drawer}
+        onclick={() => (drawer = !drawer)}
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          {#if drawer}<path d="M5 5l14 14M19 5 5 19" />{:else}<path d="M3 6h18M3 12h18M3 18h18" />{/if}
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <nav class={`drawer ${drawer ? 'open' : ''}`} aria-label="Sections">
+    <a href={`${base}/start-here/what-is-wyrd/`}>Wyrd · Start here</a>
+    <a href={`${base}/concepts/`}>Concepts</a>
+    <a href={`${base}/guides/`}>Guides</a>
+    <a href={`${base}/api/`}>Reference</a>
+    <a href={`${base}/for-agents/`}>For agents</a>
+    <a href={`${base}/fathom/`}>Fathom · coming soon</a>
+  </nav>
+
+  <div id="top">
+    {#if isFullWidth}
+      {@render children()}
+    {:else}
+      <div class="shell">
+        <aside class="side" data-pagefind-ignore>
+          <Sidebar />
+        </aside>
+        <main class="main">
+          {@render children()}
+          <Pagination />
+        </main>
+        <aside data-pagefind-ignore>
+          <Toc />
+        </aside>
+      </div>
     {/if}
   </div>
-</header>
 
-{#if isHome || isError}
-  <main id="doc-main" class="doc-home">
-    {@render children()}
-  </main>
-{:else}
-  <div class="doc-shell">
-    <aside id="doc-side" class="doc-side" class:open={menuOpen} data-pagefind-ignore>
-      <Sidebar />
-    </aside>
-    <main id="doc-main" class="doc-main">
-      {@render children()}
-      <Pagination />
-    </main>
-    <aside class="doc-toc" data-pagefind-ignore>
-      <Toc />
-    </aside>
-  </div>
-{/if}
-
-<style>
-  .skip-link {
-    position: absolute;
-    left: -9999px;
-    top: 0;
-    z-index: 100;
-    background: var(--lime);
-    color: var(--lime-ink);
-    font-family: var(--font-mono);
-    font-weight: 700;
-    padding: 8px 12px;
-    border: 2px solid var(--border);
-    border-radius: var(--r);
-  }
-  .skip-link:focus {
-    left: 8px;
-    top: 8px;
-  }
-
-  .doc-header {
-    position: sticky;
-    top: 0;
-    z-index: 40;
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 12px 20px;
-    background: var(--surface);
-    border-bottom: 3px solid var(--client-bar);
-  }
-  .brand {
-    display: inline-flex;
-    align-items: center;
-    gap: 9px;
-    text-decoration: none;
-    color: var(--text);
-  }
-  .brand-name {
-    font-family: var(--font-display);
-    font-size: 1.05rem;
-    letter-spacing: -0.3px;
-  }
-  .brand-tag {
-    font-family: var(--font-mono);
-    font-size: 0.62rem;
-    font-weight: 700;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--muted);
-    border: 2px solid var(--border);
-    border-radius: 4px;
-    padding: 2px 6px;
-  }
-  .header-right {
-    margin-left: auto;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .menu-toggle {
-    display: none;
-    font-family: var(--font-mono);
-    font-size: 0.62rem;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--text);
-    background: var(--surface);
-    border: 2px solid var(--border);
-    border-radius: var(--r);
-    box-shadow: 2px 2px 0 0 var(--shadow);
-    padding: 6px 10px;
-    cursor: pointer;
-  }
-
-  .doc-shell {
-    display: grid;
-    grid-template-columns: 248px minmax(0, 1fr) 220px;
-    gap: 0;
-    max-width: 1400px;
-    margin: 0 auto;
-  }
-  .doc-side {
-    border-right: 2px solid var(--border);
-    background: var(--surface);
-    align-self: start;
-    position: sticky;
-    top: 60px;
-    max-height: calc(100vh - 60px);
-    overflow-y: auto;
-  }
-  .doc-main {
-    min-width: 0;
-    padding: 28px 36px 64px;
-  }
-  .doc-home {
-    max-width: 1080px;
-    margin: 0 auto;
-    padding: 28px 24px 72px;
-  }
-  .doc-toc {
-    padding: 28px 18px;
-    min-width: 0;
-  }
-
-  @media (max-width: 1100px) {
-    .doc-shell {
-      grid-template-columns: 248px minmax(0, 1fr);
-    }
-    .doc-toc {
-      display: none;
-    }
-  }
-
-  @media (max-width: 820px) {
-    .menu-toggle {
-      display: inline-block;
-    }
-    .doc-shell {
-      grid-template-columns: minmax(0, 1fr);
-    }
-    .doc-side {
-      display: none;
-      position: static;
-      max-height: none;
-      border-right: 0;
-      border-bottom: 2px solid var(--border);
-    }
-    .doc-side.open {
-      display: block;
-    }
-    .doc-main {
-      padding: 20px 18px 56px;
-    }
-  }
-
-  /* Phone chrome: keep the header bar on one row at ~320px by dropping the
-     "docs" badge and tightening the gaps. The wordmark, search, theme, and menu
-     controls stay; geometry/shadows are untouched. */
-  @media (max-width: 640px) {
-    .doc-header {
-      gap: 10px;
-      padding: 10px 14px;
-    }
-    .header-right {
-      gap: 8px;
-    }
-    .brand-tag {
-      display: none;
-    }
-    .menu-toggle {
-      padding: 9px 11px;
-    }
-    .doc-home {
-      padding: 20px 16px 56px;
-    }
-  }
-</style>
+  <footer class="foot" data-pagefind-ignore>
+    <div class="foot-in">
+      <div>
+        <div class="fb"><Fuji size={22} /><span class="wm">MITARI</span></div>
+        <div class="ci">© 2026 Mitari. All rights reserved.<br />Seattle, WA</div>
+      </div>
+      <div class="fcols">
+        <div class="fcol">
+          <span class="ch">WYRD</span>
+          <a href={`${base}/start-here/quickstart/`}>Quickstart</a>
+          <a href={`${base}/concepts/`}>Concepts</a>
+          <a href={`${base}/api/`}>Reference</a>
+          <a href={`${base}/for-agents/`}>For agents</a>
+        </div>
+        <div class="fcol">
+          <span class="ch">FATHOM</span>
+          <a href={`${base}/fathom/`}>Overview</a>
+          <a href={`${base}/fathom/`}>Coming soon</a>
+        </div>
+        <div class="fcol">
+          <span class="ch">PROJECT</span>
+          <a href={GITHUB_URL} rel="noreferrer" target="_blank">GitHub</a>
+          <a href={`${base}/roadmap/`}>Roadmap</a>
+          <a href={`${base}/llms.txt`}>llms.txt</a>
+        </div>
+      </div>
+    </div>
+  </footer>
+</div>

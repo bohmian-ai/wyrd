@@ -10,7 +10,7 @@ order: 2
 
 Describe a model artifact, its interface, and the context needed to use it safely.
 
-<dl class="wyrd-defs"><dt data-kind="model">Model</dt><dd>Describe a model artifact, its interface, and the context needed to use it safely.</dd><dt>Required</dt><dd><code>interface</code>, <code>signature</code>, <code>task_type</code></dd><dt>Optional</dt><dd>2 additional spec fields — see table below.</dd></dl>
+<CardSummary kind={"model"} title={"Model"} purpose={"Describe a model artifact, its interface, and the context needed to use it safely."} required={["interface", "signature", "task_type"]} optionalCount={2} />
 
 This page is generated from the checked-in JSON Schema. Edit the Rust spec, run the schema generator, then run `mise run docs:generate` to refresh this page.
 

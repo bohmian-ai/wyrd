@@ -46,11 +46,19 @@ export function validateFrontmatter(contentPath: string, raw: unknown): DocMetad
       `Content file "${contentPath}" is missing a non-empty "title" in its frontmatter.`
     );
   }
-  const result: DocMetadata = { title: title.trim() };
-  if (typeof meta?.description === 'string') result.description = meta.description;
-  if (meta?.pillar === 'wyrd' || meta?.pillar === 'fathom' || meta?.pillar === 'shared') {
-    result.pillar = meta.pillar;
+  // `pillar` is required: it gates sidebar inclusion (derived-nav filters
+  // `pillar === 'wyrd'`) and the llms.txt agent index. A missing/invalid pillar
+  // would silently vanish the page from the human sidebar while it still routes
+  // and appears to agents — a divergent sitemap. Fail closed, naming the file,
+  // exactly like the missing-title throw above.
+  if (meta?.pillar !== 'wyrd' && meta?.pillar !== 'fathom' && meta?.pillar !== 'shared') {
+    throw new Error(
+      `Content file "${contentPath}" has a missing or invalid "pillar" in its ` +
+        `frontmatter. Expected one of: wyrd, fathom, shared.`
+    );
   }
+  const result: DocMetadata = { title: title.trim(), pillar: meta.pillar };
+  if (typeof meta?.description === 'string') result.description = meta.description;
   if (typeof meta?.group === 'string') result.group = meta.group;
   if (typeof meta?.order === 'number') result.order = meta.order;
   if (typeof meta?.draft === 'boolean') result.draft = meta.draft;

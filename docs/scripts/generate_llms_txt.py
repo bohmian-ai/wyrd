@@ -138,15 +138,18 @@ def slug_for(path: Path) -> str:
     return rel
 
 
-def read_frontmatter(path: Path) -> tuple[str, str]:
-    """Return (title, description) from a leading `---` YAML front-matter block.
+def read_frontmatter(path: Path) -> tuple[str, str, str, bool]:
+    """Return (title, description, pillar, draft) from a leading `---` block.
 
     A minimal line parser keeps the generator free of a YAML dependency in the
-    docs build environment.
+    docs build environment. `pillar`/`draft` drive the same visibility filter the
+    human sidebar applies (derived-nav.ts), so both surfaces list the same pages.
     """
     text = path.read_text(encoding="utf-8")
     title = ""
     description = ""
+    pillar = ""
+    draft = False
     if text.startswith("---"):
         end = text.find("\n---", 3)
         block = text[3:end] if end != -1 else ""
@@ -156,9 +159,13 @@ def read_frontmatter(path: Path) -> tuple[str, str]:
                 title = _unquote(stripped[len("title:") :].strip())
             elif stripped.startswith("description:"):
                 description = _unquote(stripped[len("description:") :].strip())
+            elif stripped.startswith("pillar:"):
+                pillar = _unquote(stripped[len("pillar:") :].strip())
+            elif stripped.startswith("draft:"):
+                draft = stripped[len("draft:") :].strip().lower() == "true"
     if not title:
         title = slug_for(path).rsplit("/", 1)[-1] or path.stem
-    return title, description
+    return title, description, pillar, draft
 
 
 def _unquote(value: str) -> str:
@@ -171,15 +178,20 @@ def collect_pages() -> list[tuple[str, str, str, str]]:
     """Scan the content tree and return (section, slug, title, description).
 
     The home route is injected first; every other entry is a real file on
-    disk, so the list always matches what the build prerenders.
+    disk that the build prerenders AND the human sidebar shows. The sidebar
+    (derived-nav.ts) filters `pillar === 'wyrd' && !draft`, so this generator
+    applies the same filter — both surfaces list the same pages and the agent
+    index never advertises a page the human sidebar hides.
     """
     pages: list[tuple[str, str, str, str]] = [("", HOME[0], HOME[1], HOME[2])]
     for path in sorted(CONTENT_DIR.rglob("*")):
         if path.suffix not in {".svx", ".md"}:
             continue
+        title, description, pillar, draft = read_frontmatter(path)
+        if pillar != "wyrd" or draft:
+            continue
         slug = slug_for(path)
         section = slug.split("/", 1)[0] if slug else ""
-        title, description = read_frontmatter(path)
         pages.append((section, slug, title, description))
     return pages
 

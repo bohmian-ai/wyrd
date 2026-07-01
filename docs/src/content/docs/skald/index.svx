@@ -1,4 +1,5 @@
 ---
+pillar: wyrd
 title: Agents & workflows
 description: Skald — Wyrd's runtime for defining agents and workflows once and running them from Python or Rust.
 ---

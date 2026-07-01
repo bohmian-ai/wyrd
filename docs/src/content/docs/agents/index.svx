@@ -1,4 +1,5 @@
 ---
+pillar: wyrd
 title: For agents
 description: How an agent should read and update Wyrd — stable paths, a copyable workflow, and the rules.
 ---

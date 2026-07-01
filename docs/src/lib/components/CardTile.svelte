@@ -1,9 +1,9 @@
 <script lang="ts">
   import { base } from '$app/paths';
 
-  // A single card-kind tile. Shares the .wyrd-tile-grid visual recipe (2px
-  // border, 5px semantic left-bar, hard-offset shadow) but stands alone outside
-  // the full grid, e.g. inline in prose or as a standalone call-to-action.
+  // A single card-kind tile. Self-contained visual recipe (2px border, 5px
+  // semantic left-bar, hard-offset shadow) in the scoped style block below, so it
+  // stands alone in prose or as a standalone call-to-action.
   let {
     href,
     label,

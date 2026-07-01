@@ -1,4 +1,5 @@
 ---
+pillar: wyrd
 title: Quickstart
 description: Run the local DataCard workflow from the Wyrd repo.
 ---

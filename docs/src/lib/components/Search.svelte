@@ -84,10 +84,9 @@
   });
 </script>
 
-<button class="search-trigger" type="button" onclick={show} aria-label="Search">
-  <span class="st-icon" aria-hidden="true">⌕</span>
-  <span class="st-text">Search</span>
-  <kbd class="st-kbd">⌘K</kbd>
+<button class="search" type="button" onclick={show} aria-label="Search docs">
+  Search docs…
+  <span class="k">⌘K</span>
 </button>
 
 {#if open}
@@ -132,37 +131,6 @@
 {/if}
 
 <style>
-  .search-trigger {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    font-family: var(--font-mono);
-    font-size: 0.72rem;
-    font-weight: 700;
-    color: var(--muted);
-    background: var(--surface);
-    border: 2px solid var(--border);
-    border-radius: var(--r);
-    box-shadow: 2px 2px 0 0 var(--shadow);
-    padding: 6px 10px;
-    cursor: pointer;
-  }
-  .search-trigger:hover {
-    color: var(--text);
-  }
-  .st-icon {
-    font-size: 0.9rem;
-  }
-  .st-kbd {
-    font-family: var(--font-mono);
-    font-size: 0.6rem;
-    color: var(--muted);
-    background: var(--surface-2);
-    border: 2px solid var(--border);
-    border-radius: 4px;
-    padding: 1px 5px;
-  }
-
   .search-overlay {
     position: fixed;
     inset: 0;
@@ -257,20 +225,10 @@
     padding: 0 2px;
   }
 
-  /* Phone: collapse the trigger to an icon-only button with a comfortable hit
-     area; the ⌘K hint and "Search" label are desktop affordances. The modal is
-     already viewport-relative (min(620px, 92vw)) so it stays full-width here. */
+  /* Phone: the global arcade theme hides the `.search` pill (the menu drawer
+     takes over) below 640px; the modal is viewport-relative (min(620px, 92vw))
+     so it stays full-width when opened via ⌘K. */
   @media (max-width: 640px) {
-    .st-text,
-    .st-kbd {
-      display: none;
-    }
-    .search-trigger {
-      padding: 9px 11px;
-    }
-    .st-icon {
-      font-size: 1.05rem;
-    }
     .sm-hit {
       padding: 12px 12px;
     }

@@ -20,7 +20,14 @@
   ctx.register(id, untrack(() => label));
 </script>
 
-<div class="tab-panel" role="tabpanel" hidden={ctx.activeId !== id}>
+<div
+  class="tab-panel"
+  role="tabpanel"
+  id={`tabpanel-${id}`}
+  aria-labelledby={`tab-${id}`}
+  tabindex={ctx.activeId === id ? 0 : -1}
+  hidden={ctx.activeId !== id}
+>
   {@render children?.()}
 </div>
 

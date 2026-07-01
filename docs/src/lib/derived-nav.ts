@@ -86,9 +86,15 @@ function buildNav(): { nav: NavGroup[]; flat: NavItem[] } {
 
   // Sort named group keys by GROUP_ORDER; unlisted groups sort alphabetically after.
   const namedKeys = [...buckets.keys()].filter((k) => k !== UNGROUPED);
+  // Case-insensitive lookup: generators emit lowercase group keys (`api`,
+  // `cards`) while hand-authored pages use title-case (`Concepts`). Matching
+  // on lowercase keeps a miscased group in its intended GROUP_ORDER slot
+  // instead of silently dropping to the alphabetical tail.
+  const orderIndex = (key: string) =>
+    GROUP_ORDER.findIndex((g) => g.toLowerCase() === key.toLowerCase());
   namedKeys.sort((a, b) => {
-    const ia = GROUP_ORDER.indexOf(a);
-    const ib = GROUP_ORDER.indexOf(b);
+    const ia = orderIndex(a);
+    const ib = orderIndex(b);
     if (ia !== -1 && ib !== -1) return ia - ib;
     if (ia !== -1) return -1;
     if (ib !== -1) return 1;
@@ -120,18 +126,29 @@ function buildNav(): { nav: NavGroup[]; flat: NavItem[] } {
   return { nav: groups, flat: groups.flatMap((g) => g.items) };
 }
 
-const derived = buildNav();
+// Lazily computed and memoized. buildNav() reads content.ts's module-level
+// `bySlug`, and content.ts's eager content glob transitively imports the
+// components that import this module — so computing at top level would re-enter
+// content.ts mid-initialization and read `bySlug` in its TDZ. Deferring the
+// first build to first access (sidebar render / siblings call) breaks that cycle.
+let cache: { nav: NavGroup[]; flat: NavItem[] } | undefined;
+function derived(): { nav: NavGroup[]; flat: NavItem[] } {
+  return (cache ??= buildNav());
+}
 
 // Sidebar tree: ordered groups with their items.
-export const nav: NavGroup[] = derived.nav;
-
-// Flat ordered list — the spine for prev/next pagination.
-const navFlat: NavItem[] = derived.flat;
+export function navGroups(): NavGroup[] {
+  return derived().nav;
+}
 
 // Return the prev and next pages relative to a given browser pathname.
 // pathname is base-prefixed (e.g. `/wyrd/cards/`); comparison is base-normalized.
-export function siblings(pathname: string): { prev?: NavItem; next?: NavItem } {
-  const target = normalize(stripBase(pathname));
+export function siblings(
+  pathname: string,
+  base = '/wyrd'
+): { prev?: NavItem; next?: NavItem } {
+  const navFlat = derived().flat;
+  const target = normalize(stripBase(pathname, base));
   const i = navFlat.findIndex((it) => normalize(it.path) === target);
   if (i === -1) return {};
   return { prev: navFlat[i - 1], next: navFlat[i + 1] };

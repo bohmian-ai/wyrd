@@ -30,6 +30,26 @@ status:
   phase: active
 ```
 
+Every registered card — of any kind — carries exactly these six top-level
+fields. The author supplies four; the server owns two.
+
+<DataTable
+  columns={[
+    { header: 'Field', role: 'name' },
+    { header: 'Type', role: 'type' },
+    { header: 'Origin' },
+    { header: 'Notes' }
+  ]}
+  rows={[
+    ['apiVersion', 'string', 'author', { text: 'Always <code>wyrd/v1</code>.', html: true }],
+    ['metadata', 'Metadata', 'author', { text: '<code>space</code>, <code>name</code>, <code>version</code>, <code>labels</code>, <code>annotations</code>.', html: true }],
+    ['kind', 'string', 'author', 'Selects the spec schema — Data, Model, Prompt, and 13 spec-only kinds.'],
+    ['spec', 'object', 'author', 'Kind-specific payload. Content-hashed for idempotency.'],
+    ['relationships', 'Edge[]', { text: 'server', badge: 'warn' }, { text: 'Derived from the <code>CardRef</code>s in <code>spec</code>. Never authored.', html: true }],
+    ['status', 'Status', { text: 'server', badge: 'warn' }, { text: 'Managed lifecycle state (<code>phase</code>).', html: true }]
+  ]}
+/>
+
 ## Identity
 
 A card's identity is `(space, name, version)`. This triple is immutable once

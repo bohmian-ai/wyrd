@@ -1,4 +1,5 @@
 ---
+pillar: wyrd
 title: How it connects
 description: The card system, the registry, and the Skald runtime — and how a component flows through them.
 ---

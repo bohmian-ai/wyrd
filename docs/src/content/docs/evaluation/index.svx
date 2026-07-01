@@ -1,7 +1,10 @@
 ---
+pillar: wyrd
 title: "Evaluate agents"
 description: "Score agent runs against the same task definitions in CI and against collected production records, with run_eval and the wyrd eval CLI."
 ---
+
+# Evaluate agents
 
 Model evaluation compares an output to a label. Agent evaluation is harder: the
 final response is one artifact of a process that also includes tool calls,

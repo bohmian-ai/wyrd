@@ -1,4 +1,5 @@
 ---
+pillar: wyrd
 title: What is Wyrd
 description: The typed control layer for the components of an AI system — cards, a registry, and the Skald runtime.
 ---

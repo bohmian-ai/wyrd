@@ -53,18 +53,18 @@
 {:else if data.archetype === 'reference'}
   <!-- Reference/API shell archetype. Dense tables + anchor navigation are in
        the generated content (07); this commit provides the layout shell only. -->
-  <article class="doc-content doc-ref" data-archetype="reference" data-pagefind-body>
+  <article class="prose doc-ref" data-archetype="reference" data-pagefind-body>
     {#if Content}<Content />{/if}
   </article>
 {:else if data.archetype === 'hub'}
   <!-- Section index/hub archetype. Tile grids live in the content itself
        (CardTileGrid is auto-injected by the MDsveX layout set). -->
-  <article class="doc-content doc-hub" data-archetype="hub" data-pagefind-body>
+  <article class="prose doc-hub" data-archetype="hub" data-pagefind-body>
     {#if Content}<Content />{/if}
   </article>
 {:else}
   <!-- Default: doc-article archetype. -->
-  <article class="doc-content" data-archetype="article" data-pagefind-body>
+  <article class="prose" data-archetype="article" data-pagefind-body>
     {#if Content}<Content />{/if}
   </article>
 {/if}

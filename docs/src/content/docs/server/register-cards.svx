@@ -1,4 +1,5 @@
 ---
+pillar: wyrd
 title: Register cards to a server
 description: How a local card becomes a durable, versioned record in the registry.
 ---

@@ -1,4 +1,5 @@
 ---
+pillar: wyrd
 title: Authentication
 description: API keys, Wyrd JWTs, and OIDC federation — how callers prove who they are.
 ---

@@ -1,4 +1,5 @@
 ---
+pillar: wyrd
 title: Build an Agent
 description: "Build a Wyrd Agent: prompt, tools, callbacks, session memory, and run config. Python and Rust side-by-side."
 ---

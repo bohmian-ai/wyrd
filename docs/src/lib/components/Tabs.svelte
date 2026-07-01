@@ -10,6 +10,9 @@
 
   let tabs = $state<Array<{ id: string; label: string }>>([]);
   let activeId = $state('');
+  // Tab button elements, keyed by id, so arrow-key navigation can move focus to
+  // the newly-activated tab (roving tabindex per the WAI-ARIA tabs pattern).
+  let btns = $state<Record<string, HTMLButtonElement>>({});
 
   const ctx = {
     get activeId() {
@@ -27,6 +30,24 @@
   };
 
   setContext('wyrd-tabs', ctx);
+
+  // Automatic activation: Left/Right wrap-move and Home/End jump along the
+  // tablist, activating and focusing the target tab. The buttons all stay in the
+  // DOM, so focusing the target is synchronous after activate().
+  function onKeydown(e: KeyboardEvent): void {
+    const handled = ['ArrowRight', 'ArrowLeft', 'Home', 'End'];
+    if (!handled.includes(e.key)) return;
+    e.preventDefault();
+    const i = tabs.findIndex((t) => t.id === activeId);
+    let next = i;
+    if (e.key === 'ArrowRight') next = (i + 1) % tabs.length;
+    else if (e.key === 'ArrowLeft') next = (i - 1 + tabs.length) % tabs.length;
+    else if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = tabs.length - 1;
+    const id = tabs[next].id;
+    ctx.activate(id);
+    btns[id]?.focus();
+  }
 </script>
 
 <div class="tabs">
@@ -36,9 +57,14 @@
         <button
           type="button"
           role="tab"
+          id={`tab-${t.id}`}
+          aria-controls={`tabpanel-${t.id}`}
           aria-selected={activeId === t.id}
+          tabindex={activeId === t.id ? 0 : -1}
           class:active={activeId === t.id}
+          bind:this={btns[t.id]}
           onclick={() => ctx.activate(t.id)}
+          onkeydown={onKeydown}
         >
           {t.label}
         </button>

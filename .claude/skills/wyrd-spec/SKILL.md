@@ -51,7 +51,9 @@ grep/read loop.
 3. **Decide.** Drive every cross-cutting question to an accepted decision with a
    one-paragraph rationale. These decisions are the load-bearing output — the
    plan, tasks, and arch review all hang off them.
-4. **Write** `spec.md` to `.dev/plan/<feature>/spec.md`.
+4. **Write** `spec.md` to `.dev/plan/<feature>/spec.md`. Written spec should be human
+    legible and understandable. The spec is mean to be reviewed by a human and fed to
+    an agent for planning. Write accordingly (concise, clear, consistent)
 5. **Gate 1.** Hand `spec.md` to `wyrd-architecture-reviewer` **at full-sweep
    depth** — explicitly tell it "full sweep: continue past blockers, report every
    materially-separate finding," and do **not** hand it a pre-narrowed focus list
@@ -87,6 +89,7 @@ matters now.
 
 ## Success Criteria
 - Specific, testable outcomes. Observable behavior, not implementation.
+- End to end journeys that will be tested - for user and agent experience
 
 ## Scope
 - In:

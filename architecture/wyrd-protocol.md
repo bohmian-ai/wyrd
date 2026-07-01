@@ -1,9 +1,23 @@
 # Wyrd Protocol — v1 (draft)
 
-> Superseded working draft. `architecture/wyrd-design.md` is the active design
-> authority. This document still reflects older 18-kind protocol exploration
-> and must not be used to justify `Tool`, `Skill`, or `SubAgent` as v1 Card
-> kinds.
+> **ARCHIVED — partial reference only.**
+>
+> `architecture/wyrd-design.md` is the active protocol authority.
+> `architecture/wyrd-doctrine.mdx` is the public doctrine summary.
+>
+> **What is stale in this document:**
+> - §II.5 `Tool` — not a v1 Card kind (doctrine #12)
+> - §II.7 `SubAgent` — not a v1 Card kind (doctrine #11)
+> - §II.11 `Skill` — not a v1 Card kind
+> - §IX.6 conformance tiers — reference 18 kinds; current catalog has 16
+> - §VI observation envelope — predates Bifrost; see `wyrd-design.md §Bifrost`
+> - Appendix A open issues — many now resolved; see `wyrd-design.md §Open questions`
+>
+> **What remains useful in this document:**
+> - §IV Resource operations (idempotency, optimistic concurrency, bulk ops)
+> - §VIII Transport bindings (HTTP+JSON, MCP bridge, A2A interop)
+> - §IX.6–IX.7 Conformance tiers and invariants
+> - §X Authoring guide anti-patterns
 
 **Status:** draft — not locked
 **API group:** `wyrd/v1`

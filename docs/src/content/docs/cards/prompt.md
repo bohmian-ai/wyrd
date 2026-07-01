@@ -1,13 +1,16 @@
 ---
 title: Prompt
 description: Generated reference for the Wyrd Prompt card spec.
+pillar: wyrd
+group: Reference
+order: 13
 ---
 
 # Prompt
 
 Version prompt content and the contract around its inputs and outputs.
 
-<dl class="wyrd-defs"><dt data-kind="prompt">Prompt</dt><dd>Version prompt content and the contract around its inputs and outputs.</dd><dt>Required</dt><dd><code>model</code>, <code>request</code></dd><dt>Optional</dt><dd>4 additional spec fields — see table below.</dd></dl>
+<CardSummary kind={"prompt"} title={"Prompt"} purpose={"Version prompt content and the contract around its inputs and outputs."} required={["model", "request"]} optionalCount={4} />
 
 This page is generated from the checked-in JSON Schema. Edit the Rust spec, run the schema generator, then run `mise run docs:generate` to refresh this page.
 
@@ -28,11 +31,13 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 
 ## Shape
 
-<aside class="wyrd-phase-gate"><span class="wyrd-phase-gate__badge">Phase 5a</span>Copy-pasteable YAML for a PromptCard lands with the Card write path in Phase 5a. The JSON Schema at <code>crates/wyrd-spec/schemas/prompt_spec.json</code> is the current source of truth.</aside>
+The `card.json` envelope wraps this spec under `kind: Prompt`. For a runnable authoring walkthrough, see [Your first card](/tutorials/first-card/). The JSON Schema at `crates/wyrd-spec/schemas/prompt_spec.json` is the field-level source of truth.
 
 ## Lifecycle
 
-<aside class="wyrd-phase-gate"><span class="wyrd-phase-gate__badge">Phase 5a</span>Write, version, transition, and retire flows for PromptCards land in Phase 5a.</aside>
+`PromptCard` is a shipped holder: author it locally, then register it to a
+server. Registration is idempotent on identity and rejects a changed spec at
+the same version. See [Declare a card](/how-to/declare/).
 
 ## Authoring notes
 
@@ -42,5 +47,5 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 
 ## Related
 
-- [Concepts overview](/concepts/) — where Prompt fits in the seven primitives.
+- [Card](/concepts/card/) — where Prompt fits in the card model.
 - [Card reference index](/cards/) — every kind in one place.

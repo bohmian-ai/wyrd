@@ -1,0 +1,113 @@
+---
+title: Your first card
+description: Build a DataCard from a pandas DataFrame, save it to disk, and load it back — the one runnable card workflow today.
+pillar: wyrd
+group: Tutorials
+order: 2
+---
+
+# Your first card
+
+This tutorial builds a `DataCard` from a pandas DataFrame, writes it to disk, and
+reads it back. It is the exact example that ships in the repo, explained step by
+step. No server is involved: `save` and `load` operate on the local filesystem
+only.
+
+<Aside title="Before you start" data-variant="wyrd">
+
+Set up the repo first — see [Get started](/get-started/). You can run the whole
+thing with `mise run examples:python:datacard`; this page explains what it does.
+
+</Aside>
+
+## The full example
+
+<CodeFromFile file="examples/python/datacard_local_workflow.py" lang="python" />
+
+Run it:
+
+```bash
+mise run examples:python:datacard
+```
+
+```text
+saved_card_json: true
+saved_data_file: data/data.parquet
+loaded_rows: 3
+loaded_columns: customer_id,churned,segment
+labels: domain=customer,stage=example
+annotation_source: examples/python/datacard_local_workflow.py
+```
+
+## Step by step
+
+### 1. Build the card
+
+```python
+card = DataCard(
+    PandasInterface(data=data),
+    name="customer-churn",
+    version="0.1.0",
+    labels={"domain": "customer", "stage": "example"},
+    annotations={"example.com/source": "examples/python/datacard_local_workflow.py"},
+)
+```
+
+The first positional argument is a **data interface** — `PandasInterface` owns the
+local save/load behavior for a DataFrame. `name` and `version` set the card's
+identity; `space` defaults to `default`, so this card's identity is
+`(default, customer-churn, 0.1.0)`.
+
+`labels` are indexed classification fields you filter on. `annotations` are
+descriptive metadata that travels with the card but is not indexed. Both are part
+of the card envelope — see [Card](/concepts/card/).
+
+### 2. Save to disk
+
+```python
+card.save(path)
+```
+
+`save` takes a directory path and writes the local card layout there:
+`card.json` (the envelope) plus a `data/` directory holding the serialized
+DataFrame (`data.parquet`). Nothing leaves your machine.
+
+### 3. Load it back
+
+```python
+restored = DataCard.model_validate_json((path / "card.json").read_text())
+restored.load(path)
+```
+
+`model_validate_json` reconstructs the card envelope from `card.json`. At that
+point the metadata is populated but the data is not — `load(path)` reads the
+DataFrame back from the `data/` directory into `restored.data`.
+
+### 4. Read what you saved
+
+```python
+restored.data          # the DataFrame, 3 rows
+restored.labels        # {"domain": "customer", "stage": "example"}
+restored.annotations   # {"example.com/source": "..."}
+```
+
+The restored card carries the same identity, labels, annotations, and data the
+original declared.
+
+## What ships and what doesn't
+
+<Aside title="Registration is not on the Python surface yet" data-variant="not">
+
+`DataCard.save` and `.load` are local-only by design; the card object does not
+talk to a server. Registering a card to a registry — so it gets a durable
+server-side identity and joins the lineage graph — belongs to the registry and
+client APIs, which are not yet exposed in the Python package. This tutorial
+covers the shipped local workflow.
+
+</Aside>
+
+## Next
+
+- [Declare a Data card](/how-to/declare/data/) — the recipe form of this workflow.
+- [Card](/concepts/card/) — the envelope, identity rules, and `CardRef`s.
+- [Cards](/cards/) — every kind and its shipping status.

@@ -1,0 +1,118 @@
+---
+pillar: wyrd
+title: Error remediation
+description: How agents should handle Wyrd errors.
+group: For Agents
+order: 3
+---
+
+# Error remediation
+
+Wyrd errors carry structured data. An agent must preserve that structure and act on it directly, not collapse it to prose.
+
+## Error shape
+
+All Wyrd errors follow RFC 9457 Problem Details with Wyrd extensions. A
+registration spec-drift response looks like this:
+
+```json
+{
+  "type": "https://wyrd.dev/problems/WYRD_REG_409_SPEC_DRIFT",
+  "title": "Card spec drift on re-apply",
+  "status": 409,
+  "code": "WYRD_REG_409_SPEC_DRIFT",
+  "detail": "Card 'fraud-model@2.1.0' already exists with a different spec_hash; same-version cards are immutable.",
+  "remediation": "Bump the card version, or re-apply the exact spec that was first registered at this version.",
+  "details": {
+    "card_ref": "fraud-model@2.1.0",
+    "operation": "card.register"
+  },
+  "instance": "urn:wyrd:request:req_01hwz4k9m2e3f"
+}
+```
+
+### Field reference
+
+| Field | Description | Always present |
+|---|---|---|
+| `type` | URI identifying the error class | Yes |
+| `title` | Human-readable summary of the error class, stable across instances | Yes |
+| `status` | HTTP status code as an integer | Yes |
+| `code` | Wyrd-specific machine-readable error code, stable string; use this for programmatic branching | Yes |
+| `detail` | Instance-specific description of what went wrong | Yes |
+| `remediation` | Actionable guidance for the caller or agent | Yes |
+| `details` | Structured key/value map with operation-specific fields (card id, run id, policy name, denial reason, etc.) | When applicable |
+| `instance` | Request correlation URN (`urn:wyrd:request:<id>`); the same id is also returned in the `wyrd-request-id` response header | When the server assigns a request id |
+
+## What agents must do
+
+- Preserve all structured fields from the error response; do not flatten or summarize them.
+- Use `code` for programmatic branching. `title` and `detail` are human-readable and may change in phrasing.
+- Surface policy and audit denials as explicit decisions, not generic failures. The `code`, `detail`, and `details` together identify what policy was checked and what triggered it.
+- When `remediation` is present, include it verbatim in any human-readable output or escalation.
+- Keep retries bounded and tied to idempotent operations only. Check the `code` before retrying.
+- Preserve the `instance` request URN (and the `wyrd-request-id` response header) in any escalation or support request.
+- For `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED`, the
+  `details.required_feature` names the Cargo feature that would
+  re-enable the transport. The remediation is a build-time fix, not a
+  retry path. Note: this error code is not yet emitted — it lands in
+  PR4.0 when `WyrdClient::new()` is implemented.
+- For `WYRD_CLIENT_400_CONFIG_INVALID`, the `details.field` and
+  `details.reason` name the offending config field and the rule it
+  failed. Fix the field on the config object and reconstruct the
+  client. Not a retry path.
+- For `WYRD_CLIENT_401_NO_CREDENTIALS`, the credential chain resolved no
+  usable credential. The remediation is a config fix, not a retry path:
+  set one of `WYRD_ACCESS_TOKEN`, `WYRD_WORKLOAD_TOKEN`+`WYRD_TENANT`, or
+  `WYRD_API_KEY`; pass `ClientConfig::api_key`; or add `[default].api_key`
+  to `~/.config/wyrd/credentials.toml`.
+- For `WYRD_CLIENT_503_TRANSPORT_DOWN`, the `details.transport` names
+  the unavailable transport (DNS, TCP, TLS, or connect failure). Retry
+  after the underlying network or server health recovers. Apply
+  exponential backoff between retries.
+
+## What agents must not do
+
+- Do not re-wrap a structured error as an untyped string or generic failure message.
+- Do not treat `status` as the full error identity. Two errors can share the same status code and require different handling.
+- Do not ignore `remediation` when it is present.
+- Do not infer error semantics from `detail`; it is instance-specific prose and is not stable across releases.
+
+## Policy and audit failures
+
+Policy and audit denials are decisions, not transport errors. A `403` with `code: WYRD_AUTHZ_403_POLICY_DENIED` means Wyrd evaluated the request against a named policy and rejected it. This is different from a missing credential or a malformed request.
+
+The `code` and `detail` identify the failing policy. The `details` map contains the denial reason and the card, run, or operation that triggered it (for example, `reason`, `card_id`, `policy_name`, `operation`). An agent must not retry a policy denial without first satisfying the stated condition in `remediation`.
+
+Audit failures follow the same shape. If a write is rejected because an audit record could not be committed, the `code` will identify the audit step and `remediation` will describe what the agent or operator needs to resolve before retrying.
+
+## Authorization errors
+
+Use the Wyrd `code` value, not HTTP status alone:
+
+| Code | Agent action |
+| --- | --- |
+| `WYRD_AUTH_503_VERIFY_UNAVAILABLE` | Back off and retry the same operation. Do not re-authenticate; the credential was not rejected. |
+| `WYRD_PERMISSION_500_ROLE_CORRUPT` | Do not retry. Surface the failure to a workspace admin; the stored role permission JSON must be fixed. |
+| `WYRD_AUTH_401_INVALID_CARD_REF` | Re-issue the Service or Agent credential with `wyrd auth issue-key`. |
+| `WYRD_AUTH_401_DELEGATION_DEPTH_EXCEEDED` | Do not retry. Contact the issuer; the token came from a non-conforming source. |
+| `WYRD_AUTH_400_UNSUPPORTED_GRANT_TYPE` | Check the Wyrd version and exact `grant_type` value. |
+| `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND` | Verify the requested subject is a registered Service or Agent CardRef in the current tenant. User impersonation is not supported in this version. |
+| `WYRD_AUTH_401_API_KEY_INVALID` | Do not retry with the same key. Rotate credentials via `wyrd auth issue-key` and update the deployment secret store. |
+| `WYRD_AUTHZ_403_REQUIRES_DELEGATED_TOKEN` | Do not retry. The presented token is a direct token; re-authenticate using the delegation flow (`POST /auth/token` with `grant_type: urn:ietf:params:oauth:grant-type:token-exchange`). |
+| `WYRD_AUTH_503_PREVIEW_DISABLED` | Do not retry. This route is not active in the current deploy. Contact the platform operator. |
+| `WYRD_PERMISSION_403_DENIED_RBAC` | Do not retry. The caller lacks the required RBAC permission. Request the required role from a workspace admin. |
+
+## Retry behavior
+
+Retries are only safe for idempotent operations. The `code` field is the signal for retryability:
+
+- Safe to retry: read operations (card lookup, schema inspection, run query, policy list). These have no side effects.
+- Unsafe to retry without idempotency key: card registration, run creation, policy writes. Re-sending these without a stable idempotency key may produce duplicate records.
+- Not retryable: policy denials, audit failures, authorization errors. These require a corrective action before a retry will succeed.
+
+If the error response does not include a `code`, treat the operation as non-retryable until the cause is identified.
+
+---
+
+Note: the public error catalog (one entry per `code` with retryability, context fields, and remediation patterns) is not yet emitted as a standalone file. Once the catalog generator lands, this page will link to the full per-code reference.

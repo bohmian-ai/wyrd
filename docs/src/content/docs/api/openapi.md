@@ -1,6 +1,9 @@
 ---
 title: OpenAPI
 description: Generated summary of the Wyrd OpenAPI contract.
+pillar: wyrd
+group: Reference
+order: 22
 ---
 
 # OpenAPI

@@ -1,0 +1,104 @@
+---
+title: Card
+description: The typed, versioned envelope for one AI system component — its outer shape, lifecycle, and identity rules.
+pillar: wyrd
+group: Concepts
+order: 2
+---
+
+# Card
+
+A **card** is the typed, versioned envelope Wyrd uses for every component it
+governs. Every kind shares the same outer shape; the `spec` carries the fields
+specific to that kind.
+
+## The envelope
+
+```yaml
+apiVersion: wyrd/v1
+metadata:
+  space: default
+  name: my-component
+  version: "0.1.0"
+  labels: {}
+  annotations: {}
+kind: Data          # selects the spec schema
+spec:               # kind-specific payload
+  ...
+relationships: []   # derived by the server from CardRefs in spec
+status:
+  phase: active
+```
+
+Every registered card — of any kind — carries exactly these six top-level
+fields. The author supplies four; the server owns two.
+
+<DataTable
+  columns={[
+    { header: 'Field', role: 'name' },
+    { header: 'Type', role: 'type' },
+    { header: 'Origin' },
+    { header: 'Notes' }
+  ]}
+  rows={[
+    ['apiVersion', 'string', 'author', { text: 'Always <code>wyrd/v1</code>.', html: true }],
+    ['metadata', 'Metadata', 'author', { text: '<code>space</code>, <code>name</code>, <code>version</code>, <code>labels</code>, <code>annotations</code>.', html: true }],
+    ['kind', 'string', 'author', 'Selects the spec schema — 16 native kinds (Data, Model, Prompt, and 13 spec-only) plus External.'],
+    ['spec', 'object', 'author', 'Kind-specific payload. Content-hashed for idempotency.'],
+    ['relationships', 'Edge[]', { text: 'server', badge: 'warn' }, { text: 'Derived from the <code>CardRef</code>s in <code>spec</code>. Never authored.', html: true }],
+    ['status', 'Status', { text: 'server', badge: 'warn' }, { text: 'Managed lifecycle state (<code>phase</code>).', html: true }]
+  ]}
+/>
+
+## Identity
+
+A card's identity is `(space, name, version)`. This triple is immutable once
+registered. The server rejects a changed `spec` at the same identity — to change
+a spec, bump the version.
+
+## The spec
+
+`spec` is the typed payload for the card's `kind`. The `kind` field selects
+which JSON Schema applies. The doctrine defines 16 native kinds plus `External`.
+Only the three shipped kinds (Data, Model, Prompt) have a runnable implementation
+today; the other thirteen native kinds and `External` have authored specs and
+schemas but no runtime.
+
+## Lifecycle
+
+```
+local  →  registered  →  active  →  deprecated
+```
+
+- **local**: the card exists on disk; nothing has been sent to a server.
+- **registered**: the server has accepted and stored the card.
+- **active**: the default phase after registration; the card is queryable.
+- **deprecated**: the card is still present but signals it should no longer be
+  used as a primary dependency.
+
+## CardRef
+
+A `CardRef` is a typed pointer from one card's spec to another card's identity.
+The server derives **relationships** from CardRefs — the directed lineage graph.
+You never hand-maintain the graph.
+
+```python
+from wyrd.cards import CardRef
+
+# A typed pointer to another card's identity:
+training_data = CardRef(
+    kind="Data",
+    name="churn-dataset",
+    version="0.3.0",
+    space="default",
+)
+```
+
+`kind`, `name`, `version`, and `space` are all required — a `CardRef` names a
+specific card's identity. The server reads the CardRefs embedded in a spec and
+derives the relationship edges from them.
+
+## Related
+
+- [Cards overview](/cards/) — every kind, its spec, and shipping status.
+- [Overview](/overview/) — why cards exist.

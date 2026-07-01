@@ -1,0 +1,16 @@
+---
+title: Reference
+description: The literal contract — CLI verbs, card schemas, error codes, and the API surface.
+pillar: wyrd
+group: Reference
+order: 1
+---
+
+# Reference
+
+The literal contract. Everything here is generated from source or documents a
+shipped surface — no narrative, no recommendations.
+
+- [CLI](/reference/cli/) — the `wyrd` binary: `auth`, `eval`, `principal`.
+- [Cards](/cards/) — field-level schema docs for each card kind.
+- [API](/api/) — error catalog, OpenAPI summary, and JSON Schema inventory.

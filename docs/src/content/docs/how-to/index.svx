@@ -1,0 +1,32 @@
+---
+title: How-to
+description: Goal-oriented recipes for declaring, evaluating, observing, and operating Wyrd components.
+pillar: wyrd
+group: How-to
+order: 1
+---
+
+# How-to
+
+Goal-oriented recipes. Each how-to answers one question: "how do I do X with
+Wyrd?" Skip the explanation; go straight to the code.
+
+## Build on Skald
+
+- [Build an Agent](/how-to/build-an-agent/) — a bounded loop over a Prompt with tools, callbacks, and session memory.
+- [Build a Workflow](/how-to/build-a-workflow/) — a DAG of Agent invocations, authored in Python, YAML, or Rust.
+
+## Capability domains
+
+- [Declare](/how-to/declare/) — author and register cards.
+- [Evaluate](/how-to/evaluate/) — score agent runs and models against eval definitions.
+- [Observe](/how-to/observe/) — read metrics, drift, and audit trails from a running system.
+- [Operate](/how-to/operate/) — run, restart, and manage card-governed components.
+
+<Aside title="What ships today" data-variant="wyrd">
+
+Agent and Workflow recipes run on the Skald runtime today. Declare recipes are
+available for the three shipped card kinds: Prompt, Model, and Data. Evaluate,
+Observe, and Operate recipes follow as those capability contracts ship.
+
+</Aside>

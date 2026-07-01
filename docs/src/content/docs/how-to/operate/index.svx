@@ -1,0 +1,26 @@
+---
+title: Operate
+description: Run, restart, and manage card-governed components in production.
+pillar: wyrd
+group: How-to
+order: 32
+---
+
+# Operate
+
+<Aside title="Reserved — coming when ServiceCard ships" data-variant="not">
+
+Operate recipes will be added as the ServiceCard and TriggerCard runtime
+contracts ship. The specs are authored; the runtime implementation is not yet
+available.
+
+</Aside>
+
+Operate capability covers:
+
+- Deploying a service governed by a `ServiceCard`
+- Triggering workflows from `TriggerCard` definitions
+- Managing operator lifecycle within a workflow
+
+These how-to pages will be added alongside the ServiceCard runtime. See what
+runs today in the [Overview](/overview/).

@@ -1,0 +1,66 @@
+---
+title: Declare a Data card
+description: Author a DataCard from a pandas DataFrame and save it locally.
+pillar: wyrd
+group: How-to
+order: 13
+---
+
+# Declare a Data card
+
+## Prerequisites
+
+- Wyrd set up from a repo checkout ([Get started](/get-started/))
+- pandas
+
+## Recipe
+
+```python
+from pathlib import Path
+
+import pandas as pd
+from wyrd.data import DataCard, PandasInterface
+
+df = pd.DataFrame({
+    "user_id": ["u1", "u2", "u3"],
+    "churn_score": [0.12, 0.87, 0.45],
+    "label": [0, 1, 0],
+})
+
+card = DataCard(
+    PandasInterface(data=df),
+    name="churn-scores-2024q4",
+    version="0.1.0",
+    labels={"domain": "churn", "stage": "example"},
+)
+
+card.save(Path("./churn-card"))
+```
+
+The first positional argument is a data interface — `PandasInterface` owns the
+local save/load for the DataFrame. `name` and `version` set the card's identity;
+`space` defaults to `default`.
+
+`card.save(path)` writes `card.json` (the envelope) and the serialized DataFrame
+under `path/data/`. Nothing leaves your machine.
+
+## Register
+
+The saved `card.json` is the envelope you register over HTTP:
+
+```bash
+curl -X POST "$WYRD_SERVER_URL/api/v1/cards" \
+  -H "Authorization: Bearer $WYRD_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data @churn-card/card.json
+```
+
+Registration is idempotent on identity: re-posting the same `(space, name,
+version)` with the same spec is a no-op; a changed spec at the same version is
+rejected. There is no Python registry client yet.
+
+## Reference
+
+- [Data card spec](/cards/data/) — generated field-level documentation.
+- [Your first card](/tutorials/first-card/) — the same flow with save/load explained.
+- [Cards](/cards/) — every kind and status.

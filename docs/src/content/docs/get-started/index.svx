@@ -1,0 +1,63 @@
+---
+title: Get Started
+description: Install Wyrd from the repo and run the DataCard example end to end.
+pillar: wyrd
+group: Get Started
+order: 1
+---
+
+# Get Started
+
+Wyrd is pre-release. There is no published PyPI package yet, so you install from
+a repo checkout and run through [`mise`](https://mise.jdx.dev/). This page gets
+the local DataCard workflow running; the [first-card tutorial](/tutorials/first-card/)
+explains what each step does.
+
+<Aside title="What you need" data-variant="wyrd">
+
+Python 3.10+, `git`, and `mise`. No running server is required for this
+example — `DataCard.save()` writes local files and does not register anything.
+
+</Aside>
+
+## 1. Clone and set up
+
+```bash
+git clone https://github.com/mitari-ai/wyrd.git
+cd wyrd
+mise run py:setup
+```
+
+`py:setup` builds the Python environment and installs the local `wyrd` extension
+(including pandas). This is the only supported install path until `py-wyrd`
+publishes.
+
+## 2. Run the DataCard example
+
+```bash
+mise run examples:python:datacard
+```
+
+Expected output (deterministic):
+
+```text
+saved_card_json: true
+saved_data_file: data/data.parquet
+loaded_rows: 3
+loaded_columns: customer_id,churned,segment
+labels: domain=customer,stage=example
+annotation_source: examples/python/datacard_local_workflow.py
+```
+
+The example builds a `DataCard` from a pandas DataFrame, writes the local card
+layout, loads it back, and prints what it read. The public import surface is:
+
+```python
+from wyrd.data import DataCard, PandasInterface
+```
+
+## Next
+
+- [Your first card](/tutorials/first-card/) — the same flow, explained line by line.
+- [Concepts](/concepts/) — what a Card is and why it has the shape it does.
+- [Declare recipes](/how-to/declare/) — author and register Prompt, Model, and Data cards.

@@ -1,0 +1,100 @@
+---
+title: Agent workflow
+description: A copyable end-to-end workflow for agents that declare cards and register them over HTTP.
+pillar: wyrd
+group: For Agents
+order: 2
+---
+
+# Agent workflow
+
+A literal, copyable workflow for registering cards from an agent. Author the card
+locally with the Python package, then register the saved envelope over HTTP. Every
+step is deterministic and idempotent.
+
+## Prerequisites
+
+- `WYRD_SERVER_URL` and `WYRD_ACCESS_TOKEN` set in the environment
+- Wyrd set up from a repo checkout ([Get started](/get-started/))
+
+## Workflow
+
+### 1. Check if the card already exists
+
+Cards are addressed by their `(space, name, version)` identity:
+
+```bash
+curl -sf "$WYRD_SERVER_URL/api/v1/cards/default/my-dataset/0.1.0" \
+  -H "Authorization: Bearer $WYRD_ACCESS_TOKEN"
+```
+
+A `200` returns the stored envelope — read it and continue. A `404` means the card
+is not registered; proceed to step 2.
+
+### 2. Author the card and save it locally
+
+Use the card class for the kind. Each class writes a `card.json` envelope to disk:
+
+```python
+from pathlib import Path
+
+import pandas as pd
+from wyrd.data import DataCard, PandasInterface
+
+df = pd.DataFrame({"col_a": [1, 2, 3]})
+
+card = DataCard(
+    PandasInterface(data=df),
+    name="my-dataset",
+    version="0.1.0",
+)
+
+card.save(Path("./my-dataset"))
+```
+
+### 3. Register the saved envelope
+
+```bash
+curl -X POST "$WYRD_SERVER_URL/api/v1/cards" \
+  -H "Authorization: Bearer $WYRD_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data @my-dataset/card.json
+```
+
+Registration is idempotent on identity: re-posting the same `(space, name,
+version)` with the same spec is a no-op. The same identity with a different spec
+returns `409` with code `WYRD_REG_409_SPEC_DRIFT` — bump the version.
+
+### 4. Handle errors
+
+Errors are RFC 9457 Problem Details (`application/problem+json`). Branch on `code`,
+never on `title` or `detail`:
+
+```python
+import httpx
+
+resp = httpx.post(
+    f"{server_url}/api/v1/cards",
+    headers={"Authorization": f"Bearer {token}"},
+    content=(Path("./my-dataset") / "card.json").read_bytes(),
+)
+if resp.status_code >= 400:
+    problem = resp.json()
+    if problem["code"] == "WYRD_REG_409_SPEC_DRIFT":
+        # Spec changed at the same version — bump the version and retry.
+        ...
+    # Preserve the full structure; never collapse it into prose.
+```
+
+Preserve every field (`code`, `type`, `detail`, `remediation`, `context`). There
+is no Python registry client yet — the HTTP envelope is the registration surface.
+
+## Error codes
+
+See the [Errors reference](/api/errors/) for the full catalog and
+[Error remediation](/for-agents/error-remediation/) for how to act on each code.
+
+## Related
+
+- [For Agents](/for-agents/) — rules and stable paths.
+- [Declare a Data card](/how-to/declare/data/) — the declare recipe.

@@ -24,7 +24,7 @@ executor hydrates from CodeGraph against the current code.
 
 ## When To Use
 
-- `/tasks`, or after `plan.md` passes `wyrd-architecture-review` (gate 2).
+- `/tasks`, or after `plan.md` passes `wyrd-architecture-reviewer` (gate 2).
 - Input is the commit DAG: `plan.md` plus a `tasks.yaml` skeleton (one node per
   commit, with `depends_on`) emitted by `wyrd-plan`.
 
@@ -48,7 +48,7 @@ executor hydrates from CodeGraph against the current code.
 
 ## Seams & Invariants — the load-bearing rule
 
-This section is why thinning does not starve `wyrd-architecture-review`. The arch
+This section is why thinning does not starve `wyrd-architecture-reviewer`. The arch
 gate reasons about decisions and the seams a commit depends on; with CodeGraph it
 verifies each named seam's invariant against the *actual* source. So the contract
 must make that verification possible.

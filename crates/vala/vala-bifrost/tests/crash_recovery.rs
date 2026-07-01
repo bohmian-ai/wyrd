@@ -296,7 +296,7 @@ async fn recovery_skips_live_writer_lease(pool: PgPool) {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, table_uid.as_bytes(), &batch_id)
+    vala_sql::queries::olap_catalog::precommit(&mut conn, table_uid.as_bytes(), &batch_id, "system", "system")
         .await
         .unwrap();
     // Stamp a future-expiring lease so claim_stale_precommits skips it.
@@ -364,7 +364,7 @@ async fn cold_start_maps_table_identity(pool: PgPool) {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id)
+    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id, "system", "system")
         .await
         .unwrap();
     // Leave writer_lease_expires_at NULL so claim_stale_precommits picks it up.
@@ -414,7 +414,7 @@ async fn cold_start_maps_system_shared_table_identity(pool: PgPool) {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, DataTenantId::SYSTEM_OWNER)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, sys_uid.as_bytes(), &batch_id)
+    vala_sql::queries::olap_catalog::precommit(&mut conn, sys_uid.as_bytes(), &batch_id, "system", "system")
         .await
         .unwrap();
     conn.commit().await.unwrap();
@@ -449,7 +449,7 @@ async fn recovery_disabled_when_no_recovery_pool(pool: PgPool) {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id)
+    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id, "system", "system")
         .await
         .unwrap();
     conn.commit().await.unwrap();
@@ -512,7 +512,7 @@ async fn zombie_writer_fenced_after_recovery_claim(pool: PgPool) {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id)
+    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id, "system", "system")
         .await
         .unwrap();
     sqlx::query(
@@ -587,7 +587,7 @@ async fn expired_writer_fenced_before_recovery_claim(pool: PgPool) {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id)
+    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id, "system", "system")
         .await
         .unwrap();
     sqlx::query(
@@ -661,7 +661,7 @@ async fn recovery_skips_after_unexpired_renewal(pool: PgPool) {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id)
+    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id, "system", "system")
         .await
         .unwrap();
     sqlx::query(
@@ -750,7 +750,7 @@ async fn fence_lost_after_append_is_detected_and_audited(pool: PgPool) {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id)
+    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id, "system", "system")
         .await
         .unwrap();
     sqlx::query(

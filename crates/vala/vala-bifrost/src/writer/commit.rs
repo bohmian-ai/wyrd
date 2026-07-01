@@ -89,11 +89,13 @@ pub async fn run_commit(
     table_uid: &TableUid,
     batches: Vec<RecordBatch>,
     batch_id: [u8; 16],
+    origin: &str,
+    actor: &str,
     tenant: DataTenantId,
 ) -> Result<(i64, Option<Table>), BifrostError> {
     let table_fqn = table.identifier().to_string();
 
-    let phase1 = claim_batch(pool, table_uid, &batch_id, tenant, &table_fqn).await?;
+    let phase1 = claim_batch(pool, table_uid, &batch_id, origin, actor, tenant, &table_fqn).await?;
 
     match phase1 {
         Phase1::Replay { snapshot_id } => Ok((snapshot_id, None)),
@@ -134,6 +136,8 @@ async fn claim_batch(
     pool: &PgPool,
     table_uid: &TableUid,
     batch_id: &[u8; 16],
+    origin: &str,
+    actor: &str,
     tenant: DataTenantId,
     table_fqn: &str,
 ) -> Result<Phase1, BifrostError> {
@@ -172,9 +176,15 @@ async fn claim_batch(
             Err(BifrostError::CommitConflict(table_fqn.to_string()))
         }
         None => {
-            vala_sql::queries::olap_catalog::precommit(&mut conn, table_uid.as_bytes(), batch_id)
-                .await
-                .map_err(BifrostError::Sql)?;
+            vala_sql::queries::olap_catalog::precommit(
+                &mut conn,
+                table_uid.as_bytes(),
+                batch_id,
+                origin,
+                actor,
+            )
+            .await
+            .map_err(BifrostError::Sql)?;
 
             let owner = *WRITER_INSTANCE;
             let fencing_token =
@@ -445,7 +455,8 @@ pub async fn run_commit_with_fault(
     fault: FaultPoint,
 ) -> Result<(i64, Option<Table>), BifrostError> {
     let table_fqn = table.identifier().to_string();
-    let phase1 = claim_batch(pool, table_uid, &batch_id, tenant, &table_fqn).await?;
+    let phase1 =
+        claim_batch(pool, table_uid, &batch_id, "system", "system", tenant, &table_fqn).await?;
     let (owner, fencing_token) = match phase1 {
         Phase1::Replay { snapshot_id } => return Ok((snapshot_id, None)),
         Phase1::Fresh {

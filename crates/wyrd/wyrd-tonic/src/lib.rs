@@ -14,6 +14,18 @@ pub use tonic_types;
 #[cfg(feature = "server")]
 pub use tonic_health;
 
+/// Generated `wyrd.v1` protobuf surface (compiled by `build.rs`).
+///
+/// The message structs are always present; the `bifrost_ingest_service_server`
+/// / `bifrost_ingest_service_client` submodules appear only when this crate's
+/// `server` / `client` feature is enabled.
+pub mod wyrd {
+    /// Version 1 of the Wyrd gRPC surface.
+    pub mod v1 {
+        tonic::include_proto!("wyrd.v1");
+    }
+}
+
 pub mod error;
 
 // `health` impls `tonic::server::NamedService`, which only exists under tonic's

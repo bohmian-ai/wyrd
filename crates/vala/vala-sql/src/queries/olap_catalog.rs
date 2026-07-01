@@ -145,17 +145,21 @@ pub async fn precommit(
     conn: &mut TenantConn<'_>,
     table_uid: &[u8; 16],
     batch_id: &[u8; 16],
+    origin: &str,
+    actor: &str,
 ) -> Result<(), SqlError> {
     sqlx::query(
         r#"
         INSERT INTO vala.olap_commits
             (data_tenant_id, table_uid, batch_id, state, origin, actor)
-        VALUES (wyrd.current_tenant(), $1, $2, 'precommit', 'system', 'system')
+        VALUES (wyrd.current_tenant(), $1, $2, 'precommit', $3, $4)
         ON CONFLICT (data_tenant_id, table_uid, batch_id) DO NOTHING
         "#,
     )
     .bind(table_uid.as_slice())
     .bind(batch_id.as_slice())
+    .bind(origin)
+    .bind(actor)
     .execute(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;

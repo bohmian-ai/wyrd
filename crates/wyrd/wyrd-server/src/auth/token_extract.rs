@@ -1,26 +1,21 @@
 //! Shared bearer-token extraction helpers for Wyrd auth handlers.
+//!
+//! `WYRD_ACCESS_TOKEN_HEADER` and `tenant_from_unverified_access_token` are owned
+//! by `wyrd-auth-verify` (so the gRPC ingest interceptor can reach them without
+//! depending on `wyrd-server`); this module re-exports the header and wraps the
+//! tenant helper to keep the HTTP handlers' `WyrdErrorResponse` contract intact.
 
-use axum::http::HeaderName;
-use base64::Engine;
-use wyrd_auth_verify::AccessTokenClaims;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 
-use crate::error::WyrdErrorResponse;
+pub(crate) use wyrd_auth_verify::WYRD_ACCESS_TOKEN_HEADER;
 
-pub(crate) const WYRD_ACCESS_TOKEN_HEADER: HeaderName =
-    HeaderName::from_static("x-wyrd-access-token");
+use crate::error::WyrdErrorResponse;
 
 pub(crate) fn tenant_from_unverified_access_token(
     token: &str,
 ) -> Result<DataTenantId, WyrdErrorResponse> {
-    let payload = token.split('.').nth(1).ok_or_else(bad_token_format)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| bad_token_format())?;
-    let claims: AccessTokenClaims =
-        serde_json::from_slice(&bytes).map_err(|_| bad_token_format())?;
-    Ok(claims.principal.tenant_id)
+    wyrd_auth_verify::tenant_from_unverified_access_token(token).map_err(|_| bad_token_format())
 }
 
 pub(crate) fn bad_token_format() -> WyrdErrorResponse {

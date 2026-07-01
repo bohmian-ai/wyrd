@@ -98,6 +98,13 @@ impl WyrdCatalog {
     ) -> Result<TableUid, BifrostError> {
         self.ensure_namespace(ns).await?;
 
+        // The fingerprint is user-fields-only (06 §3): the correlation
+        // (`run_id`/`card_ref`) and system columns are stripped before hashing,
+        // so their presence in the physical schema does not perturb the value the
+        // client caches and the server compares.
+        let fingerprint =
+            SchemaFingerprint::from_arrow_schema(&arrow::datatypes::Schema::new(user_fields.clone()));
+
         let all_fields = with_system_columns(user_fields, scope);
         let arrow_schema = arrow::datatypes::Schema::new(all_fields);
         let iceberg_schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)
@@ -110,7 +117,6 @@ impl WyrdCatalog {
         };
 
         let table_uid = TableUid::new_v7();
-        let fingerprint = SchemaFingerprint::from_arrow_schema(&arrow_schema);
         let fqn = format!("{}.{}", ns.as_str(), name);
 
         let location = format!("{}/{}/{}", self.warehouse, ns.as_str(), name);

@@ -3,10 +3,8 @@
 use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
 use axum::{Json, Router};
-use base64::Engine;
 use secrecy::SecretString;
 use uuid::Uuid;
-use wyrd_auth_verify::AccessTokenClaims;
 use wyrd_spec::auth::{CallbackQuery, IssueKeyRequest, TokenRequest, TokenResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
@@ -241,16 +239,8 @@ fn preview_disabled() -> WyrdError {
 fn tenant_from_unverified_access_token(
     token: &str,
 ) -> Result<wyrd_spec::DataTenantId, WyrdErrorResponse> {
-    let payload = token
-        .split('.')
-        .nth(1)
-        .ok_or_else(bad_subject_token_format)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| bad_subject_token_format())?;
-    let claims: AccessTokenClaims =
-        serde_json::from_slice(&bytes).map_err(|_| bad_subject_token_format())?;
-    Ok(claims.principal.tenant_id)
+    wyrd_auth_verify::tenant_from_unverified_access_token(token)
+        .map_err(|_| bad_subject_token_format())
 }
 
 fn bad_subject_token_format() -> WyrdErrorResponse {

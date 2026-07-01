@@ -9,6 +9,7 @@ authors = { workspace = true }
 [dependencies]
 base64 = { workspace = true }
 chrono = { workspace = true }
+http = { workspace = true }
 jsonwebtoken = { workspace = true }
 moka = { version = "0.12", features = ["future"] }
 secrecy = { workspace = true }

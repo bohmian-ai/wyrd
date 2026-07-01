@@ -1219,6 +1219,20 @@ else
 fi
 """
 
+[tasks."check:proto-drift"]
+hide = true
+description = "Fail if the checked-in wyrd.v1 FileDescriptorSet drifts from the .proto"
+run = """
+set -e
+# Rebuilding wyrd-tonic reruns build.rs, which regenerates the descriptor
+# snapshot at crates/wyrd/wyrd-tonic/proto/wyrd.v1.bin from the .proto. Force a
+# fresh compile of the build script so a stale target cache cannot mask drift.
+touch crates/wyrd/wyrd-tonic/build.rs
+cargo build --locked -p wyrd-tonic --all-features
+git diff --exit-code -- crates/wyrd/wyrd-tonic/proto/wyrd.v1.bin \\
+  || { echo 'wyrd.v1 descriptor drift detected - rebuild wyrd-tonic and commit crates/wyrd/wyrd-tonic/proto/wyrd.v1.bin'; exit 1; }
+"""
+
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
 depends = ["check", "test:unit", "test:bifrost", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:tokens", "check:wasm", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs", "check:no-legacy-server-vocab", "check:no-tonic-outside-wyrd-tonic"]

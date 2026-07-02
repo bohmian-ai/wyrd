@@ -2094,6 +2094,92 @@ pub enum WyrdError {
         /// Structured detail payload (`{ table }`).
         details: serde_json::Value,
     },
+
+    // --- WYRD_EVAL_* — eval pull-protocol ---
+    /// Eval run id not found in the in-memory run map.
+    #[error("[WYRD_EVAL_404_RUN_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_EVAL_404_RUN_NOT_FOUND",
+        status = 404,
+        title = "Eval run not found",
+        remediation = "Re-open a run with POST /v1/eval/runs."
+    )]
+    EvalRunNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Request lacked the bearer lease token on a protected eval-run route.
+    #[error("[WYRD_EVAL_401_MISSING_LEASE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_EVAL_401_MISSING_LEASE",
+        status = 401,
+        title = "Missing lease token",
+        remediation = "Send the lease_token from EvalRunOpenResponse in the Authorization: Bearer <token> header."
+    )]
+    EvalMissingLease {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Request carried a lease that does not match the run.
+    #[error("[WYRD_EVAL_403_INVALID_LEASE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_EVAL_403_INVALID_LEASE",
+        status = 403,
+        title = "Invalid lease token",
+        remediation = "Re-open the run via POST /v1/eval/runs; leases are bound to one run."
+    )]
+    EvalInvalidLease {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Submission did not match the outstanding directive.
+    #[error("[WYRD_EVAL_409_SUBMISSION_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_EVAL_409_SUBMISSION_MISMATCH",
+        status = 409,
+        title = "Eval submission did not match outstanding directive",
+        remediation = "Call POST /v1/eval/runs/{run_id}/next to retrieve the outstanding directive and retry."
+    )]
+    EvalSubmissionMismatch {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Engine, simulator, scenario loading, or server configuration failure.
+    #[error("[WYRD_EVAL_500_RUN_FAILED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_EVAL_500_RUN_FAILED",
+        status = 500,
+        title = "Eval run failed",
+        remediation = "Inspect the eval route logs and retry after correcting the underlying server or provider issue."
+    )]
+    EvalRunFailed {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Too many concurrent eval runs; client must retry after existing runs complete.
+    #[error("[WYRD_EVAL_429_TOO_MANY_RUNS] {message}")]
+    #[wyrd_error(
+        code = "WYRD_EVAL_429_TOO_MANY_RUNS",
+        status = 429,
+        title = "Too many concurrent eval runs",
+        remediation = "Wait for an existing run to complete, then retry."
+    )]
+    EvalTooManyRuns {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
 }
 
 impl WyrdError {
@@ -2241,7 +2327,13 @@ impl WyrdError {
             | Self::PayloadTooLarge { message, details }
             | Self::HarnessStart { message, details }
             | Self::HarnessBound { message, details }
-            | Self::HarnessBootstrap { message, details } => {
+            | Self::HarnessBootstrap { message, details }
+            | Self::EvalRunNotFound { message, details }
+            | Self::EvalMissingLease { message, details }
+            | Self::EvalInvalidLease { message, details }
+            | Self::EvalSubmissionMismatch { message, details }
+            | Self::EvalRunFailed { message, details }
+            | Self::EvalTooManyRuns { message, details } => {
                 (Cow::Borrowed(message.as_str()), details.clone())
             }
             Self::Storage { error } => (

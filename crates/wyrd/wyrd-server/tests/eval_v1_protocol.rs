@@ -11,7 +11,8 @@
 //! - (g) per-tenant concurrency cap counting (unit-tested in `eval::state`)
 //! - (h) 5xx responses carry a generic message + empty details
 //! - (i) run open/complete emits an audit event
-//! - interim gate: in-tenant principal lacking `card_write` → denied at open
+//! - RBAC gate: in-tenant principal lacking `evals:run` → denied at open;
+//!   principal holding `evals:run` opens successfully (tightened past card_write)
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -165,6 +166,24 @@ async fn insert_card(
     .await
     .expect("insert card");
     conn.commit().await.expect("commit card");
+}
+
+async fn insert_custom_role(pool: &PgPool, tenant: DataTenantId, name: &str, permissions: Value) {
+    let mut conn = TenantConn::acquire(pool, tenant)
+        .await
+        .expect("tenant conn");
+    sqlx::query(
+        "INSERT INTO wyrd.auth_roles (id, data_tenant_id, name, permissions, builtin) \
+         VALUES ($1, $2, $3, $4, FALSE)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(tenant.as_uuid())
+    .bind(name)
+    .bind(permissions)
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("insert custom role");
+    conn.commit().await.expect("commit custom role");
 }
 
 fn card_ref(kind: CardKind, space: &str, name: &str) -> CardRef {
@@ -742,11 +761,11 @@ async fn internal_failure_scrubs_5xx_body() {
 }
 
 // --------------------------------------------------------------------------
-// Interim RBAC gate: in-tenant principal lacking card_write → denied at open
+// RBAC gate: eval run creation requires evals:run (tightened past card_write)
 // --------------------------------------------------------------------------
 
 #[tokio::test]
-async fn open_denied_without_card_write() {
+async fn open_requires_eval_run_permission() {
     let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
         .await
         .expect("fixture starts");
@@ -755,19 +774,44 @@ async fn open_denied_without_card_write() {
     let (state, _root) = build_state(fixture.app_pool().clone());
     let eval_ref = seed_eval(&state, tenant, "prod", "rubric").await;
 
-    // `reader` resolves the Eval card (RLS is tenant-scoped) but lacks card_write.
-    let jwt = mint_jwt(&state, tenant, &["reader"]);
+    // In-tenant custom role holding cards:write but NOT evals:run. It would have
+    // passed the interim card_write gate, so denying it proves the gate tightened.
+    insert_custom_role(
+        fixture.app_pool(),
+        tenant,
+        "card_only",
+        json!([{ "resource": "cards", "action": "write" }]),
+    )
+    .await;
+
+    // Both principals resolve the Eval card (RLS is tenant-scoped); only the one
+    // holding evals:run may open a run.
+    let card_only_jwt = mint_jwt(&state, tenant, &["card_only"]);
+    let writer_jwt = mint_jwt(&state, tenant, &["writer"]);
     let app = build_router(state);
-    let (status, body) = call(
+
+    let (denied_status, denied_body) = call(
         &app,
         "POST",
         "/v1/eval/runs",
-        Some(&jwt),
+        Some(&card_only_jwt),
         None,
         open_body(&eval_ref).await,
     )
     .await;
+    assert_eq!(denied_status, StatusCode::FORBIDDEN, "{denied_body}");
+    assert_eq!(denied_body["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+    assert_eq!(denied_body["details"]["required"], "evals:run");
 
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+    let (allowed_status, allowed_body) = call(
+        &app,
+        "POST",
+        "/v1/eval/runs",
+        Some(&writer_jwt),
+        None,
+        open_body(&eval_ref).await,
+    )
+    .await;
+    assert_eq!(allowed_status, StatusCode::OK, "{allowed_body}");
+    assert!(allowed_body["run_id"].is_string(), "{allowed_body}");
 }

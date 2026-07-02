@@ -19,7 +19,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::post;
 use axum::{Json, Router};
 use vala_eval::orchestrator::{NextDirective, RunState};
-use wyrd_runtime::{Permission, Principal};
+use wyrd_runtime::{Permission, PermissionVerdict, Principal};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::eval::protocol::{
@@ -79,11 +79,12 @@ async fn open(
         .await
         .map_err(|error| WyrdErrorResponse::from(map_card_resolution_error(&error)))?;
 
-    // Interim RBAC (spec §2b): card_write against the tenant-verified Eval card.
-    // Deliberately over-broad; commit 03 refines to the concrete eval permission.
-    // Evaluated before the dataset hop so an unpermissioned principal never
-    // triggers a second read.
-    require_card_write(&principal)?;
+    // Concrete RBAC (spec §2b): `evals:run` against the tenant-verified Eval card.
+    // The `eval_ref` is already resolved within the principal's tenant (RLS), so a
+    // cross-tenant ref fails closed as 404 before RBAC is consulted. Evaluated
+    // before the dataset hop so an unpermissioned principal never triggers a
+    // second read or any run/provider work.
+    require_eval_run(&state, &principal)?;
 
     let dataset = resolver::dataset_ref(&eval_card).map_err(WyrdErrorResponse::from)?;
     let data_card = resolver::resolve_card(&mut conn, CardKind::Data, dataset.as_card_ref())
@@ -287,18 +288,27 @@ fn check_lease(headers: &HeaderMap, entry: &RunEntry) -> Result<(), WyrdErrorRes
     }
 }
 
-/// Interim `Permission::card_write` gate against the resolved Eval card.
-fn require_card_write(principal: &Principal) -> Result<(), WyrdErrorResponse> {
-    if principal
-        .effective_permissions
-        .contains(&Permission::card_write())
-    {
-        return Ok(());
+/// `Permission::eval_run` gate against the tenant-resolved principal.
+///
+/// Uses the shared synchronous RBAC checker (`AppState::permission_check`), a pure
+/// function over the principal's `effective_permissions`. A `Deny` maps to a 403
+/// `WyrdError`, mirroring the `check_authz` handler's `missing_permission` arm.
+fn require_eval_run(state: &AppState, principal: &Principal) -> Result<(), WyrdErrorResponse> {
+    let required = Permission::eval_run();
+    match state.permission_check.check(principal, &required) {
+        PermissionVerdict::Allow => Ok(()),
+        PermissionVerdict::Deny { .. } => {
+            tracing::warn!(
+                wyrd.required = %required,
+                wyrd.principal = %principal.id,
+                "eval run creation denied: principal lacks evals:run",
+            );
+            Err(WyrdErrorResponse::from(WyrdError::PermissionDeniedRbac {
+                message: "evals:run permission required to open an eval run".to_owned(),
+                details: serde_json::json!({ "required": required.to_string() }),
+            }))
+        }
     }
-    Err(WyrdErrorResponse::from(WyrdError::PermissionDeniedRbac {
-        message: "card_write permission required to open an eval run".to_owned(),
-        details: serde_json::json!({ "required": "card:write" }),
-    }))
 }
 
 /// Mint a fresh per-run lease token.

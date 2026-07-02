@@ -2,16 +2,11 @@
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, Request};
+use axum::http::Request;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use secrecy::ExposeSecret;
 
-use crate::auth::AuthenticatedPrincipal;
-use crate::auth::token_extract::{
-    auth_not_configured, extract_wyrd_access_token, tenant_from_unverified_access_token,
-};
-use crate::error::WyrdErrorResponse;
+use crate::auth::token_extract::verify_authenticated_principal;
 use crate::state::AppState;
 
 /// Reject unauthenticated requests before they reach protected handlers.
@@ -30,32 +25,13 @@ pub async fn require_authenticated(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    match authenticate(&state, request.headers()).await {
+    match verify_authenticated_principal(state.token_verifier.clone(), request.headers()).await {
         Ok(principal) => {
             request.extensions_mut().insert(principal);
             next.run(request).await
         }
         Err(rejection) => rejection.into_response(),
     }
-}
-
-async fn authenticate(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Result<AuthenticatedPrincipal, WyrdErrorResponse> {
-    let token = extract_wyrd_access_token(headers)?;
-    let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
-    let verifier = state
-        .token_verifier
-        .clone()
-        .ok_or_else(auth_not_configured)?;
-    let verified = verifier
-        .verify(&token, &expected_tenant)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
-    Ok(AuthenticatedPrincipal {
-        principal: verified.principal.clone(),
-    })
 }
 
 #[cfg(test)]

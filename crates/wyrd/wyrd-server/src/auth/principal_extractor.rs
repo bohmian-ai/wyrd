@@ -1,11 +1,8 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use secrecy::ExposeSecret;
 use wyrd_runtime::Principal;
 
-use crate::auth::token_extract::{
-    auth_not_configured, extract_wyrd_access_token, tenant_from_unverified_access_token,
-};
+use crate::auth::token_extract::verify_authenticated_principal;
 use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -33,22 +30,13 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        // Fast path: require_authenticated (post-verify) is the sole trusted producer
+        // of this extension. Any future insertion site must verify before inserting;
+        // reading an unverified principal here would be a silent auth bypass.
         if let Some(principal) = parts.extensions.get::<AuthenticatedPrincipal>() {
             return Ok(principal.clone());
         }
-        let token = extract_wyrd_access_token(&parts.headers)?;
-        let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
-        let verifier = state
-            .token_verifier
-            .clone()
-            .ok_or_else(auth_not_configured)?;
-        let verified = verifier
-            .verify(&token, &expected_tenant)
-            .await
-            .map_err(WyrdErrorResponse::from)?;
-        Ok(Self {
-            principal: verified.principal.clone(),
-        })
+        verify_authenticated_principal(state.token_verifier.clone(), &parts.headers).await
     }
 }
 

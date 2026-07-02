@@ -1,8 +1,10 @@
 //! Shared bearer-token extraction helpers for Wyrd auth handlers.
 
+use std::sync::Arc;
+
 use axum::http::{HeaderMap, HeaderName};
 use base64::Engine;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_verify::AccessTokenClaims;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
@@ -68,5 +70,21 @@ pub(crate) fn auth_not_configured() -> WyrdErrorResponse {
     WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
         message: "auth backend not configured".to_owned(),
         details: serde_json::json!({ "retry_after_seconds": 1 }),
+    })
+}
+
+pub(crate) async fn verify_authenticated_principal(
+    verifier: Option<Arc<crate::state::WyrdTokenVerifier>>,
+    headers: &HeaderMap,
+) -> Result<super::AuthenticatedPrincipal, WyrdErrorResponse> {
+    let token = extract_wyrd_access_token(headers)?;
+    let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
+    let verifier = verifier.ok_or_else(auth_not_configured)?;
+    let verified = verifier
+        .verify(&token, &expected_tenant)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
+    Ok(super::AuthenticatedPrincipal {
+        principal: verified.principal.clone(),
     })
 }

@@ -122,9 +122,10 @@ async fn request_with_missing_header_returns_401_unauthenticated() {
 }
 
 #[tokio::test]
-async fn auth_routes_receive_request_id_via_protected_router() {
-    // Auth routes are in the protected router which applies attach_request_id;
-    // the response must include the wyrd-request-id header.
+async fn auth_routes_are_reachable_without_credential_and_carry_request_id() {
+    // Guards two invariants: (1) /auth/token is NOT behind the default-deny layer
+    // (a bootstrap deadlock would prevent any client from ever obtaining a token),
+    // and (2) auth routes still carry wyrd-request-id from attach_request_id.
     let response = build_router(test_state())
         .oneshot(
             Request::builder()
@@ -137,10 +138,45 @@ async fn auth_routes_receive_request_id_via_protected_router() {
         .await
         .expect("router responds");
 
+    assert_ne!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "/auth/token must be reachable without a credential (public route)"
+    );
     assert!(
         response.headers().contains_key("wyrd-request-id"),
         "auth routes sit in the protected router and must carry wyrd-request-id"
     );
+}
+
+#[tokio::test]
+async fn v1_request_without_verifier_configured_returns_503() {
+    // When AppState has no token_verifier (auth backend not yet configured), every
+    // /v1 request must return 503 WYRD_AUTH_503_VERIFY_UNAVAILABLE — not 401 or
+    // 500. This locks the third arm of the 400/401/503 auth-error contract and the
+    // retry_after_seconds hint that agents use for backoff.
+    let tenant = DataTenantId::new_v7();
+    let token = mint_test_user_jwt(&test_state(), tenant);
+
+    let response = build_router(test_state_no_verifier())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/cards/upload/init")
+                .header("x-wyrd-access-token", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collects");
+    let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
+    assert_eq!(problem["code"], "WYRD_AUTH_503_VERIFY_UNAVAILABLE");
+    assert_eq!(problem["status"], 503);
 }
 
 #[tokio::test]
@@ -394,6 +430,18 @@ fn test_state() -> AppState {
         Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
     )
     .with_auth_handles(issuing_key, verifier)
+}
+
+fn test_state_no_verifier() -> AppState {
+    let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+    let root = tempfile::tempdir().expect("temp dir");
+    let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
+    AppState::new(
+        app_pool,
+        None,
+        Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+    )
+    // no .with_auth_handles() → token_verifier is None → 503 on any /v1 request
 }
 
 fn mint_test_user_jwt(state: &AppState, tenant: DataTenantId) -> String {

@@ -87,6 +87,7 @@ temp-env = "0.3"
 tempfile = "3"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 dashmap = "6.1"
+crossbeam-queue = "0.3"
 flate2 = "1.*"
 zstd = "0.13"
 walkdir = "2.*"

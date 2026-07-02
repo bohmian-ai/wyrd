@@ -1,0 +1,35 @@
+[package]
+name = "wyrd-queue"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "Generic bounded producer + BatchSink seam for Wyrd observation write surfaces"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+wyrd-spec = { workspace = true }
+wyrd-runtime = { workspace = true }
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+crossbeam-queue = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+serde_json = { workspace = true }
+wyrd-spec = { workspace = true }
+async-trait = { workspace = true }

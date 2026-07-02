@@ -45,6 +45,12 @@ use wyrd_spec::storage::{
     LocalBlobUploadResponse, PartUrlResponse, UploadCompleteRequest, UploadCompleteResponse,
     UploadInitRequest, UploadInitResponse, UploadPlan, VerificationGuarantee, WireProtocol,
 };
+use wyrd_spec::vala::api::{
+    AsyncJobState, AsyncQueryRequest, AsyncQueryResponse, AsyncQueryStatus, BifrostTableDescription,
+    BifrostTableEntry, DataTypeSpec, ExecutorAvailability, FieldSpec as BifrostFieldSpec, JobUid,
+    PartitionColumnSpec, PartitionTransformWire, QueryParam, RegisterOutcome, RegisterTableRequest,
+    RegisterTableResponse, SyncQueryRequest, TableScopeWire, TableStatus, TimeUnit,
+};
 use wyrd_spec::vala::eval::{
     AgentTurnSubmission, ComparisonOperator, ConversationTurn, DagError, EvalCondition,
     EvalPassGate, EvalRecordObservation, EvalRunOpenRequest, EvalRunOpenResponse, EvalSampling,
@@ -148,6 +154,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 4 section 16: shared security primitives.
     write::<SecretRef>(out, golden, "security_secret_ref")?;
     write::<TlsConfig>(out, golden, "security_tls_config")?;
+
+    // Stage 3 C2a: Bifrost wire contract (table management + query).
+    write::<BifrostTableEntry>(out, golden, "bifrost_table_entry")?;
+    write::<BifrostTableDescription>(out, golden, "bifrost_table_description")?;
+    write::<TableScopeWire>(out, golden, "bifrost_table_scope")?;
+    write::<TableStatus>(out, golden, "bifrost_table_status")?;
+    write::<DataTypeSpec>(out, golden, "bifrost_data_type_spec")?;
+    write::<BifrostFieldSpec>(out, golden, "bifrost_field_spec")?;
+    write::<TimeUnit>(out, golden, "bifrost_time_unit")?;
+    write::<PartitionTransformWire>(out, golden, "bifrost_partition_transform")?;
+    write::<PartitionColumnSpec>(out, golden, "bifrost_partition_column_spec")?;
+    write::<RegisterTableRequest>(out, golden, "bifrost_register_table_request")?;
+    write::<RegisterOutcome>(out, golden, "bifrost_register_outcome")?;
+    write::<RegisterTableResponse>(out, golden, "bifrost_register_table_response")?;
+    write::<QueryParam>(out, golden, "bifrost_query_param")?;
+    write::<JobUid>(out, golden, "bifrost_job_uid")?;
+    write::<AsyncJobState>(out, golden, "bifrost_async_job_state")?;
+    write::<ExecutorAvailability>(out, golden, "bifrost_executor_availability")?;
+    write::<SyncQueryRequest>(out, golden, "bifrost_sync_query_request")?;
+    write::<AsyncQueryRequest>(out, golden, "bifrost_async_query_request")?;
+    write::<AsyncQueryResponse>(out, golden, "bifrost_async_query_response")?;
+    write::<AsyncQueryStatus>(out, golden, "bifrost_async_query_status")?;
     let eval_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/eval/schemas");
     fs::create_dir_all(eval_fixtures)?;
     write_fixture::<EvalSpec>(eval_fixtures, "eval_spec")?;

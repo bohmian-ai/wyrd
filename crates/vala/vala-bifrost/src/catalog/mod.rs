@@ -21,6 +21,7 @@ use crate::writer::coordinator::spawn_commit_coordinator;
 pub mod iceberg_sql;
 pub mod namespaces;
 pub mod partition_spec;
+mod wire;
 
 #[allow(dead_code)]
 pub struct WyrdCatalog {
@@ -96,6 +97,11 @@ impl WyrdCatalog {
         tenant: wyrd_spec::ids::DataTenantId,
         partition_columns: &[(String, PartitionTransform)],
     ) -> Result<TableUid, BifrostError> {
+        // M6 reserved-name guard: a user field may not take a reserved system
+        // (`wyrd_*`/`data_tenant_id`) or correlation (`card_ref`/`run_id`) name —
+        // the server stamps the former and carries the latter as cell values.
+        wire::reject_reserved_field_names(&user_fields)?;
+
         self.ensure_namespace(ns).await?;
 
         // The fingerprint is user-fields-only (06 §3): the correlation
@@ -234,14 +240,42 @@ impl WyrdCatalog {
         Ok(meta)
     }
 
-    /// List tables visible to `tenant` — both `TenantOwned` and `SystemShared` rows.
-    /// Engine-internal; no stable public contract yet.
-    #[allow(dead_code)]
-    pub(crate) async fn list_tables(
+    /// List tables visible to `tenant` — both `TenantOwned` and `SystemShared` rows —
+    /// as the Arrow-free public wire entries. Each stored row is mapped via
+    /// [`wire::entry_from_row`]; a corrupt scope/status/fqn surfaces as a
+    /// `WYRD_VALA_500_*`, never a silently dropped listing.
+    pub async fn list_tables(
         &self,
         tenant: wyrd_spec::ids::DataTenantId,
-    ) -> Result<Vec<vala_sql::row_types::olap_catalog::BifrostTableRow>, BifrostError> {
-        self.registry.list_for_tenant(tenant).await
+    ) -> Result<Vec<wyrd_spec::vala::api::BifrostTableEntry>, BifrostError> {
+        let rows = self.registry.list_for_tenant(tenant).await?;
+        rows.iter().map(wire::entry_from_row).collect()
+    }
+
+    /// Describe a single table for `tenant` — the public wire entry plus its
+    /// projected field list.
+    ///
+    /// The `fields` surface user columns and the universal `card_ref`/`run_id`
+    /// correlation columns (the latter flagged `wyrd:column_class = correlation`,
+    /// Decision E), while the server-stamped `wyrd_*`/`data_tenant_id` system
+    /// columns are excluded — so `card_ref` is distinct from both user and system
+    /// columns. Resolves the same two-step (`TenantOwned` then `SystemShared`) bind
+    /// as `get`.
+    pub async fn describe_table(
+        &self,
+        ns: BifrostNamespace,
+        name: &str,
+        tenant: wyrd_spec::ids::DataTenantId,
+    ) -> Result<wyrd_spec::vala::api::BifrostTableDescription, BifrostError> {
+        let meta = self.get(ns, name, tenant).await?;
+        let entry = wire::entry_from_row(&meta.row)?;
+
+        let iceberg_schema = meta.iceberg_table.metadata().current_schema();
+        let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+            .map_err(BifrostError::Iceberg)?;
+        let fields = wire::fields_from_stored_schema(&arrow_schema)?;
+
+        Ok(wyrd_spec::vala::api::BifrostTableDescription { entry, fields })
     }
 
     /// Open a writer for `tenant` (the authenticated **data tenant**, for both

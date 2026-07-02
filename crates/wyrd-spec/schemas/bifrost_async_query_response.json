@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AsyncQueryResponse",
+  "description": "Response to an async query submission.",
+  "type": "object",
+  "required": [
+    "executor_availability",
+    "job_uid",
+    "state"
+  ],
+  "properties": {
+    "executor_availability": {
+      "description": "Executor-availability signal (review M-06).",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ExecutorAvailability"
+        }
+      ]
+    },
+    "job_uid": {
+      "description": "Assigned job id.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "state": {
+      "description": "Initial job state.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/AsyncJobState"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "AsyncJobState": {
+      "description": "Terminal/in-flight state of an async query job.",
+      "oneOf": [
+        {
+          "description": "Accepted, not yet claimed by an executor.",
+          "type": "string",
+          "enum": [
+            "Queued"
+          ]
+        },
+        {
+          "description": "Claimed by an executor.",
+          "type": "string",
+          "enum": [
+            "Claimed"
+          ]
+        },
+        {
+          "description": "Executing.",
+          "type": "string",
+          "enum": [
+            "Running"
+          ]
+        },
+        {
+          "description": "Completed successfully.",
+          "type": "string",
+          "enum": [
+            "Succeeded"
+          ]
+        },
+        {
+          "description": "Failed.",
+          "type": "string",
+          "enum": [
+            "Failed"
+          ]
+        },
+        {
+          "description": "Canceled.",
+          "type": "string",
+          "enum": [
+            "Canceled"
+          ]
+        }
+      ]
+    },
+    "ExecutorAvailability": {
+      "description": "Machine-readable executor-availability signal (review M-06). In Stage 3 a queued job is accepted but its executor does not exist yet, so status carries [`ExecutorAvailability::PendingStage5`] rather than a false \"running\" claim.",
+      "oneOf": [
+        {
+          "description": "An executor is available (Stage 5+).",
+          "type": "string",
+          "enum": [
+            "Available"
+          ]
+        },
+        {
+          "description": "No executor exists yet — the job is accepted but will not run until Stage 5.",
+          "type": "string",
+          "enum": [
+            "PendingStage5"
+          ]
+        }
+      ]
+    }
+  }
+}

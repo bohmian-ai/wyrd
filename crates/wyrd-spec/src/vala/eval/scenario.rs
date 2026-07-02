@@ -1,10 +1,11 @@
 //! Offline-only scenario shape.
 //!
-//! Scenarios are versionable test data; they live inside a `DataCard` rather
-//! than introducing a new card kind. The `EvalScenarioCollection` shape below
-//! is what the DataCard validator dispatches to when
-//! `content_kind == "EvalScenarioCollection"`. That dispatch wiring is
-//! intentionally outside this primitive contract commit.
+//! Scenarios are versionable test data. How they are stored, produced, and
+//! resolved server-side is **not yet defined**: the eval domain model — including
+//! whether scenarios are carried by a Data card, an Eval-owned object, or a new
+//! kind — is still open. This module defines only the offline
+//! `EvalScenarioCollection` shape and does not commit to a storage or dispatch
+//! mechanism.
 
 use std::collections::BTreeSet;
 

@@ -6,6 +6,7 @@ pub mod boot;
 pub mod bootstrap;
 pub mod config;
 pub mod error;
+pub mod eval;
 pub mod grpc;
 pub mod health;
 pub mod issuer_boot;

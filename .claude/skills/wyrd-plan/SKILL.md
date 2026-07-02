@@ -54,7 +54,15 @@ from CodeGraph at build time. (Canonical doctrine: `wyrd-tasks`.)
    focus list. The DAG is where sequencing, commit-ownership, and missing-edge
    errors hide — they only become visible once work is sliced into commits, and
    they are cheap to fix as plan text but expensive once discovered mid-build.
-   Resolve findings before tasks.
+   Then run the **dynamic review loop** (`review/dynamic-review-loop.md`): revise
+   `plan.md`, hand it back for a fresh full-sweep re-review, and repeat until
+   `wyrd-architecture-reviewer` returns `Decision: approve`. One correction is not
+   a pass — a fresh re-review must approve the revised `plan.md` before moving to
+   `wyrd-tasks`. `approve with changes`, `needs redesign`, and `reopen locked
+   decision` are all non-terminal; if a **spec** decision reopens, return to
+   `wyrd-spec`, otherwise revise `plan.md`, then re-submit. Preserve the loop
+   ledger (`.dev/review/architecture/{REVIEW_ID}/loop-ledger.md`) as iteration
+   evidence.
 
 ## References
 
@@ -66,6 +74,8 @@ Load from the shared doctrine library (`.claude/references/`, indexed in
   provider/observability) that shape where each commit lands.
 - `review/implementation-rules.md`, `review/rust-service-architecture.md` —
   sequence commits to pass these review rules by construction, not at the gate.
+- `review/dynamic-review-loop.md` — the terminal gate-2 loop: review → revise →
+  fresh re-review until `Decision: approve`.
 - `review/production-architecture-rubric.md` — reliability, scale, security, HA,
   and distributed-systems constraints, consulted **at plan time** so the DAG is
   sequenced with them in mind.
@@ -135,10 +145,14 @@ Before handing off:
   consequences.
 - No commit is expanded into rendered code; no `file.rs:line`.
 - `tasks.yaml` skeleton matches the DAG exactly.
-- `wyrd-architecture-reviewer` (gate 2) has run on `plan.md` and findings are
-  resolved.
+- `wyrd-architecture-reviewer` (gate 2) has run the dynamic review loop
+  (`review/dynamic-review-loop.md`) on `plan.md` and returned `Decision: approve`
+  on the final revised artifact. The loop ledger is present with one block per
+  iteration. `approve with changes` is not a pass — the gate advances only on
+  `approve`.
 
 ## Hand-Off
 
-`plan.md` + `tasks.yaml` skeleton (approved at gate 2) → **`wyrd-tasks`**: expand
+`plan.md` + `tasks.yaml` skeleton (gate 2 returned `Decision: approve` on the
+final revised artifact) → **`wyrd-tasks`**: expand
 each DAG node into a thin per-commit contract and fill `tasks.yaml`.

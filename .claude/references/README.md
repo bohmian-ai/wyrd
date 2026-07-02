@@ -41,6 +41,7 @@ references/
 | `review/production-architecture-rubric.md` | Security, reliability, performance, HA, distributed-systems thresholds | plan, review |
 | `review/agent-first-review.md` | Whether a small agent can reason about Wyrd contracts/docs/errors | spec, review |
 | `review/full-sweep-review.md` | Folder-scale review workflow, intake ledger, consensus | review |
+| `review/dynamic-review-loop.md` | Terminal review→revise→re-review loop for Gate 1/Gate 2 until `Decision: approve` | spec, plan, review |
 | `domain/iceberg-bifrost.md` | OLAP/Iceberg/Bifrost implementation doctrine | tasks, implement (when surface applies) |
 | `domain/olap-datafusion-iceberg-arrow.md` | OLAP/DataFusion/Iceberg/Arrow review checks | plan, review (when surface applies) |
 | `domain/observability-otel.md` | OTel trace/span/metric/log shape, cardinality, redaction | plan, tasks, review (when surface applies) |

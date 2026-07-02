@@ -68,6 +68,9 @@ Load from the shared doctrine library (`.claude/references/`, indexed in
 - `.claude/references/review/full-sweep-review.md`: folder-scale review workflow, intake
   ledger, specialist subreviews, right-sized architecture pass, and consensus
   ledger format.
+- `.claude/references/review/dynamic-review-loop.md`: terminal pipeline re-review loop for
+  Gate 1 (`spec.md`) and Gate 2 (`plan.md`) — review → revise → fresh re-review
+  until `Decision: approve`.
 - `.claude/references/review/agent-first-review.md`: agent-first review lens for whether a
   small/basic agent can reason about Wyrd contracts, code, docs, and errors.
 - `.claude/references/review/production-architecture-rubric.md`: security, reliability,
@@ -190,6 +193,24 @@ specialist lenses when the tool is available. If delegation is unavailable or
 not explicitly requested, run the specialist lenses locally and sequentially;
 still produce the same intake and consensus ledgers.
 
+## Pipeline Re-Review
+
+When invoked on a **revised** `spec.md` (Gate 1) or `plan.md` (Gate 2) that
+already has a prior consensus ledger, you are one iteration of the dynamic review
+loop (`.claude/references/review/dynamic-review-loop.md`). Do **not** downgrade
+to a closure-only check. Each re-review must:
+
+1. **Verify closure.** For every confirmed finding in the prior consensus
+   ledger, check the revised artifact and record whether it is closed, still
+   open, or explicitly deferred/reopened with an accepted rationale.
+2. **Run a fresh full sweep.** Re-run the specialist lenses over the revised
+   artifact to catch issues the revision itself introduced — a fix in one place
+   can break a contract, sequencing edge, or boundary elsewhere.
+3. **Emit a `Decision`.** Only `Decision: approve` lets the gate advance.
+
+Reference the prior consensus ledger path in the loop ledger and note any prior
+finding you carried forward, closed, or newly raised.
+
 ## Non-Negotiables
 
 - Wyrd is the AI layer for human and agentic work. It records, validates,
@@ -242,7 +263,11 @@ for a different format:
 - **Reuse Opportunities**: predecessor code or patterns that should be reused,
   adapted, replaced, or omitted.
 - **Decision**: approve, approve with changes, needs redesign, or reopen a
-  locked decision.
+  locked decision. At a **pipeline gate** (Gate 1 `spec.md`, Gate 2 `plan.md`),
+  only `approve` is terminal; `approve with changes`, `needs redesign`, and
+  `reopen locked decision` re-enter the dynamic review loop
+  (`.claude/references/review/dynamic-review-loop.md`) for another revision plus
+  a fresh re-review.
 
 Keep each finding readable:
 

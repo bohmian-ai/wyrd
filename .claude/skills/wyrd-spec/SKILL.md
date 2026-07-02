@@ -61,8 +61,15 @@ grep/read loop.
    decisions get *locked*; a missed finding here propagates through plan → tasks →
    code, and it is cheapest to fix as prose. Blocker-only is a false economy at a
    pipeline gate — reserve it for a fast pre-spec "is this even doctrine-legal?"
-   gut-check, never as the Gate-1 pass. Resolve findings (loop with
-   `wyrd-plan-interviewer` if a decision reopens) before moving to `wyrd-plan`.
+   gut-check, never as the Gate-1 pass. Then run the **dynamic review loop**
+   (`review/dynamic-review-loop.md`): revise `spec.md`, hand it back for a fresh
+   full-sweep re-review, and repeat until `wyrd-architecture-reviewer` returns
+   `Decision: approve`. One correction is not a pass — a fresh re-review must
+   approve the revised `spec.md` before moving to `wyrd-plan`. `approve with
+   changes`, `needs redesign`, and `reopen locked decision` are all non-terminal;
+   if a decision reopens, loop back through the interview/decision step with
+   `wyrd-plan-interviewer`, then re-submit. Preserve the loop ledger
+   (`.dev/review/architecture/{REVIEW_ID}/loop-ledger.md`) as iteration evidence.
 
 ## References
 
@@ -77,6 +84,8 @@ Load from the shared doctrine library (`.claude/references/`, indexed in
   the contracts being specced.
 - `review/review-rubric.md` — the dimensions gate 1 judges; write the spec to pass
   them by construction.
+- `review/dynamic-review-loop.md` — the terminal gate-1 loop: review → revise →
+  fresh re-review until `Decision: approve`.
 
 ## Spec Shape
 
@@ -141,10 +150,14 @@ Before handing off:
   context, boundaries, and open questions are all present.
 - Every cross-cutting question is an accepted decision with a rationale, or a
   labeled open question that blocks planning.
-- `wyrd-architecture-reviewer` (gate 1) has run on `spec.md` and its findings are
-  resolved.
+- `wyrd-architecture-reviewer` (gate 1) has run the dynamic review loop
+  (`review/dynamic-review-loop.md`) on `spec.md` and returned `Decision: approve`
+  on the final revised artifact. The loop ledger is present with one block per
+  iteration. `approve with changes` is not a pass — the gate advances only on
+  `approve`.
 
 ## Hand-Off
 
-`spec.md` (approved at gate 1) → **`wyrd-plan`**: decompose into the commit DAG
+`spec.md` (gate 1 returned `Decision: approve` on the final revised artifact) →
+**`wyrd-plan`**: decompose into the commit DAG
 (`plan.md`) in the existing `00-overview` format, then gate 2.

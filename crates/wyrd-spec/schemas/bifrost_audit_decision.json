@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuditDecision",
+  "description": "The RBAC authorization outcome recorded on an audit row.",
+  "oneOf": [
+    {
+      "description": "The operation was authorized.",
+      "type": "string",
+      "enum": [
+        "allow"
+      ]
+    },
+    {
+      "description": "The operation was refused by RBAC.",
+      "type": "string",
+      "enum": [
+        "deny"
+      ]
+    }
+  ]
+}

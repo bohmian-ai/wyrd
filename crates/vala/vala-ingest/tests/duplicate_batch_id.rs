@@ -130,6 +130,7 @@ async fn duplicate_batch_id_replays_without_double_write() {
             TableScope::TenantOwned,
             tenant,
             &[],
+            None,
         )
         .await
         .unwrap();

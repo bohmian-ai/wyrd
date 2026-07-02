@@ -80,6 +80,7 @@ async fn setup(pool: PgPool) -> Fixture {
             TableScope::TenantOwned,
             tenant,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -149,6 +150,7 @@ async fn idempotent_replay_committed_returns_prior_snapshot(pool: PgPool) {
         "system",
         "system",
         fx.tenant,
+        None,
     )
     .await
     .unwrap();
@@ -190,6 +192,7 @@ async fn committed_row_with_null_snapshot_is_metadata_mismatch(pool: PgPool) {
         "system",
         "system",
         fx.tenant,
+        None,
     )
     .await
     .unwrap_err();
@@ -243,6 +246,7 @@ async fn duplicate_failed_batch_returns_error(pool: PgPool) {
         "system",
         "system",
         fx.tenant,
+        None,
     )
     .await
     .unwrap_err();
@@ -273,6 +277,7 @@ async fn in_flight_precommit_returns_commit_conflict(pool: PgPool) {
         "system",
         "system",
         fx.tenant,
+        None,
     )
     .await
     .unwrap_err();

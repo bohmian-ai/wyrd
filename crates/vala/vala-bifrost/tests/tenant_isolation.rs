@@ -154,6 +154,7 @@ async fn seeded(pool: PgPool) -> Seeded {
             TableScope::SystemShared,
             DataTenantId::SYSTEM_OWNER,
             &[],
+            None,
         )
         .await
         .unwrap();

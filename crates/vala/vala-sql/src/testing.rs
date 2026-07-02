@@ -31,7 +31,11 @@ pub async fn migrate_for_test(pool: &PgPool) -> Result<(), SqlError> {
            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vala_recovery') THEN
                CREATE ROLE vala_recovery NOLOGIN;
            END IF;
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vala_audit_relay') THEN
+               CREATE ROLE vala_audit_relay NOLOGIN BYPASSRLS;
+           END IF;
            GRANT vala_recovery_owner TO current_user;
+           GRANT vala_audit_relay TO current_user;
          END $$",
     )
     .execute(&mut *conn)

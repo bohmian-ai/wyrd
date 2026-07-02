@@ -146,6 +146,7 @@ async fn round_trip_full() {
             TableScope::TenantOwned,
             tenant,
             &[],
+            None,
         )
         .await
         .unwrap();

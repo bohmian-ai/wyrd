@@ -222,4 +222,17 @@ pub enum BifrostError {
         /// Human-readable detail about the internal failure.
         detail: String,
     },
+
+    /// The transactional audit outbox could not durably record the operation.
+    #[error("audit outbox unavailable: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_500_AUDIT_UNAVAILABLE",
+        status = 500,
+        title = "Audit outbox unavailable",
+        remediation = "The operation was refused because its audit row could not be durably recorded. Retry; if it persists, check the audit outbox and catalog database health."
+    )]
+    AuditUnavailable {
+        /// Human-readable detail about the audit-append failure.
+        detail: String,
+    },
 }

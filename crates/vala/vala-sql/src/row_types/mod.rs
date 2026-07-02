@@ -4,6 +4,7 @@
 
 pub mod alerts;
 pub mod anchors;
+pub mod audit_outbox;
 pub mod monitor;
 pub mod olap_catalog;
 pub mod olap_query_jobs;

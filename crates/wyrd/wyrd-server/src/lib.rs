@@ -1,5 +1,6 @@
 //! Wyrd server boot and routing primitives.
 
+pub mod audit;
 pub mod auth;
 pub mod auth_boot;
 pub mod bifrost;

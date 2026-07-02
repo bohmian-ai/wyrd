@@ -16,6 +16,7 @@ use iceberg_catalog_sql::SqlCatalog;
 use sqlx::PgPool;
 use sqlx::types::Uuid;
 use wyrd_spec::ids::DataTenantId;
+use wyrd_spec::vala::api::AuditEvent;
 
 use crate::error::BifrostError;
 use crate::types::TableUid;
@@ -82,6 +83,13 @@ enum Phase1 {
 /// # Errors
 /// Returns [`BifrostError`] when the control-plane txn, Parquet write, or Iceberg
 /// append fails, or when the `batch_id` collides with a failed/in-flight anchor.
+///
+/// `audit` is the transactional audit-outbox event to append in the same tx as
+/// the successful finalize (S3.C5). It is `None` on paths that must NOT self-feed
+/// the audit spine — most importantly the relay flush (`origin == "audit-relay"`,
+/// review M-11) — and on the internal/system re-flush. On the idempotent replay
+/// path no new op occurred, so no audit row is appended.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_commit(
     pool: &PgPool,
     catalog: &SqlCatalog,
@@ -92,6 +100,7 @@ pub async fn run_commit(
     origin: &str,
     actor: &str,
     tenant: DataTenantId,
+    audit: Option<AuditEvent>,
 ) -> Result<(i64, Option<Table>), BifrostError> {
     let table_fqn = table.identifier().to_string();
 
@@ -113,6 +122,7 @@ pub async fn run_commit(
                 tenant,
                 owner,
                 fencing_token,
+                audit,
             )
             .await?;
             Ok((snapshot_id, Some(updated_table)))
@@ -235,6 +245,7 @@ async fn write_and_finalize(
     tenant: DataTenantId,
     owner: Uuid,
     fencing_token: i64,
+    audit: Option<AuditEvent>,
 ) -> Result<(i64, Table), BifrostError> {
     let files = match write_batches(table, batches).await {
         Err(e) => {
@@ -304,6 +315,20 @@ async fn write_and_finalize(
     )
     .await
     .map_err(BifrostError::Sql)?;
+
+    // Append the audit-outbox row in the SAME tx as the finalize (S3.C5): a
+    // rolled-back commit leaves no audit row, and an audit-append failure
+    // fails the op closed (WYRD_VALA_500_AUDIT_UNAVAILABLE). Only the fenced,
+    // truly-finalized commit is audited; a lost fence (finalized == false) is
+    // the recovery path's concern and appends nothing here.
+    if finalized && let Some(event) = audit.as_ref() {
+        vala_sql::queries::audit_outbox::append_audit(&mut conn, event)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "audit outbox append failed; refusing commit");
+                BifrostError::AuditUnavailable("audit outbox append failed".to_string())
+            })?;
+    }
 
     conn.commit().await.map_err(BifrostError::Sql)?;
 

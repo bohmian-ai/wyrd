@@ -80,7 +80,7 @@ async fn setup(pool: PgPool) -> Harness {
 
     let fields = vec![Field::new("val", DataType::Int64, false)];
     let table_uid = catalog
-        .create_table(NS, TABLE, fields, TableScope::TenantOwned, tenant, &[])
+        .create_table(NS, TABLE, fields, TableScope::TenantOwned, tenant, &[], None)
         .await
         .unwrap();
 
@@ -404,6 +404,7 @@ async fn cold_start_maps_system_shared_table_identity(pool: PgPool) {
             TableScope::SystemShared,
             DataTenantId::SYSTEM_OWNER,
             &[],
+            None,
         )
         .await
         .unwrap();

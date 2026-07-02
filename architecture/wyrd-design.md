@@ -1047,18 +1047,29 @@ as the Iceberg catalog and control plane and DataFusion as the query engine —
 consistent with Doctrine #4 (Postgres is control-plane only; analytical data
 lives in object store). Runtime ownership stays in `vala`: the `vala-bifrost`
 engine crate owns the Iceberg/DataFusion warehouse engine, `vala-http` exposes
-HTTP routes, `vala-ingest` owns gRPC ingest, and `wyrd-spec::vala::api` owns the
+HTTP routes _(under revision — serving ownership moving to wyrd-server, reconciled in a follow-up design pass)_, `vala-ingest` owns gRPC ingest _(under revision — serving ownership moving to wyrd-server, reconciled in a follow-up design pass)_, and `wyrd-spec::vala::api` owns the
 public wire contracts. Python-visible Bifrost behavior lives in `vala-sdk` (the
 approved Vala Python owner crate) behind its optional `python` feature.
+
+**Principle — wyrd-server is the only serving surface.** `vala-*` crates are
+engine and data-plane libraries; they are never HTTP or gRPC serving crates.
+`wyrd-server` is the single process that binds ports and owns all HTTP/gRPC
+serving. The eval consolidation (commits 01–05) is the first realization of
+this principle; Bifrost/ingest serving reconciliation follows in a separate
+design pass. The eval pull-protocol session-run (`/v1/eval/runs/{run_id}`) is an
+ephemeral server-side session entry for concurrency and ownership tracking; it
+is distinct from the doctrinal `RunRef` — the Card→Run→Observation run is a
+client-side execution record (see "no-run-registry" note at `:466`), never
+server-persisted.
 
 **Public surface.** Bifrost is a stable Wyrd public surface across HTTP, gRPC,
 Python, generated schemas, MCP/agent documentation, and stable error codes.
 The public contract includes:
 
-- HTTP table management under `/api/v1/bifrost/tables`.
+- HTTP table management under `/api/v1/bifrost/tables` _(under revision — serving ownership moving to wyrd-server, reconciled in a follow-up design pass)_.
 - HTTP query surfaces under `/api/v1/observations/query` and versioned query
-  job routes when enabled.
-- gRPC ingest through `wyrd.v1.BifrostIngestService`.
+  job routes when enabled _(under revision — serving ownership moving to wyrd-server, reconciled in a follow-up design pass)_.
+- gRPC ingest through `wyrd.v1.BifrostIngestService` _(under revision — serving ownership moving to wyrd-server, reconciled in a follow-up design pass)_.
 - The `wyrd.bifrost` Python SDK submodule.
 - Generated `wyrd-spec::vala::api` wire types such as `BifrostTableEntry`,
   register-table types, query request/response types, and table scope/status

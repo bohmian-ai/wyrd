@@ -147,7 +147,6 @@ mod tests {
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
-    use wyrd_spec::DataTenantId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec};
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
@@ -174,8 +173,8 @@ mod tests {
         )
     }
 
-    fn caller_with(permissions: impl IntoIterator<Item = Permission>) -> Caller {
-        let tenant = DataTenantId::new_v7();
+    async fn caller_with(permissions: impl IntoIterator<Item = Permission>) -> Caller {
+        let tenant = crate::test_support::test_tenant().await;
         Caller {
             data_tenant_id: tenant,
             principal: Principal::new(
@@ -214,133 +213,151 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn bifrost_tables_register_is_idempotent() {
-        let state = test_state().await;
-        let caller = caller_with([Permission::bifrost_table_write()]);
-        let name = unique_name();
-        let req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
+    // These tests drive the shared embedded-Postgres pool, whose connections
+    // take reactor affinity from the runtime that establishes them. They run on
+    // the process-wide persistent runtime (not a per-test `#[tokio::test]`
+    // runtime) so the shared pool is never poisoned by a runtime that dies at
+    // test end. See `crate::test_support::shared`.
+    #[test]
+    fn bifrost_tables_register_is_idempotent() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = caller_with([Permission::bifrost_table_write()]).await;
+            let name = unique_name();
+            let req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
 
-        let first = register_table(&state, caller.clone(), req.clone())
+            let first = register_table(&state, caller.clone(), req.clone())
+                .await
+                .expect("first register creates");
+            assert_eq!(first.outcome, RegisterOutcome::Created);
+
+            let second = register_table(&state, caller.clone(), req)
+                .await
+                .expect("second register is idempotent");
+            assert_eq!(second.outcome, RegisterOutcome::AlreadyExists);
+            assert_eq!(first.table_uid, second.table_uid);
+            assert_eq!(first.fingerprint, second.fingerprint);
+        });
+    }
+
+    #[test]
+    fn bifrost_tables_register_conflicting_schema_returns_mismatch() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = caller_with([Permission::bifrost_table_write()]).await;
+            let name = unique_name();
+
+            register_table(
+                &state,
+                caller.clone(),
+                register_req(&name, vec![field("id", DataTypeSpec::Int64)]),
+            )
             .await
             .expect("first register creates");
-        assert_eq!(first.outcome, RegisterOutcome::Created);
 
-        let second = register_table(&state, caller.clone(), req)
+            let err = register_table(
+                &state,
+                caller.clone(),
+                register_req(&name, vec![field("id", DataTypeSpec::Utf8)]),
+            )
             .await
-            .expect("second register is idempotent");
-        assert_eq!(second.outcome, RegisterOutcome::AlreadyExists);
-        assert_eq!(first.table_uid, second.table_uid);
-        assert_eq!(first.fingerprint, second.fingerprint);
+            .expect_err("conflicting schema is rejected");
+            assert_eq!(err.status(), 409);
+            assert_eq!(err.code(), "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH");
+        });
     }
 
-    #[tokio::test]
-    async fn bifrost_tables_register_conflicting_schema_returns_mismatch() {
-        let state = test_state().await;
-        let caller = caller_with([Permission::bifrost_table_write()]);
-        let name = unique_name();
-
-        register_table(
-            &state,
-            caller.clone(),
-            register_req(&name, vec![field("id", DataTypeSpec::Int64)]),
-        )
-        .await
-        .expect("first register creates");
-
-        let err = register_table(
-            &state,
-            caller.clone(),
-            register_req(&name, vec![field("id", DataTypeSpec::Utf8)]),
-        )
-        .await
-        .expect_err("conflicting schema is rejected");
-        assert_eq!(err.status(), 409);
-        assert_eq!(err.code(), "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH");
+    #[test]
+    fn bifrost_tables_register_requires_write_permission() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = caller_with([]).await;
+            let err = register_table(
+                &state,
+                caller,
+                register_req(&unique_name(), vec![field("id", DataTypeSpec::Int64)]),
+            )
+            .await
+            .expect_err("no permission is denied");
+            assert_eq!(err.status(), 403);
+        });
     }
 
-    #[tokio::test]
-    async fn bifrost_tables_register_requires_write_permission() {
-        let state = test_state().await;
-        let caller = caller_with([]);
-        let err = register_table(
-            &state,
-            caller,
-            register_req(&unique_name(), vec![field("id", DataTypeSpec::Int64)]),
-        )
-        .await
-        .expect_err("no permission is denied");
-        assert_eq!(err.status(), 403);
+    #[test]
+    fn bifrost_tables_register_system_shared_requires_install() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+
+            // A write-only caller may not install a SystemShared table.
+            let writer = caller_with([Permission::bifrost_table_write()]).await;
+            let mut denied = register_req(&unique_name(), vec![field("id", DataTypeSpec::Int64)]);
+            denied.scope = TableScopeWire::SystemShared;
+            let err = register_table(&state, writer, denied)
+                .await
+                .expect_err("write cannot install SystemShared");
+            assert_eq!(err.status(), 403);
+
+            // An install-capable caller can.
+            let installer = caller_with([Permission::bifrost_table_install()]).await;
+            let mut allowed = register_req(&unique_name(), vec![field("id", DataTypeSpec::Int64)]);
+            allowed.scope = TableScopeWire::SystemShared;
+            let created = register_table(&state, installer, allowed)
+                .await
+                .expect("install creates SystemShared");
+            assert_eq!(created.outcome, RegisterOutcome::Created);
+        });
     }
 
-    #[tokio::test]
-    async fn bifrost_tables_register_system_shared_requires_install() {
-        let state = test_state().await;
+    #[test]
+    fn bifrost_tables_list_and_describe_reflect_registration() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = caller_with([
+                Permission::bifrost_table_write(),
+                Permission::bifrost_table_read(),
+            ])
+            .await;
+            let name = unique_name();
 
-        // A write-only caller may not install a SystemShared table.
-        let writer = caller_with([Permission::bifrost_table_write()]);
-        let mut denied = register_req(&unique_name(), vec![field("id", DataTypeSpec::Int64)]);
-        denied.scope = TableScopeWire::SystemShared;
-        let err = register_table(&state, writer, denied)
+            register_table(
+                &state,
+                caller.clone(),
+                register_req(&name, vec![field("value", DataTypeSpec::Int64)]),
+            )
             .await
-            .expect_err("write cannot install SystemShared");
-        assert_eq!(err.status(), 403);
+            .expect("register creates");
 
-        // An install-capable caller can.
-        let installer = caller_with([Permission::bifrost_table_install()]);
-        let mut allowed = register_req(&unique_name(), vec![field("id", DataTypeSpec::Int64)]);
-        allowed.scope = TableScopeWire::SystemShared;
-        let created = register_table(&state, installer, allowed)
-            .await
-            .expect("install creates SystemShared");
-        assert_eq!(created.outcome, RegisterOutcome::Created);
+            let entries = list_tables(&state, caller.clone()).await.expect("list");
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.name == name && e.namespace == "vala.bifrost"),
+                "registered table is listed"
+            );
+
+            let described = describe_table(&state, caller, "vala.bifrost".to_owned(), name.clone())
+                .await
+                .expect("describe");
+            assert_eq!(described.entry.name, name);
+            assert!(
+                described
+                    .fields
+                    .iter()
+                    .any(|f| f.name == "value" && f.data_type == DataTypeSpec::Int64),
+                "describe surfaces the user field"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn bifrost_tables_list_and_describe_reflect_registration() {
-        let state = test_state().await;
-        let caller = caller_with([
-            Permission::bifrost_table_write(),
-            Permission::bifrost_table_read(),
-        ]);
-        let name = unique_name();
-
-        register_table(
-            &state,
-            caller.clone(),
-            register_req(&name, vec![field("value", DataTypeSpec::Int64)]),
-        )
-        .await
-        .expect("register creates");
-
-        let entries = list_tables(&state, caller.clone()).await.expect("list");
-        assert!(
-            entries
-                .iter()
-                .any(|e| e.name == name && e.namespace == "vala.bifrost"),
-            "registered table is listed"
-        );
-
-        let described = describe_table(&state, caller, "vala.bifrost".to_owned(), name.clone())
-            .await
-            .expect("describe");
-        assert_eq!(described.entry.name, name);
-        assert!(
-            described
-                .fields
-                .iter()
-                .any(|f| f.name == "value" && f.data_type == DataTypeSpec::Int64),
-            "describe surfaces the user field"
-        );
-    }
-
-    #[tokio::test]
-    async fn bifrost_tables_list_requires_read_permission() {
-        let state = test_state().await;
-        let caller = caller_with([]);
-        let err = list_tables(&state, caller)
-            .await
-            .expect_err("no read permission is denied");
-        assert_eq!(err.status(), 403);
+    #[test]
+    fn bifrost_tables_list_requires_read_permission() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = caller_with([]).await;
+            let err = list_tables(&state, caller)
+                .await
+                .expect_err("no read permission is denied");
+            assert_eq!(err.status(), 403);
+        });
     }
 }

@@ -18,3 +18,5 @@ export { default as Toc } from '$lib/components/Toc.svelte';
 export { default as Tabs } from '$lib/components/Tabs.svelte';
 export { default as Tab } from '$lib/components/Tab.svelte';
 export { default as Steps } from '$lib/components/Steps.svelte';
+export { default as WyrdFlowDiagram } from '$lib/components/WyrdFlowDiagram.svelte';
+export { default as WyrdSequenceDiagram } from '$lib/components/WyrdSequenceDiagram.svelte';

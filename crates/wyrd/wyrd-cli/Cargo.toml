@@ -9,6 +9,10 @@ authors = { workspace = true }
 publish = false
 description = "Wyrd command-line interface."
 
+[lib]
+name = "wyrd_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "wyrd"
 path = "src/main.rs"

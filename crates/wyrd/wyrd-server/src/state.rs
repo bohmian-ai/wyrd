@@ -8,8 +8,8 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use wyrd_auth_check::{PolicyHook, StubAllowPolicyHook};
 use wyrd_auth_issue::IssuingKey;
-use wyrd_auth_oidc::TrustedIssuerRegistry;
 use wyrd_auth_verify::TokenVerifier;
+use wyrd_crypt::SecretKey;
 use wyrd_runtime::{PermissionCheck, RbacCheck};
 use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
@@ -17,10 +17,16 @@ use wyrd_tonic::tonic_health::server::HealthReporter;
 
 use crate::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
 use crate::auth::exchange_api_key::TokenExchangeSettings;
-use crate::auth::jwt_bearer::WorkloadBindingRegistry;
 use crate::auth::permission_resolver::SqlPermissionResolver;
+use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::config::DeploymentProfile;
 use crate::health::ReadinessSnapshot;
+
+/// Production [`TokenVerifier`] specialization: SQL-backed permission resolution
+/// (`SqlPermissionResolver`) plus Postgres-backed issuer resolution
+/// (`PgIssuerResolver`). Aliased so the nested handle type stays readable across
+/// `AppState`, the boot path, and the test harness.
+pub type WyrdTokenVerifier = TokenVerifier<SqlPermissionResolver, PgIssuerResolver>;
 
 /// Runtime-ready limits derived from config.
 #[derive(Debug, Clone, Copy)]
@@ -65,11 +71,13 @@ pub struct AppState {
     /// JWT issuer for auth token routes.
     pub issuing_key: Option<Arc<IssuingKey>>,
     /// JWT verifier for token-exchange routes.
-    pub token_verifier: Option<Arc<TokenVerifier<SqlPermissionResolver>>>,
-    /// Trusted OIDC issuer registry for human login flow.
-    pub trusted_issuer_registry: Option<Arc<TrustedIssuerRegistry>>,
-    /// Workload binding registry for jwt-bearer exchanges.
-    pub workload_binding_registry: Option<Arc<WorkloadBindingRegistry>>,
+    pub token_verifier: Option<Arc<WyrdTokenVerifier>>,
+    /// Postgres-backed trusted OIDC issuer resolver for human login + federation.
+    pub trusted_issuer_resolver: Option<Arc<PgIssuerResolver>>,
+    /// Postgres-backed workload binding resolver for jwt-bearer exchanges.
+    pub workload_binding_resolver: Option<Arc<PgWorkloadBindingResolver>>,
+    /// Process-wide sealing key for decrypting issuer client secrets on read.
+    pub sealing_key: Option<Arc<SecretKey>>,
     /// Policy hook for authz-check evaluation.
     pub policy_hook: Arc<dyn PolicyHook>,
     /// Audit-fact writer for authz-check decisions.
@@ -111,8 +119,9 @@ impl AppState {
             permission_check: Arc::new(RbacCheck),
             issuing_key: None,
             token_verifier: None,
-            trusted_issuer_registry: None,
-            workload_binding_registry: None,
+            trusted_issuer_resolver: None,
+            workload_binding_resolver: None,
+            sealing_key: None,
             policy_hook: Arc::new(StubAllowPolicyHook),
             audit_writer: Arc::new(NoopAuthzAuditWriter),
             trusted_request_id_propagation: false,
@@ -141,30 +150,37 @@ impl AppState {
     pub fn with_auth_handles(
         mut self,
         issuing_key: Arc<IssuingKey>,
-        token_verifier: Arc<TokenVerifier<SqlPermissionResolver>>,
+        token_verifier: Arc<WyrdTokenVerifier>,
     ) -> Self {
         self.issuing_key = Some(issuing_key);
         self.token_verifier = Some(token_verifier);
         self
     }
 
-    /// Attach the trusted OIDC issuer registry.
+    /// Attach the Postgres-backed trusted OIDC issuer resolver.
     #[must_use]
-    pub fn with_trusted_issuer_registry(
+    pub fn with_trusted_issuer_resolver(
         mut self,
-        trusted_issuer_registry: Arc<TrustedIssuerRegistry>,
+        trusted_issuer_resolver: Arc<PgIssuerResolver>,
     ) -> Self {
-        self.trusted_issuer_registry = Some(trusted_issuer_registry);
+        self.trusted_issuer_resolver = Some(trusted_issuer_resolver);
         self
     }
 
-    /// Attach the workload binding registry.
+    /// Attach the Postgres-backed workload binding resolver.
     #[must_use]
-    pub fn with_workload_binding_registry(
+    pub fn with_workload_binding_resolver(
         mut self,
-        workload_binding_registry: Arc<WorkloadBindingRegistry>,
+        workload_binding_resolver: Arc<PgWorkloadBindingResolver>,
     ) -> Self {
-        self.workload_binding_registry = Some(workload_binding_registry);
+        self.workload_binding_resolver = Some(workload_binding_resolver);
+        self
+    }
+
+    /// Attach the process-wide issuer-secret sealing key.
+    #[must_use]
+    pub fn with_sealing_key(mut self, sealing_key: Arc<SecretKey>) -> Self {
+        self.sealing_key = Some(sealing_key);
         self
     }
 

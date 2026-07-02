@@ -17,7 +17,7 @@ use crate::error::OidcError;
 // --------------------------------------------------------------------------
 
 /// How this Wyrd deployment authenticates to the OIDC provider.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ClientAuth {
     /// HTTP Basic auth with a shared secret (RFC 6749 §2.3.1).
     SecretBasic(SecretString),
@@ -100,7 +100,7 @@ pub enum PrincipalKindPolicy {
 /// Configuration for a single trusted OIDC issuer within a tenant.
 ///
 /// Keyed by `(tenant_id, issuer)` in [`TrustedIssuerRegistry`] (F02).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TrustedIssuer {
     /// Tenant that trusts this issuer.
     pub tenant_id: DataTenantId,

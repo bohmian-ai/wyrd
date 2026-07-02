@@ -89,8 +89,14 @@ pub enum SubjectTokenType {
 pub struct TokenResponse {
     /// Signed Wyrd access token.
     pub access_token: SecretBearer,
-    /// Refresh token.
-    pub refresh_token: SecretBearer,
+    /// Refresh token. Present only for grants that issue one: human OIDC login
+    /// (`authorization_code`), API-key exchange (`wyrd_api_key`), and refresh
+    /// rotation (`refresh_token`). Absent for the workload `jwt-bearer` and
+    /// `token-exchange` (delegation) grants, whose clients re-present their
+    /// durable credential to obtain a fresh access token instead of holding a
+    /// long-lived refresh secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<SecretBearer>,
     /// Token type.
     pub token_type: TokenType,
     /// Access-token expiry timestamp.
@@ -132,7 +138,7 @@ mod tests {
     fn token_response_has_no_card_ref_wire_field() {
         let response = TokenResponse {
             access_token: SecretBearer::new("access".to_owned()),
-            refresh_token: SecretBearer::new("refresh".to_owned()),
+            refresh_token: Some(SecretBearer::new("refresh".to_owned())),
             token_type: TokenType::Bearer,
             expires_at: Utc::now(),
         };
@@ -346,13 +352,32 @@ mod tests {
     fn token_response_roundtrips() {
         let response = TokenResponse {
             access_token: SecretBearer::new("access".to_owned()),
-            refresh_token: SecretBearer::new("refresh".to_owned()),
+            refresh_token: Some(SecretBearer::new("refresh".to_owned())),
             token_type: TokenType::Bearer,
             expires_at: Utc::now(),
         };
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["token_type"], "Bearer");
         assert!(value["expires_at"].as_str().is_some());
+        assert_eq!(
+            serde_json::from_value::<TokenResponse>(value).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn token_response_without_refresh_omits_field_and_roundtrips() {
+        let response = TokenResponse {
+            access_token: SecretBearer::new("access".to_owned()),
+            refresh_token: None,
+            token_type: TokenType::Bearer,
+            expires_at: Utc::now(),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert!(
+            value.get("refresh_token").is_none(),
+            "a grant that issues no refresh token must omit the wire field"
+        );
         assert_eq!(
             serde_json::from_value::<TokenResponse>(value).unwrap(),
             response

@@ -285,7 +285,7 @@ impl RefreshTokens {
 
         Ok(ExchangedToken {
             access_token: SecretString::from(access_token),
-            refresh_token: SecretString::from(refresh_token),
+            refresh_token: Some(SecretString::from(refresh_token)),
             token_type: TokenType::Bearer,
             expires_at,
         })
@@ -474,7 +474,12 @@ mod tests {
         assert_eq!(old_row.revoked_reason.as_deref(), Some("rotated"));
 
         // New row exists and links back via rotated_from.
-        let new_hash = hash_of(&exchanged.refresh_token);
+        let new_hash = hash_of(
+            exchanged
+                .refresh_token
+                .as_ref()
+                .expect("rotation issues a refresh token"),
+        );
         let new_row = refresh_by_hash(&mut conn, &new_hash)
             .await
             .expect("lookup")
@@ -579,7 +584,13 @@ mod tests {
 
         // The successor token from conn_a's rotation should also be revoked
         // by the family revoke triggered by reuse detection.
-        let successor_hash = hash_of(&result_a.unwrap().refresh_token);
+        let exchanged_a = result_a.unwrap();
+        let successor_hash = hash_of(
+            exchanged_a
+                .refresh_token
+                .as_ref()
+                .expect("rotation issues a refresh token"),
+        );
         let successor = refresh_by_hash(&mut conn_b, &successor_hash)
             .await
             .expect("lookup")

@@ -14,7 +14,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use wyrd_auth_oidc::{JwksCache, OidcError, OidcKid, TrustedIssuerRegistry, map_claims};
+use wyrd_auth_oidc::{
+    IssuerConfigResolver, JwksCache, OidcError, OidcKid, PrincipalKindPolicy, map_claims,
+};
 use wyrd_runtime::{
     DelegationStep, PermissionSet, Principal, PrincipalId, PrincipalKind,
     PrincipalRef as RuntimePrincipalRef, RoleRef,
@@ -237,10 +239,21 @@ impl TokenHash {
 }
 
 /// External OIDC verify path. `None` until `with_external` is called.
-#[derive(Clone)]
-struct ExternalVerify {
+///
+/// Generic over the issuer resolver `I` (RPITIT trait — not dyn-compatible),
+/// so trust lookups happen per-request against the live config store.
+struct ExternalVerify<I> {
     jwks: Arc<JwksCache>,
-    trusted: Arc<TrustedIssuerRegistry>,
+    trusted: Arc<I>,
+}
+
+impl<I> Clone for ExternalVerify<I> {
+    fn clone(&self) -> Self {
+        Self {
+            jwks: Arc::clone(&self.jwks),
+            trusted: Arc::clone(&self.trusted),
+        }
+    }
 }
 
 /// Verified identity from an external OIDC issuer.
@@ -261,23 +274,46 @@ pub struct VerifiedExternalIdentity {
     pub email: Option<String>,
     /// Groups or roles extracted from the token (RBAC resolution input).
     pub groups: Vec<String>,
+    /// Whether the matched issuer represents human users or machine workloads.
+    /// Carried out of the trust resolution so callers need not re-resolve it.
+    pub principal_kind: PrincipalKindPolicy,
+    /// The audience the matched issuer expects, used as the workload binding
+    /// audience constraint without a second issuer resolution.
+    pub expected_audience: String,
     /// Full verified token claims for downstream assertion checks (e.g. nonce).
     pub raw_claims: serde_json::Value,
 }
 
 /// Stateful verifier with token-hash cache and resolver-backed permission refresh.
-#[derive(Clone)]
-pub struct TokenVerifier<R: PermissionResolver> {
+///
+/// Parametrized by the permission resolver `R` and the issuer-config resolver
+/// `I`. Both traits are RPITIT (not dyn-compatible), so the verifier holds them
+/// generically behind trait bounds rather than as trait objects.
+pub struct TokenVerifier<R: PermissionResolver, I: IssuerConfigResolver> {
     decoding_keys: Arc<HashMap<Kid, Arc<DecodingKey>>>,
     issuer: Arc<String>,
     resolver: Arc<R>,
     revocation: Option<Arc<dyn RevocationCheck>>,
     cache: Cache<TokenHash, Arc<VerifiedToken>>,
     settings: Arc<WyrdAuthVerifySettings>,
-    external: Option<ExternalVerify>,
+    external: Option<ExternalVerify<I>>,
 }
 
-impl<R: PermissionResolver + 'static> TokenVerifier<R> {
+impl<R: PermissionResolver, I: IssuerConfigResolver> Clone for TokenVerifier<R, I> {
+    fn clone(&self) -> Self {
+        Self {
+            decoding_keys: Arc::clone(&self.decoding_keys),
+            issuer: Arc::clone(&self.issuer),
+            resolver: Arc::clone(&self.resolver),
+            revocation: self.revocation.clone(),
+            cache: self.cache.clone(),
+            settings: Arc::clone(&self.settings),
+            external: self.external.clone(),
+        }
+    }
+}
+
+impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVerifier<R, I> {
     /// Construct a token verifier.
     ///
     /// # Panics
@@ -308,15 +344,11 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
         }
     }
 
-    /// Attach an external OIDC verification path backed by a JWKS cache and
-    /// trusted-issuer registry. Until this is called, `verify_external` always
+    /// Attach an external OIDC verification path backed by a JWKS cache and an
+    /// issuer-config resolver. Until this is called, `verify_external` always
     /// returns `AuthError::InvalidToken`.
     #[must_use]
-    pub fn with_external(
-        mut self,
-        jwks: Arc<JwksCache>,
-        trusted: Arc<TrustedIssuerRegistry>,
-    ) -> Self {
+    pub fn with_external(mut self, jwks: Arc<JwksCache>, trusted: Arc<I>) -> Self {
         self.external = Some(ExternalVerify { jwks, trusted });
         self
     }
@@ -515,11 +547,20 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
 
         let ext = self.external.as_ref().ok_or(AuthError::InvalidToken)?;
 
-        // Parse the issuer string into the typed form for the registry lookup.
+        // Parse the issuer string into the typed form for the trust lookup.
         let iss_url = IssuerUrl::new(iss_str).map_err(|_| AuthError::InvalidToken)?;
+
+        // Resolve this tenant's trusted issuers from the live config store, then
+        // filter by the unverified `iss`. A resolver outage fails closed as
+        // VerifyUnavailable; no matching issuer fails closed as InvalidToken
+        // (untrusted or cross-tenant).
         let trusted = ext
             .trusted
-            .get(tenant, &iss_url)
+            .trusted_issuers(tenant)
+            .await
+            .map_err(|_| AuthError::VerifyUnavailable)?
+            .into_iter()
+            .find(|ti| ti.issuer == iss_url)
             .ok_or(AuthError::InvalidToken)?;
 
         // Reject symmetric algorithms. Only asymmetric keys appear in JWKS.
@@ -567,6 +608,8 @@ impl<R: PermissionResolver + 'static> TokenVerifier<R> {
             subject: mapped.subject,
             email: mapped.email,
             groups: mapped.groups,
+            principal_kind: trusted.principal_kind,
+            expected_audience: trusted.expected_audience.clone(),
             raw_claims,
         })
     }
@@ -858,8 +901,8 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth_oidc::{
-        ClaimMapping, ClaimPath, ClientAuth, JwksCache, PrincipalKindPolicy, TrustedIssuer,
-        TrustedIssuerRegistry,
+        ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, JwksCache, OidcError,
+        PrincipalKindPolicy, TrustedIssuer,
     };
     use wyrd_runtime::{Permission, PermissionSet};
     use wyrd_runtime::{Principal, PrincipalId, PrincipalKind, RoleRef};
@@ -1275,7 +1318,7 @@ mod tests {
     fn verifier_with_revocation(
         resolver: Arc<TestResolver>,
         epoch: Option<DateTime<Utc>>,
-    ) -> TokenVerifier<TestResolver> {
+    ) -> TokenVerifier<TestResolver, StubIssuerResolver> {
         let check = Arc::new(TestRevocation {
             epoch,
             unavailable: false,
@@ -1507,13 +1550,44 @@ mod tests {
     fn verifier(
         resolver: Arc<TestResolver>,
         settings: WyrdAuthVerifySettings,
-    ) -> TokenVerifier<TestResolver> {
+    ) -> TokenVerifier<TestResolver, StubIssuerResolver> {
         let mut keys = HashMap::new();
         keys.insert(
             Kid::new("k1").expect("kid is valid"),
             Arc::new(public_key()),
         );
         TokenVerifier::new(keys, "wyrd", resolver, settings)
+    }
+
+    /// DB-free stub `IssuerConfigResolver` for the crate's own unit tests.
+    ///
+    /// Holds a fixed set of trusted issuers and filters them by tenant, mirroring
+    /// the tenant-scoping that the production Postgres resolver enforces via RLS.
+    #[derive(Debug, Default)]
+    struct StubIssuerResolver {
+        issuers: Vec<TrustedIssuer>,
+    }
+
+    impl StubIssuerResolver {
+        fn new(issuers: Vec<TrustedIssuer>) -> Self {
+            Self { issuers }
+        }
+    }
+
+    impl IssuerConfigResolver for StubIssuerResolver {
+        fn trusted_issuers(
+            &self,
+            tenant: &DataTenantId,
+        ) -> impl std::future::Future<Output = Result<Vec<TrustedIssuer>, OidcError>> + Send
+        {
+            let issuers: Vec<TrustedIssuer> = self
+                .issuers
+                .iter()
+                .filter(|ti| &ti.tenant_id == tenant)
+                .cloned()
+                .collect();
+            async move { Ok(issuers) }
+        }
     }
 
     #[derive(Debug, Default)]
@@ -1641,9 +1715,9 @@ mod tests {
         resolver: Arc<TestResolver>,
         trusted: TrustedIssuer,
         jwks: Arc<JwksCache>,
-    ) -> TokenVerifier<TestResolver> {
-        let registry = Arc::new(TrustedIssuerRegistry::from_issuers([trusted]));
-        verifier(resolver, WyrdAuthVerifySettings::default()).with_external(jwks, registry)
+    ) -> TokenVerifier<TestResolver, StubIssuerResolver> {
+        let stub = Arc::new(StubIssuerResolver::new(vec![trusted]));
+        verifier(resolver, WyrdAuthVerifySettings::default()).with_external(jwks, stub)
     }
 
     // -------------------------------------------------------------------------
@@ -1709,13 +1783,13 @@ mod tests {
             make_trusted_issuer(tenant_a, issuer.clone(), "aud-for-a", jwks_uri.clone());
         let trusted_b = make_trusted_issuer(tenant_b, issuer.clone(), "aud-for-b", jwks_uri);
 
-        let registry = Arc::new(TrustedIssuerRegistry::from_issuers([trusted_a, trusted_b]));
+        let stub = Arc::new(StubIssuerResolver::new(vec![trusted_a, trusted_b]));
         let jwks = make_jwks_cache();
         let v = verifier(
             Arc::new(TestResolver::default()),
             WyrdAuthVerifySettings::default(),
         )
-        .with_external(jwks, registry);
+        .with_external(jwks, stub);
 
         // Token signed with aud-for-a.
         let claims_a = external_claims(EXTERNAL_ISSUER, "aud-for-a", now() + 3_600, now());
@@ -1736,14 +1810,14 @@ mod tests {
 
     #[tokio::test]
     async fn verify_external_unknown_tenant_issuer_pair_returns_invalid_token() {
-        // Empty registry — the (tenant, iss) pair is not trusted.
-        let registry = Arc::new(TrustedIssuerRegistry::from_issuers([]));
+        // Empty resolver — the (tenant, iss) pair is not trusted.
+        let stub = Arc::new(StubIssuerResolver::default());
         let jwks = make_jwks_cache();
         let v = verifier(
             Arc::new(TestResolver::default()),
             WyrdAuthVerifySettings::default(),
         )
-        .with_external(jwks, registry);
+        .with_external(jwks, stub);
 
         let claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
         let token = encode_external_token(&claims, EXTERNAL_KID);
@@ -1836,9 +1910,9 @@ mod tests {
             ..WyrdAuthVerifySettings::default()
         };
         let trusted = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
-        let registry = Arc::new(TrustedIssuerRegistry::from_issuers([trusted]));
+        let stub = Arc::new(StubIssuerResolver::new(vec![trusted]));
         let v = verifier(Arc::new(TestResolver::default()), settings)
-            .with_external(make_jwks_cache(), registry);
+            .with_external(make_jwks_cache(), stub);
 
         let claims = external_claims(
             EXTERNAL_ISSUER,
@@ -1910,13 +1984,13 @@ mod tests {
         let jwks = make_jwks_cache();
         let trusted_for_old =
             make_trusted_issuer(tid, issuer.clone(), EXTERNAL_AUDIENCE, jwks_uri.clone());
-        let registry = Arc::new(TrustedIssuerRegistry::from_issuers([trusted_for_old]));
+        let stub = Arc::new(StubIssuerResolver::new(vec![trusted_for_old]));
         {
             let v = verifier(
                 Arc::new(TestResolver::default()),
                 WyrdAuthVerifySettings::default(),
             )
-            .with_external(Arc::clone(&jwks), Arc::clone(&registry));
+            .with_external(Arc::clone(&jwks), Arc::clone(&stub));
             let old_claims =
                 external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
             let old_token = encode_external_token(&old_claims, old_kid);
@@ -1929,12 +2003,12 @@ mod tests {
         // uses new_kid. The cache has the old key set; new_kid is unknown →
         // triggers one refetch → found in the new key set → success.
         let trusted_for_new = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
-        let registry2 = Arc::new(TrustedIssuerRegistry::from_issuers([trusted_for_new]));
+        let stub2 = Arc::new(StubIssuerResolver::new(vec![trusted_for_new]));
         let v2 = verifier(
             Arc::new(TestResolver::default()),
             WyrdAuthVerifySettings::default(),
         )
-        .with_external(Arc::clone(&jwks), registry2);
+        .with_external(Arc::clone(&jwks), stub2);
         let new_claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
         let new_token = encode_external_token(&new_claims, new_kid);
         v2.verify_external(&tid, &new_token)

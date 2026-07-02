@@ -5,9 +5,9 @@ use chrono::{Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use uuid::Uuid;
-use wyrd_auth_oidc::{
-    OidcError, PrincipalKindPolicy, TrustedIssuer, WorkloadBinding, WorkloadBindingResolver,
-};
+use wyrd_auth_oidc::{PrincipalKindPolicy, WorkloadBindingResolver};
+use wyrd_auth_verify::VerifiedExternalIdentity;
+use wyrd_runtime::RoleRef;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::error::WyrdError;
@@ -15,73 +15,17 @@ use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::reference::CardRef;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    insert_audit_token_exchange, list_service_account_roles, service_account_by_card_ref,
+    ServiceAccountPrincipalRow, insert_audit_token_exchange, list_service_account_roles,
+    service_account_by_card_ref,
 };
 
 use crate::auth::exchange_api_key::{
-    ExchangeError, ExchangedToken, TokenExchangeSettings, issue_for_subject, role_refs,
+    ExchangeError, ExchangedToken, IssueSubject, RefreshPolicy, TokenExchangeSettings,
+    issue_for_subject, role_refs,
 };
 use crate::auth::issue_api_key::principal_kind_for_card;
 use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
-
-/// In-memory workload binding registry used by the server auth flow.
-#[derive(Debug, Clone, Default)]
-pub struct WorkloadBindingRegistry {
-    bindings: Vec<WorkloadBinding>,
-}
-
-impl WorkloadBindingRegistry {
-    /// Build a registry from an iterator of server-owned workload bindings.
-    #[must_use]
-    pub fn from_bindings(bindings: impl IntoIterator<Item = WorkloadBinding>) -> Self {
-        bindings.into_iter().collect()
-    }
-}
-
-impl FromIterator<WorkloadBinding> for WorkloadBindingRegistry {
-    fn from_iter<T: IntoIterator<Item = WorkloadBinding>>(bindings: T) -> Self {
-        Self {
-            bindings: bindings.into_iter().collect(),
-        }
-    }
-}
-
-impl WorkloadBindingResolver for WorkloadBindingRegistry {
-    fn binding(
-        &self,
-        tenant: &DataTenantId,
-        issuer: &IssuerUrl,
-        subject: &str,
-        audience: Option<&str>,
-    ) -> impl std::future::Future<Output = Result<Option<CardRef>, OidcError>> + Send {
-        let tenant = *tenant;
-        let issuer = issuer.clone();
-        let subject = subject.to_owned();
-        let audience = audience.map(str::to_owned);
-        async move {
-            if let Some(binding) = self.bindings.iter().find(|binding| {
-                binding.tenant_id == tenant
-                    && binding.issuer == issuer
-                    && binding.subject == subject
-                    && binding.audience.as_deref() == audience.as_deref()
-            }) {
-                return Ok(Some(binding.card_ref.clone()));
-            }
-
-            Ok(self
-                .bindings
-                .iter()
-                .find(|binding| {
-                    binding.tenant_id == tenant
-                        && binding.issuer == issuer
-                        && binding.subject == subject
-                        && binding.audience.is_none()
-                })
-                .map(|binding| binding.card_ref.clone()))
-        }
-    }
-}
 
 /// Workload OIDC `jwt-bearer` exchange service.
 #[derive(Debug, Clone, Default)]
@@ -104,89 +48,17 @@ impl JwtBearer {
         let tenant_id = resolve_workload_tenant(state, headers, tenant).await?;
         let mut audit_principal_id = Uuid::nil();
         let result = async {
-            let verifier = state
-                .token_verifier
-                .as_ref()
-                .ok_or_else(auth_not_configured)?;
-            let verified = verifier
-                .verify_external(&tenant_id, assertion.expose_secret())
-                .await
-                .map_err(WyrdErrorResponse::from)?;
-            let trusted = trusted_issuer(state, tenant_id, &verified.issuer)?;
-            if trusted.principal_kind != PrincipalKindPolicy::Workload {
-                return Err(invalid_token(
-                    "issuer is not configured for workload identity",
-                ));
-            }
-            let binding_registry = state
-                .workload_binding_registry
-                .as_ref()
-                .ok_or_else(auth_not_configured)?;
-            let card_ref = binding_registry
-                .binding(
-                    &tenant_id,
-                    &verified.issuer,
-                    &verified.subject,
-                    Some(trusted.expected_audience.as_str()),
-                )
-                .await
-                .map_err(|error| {
-                    tracing::warn!(
-                        error = %error,
-                        tenant_id = %tenant_id,
-                        issuer = %verified.issuer,
-                        subject = %verified.subject,
-                        "workload binding lookup failed"
-                    );
-                    WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
-                        message: "workload binding lookup unavailable".to_owned(),
-                        details: json!({ "retry_after_seconds": 1 }),
-                    })
-                })?
-                .ok_or_else(|| principal_not_found(&verified.subject, &verified.issuer))?;
-            let principal_kind = principal_kind_for_card(&card_ref)
-                .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
-
+            let verified =
+                verify_workload_assertion(state, tenant_id, assertion.expose_secret()).await?;
+            let card_ref = resolve_workload_binding(state, tenant_id, &verified).await?;
             let mut conn = TenantConn::acquire(&state.pool, tenant_id)
                 .await
                 .map_err(sql_error)?;
-            let row = service_account_by_card_ref(&mut conn, principal_kind, &card_ref)
-                .await
-                .map_err(sql_error)?
-                .ok_or_else(|| principal_not_found_for_card_ref(&card_ref))?;
+            let (row, roles) = load_service_account_subject(&mut conn, &card_ref).await?;
             audit_principal_id = row.id;
-
-            let roles = role_refs(
-                list_service_account_roles(&mut conn, row.id)
-                    .await
-                    .map_err(sql_error)?,
-            )
-            .map_err(|_| internal_error("failed to issue workload token"))?;
-            let issuing_key = state.issuing_key.as_ref().ok_or_else(auth_not_configured)?;
-            let exchanged = issue_for_subject(
-                &mut conn,
-                issuing_key,
-                &self.settings,
-                row.id,
-                &row.principal_kind,
-                row.card_ref.0.clone(),
-                roles,
-            )
-            .await
-            .map_err(|error| workload_exchange_error(ExchangeError::from(error)))?;
-            insert_audit_token_exchange(
-                &mut conn,
-                Uuid::new_v4(),
-                row.id,
-                row.id,
-                json!([]),
-                request_id,
-                Utc::now() + self.settings.access_ttl,
-            )
-            .await
-            .map_err(sql_error)?;
+            let exchanged =
+                issue_and_audit(&mut conn, state, &self.settings, &row, roles, request_id).await?;
             conn.commit().await.map_err(sql_error)?;
-
             Ok(exchanged)
         }
         .await;
@@ -200,6 +72,116 @@ impl JwtBearer {
             }
         }
     }
+}
+
+async fn verify_workload_assertion(
+    state: &AppState,
+    tenant_id: DataTenantId,
+    assertion: &str,
+) -> Result<VerifiedExternalIdentity, WyrdErrorResponse> {
+    let verifier = state
+        .token_verifier
+        .as_ref()
+        .ok_or_else(auth_not_configured)?;
+    let verified = verifier
+        .verify_external(&tenant_id, assertion)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
+    if verified.principal_kind != PrincipalKindPolicy::Workload {
+        return Err(invalid_token(
+            "issuer is not configured for workload identity",
+        ));
+    }
+    Ok(verified)
+}
+
+async fn resolve_workload_binding(
+    state: &AppState,
+    tenant_id: DataTenantId,
+    verified: &VerifiedExternalIdentity,
+) -> Result<CardRef, WyrdErrorResponse> {
+    let binding_resolver = state
+        .workload_binding_resolver
+        .as_ref()
+        .ok_or_else(auth_not_configured)?;
+    binding_resolver
+        .binding(
+            &tenant_id,
+            &verified.issuer,
+            &verified.subject,
+            Some(verified.expected_audience.as_str()),
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                error = %error,
+                tenant_id = %tenant_id,
+                issuer = %verified.issuer,
+                subject = %verified.subject,
+                "workload binding lookup failed"
+            );
+            WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
+                message: "workload binding lookup unavailable".to_owned(),
+                details: json!({ "retry_after_seconds": 1 }),
+            })
+        })?
+        .ok_or_else(|| principal_not_found(&verified.subject, &verified.issuer))
+}
+
+async fn load_service_account_subject(
+    conn: &mut TenantConn<'_>,
+    card_ref: &CardRef,
+) -> Result<(ServiceAccountPrincipalRow, Vec<RoleRef>), WyrdErrorResponse> {
+    let principal_kind = principal_kind_for_card(card_ref)
+        .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
+    let row = service_account_by_card_ref(conn, principal_kind, card_ref)
+        .await
+        .map_err(sql_error)?
+        .ok_or_else(|| principal_not_found_for_card_ref(card_ref))?;
+    let roles = role_refs(
+        list_service_account_roles(conn, row.id)
+            .await
+            .map_err(sql_error)?,
+    )
+    .map_err(|_| internal_error("failed to issue workload token"))?;
+    Ok((row, roles))
+}
+
+async fn issue_and_audit(
+    conn: &mut TenantConn<'_>,
+    state: &AppState,
+    settings: &TokenExchangeSettings,
+    row: &ServiceAccountPrincipalRow,
+    roles: Vec<RoleRef>,
+    request_id: &str,
+) -> Result<ExchangedToken, WyrdErrorResponse> {
+    let issuing_key = state.issuing_key.as_ref().ok_or_else(auth_not_configured)?;
+    let exchanged = issue_for_subject(
+        conn,
+        issuing_key,
+        settings,
+        IssueSubject {
+            principal_id: row.id,
+            principal_kind: row.principal_kind.clone(),
+            card_ref: row.card_ref.0.clone(),
+            roles,
+        },
+        RefreshPolicy::Skip,
+    )
+    .await
+    .map_err(|error| workload_exchange_error(ExchangeError::from(error)))?;
+    insert_audit_token_exchange(
+        conn,
+        Uuid::new_v4(),
+        row.id,
+        row.id,
+        json!([]),
+        request_id,
+        Utc::now() + settings.access_ttl,
+    )
+    .await
+    .map_err(sql_error)?;
+    Ok(exchanged)
 }
 
 fn workload_exchange_error(
@@ -332,20 +314,6 @@ fn tenant_slug_from_host(headers: &HeaderMap) -> Option<TenantSlug> {
     TenantSlug::new(first.to_owned()).ok()
 }
 
-fn trusted_issuer<'a>(
-    state: &'a AppState,
-    tenant_id: DataTenantId,
-    issuer: &IssuerUrl,
-) -> Result<&'a TrustedIssuer, WyrdErrorResponse> {
-    let registry = state
-        .trusted_issuer_registry
-        .as_ref()
-        .ok_or_else(auth_not_configured)?;
-    registry
-        .get(&tenant_id, issuer)
-        .ok_or_else(|| invalid_token("issuer is not trusted for the resolved tenant"))
-}
-
 fn principal_not_found(subject: &str, issuer: &IssuerUrl) -> WyrdErrorResponse {
     WyrdErrorResponse::from(WyrdError::PrincipalNotFound {
         message: "no active Service or Agent principal is bound to card_ref".to_owned(),
@@ -410,7 +378,7 @@ mod tests {
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_oidc::{
         ClaimMapping, ClaimPath, ClientAuth, JwksCache, PrincipalKindPolicy, TrustedIssuer,
-        TrustedIssuerRegistry, WorkloadBinding,
+        WorkloadBinding,
     };
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
     use wyrd_dev_fixtures::pg::PgFixture;
@@ -423,16 +391,21 @@ mod tests {
     use wyrd_spec::ids::{CardName, SpaceName, TenantSlug};
     use wyrd_spec::reference::CardRef;
     use wyrd_sql::queries::auth::{
-        grant_role_to_service_account, insert_service_account, role_by_name,
+        grant_role_to_service_account, insert_service_account, role_by_name, upsert_trusted_issuer,
+        upsert_workload_binding,
     };
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use crate::AppState;
     use crate::auth::issue_api_key::WyrdApiKey;
     use crate::auth::permission_resolver::SqlPermissionResolver;
+    use crate::auth::pg_resolvers::{
+        PgIssuerResolver, PgWorkloadBindingResolver, binding_write_from_binding,
+        issuer_write_from_trusted,
+    };
     use crate::auth::seed::seed_builtin_roles_for_tenant;
 
-    use super::{JwtBearer, WorkloadBindingRegistry};
+    use super::JwtBearer;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -493,6 +466,10 @@ mod tests {
         ));
         assert_eq!(role_names(&verified.principal.roles), set_of(&[role_name]));
         assert_eq!(exchanged.token_type, TokenType::Bearer);
+        assert!(
+            exchanged.refresh_token.is_none(),
+            "workload jwt-bearer grant must not issue a refresh token"
+        );
 
         let rows = audit_rows(&fixture, tenant).await;
         assert_eq!(rows.len(), 1);
@@ -840,6 +817,10 @@ mod tests {
         conn.commit().await.expect("api-key exchange commits");
 
         assert_eq!(exchanged.token_type, TokenType::Bearer);
+        assert!(
+            exchanged.refresh_token.is_some(),
+            "api-key exchange must still issue a refresh token"
+        );
     }
 
     async fn test_state(fixture: &PgFixture) -> AppState {
@@ -858,6 +839,41 @@ mod tests {
         trusted: Vec<TrustedIssuer>,
         bindings: Vec<WorkloadBinding>,
     ) -> AppState {
+        // Seed issuers (and then bindings, which FK-reference them) directly into
+        // Postgres so the production Pg resolvers serve them per-request. These
+        // test issuers use PrivateKeyJwt and carry no secret, so no sealing key is
+        // needed. Each issuer/binding carries its own tenant for tenant-scoping.
+        for issuer in &trusted {
+            let write = issuer_write_from_trusted(issuer, None).expect("issuer encodes");
+            let mut conn = fixture
+                .tenant_conn_for(issuer.tenant_id)
+                .await
+                .expect("tenant conn opens");
+            upsert_trusted_issuer(&mut conn, &write)
+                .await
+                .expect("issuer upsert");
+            conn.commit().await.expect("issuer seed commits");
+        }
+        for binding in &bindings {
+            let write = binding_write_from_binding(binding).expect("binding encodes");
+            let mut conn = fixture
+                .tenant_conn_for(binding.tenant_id)
+                .await
+                .expect("tenant conn opens");
+            upsert_workload_binding(&mut conn, &write)
+                .await
+                .expect("binding upsert");
+            conn.commit().await.expect("binding seed commits");
+        }
+
+        let issuer_resolver = Arc::new(PgIssuerResolver::new(
+            Arc::new(fixture.app_pool().clone()),
+            None,
+        ));
+        let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(Arc::new(
+            fixture.app_pool().clone(),
+        )));
+
         let issuing_key = Arc::new(
             IssuingKey::from_ed_pem(
                 SecretString::from(PRIVATE_KEY_PEM.to_owned()),
@@ -871,7 +887,6 @@ mod tests {
             Kid::new("k1").expect("kid is valid"),
             Arc::new(public_key_from_pem(PUBLIC_KEY_PEM).expect("public key parses")),
         );
-        let registry = Arc::new(TrustedIssuerRegistry::from_issuers(trusted));
         let verifier = TokenVerifier::new(
             local_keys,
             "wyrd",
@@ -886,15 +901,13 @@ mod tests {
                 StdDuration::from_secs(300),
                 StdDuration::from_secs(5),
             )),
-            Arc::clone(&registry),
+            Arc::clone(&issuer_resolver),
         );
         test_state(fixture)
             .await
             .with_auth_handles(issuing_key, Arc::new(verifier))
-            .with_trusted_issuer_registry(registry)
-            .with_workload_binding_registry(Arc::new(WorkloadBindingRegistry::from_bindings(
-                bindings,
-            )))
+            .with_trusted_issuer_resolver(issuer_resolver)
+            .with_workload_binding_resolver(binding_resolver)
     }
 
     async fn bootstrap_principal(

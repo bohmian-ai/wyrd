@@ -12,6 +12,16 @@ use zeroize::Zeroize;
 pub struct SecretKey([u8; 32]);
 
 impl SecretKey {
+    /// Construct a [`SecretKey`] directly from a 32-byte AES-256 key.
+    ///
+    /// The bytes are used as-is — no KDF is applied. Use this when the caller
+    /// already holds a uniform deployment sealing key (e.g. a config-provided
+    /// secret) and must not re-hash it through Argon2.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 32]) -> SecretKey {
+        SecretKey(bytes)
+    }
+
     /// Borrow raw key bytes.
     #[must_use]
     pub fn expose(&self) -> &[u8; 32] {
@@ -104,7 +114,23 @@ pub enum CryptError {
 
 #[cfg(test)]
 mod tests {
-    use super::{decrypt, derive_key, encrypt};
+    use super::{SecretKey, decrypt, derive_key, encrypt};
+
+    #[test]
+    fn from_bytes_round_trip_and_redacted_debug() {
+        let raw: [u8; 32] = [0x42_u8; 32];
+        let key = SecretKey::from_bytes(raw);
+        let payload = match encrypt(&key, b"sealing-key-payload") {
+            Ok(payload) => payload,
+            Err(error) => panic!("{error}"),
+        };
+        let plaintext = match decrypt(&key, &payload) {
+            Ok(plaintext) => plaintext,
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(plaintext, b"sealing-key-payload");
+        assert_eq!(format!("{key:?}"), "SecretKey(***)");
+    }
 
     #[test]
     fn encrypt_decrypt_round_trip() {

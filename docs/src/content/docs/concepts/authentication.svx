@@ -1,0 +1,187 @@
+---
+title: Authentication
+description: How Wyrd tokens work and how humans, API-key principals, and machine workloads each obtain one.
+pillar: wyrd
+group: Concepts
+order: 7
+---
+
+# Authentication
+
+Wyrd issues signed EdDSA JWTs. Every authenticated request carries one in the
+`X-Wyrd-Access-Token: Bearer <token>` header. Wyrd mints the token, and it is the
+only credential the server trusts per request. There is no session cookie and no
+ambient identity.
+
+For the end-to-end picture (the identity model, the request verification path, and
+grant dispatch), start with [Identity and auth](/concepts/identity-and-auth/). This
+page covers how each caller obtains a token.
+
+## Token and principal model
+
+Every token is bound to a **principal**, the identity that performed the exchange.
+Three kinds exist:
+
+<DataTable
+  columns={[
+    { header: 'Kind', role: 'name' },
+    { header: 'Identity source' },
+    { header: 'Card kind' }
+  ]}
+  rows={[
+    ['User', 'Human OIDC login via an external IdP', 'None (email-based)'],
+    ['Service', 'API key or workload jwt-bearer, bound to a ServiceCard', 'service'],
+    ['Agent', 'API key or workload jwt-bearer, bound to an AgentCard', 'agent']
+  ]}
+/>
+
+Access tokens are short-lived. Refresh tokens are issued alongside for grants
+that support rotation (human login, API-key exchange). Workload grants issue
+access only, with no refresh, because the workload can always re-assert its
+identity.
+
+## Grant types
+
+<DataTable
+  columns={[
+    { header: 'Grant', role: 'name' },
+    { header: 'Route' },
+    { header: 'Issues refresh?' }
+  ]}
+  rows={[
+    ['wyrd_api_key', 'POST /auth/token', 'Yes'],
+    ['jwt-bearer (workload)', 'POST /auth/token', 'No'],
+    ['authorization_code (OIDC)', 'POST /auth/token', 'Yes'],
+    ['token-exchange (delegation)', 'POST /auth/token', 'No'],
+    ['refresh_token', 'POST /auth/token', 'Yes (rotated)']
+  ]}
+/>
+
+## Human OIDC login flow
+
+The user flow uses PKCE S256 to prevent authorization-code interception. The
+login state is stored server-side for at most 5 minutes.
+
+<WyrdSequenceDiagram
+  title="Human OIDC login"
+  participants={['Browser', 'Wyrd server', 'IdP']}
+  messages={[
+    { from: 'Browser', to: 'Wyrd server', label: 'GET /auth/login?issuer=…' },
+    { from: 'Wyrd server', to: 'IdP', label: 'OIDC discovery' },
+    { from: 'IdP', to: 'Wyrd server', label: 'authorization_endpoint', dashed: true },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'store PKCE + nonce + state (300s)' },
+    { from: 'Wyrd server', to: 'Browser', label: '302 redirect · S256 challenge', dashed: true },
+    { from: 'Browser', to: 'IdP', label: 'authorize' },
+    { from: 'IdP', to: 'Browser', label: 'redirect ?code&state', dashed: true },
+    { from: 'Browser', to: 'Wyrd server', label: 'GET /auth/callback?code&state' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'consume login state once' },
+    { from: 'Wyrd server', to: 'IdP', label: 'exchange code' },
+    { from: 'IdP', to: 'Wyrd server', label: 'id_token', dashed: true },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'verify id_token · nonce · map roles · upsert user' },
+    { from: 'Wyrd server', to: 'Browser', label: 'access + refresh', dashed: true }
+  ]}
+/>
+
+1. Client sends `GET /auth/login?issuer=<issuer-url>`.
+2. Server resolves the trusted issuer for the request tenant, runs OIDC
+   discovery to fetch the `authorization_endpoint`, and generates a PKCE
+   verifier (48-byte CSPRNG, base64url), S256 challenge, nonce, and opaque CSRF
+   state (32-byte CSPRNG, base64url).
+3. Server stores `(state → verifier, nonce, issuer, redirect_uri)` in Postgres
+   with a 300 s TTL and returns a `302` redirect (or JSON `authorization_url`
+   for API callers).
+4. Browser visits the IdP authorization URL with `response_type=code`,
+   `client_id`, `redirect_uri`, `scope=openid profile email`,
+   `code_challenge` (S256), `state`, and `nonce`.
+5. IdP redirects to `GET /auth/callback?code=…&state=…`.
+6. Server consumes the login-state row exactly once (single-use). Missing or
+   expired state → `400` (`WYRD_AUTH_400_INVALID_STATE`).
+7. Server exchanges the code at the IdP token endpoint, verifies the ID token
+   (JWKS, audience, expiry, nonce), and maps groups → roles.
+8. User identity upserted; server issues **access + refresh** tokens.
+
+## API-key principal flow
+
+Service and Agent principals can authenticate with a long-lived API key. The
+key is shown in plaintext exactly once at issuance and stored only as an Argon2
+hash.
+
+<WyrdSequenceDiagram
+  title="API-key principal"
+  participants={['Client', 'Wyrd server']}
+  messages={[
+    { from: 'Client', to: 'Wyrd server', label: 'POST /auth/issue-key · service_accounts:write' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'mint wyrd_sk_… · store Argon2 hash' },
+    { from: 'Wyrd server', to: 'Client', label: 'plaintext key (shown once)', dashed: true },
+    { from: 'Client', to: 'Wyrd server', label: 'POST /auth/token · wyrd_api_key' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'verify hash · tenant · active · resolve roles' },
+    { from: 'Wyrd server', to: 'Client', label: 'access + refresh', dashed: true }
+  ]}
+/>
+
+1. Admin sends `POST /auth/issue-key` (requires `service_accounts:write`). The
+   server mints a `wyrd_sk_<tenant>_<secret>` key, stores the Argon2 hash, and
+   returns the plaintext once.
+2. Caller sends `POST /auth/token` with `grant_type: wyrd_api_key` and the
+   raw key.
+3. Server parses the tenant prefix, verifies the Argon2 hash, checks the
+   principal is active and scoped to the request tenant, resolves roles.
+4. Server issues **access + refresh** tokens.
+
+## Workload jwt-bearer flow
+
+Machine workloads exchange a platform-issued JWT for a Wyrd token: Kubernetes
+service accounts, SPIFFE/SVID JWTs, GCP Workload Identity. The binding from
+`(issuer, subject, audience)` to a `CardRef` is stored on the server; the token
+carries only the assertion.
+
+<WyrdSequenceDiagram
+  title="Workload jwt-bearer"
+  participants={['Workload', 'Wyrd server', 'Issuer JWKS']}
+  messages={[
+    { from: 'Workload', to: 'Wyrd server', label: 'POST /auth/token · jwt-bearer · assertion' },
+    { from: 'Wyrd server', to: 'Issuer JWKS', label: 'fetch signing keys' },
+    { from: 'Issuer JWKS', to: 'Wyrd server', label: 'JWKS (cached · auto-rotation)', dashed: true },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'verify assertion · principal_kind=Workload' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'binding (issuer,sub,aud) → CardRef · load principal' },
+    { from: 'Wyrd server', to: 'Workload', label: 'access only · no refresh', dashed: true }
+  ]}
+/>
+
+1. Workload obtains a signed JWT from its platform (e.g. Kubernetes projected
+   volume, GCP metadata server).
+2. Workload sends `POST /auth/token` with `grant_type: urn:ietf:params:oauth:grant-type:jwt-bearer`
+   and the assertion.
+3. Server verifies the assertion against the trusted issuer's JWKS (with
+   caching and automatic key-rotation recovery).
+4. Server checks `principal_kind = Workload` on the matched issuer. Human
+   issuers are rejected.
+5. Server resolves the workload binding: `(issuer, subject, audience) → CardRef`.
+   This lookup is server-owned; the token never names its own card.
+6. Server loads the Service/Agent principal for that `CardRef` and its roles.
+7. Server issues access only, with no refresh token.
+
+## Token refresh
+
+Refresh tokens are single-use and rotated on each use. Send
+`grant_type: refresh_token` to `POST /auth/token` with the current refresh
+token. The server issues a new access + refresh pair and invalidates the
+presented token.
+
+<Aside title="Limitations">
+
+`PrivateKeyJwt` client authentication to the IdP token endpoint is not yet
+implemented. The callback flow uses `client_secret` (basic or post) or PKCE
+only. `PrivateKeyJwt` support is planned.
+
+Workload grants do not issue refresh tokens. That is intentional: workloads
+re-assert via their platform credential.
+
+</Aside>
+
+## Related
+
+- [Authorization](/concepts/authorization/): how roles and permissions are
+  resolved from a token.
+- [Cloud identity](/concepts/cloud-identity/): setting up trusted issuers and
+  workload bindings.

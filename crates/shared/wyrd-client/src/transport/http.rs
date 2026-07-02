@@ -143,7 +143,11 @@ impl HttpTransport {
             .await?;
 
         let bytes = resp.bytes().await.map_err(body_read_err)?;
-        serde_json::from_slice(&bytes).map_err(|err| WyrdError::Internal {
+        // A `2xx` with an empty body (e.g. `204 No Content` from an admin
+        // DELETE) decodes as JSON `null`, so callers can request `D = ()` or
+        // `D = serde_json::Value` for no-content routes without a second helper.
+        let bytes: &[u8] = if bytes.is_empty() { b"null" } else { &bytes };
+        serde_json::from_slice(bytes).map_err(|err| WyrdError::Internal {
             message: format!("response deserialization failed: {err}"),
             details: serde_json::json!({}),
         })

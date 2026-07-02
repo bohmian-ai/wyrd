@@ -98,6 +98,25 @@ impl PgFixture {
         self.data_tenant_id
     }
 
+    /// Seed an additional active tenant row and return its isolation key.
+    ///
+    /// **Test-only fixture — never runs on a real server boot.** This method is
+    /// only available behind the `pg` feature, which is a dev-dependency of
+    /// `wyrd-server` and is never compiled into a production binary.
+    ///
+    /// The fixture seeds one tenant at boot; multi-tenant isolation tests call
+    /// this to provision a second tenant so two distinct [`TenantConn`] handles
+    /// can prove RLS scoping. The row is written through the
+    /// `wyrd_platform_admin` pool, matching the boot seed path.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the tenant insert fails.
+    pub async fn seed_additional_tenant(&self, slug: &str) -> Result<DataTenantId, SqlError> {
+        let data_tenant_id = DataTenantId::new_v7();
+        seed_tenant(&self.platform_admin_pool, data_tenant_id, slug).await?;
+        Ok(data_tenant_id)
+    }
+
     /// Return the fixture's seeded tenant slug.
     #[must_use]
     pub fn tenant_slug(&self) -> &str {

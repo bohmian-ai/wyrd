@@ -33,9 +33,13 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 
 - [Concepts](https://mitari-ai.github.io/wyrd/concepts/): The Card/Spec/Run/Observation ontology — the four nouns everything else builds on.
 - [Architecture](https://mitari-ai.github.io/wyrd/concepts/architecture/): The three products Wyrd ships from one source tree — control plane, runtime, and data plane — over one shared spec crate.
+- [Authentication](https://mitari-ai.github.io/wyrd/concepts/authentication/): How Wyrd tokens work and how humans, API-key principals, and machine workloads each obtain one.
+- [Authorization](https://mitari-ai.github.io/wyrd/concepts/authorization/): How Wyrd resolves permissions from token role claims, and how the PolicyHook authz extension gates the POST /v1/authz/check endpoint. Covers the request contract, hook context, and how to implement, register, and mesh-integrate a hook.
 - [Card](https://mitari-ai.github.io/wyrd/concepts/card/): The typed, versioned envelope for one AI system component — its outer shape, lifecycle, and identity rules.
 - [Card kinds](https://mitari-ai.github.io/wyrd/concepts/card-kinds/): The 16 native card kinds plus External, grouped by domain, with what each declares and its shipping status.
+- [Cloud identity](https://mitari-ai.github.io/wyrd/concepts/cloud-identity/): Trusted OIDC issuers and workload bindings, with setup, admin CRUD, TOML seeding, and the sealing key.
 - [Doctrine](https://mitari-ai.github.io/wyrd/concepts/doctrine/): The design doctrine behind Wyrd's nouns, layers, services, and public surfaces.
+- [Identity and auth](https://mitari-ai.github.io/wyrd/concepts/identity-and-auth/): End-to-end map of how Wyrd scopes identity across tenants, users, services, agents, and workloads, and how the server verifies every request.
 
 ## Cards
 

@@ -294,8 +294,19 @@ A change is not done until:
   not.
 - Public contracts regenerate cleanly when touched.
 - No legacy names, routes, package names, or compatibility aliases were added.
-- Relevant `mise` or targeted cargo checks have been run, or the blocker is
-  reported clearly.
+- **`mise run pre-pr` passes green.** This is the final gate and it is
+  non-negotiable — a feature is not complete until it is green.
+  - It does not matter if the gate was already red on the base branch.
+    Inheriting a red gate does not excuse shipping red; make it green.
+  - Do not declare a gate "environment-blocked" without proof the environment
+    genuinely cannot run it. `pre-pr` needs only Docker plus the local toolchain,
+    and `PgFixture`/embedded-Postgres tests need neither an external database nor
+    Docker. Run it before claiming it cannot be run.
+  - Do not circumvent the gate to make it pass: never weaken or disable a check,
+    add `#[allow]`, delete or `#[ignore]` a failing test, or broaden a boundary
+    glob to hide a real violation. Fix the underlying cause. Only use a check's
+    own sanctioned mechanism (e.g. the documented per-file allowlist) when the
+    usage is legitimately test-only and matches an existing in-pattern precedent.
 
 ## 13. Git Identity Rules
 

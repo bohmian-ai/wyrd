@@ -43,8 +43,11 @@ pub fn build_router(state: AppState) -> Router {
     let auth_routes = crate::auth::routes::router().layer(GovernorLayer::new(auth_governor));
 
     let v1_group = crate::routes::authz::routes::mount(
-        crate::bifrost::routes::mount(
-            crate::storage::routes::mount(Router::new(), &state),
+        crate::query::routes::mount(
+            crate::bifrost::routes::mount(
+                crate::storage::routes::mount(Router::new(), &state),
+                &state,
+            ),
             &state,
         ),
         &state,

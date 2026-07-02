@@ -90,6 +90,14 @@ pub(crate) async fn test_catalog() -> Arc<WyrdCatalog> {
     shared().catalog.clone()
 }
 
+/// Return the fixture's `wyrd_app` pool for tests that must persist rows under
+/// RLS. Its connections take reactor affinity from the process-wide persistent
+/// runtime that initialized the fixture, so DB-acquiring tests must run on that
+/// runtime via `wyrd_runtime::runtime().block_on(..)`.
+pub(crate) async fn test_pool() -> sqlx::PgPool {
+    shared().fixture.app_pool().clone()
+}
+
 /// Return the fixture's seeded data tenant.
 ///
 /// `vala.bifrost_tables.data_tenant_id` carries a FK to `platform.tenants`, and

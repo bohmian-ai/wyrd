@@ -18,6 +18,7 @@ path = "src/main.rs"
 arc-swap = { workspace = true }
 arrow = { workspace = true }
 async-trait = { workspace = true }
+datafusion = { workspace = true }
 clap = { workspace = true }
 ipnetwork = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["server"] }

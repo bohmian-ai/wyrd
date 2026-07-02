@@ -11,6 +11,7 @@ pub mod grpc;
 pub mod health;
 pub mod issuer_boot;
 pub mod middleware;
+pub mod query;
 pub mod router;
 pub mod routes;
 pub mod serve;

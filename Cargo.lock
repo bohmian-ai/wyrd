@@ -10764,6 +10764,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "datafusion",
  "http-body-util",
  "insta",
  "ipnetwork",

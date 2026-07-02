@@ -10699,6 +10699,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-queue"
+version = "0.0.1"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "async-trait",
+ "crossbeam-queue",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wyrd-runtime",
+ "wyrd-spec",
+]
+
+[[package]]
 name = "wyrd-runtime"
 version = "0.0.1"
 dependencies = [

@@ -11,8 +11,8 @@ use wyrd_tonic::tonic_health::server::health_reporter;
 use wyrd_server::boot::production_guards;
 use wyrd_server::bootstrap::bootstrap_admin_key;
 use wyrd_server::grpc::{
-    GrpcError, GrpcRouterConfig, NoopInterceptor, build_grpc_router, drive_health_status,
-    publish_initial_health, serve_grpc,
+    GrpcError, GrpcRouterConfig, build_app_grpc, drive_health_status, publish_initial_health,
+    serve_grpc,
 };
 use wyrd_server::health::readiness_loop;
 use wyrd_server::shutdown::{await_drain, signal_watcher};
@@ -141,12 +141,12 @@ async fn run() -> Result<(), BootExit> {
 
     let http_router = build_router(state.clone());
 
-    // NoopInterceptor is the structural seat for the real auth interceptor.
-    // Threading it through build_grpc_router forces every future service to
-    // pass through an interceptor instance.
-    let grpc_router = build_grpc_router(
+    // build_app_grpc mounts health (unauthenticated) plus the C1 ingest service
+    // with auth completed in the handler. It hard-errors when no token verifier
+    // is configured, so ingest is never exposed unauthenticated.
+    let grpc_router = build_app_grpc(
+        &state,
         health_service,
-        NoopInterceptor,
         GrpcRouterConfig {
             reflection_enabled: config.grpc.reflection_enabled,
         },

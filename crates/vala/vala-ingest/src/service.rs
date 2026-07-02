@@ -1,42 +1,51 @@
 //! The `wyrd.v1.BifrostIngestService` gRPC server implementation.
 //!
 //! This crate owns no listener and binds no socket — S3.C2 mounts the service on
-//! the shared tonic listener, wrapping it in the auth interceptor. Here we only
-//! implement the generated trait: read the resolved [`AuthContext`] from the
-//! request extensions (the interceptor populated them), take a per-tenant stream
-//! slot, and drive the orchestrator.
+//! the shared tonic listener. Because tonic's sync `Interceptor` cannot run the
+//! async token verification, auth completes **in the handler**: `insert_batch`
+//! awaits `self.auth.authenticate(request.metadata())` as its first step, then
+//! takes a per-tenant stream slot and drives the orchestrator.
 
 use std::sync::Arc;
 
 use vala_bifrost::WyrdCatalog;
+use wyrd_auth_verify::PermissionResolver;
 use wyrd_tonic::tonic::{Request, Response, Status, Streaming};
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
     BifrostIngestService, BifrostIngestServiceServer,
 };
 use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse};
 
-use crate::auth::{AuthContext, WYRD_REQUEST_ID_METADATA};
-use crate::error::IngestError;
+use crate::auth::{IngestAuthInterceptor, WYRD_REQUEST_ID_METADATA};
 use crate::limits::{IngestLimits, StreamSemaphores};
 use crate::orchestrator::run_ingest;
 
 /// gRPC ingest service over `vala-bifrost`'s writer.
-pub struct BifrostIngestGrpc {
+///
+/// Generic over the resolver-backed verifier `R` (static dispatch, no
+/// `Box<dyn>`) so the same auth seam the HTTP extractor uses is threaded in at
+/// mount time.
+pub struct BifrostIngestGrpc<R: PermissionResolver + 'static> {
     catalog: Arc<WyrdCatalog>,
     limits: IngestLimits,
     semaphores: Arc<StreamSemaphores>,
+    auth: IngestAuthInterceptor<R>,
 }
 
-impl BifrostIngestGrpc {
+impl<R: PermissionResolver + 'static> BifrostIngestGrpc<R> {
     /// Construct from the engine catalog with default [`IngestLimits`].
     #[must_use]
-    pub fn new(catalog: Arc<WyrdCatalog>) -> Self {
-        Self::with_limits(catalog, IngestLimits::default())
+    pub fn new(catalog: Arc<WyrdCatalog>, auth: IngestAuthInterceptor<R>) -> Self {
+        Self::with_limits(catalog, auth, IngestLimits::default())
     }
 
     /// Construct with explicit limits.
     #[must_use]
-    pub fn with_limits(catalog: Arc<WyrdCatalog>, limits: IngestLimits) -> Self {
+    pub fn with_limits(
+        catalog: Arc<WyrdCatalog>,
+        auth: IngestAuthInterceptor<R>,
+        limits: IngestLimits,
+    ) -> Self {
         let semaphores = Arc::new(StreamSemaphores::new(
             limits.max_concurrent_streams_per_tenant,
         ));
@@ -44,6 +53,7 @@ impl BifrostIngestGrpc {
             catalog,
             limits,
             semaphores,
+            auth,
         }
     }
 
@@ -57,18 +67,16 @@ impl BifrostIngestGrpc {
 }
 
 #[wyrd_tonic::tonic::async_trait]
-impl BifrostIngestService for BifrostIngestGrpc {
+impl<R: PermissionResolver + 'static> BifrostIngestService for BifrostIngestGrpc<R> {
     async fn insert_batch(
         &self,
         request: Request<Streaming<InsertBatchRequest>>,
     ) -> Result<Response<InsertBatchResponse>, Status> {
-        let auth = request
-            .extensions()
-            .get::<AuthContext>()
-            .cloned()
-            .ok_or_else(|| {
-                IngestError::Unauthenticated("request carries no auth context".to_owned())
-            })?;
+        let auth = self
+            .auth
+            .authenticate(request.metadata())
+            .await
+            .map_err(Status::from)?;
 
         // Hold a per-tenant stream slot for the whole commit; dropped on return.
         let _permit = self.semaphores.acquire(auth.tenant)?;

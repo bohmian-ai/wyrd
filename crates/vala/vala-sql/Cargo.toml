@@ -19,6 +19,8 @@ testing = ["wyrd-sql/testing"]
 [dependencies]
 sqlx = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+wyrd-spec = { workspace = true }
 wyrd-sql = { path = "../../wyrd/wyrd-sql", version = "0.0.1" }
 
 [dev-dependencies]
@@ -26,5 +28,3 @@ wyrd-sql = { path = "../../wyrd/wyrd-sql", version = "0.0.1" }
 # (cfg(test) does not apply to the lib when building integration test binaries).
 vala-sql = { path = ".", features = ["testing"] }
 wyrd-sql = { workspace = true, features = ["testing"] }
-wyrd-spec = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }

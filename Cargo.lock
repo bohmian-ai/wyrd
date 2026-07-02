@@ -9746,29 +9746,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vala-http"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "axum 0.8.9",
- "chrono",
- "dashmap 6.2.1",
- "hyper 1.10.1",
- "serde",
- "serde_json",
- "subtle",
- "thiserror 2.0.18",
- "tokio",
- "tower 0.5.3",
- "tracing",
- "vala-eval",
- "wyrd-error-derive",
- "wyrd-observe",
- "wyrd-semver",
- "wyrd-spec",
-]
-
-[[package]]
 name = "vala-sql"
 version = "0.0.1"
 dependencies = [
@@ -10522,7 +10499,6 @@ dependencies = [
  "url",
  "uuid",
  "vala-eval",
- "vala-http",
  "wiremock",
  "wyrd-error-derive",
  "wyrd-semver",

@@ -15,7 +15,7 @@
 //!   language-binding feature on this crate.
 //! - The engine never touches IO directly. `TraceSource::fetch` is the only
 //!   async boundary; the in-memory impl ships here, the server-backed impl
-//!   lands in `vala-http`.
+//!   lands in `wyrd-server`.
 //!
 //! ## Public surface
 //!

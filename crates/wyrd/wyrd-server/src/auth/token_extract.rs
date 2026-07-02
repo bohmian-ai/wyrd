@@ -73,6 +73,18 @@ pub(crate) fn auth_not_configured() -> WyrdErrorResponse {
     })
 }
 
+/// Run the full Wyrd bearer-token verification sequence and return an authenticated principal.
+///
+/// Performs five steps in order: (1) extract the bearer token from `X-Wyrd-Access-Token`,
+/// (2) decode the unverified claims to derive the expected tenant, (3) require a configured
+/// verifier — returning `503 WYRD_AUTH_503_VERIFY_UNAVAILABLE` with `retry_after_seconds: 1`
+/// if none is set, (4) cryptographically verify the token against the tenant, and (5) build
+/// the [`AuthenticatedPrincipal`](super::AuthenticatedPrincipal) from the verified claims.
+///
+/// This is the single verify pipeline shared by `require_authenticated` (the `/v1` default-deny
+/// middleware) and `AuthenticatedPrincipal::from_request_parts` (the extractor fallback for
+/// off-nest routes such as `/auth/issue-key`). Both call sites produce identical
+/// `400`/`401`/`503` error responses because they share this function.
 pub(crate) async fn verify_authenticated_principal(
     verifier: Option<Arc<crate::state::WyrdTokenVerifier>>,
     headers: &HeaderMap,

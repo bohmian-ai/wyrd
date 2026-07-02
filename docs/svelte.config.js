@@ -115,7 +115,9 @@ const AUTHORING_COMPONENTS = [
   'Toc',
   'Tabs',
   'Tab',
-  'Steps'
+  'Steps',
+  'WyrdFlowDiagram',
+  'WyrdSequenceDiagram'
 ];
 
 // Svelte preprocessor that runs AFTER mdsvex. mdsvex 0.12.7's layout-module

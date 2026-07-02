@@ -1,23 +1,23 @@
 ---
 title: Cloud identity
-description: Trusted OIDC issuers and workload bindings — setup, admin CRUD, TOML seeding, and the sealing key.
+description: Trusted OIDC issuers and workload bindings, with setup, admin CRUD, TOML seeding, and the sealing key.
 pillar: wyrd
 group: Concepts
-order: 8
+order: 10
 ---
 
 # Cloud identity
 
-Cloud identity lets machine workloads — Kubernetes service accounts, SPIFFE
-JWTs, GCP Workload Identity, GitHub Actions — authenticate to Wyrd without a
-stored secret. The server holds two kinds of data:
+Cloud identity lets machine workloads authenticate to Wyrd without a stored
+secret: Kubernetes service accounts, SPIFFE JWTs, GCP Workload Identity, GitHub
+Actions. The server holds two kinds of data:
 
-- **Trusted issuers** — OIDC issuers whose JWTs Wyrd will verify. Each issuer
+- **Trusted issuers** are OIDC issuers whose JWTs Wyrd will verify. Each issuer
   is scoped to one tenant and carries a `principal_kind` of `Workload` (for
   machines) or `Human` (for human OIDC login).
-- **Workload bindings** — server-owned mappings from
-  `(issuer, subject, audience) → CardRef`. The binding tells Wyrd which
-  Service or Agent principal a given workload assertion represents.
+- **Workload bindings** are server-owned mappings from
+  `(issuer, subject, audience) → CardRef`. The binding tells Wyrd which Service or
+  Agent principal a given workload assertion represents.
 
 ## Admin CRUD
 
@@ -49,10 +49,11 @@ and do not replace entries created via the API.
 
 ```toml
 [[trusted_issuers]]
-issuer    = "https://token.actions.githubusercontent.com"
-client_id = "wyrd-staging"
-audience  = "wyrd-staging"
-principal_kind = "workload"
+issuer            = "https://token.actions.githubusercontent.com"
+client_id         = "wyrd-staging"
+expected_audience = "wyrd-staging"
+client_auth       = "public"
+principal_kind    = "workload"
 
 [trusted_issuers.claim_mapping]
 subject = "sub"
@@ -61,7 +62,10 @@ subject = "sub"
 issuer   = "https://token.actions.githubusercontent.com"
 subject  = "repo:acme/deploy:ref:refs/heads/main"
 audience = "wyrd-staging"
-card_ref = { kind = "service", name = "deploy-svc", version = "1.0.0", space = "prod" }
+kind     = "service"
+name     = "deploy-svc"
+version  = "1.0.0"
+space    = "prod"
 ```
 
 Issuer fields:
@@ -74,14 +78,16 @@ Issuer fields:
   ]}
   rows={[
     ['issuer', 'Yes', 'OIDC issuer URL. Must match the iss claim in tokens.'],
-    ['client_id', 'Yes', 'OAuth2 client id used when calling the IdP token endpoint.'],
-    ['audience', 'Yes', 'Expected aud claim in tokens from this issuer.'],
-    ['principal_kind', 'Yes', '"workload" or "human".'],
-    ['claim_mapping.subject', 'Yes', 'JWT claim path for the subject identity (typically "sub").'],
-    ['claim_mapping.email', 'No', 'JWT claim path for email (human issuers only).'],
-    ['claim_mapping.groups', 'No', 'JWT claim path for group membership (human issuers only).'],
-    ['client_secret', 'No', 'Client secret for the IdP token endpoint. Encrypted at rest with the sealing key.'],
-    ['group_role_map', 'No', 'Map from group name to list of Wyrd role names (human issuers only).']
+    ['client_id', 'Yes', 'Wyrd\'s OAuth2 client id at this IdP.'],
+    ['expected_audience', 'Yes', 'Expected aud claim in tokens from this issuer.'],
+    ['client_auth', 'Yes', 'How Wyrd authenticates to the IdP token endpoint: "public" (PKCE, no secret), "private_key_jwt", or a secret variant { secret_basic = "…" } / { secret_post = "…" }. Secret variants are encrypted at rest with the sealing key.'],
+    ['principal_kind', 'No', '"workload" or "human". Defaults to "human".'],
+    ['claim_mapping.subject', 'No', 'JWT claim path for the subject identity. Defaults to "sub".'],
+    ['claim_mapping.email', 'No', 'JWT claim path for email. Meaningful for human issuers.'],
+    ['claim_mapping.groups', 'No', 'JWT claim path for group membership. Meaningful for human issuers.'],
+    ['group_role_map', 'No', 'Map from IdP group name to a list of Wyrd role names. Meaningful for human issuers.'],
+    ['default_roles', 'No', 'Baseline Wyrd role names granted to every federated user from this issuer.'],
+    ['jwks_ttl_secs', 'No', 'JWKS cache TTL in seconds. Omit to use the boot default.']
   ]}
 />
 
@@ -92,9 +98,9 @@ stores a plaintext client secret in a column.
 
 Set one of these environment variables before boot:
 
-- `WYRD_SEALING_KEY_FILE` — path to a file containing a base64-encoded 32-byte
-  key (primary, recommended for Kubernetes secret mounts).
-- `WYRD_SEALING_KEY_BASE64` — inline base64-encoded 32-byte key (fallback).
+- `WYRD_SEALING_KEY_FILE`: path to a file containing a base64-encoded 32-byte key
+  (primary, recommended for Kubernetes secret mounts).
+- `WYRD_SEALING_KEY_BASE64`: inline base64-encoded 32-byte key (fallback).
 
 Generate a key:
 
@@ -102,10 +108,11 @@ Generate a key:
 openssl rand -base64 32
 ```
 
-The server fails closed: if any seeded issuer carries a `client_secret` and no
-sealing key is configured, boot aborts with `ServerBootError::SealingKey`.
-Issuers that use `PrivateKeyJwt` client authentication (no secret) do not
-require the sealing key.
+The server fails closed: if any seeded issuer carries a secret `client_auth`
+(`secret_basic` or `secret_post`) and no sealing key is configured, boot aborts
+with `ServerBootError::IssuerSeal`. Issuers that use `public` (PKCE) or
+`private_key_jwt` client authentication carry no secret and do not require the
+sealing key.
 
 <Aside title="Single-key limitation" type="caution">
 
@@ -130,6 +137,18 @@ binding are tracked in [issue #72](https://github.com/mitari-ai/wyrd/issues/72).
 
 To authenticate a Kubernetes service account to Wyrd:
 
+<WyrdSequenceDiagram
+  title="Workload token exchange"
+  participants={['Pod', 'Wyrd server', 'Postgres']}
+  messages={[
+    { from: 'Pod', to: 'Wyrd server', label: 'POST /auth/token · jwt-bearer · projected SA token' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'verify assertion vs trusted issuer JWKS' },
+    { from: 'Wyrd server', to: 'Postgres', label: 'lookup binding (issuer,sub,aud)' },
+    { from: 'Postgres', to: 'Wyrd server', label: 'CardRef → Service/Agent + roles', dashed: true },
+    { from: 'Wyrd server', to: 'Pod', label: 'access token · no pod secret', dashed: true }
+  ]}
+/>
+
 1. Register the cluster's OIDC issuer as a trusted issuer
    (`principal_kind = "workload"`, `audience = <your-audience>`).
 2. Create a workload binding: map the service account's `sub` claim
@@ -144,12 +163,14 @@ To authenticate a Kubernetes service account to Wyrd:
    roles, and returns an access token. No secret is stored in the pod.
 
 The same pattern works for GCP Workload Identity, GitHub Actions OIDC, and any
-platform that issues OIDC JWTs — register the platform's issuer URL and bind
-its subject claims to Wyrd card refs.
+platform that issues OIDC JWTs. Register the platform's issuer URL and bind its
+subject claims to Wyrd card refs.
 
 ## Related
 
-- [Authentication](/concepts/authentication/) — the full workload jwt-bearer
-  token exchange flow.
-- [Authorization](/concepts/authorization/) — how roles resolve from the token
+- [Identity and auth](/concepts/identity-and-auth/): the end-to-end identity and
+  request-verification map.
+- [Authentication](/concepts/authentication/): the full workload jwt-bearer token
+  exchange flow.
+- [Authorization](/concepts/authorization/): how roles resolve from the token
   after authentication.

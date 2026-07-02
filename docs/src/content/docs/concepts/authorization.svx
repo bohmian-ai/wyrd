@@ -1,16 +1,20 @@
 ---
 title: Authorization
-description: How Wyrd resolves permissions from token role claims and how the PolicyHook authz extension gates the /v1/authz/check endpoint.
+description: How Wyrd resolves permissions from token role claims, and how the PolicyHook authz extension gates the POST /v1/authz/check endpoint. Covers the request contract, hook context, and how to implement, register, and mesh-integrate a hook.
 pillar: wyrd
 group: Concepts
-order: 7
+order: 8
 ---
 
 # Authorization
 
 Wyrd has two authorization layers: RBAC resolves what a principal's roles
 permit, and the `PolicyHook` extension gates the `/v1/authz/check` endpoint for
-agent delegation. Both layers run on every authz-check request, in that order.
+agent delegation. On an authz-check request both run, in that order.
+
+For how a caller obtains a token in the first place, see
+[Authentication](/concepts/authentication/); for the whole identity picture, see
+[Identity and auth](/concepts/identity-and-auth/).
 
 ## RBAC
 
@@ -22,26 +26,25 @@ The resolution path:
 1. Token carries a list of role names in its claims.
 2. On verify, `SqlPermissionResolver.roles_by_name` fetches the permission sets
    for those role names from the tenant's role table.
-3. `effective_permissions` merges the sets. Wildcard (`resource:*`) and
-   `AnyOf` subsumption are applied — a role with `cards:*` subsumes `cards:read`,
-   `cards:write`, etc.
+3. `effective_permissions` merges the sets, applying wildcard (`resource:*`) and
+   `AnyOf` subsumption. A role with `cards:*` subsumes `cards:read`, `cards:write`,
+   and every other `cards` action.
 
 <DataTable
   columns={[
     { header: 'Built-in role', role: 'name' },
-    { header: 'Key permissions' }
+    { header: 'Permissions' }
   ]}
   rows={[
     ['admin', 'All resources and actions (*)'],
-    ['writer', 'cards:write, cards:read, service_accounts:write'],
-    ['reader', 'cards:read'],
-    ['agent', 'cards:read, observations:write, evals:write'],
+    ['writer', 'cards:read, cards:write, artifacts:read, artifacts:write, operators:invoke, evals:run, triggers:write'],
+    ['reader', 'cards:read, artifacts:read, audit:read'],
+    ['agent', 'cards:read, cards:write, artifacts:read, artifacts:write, operators:invoke, evals:run'],
     ['runtime_admin', 'service_accounts:write, delegation:issue']
   ]}
 />
 
-Built-in roles are seeded per tenant at tenant creation. Custom roles can be
-added via the admin API.
+Built-in roles are seeded per tenant at tenant creation.
 
 ## Two "kind" concepts
 
@@ -54,8 +57,8 @@ Two distinct "kind" fields appear in auth that are easy to confuse:
     { header: 'What it means' }
   ]}
   rows={[
-    ['PrincipalKind', 'User | Service { card_ref } | Agent { card_ref }', 'The identity of the token holder — who is acting.'],
-    ['PrincipalKindPolicy', 'Human | Workload', 'Per-issuer config — whether an OIDC issuer is for human login or machine workloads.']
+    ['PrincipalKind', 'User | Service { card_ref } | Agent { card_ref }', 'The identity of the token holder: who is acting.'],
+    ['PrincipalKindPolicy', 'Human | Workload', 'Per-issuer config: whether an OIDC issuer is for human login or machine workloads.']
   ]}
 />
 
@@ -63,40 +66,303 @@ Two distinct "kind" fields appear in auth that are easy to confuse:
 `PrincipalKindPolicy` is checked once during token issuance to ensure a
 workload assertion is not used for human login and vice versa.
 
-## Authz extension (PolicyHook)
+## Delegation
 
-The `PolicyHook` trait is the policy-plane seam. It lets an operator or
-embedding application plug in custom policy evaluation before Wyrd's built-in
-RBAC runs.
+Agent-to-agent calls run under a **delegated token**: an access token one
+principal mints on behalf of another Service or Agent. The caller exchanges its
+own token via the `token-exchange` grant on `POST /auth/token` and must hold the
+`delegation:issue` permission. The minted token carries an `act` chain, the
+ordered record of who delegated to whom, and no refresh token. Delegation depth is
+capped at 5.
 
-`POST /v1/authz/check` is the endpoint. Only **delegated** tokens reach it —
-tokens issued via `token-exchange` that carry a non-empty `act` (delegation)
-chain. Direct Service or User tokens are rejected with a `403`.
+<WyrdSequenceDiagram
+  title="Delegation (token-exchange)"
+  participants={['Caller', 'Wyrd server']}
+  messages={[
+    { from: 'Caller', to: 'Wyrd server', label: 'POST /auth/token · token-exchange · requested_subject' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'verify caller · require delegation:issue' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'resolve requested Service/Agent (server-owned)' },
+    { from: 'Wyrd server', to: 'Caller', label: 'delegated token · act chain · depth ≤ 5 · no refresh', dashed: true }
+  ]}
+/>
 
-The evaluation order:
+Delegation is a preview grant: it is enabled by `WYRD_AUTH_ALLOW_PREVIEW` and is
+rejected under a production profile until preview auth is cleared. Delegated
+tokens are the only tokens `/v1/authz/check` accepts.
 
-1. Server verifies the token and checks it is a delegated Service or Agent
-   token.
-2. Server builds an `AuthzCheckContext` from the verified token, request body,
-   and delegation chain.
-3. **`policy_hook.evaluate()`** runs first. The hook returns `Allow`,
-   `Deny(reason)`, or `Abstain` (pass to next layer).
-4. If the hook allows (or abstains), RBAC `permission_check` runs second,
-   checking the token's `effective_permissions` against the requested
-   `resource:action`.
-5. Both layers must pass. A `Deny` at either layer returns `403`.
+## Authz extension (authz/check)
 
-<Aside title="Production requirement">
+`POST /v1/authz/check` is Wyrd's external authorization endpoint. A caller, or a
+service mesh acting for it, asks one question: *may this delegated principal
+perform this action on this target?* Wyrd answers by running **your** policy code
+(`PolicyHook`) and then its built-in RBAC. This is the seam that lets a team run
+its own policy engine (OPA, Cedar, a hand-written rule set) inside Wyrd's
+identity and delegation model without forking the server.
 
-`StubAllowPolicyHook` is the default implementation — it allows everything.
-Wyrd refuses to boot in production with the stub in place
-(`StubAllowInProduction` error). You must provide a real `PolicyHook`
-implementation before deploying.
+Two things make it useful. Wyrd has already verified the token, enforced tenant
+isolation, confirmed the call is a **delegated** Service/Agent call, and resolved
+the full delegation chain before your hook runs, so your policy receives typed,
+trustworthy identity rather than a raw JWT to re-parse. And the endpoint speaks a
+fixed JSON contract, so a service mesh can call it as an external authorization
+provider for every inter-service hop.
+
+Only **delegated** tokens reach it: tokens issued via `token-exchange` that
+carry a non-empty `act` chain. `guard_reason` rejects User tokens, direct
+(non-delegated) Service/Agent tokens, and card-less tokens with a `403` before
+any policy runs.
+
+### The two layers
+
+Every authz-check request passes through two gates, in this order. **Both must
+pass.**
+
+1. **`PolicyHook` (your code) runs first.** It returns `Allow` or
+   `Deny { reason }`. A `Deny` short-circuits, and RBAC is not consulted.
+2. **RBAC runs second, only if the hook allowed.** Wyrd checks the callee's
+   `effective_permissions` against the requested `action`.
+
+A hook `Allow` does not bypass RBAC. It means "my policy permits this; now apply
+the principal's role permissions." Use the hook for attribute- and context-based
+rules (this caller, this target, this time, this delegation chain); leave coarse
+`resource:action` grants to RBAC.
+
+<WyrdSequenceDiagram
+  title="authz/check evaluation"
+  participants={['Caller / mesh', 'Wyrd server', 'PolicyHook']}
+  messages={[
+    { from: 'Caller / mesh', to: 'Wyrd server', label: 'POST /v1/authz/check · delegated token · X-Original-*' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'verify · guard delegated · build AuthzCheckContext' },
+    { from: 'Wyrd server', to: 'PolicyHook', label: 'evaluate(ctx)' },
+    { from: 'PolicyHook', to: 'Wyrd server', label: 'Allow / Deny(reason)', dashed: true },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'RBAC permission_check (only if hook allowed)' },
+    { from: 'Wyrd server', to: 'Caller / mesh', label: '200 allow · 200 missing_permission · 403 denied', dashed: true }
+  ]}
+/>
+
+### The request
+
+`POST /v1/authz/check`
+
+Headers:
+
+<DataTable
+  columns={[
+    { header: 'Header', role: 'name' },
+    { header: 'Required' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['X-Wyrd-Access-Token', 'Yes', 'Bearer <access-token>. Must be a delegated Service or Agent token (minted through token-exchange with a non-empty act chain). User tokens, direct Service/Agent tokens, and card-less tokens are rejected with 403 before any policy runs.'],
+    ['Content-Type', 'Yes', 'application/json.'],
+    ['X-Original-Method / -Path / -Host', 'No', 'The original request line, projected by a service mesh. Surfaced to your hook as ctx.metadata. All-or-nothing: if any of the three is missing, ctx.metadata is None, which is not an error.']
+  ]}
+/>
+
+Body:
+
+```json
+{
+  "target": { "kind": "Service", "name": "billing", "version": "1.2.0", "space": "prod" },
+  "action": "card_write",
+  "context": { "amount_cents": 5000 }
+}
+```
+
+<DataTable
+  columns={[
+    { header: 'Field', role: 'name' },
+    { header: 'Type' },
+    { header: 'Required' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['target', 'CardRef', 'Yes', 'The card the action targets: { kind, name, version, space }.'],
+    ['action', 'string', 'Yes', 'The well-known value "card_write", or any valid resource:action permission identifier. Drives the RBAC layer.'],
+    ['context', 'object', 'No', 'Arbitrary JSON, passed verbatim to your hook as ctx.request.context. Defaults to null when omitted. Unknown top-level fields on the body itself are rejected.']
+  ]}
+/>
+
+```bash
+curl -sS -X POST https://wyrd.internal/v1/authz/check \
+  -H 'X-Wyrd-Access-Token: Bearer <delegated-access-token>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "target": {"kind": "Service", "name": "billing", "version": "1.2.0", "space": "prod"},
+        "action": "card_write",
+        "context": {"amount_cents": 5000}
+      }'
+```
+
+### The response
+
+<DataTable
+  columns={[
+    { header: 'Outcome', role: 'name' },
+    { header: 'Status' },
+    { header: 'Body' }
+  ]}
+  rows={[
+    ['Allow', '200', '{ "decision": "allow" }'],
+    ['RBAC miss', '200', '{ "decision": "deny", "reason": "missing_permission", "required": "<permission>" }'],
+    ['Policy deny', '403', 'Wyrd error WYRD_AUTHZ_403_POLICY_DENIED; details.reason is the string your hook returned.'],
+    ['Not a delegated token', '403', 'Wyrd error WYRD_AUTHZ_403_REQUIRES_DELEGATED_TOKEN.'],
+    ['Unknown action', '400', 'Wyrd validation error; action was neither "card_write" nor a valid permission.'],
+    ['Missing / malformed token', '401 / 400', 'Unauthenticated (no header) or BadTokenFormat (not a Bearer credential).']
+  ]}
+/>
+
+The distinction between the two `200` cases matters: **an RBAC miss is a `200`,
+not a `403`.** The token is valid and the request was well-formed; the callee
+simply lacks the permission, so the answer is a normal "deny" decision. Only a
+`PolicyHook` denial, an explicit policy verdict, is a `403`:
+
+```json
+{
+  "code": "WYRD_AUTHZ_403_POLICY_DENIED",
+  "status": 403,
+  "message": "policy denied invoke",
+  "details": { "reason": "cross-space delegated write is not allowed" }
+}
+```
+
+### What your hook receives
+
+Wyrd builds an `AuthzCheckContext` from the verified token and the request body,
+then passes it to `PolicyHook::evaluate`. This is the entire input to your policy;
+there is no callback to fetch more identity.
+
+<DataTable
+  columns={[
+    { header: 'Field', role: 'name' },
+    { header: 'Type' },
+    { header: 'What it carries' }
+  ]}
+  rows={[
+    ['callee', 'Principal', 'The principal the call runs as: id, kind (Service/Agent with its card_ref), tenant_id, roles, and effective_permissions.'],
+    ['caller', 'PrincipalRef', 'The immediate delegator for this hop.'],
+    ['chain', 'Vec<PrincipalRef>', 'The initiator-first delegation chain. The callee is not included.'],
+    ['request', 'AuthzCheckRequest', 'The target, action, and context from the request body.'],
+    ['metadata', 'Option<...>', 'The mesh-projected method / path / host, when the X-Original-* headers were present.'],
+    ['request_id', 'RequestId', 'Correlator for audit records and response headers.']
+  ]}
+/>
+
+### Implementing a PolicyHook
+
+`PolicyHook` lives in the `wyrd-auth-check` crate. It is one async method plus a
+marker that Wyrd uses to refuse the shipped stub in production.
+
+```rust
+#[async_trait]
+pub trait PolicyHook: Send + Sync {
+    async fn evaluate(&self, ctx: &AuthzCheckContext) -> PolicyDecision;
+
+    /// Whether this is the placeholder default (defaults to false).
+    fn is_stub_default(&self) -> bool { false }
+}
+```
+
+`PolicyDecision` is `Allow` or `Deny { reason }`; the reason is surfaced to the
+caller in the `403` body. Implement `evaluate` with your policy logic: call OPA or
+Cedar, evaluate a rule set, or inspect the delegation chain directly. A real hook
+leaves `is_stub_default` at its `false` default; that is what lets it pass the
+production boot check.
+
+```rust
+use async_trait::async_trait;
+use wyrd_auth_check::{AuthzCheckContext, PolicyHook};
+use wyrd_runtime::PrincipalKind;
+use wyrd_spec::card::policy::PolicyDecision;
+
+/// Deny any delegated write whose target lives in a different space than the
+/// callee's own card. Everything else falls through to RBAC.
+#[derive(Debug)]
+struct SameSpacePolicy;
+
+#[async_trait]
+impl PolicyHook for SameSpacePolicy {
+    async fn evaluate(&self, ctx: &AuthzCheckContext) -> PolicyDecision {
+        let callee_space = match &ctx.callee.kind {
+            PrincipalKind::Service { card_ref } | PrincipalKind::Agent { card_ref } => {
+                &card_ref.space
+            }
+            _ => return PolicyDecision::deny("callee is not a service or agent"),
+        };
+
+        if &ctx.request.target.space != callee_space {
+            return PolicyDecision::deny("cross-space delegated write is not allowed");
+        }
+        PolicyDecision::Allow
+    }
+}
+```
+
+### Registering your hook
+
+The hook is a **compile-time Rust seam, not a config file.** You cannot name a
+policy engine in `server.toml` or an environment variable: a trait object can't
+be deserialized. You install it by embedding the `wyrd-server` crate and calling
+`with_policy_hook` on the assembled `AppState` before building the router.
+
+Production also requires a real audit writer. Wyrd persists one audit fact per
+authz-check decision through the `AuthzAuditWriter` trait; the shipped default is
+a no-op.
+
+```rust
+// AppState is assembled during boot (Postgres pools, signing key, issuer
+// resolvers). Install your policy plane before building the router; both
+// installers are required for a production boot.
+let state = state
+    .with_policy_hook(Arc::new(SameSpacePolicy))
+    .with_audit_writer(Arc::new(PgAuthzAuditWriter::new()));
+
+// Fails closed under APP_ENV=staging|production if either is still the shipped
+// stub, if the token verifier is missing, or if preview auth is still enabled.
+state.production_validate()?;
+
+let router = build_router(state);
+```
+
+<Aside title="The stock binary is dev-only for authz/check" type="caution">
+
+The shipped `wyrd-server` binary mounts `StubAllowPolicyHook` (allows
+everything) and `NoopAuthzAuditWriter` (writes nothing). Under a **development**
+profile these defaults let authz/check work locally. Under a **production**
+profile (`APP_ENV=staging` or `production`), `production_validate` rejects both
+stubs and the server **refuses to boot** with `StubPolicyHook` and
+`NoopAuditWriter` errors.
+
+There is no configuration path that swaps in a real hook. To run authz/check in
+production you must embed `wyrd-server` as a library, install your `PolicyHook`
+and `AuthzAuditWriter`, and serve the resulting router. The `with_policy_hook` /
+`with_audit_writer` installers and `production_validate` are the durable
+contract; the surrounding boot helpers may change.
 
 </Aside>
 
+### Service-mesh integration
+
+The optional `X-Original-Method`, `X-Original-Path`, and `X-Original-Host`
+headers exist so a service mesh can call authz/check as an **external
+authorization provider** (the ext_authz pattern). The mesh sidecar intercepts an
+inter-service request, forwards the delegated token and the original request line
+to `/v1/authz/check`, and allows or denies the hop based on the response. Your
+hook sees the projected request line in `ctx.metadata` alongside the identity and
+delegation chain.
+
+Two integration styles hit the same endpoint. In the **direct** style, the calling
+agent asks authz/check itself before making a delegated call: no mesh headers, and
+`ctx.metadata` is `None`. In the **mesh-mediated** style, a sidecar calls
+authz/check per hop with the `X-Original-*` headers projected, so `ctx.metadata`
+carries the original method, path, and host.
+
+Either way the token must be a delegated Service/Agent token, the same token that
+would carry the call itself.
+
 ## Related
 
-- [Authentication](/concepts/authentication/) — how tokens are issued.
-- [Cloud identity](/concepts/cloud-identity/) — trusted issuers and workload
+- [Authentication](/concepts/authentication/): how tokens are issued.
+- [Identity and auth](/concepts/identity-and-auth/): the end-to-end identity and
+  request-verification map.
+- [Cloud identity](/concepts/cloud-identity/): trusted issuers and workload
   bindings that feed into authentication.

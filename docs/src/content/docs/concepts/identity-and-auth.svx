@@ -1,0 +1,172 @@
+---
+title: Identity and auth
+description: End-to-end map of how Wyrd scopes identity across tenants, users, services, agents, and workloads, and how the server verifies every request.
+pillar: wyrd
+group: Concepts
+order: 6
+---
+
+# Identity and auth
+
+Wyrd owns identity and authorization on the server. Every request carries exactly
+one credential: a Wyrd-signed access token in the `X-Wyrd-Access-Token` header.
+The server verifies it, resolves the caller's permissions, and decides what runs.
+There is no session cookie and no ambient identity. A client can hold a token, but
+only the server decides what it means.
+
+This page is the map. The three pages it links to hold the detail:
+
+- [Authentication](/concepts/authentication/): how each caller obtains a token.
+- [Authorization](/concepts/authorization/): how permissions and the policy
+  extension gate an action.
+- [Cloud identity](/concepts/cloud-identity/): trusted issuers and workload
+  bindings for machine identity.
+
+## Terms
+
+<DataTable
+  columns={[
+    { header: 'Term', role: 'name' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['Tenant', 'Isolation boundary. Every principal, token, role, issuer, and binding belongs to exactly one tenant. Postgres row-level security enforces it.'],
+    ['Principal', 'The identity a token acts as. One of three kinds: User, Service, or Agent.'],
+    ['User', 'A human, authenticated through OIDC. Identified by email; no card.'],
+    ['Service', 'A non-human principal bound to a ServiceCard. Authenticates with an API key or a workload assertion.'],
+    ['Agent', 'A non-human principal bound to an AgentCard. Same auth paths as a Service.'],
+    ['Access token', 'Short-lived EdDSA JWT sent on every request. Carries the principal, tenant, and role claims.'],
+    ['Refresh token', 'Single-use, rotated token that mints a new access token. Issued only for human login and API-key exchange.'],
+    ['Delegated token', 'Access token minted on behalf of another Service/Agent, carrying an act chain. No refresh token.'],
+    ['act chain', 'RFC 8693 delegation record embedded in a token: the ordered list of principals that delegated down to the callee.'],
+    ['Trusted issuer', 'An external OIDC issuer whose JWTs Wyrd will verify, scoped to one tenant.'],
+    ['Workload binding', 'Server-owned mapping (issuer, subject, audience) → CardRef that names which Service/Agent a workload assertion represents.'],
+    ['RBAC', 'Role-based access control. A principal\'s roles resolve to an effective permission set of resource:action entries.'],
+    ['PolicyHook', 'Pluggable policy-evaluation seam that gates the /v1/authz/check endpoint before RBAC.']
+  ]}
+/>
+
+## The authenticated request path
+
+Once a caller has an access token, every request follows the same path. The
+server never trusts the token's contents until `TokenVerifier::verify` has
+checked them; the tenant is read from the unverified token only to route to the
+correct tenant verifier, not to grant anything.
+
+<WyrdSequenceDiagram
+  title="Authenticated request verification"
+  participants={['Client', 'Wyrd server', 'Postgres']}
+  messages={[
+    { from: 'Client', to: 'Wyrd server', label: 'X-Wyrd-Access-Token: Bearer <jwt>' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'tenant from unverified token → route' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'verify sig · kid · iss=wyrd · exp · tenant · revocation' },
+    { from: 'Wyrd server', to: 'Postgres', label: 'resolve roles → effective_permissions' },
+    { from: 'Postgres', to: 'Wyrd server', label: 'permissions', dashed: true },
+    { from: 'Wyrd server', to: 'Client', label: 'AuthenticatedPrincipal → handler runs', dashed: true }
+  ]}
+/>
+
+`TokenVerifier::verify` checks five things: the EdDSA signature against the key
+named by the token's `kid`, the `iss=wyrd` claim, expiry (with a configured clock
+skew), the tenant binding, and the principal's revocation epoch. A token issued
+before the principal's `tokens_not_before` is rejected. The verifier then resolves
+the token's role claims to an effective permission set through
+`SqlPermissionResolver`. The handler receives an `AuthenticatedPrincipal` and never
+re-parses the raw token.
+
+## Obtaining a token: `/auth/token` grant dispatch
+
+All machine-facing token issuance goes through one route, `POST /auth/token`,
+which matches on the `TokenRequest` grant and dispatches to the right exchange.
+Human login is the exception: it starts at `GET /auth/login` and finishes with the
+`authorization_code` grant on the same route.
+
+<WyrdFlowDiagram
+  variant="fan"
+  title="/auth/token grant dispatch"
+  steps={[
+    { label: 'POST /auth/token', sub: 'match TokenRequest' },
+    { label: 'wyrd_api_key', sub: 'API key → access + refresh' },
+    { label: 'jwt-bearer', sub: 'workload assertion → access only' },
+    { label: 'authorization_code', sub: 'OIDC callback → access + refresh' },
+    { label: 'refresh_token', sub: 'rotate → access + refresh' },
+    { label: 'token-exchange', sub: 'delegation → access only · preview-gated' }
+  ]}
+/>
+
+Who uses which grant:
+
+- **Humans** log in through OIDC (`authorization_code`) and receive **User**
+  tokens.
+- **Services and Agents** authenticate with an API key (`wyrd_api_key`) or a
+  workload assertion (`jwt-bearer`).
+- **Delegation** (`token-exchange`) lets a caller mint a scoped token for
+  another Service/Agent. It is gated behind preview auth and never issues a
+  refresh token. See [Authorization](/concepts/authorization/#delegation).
+
+The per-grant flows, with diagrams, are on the
+[Authentication](/concepts/authentication/) page.
+
+## Authorization and delegation
+
+Authentication answers *who is calling*. Authorization answers *may they do
+this*. After a token verifies, its role claims resolve to an effective
+permission set, and RBAC checks the requested `resource:action` against it.
+
+Agent-to-agent calls add a second layer. A caller with `delegation:issue` can
+exchange its token for a **delegated** Service/Agent token that carries an `act`
+chain. Only delegated tokens reach `POST /v1/authz/check`, the policy-extension
+endpoint backed by `PolicyHook`. Both layers must pass: the `PolicyHook` first,
+then RBAC. See [Authorization](/concepts/authorization/).
+
+## Development vs production auth
+
+The deployment profile selects hardened or relaxed defaults. `APP_ENV=development`
+selects `DeploymentProfile::Development`; `staging` and `production` both select
+the hardened production profile. An unrecognized value fails boot.
+
+The signing key is the difference that matters most.
+
+In **development**, if no signing key is configured, the server mints an ephemeral
+Ed25519 key at boot so auth works on a fresh local run. Those tokens do not survive
+a restart, and the key must never appear in staging or production.
+
+In **production** (staging or production), boot fails closed without
+`WYRD_SIGNING_KEY_FILE` or `WYRD_SIGNING_KEY_PEM`. It also rejects
+`auth.allow_preview=true` and refuses to boot with the default `StubAllowPolicyHook`
+or the no-op audit writer still mounted.
+
+<DataTable
+  columns={[
+    { header: 'Variable', role: 'name' },
+    { header: 'Effect on auth' }
+  ]}
+  rows={[
+    ['APP_ENV', 'development | staging | production. Selects the deployment profile; staging and production both harden.'],
+    ['WYRD_SIGNING_KEY_FILE', 'Path to the Ed25519 signing-key PEM (preferred; keeps the key out of the process environment). Required in production.'],
+    ['WYRD_SIGNING_KEY_PEM', 'Inline Ed25519 signing-key PEM (fallback). Setting both file and inline is a configuration error.'],
+    ['WYRD_AUTH_ALLOW_PREVIEW', 'Enables preview grants (token-exchange delegation). Rejected in a production profile.'],
+    ['WYRD_SERVER_TENANT_SLUG', 'Implicit tenant slug used to seed trusted issuers/bindings at boot and to resolve the login tenant.'],
+    ['WYRD_SEALING_KEY_FILE', 'AES-256-GCM key file for OIDC client-secret encryption at rest. See Cloud identity.'],
+    ['WYRD_SEALING_KEY_BASE64', 'Inline base64 sealing key (fallback for the file form).']
+  ]}
+/>
+
+<Aside title="Server config vs workspace config">
+
+Server auth runtime config lives in the `wyrd-server` crate (`config.rs`): the
+signing key, sealing key, deployment profile, tenant slug, trusted issuers, and
+workload bindings. The separate `wyrd-config` crate handles workspace `wyrd.toml`
+defaults for cards; it is not the server auth runtime config. Do not look for auth
+settings there.
+
+</Aside>
+
+## Related
+
+- [Authentication](/concepts/authentication/): per-grant token flows.
+- [Authorization](/concepts/authorization/): RBAC, delegation, and the
+  `/v1/authz/check` policy extension, including the request contract, hook context,
+  and how to implement, register, and mesh-integrate a `PolicyHook`.
+- [Cloud identity](/concepts/cloud-identity/): trusted issuers, workload bindings,
+  and the sealing key.

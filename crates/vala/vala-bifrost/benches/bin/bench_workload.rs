@@ -104,6 +104,7 @@ async fn run(args: Args) {
             TableScope::TenantOwned,
             tenant,
             &[],
+            None,
         )
         .await
         .expect("create bench table");

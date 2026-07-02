@@ -12,6 +12,10 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::auth::{PrincipalId, PrincipalKind};
+use crate::reference::CardRef;
+use crate::request_id::RequestId;
+
 /// Bifrost table-identifier newtype.
 ///
 /// The canonical table name as it appears in the Iceberg catalog and on the
@@ -406,4 +410,82 @@ pub struct AsyncQueryStatus {
     /// Sanitized error detail on failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_detail: Option<String>,
+}
+
+// ── Audit event (S3.C5 — transactional audit outbox) ─────────────────────────
+
+/// How the acting principal authenticated for an audited data-plane op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMethod {
+    /// Presented a Wyrd-issued JWT access token.
+    Jwt,
+    /// An internal, non-JWT principal (e.g. a system/relay caller).
+    Internal,
+}
+
+/// The RBAC authorization outcome recorded on an audit row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AuditDecision {
+    /// The operation was authorized.
+    Allow,
+    /// The operation was refused by RBAC.
+    Deny,
+}
+
+/// Whether the audited operation completed successfully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AuditResult {
+    /// The operation succeeded.
+    Success,
+    /// The operation failed.
+    Failure,
+}
+
+/// One audited data-plane operation — the FULL locked M-06 field set.
+///
+/// Every audited op (register/install, sync query, async submit/status, ingest
+/// commit, RBAC deny) appends exactly one hash-chained `AuditEvent` row in the
+/// operation's own Postgres transaction. The hash-chain canonical encoding and
+/// per-tenant `seq` are owned by `vala-sql`; this type is the Arrow-free,
+/// PyO3-free wire/codegen shape.
+///
+/// `card_ref` is the **writer-identity card** (who performed the op), derived
+/// from the resolved `Principal`; it is `None` only for a `User` principal.
+/// This is decoupled from the per-row `card_ref` data column.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct AuditEvent {
+    /// Request correlation ID of the audited op.
+    pub request_id: RequestId,
+    /// Distributed-trace ID, when a trace context is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    /// Logical operation name (e.g. `bifrost.register_table`).
+    pub operation: String,
+    /// Target resource the op acted on (e.g. the fully-qualified table name).
+    pub resource: String,
+    /// Writer-identity card of the acting principal; `None` for a `User`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_ref: Option<CardRef>,
+    /// Stable ID of the acting principal.
+    pub principal_id: PrincipalId,
+    /// Kind of the acting principal (tag encoding; card payload is not the audit
+    /// subject — `card_ref` is its own field).
+    pub principal_kind: PrincipalKind,
+    /// How the principal authenticated.
+    pub auth_method: AuthMethod,
+    /// Effective RBAC permission checked for the op.
+    pub permission: String,
+    /// The authorization decision.
+    pub decision: AuditDecision,
+    /// Whether the op completed successfully.
+    pub result: AuditResult,
+    /// Redacted summary of the operation payload.
+    pub payload_summary: String,
 }

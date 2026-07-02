@@ -19,7 +19,8 @@ use crate::envelope::CardKind;
 use crate::reference::CardRef;
 
 /// Kind of authenticated identity, carrying the bound card for card-backed kinds.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum PrincipalKind {
     /// Human user identity.

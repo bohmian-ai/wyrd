@@ -17,6 +17,7 @@ diagnostics = []
 testing = ["wyrd-sql/testing"]
 
 [dependencies]
+sha2 = { workspace = true }
 sqlx = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }

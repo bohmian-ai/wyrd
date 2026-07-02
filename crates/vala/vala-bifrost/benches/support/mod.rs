@@ -71,7 +71,7 @@ impl BenchFixture {
     ) {
         match self
             .catalog
-            .create_table(ns, name, extra_fields.clone(), scope, self.tenant, &[])
+            .create_table(ns, name, extra_fields.clone(), scope, self.tenant, &[], None)
             .await
         {
             Ok(_) => {}
@@ -81,7 +81,7 @@ impl BenchFixture {
                     .await
                     .expect("drop stale bench table");
                 self.catalog
-                    .create_table(ns, name, extra_fields, scope, self.tenant, &[])
+                    .create_table(ns, name, extra_fields, scope, self.tenant, &[], None)
                     .await
                     .expect("recreate bench table after drop");
             }

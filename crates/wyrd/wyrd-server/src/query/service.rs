@@ -28,11 +28,12 @@ use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::BifrostError as ValaError;
 use wyrd_spec::vala::api::{
-    AsyncJobState, AsyncQueryRequest, AsyncQueryResponse, AsyncQueryStatus, ExecutorAvailability,
-    JobUid, QueryParam, SyncQueryRequest,
+    AsyncJobState, AsyncQueryRequest, AsyncQueryResponse, AsyncQueryStatus, AuditDecision,
+    AuditResult, ExecutorAvailability, JobUid, QueryParam, SyncQueryRequest,
 };
 
 use crate::AppState;
+use crate::audit;
 use crate::auth::Caller;
 use crate::bifrost::convert;
 use crate::query::floor;
@@ -49,11 +50,31 @@ pub struct SyncQueryResult {
     pub row_count: usize,
 }
 
-/// Authorize the caller against a required permission before execution.
-fn authorize(caller: &Caller, required: Permission) -> Result<(), WyrdError> {
+/// Authorize the caller against a required permission, auditing a denial.
+///
+/// On success no row is written here — the handler audits the executed op. On
+/// denial a `decision = deny` row is appended in its own transaction (M-06
+/// doctrine: every allow AND every deny is audited) before the `403` propagates.
+async fn authorize_audited(
+    state: &AppState,
+    caller: &Caller,
+    required: Permission,
+    operation: &str,
+    resource: &str,
+) -> Result<(), WyrdError> {
     if caller.principal.effective_permissions.contains(&required) {
         return Ok(());
     }
+    let event = audit::audit_event(
+        caller,
+        operation,
+        resource,
+        &required.to_string(),
+        AuditDecision::Deny,
+        AuditResult::Failure,
+        "rbac permission denied",
+    );
+    audit::record_audit(&state.pool, caller.data_tenant_id, &event).await?;
     Err(WyrdError::PermissionDeniedRbac {
         message: format!("caller lacks required permission {required}"),
         details: json!({ "required": required }),
@@ -177,7 +198,14 @@ pub async fn run_sync_query(
     caller: Caller,
     body: SyncQueryRequest,
 ) -> Result<SyncQueryResult, WyrdError> {
-    authorize(&caller, Permission::bifrost_query_read())?;
+    authorize_audited(
+        state,
+        &caller,
+        Permission::bifrost_query_read(),
+        "vala.query.sync",
+        "vala.query",
+    )
+    .await?;
     floor::validate_query_sql(&body.sql)?;
 
     let ctx = build_tenant_session(state, &caller, &body.sql).await?;
@@ -204,6 +232,21 @@ pub async fn run_sync_query(
     }
 
     let schema_fingerprint = convert::to_hex(&SchemaFingerprint::from_arrow_schema(&schema).0);
+
+    // Audit the authorized, successful read in its own transaction — committed
+    // BEFORE the Arrow body streams to the client, so a durable record of the
+    // query precedes any result leaving the server.
+    let event = audit::audit_event(
+        &caller,
+        "vala.query.sync",
+        "vala.query",
+        &Permission::bifrost_query_read().to_string(),
+        AuditDecision::Allow,
+        AuditResult::Success,
+        "sync select executed",
+    );
+    audit::record_audit(&state.pool, caller.data_tenant_id, &event).await?;
+
     Ok(SyncQueryResult {
         body: body_bytes,
         schema_fingerprint,
@@ -253,7 +296,14 @@ pub async fn submit_async_query(
     caller: Caller,
     body: AsyncQueryRequest,
 ) -> Result<AsyncQueryResponse, WyrdError> {
-    authorize(&caller, Permission::bifrost_query_read())?;
+    authorize_audited(
+        state,
+        &caller,
+        Permission::bifrost_query_read(),
+        "vala.query.async.submit",
+        "vala.query.async",
+    )
+    .await?;
     floor::validate_query_sql(&body.sql)?;
 
     let sql_normalized = body.sql.trim().to_owned();
@@ -273,6 +323,18 @@ pub async fn submit_async_query(
     )
     .await
     .map_err(storage_error)?;
+    // Append the audit row in the SAME tx as the `olap_query_jobs` write, so the
+    // enqueued job and its audit record commit atomically (fail-closed).
+    let event = audit::audit_event(
+        &caller,
+        "vala.query.async.submit",
+        "vala.query.async",
+        &Permission::bifrost_query_read().to_string(),
+        AuditDecision::Allow,
+        AuditResult::Success,
+        "async query enqueued",
+    );
+    audit::append_on(&mut conn, &event).await?;
     conn.commit().await.map_err(storage_error)?;
 
     Ok(AsyncQueryResponse {
@@ -289,7 +351,14 @@ pub async fn get_async_query_status(
     caller: Caller,
     job_uid: JobUid,
 ) -> Result<AsyncQueryStatus, WyrdError> {
-    authorize(&caller, Permission::bifrost_query_read())?;
+    authorize_audited(
+        state,
+        &caller,
+        Permission::bifrost_query_read(),
+        "vala.query.async.status",
+        "vala.query.async",
+    )
+    .await?;
 
     let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
         .await
@@ -297,6 +366,18 @@ pub async fn get_async_query_status(
     let status = query_job_status(&mut conn, job_uid)
         .await
         .map_err(storage_error)?;
+    // Audit the authorized status read in the SAME tx as the job read. Recorded
+    // whether or not the job resolves (a `404` under RLS is still an audited op).
+    let event = audit::audit_event(
+        &caller,
+        "vala.query.async.status",
+        &format!("vala.query.async/{}", job_uid.0),
+        &Permission::bifrost_query_read().to_string(),
+        AuditDecision::Allow,
+        AuditResult::Success,
+        "async status read",
+    );
+    audit::append_on(&mut conn, &event).await?;
     conn.commit().await.map_err(storage_error)?;
 
     status.ok_or_else(|| WyrdError::NotFound {
@@ -311,9 +392,29 @@ mod tests {
     use std::time::Duration;
 
     use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
+    use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::AsyncJobState;
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
+
+    /// True when an audit-outbox row for `request_id` with the given `decision`
+    /// exists. Reads via the cross-tenant relay claim (SECURITY DEFINER) so the
+    /// assertion is independent of the reader's tenant bind; `request_id` is a
+    /// fresh UUIDv7 per caller, so the match is unique across the test binary.
+    async fn has_audit(
+        pool: &sqlx::PgPool,
+        tenant: DataTenantId,
+        request_id: &str,
+        decision: &str,
+    ) -> bool {
+        let mut conn = TenantConn::acquire(pool, tenant).await.expect("tenant conn");
+        let rows = vala_sql::queries::audit_outbox::claim_unshipped_audit(&mut conn, 10_000)
+            .await
+            .expect("claim audit rows");
+        conn.commit().await.expect("commit");
+        rows.iter()
+            .any(|r| r.request_id == request_id && r.decision == decision)
+    }
 
     /// Build an `AppState` whose `pool` is the shared fixture's `wyrd_app` pool so
     /// async-path tests persist rows under RLS.
@@ -483,6 +584,53 @@ mod tests {
                 .await
                 .expect_err("unknown job is not found");
             assert_eq!(err.status(), 404);
+        });
+    }
+
+    #[test]
+    fn query_async_submit_appends_allow_audit_row() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = db_state().await;
+            let caller = caller_with([Permission::bifrost_query_read()]).await;
+            let tenant = caller.data_tenant_id;
+            let request_id = caller.request_id.as_str().to_owned();
+            let sql = format!("SELECT {} AS n", uuid::Uuid::now_v7().as_u128());
+
+            submit_async_query(&state, caller, async_req(&sql))
+                .await
+                .expect("valid submission enqueues");
+
+            assert!(
+                has_audit(&state.pool, tenant, &request_id, "allow").await,
+                "a successful async submit appends one allow audit row"
+            );
+        });
+    }
+
+    #[test]
+    fn query_sync_denied_appends_deny_audit_row() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = db_state().await;
+            let caller = caller_with([]).await;
+            let tenant = caller.data_tenant_id;
+            let request_id = caller.request_id.as_str().to_owned();
+
+            let err = run_sync_query(
+                &state,
+                caller,
+                SyncQueryRequest {
+                    sql: "SELECT 1".to_owned(),
+                    params: vec![],
+                },
+            )
+            .await
+            .expect_err("no read permission is denied");
+            assert_eq!(err.status(), 403);
+
+            assert!(
+                has_audit(&state.pool, tenant, &request_id, "deny").await,
+                "an RBAC denial appends one deny audit row in its own tx"
+            );
         });
     }
 }

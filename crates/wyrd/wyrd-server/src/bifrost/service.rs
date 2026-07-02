@@ -11,11 +11,12 @@ use vala_bifrost::error::BifrostError as EngineBifrostError;
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
-    BifrostTableDescription, BifrostTableEntry, RegisterOutcome, RegisterTableRequest,
-    RegisterTableResponse, TableScopeWire,
+    AuditDecision, AuditResult, BifrostTableDescription, BifrostTableEntry, RegisterOutcome,
+    RegisterTableRequest, RegisterTableResponse, TableScopeWire,
 };
 
 use crate::AppState;
+use crate::audit;
 use crate::auth::Caller;
 use crate::bifrost::convert;
 
@@ -29,6 +30,33 @@ fn authorize(caller: &Caller, required: Permission) -> Result<(), WyrdError> {
     if caller.principal.effective_permissions.contains(&required) {
         return Ok(());
     }
+    Err(WyrdError::PermissionDeniedRbac {
+        message: format!("caller lacks required permission {required}"),
+        details: serde_json::json!({ "required": required }),
+    })
+}
+
+/// Authorize, appending a `decision = deny` audit row (own tx) on refusal.
+async fn authorize_audited(
+    state: &AppState,
+    caller: &Caller,
+    required: &Permission,
+    operation: &str,
+    resource: &str,
+) -> Result<(), WyrdError> {
+    if caller.principal.effective_permissions.contains(required) {
+        return Ok(());
+    }
+    let event = audit::audit_event(
+        caller,
+        operation,
+        resource,
+        &required.to_string(),
+        AuditDecision::Deny,
+        AuditResult::Failure,
+        "rbac permission denied",
+    );
+    audit::record_audit(&state.pool, caller.data_tenant_id, &event).await?;
     Err(WyrdError::PermissionDeniedRbac {
         message: format!("caller lacks required permission {required}"),
         details: serde_json::json!({ "required": required }),
@@ -58,7 +86,12 @@ pub async fn register_table(
         TableScope::SystemShared => Permission::bifrost_table_install(),
         TableScope::TenantOwned => Permission::bifrost_table_write(),
     };
-    authorize(&caller, required)?;
+    let operation = match scope {
+        TableScope::SystemShared => "vala.bifrost.install",
+        TableScope::TenantOwned => "vala.bifrost.register",
+    };
+    let fqn_for_audit = format!("{}.{}", body.namespace, body.name);
+    authorize_audited(state, &caller, &required, operation, &fqn_for_audit).await?;
 
     let ns = convert::namespace_from_wire(&body.namespace)?;
     let user_fields: Vec<Field> = body.fields.iter().map(convert::field_to_arrow).collect();
@@ -88,6 +121,17 @@ pub async fn register_table(
             }
         }
         Err(EngineBifrostError::TableNotFound(_)) => {
+            // Audit the successful registration in the SAME tx as the catalog row
+            // (append happens inside `create_table` before its commit).
+            let event = audit::audit_event(
+                &caller,
+                operation,
+                &fqn,
+                &required.to_string(),
+                AuditDecision::Allow,
+                AuditResult::Success,
+                "bifrost table registered",
+            );
             let table_uid = state
                 .bifrost
                 .create_table(
@@ -97,6 +141,7 @@ pub async fn register_table(
                     scope,
                     caller.data_tenant_id,
                     &partition_columns,
+                    Some(event),
                 )
                 .await
                 .map_err(map_engine_error)?;
@@ -145,7 +190,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec};
@@ -166,7 +210,7 @@ mod tests {
         .await
         .expect("local storage handle");
         AppState::new(
-            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
+            crate::test_support::test_pool().await,
             None,
             Arc::clone(&storage),
             crate::test_support::test_catalog().await,

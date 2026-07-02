@@ -88,6 +88,42 @@ impl WyrdCatalog {
         Ok(())
     }
 
+    /// Idempotently ensure a privileged `SystemShared` table exists.
+    ///
+    /// Used for engine-owned warehouse tables (e.g. the S3.C5 audit relay's
+    /// `vala.system.audit_log`) that must be present before the first write.
+    /// A no-op when the Iceberg table already exists; otherwise creates and
+    /// registers it under `SYSTEM_OWNER`. Safe to call on every boot.
+    pub async fn ensure_system_table(
+        &self,
+        ns: BifrostNamespace,
+        name: &str,
+        user_fields: Vec<Field>,
+        partition_columns: &[(String, PartitionTransform)],
+    ) -> Result<(), BifrostError> {
+        self.ensure_namespace(ns).await?;
+        let table_ident = iceberg::TableIdent::new(ns.to_namespace_ident(), name.to_string());
+        if self.catalog.table_exists(&table_ident).await? {
+            return Ok(());
+        }
+        self.create_table(
+            ns,
+            name,
+            user_fields,
+            TableScope::SystemShared,
+            wyrd_spec::ids::DataTenantId::SYSTEM_OWNER,
+            partition_columns,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `audit`, when present, appends one hash-chained `AuditEvent` row into the
+    /// transactional outbox **in the same tx as the `vala.bifrost_tables`
+    /// registration** (S3.C5): the control-table row and its audit record commit
+    /// atomically, and an audit-append failure fails the registration closed.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_table(
         &self,
         ns: BifrostNamespace,
@@ -96,6 +132,7 @@ impl WyrdCatalog {
         scope: TableScope,
         tenant: wyrd_spec::ids::DataTenantId,
         partition_columns: &[(String, PartitionTransform)],
+        audit: Option<wyrd_spec::vala::api::AuditEvent>,
     ) -> Result<TableUid, BifrostError> {
         // M6 reserved-name guard: a user field may not take a reserved system
         // (`wyrd_*`/`data_tenant_id`) or correlation (`card_ref`/`run_id`) name —
@@ -164,6 +201,15 @@ impl WyrdCatalog {
         )
         .await
         .map_err(BifrostError::Sql)?;
+
+        if let Some(event) = audit.as_ref() {
+            vala_sql::queries::audit_outbox::append_audit(&mut conn, event)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "audit outbox append failed; refusing register");
+                    BifrostError::AuditUnavailable("audit outbox append failed".to_string())
+                })?;
+        }
 
         conn.commit().await.map_err(BifrostError::Sql)?;
 

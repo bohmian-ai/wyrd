@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod error;
 pub mod provider;
 pub mod registry;
+pub mod relay;
 pub mod schema;
 pub mod session;
 pub mod types;

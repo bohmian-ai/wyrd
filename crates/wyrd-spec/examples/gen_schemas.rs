@@ -46,9 +46,10 @@ use wyrd_spec::storage::{
     UploadInitRequest, UploadInitResponse, UploadPlan, VerificationGuarantee, WireProtocol,
 };
 use wyrd_spec::vala::api::{
-    AsyncJobState, AsyncQueryRequest, AsyncQueryResponse, AsyncQueryStatus, BifrostTableDescription,
-    BifrostTableEntry, DataTypeSpec, ExecutorAvailability, FieldSpec as BifrostFieldSpec, JobUid,
-    PartitionColumnSpec, PartitionTransformWire, QueryParam, RegisterOutcome, RegisterTableRequest,
+    AsyncJobState, AsyncQueryRequest, AsyncQueryResponse, AsyncQueryStatus, AuditDecision,
+    AuditEvent, AuditResult, AuthMethod, BifrostTableDescription, BifrostTableEntry, DataTypeSpec,
+    ExecutorAvailability, FieldSpec as BifrostFieldSpec, JobUid, PartitionColumnSpec,
+    PartitionTransformWire, QueryParam, RegisterOutcome, RegisterTableRequest,
     RegisterTableResponse, SyncQueryRequest, TableScopeWire, TableStatus, TimeUnit,
 };
 use wyrd_spec::vala::eval::{
@@ -176,6 +177,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<AsyncQueryRequest>(out, golden, "bifrost_async_query_request")?;
     write::<AsyncQueryResponse>(out, golden, "bifrost_async_query_response")?;
     write::<AsyncQueryStatus>(out, golden, "bifrost_async_query_status")?;
+    write::<AuditEvent>(out, golden, "bifrost_audit_event")?;
+    write::<AuthMethod>(out, golden, "bifrost_audit_auth_method")?;
+    write::<AuditDecision>(out, golden, "bifrost_audit_decision")?;
+    write::<AuditResult>(out, golden, "bifrost_audit_result")?;
     let eval_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/eval/schemas");
     fs::create_dir_all(eval_fixtures)?;
     write_fixture::<EvalSpec>(eval_fixtures, "eval_spec")?;

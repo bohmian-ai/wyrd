@@ -33,6 +33,9 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        if let Some(principal) = parts.extensions.get::<AuthenticatedPrincipal>() {
+            return Ok(principal.clone());
+        }
         let token = extract_wyrd_access_token(&parts.headers)?;
         let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
         let verifier = state
@@ -60,7 +63,7 @@ mod tests {
     use wyrd_auth_verify::{
         Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
     };
-    use wyrd_runtime::PrincipalId;
+    use wyrd_runtime::{PrincipalId, PrincipalKind};
     use wyrd_spec::DataTenantId;
 
     use crate::auth::permission_resolver::SqlPermissionResolver;
@@ -96,6 +99,33 @@ mod tests {
             .expect_err("missing token fails");
 
         assert_error_code(error, "WYRD_AUTH_401_UNAUTHENTICATED");
+    }
+
+    #[tokio::test]
+    async fn extension_hit_returns_stored_principal_without_invoking_verifier() {
+        let tenant = DataTenantId::new_v7();
+        let state = test_state(tenant);
+        let principal_id = PrincipalId::new(uuid::Uuid::now_v7());
+        let stored = AuthenticatedPrincipal {
+            principal: wyrd_runtime::Principal {
+                id: principal_id,
+                kind: PrincipalKind::User,
+                tenant_id: tenant,
+                roles: Vec::new(),
+                effective_permissions: Default::default(),
+            },
+        };
+        // No token header — fallback path would reject with Unauthenticated;
+        // extension hit must short-circuit and return the stored principal.
+        let mut parts = request_parts(None);
+        parts.extensions.insert(stored.clone());
+
+        let extracted = AuthenticatedPrincipal::from_request_parts(&mut parts, &state)
+            .await
+            .expect("extension hit bypasses verifier");
+
+        assert_eq!(extracted.principal.id, stored.principal.id);
+        assert_eq!(extracted.principal.tenant_id, tenant);
     }
 
     #[tokio::test]

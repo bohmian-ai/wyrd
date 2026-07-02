@@ -49,14 +49,14 @@ mod tests {
 
     #[tokio::test]
     async fn build_production_rejects_stub_policy_hook() {
-        let result = test_state().build_production();
+        let result = test_state().await.build_production();
 
         assert!(matches!(result, Err(BuildError::StubAllowInProduction)));
     }
 
     #[tokio::test]
     async fn build_production_rejects_stub_audit_writer() {
-        let mut state = test_state();
+        let mut state = test_state().await;
         state.policy_hook = Arc::new(DenyAllPolicyHook {
             reason: "test-deny".to_owned(),
         });
@@ -72,7 +72,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_production_rejects_untrusted_request_id_configuration() {
-        let mut state = test_state();
+        let mut state = test_state().await;
         state.policy_hook = Arc::new(DenyAllPolicyHook {
             reason: "test-deny".to_owned(),
         });
@@ -102,7 +102,7 @@ mod tests {
         }
     }
 
-    fn test_state() -> AppState {
+    async fn test_state() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
@@ -111,6 +111,7 @@ mod tests {
             app_pool,
             None,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
         )
     }
 }

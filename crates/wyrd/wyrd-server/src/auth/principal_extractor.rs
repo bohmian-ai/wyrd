@@ -107,7 +107,7 @@ mod tests {
     #[tokio::test]
     async fn extractor_passes_real_jwt() {
         let tenant = DataTenantId::new_v7();
-        let state = test_state(tenant);
+        let state = test_state(tenant).await;
         let token = mint_test_user_jwt(&state, tenant, chrono::Duration::minutes(5));
         let mut parts = request_parts(Some(&token));
 
@@ -121,7 +121,7 @@ mod tests {
     #[tokio::test]
     async fn missing_header_returns_unauthenticated() {
         let tenant = DataTenantId::new_v7();
-        let state = test_state(tenant);
+        let state = test_state(tenant).await;
         let mut parts = request_parts(None);
 
         let error = AuthenticatedPrincipal::from_request_parts(&mut parts, &state)
@@ -134,7 +134,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_header_returns_bad_token_format() {
         let tenant = DataTenantId::new_v7();
-        let state = test_state(tenant);
+        let state = test_state(tenant).await;
         let mut parts = request_parts(Some("not-a-jwt"));
 
         let error = AuthenticatedPrincipal::from_request_parts(&mut parts, &state)
@@ -144,7 +144,7 @@ mod tests {
         assert_error_code(error, "WYRD_AUTH_400_BAD_TOKEN_FORMAT");
     }
 
-    fn test_state(_tenant: DataTenantId) -> crate::state::AppState {
+    async fn test_state(_tenant: DataTenantId) -> crate::state::AppState {
         use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
         use std::collections::HashMap;
         use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -178,6 +178,7 @@ mod tests {
             app_pool,
             None,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
         )
         .with_auth_handles(issuing_key, verifier)
     }

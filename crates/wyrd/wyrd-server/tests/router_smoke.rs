@@ -17,12 +17,14 @@ use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
+mod support;
+
 const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
 
 #[tokio::test]
 async fn healthz_returns_ok_without_request_id() {
-    let response = build_router(test_state())
+    let response = build_router(test_state().await)
         .oneshot(
             Request::builder()
                 .uri("/healthz")
@@ -42,7 +44,7 @@ async fn healthz_returns_ok_without_request_id() {
 
 #[tokio::test]
 async fn unauthenticated_v1_request_returns_problem_json() {
-    let response = build_router(test_state())
+    let response = build_router(test_state().await)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -74,7 +76,7 @@ async fn unauthenticated_v1_request_returns_problem_json() {
 #[tokio::test]
 async fn request_with_real_jwt_passes_extractor() {
     let tenant = DataTenantId::new_v7();
-    let state = test_state();
+    let state = test_state().await;
     let token = mint_test_user_jwt(&state, tenant);
     let response = build_router(state)
         .oneshot(
@@ -102,7 +104,7 @@ async fn request_with_real_jwt_passes_extractor() {
 
 #[tokio::test]
 async fn request_with_missing_header_returns_401_unauthenticated() {
-    let response = build_router(test_state())
+    let response = build_router(test_state().await)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -125,7 +127,7 @@ async fn request_with_missing_header_returns_401_unauthenticated() {
 async fn auth_routes_receive_request_id_via_protected_router() {
     // Auth routes are in the protected router which applies attach_request_id;
     // the response must include the wyrd-request-id header.
-    let response = build_router(test_state())
+    let response = build_router(test_state().await)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -145,7 +147,7 @@ async fn auth_routes_receive_request_id_via_protected_router() {
 
 #[tokio::test]
 async fn healthz_returns_ok_without_problem_json() {
-    let response = build_router(test_state())
+    let response = build_router(test_state().await)
         .oneshot(
             Request::builder()
                 .uri("/healthz")
@@ -171,7 +173,7 @@ async fn healthz_returns_ok_without_problem_json() {
 async fn readyz_returns_json_even_on_cold_boot() {
     // On cold boot ReadinessSnapshot::initial() is all-warmup, so /readyz returns 503.
     // The body must be application/problem+json with the correct code.
-    let response = build_router(test_state())
+    let response = build_router(test_state().await)
         .oneshot(
             Request::builder()
                 .uri("/readyz")
@@ -211,7 +213,7 @@ async fn readyz_returns_ok_when_all_probes_pass() {
         postgres: ok_probe.clone(),
         storage: ok_probe,
     }));
-    let state = test_state().with_readiness(snapshot);
+    let state = test_state().await.with_readiness(snapshot);
 
     let response = build_router(state)
         .oneshot(
@@ -236,7 +238,7 @@ async fn oversized_body_returns_413_problem_json() {
     use wyrd_server::state::LimitsConfig;
 
     // Build state with a 10-byte body limit.
-    let state = test_state().with_limits(LimitsConfig {
+    let state = test_state().await.with_limits(LimitsConfig {
         body_bytes: 10,
         timeout: std::time::Duration::from_secs(30),
         concurrency: 1024,
@@ -270,7 +272,7 @@ async fn oversized_body_returns_413_problem_json() {
     assert_eq!(problem["code"], "WYRD_SPEC_413_PAYLOAD_TOO_LARGE");
 }
 
-fn test_state() -> AppState {
+async fn test_state() -> AppState {
     let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
@@ -302,6 +304,7 @@ fn test_state() -> AppState {
         app_pool,
         None,
         Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+        support::test_catalog().await,
     )
     .with_auth_handles(issuing_key, verifier)
 }

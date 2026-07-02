@@ -6,6 +6,7 @@ use arc_swap::ArcSwap;
 use ipnetwork::IpNetwork;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
+use vala_bifrost::catalog::WyrdCatalog;
 use wyrd_auth_check::{PolicyHook, StubAllowPolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_oidc::TrustedIssuerRegistry;
@@ -58,6 +59,10 @@ pub struct AppState {
     pub platform_admin_pool: Option<PgPool>,
     /// Process-wide artifact storage handle.
     pub storage: Arc<StorageHandle>,
+    /// Process-wide Bifrost OLAP catalog. Always present: every booted server and
+    /// test harness holds a live, tenant-capable `WyrdCatalog` connected as
+    /// `wyrd_catalog` over the `iceberg_catalog` schema.
+    pub bifrost: Arc<WyrdCatalog>,
     /// Runtime preview gate for auth routes that depend on card-registry principal projection.
     pub allow_preview_auth: bool,
     /// RBAC checker for auth route permission gates.
@@ -101,12 +106,14 @@ impl AppState {
         pool: PgPool,
         platform_admin_pool: Option<PgPool>,
         storage: Arc<StorageHandle>,
+        bifrost: Arc<WyrdCatalog>,
     ) -> Self {
         let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
         Self {
             pool,
             platform_admin_pool,
             storage,
+            bifrost,
             allow_preview_auth: false,
             permission_check: Arc::new(RbacCheck),
             issuing_key: None,
@@ -331,7 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn defaults_for_test_safe() {
-        let state = test_state();
+        let state = test_state().await;
 
         assert!(!state.trusted_request_id_propagation);
         assert!(state.trusted_upstreams_parsed.is_empty());
@@ -344,7 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_state_has_fresh_cancellation_token() {
-        let state = test_state();
+        let state = test_state().await;
         assert!(!state.shutdown_token.is_cancelled());
         state.shutdown_token.cancel();
         assert!(state.shutdown_token.is_cancelled());
@@ -352,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_shutdown_token_replaces_field() {
-        let state = test_state();
+        let state = test_state().await;
         let token = tokio_util::sync::CancellationToken::new();
         let state = state.with_shutdown_token(token.clone());
         token.cancel();
@@ -361,21 +368,22 @@ mod tests {
 
     #[tokio::test]
     async fn production_validate_passes_development_profile() {
-        let state = test_state();
+        let state = test_state().await;
         assert!(state.production_validate().is_ok());
     }
 
     #[tokio::test]
     async fn production_validate_rejects_stub_on_production() {
-        let state =
-            test_state().with_deployment_profile(crate::config::DeploymentProfile::Production);
+        let state = test_state()
+            .await
+            .with_deployment_profile(crate::config::DeploymentProfile::Production);
         let err = state.production_validate().unwrap_err();
         assert!(matches!(err, ProductionValidationError::StubPolicyHook));
     }
 
     #[tokio::test]
     async fn with_limits_updates_all_fields() {
-        let state = test_state();
+        let state = test_state().await;
         let limits = LimitsConfig {
             body_bytes: 2048,
             timeout: std::time::Duration::from_millis(1000),
@@ -386,7 +394,7 @@ mod tests {
         assert_eq!(state.limits.concurrency, 10);
     }
 
-    fn test_state() -> AppState {
+    async fn test_state() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
@@ -395,6 +403,7 @@ mod tests {
             app_pool,
             None,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
         )
     }
 

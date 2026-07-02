@@ -23,6 +23,8 @@ use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 // low-level composition directly without the harness.
 use wyrd_testing::WyrdTestServer;
 
+mod support;
+
 const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
 
@@ -31,7 +33,7 @@ async fn authz_user_jwt_returns_403_kind_not_eligible() {
     let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
         .await
         .expect("fixture starts");
-    let state = test_state(fixture.app_pool().clone());
+    let state = test_state(fixture.app_pool().clone()).await;
     let token = mint_user_jwt(&state, fixture.data_tenant_id());
 
     let problem = post_authz(state, &token, true).await;
@@ -46,7 +48,7 @@ async fn authz_direct_service_jwt_returns_403_chain_empty() {
     let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
         .await
         .expect("fixture starts");
-    let state = test_state(fixture.app_pool().clone());
+    let state = test_state(fixture.app_pool().clone()).await;
     let token = mint_service_jwt(&state, fixture.data_tenant_id(), "callee");
 
     let problem = post_authz(state, &token, true).await;
@@ -104,7 +106,7 @@ async fn authz_deny_hook_returns_403_with_reason() {
     let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
         .await
         .expect("fixture starts");
-    let mut state = test_state(fixture.app_pool().clone());
+    let mut state = test_state(fixture.app_pool().clone()).await;
     state.policy_hook = Arc::new(DenyAllPolicyHook {
         reason: "test-deny".to_owned(),
     });
@@ -122,7 +124,7 @@ async fn authz_missing_x_original_method_still_uses_body_check() {
     let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
         .await
         .expect("fixture starts");
-    let state = test_state(fixture.app_pool().clone());
+    let state = test_state(fixture.app_pool().clone()).await;
     let token = mint_delegated_service_jwt(&state, fixture.data_tenant_id());
 
     let problem = post_authz(state, &token, false).await;
@@ -137,7 +139,7 @@ async fn authz_unknown_action_returns_validation_error() {
     let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
         .await
         .expect("fixture starts");
-    let state = test_state(fixture.app_pool().clone());
+    let state = test_state(fixture.app_pool().clone()).await;
     let token = mint_delegated_service_jwt(&state, fixture.data_tenant_id());
 
     let response = build_router(state)
@@ -237,7 +239,7 @@ fn authz_body(target: &CardRef) -> serde_json::Value {
     })
 }
 
-fn test_state(pool: sqlx::PgPool) -> AppState {
+async fn test_state(pool: sqlx::PgPool) -> AppState {
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
     let issuing_key = Arc::new(
@@ -268,6 +270,7 @@ fn test_state(pool: sqlx::PgPool) -> AppState {
         pool,
         None,
         Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+        support::test_catalog().await,
     )
     .with_auth_handles(issuing_key, verifier)
 }
@@ -350,6 +353,6 @@ fn card_ref(kind: CardKind, name: &str) -> CardRef {
 }
 
 #[allow(dead_code)]
-fn lazy_pool_state() -> AppState {
-    test_state(PgPoolOptions::new().connect_lazy_with(Default::default()))
+async fn lazy_pool_state() -> AppState {
+    test_state(PgPoolOptions::new().connect_lazy_with(Default::default())).await
 }

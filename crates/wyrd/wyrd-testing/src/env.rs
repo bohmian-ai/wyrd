@@ -12,6 +12,7 @@ use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use tower::ServiceExt;
 use uuid::Uuid;
+use vala_bifrost::catalog::WyrdCatalog;
 use wyrd_auth_check::{AuthzCheckRequest, AuthzCheckResponse, PolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::{
@@ -199,10 +200,28 @@ impl WyrdTestEnv {
             WyrdAuthVerifySettings::default(),
         ));
 
+        let (storage_factory, storage_props) = storage
+            .iceberg_storage_factory()
+            .map_err(|error| WyrdTestError::Start(error.to_string()))?;
+        let catalog_dsn = fixture
+            .catalog_dsn()
+            .map_err(|error| WyrdTestError::Start(error.to_string()))?;
+        let bifrost = WyrdCatalog::new(
+            catalog_dsn.expose_secret(),
+            storage.warehouse_uri(),
+            Arc::new(fixture.app_pool().clone()),
+            None,
+            storage_factory,
+            storage_props,
+        )
+        .await
+        .map_err(|error| WyrdTestError::Start(error.to_string()))?;
+
         let mut state = AppState::new(
             fixture.app_pool().clone(),
             Some(fixture.platform_admin_pool().clone()),
             storage,
+            Arc::new(bifrost),
         )
         .with_preview_auth(true)
         .with_auth_handles(Arc::clone(&issuing_key), Arc::clone(&verifier));

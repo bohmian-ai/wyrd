@@ -43,6 +43,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
+vala-bifrost = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
@@ -55,7 +56,7 @@ tower_governor = { workspace = true }
 http-body-util = "0.1"
 wyrd-spec = { workspace = true }
 wyrd-semver = { workspace = true }
-wyrd-storage = { workspace = true }
+wyrd-storage = { workspace = true, features = ["iceberg"] }
 wyrd-enterprise = { path = "../wyrd-enterprise", version = "0.0.1", optional = true }
 
 [dev-dependencies]

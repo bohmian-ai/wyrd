@@ -1352,6 +1352,7 @@ mod tests {
             PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
             None,
             Arc::clone(&storage),
+            crate::test_support::test_catalog().await,
         );
         let tenant = DataTenantId::new_v7();
         let validated = ValidatedPath {
@@ -1414,6 +1415,7 @@ mod tests {
             PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
             None,
             Arc::clone(&storage),
+            crate::test_support::test_catalog().await,
         );
         let tenant = DataTenantId::new_v7();
         let validated = ValidatedPath {
@@ -1453,6 +1455,7 @@ mod tests {
             PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
             None,
             Arc::clone(&storage),
+            crate::test_support::test_catalog().await,
         );
         let caller = read_caller();
         let path = tenant_path::build(
@@ -1505,6 +1508,7 @@ mod tests {
             PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
             None,
             Arc::clone(&storage),
+            crate::test_support::test_catalog().await,
         );
         let caller = caller_with_permissions([]);
         let path = tenant_path::build(
@@ -1539,6 +1543,7 @@ mod tests {
             PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
             None,
             Arc::clone(&storage),
+            crate::test_support::test_catalog().await,
         );
         let caller = caller_with_permissions([]);
         let path = tenant_path::build(

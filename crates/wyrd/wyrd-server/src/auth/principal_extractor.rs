@@ -1,11 +1,10 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use wyrd_runtime::Principal;
-use wyrd_spec::error::WyrdError;
 
 use crate::auth::token_extract::{
-    WYRD_ACCESS_TOKEN_HEADER, auth_not_configured, tenant_from_unverified_access_token,
+    auth_not_configured, extract_wyrd_access_token, tenant_from_unverified_access_token,
 };
 use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
@@ -34,7 +33,7 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token = extract_wyrd_access_token(parts)?;
+        let token = extract_wyrd_access_token(&parts.headers)?;
         let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
         let verifier = state
             .token_verifier
@@ -48,38 +47,6 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
             principal: verified.principal.clone(),
         })
     }
-}
-
-fn extract_wyrd_access_token(parts: &Parts) -> Result<SecretString, WyrdErrorResponse> {
-    let raw = parts
-        .headers
-        .get(WYRD_ACCESS_TOKEN_HEADER)
-        .ok_or_else(|| {
-            WyrdErrorResponse::from(WyrdError::Unauthenticated {
-                message: "missing X-Wyrd-Access-Token header".to_owned(),
-                details: serde_json::json!({ "header": "x-wyrd-access-token" }),
-            })
-        })?
-        .to_str()
-        .map_err(|_| {
-            WyrdErrorResponse::from(WyrdError::BadTokenFormat {
-                message: "X-Wyrd-Access-Token header is not valid UTF-8".to_owned(),
-                details: serde_json::json!({ "header": "x-wyrd-access-token" }),
-            })
-        })?;
-    let Some(token) = raw.strip_prefix("Bearer ") else {
-        return Err(WyrdErrorResponse::from(WyrdError::BadTokenFormat {
-            message: "X-Wyrd-Access-Token header must be a Bearer credential".to_owned(),
-            details: serde_json::json!({ "header": "x-wyrd-access-token" }),
-        }));
-    };
-    if token.is_empty() {
-        return Err(WyrdErrorResponse::from(WyrdError::BadTokenFormat {
-            message: "X-Wyrd-Access-Token bearer token is empty".to_owned(),
-            details: serde_json::json!({ "header": "x-wyrd-access-token" }),
-        }));
-    }
-    Ok(SecretString::from(token.to_owned()))
 }
 
 #[cfg(test)]

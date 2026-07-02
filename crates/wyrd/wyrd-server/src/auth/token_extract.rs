@@ -1,7 +1,8 @@
 //! Shared bearer-token extraction helpers for Wyrd auth handlers.
 
-use axum::http::HeaderName;
+use axum::http::{HeaderMap, HeaderName};
 use base64::Engine;
+use secrecy::SecretString;
 use wyrd_auth_verify::AccessTokenClaims;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
@@ -10,6 +11,39 @@ use crate::error::WyrdErrorResponse;
 
 pub(crate) const WYRD_ACCESS_TOKEN_HEADER: HeaderName =
     HeaderName::from_static("x-wyrd-access-token");
+
+pub(crate) fn extract_wyrd_access_token(
+    headers: &HeaderMap,
+) -> Result<SecretString, WyrdErrorResponse> {
+    let raw = headers
+        .get(WYRD_ACCESS_TOKEN_HEADER)
+        .ok_or_else(|| {
+            WyrdErrorResponse::from(WyrdError::Unauthenticated {
+                message: "missing X-Wyrd-Access-Token header".to_owned(),
+                details: serde_json::json!({ "header": "x-wyrd-access-token" }),
+            })
+        })?
+        .to_str()
+        .map_err(|_| {
+            WyrdErrorResponse::from(WyrdError::BadTokenFormat {
+                message: "X-Wyrd-Access-Token header is not valid UTF-8".to_owned(),
+                details: serde_json::json!({ "header": "x-wyrd-access-token" }),
+            })
+        })?;
+    let Some(token) = raw.strip_prefix("Bearer ") else {
+        return Err(WyrdErrorResponse::from(WyrdError::BadTokenFormat {
+            message: "X-Wyrd-Access-Token header must be a Bearer credential".to_owned(),
+            details: serde_json::json!({ "header": "x-wyrd-access-token" }),
+        }));
+    };
+    if token.is_empty() {
+        return Err(WyrdErrorResponse::from(WyrdError::BadTokenFormat {
+            message: "X-Wyrd-Access-Token bearer token is empty".to_owned(),
+            details: serde_json::json!({ "header": "x-wyrd-access-token" }),
+        }));
+    }
+    Ok(SecretString::from(token.to_owned()))
+}
 
 pub(crate) fn tenant_from_unverified_access_token(
     token: &str,

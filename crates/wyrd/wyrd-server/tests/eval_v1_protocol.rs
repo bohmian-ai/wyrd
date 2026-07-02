@@ -330,6 +330,42 @@ async fn open_body(eval_ref: &CardRef) -> Value {
     json!({ "eval_ref": eval_ref, "simulated_user": "client" })
 }
 
+/// Issue a request with a valid JWT but a caller-controlled raw `Authorization`
+/// header, so the lease scheme (non-`Bearer`) can be exercised — the standard
+/// `call` helper always prefixes `Bearer`.
+async fn call_with_raw_lease(
+    app: &Router,
+    uri: &str,
+    token: &str,
+    authorization: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-wyrd-access-token", format!("Bearer {token}"))
+                .header(header::AUTHORIZATION, authorization)
+                .body(Body::from(body.to_string()))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body bytes");
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("json body")
+    };
+    (status, value)
+}
+
 // --------------------------------------------------------------------------
 // (b) Auth required on all four routes
 // --------------------------------------------------------------------------
@@ -814,4 +850,74 @@ async fn open_requires_eval_run_permission() {
     .await;
     assert_eq!(allowed_status, StatusCode::OK, "{allowed_body}");
     assert!(allowed_body["run_id"].is_string(), "{allowed_body}");
+}
+
+// --------------------------------------------------------------------------
+// Lease enforcement on an owned run: the security control `check_lease` guards
+// every protected route once the owner check passes. Missing/malformed →
+// 401 missing-lease; wrong value → 403 invalid-lease. Uses a valid JWT and the
+// caller's own run so the owner check passes and the lease path is reached.
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn lease_failures_on_owned_run_are_rejected() {
+    let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+        .await
+        .expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    seed_roles(fixture.app_pool(), tenant).await;
+    let (state, _root) = build_state(fixture.app_pool().clone());
+    let eval_ref = seed_eval(&state, tenant, "prod", "rubric").await;
+
+    let jwt = mint_jwt(&state, tenant, &["writer"]);
+    let app = build_router(state);
+
+    // Open a real run the caller owns.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/eval/runs",
+        Some(&jwt),
+        None,
+        open_body(&eval_ref).await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "open: {body}");
+    let run_id = body["run_id"].as_str().expect("run_id").to_owned();
+    let real_lease = body["lease_token"].as_str().expect("lease").to_owned();
+    let next_uri = format!("/v1/eval/runs/{run_id}/next");
+
+    // (1) No Authorization lease header at all → 401 missing-lease.
+    let (status, body) = call(&app, "POST", &next_uri, Some(&jwt), None, json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "missing lease: {body}");
+    assert_eq!(body["code"], "WYRD_EVAL_401_MISSING_LEASE");
+
+    // (2) Wrong lease value (correct Bearer scheme) → 403 invalid-lease.
+    let (status, body) = call(
+        &app,
+        "POST",
+        &next_uri,
+        Some(&jwt),
+        Some("not-the-real-lease"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "invalid lease: {body}");
+    assert_eq!(body["code"], "WYRD_EVAL_403_INVALID_LEASE");
+
+    // (3) Non-Bearer scheme carrying the real lease → 401 missing-lease.
+    let (status, body) = call_with_raw_lease(
+        &app,
+        &next_uri,
+        &jwt,
+        &format!("Basic {real_lease}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "non-bearer scheme: {body}"
+    );
+    assert_eq!(body["code"], "WYRD_EVAL_401_MISSING_LEASE");
 }

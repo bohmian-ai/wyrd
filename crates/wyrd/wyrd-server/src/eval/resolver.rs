@@ -41,8 +41,15 @@ use wyrd_storage::tenant_path;
 
 use super::error::eval_internal_error;
 
-/// Relative object path (under `{tenant}/cards/{data_card_uid}/`) that holds the
-/// serialized `EvalScenarioCollection` for a Data card.
+/// **Provisional** relative object key for a Data card's serialized
+/// `EvalScenarioCollection`.
+///
+/// Eval scenario storage is not yet a settled part of the eval domain model, and
+/// there is **no production writer** for this key today — only the acceptance
+/// suite seeds it (via [`scenario_object_path`]). Until the storage model is
+/// defined, `/v1/eval` scenario-open against a normally-registered Data card fails
+/// closed with `WYRD_EVAL_500`. Tracked as a follow-up; do not treat this
+/// convention as the durable contract.
 const SCENARIO_OBJECT_RELATIVE: &str = "eval/scenario_collection.json";
 
 /// Load one card by reference under the caller's tenant RLS binding.

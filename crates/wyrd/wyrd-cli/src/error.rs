@@ -51,6 +51,16 @@ pub enum WyrdCliError {
     )]
     ServerRequiresAgentUrl,
 
+    /// Server mode requires a Wyrd access token.
+    #[error("--server requires --token (or WYRD_ACCESS_TOKEN)")]
+    #[wyrd_error(
+        code = "WYRD_CLI_400_SERVER_REQUIRES_TOKEN",
+        status = 400,
+        title = "Server mode requires an access token",
+        remediation = "Pass --token <JWT> or set WYRD_ACCESS_TOKEN when using --server."
+    )]
+    ServerRequiresToken,
+
     /// Server mode does not accept pre-collected records.
     #[error("--server is incompatible with --records")]
     #[wyrd_error(

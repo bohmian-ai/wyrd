@@ -106,22 +106,35 @@ pub enum ProtocolClientError {
 pub struct ProtocolClient {
     http: Client,
     server_url: Url,
+    access_header: String,
 }
 
 impl ProtocolClient {
     /// Build a client for one server URL.
     ///
+    /// `access_token` is the raw JWT value for `x-wyrd-access-token`; the
+    /// `Bearer ` prefix is added automatically.
+    ///
     /// # Errors
     /// Returns [`ProtocolClientError::HttpBuild`] when reqwest cannot
     /// initialize the connection pool or TLS stack.
-    pub fn new(server_url: Url, request_timeout: Duration) -> Result<Self, ProtocolClientError> {
+    pub fn new(
+        server_url: Url,
+        request_timeout: Duration,
+        access_token: String,
+    ) -> Result<Self, ProtocolClientError> {
         let http = Client::builder()
             .timeout(request_timeout)
             .build()
             .map_err(|source| ProtocolClientError::HttpBuild {
                 message: source.to_string(),
             })?;
-        Ok(Self { http, server_url })
+        let access_header = format!("Bearer {access_token}");
+        Ok(Self {
+            http,
+            server_url,
+            access_header,
+        })
     }
 
     /// Run the server pull protocol to completion.
@@ -140,6 +153,7 @@ impl ProtocolClient {
         let open: EvalRunOpenResponse = self
             .http
             .post(open_url)
+            .header("x-wyrd-access-token", &self.access_header)
             .json(&EvalRunOpenRequest {
                 eval_ref,
                 simulated_user,
@@ -176,6 +190,7 @@ impl ProtocolClient {
                 self.http
                     .post(next_url.clone())
                     .header(reqwest::header::AUTHORIZATION, &bearer)
+                    .header("x-wyrd-access-token", &self.access_header)
                     .send()
                     .and_then(reqwest::blocking::Response::error_for_status)
             })?
@@ -197,6 +212,7 @@ impl ProtocolClient {
                         self.http
                             .post(agent_url.clone())
                             .header(reqwest::header::AUTHORIZATION, &bearer)
+                            .header("x-wyrd-access-token", &self.access_header)
                             .json(&AgentTurnSubmission {
                                 scenario_id: scenario_id.clone(),
                                 turn,
@@ -222,6 +238,7 @@ impl ProtocolClient {
                         self.http
                             .post(user_url.clone())
                             .header(reqwest::header::AUTHORIZATION, &bearer)
+                            .header("x-wyrd-access-token", &self.access_header)
                             .json(&UserTurnSubmission {
                                 scenario_id: scenario_id.clone(),
                                 turn,

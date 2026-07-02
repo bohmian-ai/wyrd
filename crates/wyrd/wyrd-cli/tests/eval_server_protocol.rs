@@ -17,7 +17,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use eval_support::{spec, write_eval_card};
 
-type CapturedRequest = (String, Option<String>);
+type CapturedRequest = (String, Option<String>, Option<String>);
 
 #[derive(Clone, Default)]
 struct TestState {
@@ -36,7 +36,12 @@ async fn capture_headers(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    state.captured.lock().await.push((path, auth));
+    let access = req
+        .headers()
+        .get("x-wyrd-access-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    state.captured.lock().await.push((path, auth, access));
     next.run(req).await
 }
 
@@ -120,6 +125,8 @@ async fn server_protocol_carries_lease_after_open() {
                 &agent_url,
                 "--eval",
                 &eval_arg,
+                "--token",
+                "test-access-jwt",
                 "--judge-mock",
             ])
             .assert()
@@ -130,14 +137,23 @@ async fn server_protocol_carries_lease_after_open() {
 
     server.abort();
     let rows = state.captured.lock().await.clone();
+    assert!(!rows.is_empty(), "expected captured protocol calls");
+    for (path, _, access) in &rows {
+        assert_eq!(
+            access.as_deref(),
+            Some("Bearer test-access-jwt"),
+            "every /v1/eval call must carry the access-token JWT (path {path})"
+        );
+    }
+
     let protected: Vec<_> = rows
         .iter()
-        .filter(|(path, _)| {
+        .filter(|(path, _, _)| {
             path.ends_with("/next") || path.ends_with("/agent-turn") || path.ends_with("/user-turn")
         })
         .collect();
     assert!(!protected.is_empty(), "expected post-open protocol calls");
-    for (_, auth) in protected {
+    for (_, auth, _) in protected {
         assert_eq!(
             auth.as_deref(),
             Some("Bearer cli-lease-token"),

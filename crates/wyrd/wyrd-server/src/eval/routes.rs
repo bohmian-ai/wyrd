@@ -68,6 +68,12 @@ async fn open(
     let tenant = principal.tenant_id;
     let owner = principal.id;
 
+    // Concrete RBAC (spec §2b): gate `evals:run` before any card read. The gate is
+    // card-independent, so checking it first denies an unpermissioned principal
+    // with 403 regardless of whether the `eval_ref` exists — closing the
+    // same-tenant existence oracle — and spares a tenant conn and two DB reads.
+    require_eval_run(&state, &principal)?;
+
     // RLS hops 1 (eval_ref → Eval card) and 2 (Eval.dataset → Data card) run
     // under a single tenant bind. A foreign/missing ref returns 404, fail-closed.
     let mut conn = TenantConn::acquire(&state.pool, tenant)
@@ -78,13 +84,6 @@ async fn open(
     let eval_card = resolver::resolve_card(&mut conn, CardKind::Eval, &req.eval_ref)
         .await
         .map_err(|error| WyrdErrorResponse::from(map_card_resolution_error(&error)))?;
-
-    // Concrete RBAC (spec §2b): `evals:run` against the tenant-verified Eval card.
-    // The `eval_ref` is already resolved within the principal's tenant (RLS), so a
-    // cross-tenant ref fails closed as 404 before RBAC is consulted. Evaluated
-    // before the dataset hop so an unpermissioned principal never triggers a
-    // second read or any run/provider work.
-    require_eval_run(&state, &principal)?;
 
     let dataset = resolver::dataset_ref(&eval_card).map_err(WyrdErrorResponse::from)?;
     let data_card = resolver::resolve_card(&mut conn, CardKind::Data, dataset.as_card_ref())
@@ -175,8 +174,12 @@ async fn next(
             Ok(Json(directive))
         }
         TurnDirective::RunComplete => {
-            let eval_ref = entry.state.lock().await.eval_ref.clone();
-            entry.state.lock().await.ack_run_complete();
+            let eval_ref = {
+                let mut run = entry.state.lock().await;
+                let eval_ref = run.eval_ref.clone();
+                run.ack_run_complete();
+                eval_ref
+            };
             {
                 let mut runs = state.eval_runs.lock().map_err(|_| {
                     WyrdErrorResponse::from(eval_internal_error("eval run map lock poisoned"))

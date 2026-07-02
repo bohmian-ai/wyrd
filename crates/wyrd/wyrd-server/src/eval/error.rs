@@ -54,7 +54,7 @@ pub(crate) fn eval_internal_error(detail: impl Display) -> WyrdError {
 /// with the same not-found code as a nonexistent run. Anything else (transient
 /// DB, parse) is a scrubbed 500.
 pub(crate) fn map_card_resolution_error(error: &WyrdError) -> WyrdError {
-    if error.status() == 404 {
+    if matches!(error, WyrdError::RegistryCardNotFound { .. }) {
         return eval_run_not_found();
     }
     tracing::error!(

@@ -30,6 +30,7 @@ use crate::eval::protocol_client::{
     eval_ref,
     agent_fn,
     *,
+    access_token,
     simulated_user_fn = None,
     simulated_user = "server",
     request_timeout_secs = 60,
@@ -39,6 +40,7 @@ pub fn run_eval_py(
     server_url: &str,
     eval_ref: &str,
     agent_fn: Py<PyAny>,
+    access_token: String,
     simulated_user_fn: Option<Py<PyAny>>,
     simulated_user: &str,
     request_timeout_secs: u64,
@@ -73,7 +75,7 @@ pub fn run_eval_py(
         None
     };
 
-    let client = ProtocolClient::new(url, Duration::from_secs(request_timeout_secs))
+    let client = ProtocolClient::new(url, Duration::from_secs(request_timeout_secs), access_token)
         .map_err(protocol_error_to_py)?;
 
     let summary = py

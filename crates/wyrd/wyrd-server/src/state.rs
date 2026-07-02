@@ -20,6 +20,7 @@ use crate::auth::exchange_api_key::TokenExchangeSettings;
 use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::config::DeploymentProfile;
+use crate::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter, new_run_map};
 use crate::health::ReadinessSnapshot;
 
 /// Production [`TokenVerifier`] specialization: SQL-backed permission resolution
@@ -100,6 +101,10 @@ pub struct AppState {
     pub trusted_upstreams_parsed: Arc<[IpNetwork]>,
     /// Access/refresh token TTL settings for all exchange paths.
     pub token_exchange_settings: TokenExchangeSettings,
+    /// Tenant-keyed in-memory eval run/lease/session map. Ephemeral, single-replica.
+    pub eval_runs: EvalRuns,
+    /// Audit sink for eval run open/complete events.
+    pub eval_audit: Arc<dyn EvalAuditWriter>,
 }
 
 impl AppState {
@@ -135,7 +140,16 @@ impl AppState {
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
             trusted_upstreams_parsed: Arc::from(Vec::<IpNetwork>::new()),
             token_exchange_settings: TokenExchangeSettings::default(),
+            eval_runs: new_run_map(),
+            eval_audit: Arc::new(TracingEvalAuditWriter),
         }
+    }
+
+    /// Replace the eval audit writer, primarily for tests.
+    #[must_use]
+    pub fn with_eval_audit(mut self, eval_audit: Arc<dyn EvalAuditWriter>) -> Self {
+        self.eval_audit = eval_audit;
+        self
     }
 
     /// Override the auth preview gate, primarily for tests and local config wiring.

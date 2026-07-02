@@ -43,7 +43,7 @@ pub fn build_router(state: AppState) -> Router {
     let auth_routes = crate::auth::routes::router().layer(GovernorLayer::new(auth_governor));
 
     let v1_group = crate::auth::admin::mount(crate::routes::authz::routes::mount(
-        crate::storage::routes::mount(Router::new(), &state),
+        crate::eval::routes::mount(crate::storage::routes::mount(Router::new(), &state), &state),
         &state,
     ))
     .fallback(v1_not_found);
@@ -84,15 +84,10 @@ pub fn build_router(state: AppState) -> Router {
             crate::middleware::request_id::attach_request_id,
         ));
 
-    // Vala eval transport surface. Carries its own state and preshared-key
-    // auth, mounted independently of the Wyrd auth/middleware stack.
-    let eval_routes = vala_http::eval_router(vala_http::eval::AppState::unconfigured());
-
     Router::new()
         .merge(unprotected)
         .merge(protected)
         .with_state(state)
-        .nest("/api/v1/eval", eval_routes)
         .layer(TraceLayer::new_for_http())
 }
 

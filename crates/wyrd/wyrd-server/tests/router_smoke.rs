@@ -270,6 +270,96 @@ async fn oversized_body_returns_413_problem_json() {
     assert_eq!(problem["code"], "WYRD_SPEC_413_PAYLOAD_TOO_LARGE");
 }
 
+#[tokio::test]
+async fn unknown_v1_path_without_token_returns_401_via_layer() {
+    // The default-deny layer wraps the /v1 fallback, so an unknown /v1 path with
+    // no token is rejected with 401 before v1_not_found runs — not 404. This is
+    // the "no route-existence oracle" guarantee: unauthenticated callers cannot
+    // distinguish a real route from a missing one.
+    let response = build_router(test_state())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/this/route/does/not/exist")
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn representative_v1_routes_without_token_all_return_401() {
+    // Sweep one real route from each mounted group (storage, authz, admin). With
+    // no token every one must be rejected by the layer with 401, proving auth is
+    // a property of the whole /v1 nest rather than any single handler. Assertions
+    // key on status 401 so they are robust to the exact error code family.
+    let routes = [
+        ("POST", "/v1/cards/upload/init"),
+        ("POST", "/v1/cards/download/init"),
+        ("POST", "/v1/authz/check"),
+        (
+            "POST",
+            "/v1/principals/018f0000-0000-7000-8000-000000000001/revoke",
+        ),
+        ("GET", "/v1/admin/trusted-issuers"),
+        ("GET", "/v1/admin/workload-bindings"),
+    ];
+
+    for (method, path) in routes {
+        let response = build_router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path} must be rejected with 401 by the default-deny layer"
+        );
+    }
+}
+
+#[tokio::test]
+async fn valid_token_is_not_rejected_by_default_deny_layer() {
+    // A minted valid token on a real /v1 route must pass the layer. The handler
+    // may still fail downstream (no live DB), but the layer itself must not 401.
+    let tenant = DataTenantId::new_v7();
+    let state = test_state();
+    let token = mint_test_user_jwt(&state, tenant);
+
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/cards/upload/init")
+                .header("x-wyrd-access-token", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "card_uid": "018f0000-0000-7000-8000-000000000001",
+                        "relative_path": "model.bin",
+                        "expected_sha256": "abc",
+                        "expected_size_bytes": 1
+                    })
+                    .to_string(),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
 fn test_state() -> AppState {
     let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
     let root = tempfile::tempdir().expect("temp dir");

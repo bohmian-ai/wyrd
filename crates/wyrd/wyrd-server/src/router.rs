@@ -17,7 +17,6 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use wyrd_spec::error::WyrdError;
 
-use crate::auth::AuthenticatedPrincipal;
 use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -42,11 +41,21 @@ pub fn build_router(state: AppState) -> Router {
     );
     let auth_routes = crate::auth::routes::router().layer(GovernorLayer::new(auth_governor));
 
+    // Default-deny: authentication is a property of the whole /v1 nest, not any
+    // single handler. Attaching require_authenticated to v1_group *after* its
+    // .fallback means Router::layer wraps the fallback too, so unknown /v1 paths
+    // are rejected with 401 before v1_not_found runs (no route-existence oracle).
+    // attach_request_id remains outermost on `protected`, so the RequestId
+    // extension is already present when this layer runs.
     let v1_group = crate::auth::admin::mount(crate::routes::authz::routes::mount(
         crate::eval::routes::mount(crate::storage::routes::mount(Router::new(), &state), &state),
         &state,
     ))
-    .fallback(v1_not_found);
+    .fallback(v1_not_found)
+    .layer(middleware::from_fn_with_state(
+        state.clone(),
+        crate::middleware::authenticate::require_authenticated,
+    ));
 
     // ServiceBuilder builds the inner error-handling middleware stack as a
     // single layer. Each layer in the builder wraps the one below it; the
@@ -91,10 +100,7 @@ pub fn build_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
 }
 
-async fn v1_not_found(
-    _principal: AuthenticatedPrincipal,
-    request: Request,
-) -> Result<(), WyrdErrorResponse> {
+async fn v1_not_found(request: Request) -> Result<(), WyrdErrorResponse> {
     Err(WyrdError::NotFound {
         message: "Wyrd route not found".to_owned(),
         details: serde_json::json!({ "path": request.uri().path() }),

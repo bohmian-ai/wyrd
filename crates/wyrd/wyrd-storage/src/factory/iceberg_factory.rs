@@ -44,3 +44,73 @@ pub fn iceberg_storage_factory(backend: &BackendConfig) -> IcebergStorageResult 
 
     Ok((factory, props))
 }
+
+/// Derive the Iceberg warehouse base URI from the active backend configuration.
+///
+/// This is the single source of truth for where the catalog roots table
+/// locations; the catalog appends `{namespace}/{name}` itself, so this returns
+/// only the base (no trailing slash, no table path).
+///
+/// - `Local { root }` → `file://{root}`
+/// - `S3` → `s3://{bucket}`
+/// - `Gcs` → `gs://{bucket}`
+/// - `Azure` → `abfss://{container}@{account}.dfs.core.windows.net`
+#[must_use]
+pub fn warehouse_uri(backend: &BackendConfig) -> String {
+    match backend {
+        BackendConfig::Local { root } => format!("file://{}", root.display()),
+        BackendConfig::S3(c) => format!("s3://{}", c.bucket),
+        BackendConfig::Gcs(c) => format!("gs://{}", c.bucket),
+        BackendConfig::Azure(c) => {
+            format!("abfss://{}@{}.dfs.core.windows.net", c.container, c.account)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::warehouse_uri;
+    use crate::settings::{AzureConfig, BackendConfig, GcsConfig, S3Config};
+    use std::path::PathBuf;
+
+    #[test]
+    fn local_warehouse_uri_is_file_scheme() {
+        let backend = BackendConfig::Local {
+            root: PathBuf::from("/var/lib/wyrd/warehouse"),
+        };
+        assert_eq!(warehouse_uri(&backend), "file:///var/lib/wyrd/warehouse");
+    }
+
+    #[test]
+    fn s3_warehouse_uri_is_bucket_base() {
+        let backend = BackendConfig::S3(S3Config {
+            bucket: "wyrd-tables".to_owned(),
+            region: Some("us-east-1".to_owned()),
+            endpoint_url: None,
+            force_path_style: false,
+        });
+        assert_eq!(warehouse_uri(&backend), "s3://wyrd-tables");
+    }
+
+    #[test]
+    fn gcs_warehouse_uri_is_bucket_base() {
+        let backend = BackendConfig::Gcs(GcsConfig {
+            bucket: "wyrd-tables".to_owned(),
+            endpoint_url: None,
+        });
+        assert_eq!(warehouse_uri(&backend), "gs://wyrd-tables");
+    }
+
+    #[test]
+    fn azure_warehouse_uri_is_abfss_base() {
+        let backend = BackendConfig::Azure(AzureConfig {
+            account: "acct".to_owned(),
+            container: "tables".to_owned(),
+            endpoint_url: None,
+        });
+        assert_eq!(
+            warehouse_uri(&backend),
+            "abfss://tables@acct.dfs.core.windows.net"
+        );
+    }
+}

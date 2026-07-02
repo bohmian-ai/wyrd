@@ -31,6 +31,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 uuid = { workspace = true, features = ["v4", "v7"] }
+vala-bifrost = { workspace = true }
 wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
@@ -41,5 +42,5 @@ wyrd-semver = { workspace = true }
 wyrd-server = { workspace = true }
 wyrd-spec = { workspace = true, features = ["test-utils"] }
 wyrd-sql = { workspace = true }
-wyrd-storage = { workspace = true }
+wyrd-storage = { workspace = true, features = ["iceberg"] }
 wyrd-utils = { workspace = true, features = ["python"], optional = true }

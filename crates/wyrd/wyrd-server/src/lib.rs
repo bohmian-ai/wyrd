@@ -17,6 +17,9 @@ pub mod shutdown;
 pub mod state;
 pub mod storage;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 use axum::Router;
 
 pub use boot::{

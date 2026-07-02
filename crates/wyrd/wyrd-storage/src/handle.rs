@@ -244,6 +244,14 @@ impl StorageHandle {
         crate::factory::iceberg_factory::iceberg_storage_factory(&self.backend_config)
     }
 
+    /// Derive the Iceberg warehouse base URI from the active backend
+    /// configuration. The catalog appends `{namespace}/{name}` itself.
+    #[cfg(feature = "iceberg")]
+    #[must_use]
+    pub fn warehouse_uri(&self) -> String {
+        crate::factory::iceberg_factory::warehouse_uri(&self.backend_config)
+    }
+
     /// Probe the storage backend for liveness.
     ///
     /// For the local backend, attempts a `stat` of the configured storage root

@@ -76,7 +76,7 @@ mod tests {
     #[tokio::test]
     async fn caller_data_tenant_id_sourced_from_principal() {
         let tenant = DataTenantId::new_v7();
-        let state = test_state();
+        let state = test_state().await;
         let token = mint_test_user_jwt(&state, tenant);
         let mut parts = Request::builder()
             .uri("/v1/cards/upload/init")
@@ -97,7 +97,7 @@ mod tests {
         assert_eq!(caller.principal.tenant_id, tenant);
     }
 
-    fn test_state() -> crate::state::AppState {
+    async fn test_state() -> crate::state::AppState {
         use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
         use std::collections::HashMap;
         use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -131,6 +131,7 @@ mod tests {
             app_pool,
             None,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
         )
         .with_auth_handles(issuing_key, verifier)
     }

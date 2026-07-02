@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
+use vala_bifrost::catalog::WyrdCatalog;
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_semver::VersionBlock;
 use wyrd_spec::DataTenantId;
@@ -12,7 +13,9 @@ use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_sql::{
-    pool::{build_app_pool, build_migrator_pool, build_platform_admin_pool},
+    pool::{
+        PoolConfig, build_app_pool, build_migrator_pool, build_platform_admin_pool, build_pool,
+    },
     postgres_boot::{BootError, PostgresBoot},
 };
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
@@ -35,6 +38,9 @@ pub enum ServerBootError {
     /// Storage boot failed.
     #[error(transparent)]
     Storage(#[from] wyrd_storage::StorageError),
+    /// Bifrost catalog construction failed.
+    #[error(transparent)]
+    Bifrost(#[from] vala_bifrost::error::BifrostError),
     /// Wyrd's own signing key could not be loaded or its public key derived.
     /// Boot fails closed: without a usable signing key the server cannot mint or
     /// verify Wyrd JWTs.
@@ -128,7 +134,32 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
     let storage = StorageHandle::from_settings(storage_settings).await?;
     tracing::info!(backend = %storage.backend(), "storage handle ready");
 
-    Ok(AppState::new(pool, platform_admin_pool, storage))
+    // Bifrost catalog: connects as `wyrd_catalog` over `iceberg_catalog` (the
+    // `dsns.catalog_app` DSN already carries the role/search_path options).
+    // Recovery connects as `vala_recovery`; its presence enables the best-effort
+    // startup recovery pass. The catalog's registry reuses the `wyrd_app` request
+    // pool. Warehouse derives from the configured storage backend (single source).
+    let recovery_pool = build_pool(dsns.recovery.expose_secret(), PoolConfig::default())
+        .await
+        .map_err(ServerBootError::PoolConnect)?;
+    let (storage_factory, storage_props) = storage.iceberg_storage_factory()?;
+    let warehouse = storage.warehouse_uri();
+    let bifrost = WyrdCatalog::new(
+        dsns.catalog_app.expose_secret(),
+        warehouse,
+        Arc::new(pool.clone()),
+        Some(Arc::new(recovery_pool)),
+        storage_factory,
+        storage_props,
+    )
+    .await?;
+
+    Ok(AppState::new(
+        pool,
+        platform_admin_pool,
+        storage,
+        Arc::new(bifrost),
+    ))
 }
 
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.
@@ -390,14 +421,19 @@ mod tests {
     use tempfile::tempdir;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn app_state_retains_only_runtime_pools() {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let platform_admin_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let root = tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
-        let state = AppState::new(app_pool, Some(platform_admin_pool), storage);
+        let state = AppState::new(
+            app_pool,
+            Some(platform_admin_pool),
+            storage,
+            crate::test_support::test_catalog().await,
+        );
 
         assert!(state.platform_admin_pool.is_some());
         assert_eq!(

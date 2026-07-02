@@ -684,7 +684,7 @@ mod tests {
     #[tokio::test]
     async fn missing_state_writes_failure_audit_with_nil_principal() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let state = test_state(&fixture);
+        let state = test_state(&fixture).await;
         let headers = tenant_headers(fixture.tenant_slug());
 
         let error = exchange_authorization_code(
@@ -709,7 +709,7 @@ mod tests {
     async fn stored_invalid_issuer_writes_failure_audit_with_nil_principal() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let state = test_state(&fixture);
+        let state = test_state(&fixture).await;
         let headers = tenant_headers(fixture.tenant_slug());
         PgLoginStateStore::new(fixture.app_pool().clone())
             .put(
@@ -757,7 +757,8 @@ mod tests {
         let state = test_state_with_external(
             &fixture,
             trusted_issuer_with_jwks(tenant, jwks_uri.clone(), HashMap::new(), Vec::new()),
-        );
+        )
+        .await;
         let trusted = trusted_issuer_with_jwks(tenant, jwks_uri, HashMap::new(), Vec::new());
         let login_state = login_state_with_nonce("nonce-ok");
         let id_token = encode_external_token(&external_claims(
@@ -806,7 +807,8 @@ mod tests {
         let state = test_state_with_external(
             &fixture,
             trusted_issuer_with_jwks(tenant, jwks_uri.clone(), HashMap::new(), Vec::new()),
-        );
+        )
+        .await;
         let trusted = trusted_issuer_with_jwks(tenant, jwks_uri, HashMap::new(), Vec::new());
         let login_state = login_state_with_nonce("nonce-ok");
         let id_token = encode_external_token(&external_claims(
@@ -1037,7 +1039,7 @@ mod tests {
             .collect()
     }
 
-    fn test_state(fixture: &PgFixture) -> AppState {
+    async fn test_state(fixture: &PgFixture) -> AppState {
         let storage_root = fixture.tempdir_path().join("callback-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
@@ -1045,10 +1047,11 @@ mod tests {
             fixture.app_pool().clone(),
             None,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
         )
     }
 
-    fn test_state_with_external(fixture: &PgFixture, trusted: TrustedIssuer) -> AppState {
+    async fn test_state_with_external(fixture: &PgFixture, trusted: TrustedIssuer) -> AppState {
         let issuing_key = Arc::new(
             IssuingKey::from_ed_pem(
                 SecretString::from(PRIVATE_KEY_PEM.to_owned()),
@@ -1080,6 +1083,7 @@ mod tests {
             Arc::clone(&registry),
         );
         test_state(fixture)
+            .await
             .with_auth_handles(issuing_key, Arc::new(verifier))
             .with_trusted_issuer_registry(registry)
     }

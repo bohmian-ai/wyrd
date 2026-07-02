@@ -367,7 +367,7 @@ mod tests {
         }
     }
 
-    fn lazy_state() -> AppState {
+    async fn lazy_state() -> AppState {
         use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
         let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
@@ -377,10 +377,11 @@ mod tests {
             pool,
             None,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
         )
     }
 
-    fn fixture_state(fixture: &PgFixture) -> AppState {
+    async fn fixture_state(fixture: &PgFixture) -> AppState {
         let storage_root = fixture.tempdir_path().join("issue-key-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
@@ -388,6 +389,7 @@ mod tests {
             fixture.app_pool().clone(),
             None,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
         )
     }
 
@@ -435,7 +437,7 @@ mod tests {
     #[tokio::test]
     async fn issue_key_without_permission_is_rbac_denied() {
         let tenant = DataTenantId::new_v7();
-        let state = lazy_state();
+        let state = lazy_state().await;
         let caller = caller_with(Uuid::new_v4(), tenant, PermissionSet::new());
         let request = IssueKeyRequest {
             card_ref: service_card_ref(),
@@ -465,7 +467,7 @@ mod tests {
         let sa_id = insert_test_service_account(&mut conn, tenant, creator, &card_ref).await;
         conn.commit().await.expect("seed commits");
 
-        let state = fixture_state(&fixture);
+        let state = fixture_state(&fixture).await;
         let caller = caller_with(
             creator,
             tenant,

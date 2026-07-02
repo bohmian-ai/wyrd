@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use sqlx::PgPool;
 use tempfile::TempDir;
 use wyrd_spec::DataTenantId;
@@ -90,6 +90,20 @@ impl PgFixture {
     #[must_use]
     pub fn platform_admin_pool(&self) -> &PgPool {
         &self.platform_admin_pool
+    }
+
+    /// Resolve the Bifrost catalog DSN for this fixture's embedded Postgres.
+    ///
+    /// The DSN connects as `wyrd_catalog_app` with the `role=wyrd_catalog` +
+    /// `search_path=iceberg_catalog` options baked in — the prod catalog
+    /// identity — so a test can construct the same `WyrdCatalog` the server boot
+    /// path does. Only the embedded boot surfaces this; the roles it needs are
+    /// provisioned during `start_seeded`.
+    ///
+    /// # Errors
+    /// Returns [`FixtureError`] when DSN resolution fails.
+    pub fn catalog_dsn(&self) -> Result<SecretString, FixtureError> {
+        Ok(self.boot.dsns()?.catalog_app)
     }
 
     /// Return the fixture's tenant isolation key.

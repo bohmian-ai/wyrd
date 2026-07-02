@@ -49,6 +49,17 @@ description = "Start a clean Postgres container via docker compose and wait for 
 # test DB is empty on every invocation — no stale _sqlx_migrations ledger.
 run = ["docker compose down --volumes --remove-orphans", "docker compose up -d --build --force-recreate --renew-anon-volumes postgres --wait"]
 
+[tasks."impl:setup"]
+hide = true
+description = "One-time environment bring-up before the first wyrd-implement wave: shared docker Postgres that every worktree reaches at localhost:5432. Run once, not per worktree."
+depends = ["build:postgres"]
+run = "echo 'impl env ready: shared Postgres up; mise supplies DATABASE_URL / WYRD_* per verify task'"
+
+[tasks."impl:warm"]
+hide = true
+description = "Warm the shared sccache by compiling the workspace on the impl base before dispatching a wave. Per-worktree CARGO_TARGET_DIR means each executor is cold on disk; sccache turns those into warm object-cache hits. Requires sccache + RUSTC_WRAPPER=sccache in the environment."
+run = "cargo build --workspace --all-features --all-targets"
+
 [tasks."test:rust:workspace"]
 hide = true
 description = "Run workspace Rust unit tests (no DB required)"

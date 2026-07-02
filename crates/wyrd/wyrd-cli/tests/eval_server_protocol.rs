@@ -1,32 +1,32 @@
 mod eval_support;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use assert_cmd::prelude::*;
 use axum::Router;
 use axum::extract::{Request, State};
-use axum::http::header;
+use axum::http::{StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
+use axum::response::IntoResponse;
+use axum::routing::post;
 use serde_json::json;
 use tokio::sync::Mutex;
-use vala_eval::orchestrator::OrchestratorError;
-use vala_http::eval::{AppState, router};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_spec::vala::ids::LeaseToken;
 
-use eval_support::{eval_ref, scenario, spec, write_eval_card};
-
-#[derive(Clone, Default)]
-struct Capture {
-    rows: SharedCapturedRequests,
-}
+use eval_support::{spec, write_eval_card};
 
 type CapturedRequest = (String, Option<String>);
-type SharedCapturedRequests = Arc<Mutex<Vec<CapturedRequest>>>;
+
+#[derive(Clone, Default)]
+struct TestState {
+    captured: Arc<Mutex<Vec<CapturedRequest>>>,
+    next_call: Arc<AtomicU32>,
+}
 
 async fn capture_headers(
-    State(state): State<Capture>,
+    State(state): State<TestState>,
     req: Request,
     next: Next,
 ) -> axum::response::Response {
@@ -34,14 +34,40 @@ async fn capture_headers(
     let auth = req
         .headers()
         .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
+        .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    state.rows.lock().await.push((path, auth));
+    state.captured.lock().await.push((path, auth));
     next.run(req).await
 }
 
-fn fixed_token() -> LeaseToken {
-    LeaseToken::new("cli-lease-token").expect("static lease token is valid")
+const FIXED_RUN_ID: &str = "test-run-01";
+const FIXED_LEASE: &str = "cli-lease-token";
+
+async fn handle_open() -> axum::Json<serde_json::Value> {
+    axum::Json(json!({
+        "run_id": FIXED_RUN_ID,
+        "lease_token": FIXED_LEASE,
+    }))
+}
+
+async fn handle_next(State(state): State<TestState>) -> axum::response::Response {
+    let call = state.next_call.fetch_add(1, Ordering::SeqCst);
+    if call == 0 {
+        axum::Json(json!({
+            "kind": "agent_turn",
+            "scenario_id": "happy_path",
+            "turn": 0,
+            "message": "Start",
+            "history": []
+        }))
+        .into_response()
+    } else {
+        axum::Json(json!({ "kind": "run_complete" })).into_response()
+    }
+}
+
+async fn handle_submission() -> StatusCode {
+    StatusCode::OK
 }
 
 #[tokio::test]
@@ -59,23 +85,18 @@ async fn server_protocol_carries_lease_after_open() {
         .mount(&agent)
         .await;
 
-    let loader_ref = eval_ref();
-    let state = AppState::new(
-        Arc::new(move |got| {
-            if got == &loader_ref {
-                Ok(vec![scenario()])
-            } else {
-                Err(OrchestratorError::EmbeddedCallback {
-                    reason: "unexpected eval ref".to_owned(),
-                })
-            }
-        }),
-        Arc::new(|| Ok(fixed_token())),
-    );
-    let capture = Capture::default();
+    let state = TestState::default();
+    let next_route = format!("/v1/eval/runs/{FIXED_RUN_ID}/next");
+    let agent_turn_route = format!("/v1/eval/runs/{FIXED_RUN_ID}/agent-turn");
+    let user_turn_route = format!("/v1/eval/runs/{FIXED_RUN_ID}/user-turn");
     let app = Router::new()
-        .nest("/api/v1/eval", router(state))
-        .layer(from_fn_with_state(capture.clone(), capture_headers));
+        .route("/v1/eval/runs", post(handle_open))
+        .route(&next_route, post(handle_next))
+        .route(&agent_turn_route, post(handle_submission))
+        .route(&user_turn_route, post(handle_submission))
+        .layer(from_fn_with_state(state.clone(), capture_headers))
+        .with_state(state.clone());
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test server");
@@ -108,7 +129,7 @@ async fn server_protocol_carries_lease_after_open() {
     .expect("blocking command task joins");
 
     server.abort();
-    let rows = capture.rows.lock().await.clone();
+    let rows = state.captured.lock().await.clone();
     let protected: Vec<_> = rows
         .iter()
         .filter(|(path, _)| {

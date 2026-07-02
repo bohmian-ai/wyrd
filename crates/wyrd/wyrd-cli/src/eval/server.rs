@@ -26,7 +26,7 @@ pub async fn run_server(args: EvalRunArgs, server_url: Url) -> Result<ExitCode, 
         .build()
         .map_err(|source| WyrdCliError::HttpBuild { source })?;
     let open_url = server_url
-        .join("api/v1/eval/runs")
+        .join("v1/eval/runs")
         .map_err(|source| WyrdCliError::UrlJoin { source })?;
     let open: EvalRunOpenResponse = http
         .post(open_url)
@@ -42,7 +42,7 @@ pub async fn run_server(args: EvalRunArgs, server_url: Url) -> Result<ExitCode, 
         .await
         .map_err(|source| WyrdCliError::Http { source })?;
     let bearer = format!("Bearer {}", open.lease_token.as_str());
-    let run_path = format!("api/v1/eval/runs/{}/", open.run_id);
+    let run_path = format!("v1/eval/runs/{}/", open.run_id);
     let next_url = server_url
         .join(&(run_path.clone() + "next"))
         .map_err(|source| WyrdCliError::UrlJoin { source })?;

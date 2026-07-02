@@ -40,5 +40,4 @@ axum = { workspace = true }
 predicates = "3"
 tempfile = { workspace = true }
 uuid = { workspace = true }
-vala-http = { workspace = true }
 wiremock = { workspace = true }

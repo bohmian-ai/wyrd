@@ -36,8 +36,10 @@ use wyrd_server::auth::revocation_resolver::SqlRevocationCheck;
 use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::config::{IssuerEntry, WorkloadBindingEntry};
+use wyrd_server::grpc::{GrpcRouterConfig, build_app_grpc, serve_grpc};
 use wyrd_server::issuer_boot::ConfigFileIssuerResolver;
 use wyrd_server::{AppState, build_router};
+use wyrd_tonic::tonic_health::server::health_reporter;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     RequestedSubject, SecretBearer, SubjectTokenType, TokenRequest, TokenResponse,
@@ -80,6 +82,7 @@ enum Mode {
     Bound {
         addr: std::net::SocketAddr,
         base_url: String,
+        grpc_addr: std::net::SocketAddr,
     },
 }
 
@@ -246,13 +249,13 @@ impl WyrdTestServer {
 
     /// Return the gRPC endpoint URL when bound to a real socket.
     ///
-    /// The harness binds a single TCP socket today; this derives the gRPC URL
-    /// from that same address so `WYRD_GRPC_URL` and `WYRD_SERVER_URL` point
-    /// to the same host:port until the harness grows a dedicated gRPC listener.
+    /// The harness binds a dedicated gRPC listener on its own port (distinct
+    /// from the HTTP `base_url`) through the same `build_app_grpc` path `main`
+    /// uses, so the ingest service is reachable off that address.
     #[must_use]
     pub fn grpc_url(&self) -> Option<String> {
         match &self.mode {
-            Mode::Bound { addr, .. } => Some(format!("http://{addr}")),
+            Mode::Bound { grpc_addr, .. } => Some(format!("http://{grpc_addr}")),
             Mode::InProcess => None,
         }
     }
@@ -1075,6 +1078,36 @@ impl WyrdTestServerBuilder {
         let base_url = format!("http://{addr}");
 
         let shutdown_token = CancellationToken::new();
+
+        // Reserve a second loopback port for the gRPC listener, then drop the
+        // reservation so serve_grpc can bind it. A brief race window is
+        // acceptable inside the test harness.
+        let grpc_probe = TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| WyrdTestServerError::Bind(e.to_string()))?;
+        let grpc_addr = grpc_probe
+            .local_addr()
+            .map_err(|e| WyrdTestServerError::Bind(e.to_string()))?;
+        drop(grpc_probe);
+
+        // Mount the ingest gRPC service through the SAME build_app_grpc path
+        // `main` uses. The health_service is a throwaway reporter/service pair;
+        // the harness does not drive gRPC readiness transitions.
+        let (_grpc_reporter, health_service) = health_reporter();
+        let grpc_router = build_app_grpc(
+            &srv.inner.state,
+            health_service,
+            GrpcRouterConfig {
+                reflection_enabled: false,
+            },
+        )
+        .map_err(|e| WyrdTestServerError::Start(e.to_string()))?;
+
+        let grpc_token = shutdown_token.clone();
+        wyrd_runtime::runtime().spawn(async move {
+            let _ = serve_grpc(grpc_router, grpc_addr, grpc_token).await;
+        });
+
         let token_clone = shutdown_token.clone();
         let router = srv.inner.router.clone();
 
@@ -1087,6 +1120,7 @@ impl WyrdTestServerBuilder {
         srv.mode = Mode::Bound {
             addr,
             base_url: base_url.clone(),
+            grpc_addr,
         };
 
         wait_for_ready(&base_url).await?;

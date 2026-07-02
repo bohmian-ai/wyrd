@@ -43,6 +43,10 @@ pub enum GrpcError {
     /// Reflection builder failed to assemble. Only emitted when reflection is enabled.
     #[error("gRPC reflection assembly failed: {0}")]
     Reflection(String),
+    /// Ingest mount was requested but no token verifier is configured. Ingest is
+    /// never mounted unauthenticated, so a missing verifier is a hard boot error.
+    #[error("gRPC ingest requires a token verifier but none is configured")]
+    MissingTokenVerifier,
 }
 
 /// Inputs to [`build_grpc_router`].

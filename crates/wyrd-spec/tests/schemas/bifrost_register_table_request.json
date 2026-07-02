@@ -1,0 +1,532 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RegisterTableRequest",
+  "description": "Register (create) a Bifrost table.",
+  "type": "object",
+  "required": [
+    "fields",
+    "name",
+    "namespace"
+  ],
+  "properties": {
+    "fields": {
+      "description": "User fields only; `wyrd_*`/`card_ref`/`run_id` reserved names are rejected.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/FieldSpec"
+      }
+    },
+    "name": {
+      "description": "Table name.",
+      "type": "string"
+    },
+    "namespace": {
+      "description": "Target namespace.",
+      "type": "string"
+    },
+    "partition_columns": {
+      "description": "Declared partition columns.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/PartitionColumnSpec"
+      }
+    },
+    "scope": {
+      "description": "Table scope; defaults to `TenantOwned`.",
+      "default": "TenantOwned",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TableScopeWire"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "DataTypeSpec": {
+      "description": "Arrow-free logical column type. The exhaustive set Bifrost accepts on the register path; the `DataTypeSpec ↔ arrow::DataType` conversion lives in the server/engine, never in `wyrd-spec`.",
+      "oneOf": [
+        {
+          "description": "Boolean.",
+          "type": "string",
+          "enum": [
+            "Bool"
+          ]
+        },
+        {
+          "description": "Signed 8-bit integer.",
+          "type": "string",
+          "enum": [
+            "Int8"
+          ]
+        },
+        {
+          "description": "Signed 16-bit integer.",
+          "type": "string",
+          "enum": [
+            "Int16"
+          ]
+        },
+        {
+          "description": "Signed 32-bit integer.",
+          "type": "string",
+          "enum": [
+            "Int32"
+          ]
+        },
+        {
+          "description": "Signed 64-bit integer.",
+          "type": "string",
+          "enum": [
+            "Int64"
+          ]
+        },
+        {
+          "description": "Unsigned 8-bit integer.",
+          "type": "string",
+          "enum": [
+            "UInt8"
+          ]
+        },
+        {
+          "description": "Unsigned 16-bit integer.",
+          "type": "string",
+          "enum": [
+            "UInt16"
+          ]
+        },
+        {
+          "description": "Unsigned 32-bit integer.",
+          "type": "string",
+          "enum": [
+            "UInt32"
+          ]
+        },
+        {
+          "description": "Unsigned 64-bit integer.",
+          "type": "string",
+          "enum": [
+            "UInt64"
+          ]
+        },
+        {
+          "description": "32-bit float.",
+          "type": "string",
+          "enum": [
+            "Float32"
+          ]
+        },
+        {
+          "description": "64-bit float.",
+          "type": "string",
+          "enum": [
+            "Float64"
+          ]
+        },
+        {
+          "description": "UTF-8 string.",
+          "type": "string",
+          "enum": [
+            "Utf8"
+          ]
+        },
+        {
+          "description": "Large UTF-8 string.",
+          "type": "string",
+          "enum": [
+            "LargeUtf8"
+          ]
+        },
+        {
+          "description": "Variable-length binary.",
+          "type": "string",
+          "enum": [
+            "Binary"
+          ]
+        },
+        {
+          "description": "Large variable-length binary.",
+          "type": "string",
+          "enum": [
+            "LargeBinary"
+          ]
+        },
+        {
+          "description": "Fixed-width binary.",
+          "type": "object",
+          "required": [
+            "FixedSizeBinary"
+          ],
+          "properties": {
+            "FixedSizeBinary": {
+              "type": "object",
+              "required": [
+                "len"
+              ],
+              "properties": {
+                "len": {
+                  "description": "Byte width.",
+                  "type": "integer",
+                  "format": "int32"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "32-bit date (days since epoch).",
+          "type": "string",
+          "enum": [
+            "Date32"
+          ]
+        },
+        {
+          "description": "64-bit date (milliseconds since epoch).",
+          "type": "string",
+          "enum": [
+            "Date64"
+          ]
+        },
+        {
+          "description": "Timestamp with explicit precision and optional timezone.",
+          "type": "object",
+          "required": [
+            "Timestamp"
+          ],
+          "properties": {
+            "Timestamp": {
+              "type": "object",
+              "required": [
+                "unit"
+              ],
+              "properties": {
+                "tz": {
+                  "description": "IANA timezone string, or `None` for timezone-naive.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "unit": {
+                  "description": "Precision.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/TimeUnit"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Time-of-day at second/millisecond precision.",
+          "type": "object",
+          "required": [
+            "Time32"
+          ],
+          "properties": {
+            "Time32": {
+              "type": "object",
+              "required": [
+                "unit"
+              ],
+              "properties": {
+                "unit": {
+                  "description": "Precision.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/TimeUnit"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Time-of-day at microsecond/nanosecond precision.",
+          "type": "object",
+          "required": [
+            "Time64"
+          ],
+          "properties": {
+            "Time64": {
+              "type": "object",
+              "required": [
+                "unit"
+              ],
+              "properties": {
+                "unit": {
+                  "description": "Precision.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/TimeUnit"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "128-bit fixed-point decimal.",
+          "type": "object",
+          "required": [
+            "Decimal128"
+          ],
+          "properties": {
+            "Decimal128": {
+              "type": "object",
+              "required": [
+                "precision",
+                "scale"
+              ],
+              "properties": {
+                "precision": {
+                  "description": "Total number of digits.",
+                  "type": "integer",
+                  "format": "uint8",
+                  "minimum": 0.0
+                },
+                "scale": {
+                  "description": "Number of fractional digits.",
+                  "type": "integer",
+                  "format": "int8"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Variable-length list of a single element type.",
+          "type": "object",
+          "required": [
+            "List"
+          ],
+          "properties": {
+            "List": {
+              "$ref": "#/definitions/DataTypeSpec"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Nested struct of named fields.",
+          "type": "object",
+          "required": [
+            "Struct"
+          ],
+          "properties": {
+            "Struct": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/FieldSpec"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "FieldSpec": {
+      "description": "Arrow-free field declaration. Follows the `card::field::FieldSpec` precedent but carries a typed [`DataTypeSpec`] instead of a loose dtype string.",
+      "type": "object",
+      "required": [
+        "data_type",
+        "name"
+      ],
+      "properties": {
+        "data_type": {
+          "description": "Logical column type.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/DataTypeSpec"
+            }
+          ]
+        },
+        "metadata": {
+          "description": "String metadata. Bifrost describe uses the `wyrd:column_class` key to flag `correlation` columns distinctly from user columns.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "description": "Column name.",
+          "type": "string"
+        },
+        "nullable": {
+          "description": "Whether the column is nullable. Defaults to `true`.",
+          "default": true,
+          "type": "boolean"
+        }
+      }
+    },
+    "PartitionColumnSpec": {
+      "description": "One partition-column declaration on the register request.",
+      "type": "object",
+      "required": [
+        "column",
+        "transform"
+      ],
+      "properties": {
+        "column": {
+          "description": "Column to partition on.",
+          "type": "string"
+        },
+        "transform": {
+          "description": "Transform applied to the column value.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PartitionTransformWire"
+            }
+          ]
+        }
+      }
+    },
+    "PartitionTransformWire": {
+      "description": "Partition transform on the wire. Arrow/Iceberg-free mirror of the engine `PartitionTransform`.",
+      "oneOf": [
+        {
+          "description": "Identity (value as-is).",
+          "type": "string",
+          "enum": [
+            "Identity"
+          ]
+        },
+        {
+          "description": "Truncate a timestamp to the year.",
+          "type": "string",
+          "enum": [
+            "Year"
+          ]
+        },
+        {
+          "description": "Truncate a timestamp to the month.",
+          "type": "string",
+          "enum": [
+            "Month"
+          ]
+        },
+        {
+          "description": "Truncate a timestamp to the day.",
+          "type": "string",
+          "enum": [
+            "Day"
+          ]
+        },
+        {
+          "description": "Truncate a timestamp to the hour.",
+          "type": "string",
+          "enum": [
+            "Hour"
+          ]
+        },
+        {
+          "description": "Hash into `n` buckets.",
+          "type": "object",
+          "required": [
+            "Bucket"
+          ],
+          "properties": {
+            "Bucket": {
+              "type": "object",
+              "required": [
+                "n"
+              ],
+              "properties": {
+                "n": {
+                  "description": "Bucket count.",
+                  "type": "integer",
+                  "format": "int32"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Truncate to width `w`.",
+          "type": "object",
+          "required": [
+            "Truncate"
+          ],
+          "properties": {
+            "Truncate": {
+              "type": "object",
+              "required": [
+                "w"
+              ],
+              "properties": {
+                "w": {
+                  "description": "Truncation width.",
+                  "type": "integer",
+                  "format": "int32"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TableScopeWire": {
+      "description": "Wire form of a Bifrost table scope. Distinct from the engine `TableScope` so `wyrd-spec` carries no engine dependency; the engine maps between the two.",
+      "oneOf": [
+        {
+          "description": "Tenant-isolated by catalog namespace; carries no `data_tenant_id` column.",
+          "type": "string",
+          "enum": [
+            "TenantOwned"
+          ]
+        },
+        {
+          "description": "Cross-tenant physical table; rows carry a server-stamped `data_tenant_id`.",
+          "type": "string",
+          "enum": [
+            "SystemShared"
+          ]
+        }
+      ]
+    },
+    "TimeUnit": {
+      "description": "Timestamp / time precision. Arrow-free mirror of `arrow::datatypes::TimeUnit`.",
+      "oneOf": [
+        {
+          "description": "Seconds.",
+          "type": "string",
+          "enum": [
+            "Second"
+          ]
+        },
+        {
+          "description": "Milliseconds.",
+          "type": "string",
+          "enum": [
+            "Millisecond"
+          ]
+        },
+        {
+          "description": "Microseconds — the canonical Bifrost physical timestamp precision.",
+          "type": "string",
+          "enum": [
+            "Microsecond"
+          ]
+        },
+        {
+          "description": "Nanoseconds — a caller may name it, but Bifrost coerces to microseconds.",
+          "type": "string",
+          "enum": [
+            "Nanosecond"
+          ]
+        }
+      ]
+    }
+  }
+}

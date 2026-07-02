@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TimeUnit",
+  "description": "Timestamp / time precision. Arrow-free mirror of `arrow::datatypes::TimeUnit`.",
+  "oneOf": [
+    {
+      "description": "Seconds.",
+      "type": "string",
+      "enum": [
+        "Second"
+      ]
+    },
+    {
+      "description": "Milliseconds.",
+      "type": "string",
+      "enum": [
+        "Millisecond"
+      ]
+    },
+    {
+      "description": "Microseconds — the canonical Bifrost physical timestamp precision.",
+      "type": "string",
+      "enum": [
+        "Microsecond"
+      ]
+    },
+    {
+      "description": "Nanoseconds — a caller may name it, but Bifrost coerces to microseconds.",
+      "type": "string",
+      "enum": [
+        "Nanosecond"
+      ]
+    }
+  ]
+}

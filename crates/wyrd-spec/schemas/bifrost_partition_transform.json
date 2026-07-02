@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PartitionTransformWire",
+  "description": "Partition transform on the wire. Arrow/Iceberg-free mirror of the engine `PartitionTransform`.",
+  "oneOf": [
+    {
+      "description": "Identity (value as-is).",
+      "type": "string",
+      "enum": [
+        "Identity"
+      ]
+    },
+    {
+      "description": "Truncate a timestamp to the year.",
+      "type": "string",
+      "enum": [
+        "Year"
+      ]
+    },
+    {
+      "description": "Truncate a timestamp to the month.",
+      "type": "string",
+      "enum": [
+        "Month"
+      ]
+    },
+    {
+      "description": "Truncate a timestamp to the day.",
+      "type": "string",
+      "enum": [
+        "Day"
+      ]
+    },
+    {
+      "description": "Truncate a timestamp to the hour.",
+      "type": "string",
+      "enum": [
+        "Hour"
+      ]
+    },
+    {
+      "description": "Hash into `n` buckets.",
+      "type": "object",
+      "required": [
+        "Bucket"
+      ],
+      "properties": {
+        "Bucket": {
+          "type": "object",
+          "required": [
+            "n"
+          ],
+          "properties": {
+            "n": {
+              "description": "Bucket count.",
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Truncate to width `w`.",
+      "type": "object",
+      "required": [
+        "Truncate"
+      ],
+      "properties": {
+        "Truncate": {
+          "type": "object",
+          "required": [
+            "w"
+          ],
+          "properties": {
+            "w": {
+              "description": "Truncation width.",
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BifrostTableEntry",
+  "description": "Lightweight table listing entry — one row of the list-tables response.\n\nSchema-free by design (review M-04): the stored schema is carried only by the per-table describe contract, [`BifrostTableDescription`], so the list stays small.",
+  "type": "object",
+  "required": [
+    "fingerprint",
+    "name",
+    "namespace",
+    "partition_columns",
+    "registered_at",
+    "scope",
+    "status",
+    "table_uid",
+    "updated_at"
+  ],
+  "properties": {
+    "fingerprint": {
+      "description": "Lower-case hex of the 32-byte user-schema fingerprint.",
+      "type": "string"
+    },
+    "name": {
+      "description": "Name component of the fully-qualified name (`<ns>.<name>` → name).",
+      "type": "string"
+    },
+    "namespace": {
+      "description": "Namespace component of the fully-qualified name (`<ns>.<name>` → ns).",
+      "type": "string"
+    },
+    "partition_columns": {
+      "description": "Declared partition columns.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "registered_at": {
+      "description": "Wall-clock registration time.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "scope": {
+      "description": "Table scope (wire enum, not the engine type).",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TableScopeWire"
+        }
+      ]
+    },
+    "status": {
+      "description": "Lifecycle status.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TableStatus"
+        }
+      ]
+    },
+    "table_uid": {
+      "description": "Lower-case hex of the 16-byte table uid.",
+      "type": "string"
+    },
+    "updated_at": {
+      "description": "Wall-clock last-update time.",
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "definitions": {
+    "TableScopeWire": {
+      "description": "Wire form of a Bifrost table scope. Distinct from the engine `TableScope` so `wyrd-spec` carries no engine dependency; the engine maps between the two.",
+      "oneOf": [
+        {
+          "description": "Tenant-isolated by catalog namespace; carries no `data_tenant_id` column.",
+          "type": "string",
+          "enum": [
+            "TenantOwned"
+          ]
+        },
+        {
+          "description": "Cross-tenant physical table; rows carry a server-stamped `data_tenant_id`.",
+          "type": "string",
+          "enum": [
+            "SystemShared"
+          ]
+        }
+      ]
+    },
+    "TableStatus": {
+      "description": "Lifecycle status of a registered Bifrost table.",
+      "oneOf": [
+        {
+          "description": "Table is active and writable.",
+          "type": "string",
+          "enum": [
+            "Active"
+          ]
+        },
+        {
+          "description": "Table is deprecated but still readable.",
+          "type": "string",
+          "enum": [
+            "Deprecated"
+          ]
+        },
+        {
+          "description": "Table is quarantined and not writable.",
+          "type": "string",
+          "enum": [
+            "Quarantined"
+          ]
+        }
+      ]
+    }
+  }
+}

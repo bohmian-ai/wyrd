@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RegisterTableResponse",
+  "description": "Response to a register call.",
+  "type": "object",
+  "required": [
+    "fingerprint",
+    "outcome",
+    "table_uid"
+  ],
+  "properties": {
+    "fingerprint": {
+      "description": "Server-authoritative lower-case hex of the 32-byte schema fingerprint.",
+      "type": "string"
+    },
+    "outcome": {
+      "description": "Whether the table was created or already existed.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/RegisterOutcome"
+        }
+      ]
+    },
+    "table_uid": {
+      "description": "Lower-case hex of the 16-byte table uid.",
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "RegisterOutcome": {
+      "description": "Whether a register call created a new table or matched an existing one.",
+      "oneOf": [
+        {
+          "description": "A new table was created.",
+          "type": "string",
+          "enum": [
+            "Created"
+          ]
+        },
+        {
+          "description": "A table with a matching fingerprint already existed (idempotent).",
+          "type": "string",
+          "enum": [
+            "AlreadyExists"
+          ]
+        }
+      ]
+    }
+  }
+}

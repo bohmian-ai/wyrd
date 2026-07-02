@@ -160,6 +160,36 @@ pub enum BifrostError {
         table: String,
     },
 
+    /// The submitted query SQL was not valid or not a supported `SELECT`.
+    #[wyrd_error(
+        code = "WYRD_VALA_400_QUERY_INVALID_SQL",
+        status = 400,
+        title = "Invalid or unsupported query SQL",
+        remediation = "Submit a single SELECT statement; DDL/DML and unsupported constructs are rejected."
+    )]
+    QueryInvalidSql {
+        /// Human-readable parse/validation detail.
+        detail: String,
+    },
+
+    /// The query exceeded the configured execution time budget.
+    #[wyrd_error(
+        code = "WYRD_VALA_504_QUERY_TIMEOUT",
+        status = 504,
+        title = "Query execution timed out",
+        remediation = "Narrow the query (add filters, reduce scanned partitions) or use the async query API."
+    )]
+    QueryTimeout,
+
+    /// The query result exceeded the configured size limit.
+    #[wyrd_error(
+        code = "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
+        status = 413,
+        title = "Query result too large",
+        remediation = "Add a LIMIT or narrower filters, or use the async query API for large result sets."
+    )]
+    QueryResultTooLarge,
+
     /// An unexpected internal Bifrost failure occurred.
     #[wyrd_error(
         code = "WYRD_VALA_500_BIFROST_INTERNAL",

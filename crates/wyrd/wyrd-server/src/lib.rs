@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod auth_boot;
+pub mod bifrost;
 pub mod boot;
 pub mod bootstrap;
 pub mod config;

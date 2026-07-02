@@ -10758,6 +10758,7 @@ name = "wyrd-server"
 version = "0.0.1"
 dependencies = [
  "arc-swap",
+ "arrow",
  "async-trait",
  "axum 0.8.9",
  "base64 0.22.1",

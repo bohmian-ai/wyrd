@@ -52,6 +52,16 @@ filesystem/git access). One Workflow invocation per wave.
    land). In the **primary working tree**, check out `impl_branch`, creating it
    from `base_branch` if new (`git switch -c <impl_branch> <base_branch>`). Never
    assume `main`; the base ref comes from `tasks.yaml`.
+   - **Env up once, here — not per worktree.** Run `mise run impl:setup` a single
+     time before the first wave. It brings up the shared docker Postgres that
+     every worktree reaches at `localhost:5432`; standing it up per worktree just
+     churns the container. mise supplies `DATABASE_URL` / `WYRD_*` to each verify
+     task, so executors never hand-export env.
+   - **Build cache.** Executors set a per-worktree `CARGO_TARGET_DIR` (so parallel
+     builds don't serialize on cargo's shared-target-dir lock) and, when present,
+     `RUSTC_WRAPPER=sccache` (so those per-worktree dirs still get warm object-cache
+     hits). Make sure `sccache` is installed and `RUSTC_WRAPPER=sccache` is in the
+     environment before dispatching, or the per-worktree dirs cold-compile.
 2. Compute the next wave (pending tasks with all deps `done`). If none and any
    task is still pending, stop and report a cycle or a blocked task.
 3. **Reindex the parent, then create worktrees, then dispatch.** Let `base` =
@@ -68,9 +78,17 @@ filesystem/git access). One Workflow invocation per wave.
      session left the index current; it may still reflect `main` or a stale
      branch. Invariant: the primary tree must be on `base` when you sync.
      `.codegraph/` stays gitignored; the index is never committed.
+   - **Warm the cache before dispatch.** Run `mise run impl:warm` on `base` in the
+     primary tree (a workspace compile). With `RUSTC_WRAPPER=sccache` set, this
+     populates the shared object cache, so each executor's cold per-worktree
+     `CARGO_TARGET_DIR` compiles from warm hits instead of from scratch. Skip only
+     if sccache is unavailable (then the warm build buys nothing).
    - **Then create a worktree per node, at the explicit base:**
      `git worktree add .claude/worktrees/impl-<id> <base> -b impl/<id>-<slug>`
      (reuse the path if it already exists and is correctly based).
+   - **Trust each worktree — fixed preflight, not a discovered failure.** Run
+     `mise trust .claude/worktrees/impl-<id>` for every worktree at creation, so
+     the executor's `mise run` gates never stall on an interactive trust prompt.
    - **Then invoke** the wave Workflow (`.claude/workflows/wave.js`) with
      `args = { featureDir, base, tasks: [<nodes with file+model+worktree+crates+seams+verify>] }` —
      each node carrying the absolute `worktree` path you just created. Pass `args`
@@ -107,6 +125,16 @@ filesystem/git access). One Workflow invocation per wave.
    `base`. Keeping the sync in one place (just before dispatch) is what
    guarantees the parent is reindexed *before any change is made*, on every wave
    including the first.
+   - **Verify once per wave — do not double-verify.** After the whole wave is
+     merged, run the **union of this wave's `verify` mise tasks once** on the
+     integrated tree, to catch integration breakage the isolated executors could
+     not see. Do **not** re-run each node's verify individually (the executor
+     already gated it in its worktree) and do **not** run a full
+     `cargo build --workspace` or the feature `final_gate` here. That is the
+     three-layer model: (1) executor gates its node in its worktree, (2) the wave
+     re-runs only its own union once post-merge, (3) the broad `final_gate` runs
+     once after the last wave. Re-running the executor's gate on merge, or a full
+     workspace build every wave, is the ~2× tax to remove.
 6. Repeat from step 2 until all tasks are `done`.
 7. Hand off to the **test** stage (the feature-level `final_gate` in
    `tasks.yaml`) and then **review** (`review-and-plan`).
@@ -153,8 +181,12 @@ Each commit is one agent. Its job, in order:
    or spelunk to fill the gap.
 3. **Write code + tests** following `wyrd-rust-python` doctrine (owning crate,
    error catalog, PyO3 boundary, tenant/audit rules).
-4. **Iterate to green** against the task's `verify` commands (targeted first:
-   `cargo test -p <crate> <name> --all-features -- --test-threads=1`).
+4. **Iterate to green** against the task's `verify` **mise tasks** (each
+   `mise run <task>` — mise carries the docker/env the tests need). A bare
+   `cargo test -p <crate> <name>` is allowed only as a **private inner dev loop**;
+   acceptance is always the mise verify tasks, never a hand-run cargo gate and
+   never a hand-exported env var. `wave.js` rejects any node whose `verify` gate is
+   bare `cargo` before it runs.
 5. **Commit** on its worktree branch and return structured status.
 
 ## Model routing
@@ -194,11 +226,20 @@ directly when a commit's surface warrants. The test stage uses
 
 ## Verification
 
-- Every integrated task's `verify` commands are green before it is marked `done`.
-- After all waves: the feature-level `final_gate` (`mise run test:unit`, `lints`,
-  `check`, the `test:bifrost` Postgres matrix, `codegen:check` on contract
-  changes) is clean on the assembled branch.
-- `mise run pre-pr` clean before review.
+Three layers, each run **once** — no re-running a lower layer at a higher one:
+
+1. **Per node (executor, in its worktree):** the task's `verify` mise tasks are
+   green before the node returns `green`. Never mark a node `done` with failing
+   verify.
+2. **Per wave (main agent, post-merge):** the union of the wave's `verify` mise
+   tasks, once, on the integrated tree. Not per-node, not a full workspace build.
+3. **Per feature (main agent, after the last wave):** the feature-level
+   `final_gate` (`mise run test:unit`, `lints`, `check`, the `test:bifrost`
+   Postgres matrix, `codegen:check` on contract changes), then `mise run pre-pr`
+   clean before review.
+
+All gates are mise tasks. A bare `cargo` at any gate is a bug (mise carries the
+docker/env); `wave.js` enforces this at dispatch.
 
 ## Hand-Off
 

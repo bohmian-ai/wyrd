@@ -74,6 +74,27 @@ function executorPrompt(t) {
     `expected; hydrate from the primary tree's index via the CLI (below). Do not`,
     `build a picture of the codebase by reading files.`,
     ``,
+    `Session setup — run these FIRST, before any build or test:`,
+    `  - Per-worktree build cache (parallel waves must NOT share one target dir, or`,
+    `    they serialize on cargo's file lock). Export, inside your worktree:`,
+    `      export CARGO_TARGET_DIR=${t.worktree}/target`,
+    `      command -v sccache >/dev/null && export RUSTC_WRAPPER=sccache`,
+    `  - Load your implementation doctrine and treat it as binding: invoke the`,
+    `    wyrd-rust-python skill (Skill tool) if available, else Read`,
+    `    .claude/skills/wyrd-rust-python/SKILL.md (it is present in this worktree).`,
+    `    It carries owning-crate, WyrdError catalog, PyO3-boundary, tenant/audit rules.`,
+    ``,
+    `Verify ONLY through mise — non-negotiable:`,
+    `  - Your acceptance gates are the contract's verify tasks, each \`mise run <task>\`.`,
+    `    Run them exactly as listed. mise carries docker (Postgres), env vars`,
+    `    (DATABASE_URL, WYRD_*), and deps; a bare \`cargo test\` skips all of that and`,
+    `    fails on missing env or, worse, passes wrongly.`,
+    `  - NEVER hand-export DATABASE_URL / WYRD_* / AWS_* to force a test green. If a`,
+    `    gate fails on a missing env/dep, find the mise task that provides it; if none`,
+    `    exists, STOP and return blocked — do not improvise the environment.`,
+    `  - You MAY use \`cargo check\` / \`cargo test -p <crate> <name>\` as a PRIVATE inner`,
+    `    dev loop for speed, but acceptance is always the mise verify tasks.`,
+    ``,
     `Procedure:`,
     `1. HYDRATE — do not spelunk. Run ONE Bash call:`,
     `     codegraph explore "${(t.seams.length ? t.seams : ['(read the contract for seam symbols)']).join(' ')}"`,
@@ -105,8 +126,26 @@ function executorPrompt(t) {
   ].join('\n')
 }
 
-const results = await parallel(
-  A.tasks.map((t) => () =>
+// A1 — mise-only verify gates, enforced at dispatch. A node whose verify list is
+// empty or contains a bare `cargo` gate is REJECTED before it runs: bare cargo
+// bypasses mise's docker/env/deps, which is the entire environment-debt failure
+// class. (The executor's PRIVATE inner `cargo test -p …` loop is fine — this
+// guards the acceptance GATE list only.)
+const gateProblem = (t) => {
+  if (!Array.isArray(t.verify) || t.verify.length === 0)
+    return 'no verify gate defined — need at least one `mise run <task>`'
+  const bad = t.verify.find((v) => /^\s*cargo\b/.test(v))
+  if (bad) return `verify gate must be a mise task, got bare cargo: "${bad}" — use \`mise run <task>\` (mise carries docker/env/deps)`
+  return null
+}
+const rejected = A.tasks
+  .map((t) => ({ t, problem: gateProblem(t) }))
+  .filter((x) => x.problem)
+  .map((x) => ({ id: x.t.id, status: 'blocked', failure: x.problem }))
+const runnable = A.tasks.filter((t) => !gateProblem(t))
+
+const dispatched = await parallel(
+  runnable.map((t) => () =>
     agent(executorPrompt(t), {
       label: `impl:${t.id}`,
       phase: 'Implement',
@@ -118,4 +157,4 @@ const results = await parallel(
   )
 )
 
-return { results: results.filter(Boolean) }
+return { results: [...rejected, ...dispatched.filter(Boolean)] }

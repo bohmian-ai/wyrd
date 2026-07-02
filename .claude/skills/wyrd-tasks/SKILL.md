@@ -40,7 +40,12 @@ executor hydrates from CodeGraph against the current code.
    symbols**, never as `file.rs:line`. Line numbers go stale; CodeGraph does not.
 4. Write the thin contract using `references/thin-task-format.md`.
 5. Fill the node in `tasks.yaml` per `references/tasks-yaml-schema.md`:
-   `depends_on`, `crates`, `seams`, `model`, `status: pending`.
+   `depends_on`, `crates`, `seams`, `model`, `verify`, `status: pending`. Every
+   `verify` entry MUST be a `mise run <task>` gate — the **narrowest** mise task(s)
+   that gate this node's crate (e.g. `mise run test:wyrd-spec`), never a bare
+   `cargo …` (mise carries the docker/env the tests need, and `wave.js` rejects a
+   bare-cargo gate before it runs). The broad suite belongs to the feature-level
+   `final_gate`, run once — not in a per-node `verify`.
 6. Set the `model` hint: `sonnet` by default; `opus` when the commit touches
    concurrency, trait/object-safety design, the PyO3 boundary, migrations, or a
    novel algorithm — anywhere the iterate-to-green recovery pass will need real
@@ -112,7 +117,8 @@ Before handing off to `wyrd-implement`:
 - Every load-bearing seam is named as a symbol with an invariant; no
   `file.rs:line`, no rendered bodies.
 - `tasks.yaml` validates against the schema: every node has `depends_on`,
-  `crates`, `seams`, `model`, `status`, and an acceptance/verify reference.
+  `crates`, `seams`, `model`, `status`, and a `verify` list of `mise run <task>`
+  gates (narrowest that cover the node; no bare `cargo`).
 - The `depends_on` edges match `plan.md`'s DAG exactly.
 
 ## Hand-Off

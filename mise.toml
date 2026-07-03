@@ -113,6 +113,19 @@ hide = true
 description = "Run wyrd-error-derive tests"
 run = "cargo test -p wyrd-error-derive --all-features"
 
+[tasks."test:wyrd-server"]
+hide = true
+description = """Run wyrd-server Rust tests (lib + DB-free integration tests). The DB- and
+emulator-backed server suites (identity_e2e, storage_e2e) are env-gated and skip when their
+WYRD_* flags are unset, so this task needs no docker; the full DB e2e runs via
+test:storage:e2e / identity:e2e. Narrow gate for iterating on server code."""
+run = "cargo test -p wyrd-server --all-features"
+
+[tasks."test:wyrd-mcp"]
+hide = true
+description = "Run wyrd-mcp tests (MCP contract-artifact record types + projection). Narrow gate; no docker."
+run = "cargo test -p wyrd-mcp --all-features"
+
 [tasks."identity:e2e"]
 hide = true
 description = """Stand up real OIDC providers (Keycloak + Dex), seed test users via the Keycloak

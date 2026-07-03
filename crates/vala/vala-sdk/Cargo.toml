@@ -12,6 +12,10 @@ description = "Vala client SDK: Bifrost ingest sink, pooled producers, and fire-
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+python = ["dep:pyo3"]
+
 [dependencies]
 wyrd-queue = { workspace = true }
 wyrd-client = { workspace = true }
@@ -24,6 +28,8 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+
+pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
 wyrd-queue = { workspace = true }

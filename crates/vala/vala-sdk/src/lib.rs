@@ -25,6 +25,8 @@
 
 pub mod handle;
 pub mod observe;
+#[cfg(feature = "python")]
+pub mod python;
 pub mod scope;
 pub mod sink;
 

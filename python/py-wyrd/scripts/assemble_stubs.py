@@ -11,11 +11,12 @@ ROOT_OUTPUT_FILE = PACKAGE_DIR / "_wyrd.pyi"
 
 PUBLIC_MODULE_STUBS = {
     "agent.pyi": PACKAGE_DIR / "agent" / "__init__.pyi",
+    "bifrost.pyi": PACKAGE_DIR / "bifrost" / "__init__.pyi",
     "cards.pyi": PACKAGE_DIR / "cards" / "__init__.pyi",
     "config.pyi": PACKAGE_DIR / "config" / "__init__.pyi",
     "data.pyi": PACKAGE_DIR / "data" / "__init__.pyi",
-    "eval.pyi": PACKAGE_DIR / "eval" / "__init__.pyi",
     "model.pyi": PACKAGE_DIR / "model" / "__init__.pyi",
+    "observe.pyi": PACKAGE_DIR / "observe" / "__init__.pyi",
     "observer.pyi": PACKAGE_DIR / "observer.pyi",
     "prompt.pyi": PACKAGE_DIR / "prompt" / "__init__.pyi",
 }
@@ -97,6 +98,9 @@ def rewrite_public_imports(filename: str, content: str) -> str:
             ),
             "from .prompt import Prompt": "from ..prompt import Prompt",
             "from .observer import Observer": "from ..observer import Observer",
+        },
+        "observe.pyi": {
+            "from .bifrost import Bifrost": "from ..bifrost import Bifrost",
         },
         "observer.pyi": {
             "from wyrd.stubs.prompt import ProviderRequest, ProviderResponse": (

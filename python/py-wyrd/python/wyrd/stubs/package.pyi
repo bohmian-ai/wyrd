@@ -1,5 +1,5 @@
 #### begin imports ####
-from . import cards, config, data, eval, model, prompt
+from . import cards, config, data, model, prompt
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError
 from .agent import (
     Agent,
@@ -83,7 +83,6 @@ __all__ = [
     "cards",
     "config",
     "data",
-    "eval",
     "local_registry",
     "model",
     "prompt",

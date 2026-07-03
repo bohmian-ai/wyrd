@@ -7,8 +7,9 @@
 //! `model_json_schema()` / `pyarrow.Schema`) lives in `vala-sdk` and calls these.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
+use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit as ArrowTimeUnit};
 use serde_json::{Map, Value};
 use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec, TimeUnit};
 
@@ -36,6 +37,36 @@ pub fn json_schema_to_fieldspec(schema: &Value) -> Result<Vec<FieldSpec>, WyrdQu
 #[must_use]
 pub fn arrow_schema_to_fieldspec(schema: &Schema) -> Vec<FieldSpec> {
     schema.fields().iter().map(|f| field_to_spec(f)).collect()
+}
+
+/// Map a `Vec<FieldSpec>` into an Arrow `Schema`, the client-side forward
+/// direction that mirrors `arrow_schema_to_fieldspec`.
+///
+/// Every `DataTypeSpec` variant in the register-accepted set maps to exactly the
+/// `arrow::DataType` the server twin `data_type_to_arrow` would produce. List
+/// item fields are named `"item"` and are nullable; Struct fields recurse.
+///
+/// # Errors
+/// Returns `Ok` for all supported `DataTypeSpec` variants. The function
+/// signature returns `Result` for symmetry with `json_schema_to_arrow`.
+pub fn fieldspec_to_arrow(fields: &[FieldSpec]) -> Result<Schema, WyrdQueueError> {
+    let arrow_fields: Vec<Field> = fields
+        .iter()
+        .map(|f| Field::new(f.name.as_str(), data_type_to_arrow(&f.data_type), f.nullable))
+        .collect();
+    Ok(Schema::new(arrow_fields))
+}
+
+/// Walk a JSON-Schema object into an Arrow `Schema` in one step.
+///
+/// Composes `json_schema_to_fieldspec` then `fieldspec_to_arrow`. All
+/// `SchemaParse` failure modes are owned by the parse step.
+///
+/// # Errors
+/// Returns [`WyrdQueueError::SchemaParse`] on an unsupported or malformed
+/// JSON-Schema node, forwarded from `json_schema_to_fieldspec`.
+pub fn json_schema_to_arrow(schema: &Value) -> Result<Schema, WyrdQueueError> {
+    fieldspec_to_arrow(&json_schema_to_fieldspec(schema)?)
 }
 
 fn build_fields(
@@ -216,5 +247,56 @@ fn time_unit_from_arrow(unit: ArrowTimeUnit) -> TimeUnit {
         ArrowTimeUnit::Millisecond => TimeUnit::Millisecond,
         ArrowTimeUnit::Microsecond => TimeUnit::Microsecond,
         ArrowTimeUnit::Nanosecond => TimeUnit::Nanosecond,
+    }
+}
+
+fn time_unit_to_arrow(unit: TimeUnit) -> ArrowTimeUnit {
+    match unit {
+        TimeUnit::Second => ArrowTimeUnit::Second,
+        TimeUnit::Millisecond => ArrowTimeUnit::Millisecond,
+        TimeUnit::Microsecond => ArrowTimeUnit::Microsecond,
+        TimeUnit::Nanosecond => ArrowTimeUnit::Nanosecond,
+    }
+}
+
+fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
+    match spec {
+        DataTypeSpec::Bool => DataType::Boolean,
+        DataTypeSpec::Int8 => DataType::Int8,
+        DataTypeSpec::Int16 => DataType::Int16,
+        DataTypeSpec::Int32 => DataType::Int32,
+        DataTypeSpec::Int64 => DataType::Int64,
+        DataTypeSpec::UInt8 => DataType::UInt8,
+        DataTypeSpec::UInt16 => DataType::UInt16,
+        DataTypeSpec::UInt32 => DataType::UInt32,
+        DataTypeSpec::UInt64 => DataType::UInt64,
+        DataTypeSpec::Float32 => DataType::Float32,
+        DataTypeSpec::Float64 => DataType::Float64,
+        DataTypeSpec::Utf8 => DataType::Utf8,
+        DataTypeSpec::LargeUtf8 => DataType::LargeUtf8,
+        DataTypeSpec::Binary => DataType::Binary,
+        DataTypeSpec::LargeBinary => DataType::LargeBinary,
+        DataTypeSpec::FixedSizeBinary { len } => DataType::FixedSizeBinary(*len),
+        DataTypeSpec::Date32 => DataType::Date32,
+        DataTypeSpec::Date64 => DataType::Date64,
+        DataTypeSpec::Timestamp { unit, tz } => DataType::Timestamp(
+            time_unit_to_arrow(*unit),
+            tz.as_deref().map(Into::into),
+        ),
+        DataTypeSpec::Time32 { unit } => DataType::Time32(time_unit_to_arrow(*unit)),
+        DataTypeSpec::Time64 { unit } => DataType::Time64(time_unit_to_arrow(*unit)),
+        DataTypeSpec::Decimal128 { precision, scale } => DataType::Decimal128(*precision, *scale),
+        DataTypeSpec::List(inner) => DataType::List(Arc::new(Field::new(
+            "item",
+            data_type_to_arrow(inner),
+            true,
+        ))),
+        DataTypeSpec::Struct(fields) => {
+            let arrow_fields: Vec<Field> = fields
+                .iter()
+                .map(|f| Field::new(f.name.as_str(), data_type_to_arrow(&f.data_type), f.nullable))
+                .collect();
+            DataType::Struct(Fields::from(arrow_fields))
+        }
     }
 }

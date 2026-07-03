@@ -31,5 +31,7 @@ pub use config::QueueConfig;
 pub use error::WyrdQueueError;
 pub use producer::{Producer, ProducerMetrics};
 pub use queue::{Flushable, RecordQueue, Row};
-pub use schema::{arrow_schema_to_fieldspec, json_schema_to_fieldspec};
+pub use schema::{
+    arrow_schema_to_fieldspec, fieldspec_to_arrow, json_schema_to_arrow, json_schema_to_fieldspec,
+};
 pub use sink::{BatchSink, MockSink, SealedBatch};

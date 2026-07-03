@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BifrostPermissionDescriptor",
+  "description": "Descriptor for one Bifrost RBAC permission.\n\nEmitted by `gen_schemas` (Stage 3 C7) and returned by the `bifrost.list_permissions` MCP tool.",
+  "type": "object",
+  "required": [
+    "action",
+    "permission",
+    "resource"
+  ],
+  "properties": {
+    "action": {
+      "description": "Action component (e.g. `read`).",
+      "type": "string"
+    },
+    "permission": {
+      "description": "Permission string in `resource:action` format (e.g. `bifrost_table:read`).",
+      "type": "string"
+    },
+    "resource": {
+      "description": "Resource component (e.g. `bifrost_table`).",
+      "type": "string"
+    }
+  }
+}

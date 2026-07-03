@@ -10656,6 +10656,18 @@ dependencies = [
 [[package]]
 name = "wyrd-mcp"
 version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "reqwest 0.12.28",
+ "secrecy",
+ "serde_json",
+ "skald-tool",
+ "tokio",
+ "wyrd-client",
+ "wyrd-runtime",
+ "wyrd-spec",
+ "wyrd-testing",
+]
 
 [[package]]
 name = "wyrd-observe"

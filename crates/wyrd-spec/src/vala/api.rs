@@ -228,6 +228,38 @@ pub struct FieldSpec {
     pub metadata: BTreeMap<String, String>,
 }
 
+/// Descriptor for one entry in the Bifrost error catalog.
+///
+/// Emitted by `gen_schemas` (Stage 3 C7) and returned by the
+/// `bifrost.list_errors` MCP tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct BifrostErrorDescriptor {
+    /// Stable machine-readable error code (e.g. `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND`).
+    pub code: String,
+    /// HTTP status code associated with this error.
+    pub status: u16,
+    /// Short human-readable title.
+    pub title: String,
+    /// Actionable remediation guidance.
+    pub remediation: String,
+}
+
+/// Descriptor for one Bifrost RBAC permission.
+///
+/// Emitted by `gen_schemas` (Stage 3 C7) and returned by the
+/// `bifrost.list_permissions` MCP tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct BifrostPermissionDescriptor {
+    /// Permission string in `resource:action` format (e.g. `bifrost_table:read`).
+    pub permission: String,
+    /// Resource component (e.g. `bifrost_table`).
+    pub resource: String,
+    /// Action component (e.g. `read`).
+    pub action: String,
+}
+
 /// Partition transform on the wire. Arrow/Iceberg-free mirror of the engine
 /// `PartitionTransform`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

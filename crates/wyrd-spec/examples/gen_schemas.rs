@@ -47,10 +47,11 @@ use wyrd_spec::storage::{
 };
 use wyrd_spec::vala::api::{
     AsyncJobState, AsyncQueryRequest, AsyncQueryResponse, AsyncQueryStatus, AuditDecision,
-    AuditEvent, AuditResult, AuthMethod, BifrostTableDescription, BifrostTableEntry, DataTypeSpec,
-    ExecutorAvailability, FieldSpec as BifrostFieldSpec, JobUid, PartitionColumnSpec,
-    PartitionTransformWire, QueryParam, RegisterOutcome, RegisterTableRequest,
-    RegisterTableResponse, SyncQueryRequest, TableScopeWire, TableStatus, TimeUnit,
+    AuditEvent, AuditResult, AuthMethod, BifrostErrorDescriptor, BifrostPermissionDescriptor,
+    BifrostTableDescription, BifrostTableEntry, DataTypeSpec, ExecutorAvailability,
+    FieldSpec as BifrostFieldSpec, JobUid, PartitionColumnSpec, PartitionTransformWire, QueryParam,
+    RegisterOutcome, RegisterTableRequest, RegisterTableResponse, SyncQueryRequest, TableScopeWire,
+    TableStatus, TimeUnit,
 };
 use wyrd_spec::vala::eval::{
     AgentTurnSubmission, ComparisonOperator, ConversationTurn, DagError, EvalCondition,
@@ -181,6 +182,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<AuthMethod>(out, golden, "bifrost_audit_auth_method")?;
     write::<AuditDecision>(out, golden, "bifrost_audit_decision")?;
     write::<AuditResult>(out, golden, "bifrost_audit_result")?;
+    // Stage 3 C7: Bifrost capability catalog — error descriptors + permission descriptors.
+    // One source (these types in vala::api), two consumers: gen_schemas (snapshot) +
+    // bifrost.list_errors / bifrost.list_permissions MCP tools. Schema drift detected here.
+    write::<BifrostErrorDescriptor>(out, golden, "bifrost_error_descriptor")?;
+    write::<BifrostPermissionDescriptor>(out, golden, "bifrost_permission_descriptor")?;
     let eval_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/eval/schemas");
     fs::create_dir_all(eval_fixtures)?;
     write_fixture::<EvalSpec>(eval_fixtures, "eval_spec")?;

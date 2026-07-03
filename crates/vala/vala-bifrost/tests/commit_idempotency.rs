@@ -39,7 +39,7 @@ struct Fixture {
 
 async fn setup() -> Fixture {
     let db = vala_sql::testing::shared().await.expect("shared db");
-    vala_sql::testing::reset_for_test(db).await.expect("reset");
+    vala_sql::testing::reset_for_test(&db).await.expect("reset");
     let pool = Arc::new(db.app.clone());
 
     let tenant = DataTenantId::new_v7();

@@ -127,7 +127,7 @@ struct Seeded {
 /// (`payload`); the server stamps `data_tenant_id` from each write's bound tenant.
 async fn seeded() -> Seeded {
     let db = vala_sql::testing::shared().await.expect("shared db");
-    vala_sql::testing::reset_for_test(db).await.expect("reset");
+    vala_sql::testing::reset_for_test(&db).await.expect("reset");
     let pool = Arc::new(db.app.clone());
 
     let tmp = tempfile::tempdir().unwrap();

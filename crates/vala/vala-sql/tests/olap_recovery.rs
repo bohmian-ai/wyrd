@@ -13,9 +13,9 @@ const TABLE_UID: [u8; 16] = [0x10; 16];
 const BATCH_ID: [u8; 16] = [0x20; 16];
 const BATCH_ID_2: [u8; 16] = [0x21; 16];
 
-async fn setup() -> (&'static SharedDb, DataTenantId) {
+async fn setup() -> (SharedDb, DataTenantId) {
     let db = vala_sql::testing::shared().await.expect("shared db");
-    vala_sql::testing::reset_for_test(db).await.expect("reset");
+    vala_sql::testing::reset_for_test(&db).await.expect("reset");
     let tenant = DataTenantId::new_v7();
     vala_sql::testing::seed_tenant(&db.platform_admin, tenant.as_uuid())
         .await

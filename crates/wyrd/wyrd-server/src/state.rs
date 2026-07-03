@@ -22,6 +22,7 @@ use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::config::DeploymentProfile;
 use crate::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter, new_run_map};
 use crate::health::ReadinessSnapshot;
+use crate::postgres::ServerPostgres;
 
 /// Production [`TokenVerifier`] specialization: SQL-backed permission resolution
 /// (`SqlPermissionResolver`) plus Postgres-backed issuer resolution
@@ -57,6 +58,9 @@ impl Default for LimitsConfig {
 /// runtime database pools that already survive boot.
 #[derive(Clone)]
 pub struct AppState {
+    /// Composed production Postgres handle. Unit tests that use lazy pools may
+    /// leave this unset.
+    pub postgres: Option<Arc<ServerPostgres>>,
     /// Runtime `wyrd_app` pool. Tenant-scoped traffic uses this pool and RLS
     /// applies on tenant tables.
     pub pool: PgPool,
@@ -117,6 +121,7 @@ impl AppState {
     ) -> Self {
         let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
         Self {
+            postgres: None,
             pool,
             platform_admin_pool,
             storage,
@@ -143,6 +148,16 @@ impl AppState {
             eval_runs: new_run_map(),
             eval_audit: Arc::new(TracingEvalAuditWriter),
         }
+    }
+
+    /// Build runtime state from production-ready Postgres handles.
+    #[must_use]
+    pub fn from_postgres(postgres: Arc<ServerPostgres>, storage: Arc<StorageHandle>) -> Self {
+        let pool = postgres.app_pool().clone();
+        let platform_admin_pool = postgres.platform_admin_pool().cloned();
+        let mut state = Self::new(pool, platform_admin_pool, storage);
+        state.postgres = Some(postgres);
+        state
     }
 
     /// Replace the eval audit writer, primarily for tests.

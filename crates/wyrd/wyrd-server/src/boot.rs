@@ -13,14 +13,12 @@ use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_sql::{
-    pool::{build_app_pool, build_migrator_pool, build_platform_admin_pool},
-    postgres_boot::{BootError, PostgresBoot},
-};
+use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::config::WorkloadBindingEntry;
+use crate::postgres::ServerPostgres;
 use crate::state::AppState;
 
 /// Errors raised while assembling server state.
@@ -29,9 +27,9 @@ pub enum ServerBootError {
     /// Postgres boot or pool construction failed.
     #[error(transparent)]
     Postgres(#[from] BootError),
-    /// Runtime pool construction failed.
-    #[error("database pool construction failed")]
-    PoolConnect(#[source] sqlx::Error),
+    /// Server database readiness failed.
+    #[error(transparent)]
+    Database(#[from] crate::postgres::ServerPostgresError),
     /// SQL migrations failed.
     #[error(transparent)]
     Sql(#[from] wyrd_sql::error::SqlError),
@@ -110,31 +108,7 @@ pub async fn build_app_state() -> Result<AppState, ServerBootError> {
 /// Returns [`ServerBootError`] when DSN resolution, migrations, or runtime
 /// pool construction fails.
 pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, ServerBootError> {
-    let dsns = boot.dsns()?;
-    let migrator_pool = build_migrator_pool(dsns.migrator.expose_secret())
-        .await
-        .map_err(ServerBootError::PoolConnect)?;
-
-    let migration_result: Result<(), wyrd_sql::error::SqlError> = async {
-        wyrd_sql::migrate(&migrator_pool).await?;
-        vala_sql::migrate(&migrator_pool).await?;
-        Ok(())
-    }
-    .await;
-    migrator_pool.close().await;
-    migration_result?;
-
-    let pool = build_app_pool(dsns.app.expose_secret())
-        .await
-        .map_err(ServerBootError::PoolConnect)?;
-    let platform_admin_pool = match dsns.platform_admin {
-        Some(dsn) => Some(
-            build_platform_admin_pool(dsn.expose_secret())
-                .await
-                .map_err(ServerBootError::PoolConnect)?,
-        ),
-        None => None,
-    };
+    let postgres = Arc::new(ServerPostgres::connect_from_boot(boot).await?);
     let storage_settings = load_storage_settings()?;
     tracing::info!(
         backend = %storage_settings.backend.kind(),
@@ -146,7 +120,7 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
     let storage = StorageHandle::from_settings(storage_settings).await?;
     tracing::info!(backend = %storage.backend(), "storage handle ready");
 
-    Ok(AppState::new(pool, platform_admin_pool, storage))
+    Ok(AppState::from_postgres(postgres, storage))
 }
 
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.

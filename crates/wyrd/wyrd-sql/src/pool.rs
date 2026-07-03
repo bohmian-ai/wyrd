@@ -86,7 +86,9 @@ impl PoolConfig {
         Self::from_env_with_suffix(Self::platform_admin_defaults(), "_PLATFORM_ADMIN")
     }
 
-    fn from_env_with_suffix(defaults: Self, suffix: &str) -> Self {
+    /// Override a default pool config from `WYRD_DB_*{suffix}` env vars.
+    #[must_use]
+    pub fn from_env_with_suffix(defaults: Self, suffix: &str) -> Self {
         Self {
             max_connections: env_u32("WYRD_DB_MAX_CONNECTIONS", suffix, defaults.max_connections),
             min_connections: env_u32("WYRD_DB_MIN_CONNECTIONS", suffix, defaults.min_connections),

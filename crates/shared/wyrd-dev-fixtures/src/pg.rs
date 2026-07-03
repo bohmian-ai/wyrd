@@ -110,7 +110,7 @@ impl PgFixture {
         tenant_slug: String,
     ) -> Result<Self, FixtureError> {
         let db = vala_sql::testing::shared().await?;
-        vala_sql::testing::reset_for_test(db).await?;
+        vala_sql::testing::reset_for_test(&db).await?;
         seed_tenant(&db.platform_admin, data_tenant_id, &tenant_slug).await?;
 
         Ok(Self {

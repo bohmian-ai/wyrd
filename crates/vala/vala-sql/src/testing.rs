@@ -7,11 +7,8 @@
 //! wyrd-sql — never re-transcribed here.
 
 use sqlx::{AssertSqlSafe, PgConnection, PgPool};
-use tokio::sync::OnceCell;
 
 use crate::SqlError;
-
-static VALA_MIGRATED: OnceCell<()> = OnceCell::const_new();
 
 /// Shared pool set with Wyrd and Vala migrations guaranteed applied once.
 ///
@@ -20,12 +17,17 @@ static VALA_MIGRATED: OnceCell<()> = OnceCell::const_new();
 /// migrations fail.
 pub async fn shared() -> Result<wyrd_sql::testing::SharedDb, SqlError> {
     let db = wyrd_sql::testing::shared().await?;
-    VALA_MIGRATED
-        .get_or_try_init(|| async {
-            crate::migrate(&db.migrator).await?;
-            Ok::<(), SqlError>(())
+    let dsns = wyrd_sql::dsn::resolve_external_dsns_from_env()
+        .map_err(|error| SqlError::InvariantViolation {
+            detail: format!("test DB DSN config error: {error}"),
         })
-        .await?;
+        .and_then(|resolved| {
+            resolved.ok_or_else(|| SqlError::InvariantViolation {
+                detail: "shared test DB env unset (WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD); refusing to boot embedded in tests".to_owned(),
+            })
+        })?;
+    let vala = crate::ValaPostgres::connect_from_dsns(&dsns).await?;
+    drop(vala);
     Ok(db)
 }
 

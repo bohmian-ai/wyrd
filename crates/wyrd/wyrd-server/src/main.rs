@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use secrecy::ExposeSecret;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -20,7 +19,7 @@ use wyrd_server::{
     WyrdServerConfig, build_app_state_from_config, build_router, spawn_storage_sweeper,
 };
 use wyrd_spec::TenantSlug;
-use wyrd_sql::pool::build_app_pool;
+use wyrd_sql::WyrdPostgres;
 use wyrd_sql::postgres_boot::PostgresBoot;
 use wyrd_telemetry::{TelemetryGuard, init as init_telemetry};
 
@@ -83,11 +82,11 @@ async fn bootstrap_key(tenant: &str) -> Result<(), BootExit> {
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
     let dsns = boot.dsns().map_err(|e| BootExit::Other(Box::new(e)))?;
-    let pool = build_app_pool(dsns.app.expose_secret())
+    let postgres = WyrdPostgres::connect_from_dsns(&dsns)
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
 
-    let key = bootstrap_admin_key(&pool, &slug)
+    let key = bootstrap_admin_key(postgres.app_pool(), &slug)
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
 

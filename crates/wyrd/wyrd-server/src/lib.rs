@@ -11,6 +11,7 @@ pub mod grpc;
 pub mod health;
 pub mod issuer_boot;
 pub mod middleware;
+pub mod postgres;
 pub mod router;
 pub mod routes;
 pub mod serve;
@@ -24,6 +25,7 @@ pub use boot::{
     ServerBootError, build_app_state, build_app_state_from_config, spawn_storage_sweeper,
 };
 pub use config::WyrdServerConfig;
+pub use postgres::{ServerPostgres, ServerPostgresError};
 pub use router::build_router;
 pub use serve::serve;
 pub use state::AppState;

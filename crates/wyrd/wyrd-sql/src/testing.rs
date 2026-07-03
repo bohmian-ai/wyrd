@@ -7,7 +7,6 @@
 
 use secrecy::ExposeSecret;
 use sqlx::{AssertSqlSafe, PgConnection, PgPool};
-use tokio::sync::OnceCell;
 
 use crate::error::SqlError;
 use crate::pool::{PoolConfig, build_pool};
@@ -22,8 +21,6 @@ pub struct SharedDb {
     pub platform_admin: PgPool,
 }
 
-static MIGRATED: OnceCell<()> = OnceCell::const_new();
-
 /// Connect to the shared docker `wyrd_test` DB and return role-specific pools.
 ///
 /// # Errors
@@ -31,51 +28,34 @@ static MIGRATED: OnceCell<()> = OnceCell::const_new();
 /// migrations fail, or any role pool cannot be built.
 pub async fn shared() -> Result<SharedDb, SqlError> {
     let dsns = resolved_test_dsns()?;
+    let postgres = crate::WyrdPostgres::connect_from_dsns(&dsns).await?;
 
-    MIGRATED
-        .get_or_try_init(|| async {
-            let migrator =
-                build_pool(dsns.migrator.expose_secret(), PoolConfig::migrator_defaults())
-                    .await
-                    .map_err(SqlError::Connect)?;
-            let result = crate::migrate(&migrator).await;
-            migrator.close().await;
-            result
-        })
-        .await?;
-
-    let migrator = build_pool(dsns.migrator.expose_secret(), PoolConfig::migrator_defaults())
-        .await
-        .map_err(SqlError::Connect)?;
-    let app = build_pool(dsns.app.expose_secret(), PoolConfig::app_defaults())
-        .await
-        .map_err(SqlError::Connect)?;
-    let platform_admin_dsn = dsns
-        .platform_admin
-        .ok_or_else(|| SqlError::InvariantViolation {
-            detail: "shared test DB env unset (WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD); platform-admin pool is required for tenant seeding".to_owned(),
-        })?;
-    let platform_admin = build_pool(
-        platform_admin_dsn.expose_secret(),
-        PoolConfig::platform_admin_defaults(),
+    let migrator = build_pool(
+        dsns.migrator.expose_secret(),
+        PoolConfig::migrator_defaults(),
     )
     .await
     .map_err(SqlError::Connect)?;
+    let platform_admin = postgres
+        .platform_admin_pool()
+        .cloned()
+        .ok_or_else(|| SqlError::InvariantViolation {
+            detail: "shared test DB env unset (WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD); platform-admin pool is required for tenant seeding".to_owned(),
+        })?;
 
     Ok(SharedDb {
         migrator,
-        app,
+        app: postgres.app_pool().clone(),
         platform_admin,
     })
 }
 
 fn resolved_test_dsns() -> Result<crate::dsn::ResolvedDsns, SqlError> {
-    let resolved =
-        crate::dsn::resolve_external_dsns_from_env().map_err(|error| {
-            SqlError::InvariantViolation {
-                detail: format!("test DB DSN config error: {error}"),
-            }
-        })?;
+    let resolved = crate::dsn::resolve_external_dsns_from_env().map_err(|error| {
+        SqlError::InvariantViolation {
+            detail: format!("test DB DSN config error: {error}"),
+        }
+    })?;
     let Some(dsns) = resolved else {
         return Err(SqlError::InvariantViolation {
             detail: "shared test DB env unset (WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD); refusing to boot embedded in tests".to_owned(),

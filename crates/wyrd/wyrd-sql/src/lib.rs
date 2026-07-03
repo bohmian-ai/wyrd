@@ -12,6 +12,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 pub mod dsn;
 pub mod error;
 pub mod pool;
+pub mod postgres;
 #[cfg(feature = "embedded-postgres")]
 pub mod postgres_boot;
 pub mod queries;
@@ -22,6 +23,7 @@ pub mod testing;
 
 pub use error::SqlError;
 pub use pool::PoolConfig;
+pub use postgres::WyrdPostgres;
 pub use row_types::cards::{
     AuditCardRegistrationRow, CardRegistrationOperation, CardRow, CardStatus,
     NewAuditCardRegistrationRow, NewCardRow, ParsedCardRow,

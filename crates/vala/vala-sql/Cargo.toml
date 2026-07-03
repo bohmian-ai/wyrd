@@ -17,6 +17,7 @@ diagnostics = []
 testing = ["dep:tokio", "wyrd-sql/testing"]
 
 [dependencies]
+secrecy = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true, optional = true, features = ["sync", "macros", "rt-multi-thread"] }
 tracing = { workspace = true }

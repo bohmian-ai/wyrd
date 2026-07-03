@@ -121,7 +121,12 @@ function executorPrompt(t) {
     `   ${t.verify.map((v) => '`' + v + '`').join(', ')}.`,
     `   Budget: ${maxIters} attempts. If still red after ${maxIters}, return`,
     `   "needs_escalation" with the full failure output and what you tried.`,
-    `6. Commit on this worktree's branch with a conventional message and return:`,
+    `6. Commit on this worktree's branch. You MUST stage EVERY change first with`,
+    `   \`cd ${t.worktree} && git add -A\` — this commit likely adds NEW files and/or a`,
+    `   whole NEW crate (untracked). \`git commit -am\` stages only modified TRACKED`,
+    `   files and SILENTLY DROPS new untracked files/crates, which corrupts the commit.`,
+    `   After \`git add -A\`, run \`git status --porcelain\` and confirm it is EMPTY`,
+    `   (everything staged, nothing untracked) before you \`git commit\`. Then return:`,
     `   id, status (green|needs_escalation|blocked), branch, filesChanged, verifyRun, failure.`,
   ].join('\n')
 }

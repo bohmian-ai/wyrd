@@ -409,7 +409,8 @@ mod tests {
         let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
             .await
             .expect("fixture starts");
-        let storage_root = fixture.tempdir_path().join("storage");
+        let tempdir = tempfile::tempdir().expect("login storage tempdir");
+        let storage_root = tempdir.path().join("storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
         let state = AppState::new(

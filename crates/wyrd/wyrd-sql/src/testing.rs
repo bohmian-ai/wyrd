@@ -22,53 +22,66 @@ pub struct SharedDb {
     pub platform_admin: PgPool,
 }
 
-static SHARED: OnceCell<SharedDb> = OnceCell::const_new();
+static MIGRATED: OnceCell<()> = OnceCell::const_new();
 
-/// Connect to the shared docker `wyrd_test` DB and cache its role pools.
+/// Connect to the shared docker `wyrd_test` DB and return role-specific pools.
 ///
 /// # Errors
 /// Returns [`SqlError`] when the shared test DB env is missing or invalid,
 /// migrations fail, or any role pool cannot be built.
-pub async fn shared() -> Result<&'static SharedDb, SqlError> {
-    SHARED
+pub async fn shared() -> Result<SharedDb, SqlError> {
+    let dsns = resolved_test_dsns()?;
+
+    MIGRATED
         .get_or_try_init(|| async {
-            let resolved = crate::dsn::resolve_external_dsns_from_env().map_err(|error| {
-                SqlError::InvariantViolation {
-                    detail: format!("test DB DSN config error: {error}"),
-                }
-            })?;
-            let Some(dsns) = resolved else {
-                return Err(SqlError::InvariantViolation {
-                    detail: "shared test DB env unset (WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD); refusing to boot embedded in tests".to_owned(),
-                });
-            };
-
-            let migrator = build_pool(dsns.migrator.expose_secret(), PoolConfig::migrator_defaults())
-                .await
-                .map_err(SqlError::Connect)?;
-            crate::migrate(&migrator).await?;
-            let app = build_pool(dsns.app.expose_secret(), PoolConfig::app_defaults())
-                .await
-                .map_err(SqlError::Connect)?;
-            let platform_admin_dsn =
-                dsns.platform_admin
-                    .ok_or_else(|| SqlError::InvariantViolation {
-                        detail: "shared test DB env unset (WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD); platform-admin pool is required for tenant seeding".to_owned(),
-                    })?;
-            let platform_admin = build_pool(
-                platform_admin_dsn.expose_secret(),
-                PoolConfig::platform_admin_defaults(),
-            )
-            .await
-            .map_err(SqlError::Connect)?;
-
-            Ok(SharedDb {
-                migrator,
-                app,
-                platform_admin,
-            })
+            let migrator =
+                build_pool(dsns.migrator.expose_secret(), PoolConfig::migrator_defaults())
+                    .await
+                    .map_err(SqlError::Connect)?;
+            let result = crate::migrate(&migrator).await;
+            migrator.close().await;
+            result
         })
+        .await?;
+
+    let migrator = build_pool(dsns.migrator.expose_secret(), PoolConfig::migrator_defaults())
         .await
+        .map_err(SqlError::Connect)?;
+    let app = build_pool(dsns.app.expose_secret(), PoolConfig::app_defaults())
+        .await
+        .map_err(SqlError::Connect)?;
+    let platform_admin_dsn = dsns
+        .platform_admin
+        .ok_or_else(|| SqlError::InvariantViolation {
+            detail: "shared test DB env unset (WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD); platform-admin pool is required for tenant seeding".to_owned(),
+        })?;
+    let platform_admin = build_pool(
+        platform_admin_dsn.expose_secret(),
+        PoolConfig::platform_admin_defaults(),
+    )
+    .await
+    .map_err(SqlError::Connect)?;
+
+    Ok(SharedDb {
+        migrator,
+        app,
+        platform_admin,
+    })
+}
+
+fn resolved_test_dsns() -> Result<crate::dsn::ResolvedDsns, SqlError> {
+    let resolved =
+        crate::dsn::resolve_external_dsns_from_env().map_err(|error| {
+            SqlError::InvariantViolation {
+                detail: format!("test DB DSN config error: {error}"),
+            }
+        })?;
+    let Some(dsns) = resolved else {
+        return Err(SqlError::InvariantViolation {
+            detail: "shared test DB env unset (WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD); refusing to boot embedded in tests".to_owned(),
+        });
+    };
+    Ok(dsns)
 }
 
 impl SharedDb {

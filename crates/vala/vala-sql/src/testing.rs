@@ -18,7 +18,7 @@ static VALA_MIGRATED: OnceCell<()> = OnceCell::const_new();
 /// # Errors
 /// Returns [`SqlError`] when the shared Wyrd DB cannot be prepared or Vala
 /// migrations fail.
-pub async fn shared() -> Result<&'static wyrd_sql::testing::SharedDb, SqlError> {
+pub async fn shared() -> Result<wyrd_sql::testing::SharedDb, SqlError> {
     let db = wyrd_sql::testing::shared().await?;
     VALA_MIGRATED
         .get_or_try_init(|| async {

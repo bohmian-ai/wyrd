@@ -51,9 +51,9 @@ run = ["docker compose down --volumes --remove-orphans", "docker compose up -d -
 
 [tasks."impl:setup"]
 hide = true
-description = "One-time environment bring-up before the first wyrd-implement wave: shared docker Postgres that every worktree reaches at localhost:5432. Run once, not per worktree."
-depends = ["build:postgres"]
-run = "echo 'impl env ready: shared Postgres up; mise supplies DATABASE_URL / WYRD_* per verify task'"
+description = "One-time environment bring-up before the first wyrd-implement wave: shared docker Postgres that every worktree reaches at localhost:5432, plus the migrated wyrd_test DB the reset shard needs. Run once, not per worktree."
+depends = ["build:postgres", "db:migrate:all"]
+run = "echo 'impl env ready: shared Postgres up + wyrd_test migrated; mise supplies DATABASE_URL / WYRD_* per verify task'"
 
 [tasks."impl:warm"]
 hide = true
@@ -96,7 +96,7 @@ Only real-credential cloud storage tests (test:storage:{s3,gcs,azure}:cloud) are
 storage-integration-cloud.yml; emulator-backed storage tests run here because they are just
 docker containers, same difficulty as Postgres.
 """
-depends = ["test:rust:workspace", "test:storage:matrix", "test:sql", "test:registry-e2e"]
+depends = ["test:rust:workspace", "test:storage:matrix", "test:sql", "test:registry-e2e", "test:pg"]
 
 [tasks."test:wyrd-spec"]
 hide = true
@@ -1301,6 +1301,38 @@ Brings up Postgres, provisions roles, and applies migrations before running test
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = "cargo test --locked -p wyrd-sql --all-features --test migration_pg -- --nocapture"
+
+[tasks."db:migrate:all"]
+hide = true
+description = """Provision the dedicated wyrd_test database and migrate it once.
+Adds the cluster-global wyrd_catalog role (db:setup-roles omits it; roles are
+cluster-global, so one step serves both DBs), creates wyrd_test owned by the
+migrator superuser, and applies the wyrd-sql migrations to it. wyrd_test is a
+second logical DB on the same docker-compose container — not a second boot — and
+is distinct from the `wyrd` DB the concurrent e2e/migration tasks use, so the
+clean-slate reset shard's database-global wipe can never reach them (D8).
+"""
+depends = ["build:postgres", "db:setup-roles"]
+env = { WYRD_ADMIN_DSN = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd_test", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+run = """
+set -e
+psql "$WYRD_ADMIN_DSN" -c "CREATE ROLE wyrd_catalog NOLOGIN;" || true
+psql "$WYRD_ADMIN_DSN" -tc "SELECT 1 FROM pg_database WHERE datname = 'wyrd_test'" | grep -q 1 \
+  || psql "$WYRD_ADMIN_DSN" -c "CREATE DATABASE wyrd_test OWNER wyrd_migrator;"
+cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture
+"""
+
+[tasks."test:pg"]
+hide = true
+description = """Serial clean-slate reset self-tests against the dedicated wyrd_test DB.
+Single-threaded because reset_owned_schemas issues a database-global
+TRUNCATE … RESTART IDENTITY CASCADE; sharing a worker with other DB tests would
+race. Depends on db:migrate:all so wyrd_test is migrated exactly once — the reset
+primitive never migrates, drops, or re-runs (binding decision D4).
+"""
+depends = ["build:postgres", "db:migrate:all"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd_test", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+run = "cargo test --locked -p wyrd-sql --all-features --test reset_pg -- --test-threads=1 --nocapture"
 
 [tasks."check:security-schema-drift"]
 hide = true

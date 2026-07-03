@@ -24,6 +24,7 @@ use wyrd_sql::queries::auth::{
 use crate::auth::card_scope::resolve_card_scope;
 use crate::auth::issue_api_key::{WyrdApiKey, principal_kind_for_card};
 use crate::auth::permission_resolver::SqlPermissionResolver;
+use crate::auth::pg_resolvers::PgIssuerResolver;
 
 /// Token exchange settings.
 #[derive(Debug, Clone)]
@@ -66,7 +67,7 @@ pub struct DelegateToken {
     /// JWT issuing key.
     pub issuing_key: Arc<IssuingKey>,
     /// JWT verifier.
-    pub verifier: Arc<TokenVerifier<SqlPermissionResolver>>,
+    pub verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
     /// Permission checker.
     pub permission_check: Arc<dyn PermissionCheck>,
     /// Settings.
@@ -86,8 +87,10 @@ impl std::fmt::Debug for DelegateToken {
 pub struct ExchangedToken {
     /// Access token.
     pub access_token: SecretString,
-    /// Refresh token.
-    pub refresh_token: SecretString,
+    /// Refresh token. `None` for grants that do not issue one (workload
+    /// `jwt-bearer` and `token-exchange` delegation), whose callers hold a
+    /// durable credential they can re-present for a fresh access token.
+    pub refresh_token: Option<SecretString>,
     /// Token type.
     pub token_type: TokenType,
     /// Access token expiry.
@@ -100,11 +103,41 @@ impl ExchangedToken {
     pub fn into_response(self) -> TokenResponse {
         TokenResponse {
             access_token: SecretBearer::new(self.access_token.expose_secret().to_owned()),
-            refresh_token: SecretBearer::new(self.refresh_token.expose_secret().to_owned()),
+            refresh_token: self
+                .refresh_token
+                .map(|token| SecretBearer::new(token.expose_secret().to_owned())),
             token_type: self.token_type,
             expires_at: self.expires_at,
         }
     }
+}
+
+/// Whether a token-issuing path mints a refresh token alongside the access
+/// token.
+///
+/// Refresh tokens exist to spare a credential holder from re-proving identity.
+/// A human OIDC session and an API key benefit from that. A workload with a
+/// platform-attested assertion, or a short-lived delegated principal, do not:
+/// they can re-present their durable credential, so issuing a long-lived
+/// refresh secret only widens the leak surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RefreshPolicy {
+    /// Issue and persist a refresh token (API-key exchange, human login).
+    Mint,
+    /// Access token only; no refresh token is issued or stored.
+    Skip,
+}
+
+/// The service/agent principal a token is being issued for.
+pub(super) struct IssueSubject {
+    /// Stable principal id.
+    pub principal_id: Uuid,
+    /// Principal kind: `"service"` or `"agent"`.
+    pub principal_kind: String,
+    /// Principal card reference embedded in the access token.
+    pub card_ref: CardRef,
+    /// Effective roles embedded in the access token.
+    pub roles: Vec<RoleRef>,
 }
 
 /// API-key exchange failure.
@@ -204,10 +237,13 @@ impl ExchangeApiKey {
             conn,
             &self.issuing_key,
             &self.settings,
-            row.principal_id,
-            &row.principal_kind,
-            row.card_ref.0,
-            roles,
+            IssueSubject {
+                principal_id: row.principal_id,
+                principal_kind: row.principal_kind,
+                card_ref: row.card_ref.0,
+                roles,
+            },
+            RefreshPolicy::Mint,
         )
         .await
         .map_err(ExchangeError::from)
@@ -272,23 +308,10 @@ impl DelegateToken {
             card_scope,
             self.settings.access_ttl,
         )?;
-        let refresh_token = self.issuing_key.issue_refresh_token(
-            principal_kind_tag(&row.principal_kind).ok_or(DelegateError::SubjectNotFound)?,
-            PrincipalId::new(row.id),
-            conn.data_tenant_id(),
-            self.settings.refresh_ttl,
-        )?;
+        // Delegated tokens are short-lived and non-refreshable by design
+        // (RFC 8693). The caller re-delegates when the access token expires, so
+        // no refresh token is issued or persisted for the delegated principal.
         let expires_at = Utc::now() + self.settings.access_ttl;
-        let refresh_expires_at = Utc::now() + self.settings.refresh_ttl;
-        insert_refresh_token(
-            conn,
-            Uuid::new_v4(),
-            &row.principal_kind,
-            row.id,
-            &token_hash(&refresh_token),
-            refresh_expires_at,
-        )
-        .await?;
         insert_audit_token_exchange(
             conn,
             Uuid::new_v4(),
@@ -302,7 +325,7 @@ impl DelegateToken {
 
         Ok(ExchangedToken {
             access_token: SecretString::from(access_token),
-            refresh_token: SecretString::from(refresh_token),
+            refresh_token: None,
             token_type: TokenType::Bearer,
             expires_at,
         })
@@ -313,16 +336,20 @@ pub(super) async fn issue_for_subject(
     conn: &mut TenantConn<'_>,
     issuing_key: &IssuingKey,
     settings: &TokenExchangeSettings,
-    principal_id: Uuid,
-    principal_kind: &str,
-    card_ref: CardRef,
-    roles: Vec<RoleRef>,
+    subject: IssueSubject,
+    refresh: RefreshPolicy,
 ) -> Result<ExchangedToken, IssueOrSqlError> {
+    let IssueSubject {
+        principal_id,
+        principal_kind,
+        card_ref,
+        roles,
+    } = subject;
     let id = PrincipalId::new(principal_id);
-    let card_scope = resolve_card_scope(conn, principal_kind, &card_ref)
+    let card_scope = resolve_card_scope(conn, &principal_kind, &card_ref)
         .await
         .map_err(IssueOrSqlError::CardScope)?;
-    let access_token = match principal_kind {
+    let access_token = match principal_kind.as_str() {
         "service" => issuing_key.issue_service_access_token(
             id,
             conn.data_tenant_id(),
@@ -341,26 +368,32 @@ pub(super) async fn issue_for_subject(
         )?,
         _ => return Err(IssueOrSqlError::Issue(IssueError::InvalidPrincipalKind)),
     };
-    let refresh_token = issuing_key.issue_refresh_token(
-        principal_kind_tag(principal_kind).ok_or(IssueError::InvalidPrincipalKind)?,
-        id,
-        conn.data_tenant_id(),
-        settings.refresh_ttl,
-    )?;
+    let refresh_token = match refresh {
+        RefreshPolicy::Mint => {
+            let token = issuing_key.issue_refresh_token(
+                principal_kind_tag(&principal_kind).ok_or(IssueError::InvalidPrincipalKind)?,
+                id,
+                conn.data_tenant_id(),
+                settings.refresh_ttl,
+            )?;
+            insert_refresh_token(
+                conn,
+                Uuid::new_v4(),
+                &principal_kind,
+                principal_id,
+                &token_hash(&token),
+                Utc::now() + settings.refresh_ttl,
+            )
+            .await?;
+            Some(SecretString::from(token))
+        }
+        RefreshPolicy::Skip => None,
+    };
     let expires_at = Utc::now() + settings.access_ttl;
-    insert_refresh_token(
-        conn,
-        Uuid::new_v4(),
-        principal_kind,
-        principal_id,
-        &token_hash(&refresh_token),
-        Utc::now() + settings.refresh_ttl,
-    )
-    .await?;
 
     Ok(ExchangedToken {
         access_token: SecretString::from(access_token),
-        refresh_token: SecretString::from(refresh_token),
+        refresh_token,
         token_type: TokenType::Bearer,
         expires_at,
     })
@@ -582,7 +615,8 @@ mod tests {
     };
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{
-        CardScope, Permission, PermissionCheck, PermissionVerdict, Principal, PrincipalId, RbacCheck,
+        CardScope, Permission, PermissionCheck, PermissionVerdict, Principal, PrincipalId,
+        RbacCheck, RoleRef,
     };
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
@@ -599,6 +633,7 @@ mod tests {
     };
     use crate::auth::issue_api_key::WyrdApiKey;
     use crate::auth::permission_resolver::SqlPermissionResolver;
+    use crate::auth::seed::seed_builtin_roles_for_tenant;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -1110,7 +1145,9 @@ mod tests {
         let verifier = Arc::new(TokenVerifier::new(
             decoding_keys,
             "wyrd",
-            Arc::new(SqlPermissionResolver::new(Arc::new(fixture.app_pool().clone()))),
+            Arc::new(SqlPermissionResolver::new(Arc::new(
+                fixture.app_pool().clone(),
+            ))),
             WyrdAuthVerifySettings::default(),
         ));
         DelegateToken {
@@ -1130,12 +1167,20 @@ mod tests {
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
-        insert_service_card(&mut conn, tenant, &own, &[component.clone()]).await;
+        insert_service_card(&mut conn, tenant, &own, std::slice::from_ref(&component)).await;
         let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &own).await;
 
         let api_key = WyrdApiKey::generate(tenant);
         let key_hash = wyrd_auth_issue::hash_api_key(&api_key.secret).expect("api key hashes");
-        insert_valid_api_key(&mut conn, tenant, sa_id, user_id, &api_key.prefix, &key_hash).await;
+        insert_valid_api_key(
+            &mut conn,
+            tenant,
+            sa_id,
+            user_id,
+            &api_key.prefix,
+            &key_hash,
+        )
+        .await;
 
         let exchanged = exchange_service()
             .execute(&mut conn, api_key.secret)
@@ -1164,7 +1209,15 @@ mod tests {
 
         let api_key = WyrdApiKey::generate(tenant);
         let key_hash = wyrd_auth_issue::hash_api_key(&api_key.secret).expect("api key hashes");
-        insert_valid_api_key(&mut conn, tenant, sa_id, user_id, &api_key.prefix, &key_hash).await;
+        insert_valid_api_key(
+            &mut conn,
+            tenant,
+            sa_id,
+            user_id,
+            &api_key.prefix,
+            &key_hash,
+        )
+        .await;
 
         let result = exchange_service().execute(&mut conn, api_key.secret).await;
 
@@ -1191,7 +1244,13 @@ mod tests {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
         // Callee: a Service card whose scope is {shared} ∪ {callee own}.
-        insert_service_card(&mut conn, tenant, &callee_card, &[shared.clone()]).await;
+        insert_service_card(
+            &mut conn,
+            tenant,
+            &callee_card,
+            std::slice::from_ref(&shared),
+        )
+        .await;
         insert_test_service_account(&mut conn, tenant, user_id, &callee_card).await;
 
         // Caller token carries a scope of {shared, caller_only}. Intersection
@@ -1231,5 +1290,81 @@ mod tests {
             "callee-own card is excluded by caller scope"
         );
         assert_eq!(claims.card_scope.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delegation_issues_no_refresh_token() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+
+        // Seed the per-tenant builtin roles so the resolver maps the delegator's
+        // `runtime_admin` role claim to `delegation_issue`, and insert the target
+        // Service principal (plus its Service card so the callee scope resolves)
+        // the exchange resolves by card_ref.
+        let target_card_ref = CardRef {
+            kind: CardKind::Service,
+            name: CardName::new("delegation-target").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("prod").expect("static space is valid"),
+            uid: None,
+        };
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        seed_builtin_roles_for_tenant(&mut conn, tenant)
+            .await
+            .expect("builtin roles seed");
+        let creator = insert_test_user(&mut conn, tenant).await;
+        insert_test_service_account(&mut conn, tenant, creator, &target_card_ref).await;
+        insert_service_card(&mut conn, tenant, &target_card_ref, &[]).await;
+        conn.commit().await.expect("seed commits");
+
+        let issuing_key = test_issuing_key();
+        let subject_token = issuing_key
+            .issue_service_access_token(
+                PrincipalId::new(Uuid::new_v4()),
+                tenant,
+                test_service_card_ref(),
+                vec![RoleRef::new("runtime_admin").expect("role name is valid")],
+                CardScope::new([test_service_card_ref()]),
+                Duration::minutes(15),
+            )
+            .expect("subject token issues");
+
+        let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
+        let mut decoding_keys = HashMap::new();
+        decoding_keys.insert(Kid::new("k1").expect("kid is valid"), Arc::new(public_key));
+        let verifier = Arc::new(TokenVerifier::new(
+            decoding_keys,
+            "wyrd",
+            Arc::new(SqlPermissionResolver::new(Arc::new(
+                fixture.app_pool().clone(),
+            ))),
+            WyrdAuthVerifySettings::default(),
+        ));
+
+        let delegate = DelegateToken {
+            issuing_key,
+            verifier,
+            permission_check: Arc::new(RbacCheck),
+            settings: TokenExchangeSettings::default(),
+        };
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let exchanged = delegate
+            .execute(
+                &mut conn,
+                SecretString::from(subject_token),
+                RequestedSubject::CardRef {
+                    card_ref: target_card_ref,
+                },
+                "req-delegation-no-refresh",
+            )
+            .await
+            .expect("delegation succeeds");
+
+        assert!(
+            exchanged.refresh_token.is_none(),
+            "delegated token-exchange must not issue a refresh token"
+        );
+        assert_eq!(exchanged.token_type, wyrd_spec::auth::TokenType::Bearer);
     }
 }

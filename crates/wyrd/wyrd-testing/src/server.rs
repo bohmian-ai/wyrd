@@ -19,27 +19,27 @@ use uuid::Uuid;
 use vala_bifrost::catalog::WyrdCatalog;
 use wyrd_auth_check::{AuthzCheckRequest, AuthzCheckResponse, PolicyHook};
 use wyrd_auth_issue::IssuingKey;
-use wyrd_auth_oidc::{JwksCache, TrustedIssuer, TrustedIssuerRegistry};
+use wyrd_auth_oidc::JwksCache;
 use wyrd_auth_verify::{
     Kid, PrincipalKind, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
     public_key_from_pem,
 };
+use wyrd_crypt::SecretKey;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::{PrincipalId, RbacCheck, RoleRef};
 use wyrd_semver::VersionBlock;
 use wyrd_server::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
 use wyrd_server::auth::exchange_api_key::TokenExchangeSettings;
 use wyrd_server::auth::issue_api_key::WyrdApiKey;
-use wyrd_server::auth::jwt_bearer::WorkloadBindingRegistry;
 use wyrd_server::auth::permission_resolver::SqlPermissionResolver;
+use wyrd_server::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use wyrd_server::auth::revocation_resolver::SqlRevocationCheck;
 use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::config::{IssuerEntry, WorkloadBindingEntry};
 use wyrd_server::grpc::{GrpcRouterConfig, build_app_grpc, serve_grpc};
-use wyrd_server::issuer_boot::ConfigFileIssuerResolver;
+use wyrd_server::issuer_boot::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::{AppState, build_router};
-use wyrd_tonic::tonic_health::server::health_reporter;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     RequestedSubject, SecretBearer, SubjectTokenType, TokenRequest, TokenResponse,
@@ -52,8 +52,10 @@ use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     grant_role_to_service_account, grant_role_to_user, insert_api_key, insert_service_account,
     insert_user, revoke_role_from_service_account, revoke_role_from_user, role_by_name,
+    trusted_issuer_by_url, workload_binding_by_subject,
 };
 use wyrd_storage::{BackendConfig, StorageSettings};
+use wyrd_tonic::tonic_health::server::health_reporter;
 
 use crate::time::ClockHandle;
 
@@ -72,7 +74,7 @@ struct WyrdTestServerInner {
     storage_root: Option<tempfile::TempDir>,
     state: AppState,
     router: axum::Router,
-    verifier: Arc<TokenVerifier<SqlPermissionResolver>>,
+    verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
     issuing_key: Arc<IssuingKey>,
     api_key: SecretString,
 }
@@ -95,8 +97,6 @@ pub struct WyrdTestServerBuilder {
     storage_handle: Option<Arc<wyrd_storage::StorageHandle>>,
     access_ttl: Option<ChronoDuration>,
     auth_verify_settings: Option<WyrdAuthVerifySettings>,
-    trusted_issuer_registry: Option<Arc<TrustedIssuerRegistry>>,
-    workload_binding_registry: Option<Arc<WorkloadBindingRegistry>>,
     trusted_issuer_configs: Vec<IssuerEntry>,
     workload_binding_configs: Vec<WorkloadBindingEntry>,
 }
@@ -111,8 +111,6 @@ impl Default for WyrdTestServerBuilder {
             storage_handle: None,
             access_ttl: None,
             auth_verify_settings: None,
-            trusted_issuer_registry: None,
-            workload_binding_registry: None,
             trusted_issuer_configs: Vec::new(),
             workload_binding_configs: Vec::new(),
         }
@@ -284,32 +282,6 @@ impl WyrdTestServer {
         self.inner.fixture.app_pool().clone()
     }
 
-    /// Wire trusted OIDC issuers after server startup.
-    ///
-    /// Use this when the tenant ID is not known until after [`start_in_process`]
-    /// returns (the common case): call `data_tenant_id()`, build your
-    /// [`TrustedIssuer`] entries, then call this method to rebuild the router
-    /// with the live registry.
-    pub fn wire_trusted_issuers(&mut self, issuers: Vec<TrustedIssuer>) {
-        let registry = Arc::new(TrustedIssuerRegistry::from_issuers(issuers));
-        self.inner.state = self
-            .inner
-            .state
-            .clone()
-            .with_trusted_issuer_registry(registry);
-        self.inner.router = build_router(self.inner.state.clone());
-    }
-
-    /// Wire a workload binding registry after server startup.
-    pub fn wire_workload_bindings(&mut self, registry: Arc<WorkloadBindingRegistry>) {
-        self.inner.state = self
-            .inner
-            .state
-            .clone()
-            .with_workload_binding_registry(registry);
-        self.inner.router = build_router(self.inner.state.clone());
-    }
-
     /// Return the deterministic public verifying key.
     #[must_use]
     pub fn verifying_key(&self) -> &VerifyingKey {
@@ -404,6 +376,98 @@ impl WyrdTestServer {
     ) -> Result<Bootstrap, WyrdTestServerError> {
         self.bootstrap_machine(name, roles, CardKind::Service, "service")
             .await
+    }
+
+    /// Bootstrap a Service principal under an explicit tenant.
+    ///
+    /// The tenant-scoped analogue of [`Self::bootstrap_service`]: the service
+    /// account and its API key are written through the supplied tenant's
+    /// [`TenantConn`], and the generated key carries that tenant in its prefix
+    /// so [`Self::exchange_api_key`] resolves the same tenant. Multi-tenant
+    /// tests use this to mint a per-tenant admin that authors through the CLI.
+    ///
+    /// # Errors
+    /// Returns an error when SQL writes or API-key hashing fail.
+    pub async fn bootstrap_service_in_tenant(
+        &self,
+        tenant_id: DataTenantId,
+        name: &str,
+        roles: &[&str],
+    ) -> Result<Bootstrap, WyrdTestServerError> {
+        self.bootstrap_machine_in_tenant(tenant_id, name, roles, CardKind::Service, "service")
+            .await
+    }
+
+    /// Provision a second active tenant: seed its row and built-in roles.
+    ///
+    /// The fixture seeds one tenant at boot; the same-issuer-two-tenant
+    /// isolation test calls this to stand up tenant B so a subject bound only in
+    /// tenant A fails closed in B. Returns the new tenant's isolation key.
+    ///
+    /// # Errors
+    /// Returns an error when the tenant insert or role seed fails.
+    pub async fn seed_tenant(&self, slug: &str) -> Result<DataTenantId, WyrdTestServerError> {
+        let tenant_id = self
+            .inner
+            .fixture
+            .seed_additional_tenant(slug)
+            .await
+            .map_err(sql)?;
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
+        seed_builtin_roles_for_tenant(&mut conn, tenant_id)
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        conn.commit().await.map_err(sql)?;
+        Ok(tenant_id)
+    }
+
+    /// Return the raw `client_secret_enc` ciphertext for a trusted issuer.
+    ///
+    /// Opens a [`TenantConn`] on the supplied tenant and reads the stored
+    /// column byte-for-byte (never text-decoded), so the journey can assert the
+    /// sealing key wrote ciphertext at rest rather than plaintext. Returns
+    /// `None` when no issuer with that URL exists for the tenant, and `None`
+    /// when the issuer stores no secret (public client).
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub async fn trusted_issuer_secret_ciphertext(
+        &self,
+        tenant_id: DataTenantId,
+        issuer_url: &str,
+    ) -> Result<Option<Vec<u8>>, WyrdTestServerError> {
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
+        let row = trusted_issuer_by_url(&mut conn, issuer_url)
+            .await
+            .map_err(sql)?;
+        conn.commit().await.map_err(sql)?;
+        Ok(row.and_then(|row| row.client_secret_enc))
+    }
+
+    /// Report whether a workload binding is visible under a tenant's RLS scope.
+    ///
+    /// Opens a [`TenantConn`] bound to `tenant_id` and runs the production
+    /// `workload_binding_by_subject` lookup. The same-issuer-two-tenant
+    /// isolation test calls this once per tenant to prove storage-level RLS: a
+    /// binding authored only in tenant A is `true` under A's connection and
+    /// `false` under B's, with no shared filter — two genuinely independent
+    /// tenant-scoped reads.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub async fn workload_binding_exists(
+        &self,
+        tenant_id: DataTenantId,
+        issuer: &str,
+        subject: &str,
+        audience: Option<&str>,
+    ) -> Result<bool, WyrdTestServerError> {
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
+        let row = workload_binding_by_subject(&mut conn, issuer, subject, audience)
+            .await
+            .map_err(sql)?;
+        conn.commit().await.map_err(sql)?;
+        Ok(row.is_some())
     }
 
     /// Bootstrap an Agent principal through fixture SQL.
@@ -603,6 +667,25 @@ impl WyrdTestServer {
         card_ref: &CardRef,
         roles: &[&str],
     ) -> Result<PrincipalId, WyrdTestServerError> {
+        self.seed_card_principal_in_tenant(self.data_tenant_id(), card_ref, roles)
+            .await
+    }
+
+    /// Seed a Service/Agent principal under an explicit tenant.
+    ///
+    /// The tenant-scoped analogue of [`Self::seed_card_principal`]: the same
+    /// exact-`card_ref` seed, written through the supplied tenant's
+    /// [`TenantConn`]. Multi-tenant isolation tests use this to seed a bound
+    /// workload only in tenant A.
+    ///
+    /// # Errors
+    /// Returns an error when the card kind is not Service/Agent, or SQL fails.
+    pub async fn seed_card_principal_in_tenant(
+        &self,
+        tenant_id: DataTenantId,
+        card_ref: &CardRef,
+        roles: &[&str],
+    ) -> Result<PrincipalId, WyrdTestServerError> {
         let principal_kind = match &card_ref.kind {
             CardKind::Service => "service",
             CardKind::Agent => "agent",
@@ -613,8 +696,8 @@ impl WyrdTestServer {
             }
         };
         let principal_id = Uuid::now_v7();
-        let creator_id = self.ensure_fixture_admin().await?;
-        let mut conn = self.tenant_conn().await?;
+        let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
         insert_service_account(
             &mut conn,
             principal_id,
@@ -646,17 +729,35 @@ impl WyrdTestServer {
         card_kind: CardKind,
         principal_kind: &'static str,
     ) -> Result<Bootstrap, WyrdTestServerError> {
+        self.bootstrap_machine_in_tenant(
+            self.data_tenant_id(),
+            name,
+            roles,
+            card_kind,
+            principal_kind,
+        )
+        .await
+    }
+
+    async fn bootstrap_machine_in_tenant(
+        &self,
+        tenant_id: DataTenantId,
+        name: &str,
+        roles: &[&str],
+        card_kind: CardKind,
+        principal_kind: &'static str,
+    ) -> Result<Bootstrap, WyrdTestServerError> {
         let principal_id = Uuid::now_v7();
-        let creator_id = self.ensure_fixture_admin().await?;
+        let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
         let card_ref = card_ref(card_kind, name)?;
-        let api_key = WyrdApiKey::generate(self.data_tenant_id());
+        let api_key = WyrdApiKey::generate(tenant_id);
         let raw = api_key.secret.clone();
         let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
             .await
             .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
             .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
 
-        let mut conn = self.tenant_conn().await?;
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
         insert_service_account(
             &mut conn,
             principal_id,
@@ -697,31 +798,48 @@ impl WyrdTestServer {
         })
     }
 
-    async fn ensure_fixture_admin(&self) -> Result<Uuid, WyrdTestServerError> {
-        let id = Uuid::from_u128(0x018f0000000070008000000000000001);
-        let mut conn = self.tenant_conn().await?;
-        insert_user(
-            &mut conn,
-            id,
-            Some("fixture-admin@test.wyrd"),
-            "password",
-            None,
-        )
-        .await
-        .or_else(|error| {
-            if is_unique_violation(&error) {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        })
-        .map_err(sql)?;
+    async fn ensure_fixture_admin_for(
+        &self,
+        tenant_id: DataTenantId,
+    ) -> Result<Uuid, WyrdTestServerError> {
+        let id = fixture_admin_id(tenant_id);
+        let email = format!("fixture-admin-{}@test.wyrd", id.simple());
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
+        insert_user(&mut conn, id, Some(&email), "password", None)
+            .await
+            .or_else(|error| {
+                if is_unique_violation(&error) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(sql)?;
         conn.commit().await.map_err(sql)?;
         Ok(id)
     }
 
     async fn tenant_conn(&self) -> Result<TenantConn<'_>, WyrdTestServerError> {
         self.inner.fixture.tenant_conn().await.map_err(sql)
+    }
+
+    /// Open a tenant-scoped transaction bound to an explicit tenant.
+    ///
+    /// The RLS handle the isolation test drives directly: two distinct calls
+    /// yield two independent [`TenantConn`]s scoped to different
+    /// `data_tenant_id`s on the shared `wyrd_app` pool.
+    ///
+    /// # Errors
+    /// Returns an error when acquiring or binding the transaction fails.
+    pub async fn tenant_conn_for(
+        &self,
+        tenant_id: DataTenantId,
+    ) -> Result<TenantConn<'_>, WyrdTestServerError> {
+        self.inner
+            .fixture
+            .tenant_conn_for(tenant_id)
+            .await
+            .map_err(sql)
     }
 
     async fn raw_call(
@@ -843,34 +961,14 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Pre-wire a trusted OIDC issuer registry into the server state.
-    ///
-    /// Use when the registry contents can be determined before startup (e.g.
-    /// the tenant IDs are known in advance). For tests that need the live
-    /// tenant ID, use [`WyrdTestServer::wire_trusted_issuers`] after startup.
-    #[must_use]
-    pub fn with_trusted_issuer_registry(mut self, registry: Arc<TrustedIssuerRegistry>) -> Self {
-        self.trusted_issuer_registry = Some(registry);
-        self
-    }
-
-    /// Pre-wire a workload binding registry into the server state.
-    #[must_use]
-    pub fn with_workload_binding_registry(
-        mut self,
-        registry: Arc<WorkloadBindingRegistry>,
-    ) -> Self {
-        self.workload_binding_registry = Some(registry);
-        self
-    }
-
     /// Boot trusted OIDC issuers from `[[trusted_issuers]]` config DTOs.
     ///
-    /// At [`Self::start_in_process`] these run through the production
-    /// [`ConfigFileIssuerResolver`] + per-issuer OIDC discovery, building the
-    /// [`TrustedIssuerRegistry`] (and the verifier's external path) exactly the
-    /// way a self-hosted deployment boots. Every entry binds to the fixture's
-    /// implicit `DataTenantId`. Boot fails closed if discovery is unreachable.
+    /// At [`Self::start_in_process`] these are discovered and seeded into
+    /// Postgres via the production [`seed_trusted_issuers`] path, and the
+    /// verifier's external (foreign-OIDC) path is wired to the Postgres-backed
+    /// [`PgIssuerResolver`] exactly the way a self-hosted deployment boots.
+    /// Every entry binds to the fixture's implicit `DataTenantId`. Boot fails
+    /// closed if discovery is unreachable.
     #[must_use]
     pub fn with_trusted_issuer_configs(mut self, configs: Vec<IssuerEntry>) -> Self {
         self.trusted_issuer_configs = configs;
@@ -880,8 +978,9 @@ impl WyrdTestServerBuilder {
     /// Boot workload bindings from `[[workload_bindings]]` config DTOs.
     ///
     /// At [`Self::start_in_process`] these run through the production
-    /// [`build_workload_bindings`] boot path into the [`WorkloadBindingRegistry`],
-    /// each bound to the fixture's implicit `DataTenantId`.
+    /// [`build_workload_bindings`] boot path and are seeded into Postgres via
+    /// [`seed_workload_bindings`], each bound to the fixture's implicit
+    /// `DataTenantId`.
     #[must_use]
     pub fn with_workload_binding_configs(mut self, configs: Vec<WorkloadBindingEntry>) -> Self {
         self.workload_binding_configs = configs;
@@ -949,37 +1048,50 @@ impl WyrdTestServerBuilder {
         )));
         let verify_settings = self.auth_verify_settings.unwrap_or_default();
 
-        // Config-driven boot: resolve `[[trusted_issuers]]` through the real
-        // ConfigFileIssuerResolver + per-issuer OIDC discovery, bound to the
-        // fixture's implicit tenant. Done before the verifier is built so the
-        // verifier's external (foreign-OIDC) path can be wired to the resolved
-        // registry — the same shape the callback and jwt-bearer routes require.
-        let config_issuer_registry = if self.trusted_issuer_configs.is_empty() {
-            None
-        } else {
-            let issuers = ConfigFileIssuerResolver::new(self.trusted_issuer_configs, tenant_id)
-                .resolve()
-                .await
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-            Some(Arc::new(TrustedIssuerRegistry::from_issuers(issuers)))
-        };
+        // Postgres-backed boot, mirroring a self-hosted deployment: discover and
+        // seed `[[trusted_issuers]]` into Postgres, then seed `[[workload_bindings]]`
+        // (which FK-reference them). A deterministic test sealing key encrypts any
+        // client secret on write and decrypts it on read. The production Pg
+        // resolvers then serve issuers/bindings per-request, including on the
+        // verifier's external (foreign-OIDC) path.
+        let sealing_key = Arc::new(SecretKey::from_bytes([9_u8; 32]));
+        seed_trusted_issuers(
+            fixture.app_pool(),
+            tenant_id,
+            &self.trusted_issuer_configs,
+            Some(sealing_key.as_ref()),
+        )
+        .await
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let bindings = build_workload_bindings(&self.workload_binding_configs, tenant_id)
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        seed_workload_bindings(fixture.app_pool(), tenant_id, &bindings)
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
 
-        let verifier_base = TokenVerifier::new(decoding_keys, "wyrd", resolver, verify_settings)
-            .with_revocation(Arc::new(SqlRevocationCheck::new_with_ttl(
-                Arc::new(fixture.app_pool().clone()),
-                Duration::ZERO,
-            )));
-        let verifier = Arc::new(match &config_issuer_registry {
-            Some(registry) => verifier_base.with_external(
-                Arc::new(JwksCache::new(
-                    reqwest::Client::new(),
-                    Duration::from_secs(300),
-                    Duration::from_secs(5),
-                )),
-                Arc::clone(registry),
-            ),
-            None => verifier_base,
-        });
+        let issuer_resolver = Arc::new(PgIssuerResolver::new(
+            Arc::new(fixture.app_pool().clone()),
+            Some(Arc::clone(&sealing_key)),
+        ));
+        let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(Arc::new(
+            fixture.app_pool().clone(),
+        )));
+
+        let verifier = Arc::new(
+            TokenVerifier::new(decoding_keys, "wyrd", resolver, verify_settings)
+                .with_revocation(Arc::new(SqlRevocationCheck::new_with_ttl(
+                    Arc::new(fixture.app_pool().clone()),
+                    Duration::ZERO,
+                )))
+                .with_external(
+                    Arc::new(JwksCache::new(
+                        reqwest::Client::new(),
+                        Duration::from_secs(300),
+                        Duration::from_secs(5),
+                    )),
+                    Arc::clone(&issuer_resolver),
+                ),
+        );
 
         let exchange_settings = if let Some(ttl) = self.access_ttl {
             TokenExchangeSettings {
@@ -1020,29 +1132,16 @@ impl WyrdTestServerBuilder {
         )
         .with_preview_auth(self.allow_preview_auth)
         .with_auth_handles(Arc::clone(&issuing_key), Arc::clone(&verifier))
-        .with_token_exchange_settings(exchange_settings);
+        .with_token_exchange_settings(exchange_settings)
+        .with_trusted_issuer_resolver(issuer_resolver)
+        .with_workload_binding_resolver(binding_resolver)
+        .with_sealing_key(sealing_key);
         state.permission_check = Arc::new(RbacCheck);
         state.audit_writer = self
             .audit_writer
             .unwrap_or_else(|| Arc::new(NoopAuthzAuditWriter));
         if let Some(hook) = self.policy_hook {
             state.policy_hook = hook;
-        }
-        if let Some(registry) = self.trusted_issuer_registry {
-            state = state.with_trusted_issuer_registry(registry);
-        }
-        if let Some(registry) = self.workload_binding_registry {
-            state = state.with_workload_binding_registry(registry);
-        }
-        if let Some(registry) = config_issuer_registry {
-            state = state.with_trusted_issuer_registry(registry);
-        }
-        if !self.workload_binding_configs.is_empty() {
-            let bindings = build_workload_bindings(&self.workload_binding_configs, tenant_id)
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-            state = state.with_workload_binding_registry(Arc::new(
-                WorkloadBindingRegistry::from_bindings(bindings),
-            ));
         }
         let router = build_router(state.clone());
 
@@ -1184,6 +1283,16 @@ async fn lookup_role_id(
         .map_err(sql)?
         .map(|row| row.id)
         .ok_or_else(|| WyrdTestServerError::Sql(format!("role not found: {role}")))
+}
+
+/// Deterministic per-tenant fixture-admin user id.
+///
+/// XORing a fixed base with the tenant key yields a stable, distinct id per
+/// tenant, so each tenant's `auth_users` creator row is independent under RLS
+/// and repeated `ensure_fixture_admin_for` calls stay idempotent.
+fn fixture_admin_id(tenant_id: DataTenantId) -> Uuid {
+    const BASE: u128 = 0x018f_0000_0000_7000_8000_0000_0000_0001;
+    Uuid::from_u128(BASE ^ tenant_id.as_uuid().as_u128())
 }
 
 fn role_refs(roles: &[&str]) -> Result<Vec<RoleRef>, WyrdTestServerError> {

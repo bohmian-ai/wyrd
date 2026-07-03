@@ -1,12 +1,82 @@
 # Wyrd — full machine-readable reference
 
-Generated from `crates/wyrd-spec/schemas/`. `architecture/wyrd-design.md` is the design authority; this schema dump may include implementation drift while `wyrd-spec` is reconciled.
+Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architecture/wyrd-design.md` is the design authority; this schema dump may include implementation drift while `wyrd-spec` is reconciled.
 
-## AgentCard
+## Home
+
+- [Wyrd](https://mitari-ai.github.io/wyrd/): The typed control layer for AI systems: cards, a registry, and the Skald runtime.
+
+## Overview
+
+- [Overview](https://mitari-ai.github.io/wyrd/overview/): What Wyrd is, the coordination problem it solves, and what runs today.
+- [Where Wyrd fits](https://mitari-ai.github.io/wyrd/overview/where-wyrd-fits/): Wyrd's position in the AI stack, the Mitari platform, the lifecycle loop, and what Wyrd is deliberately not.
+
+## Tutorials
+
+- [Tutorials](https://mitari-ai.github.io/wyrd/tutorials/): Step-by-step walkthroughs from zero to your first registered card.
+- [Your first card](https://mitari-ai.github.io/wyrd/tutorials/first-card/): Build a DataCard from a pandas DataFrame, save it to disk, and load it back — the one runnable card workflow today.
+
+## How-to guides
+
+- [How-to](https://mitari-ai.github.io/wyrd/how-to/): Goal-oriented recipes for declaring, evaluating, observing, and operating Wyrd components.
+- [Build an Agent Workflow](https://mitari-ai.github.io/wyrd/how-to/build-a-workflow/): Author a workflow from Python, YAML, or Rust, then run and instrument it.
+- [Build an Agent](https://mitari-ai.github.io/wyrd/how-to/build-an-agent/): Build a Wyrd Agent: prompt, tools, callbacks, session memory, and run config. Python and Rust side-by-side.
+- [Declare](https://mitari-ai.github.io/wyrd/how-to/declare/): Author Wyrd cards in Python and save them locally — recipes for the three shipped kinds.
+- [Declare a Data card](https://mitari-ai.github.io/wyrd/how-to/declare/data/): Author a DataCard from a pandas DataFrame and save it locally.
+- [Declare a Model card](https://mitari-ai.github.io/wyrd/how-to/declare/model/): Author a ModelCard from a trained model and save it locally.
+- [Declare a Prompt card](https://mitari-ai.github.io/wyrd/how-to/declare/prompt/): Author a PromptCard from a Prompt and save it locally.
+- [Evaluate](https://mitari-ai.github.io/wyrd/how-to/evaluate/): Score agent runs and models against Wyrd eval definitions.
+- [Observe](https://mitari-ai.github.io/wyrd/how-to/observe/): Read metrics, drift signals, and audit trails from card-governed components.
+- [Operate](https://mitari-ai.github.io/wyrd/how-to/operate/): Run, restart, and manage card-governed components in production.
+
+## Concepts
+
+- [Concepts](https://mitari-ai.github.io/wyrd/concepts/): The Card/Spec/Run/Observation ontology — the four nouns everything else builds on.
+- [Architecture](https://mitari-ai.github.io/wyrd/concepts/architecture/): The three products Wyrd ships from one source tree — control plane, runtime, and data plane — over one shared spec crate.
+- [Authentication](https://mitari-ai.github.io/wyrd/concepts/authentication/): How Wyrd tokens work and how humans, API-key principals, and machine workloads each obtain one.
+- [Authorization](https://mitari-ai.github.io/wyrd/concepts/authorization/): How Wyrd resolves permissions from token role claims, and how the PolicyHook authz extension gates the POST /v1/authz/check endpoint. Covers the request contract, hook context, and how to implement, register, and mesh-integrate a hook.
+- [Card](https://mitari-ai.github.io/wyrd/concepts/card/): The typed, versioned envelope for one AI system component — its outer shape, lifecycle, and identity rules.
+- [Card kinds](https://mitari-ai.github.io/wyrd/concepts/card-kinds/): The 16 native card kinds plus External, grouped by domain, with what each declares and its shipping status.
+- [Cloud identity](https://mitari-ai.github.io/wyrd/concepts/cloud-identity/): Trusted OIDC issuers and workload bindings, with setup, admin CRUD, TOML seeding, and the sealing key.
+- [Doctrine](https://mitari-ai.github.io/wyrd/concepts/doctrine/): The design doctrine behind Wyrd's nouns, layers, services, and public surfaces.
+- [Identity and auth](https://mitari-ai.github.io/wyrd/concepts/identity-and-auth/): End-to-end map of how Wyrd scopes identity across tenants, users, services, agents, and workloads, and how the server verifies every request.
+
+## Cards
+
+- [Cards overview](https://mitari-ai.github.io/wyrd/cards/): The card envelope, how registration works, and a catalog of every card kind with its status.
+- [Data](https://mitari-ai.github.io/wyrd/cards/data/): Generated reference for the Wyrd Data card spec.
+- [Model](https://mitari-ai.github.io/wyrd/cards/model/): Generated reference for the Wyrd Model card spec.
+- [Prompt](https://mitari-ai.github.io/wyrd/cards/prompt/): Generated reference for the Wyrd Prompt card spec.
+
+## API reference
+
+- [API reference](https://mitari-ai.github.io/wyrd/api/): Error catalog, OpenAPI summary, and JSON Schema inventory — all generated from source.
+- [Errors](https://mitari-ai.github.io/wyrd/api/errors/): Error handling guidance for Wyrd API clients and agents.
+- [OpenAPI](https://mitari-ai.github.io/wyrd/api/openapi/): Generated summary of the Wyrd OpenAPI contract.
+- [Schemas](https://mitari-ai.github.io/wyrd/api/schemas/): Generated inventory of Wyrd JSON Schemas.
+
+## For Agents
+
+- [For Agents](https://mitari-ai.github.io/wyrd/for-agents/): Machine-readable surface, stable API paths, and the rules agents must follow when reading and updating Wyrd.
+- [Error remediation](https://mitari-ai.github.io/wyrd/for-agents/error-remediation/): How agents should handle Wyrd errors.
+- [Agent workflow](https://mitari-ai.github.io/wyrd/for-agents/workflow/): A copyable end-to-end workflow for agents that declare cards and register them over HTTP.
+
+## Get Started
+
+- [Get Started](https://mitari-ai.github.io/wyrd/get-started/): Install Wyrd from the repo and run the DataCard example end to end.
+
+## Reference
+
+- [Reference](https://mitari-ai.github.io/wyrd/reference/): The literal contract — CLI verbs, card schemas, error codes, and the API surface.
+- [CLI](https://mitari-ai.github.io/wyrd/reference/cli/): The wyrd binary — auth, eval, and principal commands, with every flag and environment variable.
+
+## Card schemas
+
+### AgentCard
 
 Declare an agent that Wyrd can describe, govern, evaluate, install references for, and observe. Execution stays in the user or framework runtime.
 
-URL: https://wyrd.ai/cards/agent/
+URL: https://mitari-ai.github.io/wyrd/cards/
 Schema source: crates/wyrd-spec/schemas/agent_spec.json
 
 ```json
@@ -4227,11 +4297,11 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
 }
 ```
 
-## ArtifactCard
+### ArtifactCard
 
 Track an immutable artifact that belongs to a card, run, or service release.
 
-URL: https://wyrd.ai/cards/artifact/
+URL: https://mitari-ai.github.io/wyrd/cards/
 Schema source: crates/wyrd-spec/schemas/artifact_spec.json
 
 ```json
@@ -4546,11 +4616,11 @@ Schema source: crates/wyrd-spec/schemas/artifact_spec.json
 }
 ```
 
-## AuditCard
+### AuditCard
 
 Represent a reviewable event or decision that needs durable provenance.
 
-URL: https://wyrd.ai/cards/audit/
+URL: https://mitari-ai.github.io/wyrd/cards/
 Schema source: crates/wyrd-spec/schemas/audit_spec.json
 
 ```json
@@ -4802,11 +4872,11 @@ Schema source: crates/wyrd-spec/schemas/audit_spec.json
 }
 ```
 
-## DataCard
+### DataCard
 
 Describe a dataset, feature table, document set, or other data dependency.
 
-URL: https://wyrd.ai/cards/data/
+URL: https://mitari-ai.github.io/wyrd/cards/data/
 Schema source: crates/wyrd-spec/schemas/data_spec.json
 
 ```json
@@ -6124,46 +6194,17 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
 }
 ```
 
-## DriftCard
+### DriftCard
 
 Describe the drift contract Wyrd uses to watch behavior over time.
 
-URL: https://wyrd.ai/cards/drift/
+URL: https://mitari-ai.github.io/wyrd/cards/
 Schema source: crates/wyrd-spec/schemas/drift_spec.json
 
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "definitions": {
-    "AgentEvalProfile": {
-      "description": "Agent evaluation drift profile fields.",
-      "properties": {
-        "alert_threshold": {
-          "description": "Alert threshold.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "sample_ratio": {
-          "description": "Sample ratio.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "task": {
-          "description": "Evaluation task.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "task"
-      ],
-      "type": "object"
-    },
     "CardKind": {
       "description": "Wyrd Card kind.",
       "enum": [
@@ -6250,69 +6291,121 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
-    "CustomProfile": {
-      "description": "Custom drift profile fields.",
-      "properties": {
-        "alert_threshold": {
-          "description": "Alert threshold.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "metric": {
-          "description": "Metric name.",
-          "type": "string"
-        },
-        "sample_size": {
-          "description": "Sample size.",
-          "format": "uint",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "metric"
-      ],
-      "type": "object"
-    },
-    "DriftMethod": {
-      "description": "Supported drift monitor method.",
+    "DriftCondition": {
+      "description": "Fire condition for a drift observation.",
       "oneOf": [
         {
-          "description": "Statistical process-control drift.",
-          "enum": [
-            "Spc"
+          "description": "The method's profile decides, such as PSI threshold or SPC zone.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Statistical"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
           ],
-          "type": "string"
+          "type": "object"
         },
         {
-          "description": "Population stability index drift.",
+          "description": "Fires when sample > limit.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Above"
+              ],
+              "type": "string"
+            },
+            "limit": {
+              "description": "Upper exclusive limit.",
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "limit"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Fires when sample < limit.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Below"
+              ],
+              "type": "string"
+            },
+            "limit": {
+              "description": "Lower exclusive limit.",
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "limit"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Fires when sample < lower or sample > upper.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Outside"
+              ],
+              "type": "string"
+            },
+            "lower": {
+              "description": "Lower exclusive bound.",
+              "format": "double",
+              "type": "number"
+            },
+            "upper": {
+              "description": "Upper exclusive bound.",
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "lower",
+            "upper"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DriftMethod": {
+      "description": "Drift detection method.\n\n`Agent` is intentionally absent in v1. It can return only after the signal vocabulary, profile, and scoring algorithm are locked in `wyrd-design.md`.",
+      "oneOf": [
+        {
+          "description": "Population Stability Index over a baseline distribution.",
           "enum": [
             "Psi"
           ],
           "type": "string"
         },
         {
-          "description": "Custom metric drift.",
+          "description": "Statistical Process Control over a baseline distribution or scalar stream.",
+          "enum": [
+            "Spc"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "User-defined metric with an author-supplied baseline value.",
           "enum": [
             "Custom"
           ],
           "type": "string"
         },
         {
-          "description": "Agent evaluation drift.",
-          "enum": [
-            "Agent"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "External drift method.",
+          "description": "Drift method defined externally, with no Vala-side fit or score.",
           "enum": [
             "External"
           ],
@@ -6321,85 +6414,230 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
       ]
     },
     "DriftProfile": {
-      "description": "Drift profile configuration.",
+      "description": "Method-specific math configuration. Config only; fitted state lives in `vala-drift::baseline`, never here.",
       "oneOf": [
         {
-          "description": "SPC profile.",
+          "description": "PSI profile configuration.",
           "properties": {
-            "config": {
-              "$ref": "#/definitions/SpcProfile"
-            },
-            "type": {
-              "enum": [
-                "Spc"
+            "binning_strategy": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/PsiBinningStrategy"
+                }
               ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "config",
-            "type"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "PSI profile.",
-          "properties": {
-            "config": {
-              "$ref": "#/definitions/PsiProfile"
+              "description": "Binning strategy applied to numeric features."
             },
-            "type": {
+            "categorical_features": {
+              "description": "Features treated as categorical regardless of dtype.",
+              "items": {
+                "$ref": "#/definitions/FeatureName"
+              },
+              "type": "array"
+            },
+            "kind": {
               "enum": [
                 "Psi"
               ],
               "type": "string"
+            },
+            "threshold": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/PsiThreshold"
+                }
+              ],
+              "description": "PSI threshold strategy."
             }
           },
           "required": [
-            "config",
-            "type"
+            "binning_strategy",
+            "kind",
+            "threshold"
           ],
           "type": "object"
         },
         {
-          "description": "Custom profile.",
+          "description": "SPC profile configuration.",
           "properties": {
-            "config": {
-              "$ref": "#/definitions/CustomProfile"
+            "alert_threshold": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SpcAlertThreshold"
+                }
+              ],
+              "description": "Lowest zone that should produce a Drift verdict."
             },
-            "type": {
+            "kind": {
+              "enum": [
+                "Spc"
+              ],
+              "type": "string"
+            },
+            "sample_size": {
+              "description": "Sample chunk size for baseline computation. `0` means adaptive default.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "weco_rule": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SpcWecoRule"
+                }
+              ],
+              "description": "WECO rule configuration."
+            }
+          },
+          "required": [
+            "alert_threshold",
+            "kind",
+            "sample_size",
+            "weco_rule"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Custom profile configuration.",
+          "properties": {
+            "alert_threshold": {
+              "description": "Threshold on `|mean(target) - baseline_value|` that triggers drift.",
+              "format": "double",
+              "type": "number"
+            },
+            "baseline_value": {
+              "description": "Author-supplied baseline value.",
+              "format": "double",
+              "type": "number"
+            },
+            "kind": {
               "enum": [
                 "Custom"
               ],
               "type": "string"
+            },
+            "metric_name": {
+              "description": "Column or metric name read from the target record batch.",
+              "type": "string"
             }
           },
           "required": [
-            "config",
-            "type"
+            "alert_threshold",
+            "baseline_value",
+            "kind",
+            "metric_name"
           ],
           "type": "object"
-        },
+        }
+      ]
+    },
+    "DriftSignal": {
+      "description": "How measurements enter the drift monitor.",
+      "oneOf": [
         {
-          "description": "Agent profile.",
+          "description": "PSI or SPC over a baseline dataset.",
           "properties": {
-            "config": {
-              "$ref": "#/definitions/AgentEvalProfile"
+            "baseline_ref": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Data card carrying the baseline artifact."
             },
-            "type": {
+            "features": {
+              "description": "Columns of the baseline DataCard that participate in the monitor.",
+              "items": {
+                "$ref": "#/definitions/FeatureName"
+              },
+              "type": "array"
+            },
+            "kind": {
               "enum": [
-                "Agent"
+                "Distribution"
               ],
               "type": "string"
             }
           },
           "required": [
-            "config",
-            "type"
+            "baseline_ref",
+            "features",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Named scalar emitted by the subject's runtime.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Metric"
+              ],
+              "type": "string"
+            },
+            "name": {
+              "description": "Metric name, such as `p99_latency_ms`, `mae`, or `tokens_per_call`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Score stream produced by an Eval card.",
+          "properties": {
+            "eval_ref": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Eval card whose score stream this drift consumes."
+            },
+            "kind": {
+              "enum": [
+                "EvalScore"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "eval_ref",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Measurement from an external system, such as Prometheus or OTel.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "External"
+              ],
+              "type": "string"
+            },
+            "source_ref": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Source card describing where to read the external measurement."
+            }
+          },
+          "required": [
+            "kind",
+            "source_ref"
           ],
           "type": "object"
         }
       ]
+    },
+    "FeatureName": {
+      "description": "Feature column name referenced by a DriftCard signal.",
+      "type": "string"
     },
     "NonSecretValue": {
       "description": "Non-secret JSON-like configuration value.",
@@ -6508,66 +6746,171 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
         }
       ]
     },
-    "PsiProfile": {
-      "description": "PSI profile fields.",
-      "properties": {
-        "alert_threshold": {
-          "description": "Alert threshold.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "binning_strategy": {
-          "description": "Numeric binning strategy.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "categorical_features": {
-          "description": "Categorical feature names.",
-          "items": {
-            "type": "string"
+    "PsiBinningStrategy": {
+      "description": "PSI numeric binning strategy.",
+      "oneOf": [
+        {
+          "description": "Equal-width bins across the baseline column range.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "EqualWidth"
+              ],
+              "type": "string"
+            },
+            "n_bins": {
+              "description": "Number of bins.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            }
           },
-          "type": "array"
+          "required": [
+            "kind",
+            "n_bins"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Quantile bins from sorted baseline values.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Quantile"
+              ],
+              "type": "string"
+            },
+            "n_bins": {
+              "description": "Number of bins.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "n_bins"
+          ],
+          "type": "object"
         }
-      },
-      "type": "object"
+      ]
+    },
+    "PsiThreshold": {
+      "description": "PSI alert threshold strategy.",
+      "oneOf": [
+        {
+          "description": "Chi-square approximation threshold.",
+          "properties": {
+            "alpha": {
+              "description": "Significance level.",
+              "format": "double",
+              "type": "number"
+            },
+            "kind": {
+              "enum": [
+                "ChiSquare"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "alpha",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Normal approximation threshold.",
+          "properties": {
+            "alpha": {
+              "description": "Significance level.",
+              "format": "double",
+              "type": "number"
+            },
+            "kind": {
+              "enum": [
+                "Normal"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "alpha",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Static threshold value.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "Fixed"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "description": "Fixed PSI threshold.",
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
     },
-    "SpcProfile": {
-      "description": "SPC profile fields.",
+    "SpcAlertThreshold": {
+      "description": "SPC alert threshold: the lowest zone that produces a Drift verdict.",
+      "oneOf": [
+        {
+          "description": "Zone 1.",
+          "enum": [
+            "Zone1"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Zone 2.",
+          "enum": [
+            "Zone2"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Zone 3.",
+          "enum": [
+            "Zone3"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Zone 4.",
+          "enum": [
+            "Zone4"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SpcWecoRule": {
+      "description": "WECO rule string config.",
       "properties": {
-        "alert_threshold": {
-          "description": "Alert threshold.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "feature_map": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "description": "Feature map.",
-          "type": "object"
-        },
-        "sample_size": {
-          "description": "Sample size.",
-          "format": "uint",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
+        "rule_string": {
+          "description": "Eight whitespace-separated positive `u32`s. Default: `\"8 16 4 8 2 4 1 1\"`.",
+          "type": "string"
         }
       },
+      "required": [
+        "rule_string"
+      ],
       "type": "object"
     },
     "VersionBlock": {
@@ -6575,21 +6918,18 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
       "type": "string"
     }
   },
-  "description": "Reusable drift-monitor definition.",
+  "description": "DriftCard spec body.",
   "properties": {
-    "baseline_ref": {
-      "anyOf": [
+    "condition": {
+      "allOf": [
         {
-          "$ref": "#/definitions/CardRef"
-        },
-        {
-          "type": "null"
+          "$ref": "#/definitions/DriftCondition"
         }
       ],
-      "description": "Baseline data reference."
+      "description": "When a sample becomes an emittable observation."
     },
     "description": {
-      "description": "Drift description.",
+      "description": "Free-text description authored on the card.",
       "type": [
         "string",
         "null"
@@ -6599,15 +6939,8 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
       "additionalProperties": {
         "$ref": "#/definitions/NonSecretValue"
       },
-      "description": "Free-form details.",
+      "description": "Free-form non-secret authoring metadata.",
       "type": "object"
-    },
-    "features": {
-      "description": "Feature names.",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
     },
     "method": {
       "allOf": [
@@ -6615,7 +6948,7 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
           "$ref": "#/definitions/DriftMethod"
         }
       ],
-      "description": "Drift method."
+      "description": "Drift detection method. Drives which `DriftProfile` variant is allowed."
     },
     "profile": {
       "anyOf": [
@@ -6626,118 +6959,48 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
           "type": "null"
         }
       ],
-      "description": "Method-specific profile."
+      "description": "Method-specific math configuration. Required for `Psi | Spc | Custom`, forbidden for `External`."
     },
-    "target_refs": {
-      "description": "Target data/model/service references.",
-      "items": {
-        "$ref": "#/definitions/CardRef"
-      },
-      "type": "array"
+    "signal": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/DriftSignal"
+        }
+      ],
+      "description": "How the measurement enters the monitor."
     },
-    "thresholds": {
-      "additionalProperties": {
-        "format": "double",
-        "type": "number"
-      },
-      "description": "Thresholds by metric.",
-      "type": "object"
+    "subject_ref": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardRef"
+        }
+      ],
+      "description": "Singular subject of the monitor: the entity drift is observed against. Allowed `subject_ref.kind`: `Model | Agent | Service | Data`."
     }
   },
   "required": [
-    "method"
+    "condition",
+    "method",
+    "signal",
+    "subject_ref"
   ],
   "title": "DriftSpec",
   "type": "object"
 }
 ```
 
-## EvalCard
+### EvalCard
 
 Define an evaluation suite, scoring rule, or acceptance check.
 
-URL: https://wyrd.ai/cards/eval/
+URL: https://mitari-ai.github.io/wyrd/cards/
 Schema source: crates/wyrd-spec/schemas/eval_spec.json
 
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
   "definitions": {
-    "AgenticEvalProfile": {
-      "description": "Agentic eval profile.",
-      "properties": {
-        "max_steps": {
-          "description": "Maximum step count for the evaluated behavior.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "required_tools": {
-          "description": "Required tool names or Card aliases.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "scenarios": {
-          "description": "Scenario definitions.",
-          "items": {
-            "$ref": "#/definitions/EvalScenario"
-          },
-          "type": "array"
-        }
-      },
-      "type": "object"
-    },
-    "AssertionEvalProfile": {
-      "description": "Assertion-based eval profile.",
-      "properties": {
-        "input_schema": {
-          "description": "Optional input schema."
-        },
-        "output_schema": {
-          "description": "Optional output schema."
-        },
-        "rules": {
-          "description": "Assertion expressions or rule names.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        }
-      },
-      "type": "object"
-    },
-    "BenchmarkEvalProfile": {
-      "description": "Benchmark eval profile.",
-      "properties": {
-        "dataset_refs": {
-          "description": "Dataset Card references.",
-          "items": {
-            "$ref": "#/definitions/CardRef"
-          },
-          "type": "array"
-        },
-        "metrics": {
-          "description": "Expected metric names.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "name": {
-          "description": "Benchmark name.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "name"
-      ],
-      "type": "object"
-    },
     "CardKind": {
       "description": "Wyrd Card kind.",
       "enum": [
@@ -6824,682 +7087,1245 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
-    "CustomEvalProfile": {
-      "description": "Custom eval profile.",
-      "properties": {
-        "config": {
-          "additionalProperties": {
-            "$ref": "#/definitions/NonSecretValue"
-          },
-          "description": "Non-secret profile configuration.",
-          "type": "object"
-        },
-        "name": {
-          "description": "Custom profile name.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "name"
-      ],
-      "type": "object"
-    },
-    "EvalAssertion": {
-      "description": "Evaluation assertion.",
-      "properties": {
-        "metadata": {
-          "additionalProperties": {
-            "$ref": "#/definitions/NonSecretValue"
-          },
-          "description": "Assertion metadata.",
-          "type": "object"
-        },
-        "name": {
-          "description": "Assertion name.",
-          "type": "string"
-        },
-        "rule": {
-          "description": "Assertion expression or declarative rule.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "name",
-        "rule"
-      ],
-      "type": "object"
-    },
-    "EvalPassGate": {
-      "description": "Evaluation pass gate.",
-      "properties": {
-        "name": {
-          "description": "Metric or assertion name.",
-          "type": "string"
-        },
-        "operator": {
-          "description": "Comparison operator.",
-          "type": "string"
-        },
-        "threshold": {
-          "description": "Threshold value.",
-          "format": "double",
-          "type": "number"
-        }
-      },
-      "required": [
-        "name",
-        "operator",
-        "threshold"
-      ],
-      "type": "object"
-    },
-    "EvalProfile": {
-      "description": "Typed reusable evaluation profile.",
-      "oneOf": [
+    "ComparisonOperator": {
+      "anyOf": [
         {
-          "description": "Assertion bundle profile.",
-          "properties": {
-            "config": {
-              "$ref": "#/definitions/AssertionEvalProfile"
-            },
-            "type": {
-              "enum": [
-                "assertion"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "config",
-            "type"
-          ],
-          "type": "object"
+          "$ref": "#/definitions/ParameterlessComparisonOperatorSchema"
         },
         {
-          "description": "Judge prompt/profile.",
-          "properties": {
-            "config": {
-              "$ref": "#/definitions/JudgeEvalProfile"
-            },
-            "type": {
-              "enum": [
-                "judge"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "config",
-            "type"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "Benchmark profile.",
-          "properties": {
-            "config": {
-              "$ref": "#/definitions/BenchmarkEvalProfile"
-            },
-            "type": {
-              "enum": [
-                "benchmark"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "config",
-            "type"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "Agentic evaluation profile.",
-          "properties": {
-            "config": {
-              "$ref": "#/definitions/AgenticEvalProfile"
-            },
-            "type": {
-              "enum": [
-                "agentic"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "config",
-            "type"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "Custom profile.",
-          "properties": {
-            "config": {
-              "$ref": "#/definitions/CustomEvalProfile"
-            },
-            "type": {
-              "enum": [
-                "custom"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "config",
-            "type"
-          ],
-          "type": "object"
+          "$ref": "#/definitions/ParameterizedComparisonOperator"
         }
       ]
     },
-    "EvalRubricItem": {
-      "description": "Judge rubric item.",
-      "properties": {
-        "description": {
-          "description": "Criterion description.",
-          "type": "string"
-        },
-        "name": {
-          "description": "Rubric criterion name.",
-          "type": "string"
-        },
-        "weight": {
-          "description": "Optional weight.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "description",
-        "name"
-      ],
-      "type": "object"
-    },
-    "EvalScenario": {
-      "description": "Agentic eval scenario.",
-      "properties": {
-        "expectations": {
-          "description": "Expected outcomes or checks.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "inputs": {
-          "additionalProperties": {
-            "$ref": "#/definitions/ParameterValue"
-          },
-          "description": "Scenario input values.",
-          "type": "object"
-        },
-        "name": {
-          "description": "Scenario name.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "name"
-      ],
-      "type": "object"
-    },
-    "EvalType": {
-      "description": "Reusable evaluation category.",
+    "ConditionCombinator": {
+      "description": "Logical combinator between two adjacent [`EvalCondition`] nodes.",
       "oneOf": [
         {
-          "description": "Rule/assertion evaluation.",
+          "description": "`lhs AND rhs`, short-circuiting on false.",
           "enum": [
-            "assertion"
+            "and"
           ],
           "type": "string"
         },
         {
-          "description": "LLM or model judge evaluation.",
+          "description": "`lhs OR rhs`, short-circuiting on true.",
           "enum": [
-            "judge"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Dataset or benchmark evaluation.",
-          "enum": [
-            "benchmark"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Agentic evaluation of tool use or multi-step behavior.",
-          "enum": [
-            "agentic"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Custom evaluation profile.",
-          "enum": [
-            "custom"
+            "or"
           ],
           "type": "string"
         }
       ]
     },
-    "Governance": {
-      "description": "Declarative governance and audit hooks.",
-      "properties": {
-        "approval_requirements": {
-          "description": "Required approval labels or scopes.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
+    "DivergenceMetric": {
+      "description": "Probability-divergence metric used by [`ComparisonOperator::DivergenceLessThan`].",
+      "oneOf": [
+        {
+          "description": "Kullback-Leibler divergence.",
+          "enum": [
+            "kl"
+          ],
+          "type": "string"
         },
-        "audit_ref": {
+        {
+          "description": "Jensen-Shannon divergence.",
+          "enum": [
+            "js"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Wasserstein distance.",
+          "enum": [
+            "wasserstein"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "EvalCondition": {
+      "additionalProperties": false,
+      "description": "A typed predicate evaluated against one JSON value extracted from workflow context or scenario payload.\n\nTo chain conditions, set both [`EvalCondition::combinator`] and [`EvalCondition::subsequent`]. The whole chain is evaluated left-to-right with `AND` short-circuit on false and `OR` short-circuit on true.",
+      "properties": {
+        "combinator": {
           "anyOf": [
             {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/ConditionCombinator"
             },
             {
               "type": "null"
             }
           ],
-          "description": "Audit Card reference."
+          "description": "Optional combinator for chaining."
         },
-        "metadata": {
-          "additionalProperties": {
-            "$ref": "#/definitions/NonSecretValue"
-          },
-          "description": "Governance metadata.",
-          "type": "object"
+        "expected": {
+          "description": "Right-hand side of the comparison."
         },
-        "policy_refs": {
-          "description": "Policy Card references.",
-          "items": {
-            "$ref": "#/definitions/CardRef"
-          },
-          "type": "array"
+        "operator": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ComparisonOperator"
+            }
+          ],
+          "description": "Comparison applied to `(value-at-path, expected)`."
+        },
+        "path": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/JsonPath"
+            }
+          ],
+          "description": "JSONPath into the workflow context or scenario payload."
+        },
+        "subsequent": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EvalCondition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Next link in the chain."
         }
       },
+      "required": [
+        "expected",
+        "operator",
+        "path"
+      ],
       "type": "object"
     },
-    "JudgeEvalProfile": {
-      "description": "Judge-based eval profile.",
-      "properties": {
-        "config": {
-          "additionalProperties": {
-            "$ref": "#/definitions/NonSecretValue"
-          },
-          "description": "Judge configuration without secret values.",
-          "type": "object"
-        },
-        "prompt_refs": {
-          "description": "Prompt Cards used by the judge.",
-          "items": {
-            "$ref": "#/definitions/CardRef"
-          },
-          "type": "array"
-        },
-        "rubric": {
-          "description": "Judge rubric.",
-          "items": {
-            "$ref": "#/definitions/EvalRubricItem"
-          },
-          "type": "array"
-        }
-      },
-      "type": "object"
-    },
-    "NonSecretValue": {
-      "description": "Non-secret JSON-like configuration value.",
+    "EvalContextCapture": {
+      "description": "Declares how `vala-eval` populates [`AssertionResult::actual`] when writing result rows to `eval_task_results`.\n\nEvaluation correctness ([`AssertionResult::passed`]) is unaffected by this setting. Only the stored snapshot of the extracted value changes.\n\nSet at the [`super::spec::EvalSpec`] level via `context_capture`. Absent means `Full`.",
       "oneOf": [
         {
-          "description": "String value.",
-          "properties": {
-            "type": {
-              "enum": [
-                "str"
-              ],
-              "type": "string"
-            },
-            "value": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "value"
+          "description": "Store the raw value extracted at the context path. Default for offline evals.",
+          "enum": [
+            "full"
           ],
-          "type": "object"
+          "type": "string"
         },
         {
-          "description": "Numeric value.",
+          "description": "Store a SHA-256 hex digest of the extracted value. Allows determinism checks without persisting PII.",
+          "enum": [
+            "hash"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Do not populate `actual`. Use when the eval runs over production traffic where context fields may contain PII.",
+          "enum": [
+            "redact"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "EvalPassGate": {
+      "description": "Workflow-level pass criterion.\n\nSelects how [`AssertionResult`] rows roll up into the workflow's `pass / fail` outcome. Thresholds are in `[0.0, 1.0]`; out-of-range values are rejected by [`EvalPassGate::validate`].",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Pass iff `(passed_tasks / total_tasks) >= threshold`.",
           "properties": {
-            "type": {
+            "kind": {
               "enum": [
-                "number"
+                "overall_pass_rate"
               ],
               "type": "string"
             },
-            "value": {
+            "threshold": {
+              "description": "Minimum accepted overall pass rate in `[0.0, 1.0]`.",
               "format": "double",
               "type": "number"
             }
           },
           "required": [
-            "type",
-            "value"
+            "kind",
+            "threshold"
           ],
           "type": "object"
         },
         {
-          "description": "Boolean value.",
+          "additionalProperties": false,
+          "description": "Pass iff the minimum per-task pass rate across **all** tasks meets the threshold.\n\nComputed as `min(pass_rate per task across all subjects)`. A task that never appears scores 0.0. This is task-level, not judge-type-level \u2014 `LlmJudge` and other task types all contribute equally.",
           "properties": {
-            "type": {
+            "kind": {
               "enum": [
-                "bool"
+                "per_judge_pass_rate"
               ],
               "type": "string"
             },
-            "value": {
-              "type": "boolean"
+            "threshold": {
+              "description": "Minimum accepted per-task pass rate in `[0.0, 1.0]`.",
+              "format": "double",
+              "type": "number"
             }
           },
           "required": [
-            "type",
-            "value"
+            "kind",
+            "threshold"
           ],
           "type": "object"
         },
         {
-          "description": "List of non-secret values.",
+          "additionalProperties": false,
+          "description": "Pass iff every task passes.",
           "properties": {
-            "type": {
+            "kind": {
               "enum": [
-                "list"
+                "all_pass"
               ],
               "type": "string"
-            },
-            "value": {
-              "items": {
-                "$ref": "#/definitions/NonSecretValue"
-              },
-              "type": "array"
             }
           },
           "required": [
-            "type",
-            "value"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "Object of non-secret values.",
-          "properties": {
-            "type": {
-              "enum": [
-                "object"
-              ],
-              "type": "string"
-            },
-            "value": {
-              "additionalProperties": {
-                "$ref": "#/definitions/NonSecretValue"
-              },
-              "type": "object"
-            }
-          },
-          "required": [
-            "type",
-            "value"
+            "kind"
           ],
           "type": "object"
         }
       ]
     },
-    "ObservationHooks": {
-      "description": "Observation routing hooks for Cards that produce runs or events.",
-      "properties": {
-        "events": {
-          "description": "Event names to observe.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "route_refs": {
-          "description": "Observation route Card references.",
-          "items": {
-            "$ref": "#/definitions/CardRef"
-          },
-          "type": "array"
-        }
-      },
-      "type": "object"
-    },
-    "ParameterValue": {
-      "description": "Typed parameter value for experiments, runs, workflows, and tools.",
+    "EvalSampling": {
+      "description": "Sampling policy applied at the record-ingest boundary.\n\n`vala-eval` enforces the policy when records are admitted for evaluation.",
       "oneOf": [
         {
-          "description": "Integer value.",
+          "additionalProperties": false,
+          "description": "Probabilistic selection.",
           "properties": {
-            "type": {
+            "kind": {
               "enum": [
-                "int"
+                "ratio"
               ],
               "type": "string"
             },
-            "value": {
-              "format": "int64",
+            "ratio": {
+              "description": "Selection ratio in `[0.0, 1.0]`.",
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "ratio"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Deterministic 1-in-N selection by hashing a stable key path.",
+          "properties": {
+            "bucket": {
+              "description": "Selected bucket. Must be less than `modulus`.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "key_path": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/JsonPath"
+                }
+              ],
+              "description": "JSONPath selecting the stable key to hash."
+            },
+            "kind": {
+              "enum": [
+                "deterministic_by_hash"
+              ],
+              "type": "string"
+            },
+            "modulus": {
+              "description": "Positive modulus for bucket assignment.",
+              "format": "uint32",
+              "minimum": 0.0,
               "type": "integer"
             }
           },
           "required": [
-            "type",
-            "value"
+            "bucket",
+            "key_path",
+            "kind",
+            "modulus"
           ],
           "type": "object"
         },
         {
-          "description": "Floating-point value.",
+          "additionalProperties": false,
+          "description": "Every Nth record.",
           "properties": {
-            "type": {
+            "kind": {
               "enum": [
-                "float"
+                "every_nth"
               ],
               "type": "string"
             },
-            "value": {
+            "n": {
+              "description": "Positive interval. Must be at least 1.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "n"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "EvalTask": {
+      "description": "One task in an `EvalSpec` DAG. Adjacently-tagged on the wire by `\"kind\"`; the inner record fields live alongside.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Programmatic assertion against the workflow context.",
+          "properties": {
+            "condition": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EvalCondition"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional gate evaluated before the task runs."
+            },
+            "context_path": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/JsonPath"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Path to the single value to assert against."
+            },
+            "depends_on": {
+              "description": "IDs of upstream tasks that must complete before this task runs.",
+              "items": {
+                "$ref": "#/definitions/TaskId"
+              },
+              "type": "array"
+            },
+            "expected": {
+              "description": "Right-hand side of the comparison."
+            },
+            "id": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TaskId"
+                }
+              ],
+              "description": "Unique identifier within the enclosing eval task map."
+            },
+            "item_context_path": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/JsonPath"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Path to an array the runtime iterates and asserts per item."
+            },
+            "kind": {
+              "enum": [
+                "assertion"
+              ],
+              "type": "string"
+            },
+            "operator": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ComparisonOperator"
+                }
+              ],
+              "description": "Comparison applied to the observed value and expected value."
+            }
+          },
+          "required": [
+            "expected",
+            "id",
+            "kind",
+            "operator"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "LLM-as-judge evaluation via a `Prompt` card.",
+          "properties": {
+            "condition": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EvalCondition"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional gate evaluated before the task runs."
+            },
+            "context_path": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/JsonPath"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional JSONPath selecting the context passed to the judge."
+            },
+            "depends_on": {
+              "description": "IDs of upstream tasks that must complete before this task runs.",
+              "items": {
+                "$ref": "#/definitions/TaskId"
+              },
+              "type": "array"
+            },
+            "expected": {
+              "description": "Right-hand side of the comparison."
+            },
+            "id": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TaskId"
+                }
+              ],
+              "description": "Unique identifier within the enclosing eval task map."
+            },
+            "judge_ref": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Reference to a `Prompt` card."
+            },
+            "kind": {
+              "enum": [
+                "llm_judge"
+              ],
+              "type": "string"
+            },
+            "max_retries": {
+              "default": 2,
+              "description": "Maximum retries on transient runtime failures.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "operator": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ComparisonOperator"
+                }
+              ],
+              "description": "Comparison applied to the judge response and expected value."
+            }
+          },
+          "required": [
+            "expected",
+            "id",
+            "judge_ref",
+            "kind",
+            "operator"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Assertion over the assembled OTel trace document.",
+          "properties": {
+            "condition": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EvalCondition"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional gate evaluated before the task runs."
+            },
+            "depends_on": {
+              "description": "IDs of upstream tasks that must complete before this task runs.",
+              "items": {
+                "$ref": "#/definitions/TaskId"
+              },
+              "type": "array"
+            },
+            "expected": {
+              "description": "Right-hand side of the comparison."
+            },
+            "id": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TaskId"
+                }
+              ],
+              "description": "Unique identifier within the enclosing eval task map."
+            },
+            "kind": {
+              "enum": [
+                "trace_assertion"
+              ],
+              "type": "string"
+            },
+            "operator": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ComparisonOperator"
+                }
+              ],
+              "description": "Comparison applied to the selected trace value and expected value."
+            },
+            "span_selector": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/JsonPath"
+                }
+              ],
+              "description": "JSONPath into the assembled trace document."
+            }
+          },
+          "required": [
+            "expected",
+            "id",
+            "kind",
+            "operator",
+            "span_selector"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Assertion over the assembled GenAI workflow envelope.",
+          "properties": {
+            "condition": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EvalCondition"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional gate evaluated before the task runs."
+            },
+            "depends_on": {
+              "description": "IDs of upstream tasks that must complete before this task runs.",
+              "items": {
+                "$ref": "#/definitions/TaskId"
+              },
+              "type": "array"
+            },
+            "expected": {
+              "description": "Right-hand side of the comparison."
+            },
+            "id": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TaskId"
+                }
+              ],
+              "description": "Unique identifier within the enclosing eval task map."
+            },
+            "kind": {
+              "enum": [
+                "agent_assertion"
+              ],
+              "type": "string"
+            },
+            "operator": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ComparisonOperator"
+                }
+              ],
+              "description": "Comparison applied to the selected workflow value and expected value."
+            },
+            "workflow_field_path": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/JsonPath"
+                }
+              ],
+              "description": "JSONPath into the GenAI workflow envelope."
+            }
+          },
+          "required": [
+            "expected",
+            "id",
+            "kind",
+            "operator",
+            "workflow_field_path"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "JsonPath": {
+      "maxLength": 1024,
+      "minLength": 1,
+      "pattern": "^\\$.*$",
+      "type": "string"
+    },
+    "JsonValueType": {
+      "description": "JSON value-type set used by [`ComparisonOperator::IsType`].",
+      "oneOf": [
+        {
+          "description": "JSON null.",
+          "enum": [
+            "null"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "JSON boolean.",
+          "enum": [
+            "bool"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "JSON number.",
+          "enum": [
+            "number"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "JSON string.",
+          "enum": [
+            "string"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "JSON array.",
+          "enum": [
+            "array"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "JSON object.",
+          "enum": [
+            "object"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ParameterizedComparisonOperator": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "inclusive": {
+              "type": "boolean"
+            },
+            "kind": {
+              "enum": [
+                "in_range"
+              ],
+              "type": "string"
+            },
+            "max": {
+              "format": "double",
+              "type": "number"
+            },
+            "min": {
               "format": "double",
               "type": "number"
             }
           },
           "required": [
-            "type",
-            "value"
+            "inclusive",
+            "kind",
+            "max",
+            "min"
           ],
           "type": "object"
         },
         {
-          "description": "String value.",
+          "additionalProperties": false,
           "properties": {
-            "type": {
-              "enum": [
-                "str"
-              ],
-              "type": "string"
-            },
-            "value": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "value"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "Boolean value.",
-          "properties": {
-            "type": {
-              "enum": [
-                "bool"
-              ],
-              "type": "string"
-            },
-            "value": {
+            "inclusive": {
               "type": "boolean"
+            },
+            "kind": {
+              "enum": [
+                "not_in_range"
+              ],
+              "type": "string"
+            },
+            "max": {
+              "format": "double",
+              "type": "number"
+            },
+            "min": {
+              "format": "double",
+              "type": "number"
             }
           },
           "required": [
-            "type",
-            "value"
+            "inclusive",
+            "kind",
+            "max",
+            "min"
           ],
           "type": "object"
         },
         {
-          "description": "Structured JSON value.",
+          "additionalProperties": false,
           "properties": {
-            "type": {
+            "kind": {
               "enum": [
-                "json"
+                "approximately_equals"
               ],
               "type": "string"
             },
-            "value": true
+            "tolerance": {
+              "format": "double",
+              "type": "number"
+            }
           },
           "required": [
-            "type",
-            "value"
+            "kind",
+            "tolerance"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "matches_regex"
+              ],
+              "type": "string"
+            },
+            "pattern": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "pattern"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "not_matches_regex"
+              ],
+              "type": "string"
+            },
+            "pattern": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "pattern"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "has_min_length"
+              ],
+              "type": "string"
+            },
+            "min": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "min"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "has_max_length"
+              ],
+              "type": "string"
+            },
+            "max": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "max"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "expected": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "kind": {
+              "enum": [
+                "length"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "expected",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "length_greater_than"
+              ],
+              "type": "string"
+            },
+            "min": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "min"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "length_less_than"
+              ],
+              "type": "string"
+            },
+            "max": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "max"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "expected": {
+              "$ref": "#/definitions/JsonValueType"
+            },
+            "kind": {
+              "enum": [
+                "is_type"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "expected",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "within_abs_tolerance"
+              ],
+              "type": "string"
+            },
+            "tolerance": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "tolerance"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "within_pct_tolerance"
+              ],
+              "type": "string"
+            },
+            "pct": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "pct"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "within_std_dev"
+              ],
+              "type": "string"
+            },
+            "mean": {
+              "format": "double",
+              "type": "number"
+            },
+            "sigma": {
+              "format": "double",
+              "type": "number"
+            },
+            "std_dev": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "mean",
+            "sigma",
+            "std_dev"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "between_percentiles"
+              ],
+              "type": "string"
+            },
+            "lower_pct": {
+              "format": "double",
+              "type": "number"
+            },
+            "upper_pct": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "lower_pct",
+            "upper_pct"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "divergence_less_than"
+              ],
+              "type": "string"
+            },
+            "metric": {
+              "$ref": "#/definitions/DivergenceMetric"
+            },
+            "threshold": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "metric",
+            "threshold"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "cosine_similarity_at_least"
+              ],
+              "type": "string"
+            },
+            "threshold": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "threshold"
           ],
           "type": "object"
         }
       ]
+    },
+    "ParameterlessComparisonOperatorSchema": {
+      "enum": [
+        "equals",
+        "not_equals",
+        "greater_than",
+        "greater_than_or_equals",
+        "less_than",
+        "less_than_or_equals",
+        "is_positive",
+        "is_negative",
+        "is_zero",
+        "contains",
+        "not_contains",
+        "contains_ignore_case",
+        "starts_with",
+        "ends_with",
+        "is_email",
+        "is_url",
+        "is_uuid",
+        "is_ipv4",
+        "is_ipv6",
+        "is_json",
+        "in",
+        "not_in",
+        "is_subset",
+        "is_superset",
+        "is_disjoint",
+        "all_of",
+        "any_of",
+        "none_of",
+        "is_empty",
+        "is_non_empty",
+        "unique_values",
+        "is_truthy",
+        "is_falsy",
+        "is_null",
+        "is_not_null",
+        "is_string",
+        "is_number",
+        "is_boolean",
+        "is_object"
+      ],
+      "type": "string"
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
     },
+    "TaskId": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]*$",
+      "type": "string"
+    },
     "VersionBlock": {
       "description": "Semver-compatible version string.",
       "type": "string"
+    },
+    "Workflow": {
+      "additionalProperties": false,
+      "description": "Author-declared workflow field map for eval task inputs and outputs.",
+      "properties": {
+        "fields": {
+          "additionalProperties": {
+            "$ref": "#/definitions/WorkflowFieldType"
+          },
+          "description": "Map from workflow field name to the expected JSON shape at that key.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "fields"
+      ],
+      "type": "object"
+    },
+    "WorkflowFieldType": {
+      "description": "Declared JSON shape for one workflow field.",
+      "oneOf": [
+        {
+          "description": "String-shaped field.",
+          "enum": [
+            "string"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Integer-shaped field.",
+          "enum": [
+            "integer"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Floating-point field.",
+          "enum": [
+            "float"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Boolean-shaped field.",
+          "enum": [
+            "boolean"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Object-shaped field.",
+          "enum": [
+            "object"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Array-shaped field.",
+          "enum": [
+            "array"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Field with no declared shape restriction.",
+          "enum": [
+            "any"
+          ],
+          "type": "string"
+        }
+      ]
     }
   },
-  "description": "Reusable evaluation logic and pass gates.",
+  "description": "The typed spec body for an `Eval` card.\n\nThis struct does not carry a discriminator; the outer `CardBody` enum carries the envelope-level `kind: Eval` and `spec: { ... }` wire shape.\n\nAuthors declare: - `subject_ref` \u2014 canonical card this rubric judges per doctrine #3 and the `ObservationCriteria.subject_refs` precedent. - `dataset` \u2014 source data, typically a `Data` card with eval scenarios. - `tasks` \u2014 the rubric DAG. - `workflow` \u2014 optional declared workflow shape. - `sampling` \u2014 optional production sampling policy. - `pass_gate` \u2014 optional workflow-level pass criterion. - `context_capture` \u2014 durable storage policy for `AssertionResult::actual`.\n\nThis struct does not carry envelope identity, tenant partitioning, triggers, or alert dispatch. Alert wiring is deferred until the drift primitives and secret reference model are locked.",
   "properties": {
-    "assertions": {
-      "description": "Assertion definitions.",
-      "items": {
-        "$ref": "#/definitions/EvalAssertion"
-      },
-      "type": "array"
+    "context_capture": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/EvalContextCapture"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "How `vala-eval` captures extracted values in [`super::AssertionResult::actual`].\n\nSet to [`EvalContextCapture::Redact`] when this eval runs over production traffic where context fields may contain PII. Absent means [`EvalContextCapture::Full`]."
     },
-    "dataset_refs": {
-      "description": "Dataset references.",
-      "items": {
-        "$ref": "#/definitions/CardRef"
-      },
-      "type": "array"
+    "dataset": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CardRef"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Source data for offline runs.\n\nValidation enforces `dataset.kind == Data`."
     },
-    "default_parameters": {
+    "pass_gate": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/EvalPassGate"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional workflow-level pass gate."
+    },
+    "sampling": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/EvalSampling"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional sampling policy applied at the record-ingest boundary."
+    },
+    "subject_ref": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CardRef"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Declarative subject \u2014 the card whose runs this rubric judges.\n\nWhen `Some`, registration can derive an `evaluates` relationship. Runtime records may still supply the subject when this is `None`.\n\n**Presence rule (D8).** The struct keeps `Option<CardRef>`, but registry validation at `wyrd apply` rejects an Eval card with `subject_ref = None` whenever the card receives online observations (`run.observe.eval(...)` needs the identity chain). It may be `None` only for pure-offline rubric cards driven entirely by datasets and scenarios. The validator itself ships with the registry surface; this field documents the rule the validator enforces, consistent with the kind-restriction note on `validate()` below."
+    },
+    "tasks": {
       "additionalProperties": {
-        "$ref": "#/definitions/ParameterValue"
+        "$ref": "#/definitions/EvalTask"
       },
-      "description": "Default non-secret parameters for eval orchestration.",
+      "description": "Task DAG keyed by `TaskId`.",
       "type": "object"
     },
-    "description": {
-      "description": "Eval description.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "details": {
-      "additionalProperties": {
-        "$ref": "#/definitions/NonSecretValue"
-      },
-      "description": "Free-form details.",
-      "type": "object"
-    },
-    "eval_type": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/EvalType"
-        }
-      ],
-      "description": "Eval type, such as `judge`, `assertion`, or `benchmark`."
-    },
-    "governance": {
+    "workflow": {
       "anyOf": [
         {
-          "$ref": "#/definitions/Governance"
+          "$ref": "#/definitions/Workflow"
         },
         {
           "type": "null"
         }
       ],
-      "description": "Governance and audit requirements."
-    },
-    "judge_refs": {
-      "description": "Judge Card references.",
-      "items": {
-        "$ref": "#/definitions/CardRef"
-      },
-      "type": "array"
-    },
-    "observation_hooks": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/ObservationHooks"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Observation routing for eval runs."
-    },
-    "pass_gates": {
-      "description": "Pass gate definitions.",
-      "items": {
-        "$ref": "#/definitions/EvalPassGate"
-      },
-      "type": "array"
-    },
-    "profile": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/EvalProfile"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Reusable evaluation profile."
-    },
-    "target_refs": {
-      "description": "Target Card references.",
-      "items": {
-        "$ref": "#/definitions/CardRef"
-      },
-      "type": "array"
+      "description": "Optional declared workflow shape used as a path validation hint."
     }
   },
   "required": [
-    "eval_type"
+    "tasks"
   ],
   "title": "EvalSpec",
   "type": "object"
 }
 ```
 
-## ExperimentCard
+### ExperimentCard
 
 Group work-in-progress runs and candidate changes under a single intent.
 
-URL: https://wyrd.ai/cards/experiment/
+URL: https://mitari-ai.github.io/wyrd/cards/
 Schema source: crates/wyrd-spec/schemas/experiment_spec.json
 
 ```json
@@ -8104,11 +8930,11 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
 }
 ```
 
-## MCPCard
+### MCPCard
 
 Describe an MCP surface that tools and agents can discover consistently.
 
-URL: https://wyrd.ai/cards/mcp/
+URL: https://mitari-ai.github.io/wyrd/cards/
 Schema source: crates/wyrd-spec/schemas/mcp_spec.json
 
 ```json
@@ -8367,11 +9193,11 @@ Schema source: crates/wyrd-spec/schemas/mcp_spec.json
 }
 ```
 
-## ModelCard
+### ModelCard
 
 Describe a model artifact, its interface, and the context needed to use it safely.
 
-URL: https://wyrd.ai/cards/model/
+URL: https://mitari-ai.github.io/wyrd/cards/model/
 Schema source: crates/wyrd-spec/schemas/model_spec.json
 
 ```json
@@ -9472,11 +10298,11 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
 }
 ```
 
-## OperatorCard
+### OperatorCard
 
 Describe an operator that performs bounded work inside a workflow or service.
 
-URL: https://wyrd.ai/cards/operator/
+URL: https://mitari-ai.github.io/wyrd/cards/
 Schema source: crates/wyrd-spec/schemas/operator_spec.json
 
 ```json
@@ -9812,11 +10638,11 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
 }
 ```
 
-## PolicyCard
+### PolicyCard
 
 Capture rules that decide whether a card, run, or action is allowed.
 
-URL: https://wyrd.ai/cards/policy/
+URL: https://mitari-ai.github.io/wyrd/cards/
 Schema source: crates/wyrd-spec/schemas/policy_spec.json
 
 ```json
@@ -9997,11 +10823,11 @@ Schema source: crates/wyrd-spec/schemas/policy_spec.json
 }
 ```
 
-## PromptCard
+### PromptCard
 
 Version prompt content and the contract around its inputs and outputs.
 
-URL: https://wyrd.ai/cards/prompt/
+URL: https://mitari-ai.github.io/wyrd/cards/prompt/
 Schema source: crates/wyrd-spec/schemas/prompt_spec.json
 
 ```json
@@ -14033,11 +14859,11 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
 }
 ```
 
-## ServiceCard
+### ServiceCard
 
 Describe a deployable service and the runtime rules Wyrd can lock.
 
-URL: https://wyrd.ai/cards/service/
+URL: https://mitari-ai.github.io/wyrd/cards/
 Schema source: crates/wyrd-spec/schemas/service_spec.json
 
 ```json
@@ -14534,11 +15360,11 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
 }
 ```
 
-## TriggerCard
+### TriggerCard
 
 Describe an event source that can start a workflow or service action.
 
-URL: https://wyrd.ai/cards/trigger/
+URL: https://mitari-ai.github.io/wyrd/cards/
 Schema source: crates/wyrd-spec/schemas/trigger_spec.json
 
 ```json
@@ -14864,11 +15690,11 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
 }
 ```
 
-## WorkflowCard
+### WorkflowCard
 
 Describe a coordinated sequence of operators, tools, agents, or services.
 
-URL: https://wyrd.ai/cards/workflow/
+URL: https://mitari-ai.github.io/wyrd/cards/
 Schema source: crates/wyrd-spec/schemas/workflow_spec.json
 
 ```json
@@ -19591,10 +20417,3 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
   "type": "object"
 }
 ```
-
-## SourceCard
-
-Declare where Wyrd reads external observations, archived runs, or object-store evidence.
-
-URL: https://wyrd.ai/cards/source/
-SourceSpec is design-authoritative in architecture/wyrd-design.md and pending in wyrd-spec.

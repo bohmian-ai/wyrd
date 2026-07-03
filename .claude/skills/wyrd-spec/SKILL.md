@@ -1,6 +1,6 @@
 ---
 name: wyrd-spec
-description: First stage of the Wyrd build pipeline. Turns a raw idea into a durable spec.md — the decision and contract authority — before any planning or code. Use when the user says /spec, starts a new Wyrd feature or significant change, has an ambiguous idea, or needs success criteria and architectural decisions settled before a plan exists. Routes to wyrd-architecture-review (gate 1). Do not write code or a commit plan here.
+description: First stage of the Wyrd build pipeline. Turns a raw idea into a durable spec.md — the decision and contract authority — before any planning or code. Use when the user says /spec, starts a new Wyrd feature or significant change, has an ambiguous idea, or needs success criteria and architectural decisions settled before a plan exists. Routes to wyrd-architecture-reviewer skill (gate 1). Do not write code or a commit plan here.
 ---
 
 # Wyrd Spec
@@ -11,7 +11,7 @@ Produce `spec.md`: the *what and why*. It is the decision and contract authority
 the rest of the pipeline executes against. It does **not** contain code, a commit
 DAG, or file-level detail — those belong to `plan` and `tasks`.
 
-The spec exists so `wyrd-architecture-review` can catch doctrine and architecture
+The spec exists so `wyrd-architecture-reviewer` can catch doctrine and architecture
 gotchas at the cheapest possible point — before a commit is planned, let alone
 written.
 
@@ -51,10 +51,25 @@ grep/read loop.
 3. **Decide.** Drive every cross-cutting question to an accepted decision with a
    one-paragraph rationale. These decisions are the load-bearing output — the
    plan, tasks, and arch review all hang off them.
-4. **Write** `spec.md` to `.dev/plan/<feature>/spec.md`.
-5. **Gate 1.** Hand `spec.md` to `wyrd-architecture-review`. Resolve findings
-   (loop with `wyrd-plan-interviewer` if a decision reopens) before moving to
-   `wyrd-plan`.
+4. **Write** `spec.md` to `.dev/plan/<feature>/spec.md`. Written spec should be human
+    legible and understandable. The spec is mean to be reviewed by a human and fed to
+    an agent for planning. Write accordingly (concise, clear, consistent)
+5. **Gate 1.** Hand `spec.md` to `wyrd-architecture-reviewer` **at full-sweep
+   depth** — explicitly tell it "full sweep: continue past blockers, report every
+   materially-separate finding," and do **not** hand it a pre-narrowed focus list
+   (a short focus list silently scopes it to blocker-only). The spec is where
+   decisions get *locked*; a missed finding here propagates through plan → tasks →
+   code, and it is cheapest to fix as prose. Blocker-only is a false economy at a
+   pipeline gate — reserve it for a fast pre-spec "is this even doctrine-legal?"
+   gut-check, never as the Gate-1 pass. Then run the **dynamic review loop**
+   (`review/dynamic-review-loop.md`): revise `spec.md`, hand it back for a fresh
+   full-sweep re-review, and repeat until `wyrd-architecture-reviewer` returns
+   `Decision: approve`. One correction is not a pass — a fresh re-review must
+   approve the revised `spec.md` before moving to `wyrd-plan`. `approve with
+   changes`, `needs redesign`, and `reopen locked decision` are all non-terminal;
+   if a decision reopens, loop back through the interview/decision step with
+   `wyrd-plan-interviewer`, then re-submit. Preserve the loop ledger
+   (`.dev/review/architecture/{REVIEW_ID}/loop-ledger.md`) as iteration evidence.
 
 ## References
 
@@ -69,6 +84,8 @@ Load from the shared doctrine library (`.claude/references/`, indexed in
   the contracts being specced.
 - `review/review-rubric.md` — the dimensions gate 1 judges; write the spec to pass
   them by construction.
+- `review/dynamic-review-loop.md` — the terminal gate-1 loop: review → revise →
+  fresh re-review until `Decision: approve`.
 
 ## Spec Shape
 
@@ -81,6 +98,7 @@ matters now.
 
 ## Success Criteria
 - Specific, testable outcomes. Observable behavior, not implementation.
+- End to end journeys that will be tested - for user and agent experience
 
 ## Scope
 - In:
@@ -132,10 +150,14 @@ Before handing off:
   context, boundaries, and open questions are all present.
 - Every cross-cutting question is an accepted decision with a rationale, or a
   labeled open question that blocks planning.
-- `wyrd-architecture-review` (gate 1) has run on `spec.md` and its findings are
-  resolved.
+- `wyrd-architecture-reviewer` (gate 1) has run the dynamic review loop
+  (`review/dynamic-review-loop.md`) on `spec.md` and returned `Decision: approve`
+  on the final revised artifact. The loop ledger is present with one block per
+  iteration. `approve with changes` is not a pass — the gate advances only on
+  `approve`.
 
 ## Hand-Off
 
-`spec.md` (approved at gate 1) → **`wyrd-plan`**: decompose into the commit DAG
+`spec.md` (gate 1 returned `Decision: approve` on the final revised artifact) →
+**`wyrd-plan`**: decompose into the commit DAG
 (`plan.md`) in the existing `00-overview` format, then gate 2.

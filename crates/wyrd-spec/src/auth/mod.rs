@@ -1,5 +1,6 @@
 //! Authentication request and response contracts.
 
+mod admin;
 mod card_scope;
 mod issue_key;
 mod oidc;
@@ -9,6 +10,10 @@ mod revoke;
 mod secret_bearer;
 mod token;
 
+pub use admin::{
+    ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
+    PrincipalKindPayload, TrustedIssuerView, WorkloadBindingView,
+};
 pub use card_scope::CardScope;
 pub use issue_key::{IssueKeyRequest, IssueKeyResponse};
 pub use oidc::{AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, UrlParseError};

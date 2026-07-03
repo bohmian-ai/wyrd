@@ -71,7 +71,15 @@ impl BenchFixture {
     ) {
         match self
             .catalog
-            .create_table(ns, name, extra_fields.clone(), scope, self.tenant, &[], None)
+            .create_table(
+                ns,
+                name,
+                extra_fields.clone(),
+                scope,
+                self.tenant,
+                &[],
+                None,
+            )
             .await
         {
             Ok(_) => {}

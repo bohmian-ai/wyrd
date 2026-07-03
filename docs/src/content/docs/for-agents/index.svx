@@ -1,0 +1,59 @@
+---
+title: For Agents
+description: Machine-readable surface, stable API paths, and the rules agents must follow when reading and updating Wyrd.
+pillar: wyrd
+group: For Agents
+order: 1
+---
+
+# For Agents
+
+This section is written for AI agents that use Wyrd as a tool — reading cards,
+registering new ones, querying relationships, and acting on errors.
+
+## Machine-readable surface
+
+Wyrd publishes a static agent surface that is stable across deployments and
+requires no authentication to read.
+
+| Resource | Purpose |
+| --- | --- |
+| [llms.txt](/llms.txt) | Compact page index — every route with a one-line description. Start here. |
+| [llms-full.txt](/llms-full.txt) | Full reference — page index plus every card JSON Schema embedded verbatim. |
+| [JSON Schemas](https://github.com/mitari-ai/wyrd/tree/main/crates/wyrd-spec/schemas) | Source schemas in `crates/wyrd-spec/schemas/` — one file per card kind. |
+
+**Kind gate.** Only `data`, `model`, and `prompt` have standalone card pages
+under `/cards/`. Every other kind resolves to the `/cards/` catalog. The
+`llms-full.txt` `URL:` field reflects this: check it before constructing a
+route.
+
+## Rules
+
+1. **Preserve structured errors.** Never collapse a Wyrd error into prose. Keep
+   all fields (`code`, `type`, `detail`, `remediation`, `context`).
+2. **Use `code` for branching.** `title` and `detail` are for humans. `code` is
+   the stable machine-readable key.
+3. **Keep names stable.** A card's `(space, name, version)` identity is
+   immutable after registration. Don't generate random names.
+4. **Register, don't re-author.** If a card already exists for the component,
+   read it with `GET /api/v1/cards/{space}/{name}/{version}` rather than
+   recreating it.
+5. **Declare before you run.** Register the model and prompt cards before
+   running an agent loop so the run record can reference them.
+
+## Stable API paths
+
+| Resource | URL |
+| --- | --- |
+| Cards catalog | `GET /api/v1/cards` |
+| Card by identity | `GET /api/v1/cards/{space}/{name}/{version}` |
+| Register | `POST /api/v1/cards` |
+| Relationships | `GET /api/v1/cards/{space}/{name}/{version}/relationships` |
+| Health | `GET /health` |
+
+## Pages
+
+- [Agent workflow](/for-agents/workflow/) — a copyable end-to-end workflow for
+  agents that need to declare and register cards.
+- [Error remediation](/for-agents/error-remediation/) — how to act on each
+  structured error code.

@@ -2,10 +2,12 @@
 
 use std::sync::Arc;
 
+use base64::Engine;
 use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use wyrd_auth_oidc::WorkloadBinding;
+use wyrd_crypt::SecretKey;
 use wyrd_semver::VersionBlock;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
@@ -20,6 +22,7 @@ use wyrd_sql::{
 };
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
+use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::config::WorkloadBindingEntry;
 use crate::state::AppState;
 
@@ -77,6 +80,21 @@ pub enum ServerBootError {
         /// What made the entry invalid.
         message: String,
     },
+    /// A configured `[[trusted_issuers]]` entry carries a client secret but no
+    /// sealing key was provisioned to encrypt it. Boot fails closed rather than
+    /// persisting a secret in plaintext.
+    #[error("trusted issuer {issuer} could not be sealed: {message}")]
+    IssuerSeal {
+        /// The issuer URL whose secret could not be sealed.
+        issuer: String,
+        /// What made sealing fail (missing key, encryption, or serialization).
+        message: String,
+    },
+    /// `WYRD_SEALING_KEY_FILE`/`WYRD_SEALING_KEY_BASE64` was set but did not
+    /// decode to a 32-byte AES-256-GCM key. Boot fails closed rather than
+    /// proceeding with an unusable sealing key.
+    #[error("WYRD_SEALING_KEY is invalid: {0}")]
+    SealingKey(String),
 }
 
 /// Resolve database configuration, run migrations, and assemble runtime state.
@@ -209,6 +227,10 @@ pub async fn build_app_state_from_config(
         .filter_map(|cidr| cidr.parse::<ipnetwork::IpNetwork>().ok())
         .collect();
 
+    // Decode the optional process-wide sealing key once. It is shared by the
+    // issuer resolver (decrypt on read) and boot-time seeding (encrypt on write).
+    let sealing_key = build_sealing_key(config)?;
+
     let mut state = state
         .with_deployment_profile(config.deployment_profile)
         .with_shutdown_token(shutdown)
@@ -219,54 +241,35 @@ pub async fn build_app_state_from_config(
         .with_trusted_request_id_propagation(config.request_id.trust_upstream)
         .with_preview_auth(config.auth.allow_preview);
 
-    // Resolve the implicit tenant once for both the trusted-issuer and
-    // workload-binding registries. Both resolve through the same slug path the
-    // request handlers use, so the bound tenant matches request-time lookups by
-    // construction.
-    let implicit_tenant =
-        if config.trusted_issuers.is_empty() && config.workload_bindings.is_empty() {
-            None
-        } else {
-            let slug = config.auth.tenant_slug.as_ref().ok_or_else(|| {
-                ServerBootError::TenantSlugUnresolved {
-                    slug: "(unset)".to_owned(),
-                }
-            })?;
-            Some(crate::issuer_boot::resolve_implicit_tenant(&state.pool, slug).await?)
-        };
-
-    // Resolve the configured trusted issuers into the static registry. Discovery
-    // failures fail boot closed. The resolved registry is also handed to the
-    // token verifier below so its external (foreign-OIDC) path can exchange
-    // federated tokens.
-    let trusted_issuer_registry = if config.trusted_issuers.is_empty() {
-        None
-    } else {
-        let tenant_id =
-            implicit_tenant.expect("implicit tenant resolved when trusted issuers are configured");
-        let issuers = crate::issuer_boot::ConfigFileIssuerResolver::new(
-            config.trusted_issuers.clone(),
-            tenant_id,
-        )
-        .resolve()
-        .await?;
-        let registry = Arc::new(wyrd_auth_oidc::TrustedIssuerRegistry::from_issuers(issuers));
-        state = state.with_trusted_issuer_registry(Arc::clone(&registry));
-        Some(registry)
-    };
+    // Postgres is the single source of issuer/binding resolution. Both resolvers
+    // are always attached; an empty config simply means the tenant federates no
+    // issuers and binds no workloads, which they resolve as empty results. The
+    // issuer resolver also feeds the token verifier's external (foreign-OIDC)
+    // path so federated tokens can be exchanged per-request.
+    let issuer_resolver = Arc::new(PgIssuerResolver::new(
+        Arc::new(state.pool.clone()),
+        sealing_key.clone(),
+    ));
+    let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(Arc::new(state.pool.clone())));
+    state = state
+        .with_trusted_issuer_resolver(Arc::clone(&issuer_resolver))
+        .with_workload_binding_resolver(binding_resolver);
+    if let Some(key) = sealing_key.clone() {
+        state = state.with_sealing_key(key);
+    }
 
     // Install Wyrd's own auth handles (issuing key + token verifier). A server
     // without a signing key cannot mint or verify Wyrd JWTs, so auth is the same
     // working experience across environments: a production profile (staging and
     // production) fails boot closed when no key is provisioned; development mints
     // an ephemeral key so auth works on a fresh local run. The verifier's
-    // external path is wired to the trusted-issuer registry resolved above.
+    // external path is wired to the Postgres issuer resolver built above.
     match config.auth.signing_key.as_ref() {
         Some(signing_key) => {
             let (issuing_key, verifier) = crate::auth_boot::build_auth_handles(
                 signing_key,
                 &state.pool,
-                trusted_issuer_registry.as_ref(),
+                Arc::clone(&issuer_resolver),
             )?;
             state = state.with_auth_handles(issuing_key, verifier);
         }
@@ -288,26 +291,70 @@ pub async fn build_app_state_from_config(
             let (issuing_key, verifier) = crate::auth_boot::build_auth_handles(
                 &ephemeral,
                 &state.pool,
-                trusted_issuer_registry.as_ref(),
+                Arc::clone(&issuer_resolver),
             )?;
             state = state.with_auth_handles(issuing_key, verifier);
         }
     }
 
-    // Populate the in-memory workload binding registry from `[[workload_bindings]]`.
-    // Each entry's card target is built into a server-owned `CardRef` (F04, never
-    // from token claims) under the SAME implicit tenant the request-time
-    // `WorkloadBindingResolver::binding` lookup is keyed by, so matches hold by
-    // construction. Building the ref is not a card-existence check.
-    if !config.workload_bindings.is_empty() {
-        let tenant_id = implicit_tenant
-            .expect("implicit tenant resolved when workload bindings are configured");
+    // Seed `[[trusted_issuers]]` and `[[workload_bindings]]` into Postgres under
+    // the implicit tenant. Both resolve the slug through the same
+    // `resolve_by_slug_for_app` path the request handlers use, so the bound
+    // tenant matches request-time lookups by construction. Issuers are seeded
+    // first because workload bindings reference them by FK. Each binding's card
+    // target is built into a server-owned `CardRef` (F04, never from token
+    // claims); building the ref is not a card-existence check.
+    if !config.trusted_issuers.is_empty() || !config.workload_bindings.is_empty() {
+        let slug = config.auth.tenant_slug.as_ref().ok_or_else(|| {
+            ServerBootError::TenantSlugUnresolved {
+                slug: "(unset)".to_owned(),
+            }
+        })?;
+        let tenant_id = crate::issuer_boot::resolve_implicit_tenant(&state.pool, slug).await?;
+
+        crate::issuer_boot::seed_trusted_issuers(
+            &state.pool,
+            tenant_id,
+            &config.trusted_issuers,
+            sealing_key.as_deref(),
+        )
+        .await?;
+
         let bindings = build_workload_bindings(&config.workload_bindings, tenant_id)?;
-        let registry = crate::auth::jwt_bearer::WorkloadBindingRegistry::from_bindings(bindings);
-        state = state.with_workload_binding_registry(Arc::new(registry));
+        crate::issuer_boot::seed_workload_bindings(&state.pool, tenant_id, &bindings).await?;
     }
 
     Ok(state)
+}
+
+/// Decode the optional base64 sealing key from config into an AES-256-GCM key.
+///
+/// Returns `Ok(None)` when no sealing key is configured. Boot fails closed with
+/// [`ServerBootError::SealingKey`] when the key is set but is not valid base64
+/// or does not decode to exactly 32 bytes.
+///
+/// **Single-key model:** this function produces one static process-wide key. There
+/// is no key-id column, no keyring, and no live rotation path. See `config.rs`
+/// `AuthConfig::sealing_key` for the manual rotation runbook. Key-id versioning,
+/// keyring support, KMS-backed KEK, and AAD binding are tracked in issue #72.
+fn build_sealing_key(
+    config: &crate::config::WyrdServerConfig,
+) -> Result<Option<Arc<SecretKey>>, ServerBootError> {
+    let Some(encoded) = config.auth.sealing_key.as_ref() else {
+        return Ok(None);
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.expose_secret())
+        .map_err(|error| {
+            ServerBootError::SealingKey(format!("sealing key is not valid base64: {error}"))
+        })?;
+    let key: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+        ServerBootError::SealingKey(format!(
+            "sealing key must decode to 32 bytes, got {}",
+            bytes.len()
+        ))
+    })?;
+    Ok(Some(Arc::new(SecretKey::from_bytes(key))))
 }
 
 /// Map `[[workload_bindings]]` config entries to domain [`WorkloadBinding`]s, all
@@ -472,44 +519,6 @@ mod tests {
         // F4: every binding carries the resolved implicit tenant, never a sentinel.
         assert_eq!(bindings[0].tenant_id, tenant);
         assert_ne!(bindings[0].tenant_id, DataTenantId::SYSTEM_OWNER);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn workload_binding_registry_resolves_bound_and_rejects_unbound() {
-        use wyrd_auth_oidc::WorkloadBindingResolver;
-
-        let tenant = implicit_tenant();
-        let bindings =
-            build_workload_bindings(&[sample_binding_entry()], tenant).expect("bindings build");
-        let registry = crate::auth::jwt_bearer::WorkloadBindingRegistry::from_bindings(bindings);
-        let issuer = IssuerUrl::new("https://idp.example.com".to_owned()).expect("issuer url");
-
-        let card_ref = registry
-            .binding(
-                &tenant,
-                &issuer,
-                "system:serviceaccount:default/my-sa",
-                Some("my-audience"),
-            )
-            .await
-            .expect("lookup ok")
-            .expect("bound subject resolves to a card ref");
-        assert_eq!(card_ref.kind, CardKind::Service);
-        assert_eq!(card_ref.name.to_string(), "my-model");
-        assert_eq!(card_ref.version.to_string(), "1.0.0");
-        assert_eq!(card_ref.space.to_string(), "prod");
-        assert!(card_ref.uid.is_none());
-
-        let unbound = registry
-            .binding(
-                &tenant,
-                &issuer,
-                "system:serviceaccount:default/other-sa",
-                Some("my-audience"),
-            )
-            .await
-            .expect("lookup ok");
-        assert!(unbound.is_none(), "unbound subject must resolve to None");
     }
 
     #[test]

@@ -46,9 +46,10 @@ mod audit_relay {
         };
         let (factory, props) = iceberg_storage_factory(&backend).unwrap();
         let catalog_uri = vala_sql::testing::catalog_uri(&pool);
-        let catalog = WyrdCatalog::new(&catalog_uri, &warehouse, pool.clone(), None, factory, props)
-            .await
-            .unwrap();
+        let catalog =
+            WyrdCatalog::new(&catalog_uri, &warehouse, pool.clone(), None, factory, props)
+                .await
+                .unwrap();
         let catalog = Arc::new(catalog);
 
         AuditRelay::new(catalog.clone(), pool.clone())
@@ -88,7 +89,7 @@ mod audit_relay {
     /// Append `n` hash-chained outbox rows under `tenant`'s bind.
     ///
     /// `vala.audit_chain_head.data_tenant_id` is FK'd to `platform.tenants`, so
-    /// the tenant is registered first (the SystemShared warehouse write, by
+    /// the tenant is registered first (the `SystemShared` warehouse write, by
     /// contrast, only stamps `data_tenant_id` and needs no FK row).
     async fn seed_audit(pool: &PgPool, tenant: DataTenantId, n: usize) {
         vala_sql::testing::seed_tenant(pool, tenant.as_uuid())
@@ -96,9 +97,12 @@ mod audit_relay {
             .unwrap();
         let mut conn = TenantConn::acquire(pool, tenant).await.unwrap();
         for i in 0..n {
-            vala_sql::queries::audit_outbox::append_audit(&mut conn, &audit_event(&format!("op-{i}")))
-                .await
-                .unwrap();
+            vala_sql::queries::audit_outbox::append_audit(
+                &mut conn,
+                &audit_event(&format!("op-{i}")),
+            )
+            .await
+            .unwrap();
         }
         conn.commit().await.unwrap();
     }
@@ -170,7 +174,11 @@ mod audit_relay {
         let first = relay.claim(100).await.unwrap();
         assert_eq!(first.len(), 1, "one tenant, one shipment");
         relay.ship(&first[0]).await.unwrap();
-        assert_eq!(audit_log_count(&fx.catalog, t).await, 4, "first ship lands 4");
+        assert_eq!(
+            audit_log_count(&fx.catalog, t).await,
+            4,
+            "first ship lands 4"
+        );
 
         // Recovery: the range is still unshipped, so a re-claim returns the same
         // seq range and thus the same deterministic batch_id.

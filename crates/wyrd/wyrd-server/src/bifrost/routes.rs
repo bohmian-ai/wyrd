@@ -12,9 +12,9 @@ use crate::bifrost::service;
 use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
 
-/// Mount the Bifrost catalog routes into an existing `/v1` router.
-pub fn mount(router: Router<AppState>, _state: &AppState) -> Router<AppState> {
-    router
+/// Standalone Bifrost catalog router for the `/v1` group.
+pub fn router() -> Router<AppState> {
+    Router::new()
         .route("/bifrost/tables", post(register).get(list))
         .route("/bifrost/tables/{namespace}/{name}", get(describe))
 }

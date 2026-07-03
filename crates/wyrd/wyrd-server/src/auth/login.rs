@@ -107,15 +107,15 @@ pub async fn login(
     Query(query): Query<LoginQuery>,
 ) -> Result<Response, WyrdErrorResponse> {
     let tenant_id = resolve_login_tenant(&state, &headers).await?;
-    let trusted = trusted_issuer(&state, tenant_id, &query.issuer)?;
-    let provider = discover_provider(trusted).await?;
+    let trusted = crate::auth::trusted_issuer(&state, tenant_id, &query.issuer).await?;
+    let provider = discover_provider(&trusted).await?;
     let redirect_uri = callback_redirect_uri(&headers)?;
     let state_key = auth_state_key();
     let code_verifier = pkce_verifier();
     let nonce = auth_nonce();
     let authz_url = build_authorization_url(
         &provider,
-        trusted,
+        &trusted,
         &redirect_uri,
         &state_key,
         code_verifier.expose_secret(),
@@ -149,8 +149,12 @@ pub async fn login(
     }
 }
 
+/// Lifetime of a persisted login-state row: the browser must complete the IdP
+/// round-trip and hit `/auth/callback` within this window or the state is gone.
 const LOGIN_STATE_TTL: Duration = Duration::from_secs(300);
 
+/// Whether the client prefers a JSON response (`Accept: application/json`) over
+/// the default `302` redirect to the IdP.
 fn wants_json(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
@@ -158,29 +162,42 @@ fn wants_json(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.contains("application/json"))
 }
 
+/// Generate the opaque CSRF `state` value that ties this login attempt to its
+/// callback (32 random bytes, base64url).
 fn auth_state_key() -> String {
     random_b64url(32)
 }
 
+/// Generate the OIDC `nonce` bound into the authorization request and later
+/// verified against the returned ID token (32 random bytes, base64url).
 fn auth_nonce() -> String {
     random_b64url(32)
 }
 
+/// Generate the PKCE code verifier (48 random bytes, base64url). Kept server-side
+/// in the login-state store and never sent to the browser.
 fn pkce_verifier() -> SecretString {
     SecretString::from(random_b64url(48))
 }
 
+/// Derive the PKCE `S256` code challenge — base64url(SHA-256(verifier)) — sent to
+/// the IdP in the authorization request.
 fn pkce_challenge(verifier: &str) -> String {
     let digest = Sha256::digest(verifier.as_bytes());
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
+/// Draw `bytes` of CSPRNG randomness and encode as base64url (no padding). Shared
+/// by the state, nonce, and PKCE-verifier generators.
 fn random_b64url(bytes: usize) -> String {
     let mut buf = vec![0_u8; bytes];
     rand::rng().fill_bytes(&mut buf);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
 
+/// Build the `redirect_uri` the IdP sends the browser back to, derived from the
+/// request `Host` (and `X-Forwarded-Proto` when present). Must match the value
+/// replayed at the token exchange, so it is stored with the login state.
 fn callback_redirect_uri(headers: &HeaderMap) -> Result<String, WyrdErrorResponse> {
     let host = headers
         .get(header::HOST)
@@ -195,6 +212,8 @@ fn callback_redirect_uri(headers: &HeaderMap) -> Result<String, WyrdErrorRespons
     Ok(format!("{scheme}://{host}/auth/callback"))
 }
 
+/// Resolve the tenant for this login request from the request host subdomain,
+/// failing closed with `InvalidToken` when no active tenant matches.
 async fn resolve_login_tenant(
     state: &AppState,
     headers: &HeaderMap,
@@ -210,6 +229,9 @@ async fn resolve_login_tenant(
     ))
 }
 
+/// Extract the tenant slug from the leftmost host label (e.g. `acme` in
+/// `acme.wyrd.cloud`). Returns `None` for `localhost`-style hosts that carry no
+/// tenant subdomain.
 fn tenant_slug_from_host(headers: &HeaderMap) -> Option<TenantSlug> {
     let host = headers.get(header::HOST)?.to_str().ok()?;
     let host = host.split(':').next().unwrap_or(host);
@@ -222,6 +244,8 @@ fn tenant_slug_from_host(headers: &HeaderMap) -> Option<TenantSlug> {
     TenantSlug::new(first.to_owned()).ok()
 }
 
+/// Look up an active tenant id by slug through the `wyrd_app` pool, mapping a
+/// store outage to a fail-closed `503`.
 async fn resolve_tenant_slug(
     pool: &sqlx::PgPool,
     slug: &TenantSlug,
@@ -231,22 +255,8 @@ async fn resolve_tenant_slug(
         .map_err(sql_error)
 }
 
-fn trusted_issuer<'a>(
-    state: &'a AppState,
-    tenant_id: DataTenantId,
-    issuer: &IssuerUrl,
-) -> Result<&'a TrustedIssuer, WyrdErrorResponse> {
-    let registry = state.trusted_issuer_registry.as_ref().ok_or_else(|| {
-        WyrdErrorResponse::from(WyrdError::Internal {
-            message: "trusted issuer registry is not configured".to_owned(),
-            details: serde_json::json!({}),
-        })
-    })?;
-    registry
-        .get(&tenant_id, issuer)
-        .ok_or_else(|| invalid_token("issuer is not trusted for the resolved tenant"))
-}
-
+/// Resolve the trusted issuer's OIDC `authorization_endpoint` via discovery. A
+/// discovery failure is a `503` (`DiscoveryUnavailable`), never a silent skip.
 async fn discover_provider(trusted: &TrustedIssuer) -> Result<Url, WyrdErrorResponse> {
     let issuer_url = Url::parse(trusted.issuer.as_str()).map_err(|_| {
         WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
@@ -266,6 +276,9 @@ async fn discover_provider(trusted: &TrustedIssuer) -> Result<Url, WyrdErrorResp
     Ok(provider.metadata.authorization_endpoint)
 }
 
+/// Assemble the IdP authorization URL: `response_type=code`, the client id,
+/// redirect URI, `openid profile email` scope, the PKCE `S256` challenge, and the
+/// CSRF `state` + `nonce`. This is the URL the browser is sent to.
 fn build_authorization_url(
     authorization_endpoint: &Url,
     trusted: &TrustedIssuer,
@@ -289,6 +302,8 @@ fn build_authorization_url(
     Ok(url)
 }
 
+/// Build a `401` [`WyrdError::InvalidToken`] for a login request that cannot be
+/// trusted (missing host, unresolvable tenant, untrusted issuer).
 fn invalid_token(message: &str) -> WyrdErrorResponse {
     WyrdErrorResponse::from(WyrdError::InvalidToken {
         message: message.to_owned(),
@@ -296,6 +311,8 @@ fn invalid_token(message: &str) -> WyrdErrorResponse {
     })
 }
 
+/// Map a login-path store error to a fail-closed `503` and log the cause; the
+/// raw SQL error never reaches the client.
 fn sql_error(error: impl Into<SqlError>) -> WyrdErrorResponse {
     let error = error.into();
     tracing::warn!(error = %error, "OIDC login SQL unavailable");

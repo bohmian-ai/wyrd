@@ -233,7 +233,14 @@ impl IssuingKey {
             kind: PrincipalKind::Service { card_ref },
             tenant_id,
         };
-        self.issue_access_token_with_claims(sa_id.to_string(), principal, roles, card_scope, None, ttl)
+        self.issue_access_token_with_claims(
+            sa_id.to_string(),
+            principal,
+            roles,
+            card_scope,
+            None,
+            ttl,
+        )
     }
 
     /// Mint an access token for an Agent principal.
@@ -268,7 +275,14 @@ impl IssuingKey {
             kind: PrincipalKind::Agent { card_ref },
             tenant_id,
         };
-        self.issue_access_token_with_claims(agent_id.to_string(), principal, roles, card_scope, None, ttl)
+        self.issue_access_token_with_claims(
+            agent_id.to_string(),
+            principal,
+            roles,
+            card_scope,
+            None,
+            ttl,
+        )
     }
 
     /// Mint a delegated access token via RFC 8693 token exchange.

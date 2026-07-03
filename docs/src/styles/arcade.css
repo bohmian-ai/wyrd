@@ -1,0 +1,1619 @@
+/* ============================================================================
+   ARCADE THEME — Direction A ("Arcade Cabinet"), the shipped docs skin.
+   Every value resolves to a token from wyrd-tokens.css (generated from
+   palette.json). No raw hex except the always-dark cabinet chrome, which is the
+   brand's fixed "marquee" surface (matches brand/landing-vision.html +
+   wyrd-ui-source-of-truth-v2.html .pagehead). Zero blur, hard-offset shadows,
+   5px radius, 2/3px ink borders. All rules are scoped under `.mk` and the app is
+   wrapped in `<div class="mk a">` by the root layout.
+   ============================================================================ */
+
+@import '@fontsource/archivo/500.css';
+@import '@fontsource/archivo/700.css';
+@import '@fontsource/archivo/800.css';
+@import '@fontsource/archivo-black/400.css';
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/700.css';
+@import '@fontsource/vt323';
+@import '@fontsource/press-start-2p';
+@import './wyrd-tokens.css';
+
+/* fixed cabinet surface (always dark, both themes) */
+.mk {
+  --cab: #0b0b0e;
+  --cab-ink: #f4f4f5;
+  --cab-dim: #8a8a95;
+  --cab-line: #26262d;
+}
+
+/* Native scrollbars (window + the sticky sidebar/toc overflow columns) follow
+   the active theme. Without this they render in the UA's default light scheme —
+   the two bright white scrollbar tracks flanking the dark shell. */
+:root[data-theme='dark'] {
+  color-scheme: dark;
+}
+:root[data-theme='light'] {
+  color-scheme: light;
+}
+
+.mk *,
+.mk *::before,
+.mk *::after {
+  box-sizing: border-box;
+}
+.mk {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-weight: 500;
+  line-height: 1.55;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+.mk a {
+  color: inherit;
+  text-decoration: none;
+}
+.mk ::selection {
+  background: var(--rune-strong);
+  color: #0b0b0e;
+}
+.mk .wrap {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 0 28px;
+}
+
+/* ---- fuji mark ---- */
+.mk .fuji .p {
+  fill: var(--rune-strong);
+}
+.mk .fuji .c {
+  fill: var(--lime);
+}
+
+/* ---- marquee / nav (cabinet) ---- */
+.mk .marquee {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: var(--cab);
+  border-bottom: 3px solid var(--lime);
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 11px 22px;
+}
+.mk .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.mk .brand .fuji {
+  width: 22px;
+  height: 22px;
+  display: block;
+}
+.mk .brand .wm {
+  font-family: var(--font-arcade);
+  font-size: 13px;
+  letter-spacing: 1.5px;
+  color: var(--cab-ink);
+}
+.mk .brand .co {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--cab-dim);
+  border-left: 2px solid var(--cab-line);
+  padding-left: 8px;
+}
+
+/* product switch (Wyrd / Fathom) */
+.mk .switch {
+  display: inline-flex;
+  gap: 5px;
+  margin-left: 6px;
+}
+.mk .switch a {
+  position: relative;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--cab-dim);
+  padding: 6px 11px;
+  border: 2px solid var(--cab-line);
+  border-radius: var(--r);
+}
+.mk .switch a.on[data-k='wyrd'] {
+  color: var(--lime-ink);
+  background: var(--lime);
+  border-color: var(--lime);
+}
+.mk .switch a[data-k='fathom'] {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.mk .switch a .soon {
+  font-size: 7.5px;
+  letter-spacing: 0.08em;
+  padding: 2px 4px;
+  border-radius: 3px;
+  background: var(--rune-strong);
+  color: #160c2e;
+}
+.mk .marquee .right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+/* search stub */
+.mk .search {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--cab-dim);
+  background: #17171b;
+  border: 2px solid var(--cab-line);
+  border-radius: var(--r);
+  padding: 6px 10px;
+  min-width: 168px;
+  cursor: text;
+}
+.mk .search .k {
+  margin-left: auto;
+  font-size: 9px;
+  font-weight: 700;
+  border: 2px solid var(--cab-line);
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+
+/* icon button (theme, github, menu) */
+.mk .iconbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  color: var(--cab-ink);
+  background: #17171b;
+  border: 2px solid var(--cab-line);
+  border-radius: var(--r);
+  cursor: pointer;
+}
+.mk .iconbtn:hover {
+  border-color: var(--lime);
+  color: var(--lime);
+}
+.mk .iconbtn svg {
+  width: 17px;
+  height: 17px;
+  display: block;
+}
+.mk .menu {
+  display: none;
+}
+
+/* drawer (mobile) */
+.mk .drawer {
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 22px 18px;
+  background: var(--cab);
+  border-bottom: 3px solid var(--lime);
+}
+.mk .drawer.open {
+  display: flex;
+}
+.mk .drawer a {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #cfcfd6;
+  padding: 10px 12px;
+  border: 2px solid var(--cab-line);
+  border-radius: var(--r);
+}
+.mk .drawer a:hover {
+  color: var(--lime-ink);
+  background: var(--lime);
+  border-color: var(--lime);
+}
+
+/* ---- buttons ---- */
+.mk .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 12.5px;
+  letter-spacing: 0.02em;
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  padding: 11px 18px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    transform 0.08s ease,
+    box-shadow 0.08s ease;
+}
+.mk .btn-lime {
+  background: var(--lime);
+  color: var(--lime-ink);
+  border-color: var(--border);
+  box-shadow: 4px 4px 0 0 var(--shadow);
+}
+.mk .btn-violet {
+  background: var(--rune-btn);
+  color: var(--rune-btn-ink);
+  border-color: var(--border);
+  box-shadow: 4px 4px 0 0 var(--shadow);
+}
+.mk .btn-ghost {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 4px 4px 0 0 var(--shadow);
+}
+.mk .btn:hover {
+  transform: translate(-2px, -2px);
+  box-shadow: 6px 6px 0 0 var(--shadow);
+}
+.mk .btn:active {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 0 var(--shadow);
+}
+.mk .btn-sm {
+  padding: 8px 13px;
+  font-size: 11px;
+  box-shadow: 3px 3px 0 0 var(--shadow);
+}
+
+/* ---- eyebrows + section heads ---- */
+.mk .eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-family: var(--font-arcade);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  color: var(--lime-text);
+  border: 2px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--r);
+  padding: 7px 11px;
+}
+.mk .eyebrow::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  background: var(--lime);
+  box-shadow: 2px 2px 0 0 var(--shadow);
+}
+.mk .sec-eye {
+  font-family: var(--font-arcade);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  color: var(--rune-strong);
+  display: inline-block;
+  margin-bottom: 14px;
+}
+/* Section heads follow the SoT .sechead h2 (and the docs prose h2): the
+   Press Start 2P arcade face, sized down with a generous line-height so the
+   tall caps stay legible and long titles wrap. Not Archivo Black — that face
+   is reserved for the wordmark. */
+.mk h2.title {
+  font-family: var(--font-arcade);
+  font-size: clamp(15px, 1.9vw, 21px);
+  line-height: 1.5;
+  letter-spacing: 0.5px;
+}
+.mk h2.title em {
+  font-style: normal;
+  color: var(--rune-strong);
+}
+.mk h2.title .lime {
+  color: var(--lime-text);
+}
+.mk .lead {
+  font-size: 16px;
+  line-height: 1.62;
+  color: var(--muted);
+  max-width: 62ch;
+}
+.mk .lead b {
+  color: var(--text);
+  font-weight: 700;
+}
+
+/* ---- hero plane ---- */
+.mk .hero {
+  position: relative;
+  overflow: hidden;
+  border-bottom: 3px solid var(--border);
+}
+.mk .plane {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: linear-gradient(180deg, var(--sky-top), var(--sky-bot));
+}
+.mk .plane svg {
+  position: absolute;
+  display: block;
+}
+.mk .plane .stars {
+  left: 0;
+  right: 0;
+  top: 0;
+  width: 100%;
+  height: 66%;
+}
+.mk .plane .grid {
+  left: 0;
+  right: 0;
+  bottom: 0;
+  width: 100%;
+  height: 30%;
+}
+.mk .hero-in {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: 1.05fr 0.95fr;
+  gap: 48px;
+  align-items: center;
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 72px 28px 84px;
+}
+/* Canonical LOUD hero block (SoT §7 .l-hero): Press Start 2P set in a violet
+   hero block with a 10px hard shadow — the brand's hero/landing face. Archivo
+   Black is retired to the wordmark; the headline is the pixel display face. */
+.mk .hero h1 {
+  display: inline-block;
+  font-family: var(--font-arcade);
+  font-size: clamp(15px, 2.1vw, 23px);
+  line-height: 1.4;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin: 18px 0 6px;
+  padding: 18px 20px;
+  border: 3px solid var(--border);
+  border-radius: var(--r);
+  background: var(--hero-bg);
+  color: var(--hero-ink);
+  box-shadow: 10px 10px 0 0 var(--shadow);
+}
+.mk .hero h1 .hl {
+  color: var(--lime);
+}
+.mk .hero-sub {
+  font-size: 17px;
+  line-height: 1.58;
+  color: var(--text);
+  max-width: 52ch;
+  margin-bottom: 26px;
+}
+.mk .hero-sub .w {
+  color: var(--lime-text);
+  font-weight: 700;
+}
+.mk .hero-sub .f {
+  color: var(--rune-strong);
+  font-weight: 700;
+}
+.mk .hero-cta {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+/* layer stack (Fathom on Wyrd) */
+.mk .stack .layer {
+  border: 3px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  padding: 16px;
+  box-shadow: 10px 10px 0 0 var(--shadow);
+}
+.mk .stack .layer .lhd {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.mk .stack .layer .nm {
+  font-family: var(--font-display);
+  font-size: 20px;
+}
+.mk .stack .layer .tg {
+  font-family: var(--font-arcade);
+  font-size: 7.5px;
+  letter-spacing: 0.04em;
+  padding: 5px 7px;
+  border-radius: 4px;
+}
+.mk .stack .layer .dot {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.mk .stack .layer p {
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.5;
+  margin-bottom: 11px;
+}
+.mk .stack .layer p b {
+  color: var(--text);
+}
+.mk .stack .chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.mk .stack .chips span {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text);
+  border: 2px solid var(--border);
+  background: var(--surface-2);
+  border-radius: 4px;
+  padding: 3px 7px;
+}
+.mk .stack .fathom {
+  border-color: var(--rune-strong);
+}
+.mk .stack .fathom .nm {
+  color: var(--rune-strong);
+}
+.mk .stack .fathom .tg {
+  background: var(--rune-strong);
+  color: #160c2e;
+}
+.mk .stack .wyrd {
+  border-color: var(--lime);
+}
+.mk .stack .wyrd .tg {
+  background: var(--lime);
+  color: var(--lime-ink);
+}
+.mk .stack .seam {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  margin: 12px 0;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.mk .stack .seam .ar {
+  color: var(--rune-strong);
+  font-size: 13px;
+}
+.mk .stack .base {
+  margin-top: 13px;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border: 2px dashed var(--border);
+  border-radius: var(--r);
+  padding: 9px 11px;
+}
+
+/* ---- generic section ---- */
+.mk .sec {
+  padding: 76px 0;
+}
+.mk .sec.center {
+  text-align: center;
+}
+.mk .sec.center .lead {
+  margin-left: auto;
+  margin-right: auto;
+}
+.mk .sec.alt {
+  background: var(--surface);
+  border-top: 3px solid var(--border);
+  border-bottom: 3px solid var(--border);
+}
+.mk .sec-head {
+  margin-bottom: 26px;
+}
+
+/* ---- card grids / pillars / hub tiles ---- */
+.mk .grid3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 18px;
+}
+.mk .grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+}
+.mk .card {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  box-shadow: 4px 4px 0 0 var(--shadow);
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  text-align: left;
+  transition:
+    transform 0.08s ease,
+    box-shadow 0.08s ease;
+}
+.mk a.card:hover {
+  transform: translate(-2px, -2px);
+  box-shadow: 7px 7px 0 0 var(--shadow);
+}
+.mk .card .ct {
+  font-family: var(--font-display);
+  font-size: 17px;
+  margin-bottom: 7px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.mk .card .d {
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  border: 2px solid var(--border);
+  flex: 0 0 auto;
+}
+.mk .card .d.client {
+  background: var(--client);
+}
+.mk .card .d.server {
+  background: var(--server);
+}
+.mk .card .d.control {
+  background: var(--control);
+}
+.mk .card .d.rune {
+  background: var(--rune-strong);
+}
+.mk .card p {
+  font-size: 13.5px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.mk .card .meta {
+  margin-top: 12px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.mk .card .kbar {
+  height: 6px;
+  margin: -18px -18px 14px;
+  border-bottom: 2px solid var(--border);
+}
+.mk .card .kbar.client {
+  background: var(--client);
+}
+.mk .card .kbar.server {
+  background: var(--server);
+}
+.mk .card .kbar.control {
+  background: var(--control);
+}
+.mk .card .kbar.rune {
+  background: var(--rune-strong);
+}
+
+/* lifecycle band */
+.mk .life {
+  border: 3px solid var(--border);
+  border-radius: var(--r);
+  overflow: hidden;
+  background: var(--surface);
+  box-shadow: 6px 6px 0 0 var(--shadow);
+}
+.mk .life .stages {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+}
+.mk .life .stage {
+  padding: 20px 18px;
+  border-right: 2px dashed var(--border);
+  text-align: left;
+}
+.mk .life .stage:last-child {
+  border-right: 0;
+}
+.mk .life .stage .n {
+  font-family: var(--font-pixel);
+  font-size: 32px;
+  line-height: 0.8;
+  color: var(--lime-text);
+  display: block;
+  margin-bottom: 9px;
+}
+.mk .life .stage h4 {
+  font-family: var(--font-display);
+  font-size: 14px;
+  margin-bottom: 5px;
+}
+.mk .life .stage p {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+.mk .life .rail {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 18px;
+  border-top: 2px solid var(--border);
+  background: var(--surface-2);
+  flex-wrap: wrap;
+}
+.mk .life .rail .seg {
+  height: 8px;
+  flex: 1;
+  min-width: 120px;
+  border: 2px solid var(--border);
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--lime) 0 50%, var(--rune-strong) 50% 100%);
+}
+.mk .life .rail .lab {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.mk .life .rail .lab .w {
+  color: var(--lime-text);
+}
+.mk .life .rail .lab .f {
+  color: var(--rune-strong);
+}
+
+/* ---- doc shell (article / reference) ---- */
+.mk .shell {
+  display: grid;
+  grid-template-columns: 250px minmax(0, 1fr) 212px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+.mk .side {
+  border-right: 2px solid var(--border);
+  background: var(--surface);
+}
+.mk .side > nav {
+  position: sticky;
+  top: 57px;
+  max-height: calc(100vh - 57px);
+  overflow-y: auto;
+  padding: 22px 14px 40px;
+}
+.mk .side .grp {
+  margin-bottom: 18px;
+}
+.mk .side .grp > .gh {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 0 8px 7px;
+  border-bottom: 2px dashed var(--border);
+  margin-bottom: 7px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.mk .side .grp > .gh::-webkit-details-marker {
+  display: none;
+}
+.mk .side .grp > .gh:hover {
+  color: var(--text);
+}
+.mk .side .grp > .gh:focus-visible {
+  outline: 2px solid var(--rune-strong);
+  outline-offset: 2px;
+}
+.mk .side .grp > .gh::after {
+  content: '▸';
+  margin-left: auto;
+  color: var(--rune-strong);
+  transition: transform 0.12s ease;
+}
+.mk .side .grp[open] > .gh::after {
+  transform: rotate(90deg);
+}
+.mk .side .grp > .gh .b {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  border: 2px solid var(--border);
+}
+.mk .side .grp .b.client {
+  background: var(--client);
+}
+.mk .side .grp .b.server {
+  background: var(--server);
+}
+.mk .side .grp .b.control {
+  background: var(--control);
+}
+.mk .side .grp .b.rune {
+  background: var(--rune-strong);
+}
+.mk .side a {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted);
+  padding: 6px 8px;
+  border-radius: var(--r);
+}
+.mk .side a:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+.mk .side a.on {
+  color: var(--text);
+  background: var(--rune-soft);
+  font-weight: 700;
+}
+.mk .side a.on::before {
+  content: '▸';
+  color: var(--rune-strong);
+}
+.mk .side a .soon {
+  margin-left: auto;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--rune-strong);
+  border: 2px solid var(--rune-strong);
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+
+.mk .main {
+  min-width: 0;
+  padding: 30px 40px 64px;
+}
+.mk .crumbs {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 14px;
+}
+.mk .crumbs .sep {
+  color: var(--rune-strong);
+  padding: 0 6px;
+}
+
+/* prose */
+.mk .prose {
+  max-width: 74ch;
+}
+.mk .prose h1 {
+  font-family: var(--font-display);
+  font-size: 33px;
+  line-height: 1.08;
+  letter-spacing: -0.6px;
+  margin-bottom: 12px;
+}
+.mk .prose .deck {
+  font-size: 17px;
+  color: var(--muted);
+  line-height: 1.55;
+  margin-bottom: 26px;
+}
+.mk .prose h2 {
+  font-family: var(--font-display);
+  font-size: 21px;
+  letter-spacing: -0.3px;
+  margin: 34px 0 12px;
+  padding-left: 13px;
+  border-left: 7px solid var(--rune-strong);
+}
+.mk .prose h3 {
+  font-family: var(--font-display);
+  font-size: 16px;
+  margin: 24px 0 9px;
+}
+.mk .prose p {
+  font-size: 15px;
+  line-height: 1.68;
+  margin-bottom: 15px;
+}
+.mk .prose a.lk {
+  color: var(--rune-strong);
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.mk .prose :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  background: var(--rune-soft);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+.mk .prose ul {
+  margin: 0 0 15px 0;
+  padding-left: 4px;
+  list-style: none;
+}
+.mk .prose ul li {
+  position: relative;
+  padding-left: 20px;
+  font-size: 15px;
+  line-height: 1.6;
+  margin-bottom: 7px;
+}
+.mk .prose ul li::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 9px;
+  width: 8px;
+  height: 8px;
+  background: var(--lime);
+  border: 2px solid var(--border);
+}
+
+/* code block */
+.mk .code {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  box-shadow: 3px 3px 0 0 var(--shadow);
+  overflow: hidden;
+  margin: 0 0 18px;
+}
+.mk .code .ch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 2px solid var(--border);
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.mk .code .ch .fn {
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mk .code .ch .lang {
+  color: var(--rune-strong);
+}
+.mk .code .ch .copy {
+  margin-left: auto;
+  border: 2px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 7px;
+  cursor: pointer;
+  color: var(--text);
+  background: var(--surface);
+}
+.mk .code pre {
+  margin: 0;
+  padding: 14px 16px;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.6;
+}
+/* Shiki dual-theme output. The highlighter inlines github-light colors + a
+   --shiki-dark var per token. Drop Shiki's own background so the `.code`
+   surface shows through, and swap every token to its --shiki-dark value in
+   dark mode. Code inside the block must not inherit the inline-code chip. */
+.mk .code pre.shiki {
+  background: transparent !important;
+}
+.mk .code pre code {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: inherit;
+}
+:root[data-theme='dark'] .mk .code pre.shiki,
+:root[data-theme='dark'] .mk .code pre.shiki span {
+  color: var(--shiki-dark) !important;
+}
+
+/* aside / admonition */
+.mk .aside {
+  border: 2px solid var(--border);
+  border-left: 7px solid var(--rune-strong);
+  border-radius: var(--r);
+  background: var(--rune-soft);
+  padding: 14px 16px;
+  margin: 0 0 20px;
+}
+.mk .aside .at {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--rune-strong);
+  margin-bottom: 6px;
+}
+.mk .aside p {
+  font-size: 14px;
+  line-height: 1.55;
+  margin: 0;
+}
+
+/* tabs */
+.mk .tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 2px solid var(--border);
+  margin-bottom: -2px;
+}
+.mk .tabs .tab {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  padding: 7px 12px;
+  border: 2px solid transparent;
+  border-bottom: 0;
+  border-radius: var(--r) var(--r) 0 0;
+  cursor: pointer;
+}
+.mk .tabs .tab.on {
+  color: var(--text);
+  background: var(--surface);
+  border-color: var(--border);
+}
+
+/* on-page toc */
+.mk .toc {
+  position: sticky;
+  top: 57px;
+  align-self: start;
+  padding: 30px 16px;
+  max-height: calc(100vh - 57px);
+  overflow-y: auto;
+}
+.mk .toc .th {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 11px;
+}
+.mk .toc a {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--muted);
+  padding: 4px 0 4px 11px;
+  border-left: 2px solid var(--border);
+}
+.mk .toc a.on {
+  color: var(--rune-strong);
+  border-left-color: var(--rune-strong);
+  font-weight: 700;
+}
+.mk .toc a.sub {
+  padding-left: 22px;
+}
+
+/* pagination */
+.mk .pag {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 40px;
+  padding-top: 26px;
+  border-top: 2px dashed var(--border);
+  max-width: 74ch;
+}
+.mk .pag a {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  box-shadow: 3px 3px 0 0 var(--shadow);
+  padding: 12px 14px;
+}
+.mk .pag a:hover {
+  transform: translate(-2px, -2px);
+  box-shadow: 5px 5px 0 0 var(--shadow);
+}
+.mk .pag a.next {
+  text-align: right;
+}
+.mk .pag .dir {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.mk .pag .lbl {
+  font-family: var(--font-display);
+  font-size: 15px;
+  margin-top: 3px;
+}
+
+/* ---- reference tables ---- */
+.mk .anchor-rail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-bottom: 22px;
+  padding-bottom: 18px;
+  border-bottom: 2px dashed var(--border);
+}
+.mk .anchor-rail a {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--muted);
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  padding: 5px 9px;
+}
+.mk .anchor-rail a:hover {
+  color: var(--lime-ink);
+  background: var(--lime);
+  border-color: var(--lime);
+}
+/* Reference tables (`table.ref`) and every markdown-authored content table in
+   the doc body share one clean recipe, so an authored `| … |` table renders
+   with the same bordered card, header fill, and 2px dividers as the mock's
+   Card-envelope table instead of the browser default. */
+.mk table.ref,
+.mk .main table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  overflow: hidden;
+  background: var(--surface);
+  box-shadow: 3px 3px 0 0 var(--shadow);
+  margin: 0 0 26px;
+}
+.mk table.ref th,
+.mk .main table th {
+  text-align: left;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 700;
+  padding: 9px 11px;
+  border-bottom: 2px solid var(--border);
+  background: var(--surface-2);
+}
+.mk table.ref td,
+.mk .main table td {
+  padding: 9px 11px;
+  border-bottom: 2px solid var(--border);
+  vertical-align: top;
+}
+.mk table.ref tr:last-child td,
+.mk .main table tbody tr:last-child td {
+  border-bottom: 0;
+}
+.mk table.ref .nm {
+  color: var(--rune-strong);
+  font-weight: 700;
+}
+.mk table.ref .req {
+  color: var(--danger);
+  font-weight: 700;
+}
+.mk table.ref .ty {
+  color: var(--lime-text);
+}
+.mk .st {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.mk .st.ok {
+  color: var(--ok);
+}
+.mk .st.warn {
+  color: var(--warn);
+}
+.mk .st.danger {
+  color: var(--danger);
+}
+.mk .schema {
+  display: grid;
+  grid-template-columns: 8.5rem 1fr;
+  gap: 6px 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  padding: 14px 16px;
+  margin-bottom: 24px;
+}
+.mk .schema dt {
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+}
+.mk .schema dd {
+  margin: 0;
+  color: var(--text);
+}
+.mk .ref-h2 {
+  font-family: var(--font-display);
+  font-size: 20px;
+  margin: 30px 0 14px;
+  padding-left: 12px;
+  border-left: 7px solid var(--rune-strong);
+}
+.mk .pill {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  border: 2px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 7px;
+}
+.mk .pill.get {
+  color: var(--ok);
+}
+.mk .pill.post {
+  color: var(--rune-strong);
+}
+
+/* ---- fathom coming soon ---- */
+.mk .soon-wrap {
+  position: relative;
+  overflow: hidden;
+  min-height: calc(100vh - 57px);
+  display: flex;
+  align-items: center;
+}
+.mk .soon-in {
+  position: relative;
+  z-index: 2;
+  max-width: 720px;
+  margin: 0 auto;
+  text-align: center;
+  padding: 80px 28px;
+}
+.mk .soon-in .fuji {
+  width: 54px;
+  height: 54px;
+  margin: 0 auto 22px;
+}
+.mk .soon-eye {
+  font-family: var(--font-arcade);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--rune-strong);
+  border: 2px solid var(--rune-strong);
+  border-radius: var(--r);
+  padding: 8px 12px;
+  display: inline-block;
+  margin-bottom: 22px;
+}
+.mk .soon-in h1 {
+  font-family: var(--font-display);
+  font-size: clamp(34px, 5vw, 54px);
+  line-height: 1.04;
+  letter-spacing: -1px;
+  margin-bottom: 18px;
+}
+.mk .soon-in h1 .v {
+  color: var(--rune-strong);
+}
+.mk .soon-in .lead {
+  margin: 0 auto 30px;
+}
+.mk .soon-form {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.mk .soon-form input {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface);
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  box-shadow: 3px 3px 0 0 var(--shadow);
+  padding: 11px 14px;
+  min-width: 240px;
+}
+.mk .soon-feat {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+  margin-top: 34px;
+}
+.mk .soon-feat span {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--text);
+  border: 2px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--r);
+  padding: 6px 10px;
+}
+
+/* ---- 404 ---- */
+.mk .nf {
+  position: relative;
+  overflow: hidden;
+  min-height: calc(100vh - 57px);
+  display: flex;
+  align-items: center;
+}
+.mk .nf-in {
+  position: relative;
+  z-index: 2;
+  max-width: 640px;
+  margin: 0 auto;
+  text-align: center;
+  padding: 70px 28px;
+}
+.mk .nf .big {
+  font-family: var(--font-arcade);
+  font-size: clamp(40px, 9vw, 92px);
+  line-height: 1;
+  color: var(--lime-text);
+  text-shadow: 4px 4px 0 var(--shadow);
+  margin-bottom: 14px;
+}
+.mk .nf .go {
+  font-family: var(--font-display);
+  font-size: clamp(22px, 3.4vw, 32px);
+  letter-spacing: -0.4px;
+  margin-bottom: 12px;
+}
+.mk .nf .coin {
+  font-family: var(--font-pixel);
+  font-size: 26px;
+  color: var(--rune-strong);
+  margin: 18px 0 26px;
+  animation: blink 1.1s steps(1) infinite;
+}
+@keyframes blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+/* ---- footer ---- */
+.mk .foot {
+  background: var(--cab);
+  border-top: 3px solid var(--border);
+  padding: 36px 28px;
+}
+.mk .foot-in {
+  max-width: 1180px;
+  margin: 0 auto;
+  display: flex;
+  justify-content: space-between;
+  gap: 32px;
+  flex-wrap: wrap;
+}
+.mk .foot .fb {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.mk .foot .fb .fuji {
+  width: 22px;
+  height: 22px;
+}
+.mk .foot .fb .wm {
+  font-family: var(--font-arcade);
+  font-size: 12px;
+  letter-spacing: 1.5px;
+  color: var(--cab-ink);
+}
+.mk .foot .ci {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--cab-dim);
+  line-height: 1.7;
+}
+.mk .foot .fcols {
+  display: flex;
+  gap: 48px;
+  flex-wrap: wrap;
+}
+.mk .foot .fcol {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.mk .foot .fcol .ch {
+  font-family: var(--font-arcade);
+  font-size: 8px;
+  color: var(--cab-dim);
+  letter-spacing: 0.06em;
+  margin-bottom: 2px;
+}
+.mk .foot .fcol a {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: #a6a6b0;
+}
+.mk .foot .fcol a:hover {
+  color: var(--lime);
+}
+
+/* ---- mock gallery index ---- */
+.mk .gallery {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 54px 28px 80px;
+}
+.mk .gallery h1 {
+  font-family: var(--font-display);
+  font-size: 30px;
+  margin-bottom: 8px;
+}
+.mk .gallery .sub {
+  color: var(--muted);
+  margin-bottom: 30px;
+  font-size: 15px;
+}
+
+/* ---- responsive ---- */
+@media (max-width: 1080px) {
+  .mk .shell {
+    grid-template-columns: 230px minmax(0, 1fr);
+  }
+  .mk .toc {
+    display: none;
+  }
+  .mk .hero-in {
+    grid-template-columns: 1fr;
+    gap: 36px;
+    padding: 56px 28px 64px;
+  }
+  .mk .grid3 {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+@media (max-width: 820px) {
+  .mk .switch,
+  .mk .search {
+    display: none;
+  }
+  .mk .menu {
+    display: inline-flex;
+  }
+  .mk .shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .mk .side {
+    display: none;
+  }
+  .mk .main {
+    padding: 24px 20px 56px;
+  }
+  .mk .grid3,
+  .mk .grid2 {
+    grid-template-columns: 1fr;
+  }
+  .mk .life .stages {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+@media (max-width: 560px) {
+  .mk .brand .co {
+    display: none;
+  }
+  .mk .pag {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ============================================================================
+   Concepts diagram (WyrdConceptsDiagram) + numbered defs (how-it-connects).
+   Ported from the retired wyrd.css skin — the only two recipes still consumed
+   by live pages. Token-only, so light/dark both work under the arcade theme.
+   ============================================================================ */
+.mk .wyrd-diagram {
+  display: block;
+  width: 100%;
+  max-width: 680px;
+  height: auto;
+  margin: 1.5rem auto;
+}
+.mk .wyrd-diagram .node-shadow,
+.mk .wyrd-diagram .node-fill,
+.mk .wyrd-diagram .node-fill-accent,
+.mk .wyrd-diagram .node-stroke {
+  rx: var(--r);
+  ry: var(--r);
+}
+.mk .wyrd-diagram .node-shadow {
+  fill: var(--shadow);
+}
+.mk .wyrd-diagram .node-fill {
+  fill: var(--surface);
+}
+.mk .wyrd-diagram .node-fill-accent {
+  fill: var(--rune);
+}
+.mk .wyrd-diagram .node-stroke {
+  fill: none;
+  stroke: var(--border);
+  stroke-width: 2.5;
+}
+.mk .wyrd-diagram .node-text {
+  fill: var(--text);
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 700;
+  text-anchor: middle;
+}
+.mk .wyrd-diagram .node-text-on-accent {
+  fill: var(--hero-ink);
+}
+.mk .wyrd-diagram .node-sub {
+  fill: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-anchor: middle;
+}
+.mk .wyrd-diagram .node-sub-on-accent {
+  fill: color-mix(in srgb, var(--hero-ink) 78%, transparent);
+}
+.mk .wyrd-diagram .arrow {
+  fill: none;
+  stroke: var(--border);
+  stroke-width: 3;
+  marker-end: url(#wyrd-arrow);
+}
+.mk .wyrd-diagram .arrow-label {
+  fill: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+.mk .wyrd-defs {
+  margin: 1.5rem 0;
+  display: grid;
+  grid-template-columns: minmax(150px, 210px) 1fr;
+  gap: 12px 18px;
+  align-items: stretch;
+}
+.mk .wyrd-defs dt {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+  color: var(--text);
+  background: var(--surface);
+  border: 2px solid var(--border);
+  border-left: 5px solid var(--rune-strong);
+  border-radius: var(--r);
+  box-shadow: 3px 3px 0 0 var(--shadow);
+  padding: 10px 13px;
+}
+.mk .wyrd-defs dt::before {
+  content: attr(data-step);
+  font-family: var(--font-pixel);
+  font-size: 1.35rem;
+  line-height: 0.75;
+  color: var(--rune-strong);
+}
+.mk .wyrd-defs dd {
+  margin: 0;
+  align-self: center;
+  color: var(--text);
+  line-height: 1.55;
+}
+.mk .wyrd-defs dt[data-kind="agent"],
+.mk .wyrd-defs dt[data-kind="data"],
+.mk .wyrd-defs dt[data-kind="source"],
+.mk .wyrd-defs dt[data-kind="trigger"],
+.mk .wyrd-defs dt[data-kind="workflow"] {
+  border-left-color: var(--client-bar);
+}
+.mk .wyrd-defs dt[data-kind="service"],
+.mk .wyrd-defs dt[data-kind="eval"],
+.mk .wyrd-defs dt[data-kind="experiment"],
+.mk .wyrd-defs dt[data-kind="mcp"] {
+  border-left-color: var(--server-bar);
+}
+.mk .wyrd-defs dt[data-kind="policy"],
+.mk .wyrd-defs dt[data-kind="audit"],
+.mk .wyrd-defs dt[data-kind="operator"] {
+  border-left-color: var(--control-bar);
+}
+.mk .wyrd-defs dt[data-kind="model"],
+.mk .wyrd-defs dt[data-kind="prompt"],
+.mk .wyrd-defs dt[data-kind="artifact"],
+.mk .wyrd-defs dt[data-kind="drift"] {
+  border-left-color: var(--rune-strong);
+}
+@media (max-width: 640px) {
+  .mk .wyrd-defs {
+    grid-template-columns: 1fr;
+    gap: 6px 0;
+  }
+  .mk .wyrd-defs dd {
+    margin: 0 0 0.75rem;
+    align-self: start;
+  }
+}

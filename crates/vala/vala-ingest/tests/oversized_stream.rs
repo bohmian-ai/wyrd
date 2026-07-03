@@ -61,7 +61,9 @@ async fn oversized_stream_byte_cap_rejects_before_decode() {
     // 100 bytes of non-Arrow payload: the byte cap trips before the decoder runs.
     let source = VecSource::new(vec![Ok(frame(100))]);
 
-    let err = collect_frames(source, &limits).await.expect_err("byte cap trips");
+    let err = collect_frames(source, &limits)
+        .await
+        .expect_err("byte cap trips");
     assert!(
         matches!(err, IngestError::BatchTooLarge { .. }),
         "expected BatchTooLarge, got {err:?}"

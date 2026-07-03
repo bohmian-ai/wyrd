@@ -42,8 +42,12 @@ fn shutdown_drains_then_rejects_enqueue() {
     let sink = Arc::new(MockSink::new());
     let producer = Producer::new("ns.tbl".to_owned(), user_schema(), sink.clone(), no_auto());
 
-    producer.enqueue(br#"{"id": 1}"#.to_vec(), card(), None).expect("enqueue");
-    producer.enqueue(br#"{"id": 2}"#.to_vec(), card(), None).expect("enqueue");
+    producer
+        .enqueue(br#"{"id": 1}"#.to_vec(), card(), None)
+        .expect("enqueue");
+    producer
+        .enqueue(br#"{"id": 2}"#.to_vec(), card(), None)
+        .expect("enqueue");
 
     producer.shutdown().expect("shutdown drains");
 
@@ -54,7 +58,11 @@ fn shutdown_drains_then_rejects_enqueue() {
     let err = producer
         .enqueue(br#"{"id": 3}"#.to_vec(), card(), None)
         .unwrap_err();
-    assert_eq!(err.code(), "WYRD_CLIENT_429_QUEUE_FULL", "draining rejects new rows");
+    assert_eq!(
+        err.code(),
+        "WYRD_CLIENT_429_QUEUE_FULL",
+        "draining rejects new rows"
+    );
 }
 
 #[test]
@@ -68,7 +76,9 @@ fn stalled_sink_flush_times_out() {
     };
     let producer = Producer::new("ns.tbl".to_owned(), user_schema(), sink, config);
 
-    producer.enqueue(br#"{"id": 1}"#.to_vec(), card(), None).expect("enqueue");
+    producer
+        .enqueue(br#"{"id": 1}"#.to_vec(), card(), None)
+        .expect("enqueue");
 
     let err = producer.flush().unwrap_err();
     assert_eq!(err.code(), "WYRD_CLIENT_504_FLUSH_TIMEOUT");

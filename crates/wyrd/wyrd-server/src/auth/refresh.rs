@@ -299,7 +299,7 @@ impl RefreshTokens {
 
         Ok(ExchangedToken {
             access_token: SecretString::from(access_token),
-            refresh_token: SecretString::from(refresh_token),
+            refresh_token: Some(SecretString::from(refresh_token)),
             token_type: TokenType::Bearer,
             expires_at,
         })
@@ -532,7 +532,12 @@ mod tests {
         assert_eq!(old_row.revoked_reason.as_deref(), Some("rotated"));
 
         // New row exists and links back via rotated_from.
-        let new_hash = hash_of(&exchanged.refresh_token);
+        let new_hash = hash_of(
+            exchanged
+                .refresh_token
+                .as_ref()
+                .expect("rotation issues a refresh token"),
+        );
         let new_row = refresh_by_hash(&mut conn, &new_hash)
             .await
             .expect("lookup")
@@ -567,7 +572,13 @@ mod tests {
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
-        insert_service_card(&mut conn, tenant, &card_ref, &[component.clone()]).await;
+        insert_service_card(
+            &mut conn,
+            tenant,
+            &card_ref,
+            std::slice::from_ref(&component),
+        )
+        .await;
         let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
@@ -581,7 +592,10 @@ mod tests {
 
         // The re-minted token carries the full resolved scope (own ∪ components),
         // never an empty-scope regression.
-        assert!(claims.card_scope.contains(&card_ref), "own card is in scope");
+        assert!(
+            claims.card_scope.contains(&card_ref),
+            "own card is in scope"
+        );
         assert!(
             claims.card_scope.contains(&component),
             "component card is in scope"
@@ -687,7 +701,13 @@ mod tests {
 
         // The successor token from conn_a's rotation should also be revoked
         // by the family revoke triggered by reuse detection.
-        let successor_hash = hash_of(&result_a.unwrap().refresh_token);
+        let exchanged_a = result_a.unwrap();
+        let successor_hash = hash_of(
+            exchanged_a
+                .refresh_token
+                .as_ref()
+                .expect("rotation issues a refresh token"),
+        );
         let successor = refresh_by_hash(&mut conn_b, &successor_hash)
             .await
             .expect("lookup")

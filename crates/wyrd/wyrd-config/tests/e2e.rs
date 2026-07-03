@@ -117,10 +117,7 @@ fn e2e_policy_card_gets_policy_kind_space() {
     let mut meta = fresh_meta("data-retention");
     apply_defaults(&mut meta, &CardKind::Policy, &cfg);
 
-    assert_eq!(
-        meta.space.as_ref().map(SpaceName::as_str),
-        Some("gov-prod"),
-    );
+    assert_eq!(meta.space.as_ref().map(SpaceName::as_str), Some("gov-prod"),);
     assert_eq!(
         meta.labels.get(&lk("team")).map(LabelValue::as_str),
         Some("platform"),

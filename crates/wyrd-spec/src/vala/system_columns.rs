@@ -4,7 +4,7 @@ pub const WYRD_EVENT_TIME: &str = "wyrd_event_time";
 pub const WYRD_INGESTED_AT: &str = "wyrd_ingested_at";
 /// Arrow column name for the 16-byte batch idempotency key.
 pub const WYRD_BATCH_ID: &str = "wyrd_batch_id";
-/// Arrow column name for the tenant isolation key on SystemShared tables.
+/// Arrow column name for the tenant isolation key on `SystemShared` tables.
 pub const DATA_TENANT_ID: &str = "data_tenant_id";
 
 /// Ordered list of column names that are reserved for Bifrost system use.
@@ -53,7 +53,7 @@ impl SystemColumnSet {
         }
     }
 
-    /// Returns the system columns for a SystemShared table (includes tenant_id).
+    /// Returns the system columns for a `SystemShared` table (includes `tenant_id`).
     pub const fn for_system_shared() -> Self {
         Self {
             event_time: WYRD_EVENT_TIME,

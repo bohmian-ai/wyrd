@@ -34,7 +34,7 @@ struct VecSource {
 
 impl FrameSource for VecSource {
     async fn next_frame(&mut self) -> Result<Option<InsertBatchRequest>, Status> {
-        Ok(self.frames.pop_front().transpose()?)
+        self.frames.pop_front().transpose()
     }
 }
 
@@ -49,7 +49,11 @@ fn ingest_batch() -> Vec<u8> {
         schema.clone(),
         vec![
             Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
-            Arc::new(StringArray::from(vec![run_id.clone(), run_id.clone(), run_id])),
+            Arc::new(StringArray::from(vec![
+                run_id.clone(),
+                run_id.clone(),
+                run_id,
+            ])),
             Arc::new(StringArray::from(vec![CARD, CARD, CARD])),
         ],
     )

@@ -1,6 +1,8 @@
 pub mod issue_key;
 pub mod login;
 pub mod refresh;
+pub mod trusted_issuer;
+pub mod workload_binding;
 
 use std::process::ExitCode;
 
@@ -16,6 +18,12 @@ pub enum AuthCommand {
     Login(login::LoginArgs),
     /// Rotate a Wyrd refresh token and print the new access and refresh tokens.
     Refresh(refresh::RefreshArgs),
+    /// Manage trusted OIDC issuers (add, list, rm).
+    #[command(subcommand)]
+    TrustedIssuer(trusted_issuer::TrustedIssuerCommand),
+    /// Manage workload bindings (add, list, rm).
+    #[command(subcommand)]
+    WorkloadBinding(workload_binding::WorkloadBindingCommand),
 }
 
 pub async fn dispatch(command: AuthCommand) -> Result<ExitCode, WyrdCliError> {
@@ -23,5 +31,7 @@ pub async fn dispatch(command: AuthCommand) -> Result<ExitCode, WyrdCliError> {
         AuthCommand::IssueKey(args) => issue_key::dispatch(args).await,
         AuthCommand::Login(args) => login::dispatch(args).await,
         AuthCommand::Refresh(args) => refresh::dispatch(args).await,
+        AuthCommand::TrustedIssuer(cmd) => trusted_issuer::dispatch(cmd).await,
+        AuthCommand::WorkloadBinding(cmd) => workload_binding::dispatch(cmd).await,
     }
 }

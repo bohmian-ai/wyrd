@@ -23,7 +23,7 @@ pub enum BifrostError {
         column: String,
     },
 
-    /// A SystemShared table schema is missing the required `data_tenant_id` column.
+    /// A `SystemShared` table schema is missing the required `data_tenant_id` column.
     #[error("SystemShared table missing data_tenant_id column: {table}")]
     #[wyrd_error(
         code = "WYRD_VALA_400_BIFROST_MISSING_TENANT_COLUMN",

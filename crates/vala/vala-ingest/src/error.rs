@@ -122,7 +122,8 @@ impl IngestError {
         let code = self.grpc_code();
         let reason = self.wyrd_code();
         let message = self.to_string();
-        let details = ErrorDetails::with_error_info(reason, WYRD_ERROR_DOMAIN, [] as [(String, String); 0]);
+        let details =
+            ErrorDetails::with_error_info(reason, WYRD_ERROR_DOMAIN, [] as [(String, String); 0]);
         Status::with_error_details(code, message, details)
     }
 

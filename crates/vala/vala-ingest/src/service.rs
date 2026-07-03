@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use vala_bifrost::WyrdCatalog;
-use wyrd_auth_verify::PermissionResolver;
+use wyrd_auth_verify::{IssuerConfigResolver, PermissionResolver};
 use wyrd_tonic::tonic::{Request, Response, Status, Streaming};
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
     BifrostIngestService, BifrostIngestServiceServer,
@@ -22,20 +22,20 @@ use crate::orchestrator::run_ingest;
 
 /// gRPC ingest service over `vala-bifrost`'s writer.
 ///
-/// Generic over the resolver-backed verifier `R` (static dispatch, no
-/// `Box<dyn>`) so the same auth seam the HTTP extractor uses is threaded in at
-/// mount time.
-pub struct BifrostIngestGrpc<R: PermissionResolver + 'static> {
+/// Generic over the resolver-backed verifier's `R` (permission resolver) and
+/// `I` (issuer-config resolver) — static dispatch, no `Box<dyn>` — so the same
+/// auth seam the HTTP extractor uses is threaded in at mount time.
+pub struct BifrostIngestGrpc<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> {
     catalog: Arc<WyrdCatalog>,
     limits: IngestLimits,
     semaphores: Arc<StreamSemaphores>,
-    auth: IngestAuthInterceptor<R>,
+    auth: IngestAuthInterceptor<R, I>,
 }
 
-impl<R: PermissionResolver + 'static> BifrostIngestGrpc<R> {
+impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> BifrostIngestGrpc<R, I> {
     /// Construct from the engine catalog with default [`IngestLimits`].
     #[must_use]
-    pub fn new(catalog: Arc<WyrdCatalog>, auth: IngestAuthInterceptor<R>) -> Self {
+    pub fn new(catalog: Arc<WyrdCatalog>, auth: IngestAuthInterceptor<R, I>) -> Self {
         Self::with_limits(catalog, auth, IngestLimits::default())
     }
 
@@ -43,7 +43,7 @@ impl<R: PermissionResolver + 'static> BifrostIngestGrpc<R> {
     #[must_use]
     pub fn with_limits(
         catalog: Arc<WyrdCatalog>,
-        auth: IngestAuthInterceptor<R>,
+        auth: IngestAuthInterceptor<R, I>,
         limits: IngestLimits,
     ) -> Self {
         let semaphores = Arc::new(StreamSemaphores::new(
@@ -67,7 +67,9 @@ impl<R: PermissionResolver + 'static> BifrostIngestGrpc<R> {
 }
 
 #[wyrd_tonic::tonic::async_trait]
-impl<R: PermissionResolver + 'static> BifrostIngestService for BifrostIngestGrpc<R> {
+impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> BifrostIngestService
+    for BifrostIngestGrpc<R, I>
+{
     async fn insert_batch(
         &self,
         request: Request<Streaming<InsertBatchRequest>>,

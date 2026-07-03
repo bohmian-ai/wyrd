@@ -49,6 +49,17 @@ description = "Start a clean Postgres container via docker compose and wait for 
 # test DB is empty on every invocation — no stale _sqlx_migrations ledger.
 run = ["docker compose down --volumes --remove-orphans", "docker compose up -d --build --force-recreate --renew-anon-volumes postgres --wait"]
 
+[tasks."impl:setup"]
+hide = true
+description = "One-time environment bring-up before the first wyrd-implement wave: shared docker Postgres that every worktree reaches at localhost:5432. Run once, not per worktree."
+depends = ["build:postgres"]
+run = "echo 'impl env ready: shared Postgres up; mise supplies DATABASE_URL / WYRD_* per verify task'"
+
+[tasks."impl:warm"]
+hide = true
+description = "Warm the shared sccache by compiling the workspace on the impl base before dispatching a wave. Per-worktree CARGO_TARGET_DIR means each executor is cold on disk; sccache turns those into warm object-cache hits. Requires sccache + RUSTC_WRAPPER=sccache in the environment."
+run = "cargo build --workspace --all-features --all-targets"
+
 [tasks."test:rust:workspace"]
 hide = true
 description = "Run workspace Rust unit tests (no DB required)"
@@ -415,7 +426,9 @@ if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/wyrd/wyrd-server/Cargo.toml' \
   --glob '!crates/wyrd/wyrd-server/src/auth/jwt_bearer.rs' \
   --glob '!crates/wyrd/wyrd-server/src/auth/callback.rs' \
-  --glob '!crates/wyrd/wyrd-server/src/issuer_boot.rs'; then
+  --glob '!crates/wyrd/wyrd-server/src/auth/admin.rs' \
+  --glob '!crates/wyrd/wyrd-server/src/issuer_boot.rs' \
+  --glob '!crates/wyrd/wyrd-cli/src/auth/trusted_issuer.rs'; then
   echo 'mock dependency leaked outside wyrd-testing'
   exit 1
 fi
@@ -974,35 +987,47 @@ description = "Validate local Markdown links in the docs site"
 dir = "docs"
 run = "python scripts/check_links.py"
 
-[tasks."docs:astro:check"]
+[tasks."docs:a11y"]
 hide = true
-description = "Run Astro type and content checks for the docs site"
+description = "A11y gate: landmarks, heading order, WCAG AA contrast, keyboard controls over prerendered build"
 dir = "docs"
-run = "pnpm astro check"
+run = "python scripts/check_a11y.py"
+
+[tasks."docs:svelte:check"]
+hide = true
+description = "Run svelte-check type and content checks for the docs site"
+dir = "docs"
+run = "pnpm check"
 
 [tasks."docs:build"]
-description = "Build the Starlight docs site"
+description = "Build the SvelteKit docs site"
 dir = "docs"
-run = "pnpm astro build"
+run = "pnpm build"
+
+[tasks."docs:preview"]
+description = "Serve the production static build at http://localhost:4173/wyrd/"
+depends = ["docs:build"]
+dir = "docs"
+run = "pnpm preview --host 0.0.0.0 --port ${WYRD_DOCS_PREVIEW_PORT:-4173}"
 
 [tasks."docs:check"]
 hide = true
-description = "Docs gate: install, generate, drift check, command check, link check, Astro check, and build"
+description = "Docs gate: install, generate, drift check, command check, link check, build, and a11y"
 depends = ["docs:install"]
 run = """
 mise run docs:generate
-git diff --exit-code -- docs/src/content/docs/cards/ docs/src/content/docs/api/ || (echo "Generated docs are out of date. Run 'mise run docs:generate' and commit the result." && exit 1)
+git diff --exit-code -- docs/src/content/docs/cards/ docs/src/content/docs/api/ docs/public/llms.txt docs/public/llms-full.txt || (echo "Generated docs are out of date. Run 'mise run docs:generate' and commit the result." && exit 1)
 mise run docs:check:commands
 mise run docs:linkcheck
-mise run docs:astro:check
 mise run docs:build
+mise run docs:a11y
 """
 
 [tasks."docs:dev"]
-description = "Run the Starlight docs dev server on :4321"
+description = "Run the SvelteKit docs dev server on :4321"
 depends = ["docs:install", "docs:generate"]
 dir = "docs"
-run = "pnpm astro dev --host 0.0.0.0 --port ${WYRD_DOCS_PORT:-4321}"
+run = "pnpm dev --host 0.0.0.0 --port ${WYRD_DOCS_PORT:-4321}"
 
 [tasks."dev:both"]
 description = "Run wyrd-server (:8080) and UI (:3000) in parallel"

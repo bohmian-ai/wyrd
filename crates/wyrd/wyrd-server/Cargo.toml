@@ -28,7 +28,7 @@ tokio = { workspace = true, features = ["signal"] }
 tokio-util = { workspace = true }
 url = { workspace = true }
 axum = { workspace = true }
-vala-http = { workspace = true }
+vala-eval = { workspace = true, features = ["orchestrator"] }
 wyrd-telemetry = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 base64 = { workspace = true }
@@ -41,6 +41,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true }
+subtle = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
@@ -52,6 +53,7 @@ wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-auth-check = { workspace = true }
+wyrd-crypt = { path = "../../shared/wyrd-crypt", version = "0.0.1" }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1", features = ["embedded-postgres"] }
 tower = { workspace = true, features = ["util", "timeout", "limit", "load-shed"] }
 tower-http = { workspace = true, features = ["trace", "catch-panic"] }
@@ -73,3 +75,5 @@ wiremock = { workspace = true }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
 wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
 wyrd-testing = { path = "../wyrd-testing", version = "0.0.1" }
+wyrd-cli = { path = "../wyrd-cli", version = "0.0.1" }
+wyrd-client = { path = "../../shared/wyrd-client", version = "0.0.1" }

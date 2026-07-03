@@ -145,8 +145,9 @@ impl WyrdCatalog {
         // (`run_id`/`card_ref`) and system columns are stripped before hashing,
         // so their presence in the physical schema does not perturb the value the
         // client caches and the server compares.
-        let fingerprint =
-            SchemaFingerprint::from_arrow_schema(&arrow::datatypes::Schema::new(user_fields.clone()));
+        let fingerprint = SchemaFingerprint::from_arrow_schema(&arrow::datatypes::Schema::new(
+            user_fields.clone(),
+        ));
 
         let all_fields = with_system_columns(user_fields, scope);
         let arrow_schema = arrow::datatypes::Schema::new(all_fields);

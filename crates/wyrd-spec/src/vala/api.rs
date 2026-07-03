@@ -54,7 +54,9 @@ fn default_true() -> bool {
 
 /// Wire form of a Bifrost table scope. Distinct from the engine `TableScope` so
 /// `wyrd-spec` carries no engine dependency; the engine maps between the two.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub enum TableScopeWire {
     /// Tenant-isolated by catalog namespace; carries no `data_tenant_id` column.
@@ -322,9 +324,7 @@ pub enum QueryParam {
 }
 
 /// Opaque async-query job identifier.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(transparent)]
 pub struct JobUid(pub uuid::Uuid);

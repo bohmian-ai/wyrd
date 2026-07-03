@@ -63,7 +63,10 @@ impl StreamSemaphores {
     }
 
     fn semaphore_for(&self, tenant: DataTenantId) -> Arc<Semaphore> {
-        let mut guard = self.inner.lock().expect("stream semaphore registry poisoned");
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("stream semaphore registry poisoned");
         Arc::clone(
             guard
                 .entry(tenant)

@@ -70,11 +70,7 @@ impl PrincipalKind {
             Self::Service { card_ref } => card_ref.kind == CardKind::Service,
             Self::Agent { card_ref } => card_ref.kind == CardKind::Agent,
         };
-        if ok {
-            Ok(())
-        } else {
-            Err(CardKindMismatch)
-        }
+        if ok { Ok(()) } else { Err(CardKindMismatch) }
     }
 }
 

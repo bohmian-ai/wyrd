@@ -51,6 +51,16 @@ pub enum WyrdCliError {
     )]
     ServerRequiresAgentUrl,
 
+    /// Server mode requires a Wyrd access token.
+    #[error("--server requires --token (or WYRD_ACCESS_TOKEN)")]
+    #[wyrd_error(
+        code = "WYRD_CLI_400_SERVER_REQUIRES_TOKEN",
+        status = 400,
+        title = "Server mode requires an access token",
+        remediation = "Pass --token <JWT> or set WYRD_ACCESS_TOKEN when using --server."
+    )]
+    ServerRequiresToken,
+
     /// Server mode does not accept pre-collected records.
     #[error("--server is incompatible with --records")]
     #[wyrd_error(
@@ -220,6 +230,21 @@ pub enum WyrdCliError {
     )]
     RevokeFailed {
         /// HTTP status returned by the server.
+        status: u16,
+        /// Response body or error detail.
+        detail: String,
+    },
+
+    /// Admin operation failed (trusted-issuer or workload-binding management).
+    #[error("admin operation failed: status={status}, detail={detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_500_ADMIN_FAILED",
+        status = 500,
+        title = "Admin operation failed",
+        remediation = "Check the request parameters, access token, and server connectivity."
+    )]
+    AdminFailed {
+        /// HTTP status returned by the server (400 for local validation failures).
         status: u16,
         /// Response body or error detail.
         detail: String,

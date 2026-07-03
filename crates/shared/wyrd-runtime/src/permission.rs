@@ -304,7 +304,7 @@ impl Permission {
         }
     }
 
-    /// Install a SystemShared Bifrost table (cross-tenant DDL).
+    /// Install a `SystemShared` Bifrost table (cross-tenant DDL).
     #[must_use]
     pub const fn bifrost_table_install() -> Self {
         Self {

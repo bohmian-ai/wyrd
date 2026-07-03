@@ -68,7 +68,12 @@ impl AuditRelay {
     /// Returns [`BifrostError`] when the catalog create/register fails.
     pub async fn ensure_audit_log_table(&self) -> Result<(), BifrostError> {
         self.catalog
-            .ensure_system_table(BifrostNamespace::System, AUDIT_LOG_TABLE, audit_log_fields(), &[])
+            .ensure_system_table(
+                BifrostNamespace::System,
+                AUDIT_LOG_TABLE,
+                audit_log_fields(),
+                &[],
+            )
             .await
     }
 
@@ -114,8 +119,7 @@ impl AuditRelay {
             batch_id: shipment.batch_id,
             origin: AUDIT_RELAY_ORIGIN.to_owned(),
             actor: AUDIT_RELAY_ORIGIN.to_owned(),
-            request_id: RequestId::parse(&uuid::Uuid::now_v7().to_string())
-                .expect("UUIDv7 is a valid request id"),
+            request_id: RequestId::now_v7(),
             card_ref: None,
         };
         writer.flush(ctx).await?;
@@ -245,25 +249,47 @@ fn build_audit_log_batch(rows: &[AuditOutboxRow]) -> Result<RecordBatch, Bifrost
     let seq = Int64Array::from(rows.iter().map(|r| r.seq).collect::<Vec<_>>());
     let entry_hash = StringArray::from(rows.iter().map(|r| hex(&r.entry_hash)).collect::<Vec<_>>());
     let prev_hash = StringArray::from(rows.iter().map(|r| hex(&r.prev_hash)).collect::<Vec<_>>());
-    let request_id = StringArray::from(rows.iter().map(|r| r.request_id.clone()).collect::<Vec<_>>());
+    let request_id = StringArray::from(
+        rows.iter()
+            .map(|r| r.request_id.clone())
+            .collect::<Vec<_>>(),
+    );
     let trace_id = StringArray::from(rows.iter().map(|r| r.trace_id.clone()).collect::<Vec<_>>());
     let operation = StringArray::from(rows.iter().map(|r| r.operation.clone()).collect::<Vec<_>>());
     let resource = StringArray::from(rows.iter().map(|r| r.resource.clone()).collect::<Vec<_>>());
     let audit_card_ref =
         StringArray::from(rows.iter().map(|r| r.card_ref.clone()).collect::<Vec<_>>());
-    let principal_id =
-        StringArray::from(rows.iter().map(|r| r.principal_id.to_string()).collect::<Vec<_>>());
-    let principal_kind =
-        StringArray::from(rows.iter().map(|r| r.principal_kind.clone()).collect::<Vec<_>>());
-    let auth_method =
-        StringArray::from(rows.iter().map(|r| r.auth_method.clone()).collect::<Vec<_>>());
-    let permission = StringArray::from(rows.iter().map(|r| r.permission.clone()).collect::<Vec<_>>());
+    let principal_id = StringArray::from(
+        rows.iter()
+            .map(|r| r.principal_id.to_string())
+            .collect::<Vec<_>>(),
+    );
+    let principal_kind = StringArray::from(
+        rows.iter()
+            .map(|r| r.principal_kind.clone())
+            .collect::<Vec<_>>(),
+    );
+    let auth_method = StringArray::from(
+        rows.iter()
+            .map(|r| r.auth_method.clone())
+            .collect::<Vec<_>>(),
+    );
+    let permission = StringArray::from(
+        rows.iter()
+            .map(|r| r.permission.clone())
+            .collect::<Vec<_>>(),
+    );
     let decision = StringArray::from(rows.iter().map(|r| r.decision.clone()).collect::<Vec<_>>());
     let result = StringArray::from(rows.iter().map(|r| r.result.clone()).collect::<Vec<_>>());
-    let payload_summary =
-        StringArray::from(rows.iter().map(|r| r.payload_summary.clone()).collect::<Vec<_>>());
+    let payload_summary = StringArray::from(
+        rows.iter()
+            .map(|r| r.payload_summary.clone())
+            .collect::<Vec<_>>(),
+    );
     let created_at_us = Int64Array::from(
-        rows.iter().map(|r| r.created_at.timestamp_micros()).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|r| r.created_at.timestamp_micros())
+            .collect::<Vec<_>>(),
     );
     let null_corr = StringArray::from(vec![None::<String>; rows.len()]);
 
@@ -298,9 +324,10 @@ fn build_audit_log_batch(rows: &[AuditOutboxRow]) -> Result<RecordBatch, Bifrost
 
 /// Lowercase hex-encode a byte slice (used for the chain-hash columns).
 fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
+        let _ = write!(out, "{byte:02x}");
     }
     out
 }

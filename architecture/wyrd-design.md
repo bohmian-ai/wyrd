@@ -10,52 +10,49 @@ When this disagrees with `wyrd-protocol.openapi.yaml`, `wyrd-protocol.md`,
 `specs/*.yaml`, or the Rust code in `crates/wyrd-spec`, **this file wins**.
 Downstream artifacts are brought up to this version in a sync pass.
 
-## Implementation drift
+---
 
-This repository is mid-reconciliation. The active doctrine is the 16 native
-kind catalog in this document plus `External`. Current `wyrd-spec` code and
-generated schemas no longer expose stale `Tool`, `Skill`, or `SubAgent` specs;
-they now expose `SourceSpec` (the bucket-keyed `SourceKind` union below). New
-work must follow this document: tools are runtime registry entries, sub-agency
-is an Agent relationship, skills are not a v1 Card kind, and external
-observations are read through `Source` cards.
+## Table of contents
 
-Do not expand stale card kinds or cite generated schema presence as doctrine.
-Remaining `Source` follow-up is the runtime read adapter in `vala` keyed on
-`(kind, vendor)` and the `wyrd source check` preflight; the spec, schemas, and
-card-kind tests are landed.
-
-The **governance token is removed** (doctrine #18): emit is an Auth-plane
-route, not a third plane. The JWT (`principal.card_ref`) plus `run_id` carry
-everything an emission needs. The scaffolding has been deleted — the
-`wyrd.auth_governance_tokens` table (from migration `20260601000001_auth.sql`),
-its `GovernanceTokenRow` row mirror + query slot, the `migration_pg.rs` table
-assertion, and the `Scope::TokenIssue` (`token:issue`) capability. The
-`wyrd-enterprise` `LicenseFeature::Governance` flag is retained as the
-enterprise governance-tier gate (policy + audit), not a token. No
-`WYRD_GOV_TOKEN` env var, no `wyrd gov-token` CLI.
+- [Doctrine](#doctrine) — 18 design principles
+- [Kind catalog](#kind-catalog) — 16 native kinds + External
+- [Per-kind specs](#per-kind-specs) — field shapes per kind
+  - [Data](#data) · [Model](#model) · [Artifact](#artifact) · [Experiment](#experiment)
+  - [Prompt](#prompt) · [Agent](#agent) · [Workflow](#workflow) · [Mcp](#mcp)
+  - [Service](#service) · [Policy](#policy) · [Audit](#audit)
+  - [Drift](#drift) · [Eval](#eval) · [Source](#source) · [Bifrost](#bifrost--wyrds-olap-warehouse)
+  - [Trigger](#trigger) · [Operator](#operator)
+- [Spec-file authoring](#spec-file-authoring) — `ref` / `path` / `inline`, pre-registration matrix
+- [Workspace config](#workspace-config-wyrdtoml) — `wyrd.toml` defaults and merge rules
+- [Reference-direction quick reference](#reference-direction-quick-reference) — who refs whom
+- [Worked directory layout](#worked-directory-layout) — example deployment tree
+- [Questions and resolutions](#questions-and-resolutions) — open and resolved design decisions
 
 ---
 
 ## Doctrine
 
-1. **Cards are independent registry entries.** No card "owns" another. The
+1. **Cards are independent.** No card "owns" another. The
    deployment unit is a directory of card YAMLs applied together.
 2. **One fact, one owning Kind.** If a field could live in two places, the
    doctrine has a gap. Surface it.
 3. **Monitors declare subjects.** Drift and Eval reference what they
    observe. Subjects do not list their observers. Each declares a single
    `subject_ref`.
-4. **Reactions are Operators. Wiring is Triggers.** Drift/Eval/Policy never
+4. **Reactions are Operators; wiring is Triggers.** Drift/Eval/Policy never
    inline reaction logic.
 5. **Service composes for deployment, not observation.** Drift/Eval/Trigger/
    Operator/Audit/Source are peer cards, not Service components.
-6. **Enforcement is composed at the surface that enforces it.** Service
+6. **Enforcement is composed at the enforcing surface.** Service
    composes Policy for runtime gates.
-7. **Wyrd reads. It does not push.** Application code emits to its own
-   observability stack with its own SDKs. Wyrd records internal observations
-   in `vala`; external data is queried through `Source` cards.
-8. **Lineage is server-derived from `*_refs`.** Never authored. Never edited.
+7. **Native observation first; external data by reading only.** AI services
+   record runtime behavior through Wyrd's native observation system
+   (`wyrd.observe` → `vala`, linked to registered cards) — this is the
+   primary path. When data already lives in an external system (Prometheus,
+   Snowflake, object storage), `Source` cards let Wyrd query it. Wyrd never
+   writes to external data stores and never requires external systems to push
+   data in.
+8. **Lineage is server-derived.** Derived from `*_refs`. Never authored. Never edited.
 9. **Status is server-managed.** Authors never write `status:`.
 10. **Every cross-card pointer is a `CardRef`.** No string-typed parents or
     path-typed lookups in the protocol. Co-location is expressed by the
@@ -69,7 +66,7 @@ enterprise governance-tier gate (policy + audit), not a token. No
 13. **No event vocabulary on the wire.** "Observation" comes from Drift/Eval;
     "trigger firing" comes from the `TriggerSource` enum. Free-form
     event-name strings are doctrine drift.
-14. **Harness-host config does not belong on Cards.** Permission modes,
+14. **Host config stays off Cards.** Permission modes,
     sandboxes, isolation, effort, and per-CLI compatibility are properties of
     the host that runs the Agent, not of the Agent contract.
 15. **Monitors are pure observation producers.** Drift and Eval describe what
@@ -303,6 +300,10 @@ spec:
 Identity is derived from the Service's `card_ref` and bound on first deploy
 contact — no `service_account` field on the spec. See "Runtime identity".
 
+Worked examples: `architecture/specs/01-ml-prediction-service.yaml`,
+`architecture/specs/02-llm-agent-service.yaml`,
+`architecture/specs/06-multi-agent-service.yaml`.
+
 ### Policy
 Declarative governance rules. CEL-evaluated. Three lifecycle phases share one
 rule shape; the `action` field on each rule says when it fires:
@@ -342,6 +343,8 @@ Closed enums:
 
 ### Runtime identity
 
+#### Principal model
+
 Wyrd principals are UUID-backed runtime identities for `User`, `Service`,
 and `Agent` kinds. `Service` and `Agent` principals are card-bound: each
 carries a `card_ref` discriminated on `PrincipalKind`. `wyrd apply` for a
@@ -355,6 +358,8 @@ operations are separated, matching the kubectl pattern (`apply` then
 |---|---|---|
 | Register card + create principal | `wyrd apply -f service.yaml` | Idempotent. Writes card, upserts the Service/Agent principal keyed on `(tenant_id, card_kind, card_uid)`. Re-apply preserves `principal_id`. No secret. |
 | Mint a card-bound API key | `wyrd auth issue-key <card_ref>` | Admin-authenticated. Requires an applied principal. Returns the key to the caller. Caller uploads to the deploy environment's secret store. Re-issuable for rotation. |
+
+#### API key → JWT flow
 
 Deploy-time secret injection (Vault Agent, External Secrets Operator, AWS
 Secrets Manager CSI driver, etc.) puts the API key into the pod as
@@ -372,6 +377,8 @@ Env vars in deployed services:
 | `WYRD_API_KEY` | REQUIRED | Deploy environment's secret store (key minted by `wyrd auth issue-key <card_ref>`) | Exchanged ONCE at startup at `POST /auth/token` for short-lived JWT. SDK auto-refreshes. JWT carries the card-bound `principal` claim (kind, id, tenant, `card_ref`). |
 | `WYRD_SERVER_URL` | REQUIRED | Static config | Wyrd server HTTP base URL (default `http://localhost:50050`). Read by `ClientConfig::from_env`. |
 | `WYRD_GRPC_URL` | OPTIONAL | Static config | Wyrd server gRPC endpoint (default `http://localhost:50051`). Read by `ClientConfig::from_env`. |
+
+#### Cross-service delegation
 
 The API key is exchanged at startup — never on the wire. The JWT — not the API
 key — is what travels on cross-service calls in the dedicated
@@ -393,7 +400,7 @@ Content-Type: application/json
 { "amount": 100 }
 ```
 
-#### `Wyrd-Request-Id` — request correlator
+#### Request correlator — `Wyrd-Request-Id`
 
 A Wyrd-owned, request-scoped opaque ID that joins every hop of a logical
 request. It is the sole correlator for policy ancestry and audit replay —
@@ -813,6 +820,9 @@ spec:
   details: { string: NonSecretValue }
 ```
 
+Worked examples: `architecture/specs/01-ml-prediction-service.yaml`,
+`architecture/specs/04-external-mlflow.yaml`.
+
 **`Agent` is deliberately absent from `DriftMethod` in v1.** Agent-behavior drift
 (tool-call distribution shifts, response-format drift, step-count anomalies) is
 real but underspecified: it has no settled signal vocabulary, no profile shape,
@@ -932,6 +942,9 @@ final response for that scenario); top-level `Eval.tasks` are the **mechanic
 view** (judged against intermediate workflow records / spans / tool calls).
 Both run in one pass.
 
+Worked examples: `architecture/specs/02-llm-agent-service.yaml`,
+`architecture/specs/03-rag-workflow-service.yaml`.
+
 ### Source
 Read-side reference to an external data system. **Wyrd reads, never writes.**
 
@@ -1046,19 +1059,32 @@ The substrate is Apache Iceberg-managed Parquet in object storage, with Postgres
 as the Iceberg catalog and control plane and DataFusion as the query engine —
 consistent with Doctrine #4 (Postgres is control-plane only; analytical data
 lives in object store). Runtime ownership stays in `vala`: the `vala-bifrost`
-engine crate owns the Iceberg/DataFusion warehouse engine, `vala-http` exposes
-HTTP routes, `vala-ingest` owns gRPC ingest, and `wyrd-spec::vala::api` owns the
-public wire contracts. Python-visible Bifrost behavior lives in `vala-sdk` (the
+engine crate owns the Iceberg/DataFusion warehouse engine, `vala-ingest` owns
+gRPC ingest _(under revision — serving ownership moving to wyrd-server, reconciled in a follow-up design pass)_, and `wyrd-spec::vala::api` owns the
+public wire contracts. HTTP serving for these routes now belongs to `wyrd-server`:
+the eval consolidation dissolved the former `vala-http` crate, per the principle
+below. Python-visible Bifrost behavior lives in `vala-sdk` (the
 approved Vala Python owner crate) behind its optional `python` feature.
+
+**Principle — wyrd-server is the only serving surface.** `vala-*` crates are
+engine and data-plane libraries; they are never HTTP or gRPC serving crates.
+`wyrd-server` is the single process that binds ports and owns all HTTP/gRPC
+serving. The eval consolidation (commits 01–05) is the first realization of
+this principle; Bifrost/ingest serving reconciliation follows in a separate
+design pass. The eval pull-protocol session-run (`/v1/eval/runs/{run_id}`) is an
+ephemeral server-side session entry for concurrency and ownership tracking; it
+is distinct from the doctrinal `RunRef` — the Card→Run→Observation run is a
+client-side execution record (see the "There is no run registry" note under
+_Observation identity — `Card → Run → Observation`_), never server-persisted.
 
 **Public surface.** Bifrost is a stable Wyrd public surface across HTTP, gRPC,
 Python, generated schemas, MCP/agent documentation, and stable error codes.
 The public contract includes:
 
-- HTTP table management under `/api/v1/bifrost/tables`.
+- HTTP table management under `/api/v1/bifrost/tables` _(under revision — serving ownership moving to wyrd-server, reconciled in a follow-up design pass)_.
 - HTTP query surfaces under `/api/v1/observations/query` and versioned query
-  job routes when enabled.
-- gRPC ingest through `wyrd.v1.BifrostIngestService`.
+  job routes when enabled _(under revision — serving ownership moving to wyrd-server, reconciled in a follow-up design pass)_.
+- gRPC ingest through `wyrd.v1.BifrostIngestService` _(under revision — serving ownership moving to wyrd-server, reconciled in a follow-up design pass)_.
 - The `wyrd.bifrost` Python SDK submodule.
 - Generated `wyrd-spec::vala::api` wire types such as `BifrostTableEntry`,
   register-table types, query request/response types, and table scope/status
@@ -1442,32 +1468,66 @@ services/ops-copilot/
 
 ---
 
-## Open questions
+## Questions and resolutions
+
+**Open**
 
 1. Per-component Policy binding on `ServiceComponent`. Workaround: rule
    expressions scope by `agent.name`. Decision pending a real use case.
-2. **Closed.** Source vendor read adapters. `SourceKind` is a closed,
-   bucket-keyed tagged union (`object_store`, `sql_warehouse`, `metrics`,
-   `logs`, `traces`); each bucket nests a `vendor`-keyed `*Connection` union,
-   and secrets are server-side env-var names (`SourceAuth`), never card values.
-   Adding a vendor is a new `*Connection` variant plus a `vala` read adapter —
-   no bucket or consumer churn. Remaining runtime work: the `vala` read trait
-   keyed on `(kind, vendor)`, and a connectivity/scope preflight
-   (`wyrd source check <ref>`) reporting per-capability OK/error.
-3. Format negotiation for `object_store` Source — schema-on-read vs registered
+2. Format negotiation for `object_store` Source — schema-on-read vs registered
    schema reference.
-4. Time-window semantics for how Drift/Eval cards describe the read range
+3. Time-window semantics for how Drift/Eval cards describe the read range
    over `source_ref`.
-5. Service-level Drift subject semantics — what "drift on a Service" computes
+4. Service-level Drift subject semantics — what "drift on a Service" computes
    when Wyrd reads internal traces vs external Sources, given the subject is
    singular.
-6. Default Source binding at the Service or Agent level to avoid repeating
+5. Default Source binding at the Service or Agent level to avoid repeating
    `source_ref` on every Drift/Eval.
-7. Whether tool hook phases need a closed enum on `Policy.rules` or can stay
+6. Whether tool hook phases need a closed enum on `Policy.rules` or can stay
    off the wire entirely (no consumer today).
-8. **Closed.** `Eval` does not carry its own `signal` decomposition. Eval IS
-    the signal — its per-task pass/fail aggregates into a score stream
-    consumed downstream by `Drift` with `DriftSignal::EvalScore`. The input
-    edges (`dataset` vs `source_ref`) are optional refs, not a tagged enum:
-    presence is the mode (offline driver, online sink, both, or neither →
-    vala default archive).
+
+**Resolved**
+
+- **Source vendor read adapters.** `SourceKind` is a closed, bucket-keyed tagged
+  union (`object_store`, `sql_warehouse`, `metrics`, `logs`, `traces`); each
+  bucket nests a `vendor`-keyed `*Connection` union, and secrets are server-side
+  env-var names (`SourceAuth`), never card values. Adding a vendor is a new
+  `*Connection` variant plus a `vala` read adapter — no bucket or consumer churn.
+  Remaining runtime work: the `vala` read trait keyed on `(kind, vendor)`, and a
+  connectivity preflight (`wyrd source check <ref>`).
+
+- **Eval signal decomposition.** `Eval` does not carry its own `signal`
+  decomposition. Eval IS the signal — its per-task pass/fail aggregates into a
+  score stream consumed downstream by `Drift` with `DriftSignal::EvalScore`. The
+  input edges (`dataset` vs `source_ref`) are optional refs, not a tagged enum:
+  presence is the mode (offline driver, online sink, both, or neither → vala
+  default archive).
+
+---
+
+## Appendix: Implementation status
+
+This section tracks reconciliation work in progress. It is internal bookkeeping
+and does not affect the protocol contract above.
+
+**Active reconciliation (as of v1):**
+- The active doctrine is the 16 native kind catalog plus `External`. Current
+  `wyrd-spec` code and generated schemas no longer expose stale `Tool`, `Skill`,
+  or `SubAgent` specs; they now expose `SourceSpec` (the bucket-keyed `SourceKind`
+  union). New work must follow this document: tools are runtime registry entries,
+  sub-agency is an Agent relationship, skills are not a v1 Card kind, and external
+  observations are read through `Source` cards.
+- Do not expand stale card kinds or cite generated schema presence as doctrine.
+- Remaining `Source` follow-up: the runtime read adapter in `vala` keyed on
+  `(kind, vendor)` and the `wyrd source check` preflight.
+
+**Governance token removal (doctrine #18):**
+- Emit is an Auth-plane route, not a third plane. The JWT (`principal.card_ref`)
+  plus `run_id` carry everything an emission needs.
+- The following scaffolding has been deleted: the `wyrd.auth_governance_tokens`
+  table (migration `20260601000001_auth.sql`), its `GovernanceTokenRow` row mirror
+  and query slot, the `migration_pg.rs` table assertion, and `Scope::TokenIssue`
+  (`token:issue`).
+- The `wyrd-enterprise` `LicenseFeature::Governance` flag is retained as the
+  enterprise governance-tier gate (policy + audit), not a token.
+- No `WYRD_GOV_TOKEN` env var. No `wyrd gov-token` CLI.

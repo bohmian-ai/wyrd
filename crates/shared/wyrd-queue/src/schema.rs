@@ -38,7 +38,10 @@ pub fn arrow_schema_to_fieldspec(schema: &Schema) -> Vec<FieldSpec> {
     schema.fields().iter().map(|f| field_to_spec(f)).collect()
 }
 
-fn build_fields(obj_schema: &Value, defs: Option<&Map<String, Value>>) -> Result<Vec<FieldSpec>, WyrdQueueError> {
+fn build_fields(
+    obj_schema: &Value,
+    defs: Option<&Map<String, Value>>,
+) -> Result<Vec<FieldSpec>, WyrdQueueError> {
     let props = obj_schema
         .get("properties")
         .and_then(Value::as_object)
@@ -72,7 +75,10 @@ fn build_fields(obj_schema: &Value, defs: Option<&Map<String, Value>>) -> Result
     Ok(out)
 }
 
-fn map_type(prop: &Value, defs: Option<&Map<String, Value>>) -> Result<DataTypeSpec, WyrdQueueError> {
+fn map_type(
+    prop: &Value,
+    defs: Option<&Map<String, Value>>,
+) -> Result<DataTypeSpec, WyrdQueueError> {
     if let Some(reference) = prop.get("$ref").and_then(Value::as_str) {
         let resolved = resolve_ref(reference, defs)?;
         return map_type(resolved, defs);
@@ -81,7 +87,9 @@ fn map_type(prop: &Value, defs: Option<&Map<String, Value>>) -> Result<DataTypeS
         let branch = any
             .iter()
             .find(|b| b.get("type").and_then(Value::as_str) != Some("null"))
-            .ok_or_else(|| WyrdQueueError::SchemaParse("anyOf without a non-null branch".to_owned()))?;
+            .ok_or_else(|| {
+                WyrdQueueError::SchemaParse("anyOf without a non-null branch".to_owned())
+            })?;
         return map_type(branch, defs);
     }
     // A bare `{"enum": [...]}` (no explicit type) is a string enumeration → Utf8;

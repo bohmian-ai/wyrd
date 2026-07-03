@@ -27,10 +27,7 @@ use crate::row_types::audit_outbox::AuditOutboxRow;
 ///
 /// # Errors
 /// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
-pub async fn append_audit(
-    conn: &mut TenantConn<'_>,
-    event: &AuditEvent,
-) -> Result<i64, SqlError> {
+pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Result<i64, SqlError> {
     sqlx::query(
         r#"
         INSERT INTO vala.audit_chain_head (data_tenant_id)

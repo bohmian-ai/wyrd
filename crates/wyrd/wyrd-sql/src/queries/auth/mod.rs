@@ -14,8 +14,10 @@ pub mod revocation;
 pub mod role_assignments;
 pub mod roles;
 pub mod service_accounts;
+pub mod trusted_issuers;
 pub mod user_identities;
 pub mod users;
+pub mod workload_bindings;
 
 pub use api_keys::revoke_api_key;
 pub use login_state::{LoginStateRow, insert_login_state, take_login_state};
@@ -43,5 +45,14 @@ pub use service_accounts::{
     insert_service_account, service_account_by_card_ref, service_account_by_id,
     touch_api_key_last_used,
 };
+pub use trusted_issuers::{
+    TrustedIssuerWrite, delete_trusted_issuer, insert_trusted_issuer, trusted_issuer_by_url,
+    trusted_issuer_exists, trusted_issuers_for_tenant, upsert_trusted_issuer,
+};
 pub use user_identities::{upsert_user_identity, user_id_by_identity};
 pub use users::{UserRow, delete_user, insert_user, user_by_email, user_by_id};
+pub use workload_bindings::{
+    WorkloadBindingWrite, delete_workload_binding, delete_workload_bindings_for_issuer,
+    insert_workload_binding, upsert_workload_binding, workload_binding_by_key,
+    workload_binding_by_subject, workload_bindings_for_tenant,
+};

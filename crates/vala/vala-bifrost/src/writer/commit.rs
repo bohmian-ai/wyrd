@@ -104,7 +104,10 @@ pub async fn run_commit(
 ) -> Result<(i64, Option<Table>), BifrostError> {
     let table_fqn = table.identifier().to_string();
 
-    let phase1 = claim_batch(pool, table_uid, &batch_id, origin, actor, tenant, &table_fqn).await?;
+    let phase1 = claim_batch(
+        pool, table_uid, &batch_id, origin, actor, tenant, &table_fqn,
+    )
+    .await?;
 
     match phase1 {
         Phase1::Replay { snapshot_id } => Ok((snapshot_id, None)),
@@ -480,8 +483,10 @@ pub async fn run_commit_with_fault(
     fault: FaultPoint,
 ) -> Result<(i64, Option<Table>), BifrostError> {
     let table_fqn = table.identifier().to_string();
-    let phase1 =
-        claim_batch(pool, table_uid, &batch_id, "system", "system", tenant, &table_fqn).await?;
+    let phase1 = claim_batch(
+        pool, table_uid, &batch_id, "system", "system", tenant, &table_fqn,
+    )
+    .await?;
     let (owner, fencing_token) = match phase1 {
         Phase1::Replay { snapshot_id } => return Ok((snapshot_id, None)),
         Phase1::Fresh {

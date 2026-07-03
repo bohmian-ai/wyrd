@@ -77,13 +77,13 @@ pub async fn exchange_authorization_code(
         };
         let issuer = wyrd_spec::auth::IssuerUrl::new(login_state.issuer.clone())
             .map_err(|_| invalid_token("stored issuer URL is invalid"))?;
-        let trusted = trusted_issuer(state, tenant_id, &issuer)?;
-        let provider = discover_provider(trusted).await?;
-        let id_token = exchange_code_for_id_token(&provider, trusted, &login_state, code).await?;
+        let trusted = crate::auth::trusted_issuer(state, tenant_id, &issuer).await?;
+        let provider = discover_provider(&trusted).await?;
+        let id_token = exchange_code_for_id_token(&provider, &trusted, &login_state, code).await?;
         finish_authorization_code_exchange(
             state,
             tenant_id,
-            trusted,
+            &trusted,
             &login_state,
             &id_token,
             request_id,
@@ -231,7 +231,7 @@ async fn issue_and_record_user_session(
 
     Ok(ExchangedToken {
         access_token: SecretString::from(access_token),
-        refresh_token: SecretString::from(refresh_token),
+        refresh_token: Some(SecretString::from(refresh_token)),
         token_type: TokenType::Bearer,
         expires_at,
     })
@@ -316,22 +316,6 @@ fn audit_error_tag(error: &WyrdError) -> &'static str {
         WyrdError::RoleCorrupt { .. } => "RoleCorrupt",
         _ => "WyrdError",
     }
-}
-
-fn trusted_issuer<'a>(
-    state: &'a AppState,
-    tenant_id: wyrd_spec::DataTenantId,
-    issuer: &wyrd_spec::auth::IssuerUrl,
-) -> Result<&'a TrustedIssuer, WyrdErrorResponse> {
-    let registry = state.trusted_issuer_registry.as_ref().ok_or_else(|| {
-        WyrdErrorResponse::from(WyrdError::Internal {
-            message: "trusted issuer registry is not configured".to_owned(),
-            details: serde_json::json!({}),
-        })
-    })?;
-    registry
-        .get(&tenant_id, issuer)
-        .ok_or_else(|| invalid_token("issuer is not trusted for the resolved tenant"))
 }
 
 fn tenant_slug_from_host(headers: &HeaderMap) -> Option<wyrd_spec::ids::TenantSlug> {
@@ -560,16 +544,18 @@ mod tests {
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_oidc::{
         ClaimMapping, ClaimPath, ClientAuth, JwksCache, PrincipalKindPolicy, TrustedIssuer,
-        TrustedIssuerRegistry,
     };
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
+    use wyrd_crypt::SecretKey;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{IssuerUrl, TokenResponse, TokenType};
+    use wyrd_sql::queries::auth::upsert_trusted_issuer;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use crate::auth::login::{LoginStateEntry, PgLoginStateStore};
     use crate::auth::permission_resolver::SqlPermissionResolver;
+    use crate::auth::pg_resolvers::{PgIssuerResolver, issuer_write_from_trusted};
     use crate::error::WyrdErrorResponse;
     use crate::state::AppState;
 
@@ -783,7 +769,14 @@ mod tests {
 
         assert_eq!(response.token_type, TokenType::Bearer);
         assert!(!response.access_token.expose().is_empty());
-        assert!(!response.refresh_token.expose().is_empty());
+        assert!(
+            !response
+                .refresh_token
+                .as_ref()
+                .expect("human OIDC login issues a refresh token")
+                .expose()
+                .is_empty()
+        );
         assert_ne!(audit_principal_id, Uuid::nil());
         assert_eq!(refresh_token_count(&fixture, audit_principal_id).await, 1);
         let audit = audit_rows(&fixture).await;
@@ -1052,6 +1045,27 @@ mod tests {
     }
 
     async fn test_state_with_external(fixture: &PgFixture, trusted: TrustedIssuer) -> AppState {
+        // Seed the issuer into Postgres so the production Pg resolver serves it on
+        // the verifier's external path. These issuers carry a SecretPost client
+        // secret, so a deterministic test sealing key encrypts it on write and
+        // decrypts it on read.
+        let sealing_key = Arc::new(SecretKey::from_bytes([7_u8; 32]));
+        let write =
+            issuer_write_from_trusted(&trusted, Some(&sealing_key)).expect("issuer encodes");
+        let mut conn = fixture
+            .tenant_conn_for(trusted.tenant_id)
+            .await
+            .expect("tenant conn opens");
+        upsert_trusted_issuer(&mut conn, &write)
+            .await
+            .expect("issuer upsert");
+        conn.commit().await.expect("issuer seed commits");
+
+        let issuer_resolver = Arc::new(PgIssuerResolver::new(
+            Arc::new(fixture.app_pool().clone()),
+            Some(Arc::clone(&sealing_key)),
+        ));
+
         let issuing_key = Arc::new(
             IssuingKey::from_ed_pem(
                 SecretString::from(PRIVATE_KEY_PEM.to_owned()),
@@ -1065,7 +1079,6 @@ mod tests {
             Kid::new("k1").expect("kid is valid"),
             Arc::new(public_key_from_pem(PUBLIC_KEY_PEM).expect("public key parses")),
         );
-        let registry = Arc::new(TrustedIssuerRegistry::from_issuers([trusted]));
         let verifier = TokenVerifier::new(
             local_keys,
             "wyrd",
@@ -1080,12 +1093,13 @@ mod tests {
                 StdDuration::from_secs(300),
                 StdDuration::from_secs(5),
             )),
-            Arc::clone(&registry),
+            Arc::clone(&issuer_resolver),
         );
         test_state(fixture)
             .await
             .with_auth_handles(issuing_key, Arc::new(verifier))
-            .with_trusted_issuer_registry(registry)
+            .with_trusted_issuer_resolver(issuer_resolver)
+            .with_sealing_key(sealing_key)
     }
 
     fn tenant_headers(slug: &str) -> HeaderMap {

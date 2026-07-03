@@ -176,7 +176,10 @@ async fn round_trip_full() {
     .unwrap();
 
     writer.write(batch).await.unwrap();
-    let snapshot_id = writer.flush(vala_bifrost::writer::BifrostWriteContext::system()).await.unwrap();
+    let snapshot_id = writer
+        .flush(vala_bifrost::writer::BifrostWriteContext::system())
+        .await
+        .unwrap();
     assert!(
         snapshot_id > 0,
         "snapshot_id should be positive after commit"

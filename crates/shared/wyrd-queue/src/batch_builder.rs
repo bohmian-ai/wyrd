@@ -125,8 +125,9 @@ impl BatchBuilder {
             self.rows.iter().map(|r| r.run_id.clone()),
         )));
 
-        let batch = RecordBatch::try_new(self.output_schema(), columns)
-            .map_err(|e| WyrdQueueError::SchemaParse(format!("record batch assembly failed: {e}")))?;
+        let batch = RecordBatch::try_new(self.output_schema(), columns).map_err(|e| {
+            WyrdQueueError::SchemaParse(format!("record batch assembly failed: {e}"))
+        })?;
         Ok(batch)
     }
 
@@ -201,7 +202,12 @@ fn build_column(field: &Field, rows: &[BuiltRow]) -> Result<ArrayRef, WyrdQueueE
     let name = field.name();
     let nullable = field.is_nullable();
     let array: ArrayRef = match field.data_type() {
-        DataType::Boolean => Arc::new(BooleanArray::from(collect(name, rows, nullable, Value::as_bool)?)),
+        DataType::Boolean => Arc::new(BooleanArray::from(collect(
+            name,
+            rows,
+            nullable,
+            Value::as_bool,
+        )?)),
         DataType::Int8 => Arc::new(Int8Array::from(collect(name, rows, nullable, |v| {
             v.as_i64().and_then(|n| i8::try_from(n).ok())
         })?)),
@@ -211,7 +217,12 @@ fn build_column(field: &Field, rows: &[BuiltRow]) -> Result<ArrayRef, WyrdQueueE
         DataType::Int32 => Arc::new(Int32Array::from(collect(name, rows, nullable, |v| {
             v.as_i64().and_then(|n| i32::try_from(n).ok())
         })?)),
-        DataType::Int64 => Arc::new(Int64Array::from(collect(name, rows, nullable, Value::as_i64)?)),
+        DataType::Int64 => Arc::new(Int64Array::from(collect(
+            name,
+            rows,
+            nullable,
+            Value::as_i64,
+        )?)),
         DataType::UInt8 => Arc::new(UInt8Array::from(collect(name, rows, nullable, |v| {
             v.as_u64().and_then(|n| u8::try_from(n).ok())
         })?)),
@@ -221,17 +232,26 @@ fn build_column(field: &Field, rows: &[BuiltRow]) -> Result<ArrayRef, WyrdQueueE
         DataType::UInt32 => Arc::new(UInt32Array::from(collect(name, rows, nullable, |v| {
             v.as_u64().and_then(|n| u32::try_from(n).ok())
         })?)),
-        DataType::UInt64 => Arc::new(UInt64Array::from(collect(name, rows, nullable, Value::as_u64)?)),
-        DataType::Float32 => Arc::new(Float32Array::from(collect(name, rows, nullable, |v| {
-            v.as_f64().map(|n| n as f32)
-        })?)),
-        DataType::Float64 => Arc::new(Float64Array::from(collect(name, rows, nullable, Value::as_f64)?)),
-        DataType::Utf8 | DataType::LargeUtf8 => Arc::new(StringArray::from(collect(
+        DataType::UInt64 => Arc::new(UInt64Array::from(collect(
             name,
             rows,
             nullable,
-            |v| v.as_str().map(str::to_owned),
+            Value::as_u64,
         )?)),
+        DataType::Float32 => Arc::new(Float32Array::from(collect(name, rows, nullable, |v| {
+            v.as_f64().map(|n| n as f32)
+        })?)),
+        DataType::Float64 => Arc::new(Float64Array::from(collect(
+            name,
+            rows,
+            nullable,
+            Value::as_f64,
+        )?)),
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            Arc::new(StringArray::from(collect(name, rows, nullable, |v| {
+                v.as_str().map(str::to_owned)
+            })?))
+        }
         DataType::Date32 => Arc::new(Date32Array::from(collect(name, rows, nullable, |v| {
             v.as_str().and_then(parse_date_days)
         })?)),

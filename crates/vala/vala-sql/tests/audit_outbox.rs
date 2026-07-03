@@ -70,8 +70,14 @@ mod audit_outbox {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].0, 1);
         assert_eq!(rows[0].1, ZERO_HASH, "row 1 prev_hash is 32 zero bytes");
-        assert_eq!(rows[1].1, rows[0].2, "row 2 prev_hash links row 1 entry_hash");
-        assert_eq!(rows[2].1, rows[1].2, "row 3 prev_hash links row 2 entry_hash");
+        assert_eq!(
+            rows[1].1, rows[0].2,
+            "row 2 prev_hash links row 1 entry_hash"
+        );
+        assert_eq!(
+            rows[2].1, rows[1].2,
+            "row 3 prev_hash links row 2 entry_hash"
+        );
 
         let (last_seq, head_hash): (i64, Vec<u8>) = sqlx::query_as(
             "SELECT last_seq, head_hash FROM vala.audit_chain_head WHERE data_tenant_id = $1",
@@ -81,7 +87,10 @@ mod audit_outbox {
         .await
         .unwrap();
         assert_eq!(last_seq, 3);
-        assert_eq!(head_hash, rows[2].2, "head_hash tracks the latest entry_hash");
+        assert_eq!(
+            head_hash, rows[2].2,
+            "head_hash tracks the latest entry_hash"
+        );
     }
 
     #[sqlx::test(migrations = false)]
@@ -89,11 +98,15 @@ mod audit_outbox {
         let tenant = seed(&pool).await;
         append(&pool, tenant, "op.a").await;
 
-        let deleted = sqlx::query("DELETE FROM vala.audit_outbox WHERE data_tenant_id = $1 AND seq = 1")
-            .bind(tenant.as_uuid())
-            .execute(&pool)
-            .await;
-        assert!(deleted.is_err(), "DELETE must be rejected by the append-only trigger");
+        let deleted =
+            sqlx::query("DELETE FROM vala.audit_outbox WHERE data_tenant_id = $1 AND seq = 1")
+                .bind(tenant.as_uuid())
+                .execute(&pool)
+                .await;
+        assert!(
+            deleted.is_err(),
+            "DELETE must be rejected by the append-only trigger"
+        );
 
         let tampered = sqlx::query(
             "UPDATE vala.audit_outbox SET operation = 'tampered'
@@ -147,10 +160,13 @@ mod audit_outbox {
 
         // Marking tenant A shipped must not touch tenant B's rows.
         let batch_a = [0x0Au8; 16];
-        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_a).await.unwrap();
-        let shipped_a = vala_sql::queries::audit_outbox::mark_audit_shipped(&mut conn, 1, 2, &batch_a)
+        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_a)
             .await
             .unwrap();
+        let shipped_a =
+            vala_sql::queries::audit_outbox::mark_audit_shipped(&mut conn, 1, 2, &batch_a)
+                .await
+                .unwrap();
         conn.commit().await.unwrap();
         assert_eq!(shipped_a, 2, "both tenant-A rows ship");
 
@@ -182,7 +198,9 @@ mod audit_outbox {
         append(&pool, tenant_b, "b.1").await;
 
         // Cross-tenant claim (SECURITY DEFINER) sees every unshipped row.
-        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_a).await.unwrap();
+        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_a)
+            .await
+            .unwrap();
         let claimed = vala_sql::queries::audit_outbox::claim_unshipped_audit(&mut conn, 100)
             .await
             .unwrap();
@@ -190,7 +208,9 @@ mod audit_outbox {
         assert_eq!(claimed.len(), 3, "claim spans both tenants");
 
         // Ship per tenant under that tenant's bind.
-        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_a).await.unwrap();
+        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_a)
+            .await
+            .unwrap();
         assert_eq!(
             vala_sql::queries::audit_outbox::mark_audit_shipped(&mut conn, 1, 2, &[0x0Au8; 16])
                 .await
@@ -199,7 +219,9 @@ mod audit_outbox {
         );
         conn.commit().await.unwrap();
 
-        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_b).await.unwrap();
+        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_b)
+            .await
+            .unwrap();
         assert_eq!(
             vala_sql::queries::audit_outbox::mark_audit_shipped(&mut conn, 1, 1, &[0x0Bu8; 16])
                 .await
@@ -209,7 +231,9 @@ mod audit_outbox {
         conn.commit().await.unwrap();
 
         // Nothing left to claim.
-        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_a).await.unwrap();
+        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_a)
+            .await
+            .unwrap();
         let remaining = vala_sql::queries::audit_outbox::claim_unshipped_audit(&mut conn, 100)
             .await
             .unwrap();

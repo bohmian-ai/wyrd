@@ -135,10 +135,11 @@ fn split_fqn(fqn: &str) -> Option<(BifrostNamespace, String)> {
         BifrostNamespace::Eval,
     ] {
         let prefix = format!("{}.", ns.as_str());
-        if let Some(rest) = fqn.strip_prefix(&prefix) {
-            if !rest.is_empty() && !rest.contains('.') {
-                return Some((ns, rest.to_owned()));
-            }
+        if let Some(rest) = fqn.strip_prefix(&prefix)
+            && !rest.is_empty()
+            && !rest.contains('.')
+        {
+            return Some((ns, rest.to_owned()));
         }
     }
     None
@@ -407,7 +408,9 @@ mod tests {
         request_id: &str,
         decision: &str,
     ) -> bool {
-        let mut conn = TenantConn::acquire(pool, tenant).await.expect("tenant conn");
+        let mut conn = TenantConn::acquire(pool, tenant)
+            .await
+            .expect("tenant conn");
         let rows = vala_sql::queries::audit_outbox::claim_unshipped_audit(&mut conn, 10_000)
             .await
             .expect("claim audit rows");
@@ -529,9 +532,10 @@ mod tests {
         wyrd_runtime::runtime().block_on(async {
             let state = db_state().await;
             let caller = caller_with([Permission::bifrost_query_read()]).await;
-            let err = submit_async_query(&state, caller, async_req("DROP TABLE \"vala.bifrost.t\""))
-                .await
-                .expect_err("non-SELECT is rejected before enqueue");
+            let err =
+                submit_async_query(&state, caller, async_req("DROP TABLE \"vala.bifrost.t\""))
+                    .await
+                    .expect_err("non-SELECT is rejected before enqueue");
             assert_eq!(err.status(), 400);
             assert_eq!(err.code(), "WYRD_VALA_400_QUERY_INVALID_SQL");
         });

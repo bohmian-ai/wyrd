@@ -113,9 +113,15 @@ async fn idempotent_replay_committed_returns_prior_snapshot(pool: PgPool) {
     let fx = setup(pool).await;
 
     let mut c = conn(&fx).await;
-    vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID, "system", "system")
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut c,
+        fx.table_uid.as_bytes(),
+        &BATCH_ID,
+        "system",
+        "system",
+    )
+    .await
+    .unwrap();
     // Stamp owner + token within the same conn to avoid row-lock deadlock.
     let owner = sqlx::types::Uuid::new_v4();
     sqlx::query(
@@ -167,9 +173,15 @@ async fn committed_row_with_null_snapshot_is_metadata_mismatch(pool: PgPool) {
     let fx = setup(pool).await;
 
     let mut c = conn(&fx).await;
-    vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID, "system", "system")
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut c,
+        fx.table_uid.as_bytes(),
+        &BATCH_ID,
+        "system",
+        "system",
+    )
+    .await
+    .unwrap();
     // Force the corruption case: committed state with snapshot_id left NULL.
     sqlx::query(
         "UPDATE vala.olap_commits SET state = 'committed', committed_at = now() \
@@ -208,9 +220,15 @@ async fn duplicate_failed_batch_returns_error(pool: PgPool) {
     let fx = setup(pool).await;
 
     let mut c = conn(&fx).await;
-    vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID, "system", "system")
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut c,
+        fx.table_uid.as_bytes(),
+        &BATCH_ID,
+        "system",
+        "system",
+    )
+    .await
+    .unwrap();
     // Stamp owner + token within the same conn to avoid row-lock deadlock.
     let owner = sqlx::types::Uuid::new_v4();
     sqlx::query(
@@ -262,9 +280,15 @@ async fn in_flight_precommit_returns_commit_conflict(pool: PgPool) {
     let fx = setup(pool).await;
 
     let mut c = conn(&fx).await;
-    vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID, "system", "system")
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut c,
+        fx.table_uid.as_bytes(),
+        &BATCH_ID,
+        "system",
+        "system",
+    )
+    .await
+    .unwrap();
     c.commit().await.unwrap();
 
     let err = run_commit(

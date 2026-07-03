@@ -109,7 +109,9 @@ async fn olap_query_jobs_cross_tenant_status_is_invisible(pool: PgPool) {
         .unwrap();
     let params = JsonValue::Array(Vec::new());
 
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_a).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_a)
+        .await
+        .unwrap();
     let job_uid = enqueue_query_job(
         &mut conn,
         NewQueryJob {
@@ -122,7 +124,9 @@ async fn olap_query_jobs_cross_tenant_status_is_invisible(pool: PgPool) {
     .unwrap();
     conn.commit().await.unwrap();
 
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_b).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_b)
+        .await
+        .unwrap();
     let status = query_job_status(&mut conn, job_uid).await.unwrap();
     conn.commit().await.unwrap();
 

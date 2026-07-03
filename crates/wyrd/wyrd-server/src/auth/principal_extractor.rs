@@ -1,12 +1,8 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use secrecy::{ExposeSecret, SecretString};
 use wyrd_runtime::Principal;
-use wyrd_spec::error::WyrdError;
 
-use crate::auth::token_extract::{
-    WYRD_ACCESS_TOKEN_HEADER, auth_not_configured, tenant_from_unverified_access_token,
-};
+use crate::auth::token_extract::verify_authenticated_principal;
 use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -34,52 +30,14 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token = extract_wyrd_access_token(parts)?;
-        let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
-        let verifier = state
-            .token_verifier
-            .clone()
-            .ok_or_else(auth_not_configured)?;
-        let verified = verifier
-            .verify(&token, &expected_tenant)
-            .await
-            .map_err(WyrdErrorResponse::from)?;
-        Ok(Self {
-            principal: verified.principal.clone(),
-        })
+        // Fast path: require_authenticated (post-verify) is the sole trusted producer
+        // of this extension. Any future insertion site must verify before inserting;
+        // reading an unverified principal here would be a silent auth bypass.
+        if let Some(principal) = parts.extensions.get::<AuthenticatedPrincipal>() {
+            return Ok(principal.clone());
+        }
+        verify_authenticated_principal(state.token_verifier.clone(), &parts.headers).await
     }
-}
-
-fn extract_wyrd_access_token(parts: &Parts) -> Result<SecretString, WyrdErrorResponse> {
-    let raw = parts
-        .headers
-        .get(WYRD_ACCESS_TOKEN_HEADER)
-        .ok_or_else(|| {
-            WyrdErrorResponse::from(WyrdError::Unauthenticated {
-                message: "missing X-Wyrd-Access-Token header".to_owned(),
-                details: serde_json::json!({ "header": "x-wyrd-access-token" }),
-            })
-        })?
-        .to_str()
-        .map_err(|_| {
-            WyrdErrorResponse::from(WyrdError::BadTokenFormat {
-                message: "X-Wyrd-Access-Token header is not valid UTF-8".to_owned(),
-                details: serde_json::json!({ "header": "x-wyrd-access-token" }),
-            })
-        })?;
-    let Some(token) = raw.strip_prefix("Bearer ") else {
-        return Err(WyrdErrorResponse::from(WyrdError::BadTokenFormat {
-            message: "X-Wyrd-Access-Token header must be a Bearer credential".to_owned(),
-            details: serde_json::json!({ "header": "x-wyrd-access-token" }),
-        }));
-    };
-    if token.is_empty() {
-        return Err(WyrdErrorResponse::from(WyrdError::BadTokenFormat {
-            message: "X-Wyrd-Access-Token bearer token is empty".to_owned(),
-            details: serde_json::json!({ "header": "x-wyrd-access-token" }),
-        }));
-    }
-    Ok(SecretString::from(token.to_owned()))
 }
 
 #[cfg(test)]
@@ -93,7 +51,7 @@ mod tests {
     use wyrd_auth_verify::{
         Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
     };
-    use wyrd_runtime::PrincipalId;
+    use wyrd_runtime::{PrincipalId, PrincipalKind};
     use wyrd_spec::DataTenantId;
 
     use crate::auth::permission_resolver::SqlPermissionResolver;
@@ -129,6 +87,34 @@ mod tests {
             .expect_err("missing token fails");
 
         assert_error_code(error, "WYRD_AUTH_401_UNAUTHENTICATED");
+    }
+
+    #[tokio::test]
+    async fn extension_hit_returns_stored_principal_without_invoking_verifier() {
+        let tenant = DataTenantId::new_v7();
+        let state = test_state(tenant).await;
+        let principal_id = PrincipalId::new(uuid::Uuid::now_v7());
+        let stored = AuthenticatedPrincipal {
+            principal: wyrd_runtime::Principal {
+                id: principal_id,
+                kind: PrincipalKind::User,
+                tenant_id: tenant,
+                roles: Vec::new(),
+                effective_permissions: Default::default(),
+                card_scope: Default::default(),
+            },
+        };
+        // No token header — fallback path would reject with Unauthenticated;
+        // extension hit must short-circuit and return the stored principal.
+        let mut parts = request_parts(None);
+        parts.extensions.insert(stored.clone());
+
+        let extracted = AuthenticatedPrincipal::from_request_parts(&mut parts, &state)
+            .await
+            .expect("extension hit bypasses verifier");
+
+        assert_eq!(extracted.principal.id, stored.principal.id);
+        assert_eq!(extracted.principal.tenant_id, tenant);
     }
 
     #[tokio::test]

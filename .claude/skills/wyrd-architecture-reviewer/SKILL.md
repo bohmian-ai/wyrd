@@ -68,6 +68,9 @@ Load from the shared doctrine library (`.claude/references/`, indexed in
 - `.claude/references/review/full-sweep-review.md`: folder-scale review workflow, intake
   ledger, specialist subreviews, right-sized architecture pass, and consensus
   ledger format.
+- `.claude/references/review/dynamic-review-loop.md`: terminal pipeline re-review loop for
+  Gate 1 (`spec.md`) and Gate 2 (`plan.md`) — review → revise → fresh re-review
+  until `Decision: approve`.
 - `.claude/references/review/agent-first-review.md`: agent-first review lens for whether a
   small/basic agent can reason about Wyrd contracts, code, docs, and errors.
 - `.claude/references/review/production-architecture-rubric.md`: security, reliability,
@@ -145,6 +148,18 @@ Routing:
     - `full sweep`: continue past blockers and report every legitimate,
       materially separate finding found in the reviewed artifact.
 
+    **Default depth by context.** When you are invoked as a **pipeline gate** —
+    reviewing a `spec.md` (Gate 1) or a `plan.md` / commit DAG (Gate 2) — default
+    to **full sweep** even if the caller hands you a focus list. A focus list at a
+    gate is a hint about what matters most, *not* a scope cap; widen past it and
+    report every materially-separate finding. These artifacts are prose, so a
+    miss is cheap to fix now and expensive once it reaches code — exhaustiveness
+    is the whole point of the gate. Use `blocker-only` only when the caller
+    explicitly wants a fast go/no-go (e.g. a pre-spec "is this doctrine-legal?"
+    check), and `requested scope` only when the caller names a single surface and
+    says not to look wider. If a focus list and a gate context conflict, the gate
+    wins: sweep.
+
 ## Full Sweep Mode
 
 Use full sweep mode when the target is a plan folder or multi-file proposal
@@ -177,6 +192,24 @@ user explicitly asks to delegate, use subagents or parallel reviewers for the
 specialist lenses when the tool is available. If delegation is unavailable or
 not explicitly requested, run the specialist lenses locally and sequentially;
 still produce the same intake and consensus ledgers.
+
+## Pipeline Re-Review
+
+When invoked on a **revised** `spec.md` (Gate 1) or `plan.md` (Gate 2) that
+already has a prior consensus ledger, you are one iteration of the dynamic review
+loop (`.claude/references/review/dynamic-review-loop.md`). Do **not** downgrade
+to a closure-only check. Each re-review must:
+
+1. **Verify closure.** For every confirmed finding in the prior consensus
+   ledger, check the revised artifact and record whether it is closed, still
+   open, or explicitly deferred/reopened with an accepted rationale.
+2. **Run a fresh full sweep.** Re-run the specialist lenses over the revised
+   artifact to catch issues the revision itself introduced — a fix in one place
+   can break a contract, sequencing edge, or boundary elsewhere.
+3. **Emit a `Decision`.** Only `Decision: approve` lets the gate advance.
+
+Reference the prior consensus ledger path in the loop ledger and note any prior
+finding you carried forward, closed, or newly raised.
 
 ## Non-Negotiables
 
@@ -230,7 +263,11 @@ for a different format:
 - **Reuse Opportunities**: predecessor code or patterns that should be reused,
   adapted, replaced, or omitted.
 - **Decision**: approve, approve with changes, needs redesign, or reopen a
-  locked decision.
+  locked decision. At a **pipeline gate** (Gate 1 `spec.md`, Gate 2 `plan.md`),
+  only `approve` is terminal; `approve with changes`, `needs redesign`, and
+  `reopen locked decision` re-enter the dynamic review loop
+  (`.claude/references/review/dynamic-review-loop.md`) for another revision plus
+  a fresh re-review.
 
 Keep each finding readable:
 

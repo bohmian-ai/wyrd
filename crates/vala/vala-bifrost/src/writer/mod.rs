@@ -16,7 +16,7 @@ pub mod file_writer;
 /// orchestrator down to the writer, replacing the engine's former self-minted
 /// `batch_id` and the hardcoded `system`/`system` audit columns.
 ///
-/// - `batch_id` — the stream's `wyrd_batch_id` (16-byte UUIDv7); the durable
+/// - `batch_id` — the stream's `wyrd_batch_id` (16-byte `UUIDv7`); the durable
 ///   dedup key checked against `vala.olap_commits` before any Parquet write.
 /// - `origin` / `actor` — audit columns stamped on the precommit row (e.g.
 ///   `"ingest"` / the resolved principal id).
@@ -40,16 +40,14 @@ pub struct BifrostWriteContext {
 impl BifrostWriteContext {
     /// Context for the Stage-1 internal / recovery re-flush path: `origin` and
     /// `actor` are `"system"`, `card_ref` is `None`, and the `batch_id` /
-    /// `request_id` are freshly minted UUIDv7 values.
+    /// `request_id` are freshly minted `UUIDv7` values.
     #[must_use]
     pub fn system() -> Self {
-        let request_id = RequestId::parse(&uuid::Uuid::now_v7().to_string())
-            .expect("UUIDv7 is a valid request id");
         Self {
             batch_id: *uuid::Uuid::now_v7().as_bytes(),
             origin: "system".to_owned(),
             actor: "system".to_owned(),
-            request_id,
+            request_id: RequestId::now_v7(),
             card_ref: None,
         }
     }

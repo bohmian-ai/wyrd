@@ -52,7 +52,10 @@ fn required_drives_nullability() {
     });
     let specs = json_schema_to_fieldspec(&schema).expect("maps");
 
-    assert!(!field(&specs, "id").nullable, "required field is non-nullable");
+    assert!(
+        !field(&specs, "id").nullable,
+        "required field is non-nullable"
+    );
     assert!(field(&specs, "note").nullable, "unlisted field is nullable");
 }
 
@@ -148,7 +151,10 @@ fn arrow_schema_maps_precision_types_verbatim() {
     assert!(!field(&specs, "small").nullable);
     assert_eq!(
         field(&specs, "money").data_type,
-        DataTypeSpec::Decimal128 { precision: 10, scale: 2 }
+        DataTypeSpec::Decimal128 {
+            precision: 10,
+            scale: 2
+        }
     );
     assert_eq!(
         field(&specs, "local").data_type,

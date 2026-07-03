@@ -56,6 +56,9 @@ def render_openapi() -> str:
         "---",
         "title: OpenAPI",
         "description: Generated summary of the Wyrd OpenAPI contract.",
+        "pillar: wyrd",
+        "group: Reference",
+        "order: 22",
         "---",
         "",
         "# OpenAPI",
@@ -84,30 +87,39 @@ def render_openapi() -> str:
 
 def render_schemas() -> str:
     schema_files = sorted(SCHEMA_DIR.glob("*.json"))
-    lines = [
-        "---",
-        "title: Schemas",
-        "description: Generated inventory of Wyrd JSON Schemas.",
-        "---",
-        "",
-        "# Schemas",
-        "",
-        "These schemas are generated from the Wyrd spec crate and checked into the repository for clients, docs, and agents. `architecture/wyrd-design.md` remains the design authority; this inventory may include implementation drift while contracts are being reconciled.",
-        "",
-        "| Schema | Title |",
-        "| --- | --- |",
+    schema_dir = SCHEMA_DIR.relative_to(REPO_ROOT)
+    # Emit data rows (filename + type title); the shared DataTable component owns
+    # the presentation. The directory prefix is stated once in the intro, so rows
+    # carry only the filename.
+    columns = [
+        {"header": "Schema", "role": "name"},
+        {"header": "Title", "role": "type"},
     ]
-
+    rows = []
     for schema_path in schema_files:
         try:
             schema = json.loads(schema_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             schema = {}
         title = schema.get("title") or schema_path.stem
-        rel = schema_path.relative_to(REPO_ROOT)
-        lines.append(f"| `{md_escape(str(rel))}` | {md_escape(str(title))} |")
+        rows.append([schema_path.name, str(title)])
 
-    lines.append("")
+    lines = [
+        "---",
+        "title: Schemas",
+        "description: Generated inventory of Wyrd JSON Schemas.",
+        "pillar: wyrd",
+        "group: Reference",
+        "order: 23",
+        "---",
+        "",
+        "# Schemas",
+        "",
+        f"These schemas are generated from the Wyrd spec crate and checked into the repository under `{schema_dir}/` for clients, docs, and agents. `architecture/wyrd-design.md` remains the design authority; this inventory may include implementation drift while contracts are being reconciled.",
+        "",
+        f"<DataTable columns={{{json.dumps(columns)}}} rows={{{json.dumps(rows)}}} />",
+        "",
+    ]
     return "\n".join(lines)
 
 
@@ -117,23 +129,25 @@ def render_errors() -> str:
             "---",
             "title: Errors",
             "description: Error handling guidance for Wyrd API clients and agents.",
+            "pillar: wyrd",
+            "group: Reference",
+            "order: 21",
             "---",
             "",
             "# Errors",
             "",
-            "Wyrd returns errors as structured RFC 7807 Problem Details objects. Agents and SDK clients must preserve the full structure and must not collapse errors into prose.",
+            "Wyrd returns errors as structured RFC 9457 Problem Details objects (`application/problem+json`). Agents and SDK clients must preserve the full structure and must not collapse errors into prose.",
+            "",
+            "This page is the generated error catalog. For how an agent should act on these errors, see [Error remediation](/for-agents/error-remediation/).",
             "",
             "## Client transport codes",
             "",
             "| Code | Status | Title | Remediation |",
             "|---|---:|---|---|",
-            "| `WYRD_CLIENT_400_CONFIG_INVALID` | 400 | Client transport configuration failed validation | [Transports troubleshooting](/transports/troubleshooting/#config-validation) |",
-            "| `WYRD_CLIENT_400_TRANSPORT_FEATURE_DISABLED` | 400 | Selected transport variant is not compiled into this build (**not yet emitted**; lands in PR4.0) | [Transports troubleshooting](/transports/troubleshooting/#feature-disabled) |",
-            "| `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE` | 413 | Flush body exceeded the server's accepted payload size | [Transports troubleshooting](/transports/troubleshooting/#payload-too-large) |",
-            "| `WYRD_CLIENT_503_TRANSPORT_DOWN` | 503 | Client transport is unavailable | [Transports troubleshooting](/transports/troubleshooting/#transport-down) |",
-            "| `WYRD_CLIENT_504_FLUSH_TIMEOUT` | 504 | Flush exceeded per-call timeout | [Transports troubleshooting](/transports/troubleshooting/#flush-timeout) |",
+            "| `WYRD_CLIENT_400_CONFIG_INVALID` | 400 | Client transport configuration failed validation | Fix the `details.field` named on the error, then reconstruct the client. Not a retry path. |",
+            "| `WYRD_CLIENT_401_NO_CREDENTIALS` | 401 | Credential chain produced no usable credential | Set `WYRD_ACCESS_TOKEN`, `WYRD_WORKLOAD_TOKEN`+`WYRD_TENANT`, or `WYRD_API_KEY`. Not a retry path. |",
+            "| `WYRD_CLIENT_503_TRANSPORT_DOWN` | 503 | Client transport is unavailable | Retry with backoff once the network or server health recovers. |",
             "",
-            "See [Error Codes](/reference/errors/) for the current catalog.",
             "## Error fields",
             "",
             "| Field | Description |",
@@ -157,10 +171,6 @@ def render_errors() -> str:
             "- Keep retries bounded and tied to idempotent operations.",
             "- Link remediation steps to the card or run that caused the error.",
             "",
-            "## Catalog",
-            "",
-            "The full Wyrd error catalog is not emitted as a standalone generated file yet. The Skald runtime codes below are seed tables for that generator.",
-            "",
             "## Skald agent codes",
             "",
             "| Code | Status | When |",
@@ -181,20 +191,36 @@ def render_errors() -> str:
             "| `WYRD_WORKFLOW_422_CYCLE` | 422 | The workflow DAG contains a cycle. |",
             "| `WYRD_WORKFLOW_422_MISSING_DEPENDENCY` | 422 | A step depends on an id that does not exist. |",
             "| `WYRD_WORKFLOW_422_DUPLICATE_STEP_ID` | 422 | Two steps share the same id. |",
+            "| `WYRD_WORKFLOW_422_MISSING_NAME` | 422 | `save` or `to_card` was called on an anonymous workflow. |",
             "| `WYRD_WORKFLOW_422_MISSING_PARAMETER` | 422 | A prompt placeholder exists in neither workflow input nor upstream parameters. |",
+            "",
+            "## Prompt and CLI authoring codes",
+            "",
+            "| Code | Status | When |",
+            "| --- | --- | --- |",
+            "| `WYRD_AGENT_422_STRUCTURED_DECODE` | 422 | Response text is not valid JSON when `Prompt.output` is set. |",
+            "| `WYRD_PROMPT_422_PYDANTIC_REQUIRED` | 422 | Pydantic is required for class-based `Prompt(output=Model)` schemas. |",
+            "| `WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA` | 422 | The `Prompt(output=...)` dict cannot be reduced to JSON Schema. |",
+            "| `WYRD_PROMPT_400_PROVIDER_MISMATCH` | 400 | A provider accessor was called on a different provider's response. |",
+            "| `WYRD_CLI_400_CARD_EXTENSION_UNSUPPORTED` | 400 | A card file extension is not `.json`, `.yaml`, or `.yml`. |",
+            "| `WYRD_CLI_500_IO` | 500 | Filesystem IO failed during a CLI operation. |",
+            "",
+            "## Registry codes",
+            "",
+            "| Code | Status | When |",
+            "| --- | --- | --- |",
+            "| `WYRD_REG_409_SPEC_DRIFT` | 409 | Re-apply with the same identity but a different `spec_hash`; same-version cards are immutable. |",
             "",
             "## Eval protocol codes",
             "",
             "| Code | Status | When |",
             "| --- | --- | --- |",
-            "| `WYRD_EVAL_404_RUN_NOT_FOUND` | 404 | The `run_id` path parameter does not match any open run. Re-open with `POST /api/v1/eval/runs`. |",
+            "| `WYRD_EVAL_404_RUN_NOT_FOUND` | 404 | The `run_id` path parameter does not match any open run. Re-open with `POST /v1/eval/runs`. |",
             "| `WYRD_EVAL_401_MISSING_LEASE` | 401 | The request did not include an `Authorization: Bearer <token>` header. Send the `lease_token` from the open response. |",
-            "| `WYRD_EVAL_403_INVALID_LEASE` | 403 | The bearer token does not match the lease minted for the run. Re-open the run; leases are bound to one run. |",
-            "| `WYRD_EVAL_401_API_KEY_INVALID` | 401 | The server has `WYRD_API_KEY` set and the request did not send a matching bearer token. |",
-            "| `WYRD_EVAL_409_SUBMISSION_MISMATCH` | 409 | The submission kind, scenario id, or turn counter does not match the outstanding directive. Call `/next` to retrieve the current directive and retry. |",
+            "| `WYRD_EVAL_403_INVALID_LEASE` | 403 | The bearer token does not match the lease minted for the run. Re-open the run via `POST /v1/eval/runs`; leases are bound to one run. |",
+            "| `WYRD_EVAL_409_SUBMISSION_MISMATCH` | 409 | The submission kind, scenario id, or turn counter does not match the outstanding directive. Call `POST /v1/eval/runs/{run_id}/next` to retrieve the current directive and retry. |",
             "| `WYRD_EVAL_429_TOO_MANY_RUNS` | 429 | The server has reached its concurrent-run cap. Wait for an existing run to complete, then retry. |",
-            "| `WYRD_EVAL_500_RUN_FAILED` | 500 | The eval engine, simulator, or scenario loader encountered an internal error. Inspect server logs for the chained detail. |",
-            "| `WYRD_EVAL_500_RESULTS_PERSISTENCE_FAILED` | 500 | Results serialization or filesystem write failed after the run completed. Inspect server logs and available disk space. |",
+            "| `WYRD_EVAL_500_RUN_FAILED` | 500 | The eval engine or scenario loader encountered an internal error. Inspect server logs for the chained detail. |",
             "",
         ]
     )

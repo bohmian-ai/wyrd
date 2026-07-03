@@ -1,0 +1,223 @@
+---
+title: Core doctrine
+description: The design doctrine behind Wyrd's nouns, layers, services, and public surfaces.
+---
+
+# Wyrd core doctrine
+
+`architecture/wyrd-design.md` is the active protocol authority. This page is
+the public doctrine summary for developers and agents.
+
+## Document map
+
+| Doc | Purpose | Authority |
+|---|---|---|
+| `wyrd-doctrine.mdx` | Design doctrine — the "why" | Stable guidance |
+| `wyrd-design.md` | Protocol spec — the "what" | Wins on conflict |
+| `wyrd-protocol.md` | Older draft — historical reference | Partially superseded |
+
+## Purpose
+
+Wyrd is the AI layer for human and agentic work. It does not become the user's
+application runtime, training framework, workflow engine, or cloud platform.
+
+Wyrd makes AI work declarative, connectable, inspectable, reproducible, and operable. Users
+describe the things that matter. Wyrd records those descriptions, validates
+them, links them, observes what happens, governs decisions, and exposes the
+result through human and agent-facing surfaces and an enterprise intelligence layer called Fathom
+
+## Object model
+
+Wyrd is built around declared intent.
+
+| Layer | Meaning |
+|---|---|
+| Core nouns | The durable concepts every other layer uses: Card, Spec, Run, Observation. |
+| Card kinds | Domain specializations of `Card`; the kind changes the spec, not the ontology. |
+| Foundations | Envelope, metadata, `CardRef`, relationship, status, and version. |
+| Services | Registry, storage, lineage, policy, install, audit, observability, evaluation, drift, and runtime. |
+| Surfaces | HTTP, Language SDK, CLI, UI, MCP, IDE integrations, and generated docs. |
+
+Do not skip layers. A service operates on Wyrd foundations. A surface exposes a
+service. A card kind specializes `Card`. Runtime details stay behind the
+contract that explains them.
+
+```text
+Cards declare.
+Specs define.
+CardRefs connect.
+Relationships explain.
+Status tracks lifecycle.
+Runs record execution.
+Observations record measured facts.
+Policy governs decisions.
+Audit records accountability.
+```
+
+## Core nouns
+
+| Noun | What it means in Wyrd |
+|---|---|
+| Card | A declared thing with identity, kind, version, spec, relationships, and status. |
+| Spec | The declared payload that gives a card its kind-specific meaning. |
+| Run | One execution of declared behavior. |
+| Observation | A measured fact produced by or attached to a run, card, service, or workflow. |
+
+Everything else should first try to fit as a card kind, spec field,
+relationship, run, or observation. Add a new noun only when those shapes cannot
+express the concept without lying.
+
+## Card kinds
+
+The v1 doctrine has 16 native kinds plus `External` for forward compatibility.
+
+| Domain | Kinds |
+|---|---|
+| Data plane | Data, Model, Artifact, Experiment |
+| Agent plane | Prompt, Agent, Workflow, Mcp |
+| Composition | Service |
+| Governance | Policy, Audit |
+| Observability | Drift, Eval, Source |
+| Reaction | Trigger, Operator |
+
+Tools are runtime names resolved by Skald's tool registry; they are not Cards.
+Sub-agency is an Agent invoking another Agent; it is a relationship, not a
+`SubAgent` kind. Skills are not a v1 Card kind.
+
+
+## Foundations
+
+Every card uses the same envelope:
+
+```yaml
+apiVersion: wyrd/v1
+metadata:
+  space: prod
+  name: churn-model
+  version: "1.2.0"
+  labels:
+    domain: churn
+    stage: production
+  annotations:
+    example.com/source: training-job-42
+kind: Model
+spec:
+  ...
+relationships: []
+status: null
+```
+
+`metadata.labels` are short indexed classification fields. Use them for values
+humans, agents, policy, or inventory views filter on.
+
+`metadata.annotations` are descriptive metadata fields. Use them for longer
+context that should travel with the Card but should not be indexed as a primary
+classification field.
+
+`tags` are not Wyrd's public metadata contract. Public Card metadata uses
+`labels` and `annotations`.
+
+Authors write `CardRef` values inside specs. The server derives relationships
+from them. Lineage reads those relationships; users do not author a parallel
+lineage graph.
+
+## Service boundaries
+
+Wyrd ships three products from one source tree. `wyrd-spec` is the shared Rust
+crate that defines all wire types. Each product depends on it; none owns it.
+This is what keeps contracts identical across the HTTP API, SDK, CLI, MCP, and
+generated schemas.
+
+| Product | Domain |
+|---|---|
+| **wyrd** | Registry, lineage, policy, auth, install, audit |
+| **vala** | Bifrost OLAP warehouse, observations, drift evaluation, agent eval |
+| **skald** | LLM providers, prompt execution, tool registry, agent runtime, workflows |
+
+Services compose foundations instead of inventing private shapes:
+
+- **Registry** stores and validates cards; derives relationships from `CardRef`s; manages version and space isolation.
+- **Lineage** reads derived relationships to answer provenance queries.
+- **Policy** evaluates CEL rules at register-time (classify), deploy-time (gate), and runtime (invoke).
+- **Bifrost / Observability** records runs and observations in Wyrd's internal OLAP store; reads external data through `Source` cards.
+
+## Runtime boundary
+
+Wyrd records, validates, governs, links, installs, observes, and exposes AI
+system components. User code owns inference loops, training loops, app servers,
+agent processes, and deployment mechanics. Wyrd provides the observation and
+governance layer: services emit runtime behavior through Wyrd's native system
+and hook into it for lineage, policy enforcement, and drift monitoring.
+
+Runtime results that persist become runs, observations, artifact cards,
+relationships, audit records, or status updates through service-owned paths.
+
+## Public surfaces
+
+
+The SDK, HTTP API, CLI, IDE integrations, UI, generated schemas, and MCP
+tools all project the same card contract. A surface may add ergonomic
+shortcuts, but it does not invent new shapes, rename durable fields, or expose
+server-internal state. All contracts live on the API wire, making Wyrd language-agnostic.
+
+What a user declares in Python should be recognizable in the HTTP payload, the
+stored card, the generated schema, and the MCP tool input.
+
+## What to reject
+
+**Card model**
+- Compatibility aliases from predecessor projects
+- One-off artifact reference wrappers
+- Duplicate public shapes for the same concept
+- Authored lineage graphs that bypass `CardRef`s and derived relationships
+
+**Card kinds**
+- `Tool`, `Skill`, or `SubAgent` as new v1 public card-kind work
+
+**Public surfaces**
+- Per-kind registration methods on card objects
+- Server-only fields in client contracts
+- Surface-specific vocabulary that diverges from the spec
+
+**Spec discipline**
+- Live runtime objects in specs
+- Untyped strings where Wyrd has a domain type
+- Runtime plugins where a closed enum is the real contract
+
+**Observation model**
+- Public event-shaped payloads where `card`, `run`, `observation`, `relationship`,
+  `status`, `policy`, or `audit` names the concept more clearly
+
+**Implementation hygiene**
+- Hidden side effects during local card construction
+- Generated files edited by hand
+
+## Implementation rule
+
+Every implementation should preserve the doctrine:
+
+- contracts are typed
+- specs are declarative
+- CardRefs are explicit
+- relationships are derived
+- artifacts are cards
+- registration is centralized
+- runtime behavior stays out of durable specs
+- public surfaces use Wyrd vocabulary
+
+If a plan violates one of these rules, the plan needs a named exception and a
+reason strong enough to survive review.
+
+---
+
+## Further reading
+
+| Topic | Location |
+|---|---|
+| Full doctrine (18 numbered principles) | `architecture/wyrd-design.md §Doctrine` |
+| Per-kind spec reference | `architecture/wyrd-design.md §Per-kind specs` |
+| Spec-file authoring, `path:` / `inline:` / `ref:` | `architecture/wyrd-design.md §Spec-file authoring` |
+| Workspace config (`wyrd.toml`) | `architecture/wyrd-design.md §Workspace config` |
+| Reference-direction quick reference | `architecture/wyrd-design.md §Reference-direction quick reference` |
+| Auth, principal model, delegation | `architecture/wyrd-design.md §Runtime identity` |
+| Bifrost OLAP warehouse | `architecture/wyrd-design.md §Bifrost` |

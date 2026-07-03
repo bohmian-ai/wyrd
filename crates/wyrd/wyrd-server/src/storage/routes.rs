@@ -20,9 +20,12 @@ use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
 use crate::storage::service;
 
-/// Mount storage routes into an existing `/v1` router.
-pub fn mount(router: Router<AppState>, state: &AppState) -> Router<AppState> {
-    let router = router
+/// Standalone storage router for the `/v1` group.
+///
+/// Local-blob upload/download routes are registered only when the backend is
+/// [`BackendConfig::Local`], so `&state` is read at build time.
+pub fn router(state: &AppState) -> Router<AppState> {
+    let router = Router::new()
         .route("/cards/upload/init", post(init))
         .route("/cards/upload/{id}/part-url", post(part_url))
         .route("/cards/upload/{id}/complete", post(complete))

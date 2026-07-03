@@ -34,7 +34,11 @@ fn principal_with_scope(cards: &[&str]) -> Principal {
 }
 
 fn batch_with_card_refs(values: Vec<Option<&str>>) -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![Field::new("card_ref", DataType::Utf8, true)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "card_ref",
+        DataType::Utf8,
+        true,
+    )]));
     let column = Arc::new(StringArray::from(values)) as Arc<dyn arrow::array::Array>;
     RecordBatch::try_new(schema, vec![column]).expect("batch builds")
 }

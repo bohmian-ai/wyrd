@@ -38,7 +38,10 @@ fn bench_commit_latency(c: &mut Criterion) {
                 .expect("open bench writer");
             let batch = workload::make_bench_batch(10_000);
             writer.write(batch).await.expect("write bench batch");
-            writer.flush(vala_bifrost::writer::BifrostWriteContext::system()).await.expect("flush bench writer")
+            writer
+                .flush(vala_bifrost::writer::BifrostWriteContext::system())
+                .await
+                .expect("flush bench writer")
         });
     });
 }

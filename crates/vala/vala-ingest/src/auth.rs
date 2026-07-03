@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_verify::{
-    PermissionResolver, TokenVerifier, WYRD_ACCESS_TOKEN_HEADER,
+    IssuerConfigResolver, PermissionResolver, TokenVerifier, WYRD_ACCESS_TOKEN_HEADER,
     tenant_from_unverified_access_token,
 };
 use wyrd_runtime::Principal;
@@ -67,10 +67,7 @@ pub fn read_or_mint_request_id(metadata: &MetadataMap) -> RequestId {
         .get(WYRD_REQUEST_ID_METADATA)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| RequestId::parse(value).ok())
-        .unwrap_or_else(|| {
-            RequestId::parse(&uuid::Uuid::now_v7().to_string())
-                .expect("UUIDv7 is a valid request id")
-        })
+        .unwrap_or_else(RequestId::now_v7)
 }
 
 /// Verify the inbound stream's bearer through `verifier` and build the
@@ -79,8 +76,8 @@ pub fn read_or_mint_request_id(metadata: &MetadataMap) -> RequestId {
 /// # Errors
 /// Returns [`IngestError::Unauthenticated`] when the bearer is missing, does not
 /// name a tenant, or fails signature/tenant verification.
-pub async fn authenticate<R: PermissionResolver + 'static>(
-    verifier: &TokenVerifier<R>,
+pub async fn authenticate<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>(
+    verifier: &TokenVerifier<R, I>,
     metadata: &MetadataMap,
 ) -> Result<AuthContext, IngestError> {
     let token = extract_bearer(metadata)?;
@@ -104,11 +101,14 @@ pub async fn authenticate<R: PermissionResolver + 'static>(
 /// and wires [`authenticate`] into request-extension population; this type keeps
 /// the verifier seam in one place so ingest can never grow a second auth path.
 #[derive(Clone)]
-pub struct IngestAuthInterceptor<R: PermissionResolver + 'static> {
-    verifier: Arc<TokenVerifier<R>>,
+pub struct IngestAuthInterceptor<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
+{
+    verifier: Arc<TokenVerifier<R, I>>,
 }
 
-impl<R: PermissionResolver + 'static> IngestAuthInterceptor<R> {
+impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
+    IngestAuthInterceptor<R, I>
+{
     /// Verify `metadata`'s bearer and produce the [`AuthContext`].
     ///
     /// # Errors
@@ -119,9 +119,12 @@ impl<R: PermissionResolver + 'static> IngestAuthInterceptor<R> {
 }
 
 /// Construct an [`IngestAuthInterceptor`] bound to `verifier`.
-pub fn ingest_auth_interceptor<R: PermissionResolver + 'static>(
-    verifier: Arc<TokenVerifier<R>>,
-) -> IngestAuthInterceptor<R> {
+pub fn ingest_auth_interceptor<
+    R: PermissionResolver + 'static,
+    I: IssuerConfigResolver + 'static,
+>(
+    verifier: Arc<TokenVerifier<R, I>>,
+) -> IngestAuthInterceptor<R, I> {
     IngestAuthInterceptor { verifier }
 }
 

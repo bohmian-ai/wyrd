@@ -812,13 +812,14 @@ mod tests {
     async fn mixed_inputs_are_rejected() {
         // app + migrator present but catalog/recovery missing is now incomplete;
         // any partial subset short of the full external set is rejected.
-        let cases: [(
-            Option<&str>,
-            Option<&str>,
-            Option<&str>,
-            Option<&str>,
-            Option<&str>,
-        ); 6] = [
+        type DsnCase<'a> = (
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+        );
+        let cases: [DsnCase; 6] = [
             (Some(APP_URL), Some(MIGRATOR_PW), None, None, None),
             (
                 Some(APP_URL),

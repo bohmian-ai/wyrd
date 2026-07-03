@@ -25,9 +25,9 @@ use crate::state::AppState;
 /// Content type of the sync-query Arrow IPC stream response.
 const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 
-/// Mount the query routes into an existing `/v1` router.
-pub fn mount(router: Router<AppState>, _state: &AppState) -> Router<AppState> {
-    router
+/// Standalone query router for the `/v1` group.
+pub fn router() -> Router<AppState> {
+    Router::new()
         .route("/query", post(sync_query))
         .route("/query/async", post(async_query))
         .route("/query/async/{job_uid}", get(async_query_status))

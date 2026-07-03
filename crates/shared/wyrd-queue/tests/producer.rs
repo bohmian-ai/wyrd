@@ -55,10 +55,17 @@ fn config_no_auto() -> QueueConfig {
 #[test]
 fn manual_flush_returns_stable_batch_ids() {
     let sink = Arc::new(MockSink::new());
-    let producer = Producer::new("ns.tbl".to_owned(), user_schema(), sink.clone(), config_no_auto());
+    let producer = Producer::new(
+        "ns.tbl".to_owned(),
+        user_schema(),
+        sink.clone(),
+        config_no_auto(),
+    );
 
     for i in 0..3 {
-        producer.enqueue(row(i, "x"), card("alpha"), None).expect("enqueue");
+        producer
+            .enqueue(row(i, "x"), card("alpha"), None)
+            .expect("enqueue");
     }
     let ids = producer.flush().expect("flush");
 
@@ -82,8 +89,12 @@ fn size_trigger_flushes_without_manual_call() {
     };
     let producer = Producer::new("ns.tbl".to_owned(), user_schema(), sink.clone(), config);
 
-    producer.enqueue(row(1, "a"), card("alpha"), None).expect("enqueue");
-    producer.enqueue(row(2, "b"), card("alpha"), None).expect("enqueue");
+    producer
+        .enqueue(row(1, "a"), card("alpha"), None)
+        .expect("enqueue");
+    producer
+        .enqueue(row(2, "b"), card("alpha"), None)
+        .expect("enqueue");
 
     wait_until(|| total_rows(&sink.received()) >= 2);
     assert_eq!(total_rows(&sink.received()), 2);
@@ -99,7 +110,9 @@ fn timer_trigger_flushes() {
     };
     let producer = Producer::new("ns.tbl".to_owned(), user_schema(), sink.clone(), config);
 
-    producer.enqueue(row(1, "a"), card("alpha"), None).expect("enqueue");
+    producer
+        .enqueue(row(1, "a"), card("alpha"), None)
+        .expect("enqueue");
 
     wait_until(|| total_rows(&sink.received()) >= 1);
     assert_eq!(total_rows(&sink.received()), 1);
@@ -108,11 +121,20 @@ fn timer_trigger_flushes() {
 #[test]
 fn fail_next_rebuffers_with_no_loss() {
     let sink = Arc::new(MockSink::new());
-    let producer = Producer::new("ns.tbl".to_owned(), user_schema(), sink.clone(), config_no_auto());
+    let producer = Producer::new(
+        "ns.tbl".to_owned(),
+        user_schema(),
+        sink.clone(),
+        config_no_auto(),
+    );
     sink.fail_next(1);
 
-    producer.enqueue(row(1, "a"), card("alpha"), None).expect("enqueue");
-    producer.enqueue(row(2, "b"), card("alpha"), None).expect("enqueue");
+    producer
+        .enqueue(row(1, "a"), card("alpha"), None)
+        .expect("enqueue");
+    producer
+        .enqueue(row(2, "b"), card("alpha"), None)
+        .expect("enqueue");
 
     // First flush hits the forced sink failure; rows are re-buffered, not lost.
     assert!(producer.flush().is_err(), "forced sink failure surfaces");
@@ -120,16 +142,27 @@ fn fail_next_rebuffers_with_no_loss() {
 
     // Second flush drains the re-buffered rows successfully.
     producer.flush().expect("second flush");
-    assert_eq!(total_rows(&sink.received()), 2, "no rows lost across re-buffer");
+    assert_eq!(
+        total_rows(&sink.received()),
+        2,
+        "no rows lost across re-buffer"
+    );
 }
 
 #[test]
 fn metrics_account_every_enqueue() {
     let sink = Arc::new(MockSink::new());
-    let producer = Producer::new("ns.tbl".to_owned(), user_schema(), sink.clone(), config_no_auto());
+    let producer = Producer::new(
+        "ns.tbl".to_owned(),
+        user_schema(),
+        sink.clone(),
+        config_no_auto(),
+    );
 
     for i in 0..5 {
-        producer.enqueue(row(i, "x"), card("alpha"), None).expect("enqueue");
+        producer
+            .enqueue(row(i, "x"), card("alpha"), None)
+            .expect("enqueue");
     }
     producer.flush().expect("flush");
 
@@ -142,13 +175,26 @@ fn metrics_account_every_enqueue() {
 #[test]
 fn mixed_card_and_run_flush_to_one_batch() {
     let sink = Arc::new(MockSink::new());
-    let producer = Producer::new("ns.tbl".to_owned(), user_schema(), sink.clone(), config_no_auto());
+    let producer = Producer::new(
+        "ns.tbl".to_owned(),
+        user_schema(),
+        sink.clone(),
+        config_no_auto(),
+    );
 
     producer
-        .enqueue(row(1, "a"), card("alpha"), Some(RunId::from_string("run-a".to_owned())))
+        .enqueue(
+            row(1, "a"),
+            card("alpha"),
+            Some(RunId::from_string("run-a".to_owned())),
+        )
         .expect("enqueue");
     producer
-        .enqueue(row(2, "b"), card("beta"), Some(RunId::from_string("run-b".to_owned())))
+        .enqueue(
+            row(2, "b"),
+            card("beta"),
+            Some(RunId::from_string("run-b".to_owned())),
+        )
         .expect("enqueue");
     producer
         .enqueue(row(3, "c"), card("gamma"), None)

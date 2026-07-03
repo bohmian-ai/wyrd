@@ -82,9 +82,11 @@ pub fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
         DataTypeSpec::Time32 { unit } => DataType::Time32(time_unit_to_arrow(*unit)),
         DataTypeSpec::Time64 { unit } => DataType::Time64(time_unit_to_arrow(*unit)),
         DataTypeSpec::Decimal128 { precision, scale } => DataType::Decimal128(*precision, *scale),
-        DataTypeSpec::List(inner) => {
-            DataType::List(Arc::new(Field::new("item", data_type_to_arrow(inner), true)))
-        }
+        DataTypeSpec::List(inner) => DataType::List(Arc::new(Field::new(
+            "item",
+            data_type_to_arrow(inner),
+            true,
+        ))),
         DataTypeSpec::Struct(fields) => {
             DataType::Struct(fields.iter().map(field_to_arrow).collect())
         }
@@ -129,7 +131,9 @@ pub fn data_type_from_arrow(dt: &DataType) -> Result<DataTypeSpec, WyrdError> {
             precision: *precision,
             scale: *scale,
         },
-        DataType::List(field) => DataTypeSpec::List(Box::new(data_type_from_arrow(field.data_type())?)),
+        DataType::List(field) => {
+            DataTypeSpec::List(Box::new(data_type_from_arrow(field.data_type())?))
+        }
         DataType::Struct(fields) => {
             let mut specs = Vec::with_capacity(fields.len());
             for field in fields {

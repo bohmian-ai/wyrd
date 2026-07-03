@@ -199,8 +199,8 @@ pub fn reject_reserved_field_names(user_fields: &[Field]) -> Result<(), BifrostE
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field};
-    use sqlx::types::chrono::Utc;
     use sqlx::types::Uuid;
+    use sqlx::types::chrono::Utc;
 
     fn sample_row() -> BifrostTableRow {
         BifrostTableRow {
@@ -266,7 +266,10 @@ mod tests {
 
         let card_ref = fields.iter().find(|f| f.name == "card_ref").unwrap();
         assert_eq!(
-            card_ref.metadata.get("wyrd:column_class").map(String::as_str),
+            card_ref
+                .metadata
+                .get("wyrd:column_class")
+                .map(String::as_str),
             Some("correlation")
         );
 

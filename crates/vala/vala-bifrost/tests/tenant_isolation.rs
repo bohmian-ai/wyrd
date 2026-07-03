@@ -184,7 +184,10 @@ async fn write_rows(catalog: &WyrdCatalog, tenant: DataTenantId, payloads: &[&st
         .await
         .unwrap();
     writer.write(batch).await.unwrap();
-    writer.flush(vala_bifrost::writer::BifrostWriteContext::system()).await.unwrap();
+    writer
+        .flush(vala_bifrost::writer::BifrostWriteContext::system())
+        .await
+        .unwrap();
 }
 
 async fn register_a(seeded: &Seeded, ctx: &SessionContext) {

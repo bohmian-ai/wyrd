@@ -198,11 +198,12 @@ pub fn validate_card_scope(
 ) -> Result<(), IngestError> {
     let scope = principal.card_scope();
     for batch in batches {
-        let column = batch.column_by_name(CARD_REF).ok_or_else(|| {
-            IngestError::CardScopeDenied {
-                card_ref: "<absent>".to_owned(),
-            }
-        })?;
+        let column =
+            batch
+                .column_by_name(CARD_REF)
+                .ok_or_else(|| IngestError::CardScopeDenied {
+                    card_ref: "<absent>".to_owned(),
+                })?;
         let cards = column
             .as_any()
             .downcast_ref::<StringArray>()

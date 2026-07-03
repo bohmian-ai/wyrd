@@ -147,7 +147,10 @@ impl CommitActor {
         let audit = if ctx.origin == AUDIT_RELAY_ORIGIN {
             None
         } else {
-            Some(ingest_audit_event(&ctx, &self.table.identifier().to_string()))
+            Some(ingest_audit_event(
+                &ctx,
+                &self.table.identifier().to_string(),
+            ))
         };
 
         let stamped: Vec<RecordBatch> = match batches

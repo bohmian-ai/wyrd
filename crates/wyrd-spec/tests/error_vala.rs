@@ -23,7 +23,11 @@ fn bifrost_error_delegates_code_and_status_into_wyrd_error() {
             "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
             413,
         ),
-        (BifrostError::QueryTimeout, "WYRD_VALA_504_QUERY_TIMEOUT", 504),
+        (
+            BifrostError::QueryTimeout,
+            "WYRD_VALA_504_QUERY_TIMEOUT",
+            504,
+        ),
     ];
 
     for (wire, code, status) in cases {
@@ -50,7 +54,10 @@ fn bifrost_error_lifts_into_problem_json_without_losing_code() {
 
     let problem = error.as_problem_json();
 
-    assert_eq!(problem["code"], "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH");
+    assert_eq!(
+        problem["code"],
+        "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH"
+    );
     assert_eq!(problem["status"], 409);
     assert_eq!(problem["title"], "Schema fingerprint mismatch");
     assert_eq!(

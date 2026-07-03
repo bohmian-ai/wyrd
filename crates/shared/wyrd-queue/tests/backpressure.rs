@@ -73,7 +73,10 @@ fn full_channel_returns_429_and_counts_the_drop() {
     assert!(rejected > 0, "a saturated channel must reject");
 
     let metrics = producer.metrics();
-    assert_eq!(metrics.dropped, rejected, "every rejection bumps the drop counter");
+    assert_eq!(
+        metrics.dropped, rejected,
+        "every rejection bumps the drop counter"
+    );
     assert_eq!(
         metrics.accepted + metrics.dropped,
         attempts as u64 + 1,

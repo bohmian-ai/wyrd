@@ -17,7 +17,6 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use wyrd_spec::error::WyrdError;
 
-use crate::auth::AuthenticatedPrincipal;
 use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -42,17 +41,30 @@ pub fn build_router(state: AppState) -> Router {
     );
     let auth_routes = crate::auth::routes::router().layer(GovernorLayer::new(auth_governor));
 
-    let v1_group = crate::routes::authz::routes::mount(
-        crate::query::routes::mount(
-            crate::bifrost::routes::mount(
-                crate::storage::routes::mount(Router::new(), &state),
-                &state,
-            ),
-            &state,
-        ),
-        &state,
-    )
-    .fallback(v1_not_found);
+    // Default-deny: authentication is a property of the whole /v1 nest, not any
+    // single handler. Attaching require_authenticated to v1_group *after* its
+    // .fallback means Router::layer wraps the fallback too, so unknown /v1 paths
+    // are rejected with 401 before v1_not_found runs (no route-existence oracle).
+    // attach_request_id remains outermost on `protected`, so the RequestId
+    // extension is already present when this layer runs.
+    //
+    // The /v1 nest composes every route group with a flat `.merge()` chain under
+    // the one default-deny layer: storage, eval, authz, admin (identity) plus
+    // query and bifrost (OLAP). Each group is a standalone `Router` built by its
+    // own `routes::router()`; only storage reads `&state` (to gate local-blob
+    // routes on the backend config).
+    let v1_group = Router::new()
+        .merge(crate::storage::routes::router(&state))
+        .merge(crate::eval::routes::router())
+        .merge(crate::bifrost::routes::router())
+        .merge(crate::query::routes::router())
+        .merge(crate::routes::authz::routes::router())
+        .merge(crate::auth::admin::router())
+        .fallback(v1_not_found)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::middleware::authenticate::require_authenticated,
+        ));
 
     // ServiceBuilder builds the inner error-handling middleware stack as a
     // single layer. Each layer in the builder wraps the one below it; the
@@ -90,22 +102,14 @@ pub fn build_router(state: AppState) -> Router {
             crate::middleware::request_id::attach_request_id,
         ));
 
-    // Vala eval transport surface. Carries its own state and preshared-key
-    // auth, mounted independently of the Wyrd auth/middleware stack.
-    let eval_routes = vala_http::eval_router(vala_http::eval::AppState::unconfigured());
-
     Router::new()
         .merge(unprotected)
         .merge(protected)
         .with_state(state)
-        .nest("/api/v1/eval", eval_routes)
         .layer(TraceLayer::new_for_http())
 }
 
-async fn v1_not_found(
-    _principal: AuthenticatedPrincipal,
-    request: Request,
-) -> Result<(), WyrdErrorResponse> {
+async fn v1_not_found(request: Request) -> Result<(), WyrdErrorResponse> {
     Err(WyrdError::NotFound {
         message: "Wyrd route not found".to_owned(),
         details: serde_json::json!({ "path": request.uri().path() }),

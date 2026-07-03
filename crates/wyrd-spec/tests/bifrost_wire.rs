@@ -2,10 +2,10 @@
 
 use schemars::schema_for;
 use wyrd_spec::vala::api::{
-    AsyncJobState, AsyncQueryResponse, AsyncQueryStatus, BifrostTableDescription, BifrostTableEntry,
-    DataTypeSpec, ExecutorAvailability, FieldSpec, JobUid, PartitionColumnSpec,
-    PartitionTransformWire, QueryParam, RegisterOutcome, RegisterTableRequest, RegisterTableResponse,
-    SyncQueryRequest, TableScopeWire, TableStatus, TimeUnit,
+    AsyncJobState, AsyncQueryResponse, AsyncQueryStatus, BifrostTableDescription,
+    BifrostTableEntry, DataTypeSpec, ExecutorAvailability, FieldSpec, JobUid, PartitionColumnSpec,
+    PartitionTransformWire, QueryParam, RegisterOutcome, RegisterTableRequest,
+    RegisterTableResponse, SyncQueryRequest, TableScopeWire, TableStatus, TimeUnit,
 };
 
 fn bifrost_wire_round_trip<T>(value: &T) -> T
@@ -30,7 +30,10 @@ fn bifrost_wire_field_spec_round_trips_and_defaults_nullable_true() {
 
     // nullable defaults to true when absent; empty metadata is omitted on the wire.
     let json = serde_json::to_value(&spec).expect("serialize");
-    assert!(json.get("metadata").is_none(), "empty metadata must be skipped");
+    assert!(
+        json.get("metadata").is_none(),
+        "empty metadata must be skipped"
+    );
 
     let minimal: FieldSpec =
         serde_json::from_str(r#"{"name":"x","data_type":"Utf8"}"#).expect("deserialize minimal");
@@ -62,10 +65,9 @@ fn bifrost_wire_table_scope_wire_defaults_to_tenant_owned() {
 
 #[test]
 fn bifrost_wire_register_request_defaults_partition_and_scope() {
-    let req: RegisterTableRequest = serde_json::from_str(
-        r#"{"namespace":"vala.bifrost","name":"events","fields":[]}"#,
-    )
-    .expect("deserialize");
+    let req: RegisterTableRequest =
+        serde_json::from_str(r#"{"namespace":"vala.bifrost","name":"events","fields":[]}"#)
+            .expect("deserialize");
     assert!(req.partition_columns.is_empty());
     assert_eq!(req.scope, TableScopeWire::TenantOwned);
 }

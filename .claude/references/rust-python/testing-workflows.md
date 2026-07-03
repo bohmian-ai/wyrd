@@ -54,7 +54,6 @@ mise run check:client-tier
 mise run check:pyo3-scope
 mise run check:mocks-scope
 mise run check:unwrap-audit
-mise run check:wasm
 ```
 
 ## Test Design

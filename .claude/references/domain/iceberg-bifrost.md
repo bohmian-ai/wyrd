@@ -162,8 +162,8 @@ cargo test -p vala-bifrost --all-features -- --test-threads=1
 - For Python-visible warehouse work, run `mise run py:setup` and
   `mise run py:test:unit`.
 - For foundation boundary changes, include `check:client-tier`,
-  `check:pyo3-scope`, `check:mocks-scope`, `check:unwrap-audit`, and
-  `check:wasm` when relevant.
+  `check:pyo3-scope`, `check:mocks-scope`, and `check:unwrap-audit` when
+  relevant.
 
 ## Reject These Patterns
 

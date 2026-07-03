@@ -807,11 +807,6 @@ description = "Assert generated theme CSS targets are in sync with palette.json 
 dir = "crates/wyrd/wyrd-server/wyrd-ui"
 run = "node brand/gen-theme.mjs --check"
 
-[tasks."check:wasm"]
-hide = true
-description = "Build wyrd-spec for wasm32"
-run = "cargo check --locked --target wasm32-unknown-unknown -p wyrd-spec --features wasm"
-
 [tasks."sqlx:prepare"]
 hide = true
 description = "Refresh committed sqlx offline query metadata"

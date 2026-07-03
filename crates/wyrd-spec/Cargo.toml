@@ -15,7 +15,6 @@ path = "src/lib.rs"
 default = []
 server = ["dep:utoipa", "wyrd-semver/server"]
 test-utils = []
-wasm = ["uuid/js"]
 
 [dependencies]
 base64 = { workspace = true }

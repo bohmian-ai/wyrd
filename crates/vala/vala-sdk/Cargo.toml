@@ -1,0 +1,34 @@
+[package]
+name = "vala-sdk"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "Vala client SDK: Bifrost ingest sink, pooled producers, and fire-and-forget observe surface."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+wyrd-queue = { workspace = true }
+wyrd-client = { workspace = true }
+wyrd-spec = { workspace = true }
+wyrd-runtime = { workspace = true }
+arrow-schema = { workspace = true }
+async-trait = { workspace = true }
+secrecy = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+wyrd-queue = { workspace = true }
+wyrd-runtime = { workspace = true }
+arrow-schema = { workspace = true }
+async-trait = { workspace = true }
+secrecy = { workspace = true }
+serde_json = { workspace = true }

@@ -9790,6 +9790,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "vala-sdk"
+version = "0.0.1"
+dependencies = [
+ "arrow-schema",
+ "async-trait",
+ "hex",
+ "secrecy",
+ "serde_json",
+ "sha2 0.10.9",
+ "tracing",
+ "wyrd-client",
+ "wyrd-queue",
+ "wyrd-runtime",
+ "wyrd-spec",
+]
+
+[[package]]
 name = "vala-sql"
 version = "0.0.1"
 dependencies = [

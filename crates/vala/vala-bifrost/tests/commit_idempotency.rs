@@ -4,10 +4,7 @@
 //! engine takes BEFORE writing any Parquet (`lookup_idempotent` → early return),
 //! plus the corruption guard for a `committed` row with a NULL `snapshot_id`.
 //!
-//! Uses a bare `#[sqlx::test]` + in-body `migrate_for_test` (the vala migrations
-//! depend on wyrd-sql prerequisites and cannot be applied via a `migrations=`
-//! arg). Run with a live Postgres: `DATABASE_URL=... cargo test -p vala-bifrost
-//! --all-features --test commit_idempotency`.
+//! Run with `mise run test:bifrost`.
 
 use std::sync::Arc;
 
@@ -40,12 +37,13 @@ struct Fixture {
     tenant: DataTenantId,
 }
 
-async fn setup(pool: PgPool) -> Fixture {
-    let pool = Arc::new(pool);
-    vala_sql::testing::migrate_for_test(&pool).await.unwrap();
+async fn setup() -> Fixture {
+    let db = vala_sql::testing::shared().await.expect("shared db");
+    vala_sql::testing::reset_for_test(db).await.expect("reset");
+    let pool = Arc::new(db.app.clone());
 
     let tenant = DataTenantId::new_v7();
-    vala_sql::testing::seed_tenant(&pool, tenant.as_uuid())
+    vala_sql::testing::seed_tenant(&db.platform_admin, tenant.as_uuid())
         .await
         .unwrap();
 
@@ -55,7 +53,7 @@ async fn setup(pool: PgPool) -> Fixture {
         root: tmp.path().to_path_buf(),
     };
     let (factory, props) = iceberg_storage_factory(&backend).unwrap();
-    let catalog_uri = vala_sql::testing::catalog_uri(&pool);
+    let catalog_uri = vala_sql::testing::catalog_uri(&db.migrator);
 
     let wyrd_catalog = WyrdCatalog::new(
         &catalog_uri,
@@ -107,9 +105,9 @@ async fn conn(fx: &Fixture) -> vala_sql::TenantConn<'_> {
         .unwrap()
 }
 
-#[sqlx::test]
-async fn idempotent_replay_committed_returns_prior_snapshot(pool: PgPool) {
-    let fx = setup(pool).await;
+#[tokio::test]
+async fn idempotent_replay_committed_returns_prior_snapshot() {
+    let fx = setup().await;
 
     let mut c = conn(&fx).await;
     vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID)
@@ -158,9 +156,9 @@ async fn idempotent_replay_committed_returns_prior_snapshot(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
-async fn committed_row_with_null_snapshot_is_metadata_mismatch(pool: PgPool) {
-    let fx = setup(pool).await;
+#[tokio::test]
+async fn committed_row_with_null_snapshot_is_metadata_mismatch() {
+    let fx = setup().await;
 
     let mut c = conn(&fx).await;
     vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID)
@@ -196,9 +194,9 @@ async fn committed_row_with_null_snapshot_is_metadata_mismatch(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
-async fn duplicate_failed_batch_returns_error(pool: PgPool) {
-    let fx = setup(pool).await;
+#[tokio::test]
+async fn duplicate_failed_batch_returns_error() {
+    let fx = setup().await;
 
     let mut c = conn(&fx).await;
     vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID)
@@ -247,9 +245,9 @@ async fn duplicate_failed_batch_returns_error(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
-async fn in_flight_precommit_returns_commit_conflict(pool: PgPool) {
-    let fx = setup(pool).await;
+#[tokio::test]
+async fn in_flight_precommit_returns_commit_conflict() {
+    let fx = setup().await;
 
     let mut c = conn(&fx).await;
     vala_sql::queries::olap_catalog::precommit(&mut c, fx.table_uid.as_bytes(), &BATCH_ID)

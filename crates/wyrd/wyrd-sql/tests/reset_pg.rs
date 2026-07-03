@@ -6,41 +6,17 @@
 //! wyrd-sql without `--all-features` — never sees the `wyrd_sql::testing` symbol.
 #![cfg(feature = "testing")]
 
-use secrecy::ExposeSecret;
-use sqlx::{Connection, PgConnection};
 use wyrd_sql::OWNED_SCHEMAS;
-use wyrd_sql::postgres_boot::PostgresBoot;
-use wyrd_sql::testing::reset_owned_schemas;
-
-/// Connect as the migrator superuser via the `PostgresBoot` External branch.
-///
-/// Returns `None` when the env DSNs are absent so the suite skips instead of
-/// falling back to the all-unset embedded cluster (binding decision D2).
-async fn superuser_conn() -> Option<PgConnection> {
-    if std::env::var("WYRD_DATABASE_URL").is_err()
-        || std::env::var("WYRD_DATABASE_MIGRATOR_PASSWORD").is_err()
-    {
-        return None;
-    }
-
-    let boot = PostgresBoot::from_env()
-        .await
-        .expect("external Postgres boot resolves from env DSNs");
-    let dsns = boot.dsns().expect("external DSNs resolve");
-    let conn = PgConnection::connect(dsns.migrator.expose_secret())
-        .await
-        .expect("connects to wyrd_test as the migrator superuser");
-    Some(conn)
-}
+use wyrd_sql::testing;
 
 #[tokio::test]
 async fn reset_empties_owned_tables_and_restarts_identity() {
-    let Some(mut conn) = superuser_conn().await else {
-        return;
-    };
+    let db = testing::shared().await.expect("shared test DB");
+    db.reset().await.expect("shared DB reset");
+    let mut conn = db.migrator.acquire().await.expect("migrator connection");
 
     sqlx::query("DROP TABLE IF EXISTS wyrd.reset_selftest")
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await
         .expect("drops any leftover scratch table");
     sqlx::query(
@@ -49,24 +25,24 @@ async fn reset_empties_owned_tables_and_restarts_identity() {
              label text NOT NULL
          )",
     )
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await
     .expect("creates scratch table in an owned schema");
 
     for label in ["a", "b", "c"] {
         sqlx::query("INSERT INTO wyrd.reset_selftest (label) VALUES ($1)")
             .bind(label)
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .await
             .expect("seeds scratch row");
     }
 
-    reset_owned_schemas(&mut conn, OWNED_SCHEMAS)
+    testing::reset_owned_schemas(&mut *conn, OWNED_SCHEMAS)
         .await
         .expect("reset succeeds");
 
     let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.reset_selftest")
-        .fetch_one(&mut conn)
+        .fetch_one(&mut *conn)
         .await
         .expect("counts scratch rows after reset");
     assert_eq!(
@@ -77,7 +53,7 @@ async fn reset_empties_owned_tables_and_restarts_identity() {
     let next_id: i64 = sqlx::query_scalar(
         "INSERT INTO wyrd.reset_selftest (label) VALUES ('post-reset') RETURNING id",
     )
-    .fetch_one(&mut conn)
+    .fetch_one(&mut *conn)
     .await
     .expect("inserts a row after reset");
     assert_eq!(
@@ -86,19 +62,19 @@ async fn reset_empties_owned_tables_and_restarts_identity() {
     );
 
     sqlx::query("DROP TABLE wyrd.reset_selftest")
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await
         .expect("drops scratch table");
 }
 
 #[tokio::test]
 async fn reset_preserves_sqlx_migrations_ledger() {
-    let Some(mut conn) = superuser_conn().await else {
-        return;
-    };
+    let db = testing::shared().await.expect("shared test DB");
+    db.reset().await.expect("shared DB reset");
+    let mut conn = db.migrator.acquire().await.expect("migrator connection");
 
     let before: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd._sqlx_migrations")
-        .fetch_one(&mut conn)
+        .fetch_one(&mut *conn)
         .await
         .expect("counts the migration ledger before reset");
     assert!(
@@ -106,12 +82,12 @@ async fn reset_preserves_sqlx_migrations_ledger() {
         "the migration ledger must be populated before the reset runs"
     );
 
-    reset_owned_schemas(&mut conn, OWNED_SCHEMAS)
+    testing::reset_owned_schemas(&mut *conn, OWNED_SCHEMAS)
         .await
         .expect("reset succeeds");
 
     let after: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd._sqlx_migrations")
-        .fetch_one(&mut conn)
+        .fetch_one(&mut *conn)
         .await
         .expect("counts the migration ledger after reset");
     assert_eq!(

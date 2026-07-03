@@ -7,10 +7,8 @@
 //!     it injects only on `WyrdTableProvider` scans and leaves foreign providers
 //!     (`MemTable` / CTAS targets) untouched.
 //!
-//! The pure unit tests below need no database. The value-level tests use a bare
-//! `#[sqlx::test]` + in-body `migrate_for_test` (the vala migrations are not
-//! self-contained — no `migrations=` arg). Run with a live Postgres:
-//! `DATABASE_URL=... cargo test -p vala-bifrost --all-features --test tenant_isolation`.
+//! The pure unit tests below need no database. Run value-level tests with
+//! `mise run test:bifrost`.
 
 use std::sync::Arc;
 
@@ -21,7 +19,6 @@ use datafusion::config::ConfigOptions;
 use datafusion::datasource::MemTable;
 use datafusion::optimizer::analyzer::AnalyzerRule;
 use datafusion::prelude::SessionContext;
-use sqlx::PgPool;
 use tempfile::TempDir;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost::catalog::namespaces::BifrostNamespace;
@@ -128,9 +125,10 @@ struct Seeded {
 /// Build a `SystemShared` table and seed two tenants' rows into it via two
 /// server-bound, single-tenant writes. The append batch carries USER FIELDS ONLY
 /// (`payload`); the server stamps `data_tenant_id` from each write's bound tenant.
-async fn seeded(pool: PgPool) -> Seeded {
-    let pool = Arc::new(pool);
-    vala_sql::testing::migrate_for_test(&pool).await.unwrap();
+async fn seeded() -> Seeded {
+    let db = vala_sql::testing::shared().await.expect("shared db");
+    vala_sql::testing::reset_for_test(db).await.expect("reset");
+    let pool = Arc::new(db.app.clone());
 
     let tmp = tempfile::tempdir().unwrap();
     let warehouse = format!("file://{}", tmp.path().display());
@@ -138,7 +136,7 @@ async fn seeded(pool: PgPool) -> Seeded {
         root: tmp.path().to_path_buf(),
     };
     let (factory, props) = iceberg_storage_factory(&backend).unwrap();
-    let catalog_uri = vala_sql::testing::catalog_uri(&pool);
+    let catalog_uri = vala_sql::testing::catalog_uri(&db.migrator);
     let catalog = WyrdCatalog::new(&catalog_uri, &warehouse, pool.clone(), None, factory, props)
         .await
         .unwrap();
@@ -244,9 +242,9 @@ async fn assert_shapes_isolate(ctx: &SessionContext) {
 }
 
 /// Full shape set with the analyzer registered (both layers active).
-#[sqlx::test]
-async fn value_level_isolation_with_analyzer(pool: PgPool) {
-    let s = seeded(pool).await;
+#[tokio::test]
+async fn value_level_isolation_with_analyzer() {
+    let s = seeded().await;
     let ctx = wyrd_session_context(s.a);
     register_a(&s, &ctx).await;
     assert_shapes_isolate(&ctx).await;
@@ -256,9 +254,9 @@ async fn value_level_isolation_with_analyzer(pool: PgPool) {
 /// a plain `SessionContext::new()` with NO `TenantPredicateRule` registered. They
 /// hold iff the provider physical `FilterExec` — not the analyzer — is the
 /// authoritative boundary for every shape, including the inner-relation projection.
-#[sqlx::test]
-async fn value_level_isolation_provider_only_no_analyzer(pool: PgPool) {
-    let s = seeded(pool).await;
+#[tokio::test]
+async fn value_level_isolation_provider_only_no_analyzer() {
+    let s = seeded().await;
     let ctx = SessionContext::new();
     register_a(&s, &ctx).await;
     assert_shapes_isolate(&ctx).await;
@@ -268,9 +266,9 @@ async fn value_level_isolation_provider_only_no_analyzer(pool: PgPool) {
 /// `data_tenant_id = <a>` filter on a REAL `WyrdTableProvider` scan — guarding
 /// against the two-hop downcast silently regressing to always-`None`, which every
 /// value-level test would survive (the provider `FilterExec` would still isolate).
-#[sqlx::test]
-async fn analyzer_injects_on_real_wyrd_provider(pool: PgPool) {
-    let s = seeded(pool).await;
+#[tokio::test]
+async fn analyzer_injects_on_real_wyrd_provider() {
+    let s = seeded().await;
     let ctx = SessionContext::new();
     register_a(&s, &ctx).await;
 
@@ -295,9 +293,9 @@ async fn analyzer_injects_on_real_wyrd_provider(pool: PgPool) {
 }
 
 /// A view defined over the shared table must isolate the same way.
-#[sqlx::test]
-async fn value_level_isolation_through_view(pool: PgPool) {
-    let s = seeded(pool).await;
+#[tokio::test]
+async fn value_level_isolation_through_view() {
+    let s = seeded().await;
     let ctx = wyrd_session_context(s.a);
     register_a(&s, &ctx).await;
 
@@ -315,9 +313,9 @@ async fn value_level_isolation_through_view(pool: PgPool) {
 /// CTAS exfiltration shape: the materialized target must contain only A's rows.
 /// The source scan (`shared`, a `WyrdTableProvider`) is filtered to A; the analyzer
 /// must NOT inject onto the CTAS `MemTable` target (it has no `data_tenant_id` column).
-#[sqlx::test]
-async fn value_level_isolation_through_ctas(pool: PgPool) {
-    let s = seeded(pool).await;
+#[tokio::test]
+async fn value_level_isolation_through_ctas() {
+    let s = seeded().await;
     let ctx = wyrd_session_context(s.a);
     register_a(&s, &ctx).await;
 

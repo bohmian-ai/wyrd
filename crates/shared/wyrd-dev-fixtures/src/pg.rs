@@ -1,48 +1,30 @@
-//! Embedded Postgres fixtures for SQL integration tests.
+//! Shared Postgres fixtures for SQL integration tests.
 
-use std::path::Path;
-
-use secrecy::ExposeSecret;
 use sqlx::PgPool;
-use tempfile::TempDir;
 use wyrd_spec::DataTenantId;
-use wyrd_sql::postgres_boot::{BootError, EmbeddedConfig, PostgresBoot};
-use wyrd_sql::{PoolConfig, SqlError, TenantConn};
+use wyrd_sql::{SqlError, TenantConn};
 
-/// Per-test embedded Postgres fixture with Wyrd and Vala migrations applied.
+/// Per-test Postgres fixture backed by the shared docker `wyrd_test` database.
 pub struct PgFixture {
     app_pool: PgPool,
     platform_admin_pool: PgPool,
-    boot: PostgresBoot,
     data_tenant_id: DataTenantId,
     tenant_slug: String,
-    tempdir: TempDir,
 }
 
-/// Errors returned while starting an embedded Postgres fixture.
+/// Errors returned while starting a shared Postgres fixture.
 #[derive(Debug, thiserror::Error)]
 pub enum FixtureError {
-    /// Temporary data directory creation failed.
-    #[error("tempdir create failed: {0}")]
-    TempDir(#[from] std::io::Error),
-    /// Embedded Postgres boot failed.
-    #[error("postgres boot failed: {0}")]
-    Boot(#[from] BootError),
-    /// Embedded boot did not return a platform-admin DSN.
-    #[error("embedded Postgres boot did not return a platform-admin DSN")]
-    MissingPlatformAdminDsn,
     /// SQL layer failed.
     #[error("sql layer failed: {0}")]
     Sql(#[from] SqlError),
 }
 
 impl PgFixture {
-    /// Start embedded Postgres, run Wyrd and Vala migrations, and seed one
-    /// deterministic test tenant row.
+    /// Reset the shared test database and seed one deterministic test tenant row.
     ///
     /// # Errors
-    /// Returns [`FixtureError`] when tempdir creation, embedded Postgres boot,
-    /// pool construction, migration, or seed insert fails.
+    /// Returns [`FixtureError`] when shared DB setup, reset, or seed insert fails.
     pub async fn start() -> Result<Self, FixtureError> {
         let data_tenant_id = DataTenantId::new_v7();
         let tenant_slug = "test-tenant-1".to_owned();
@@ -123,71 +105,19 @@ impl PgFixture {
         &self.tenant_slug
     }
 
-    /// Return the embedded Postgres port.
-    #[must_use]
-    pub fn port(&self) -> Option<u16> {
-        match &self.boot {
-            PostgresBoot::Embedded(handle) => Some(handle.port()),
-            PostgresBoot::External { .. } => None,
-        }
-    }
-
-    /// Return the root temporary directory that owns this fixture's data.
-    #[must_use]
-    pub fn tempdir_path(&self) -> &Path {
-        self.tempdir.path()
-    }
-
     async fn start_seeded(
         data_tenant_id: DataTenantId,
         tenant_slug: String,
     ) -> Result<Self, FixtureError> {
-        let tempdir = tempfile::tempdir()?;
-        let boot = PostgresBoot::embedded(EmbeddedConfig {
-            data_dir: tempdir.path().join("pg"),
-            port: 0,
-            ..EmbeddedConfig::default()
-        })
-        .await?;
-        let dsns = boot.dsns()?;
-
-        let migrator_pool = wyrd_sql::pool::build_pool(
-            dsns.migrator.expose_secret(),
-            PoolConfig::migrator_defaults(),
-        )
-        .await
-        .map_err(SqlError::Connect)?;
-        let migrate_result = async {
-            wyrd_sql::migrate(&migrator_pool).await?;
-            vala_sql::migrate(&migrator_pool).await
-        }
-        .await;
-        migrator_pool.close().await;
-        migrate_result?;
-
-        let app_pool =
-            wyrd_sql::pool::build_pool(dsns.app.expose_secret(), PoolConfig::app_defaults())
-                .await
-                .map_err(SqlError::Connect)?;
-        let platform_admin_dsn = dsns
-            .platform_admin
-            .ok_or(FixtureError::MissingPlatformAdminDsn)?;
-        let platform_admin_pool = wyrd_sql::pool::build_pool(
-            platform_admin_dsn.expose_secret(),
-            PoolConfig::platform_admin_defaults(),
-        )
-        .await
-        .map_err(SqlError::Connect)?;
-
-        seed_tenant(&platform_admin_pool, data_tenant_id, &tenant_slug).await?;
+        let db = vala_sql::testing::shared().await?;
+        vala_sql::testing::reset_for_test(db).await?;
+        seed_tenant(&db.platform_admin, data_tenant_id, &tenant_slug).await?;
 
         Ok(Self {
-            app_pool,
-            platform_admin_pool,
-            boot,
+            app_pool: db.app.clone(),
+            platform_admin_pool: db.platform_admin.clone(),
             data_tenant_id,
             tenant_slug,
-            tempdir,
         })
     }
 }
@@ -213,9 +143,6 @@ async fn seed_tenant(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::path::PathBuf;
-
     use super::PgFixture;
     use wyrd_spec::DataTenantId;
     use wyrd_sql::tenant_conn::CURRENT_TENANT_GUC;
@@ -240,58 +167,6 @@ mod tests {
 
         assert_eq!(fixture.tenant_slug(), "custom-tenant");
         assert_seeded_tenant(&fixture, "custom-tenant").await;
-    }
-
-    #[tokio::test]
-    async fn ten_concurrent_fixtures_are_isolated() {
-        let fixtures = futures_for_concurrent_start().await;
-
-        let ports = fixtures
-            .iter()
-            .map(|fixture| fixture.port().expect("embedded port is available"))
-            .collect::<HashSet<_>>();
-        let tenant_ids = fixtures
-            .iter()
-            .map(PgFixture::data_tenant_id)
-            .collect::<HashSet<_>>();
-        let tempdirs = fixtures
-            .iter()
-            .map(|fixture| fixture.tempdir_path().to_path_buf())
-            .collect::<HashSet<_>>();
-
-        assert_eq!(ports.len(), fixtures.len());
-        assert_eq!(tenant_ids.len(), fixtures.len());
-        assert_eq!(tempdirs.len(), fixtures.len());
-    }
-
-    #[tokio::test]
-    async fn data_dir_is_removed_after_drop() {
-        let tempdir_path = {
-            let fixture = PgFixture::start().await.expect("fixture starts");
-            fixture.tempdir_path().to_path_buf()
-        };
-
-        assert_path_removed(tempdir_path);
-    }
-
-    async fn futures_for_concurrent_start() -> Vec<PgFixture> {
-        let (a, b, c, d, e, f, g, h, i, j) = tokio::join!(
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-        );
-
-        [a, b, c, d, e, f, g, h, i, j]
-            .into_iter()
-            .map(|result| result.expect("concurrent fixture starts"))
-            .collect()
     }
 
     async fn assert_required_schemas(fixture: &PgFixture) {
@@ -378,13 +253,6 @@ mod tests {
             msg.contains("invalid input syntax for type uuid")
                 || msg.contains("unrecognized configuration parameter"),
             "expected loud RLS failure, got: {err}"
-        );
-    }
-
-    fn assert_path_removed(path: PathBuf) {
-        assert!(
-            !path.exists(),
-            "fixture temporary data directory should be removed after drop: {path:?}"
         );
     }
 }

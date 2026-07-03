@@ -68,24 +68,19 @@ cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server --exclud
 cargo test --locked -p wyrd-client
 cargo test --locked -p vala-core
 cargo test --locked -p vala-sql --lib
-cargo test --locked -p wyrd-server --all-features
 """
 
 [tasks."test:bifrost"]
-description = """Run vala-bifrost and vala-sql #[sqlx::test] integration tests against docker-compose Postgres.
-These provision ephemeral per-test databases; migrate_for_test bootstraps the roles and
-schemas inside each one, so the suite needs only a CREATEDB-capable DATABASE_URL (the
-docker-compose bootstrap superuser wyrd_migrator) and nothing pre-provisioned. Excluded
-from test:rust:workspace because that gate is DB-free.
+description = """Run vala-bifrost and vala-sql integration tests against the shared wyrd_test Postgres DB.
+Runs serially because each test resets shared database state at test start.
 """
-depends = ["build:postgres"]
-env = { DATABASE_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost:5432/wyrd" }
+depends = ["build:postgres", "db:migrate:all", "test:pg"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd_test", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 # Default features only: --all-features would enable `python`, which links
-# libpython at runtime and aborts outside the py env. The Stage 1 DB tests need
-# neither `python` nor `bench-bin`; iceberg/datafusion are hard deps.
+# libpython at runtime and aborts outside the py env.
 run = """
-cargo test --locked -p vala-bifrost
-cargo test --locked -p vala-sql --all-features
+cargo test --locked -p vala-bifrost -- --test-threads=1
+cargo test --locked -p vala-sql --all-features -- --test-threads=1
 """
 
 [tasks."test:unit"]
@@ -115,11 +110,10 @@ run = "cargo test -p wyrd-error-derive --all-features"
 
 [tasks."test:wyrd-server"]
 hide = true
-description = """Run wyrd-server Rust tests (lib + DB-free integration tests). The DB- and
-emulator-backed server suites (identity_e2e, storage_e2e) are env-gated and skip when their
-WYRD_* flags are unset, so this task needs no docker; the full DB e2e runs via
-test:storage:e2e / identity:e2e. Narrow gate for iterating on server code."""
-run = "cargo test -p wyrd-server --all-features"
+description = """Run wyrd-server Rust tests against the shared wyrd_test Postgres DB."""
+depends = ["test:pg"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd_test", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+run = "cargo test --locked -p wyrd-server --all-features -- --test-threads=1"
 
 [tasks."test:wyrd-mcp"]
 hide = true
@@ -1320,6 +1314,7 @@ psql "$WYRD_ADMIN_DSN" -c "CREATE ROLE wyrd_catalog NOLOGIN;" || true
 psql "$WYRD_ADMIN_DSN" -tc "SELECT 1 FROM pg_database WHERE datname = 'wyrd_test'" | grep -q 1 \
   || psql "$WYRD_ADMIN_DSN" -c "CREATE DATABASE wyrd_test OWNER wyrd_migrator;"
 cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture
+cargo test --locked -p vala-sql --all-features --test migration_pg -- vala_migrations_apply_and_are_idempotent --nocapture
 """
 
 [tasks."test:pg"]
@@ -1332,7 +1327,13 @@ primitive never migrates, drops, or re-runs (binding decision D4).
 """
 depends = ["build:postgres", "db:migrate:all"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd_test", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
-run = "cargo test --locked -p wyrd-sql --all-features --test reset_pg -- --test-threads=1 --nocapture"
+run = """
+cargo test --locked -p wyrd-sql --all-features --test reset_pg -- --test-threads=1 --nocapture
+cargo test --locked -p wyrd-dev-fixtures --all-features -- --test-threads=1
+cargo test --locked -p wyrd-storage --all-features -- --test-threads=1
+cargo test --locked -p wyrd-testing --all-features -- --test-threads=1
+cargo test --locked -p wyrd-server --all-features -- --test-threads=1
+"""
 
 [tasks."check:security-schema-drift"]
 hide = true

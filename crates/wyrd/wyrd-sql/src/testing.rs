@@ -5,9 +5,82 @@
 //! migrations. Call this before vala-sql or any crate that depends on the
 //! platform and wyrd schemas being in place.
 
-use sqlx::{AssertSqlSafe, PgConnection};
+use secrecy::ExposeSecret;
+use sqlx::{AssertSqlSafe, PgConnection, PgPool};
+use tokio::sync::OnceCell;
 
 use crate::error::SqlError;
+use crate::pool::{PoolConfig, build_pool};
+
+/// Shared pool set for live-Postgres tests against the docker `wyrd_test` DB.
+pub struct SharedDb {
+    /// Superuser migrator pool. Use for migration and reset only.
+    pub migrator: PgPool,
+    /// RLS-enforced app pool. Test bodies use this pool.
+    pub app: PgPool,
+    /// BYPASSRLS platform-admin pool. Use for tenant seeding.
+    pub platform_admin: PgPool,
+}
+
+static SHARED: OnceCell<SharedDb> = OnceCell::const_new();
+
+/// Connect to the shared docker `wyrd_test` DB and cache its role pools.
+///
+/// # Errors
+/// Returns [`SqlError`] when the shared test DB env is missing or invalid,
+/// migrations fail, or any role pool cannot be built.
+pub async fn shared() -> Result<&'static SharedDb, SqlError> {
+    SHARED
+        .get_or_try_init(|| async {
+            let resolved = crate::dsn::resolve_external_dsns_from_env().map_err(|error| {
+                SqlError::InvariantViolation {
+                    detail: format!("test DB DSN config error: {error}"),
+                }
+            })?;
+            let Some(dsns) = resolved else {
+                return Err(SqlError::InvariantViolation {
+                    detail: "shared test DB env unset (WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD); refusing to boot embedded in tests".to_owned(),
+                });
+            };
+
+            let migrator = build_pool(dsns.migrator.expose_secret(), PoolConfig::migrator_defaults())
+                .await
+                .map_err(SqlError::Connect)?;
+            crate::migrate(&migrator).await?;
+            let app = build_pool(dsns.app.expose_secret(), PoolConfig::app_defaults())
+                .await
+                .map_err(SqlError::Connect)?;
+            let platform_admin_dsn =
+                dsns.platform_admin
+                    .ok_or_else(|| SqlError::InvariantViolation {
+                        detail: "shared test DB env unset (WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD); platform-admin pool is required for tenant seeding".to_owned(),
+                    })?;
+            let platform_admin = build_pool(
+                platform_admin_dsn.expose_secret(),
+                PoolConfig::platform_admin_defaults(),
+            )
+            .await
+            .map_err(SqlError::Connect)?;
+
+            Ok(SharedDb {
+                migrator,
+                app,
+                platform_admin,
+            })
+        })
+        .await
+}
+
+impl SharedDb {
+    /// Clean-slate reset of Wyrd-owned schemas. Call at the start of each test.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the reset connection or truncate fails.
+    pub async fn reset(&self) -> Result<(), SqlError> {
+        let mut conn = self.migrator.acquire().await.map_err(SqlError::Connect)?;
+        reset_owned_schemas(&mut conn, crate::OWNED_SCHEMAS).await
+    }
+}
 
 const TEST_ROLE_BOOTSTRAP_SQL: &str = r#"
 DO $$

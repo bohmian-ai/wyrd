@@ -11,21 +11,17 @@ authors = { workspace = true }
 default = []
 dev = []
 pg = [
-    "dep:secrecy",
     "dep:sqlx",
-    "dep:tempfile",
     "dep:thiserror",
     "dep:tokio",
     "dep:vala-sql",
+    "vala-sql/testing",
     "dep:wyrd-sql",
     "dep:wyrd-spec",
-    "wyrd-sql/embedded-postgres",
 ]
 
 [dependencies]
-secrecy = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
-tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["macros", "rt-multi-thread"] }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1", optional = true }

@@ -6,9 +6,55 @@
 //! migrations depend on `platform.tenants` and `wyrd.current_tenant()` from
 //! wyrd-sql — never re-transcribed here.
 
-use sqlx::{AssertSqlSafe, PgPool};
+use sqlx::{AssertSqlSafe, PgConnection, PgPool};
+use tokio::sync::OnceCell;
 
 use crate::SqlError;
+
+static VALA_MIGRATED: OnceCell<()> = OnceCell::const_new();
+
+/// Shared pool set with Wyrd and Vala migrations guaranteed applied once.
+///
+/// # Errors
+/// Returns [`SqlError`] when the shared Wyrd DB cannot be prepared or Vala
+/// migrations fail.
+pub async fn shared() -> Result<&'static wyrd_sql::testing::SharedDb, SqlError> {
+    let db = wyrd_sql::testing::shared().await?;
+    VALA_MIGRATED
+        .get_or_try_init(|| async {
+            crate::migrate(&db.migrator).await?;
+            Ok::<(), SqlError>(())
+        })
+        .await?;
+    Ok(db)
+}
+
+/// Reset Wyrd and Vala owned schemas, then restore migration-seeded sentinel data.
+///
+/// # Errors
+/// Returns [`SqlError`] when reset or sentinel restore fails.
+pub async fn reset_for_test(db: &wyrd_sql::testing::SharedDb) -> Result<(), SqlError> {
+    let schemas: Vec<&str> = wyrd_sql::OWNED_SCHEMAS
+        .iter()
+        .chain(crate::OWNED_SCHEMAS.iter())
+        .copied()
+        .collect();
+    let mut conn = db.migrator.acquire().await.map_err(SqlError::Connect)?;
+    wyrd_sql::testing::reset_owned_schemas(&mut conn, &schemas).await?;
+    seed_system_owner(&mut conn).await
+}
+
+async fn seed_system_owner(conn: &mut PgConnection) -> Result<(), SqlError> {
+    sqlx::query(
+        "INSERT INTO platform.tenants (data_tenant_id, slug, display_name, status)
+         VALUES ('00000000-0000-0000-0000-000000000000', 'wyrd-system-owner', 'Wyrd System Owner', 'active')
+         ON CONFLICT (data_tenant_id) DO NOTHING",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(SqlError::from)?;
+    Ok(())
+}
 
 /// Apply wyrd-sql prerequisites then vala-sql migrations against a test pool.
 ///

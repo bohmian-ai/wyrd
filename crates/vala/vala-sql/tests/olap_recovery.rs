@@ -3,25 +3,28 @@
 //! Covers the widened state FSM, the recovery audit table, and the
 //! SECURITY DEFINER claim/finalize routines added by the olap_recovery
 //! migration. Run against a live Postgres:
-//!   DATABASE_URL=... cargo test -p vala-sql --all-features --test olap_recovery
+//!   mise run test:bifrost
 
-use sqlx::PgPool;
 use sqlx::types::Uuid;
 use wyrd_spec::DataTenantId;
+use wyrd_sql::testing::SharedDb;
 
 const TABLE_UID: [u8; 16] = [0x10; 16];
 const BATCH_ID: [u8; 16] = [0x20; 16];
 const BATCH_ID_2: [u8; 16] = [0x21; 16];
 
-async fn setup(pool: &PgPool) -> DataTenantId {
-    vala_sql::testing::migrate_for_test(pool).await.unwrap();
+async fn setup() -> (&'static SharedDb, DataTenantId) {
+    let db = vala_sql::testing::shared().await.expect("shared db");
+    vala_sql::testing::reset_for_test(db).await.expect("reset");
     let tenant = DataTenantId::new_v7();
-    vala_sql::testing::seed_tenant(pool, tenant.as_uuid())
+    vala_sql::testing::seed_tenant(&db.platform_admin, tenant.as_uuid())
         .await
         .unwrap();
 
     let fingerprint = [0u8; 32];
-    let mut conn = vala_sql::TenantConn::acquire(pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     vala_sql::queries::olap_catalog::upsert_table(
         &mut conn,
         &TABLE_UID,
@@ -34,14 +37,16 @@ async fn setup(pool: &PgPool) -> DataTenantId {
     .unwrap();
     conn.commit().await.unwrap();
 
-    tenant
+    (db, tenant)
 }
 
-#[sqlx::test(migrations = false)]
-async fn aborted_state_accepted(pool: PgPool) {
-    let tenant = setup(&pool).await;
+#[tokio::test]
+async fn aborted_state_accepted() {
+    let (db, tenant) = setup().await;
 
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     vala_sql::queries::olap_catalog::precommit(&mut conn, &TABLE_UID, &BATCH_ID)
         .await
         .unwrap();
@@ -50,7 +55,9 @@ async fn aborted_state_accepted(pool: PgPool) {
         .unwrap();
     conn.commit().await.unwrap();
 
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     let row = vala_sql::queries::olap_catalog::lookup_idempotent(&mut conn, &TABLE_UID, &BATCH_ID)
         .await
         .unwrap()
@@ -60,21 +67,25 @@ async fn aborted_state_accepted(pool: PgPool) {
     assert_eq!(row.state, "aborted");
 }
 
-#[sqlx::test(migrations = false)]
-async fn audit_row_roundtrips_with_byte_ids(pool: PgPool) {
-    let tenant = setup(&pool).await;
+#[tokio::test]
+async fn audit_row_roundtrips_with_byte_ids() {
+    let (db, tenant) = setup().await;
 
     let owner = Uuid::from_bytes([0x01u8; 16]);
     let token: i64 = 999;
     let snapshot_id: i64 = 12345;
 
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     vala_sql::queries::olap_catalog::precommit(&mut conn, &TABLE_UID, &BATCH_ID)
         .await
         .unwrap();
     conn.commit().await.unwrap();
 
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     vala_sql::queries::olap_catalog::record_fence_loss_after_append(
         &mut conn,
         &TABLE_UID,
@@ -96,21 +107,23 @@ async fn audit_row_roundtrips_with_byte_ids(pool: PgPool) {
     )
     .bind(TABLE_UID.as_slice())
     .bind(BATCH_ID.as_slice())
-    .fetch_one(&pool)
+    .fetch_one(&db.migrator)
     .await
     .unwrap();
 
     assert_eq!(count, 1, "audit row must be inserted");
 }
 
-#[sqlx::test(migrations = false)]
-async fn claim_skips_live_lease(pool: PgPool) {
-    let tenant = setup(&pool).await;
+#[tokio::test]
+async fn claim_skips_live_lease() {
+    let (db, tenant) = setup().await;
 
     let owner = Uuid::from_bytes([0x02u8; 16]);
     let token: i64 = 1;
 
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     vala_sql::queries::olap_catalog::precommit(&mut conn, &TABLE_UID, &BATCH_ID)
         .await
         .unwrap();
@@ -122,7 +135,9 @@ async fn claim_skips_live_lease(pool: PgPool) {
     conn.commit().await.unwrap();
 
     let recovery_owner = Uuid::from_bytes([0x03u8; 16]);
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     let claimed =
         vala_sql::queries::olap_catalog::claim_stale_precommits(&mut conn, recovery_owner, 10)
             .await
@@ -135,11 +150,13 @@ async fn claim_skips_live_lease(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = false)]
-async fn claim_takes_expired_lease(pool: PgPool) {
-    let tenant = setup(&pool).await;
+#[tokio::test]
+async fn claim_takes_expired_lease() {
+    let (db, tenant) = setup().await;
 
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     vala_sql::queries::olap_catalog::precommit(&mut conn, &TABLE_UID, &BATCH_ID)
         .await
         .unwrap();
@@ -155,12 +172,14 @@ async fn claim_takes_expired_lease(pool: PgPool) {
     .bind(TABLE_UID.as_slice())
     .bind(BATCH_ID.as_slice())
     .bind(Uuid::from_bytes([0x04u8; 16]))
-    .execute(&pool)
+    .execute(&db.migrator)
     .await
     .unwrap();
 
     let recovery_owner = Uuid::from_bytes([0x05u8; 16]);
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     let claimed =
         vala_sql::queries::olap_catalog::claim_stale_precommits(&mut conn, recovery_owner, 10)
             .await
@@ -176,14 +195,16 @@ async fn claim_takes_expired_lease(pool: PgPool) {
     assert_ne!(claimed[0].fencing_token, 0);
 }
 
-#[sqlx::test(migrations = false)]
-async fn renew_fence_returns_false_after_claim(pool: PgPool) {
-    let tenant = setup(&pool).await;
+#[tokio::test]
+async fn renew_fence_returns_false_after_claim() {
+    let (db, tenant) = setup().await;
 
     let writer_owner = Uuid::from_bytes([0x06u8; 16]);
     let writer_token: i64 = 42;
 
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     vala_sql::queries::olap_catalog::precommit(&mut conn, &TABLE_UID, &BATCH_ID_2)
         .await
         .unwrap();
@@ -200,12 +221,14 @@ async fn renew_fence_returns_false_after_claim(pool: PgPool) {
     .bind(BATCH_ID_2.as_slice())
     .bind(writer_owner)
     .bind(writer_token)
-    .execute(&pool)
+    .execute(&db.migrator)
     .await
     .unwrap();
 
     let recovery_owner = Uuid::from_bytes([0x07u8; 16]);
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     let claimed =
         vala_sql::queries::olap_catalog::claim_stale_precommits(&mut conn, recovery_owner, 10)
             .await
@@ -214,7 +237,9 @@ async fn renew_fence_returns_false_after_claim(pool: PgPool) {
 
     assert_eq!(claimed.len(), 1, "recovery must have claimed the row");
 
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     let held = vala_sql::queries::olap_catalog::renew_writer_fence(
         &mut conn,
         &TABLE_UID,
@@ -233,19 +258,23 @@ async fn renew_fence_returns_false_after_claim(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = false)]
-async fn scan_failed_leaves_precommit_and_allows_retry(pool: PgPool) {
-    let tenant = setup(&pool).await;
+#[tokio::test]
+async fn scan_failed_leaves_precommit_and_allows_retry() {
+    let (db, tenant) = setup().await;
 
     // Bare precommit (no lease) is immediately claimable.
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     vala_sql::queries::olap_catalog::precommit(&mut conn, &TABLE_UID, &BATCH_ID)
         .await
         .unwrap();
     conn.commit().await.unwrap();
 
     let recovery_owner = Uuid::from_bytes([0x08u8; 16]);
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     let claimed =
         vala_sql::queries::olap_catalog::claim_stale_precommits(&mut conn, recovery_owner, 10)
             .await
@@ -254,7 +283,9 @@ async fn scan_failed_leaves_precommit_and_allows_retry(pool: PgPool) {
     assert_eq!(claimed.len(), 1, "bare precommit must be claimed");
     let token = claimed[0].fencing_token;
 
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     vala_sql::queries::olap_catalog::mark_recovery_scan_failed(
         &mut conn,
         &TABLE_UID,
@@ -274,7 +305,7 @@ async fn scan_failed_leaves_precommit_and_allows_retry(pool: PgPool) {
         )
         .bind(TABLE_UID.as_slice())
         .bind(BATCH_ID.as_slice())
-        .fetch_one(&pool)
+        .fetch_one(&db.migrator)
         .await
         .unwrap();
 
@@ -296,7 +327,7 @@ async fn scan_failed_leaves_precommit_and_allows_retry(pool: PgPool) {
     )
     .bind(TABLE_UID.as_slice())
     .bind(BATCH_ID.as_slice())
-    .fetch_one(&pool)
+    .fetch_one(&db.migrator)
     .await
     .unwrap();
     assert_eq!(
@@ -307,7 +338,9 @@ async fn scan_failed_leaves_precommit_and_allows_retry(pool: PgPool) {
 
     // A second recovery pass can re-claim the row (retry is possible).
     let retry_owner = Uuid::from_bytes([0x09u8; 16]);
-    let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     let reclaimed =
         vala_sql::queries::olap_catalog::claim_stale_precommits(&mut conn, retry_owner, 10)
             .await

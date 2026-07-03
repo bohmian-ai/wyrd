@@ -9,6 +9,7 @@
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+pub mod dsn;
 pub mod error;
 pub mod pool;
 #[cfg(feature = "embedded-postgres")]

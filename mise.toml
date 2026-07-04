@@ -69,7 +69,7 @@ run = "cargo build --workspace --all-features --all-targets"
 hide = true
 description = "Run workspace Rust unit tests (no DB required)"
 run = """
-cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server --exclude vala-bifrost --exclude vala-sql --exclude vala-core --exclude wyrd-client --exclude wyrd-dev-fixtures --exclude wyrd-sql --exclude wyrd-storage
+cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server --exclude vala-bifrost --exclude vala-sql --exclude vala-core --exclude wyrd-client --exclude wyrd-dev-fixtures --exclude wyrd-sql --exclude wyrd-storage --exclude wyrd-testing
 cargo test --locked -p wyrd-client
 cargo test --locked -p vala-core
 cargo test --locked -p vala-sql --lib
@@ -115,7 +115,10 @@ hide = true
 description = """Run wyrd-server Rust tests against the local Postgres database."""
 depends = ["db:setup-roles"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
-run = "cargo test --locked -p wyrd-server --all-features -- --test-threads=1"
+run = """
+cargo test --locked -p wyrd-server --all-features -- --test-threads=1
+cargo test --locked -p wyrd-testing --all-features -- --test-threads=1
+"""
 
 [tasks."test:wyrd-mcp"]
 hide = true

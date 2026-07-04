@@ -1,7 +1,6 @@
 """Smoke tests for the wyrd.testing.WyrdTestServer context manager."""
 
 import pytest
-
 from wyrd._wyrd import WyrdError
 from wyrd.testing import WyrdTestServer
 

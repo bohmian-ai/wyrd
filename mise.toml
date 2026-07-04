@@ -36,7 +36,6 @@ jobs = 1
 UI_DIR = "crates/wyrd/wyrd-server/wyrd-ui"
 PY_DIR = "python/py-wyrd"
 WYRD_DEV_PG_CACHE = "${HOME}/.cache/wyrd/pg"
-CARGO_TARGET_DIR = "/Volumes/T7/cargo-target/wyrd-state-abstraction"
 
 [tasks.fmt]
 description = "Format all Rust code"

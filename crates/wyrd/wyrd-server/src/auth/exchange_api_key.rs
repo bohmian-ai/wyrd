@@ -608,12 +608,6 @@ pub async fn map_exchange_error_to_wyrd(
             message: "API key hash verification failed".to_owned(),
             details: json!({ "reason": "hash_mismatch" }),
         },
-        ExchangeError::Issue(IssueError::CardScopeTooLarge { encoded_len, limit }) => {
-            WyrdError::CardScopeTooLarge {
-                message: "card_ref_scope exceeded bearer token size limit".to_owned(),
-                details: json!({ "encoded_len": encoded_len, "limit": limit }),
-            }
-        }
         ExchangeError::Issue(_) | ExchangeError::Join(_) | ExchangeError::InvalidRole => {
             WyrdError::Internal {
                 message: "failed to exchange API key".to_owned(),
@@ -646,12 +640,6 @@ impl From<DelegateError> for WyrdError {
                     details: json!({ "max": max }),
                 }
             }
-            DelegateError::Issue(IssueError::CardScopeTooLarge { encoded_len, limit }) => {
-                WyrdError::CardScopeTooLarge {
-                    message: "card_ref_scope exceeded bearer token size limit".to_owned(),
-                    details: json!({ "encoded_len": encoded_len, "limit": limit }),
-                }
-            }
             DelegateError::Issue(_) | DelegateError::InvalidRole => WyrdError::Internal {
                 message: "failed to issue delegated token".to_owned(),
                 details: json!({}),
@@ -677,12 +665,13 @@ mod tests {
     use uuid::Uuid;
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
+    use wyrd_dev_fixtures::cards::seed_backing_card;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{PrincipalId, RbacCheck, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::RequestedSubject;
-    use wyrd_spec::envelope::{CardKind, Spec};
+    use wyrd_spec::envelope::CardKind;
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -748,7 +737,7 @@ mod tests {
         created_by: Uuid,
         card_ref: &CardRef,
     ) -> Uuid {
-        insert_test_card(conn, card_ref, created_by).await;
+        seed_backing_card(conn, card_ref, created_by).await;
         let sa_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO wyrd.auth_service_accounts
@@ -767,45 +756,6 @@ mod tests {
         .await
         .expect("service account inserts");
         sa_id
-    }
-
-    async fn insert_test_card(conn: &mut TenantConn<'_>, card_ref: &CardRef, created_by: Uuid) {
-        let spec = match &card_ref.kind {
-            CardKind::Service => {
-                Spec::from_kind_and_value(&CardKind::Service, serde_json::json!({}))
-                    .expect("service fixture spec decodes")
-            }
-            other => panic!("unexpected test card kind: {other:?}"),
-        };
-        let (spec_hash, _) = spec
-            .canonical_hash_with_bytes()
-            .expect("fixture spec hashes");
-        let spec_json = serde_json::to_value(&spec).expect("fixture spec serializes");
-
-        sqlx::query(
-            r#"
-            INSERT INTO wyrd.cards (
-                card_uid, data_tenant_id, kind, space, name, version, spec,
-                spec_hash, artifact_hash, labels, annotations, status, created_by
-            )
-            VALUES (
-                $1, wyrd.current_tenant(), $2, $3, $4, $5, $6,
-                $7, NULL, '{}'::jsonb, '{}'::jsonb, 'active', $8
-            )
-            ON CONFLICT (data_tenant_id, kind, space, name, version) DO NOTHING
-            "#,
-        )
-        .bind(Uuid::now_v7())
-        .bind(card_ref.kind.wire_name())
-        .bind(card_ref.space.as_str())
-        .bind(card_ref.name.as_str())
-        .bind(card_ref.version.as_str())
-        .bind(spec_json)
-        .bind(spec_hash.as_str())
-        .bind(created_by)
-        .execute(&mut **conn.transaction())
-        .await
-        .expect("fixture card inserts");
     }
 
     async fn insert_lifecycle_key(

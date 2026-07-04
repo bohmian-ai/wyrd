@@ -309,7 +309,7 @@ mod tests {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKind::Service {
                 card_ref: own.clone(),
-                card_ref_scope: CardRefScope::try_from_root_and_members(&own, [composed.clone()]),
+                card_ref_scope: CardRefScope::from_root_and_members(&own, [composed.clone()]),
             },
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
             roles: Vec::new(),

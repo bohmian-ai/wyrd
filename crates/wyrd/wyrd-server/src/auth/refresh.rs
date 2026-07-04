@@ -13,13 +13,17 @@ use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::TokenType;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::reference::CardRef;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     consume_active_refresh, insert_audit_token_exchange, insert_refresh_token_rotated,
     list_service_account_roles, refresh_by_hash, revoke_refresh_family, service_account_by_id,
 };
 
-use crate::auth::card_scope::resolve_card_ref_scope;
+use crate::auth::card_scope::{
+    IssueErrorOrWyrd, MINT_KIND_REFRESH, issue_scope_error, resolve_card_ref_scope,
+    write_scope_mint_success_audit,
+};
 use crate::auth::exchange_api_key::{
     ExchangedToken, IssueOrSqlError, TokenExchangeSettings, principal_kind_wire, role_refs,
     token_hash,
@@ -79,12 +83,6 @@ impl From<RefreshError> for WyrdError {
                 message: "auth backend unavailable".to_owned(),
                 details: json!({ "retry_after_seconds": 1 }),
             },
-            RefreshError::Issue(IssueError::CardScopeTooLarge { encoded_len, limit }) => {
-                WyrdError::CardScopeTooLarge {
-                    message: "card_ref_scope exceeded bearer token size limit".to_owned(),
-                    details: json!({ "encoded_len": encoded_len, "limit": limit }),
-                }
-            }
             RefreshError::Issue(_) => WyrdError::Internal {
                 message: "token issue failed during refresh rotation".to_owned(),
                 details: json!({}),
@@ -136,6 +134,7 @@ impl RefreshTokens {
                             principal_id,
                             &principal_kind,
                             active.id,
+                            request_id,
                         )
                         .await?
                     }
@@ -232,6 +231,7 @@ impl RefreshTokens {
         principal_id: Uuid,
         principal_kind: &str,
         rotated_from: Uuid,
+        request_id: &str,
     ) -> Result<ExchangedToken, RefreshError> {
         let sa = service_account_by_id(conn, principal_id)
             .await?
@@ -252,22 +252,28 @@ impl RefreshTokens {
         let card_ref_scope = resolve_card_ref_scope(conn, &card_ref).await?;
 
         let access_token = match principal_kind {
-            "service" => self.issuing_key.issue_service_access_token(
-                pid,
-                tenant_id,
-                card_ref.clone(),
-                card_ref_scope.clone(),
-                roles.clone(),
-                self.settings.access_ttl,
-            )?,
-            "agent" => self.issuing_key.issue_agent_access_token(
-                pid,
-                tenant_id,
-                card_ref,
-                card_ref_scope,
-                roles,
-                self.settings.access_ttl,
-            )?,
+            "service" => self
+                .issuing_key
+                .issue_service_access_token(
+                    pid,
+                    tenant_id,
+                    card_ref.clone(),
+                    card_ref_scope.clone(),
+                    roles.clone(),
+                    self.settings.access_ttl,
+                )
+                .map_err(|e| map_refresh_issue_error(e, &card_ref))?,
+            "agent" => self
+                .issuing_key
+                .issue_agent_access_token(
+                    pid,
+                    tenant_id,
+                    card_ref.clone(),
+                    card_ref_scope.clone(),
+                    roles.clone(),
+                    self.settings.access_ttl,
+                )
+                .map_err(|e| map_refresh_issue_error(e, &card_ref))?,
             _ => return Err(RefreshError::Issue(IssueError::InvalidPrincipalKind)),
         };
 
@@ -298,12 +304,35 @@ impl RefreshTokens {
         )
         .await?;
 
+        write_scope_mint_success_audit(
+            conn,
+            principal_id,
+            &card_ref,
+            &card_ref_scope,
+            request_id,
+            MINT_KIND_REFRESH,
+        )
+        .await?;
+
         Ok(ExchangedToken {
             access_token: SecretString::from(access_token),
             refresh_token: Some(SecretString::from(refresh_token)),
             token_type: TokenType::Bearer,
             expires_at,
         })
+    }
+}
+
+/// Convert a card-bound issuer error into the refresh error channel.
+///
+/// Routes `IssueError::CardScopeTooLarge` through `issue_scope_error` so that
+/// the resulting `WyrdError::CardScopeTooLarge` always carries `scope_mint_root`
+/// in its details, enabling `scope_failure_root` to extract the root for the
+/// audit failure write.
+fn map_refresh_issue_error(error: IssueError, root: &CardRef) -> RefreshError {
+    match issue_scope_error(error, root) {
+        IssueErrorOrWyrd::Issue(e) => RefreshError::Issue(e),
+        IssueErrorOrWyrd::Wyrd(e) => RefreshError::Wyrd(e),
     }
 }
 
@@ -352,11 +381,13 @@ mod tests {
     use wyrd_runtime::PrincipalId;
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::envelope::{CardKind, Spec};
+    use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{insert_refresh_token, insert_service_account, refresh_by_hash};
+
+    use wyrd_dev_fixtures::cards::seed_backing_card;
 
     use super::{RefreshError, RefreshTokens};
     use crate::auth::exchange_api_key::TokenExchangeSettings;
@@ -432,7 +463,7 @@ mod tests {
         created_by: Uuid,
         card_ref: &CardRef,
     ) -> Uuid {
-        insert_test_card(conn, card_ref, created_by).await;
+        seed_backing_card(conn, card_ref, created_by).await;
         let sa_id = Uuid::new_v4();
         insert_service_account(
             conn, sa_id, "service", card_ref, "test-sa", None, created_by,
@@ -440,45 +471,6 @@ mod tests {
         .await
         .expect("service account inserts");
         sa_id
-    }
-
-    async fn insert_test_card(conn: &mut TenantConn<'_>, card_ref: &CardRef, created_by: Uuid) {
-        let spec = match &card_ref.kind {
-            CardKind::Service => {
-                Spec::from_kind_and_value(&CardKind::Service, serde_json::json!({}))
-                    .expect("service fixture spec decodes")
-            }
-            other => panic!("unexpected test card kind: {other:?}"),
-        };
-        let (spec_hash, _) = spec
-            .canonical_hash_with_bytes()
-            .expect("fixture spec hashes");
-        let spec_json = serde_json::to_value(&spec).expect("fixture spec serializes");
-
-        sqlx::query(
-            r#"
-            INSERT INTO wyrd.cards (
-                card_uid, data_tenant_id, kind, space, name, version, spec,
-                spec_hash, artifact_hash, labels, annotations, status, created_by
-            )
-            VALUES (
-                $1, wyrd.current_tenant(), $2, $3, $4, $5, $6,
-                $7, NULL, '{}'::jsonb, '{}'::jsonb, 'active', $8
-            )
-            ON CONFLICT (data_tenant_id, kind, space, name, version) DO NOTHING
-            "#,
-        )
-        .bind(Uuid::now_v7())
-        .bind(card_ref.kind.wire_name())
-        .bind(card_ref.space.as_str())
-        .bind(card_ref.name.as_str())
-        .bind(card_ref.version.as_str())
-        .bind(spec_json)
-        .bind(spec_hash.as_str())
-        .bind(created_by)
-        .execute(&mut **conn.transaction())
-        .await
-        .expect("fixture card inserts");
     }
 
     async fn seed_active_refresh(
@@ -800,5 +792,43 @@ mod tests {
         let extracted = super::tenant_from_refresh_jwt(&jwt).expect("tenant extracted");
 
         assert_eq!(extracted, tenant_id);
+    }
+
+    #[tokio::test]
+    async fn rotation_writes_card_scope_mint_audit_row() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let key = test_issuing_key();
+        let card_ref = service_card_ref();
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
+
+        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindWire::Service, sa_id, tenant);
+        let hash = hash_of(&refresh_jwt);
+        seed_active_refresh(&mut conn, "service", sa_id, &hash).await;
+
+        refresh_service()
+            .execute(&mut conn, refresh_jwt, "req-scope-audit")
+            .await
+            .expect("rotation succeeds");
+
+        let row: (String, String, i32) = sqlx::query_as(
+            "SELECT mint_kind, result, scope_member_count
+               FROM wyrd.audit_card_scope_mint
+              WHERE data_tenant_id = $1
+                AND principal_id = $2
+              LIMIT 1",
+        )
+        .bind(tenant.as_uuid())
+        .bind(sa_id)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("audit_card_scope_mint row exists");
+
+        assert_eq!(row.0, "refresh", "mint_kind is refresh");
+        assert_eq!(row.1, "success", "result is success");
+        assert_eq!(row.2, 1, "single-card scope has member count 1");
     }
 }

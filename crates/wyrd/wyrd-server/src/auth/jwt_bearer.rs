@@ -385,6 +385,7 @@ mod tests {
         WorkloadBinding,
     };
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
+    use wyrd_dev_fixtures::cards::seed_card_with_spec;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
@@ -980,7 +981,7 @@ mod tests {
                     }),
                 )
                 .expect("prompt fixture spec decodes");
-                insert_test_card_with_spec(conn, &prompt_ref, &prompt_spec, created_by).await?;
+                seed_card_with_spec(conn, &prompt_ref, &prompt_spec, created_by).await;
                 Spec::from_kind_and_value(
                     &CardKind::Agent,
                     serde_json::json!({
@@ -1000,43 +1001,7 @@ mod tests {
             .expect("prompt fixture spec decodes"),
             other => panic!("unexpected test card kind: {other:?}"),
         };
-        insert_test_card_with_spec(conn, target_ref, &spec, created_by).await
-    }
-
-    async fn insert_test_card_with_spec(
-        conn: &mut TenantConn<'_>,
-        card_ref: &CardRef,
-        spec: &Spec,
-        created_by: Uuid,
-    ) -> Result<(), sqlx::Error> {
-        let (spec_hash, _) = spec
-            .canonical_hash_with_bytes()
-            .expect("fixture spec hashes");
-        let spec_json = serde_json::to_value(spec).expect("fixture spec serializes");
-
-        sqlx::query(
-            r#"
-            INSERT INTO wyrd.cards (
-                card_uid, data_tenant_id, kind, space, name, version, spec,
-                spec_hash, artifact_hash, labels, annotations, status, created_by
-            )
-            VALUES (
-                $1, wyrd.current_tenant(), $2, $3, $4, $5, $6,
-                $7, NULL, '{}'::jsonb, '{}'::jsonb, 'active', $8
-            )
-            ON CONFLICT (data_tenant_id, kind, space, name, version) DO NOTHING
-            "#,
-        )
-        .bind(Uuid::now_v7())
-        .bind(card_ref.kind.wire_name())
-        .bind(card_ref.space.as_str())
-        .bind(card_ref.name.as_str())
-        .bind(card_ref.version.as_str())
-        .bind(spec_json)
-        .bind(spec_hash.as_str())
-        .bind(created_by)
-        .execute(&mut **conn.transaction())
-        .await?;
+        seed_card_with_spec(conn, target_ref, &spec, created_by).await;
         Ok(())
     }
 

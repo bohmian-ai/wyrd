@@ -1,7 +1,6 @@
 //! Card references authored inside specs.
 
 use std::fmt;
-use std::iter::FromIterator;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -27,6 +26,20 @@ pub struct CardRef {
     /// Optional resolved UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<CardUid>,
+}
+
+impl CardRef {
+    /// True when two card refs share the authorization identity tuple.
+    ///
+    /// The optional `uid` is ignored — authorization is identity-based on
+    /// `(kind, name, version, space)` only.
+    #[must_use]
+    pub fn same_identity(&self, other: &CardRef) -> bool {
+        self.kind == other.kind
+            && self.name == other.name
+            && self.version == other.version
+            && self.space == other.space
+    }
 }
 
 /// Reference to an agent prompt, either inline or by Prompt Card reference.
@@ -88,18 +101,18 @@ impl CardRefScope {
         self.0.len()
     }
 
-    /// Build a scope and guarantee that `root` is a member.
+    /// Build a scope and guarantee that `root` is the first member.
+    ///
+    /// Duplicate identity (same `(kind, name, version, space)`, ignoring `uid`)
+    /// is removed. Root is always retained as the first element.
     #[must_use]
-    pub fn try_from_root_and_members(
+    pub fn from_root_and_members(
         root: &CardRef,
         members: impl IntoIterator<Item = CardRef>,
     ) -> Self {
         let mut scope = vec![root.clone()];
         for member in members {
-            if !scope
-                .iter()
-                .any(|existing| Self::same_identity(existing, &member))
-            {
+            if !scope.iter().any(|existing| existing.same_identity(&member)) {
                 scope.push(member);
             }
         }
@@ -107,37 +120,42 @@ impl CardRefScope {
     }
 
     /// Build an own-card-only scope.
+    ///
+    /// Passing this as `card_ref_scope` on issuance is the canonical way to
+    /// express "this token is scoped only to its own card." An empty
+    /// `card_ref_scope` on a received wire token carries the same meaning and
+    /// is upgraded to `own` by the verifier's `seed_scope` call.
     #[must_use]
     pub fn own(root: &CardRef) -> Self {
-        Self::try_from_root_and_members(root, std::iter::empty())
+        Self::from_root_and_members(root, std::iter::empty())
     }
 
-    /// Return true for an empty scope or a scope containing its root.
+    /// True when the scope is empty (vacuously) or contains the root card.
+    ///
+    /// An empty scope is permitted because the wire format omits the scope
+    /// field for own-scoped tokens and the verifier upgrades it to `own(root)`
+    /// via `seed_scope`. If you need a stricter guarantee that the root was
+    /// explicitly present at construction time, use `authorizes` on a
+    /// non-empty scope.
     #[must_use]
-    pub fn contains_root(&self, root: &CardRef) -> bool {
+    pub fn permits_root(&self, root: &CardRef) -> bool {
         self.is_empty() || self.authorizes(root)
     }
 
     /// Return true when `card` is authorized by identity.
     #[must_use]
     pub fn authorizes(&self, card: &CardRef) -> bool {
-        self.0
-            .iter()
-            .any(|member| Self::same_identity(member, card))
-    }
-
-    /// Return true when two card refs share the authorization identity tuple.
-    fn same_identity(a: &CardRef, b: &CardRef) -> bool {
-        a.kind == b.kind && a.name == b.name && a.version == b.version && a.space == b.space
+        self.0.iter().any(|member| member.same_identity(card))
     }
 }
 
-impl FromIterator<CardRef> for CardRefScope {
-    fn from_iter<I: IntoIterator<Item = CardRef>>(iter: I) -> Self {
-        Self(iter.into_iter().collect())
-    }
-}
-
+/// Serializes as a JSON array of `Display` strings (`"space/Kind/name@version"`).
+///
+/// This is the canonical wire encoding for `card_ref_scope` members in JWT claims
+/// and HTTP payloads. Individual `card_ref` fields use an object shape instead —
+/// this asymmetry exists because scope members are positional (root-first) and
+/// compact by design. An empty array means "own-card scope"; the verifier upgrades
+/// it to `own(root)` via `seed_scope`.
 impl Serialize for CardRefScope {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(self.0.iter().map(ToString::to_string))
@@ -146,11 +164,14 @@ impl Serialize for CardRefScope {
 
 impl<'de> Deserialize<'de> for CardRefScope {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = Vec::<String>::deserialize(deserializer)?;
-        raw.into_iter()
-            .map(|value| value.parse::<CardRef>().map_err(serde::de::Error::custom))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Self)
+        let members: Vec<CardRef> = Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|s| s.parse::<CardRef>().map_err(serde::de::Error::custom))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(match members.as_slice() {
+            [] => Self::default(),
+            [root, rest @ ..] => Self::from_root_and_members(root, rest.iter().cloned()),
+        })
     }
 }
 

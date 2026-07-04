@@ -227,7 +227,7 @@ impl IssuingKey {
         if card_ref.kind != CardKind::Service {
             return Err(IssueError::InvalidCardRef);
         }
-        let card_ref_scope = CardRefScope::try_from_root_and_members(
+        let card_ref_scope = CardRefScope::from_root_and_members(
             &card_ref,
             card_ref_scope.as_slice().iter().cloned(),
         );
@@ -268,7 +268,7 @@ impl IssuingKey {
         if card_ref.kind != CardKind::Agent {
             return Err(IssueError::InvalidCardRef);
         }
-        let card_ref_scope = CardRefScope::try_from_root_and_members(
+        let card_ref_scope = CardRefScope::from_root_and_members(
             &card_ref,
             card_ref_scope.as_slice().iter().cloned(),
         );

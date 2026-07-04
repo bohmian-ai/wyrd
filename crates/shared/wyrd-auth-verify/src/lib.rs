@@ -842,7 +842,7 @@ fn seed_scope(card_ref: &CardRef, wire_scope: &CardRefScope) -> Result<CardRefSc
     if wire_scope.is_empty() {
         return Ok(CardRefScope::own(card_ref));
     }
-    if !wire_scope.contains_root(card_ref) {
+    if !wire_scope.permits_root(card_ref) {
         return Err(AuthError::CardScopeMissingRoot);
     }
     Ok(wire_scope.clone())
@@ -1159,6 +1159,58 @@ mod tests {
             verified.principal.kind,
             PrincipalKind::Agent { card_ref: ref actual, .. } if actual == &card_ref
         ));
+    }
+
+    #[tokio::test]
+    async fn into_verified_rejects_scope_missing_root_card() {
+        // Forge a service token whose card_ref_scope does NOT contain the card_ref.
+        // The scope is built from a different card ("other-service"), but card_ref
+        // is "billing". seed_scope should reject with CardScopeMissingRoot.
+        let card_ref = card_ref(CardKind::Service);
+        let other_card = named_card_ref(CardKind::Service, "other-service");
+        let claims = AccessTokenClaims {
+            principal: TokenPrincipalRef {
+                kind: PrincipalKindWire::Service,
+                card_ref: Some(card_ref.clone()),
+                card_ref_scope: CardRefScope::own(&other_card),
+                ..user_ref()
+            },
+            ..claims_with_times(now() + 3_600, now())
+        };
+
+        let result = claims.into_verified(&TestResolver::default()).await;
+
+        assert!(
+            matches!(result, Err(AuthError::CardScopeMissingRoot)),
+            "scope missing root should fail: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn into_verified_accepts_scope_containing_root_card() {
+        let card_ref = card_ref(CardKind::Service);
+        let claims = AccessTokenClaims {
+            principal: TokenPrincipalRef {
+                kind: PrincipalKindWire::Service,
+                card_ref: Some(card_ref.clone()),
+                card_ref_scope: CardRefScope::own(&card_ref),
+                ..user_ref()
+            },
+            ..claims_with_times(now() + 3_600, now())
+        };
+
+        let result = claims.into_verified(&TestResolver::default()).await;
+
+        assert!(
+            result.is_ok(),
+            "scope containing root should verify: {result:?}"
+        );
+        if let Ok(verified) = result {
+            assert!(matches!(
+                verified.principal.kind,
+                PrincipalKind::Service { card_ref: ref actual, .. } if actual == &card_ref
+            ));
+        }
     }
 
     #[tokio::test]

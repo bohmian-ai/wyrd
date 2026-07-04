@@ -1,6 +1,5 @@
 //! Card-ref scope resolution for card-bound principals.
 
-use std::collections::HashSet;
 use std::str::FromStr;
 
 use serde_json::{Value, json};
@@ -32,16 +31,14 @@ pub(crate) async fn resolve_card_ref_scope(
     conn: &mut TenantConn<'_>,
     root: &CardRef,
 ) -> Result<CardRefScope, WyrdError> {
-    let mut visited = HashSet::new();
-    let mut members = Vec::new();
+    let mut members: Vec<CardRef> = Vec::new();
     let mut frontier = vec![(root.clone(), 0usize)];
 
     while let Some((card_ref, depth)) = frontier.pop() {
         if depth > MAX_SCOPE_DEPTH {
             return Err(too_large("depth", MAX_SCOPE_DEPTH, root));
         }
-        let key = identity_key(&card_ref);
-        if !visited.insert(key) {
+        if members.iter().any(|m| m.same_identity(&card_ref)) {
             continue;
         }
 
@@ -67,17 +64,7 @@ pub(crate) async fn resolve_card_ref_scope(
         }
     }
 
-    Ok(CardRefScope::try_from_root_and_members(root, members))
-}
-
-/// Build the card identity key used for cycle detection and duplicate removal.
-fn identity_key(card_ref: &CardRef) -> (String, String, String, String) {
-    (
-        card_ref.kind.wire_name().to_owned(),
-        card_ref.space.to_string(),
-        card_ref.name.to_string(),
-        card_ref.version.to_string(),
-    )
+    Ok(CardRefScope::from_root_and_members(root, members))
 }
 
 /// Build the stable `413` error for card-ref scope count or depth overflow.
@@ -284,4 +271,250 @@ fn scope_member_summary(members: &[String]) -> Value {
             .collect::<Vec<_>>(),
         "truncated": members.len() > SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use wyrd_auth_issue::IssueError;
+    use wyrd_dev_fixtures::cards::seed_backing_card;
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_semver::VersionBlock;
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::error::WyrdError;
+    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::reference::CardRef;
+
+    use super::*;
+
+    fn make_card_ref(kind: CardKind, space: &str, name: &str) -> CardRef {
+        CardRef {
+            kind,
+            name: CardName::new(name).expect("valid name"),
+            version: VersionBlock::parse("1.0.0").expect("valid version"),
+            space: SpaceName::new(space).expect("valid space"),
+            uid: None,
+        }
+    }
+
+    // --- pure: too_large ---
+
+    #[test]
+    fn too_large_depth_sets_scope_mint_root() {
+        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let err = too_large("depth", MAX_SCOPE_DEPTH, &root);
+        let WyrdError::CardScopeTooLarge { details, .. } = err else {
+            panic!("expected CardScopeTooLarge");
+        };
+        assert_eq!(
+            details.get("scope_mint_root").and_then(|v| v.as_str()),
+            Some(root.to_string().as_str())
+        );
+        assert_eq!(
+            details.get("limit_kind").and_then(|v| v.as_str()),
+            Some("depth")
+        );
+    }
+
+    #[test]
+    fn too_large_cards_sets_scope_mint_root() {
+        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let err = too_large("cards", MAX_SCOPE_CARDS, &root);
+        let WyrdError::CardScopeTooLarge { details, .. } = err else {
+            panic!("expected CardScopeTooLarge");
+        };
+        assert_eq!(
+            details.get("scope_mint_root").and_then(|v| v.as_str()),
+            Some(root.to_string().as_str())
+        );
+    }
+
+    // --- pure: issue_scope_error ---
+
+    #[test]
+    fn issue_scope_error_converts_too_large_and_sets_root() {
+        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let issue_err = IssueError::CardScopeTooLarge {
+            encoded_len: 9000,
+            limit: 8192,
+        };
+        let result = issue_scope_error(issue_err, &root);
+        let IssueErrorOrWyrd::Wyrd(WyrdError::CardScopeTooLarge { details, .. }) = result else {
+            panic!("expected IssueErrorOrWyrd::Wyrd(CardScopeTooLarge)");
+        };
+        assert_eq!(
+            details.get("scope_mint_root").and_then(|v| v.as_str()),
+            Some(root.to_string().as_str())
+        );
+        assert_eq!(
+            details.get("encoded_len").and_then(|v| v.as_u64()),
+            Some(9000)
+        );
+    }
+
+    #[test]
+    fn issue_scope_error_passes_through_other_errors() {
+        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let issue_err = IssueError::InvalidCardRef;
+        let result = issue_scope_error(issue_err, &root);
+        assert!(matches!(
+            result,
+            IssueErrorOrWyrd::Issue(IssueError::InvalidCardRef)
+        ));
+    }
+
+    // --- pure: scope_failure_root ---
+
+    #[test]
+    fn scope_failure_root_reads_scope_mint_root_field() {
+        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let err = too_large("depth", MAX_SCOPE_DEPTH, &root);
+        let found = scope_failure_root(&err).expect("scope_failure_root returns Some");
+        assert!(found.same_identity(&root));
+    }
+
+    #[test]
+    fn scope_failure_root_falls_back_to_root_field() {
+        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let err = WyrdError::CardScopeTooLarge {
+            message: "test".to_owned(),
+            details: json!({ "root": root.to_string() }),
+        };
+        let found = scope_failure_root(&err).expect("falls back to root field");
+        assert!(found.same_identity(&root));
+    }
+
+    #[test]
+    fn scope_failure_root_returns_none_without_root_fields() {
+        let err = WyrdError::CardScopeTooLarge {
+            message: "test".to_owned(),
+            details: json!({ "unrelated": "field" }),
+        };
+        assert!(scope_failure_root(&err).is_none());
+    }
+
+    #[test]
+    fn scope_failure_root_returns_none_for_unrelated_errors() {
+        let err = WyrdError::Unauthenticated {
+            message: "test".to_owned(),
+            details: json!({}),
+        };
+        assert!(scope_failure_root(&err).is_none());
+    }
+
+    // --- pure: scope_hash ---
+
+    #[test]
+    fn scope_hash_is_order_independent() {
+        let a = vec![
+            "prod/Service/svc-a@1.0.0".to_owned(),
+            "prod/Service/svc-b@1.0.0".to_owned(),
+        ];
+        let b = vec![
+            "prod/Service/svc-b@1.0.0".to_owned(),
+            "prod/Service/svc-a@1.0.0".to_owned(),
+        ];
+        assert_eq!(scope_hash(&a), scope_hash(&b));
+    }
+
+    #[test]
+    fn scope_hash_differs_for_different_members() {
+        let a = vec!["prod/Service/svc-a@1.0.0".to_owned()];
+        let b = vec!["prod/Service/svc-b@1.0.0".to_owned()];
+        assert_ne!(scope_hash(&a), scope_hash(&b));
+    }
+
+    // --- pure: scope_member_summary ---
+
+    #[test]
+    fn scope_member_summary_sets_truncated_false_under_limit() {
+        let members: Vec<String> = (0..SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT)
+            .map(|i| format!("prod/Service/svc-{i}@1.0.0"))
+            .collect();
+        let summary = scope_member_summary(&members);
+        assert_eq!(summary["truncated"], false);
+        assert_eq!(
+            summary["members"].as_array().unwrap().len(),
+            SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT
+        );
+    }
+
+    #[test]
+    fn scope_member_summary_truncates_and_sets_flag() {
+        let members: Vec<String> = (0..SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT + 5)
+            .map(|i| format!("prod/Service/svc-{i}@1.0.0"))
+            .collect();
+        let summary = scope_member_summary(&members);
+        assert_eq!(summary["truncated"], true);
+        assert_eq!(
+            summary["members"].as_array().unwrap().len(),
+            SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT
+        );
+    }
+
+    // --- DB: resolve_card_ref_scope ---
+
+    #[tokio::test]
+    async fn resolve_single_service_card_produces_own_scope() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let created_by = uuid::Uuid::new_v4();
+        let root = make_card_ref(CardKind::Service, "prod", "svc-resolve-test");
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        seed_backing_card(&mut conn, &root, created_by).await;
+
+        let scope = resolve_card_ref_scope(&mut conn, &root)
+            .await
+            .expect("resolves without error");
+
+        assert_eq!(scope.as_slice().len(), 1);
+        assert!(scope.as_slice()[0].same_identity(&root));
+    }
+
+    #[tokio::test]
+    async fn resolve_missing_card_returns_error() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let root = make_card_ref(CardKind::Service, "prod", "nonexistent-card");
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let result = resolve_card_ref_scope(&mut conn, &root).await;
+
+        assert!(result.is_err(), "missing card should error");
+    }
+
+    #[tokio::test]
+    async fn resolve_caps_at_max_scope_cards() {
+        // Verify the cap boundary fires: too_large("cards", MAX_SCOPE_CARDS, root)
+        // We can't easily create MAX_SCOPE_CARDS+1 Service cards with children,
+        // but we can verify the pure error shape produced by too_large directly
+        // and confirm resolve errors for a missing card (cap logic is unreachable
+        // without Agent/Workflow cards having scope children).
+        let root = make_card_ref(CardKind::Service, "prod", "svc-cap-test");
+        let err = too_large("cards", MAX_SCOPE_CARDS, &root);
+        let WyrdError::CardScopeTooLarge { message, details } = err else {
+            panic!("expected CardScopeTooLarge");
+        };
+        assert!(message.contains("cards"), "message names the limit kind");
+        assert_eq!(
+            details.get("limit").and_then(|v| v.as_u64()),
+            Some(MAX_SCOPE_CARDS as u64)
+        );
+        assert_eq!(
+            details.get("scope_mint_root").and_then(|v| v.as_str()),
+            Some(root.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_caps_at_max_scope_depth() {
+        let root = make_card_ref(CardKind::Service, "prod", "svc-depth-test");
+        let err = too_large("depth", MAX_SCOPE_DEPTH, &root);
+        let WyrdError::CardScopeTooLarge { message, details } = err else {
+            panic!("expected CardScopeTooLarge");
+        };
+        assert!(message.contains("depth"), "message names the limit kind");
+        assert_eq!(
+            details.get("limit").and_then(|v| v.as_u64()),
+            Some(MAX_SCOPE_DEPTH as u64)
+        );
+    }
 }

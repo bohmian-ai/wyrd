@@ -1,9 +1,7 @@
 //! Crash-recovery tests: proves the 2PC pre-commit-row protocol survives
 //! writer crashes and correctly reconciles on engine restart.
 //!
-//! Uses bare `#[sqlx::test]` + in-body `migrate_for_test`; see `commit_idempotency.rs`
-//! for the rationale. Requires a live Postgres. Run via `mise run test:bifrost` or
-//! `DATABASE_URL=... cargo test --locked -p vala-bifrost --test crash_recovery`.
+//! Run via `mise run test:bifrost`.
 
 use std::sync::Arc;
 
@@ -33,12 +31,14 @@ struct Harness {
     factory: Arc<dyn iceberg::io::StorageFactory>,
     props: std::collections::HashMap<String, String>,
     pool: Arc<PgPool>,
+    recovery_pool: Arc<PgPool>,
+    migrator: Arc<PgPool>,
     tenant: DataTenantId,
     table_uid: TableUid,
 }
 
 fn test_warehouse(
-    pool: &Arc<PgPool>,
+    catalog_pool: &PgPool,
 ) -> (
     String,
     String,
@@ -52,26 +52,32 @@ fn test_warehouse(
         root: tmp.path().to_path_buf(),
     };
     let (factory, props) = iceberg_storage_factory(&backend).unwrap();
-    let catalog_uri = vala_sql::testing::catalog_uri(pool);
+    let catalog_uri = vala_sql::testing::catalog_uri(catalog_pool);
     (catalog_uri, warehouse, factory, props, tmp)
 }
 
-async fn setup(pool: PgPool) -> Harness {
-    let pool = Arc::new(pool);
-    vala_sql::testing::migrate_for_test(&pool).await.unwrap();
+async fn setup() -> Harness {
+    let db = vala_sql::testing::shared().await.expect("shared db");
+    vala_sql::testing::reset_for_test(&db).await.expect("reset");
+    let pool = Arc::new(db.app.clone());
+    let recovery_pool = Arc::new(
+        vala_sql::testing::recovery_pool()
+            .await
+            .expect("recovery pool"),
+    );
 
     let tenant = DataTenantId::new_v7();
-    vala_sql::testing::seed_tenant(&pool, tenant.as_uuid())
+    vala_sql::testing::seed_tenant(&db.platform_admin, tenant.as_uuid())
         .await
         .unwrap();
 
-    let (catalog_uri, warehouse, factory, props, tmp) = test_warehouse(&pool);
+    let (catalog_uri, warehouse, factory, props, tmp) = test_warehouse(&db.migrator);
 
     let catalog = WyrdCatalog::new(
         &catalog_uri,
         &warehouse,
         pool.clone(),
-        Some(pool.clone()),
+        Some(recovery_pool.clone()),
         factory.clone(),
         props.clone(),
     )
@@ -91,6 +97,8 @@ async fn setup(pool: PgPool) -> Harness {
         factory,
         props,
         pool,
+        recovery_pool,
+        migrator: Arc::new(db.migrator.clone()),
         tenant,
         table_uid,
     }
@@ -116,7 +124,7 @@ async fn rebuild_catalog(h: &Harness) -> WyrdCatalog {
         &h.catalog_uri,
         &h.warehouse,
         h.pool.clone(),
-        Some(h.pool.clone()),
+        Some(h.recovery_pool.clone()),
         h.factory.clone(),
         h.props.clone(),
     )
@@ -156,9 +164,9 @@ async fn load_sql_catalog(h: &Harness) -> iceberg_catalog_sql::SqlCatalog {
 /// lease) but before writing any Parquet. Recovery on the next engine start
 /// claims the orphaned row, finds no matching snapshot (`snapshot_absent`), and
 /// finalizes it as 'aborted'.
-#[sqlx::test]
-async fn precommit_row_aborts_on_restart(pool: PgPool) {
-    let h = setup(pool).await;
+#[tokio::test]
+async fn precommit_row_aborts_on_restart() {
+    let h = setup().await;
     let table = load_table(&h).await;
     let catalog = load_sql_catalog(&h).await;
 
@@ -183,7 +191,7 @@ async fn precommit_row_aborts_on_restart(pool: PgPool) {
 
     let pending: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_commits WHERE state = 'precommit'")
-            .fetch_one(&*h.pool)
+            .fetch_one(&*h.migrator)
             .await
             .unwrap();
     assert_eq!(pending, 1, "one orphaned precommit row");
@@ -194,7 +202,7 @@ async fn precommit_row_aborts_on_restart(pool: PgPool) {
 
     let aborted: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_commits WHERE state = 'aborted'")
-            .fetch_one(&*h.pool)
+            .fetch_one(&*h.migrator)
             .await
             .unwrap();
     assert_eq!(aborted, 1, "recovery must abort the orphaned precommit");
@@ -202,7 +210,7 @@ async fn precommit_row_aborts_on_restart(pool: PgPool) {
     let audited: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM vala.olap_recovery_events WHERE oracle_result = 'snapshot_absent'",
     )
-    .fetch_one(&*h.pool)
+    .fetch_one(&*h.migrator)
     .await
     .unwrap();
     assert_eq!(audited, 1, "one snapshot_absent audit row");
@@ -211,9 +219,9 @@ async fn precommit_row_aborts_on_restart(pool: PgPool) {
 /// Writer crashes AFTER the Iceberg commit but BEFORE `finalize_committed`. The
 /// snapshot is real and carries `wyrd_batch_id`. Recovery finds it (`snapshot_found`)
 /// and rolls forward: finalizes 'committed'.
-#[sqlx::test]
-async fn snapshot_committed_but_not_finalized_rolls_forward(pool: PgPool) {
-    let h = setup(pool).await;
+#[tokio::test]
+async fn snapshot_committed_but_not_finalized_rolls_forward() {
+    let h = setup().await;
     let table = load_table(&h).await;
     let catalog = load_sql_catalog(&h).await;
 
@@ -237,7 +245,7 @@ async fn snapshot_committed_but_not_finalized_rolls_forward(pool: PgPool) {
     // Row is still 'precommit' (finalize_committed was never called).
     let pending: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_commits WHERE state = 'precommit'")
-            .fetch_one(&*h.pool)
+            .fetch_one(&*h.migrator)
             .await
             .unwrap();
     assert_eq!(pending, 1, "precommit row persists after fault");
@@ -245,9 +253,11 @@ async fn snapshot_committed_but_not_finalized_rolls_forward(pool: PgPool) {
     // But the lease has NOT been expired by the fault, so recovery won't claim it
     // immediately (live lease). Expire it manually to let recovery in.
     sqlx::query(
-        "UPDATE vala.olap_commits SET writer_lease_expires_at = now() - interval '1 second'",
+        "UPDATE vala.olap_commits SET writer_lease_expires_at = now() - interval '1 second' \
+         WHERE batch_id = $1",
     )
-    .execute(&*h.pool)
+    .bind(batch_id.as_slice())
+    .execute(&*h.migrator)
     .await
     .unwrap();
 
@@ -257,14 +267,14 @@ async fn snapshot_committed_but_not_finalized_rolls_forward(pool: PgPool) {
 
     let committed: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_commits WHERE state = 'committed'")
-            .fetch_one(&*h.pool)
+            .fetch_one(&*h.migrator)
             .await
             .unwrap();
     assert_eq!(committed, 1, "recovery must commit the roll-forward batch");
 
     let snapshot_id: Option<i64> =
         sqlx::query_scalar("SELECT snapshot_id FROM vala.olap_commits WHERE state = 'committed'")
-            .fetch_one(&*h.pool)
+            .fetch_one(&*h.migrator)
             .await
             .unwrap();
     assert!(
@@ -275,7 +285,7 @@ async fn snapshot_committed_but_not_finalized_rolls_forward(pool: PgPool) {
     let audited: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM vala.olap_recovery_events WHERE oracle_result = 'snapshot_found'",
     )
-    .fetch_one(&*h.pool)
+    .fetch_one(&*h.migrator)
     .await
     .unwrap();
     assert_eq!(audited, 1, "one snapshot_found audit row");
@@ -284,9 +294,9 @@ async fn snapshot_committed_but_not_finalized_rolls_forward(pool: PgPool) {
 /// Recovery must NOT touch a precommit row whose writer lease is still in the
 /// future (live writer mid-commit). Only after the lease expires may recovery
 /// claim and reconcile the row.
-#[sqlx::test]
-async fn recovery_skips_live_writer_lease(pool: PgPool) {
-    let h = setup(pool).await;
+#[tokio::test]
+async fn recovery_skips_live_writer_lease() {
+    let h = setup().await;
 
     // Insert a precommit row with a FUTURE lease manually (simulating a live writer).
     let table_uid = h.table_uid;
@@ -323,22 +333,24 @@ async fn recovery_skips_live_writer_lease(pool: PgPool) {
     )
     .bind(table_uid.as_bytes().as_slice())
     .bind(batch_id.as_slice())
-    .fetch_one(&*h.pool)
+    .fetch_one(&*h.migrator)
     .await
     .unwrap();
     assert_eq!(state, "precommit", "live lease must protect the row");
 
     let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_recovery_events")
-        .fetch_one(&*h.pool)
+        .fetch_one(&*h.migrator)
         .await
         .unwrap();
     assert_eq!(events, 0, "no audit row for skipped live lease");
 
     // Now expire the lease and rebuild — recovery must claim and abort.
     sqlx::query(
-        "UPDATE vala.olap_commits SET writer_lease_expires_at = now() - interval '1 second'",
+        "UPDATE vala.olap_commits SET writer_lease_expires_at = now() - interval '1 second' \
+         WHERE batch_id = $1",
     )
-    .execute(&*h.pool)
+    .bind(batch_id.as_slice())
+    .execute(&*h.migrator)
     .await
     .unwrap();
 
@@ -346,7 +358,7 @@ async fn recovery_skips_live_writer_lease(pool: PgPool) {
 
     let aborted: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_commits WHERE state = 'aborted'")
-            .fetch_one(&*h.pool)
+            .fetch_one(&*h.migrator)
             .await
             .unwrap();
     assert_eq!(aborted, 1, "expired lease is now claimed and aborted");
@@ -355,9 +367,9 @@ async fn recovery_skips_live_writer_lease(pool: PgPool) {
 /// Cold start: recovery resolves table identity purely from the
 /// `bifrost_tables` join in `claim_stale_precommits`, not from any in-memory
 /// registry state. The engine starts with an empty cache.
-#[sqlx::test]
-async fn cold_start_maps_table_identity(pool: PgPool) {
-    let h = setup(pool).await;
+#[tokio::test]
+async fn cold_start_maps_table_identity() {
+    let h = setup().await;
 
     // Insert a bare precommit row with no lease (null = eligible for recovery).
     let batch_id = *uuid::Uuid::now_v7().as_bytes();
@@ -377,7 +389,7 @@ async fn cold_start_maps_table_identity(pool: PgPool) {
     // decided snapshot_absent (no Iceberg snapshot was ever committed).
     let aborted: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_commits WHERE state = 'aborted'")
-            .fetch_one(&*h.pool)
+            .fetch_one(&*h.migrator)
             .await
             .unwrap();
     assert_eq!(
@@ -389,9 +401,9 @@ async fn cold_start_maps_table_identity(pool: PgPool) {
 /// Same cold-start identity mapping, but for a `SystemShared` table bound to
 /// `SYSTEM_OWNER`. A scope-specific bug in the RLS bind for system tables would
 /// pass `cold_start_maps_table_identity` and fail silently here.
-#[sqlx::test]
-async fn cold_start_maps_system_shared_table_identity(pool: PgPool) {
-    let h = setup(pool).await;
+#[tokio::test]
+async fn cold_start_maps_system_shared_table_identity() {
+    let h = setup().await;
 
     // Register a system-shared table owned by SYSTEM_OWNER.
     let catalog = rebuild_catalog(&h).await;
@@ -427,7 +439,7 @@ async fn cold_start_maps_system_shared_table_identity(pool: PgPool) {
     )
     .bind(sys_uid.as_bytes().as_slice())
     .bind(batch_id.as_slice())
-    .fetch_one(&*h.pool)
+    .fetch_one(&*h.migrator)
     .await
     .unwrap();
     assert_eq!(
@@ -440,9 +452,9 @@ async fn cold_start_maps_system_shared_table_identity(pool: PgPool) {
 /// must skip the startup scan entirely and leave stale precommit rows untouched.
 /// Guards the MAJOR-4 contract — a regression that ran recovery unconditionally
 /// (or on the wrong pool) would abort rows it must never touch.
-#[sqlx::test]
-async fn recovery_disabled_when_no_recovery_pool(pool: PgPool) {
-    let h = setup(pool).await;
+#[tokio::test]
+async fn recovery_disabled_when_no_recovery_pool() {
+    let h = setup().await;
 
     // Bare precommit row (no lease) — would be claimed if recovery ran.
     let batch_id = *uuid::Uuid::now_v7().as_bytes();
@@ -471,7 +483,7 @@ async fn recovery_disabled_when_no_recovery_pool(pool: PgPool) {
     )
     .bind(h.table_uid.as_bytes().as_slice())
     .bind(batch_id.as_slice())
-    .fetch_one(&*h.pool)
+    .fetch_one(&*h.migrator)
     .await
     .unwrap();
     assert_eq!(
@@ -480,7 +492,7 @@ async fn recovery_disabled_when_no_recovery_pool(pool: PgPool) {
     );
 
     let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_recovery_events")
-        .fetch_one(&*h.pool)
+        .fetch_one(&*h.migrator)
         .await
         .unwrap();
     assert_eq!(events, 0, "disabled recovery must write no audit rows");
@@ -500,10 +512,10 @@ async fn recovery_disabled_when_no_recovery_pool(pool: PgPool) {
 /// Simulates the recovery-claim step by directly stamping `recovery_fencing_token`
 /// (what `vala.claim_stale_precommits` does), then proves the guarded renewal
 /// returns false and leaves the FSM unchanged.
-#[sqlx::test]
-async fn zombie_writer_fenced_after_recovery_claim(pool: PgPool) {
+#[tokio::test]
+async fn zombie_writer_fenced_after_recovery_claim() {
     const TOKEN: i64 = 99;
-    let h = setup(pool).await;
+    let h = setup().await;
     let batch_id = *uuid::Uuid::now_v7().as_bytes();
     let owner = sqlx::types::Uuid::new_v4();
 
@@ -554,7 +566,7 @@ async fn zombie_writer_fenced_after_recovery_claim(pool: PgPool) {
     )
     .bind(h.table_uid.as_bytes().as_slice())
     .bind(batch_id.as_slice())
-    .fetch_one(&*h.pool)
+    .fetch_one(&*h.migrator)
     .await
     .unwrap();
     assert_eq!(state, "precommit", "zombie must not advance the FSM");
@@ -564,7 +576,7 @@ async fn zombie_writer_fenced_after_recovery_claim(pool: PgPool) {
     )
     .bind(h.table_uid.as_bytes().as_slice())
     .bind(batch_id.as_slice())
-    .fetch_one(&*h.pool)
+    .fetch_one(&*h.migrator)
     .await
     .unwrap();
     assert!(
@@ -576,10 +588,10 @@ async fn zombie_writer_fenced_after_recovery_claim(pool: PgPool) {
 /// An expired-lease writer is fenced by the guarded renewal even when recovery
 /// has NOT yet claimed the row — the `writer_lease_expires_at` > `now()` predicate
 /// fails closed before any recovery involvement.
-#[sqlx::test]
-async fn expired_writer_fenced_before_recovery_claim(pool: PgPool) {
+#[tokio::test]
+async fn expired_writer_fenced_before_recovery_claim() {
     const TOKEN: i64 = 42;
-    let h = setup(pool).await;
+    let h = setup().await;
     let batch_id = *uuid::Uuid::now_v7().as_bytes();
     let owner = sqlx::types::Uuid::new_v4();
 
@@ -631,7 +643,7 @@ async fn expired_writer_fenced_before_recovery_claim(pool: PgPool) {
     )
     .bind(h.table_uid.as_bytes().as_slice())
     .bind(batch_id.as_slice())
-    .fetch_one(&*h.pool)
+    .fetch_one(&*h.migrator)
     .await
     .unwrap();
     assert_eq!(
@@ -640,7 +652,7 @@ async fn expired_writer_fenced_before_recovery_claim(pool: PgPool) {
     );
 
     let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_recovery_events")
-        .fetch_one(&*h.pool)
+        .fetch_one(&*h.migrator)
         .await
         .unwrap();
     assert_eq!(events, 0, "no recovery events — no recovery ran");
@@ -649,10 +661,10 @@ async fn expired_writer_fenced_before_recovery_claim(pool: PgPool) {
 /// A freshly renewed lease (`writer_lease_expires_at` well in the future) must
 /// prevent recovery from claiming the row, even if recovery runs between the
 /// renewal and the Iceberg append.
-#[sqlx::test]
-async fn recovery_skips_after_unexpired_renewal(pool: PgPool) {
+#[tokio::test]
+async fn recovery_skips_after_unexpired_renewal() {
     const TOKEN: i64 = 55;
-    let h = setup(pool).await;
+    let h = setup().await;
     let batch_id = *uuid::Uuid::now_v7().as_bytes();
     let owner = sqlx::types::Uuid::new_v4();
 
@@ -687,7 +699,7 @@ async fn recovery_skips_after_unexpired_renewal(pool: PgPool) {
     )
     .bind(h.table_uid.as_bytes().as_slice())
     .bind(batch_id.as_slice())
-    .fetch_one(&*h.pool)
+    .fetch_one(&*h.migrator)
     .await
     .unwrap();
     assert_eq!(
@@ -696,7 +708,7 @@ async fn recovery_skips_after_unexpired_renewal(pool: PgPool) {
     );
 
     let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_recovery_events")
-        .fetch_one(&*h.pool)
+        .fetch_one(&*h.migrator)
         .await
         .unwrap();
     assert_eq!(
@@ -737,9 +749,9 @@ async fn recovery_skips_after_unexpired_renewal(pool: PgPool) {
 /// iceberg-rust version cannot roll back the orphaned snapshot). The bare audit
 /// INSERT contract is covered separately by `audit_row_roundtrips_with_byte_ids`
 /// in vala-sql/tests/olap_recovery.rs.
-#[sqlx::test]
-async fn fence_lost_after_append_is_detected_and_audited(pool: PgPool) {
-    let h = setup(pool).await;
+#[tokio::test]
+async fn fence_lost_after_append_is_detected_and_audited() {
+    let h = setup().await;
 
     let batch_id = *uuid::Uuid::now_v7().as_bytes();
     let writer_owner = sqlx::types::Uuid::new_v4();
@@ -775,7 +787,7 @@ async fn fence_lost_after_append_is_detected_and_audited(pool: PgPool) {
     )
     .bind(h.table_uid.as_bytes().as_slice())
     .bind(batch_id.as_slice())
-    .fetch_one(&*h.pool)
+    .fetch_one(&*h.migrator)
     .await
     .unwrap();
     assert_eq!(
@@ -824,7 +836,7 @@ async fn fence_lost_after_append_is_detected_and_audited(pool: PgPool) {
     )
     .bind(h.table_uid.as_bytes().as_slice())
     .bind(batch_id.as_slice())
-    .fetch_one(&*h.pool)
+    .fetch_one(&*h.migrator)
     .await
     .unwrap();
     assert_eq!(
@@ -846,7 +858,7 @@ async fn fence_lost_after_append_is_detected_and_audited(pool: PgPool) {
         "SELECT COUNT(*) FROM vala.olap_recovery_events \
          WHERE event_kind = 'recovery_decision' AND new_state = 'aborted'",
     )
-    .fetch_one(&*h.pool)
+    .fetch_one(&*h.migrator)
     .await
     .unwrap();
     assert_eq!(decisions, 1, "recovery_decision abort row must be present");

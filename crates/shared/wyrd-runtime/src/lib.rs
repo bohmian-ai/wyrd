@@ -40,12 +40,6 @@ pub fn runtime() -> &'static Runtime {
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn build_runtime() -> std::io::Result<Runtime> {
     Runtime::new()
-}
-
-#[cfg(target_arch = "wasm32")]
-fn build_runtime() -> std::io::Result<Runtime> {
-    tokio::runtime::Builder::new_current_thread().build()
 }

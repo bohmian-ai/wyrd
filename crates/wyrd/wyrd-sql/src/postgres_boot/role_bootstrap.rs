@@ -3,11 +3,9 @@
 use secrecy::ExposeSecret;
 
 use super::EmbeddedRoleCredentials;
+pub(crate) use crate::dsn::{WYRD_APP_ROLE, WYRD_MIGRATOR_ROLE, WYRD_PLATFORM_ADMIN_ROLE};
 
 pub(crate) const WYRD_DATABASE: &str = "wyrd";
-pub(crate) const WYRD_MIGRATOR_ROLE: &str = "wyrd_migrator";
-pub(crate) const WYRD_APP_ROLE: &str = "wyrd_app";
-pub(crate) const WYRD_PLATFORM_ADMIN_ROLE: &str = "wyrd_platform_admin";
 
 pub(crate) const ROLE_BOOTSTRAP_SQL_TEMPLATE: &str = r#"
 DO $$

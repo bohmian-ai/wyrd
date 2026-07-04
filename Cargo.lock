@@ -9749,7 +9749,9 @@ dependencies = [
 name = "vala-sql"
 version = "0.0.1"
 dependencies = [
+ "secrecy",
  "sqlx 0.9.0",
+ "tokio",
  "tracing",
  "uuid",
  "vala-sql",
@@ -10558,9 +10560,7 @@ dependencies = [
 name = "wyrd-dev-fixtures"
 version = "0.0.1"
 dependencies = [
- "secrecy",
  "sqlx 0.9.0",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "vala-sql",

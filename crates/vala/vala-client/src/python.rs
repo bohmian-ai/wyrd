@@ -24,6 +24,7 @@ use crate::eval::protocol_client::{
 /// # Errors
 /// Returns a structured Wyrd Python error when inputs, transport, protocol
 /// decoding, or Python callbacks fail.
+#[allow(clippy::too_many_arguments)]
 #[pyfunction(name = "run_eval")]
 #[pyo3(signature = (
     server_url,

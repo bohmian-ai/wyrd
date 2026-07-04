@@ -1031,7 +1031,8 @@ mod tests {
     }
 
     fn test_state(fixture: &PgFixture) -> AppState {
-        let storage_root = fixture.tempdir_path().join("callback-storage");
+        let dir = tempfile::tempdir().expect("callback storage tempdir");
+        let storage_root = dir.keep().join("callback-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
         AppState::new(

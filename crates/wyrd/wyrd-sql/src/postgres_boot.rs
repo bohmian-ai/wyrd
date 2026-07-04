@@ -16,26 +16,17 @@ use pg_embed::postgres::{PgEmbed, PgSettings};
 use rand::distr::{Alphanumeric, SampleString};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::AssertSqlSafe;
-use url::Url;
 
+use crate::dsn::DsnError;
 use crate::pool::build_pool;
 use role_bootstrap::{
     WYRD_APP_ROLE, WYRD_DATABASE, WYRD_MIGRATOR_ROLE, WYRD_PLATFORM_ADMIN_ROLE, role_bootstrap_sql,
 };
 
+pub use crate::dsn::{
+    APP_DSN_ENV, MIGRATOR_PASSWORD_ENV, PLATFORM_ADMIN_PASSWORD_ENV, ResolvedDsns,
+};
 pub use crate::pool::PoolConfig;
-
-/// Canonical Wyrd database URL. Carries the `wyrd_app` userinfo; migrator and
-/// platform-admin DSNs are synthesized at boot by swapping userinfo with the
-/// per-role passwords below.
-pub const APP_DSN_ENV: &str = "WYRD_DATABASE_URL";
-/// `wyrd_migrator` password for external Postgres. Required alongside
-/// `WYRD_DATABASE_URL` whenever Wyrd applies migrations against external
-/// Postgres.
-pub const MIGRATOR_PASSWORD_ENV: &str = "WYRD_DATABASE_MIGRATOR_PASSWORD";
-/// Optional `wyrd_platform_admin` password for external Postgres. Required
-/// when the audited cross-tenant platform-admin surface is enabled.
-pub const PLATFORM_ADMIN_PASSWORD_ENV: &str = "WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD";
 
 const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
 const HOME_ENV: &str = "HOME";
@@ -47,17 +38,9 @@ const WYRD_CONFIG_END: &str = "# END WYRD EMBEDDED CONFIG";
 /// Postgres boot errors.
 #[derive(Debug, thiserror::Error)]
 pub enum BootError {
-    /// DSN environment variables were partially configured.
-    #[error(
-        "mixed database configuration: set WYRD_DATABASE_URL with \
-         WYRD_DATABASE_MIGRATOR_PASSWORD (and optionally \
-         WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD) for external Postgres, or \
-         leave all three unset for embedded mode"
-    )]
-    MixedDsnConfig,
-    /// The canonical `WYRD_DATABASE_URL` could not be parsed.
-    #[error("invalid WYRD_DATABASE_URL: {0}")]
-    InvalidDatabaseUrl(#[source] url::ParseError),
+    /// External DSN resolution failed.
+    #[error(transparent)]
+    Dsn(#[from] DsnError),
     /// Embedded Postgres startup failed.
     #[error("embedded Postgres startup failed")]
     Embedded(#[source] pg_embed::pg_errors::Error),
@@ -67,32 +50,6 @@ pub enum BootError {
     /// Database pool construction failed.
     #[error("database pool construction failed")]
     PoolConnect(#[source] sqlx::Error),
-}
-
-/// Resolved role-specific Postgres DSNs.
-///
-/// DSNs are secret-bearing because they normally include role passwords.
-#[derive(Clone)]
-pub struct ResolvedDsns {
-    /// Runtime `wyrd_app` DSN. RLS applies to connections built from this DSN.
-    pub app: SecretString,
-    /// Boot-only `wyrd_migrator` DSN. This pool must be closed after migrations.
-    pub migrator: SecretString,
-    /// Optional audited cross-tenant `wyrd_platform_admin` DSN.
-    pub platform_admin: Option<SecretString>,
-}
-
-impl fmt::Debug for ResolvedDsns {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ResolvedDsns")
-            .field("app", &"<redacted>")
-            .field("migrator", &"<redacted>")
-            .field(
-                "platform_admin",
-                &self.platform_admin.as_ref().map(|_| "<redacted>"),
-            )
-            .finish()
-    }
 }
 
 /// Postgres boot mode selected from deploy configuration.
@@ -143,20 +100,18 @@ impl PostgresBoot {
     /// roles, and derives the three role DSNs from the managed instance.
     ///
     /// # Errors
-    /// Returns [`BootError::MixedDsnConfig`] for partial or incoherent
-    /// configuration. Returns [`BootError::InvalidDatabaseUrl`] when the
-    /// canonical URL cannot be parsed. Returns embedded startup or filesystem
-    /// errors when embedded mode is selected and the managed instance cannot
-    /// be started.
+    /// Returns [`BootError::Dsn`] for partial, incoherent, or invalid external
+    /// configuration. Returns embedded startup or filesystem errors when
+    /// embedded mode is selected and the managed instance cannot be started.
     pub async fn from_env() -> Result<Self, BootError> {
-        Self::from_optional_dsns(
-            env::var(APP_DSN_ENV).ok(),
-            env::var(MIGRATOR_PASSWORD_ENV).ok().map(SecretString::from),
-            env::var(PLATFORM_ADMIN_PASSWORD_ENV)
-                .ok()
-                .map(SecretString::from),
-        )
-        .await
+        match crate::dsn::resolve_external_dsns_from_env()? {
+            Some(dsns) => Ok(Self::External {
+                app_dsn: dsns.app,
+                migrator_dsn: dsns.migrator,
+                platform_admin_dsn: dsns.platform_admin,
+            }),
+            None => Self::embedded(EmbeddedConfig::default()).await,
+        }
     }
 
     /// Start embedded Postgres with an explicit configuration.
@@ -191,42 +146,21 @@ impl PostgresBoot {
         }
     }
 
+    #[cfg(test)]
     async fn from_optional_dsns(
         app: Option<String>,
         migrator_password: Option<SecretString>,
         platform_admin_password: Option<SecretString>,
     ) -> Result<Self, BootError> {
-        match (app, migrator_password, platform_admin_password) {
-            (Some(app_url), Some(migrator_pw), platform_admin_pw) => {
-                let base = Url::parse(&app_url).map_err(BootError::InvalidDatabaseUrl)?;
-                let migrator_dsn = role_dsn(&base, WYRD_MIGRATOR_ROLE, &migrator_pw);
-                let platform_admin_dsn = platform_admin_pw
-                    .as_ref()
-                    .map(|pw| role_dsn(&base, WYRD_PLATFORM_ADMIN_ROLE, pw))
-                    .map(SecretString::from);
-                Ok(Self::External {
-                    app_dsn: SecretString::from(app_url),
-                    migrator_dsn: SecretString::from(migrator_dsn),
-                    platform_admin_dsn,
-                })
-            }
-            (None, None, None) => Self::embedded(EmbeddedConfig::default()).await,
-            _ => Err(BootError::MixedDsnConfig),
+        match crate::dsn::resolve_external_dsns(app, migrator_password, platform_admin_password)? {
+            Some(dsns) => Ok(Self::External {
+                app_dsn: dsns.app,
+                migrator_dsn: dsns.migrator,
+                platform_admin_dsn: dsns.platform_admin,
+            }),
+            None => Self::embedded(EmbeddedConfig::default()).await,
         }
     }
-}
-
-/// Synthesize a role DSN by replacing the userinfo of `base` with `role` and
-/// `password`. Host, port, database, and query string are preserved. The role
-/// name comes from the schema-side constants in `role_bootstrap`, not from
-/// operator configuration.
-fn role_dsn(base: &Url, role: &str, password: &SecretString) -> String {
-    let mut dsn = base.clone();
-    dsn.set_username(role)
-        .expect("role name is URL-safe ASCII per role_bootstrap constants");
-    dsn.set_password(Some(password.expose_secret()))
-        .expect("password is URL-safe via set_password percent-encoding");
-    dsn.into()
 }
 
 /// Handle for a managed embedded Postgres instance.
@@ -661,8 +595,9 @@ mod tests {
     use secrecy::ExposeSecret;
 
     use super::{
-        APP_DSN_ENV, BootError, EmbeddedConfig, EmbeddedRoleCredentials, MIGRATOR_PASSWORD_ENV,
-        PLATFORM_ADMIN_PASSWORD_ENV, PostgresBoot, SecretString, write_embedded_postgres_config,
+        APP_DSN_ENV, BootError, DsnError, EmbeddedConfig, EmbeddedRoleCredentials,
+        MIGRATOR_PASSWORD_ENV, PLATFORM_ADMIN_PASSWORD_ENV, PostgresBoot, SecretString,
+        write_embedded_postgres_config,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -728,7 +663,7 @@ mod tests {
             )
             .await;
 
-            assert!(matches!(result, Err(BootError::MixedDsnConfig)));
+            assert!(matches!(result, Err(BootError::Dsn(DsnError::Mixed))));
         }
     }
 
@@ -740,7 +675,10 @@ mod tests {
             None,
         )
         .await;
-        assert!(matches!(result, Err(BootError::InvalidDatabaseUrl(_))));
+        assert!(matches!(
+            result,
+            Err(BootError::Dsn(DsnError::InvalidUrl(_)))
+        ));
     }
 
     #[tokio::test]

@@ -62,20 +62,20 @@ def serve(mock: ProtocolMock) -> tuple[str, HTTPServer, threading.Thread]:
 
         def do_POST(self) -> None:  # noqa: N802
             body = self._read_json()
-            if self.path == "/api/v1/eval/runs":
+            if self.path == "/v1/eval/runs":
                 mock.received_open = body
                 self._write_json(200, {"run_id": TEST_RUN_ID, "lease_token": TEST_LEASE})
                 return
-            if self.path == f"/api/v1/eval/runs/{TEST_RUN_ID}/next":
+            if self.path == f"/v1/eval/runs/{TEST_RUN_ID}/next":
                 if self._check_lease():
                     self._write_json(200, mock.next_directive())
                 return
-            if self.path == f"/api/v1/eval/runs/{TEST_RUN_ID}/agent-turn":
+            if self.path == f"/v1/eval/runs/{TEST_RUN_ID}/agent-turn":
                 if self._check_lease():
                     mock.received_agent_turns.append(body)
                     self._write_json(202, {})
                 return
-            if self.path == f"/api/v1/eval/runs/{TEST_RUN_ID}/user-turn":
+            if self.path == f"/v1/eval/runs/{TEST_RUN_ID}/user-turn":
                 if self._check_lease():
                     mock.received_user_turns.append(body)
                     self._write_json(202, {})

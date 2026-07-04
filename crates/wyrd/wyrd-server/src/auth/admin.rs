@@ -587,16 +587,16 @@ mod tests {
     }
 
     async fn test_state(fixture: &PgFixture) -> AppState {
+        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
+            fixture.wyrd_postgres().clone(),
+            fixture.vala_postgres().clone(),
+        ));
         let dir = tempfile::tempdir().expect("admin storage tempdir");
         let storage_root = dir.keep().join("admin-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
-        AppState::new(
-            fixture.app_pool().clone(),
-            None,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-        )
-        .with_sealing_key(Arc::new(sealing_key()))
+        AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))))
+            .with_sealing_key(Arc::new(sealing_key()))
     }
 
     fn principal_with(tenant: DataTenantId, perms: PermissionSet) -> AuthenticatedPrincipal {

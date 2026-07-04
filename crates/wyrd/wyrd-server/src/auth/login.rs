@@ -413,11 +413,11 @@ mod tests {
         let storage_root = tempdir.path().join("storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
-        let state = AppState::new(
-            fixture.app_pool().clone(),
-            None,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-        );
+        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
+            fixture.wyrd_postgres().clone(),
+            fixture.vala_postgres().clone(),
+        ));
+        let state = AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))));
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, HeaderValue::from_static("localhost"));
 

@@ -104,13 +104,11 @@ mod tests {
 
     fn test_state() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-
-        AppState::new(
-            app_pool,
-            None,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-        )
+        AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))))
     }
 }

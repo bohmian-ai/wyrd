@@ -830,15 +830,15 @@ mod tests {
     }
 
     async fn test_state(fixture: &PgFixture) -> AppState {
+        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
+            fixture.wyrd_postgres().clone(),
+            fixture.vala_postgres().clone(),
+        ));
         let dir = tempfile::tempdir().expect("jwt-bearer storage tempdir");
         let storage_root = dir.keep().join("jwt-bearer-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
-        AppState::new(
-            fixture.app_pool().clone(),
-            None,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-        )
+        AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))))
     }
 
     async fn test_state_with_external(

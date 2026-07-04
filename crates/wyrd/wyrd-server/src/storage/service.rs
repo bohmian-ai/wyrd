@@ -1255,6 +1255,7 @@ mod tests {
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use std::sync::Arc;
     use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
+    use crate::postgres::ServerPostgres;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::storage::SinglePutComplete;
@@ -1348,11 +1349,11 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let state = AppState::new(
-            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
-            None,
-            Arc::clone(&storage),
-        );
+        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
+        let state = AppState::new(postgres, Arc::clone(&storage));
         let tenant = DataTenantId::new_v7();
         let validated = ValidatedPath {
             full: format!("{tenant}/cards/018f0000-0000-7000-8000-000000000000/model.bin"),
@@ -1410,11 +1411,11 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let state = AppState::new(
-            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
-            None,
-            Arc::clone(&storage),
-        );
+        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
+        let state = AppState::new(postgres, Arc::clone(&storage));
         let tenant = DataTenantId::new_v7();
         let validated = ValidatedPath {
             full: format!("{tenant}/cards/018f0000-0000-7000-8000-000000000000/model.bin"),
@@ -1449,11 +1450,11 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let state = AppState::new(
-            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
-            None,
-            Arc::clone(&storage),
-        );
+        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
+        let state = AppState::new(postgres, Arc::clone(&storage));
         let caller = read_caller();
         let path = tenant_path::build(
             caller.data_tenant_id,
@@ -1501,11 +1502,11 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let state = AppState::new(
-            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
-            None,
-            Arc::clone(&storage),
-        );
+        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
+        let state = AppState::new(postgres, Arc::clone(&storage));
         let caller = caller_with_permissions([]);
         let path = tenant_path::build(
             caller.data_tenant_id,
@@ -1535,11 +1536,11 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let state = AppState::new(
-            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
-            None,
-            Arc::clone(&storage),
-        );
+        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
+        let state = AppState::new(postgres, Arc::clone(&storage));
         let caller = caller_with_permissions([]);
         let path = tenant_path::build(
             caller.data_tenant_id,

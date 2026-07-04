@@ -127,9 +127,11 @@ mod tests {
                 ..WyrdAuthVerifySettings::default()
             },
         ));
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
         crate::state::AppState::new(
-            app_pool,
-            None,
+            postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
         )
         .with_auth_handles(issuing_key, verifier)

@@ -13,6 +13,7 @@ use wyrd_auth_verify::{
 };
 use wyrd_runtime::PrincipalId;
 use wyrd_server::health::{ProbeOutcome, ProbeReason, ReadinessSnapshot};
+use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -398,6 +399,9 @@ async fn valid_token_is_not_rejected_by_default_deny_layer() {
 
 fn test_state() -> AppState {
     let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+    let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
+    let vala = vala_sql::ValaPostgres::from_pools(app_pool.clone(), None);
+    let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
     let issuing_key = Arc::new(
@@ -418,29 +422,24 @@ fn test_state() -> AppState {
         "wyrd",
         Arc::new(
             wyrd_server::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(
-                app_pool.clone(),
+                app_pool,
             )),
         ),
         WyrdAuthVerifySettings::default(),
     ));
 
-    AppState::new(
-        app_pool,
-        None,
-        Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-    )
-    .with_auth_handles(issuing_key, verifier)
+    AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))))
+        .with_auth_handles(issuing_key, verifier)
 }
 
 fn test_state_no_verifier() -> AppState {
     let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+    let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
+    let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+    let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-    AppState::new(
-        app_pool,
-        None,
-        Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-    )
+    AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))))
     // no .with_auth_handles() → token_verifier is None → 503 on any /v1 request
 }
 

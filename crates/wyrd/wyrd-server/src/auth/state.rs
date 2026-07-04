@@ -11,7 +11,7 @@ use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::state::WyrdTokenVerifier;
 
 /// Authentication handles: token issuance + verification + issuer/binding resolution.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ServerAuth {
     pub allow_preview: bool,
     pub issuing_key: Option<Arc<IssuingKey>>,
@@ -20,20 +20,6 @@ pub struct ServerAuth {
     pub workload_binding_resolver: Option<Arc<PgWorkloadBindingResolver>>,
     pub sealing_key: Option<Arc<SecretKey>>,
     pub token_exchange_settings: TokenExchangeSettings,
-}
-
-impl Default for ServerAuth {
-    fn default() -> Self {
-        Self {
-            allow_preview: false,
-            issuing_key: None,
-            token_verifier: None,
-            trusted_issuer_resolver: None,
-            workload_binding_resolver: None,
-            sealing_key: None,
-            token_exchange_settings: TokenExchangeSettings::default(),
-        }
-    }
 }
 
 /// Authorization handles: policy decision + RBAC evaluation + decision audit.

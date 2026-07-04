@@ -52,7 +52,9 @@ impl JwtBearer {
             let verified =
                 verify_workload_assertion(state, tenant_id, assertion.expose_secret()).await?;
             let card_ref = resolve_workload_binding(state, tenant_id, &verified).await?;
-            let mut conn = state.postgres.tenant_conn(tenant_id)
+            let mut conn = state
+                .postgres
+                .tenant_conn(tenant_id)
                 .await
                 .map_err(sql_error)?;
             let (row, roles) = load_service_account_subject(&mut conn, &card_ref).await?;
@@ -158,7 +160,11 @@ async fn issue_and_audit(
     roles: Vec<RoleRef>,
     request_id: &str,
 ) -> Result<ExchangedToken, WyrdErrorResponse> {
-    let issuing_key = state.auth.issuing_key.as_ref().ok_or_else(auth_not_configured)?;
+    let issuing_key = state
+        .auth
+        .issuing_key
+        .as_ref()
+        .ok_or_else(auth_not_configured)?;
     let exchanged = issue_for_subject(
         conn,
         issuing_key,
@@ -816,7 +822,11 @@ mod tests {
             .await
             .expect("tenant conn opens");
         let exchanged = crate::auth::exchange_api_key::ExchangeApiKey {
-            issuing_key: state.auth.issuing_key.clone().expect("issuing key configured"),
+            issuing_key: state
+                .auth
+                .issuing_key
+                .clone()
+                .expect("issuing key configured"),
             settings: Default::default(),
         }
         .execute(&mut conn, SecretString::from(token), "req-api-key")
@@ -840,7 +850,10 @@ mod tests {
         let storage_root = dir.keep().join("jwt-bearer-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
-        AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))))
+        AppState::new(
+            postgres,
+            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+        )
     }
 
     async fn test_state_with_external(

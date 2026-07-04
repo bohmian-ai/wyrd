@@ -1252,7 +1252,7 @@ description = "Fail if from_pools is called outside the eight DB-free-unit-test 
 run = """
 set -e
 # from_pools may only be *called* from the eight DB-free-unit-test sites (task 03 §5).
-! rg -n --no-heading -e '\.from_pools\(|::from_pools\(' \
+! rg -n --no-heading -e '\\.from_pools\\(|::from_pools\\(' \
     --glob '!crates/wyrd/wyrd-sql/src/postgres.rs' \
     --glob '!crates/vala/vala-sql/src/postgres.rs' \
     --glob '!crates/wyrd/wyrd-server/src/state.rs' \
@@ -1272,7 +1272,7 @@ description = "Fail if wyrd-dev-fixtures imports wyrd-server or ServerPostgres::
 run = """
 set -e
 # 1. wyrd-dev-fixtures must never import wyrd-server.
-! rg -n --no-heading -e '\buse\s+wyrd_server\b|\bwyrd_server::' \
+! rg -n --no-heading -e '\\buse\\s+wyrd_server\\b|\\bwyrd_server::' \
     crates/shared/wyrd-dev-fixtures/
 # 2. ServerPostgres composition (from_parts) stays in server + test harness only.
 ! rg -n --no-heading -e 'ServerPostgres::from_parts' \

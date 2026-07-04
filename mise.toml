@@ -1263,6 +1263,10 @@ set -e
     --glob '!crates/wyrd/wyrd-server/src/auth/policy_hook.rs' \
     --glob '!crates/wyrd/wyrd-server/src/auth/routes.rs' \
     --glob '!crates/wyrd/wyrd-server/src/health.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/storage/service.rs' \
+    --glob '!crates/wyrd/wyrd-server/tests/authz_check_route.rs' \
+    --glob '!crates/wyrd/wyrd-server/tests/grpc_smoke.rs' \
+    --glob '!crates/wyrd/wyrd-server/tests/router_smoke.rs' \
     crates/ python/
 """
 

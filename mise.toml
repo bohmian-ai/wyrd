@@ -69,11 +69,12 @@ run = "cargo build --workspace --all-features --all-targets"
 hide = true
 description = "Run workspace Rust unit tests (no DB required)"
 run = """
-cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server --exclude vala-bifrost --exclude vala-sql --exclude vala-core --exclude wyrd-client --exclude wyrd-dev-fixtures --exclude wyrd-sql
+cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server --exclude vala-bifrost --exclude vala-sql --exclude vala-core --exclude wyrd-client --exclude wyrd-dev-fixtures --exclude wyrd-sql --exclude wyrd-storage
 cargo test --locked -p wyrd-client
 cargo test --locked -p vala-core
 cargo test --locked -p vala-sql --lib
 cargo test --locked -p wyrd-sql --lib
+cargo test --locked -p wyrd-storage --lib
 """
 
 [tasks."test:bifrost"]
@@ -1339,6 +1340,7 @@ run = """
 cargo test --locked -p wyrd-sql --all-features -- --nocapture --test-threads=1
 cargo test --locked -p wyrd-dev-fixtures --all-features -- --test-threads=1
 cargo test --locked -p vala-sql --all-features -- --test-threads=1
+cargo test --locked -p wyrd-storage --all-features --test sweeper -- --test-threads=1
 """
 
 [tasks."db:migrate:all"]

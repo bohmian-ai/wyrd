@@ -397,6 +397,9 @@ mod tests {
             .await
             .expect("state inserts");
 
+        // Wait long enough that Postgres clock advances past expires_at = now() + 0.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
         let consumed = store
             .take(tenant, "state-expired")
             .await

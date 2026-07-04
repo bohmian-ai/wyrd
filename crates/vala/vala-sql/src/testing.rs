@@ -11,7 +11,17 @@ use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 
 use crate::SqlError;
 
-const DEFAULT_TEST_VALA_RECOVERY_PASSWORD: &str = "vala_recovery_pw";
+fn resolved_test_dsns() -> Result<wyrd_sql::dsn::ResolvedDsns, SqlError> {
+    wyrd_sql::dsn::resolve_external_dsns_from_env()
+        .map_err(|error| SqlError::InvariantViolation {
+            detail: format!("test DB DSN config error: {error}"),
+        })
+        .and_then(|resolved| {
+            resolved.ok_or_else(|| SqlError::InvariantViolation {
+                detail: "shared test DB env unset (WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD); refusing to boot embedded in tests".to_owned(),
+            })
+        })
+}
 
 /// Shared pool set with Wyrd and Vala migrations guaranteed applied once.
 ///
@@ -20,16 +30,9 @@ const DEFAULT_TEST_VALA_RECOVERY_PASSWORD: &str = "vala_recovery_pw";
 /// migrations fail.
 pub async fn shared() -> Result<wyrd_sql::testing::SharedDb, SqlError> {
     let db = wyrd_sql::testing::shared().await?;
-    let dsns = wyrd_sql::dsn::resolve_external_dsns_from_env()
-        .map_err(|error| SqlError::InvariantViolation {
-            detail: format!("test DB DSN config error: {error}"),
-        })
-        .and_then(|resolved| {
-            resolved.ok_or_else(|| SqlError::InvariantViolation {
-                detail: "shared test DB env unset (WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD); refusing to boot embedded in tests".to_owned(),
-            })
-        })?;
-    let vala = crate::ValaPostgres::connect_from_dsns(&dsns).await?;
+    // resolve again because SharedDb does not expose its ResolvedDsns
+    let dsns = resolved_test_dsns()?;
+    let vala = crate::ValaPostgres::connect_after_wyrd(&dsns).await?;
     drop(vala);
     Ok(db)
 }
@@ -39,17 +42,12 @@ pub async fn shared() -> Result<wyrd_sql::testing::SharedDb, SqlError> {
 /// # Errors
 /// Returns [`SqlError`] when shared DB env is missing or the pool cannot connect.
 pub async fn recovery_pool() -> Result<PgPool, SqlError> {
-    let dsns = wyrd_sql::dsn::resolve_external_dsns_from_env()
-        .map_err(|error| SqlError::InvariantViolation {
-            detail: format!("test DB DSN config error: {error}"),
-        })
-        .and_then(|resolved| {
-            resolved.ok_or_else(|| SqlError::InvariantViolation {
-                detail: "shared test DB env unset (WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD); refusing to boot embedded in tests".to_owned(),
-            })
-        })?;
+    let dsns = resolved_test_dsns()?;
     let password = std::env::var(crate::postgres::VALA_RECOVERY_PASSWORD_ENV)
-        .unwrap_or_else(|_| DEFAULT_TEST_VALA_RECOVERY_PASSWORD.to_owned());
+        .map_err(|_| SqlError::InvariantViolation {
+            detail: "VALA_RECOVERY_PASSWORD must be set to connect recovery pool in tests"
+                .to_owned(),
+        })?;
     crate::postgres::connect_recovery_pool(&dsns, SecretString::from(password)).await
 }
 
@@ -65,6 +63,13 @@ pub async fn reset_for_test(db: &wyrd_sql::testing::SharedDb) -> Result<(), SqlE
         .collect();
     let mut conn = db.migrator.acquire().await.map_err(SqlError::Connect)?;
     wyrd_sql::testing::reset_owned_schemas(&mut conn, &schemas).await?;
+    sqlx::query(
+        "ALTER SEQUENCE vala.writer_fencing_seq RESTART WITH 1; \
+         ALTER SEQUENCE vala.recovery_fencing_seq RESTART WITH 1",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(SqlError::from)?;
     seed_system_owner(&mut conn).await
 }
 

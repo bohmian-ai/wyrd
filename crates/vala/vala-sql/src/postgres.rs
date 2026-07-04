@@ -131,7 +131,7 @@ pub async fn connect_recovery_pool(
         .map_err(|error| SqlError::InvariantViolation {
             detail: format!("vala recovery DSN config error: {error}"),
         })?;
-    build_pool(&recovery_dsn, vala_recovery_pool_config())
+    build_pool(recovery_dsn.expose_secret(), vala_recovery_pool_config())
         .await
         .map_err(SqlError::Connect)
 }

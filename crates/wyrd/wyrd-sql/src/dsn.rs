@@ -86,12 +86,11 @@ pub fn resolve_external_dsns(
             let migrator_dsn = role_dsn(&base, WYRD_MIGRATOR_ROLE, &migrator_pw);
             let platform_admin_dsn = platform_admin_pw
                 .as_ref()
-                .map(|pw| role_dsn(&base, WYRD_PLATFORM_ADMIN_ROLE, pw))
-                .map(SecretString::from);
+                .map(|pw| role_dsn(&base, WYRD_PLATFORM_ADMIN_ROLE, pw));
 
             Ok(Some(ResolvedDsns {
                 app: SecretString::from(app_url),
-                migrator: SecretString::from(migrator_dsn),
+                migrator: migrator_dsn,
                 platform_admin: platform_admin_dsn,
             }))
         }
@@ -117,13 +116,13 @@ pub fn resolve_external_dsns_from_env() -> Result<Option<ResolvedDsns>, DsnError
 
 /// Synthesize a role DSN by replacing the userinfo of `base` with `role` and
 /// `password`. Host, port, database, and query string are preserved.
-pub fn role_dsn(base: &Url, role: &str, password: &SecretString) -> String {
+pub fn role_dsn(base: &Url, role: &str, password: &SecretString) -> SecretString {
     let mut dsn = base.clone();
     dsn.set_username(role)
         .expect("role name is URL-safe ASCII per role constants");
     dsn.set_password(Some(password.expose_secret()))
         .expect("password is URL-safe via set_password percent-encoding");
-    dsn.into()
+    SecretString::from(String::from(dsn))
 }
 
 /// Synthesize a role DSN from a secret-bearing base DSN string.
@@ -134,7 +133,7 @@ pub fn role_dsn_from_base(
     base: &SecretString,
     role: &str,
     password: &SecretString,
-) -> Result<String, DsnError> {
+) -> Result<SecretString, DsnError> {
     let base = Url::parse(base.expose_secret()).map_err(DsnError::InvalidUrl)?;
     Ok(role_dsn(&base, role, password))
 }

@@ -53,6 +53,19 @@ impl WyrdPostgres {
         })
     }
 
+    /// Wrap pre-built pools into a handle.
+    ///
+    /// **Migrations are assumed already applied elsewhere.** Production and
+    /// DB-backed tests use `connect_from_dsns`, which migrates. This seam exists
+    /// only for DB-free unit tests that construct lazy pools and never issue a
+    /// query. Gated behind `testing` / `cfg(test)` so it cannot be reached from a
+    /// production build.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn from_pools(app: PgPool, platform_admin: Option<PgPool>) -> Self {
+        Self { app, platform_admin }
+    }
+
     /// Borrow the RLS-enforced runtime app pool.
     #[must_use]
     pub fn app_pool(&self) -> &PgPool {

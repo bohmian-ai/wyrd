@@ -1246,9 +1246,47 @@ else
 fi
 """
 
+[tasks."check:from-pools-allowlist"]
+hide = true
+description = "Fail if from_pools is called outside the eight DB-free-unit-test allowlist sites"
+run = """
+set -e
+# from_pools may only be *called* from the eight DB-free-unit-test sites (task 03 §5).
+! rg -n --no-heading -e '\.from_pools\(|::from_pools\(' \
+    --glob '!crates/wyrd/wyrd-sql/src/postgres.rs' \
+    --glob '!crates/vala/vala-sql/src/postgres.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/state.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/boot.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/middleware/authenticate.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/auth/principal_extractor.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/auth/caller_extractor.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/auth/policy_hook.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/auth/routes.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/health.rs' \
+    crates/ python/
+"""
+
+[tasks."check:fixtures-no-server"]
+hide = true
+description = "Fail if wyrd-dev-fixtures imports wyrd-server or ServerPostgres::from_parts appears outside wyrd-server/wyrd-testing"
+run = """
+set -e
+# 1. wyrd-dev-fixtures must never import wyrd-server.
+! rg -n --no-heading -e '\buse\s+wyrd_server\b|\bwyrd_server::' \
+    crates/shared/wyrd-dev-fixtures/
+# 2. ServerPostgres composition (from_parts) stays in server + test harness only.
+! rg -n --no-heading -e 'ServerPostgres::from_parts' \
+    --glob '!crates/wyrd/wyrd-server/**' \
+    --glob '!crates/wyrd/wyrd-testing/**' \
+    crates/ python/
+# 3. wyrd-dev-fixtures Cargo.toml must not declare wyrd-server as a dependency.
+! rg -n --no-heading -e '^[[:space:]]*wyrd-server[[:space:]]*=' \
+    crates/shared/wyrd-dev-fixtures/Cargo.toml
+"""
+
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
-depends = ["check", "test:unit", "test:bifrost", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:tokens", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs", "check:no-legacy-server-vocab", "check:no-tonic-outside-wyrd-tonic"]
+depends = ["check", "test:unit", "test:bifrost", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:tokens", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs", "check:no-legacy-server-vocab", "check:no-tonic-outside-wyrd-tonic", "check:from-pools-allowlist", "check:fixtures-no-server"]
 
 [tasks."db:setup-roles"]
 hide = true

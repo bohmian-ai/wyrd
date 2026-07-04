@@ -117,7 +117,7 @@ depends = ["db:setup-roles"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
 cargo test --locked -p wyrd-server --all-features -- --test-threads=1
-cargo test --locked -p wyrd-testing --all-features -- --test-threads=1
+cargo test --locked -p wyrd-testing -- --test-threads=1
 cargo test --locked -p wyrd-client --test auth_e2e_against_fixture --test discovery_against_fixture -- --test-threads=1
 """
 

@@ -37,7 +37,7 @@ async fn reset_empties_owned_tables_and_restarts_identity() {
             .expect("seeds scratch row");
     }
 
-    testing::reset_owned_schemas(&mut *conn, OWNED_SCHEMAS)
+    testing::reset_owned_schemas(&mut conn, OWNED_SCHEMAS)
         .await
         .expect("reset succeeds");
 
@@ -82,7 +82,7 @@ async fn reset_preserves_sqlx_migrations_ledger() {
         "the migration ledger must be populated before the reset runs"
     );
 
-    testing::reset_owned_schemas(&mut *conn, OWNED_SCHEMAS)
+    testing::reset_owned_schemas(&mut conn, OWNED_SCHEMAS)
         .await
         .expect("reset succeeds");
 

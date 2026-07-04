@@ -56,7 +56,7 @@ run = ["docker compose down --volumes --remove-orphans", "docker compose up -d -
 
 [tasks."impl:setup"]
 hide = true
-description = "One-time environment bring-up before the first wyrd-implement wave: shared docker Postgres that every worktree reaches at localhost:5432. Run once, not per worktree."
+description = "One-time environment bring-up before the first wyrd-implement wave: shared docker Postgres that every worktree reaches at 127.0.0.1:55432. Run once, not per worktree."
 depends = ["db:setup-roles"]
 run = "echo 'impl env ready: shared Postgres up; mise supplies DATABASE_URL / WYRD_* per verify task'"
 
@@ -80,7 +80,7 @@ description = """Run vala-bifrost integration tests against local Postgres.
 Runs serially because each test resets shared database state at test start.
 """
 depends = ["db:setup-roles"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = "cargo test --locked -p vala-bifrost -- --test-threads=1"
 
 [tasks."test:unit"]
@@ -112,7 +112,7 @@ run = "cargo test -p wyrd-error-derive --all-features"
 hide = true
 description = """Run wyrd-server Rust tests against the local Postgres database."""
 depends = ["db:setup-roles"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = "cargo test --locked -p wyrd-server --all-features -- --test-threads=1"
 
 [tasks."test:wyrd-mcp"]
@@ -127,7 +127,7 @@ admin REST API, export env gates, run the identity e2e suite against both issuer
 Gated by WYRD_IDENTITY_E2E=1; skipped when the env var is unset so default local runs are fast.
 """
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
-env = { WYRD_IDENTITY_E2E = "1", WYRD_KEYCLOAK_ISSUER = "http://localhost:8080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_IDENTITY_E2E = "1", WYRD_KEYCLOAK_ISSUER = "http://localhost:8080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
 set -e
 
@@ -513,21 +513,21 @@ run = "cargo test -p wyrd-storage --all-features --test integration_azurite -- -
 hide = true
 description = "Run server-level storage HTTP e2e tests (local single-put + S3/GCS/Azure multipart) against the docker emulators + Postgres"
 depends = ["storage:up", "build:postgres", "db:setup-roles", "db:migrate"]
-env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_INTEGRATION_S3 = "1", WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_GCS_EMULATOR_HOST = "http://localhost:4443", WYRD_AZURE_EMULATOR_ENDPOINT = "http://127.0.0.1:10000", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_INTEGRATION_S3 = "1", WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_GCS_EMULATOR_HOST = "http://localhost:4443", WYRD_AZURE_EMULATOR_ENDPOINT = "http://127.0.0.1:10000", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = "cargo test -p wyrd-server --all-features --test storage_e2e -- --nocapture --test-threads=1"
 
 [tasks."test:registry-e2e"]
 hide = true
 description = "Cards registration end-to-end against a real Postgres"
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
-env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = "cargo test --locked -p wyrd-sql --features test-e2e --test cards_e2e -- --include-ignored"
 
 [tasks."test:storage:s3:cloud"]
 hide = true
 description = "Run the StorageHandle CRUD + server multipart e2e against real AWS S3 (merge-to-main only; requires AWS creds + WYRD_STORAGE_S3_BUCKET in env)"
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
-env = { WYRD_STORAGE_CLOUD_S3 = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_STORAGE_CLOUD_S3 = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
 cargo test -p wyrd-storage --all-features --test handle_crud s3_cloud_handle_crud -- --nocapture
 cargo test -p wyrd-server --all-features --test storage_e2e s3_multipart_e2e_cloud -- --nocapture
@@ -537,7 +537,7 @@ cargo test -p wyrd-server --all-features --test storage_e2e s3_multipart_e2e_clo
 hide = true
 description = "Run the StorageHandle CRUD + server multipart e2e against real GCS (merge-to-main only; requires GCP creds + WYRD_STORAGE_GCS_BUCKET in env)"
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
-env = { WYRD_STORAGE_CLOUD_GCS = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_STORAGE_CLOUD_GCS = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
 cargo test -p wyrd-storage --all-features --test handle_crud gcs_cloud_handle_crud -- --nocapture
 cargo test -p wyrd-server --all-features --test storage_e2e gcs_multipart_e2e_cloud -- --nocapture
@@ -547,7 +547,7 @@ cargo test -p wyrd-server --all-features --test storage_e2e gcs_multipart_e2e_cl
 hide = true
 description = "Run the StorageHandle CRUD + server multipart e2e against real Azure Blob Storage (merge-to-main only; requires Azure creds + WYRD_STORAGE_AZURE_{ACCOUNT,CONTAINER} in env)"
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
-env = { WYRD_STORAGE_CLOUD_AZURE = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_STORAGE_CLOUD_AZURE = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
 cargo test -p wyrd-storage --all-features --test handle_crud azure_cloud_handle_crud -- --nocapture
 cargo test -p wyrd-server --all-features --test storage_e2e azure_multipart_e2e_cloud -- --nocapture
@@ -1257,7 +1257,7 @@ Targets the local docker-compose Postgres by default; the docker-compose
 bootstrap user is wyrd_migrator (which owns the database).
 """
 depends = ["build:postgres"]
-env = { WYRD_MIGRATOR_DSN = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd" }
+env = { WYRD_MIGRATOR_DSN = "postgres://wyrd_migrator:wyrd_migrator_pw@127.0.0.1:55432/wyrd" }
 run = """
 for i in $(seq 1 30); do
   if psql "$WYRD_MIGRATOR_DSN" -c "SELECT 1" >/dev/null 2>&1; then
@@ -1282,7 +1282,7 @@ roles (wyrd_migrator BYPASSRLS, wyrd_app no-BYPASSRLS, wyrd_platform_admin
 BYPASSRLS) are present before applying DDL.
 """
 depends = ["db:setup-roles"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw" }
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw" }
 run = "cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture"
 
 [tasks."test:sql"]
@@ -1290,8 +1290,8 @@ hide = true
 description = """Run live Postgres SQL integration tests against docker-compose Postgres.
 Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, and Vala SQL suites.
 """
-depends = ["db:setup-roles"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+depends = ["dev:pg:nuke", "db:setup-roles"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
 cargo test --locked -p wyrd-sql --all-features -- --nocapture --test-threads=1
 cargo test --locked -p wyrd-dev-fixtures --all-features -- --test-threads=1
@@ -1302,7 +1302,7 @@ cargo test --locked -p vala-sql --all-features -- --test-threads=1
 hide = true
 description = "Manual Wyrd + Vala migration smoke test against local docker-compose Postgres."
 depends = ["db:setup-roles"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
 cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture
 cargo test --locked -p vala-sql --all-features --test migration_pg -- vala_migrations_apply_and_are_idempotent --nocapture
@@ -1330,8 +1330,17 @@ run = "cargo test --locked -p vala-core --tests alert_router -- schema_drift"
 
 [tasks."dev:pg:nuke"]
 hide = true
-description = "Wipe embedded pg cache"
-run = "rm -rf ${WYRD_DEV_PG_CACHE}"
+description = "Wipe embedded pg cache used by PostgresBoot"
+run = """
+cache_dir="${WYRD_DEV_PG_CACHE:-$HOME/.local/share/wyrd/pg}"
+case "$cache_dir" in
+  ""|"/")
+    echo "refusing to wipe unsafe WYRD_DEV_PG_CACHE='$cache_dir'" >&2
+    exit 1
+    ;;
+esac
+rm -rf "$cache_dir"
+"""
 
 [tasks."bench"]
 description = """vala-bifrost criterion microbenches against docker-compose Postgres.
@@ -1340,7 +1349,7 @@ benches. The warehouse dir is reset so a fresh catalog never disagrees with
 stale on-disk Iceberg metadata.
 """
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
-env = { BIFROST_TEST_DB_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd" }
+env = { BIFROST_TEST_DB_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@127.0.0.1:55432/wyrd" }
 run = """
 rm -rf /tmp/vala-bifrost-bench
 cargo bench -p vala-bifrost --features bench-bin
@@ -1352,7 +1361,7 @@ description = """vala-bifrost large-workload bench (~5 min, release) against doc
 Brings up a clean Postgres, provisions roles, and applies migrations first.
 """
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
-env = { WYRD_BENCH_PG_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd" }
+env = { WYRD_BENCH_PG_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@127.0.0.1:55432/wyrd" }
 run = """
 cargo run --release -p vala-bifrost --bin bench_workload --features bench-bin -- \
   --rows 10000000 --batch-size 65536 --workload selective \

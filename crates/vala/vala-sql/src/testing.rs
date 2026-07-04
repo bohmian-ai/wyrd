@@ -43,11 +43,12 @@ pub async fn shared() -> Result<wyrd_sql::testing::SharedDb, SqlError> {
 /// Returns [`SqlError`] when shared DB env is missing or the pool cannot connect.
 pub async fn recovery_pool() -> Result<PgPool, SqlError> {
     let dsns = resolved_test_dsns()?;
-    let password = std::env::var(crate::postgres::VALA_RECOVERY_PASSWORD_ENV)
-        .map_err(|_| SqlError::InvariantViolation {
+    let password = std::env::var(crate::postgres::VALA_RECOVERY_PASSWORD_ENV).map_err(|_| {
+        SqlError::InvariantViolation {
             detail: "VALA_RECOVERY_PASSWORD must be set to connect recovery pool in tests"
                 .to_owned(),
-        })?;
+        }
+    })?;
     crate::postgres::connect_recovery_pool(&dsns, SecretString::from(password)).await
 }
 
@@ -63,13 +64,14 @@ pub async fn reset_for_test(db: &wyrd_sql::testing::SharedDb) -> Result<(), SqlE
         .collect();
     let mut conn = db.migrator.acquire().await.map_err(SqlError::Connect)?;
     wyrd_sql::testing::reset_owned_schemas(&mut conn, &schemas).await?;
-    sqlx::query(
-        "ALTER SEQUENCE vala.writer_fencing_seq RESTART WITH 1; \
-         ALTER SEQUENCE vala.recovery_fencing_seq RESTART WITH 1",
-    )
-    .execute(&mut *conn)
-    .await
-    .map_err(SqlError::from)?;
+    sqlx::query("ALTER SEQUENCE vala.writer_fencing_seq RESTART WITH 1")
+        .execute(&mut *conn)
+        .await
+        .map_err(SqlError::from)?;
+    sqlx::query("ALTER SEQUENCE vala.recovery_fencing_seq RESTART WITH 1")
+        .execute(&mut *conn)
+        .await
+        .map_err(SqlError::from)?;
     seed_system_owner(&mut conn).await
 }
 

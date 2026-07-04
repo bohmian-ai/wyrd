@@ -36,28 +36,30 @@ async fn reset_clears_vala_tables_and_reseeds_sentinel() {
         .unwrap();
     conn.commit().await.unwrap();
 
-    let before: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_commits")
-            .fetch_one(&db.migrator)
-            .await
-            .unwrap();
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_commits")
+        .fetch_one(&db.migrator)
+        .await
+        .unwrap();
     assert_eq!(before, 1, "precommit row must exist before reset");
 
-    vala_sql::testing::reset_for_test(&db).await.expect("second reset");
+    vala_sql::testing::reset_for_test(&db)
+        .await
+        .expect("second reset");
 
-    let after_commits: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_commits")
-            .fetch_one(&db.migrator)
-            .await
-            .unwrap();
+    let after_commits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_commits")
+        .fetch_one(&db.migrator)
+        .await
+        .unwrap();
     assert_eq!(after_commits, 0, "olap_commits must be empty after reset");
 
-    let after_events: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_recovery_events")
-            .fetch_one(&db.migrator)
-            .await
-            .unwrap();
-    assert_eq!(after_events, 0, "olap_recovery_events must be empty after reset");
+    let after_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vala.olap_recovery_events")
+        .fetch_one(&db.migrator)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_events, 0,
+        "olap_recovery_events must be empty after reset"
+    );
 
     let sentinel: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM platform.tenants WHERE slug = 'wyrd-system-owner'",

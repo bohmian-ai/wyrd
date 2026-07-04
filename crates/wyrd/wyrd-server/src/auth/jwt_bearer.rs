@@ -825,7 +825,10 @@ mod tests {
 
     async fn test_state(fixture: &PgFixture) -> AppState {
         let dir = tempfile::tempdir().expect("jwt-bearer storage tempdir");
-        let storage_root = dir.into_path().join("jwt-bearer-storage");
+        let storage_root = dir
+            .keep()
+            .expect("keep jwt-bearer temp dir")
+            .join("jwt-bearer-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
         AppState::new(

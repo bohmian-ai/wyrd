@@ -391,7 +391,10 @@ mod tests {
 
     fn fixture_state(fixture: &PgFixture) -> AppState {
         let dir = tempfile::tempdir().expect("routes storage tempdir");
-        let storage_root = dir.into_path().join("issue-key-storage");
+        let storage_root = dir
+            .keep()
+            .expect("keep routes temp dir")
+            .join("issue-key-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
         AppState::new(

@@ -588,7 +588,10 @@ mod tests {
 
     async fn test_state(fixture: &PgFixture) -> AppState {
         let dir = tempfile::tempdir().expect("admin storage tempdir");
-        let storage_root = dir.into_path().join("admin-storage");
+        let storage_root = dir
+            .keep()
+            .expect("keep admin temp dir")
+            .join("admin-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
         AppState::new(

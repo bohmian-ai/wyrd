@@ -19,6 +19,7 @@ use wyrd_sql::queries::auth::{
     list_service_account_roles, refresh_by_hash, revoke_refresh_family, service_account_by_id,
 };
 
+use crate::auth::card_scope::resolve_card_ref_scope;
 use crate::auth::exchange_api_key::{
     ExchangedToken, IssueOrSqlError, TokenExchangeSettings, principal_kind_wire, role_refs,
     token_hash,
@@ -48,6 +49,9 @@ pub enum RefreshError {
     /// Token issue failed.
     #[error("token issue error")]
     Issue(#[from] IssueError),
+    /// Wyrd contract error.
+    #[error("wyrd error")]
+    Wyrd(#[from] WyrdError),
 }
 
 impl From<IssueOrSqlError> for RefreshError {
@@ -55,6 +59,7 @@ impl From<IssueOrSqlError> for RefreshError {
         match error {
             IssueOrSqlError::Issue(e) => Self::Issue(e),
             IssueOrSqlError::Database(e) => Self::Database(e),
+            IssueOrSqlError::Wyrd(e) => Self::Wyrd(e),
         }
     }
 }
@@ -74,10 +79,17 @@ impl From<RefreshError> for WyrdError {
                 message: "auth backend unavailable".to_owned(),
                 details: json!({ "retry_after_seconds": 1 }),
             },
+            RefreshError::Issue(IssueError::CardScopeTooLarge { encoded_len, limit }) => {
+                WyrdError::CardScopeTooLarge {
+                    message: "card_ref_scope exceeded bearer token size limit".to_owned(),
+                    details: json!({ "encoded_len": encoded_len, "limit": limit }),
+                }
+            }
             RefreshError::Issue(_) => WyrdError::Internal {
                 message: "token issue failed during refresh rotation".to_owned(),
                 details: json!({}),
             },
+            RefreshError::Wyrd(error) => error,
         }
     }
 }
@@ -237,19 +249,22 @@ impl RefreshTokens {
         let pid = PrincipalId::new(principal_id);
         let tenant_id = conn.data_tenant_id();
         let card_ref = sa.card_ref.0;
+        let card_ref_scope = resolve_card_ref_scope(conn, &card_ref).await?;
 
         let access_token = match principal_kind {
             "service" => self.issuing_key.issue_service_access_token(
                 pid,
                 tenant_id,
-                card_ref,
-                roles,
+                card_ref.clone(),
+                card_ref_scope.clone(),
+                roles.clone(),
                 self.settings.access_ttl,
             )?,
             "agent" => self.issuing_key.issue_agent_access_token(
                 pid,
                 tenant_id,
                 card_ref,
+                card_ref_scope,
                 roles,
                 self.settings.access_ttl,
             )?,

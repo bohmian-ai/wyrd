@@ -457,6 +457,11 @@ fn derive_cascade_children(spec: &WorkflowSpec) -> Vec<CardRef> {
     out
 }
 
+/// Return card refs declared by a workflow for card-ref scope traversal.
+pub(crate) fn scope_child_card_refs(spec: &WorkflowSpec) -> Vec<CardRef> {
+    derive_cascade_children(spec)
+}
+
 fn card_name(field: &str, value: &str) -> Result<CardName, WyrdError> {
     CardName::new(value).map_err(|error| {
         WorkflowCardError::validation(format!("{field} must be a valid CardName: {error}")).into()

@@ -114,6 +114,7 @@ mod tests {
                 .parse::<DataTenantId>()
                 .expect("static tenant id is valid"),
             card_ref: None,
+            card_ref_scope: Default::default(),
         }
     }
 

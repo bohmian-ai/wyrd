@@ -24,7 +24,7 @@ use wyrd_runtime::{
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, CardRefScope};
 
 /// Hard cap on RFC 8693 delegation depth.
 pub const MAX_DELEGATION_DEPTH: usize = 5;
@@ -90,6 +90,9 @@ pub enum AuthError {
     /// Card-bound principal claim is missing or has the wrong card reference kind.
     #[error("invalid card_ref")]
     InvalidCardRef,
+    /// Card-bound principal scope is non-empty but does not contain its root card.
+    #[error("card_ref_scope is missing the root card_ref")]
+    CardScopeMissingRoot,
     /// Delegation chain exceeded the supported depth.
     #[error("delegation depth exceeded")]
     DelegationDepthExceeded,
@@ -679,6 +682,9 @@ pub struct TokenPrincipalRef {
     /// Bound card reference for Service and Agent principals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card_ref: Option<CardRef>,
+    /// Transitive card authorization scope.
+    #[serde(default, skip_serializing_if = "CardRefScope::is_empty")]
+    pub card_ref_scope: CardRefScope,
 }
 
 /// Principal kind discriminant used in token claims.
@@ -726,24 +732,38 @@ impl From<(&RuntimePrincipalRef, DataTenantId)> for TokenPrincipalRef {
             },
             tenant_id,
             card_ref: ref_.card_ref().cloned(),
+            card_ref_scope: ref_.card_ref_scope().cloned().unwrap_or_default(),
         }
     }
 }
 
 impl From<&Principal> for TokenPrincipalRef {
     fn from(principal: &Principal) -> Self {
-        let (kind, card_ref) = match &principal.kind {
-            PrincipalKind::User => (PrincipalKindWire::User, None),
-            PrincipalKind::Service { card_ref } => {
-                (PrincipalKindWire::Service, Some(card_ref.clone()))
-            }
-            PrincipalKind::Agent { card_ref } => (PrincipalKindWire::Agent, Some(card_ref.clone())),
+        let (kind, card_ref, card_ref_scope) = match &principal.kind {
+            PrincipalKind::User => (PrincipalKindWire::User, None, CardRefScope::default()),
+            PrincipalKind::Service {
+                card_ref,
+                card_ref_scope,
+            } => (
+                PrincipalKindWire::Service,
+                Some(card_ref.clone()),
+                card_ref_scope.clone(),
+            ),
+            PrincipalKind::Agent {
+                card_ref,
+                card_ref_scope,
+            } => (
+                PrincipalKindWire::Agent,
+                Some(card_ref.clone()),
+                card_ref_scope.clone(),
+            ),
         };
         Self {
             id: principal.id,
             kind,
             tenant_id: principal.tenant_id,
             card_ref,
+            card_ref_scope,
         }
     }
 }
@@ -758,8 +778,11 @@ impl AccessTokenClaims {
         &self,
         resolver: &R,
     ) -> Result<VerifiedToken, AuthError> {
-        let kind =
-            wire_kind_into_principal_kind(self.principal.kind, self.principal.card_ref.as_ref())?;
+        let kind = wire_kind_into_principal_kind(
+            self.principal.kind,
+            self.principal.card_ref.as_ref(),
+            &self.principal.card_ref_scope,
+        )?;
         let effective_permissions = resolver
             .resolve(&self.principal.tenant_id, &self.roles)
             .await
@@ -792,6 +815,7 @@ impl AccessTokenClaims {
 fn wire_kind_into_principal_kind(
     wire: PrincipalKindWire,
     card_ref: Option<&CardRef>,
+    card_ref_scope: &CardRefScope,
 ) -> Result<PrincipalKind, AuthError> {
     match (wire, card_ref) {
         (PrincipalKindWire::User, Some(_)) => Err(AuthError::InvalidCardRef),
@@ -799,11 +823,13 @@ fn wire_kind_into_principal_kind(
         (PrincipalKindWire::Service, Some(card_ref)) if card_ref.kind == CardKind::Service => {
             Ok(PrincipalKind::Service {
                 card_ref: card_ref.clone(),
+                card_ref_scope: seed_scope(card_ref, card_ref_scope)?,
             })
         }
         (PrincipalKindWire::Agent, Some(card_ref)) if card_ref.kind == CardKind::Agent => {
             Ok(PrincipalKind::Agent {
                 card_ref: card_ref.clone(),
+                card_ref_scope: seed_scope(card_ref, card_ref_scope)?,
             })
         }
         (PrincipalKindWire::Service | PrincipalKindWire::Agent, _) => {
@@ -812,14 +838,27 @@ fn wire_kind_into_principal_kind(
     }
 }
 
+fn seed_scope(card_ref: &CardRef, wire_scope: &CardRefScope) -> Result<CardRefScope, AuthError> {
+    if wire_scope.is_empty() {
+        return Ok(CardRefScope::own(card_ref));
+    }
+    if !wire_scope.contains_root(card_ref) {
+        return Err(AuthError::CardScopeMissingRoot);
+    }
+    Ok(wire_scope.clone())
+}
+
 fn flatten_act_chain(mut act: Option<&ActClaim>) -> Result<Vec<DelegationStep>, AuthError> {
     let mut out = Vec::new();
     while let Some(layer) = act {
         if out.len() >= MAX_DELEGATION_DEPTH {
             return Err(AuthError::DelegationDepthExceeded);
         }
-        let kind =
-            wire_kind_into_principal_kind(layer.principal.kind, layer.principal.card_ref.as_ref())?;
+        let kind = wire_kind_into_principal_kind(
+            layer.principal.kind,
+            layer.principal.card_ref.as_ref(),
+            &CardRefScope::default(),
+        )?;
         out.push(DelegationStep {
             principal: RuntimePrincipalRef {
                 id: layer.principal.id,
@@ -911,7 +950,7 @@ mod tests {
     use wyrd_spec::auth::IssuerUrl;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::reference::{CardRef, CardRefScope};
 
     use super::{
         AccessTokenClaims, ActClaim, AuthError, Kid, MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH,
@@ -943,6 +982,7 @@ mod tests {
             principal_id(),
             PrincipalKind::Service {
                 card_ref: card_ref.clone(),
+                card_ref_scope: CardRefScope::own(&card_ref),
             },
             tenant_id(),
             vec![role()],
@@ -954,7 +994,8 @@ mod tests {
         assert_eq!(projected.id, principal.id);
         assert_eq!(projected.kind, PrincipalKindWire::Service);
         assert_eq!(projected.tenant_id, principal.tenant_id);
-        assert_eq!(projected.card_ref, Some(card_ref));
+        assert_eq!(projected.card_ref, Some(card_ref.clone()));
+        assert_eq!(projected.card_ref_scope, CardRefScope::own(&card_ref));
     }
 
     #[test]
@@ -1116,7 +1157,7 @@ mod tests {
 
         assert!(matches!(
             verified.principal.kind,
-            PrincipalKind::Agent { card_ref: ref actual } if actual == &card_ref
+            PrincipalKind::Agent { card_ref: ref actual, .. } if actual == &card_ref
         ));
     }
 
@@ -1411,6 +1452,7 @@ mod tests {
                 kind: PrincipalKindWire::User,
                 tenant_id: tenant_id(),
                 card_ref: None,
+                card_ref_scope: CardRefScope::default(),
             },
             roles: vec![role()],
             act: None,
@@ -1470,15 +1512,18 @@ mod tests {
             kind: PrincipalKindWire::User,
             tenant_id: tenant_id(),
             card_ref: None,
+            card_ref_scope: CardRefScope::default(),
         }
     }
 
     fn service_ref(name: &str) -> TokenPrincipalRef {
+        let card_ref = named_card_ref(CardKind::Service, name);
         TokenPrincipalRef {
             id: principal_id(),
             kind: PrincipalKindWire::Service,
             tenant_id: tenant_id(),
-            card_ref: Some(named_card_ref(CardKind::Service, name)),
+            card_ref: Some(card_ref.clone()),
+            card_ref_scope: CardRefScope::own(&card_ref),
         }
     }
 

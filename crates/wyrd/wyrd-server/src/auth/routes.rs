@@ -13,6 +13,10 @@ use wyrd_spec::request_id::RequestId;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::auth::callback::exchange_authorization_code;
+use crate::auth::card_scope::{
+    MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_DELEGATION, MINT_KIND_REFRESH,
+    audit_scope_mint_failure_best_effort,
+};
 use crate::auth::exchange_api_key::{DelegateToken, ExchangeApiKey, map_exchange_error_to_wyrd};
 use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
 use crate::auth::jwt_bearer::JwtBearer;
@@ -61,12 +65,24 @@ async fn token(
                 issuing_key,
                 settings: state.token_exchange_settings.clone(),
             }
-            .execute(&mut conn, SecretString::from(api_key.expose().to_owned()))
+            .execute(
+                &mut conn,
+                SecretString::from(api_key.expose().to_owned()),
+                req_id,
+            )
             .await;
             let exchanged = match exchanged {
                 Ok(exchanged) => exchanged,
                 Err(error) => {
                     let wyrd = map_exchange_error_to_wyrd(&mut conn, &prefix, error).await;
+                    audit_scope_mint_failure_best_effort(
+                        &state.pool,
+                        parsed.tenant_id,
+                        req_id,
+                        MINT_KIND_API_KEY_EXCHANGE,
+                        &wyrd,
+                    )
+                    .await;
                     return Err(WyrdErrorResponse::from(wyrd));
                 }
             };
@@ -102,8 +118,22 @@ async fn token(
                 requested_subject,
                 req_id,
             )
-            .await
-            .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
+            .await;
+            let exchanged = match exchanged {
+                Ok(exchanged) => exchanged,
+                Err(error) => {
+                    let wyrd = WyrdError::from(error);
+                    audit_scope_mint_failure_best_effort(
+                        &state.pool,
+                        tenant_id,
+                        req_id,
+                        MINT_KIND_DELEGATION,
+                        &wyrd,
+                    )
+                    .await;
+                    return Err(WyrdErrorResponse::from(wyrd));
+                }
+            };
             conn.commit().await.map_err(sql_error)?;
             Ok(Json(exchanged.into_response()))
         }
@@ -119,8 +149,22 @@ async fn token(
                 settings: state.token_exchange_settings.clone(),
             }
             .execute(&mut conn, SecretString::from(secret), req_id)
-            .await
-            .map_err(WyrdErrorResponse::from)?;
+            .await;
+            let exchanged = match exchanged {
+                Ok(exchanged) => exchanged,
+                Err(error) => {
+                    let wyrd = WyrdError::from(error);
+                    audit_scope_mint_failure_best_effort(
+                        &state.pool,
+                        tenant_id,
+                        req_id,
+                        MINT_KIND_REFRESH,
+                        &wyrd,
+                    )
+                    .await;
+                    return Err(WyrdErrorResponse::from(wyrd));
+                }
+            };
             conn.commit().await.map_err(sql_error)?;
             Ok(Json(exchanged.into_response()))
         }
@@ -310,6 +354,7 @@ mod tests {
                 kind: PrincipalKindWire::User,
                 tenant_id,
                 card_ref: None,
+                card_ref_scope: Default::default(),
             },
             roles: vec![],
             act: None,

@@ -176,6 +176,10 @@ pub fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
             message: "non-user token card_ref claim is absent or malformed".to_owned(),
             details: serde_json::json!({}),
         },
+        AuthError::CardScopeMissingRoot => WyrdError::InvalidCardRef {
+            message: "card-bound token scope is missing its root card_ref".to_owned(),
+            details: serde_json::json!({ "field": "card_ref_scope" }),
+        },
         AuthError::DelegationDepthExceeded => WyrdError::DelegationDepthExceededVerify {
             message: format!(
                 "delegation chain exceeds MAX_DELEGATION_DEPTH={MAX_DELEGATION_DEPTH}"

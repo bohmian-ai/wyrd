@@ -19,6 +19,7 @@ use wyrd_sql::queries::auth::{
     service_account_by_card_ref,
 };
 
+use crate::auth::card_scope::MINT_KIND_JWT_BEARER;
 use crate::auth::exchange_api_key::{
     ExchangeError, ExchangedToken, IssueSubject, RefreshPolicy, TokenExchangeSettings,
     issue_for_subject, role_refs,
@@ -167,6 +168,8 @@ async fn issue_and_audit(
             roles,
         },
         RefreshPolicy::Skip,
+        request_id,
+        MINT_KIND_JWT_BEARER,
     )
     .await
     .map_err(|error| workload_exchange_error(ExchangeError::from(error)))?;
@@ -194,6 +197,7 @@ fn workload_exchange_error(
                 details: json!({ "retry_after_seconds": 1 }),
             })
         }
+        crate::auth::exchange_api_key::ExchangeError::Wyrd(error) => WyrdErrorResponse::from(error),
         crate::auth::exchange_api_key::ExchangeError::Issue(_)
         | crate::auth::exchange_api_key::ExchangeError::Join(_)
         | crate::auth::exchange_api_key::ExchangeError::InvalidRole => {
@@ -462,7 +466,7 @@ mod tests {
             .expect("issued token verifies");
         assert!(matches!(
             &verified.principal.kind,
-            PrincipalKind::Service { card_ref } if *card_ref == binding.card_ref
+            PrincipalKind::Service { card_ref, .. } if *card_ref == binding.card_ref
         ));
         assert_eq!(role_names(&verified.principal.roles), set_of(&[role_name]));
         assert_eq!(exchanged.token_type, TokenType::Bearer);
@@ -525,7 +529,7 @@ mod tests {
             .expect("issued token verifies");
         assert!(matches!(
             &verified.principal.kind,
-            PrincipalKind::Agent { card_ref } if card_ref.name.as_str() == "agent"
+            PrincipalKind::Agent { card_ref, .. } if card_ref.name.as_str() == "agent"
         ));
     }
 
@@ -743,7 +747,7 @@ mod tests {
             .expect("issued token verifies");
         assert!(matches!(
             &verified.principal.kind,
-            PrincipalKind::Service { card_ref } if *card_ref == binding.card_ref
+            PrincipalKind::Service { card_ref, .. } if *card_ref == binding.card_ref
         ));
     }
 
@@ -811,7 +815,7 @@ mod tests {
             issuing_key: state.issuing_key.clone().expect("issuing key configured"),
             settings: Default::default(),
         }
-        .execute(&mut conn, SecretString::from(token))
+        .execute(&mut conn, SecretString::from(token), "req-api-key")
         .await
         .expect("api-key exchange still succeeds");
         conn.commit().await.expect("api-key exchange commits");

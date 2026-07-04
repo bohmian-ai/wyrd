@@ -105,6 +105,7 @@ fn mint_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> String {
                 kind: PrincipalKindWire::User,
                 tenant_id: tenant,
                 card_ref: None,
+                card_ref_scope: Default::default(),
             },
             role_refs,
             Duration::minutes(15),

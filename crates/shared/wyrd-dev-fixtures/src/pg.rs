@@ -1,13 +1,16 @@
 //! Shared Postgres fixtures for SQL integration tests.
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, pool::PoolConnection};
 use wyrd_spec::DataTenantId;
 use wyrd_sql::{SqlError, TenantConn};
+
+const FIXTURE_ADVISORY_LOCK_KEY: i64 = 0x0057_5946_4958_5452;
 
 /// Per-test Postgres fixture backed by the shared docker `wyrd_test` database.
 pub struct PgFixture {
     app_pool: PgPool,
     platform_admin_pool: PgPool,
+    _fixture_lock: PoolConnection<Postgres>,
     data_tenant_id: DataTenantId,
     tenant_slug: String,
 }
@@ -110,16 +113,36 @@ impl PgFixture {
         tenant_slug: String,
     ) -> Result<Self, FixtureError> {
         let db = vala_sql::testing::shared().await?;
+        let fixture_lock = acquire_fixture_advisory_lock(&db.migrator).await?;
         vala_sql::testing::reset_for_test(&db).await?;
         seed_tenant(&db.platform_admin, data_tenant_id, &tenant_slug).await?;
 
         Ok(Self {
             app_pool: db.app.clone(),
             platform_admin_pool: db.platform_admin.clone(),
+            _fixture_lock: fixture_lock,
             data_tenant_id,
             tenant_slug,
         })
     }
+}
+
+/// Acquire the shared database fixture lock for the fixture lifetime.
+///
+/// # Errors
+/// Returns [`SqlError::Connect`] when the lock connection cannot be acquired or
+/// Postgres cannot acquire the advisory lock.
+async fn acquire_fixture_advisory_lock(
+    pool: &PgPool,
+) -> Result<PoolConnection<Postgres>, SqlError> {
+    let mut conn = pool.acquire().await.map_err(SqlError::Connect)?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(FIXTURE_ADVISORY_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+        .map_err(SqlError::Connect)?;
+    conn.close_on_drop();
+    Ok(conn)
 }
 
 async fn seed_tenant(
@@ -148,6 +171,7 @@ mod tests {
     use wyrd_sql::tenant_conn::CURRENT_TENANT_GUC;
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn fixture_smoke() {
         let fixture = PgFixture::start().await.expect("fixture starts");
 
@@ -160,6 +184,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn start_with_slug_uses_custom_slug() {
         let fixture = PgFixture::start_with_slug("custom-tenant")
             .await

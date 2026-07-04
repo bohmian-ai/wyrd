@@ -55,7 +55,7 @@ mod tests {
     use wyrd_spec::card::policy::PolicyDecision;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
 
     use super::{AuthzAuditWriter, NoopAuthzAuditWriter};
@@ -100,10 +100,12 @@ mod tests {
     }
 
     fn principal(name: &str, tenant_id: DataTenantId) -> Principal {
+        let card_ref = card_ref(name);
         Principal {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKind::Service {
-                card_ref: card_ref(name),
+                card_ref: card_ref.clone(),
+                card_ref_scope: CardRefScope::own(&card_ref),
             },
             tenant_id,
             roles: Vec::new(),

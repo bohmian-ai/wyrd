@@ -1,12 +1,14 @@
 //! Card references authored inside specs.
 
 use std::fmt;
+use std::iter::FromIterator;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
 use crate::card::agent::AgentSpec;
-use crate::envelope::CardKind;
+use crate::card::drift::DriftSignal;
+use crate::envelope::{CardKind, Spec};
 use crate::ids::{CardName, CardUid, SpaceName};
 use wyrd_semver::VersionBlock;
 
@@ -58,6 +60,169 @@ pub enum AgentRef {
     Inline(Box<AgentSpec>),
     /// Reference to a registered Agent Card.
     Card(CardRef),
+}
+
+/// A principal's card authorization set.
+///
+/// Authorization is identity-based on `(kind, name, version, space)`. The
+/// optional resolved `uid` is ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CardRefScope(Vec<CardRef>);
+
+impl CardRefScope {
+    /// Borrow scope members.
+    #[must_use]
+    pub fn as_slice(&self) -> &[CardRef] {
+        &self.0
+    }
+
+    /// Whether the scope has no members.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Number of scope members.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Build a scope and guarantee that `root` is a member.
+    #[must_use]
+    pub fn try_from_root_and_members(
+        root: &CardRef,
+        members: impl IntoIterator<Item = CardRef>,
+    ) -> Self {
+        let mut scope = vec![root.clone()];
+        for member in members {
+            if !scope
+                .iter()
+                .any(|existing| Self::same_identity(existing, &member))
+            {
+                scope.push(member);
+            }
+        }
+        Self(scope)
+    }
+
+    /// Build an own-card-only scope.
+    #[must_use]
+    pub fn own(root: &CardRef) -> Self {
+        Self::try_from_root_and_members(root, std::iter::empty())
+    }
+
+    /// Return true for an empty scope or a scope containing its root.
+    #[must_use]
+    pub fn contains_root(&self, root: &CardRef) -> bool {
+        self.is_empty() || self.authorizes(root)
+    }
+
+    /// Return true when `card` is authorized by identity.
+    #[must_use]
+    pub fn authorizes(&self, card: &CardRef) -> bool {
+        self.0
+            .iter()
+            .any(|member| Self::same_identity(member, card))
+    }
+
+    /// Return true when two card refs share the authorization identity tuple.
+    fn same_identity(a: &CardRef, b: &CardRef) -> bool {
+        a.kind == b.kind && a.name == b.name && a.version == b.version && a.space == b.space
+    }
+}
+
+impl FromIterator<CardRef> for CardRefScope {
+    fn from_iter<I: IntoIterator<Item = CardRef>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl Serialize for CardRefScope {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(ToString::to_string))
+    }
+}
+
+impl<'de> Deserialize<'de> for CardRefScope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Vec::<String>::deserialize(deserializer)?;
+        raw.into_iter()
+            .map(|value| value.parse::<CardRef>().map_err(serde::de::Error::custom))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Self)
+    }
+}
+
+/// Every card ref a spec declares, for auth-scope traversal.
+#[must_use]
+pub fn scope_child_card_refs(spec: &Spec) -> Vec<CardRef> {
+    match spec {
+        Spec::Data(data) => data
+            .card_refs()
+            .chain(data.materialized_split_refs())
+            .chain(data.interface.manifest_ref())
+            .cloned()
+            .collect(),
+        Spec::Model(model) => model.card_refs().cloned().collect(),
+        Spec::Experiment(experiment) => experiment
+            .target_refs
+            .iter()
+            .chain(experiment.card_refs.iter())
+            .cloned()
+            .collect(),
+        Spec::Prompt(_) => Vec::new(),
+        Spec::Agent(agent) => crate::card::agent::scope_child_card_refs(agent),
+        Spec::Workflow(workflow) => crate::card::workflow::scope_child_card_refs(workflow),
+        Spec::Eval(eval) => eval
+            .subject_ref
+            .iter()
+            .chain(eval.dataset.iter().map(|dataset| dataset.as_card_ref()))
+            .cloned()
+            .collect(),
+        Spec::Drift(drift) => {
+            let mut out = vec![drift.subject_ref.clone()];
+            match &drift.signal {
+                DriftSignal::Distribution { baseline_ref, .. } => out.push(baseline_ref.clone()),
+                DriftSignal::EvalScore { eval_ref } => out.push(eval_ref.clone()),
+                DriftSignal::External { source_ref } => out.push(source_ref.clone()),
+                DriftSignal::Metric { .. } => {}
+            }
+            out
+        }
+        Spec::Service(service) => service
+            .components
+            .iter()
+            .map(|component| component.card_ref.clone())
+            .collect(),
+        Spec::Policy(_) => Vec::new(),
+        Spec::Mcp(mcp) => mcp.tool_refs.clone(),
+        Spec::Audit(audit) => audit
+            .subject_refs
+            .iter()
+            .chain(audit.policy_refs.iter())
+            .chain(audit.evidence_refs.iter())
+            .cloned()
+            .collect(),
+        Spec::Artifact(artifact) => artifact.schema_ref.iter().cloned().collect(),
+        Spec::Trigger(trigger) => {
+            let source = match &trigger.source {
+                crate::card::trigger::TriggerSource::DriftObservation { card }
+                | crate::card::trigger::TriggerSource::EvalObservation { card } => {
+                    Some(card.clone())
+                }
+                crate::card::trigger::TriggerSource::Schedule { .. } => None,
+            };
+            source.into_iter().chain([trigger.target.clone()]).collect()
+        }
+        Spec::Operator(operator) => operator
+            .pre_invoke
+            .iter()
+            .chain(operator.post_invoke.iter())
+            .cloned()
+            .collect(),
+        Spec::Source(_) => Vec::new(),
+    }
 }
 
 impl From<AgentSpec> for AgentRef {

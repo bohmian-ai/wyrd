@@ -13,7 +13,7 @@ use wyrd_runtime::{Permission, PermissionCheck, PrincipalId, PrincipalKind, Role
 use wyrd_spec::auth::{RequestedSubject, SecretBearer, TokenResponse, TokenType};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, insert_audit_token_exchange,
@@ -21,6 +21,10 @@ use wyrd_sql::queries::auth::{
     touch_api_key_last_used,
 };
 
+use crate::auth::card_scope::{
+    IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_DELEGATION, issue_scope_error,
+    resolve_card_ref_scope, write_scope_mint_success_audit,
+};
 use crate::auth::issue_api_key::{WyrdApiKey, principal_kind_for_card};
 use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::auth::pg_resolvers::PgIssuerResolver;
@@ -166,6 +170,9 @@ pub enum ExchangeError {
     /// Database operation failed.
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
+    /// Wyrd contract error.
+    #[error("wyrd error")]
+    Wyrd(#[from] WyrdError),
 }
 
 /// Delegated token failure.
@@ -189,6 +196,9 @@ pub enum DelegateError {
     /// Database operation failed.
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
+    /// Wyrd contract error.
+    #[error("wyrd error")]
+    Wyrd(#[from] WyrdError),
 }
 
 impl ExchangeApiKey {
@@ -202,6 +212,7 @@ impl ExchangeApiKey {
         &self,
         conn: &mut TenantConn<'_>,
         api_key: SecretString,
+        request_id: &str,
     ) -> Result<ExchangedToken, ExchangeError> {
         let parsed =
             WyrdApiKey::parse(api_key.expose_secret()).map_err(|_| ExchangeError::NotFound)?;
@@ -237,6 +248,8 @@ impl ExchangeApiKey {
                 roles,
             },
             RefreshPolicy::Mint,
+            request_id,
+            MINT_KIND_API_KEY_EXCHANGE,
         )
         .await
         .map_err(ExchangeError::from)
@@ -267,7 +280,9 @@ impl DelegateToken {
             .map_err(|_| DelegateError::PermissionDenied)?;
 
         let row = resolve_requested_subject(conn, requested_subject).await?;
-        let _ = runtime_principal_kind(&row.principal_kind, row.card_ref.0.clone())
+        let requested_card_ref = row.card_ref.0.clone();
+        let card_ref_scope = resolve_card_ref_scope(conn, &requested_card_ref).await?;
+        let _ = runtime_principal_kind(&row.principal_kind, requested_card_ref.clone())
             .ok_or(DelegateError::SubjectNotFound)?;
         let roles = role_refs(list_service_account_roles(conn, row.id).await?)
             .map_err(|_| DelegateError::InvalidRole)?;
@@ -284,15 +299,19 @@ impl DelegateToken {
             row.id,
             &row.principal_kind,
             conn.data_tenant_id(),
-            row.card_ref.0.clone(),
+            requested_card_ref.clone(),
+            card_ref_scope.clone(),
         )
         .ok_or(DelegateError::SubjectNotFound)?;
-        let access_token = self.issuing_key.issue_delegated_access_token(
-            &caller,
-            requested_ref,
-            roles.clone(),
-            self.settings.access_ttl,
-        )?;
+        let access_token = self
+            .issuing_key
+            .issue_delegated_access_token(
+                &caller,
+                requested_ref,
+                roles.clone(),
+                self.settings.access_ttl,
+            )
+            .map_err(|error| delegate_issue_error(error, &requested_card_ref))?;
         // Delegated tokens are short-lived and non-refreshable by design
         // (RFC 8693). The caller re-delegates when the access token expires, so
         // no refresh token is issued or persisted for the delegated principal.
@@ -305,6 +324,15 @@ impl DelegateToken {
             json!(verified.delegation_chain),
             request_id,
             expires_at,
+        )
+        .await?;
+        write_scope_mint_success_audit(
+            conn,
+            row.id,
+            &requested_card_ref,
+            &card_ref_scope,
+            request_id,
+            MINT_KIND_DELEGATION,
         )
         .await?;
 
@@ -323,6 +351,8 @@ pub(super) async fn issue_for_subject(
     settings: &TokenExchangeSettings,
     subject: IssueSubject,
     refresh: RefreshPolicy,
+    request_id: &str,
+    mint_kind: &str,
 ) -> Result<ExchangedToken, IssueOrSqlError> {
     let IssueSubject {
         principal_id,
@@ -331,21 +361,28 @@ pub(super) async fn issue_for_subject(
         roles,
     } = subject;
     let id = PrincipalId::new(principal_id);
+    let card_ref_scope = resolve_card_ref_scope(conn, &card_ref).await?;
     let access_token = match principal_kind.as_str() {
-        "service" => issuing_key.issue_service_access_token(
-            id,
-            conn.data_tenant_id(),
-            card_ref.clone(),
-            roles.clone(),
-            settings.access_ttl,
-        )?,
-        "agent" => issuing_key.issue_agent_access_token(
-            id,
-            conn.data_tenant_id(),
-            card_ref.clone(),
-            roles.clone(),
-            settings.access_ttl,
-        )?,
+        "service" => issuing_key
+            .issue_service_access_token(
+                id,
+                conn.data_tenant_id(),
+                card_ref.clone(),
+                card_ref_scope.clone(),
+                roles.clone(),
+                settings.access_ttl,
+            )
+            .map_err(|error| issue_or_wyrd_error(error, &card_ref))?,
+        "agent" => issuing_key
+            .issue_agent_access_token(
+                id,
+                conn.data_tenant_id(),
+                card_ref.clone(),
+                card_ref_scope.clone(),
+                roles.clone(),
+                settings.access_ttl,
+            )
+            .map_err(|error| issue_or_wyrd_error(error, &card_ref))?,
         _ => return Err(IssueOrSqlError::Issue(IssueError::InvalidPrincipalKind)),
     };
     let refresh_token = match refresh {
@@ -370,6 +407,15 @@ pub(super) async fn issue_for_subject(
         RefreshPolicy::Skip => None,
     };
     let expires_at = Utc::now() + settings.access_ttl;
+    write_scope_mint_success_audit(
+        conn,
+        principal_id,
+        &card_ref,
+        &card_ref_scope,
+        request_id,
+        mint_kind,
+    )
+    .await?;
 
     Ok(ExchangedToken {
         access_token: SecretString::from(access_token),
@@ -379,12 +425,30 @@ pub(super) async fn issue_for_subject(
     })
 }
 
+/// Map card-bound issuer errors into the API-key exchange error channel.
+fn issue_or_wyrd_error(error: IssueError, root: &CardRef) -> IssueOrSqlError {
+    match issue_scope_error(error, root) {
+        IssueErrorOrWyrd::Issue(error) => IssueOrSqlError::Issue(error),
+        IssueErrorOrWyrd::Wyrd(error) => IssueOrSqlError::Wyrd(error),
+    }
+}
+
+/// Map card-bound issuer errors into the delegation error channel.
+fn delegate_issue_error(error: IssueError, root: &CardRef) -> DelegateError {
+    match issue_scope_error(error, root) {
+        IssueErrorOrWyrd::Issue(error) => DelegateError::Issue(error),
+        IssueErrorOrWyrd::Wyrd(error) => DelegateError::Wyrd(error),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(super) enum IssueOrSqlError {
     #[error("issue")]
     Issue(#[from] IssueError),
     #[error("db")]
     Database(#[from] sqlx::Error),
+    #[error("wyrd")]
+    Wyrd(#[from] WyrdError),
 }
 
 impl From<IssueOrSqlError> for ExchangeError {
@@ -392,6 +456,7 @@ impl From<IssueOrSqlError> for ExchangeError {
         match error {
             IssueOrSqlError::Issue(error) => Self::Issue(error),
             IssueOrSqlError::Database(error) => Self::Database(error),
+            IssueOrSqlError::Wyrd(error) => Self::Wyrd(error),
         }
     }
 }
@@ -429,9 +494,19 @@ pub(super) fn principal_kind_wire(value: &str) -> Option<PrincipalKindWire> {
 fn runtime_principal_kind(value: &str, card_ref: CardRef) -> Option<PrincipalKind> {
     match value {
         "service" if card_ref.kind == CardKind::Service => {
-            Some(PrincipalKind::Service { card_ref })
+            let card_ref_scope = CardRefScope::own(&card_ref);
+            Some(PrincipalKind::Service {
+                card_ref,
+                card_ref_scope,
+            })
         }
-        "agent" if card_ref.kind == CardKind::Agent => Some(PrincipalKind::Agent { card_ref }),
+        "agent" if card_ref.kind == CardKind::Agent => {
+            let card_ref_scope = CardRefScope::own(&card_ref);
+            Some(PrincipalKind::Agent {
+                card_ref,
+                card_ref_scope,
+            })
+        }
         _ => None,
     }
 }
@@ -441,12 +516,14 @@ fn principal_ref(
     kind: &str,
     tenant_id: wyrd_spec::DataTenantId,
     card_ref: CardRef,
+    card_ref_scope: CardRefScope,
 ) -> Option<TokenPrincipalRef> {
     Some(TokenPrincipalRef {
         id: PrincipalId::new(id),
         kind: principal_kind_wire(kind)?,
         tenant_id,
         card_ref: Some(card_ref),
+        card_ref_scope,
     })
 }
 
@@ -531,12 +608,19 @@ pub async fn map_exchange_error_to_wyrd(
             message: "API key hash verification failed".to_owned(),
             details: json!({ "reason": "hash_mismatch" }),
         },
+        ExchangeError::Issue(IssueError::CardScopeTooLarge { encoded_len, limit }) => {
+            WyrdError::CardScopeTooLarge {
+                message: "card_ref_scope exceeded bearer token size limit".to_owned(),
+                details: json!({ "encoded_len": encoded_len, "limit": limit }),
+            }
+        }
         ExchangeError::Issue(_) | ExchangeError::Join(_) | ExchangeError::InvalidRole => {
             WyrdError::Internal {
                 message: "failed to exchange API key".to_owned(),
                 details: json!({}),
             }
         }
+        ExchangeError::Wyrd(error) => error,
         ExchangeError::Database(_) => WyrdError::AuthVerifyUnavailable {
             message: "auth backend unavailable".to_owned(),
             details: json!({ "retry_after_seconds": 1 }),
@@ -562,10 +646,17 @@ impl From<DelegateError> for WyrdError {
                     details: json!({ "max": max }),
                 }
             }
+            DelegateError::Issue(IssueError::CardScopeTooLarge { encoded_len, limit }) => {
+                WyrdError::CardScopeTooLarge {
+                    message: "card_ref_scope exceeded bearer token size limit".to_owned(),
+                    details: json!({ "encoded_len": encoded_len, "limit": limit }),
+                }
+            }
             DelegateError::Issue(_) | DelegateError::InvalidRole => WyrdError::Internal {
                 message: "failed to issue delegated token".to_owned(),
                 details: json!({}),
             },
+            DelegateError::Wyrd(error) => error,
             DelegateError::Database(_) => WyrdError::AuthVerifyUnavailable {
                 message: "auth backend unavailable".to_owned(),
                 details: json!({ "retry_after_seconds": 1 }),
@@ -594,7 +685,7 @@ mod tests {
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::ApiKeyStatus;
 
@@ -747,19 +838,23 @@ mod tests {
         let id_b: PrincipalId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03"
             .parse()
             .expect("static id");
+        let initiator_ref = make_card("initiator");
         let a = DelegationStep {
             principal: RuntimePrincipalRef {
                 id: id_a,
                 kind: PrincipalKind::Service {
-                    card_ref: make_card("initiator"),
+                    card_ref: initiator_ref.clone(),
+                    card_ref_scope: CardRefScope::own(&initiator_ref),
                 },
             },
         };
+        let immediate_ref = make_card("immediate");
         let b = DelegationStep {
             principal: RuntimePrincipalRef {
                 id: id_b,
                 kind: PrincipalKind::Service {
-                    card_ref: make_card("immediate"),
+                    card_ref: immediate_ref.clone(),
+                    card_ref_scope: CardRefScope::own(&immediate_ref),
                 },
             },
         };
@@ -884,7 +979,9 @@ mod tests {
             .tenant_conn_for(tenant_b)
             .await
             .expect("tenant B conn opens");
-        let result = exchange_service().execute(&mut conn, key.secret).await;
+        let result = exchange_service()
+            .execute(&mut conn, key.secret, "req-cross-tenant")
+            .await;
 
         assert!(matches!(result, Err(ExchangeError::CrossTenant)));
     }
@@ -917,7 +1014,9 @@ mod tests {
         .await
         .expect("revoked api key inserts");
 
-        let result = exchange_service().execute(&mut conn, key.secret).await;
+        let result = exchange_service()
+            .execute(&mut conn, key.secret, "req-revoked")
+            .await;
 
         assert!(matches!(result, Err(ExchangeError::NotFound)));
     }
@@ -949,7 +1048,9 @@ mod tests {
         .await
         .expect("api key with wrong hash inserts");
 
-        let result = exchange_service().execute(&mut conn, key.secret).await;
+        let result = exchange_service()
+            .execute(&mut conn, key.secret, "req-hash-mismatch")
+            .await;
 
         assert!(matches!(result, Err(ExchangeError::HashMismatch)));
     }
@@ -968,6 +1069,7 @@ mod tests {
                 PrincipalId::new(Uuid::new_v4()),
                 tenant,
                 test_service_card_ref(),
+                CardRefScope::default(),
                 vec![],
                 Duration::minutes(15),
             )
@@ -1036,6 +1138,7 @@ mod tests {
                 PrincipalId::new(Uuid::new_v4()),
                 tenant,
                 test_service_card_ref(),
+                CardRefScope::default(),
                 vec![RoleRef::new("runtime_admin").expect("role name is valid")],
                 Duration::minutes(15),
             )

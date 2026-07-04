@@ -4,7 +4,7 @@ use wyrd_semver::VersionBlock;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, CardRefScope};
 
 fn card_ref(kind: CardKind, name: &str) -> CardRef {
     CardRef {
@@ -31,14 +31,18 @@ fn user() -> Principal {
 }
 
 fn service() -> Principal {
+    let card_ref = card_ref(CardKind::Service, "service");
     principal(PrincipalKind::Service {
-        card_ref: card_ref(CardKind::Service, "service"),
+        card_ref: card_ref.clone(),
+        card_ref_scope: CardRefScope::own(&card_ref),
     })
 }
 
 fn agent() -> Principal {
+    let card_ref = card_ref(CardKind::Agent, "agent");
     principal(PrincipalKind::Agent {
-        card_ref: card_ref(CardKind::Agent, "agent"),
+        card_ref: card_ref.clone(),
+        card_ref_scope: CardRefScope::own(&card_ref),
     })
 }
 

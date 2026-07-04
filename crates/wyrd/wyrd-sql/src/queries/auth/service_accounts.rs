@@ -369,6 +369,48 @@ pub async fn insert_audit_token_exchange(
     Ok(())
 }
 
+/// Insert durable card-ref scope mint audit.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_audit_card_scope_mint(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+    principal_id: Option<Uuid>,
+    mint_kind: &str,
+    root_card_ref: &CardRef,
+    request_id: &str,
+    result: &str,
+    scope_member_count: Option<i32>,
+    scope_hash: Option<&str>,
+    scope_members: Value,
+    failure_code: Option<&str>,
+    failure_reason: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO wyrd.audit_card_scope_mint (
+            id, data_tenant_id, principal_id, mint_kind, root_card_ref,
+            request_id, result, scope_member_count, scope_hash, scope_members,
+            failure_code, failure_reason
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        "#,
+    )
+    .bind(id)
+    .bind(conn.data_tenant_id().as_uuid())
+    .bind(principal_id)
+    .bind(mint_kind)
+    .bind(Json(root_card_ref))
+    .bind(request_id)
+    .bind(result)
+    .bind(scope_member_count)
+    .bind(scope_hash)
+    .bind(scope_members)
+    .bind(failure_code)
+    .bind(failure_reason)
+    .execute(&mut **conn.transaction())
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::types::Json;

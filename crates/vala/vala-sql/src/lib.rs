@@ -299,27 +299,6 @@ mod tests {
     }
 
     #[test]
-    fn shared_pool_contract_uses_wyrd_runtime_pool_by_reference() {
-        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let lib = fs::read_to_string(crate_dir.join("src/lib.rs"))
-            .expect("Vala lib module doc is readable");
-        let manifest =
-            fs::read_to_string(crate_dir.join("Cargo.toml")).expect("manifest is readable");
-        let uncommented_lib = without_line_comments(&lib);
-        let production_lib = production_source(&uncommented_lib);
-
-        assert!(lib.contains("shared [`TenantConn`] wrapper"));
-        assert!(production_lib.contains("pub async fn migrate(migrator_pool: &PgPool)"));
-        assert!(manifest.contains("wyrd-sql"));
-        assert!(
-            !production_lib.contains("PoolConfig")
-                && !production_lib.contains("build_pool")
-                && !production_lib.contains("PostgresBoot"),
-            "vala-sql must consume Wyrd-owned pools by reference, not build another pool"
-        );
-    }
-
-    #[test]
     fn cross_crate_transaction_boundary_is_documented() {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let lib_doc = fs::read_to_string(crate_dir.join("src/lib.rs"))

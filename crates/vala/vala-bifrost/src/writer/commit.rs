@@ -128,7 +128,7 @@ async fn expire_writer_lease(
     let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
         .await
         .map_err(BifrostError::Sql)?;
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE vala.olap_commits \
          SET writer_lease_expires_at = now() - interval '1 second' \
          WHERE table_uid = $1 AND batch_id = $2",
@@ -138,6 +138,12 @@ async fn expire_writer_lease(
     .execute(&mut **conn.transaction())
     .await
     .map_err(|e| BifrostError::Sql(vala_sql::SqlError::from(e)))?;
+    if result.rows_affected() != 1 {
+        return Err(BifrostError::Internal(format!(
+            "expire_writer_lease: expected 1 row updated, got {}; table_uid={table_uid:?} batch_id={batch_id:?}",
+            result.rows_affected()
+        )));
+    }
     conn.commit().await.map_err(BifrostError::Sql)
 }
 

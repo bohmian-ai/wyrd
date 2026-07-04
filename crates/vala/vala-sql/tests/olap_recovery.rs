@@ -9,11 +9,7 @@ use sqlx::types::Uuid;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::testing::SharedDb;
 
-const TABLE_UID: [u8; 16] = [0x10; 16];
-const BATCH_ID: [u8; 16] = [0x20; 16];
-const BATCH_ID_2: [u8; 16] = [0x21; 16];
-
-async fn setup() -> (SharedDb, DataTenantId) {
+async fn setup() -> (SharedDb, DataTenantId, [u8; 16], [u8; 16]) {
     let db = vala_sql::testing::shared().await.expect("shared db");
     vala_sql::testing::reset_for_test(&db).await.expect("reset");
     let tenant = DataTenantId::new_v7();
@@ -21,13 +17,15 @@ async fn setup() -> (SharedDb, DataTenantId) {
         .await
         .unwrap();
 
+    let table_uid = *uuid::Uuid::now_v7().as_bytes();
+    let batch_id = *uuid::Uuid::now_v7().as_bytes();
     let fingerprint = [0u8; 32];
     let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
         .await
         .unwrap();
     vala_sql::queries::olap_catalog::upsert_table(
         &mut conn,
-        &TABLE_UID,
+        &table_uid,
         "ns.tbl",
         &fingerprint,
         "tenant_owned",
@@ -37,20 +35,20 @@ async fn setup() -> (SharedDb, DataTenantId) {
     .unwrap();
     conn.commit().await.unwrap();
 
-    (db, tenant)
+    (db, tenant, table_uid, batch_id)
 }
 
 #[tokio::test]
 async fn aborted_state_accepted() {
-    let (db, tenant) = setup().await;
+    let (db, tenant, table_uid, batch_id) = setup().await;
 
     let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, &TABLE_UID, &BATCH_ID)
+    vala_sql::queries::olap_catalog::precommit(&mut conn, &table_uid, &batch_id)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::finalize_aborted(&mut conn, &TABLE_UID, &BATCH_ID)
+    vala_sql::queries::olap_catalog::finalize_aborted(&mut conn, &table_uid, &batch_id)
         .await
         .unwrap();
     conn.commit().await.unwrap();
@@ -58,7 +56,7 @@ async fn aborted_state_accepted() {
     let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
         .await
         .unwrap();
-    let row = vala_sql::queries::olap_catalog::lookup_idempotent(&mut conn, &TABLE_UID, &BATCH_ID)
+    let row = vala_sql::queries::olap_catalog::lookup_idempotent(&mut conn, &table_uid, &batch_id)
         .await
         .unwrap()
         .expect("row must exist");
@@ -69,7 +67,7 @@ async fn aborted_state_accepted() {
 
 #[tokio::test]
 async fn audit_row_roundtrips_with_byte_ids() {
-    let (db, tenant) = setup().await;
+    let (db, tenant, table_uid, batch_id) = setup().await;
 
     let owner = Uuid::from_bytes([0x01u8; 16]);
     let token: i64 = 999;
@@ -78,7 +76,7 @@ async fn audit_row_roundtrips_with_byte_ids() {
     let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, &TABLE_UID, &BATCH_ID)
+    vala_sql::queries::olap_catalog::precommit(&mut conn, &table_uid, &batch_id)
         .await
         .unwrap();
     conn.commit().await.unwrap();
@@ -88,8 +86,8 @@ async fn audit_row_roundtrips_with_byte_ids() {
         .unwrap();
     vala_sql::queries::olap_catalog::record_fence_loss_after_append(
         &mut conn,
-        &TABLE_UID,
-        &BATCH_ID,
+        &table_uid,
+        &batch_id,
         owner,
         token,
         snapshot_id,
@@ -105,8 +103,8 @@ async fn audit_row_roundtrips_with_byte_ids() {
           WHERE table_uid = $1 AND batch_id = $2
             AND event_kind = 'fence_lost_after_append'",
     )
-    .bind(TABLE_UID.as_slice())
-    .bind(BATCH_ID.as_slice())
+    .bind(table_uid.as_slice())
+    .bind(batch_id.as_slice())
     .fetch_one(&db.migrator)
     .await
     .unwrap();
@@ -116,7 +114,7 @@ async fn audit_row_roundtrips_with_byte_ids() {
 
 #[tokio::test]
 async fn claim_skips_live_lease() {
-    let (db, tenant) = setup().await;
+    let (db, tenant, table_uid, batch_id) = setup().await;
 
     let owner = Uuid::from_bytes([0x02u8; 16]);
     let token: i64 = 1;
@@ -124,11 +122,11 @@ async fn claim_skips_live_lease() {
     let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, &TABLE_UID, &BATCH_ID)
+    vala_sql::queries::olap_catalog::precommit(&mut conn, &table_uid, &batch_id)
         .await
         .unwrap();
     vala_sql::queries::olap_catalog::record_writer_lease(
-        &mut conn, &TABLE_UID, &BATCH_ID, owner, token, 3600,
+        &mut conn, &table_uid, &batch_id, owner, token, 3600,
     )
     .await
     .unwrap();
@@ -152,12 +150,12 @@ async fn claim_skips_live_lease() {
 
 #[tokio::test]
 async fn claim_takes_expired_lease() {
-    let (db, tenant) = setup().await;
+    let (db, tenant, table_uid, batch_id) = setup().await;
 
     let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, &TABLE_UID, &BATCH_ID)
+    vala_sql::queries::olap_catalog::precommit(&mut conn, &table_uid, &batch_id)
         .await
         .unwrap();
     conn.commit().await.unwrap();
@@ -169,8 +167,8 @@ async fn claim_takes_expired_lease() {
                 writer_lease_expires_at = now() - interval '1 minute'
           WHERE table_uid = $1 AND batch_id = $2",
     )
-    .bind(TABLE_UID.as_slice())
-    .bind(BATCH_ID.as_slice())
+    .bind(table_uid.as_slice())
+    .bind(batch_id.as_slice())
     .bind(Uuid::from_bytes([0x04u8; 16]))
     .execute(&db.migrator)
     .await
@@ -187,8 +185,8 @@ async fn claim_takes_expired_lease() {
     conn.commit().await.unwrap();
 
     assert_eq!(claimed.len(), 1, "expired-lease row must be claimed");
-    assert_eq!(claimed[0].table_uid, TABLE_UID.as_slice());
-    assert_eq!(claimed[0].batch_id, BATCH_ID.as_slice());
+    assert_eq!(claimed[0].table_uid, table_uid.as_slice());
+    assert_eq!(claimed[0].batch_id, batch_id.as_slice());
     assert_eq!(claimed[0].fqn, "ns.tbl");
     assert_eq!(claimed[0].namespace, "ns");
     assert_eq!(claimed[0].name, "tbl");
@@ -197,7 +195,8 @@ async fn claim_takes_expired_lease() {
 
 #[tokio::test]
 async fn renew_fence_returns_false_after_claim() {
-    let (db, tenant) = setup().await;
+    let (db, tenant, table_uid, _) = setup().await;
+    let batch_id = *uuid::Uuid::now_v7().as_bytes();
 
     let writer_owner = Uuid::from_bytes([0x06u8; 16]);
     let writer_token: i64 = 42;
@@ -205,7 +204,7 @@ async fn renew_fence_returns_false_after_claim() {
     let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, &TABLE_UID, &BATCH_ID_2)
+    vala_sql::queries::olap_catalog::precommit(&mut conn, &table_uid, &batch_id)
         .await
         .unwrap();
     conn.commit().await.unwrap();
@@ -217,8 +216,8 @@ async fn renew_fence_returns_false_after_claim() {
                 writer_lease_expires_at = now() - interval '1 minute'
           WHERE table_uid = $1 AND batch_id = $2",
     )
-    .bind(TABLE_UID.as_slice())
-    .bind(BATCH_ID_2.as_slice())
+    .bind(table_uid.as_slice())
+    .bind(batch_id.as_slice())
     .bind(writer_owner)
     .bind(writer_token)
     .execute(&db.migrator)
@@ -242,8 +241,8 @@ async fn renew_fence_returns_false_after_claim() {
         .unwrap();
     let held = vala_sql::queries::olap_catalog::renew_writer_fence(
         &mut conn,
-        &TABLE_UID,
-        &BATCH_ID_2,
+        &table_uid,
+        &batch_id,
         writer_owner,
         writer_token,
         60,
@@ -260,13 +259,13 @@ async fn renew_fence_returns_false_after_claim() {
 
 #[tokio::test]
 async fn scan_failed_leaves_precommit_and_allows_retry() {
-    let (db, tenant) = setup().await;
+    let (db, tenant, table_uid, batch_id) = setup().await;
 
     // Bare precommit (no lease) is immediately claimable.
     let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, &TABLE_UID, &BATCH_ID)
+    vala_sql::queries::olap_catalog::precommit(&mut conn, &table_uid, &batch_id)
         .await
         .unwrap();
     conn.commit().await.unwrap();
@@ -288,8 +287,8 @@ async fn scan_failed_leaves_precommit_and_allows_retry() {
         .unwrap();
     vala_sql::queries::olap_catalog::mark_recovery_scan_failed(
         &mut conn,
-        &TABLE_UID,
-        &BATCH_ID,
+        &table_uid,
+        &batch_id,
         token,
         "transient FileIO error",
     )
@@ -303,8 +302,8 @@ async fn scan_failed_leaves_precommit_and_allows_retry() {
                FROM vala.olap_commits
               WHERE table_uid = $1 AND batch_id = $2",
         )
-        .bind(TABLE_UID.as_slice())
-        .bind(BATCH_ID.as_slice())
+        .bind(table_uid.as_slice())
+        .bind(batch_id.as_slice())
         .fetch_one(&db.migrator)
         .await
         .unwrap();
@@ -325,8 +324,8 @@ async fn scan_failed_leaves_precommit_and_allows_retry() {
         "SELECT recovery_owner FROM vala.olap_recovery_events
           WHERE table_uid = $1 AND batch_id = $2 AND oracle_result = 'scan_failed'",
     )
-    .bind(TABLE_UID.as_slice())
-    .bind(BATCH_ID.as_slice())
+    .bind(table_uid.as_slice())
+    .bind(batch_id.as_slice())
     .fetch_one(&db.migrator)
     .await
     .unwrap();

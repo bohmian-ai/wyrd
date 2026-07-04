@@ -253,8 +253,10 @@ async fn snapshot_committed_but_not_finalized_rolls_forward() {
     // But the lease has NOT been expired by the fault, so recovery won't claim it
     // immediately (live lease). Expire it manually to let recovery in.
     sqlx::query(
-        "UPDATE vala.olap_commits SET writer_lease_expires_at = now() - interval '1 second'",
+        "UPDATE vala.olap_commits SET writer_lease_expires_at = now() - interval '1 second' \
+         WHERE batch_id = $1",
     )
+    .bind(batch_id.as_slice())
     .execute(&*h.migrator)
     .await
     .unwrap();
@@ -344,8 +346,10 @@ async fn recovery_skips_live_writer_lease() {
 
     // Now expire the lease and rebuild — recovery must claim and abort.
     sqlx::query(
-        "UPDATE vala.olap_commits SET writer_lease_expires_at = now() - interval '1 second'",
+        "UPDATE vala.olap_commits SET writer_lease_expires_at = now() - interval '1 second' \
+         WHERE batch_id = $1",
     )
+    .bind(batch_id.as_slice())
     .execute(&*h.migrator)
     .await
     .unwrap();

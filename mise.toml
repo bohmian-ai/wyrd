@@ -26,6 +26,10 @@ protoc = "33.2"
 
 [settings]
 env_shell_expand = false
+# jobs = 1: serializes all tasks to prevent concurrent test:sql / test:bifrost /
+# test:wyrd-server from racing the shared Postgres database. Side-effect: also
+# serializes unrelated tasks (lints, codegen). Lift when DB tasks gain explicit
+# depends chains that prevent races without global serialization.
 jobs = 1
 
 [env]

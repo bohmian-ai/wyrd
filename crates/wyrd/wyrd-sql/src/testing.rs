@@ -11,7 +11,7 @@ use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 use crate::error::SqlError;
 use crate::pool::{PoolConfig, build_pool};
 
-/// Shared pool set for live-Postgres tests against the docker `wyrd_test` DB.
+/// Shared pool set for live-Postgres tests against the local docker database.
 pub struct SharedDb {
     /// Superuser migrator pool. Use for migration and reset only.
     pub migrator: PgPool,
@@ -21,7 +21,7 @@ pub struct SharedDb {
     pub platform_admin: PgPool,
 }
 
-/// Connect to the shared docker `wyrd_test` DB and return role-specific pools.
+/// Connect to the shared local docker database and return role-specific pools.
 ///
 /// # Errors
 /// Returns [`SqlError`] when the shared test DB env is missing or invalid,
@@ -65,7 +65,10 @@ fn resolved_test_dsns() -> Result<crate::dsn::ResolvedDsns, SqlError> {
 }
 
 impl SharedDb {
-    /// Clean-slate reset of Wyrd-owned schemas. Call at the start of each test.
+    /// Clean-slate reset of Wyrd-owned schemas. Call at the start of each Wyrd test.
+    ///
+    /// **Vala and bifrost tests**: call [`vala_sql::testing::reset_for_test`] instead.
+    /// It resets both Wyrd and Vala schemas and re-seeds the `wyrd-system-owner` sentinel.
     ///
     /// # Errors
     /// Returns [`SqlError`] when the reset connection or truncate fails.

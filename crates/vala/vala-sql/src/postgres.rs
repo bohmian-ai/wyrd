@@ -1,4 +1,9 @@
 //! Production-ready Postgres handle for Vala SQL.
+//!
+//! `ValaPostgres` intentionally owns its connection pools rather than borrowing
+//! Wyrd-owned pools by reference. The original vala-sql design consumed pools
+//! via `TenantConn` shared references; this module adds Vala-specific roles
+//! (`vala_recovery`) that require dedicated pool construction at the Vala tier.
 
 use std::env;
 use std::time::Duration;

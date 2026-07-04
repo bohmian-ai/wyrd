@@ -265,12 +265,13 @@ Excludes real cloud storage integration tests (`test:storage:*:cloud`). Those ru
 ### Quick Iteration
 
 While working on a specific area:
-- all test should be invoked with mise
+- all tests should be invoked with mise
 
 ```bash
 # Rust only
-# crate specific tests
-mise run test:sql # runs cargo test -p <crate> <test_name> --all-features -- --nocapture --test-threads=1 under the hood
+# Per-crate iteration (requires a running Postgres and WYRD_DATABASE_URL set; prefer mise tasks for crate-specific runs):
+cargo test --locked -p <crate> <test_name> --all-features -- --nocapture --test-threads=1
+mise run test:sql      # runs all SQL-backed integration tests across wyrd-sql, wyrd-dev-fixtures, and vala-sql
 mise run test:unit     # all Rust tests including SQL and storage emulators
 
 # Python only

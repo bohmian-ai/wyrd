@@ -118,6 +118,29 @@ pub async fn run_commit(
     }
 }
 
+#[cfg(any(test, feature = "testing", feature = "bench-bin"))]
+async fn expire_writer_lease(
+    pool: &PgPool,
+    table_uid: &TableUid,
+    batch_id: &[u8; 16],
+    tenant: DataTenantId,
+) -> Result<(), BifrostError> {
+    let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
+        .await
+        .map_err(BifrostError::Sql)?;
+    sqlx::query(
+        "UPDATE vala.olap_commits \
+         SET writer_lease_expires_at = now() - interval '1 second' \
+         WHERE table_uid = $1 AND batch_id = $2",
+    )
+    .bind(table_uid.as_bytes().as_slice())
+    .bind(batch_id.as_slice())
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(|e| BifrostError::Sql(vala_sql::SqlError::from(e)))?;
+    conn.commit().await.map_err(BifrostError::Sql)
+}
+
 /// Phase 1 of [`run_commit`]: dispatch on the prior 2PC anchor, then claim the
 /// batch for a fresh write and record the initial writer lease.
 ///
@@ -458,16 +481,7 @@ pub async fn run_commit_with_fault(
         FaultPoint::AfterPreCommitRow { lease } => {
             if matches!(lease, Lease::Expired) {
                 // Force the lease to expired so recovery can claim the row.
-                sqlx::query(
-                    "UPDATE vala.olap_commits \
-                     SET writer_lease_expires_at = now() - interval '1 second' \
-                     WHERE table_uid = $1 AND batch_id = $2",
-                )
-                .bind(table_uid.as_bytes().as_slice())
-                .bind(batch_id.as_slice())
-                .execute(pool)
-                .await
-                .map_err(|e| BifrostError::Sql(vala_sql::SqlError::from(e)))?;
+                expire_writer_lease(pool, table_uid, &batch_id, tenant).await?;
             }
             Err(BifrostError::Internal("fault: AfterPreCommitRow".into()))
         }
@@ -488,16 +502,7 @@ pub async fn run_commit_with_fault(
         FaultPoint::BeforeIcebergCommit => {
             // Write files, expire the lease, then fail before renewal.
             let _files = write_batches(table, batches).await?;
-            sqlx::query(
-                "UPDATE vala.olap_commits \
-                 SET writer_lease_expires_at = now() - interval '1 second' \
-                 WHERE table_uid = $1 AND batch_id = $2",
-            )
-            .bind(table_uid.as_bytes().as_slice())
-            .bind(batch_id.as_slice())
-            .execute(pool)
-            .await
-            .map_err(|e| BifrostError::Sql(vala_sql::SqlError::from(e)))?;
+            expire_writer_lease(pool, table_uid, &batch_id, tenant).await?;
             Err(BifrostError::Internal("fault: BeforeIcebergCommit".into()))
         }
 
@@ -522,16 +527,7 @@ pub async fn run_commit_with_fault(
             conn.commit().await.map_err(BifrostError::Sql)?;
 
             // Expire the freshly-renewed lease so recovery can claim it.
-            sqlx::query(
-                "UPDATE vala.olap_commits \
-                 SET writer_lease_expires_at = now() - interval '1 second' \
-                 WHERE table_uid = $1 AND batch_id = $2",
-            )
-            .bind(table_uid.as_bytes().as_slice())
-            .bind(batch_id.as_slice())
-            .execute(pool)
-            .await
-            .map_err(|e| BifrostError::Sql(vala_sql::SqlError::from(e)))?;
+            expire_writer_lease(pool, table_uid, &batch_id, tenant).await?;
 
             // Now proceed to the Iceberg commit (recovery_fencing_token may be
             // set by the time this runs if recovery claimed the row).

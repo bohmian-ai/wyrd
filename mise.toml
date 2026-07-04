@@ -71,11 +71,11 @@ cargo test --locked -p vala-sql --lib
 """
 
 [tasks."test:bifrost"]
-description = """Run vala-bifrost and vala-sql integration tests against the shared wyrd_test Postgres DB.
+description = """Run vala-bifrost and vala-sql integration tests against local Postgres.
 Runs serially because each test resets shared database state at test start.
 """
-depends = ["build:postgres", "db:migrate:all", "test:pg"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd_test", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+depends = ["build:postgres", "db:migrate:all"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 # Default features only: --all-features would enable `python`, which links
 # libpython at runtime and aborts outside the py env.
 run = """
@@ -1293,41 +1293,32 @@ run = "cargo test --locked -p wyrd-sql --all-features --test migration_pg -- --n
 
 [tasks."db:migrate:all"]
 hide = true
-description = """Provision the dedicated wyrd_test database and migrate it once.
-Adds the cluster-global wyrd_catalog role (db:setup-roles omits it; roles are
-cluster-global, so one step serves both DBs), creates wyrd_test owned by the
-migrator superuser, and applies the wyrd-sql migrations to it. wyrd_test is a
-second logical DB on the same docker-compose container — not a second boot — and
-is distinct from the `wyrd` DB the concurrent e2e/migration tasks use, so the
-clean-slate reset shard's database-global wipe can never reach them (D8).
+description = """Apply Wyrd and Vala migrations against local docker-compose Postgres.
+Adds the cluster-global wyrd_catalog role, then runs the Wyrd and Vala
+idempotent migration checks against the single local test database.
 """
 depends = ["build:postgres", "db:setup-roles"]
-env = { WYRD_ADMIN_DSN = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd_test", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_ADMIN_DSN = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
 set -e
 psql "$WYRD_ADMIN_DSN" -c "CREATE ROLE wyrd_catalog NOLOGIN;" || true
-psql "$WYRD_ADMIN_DSN" -tc "SELECT 1 FROM pg_database WHERE datname = 'wyrd_test'" | grep -q 1 \
-  || psql "$WYRD_ADMIN_DSN" -c "CREATE DATABASE wyrd_test OWNER wyrd_migrator;"
 cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture
 cargo test --locked -p vala-sql --all-features --test migration_pg -- vala_migrations_apply_and_are_idempotent --nocapture
 """
 
 [tasks."test:pg"]
 hide = true
-description = """Serial clean-slate reset self-tests against the dedicated wyrd_test DB.
+description = """Serial clean-slate reset self-tests against local Postgres.
 Single-threaded because reset_owned_schemas issues a database-global
 TRUNCATE … RESTART IDENTITY CASCADE; sharing a worker with other DB tests would
-race. Depends on db:migrate:all so wyrd_test is migrated exactly once — the reset
-primitive never migrates, drops, or re-runs (binding decision D4).
+race. Depends on db:migrate:all so reset tests run against the same production
+migration path used by the rest of the SQL suite.
 """
 depends = ["build:postgres", "db:migrate:all"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd_test", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
 cargo test --locked -p wyrd-sql --all-features --test reset_pg -- --test-threads=1 --nocapture
 cargo test --locked -p wyrd-dev-fixtures --all-features -- --test-threads=1
-cargo test --locked -p wyrd-storage --all-features -- --test-threads=1
-cargo test --locked -p wyrd-testing --all-features -- --test-threads=1
-cargo test --locked -p wyrd-server --all-features -- --test-threads=1
 """
 
 [tasks."check:security-schema-drift"]

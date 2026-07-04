@@ -125,3 +125,16 @@ pub fn role_dsn(base: &Url, role: &str, password: &SecretString) -> String {
         .expect("password is URL-safe via set_password percent-encoding");
     dsn.into()
 }
+
+/// Synthesize a role DSN from a secret-bearing base DSN string.
+///
+/// # Errors
+/// Returns [`DsnError::InvalidUrl`] when `base` is not a valid URL.
+pub fn role_dsn_from_base(
+    base: &SecretString,
+    role: &str,
+    password: &SecretString,
+) -> Result<String, DsnError> {
+    let base = Url::parse(base.expose_secret()).map_err(DsnError::InvalidUrl)?;
+    Ok(role_dsn(&base, role, password))
+}

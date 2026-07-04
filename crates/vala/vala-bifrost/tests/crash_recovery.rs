@@ -31,6 +31,7 @@ struct Harness {
     factory: Arc<dyn iceberg::io::StorageFactory>,
     props: std::collections::HashMap<String, String>,
     pool: Arc<PgPool>,
+    recovery_pool: Arc<PgPool>,
     migrator: Arc<PgPool>,
     tenant: DataTenantId,
     table_uid: TableUid,
@@ -59,6 +60,11 @@ async fn setup() -> Harness {
     let db = vala_sql::testing::shared().await.expect("shared db");
     vala_sql::testing::reset_for_test(&db).await.expect("reset");
     let pool = Arc::new(db.app.clone());
+    let recovery_pool = Arc::new(
+        vala_sql::testing::recovery_pool()
+            .await
+            .expect("recovery pool"),
+    );
 
     let tenant = DataTenantId::new_v7();
     vala_sql::testing::seed_tenant(&db.platform_admin, tenant.as_uuid())
@@ -71,7 +77,7 @@ async fn setup() -> Harness {
         &catalog_uri,
         &warehouse,
         pool.clone(),
-        Some(pool.clone()),
+        Some(recovery_pool.clone()),
         factory.clone(),
         props.clone(),
     )
@@ -91,6 +97,7 @@ async fn setup() -> Harness {
         factory,
         props,
         pool,
+        recovery_pool,
         migrator: Arc::new(db.migrator.clone()),
         tenant,
         table_uid,
@@ -117,7 +124,7 @@ async fn rebuild_catalog(h: &Harness) -> WyrdCatalog {
         &h.catalog_uri,
         &h.warehouse,
         h.pool.clone(),
-        Some(h.pool.clone()),
+        Some(h.recovery_pool.clone()),
         h.factory.clone(),
         h.props.clone(),
     )

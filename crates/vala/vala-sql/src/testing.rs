@@ -6,9 +6,12 @@
 //! migrations depend on `platform.tenants` and `wyrd.current_tenant()` from
 //! wyrd-sql — never re-transcribed here.
 
+use secrecy::SecretString;
 use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 
 use crate::SqlError;
+
+const DEFAULT_TEST_VALA_RECOVERY_PASSWORD: &str = "vala_recovery_pw";
 
 /// Shared pool set with Wyrd and Vala migrations guaranteed applied once.
 ///
@@ -29,6 +32,25 @@ pub async fn shared() -> Result<wyrd_sql::testing::SharedDb, SqlError> {
     let vala = crate::ValaPostgres::connect_from_dsns(&dsns).await?;
     drop(vala);
     Ok(db)
+}
+
+/// Connect to the shared test DB as `vala_recovery`.
+///
+/// # Errors
+/// Returns [`SqlError`] when shared DB env is missing or the pool cannot connect.
+pub async fn recovery_pool() -> Result<PgPool, SqlError> {
+    let dsns = wyrd_sql::dsn::resolve_external_dsns_from_env()
+        .map_err(|error| SqlError::InvariantViolation {
+            detail: format!("test DB DSN config error: {error}"),
+        })
+        .and_then(|resolved| {
+            resolved.ok_or_else(|| SqlError::InvariantViolation {
+                detail: "shared test DB env unset (WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD); refusing to boot embedded in tests".to_owned(),
+            })
+        })?;
+    let password = std::env::var(crate::postgres::VALA_RECOVERY_PASSWORD_ENV)
+        .unwrap_or_else(|_| DEFAULT_TEST_VALA_RECOVERY_PASSWORD.to_owned());
+    crate::postgres::connect_recovery_pool(&dsns, SecretString::from(password)).await
 }
 
 /// Reset Wyrd and Vala owned schemas, then restore migration-seeded sentinel data.

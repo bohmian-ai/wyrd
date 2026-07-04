@@ -64,7 +64,7 @@ pub(crate) async fn resolve_card_ref_scope(
         }
     }
 
-    Ok(CardRefScope::from_root_and_members(root, members))
+    Ok(CardRefScope::try_from_root_and_members(root, members))
 }
 
 /// Build the stable `413` error for card-ref scope count or depth overflow.

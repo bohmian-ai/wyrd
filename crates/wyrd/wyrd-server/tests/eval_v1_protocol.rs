@@ -39,6 +39,7 @@ use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::eval::resolver::{resolve_card_for_tenant, scenario_object_path};
 use wyrd_server::eval::{EvalAuditEvent, EvalAuditKind, EvalAuditWriter};
+use wyrd_server::auth::ServerAuth;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::data::{
@@ -93,7 +94,11 @@ fn build_state(fixture: &PgFixture) -> (AppState, TempDir) {
         postgres,
         Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
     )
-    .with_auth_handles(issuing_key, verifier);
+    .with_auth(ServerAuth {
+        issuing_key: Some(issuing_key),
+        token_verifier: Some(verifier),
+        ..ServerAuth::default()
+    });
     (state, root)
 }
 
@@ -103,6 +108,7 @@ fn mint_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> String {
         .map(|role| RoleRef::new(role).expect("valid role"))
         .collect::<Vec<RoleRef>>();
     state
+        .auth
         .issuing_key
         .as_ref()
         .expect("issuing key")

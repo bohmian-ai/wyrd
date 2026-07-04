@@ -17,6 +17,7 @@ use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
+use crate::auth::state::ServerAuth;
 use crate::config::WorkloadBindingEntry;
 use crate::postgres::ServerPostgres;
 use crate::state::AppState;
@@ -181,8 +182,7 @@ pub async fn build_app_state_from_config(
         .with_limits(config.limits.into_state())
         .with_grpc_health(reporter)
         .with_trusted_upstreams_parsed(Arc::from(trusted_upstreams_parsed))
-        .with_trusted_request_id_propagation(config.request_id.trust_upstream)
-        .with_preview_auth(config.auth.allow_preview);
+        .with_trusted_request_id_propagation(config.request_id.trust_upstream);
 
     // Postgres is the single source of issuer/binding resolution. Both resolvers
     // are always attached; an empty config simply means the tenant federates no
@@ -196,12 +196,6 @@ pub async fn build_app_state_from_config(
     let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(Arc::new(
         state.postgres.app_pool().clone(),
     )));
-    state = state
-        .with_trusted_issuer_resolver(Arc::clone(&issuer_resolver))
-        .with_workload_binding_resolver(binding_resolver);
-    if let Some(key) = sealing_key.clone() {
-        state = state.with_sealing_key(key);
-    }
 
     // Install Wyrd's own auth handles (issuing key + token verifier). A server
     // without a signing key cannot mint or verify Wyrd JWTs, so auth is the same
@@ -209,15 +203,12 @@ pub async fn build_app_state_from_config(
     // production) fails boot closed when no key is provisioned; development mints
     // an ephemeral key so auth works on a fresh local run. The verifier's
     // external path is wired to the Postgres issuer resolver built above.
-    match config.auth.signing_key.as_ref() {
-        Some(signing_key) => {
-            let (issuing_key, verifier) = crate::auth_boot::build_auth_handles(
-                signing_key,
-                state.postgres.app_pool(),
-                Arc::clone(&issuer_resolver),
-            )?;
-            state = state.with_auth_handles(issuing_key, verifier);
-        }
+    let (issuing_key, verifier) = match config.auth.signing_key.as_ref() {
+        Some(signing_key) => crate::auth_boot::build_auth_handles(
+            signing_key,
+            state.postgres.app_pool(),
+            Arc::clone(&issuer_resolver),
+        )?,
         None if config.deployment_profile.is_production() => {
             return Err(ServerBootError::SigningKey(
                 "no signing key configured (set WYRD_SIGNING_KEY_FILE or WYRD_SIGNING_KEY_PEM)"
@@ -233,14 +224,22 @@ pub async fn build_app_state_from_config(
                  key must never be used in staging or production. Set WYRD_SIGNING_KEY_FILE to \
                  provision a stable key."
             );
-            let (issuing_key, verifier) = crate::auth_boot::build_auth_handles(
+            crate::auth_boot::build_auth_handles(
                 &ephemeral,
                 state.postgres.app_pool(),
                 Arc::clone(&issuer_resolver),
-            )?;
-            state = state.with_auth_handles(issuing_key, verifier);
+            )?
         }
-    }
+    };
+    state = state.with_auth(ServerAuth {
+        allow_preview: config.auth.allow_preview,
+        issuing_key: Some(issuing_key),
+        token_verifier: Some(verifier),
+        trusted_issuer_resolver: Some(Arc::clone(&issuer_resolver)),
+        workload_binding_resolver: Some(binding_resolver),
+        sealing_key: sealing_key.clone(),
+        token_exchange_settings: crate::auth::exchange_api_key::TokenExchangeSettings::default(),
+    });
 
     // Seed `[[trusted_issuers]]` and `[[workload_bindings]]` into Postgres under
     // the implicit tenant. Both resolve the slug through the same

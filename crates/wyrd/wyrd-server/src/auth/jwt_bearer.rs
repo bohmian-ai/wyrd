@@ -81,6 +81,7 @@ async fn verify_workload_assertion(
     assertion: &str,
 ) -> Result<VerifiedExternalIdentity, WyrdErrorResponse> {
     let verifier = state
+        .auth
         .token_verifier
         .as_ref()
         .ok_or_else(auth_not_configured)?;
@@ -102,6 +103,7 @@ async fn resolve_workload_binding(
     verified: &VerifiedExternalIdentity,
 ) -> Result<CardRef, WyrdErrorResponse> {
     let binding_resolver = state
+        .auth
         .workload_binding_resolver
         .as_ref()
         .ok_or_else(auth_not_configured)?;
@@ -156,7 +158,7 @@ async fn issue_and_audit(
     roles: Vec<RoleRef>,
     request_id: &str,
 ) -> Result<ExchangedToken, WyrdErrorResponse> {
-    let issuing_key = state.issuing_key.as_ref().ok_or_else(auth_not_configured)?;
+    let issuing_key = state.auth.issuing_key.as_ref().ok_or_else(auth_not_configured)?;
     let exchanged = issue_for_subject(
         conn,
         issuing_key,
@@ -814,7 +816,7 @@ mod tests {
             .await
             .expect("tenant conn opens");
         let exchanged = crate::auth::exchange_api_key::ExchangeApiKey {
-            issuing_key: state.issuing_key.clone().expect("issuing key configured"),
+            issuing_key: state.auth.issuing_key.clone().expect("issuing key configured"),
             settings: Default::default(),
         }
         .execute(&mut conn, SecretString::from(token), "req-api-key")
@@ -912,9 +914,13 @@ mod tests {
         );
         test_state(fixture)
             .await
-            .with_auth_handles(issuing_key, Arc::new(verifier))
-            .with_trusted_issuer_resolver(issuer_resolver)
-            .with_workload_binding_resolver(binding_resolver)
+            .with_auth(crate::auth::ServerAuth {
+                issuing_key: Some(issuing_key),
+                token_verifier: Some(Arc::new(verifier)),
+                trusted_issuer_resolver: Some(issuer_resolver),
+                workload_binding_resolver: Some(binding_resolver),
+                ..crate::auth::ServerAuth::default()
+            })
     }
 
     async fn bootstrap_principal(
@@ -1106,6 +1112,7 @@ mod tests {
         token: &str,
     ) -> Result<wyrd_auth_verify::VerifiedToken, wyrd_auth_verify::AuthError> {
         state
+            .auth
             .token_verifier
             .as_ref()
             .expect("token verifier configured")

@@ -22,13 +22,13 @@ impl AppState {
     /// # Errors
     /// Returns a specific [`BuildError`] when a dev/test default is still mounted.
     pub fn build_production(self) -> Result<Self, BuildError> {
-        if self.policy_hook.is_stub_default() {
+        if self.authz.policy_hook.is_stub_default() {
             return Err(BuildError::StubAllowInProduction);
         }
         if self.trusted_request_id_propagation && self.trusted_upstreams_parsed.is_empty() {
             return Err(BuildError::RequestIdPropagationWithoutTrustedUpstreams);
         }
-        if self.audit_writer.is_stub_default() {
+        if self.authz.audit_writer.is_stub_default() {
             return Err(BuildError::NoopAuditWriterInProduction);
         }
         Ok(self)
@@ -57,10 +57,10 @@ mod tests {
     #[tokio::test]
     async fn build_production_rejects_stub_audit_writer() {
         let mut state = test_state();
-        state.policy_hook = Arc::new(DenyAllPolicyHook {
+        state.authz.policy_hook = Arc::new(DenyAllPolicyHook {
             reason: "test-deny".to_owned(),
         });
-        state.audit_writer = Arc::new(NoopAuthzAuditWriter);
+        state.authz.audit_writer = Arc::new(NoopAuthzAuditWriter);
 
         let result = state.build_production();
 
@@ -73,10 +73,10 @@ mod tests {
     #[tokio::test]
     async fn build_production_rejects_untrusted_request_id_configuration() {
         let mut state = test_state();
-        state.policy_hook = Arc::new(DenyAllPolicyHook {
+        state.authz.policy_hook = Arc::new(DenyAllPolicyHook {
             reason: "test-deny".to_owned(),
         });
-        state.audit_writer = Arc::new(ReadyAuditWriter);
+        state.authz.audit_writer = Arc::new(ReadyAuditWriter);
         state.trusted_request_id_propagation = true;
 
         let result = state.build_production();

@@ -206,10 +206,14 @@ impl WyrdTestEnv {
             fixture.vala_postgres().clone(),
         ));
         let mut state = AppState::new(postgres, storage)
-            .with_preview_auth(true)
-            .with_auth_handles(Arc::clone(&issuing_key), Arc::clone(&verifier));
-        state.permission_check = Arc::new(RbacCheck);
-        state.audit_writer = Arc::new(NoopAuthzAuditWriter);
+            .with_auth(wyrd_server::auth::ServerAuth {
+                allow_preview: true,
+                issuing_key: Some(Arc::clone(&issuing_key)),
+                token_verifier: Some(Arc::clone(&verifier)),
+                ..wyrd_server::auth::ServerAuth::default()
+            });
+        state.authz.permission_check = Arc::new(RbacCheck);
+        state.authz.audit_writer = Arc::new(NoopAuthzAuditWriter);
         let router = build_router(state.clone());
 
         Ok(Self {
@@ -237,7 +241,7 @@ impl WyrdTestEnv {
     /// Override the default allow policy hook.
     #[must_use]
     pub fn with_policy_hook(mut self, hook: Arc<dyn PolicyHook>) -> Self {
-        self.inner.state.policy_hook = hook;
+        self.inner.state.authz.policy_hook = hook;
         self.inner.router = build_router(self.inner.state.clone());
         self
     }
@@ -918,6 +922,7 @@ mod tests {
             .expect("key exchanges");
         let verified = env
             .state()
+            .auth
             .token_verifier
             .as_ref()
             .expect("verifier exists")
@@ -955,6 +960,7 @@ mod tests {
             .expect("key re-exchanges after grant");
         let verified = env
             .state()
+            .auth
             .token_verifier
             .as_ref()
             .expect("verifier exists")
@@ -978,6 +984,7 @@ mod tests {
             .expect("key re-exchanges after revoke");
         let verified = env
             .state()
+            .auth
             .token_verifier
             .as_ref()
             .expect("verifier exists")

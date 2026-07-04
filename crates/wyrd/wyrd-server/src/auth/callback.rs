@@ -130,6 +130,7 @@ async fn finish_authorization_code_exchange(
     audit_principal_id: &mut Uuid,
 ) -> Result<TokenResponse, WyrdErrorResponse> {
     let verifier = state
+        .auth
         .token_verifier
         .as_ref()
         .ok_or_else(auth_not_configured)?;
@@ -152,7 +153,7 @@ async fn finish_authorization_code_exchange(
     .map_err(sql_error)?;
     *audit_principal_id = principal_id;
     let roles = role_names_to_refs(trusted, &verified.groups)?;
-    let issuing_key = state.issuing_key.as_ref().ok_or_else(auth_not_configured)?;
+    let issuing_key = state.auth.issuing_key.as_ref().ok_or_else(auth_not_configured)?;
     let exchanged = issue_and_record_user_session(
         &mut conn,
         issuing_key,
@@ -1094,9 +1095,13 @@ mod tests {
             Arc::clone(&issuer_resolver),
         );
         test_state(fixture)
-            .with_auth_handles(issuing_key, Arc::new(verifier))
-            .with_trusted_issuer_resolver(issuer_resolver)
-            .with_sealing_key(sealing_key)
+            .with_auth(crate::auth::ServerAuth {
+                issuing_key: Some(issuing_key),
+                token_verifier: Some(Arc::new(verifier)),
+                trusted_issuer_resolver: Some(issuer_resolver),
+                sealing_key: Some(sealing_key),
+                ..crate::auth::ServerAuth::default()
+            })
     }
 
     fn tenant_headers(slug: &str) -> HeaderMap {

@@ -56,14 +56,14 @@ async fn token(
                     details: serde_json::json!({ "reason": "format" }),
                 })
             })?;
-            let issuing_key = state.issuing_key.clone().ok_or_else(auth_not_configured)?;
+            let issuing_key = state.auth.issuing_key.clone().ok_or_else(auth_not_configured)?;
             let mut conn = state.postgres.tenant_conn(parsed.tenant_id)
                 .await
                 .map_err(sql_error)?;
             let prefix = parsed.prefix.clone();
             let exchanged = ExchangeApiKey {
                 issuing_key,
-                settings: state.token_exchange_settings.clone(),
+                settings: state.auth.token_exchange_settings.clone(),
             }
             .execute(
                 &mut conn,
@@ -94,11 +94,12 @@ async fn token(
             subject_token_type: _,
             requested_subject,
         } => {
-            if !state.allow_preview_auth {
+            if !state.auth.allow_preview {
                 return Err(WyrdErrorResponse::from(preview_disabled()));
             }
-            let issuing_key = state.issuing_key.clone().ok_or_else(auth_not_configured)?;
+            let issuing_key = state.auth.issuing_key.clone().ok_or_else(auth_not_configured)?;
             let verifier = state
+                .auth
                 .token_verifier
                 .clone()
                 .ok_or_else(auth_not_configured)?;
@@ -109,8 +110,8 @@ async fn token(
             let exchanged = DelegateToken {
                 issuing_key,
                 verifier,
-                permission_check: state.permission_check.clone(),
-                settings: state.token_exchange_settings.clone(),
+                permission_check: state.authz.permission_check.clone(),
+                settings: state.auth.token_exchange_settings.clone(),
             }
             .execute(
                 &mut conn,
@@ -143,10 +144,10 @@ async fn token(
             let mut conn = state.postgres.tenant_conn(tenant_id)
                 .await
                 .map_err(sql_error)?;
-            let issuing_key = state.issuing_key.clone().ok_or_else(auth_not_configured)?;
+            let issuing_key = state.auth.issuing_key.clone().ok_or_else(auth_not_configured)?;
             let exchanged = RefreshTokens {
                 issuing_key,
-                settings: state.token_exchange_settings.clone(),
+                settings: state.auth.token_exchange_settings.clone(),
             }
             .execute(&mut conn, SecretString::from(secret), req_id)
             .await;
@@ -185,7 +186,7 @@ async fn token(
         }
         TokenRequest::JwtBearer { assertion, tenant } => {
             let exchanged = JwtBearer {
-                settings: state.token_exchange_settings.clone(),
+                settings: state.auth.token_exchange_settings.clone(),
             }
             .execute(
                 &state,

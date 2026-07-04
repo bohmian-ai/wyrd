@@ -14,6 +14,7 @@ use wyrd_auth_verify::{
 use wyrd_runtime::PrincipalId;
 use wyrd_server::health::{ProbeOutcome, ProbeReason, ReadinessSnapshot};
 use wyrd_server::postgres::ServerPostgres;
+use wyrd_server::auth::ServerAuth;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -429,7 +430,11 @@ fn test_state() -> AppState {
     ));
 
     AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))))
-        .with_auth_handles(issuing_key, verifier)
+        .with_auth(ServerAuth {
+            issuing_key: Some(issuing_key),
+            token_verifier: Some(verifier),
+            ..ServerAuth::default()
+        })
 }
 
 fn test_state_no_verifier() -> AppState {
@@ -452,6 +457,7 @@ fn mint_test_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
         card_ref_scope: Default::default(),
     };
     state
+        .auth
         .issuing_key
         .as_ref()
         .expect("test state has issuing key")

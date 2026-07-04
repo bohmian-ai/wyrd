@@ -296,7 +296,7 @@ fn check_lease(headers: &HeaderMap, entry: &RunEntry) -> Result<(), WyrdErrorRes
 /// `WyrdError`, mirroring the `check_authz` handler's `missing_permission` arm.
 fn require_eval_run(state: &AppState, principal: &Principal) -> Result<(), WyrdErrorResponse> {
     let required = Permission::eval_run();
-    match state.permission_check.check(principal, &required) {
+    match state.authz.permission_check.check(principal, &required) {
         PermissionVerdict::Allow => Ok(()),
         PermissionVerdict::Deny { .. } => {
             tracing::warn!(

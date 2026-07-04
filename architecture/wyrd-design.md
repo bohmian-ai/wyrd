@@ -96,8 +96,14 @@ Downstream artifacts are brought up to this version in a sync pass.
     `Permission { resource, action }` like every other call. The legacy
     per-card **governance token is removed** — the JWT proves the principal and
     bounds its emittable **card scope**. For card-bound principals, the scope is
-    the principal's own `card_ref` plus the transitive card-ref graph reachable
-    from that card's spec. Service principals start from their Service card and
+    the principal's own `card_ref` plus the **observation-target** cards reachable
+    through the transitive card-ref graph declared in that card's spec. A card
+    enters the scope only if its kind is an observation target — a kind a client
+    (`wyrd.observer`, Bifrost, drift, eval) attributes records to: `Data`,
+    `Model`, `Experiment`, `Prompt`, `Agent`, `Workflow`, `Eval`, `Drift`,
+    `Service`, `Mcp`, `Artifact`, `Source`. Control-plane kinds (`Policy`,
+    `Audit`, `Operator`, `Trigger`) may be referenced for governance but never
+    enter the emit scope. Service principals start from their Service card and
     therefore include declared `Service.components`; Agent principals start from
     their Agent card and include its declared card refs. The observation envelope
     carries the run's Target `card_ref`, which the server authorizes against that
@@ -460,12 +466,16 @@ Consequences, stated so they stop drifting:
 
 - **`card_ref` is authorized, not trusted.** The server checks the asserted
   `card_ref` against the principal's **card scope**. For Service and Agent
-  principals, the scope is the principal's own `card_ref` plus the transitive
-  card-ref graph reachable from that card's spec. Service cards contribute
-  `Service.components`; Agent and other reachable card specs contribute their
-  declared card refs according to the shared card-ref extraction rules. A
-  `card_ref` outside that set is rejected: a principal may not attribute records
-  to a card outside its declared graph. The scope can be resolved from the
+  principals, the scope is the principal's own `card_ref` plus the
+  **observation-target** cards reachable through the transitive card-ref graph
+  declared in that card's spec. A card is in scope only if its kind is an
+  observation target (`Data`, `Model`, `Experiment`, `Prompt`, `Agent`,
+  `Workflow`, `Eval`, `Drift`, `Service`, `Mcp`, `Artifact`, `Source`);
+  control-plane kinds (`Policy`, `Audit`, `Operator`, `Trigger`) never enter the
+  emit scope. Service cards contribute `Service.components`; other reachable
+  specs contribute their declared card refs according to the shared card-ref
+  extraction rules. A `card_ref` outside that set is rejected: a principal may
+  not attribute records to a card outside its declared graph. The scope can be resolved from the
   registry at ingest or carried as a claim minted into the JWT at `/auth/token`
   — an implementation choice deferred to the runtime stage.
 - **This is not the governance token.** `card_ref` is one field in the

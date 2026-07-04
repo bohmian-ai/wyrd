@@ -70,7 +70,7 @@ hide = true
 description = "Run workspace Rust unit tests (no DB required)"
 run = """
 cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server --exclude vala-bifrost --exclude vala-sql --exclude vala-core --exclude wyrd-client --exclude wyrd-dev-fixtures --exclude wyrd-sql --exclude wyrd-storage --exclude wyrd-testing
-cargo test --locked -p wyrd-client
+cargo test --locked -p wyrd-client --lib
 cargo test --locked -p vala-core
 cargo test --locked -p vala-sql --lib
 cargo test --locked -p wyrd-sql --lib
@@ -118,6 +118,7 @@ env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyr
 run = """
 cargo test --locked -p wyrd-server --all-features -- --test-threads=1
 cargo test --locked -p wyrd-testing --all-features -- --test-threads=1
+cargo test --locked -p wyrd-client --test auth_e2e_against_fixture --test discovery_against_fixture -- --test-threads=1
 """
 
 [tasks."test:wyrd-mcp"]

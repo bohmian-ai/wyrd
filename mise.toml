@@ -8,7 +8,7 @@
 #                        answer to "make sure everything passes" (Rust + Python +
 #                        codegen + docs + every boundary invariant).
 #
-#   mise run test:unit   All Rust tests (workspace + storage emulators + sql).
+#   mise run test:unit   All Rust tests except Bifrost and real-cloud storage.
 #   mise run test:bifrost   DataFusion/Postgres Rust tests (separate CI job).
 #   mise run py:test:unit   Python suite (builds the extension, then pytest).
 #
@@ -26,6 +26,7 @@ protoc = "33.2"
 
 [settings]
 env_shell_expand = false
+jobs = 1
 
 [env]
 UI_DIR = "crates/wyrd/wyrd-server/wyrd-ui"
@@ -51,9 +52,9 @@ run = ["docker compose down --volumes --remove-orphans", "docker compose up -d -
 
 [tasks."impl:setup"]
 hide = true
-description = "One-time environment bring-up before the first wyrd-implement wave: shared docker Postgres that every worktree reaches at localhost:5432, plus the migrated wyrd_test DB the reset shard needs. Run once, not per worktree."
-depends = ["build:postgres", "db:migrate:all"]
-run = "echo 'impl env ready: shared Postgres up + wyrd_test migrated; mise supplies DATABASE_URL / WYRD_* per verify task'"
+description = "One-time environment bring-up before the first wyrd-implement wave: shared docker Postgres that every worktree reaches at localhost:5432. Run once, not per worktree."
+depends = ["db:setup-roles"]
+run = "echo 'impl env ready: shared Postgres up; mise supplies DATABASE_URL / WYRD_* per verify task'"
 
 [tasks."impl:warm"]
 hide = true
@@ -71,17 +72,12 @@ cargo test --locked -p vala-sql --lib
 """
 
 [tasks."test:bifrost"]
-description = """Run vala-bifrost and vala-sql integration tests against local Postgres.
+description = """Run vala-bifrost integration tests against local Postgres.
 Runs serially because each test resets shared database state at test start.
 """
-depends = ["build:postgres", "db:migrate:all"]
+depends = ["db:setup-roles"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
-# Default features only: --all-features would enable `python`, which links
-# libpython at runtime and aborts outside the py env.
-run = """
-cargo test --locked -p vala-bifrost -- --test-threads=1
-cargo test --locked -p vala-sql --all-features -- --test-threads=1
-"""
+run = "cargo test --locked -p vala-bifrost -- --test-threads=1"
 
 [tasks."test:unit"]
 description = """Aggregate Rust test gate: workspace + storage emulator matrix + sql + registry-e2e.
@@ -91,7 +87,7 @@ Only real-credential cloud storage tests (test:storage:{s3,gcs,azure}:cloud) are
 storage-integration-cloud.yml; emulator-backed storage tests run here because they are just
 docker containers, same difficulty as Postgres.
 """
-depends = ["test:rust:workspace", "test:storage:matrix", "test:sql", "test:registry-e2e", "test:pg"]
+depends = ["test:rust:workspace", "test:storage:matrix", "test:sql", "test:wyrd-server", "test:registry-e2e"]
 
 [tasks."test:wyrd-spec"]
 hide = true
@@ -110,9 +106,9 @@ run = "cargo test -p wyrd-error-derive --all-features"
 
 [tasks."test:wyrd-server"]
 hide = true
-description = """Run wyrd-server Rust tests against the shared wyrd_test Postgres DB."""
-depends = ["test:pg"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd_test", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+description = """Run wyrd-server Rust tests against the local Postgres database."""
+depends = ["db:setup-roles"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = "cargo test --locked -p wyrd-server --all-features -- --test-threads=1"
 
 [tasks."test:wyrd-mcp"]
@@ -1256,6 +1252,7 @@ description = """Create wyrd_app and wyrd_platform_admin roles in the target Pos
 Targets the local docker-compose Postgres by default; the docker-compose
 bootstrap user is wyrd_migrator (which owns the database).
 """
+depends = ["build:postgres"]
 env = { WYRD_MIGRATOR_DSN = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd" }
 run = """
 for i in $(seq 1 30); do
@@ -1267,8 +1264,10 @@ done
 psql "$WYRD_MIGRATOR_DSN" -c "ALTER ROLE wyrd_migrator BYPASSRLS;" || true
 psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE wyrd_app LOGIN PASSWORD 'wyrd_app_pw';" || true
 psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE wyrd_platform_admin LOGIN PASSWORD 'wyrd_platform_admin_pw' BYPASSRLS;" || true
+psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE wyrd_catalog NOLOGIN;" || true
 psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE vala_recovery_owner NOLOGIN BYPASSRLS;" || true
 psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE vala_recovery LOGIN PASSWORD 'vala_recovery_pw';" || true
+psql "$WYRD_MIGRATOR_DSN" -c "GRANT wyrd_catalog TO wyrd_migrator;" || true
 psql "$WYRD_MIGRATOR_DSN" -c "GRANT vala_recovery_owner TO wyrd_migrator;" || true
 """
 
@@ -1285,40 +1284,24 @@ run = "cargo test --locked -p wyrd-sql --all-features --test migration_pg -- mig
 [tasks."test:sql"]
 hide = true
 description = """Run live Postgres SQL integration tests against docker-compose Postgres.
-Brings up Postgres, provisions roles, and applies migrations before running tests.
+Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, and Vala SQL suites.
 """
-depends = ["build:postgres", "db:setup-roles", "db:migrate"]
+depends = ["db:setup-roles"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
-run = "cargo test --locked -p wyrd-sql --all-features --test migration_pg -- --nocapture"
+run = """
+cargo test --locked -p wyrd-sql --all-features -- --nocapture --test-threads=1
+cargo test --locked -p wyrd-dev-fixtures --all-features -- --test-threads=1
+cargo test --locked -p vala-sql --all-features -- --test-threads=1
+"""
 
 [tasks."db:migrate:all"]
 hide = true
-description = """Apply Wyrd and Vala migrations against local docker-compose Postgres.
-Adds the cluster-global wyrd_catalog role, then runs the Wyrd and Vala
-idempotent migration checks against the single local test database.
-"""
-depends = ["build:postgres", "db:setup-roles"]
-env = { WYRD_ADMIN_DSN = "postgres://wyrd_migrator:wyrd_migrator_pw@localhost/wyrd", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
-run = """
-set -e
-psql "$WYRD_ADMIN_DSN" -c "CREATE ROLE wyrd_catalog NOLOGIN;" || true
-cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture
-cargo test --locked -p vala-sql --all-features --test migration_pg -- vala_migrations_apply_and_are_idempotent --nocapture
-"""
-
-[tasks."test:pg"]
-hide = true
-description = """Serial clean-slate reset self-tests against local Postgres.
-Single-threaded because reset_owned_schemas issues a database-global
-TRUNCATE … RESTART IDENTITY CASCADE; sharing a worker with other DB tests would
-race. Depends on db:migrate:all so reset tests run against the same production
-migration path used by the rest of the SQL suite.
-"""
-depends = ["build:postgres", "db:migrate:all"]
+description = "Manual Wyrd + Vala migration smoke test against local docker-compose Postgres."
+depends = ["db:setup-roles"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@localhost/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
-cargo test --locked -p wyrd-sql --all-features --test reset_pg -- --test-threads=1 --nocapture
-cargo test --locked -p wyrd-dev-fixtures --all-features -- --test-threads=1
+cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture
+cargo test --locked -p vala-sql --all-features --test migration_pg -- vala_migrations_apply_and_are_idempotent --nocapture
 """
 
 [tasks."check:security-schema-drift"]

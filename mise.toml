@@ -36,6 +36,7 @@ jobs = 1
 UI_DIR = "crates/wyrd/wyrd-server/wyrd-ui"
 PY_DIR = "python/py-wyrd"
 WYRD_DEV_PG_CACHE = "${HOME}/.cache/wyrd/pg"
+CARGO_TARGET_DIR = "/Volumes/T7/cargo-target/wyrd-state-abstraction"
 
 [tasks.fmt]
 description = "Format all Rust code"
@@ -527,7 +528,7 @@ hide = true
 description = "Cards registration end-to-end against a real Postgres"
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
 env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
-run = "cargo test --locked -p wyrd-sql --features test-e2e --test cards_e2e -- --include-ignored"
+run = "cargo test --locked -p wyrd-sql --features test-e2e --test cards_e2e -- --include-ignored --test-threads=1"
 
 [tasks."test:storage:s3:cloud"]
 hide = true

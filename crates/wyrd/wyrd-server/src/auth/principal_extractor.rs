@@ -177,6 +177,7 @@ mod tests {
             kind: wyrd_auth_verify::PrincipalKindWire::User,
             tenant_id: tenant,
             card_ref: None,
+            card_ref_scope: Default::default(),
         };
         state
             .issuing_key

@@ -458,6 +458,7 @@ mod tests {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKind::Service {
                 card_ref: card_ref(name),
+                card_ref_scope: wyrd_spec::reference::CardRefScope::own(&card_ref(name)),
             },
             tenant_id: DataTenantId::new_v7(),
             roles: Vec::new(),

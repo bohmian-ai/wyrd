@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, CardRefScope};
 
 use crate::permission::PermissionSet;
 
@@ -34,11 +34,15 @@ pub enum PrincipalKind {
     Service {
         /// Bound Service card.
         card_ref: CardRef,
+        /// Transitive card authorization set; always contains `card_ref`.
+        card_ref_scope: CardRefScope,
     },
     /// Card-bound agent identity.
     Agent {
         /// Bound Agent card.
         card_ref: CardRef,
+        /// Transitive card authorization set; always contains `card_ref`.
+        card_ref_scope: CardRefScope,
     },
 }
 
@@ -146,11 +150,28 @@ impl Principal {
     #[must_use]
     pub fn card_ref(&self) -> Option<&CardRef> {
         match &self.kind {
-            PrincipalKind::Service { card_ref } | PrincipalKind::Agent { card_ref } => {
+            PrincipalKind::Service { card_ref, .. } | PrincipalKind::Agent { card_ref, .. } => {
                 Some(card_ref)
             }
             PrincipalKind::User => None,
         }
+    }
+
+    /// Returns the card scope for service and agent principals.
+    #[must_use]
+    pub fn card_ref_scope(&self) -> Option<&CardRefScope> {
+        match &self.kind {
+            PrincipalKind::Service { card_ref_scope, .. }
+            | PrincipalKind::Agent { card_ref_scope, .. } => Some(card_ref_scope),
+            PrincipalKind::User => None,
+        }
+    }
+
+    /// True when this principal is authorized to emit for `card`.
+    #[must_use]
+    pub fn authorizes_card(&self, card: &CardRef) -> bool {
+        self.card_ref_scope()
+            .is_some_and(|scope| scope.authorizes(card))
     }
 }
 
@@ -178,9 +199,19 @@ impl PrincipalRef {
     #[must_use]
     pub fn card_ref(&self) -> Option<&CardRef> {
         match &self.kind {
-            PrincipalKind::Service { card_ref } | PrincipalKind::Agent { card_ref } => {
+            PrincipalKind::Service { card_ref, .. } | PrincipalKind::Agent { card_ref, .. } => {
                 Some(card_ref)
             }
+            PrincipalKind::User => None,
+        }
+    }
+
+    /// Returns the card scope for service and agent principals.
+    #[must_use]
+    pub fn card_ref_scope(&self) -> Option<&CardRefScope> {
+        match &self.kind {
+            PrincipalKind::Service { card_ref_scope, .. }
+            | PrincipalKind::Agent { card_ref_scope, .. } => Some(card_ref_scope),
             PrincipalKind::User => None,
         }
     }
@@ -193,7 +224,7 @@ mod tests {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::reference::{CardRef, CardRefScope};
 
     fn service_card_ref() -> CardRef {
         CardRef {
@@ -234,6 +265,7 @@ mod tests {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKind::Service {
                 card_ref: card_ref.clone(),
+                card_ref_scope: CardRefScope::own(&card_ref),
             },
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
             roles: vec![RoleRef::new("agent").expect("static role is valid")],
@@ -250,6 +282,7 @@ mod tests {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKind::Service {
                 card_ref: card_ref.clone(),
+                card_ref_scope: CardRefScope::own(&card_ref),
             },
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
             roles: vec![RoleRef::new("agent").expect("static role is valid")],
@@ -260,6 +293,47 @@ mod tests {
 
         assert_eq!(principal_ref.id, principal.id);
         assert_eq!(principal_ref.card_ref(), Some(&card_ref));
+        assert_eq!(
+            principal_ref.card_ref_scope(),
+            Some(&CardRefScope::own(&card_ref))
+        );
         assert_eq!(principal_ref.kind, principal.kind);
+    }
+
+    #[test]
+    fn principal_authorizes_cards_from_scope() {
+        let own = service_card_ref();
+        let mut composed = service_card_ref();
+        composed.name = CardName::new("composed").expect("static card name is valid");
+        let principal = Principal {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: PrincipalKind::Service {
+                card_ref: own.clone(),
+                card_ref_scope: CardRefScope::from_root_and_members(&own, [composed.clone()]),
+            },
+            tenant_id: wyrd_spec::DataTenantId::new_v7(),
+            roles: Vec::new(),
+            effective_permissions: PermissionSet::new(),
+        };
+
+        assert!(principal.authorizes_card(&own));
+        assert!(principal.authorizes_card(&composed));
+
+        let mut unrelated = service_card_ref();
+        unrelated.name = CardName::new("unrelated").expect("static card name is valid");
+        assert!(!principal.authorizes_card(&unrelated));
+    }
+
+    #[test]
+    fn user_principal_authorizes_no_cards() {
+        let principal = Principal {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: PrincipalKind::User,
+            tenant_id: wyrd_spec::DataTenantId::new_v7(),
+            roles: Vec::new(),
+            effective_permissions: PermissionSet::new(),
+        };
+
+        assert!(!principal.authorizes_card(&service_card_ref()));
     }
 }

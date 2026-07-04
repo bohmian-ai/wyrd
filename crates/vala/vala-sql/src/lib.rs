@@ -10,7 +10,7 @@
 
 #![deny(missing_docs)]
 
-use sqlx::{AssertSqlSafe, PgPool};
+use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 
 pub mod postgres;
 pub mod queries;
@@ -29,6 +29,7 @@ pub const ICEBERG_CATALOG_SCHEMA: &str = "iceberg_catalog";
 pub const OWNED_SCHEMAS: &[&str] = &[OBSERVABILITY_SCHEMA, ICEBERG_CATALOG_SCHEMA];
 /// Search path used only by the boot migrator connection.
 pub const MIGRATION_SEARCH_PATH: &str = "vala, iceberg_catalog, public";
+const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x0056_5441_4c41_5351;
 
 /// Apply embedded Vala SQL migrations against a boot-only migrator pool.
 ///
@@ -42,6 +43,7 @@ pub const MIGRATION_SEARCH_PATH: &str = "vala, iceberg_catalog, public";
 /// Returns [`SqlError::Migrate`] when migration execution fails.
 pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
     let mut conn = migrator_pool.acquire().await.map_err(SqlError::Connect)?;
+    acquire_migration_advisory_lock(&mut conn).await?;
 
     let result: Result<(), SqlError> = async {
         for schema in OWNED_SCHEMAS {
@@ -82,6 +84,17 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
     }
     .await;
 
+    let unlock_result = release_migration_advisory_lock(&mut conn).await;
+    if let Err(error) = unlock_result {
+        if result.is_ok() {
+            return Err(error);
+        }
+        tracing::warn!(
+            error = %error,
+            "failed to release vala-sql migration advisory lock after migration error"
+        );
+    }
+
     if let Err(error) = conn.close().await {
         tracing::warn!(
             error = %error,
@@ -90,6 +103,32 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
     }
 
     result
+}
+
+/// Acquire the Vala SQL migration advisory lock on the current session.
+///
+/// # Errors
+/// Returns [`SqlError::Connect`] when Postgres cannot acquire the lock.
+async fn acquire_migration_advisory_lock(conn: &mut PgConnection) -> Result<(), SqlError> {
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MIGRATION_ADVISORY_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+        .map_err(SqlError::Connect)?;
+    Ok(())
+}
+
+/// Release the Vala SQL migration advisory lock on the current session.
+///
+/// # Errors
+/// Returns [`SqlError::Connect`] when Postgres cannot release the lock.
+async fn release_migration_advisory_lock(conn: &mut PgConnection) -> Result<(), SqlError> {
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(MIGRATION_ADVISORY_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+        .map_err(SqlError::Connect)?;
+    Ok(())
 }
 
 #[cfg(test)]

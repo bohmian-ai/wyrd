@@ -42,7 +42,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     RequestedSubject, SecretBearer, SubjectTokenType, TokenRequest, TokenResponse,
 };
-use wyrd_spec::envelope::CardKind;
+use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
@@ -350,6 +350,7 @@ impl WyrdTestServer {
             kind: PrincipalKindWire::User,
             tenant_id: self.data_tenant_id(),
             card_ref: None,
+            card_ref_scope: Default::default(),
         };
         let jwt = self
             .inner
@@ -755,6 +756,7 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
 
         let mut conn = self.tenant_conn_for(tenant_id).await?;
+        seed_machine_card(&mut conn, &card_ref, creator_id).await?;
         insert_service_account(
             &mut conn,
             principal_id,
@@ -1257,6 +1259,148 @@ fn card_ref(kind: CardKind, name: &str) -> Result<CardRef, WyrdTestServerError> 
             CardUid::new(Uuid::now_v7().to_string()).expect("generated UUIDv7 is a valid CardUid"),
         ),
     })
+}
+
+/// Seed the backing Card row for a fixture-created Service or Agent principal.
+///
+/// # Errors
+/// Returns an error when the fixture spec cannot be encoded or Postgres rejects
+/// the insert.
+async fn seed_machine_card(
+    conn: &mut TenantConn<'_>,
+    machine_ref: &CardRef,
+    creator_id: Uuid,
+) -> Result<(), WyrdTestServerError> {
+    let spec = match &machine_ref.kind {
+        CardKind::Service => machine_card_spec(&machine_ref.kind)?,
+        CardKind::Agent => {
+            let prompt_ref = card_ref(CardKind::Prompt, &format!("{}-prompt", machine_ref.name))?;
+            seed_prompt_card(conn, &prompt_ref, creator_id).await?;
+            Spec::from_kind_and_value(
+                &CardKind::Agent,
+                serde_json::json!({
+                    "prompt": prompt_ref,
+                }),
+            )
+            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
+        }
+        other => {
+            return Err(WyrdTestServerError::Auth(format!(
+                "machine fixture card must be Service or Agent, got {other:?}"
+            )));
+        }
+    };
+    insert_fixture_card(conn, machine_ref, &spec, creator_id).await
+}
+
+/// Seed a minimal Prompt Card for fixture-created Agent principals.
+///
+/// # Errors
+/// Returns an error when the prompt spec cannot be decoded or Postgres rejects
+/// the insert.
+async fn seed_prompt_card(
+    conn: &mut TenantConn<'_>,
+    card_ref: &CardRef,
+    creator_id: Uuid,
+) -> Result<(), WyrdTestServerError> {
+    let spec = Spec::from_kind_and_value(
+        &CardKind::Prompt,
+        serde_json::json!({
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "messages": "Fixture agent."
+        }),
+    )
+    .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+    insert_fixture_card(conn, card_ref, &spec, creator_id).await
+}
+
+/// Insert a fixture Card row inside the caller's tenant transaction.
+///
+/// # Errors
+/// Returns an error when canonical hashing, JSON encoding, or the SQL insert
+/// fails.
+async fn insert_fixture_card(
+    conn: &mut TenantConn<'_>,
+    card_ref: &CardRef,
+    spec: &Spec,
+    creator_id: Uuid,
+) -> Result<(), WyrdTestServerError> {
+    let (spec_hash, _) = spec
+        .canonical_hash_with_bytes()
+        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+    let spec_json =
+        serde_json::to_value(spec).map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+    let uid = card_ref
+        .uid
+        .as_ref()
+        .ok_or_else(|| WyrdTestServerError::Auth("machine CardRef must carry a uid".to_owned()))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO wyrd.cards (
+            card_uid,
+            data_tenant_id,
+            kind,
+            space,
+            name,
+            version,
+            spec,
+            spec_hash,
+            artifact_hash,
+            labels,
+            annotations,
+            status,
+            created_by
+        )
+        VALUES (
+            $1,
+            wyrd.current_tenant(),
+            $2,
+            $3,
+            $4,
+            $5,
+            $6,
+            $7,
+            NULL,
+            '{}'::jsonb,
+            '{}'::jsonb,
+            'active',
+            $8
+        )
+        "#,
+    )
+    .bind(uid.as_uuid())
+    .bind(card_ref.kind.wire_name())
+    .bind(card_ref.space.as_str())
+    .bind(card_ref.name.as_str())
+    .bind(card_ref.version.as_str())
+    .bind(spec_json)
+    .bind(spec_hash.as_str())
+    .bind(creator_id)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(sql)?;
+
+    Ok(())
+}
+
+/// Build the minimal fixture Card spec for a Service principal.
+///
+/// # Errors
+/// Returns an error when the requested kind is not service-principal-backed.
+fn machine_card_spec(kind: &CardKind) -> Result<Spec, WyrdTestServerError> {
+    let value = match kind {
+        CardKind::Service => serde_json::json!({}),
+        other => {
+            return Err(WyrdTestServerError::Auth(format!(
+                "machine fixture card must be Service, got {other:?}"
+            )));
+        }
+    };
+
+    Spec::from_kind_and_value(kind, value)
+        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))
 }
 
 async fn parse_success<T>(response: Response<Body>) -> Result<T, WyrdTestServerError>

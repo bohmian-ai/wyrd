@@ -107,7 +107,7 @@ mod tests {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, IdempotencyKey, SpaceName};
-    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
 
     fn request_id() -> RequestId {
@@ -126,10 +126,12 @@ mod tests {
     }
 
     fn service_principal(name: &str) -> Principal {
+        let card_ref = card_ref(CardKind::Service, name);
         Principal {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKind::Service {
-                card_ref: card_ref(CardKind::Service, name),
+                card_ref: card_ref.clone(),
+                card_ref_scope: CardRefScope::own(&card_ref),
             },
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
             roles: Vec::new(),

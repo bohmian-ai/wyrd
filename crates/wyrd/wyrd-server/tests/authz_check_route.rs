@@ -283,6 +283,7 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
                 kind: PrincipalKindWire::User,
                 tenant_id: tenant,
                 card_ref: None,
+                card_ref_scope: Default::default(),
             },
             Vec::new(),
             Duration::minutes(5),
@@ -299,6 +300,7 @@ fn mint_service_jwt(state: &AppState, tenant: DataTenantId, name: &str) -> Strin
             PrincipalId::new(uuid::Uuid::now_v7()),
             tenant,
             card_ref(CardKind::Service, name),
+            wyrd_spec::reference::CardRefScope::default(),
             Vec::new(),
             Duration::minutes(5),
         )
@@ -306,17 +308,21 @@ fn mint_service_jwt(state: &AppState, tenant: DataTenantId, name: &str) -> Strin
 }
 
 fn mint_delegated_service_jwt(state: &AppState, tenant: DataTenantId) -> String {
+    let caller_ref = card_ref(CardKind::Service, "caller");
     let caller = TokenPrincipalRef {
         id: PrincipalId::new(uuid::Uuid::now_v7()),
         kind: PrincipalKindWire::Service,
         tenant_id: tenant,
-        card_ref: Some(card_ref(CardKind::Service, "caller")),
+        card_ref: Some(caller_ref.clone()),
+        card_ref_scope: wyrd_spec::reference::CardRefScope::own(&caller_ref),
     };
+    let requested_ref = card_ref(CardKind::Service, "callee");
     let requested = TokenPrincipalRef {
         id: PrincipalId::new(uuid::Uuid::now_v7()),
         kind: PrincipalKindWire::Service,
         tenant_id: tenant,
-        card_ref: Some(card_ref(CardKind::Service, "callee")),
+        card_ref: Some(requested_ref.clone()),
+        card_ref_scope: wyrd_spec::reference::CardRefScope::own(&requested_ref),
     };
 
     state

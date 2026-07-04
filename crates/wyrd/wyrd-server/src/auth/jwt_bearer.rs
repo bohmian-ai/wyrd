@@ -19,6 +19,7 @@ use wyrd_sql::queries::auth::{
     service_account_by_card_ref,
 };
 
+use crate::auth::card_scope::MINT_KIND_JWT_BEARER;
 use crate::auth::exchange_api_key::{
     ExchangeError, ExchangedToken, IssueSubject, RefreshPolicy, TokenExchangeSettings,
     issue_for_subject, role_refs,
@@ -167,6 +168,8 @@ async fn issue_and_audit(
             roles,
         },
         RefreshPolicy::Skip,
+        request_id,
+        MINT_KIND_JWT_BEARER,
     )
     .await
     .map_err(|error| workload_exchange_error(ExchangeError::from(error)))?;
@@ -194,6 +197,7 @@ fn workload_exchange_error(
                 details: json!({ "retry_after_seconds": 1 }),
             })
         }
+        crate::auth::exchange_api_key::ExchangeError::Wyrd(error) => WyrdErrorResponse::from(error),
         crate::auth::exchange_api_key::ExchangeError::Issue(_)
         | crate::auth::exchange_api_key::ExchangeError::Join(_)
         | crate::auth::exchange_api_key::ExchangeError::InvalidRole => {
@@ -381,15 +385,17 @@ mod tests {
         WorkloadBinding,
     };
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
+    use wyrd_dev_fixtures::cards::seed_card_with_spec;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{IssuerUrl, TokenType};
-    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, SpaceName, TenantSlug};
     use wyrd_spec::reference::CardRef;
+    use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{
         grant_role_to_service_account, insert_service_account, role_by_name, upsert_trusted_issuer,
         upsert_workload_binding,
@@ -462,7 +468,7 @@ mod tests {
             .expect("issued token verifies");
         assert!(matches!(
             &verified.principal.kind,
-            PrincipalKind::Service { card_ref } if *card_ref == binding.card_ref
+            PrincipalKind::Service { card_ref, .. } if *card_ref == binding.card_ref
         ));
         assert_eq!(role_names(&verified.principal.roles), set_of(&[role_name]));
         assert_eq!(exchanged.token_type, TokenType::Bearer);
@@ -525,7 +531,7 @@ mod tests {
             .expect("issued token verifies");
         assert!(matches!(
             &verified.principal.kind,
-            PrincipalKind::Agent { card_ref } if card_ref.name.as_str() == "agent"
+            PrincipalKind::Agent { card_ref, .. } if card_ref.name.as_str() == "agent"
         ));
     }
 
@@ -743,7 +749,7 @@ mod tests {
             .expect("issued token verifies");
         assert!(matches!(
             &verified.principal.kind,
-            PrincipalKind::Service { card_ref } if *card_ref == binding.card_ref
+            PrincipalKind::Service { card_ref, .. } if *card_ref == binding.card_ref
         ));
     }
 
@@ -811,7 +817,7 @@ mod tests {
             issuing_key: state.issuing_key.clone().expect("issuing key configured"),
             settings: Default::default(),
         }
-        .execute(&mut conn, SecretString::from(token))
+        .execute(&mut conn, SecretString::from(token), "req-api-key")
         .await
         .expect("api-key exchange still succeeds");
         conn.commit().await.expect("api-key exchange commits");
@@ -933,6 +939,7 @@ mod tests {
             other => panic!("unexpected card kind in test: {other:?}"),
         };
         let card_ref = card_ref(card_kind, name);
+        insert_test_card(&mut conn, &card_ref, creator_id).await?;
         insert_service_account(
             &mut conn,
             id,
@@ -951,6 +958,51 @@ mod tests {
         }
         conn.commit().await.expect("principal seed commits");
         Ok(id)
+    }
+
+    async fn insert_test_card(
+        conn: &mut TenantConn<'_>,
+        target_ref: &CardRef,
+        created_by: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        let spec = match &target_ref.kind {
+            CardKind::Service => {
+                Spec::from_kind_and_value(&CardKind::Service, serde_json::json!({}))
+                    .expect("service fixture spec decodes")
+            }
+            CardKind::Agent => {
+                let prompt_ref = card_ref(CardKind::Prompt, &format!("{}-prompt", target_ref.name));
+                let prompt_spec = Spec::from_kind_and_value(
+                    &CardKind::Prompt,
+                    serde_json::json!({
+                        "provider": "openai",
+                        "model": "gpt-4o-mini",
+                        "messages": "Fixture agent."
+                    }),
+                )
+                .expect("prompt fixture spec decodes");
+                seed_card_with_spec(conn, &prompt_ref, &prompt_spec, created_by).await;
+                Spec::from_kind_and_value(
+                    &CardKind::Agent,
+                    serde_json::json!({
+                        "prompt": prompt_ref,
+                    }),
+                )
+                .expect("agent fixture spec decodes")
+            }
+            CardKind::Prompt => Spec::from_kind_and_value(
+                &CardKind::Prompt,
+                serde_json::json!({
+                    "provider": "openai",
+                    "model": "gpt-4o-mini",
+                    "messages": "Fixture agent."
+                }),
+            )
+            .expect("prompt fixture spec decodes"),
+            other => panic!("unexpected test card kind: {other:?}"),
+        };
+        seed_card_with_spec(conn, target_ref, &spec, created_by).await;
+        Ok(())
     }
 
     async fn insert_creator_user(

@@ -1,15 +1,30 @@
 //! Shared Postgres fixtures for SQL integration tests.
 
-use sqlx::PgPool;
-use wyrd_spec::DataTenantId;
-use wyrd_sql::{SqlError, TenantConn};
+use std::collections::hash_map::DefaultHasher;
+use std::env;
+use std::hash::{Hash, Hasher};
+use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Per-test Postgres fixture backed by the shared docker `wyrd_test` database.
+use secrecy::{ExposeSecret, SecretString};
+use sqlx::{AssertSqlSafe, PgPool};
+use url::Url;
+use wyrd_spec::DataTenantId;
+use wyrd_sql::dsn::ResolvedDsns;
+use wyrd_sql::pool::build_pool;
+use wyrd_sql::{PoolConfig, SqlError, TenantConn};
+
+static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Per-test Postgres fixture backed by a fixture-owned database.
 pub struct PgFixture {
     app_pool: PgPool,
     platform_admin_pool: PgPool,
     data_tenant_id: DataTenantId,
     tenant_slug: String,
+    _test_db: TestDatabase,
 }
 
 /// Errors returned while starting a shared Postgres fixture.
@@ -21,10 +36,10 @@ pub enum FixtureError {
 }
 
 impl PgFixture {
-    /// Reset the shared test database and seed one deterministic test tenant row.
+    /// Create an isolated test database and seed one deterministic test tenant row.
     ///
     /// # Errors
-    /// Returns [`FixtureError`] when shared DB setup, reset, or seed insert fails.
+    /// Returns [`FixtureError`] when database creation, migration, or seed insert fails.
     pub async fn start() -> Result<Self, FixtureError> {
         let data_tenant_id = DataTenantId::new_v7();
         let tenant_slug = "test-tenant-1".to_owned();
@@ -109,8 +124,8 @@ impl PgFixture {
         data_tenant_id: DataTenantId,
         tenant_slug: String,
     ) -> Result<Self, FixtureError> {
-        let db = vala_sql::testing::shared().await?;
-        vala_sql::testing::reset_for_test(&db).await?;
+        let test_db = TestDatabase::create().await?;
+        let db = test_db.connect().await?;
         seed_tenant(&db.platform_admin, data_tenant_id, &tenant_slug).await?;
 
         Ok(Self {
@@ -118,8 +133,189 @@ impl PgFixture {
             platform_admin_pool: db.platform_admin.clone(),
             data_tenant_id,
             tenant_slug,
+            _test_db: test_db,
         })
     }
+}
+
+struct TestDatabase {
+    name: String,
+    maintenance_dsn: SecretString,
+}
+
+struct TestDbPools {
+    app: PgPool,
+    platform_admin: PgPool,
+}
+
+impl TestDatabase {
+    async fn create() -> Result<Self, SqlError> {
+        let base = resolved_external_test_dsns()?;
+        let maintenance_dsn = database_dsn(&base.migrator, "wyrd")?;
+        let name = unique_database_name();
+        let maintenance_pool = build_pool(
+            maintenance_dsn.expose_secret(),
+            PoolConfig::migrator_defaults(),
+        )
+        .await
+        .map_err(SqlError::Connect)?;
+
+        sqlx::query(AssertSqlSafe(format!(
+            "CREATE DATABASE {name} OWNER wyrd_migrator"
+        )))
+        .execute(&maintenance_pool)
+        .await
+        .map_err(SqlError::from)?;
+        maintenance_pool.close().await;
+
+        let test_db = Self {
+            name,
+            maintenance_dsn,
+        };
+        test_db.migrate(&base).await?;
+        Ok(test_db)
+    }
+
+    async fn connect(&self) -> Result<TestDbPools, SqlError> {
+        let dsns = self.resolved_dsns()?;
+        let app = build_pool(dsns.app.expose_secret(), PoolConfig::app_defaults())
+            .await
+            .map_err(SqlError::Connect)?;
+        let platform_admin_dsn =
+            dsns.platform_admin
+                .ok_or_else(|| SqlError::InvariantViolation {
+                    detail: "test DB env unset (WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD); platform-admin pool is required for tenant seeding".to_owned(),
+                })?;
+        let platform_admin = build_pool(
+            platform_admin_dsn.expose_secret(),
+            PoolConfig::platform_admin_defaults(),
+        )
+        .await
+        .map_err(SqlError::Connect)?;
+
+        Ok(TestDbPools {
+            app,
+            platform_admin,
+        })
+    }
+
+    async fn migrate(&self, base: &ResolvedDsns) -> Result<(), SqlError> {
+        let migrator_dsn = database_dsn(&base.migrator, &self.name)?;
+        let migrator = build_pool(
+            migrator_dsn.expose_secret(),
+            PoolConfig::migrator_defaults(),
+        )
+        .await
+        .map_err(SqlError::Connect)?;
+
+        let result = async {
+            wyrd_sql::migrate(&migrator).await?;
+            vala_sql::migrate(&migrator).await
+        }
+        .await;
+        migrator.close().await;
+        result
+    }
+
+    fn resolved_dsns(&self) -> Result<ResolvedDsns, SqlError> {
+        let base = resolved_external_test_dsns()?;
+        Ok(ResolvedDsns {
+            app: database_dsn(&base.app, &self.name)?,
+            migrator: database_dsn(&base.migrator, &self.name)?,
+            platform_admin: base
+                .platform_admin
+                .as_ref()
+                .map(|dsn| database_dsn(dsn, &self.name))
+                .transpose()?,
+        })
+    }
+}
+
+impl Drop for TestDatabase {
+    fn drop(&mut self) {
+        let database_name = self.name.clone();
+        let maintenance_dsn = self.maintenance_dsn.clone();
+        let handle = thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("failed to build test database cleanup runtime: {error}");
+                    return;
+                }
+            };
+
+            runtime.block_on(async move {
+                let pool = match build_pool(
+                    maintenance_dsn.expose_secret(),
+                    PoolConfig::migrator_defaults(),
+                )
+                .await
+                {
+                    Ok(pool) => pool,
+                    Err(error) => {
+                        eprintln!("failed to connect for test database cleanup: {error}");
+                        return;
+                    }
+                };
+                let drop_result = sqlx::query(AssertSqlSafe(format!(
+                    "DROP DATABASE IF EXISTS {database_name} WITH (FORCE)"
+                )))
+                .execute(&pool)
+                .await;
+                pool.close().await;
+
+                if let Err(error) = drop_result {
+                    eprintln!("failed to drop test database {database_name}: {error}");
+                }
+            });
+        });
+
+        if handle.join().is_err() {
+            eprintln!("test database cleanup thread panicked");
+        }
+    }
+}
+
+fn resolved_external_test_dsns() -> Result<ResolvedDsns, SqlError> {
+    wyrd_sql::dsn::resolve_external_dsns_from_env()
+        .map_err(|error| SqlError::InvariantViolation {
+            detail: format!("test DB DSN config error: {error}"),
+        })?
+        .ok_or_else(|| SqlError::InvariantViolation {
+            detail: "test DB env unset (WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD); refusing to boot embedded in tests".to_owned(),
+        })
+}
+
+fn database_dsn(base: &SecretString, database: &str) -> Result<SecretString, SqlError> {
+    let mut url =
+        Url::parse(base.expose_secret()).map_err(|error| SqlError::InvariantViolation {
+            detail: format!("test DB DSN parse error: {error}"),
+        })?;
+    url.set_path(database);
+    Ok(SecretString::from(url.to_string()))
+}
+
+fn unique_database_name() -> String {
+    let cwd = env::current_dir()
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let mut hasher = DefaultHasher::new();
+    cwd.hash(&mut hasher);
+    let worktree_hash = hasher.finish();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let counter = TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let raw = format!(
+        "wyrd_test_{worktree_hash:016x}_{:x}_{counter:x}_{now:x}",
+        process::id()
+    );
+    raw.chars().take(63).collect()
 }
 
 async fn seed_tenant(

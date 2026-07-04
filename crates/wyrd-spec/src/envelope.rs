@@ -480,6 +480,26 @@ impl CardKind {
             Self::External => "External",
         }
     }
+
+    /// True when observations may be attributed to this card kind.
+    #[must_use]
+    pub const fn is_observation_target(&self) -> bool {
+        match self {
+            Self::Data
+            | Self::Model
+            | Self::Experiment
+            | Self::Prompt
+            | Self::Agent
+            | Self::Workflow
+            | Self::Eval
+            | Self::Drift
+            | Self::Service
+            | Self::Mcp
+            | Self::Artifact
+            | Self::Source => true,
+            Self::Policy | Self::Audit | Self::Operator | Self::Trigger | Self::External => false,
+        }
+    }
 }
 
 impl Serialize for CardKind {

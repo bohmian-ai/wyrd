@@ -450,6 +450,7 @@ fn mint_test_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
         kind: PrincipalKindWire::User,
         tenant_id: tenant,
         card_ref: None,
+        card_ref_scope: Default::default(),
     };
     state
         .issuing_key

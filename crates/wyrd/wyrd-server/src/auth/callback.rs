@@ -67,7 +67,7 @@ pub async fn exchange_authorization_code(
     request_id: &str,
 ) -> Result<TokenResponse, WyrdErrorResponse> {
     let tenant_id = resolve_callback_tenant(state, headers).await?;
-    let store = PgLoginStateStore::new(state.pool.clone());
+    let store = PgLoginStateStore::new(state.postgres.app_pool().clone());
     let mut audit_principal_id = Uuid::nil();
     let result = async {
         let Some(login_state) = store.take(tenant_id, state_key).await.map_err(sql_error)? else {
@@ -139,7 +139,7 @@ async fn finish_authorization_code_exchange(
         .map_err(WyrdErrorResponse::from)?;
     verify_nonce(login_state, &verified.raw_claims)?;
 
-    let mut conn = TenantConn::acquire(&state.pool, tenant_id)
+    let mut conn = state.postgres.tenant_conn(tenant_id)
         .await
         .map_err(sql_error)?;
     let principal_id = ensure_user_identity(
@@ -242,7 +242,7 @@ async fn resolve_callback_tenant(
     let Some(slug) = tenant_slug_from_host(headers) else {
         return Err(invalid_token("request host does not encode a tenant"));
     };
-    match wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app(&state.pool, &slug)
+    match wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app(state.postgres.app_pool(), &slug)
         .await
         .map_err(sql_error)?
     {
@@ -262,7 +262,7 @@ async fn audit_authorization_code_failure(
     request_id: &str,
     error: &WyrdErrorResponse,
 ) {
-    let mut conn = match TenantConn::acquire(&state.pool, tenant_id).await {
+    let mut conn = match state.postgres.tenant_conn(tenant_id).await {
         Ok(conn) => conn,
         Err(audit_error) => {
             tracing::warn!(

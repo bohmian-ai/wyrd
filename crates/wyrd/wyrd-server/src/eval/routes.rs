@@ -26,8 +26,6 @@ use wyrd_spec::vala::eval::protocol::{
     AgentTurnSubmission, EvalRunOpenRequest, EvalRunOpenResponse, TurnDirective, UserTurnSubmission,
 };
 use wyrd_spec::vala::ids::{LeaseToken, RunId};
-use wyrd_sql::TenantConn;
-
 use crate::auth::AuthenticatedPrincipal;
 use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
@@ -76,7 +74,7 @@ async fn open(
 
     // RLS hops 1 (eval_ref → Eval card) and 2 (Eval.dataset → Data card) run
     // under a single tenant bind. A foreign/missing ref returns 404, fail-closed.
-    let mut conn = TenantConn::acquire(&state.pool, tenant)
+    let mut conn = state.postgres.tenant_conn(tenant)
         .await
         .map_err(|error| {
             WyrdErrorResponse::from(eval_internal_error(format!("tenant conn: {error}")))

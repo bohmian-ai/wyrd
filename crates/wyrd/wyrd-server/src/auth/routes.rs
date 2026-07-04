@@ -57,7 +57,7 @@ async fn token(
                 })
             })?;
             let issuing_key = state.issuing_key.clone().ok_or_else(auth_not_configured)?;
-            let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, parsed.tenant_id)
+            let mut conn = state.postgres.tenant_conn(parsed.tenant_id)
                 .await
                 .map_err(sql_error)?;
             let prefix = parsed.prefix.clone();
@@ -76,7 +76,7 @@ async fn token(
                 Err(error) => {
                     let wyrd = map_exchange_error_to_wyrd(&mut conn, &prefix, error).await;
                     audit_scope_mint_failure_best_effort(
-                        &state.pool,
+                        state.postgres.app_pool(),
                         parsed.tenant_id,
                         req_id,
                         MINT_KIND_API_KEY_EXCHANGE,
@@ -103,7 +103,7 @@ async fn token(
                 .clone()
                 .ok_or_else(auth_not_configured)?;
             let tenant_id = tenant_from_unverified_access_token(subject_token.expose())?;
-            let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, tenant_id)
+            let mut conn = state.postgres.tenant_conn(tenant_id)
                 .await
                 .map_err(sql_error)?;
             let exchanged = DelegateToken {
@@ -124,7 +124,7 @@ async fn token(
                 Err(error) => {
                     let wyrd = WyrdError::from(error);
                     audit_scope_mint_failure_best_effort(
-                        &state.pool,
+                        state.postgres.app_pool(),
                         tenant_id,
                         req_id,
                         MINT_KIND_DELEGATION,
@@ -140,7 +140,7 @@ async fn token(
         TokenRequest::RefreshToken { refresh_token } => {
             let secret = refresh_token.expose().to_owned();
             let tenant_id = tenant_from_refresh_jwt(&secret)?;
-            let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, tenant_id)
+            let mut conn = state.postgres.tenant_conn(tenant_id)
                 .await
                 .map_err(sql_error)?;
             let issuing_key = state.issuing_key.clone().ok_or_else(auth_not_configured)?;
@@ -155,7 +155,7 @@ async fn token(
                 Err(error) => {
                     let wyrd = WyrdError::from(error);
                     audit_scope_mint_failure_best_effort(
-                        &state.pool,
+                        state.postgres.app_pool(),
                         tenant_id,
                         req_id,
                         MINT_KIND_REFRESH,
@@ -243,7 +243,7 @@ async fn issue_key(
     };
 
     let tenant = caller.principal.tenant_id;
-    let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, tenant)
+    let mut conn = state.postgres.tenant_conn(tenant)
         .await
         .map_err(sql_error)?;
     let service = IssueApiKey::default();

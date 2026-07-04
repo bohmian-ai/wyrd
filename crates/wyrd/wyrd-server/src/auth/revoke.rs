@@ -38,7 +38,7 @@ async fn acquire_conn(
     state: &AppState,
     tenant: DataTenantId,
 ) -> Result<TenantConn<'_>, WyrdErrorResponse> {
-    TenantConn::acquire(&state.pool, tenant)
+    state.postgres.tenant_conn(tenant)
         .await
         .map_err(internal_error)
 }
@@ -89,7 +89,7 @@ async fn fan_out_notify(
     kind: PrincipalKindWire,
     id: PrincipalId,
 ) {
-    if let Err(e) = notify_principal_revoked(&state.pool, tenant, kind, id).await {
+    if let Err(e) = notify_principal_revoked(state.postgres.app_pool(), tenant, kind, id).await {
         tracing::warn!(
             error = %e,
             "revocation NOTIFY failed; the epoch write is durable, TTL will enforce it"

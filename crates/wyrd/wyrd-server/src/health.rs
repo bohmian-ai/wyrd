@@ -110,7 +110,8 @@ async fn probe_postgres(state: &AppState, probe_timeout: Duration) -> ProbeOutco
     let started = std::time::Instant::now();
     let result = timeout(probe_timeout, async {
         let mut conn = state
-            .pool
+            .postgres
+            .app_pool()
             .acquire()
             .await
             .map_err(|e| (ProbeReason::PoolAcquire, e))?;

@@ -407,7 +407,7 @@ async fn acquire_conn<'a>(
     state: &'a AppState,
     caller: &AuthenticatedPrincipal,
 ) -> Result<TenantConn<'a>, WyrdErrorResponse> {
-    TenantConn::acquire(&state.pool, caller.principal.tenant_id)
+    state.postgres.tenant_conn(caller.principal.tenant_id)
         .await
         .map_err(sql_unavailable)
 }

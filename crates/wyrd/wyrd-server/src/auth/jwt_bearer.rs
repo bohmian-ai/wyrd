@@ -52,7 +52,7 @@ impl JwtBearer {
             let verified =
                 verify_workload_assertion(state, tenant_id, assertion.expose_secret()).await?;
             let card_ref = resolve_workload_binding(state, tenant_id, &verified).await?;
-            let mut conn = TenantConn::acquire(&state.pool, tenant_id)
+            let mut conn = state.postgres.tenant_conn(tenant_id)
                 .await
                 .map_err(sql_error)?;
             let (row, roles) = load_service_account_subject(&mut conn, &card_ref).await?;
@@ -225,7 +225,7 @@ async fn audit_workload_failure(
     request_id: &str,
     error: &WyrdErrorResponse,
 ) {
-    let mut conn = match TenantConn::acquire(&state.pool, tenant_id).await {
+    let mut conn = match state.postgres.tenant_conn(tenant_id).await {
         Ok(conn) => conn,
         Err(audit_error) => {
             tracing::warn!(
@@ -282,7 +282,7 @@ async fn resolve_workload_tenant(
     tenant: Option<TenantSlug>,
 ) -> Result<DataTenantId, WyrdErrorResponse> {
     if let Some(host_tenant) = tenant_slug_from_host(headers) {
-        return resolve_tenant_slug(&state.pool, &host_tenant)
+        return resolve_tenant_slug(state.postgres.app_pool(), &host_tenant)
             .await?
             .ok_or_else(|| invalid_token("request host tenant could not be resolved"));
     }
@@ -292,7 +292,7 @@ async fn resolve_workload_tenant(
             "tenant could not be resolved for workload token",
         ));
     };
-    resolve_tenant_slug(&state.pool, &fallback)
+    resolve_tenant_slug(state.postgres.app_pool(), &fallback)
         .await?
         .ok_or_else(|| invalid_token("requested tenant could not be resolved"))
 }

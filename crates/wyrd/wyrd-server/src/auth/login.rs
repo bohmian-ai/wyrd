@@ -126,7 +126,7 @@ pub async fn login(
             .map_err(|_| invalid_token("authorization URL is invalid"))?,
         state: state_key.clone(),
     };
-    let store = PgLoginStateStore::new(state.pool.clone());
+    let store = PgLoginStateStore::new(state.postgres.app_pool().clone());
     store
         .put(
             tenant_id,
@@ -219,7 +219,7 @@ async fn resolve_login_tenant(
     headers: &HeaderMap,
 ) -> Result<DataTenantId, WyrdErrorResponse> {
     if let Some(slug) = tenant_slug_from_host(headers)
-        && let Some(tenant) = resolve_tenant_slug(&state.pool, &slug).await?
+        && let Some(tenant) = resolve_tenant_slug(state.postgres.app_pool(), &slug).await?
     {
         return Ok(tenant);
     }

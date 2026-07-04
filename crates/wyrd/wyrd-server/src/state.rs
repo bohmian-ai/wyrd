@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use ipnetwork::IpNetwork;
-use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use wyrd_auth_check::{PolicyHook, StubAllowPolicyHook};
 use wyrd_auth_issue::IssuingKey;
@@ -58,15 +57,8 @@ impl Default for LimitsConfig {
 /// runtime database pools that already survive boot.
 #[derive(Clone)]
 pub struct AppState {
-    /// Composed production Postgres handle. Unit tests that use lazy pools may
-    /// leave this unset.
-    pub postgres: Option<Arc<ServerPostgres>>,
-    /// Runtime `wyrd_app` pool. Tenant-scoped traffic uses this pool and RLS
-    /// applies on tenant tables.
-    pub pool: PgPool,
-    /// Optional audited `wyrd_platform_admin` pool for cross-tenant platform
-    /// operations. Dedicated deployments may leave this unset.
-    pub platform_admin_pool: Option<PgPool>,
+    /// Composed production Postgres handle. Single DB access path for all routes.
+    pub postgres: Arc<ServerPostgres>,
     /// Process-wide artifact storage handle.
     pub storage: Arc<StorageHandle>,
     /// Runtime preview gate for auth routes that depend on card-registry principal projection.
@@ -112,18 +104,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Build runtime state from the pools that survive boot.
+    /// Build runtime state from production-ready Postgres handles.
     #[must_use]
-    pub fn new(
-        pool: PgPool,
-        platform_admin_pool: Option<PgPool>,
-        storage: Arc<StorageHandle>,
-    ) -> Self {
+    pub fn new(postgres: Arc<ServerPostgres>, storage: Arc<StorageHandle>) -> Self {
         let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
         Self {
-            postgres: None,
-            pool,
-            platform_admin_pool,
+            postgres,
             storage,
             allow_preview_auth: false,
             permission_check: Arc::new(RbacCheck),
@@ -148,16 +134,6 @@ impl AppState {
             eval_runs: new_run_map(),
             eval_audit: Arc::new(TracingEvalAuditWriter),
         }
-    }
-
-    /// Build runtime state from production-ready Postgres handles.
-    #[must_use]
-    pub fn from_postgres(postgres: Arc<ServerPostgres>, storage: Arc<StorageHandle>) -> Self {
-        let pool = postgres.app_pool().clone();
-        let platform_admin_pool = postgres.platform_admin_pool().cloned();
-        let mut state = Self::new(pool, platform_admin_pool, storage);
-        state.postgres = Some(postgres);
-        state
     }
 
     /// Replace the eval audit writer, primarily for tests.
@@ -372,6 +348,8 @@ mod tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
+    use crate::postgres::ServerPostgres;
+
     use super::{AppState, LimitsConfig, ProductionValidationError};
 
     #[tokio::test]
@@ -433,14 +411,12 @@ mod tests {
 
     fn test_state() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-
-        AppState::new(
-            app_pool,
-            None,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-        )
+        AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))))
     }
 
     fn card_ref(name: &str) -> CardRef {

@@ -12,9 +12,9 @@ use wyrd_auth_verify::{
     public_key_from_pem,
 };
 use wyrd_runtime::PrincipalId;
+use wyrd_server::auth::ServerAuth;
 use wyrd_server::health::{ProbeOutcome, ProbeReason, ReadinessSnapshot};
 use wyrd_server::postgres::ServerPostgres;
-use wyrd_server::auth::ServerAuth;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -422,19 +422,20 @@ fn test_state() -> AppState {
         keys,
         "wyrd",
         Arc::new(
-            wyrd_server::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(
-                app_pool,
-            )),
+            wyrd_server::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(app_pool)),
         ),
         WyrdAuthVerifySettings::default(),
     ));
 
-    AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))))
-        .with_auth(ServerAuth {
-            issuing_key: Some(issuing_key),
-            token_verifier: Some(verifier),
-            ..ServerAuth::default()
-        })
+    AppState::new(
+        postgres,
+        Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+    )
+    .with_auth(ServerAuth {
+        issuing_key: Some(issuing_key),
+        token_verifier: Some(verifier),
+        ..ServerAuth::default()
+    })
 }
 
 fn test_state_no_verifier() -> AppState {
@@ -444,7 +445,10 @@ fn test_state_no_verifier() -> AppState {
     let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-    AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))))
+    AppState::new(
+        postgres,
+        Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+    )
     // no .with_auth_handles() → token_verifier is None → 503 on any /v1 request
 }
 

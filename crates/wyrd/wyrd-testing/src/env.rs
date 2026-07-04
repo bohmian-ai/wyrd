@@ -205,13 +205,12 @@ impl WyrdTestEnv {
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
         ));
-        let mut state = AppState::new(postgres, storage)
-            .with_auth(wyrd_server::auth::ServerAuth {
-                allow_preview: true,
-                issuing_key: Some(Arc::clone(&issuing_key)),
-                token_verifier: Some(Arc::clone(&verifier)),
-                ..wyrd_server::auth::ServerAuth::default()
-            });
+        let mut state = AppState::new(postgres, storage).with_auth(wyrd_server::auth::ServerAuth {
+            allow_preview: true,
+            issuing_key: Some(Arc::clone(&issuing_key)),
+            token_verifier: Some(Arc::clone(&verifier)),
+            ..wyrd_server::auth::ServerAuth::default()
+        });
         state.authz.permission_check = Arc::new(RbacCheck);
         state.authz.audit_writer = Arc::new(NoopAuthzAuditWriter);
         let router = build_router(state.clone());

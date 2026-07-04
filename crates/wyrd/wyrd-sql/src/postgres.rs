@@ -63,7 +63,10 @@ impl WyrdPostgres {
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn from_pools(app: PgPool, platform_admin: Option<PgPool>) -> Self {
-        Self { app, platform_admin }
+        Self {
+            app,
+            platform_admin,
+        }
     }
 
     /// Borrow the RLS-enforced runtime app pool.

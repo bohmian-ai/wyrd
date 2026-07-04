@@ -1106,16 +1106,15 @@ impl WyrdTestServerBuilder {
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
         ));
-        let mut state = AppState::new(postgres, storage)
-            .with_auth(wyrd_server::auth::ServerAuth {
-                allow_preview: self.allow_preview_auth,
-                issuing_key: Some(Arc::clone(&issuing_key)),
-                token_verifier: Some(Arc::clone(&verifier)),
-                token_exchange_settings: exchange_settings,
-                trusted_issuer_resolver: Some(issuer_resolver),
-                workload_binding_resolver: Some(binding_resolver),
-                sealing_key: Some(sealing_key),
-            });
+        let mut state = AppState::new(postgres, storage).with_auth(wyrd_server::auth::ServerAuth {
+            allow_preview: self.allow_preview_auth,
+            issuing_key: Some(Arc::clone(&issuing_key)),
+            token_verifier: Some(Arc::clone(&verifier)),
+            token_exchange_settings: exchange_settings,
+            trusted_issuer_resolver: Some(issuer_resolver),
+            workload_binding_resolver: Some(binding_resolver),
+            sealing_key: Some(sealing_key),
+        });
         state.authz.permission_check = Arc::new(RbacCheck);
         state.authz.audit_writer = self
             .audit_writer

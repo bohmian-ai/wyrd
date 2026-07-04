@@ -80,7 +80,10 @@ impl ValaPostgres {
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn from_pools(pool: PgPool, recovery_pool: Option<PgPool>) -> Self {
-        Self { pool, recovery_pool }
+        Self {
+            pool,
+            recovery_pool,
+        }
     }
 
     /// Borrow the Vala/Bifrost runtime pool.

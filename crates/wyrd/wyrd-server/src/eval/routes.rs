@@ -14,6 +14,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::auth::AuthenticatedPrincipal;
+use crate::error::WyrdErrorResponse;
+use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::post;
@@ -26,9 +29,6 @@ use wyrd_spec::vala::eval::protocol::{
     AgentTurnSubmission, EvalRunOpenRequest, EvalRunOpenResponse, TurnDirective, UserTurnSubmission,
 };
 use wyrd_spec::vala::ids::{LeaseToken, RunId};
-use crate::auth::AuthenticatedPrincipal;
-use crate::error::WyrdErrorResponse;
-use crate::state::AppState;
 
 use super::audit::{EvalAuditEvent, EvalAuditKind};
 use super::error::{
@@ -74,11 +74,9 @@ async fn open(
 
     // RLS hops 1 (eval_ref → Eval card) and 2 (Eval.dataset → Data card) run
     // under a single tenant bind. A foreign/missing ref returns 404, fail-closed.
-    let mut conn = state.postgres.tenant_conn(tenant)
-        .await
-        .map_err(|error| {
-            WyrdErrorResponse::from(eval_internal_error(format!("tenant conn: {error}")))
-        })?;
+    let mut conn = state.postgres.tenant_conn(tenant).await.map_err(|error| {
+        WyrdErrorResponse::from(eval_internal_error(format!("tenant conn: {error}")))
+    })?;
     let eval_card = resolver::resolve_card(&mut conn, CardKind::Eval, &req.eval_ref)
         .await
         .map_err(|error| WyrdErrorResponse::from(map_card_resolution_error(&error)))?;

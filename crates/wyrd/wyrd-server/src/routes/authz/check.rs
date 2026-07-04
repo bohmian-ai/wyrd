@@ -85,7 +85,9 @@ pub async fn check_authz(
     // Skip audit write when using the default stub writer (test/dev environments).
     // build_production() prevents this branch from being reached in production.
     if !state.authz.audit_writer.is_stub_default() {
-        let mut conn = state.postgres.tenant_conn(ctx.callee.tenant_id)
+        let mut conn = state
+            .postgres
+            .tenant_conn(ctx.callee.tenant_id)
             .await
             .map_err(sql_error)?;
         state

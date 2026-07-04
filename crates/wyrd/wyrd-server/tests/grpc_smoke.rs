@@ -3,8 +3,8 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio_util::sync::CancellationToken;
-use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::AppState;
+use wyrd_server::postgres::ServerPostgres;
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 use wyrd_tonic::health::HealthSnapshot;
 use wyrd_tonic::health::WyrdHealthSentinel;
@@ -22,7 +22,10 @@ fn test_state() -> AppState {
     let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-    AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))))
+    AppState::new(
+        postgres,
+        Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+    )
 }
 
 #[derive(Clone)]

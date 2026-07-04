@@ -417,7 +417,10 @@ mod tests {
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
         ));
-        let state = AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))));
+        let state = AppState::new(
+            postgres,
+            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+        );
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, HeaderValue::from_static("localhost"));
 

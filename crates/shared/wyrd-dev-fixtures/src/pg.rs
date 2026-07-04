@@ -195,13 +195,13 @@ impl TestDatabase {
         let dsns = self.resolved_dsns()?;
         let wyrd = WyrdPostgres::connect_from_dsns(&dsns).await?;
         let vala = ValaPostgres::connect_after_wyrd(&dsns).await?;
-        let migrator_dsn = database_dsn(
-            &resolved_external_test_dsns()?.migrator,
-            &self.name,
-        )?;
-        let migrator = build_pool(migrator_dsn.expose_secret(), PoolConfig::migrator_defaults())
-            .await
-            .map_err(SqlError::Connect)?;
+        let migrator_dsn = database_dsn(&resolved_external_test_dsns()?.migrator, &self.name)?;
+        let migrator = build_pool(
+            migrator_dsn.expose_secret(),
+            PoolConfig::migrator_defaults(),
+        )
+        .await
+        .map_err(SqlError::Connect)?;
         let app = wyrd.app_pool().clone();
         let platform_admin = wyrd
             .platform_admin_pool()

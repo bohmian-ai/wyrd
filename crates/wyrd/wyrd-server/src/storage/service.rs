@@ -82,7 +82,9 @@ pub async fn upload_init(
     })?;
     let wire_protocol = derive_wire_protocol(backend, planned);
 
-    let mut conn = state.postgres.tenant_conn(caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     if let Some(key) = idempotency_key.as_ref()
@@ -178,7 +180,9 @@ pub async fn upload_init(
         }
     };
 
-    let mut conn = state.postgres.tenant_conn(caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     persist_s3_upload_id_and_audit(
@@ -223,7 +227,9 @@ pub async fn upload_part_url(
     authorize_card_write(&caller)?;
     let upload_uuid = upload_id_uuid(&upload_id)?;
 
-    let mut conn = state.postgres.tenant_conn(caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     let row = load_upload(&mut conn, upload_uuid).await?;
@@ -288,7 +294,9 @@ pub async fn upload_complete(
     authorize_card_write(&caller)?;
     let upload_uuid = upload_id_uuid(&upload_id)?;
 
-    let mut conn = state.postgres.tenant_conn(caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     let row = load_pending_upload(&mut conn, upload_uuid).await?;
@@ -360,7 +368,9 @@ pub async fn upload_complete(
     };
     verify_object_head(state, &caller, upload_uuid, &validated, &row, &head).await?;
 
-    let mut conn = state.postgres.tenant_conn(caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     wyrd_sql::queries::storage::artifact_metadata::insert(
@@ -420,7 +430,9 @@ pub async fn upload_abort(
     authorize_card_write(&caller)?;
     let upload_uuid = upload_id_uuid(&upload_id)?;
 
-    let mut conn = state.postgres.tenant_conn(caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     let row = load_upload(&mut conn, upload_uuid).await?;
@@ -445,7 +457,9 @@ pub async fn upload_abort(
         tracing::warn!(error = %error, upload_id = %upload_id, "best-effort backend abort failed");
     }
 
-    let mut conn = state.postgres.tenant_conn(caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     let aborted =
@@ -502,7 +516,9 @@ pub async fn download_init(
     authorize_card_read(&caller)?;
     let validated = validated_download_path(&caller, &body)?;
 
-    let mut conn = state.postgres.tenant_conn(caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     let metadata = load_artifact_metadata(&mut conn, &validated).await?;
@@ -516,7 +532,9 @@ pub async fn download_init(
         request_ttl_secs
     };
 
-    let mut conn = state.postgres.tenant_conn(caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     audit::write(
@@ -1251,11 +1269,11 @@ fn internal_error(message: impl Into<String>, details: serde_json::Value) -> Wyr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::postgres::ServerPostgres;
     use axum::body::to_bytes;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use std::sync::Arc;
     use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
-    use crate::postgres::ServerPostgres;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::storage::SinglePutComplete;

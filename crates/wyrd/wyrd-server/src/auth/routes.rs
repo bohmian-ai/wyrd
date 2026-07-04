@@ -56,8 +56,14 @@ async fn token(
                     details: serde_json::json!({ "reason": "format" }),
                 })
             })?;
-            let issuing_key = state.auth.issuing_key.clone().ok_or_else(auth_not_configured)?;
-            let mut conn = state.postgres.tenant_conn(parsed.tenant_id)
+            let issuing_key = state
+                .auth
+                .issuing_key
+                .clone()
+                .ok_or_else(auth_not_configured)?;
+            let mut conn = state
+                .postgres
+                .tenant_conn(parsed.tenant_id)
                 .await
                 .map_err(sql_error)?;
             let prefix = parsed.prefix.clone();
@@ -97,14 +103,20 @@ async fn token(
             if !state.auth.allow_preview {
                 return Err(WyrdErrorResponse::from(preview_disabled()));
             }
-            let issuing_key = state.auth.issuing_key.clone().ok_or_else(auth_not_configured)?;
+            let issuing_key = state
+                .auth
+                .issuing_key
+                .clone()
+                .ok_or_else(auth_not_configured)?;
             let verifier = state
                 .auth
                 .token_verifier
                 .clone()
                 .ok_or_else(auth_not_configured)?;
             let tenant_id = tenant_from_unverified_access_token(subject_token.expose())?;
-            let mut conn = state.postgres.tenant_conn(tenant_id)
+            let mut conn = state
+                .postgres
+                .tenant_conn(tenant_id)
                 .await
                 .map_err(sql_error)?;
             let exchanged = DelegateToken {
@@ -141,10 +153,16 @@ async fn token(
         TokenRequest::RefreshToken { refresh_token } => {
             let secret = refresh_token.expose().to_owned();
             let tenant_id = tenant_from_refresh_jwt(&secret)?;
-            let mut conn = state.postgres.tenant_conn(tenant_id)
+            let mut conn = state
+                .postgres
+                .tenant_conn(tenant_id)
                 .await
                 .map_err(sql_error)?;
-            let issuing_key = state.auth.issuing_key.clone().ok_or_else(auth_not_configured)?;
+            let issuing_key = state
+                .auth
+                .issuing_key
+                .clone()
+                .ok_or_else(auth_not_configured)?;
             let exchanged = RefreshTokens {
                 issuing_key,
                 settings: state.auth.token_exchange_settings.clone(),
@@ -244,7 +262,9 @@ async fn issue_key(
     };
 
     let tenant = caller.principal.tenant_id;
-    let mut conn = state.postgres.tenant_conn(tenant)
+    let mut conn = state
+        .postgres
+        .tenant_conn(tenant)
         .await
         .map_err(sql_error)?;
     let service = IssueApiKey::default();
@@ -431,7 +451,10 @@ mod tests {
         let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-        AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))))
+        AppState::new(
+            postgres,
+            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+        )
     }
 
     fn fixture_state(fixture: &PgFixture) -> AppState {
@@ -443,7 +466,10 @@ mod tests {
         let storage_root = dir.keep().join("issue-key-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
-        AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))))
+        AppState::new(
+            postgres,
+            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+        )
     }
 
     async fn insert_test_user(conn: &mut TenantConn<'_>, tenant: DataTenantId) -> Uuid {

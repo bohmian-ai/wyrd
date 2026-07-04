@@ -140,7 +140,9 @@ async fn finish_authorization_code_exchange(
         .map_err(WyrdErrorResponse::from)?;
     verify_nonce(login_state, &verified.raw_claims)?;
 
-    let mut conn = state.postgres.tenant_conn(tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(tenant_id)
         .await
         .map_err(sql_error)?;
     let principal_id = ensure_user_identity(
@@ -153,7 +155,11 @@ async fn finish_authorization_code_exchange(
     .map_err(sql_error)?;
     *audit_principal_id = principal_id;
     let roles = role_names_to_refs(trusted, &verified.groups)?;
-    let issuing_key = state.auth.issuing_key.as_ref().ok_or_else(auth_not_configured)?;
+    let issuing_key = state
+        .auth
+        .issuing_key
+        .as_ref()
+        .ok_or_else(auth_not_configured)?;
     let exchanged = issue_and_record_user_session(
         &mut conn,
         issuing_key,
@@ -243,9 +249,12 @@ async fn resolve_callback_tenant(
     let Some(slug) = tenant_slug_from_host(headers) else {
         return Err(invalid_token("request host does not encode a tenant"));
     };
-    match wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app(state.postgres.app_pool(), &slug)
-        .await
-        .map_err(sql_error)?
+    match wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app(
+        state.postgres.app_pool(),
+        &slug,
+    )
+    .await
+    .map_err(sql_error)?
     {
         Some(tenant) => Ok(tenant),
         None => Err(invalid_token("request tenant could not be resolved")),
@@ -1040,7 +1049,10 @@ mod tests {
         let storage_root = dir.keep().join("callback-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
-        AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))))
+        AppState::new(
+            postgres,
+            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+        )
     }
 
     async fn test_state_with_external(fixture: &PgFixture, trusted: TrustedIssuer) -> AppState {
@@ -1094,14 +1106,13 @@ mod tests {
             )),
             Arc::clone(&issuer_resolver),
         );
-        test_state(fixture)
-            .with_auth(crate::auth::ServerAuth {
-                issuing_key: Some(issuing_key),
-                token_verifier: Some(Arc::new(verifier)),
-                trusted_issuer_resolver: Some(issuer_resolver),
-                sealing_key: Some(sealing_key),
-                ..crate::auth::ServerAuth::default()
-            })
+        test_state(fixture).with_auth(crate::auth::ServerAuth {
+            issuing_key: Some(issuing_key),
+            token_verifier: Some(Arc::new(verifier)),
+            trusted_issuer_resolver: Some(issuer_resolver),
+            sealing_key: Some(sealing_key),
+            ..crate::auth::ServerAuth::default()
+        })
     }
 
     fn tenant_headers(slug: &str) -> HeaderMap {

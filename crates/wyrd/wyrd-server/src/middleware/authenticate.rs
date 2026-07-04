@@ -25,7 +25,8 @@ pub async fn require_authenticated(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    match verify_authenticated_principal(state.auth.token_verifier.clone(), request.headers()).await {
+    match verify_authenticated_principal(state.auth.token_verifier.clone(), request.headers()).await
+    {
         Ok(principal) => {
             request.extensions_mut().insert(principal);
             next.run(request).await

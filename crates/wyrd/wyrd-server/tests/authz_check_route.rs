@@ -2,7 +2,6 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use chrono::Duration;
 use sqlx::postgres::PgPoolOptions;
-use wyrd_server::postgres::ServerPostgres;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -15,6 +14,7 @@ use wyrd_auth_verify::{
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_semver::VersionBlock;
 use wyrd_server::auth::ServerAuth;
+use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::envelope::CardKind;
@@ -262,19 +262,20 @@ fn test_state(pool: sqlx::PgPool) -> AppState {
         keys,
         "wyrd",
         Arc::new(
-            wyrd_server::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(
-                pool,
-            )),
+            wyrd_server::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(pool)),
         ),
         WyrdAuthVerifySettings::default(),
     ));
 
-    AppState::new(postgres, Arc::new(StorageHandle::new(BackendSigner::Local(signer))))
-        .with_auth(ServerAuth {
-            issuing_key: Some(issuing_key),
-            token_verifier: Some(verifier),
-            ..ServerAuth::default()
-        })
+    AppState::new(
+        postgres,
+        Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+    )
+    .with_auth(ServerAuth {
+        issuing_key: Some(issuing_key),
+        token_verifier: Some(verifier),
+        ..ServerAuth::default()
+    })
 }
 
 fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {

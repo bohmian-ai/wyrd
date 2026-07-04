@@ -22,6 +22,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use chrono::Duration;
 use serde_json::{Value, json};
+use sqlx::PgPool;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use wyrd_auth_issue::IssuingKey;
@@ -29,17 +30,16 @@ use wyrd_auth_verify::{
     Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
     public_key_from_pem,
 };
+use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::PrincipalId;
 use wyrd_runtime::RoleRef;
 use wyrd_semver::VersionBlock;
-use sqlx::PgPool;
-use wyrd_dev_fixtures::pg::PgFixture;
+use wyrd_server::auth::ServerAuth;
 use wyrd_server::auth::permission_resolver::SqlPermissionResolver;
 use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
-use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::eval::resolver::{resolve_card_for_tenant, scenario_object_path};
 use wyrd_server::eval::{EvalAuditEvent, EvalAuditKind, EvalAuditWriter};
-use wyrd_server::auth::ServerAuth;
+use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::data::{
@@ -671,7 +671,13 @@ async fn cross_tenant_judge_ref_denied_no_provider_call() {
     // The judge path (whenever server-side scoring wires) resolves through the
     // same tenant-bound resolver. Under tenant A the tenant-B judge is invisible;
     // no provider is ever constructed, so no provider call is possible.
-    let denied = resolve_card_for_tenant(state.postgres.app_pool(), tenant_a, CardKind::Prompt, &judge_ref).await;
+    let denied = resolve_card_for_tenant(
+        state.postgres.app_pool(),
+        tenant_a,
+        CardKind::Prompt,
+        &judge_ref,
+    )
+    .await;
     assert!(
         denied.is_err(),
         "tenant A must not resolve tenant B's judge"
@@ -679,8 +685,13 @@ async fn cross_tenant_judge_ref_denied_no_provider_call() {
     assert_eq!(denied.unwrap_err().status(), 404);
 
     // Sanity: the same ref resolves under its own tenant.
-    let allowed =
-        resolve_card_for_tenant(state.postgres.app_pool(), tenant_b, CardKind::Prompt, &judge_ref).await;
+    let allowed = resolve_card_for_tenant(
+        state.postgres.app_pool(),
+        tenant_b,
+        CardKind::Prompt,
+        &judge_ref,
+    )
+    .await;
     assert!(allowed.is_ok(), "tenant B owns the judge card");
 }
 

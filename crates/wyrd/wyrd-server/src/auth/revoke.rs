@@ -38,7 +38,9 @@ async fn acquire_conn(
     state: &AppState,
     tenant: DataTenantId,
 ) -> Result<TenantConn<'_>, WyrdErrorResponse> {
-    state.postgres.tenant_conn(tenant)
+    state
+        .postgres
+        .tenant_conn(tenant)
         .await
         .map_err(internal_error)
 }

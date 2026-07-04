@@ -682,7 +682,7 @@ mod tests {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::RequestedSubject;
-    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -728,7 +728,7 @@ mod tests {
     }
 
     async fn insert_test_user(conn: &mut TenantConn<'_>, tenant_id: DataTenantId) -> Uuid {
-        let user_id = Uuid::new_v4();
+        let user_id = Uuid::now_v7();
         sqlx::query(
             "INSERT INTO wyrd.auth_users (id, data_tenant_id, email, auth_type, status)
              VALUES ($1, $2, $3, 'password', 'active')",
@@ -748,6 +748,7 @@ mod tests {
         created_by: Uuid,
         card_ref: &CardRef,
     ) -> Uuid {
+        insert_test_card(conn, card_ref, created_by).await;
         let sa_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO wyrd.auth_service_accounts
@@ -756,7 +757,7 @@ mod tests {
         )
         .bind(sa_id)
         .bind(tenant_id.as_uuid())
-        .bind(Uuid::new_v4())
+        .bind(Uuid::now_v7())
         .bind(Json(card_ref.clone()))
         .bind(card_ref.space.as_str())
         .bind(format!("svc-{}", sa_id))
@@ -766,6 +767,45 @@ mod tests {
         .await
         .expect("service account inserts");
         sa_id
+    }
+
+    async fn insert_test_card(conn: &mut TenantConn<'_>, card_ref: &CardRef, created_by: Uuid) {
+        let spec = match &card_ref.kind {
+            CardKind::Service => {
+                Spec::from_kind_and_value(&CardKind::Service, serde_json::json!({}))
+                    .expect("service fixture spec decodes")
+            }
+            other => panic!("unexpected test card kind: {other:?}"),
+        };
+        let (spec_hash, _) = spec
+            .canonical_hash_with_bytes()
+            .expect("fixture spec hashes");
+        let spec_json = serde_json::to_value(&spec).expect("fixture spec serializes");
+
+        sqlx::query(
+            r#"
+            INSERT INTO wyrd.cards (
+                card_uid, data_tenant_id, kind, space, name, version, spec,
+                spec_hash, artifact_hash, labels, annotations, status, created_by
+            )
+            VALUES (
+                $1, wyrd.current_tenant(), $2, $3, $4, $5, $6,
+                $7, NULL, '{}'::jsonb, '{}'::jsonb, 'active', $8
+            )
+            ON CONFLICT (data_tenant_id, kind, space, name, version) DO NOTHING
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(card_ref.kind.wire_name())
+        .bind(card_ref.space.as_str())
+        .bind(card_ref.name.as_str())
+        .bind(card_ref.version.as_str())
+        .bind(spec_json)
+        .bind(spec_hash.as_str())
+        .bind(created_by)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("fixture card inserts");
     }
 
     async fn insert_lifecycle_key(

@@ -390,10 +390,11 @@ mod tests {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{IssuerUrl, TokenType};
-    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, SpaceName, TenantSlug};
     use wyrd_spec::reference::CardRef;
+    use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{
         grant_role_to_service_account, insert_service_account, role_by_name, upsert_trusted_issuer,
         upsert_workload_binding,
@@ -937,6 +938,7 @@ mod tests {
             other => panic!("unexpected card kind in test: {other:?}"),
         };
         let card_ref = card_ref(card_kind, name);
+        insert_test_card(&mut conn, &card_ref, creator_id).await?;
         insert_service_account(
             &mut conn,
             id,
@@ -955,6 +957,87 @@ mod tests {
         }
         conn.commit().await.expect("principal seed commits");
         Ok(id)
+    }
+
+    async fn insert_test_card(
+        conn: &mut TenantConn<'_>,
+        target_ref: &CardRef,
+        created_by: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        let spec = match &target_ref.kind {
+            CardKind::Service => {
+                Spec::from_kind_and_value(&CardKind::Service, serde_json::json!({}))
+                    .expect("service fixture spec decodes")
+            }
+            CardKind::Agent => {
+                let prompt_ref = card_ref(CardKind::Prompt, &format!("{}-prompt", target_ref.name));
+                let prompt_spec = Spec::from_kind_and_value(
+                    &CardKind::Prompt,
+                    serde_json::json!({
+                        "provider": "openai",
+                        "model": "gpt-4o-mini",
+                        "messages": "Fixture agent."
+                    }),
+                )
+                .expect("prompt fixture spec decodes");
+                insert_test_card_with_spec(conn, &prompt_ref, &prompt_spec, created_by).await?;
+                Spec::from_kind_and_value(
+                    &CardKind::Agent,
+                    serde_json::json!({
+                        "prompt": prompt_ref,
+                    }),
+                )
+                .expect("agent fixture spec decodes")
+            }
+            CardKind::Prompt => Spec::from_kind_and_value(
+                &CardKind::Prompt,
+                serde_json::json!({
+                    "provider": "openai",
+                    "model": "gpt-4o-mini",
+                    "messages": "Fixture agent."
+                }),
+            )
+            .expect("prompt fixture spec decodes"),
+            other => panic!("unexpected test card kind: {other:?}"),
+        };
+        insert_test_card_with_spec(conn, target_ref, &spec, created_by).await
+    }
+
+    async fn insert_test_card_with_spec(
+        conn: &mut TenantConn<'_>,
+        card_ref: &CardRef,
+        spec: &Spec,
+        created_by: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        let (spec_hash, _) = spec
+            .canonical_hash_with_bytes()
+            .expect("fixture spec hashes");
+        let spec_json = serde_json::to_value(spec).expect("fixture spec serializes");
+
+        sqlx::query(
+            r#"
+            INSERT INTO wyrd.cards (
+                card_uid, data_tenant_id, kind, space, name, version, spec,
+                spec_hash, artifact_hash, labels, annotations, status, created_by
+            )
+            VALUES (
+                $1, wyrd.current_tenant(), $2, $3, $4, $5, $6,
+                $7, NULL, '{}'::jsonb, '{}'::jsonb, 'active', $8
+            )
+            ON CONFLICT (data_tenant_id, kind, space, name, version) DO NOTHING
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(card_ref.kind.wire_name())
+        .bind(card_ref.space.as_str())
+        .bind(card_ref.name.as_str())
+        .bind(card_ref.version.as_str())
+        .bind(spec_json)
+        .bind(spec_hash.as_str())
+        .bind(created_by)
+        .execute(&mut **conn.transaction())
+        .await?;
+        Ok(())
     }
 
     async fn insert_creator_user(

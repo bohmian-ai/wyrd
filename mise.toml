@@ -48,11 +48,24 @@ run = "cargo clippy --locked --workspace --all-features --all-targets -- -D warn
 [tasks."build:postgres"]
 hide = true
 description = "Start a clean Postgres container via docker compose and wait for it to be healthy"
+depends = ["db:teardown-postgres-port"]
 # --force-recreate --renew-anon-volumes guarantees a genuinely fresh container
 # and storage even if a healthy container is already running (otherwise `up` is a
 # no-op and reuses the old PGDATA). Combined with the postgres tmpfs mount, the
 # test DB is empty on every invocation — no stale _sqlx_migrations ledger.
 run = ["docker compose down --volumes --remove-orphans", "docker compose up -d --build --force-recreate --renew-anon-volumes postgres --wait"]
+
+[tasks."db:teardown-postgres-port"]
+hide = true
+description = "Remove any Docker container publishing the local test Postgres port"
+run = """
+set -eu
+
+for id in $(docker ps -aq --filter publish=55432); do
+  echo "removing Docker container publishing 55432: $id"
+  docker rm -f -v "$id"
+done
+"""
 
 [tasks."impl:setup"]
 hide = true

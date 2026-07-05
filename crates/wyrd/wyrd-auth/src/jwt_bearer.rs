@@ -21,9 +21,10 @@ use wyrd_sql::queries::auth::{
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
 use crate::card_scope::MINT_KIND_JWT_BEARER;
+use crate::error::auth_error_to_wyrd;
 use crate::exchange_api_key::{
     ExchangeError, ExchangedToken, IssueSubject, RefreshPolicy, TokenExchangeSettings,
-    auth_error_to_wyrd, issue_for_subject, role_refs,
+    issue_for_subject, role_refs,
 };
 use crate::issue_api_key::principal_kind_for_card;
 use crate::permission_resolver::SqlPermissionResolver;
@@ -86,8 +87,15 @@ impl JwtBearer {
         match result {
             Ok(token) => Ok(token),
             Err(error) => {
-                audit_workload_failure(postgres, tenant_id, audit_principal_id, request_id, &error)
-                    .await;
+                audit_workload_failure(
+                    postgres,
+                    tenant_id,
+                    audit_principal_id,
+                    request_id,
+                    self.settings.access_ttl,
+                    &error,
+                )
+                .await;
                 Err(error)
             }
         }
@@ -219,6 +227,7 @@ async fn audit_workload_failure(
     tenant_id: DataTenantId,
     principal_id: Uuid,
     request_id: &str,
+    access_ttl: Duration,
     error: &WyrdError,
 ) {
     let mut conn = match postgres.tenant_conn(tenant_id).await {
@@ -239,7 +248,7 @@ async fn audit_workload_failure(
         principal_id,
         json!([{ "error": audit_error_tag(error) }]),
         request_id,
-        Utc::now() + Duration::minutes(15),
+        Utc::now() + access_ttl,
     )
     .await
     {

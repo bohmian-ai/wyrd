@@ -2,16 +2,16 @@
 
 use axum::Json;
 use axum::extract::{Extension, Query, State};
-use axum::http::{HeaderMap, header};
+use axum::http::HeaderMap;
 use secrecy::SecretString;
 use uuid::Uuid;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{CallbackQuery, TokenResponse};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
 use wyrd_sql::SqlError;
 
+use crate::auth::{auth_not_configured, invalid_token, tenant_slug_from_host};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -95,32 +95,6 @@ async fn resolve_callback_tenant(
     }
 }
 
-fn tenant_slug_from_host(headers: &HeaderMap) -> Option<TenantSlug> {
-    let host = headers.get(header::HOST)?.to_str().ok()?;
-    let host = host.split(':').next().unwrap_or(host);
-    let mut segments = host.split('.').filter(|segment| !segment.is_empty());
-    let first = segments.next()?;
-    let second = segments.next()?;
-    if first == "localhost" || second == "localhost" {
-        return None;
-    }
-    TenantSlug::new(first.to_owned()).ok()
-}
-
-fn invalid_token(message: &str) -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::InvalidToken {
-        message: message.to_owned(),
-        details: serde_json::json!({}),
-    })
-}
-
-fn auth_not_configured() -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::Internal {
-        message: "auth signing or verification handle is not configured".to_owned(),
-        details: serde_json::json!({}),
-    })
-}
-
 fn sql_error(error: impl Into<SqlError>) -> WyrdErrorResponse {
     let error = error.into();
     tracing::warn!(error = %error, "OIDC callback SQL unavailable");
@@ -165,7 +139,9 @@ mod tests {
     };
     use wyrd_auth::login::{LoginStateEntry, PgLoginStateStore};
 
-    use super::{exchange_authorization_code, tenant_slug_from_host};
+    use crate::auth::tenant_slug_from_host;
+
+    use super::exchange_authorization_code;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";

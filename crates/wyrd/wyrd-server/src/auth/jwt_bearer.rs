@@ -1,6 +1,6 @@
 //! Workload OIDC `jwt-bearer` exchange.
 
-use axum::http::{HeaderMap, header};
+use axum::http::HeaderMap;
 use secrecy::SecretString;
 use serde_json::json;
 use wyrd_auth::exchange_api_key::{ExchangedToken, TokenExchangeSettings};
@@ -8,6 +8,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 
+use crate::auth::{auth_not_configured, invalid_token, tenant_slug_from_host};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -83,32 +84,6 @@ async fn resolve_tenant_slug(
     wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app(pool, slug)
         .await
         .map_err(sql_error)
-}
-
-fn tenant_slug_from_host(headers: &HeaderMap) -> Option<TenantSlug> {
-    let host = headers.get(header::HOST)?.to_str().ok()?;
-    let host = host.split(':').next().unwrap_or(host);
-    let mut segments = host.split('.').filter(|segment| !segment.is_empty());
-    let first = segments.next()?;
-    let second = segments.next()?;
-    if first == "localhost" || second == "localhost" {
-        return None;
-    }
-    TenantSlug::new(first.to_owned()).ok()
-}
-
-fn invalid_token(message: &str) -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::InvalidToken {
-        message: message.to_owned(),
-        details: json!({}),
-    })
-}
-
-fn auth_not_configured() -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::Internal {
-        message: "auth signing or verification handle is not configured".to_owned(),
-        details: json!({}),
-    })
 }
 
 fn sql_error(error: impl Into<wyrd_sql::SqlError>) -> WyrdErrorResponse {

@@ -106,6 +106,7 @@ pub fn issue_scope_error(error: IssueError, root: &CardRef) -> IssueErrorOrWyrd 
 }
 
 /// Result of mapping an issuer error at a card-bound mint site.
+#[derive(Debug)]
 pub enum IssueErrorOrWyrd {
     /// Token issuer rejected the mint operation.
     Issue(IssueError),
@@ -132,7 +133,10 @@ pub async fn write_scope_mint_success_audit(
         root,
         request_id,
         "success",
-        Some(i32::try_from(scope.len()).unwrap_or(i32::MAX)),
+        Some(
+            i32::try_from(scope.len())
+                .expect("MAX_SCOPE_CARDS invariant: scope count fits into i32"),
+        ),
         Some(&scope_hash),
         scope_member_summary(&members),
         None,

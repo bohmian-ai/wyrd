@@ -8,9 +8,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wyrd_auth_issue::{DelegationCaller, IssueError, IssuingKey};
-use wyrd_auth_verify::{
-    ActClaim, AuthError, MAX_DELEGATION_DEPTH, PrincipalKindWire, TokenPrincipalRef, TokenVerifier,
-};
+use wyrd_auth_verify::{ActClaim, AuthError, PrincipalKindWire, TokenPrincipalRef, TokenVerifier};
 use wyrd_runtime::{Permission, PermissionCheck, PrincipalId, PrincipalKind, RoleRef};
 use wyrd_spec::auth::{RequestedSubject, SecretBearer, TokenResponse, TokenType};
 use wyrd_spec::envelope::CardKind;
@@ -27,6 +25,7 @@ use crate::card_scope::{
     IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_DELEGATION, issue_scope_error,
     resolve_card_ref_scope, write_scope_mint_success_audit,
 };
+use crate::error::auth_error_to_wyrd;
 use crate::issue_api_key::{WyrdApiKey, principal_kind_for_card};
 use crate::permission_resolver::SqlPermissionResolver;
 use crate::pg_resolvers::PgIssuerResolver;
@@ -126,7 +125,7 @@ impl ExchangedToken {
 /// they can re-present their durable credential, so issuing a long-lived
 /// refresh secret only widens the leak surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefreshPolicy {
+pub(crate) enum RefreshPolicy {
     /// Issue and persist a refresh token (API-key exchange, human login).
     Mint,
     /// Access token only; no refresh token is issued or stored.
@@ -134,7 +133,7 @@ pub enum RefreshPolicy {
 }
 
 /// The service/agent principal a token is being issued for.
-pub struct IssueSubject {
+pub(crate) struct IssueSubject {
     /// Stable principal id.
     pub principal_id: Uuid,
     /// Principal kind: `"service"` or `"agent"`.
@@ -347,7 +346,7 @@ impl DelegateToken {
 }
 
 /// Issue an access token, optional refresh token, and scope-mint audit for a principal.
-pub async fn issue_for_subject(
+pub(crate) async fn issue_for_subject(
     conn: &mut TenantConn<'_>,
     issuing_key: &IssuingKey,
     settings: &TokenExchangeSettings,
@@ -445,7 +444,7 @@ fn delegate_issue_error(error: IssueError, root: &CardRef) -> DelegateError {
 
 /// Error channel for token issue and database work during subject token minting.
 #[derive(Debug, thiserror::Error)]
-pub enum IssueOrSqlError {
+pub(crate) enum IssueOrSqlError {
     /// Token issuer rejected the mint operation.
     #[error("issue")]
     Issue(#[from] IssueError),
@@ -486,12 +485,12 @@ async fn resolve_requested_subject(
 }
 
 /// Convert stored role names into runtime role references.
-pub fn role_refs(names: Vec<String>) -> Result<Vec<RoleRef>, wyrd_runtime::InvalidRoleName> {
+pub(crate) fn role_refs(names: Vec<String>) -> Result<Vec<RoleRef>, wyrd_runtime::InvalidRoleName> {
     names.into_iter().map(|name| RoleRef::new(&name)).collect()
 }
 
 /// Convert a stored principal kind string into the token wire enum.
-pub fn principal_kind_wire(value: &str) -> Option<PrincipalKindWire> {
+pub(crate) fn principal_kind_wire(value: &str) -> Option<PrincipalKindWire> {
     match value {
         "service" => Some(PrincipalKindWire::Service),
         "agent" => Some(PrincipalKindWire::Agent),
@@ -550,7 +549,7 @@ fn act_from_chain(
 
 /// Hash a bearer secret for storage lookup and comparison.
 #[must_use]
-pub fn token_hash(token: &str) -> String {
+pub(crate) fn token_hash(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
@@ -660,82 +659,6 @@ impl From<DelegateError> for WyrdError {
                 details: json!({ "retry_after_seconds": 1 }),
             },
         }
-    }
-}
-
-pub(crate) fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
-    match error {
-        AuthError::Jwt(error) => jwt_error_to_wyrd(&error),
-        AuthError::InvalidToken => invalid_token("token rejected"),
-        AuthError::TokenExpired => WyrdError::TokenExpired {
-            message: "token expired".to_owned(),
-            details: json!({}),
-        },
-        AuthError::InvalidCardRef => WyrdError::InvalidCardRef {
-            message: "non-user token card_ref claim is absent or malformed".to_owned(),
-            details: json!({}),
-        },
-        AuthError::CardScopeMissingRoot => WyrdError::InvalidCardRef {
-            message: "card-bound token scope is missing its root card_ref".to_owned(),
-            details: json!({ "field": "card_ref_scope" }),
-        },
-        AuthError::DelegationDepthExceeded => WyrdError::DelegationDepthExceededVerify {
-            message: format!(
-                "delegation chain exceeds MAX_DELEGATION_DEPTH={MAX_DELEGATION_DEPTH}"
-            ),
-            details: json!({ "max": MAX_DELEGATION_DEPTH }),
-        },
-        AuthError::Revoked => WyrdError::CredentialRevoked {
-            message: "credential revoked".to_owned(),
-            details: json!({}),
-        },
-        AuthError::BadTokenFormat => WyrdError::BadTokenFormat {
-            message: "authorization header malformed".to_owned(),
-            details: json!({}),
-        },
-        AuthError::VerifyUnavailable => WyrdError::AuthVerifyUnavailable {
-            message: "auth verify backend unavailable".to_owned(),
-            details: json!({ "retry_after_seconds": 1 }),
-        },
-        AuthError::PermissionsCorrupt => WyrdError::RoleCorrupt {
-            message: "stored role permissions failed to decode".to_owned(),
-            details: json!({}),
-        },
-    }
-}
-
-fn jwt_error_to_wyrd(error: &jsonwebtoken::errors::Error) -> WyrdError {
-    use jsonwebtoken::errors::ErrorKind;
-
-    tracing::debug!(jwt_error = ?error.kind(), "JWT validation failed");
-
-    match error.kind() {
-        ErrorKind::ExpiredSignature => WyrdError::TokenExpired {
-            message: "token expired".to_owned(),
-            details: json!({}),
-        },
-        ErrorKind::Base64(_) | ErrorKind::Json(_) | ErrorKind::Utf8(_) => {
-            WyrdError::BadTokenFormat {
-                message: "token payload is malformed".to_owned(),
-                details: json!({}),
-            }
-        }
-        ErrorKind::InvalidSignature
-        | ErrorKind::InvalidIssuer
-        | ErrorKind::InvalidSubject
-        | ErrorKind::InvalidAudience
-        | ErrorKind::InvalidAlgorithm
-        | ErrorKind::InvalidAlgorithmName => {
-            invalid_token("bearer token signature, issuer, subject, audience, or algorithm invalid")
-        }
-        _ => invalid_token("bearer token rejected"),
-    }
-}
-
-fn invalid_token(message: &str) -> WyrdError {
-    WyrdError::InvalidToken {
-        message: message.to_owned(),
-        details: json!({}),
     }
 }
 

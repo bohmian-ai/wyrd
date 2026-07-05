@@ -21,10 +21,10 @@ use wyrd_auth_verify::{
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::{PrincipalId, RbacCheck, RoleRef};
 use wyrd_semver::VersionBlock;
-use wyrd_server::auth::issue_api_key::WyrdApiKey;
-use wyrd_server::auth::permission_resolver::SqlPermissionResolver;
-use wyrd_server::auth::pg_resolvers::PgIssuerResolver;
-use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
+use wyrd_auth::issue_api_key::WyrdApiKey;
+use wyrd_auth::permission_resolver::SqlPermissionResolver;
+use wyrd_auth::pg_resolvers::PgIssuerResolver;
+use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::components::auth::audit_writer::NoopAuthzAuditWriter;
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};

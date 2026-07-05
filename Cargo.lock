@@ -10920,6 +10920,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "wyrd-auth",
  "wyrd-auth-check",
  "wyrd-auth-issue",
  "wyrd-auth-oidc",

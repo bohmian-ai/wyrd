@@ -20,7 +20,8 @@ use wyrd_sql::queries::auth::{
 };
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
-use crate::exchange_api_key::{ExchangedToken, auth_error_to_wyrd, role_refs, token_hash};
+use crate::error::auth_error_to_wyrd;
+use crate::exchange_api_key::{ExchangedToken, role_refs, token_hash};
 use crate::login::{LoginStateEntry, PgLoginStateStore};
 use crate::permission_resolver::SqlPermissionResolver;
 use crate::pg_resolvers::PgIssuerResolver;

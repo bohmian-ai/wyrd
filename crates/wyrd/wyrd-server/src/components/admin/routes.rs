@@ -450,11 +450,13 @@ async fn discover_jwks_uri(issuer: &IssuerUrl) -> Result<url::Url, WyrdErrorResp
     let provider = OidcProvider::discover(url, reqwest::Client::new())
         .await
         .map_err(|error| {
+            tracing::warn!(
+                error = %error,
+                issuer = issuer.as_str(),
+                "OIDC discovery failed for admin create"
+            );
             WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
-                message: format!(
-                    "OIDC discovery failed for issuer {}: {error}",
-                    issuer.as_str()
-                ),
+                message: "OIDC discovery failed for issuer".to_owned(),
                 details: serde_json::json!({ "issuer": issuer.as_str() }),
             })
         })?;

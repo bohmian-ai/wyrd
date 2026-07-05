@@ -6,6 +6,7 @@
 
 pub mod callback;
 pub mod card_scope;
+pub(crate) mod error;
 pub mod exchange_api_key;
 pub mod issue_api_key;
 pub mod issuer;
@@ -21,3 +22,7 @@ pub mod revoke;
 pub mod roles;
 pub mod seed;
 pub mod service_accounts;
+
+pub use callback::AuthorizationCodeExchange;
+pub use exchange_api_key::{DelegateToken, ExchangeApiKey};
+pub use jwt_bearer::JwtBearer;

@@ -22,3 +22,39 @@ pub fn require_service_accounts_write(
         details: serde_json::json!({ "required": "service_accounts:write" }),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use wyrd_runtime::permission::PermissionSet;
+    use wyrd_runtime::principal::{PrincipalId, PrincipalKind, RoleRef};
+    use wyrd_runtime::{Permission, Principal};
+    use wyrd_spec::error::WyrdError;
+
+    use super::require_service_accounts_write;
+
+    fn principal_with_permissions(permissions: impl IntoIterator<Item = Permission>) -> Principal {
+        Principal {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: PrincipalKind::User,
+            tenant_id: wyrd_spec::DataTenantId::new_v7(),
+            roles: vec![RoleRef::new("viewer").expect("static role is valid")],
+            effective_permissions: PermissionSet::from_iter(permissions),
+        }
+    }
+
+    #[test]
+    fn allows_principal_with_service_accounts_write() {
+        let principal = principal_with_permissions([Permission::service_accounts_write()]);
+        assert!(require_service_accounts_write(&principal, "manage issuers").is_ok());
+    }
+
+    #[test]
+    fn denies_principal_without_permission() {
+        let principal = principal_with_permissions([]);
+        let result = require_service_accounts_write(&principal, "manage issuers");
+        assert!(
+            matches!(result, Err(WyrdError::PermissionDeniedRbac { .. })),
+            "empty permission set should be denied, got: {result:?}"
+        );
+    }
+}

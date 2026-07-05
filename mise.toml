@@ -69,10 +69,15 @@ run = "cargo build --workspace --all-features --all-targets"
 hide = true
 description = "Run workspace Rust unit tests (no DB required)"
 run = """
-cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server --exclude vala-bifrost --exclude vala-sql --exclude vala-core --exclude wyrd-client
-cargo test --locked -p wyrd-client
+cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server --exclude vala-bifrost --exclude vala-sql --exclude vala-core --exclude wyrd-client --exclude wyrd-dev-fixtures --exclude wyrd-sql --exclude wyrd-storage --exclude wyrd-testing
+cargo test --locked -p wyrd-client --lib
+cargo test --locked -p wyrd-client --test transport
 cargo test --locked -p vala-core
 cargo test --locked -p vala-sql --lib
+cargo test --locked -p wyrd-sql --lib
+# wyrd-storage runs whole-package here: emulator tests self-skip on unset WYRD_STORAGE_INTEGRATION_*,
+# and the Postgres-backed sweeper suite is #[ignore]'d (runs via test:sql --include-ignored).
+cargo test --locked -p wyrd-storage --all-features
 """
 
 [tasks."test:bifrost"]
@@ -113,7 +118,11 @@ hide = true
 description = """Run wyrd-server Rust tests against the local Postgres database."""
 depends = ["db:setup-roles"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
-run = "cargo test --locked -p wyrd-server --all-features -- --test-threads=1"
+run = """
+cargo test --locked -p wyrd-server --all-features -- --test-threads=1
+cargo test --locked -p wyrd-testing -- --test-threads=1
+cargo test --locked -p wyrd-client --test auth_e2e_against_fixture --test discovery_against_fixture -- --test-threads=1
+"""
 
 [tasks."test:wyrd-mcp"]
 hide = true
@@ -483,11 +492,6 @@ hide = true
 description = "Tail local storage emulator logs"
 run = "docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml logs -f"
 
-[tasks."test:storage:local"]
-hide = true
-description = "Run wyrd-storage local backend integration tests"
-run = "cargo test -p wyrd-storage --all-features --test integration_local"
-
 [tasks."test:storage:rustfs"]
 hide = true
 description = "Run wyrd-storage S3 integration tests against the local RustFS emulator; requires storage:up"
@@ -521,7 +525,7 @@ hide = true
 description = "Cards registration end-to-end against a real Postgres"
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
 env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
-run = "cargo test --locked -p wyrd-sql --features test-e2e --test cards_e2e -- --include-ignored"
+run = "cargo test --locked -p wyrd-sql --features test-e2e --test cards_e2e -- --include-ignored --test-threads=1"
 
 [tasks."test:storage:s3:cloud"]
 hide = true
@@ -560,13 +564,10 @@ depends = ["test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azur
 
 [tasks."test:storage:matrix"]
 hide = true
-description = "Run all storage emulator integration tests (signer-tier + operator data-plane + server e2e); requires storage:up"
-depends = ["test:storage:local", "test:storage:gcs-emu", "test:storage:rustfs", "test:storage:azurite", "test:storage:handle:local", "test:storage:handle:emulators", "test:storage:e2e"]
-
-[tasks."test:storage:handle:local"]
-hide = true
-description = "Run StorageHandle CRUD tests for the local filesystem backend (no emulator needed)"
-run = "cargo test -p wyrd-storage --all-features --test handle_crud local_handle_crud -- --nocapture"
+description = """Run all storage emulator integration tests (signer-tier + operator data-plane + server e2e); requires storage:up.
+Offline-only storage tests (integration_local, handle_crud::local_handle_crud) are NOT here -- they run in test:rust:workspace via `cargo test -p wyrd-storage`.
+"""
+depends = ["test:storage:gcs-emu", "test:storage:rustfs", "test:storage:azurite", "test:storage:handle:emulators", "test:storage:e2e"]
 
 [tasks."test:storage:handle:s3-emu"]
 hide = true
@@ -1246,9 +1247,86 @@ else
 fi
 """
 
+[tasks."check:from-pools-allowlist"]
+hide = true
+description = "Fail if from_pools is called outside the 14 allowlisted sites (2 definition files, 9 production wiring files, 3 test files)"
+run = """
+set -e
+# from_pools may only be called from the 14 sites below.
+# 2 definition files: wyrd-sql/src/postgres.rs, vala-sql/src/postgres.rs
+# 9 production wiring files: wyrd-server/src/{state,boot,middleware/authenticate,auth/{principal_extractor,caller_extractor,policy_hook,routes},health,postgres}.rs
+# 3 test files: wyrd-server/tests/{authz_check_route,grpc_smoke,router_smoke}.rs
+! rg -n --no-heading -e '\\.from_pools\\(|::from_pools\\(' \
+    --glob '!crates/wyrd/wyrd-sql/src/postgres.rs' \
+    --glob '!crates/vala/vala-sql/src/postgres.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/state.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/boot.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/middleware/authenticate.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/auth/principal_extractor.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/auth/caller_extractor.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/auth/policy_hook.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/auth/routes.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/health.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/postgres.rs' \
+    --glob '!crates/wyrd/wyrd-server/tests/authz_check_route.rs' \
+    --glob '!crates/wyrd/wyrd-server/tests/grpc_smoke.rs' \
+    --glob '!crates/wyrd/wyrd-server/tests/router_smoke.rs' \
+    crates/ python/
+"""
+
+[tasks."check:fixtures-no-server"]
+hide = true
+description = "Fail if wyrd-dev-fixtures imports wyrd-server or ServerPostgres::from_parts appears outside wyrd-server/wyrd-testing"
+run = """
+set -e
+# 1. wyrd-dev-fixtures must never import wyrd-server.
+! rg -n --no-heading -e '\\buse\\s+wyrd_server\\b|\\bwyrd_server::' \
+    crates/shared/wyrd-dev-fixtures/
+# 2. ServerPostgres composition (from_parts) stays in server + test harness only.
+! rg -n --no-heading -e 'ServerPostgres::from_parts' \
+    --glob '!crates/wyrd/wyrd-server/**' \
+    --glob '!crates/wyrd/wyrd-testing/**' \
+    crates/ python/
+# 3. wyrd-dev-fixtures Cargo.toml must not declare wyrd-server as a dependency.
+! rg -n --no-heading -e '^[[:space:]]*wyrd-server[[:space:]]*=' \
+    crates/shared/wyrd-dev-fixtures/Cargo.toml
+"""
+
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
-depends = ["check", "test:unit", "test:bifrost", "codegen:check", "cardkind:check", "check:client-tier", "check:registry-no-server-routes", "check:pyo3-scope", "check:mocks-scope", "check:unwrap-audit", "check:audit-script", "check:storage:drift", "check:registry-tx-coupling", "check:registry-immutable-spec-hash", "check:registry-single-table", "check:object-store-pin", "check:error-coverage", "check:tenant-isolation", "check:test-contracts", "check:tokens", "py:setup", "py:format:check", "py:lints", "py:typecheck", "py:test:unit", "examples:python:datacard", "check:examples", "check:docs", "check:no-legacy-server-vocab", "check:no-tonic-outside-wyrd-tonic"]
+depends = [
+  "check",
+  "test:unit",
+  "test:bifrost",
+  "codegen:check",
+  "cardkind:check",
+  "check:client-tier",
+  "check:registry-no-server-routes",
+  "check:pyo3-scope",
+  "check:mocks-scope",
+  "check:unwrap-audit",
+  "check:audit-script",
+  "check:storage:drift",
+  "check:registry-tx-coupling",
+  "check:registry-immutable-spec-hash",
+  "check:registry-single-table",
+  "check:object-store-pin",
+  "check:error-coverage",
+  "check:tenant-isolation",
+  "check:test-contracts",
+  "check:tokens",
+  "py:setup",
+  "py:format:check",
+  "py:lints",
+  "py:typecheck",
+  "py:test:unit",
+  "examples:python:datacard",
+  "check:examples",
+  "check:docs",
+  "check:no-legacy-server-vocab",
+  "check:no-tonic-outside-wyrd-tonic",
+  "check:from-pools-allowlist",
+  "check:fixtures-no-server"]
 
 [tasks."db:setup-roles"]
 hide = true
@@ -1296,6 +1374,7 @@ run = """
 cargo test --locked -p wyrd-sql --all-features -- --nocapture --test-threads=1
 cargo test --locked -p wyrd-dev-fixtures --all-features -- --test-threads=1
 cargo test --locked -p vala-sql --all-features -- --test-threads=1
+cargo test --locked -p wyrd-storage --all-features --test sweeper -- --include-ignored --test-threads=1
 """
 
 [tasks."db:migrate:all"]

@@ -44,6 +44,7 @@ def test_protocol_client_delegated_user_turn_round_trips():
             server_url=base_url,
             eval_ref="team/eval-card@1.0.0",
             agent_fn=agent_fn,
+            access_token="test-token",
             simulated_user_fn=simulated_user_fn,
             simulated_user="client",
         )

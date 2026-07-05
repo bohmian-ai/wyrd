@@ -9,7 +9,7 @@ authors = { workspace = true }
 
 [features]
 embedded-postgres = ["dep:pg-embed", "dep:rand", "dep:urlencoding"]
-test-e2e = []
+test-e2e = ["testing"]
 testing = ["dep:tokio"]
 
 [dependencies]

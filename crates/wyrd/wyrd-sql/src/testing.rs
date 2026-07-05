@@ -19,6 +19,8 @@ pub struct SharedDb {
     pub app: PgPool,
     /// BYPASSRLS platform-admin pool. Use for tenant seeding.
     pub platform_admin: PgPool,
+    /// Real control-plane handle — same pools, for production-shaped construction.
+    pub wyrd: crate::WyrdPostgres,
 }
 
 /// Connect to the shared local docker database and return role-specific pools.
@@ -47,6 +49,7 @@ pub async fn shared() -> Result<SharedDb, SqlError> {
         migrator,
         app: postgres.app_pool().clone(),
         platform_admin,
+        wyrd: postgres,
     })
 }
 

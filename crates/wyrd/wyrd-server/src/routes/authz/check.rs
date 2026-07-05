@@ -32,6 +32,7 @@ pub async fn check_authz(
     let token = extract_wyrd_access_token(&headers)?;
     let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
     let verifier = state
+        .auth
         .token_verifier
         .clone()
         .ok_or_else(auth_not_configured)?;
@@ -65,9 +66,9 @@ pub async fn check_authz(
     let required = permission_for_action(&request.action)?;
     let ctx = AuthzCheckContext::from_verified(&verified, request, metadata, request_id)
         .map_err(WyrdError::from)?;
-    let hook_decision = state.policy_hook.evaluate(&ctx).await;
+    let hook_decision = state.authz.policy_hook.evaluate(&ctx).await;
     let decision = match hook_decision {
-        PolicyDecision::Allow => match state.permission_check.check(&ctx.callee, &required) {
+        PolicyDecision::Allow => match state.authz.permission_check.check(&ctx.callee, &required) {
             PermissionVerdict::Allow => PolicyDecision::Allow,
             PermissionVerdict::Deny {
                 reason: PermissionDenyReason::Rbac { .. },
@@ -83,11 +84,14 @@ pub async fn check_authz(
 
     // Skip audit write when using the default stub writer (test/dev environments).
     // build_production() prevents this branch from being reached in production.
-    if !state.audit_writer.is_stub_default() {
-        let mut conn = wyrd_sql::TenantConn::acquire(&state.pool, ctx.callee.tenant_id)
+    if !state.authz.audit_writer.is_stub_default() {
+        let mut conn = state
+            .postgres
+            .tenant_conn(ctx.callee.tenant_id)
             .await
             .map_err(sql_error)?;
         state
+            .authz
             .audit_writer
             .write_authz_check(&mut conn, &ctx, &decision)
             .await?;

@@ -12,7 +12,9 @@ use wyrd_auth_verify::{
     public_key_from_pem,
 };
 use wyrd_runtime::PrincipalId;
+use wyrd_server::auth::ServerAuth;
 use wyrd_server::health::{ProbeOutcome, ProbeReason, ReadinessSnapshot};
+use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -398,6 +400,7 @@ async fn valid_token_is_not_rejected_by_default_deny_layer() {
 
 fn test_state() -> AppState {
     let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+    let postgres = Arc::new(ServerPostgres::lazy_for_tests(app_pool.clone()));
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
     let issuing_key = Arc::new(
@@ -417,28 +420,30 @@ fn test_state() -> AppState {
         keys,
         "wyrd",
         Arc::new(
-            wyrd_server::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(
-                app_pool.clone(),
-            )),
+            wyrd_server::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(app_pool)),
         ),
         WyrdAuthVerifySettings::default(),
     ));
 
     AppState::new(
-        app_pool,
-        None,
+        postgres,
         Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
     )
-    .with_auth_handles(issuing_key, verifier)
+    .with_auth(ServerAuth {
+        issuing_key: Some(issuing_key),
+        token_verifier: Some(verifier),
+        ..ServerAuth::default()
+    })
 }
 
 fn test_state_no_verifier() -> AppState {
-    let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+    let postgres = Arc::new(ServerPostgres::lazy_for_tests(
+        PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
+    ));
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
     AppState::new(
-        app_pool,
-        None,
+        postgres,
         Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
     )
     // no .with_auth_handles() → token_verifier is None → 503 on any /v1 request
@@ -453,6 +458,7 @@ fn mint_test_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
         card_ref_scope: Default::default(),
     };
     state
+        .auth
         .issuing_key
         .as_ref()
         .expect("test state has issuing key")

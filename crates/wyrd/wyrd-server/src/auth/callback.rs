@@ -67,7 +67,7 @@ pub async fn exchange_authorization_code(
     request_id: &str,
 ) -> Result<TokenResponse, WyrdErrorResponse> {
     let tenant_id = resolve_callback_tenant(state, headers).await?;
-    let store = PgLoginStateStore::new(state.pool.clone());
+    let store = PgLoginStateStore::new(state.postgres.app_pool().clone());
     let mut audit_principal_id = Uuid::nil();
     let result = async {
         let Some(login_state) = store.take(tenant_id, state_key).await.map_err(sql_error)? else {
@@ -130,6 +130,7 @@ async fn finish_authorization_code_exchange(
     audit_principal_id: &mut Uuid,
 ) -> Result<TokenResponse, WyrdErrorResponse> {
     let verifier = state
+        .auth
         .token_verifier
         .as_ref()
         .ok_or_else(auth_not_configured)?;
@@ -139,7 +140,9 @@ async fn finish_authorization_code_exchange(
         .map_err(WyrdErrorResponse::from)?;
     verify_nonce(login_state, &verified.raw_claims)?;
 
-    let mut conn = TenantConn::acquire(&state.pool, tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(tenant_id)
         .await
         .map_err(sql_error)?;
     let principal_id = ensure_user_identity(
@@ -152,7 +155,11 @@ async fn finish_authorization_code_exchange(
     .map_err(sql_error)?;
     *audit_principal_id = principal_id;
     let roles = role_names_to_refs(trusted, &verified.groups)?;
-    let issuing_key = state.issuing_key.as_ref().ok_or_else(auth_not_configured)?;
+    let issuing_key = state
+        .auth
+        .issuing_key
+        .as_ref()
+        .ok_or_else(auth_not_configured)?;
     let exchanged = issue_and_record_user_session(
         &mut conn,
         issuing_key,
@@ -242,9 +249,12 @@ async fn resolve_callback_tenant(
     let Some(slug) = tenant_slug_from_host(headers) else {
         return Err(invalid_token("request host does not encode a tenant"));
     };
-    match wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app(&state.pool, &slug)
-        .await
-        .map_err(sql_error)?
+    match wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app(
+        state.postgres.app_pool(),
+        &slug,
+    )
+    .await
+    .map_err(sql_error)?
     {
         Some(tenant) => Ok(tenant),
         None => Err(invalid_token("request tenant could not be resolved")),
@@ -262,7 +272,7 @@ async fn audit_authorization_code_failure(
     request_id: &str,
     error: &WyrdErrorResponse,
 ) {
-    let mut conn = match TenantConn::acquire(&state.pool, tenant_id).await {
+    let mut conn = match state.postgres.tenant_conn(tenant_id).await {
         Ok(conn) => conn,
         Err(audit_error) => {
             tracing::warn!(
@@ -1031,13 +1041,16 @@ mod tests {
     }
 
     fn test_state(fixture: &PgFixture) -> AppState {
+        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
+            fixture.wyrd_postgres().clone(),
+            fixture.vala_postgres().clone(),
+        ));
         let dir = tempfile::tempdir().expect("callback storage tempdir");
         let storage_root = dir.keep().join("callback-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
         AppState::new(
-            fixture.app_pool().clone(),
-            None,
+            postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
         )
     }
@@ -1093,10 +1106,13 @@ mod tests {
             )),
             Arc::clone(&issuer_resolver),
         );
-        test_state(fixture)
-            .with_auth_handles(issuing_key, Arc::new(verifier))
-            .with_trusted_issuer_resolver(issuer_resolver)
-            .with_sealing_key(sealing_key)
+        test_state(fixture).with_auth(crate::auth::ServerAuth {
+            issuing_key: Some(issuing_key),
+            token_verifier: Some(Arc::new(verifier)),
+            trusted_issuer_resolver: Some(issuer_resolver),
+            sealing_key: Some(sealing_key),
+            ..crate::auth::ServerAuth::default()
+        })
     }
 
     fn tenant_headers(slug: &str) -> HeaderMap {

@@ -21,10 +21,12 @@ pub mod revoke;
 pub mod roles;
 pub mod routes;
 pub mod seed;
+pub mod state;
 pub(crate) mod token_extract;
 
 pub use caller_extractor::Caller;
 pub use principal_extractor::AuthenticatedPrincipal;
+pub use state::{ServerAuth, ServerAuthz};
 
 use crate::error::WyrdErrorResponse;
 use crate::state::AppState;
@@ -55,7 +57,7 @@ pub(crate) async fn trusted_issuer(
     tenant_id: DataTenantId,
     issuer: &IssuerUrl,
 ) -> Result<TrustedIssuer, WyrdErrorResponse> {
-    let resolver = state.trusted_issuer_resolver.as_ref().ok_or_else(|| {
+    let resolver = state.auth.trusted_issuer_resolver.as_ref().ok_or_else(|| {
         WyrdErrorResponse::from(WyrdError::Internal {
             message: "trusted issuer resolver is not configured".to_owned(),
             details: serde_json::json!({}),

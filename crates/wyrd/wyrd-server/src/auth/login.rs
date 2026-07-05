@@ -126,7 +126,7 @@ pub async fn login(
             .map_err(|_| invalid_token("authorization URL is invalid"))?,
         state: state_key.clone(),
     };
-    let store = PgLoginStateStore::new(state.pool.clone());
+    let store = PgLoginStateStore::new(state.postgres.app_pool().clone());
     store
         .put(
             tenant_id,
@@ -219,7 +219,7 @@ async fn resolve_login_tenant(
     headers: &HeaderMap,
 ) -> Result<DataTenantId, WyrdErrorResponse> {
     if let Some(slug) = tenant_slug_from_host(headers)
-        && let Some(tenant) = resolve_tenant_slug(&state.pool, &slug).await?
+        && let Some(tenant) = resolve_tenant_slug(state.postgres.app_pool(), &slug).await?
     {
         return Ok(tenant);
     }
@@ -397,6 +397,9 @@ mod tests {
             .await
             .expect("state inserts");
 
+        // Wait long enough that Postgres clock advances past expires_at = now() + 0.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
         let consumed = store
             .take(tenant, "state-expired")
             .await
@@ -413,9 +416,12 @@ mod tests {
         let storage_root = tempdir.path().join("storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
+        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
+            fixture.wyrd_postgres().clone(),
+            fixture.vala_postgres().clone(),
+        ));
         let state = AppState::new(
-            fixture.app_pool().clone(),
-            None,
+            postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
         );
         let mut headers = HeaderMap::new();

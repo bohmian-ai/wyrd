@@ -18,6 +18,7 @@ def test_protocol_client_malformed_directive_raises_wyrd_error():
                 server_url=base_url,
                 eval_ref="team/eval-card@1.0.0",
                 agent_fn=lambda message, history: "irrelevant",
+                access_token="test-token",
             )
     finally:
         server.shutdown()
@@ -48,6 +49,7 @@ def test_protocol_client_propagates_agent_fn_exception():
                 server_url=base_url,
                 eval_ref="team/eval-card@1.0.0",
                 agent_fn=agent_fn,
+                access_token="test-token",
             )
     finally:
         server.shutdown()
@@ -62,6 +64,7 @@ def test_protocol_client_requires_simulated_user_fn_in_client_mode():
             server_url="http://127.0.0.1:1",
             eval_ref="team/eval-card@1.0.0",
             agent_fn=lambda message, history: "x",
+            access_token="test-token",
             simulated_user="client",
         )
 

@@ -37,6 +37,7 @@ use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::config::{IssuerEntry, WorkloadBindingEntry};
 use wyrd_server::issuer_boot::{seed_trusted_issuers, seed_workload_bindings};
+use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
@@ -1101,23 +1102,25 @@ impl WyrdTestServerBuilder {
             TokenExchangeSettings::default()
         };
 
-        let mut state = AppState::new(
-            fixture.app_pool().clone(),
-            Some(fixture.platform_admin_pool().clone()),
-            storage,
-        )
-        .with_preview_auth(self.allow_preview_auth)
-        .with_auth_handles(Arc::clone(&issuing_key), Arc::clone(&verifier))
-        .with_token_exchange_settings(exchange_settings)
-        .with_trusted_issuer_resolver(issuer_resolver)
-        .with_workload_binding_resolver(binding_resolver)
-        .with_sealing_key(sealing_key);
-        state.permission_check = Arc::new(RbacCheck);
-        state.audit_writer = self
+        let postgres = Arc::new(ServerPostgres::from_parts(
+            fixture.wyrd_postgres().clone(),
+            fixture.vala_postgres().clone(),
+        ));
+        let mut state = AppState::new(postgres, storage).with_auth(wyrd_server::auth::ServerAuth {
+            allow_preview: self.allow_preview_auth,
+            issuing_key: Some(Arc::clone(&issuing_key)),
+            token_verifier: Some(Arc::clone(&verifier)),
+            token_exchange_settings: exchange_settings,
+            trusted_issuer_resolver: Some(issuer_resolver),
+            workload_binding_resolver: Some(binding_resolver),
+            sealing_key: Some(sealing_key),
+        });
+        state.authz.permission_check = Arc::new(RbacCheck);
+        state.authz.audit_writer = self
             .audit_writer
             .unwrap_or_else(|| Arc::new(NoopAuthzAuditWriter));
         if let Some(hook) = self.policy_hook {
-            state.policy_hook = hook;
+            state.authz.policy_hook = hook;
         }
         let router = build_router(state.clone());
 

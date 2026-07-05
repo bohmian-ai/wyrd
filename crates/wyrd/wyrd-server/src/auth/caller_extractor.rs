@@ -127,12 +127,18 @@ mod tests {
                 ..WyrdAuthVerifySettings::default()
             },
         ));
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
         crate::state::AppState::new(
-            app_pool,
-            None,
+            postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
         )
-        .with_auth_handles(issuing_key, verifier)
+        .with_auth(crate::auth::ServerAuth {
+            issuing_key: Some(issuing_key),
+            token_verifier: Some(verifier),
+            ..crate::auth::ServerAuth::default()
+        })
     }
 
     fn mint_test_user_jwt(state: &crate::state::AppState, tenant: DataTenantId) -> String {
@@ -144,6 +150,7 @@ mod tests {
             card_ref_scope: Default::default(),
         };
         state
+            .auth
             .issuing_key
             .as_ref()
             .expect("test state has issuing key")

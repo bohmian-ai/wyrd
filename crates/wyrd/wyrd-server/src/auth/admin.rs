@@ -243,8 +243,8 @@ async fn create_trusted_issuer(
 
     // Encrypt before insert. A secret-bearing issuer with no sealing key fails
     // closed here — plaintext never lands in a column.
-    let write =
-        issuer_write_from_trusted(&trusted, state.sealing_key.as_deref()).map_err(seal_error)?;
+    let write = issuer_write_from_trusted(&trusted, state.auth.sealing_key.as_deref())
+        .map_err(seal_error)?;
 
     let mut conn = acquire_conn(&state, &caller).await?;
     insert_trusted_issuer(&mut conn, &write)
@@ -407,7 +407,9 @@ async fn acquire_conn<'a>(
     state: &'a AppState,
     caller: &AuthenticatedPrincipal,
 ) -> Result<TenantConn<'a>, WyrdErrorResponse> {
-    TenantConn::acquire(&state.pool, caller.principal.tenant_id)
+    state
+        .postgres
+        .tenant_conn(caller.principal.tenant_id)
         .await
         .map_err(sql_unavailable)
 }
@@ -587,16 +589,22 @@ mod tests {
     }
 
     async fn test_state(fixture: &PgFixture) -> AppState {
+        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
+            fixture.wyrd_postgres().clone(),
+            fixture.vala_postgres().clone(),
+        ));
         let dir = tempfile::tempdir().expect("admin storage tempdir");
         let storage_root = dir.keep().join("admin-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
         AppState::new(
-            fixture.app_pool().clone(),
-            None,
+            postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
         )
-        .with_sealing_key(Arc::new(sealing_key()))
+        .with_auth(crate::auth::ServerAuth {
+            sealing_key: Some(Arc::new(sealing_key())),
+            ..crate::auth::ServerAuth::default()
+        })
     }
 
     fn principal_with(tenant: DataTenantId, perms: PermissionSet) -> AuthenticatedPrincipal {

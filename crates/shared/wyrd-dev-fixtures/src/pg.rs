@@ -11,16 +11,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::{AssertSqlSafe, PgPool};
 use url::Url;
+use vala_sql::ValaPostgres;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::dsn::ResolvedDsns;
 use wyrd_sql::pool::build_pool;
-use wyrd_sql::{PoolConfig, SqlError, TenantConn};
+use wyrd_sql::{PoolConfig, SqlError, TenantConn, WyrdPostgres};
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Per-test Postgres fixture backed by a fixture-owned database.
 pub struct PgFixture {
-    app_pool: PgPool,
+    wyrd: WyrdPostgres,
+    vala: ValaPostgres,
     platform_admin_pool: PgPool,
     data_tenant_id: DataTenantId,
     tenant_slug: String,
@@ -74,13 +76,25 @@ impl PgFixture {
         &self,
         data_tenant_id: DataTenantId,
     ) -> Result<TenantConn<'_>, SqlError> {
-        TenantConn::acquire(&self.app_pool, data_tenant_id).await
+        self.wyrd.tenant_conn(data_tenant_id).await
+    }
+
+    /// Borrow the real control-plane handle.
+    #[must_use]
+    pub fn wyrd_postgres(&self) -> &WyrdPostgres {
+        &self.wyrd
+    }
+
+    /// Borrow the real Vala warehouse handle.
+    #[must_use]
+    pub fn vala_postgres(&self) -> &ValaPostgres {
+        &self.vala
     }
 
     /// Borrow the runtime `wyrd_app` pool.
     #[must_use]
     pub fn app_pool(&self) -> &PgPool {
-        &self.app_pool
+        self.wyrd.app_pool()
     }
 
     /// Borrow the audited `wyrd_platform_admin` pool.
@@ -125,12 +139,13 @@ impl PgFixture {
         tenant_slug: String,
     ) -> Result<Self, FixtureError> {
         let test_db = TestDatabase::create().await?;
-        let db = test_db.connect().await?;
-        seed_tenant(&db.platform_admin, data_tenant_id, &tenant_slug).await?;
+        let handles = test_db.connect_handles().await?;
+        seed_tenant(&handles.platform_admin, data_tenant_id, &tenant_slug).await?;
 
         Ok(Self {
-            app_pool: db.app.clone(),
-            platform_admin_pool: db.platform_admin.clone(),
+            platform_admin_pool: handles.platform_admin,
+            wyrd: handles.wyrd,
+            vala: handles.vala,
             data_tenant_id,
             tenant_slug,
             _test_db: test_db,
@@ -143,8 +158,9 @@ struct TestDatabase {
     maintenance_dsn: SecretString,
 }
 
-struct TestDbPools {
-    app: PgPool,
+struct TestDbHandles {
+    wyrd: WyrdPostgres,
+    vala: ValaPostgres,
     platform_admin: PgPool,
 }
 
@@ -176,27 +192,17 @@ impl TestDatabase {
         Ok(test_db)
     }
 
-    async fn connect(&self) -> Result<TestDbPools, SqlError> {
+    async fn connect_handles(&self) -> Result<TestDbHandles, SqlError> {
         let dsns = self.resolved_dsns()?;
-        let app = build_pool(dsns.app.expose_secret(), PoolConfig::app_defaults())
-            .await
-            .map_err(SqlError::Connect)?;
-        let platform_admin_dsn =
-            dsns.platform_admin
-                .ok_or_else(|| SqlError::InvariantViolation {
-                    detail: "test DB env unset (WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD); platform-admin pool is required for tenant seeding".to_owned(),
-                })?;
-        let platform_admin = build_pool(
-            platform_admin_dsn.expose_secret(),
-            PoolConfig::platform_admin_defaults(),
-        )
-        .await
-        .map_err(SqlError::Connect)?;
-
-        Ok(TestDbPools {
-            app,
-            platform_admin,
-        })
+        let wyrd = WyrdPostgres::connect_from_dsns(&dsns).await?;
+        let vala = ValaPostgres::connect_after_wyrd(&dsns).await?;
+        let platform_admin = wyrd
+            .platform_admin_pool()
+            .cloned()
+            .ok_or_else(|| SqlError::InvariantViolation {
+                detail: "test DB env unset (WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD); platform-admin pool is required for tenant seeding".to_owned(),
+            })?;
+        Ok(TestDbHandles { wyrd, vala, platform_admin })
     }
 
     async fn migrate(&self, base: &ResolvedDsns) -> Result<(), SqlError> {

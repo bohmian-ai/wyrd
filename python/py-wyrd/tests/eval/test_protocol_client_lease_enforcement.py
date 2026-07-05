@@ -32,6 +32,7 @@ def test_protocol_client_carries_lease_through_full_walk():
             server_url=base_url,
             eval_ref="team/eval-card@1.0.0",
             agent_fn=agent_fn,
+            access_token="test-token",
         )
     finally:
         server.shutdown()

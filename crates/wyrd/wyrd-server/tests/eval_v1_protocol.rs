@@ -30,13 +30,16 @@ use wyrd_auth_verify::{
     Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
     public_key_from_pem,
 };
+use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::PrincipalId;
 use wyrd_runtime::RoleRef;
 use wyrd_semver::VersionBlock;
+use wyrd_server::auth::ServerAuth;
 use wyrd_server::auth::permission_resolver::SqlPermissionResolver;
 use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::eval::resolver::{resolve_card_for_tenant, scenario_object_path};
 use wyrd_server::eval::{EvalAuditEvent, EvalAuditKind, EvalAuditWriter};
+use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::data::{
@@ -59,7 +62,11 @@ const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX
 // Harness
 // --------------------------------------------------------------------------
 
-fn build_state(pool: PgPool) -> (AppState, TempDir) {
+fn build_state(fixture: &PgFixture) -> (AppState, TempDir) {
+    let postgres = Arc::new(ServerPostgres::from_parts(
+        fixture.wyrd_postgres().clone(),
+        fixture.vala_postgres().clone(),
+    ));
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
     let issuing_key = Arc::new(
@@ -78,15 +85,20 @@ fn build_state(pool: PgPool) -> (AppState, TempDir) {
     let verifier = Arc::new(TokenVerifier::new(
         keys,
         "wyrd",
-        Arc::new(SqlPermissionResolver::new(Arc::new(pool.clone()))),
+        Arc::new(SqlPermissionResolver::new(Arc::new(
+            fixture.app_pool().clone(),
+        ))),
         WyrdAuthVerifySettings::default(),
     ));
     let state = AppState::new(
-        pool,
-        None,
+        postgres,
         Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
     )
-    .with_auth_handles(issuing_key, verifier);
+    .with_auth(ServerAuth {
+        issuing_key: Some(issuing_key),
+        token_verifier: Some(verifier),
+        ..ServerAuth::default()
+    });
     (state, root)
 }
 
@@ -96,6 +108,7 @@ fn mint_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> String {
         .map(|role| RoleRef::new(role).expect("valid role"))
         .collect::<Vec<RoleRef>>();
     state
+        .auth
         .issuing_key
         .as_ref()
         .expect("issuing key")
@@ -261,7 +274,7 @@ async fn seed_eval(state: &AppState, tenant: DataTenantId, space: &str, name: &s
     let data_uid = CardUid::new(uuid::Uuid::now_v7()).expect("data uid");
     let data_ref = card_ref(CardKind::Data, space, &format!("{name}-data"));
     insert_card(
-        &state.pool,
+        state.postgres.app_pool(),
         tenant,
         data_uid.clone(),
         CardKind::Data,
@@ -275,7 +288,7 @@ async fn seed_eval(state: &AppState, tenant: DataTenantId, space: &str, name: &s
 
     let eval_uid = CardUid::new(uuid::Uuid::now_v7()).expect("eval uid");
     insert_card(
-        &state.pool,
+        state.postgres.app_pool(),
         tenant,
         eval_uid,
         CardKind::Eval,
@@ -376,7 +389,7 @@ async fn unauthenticated_request_to_each_route_returns_401() {
     let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
         .await
         .expect("fixture starts");
-    let (state, _root) = build_state(fixture.app_pool().clone());
+    let (state, _root) = build_state(&fixture);
     let app = build_router(state);
     let run = uuid::Uuid::now_v7();
 
@@ -419,7 +432,7 @@ async fn full_lifecycle_and_audit_under_one_jwt() {
         .expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     seed_roles(fixture.app_pool(), tenant).await;
-    let (state, _root) = build_state(fixture.app_pool().clone());
+    let (state, _root) = build_state(&fixture);
     let audit = Arc::new(RecordingAudit::default());
     let state = state.with_eval_audit(audit.clone());
 
@@ -527,7 +540,7 @@ async fn cross_tenant_eval_ref_space_collision_returns_404() {
         .expect("fixture starts");
     let tenant_a = fixture.data_tenant_id();
     seed_roles(fixture.app_pool(), tenant_a).await;
-    let (state, _root) = build_state(fixture.app_pool().clone());
+    let (state, _root) = build_state(&fixture);
 
     let tenant_b = DataTenantId::new_v7();
     seed_tenant(fixture.platform_admin_pool(), tenant_b, "tenant-b").await;
@@ -565,7 +578,7 @@ async fn cross_tenant_dataset_denied_before_bytes() {
         .expect("fixture starts");
     let tenant_a = fixture.data_tenant_id();
     seed_roles(fixture.app_pool(), tenant_a).await;
-    let (state, _root) = build_state(fixture.app_pool().clone());
+    let (state, _root) = build_state(&fixture);
 
     let tenant_b = DataTenantId::new_v7();
     seed_tenant(fixture.platform_admin_pool(), tenant_b, "tenant-b").await;
@@ -573,7 +586,7 @@ async fn cross_tenant_dataset_denied_before_bytes() {
     // Data card lives only in tenant B (colliding identity).
     let data_uid = CardUid::new(uuid::Uuid::now_v7()).expect("uid");
     insert_card(
-        &state.pool,
+        state.postgres.app_pool(),
         tenant_b,
         data_uid,
         CardKind::Data,
@@ -587,7 +600,7 @@ async fn cross_tenant_dataset_denied_before_bytes() {
     let eval_uid = CardUid::new(uuid::Uuid::now_v7()).expect("uid");
     let dataset_ref = card_ref(CardKind::Data, "shared", "dataset");
     insert_card(
-        &state.pool,
+        state.postgres.app_pool(),
         tenant_a,
         eval_uid,
         CardKind::Eval,
@@ -630,7 +643,7 @@ async fn cross_tenant_judge_ref_denied_no_provider_call() {
         .await
         .expect("fixture starts");
     let tenant_a = fixture.data_tenant_id();
-    let (state, _root) = build_state(fixture.app_pool().clone());
+    let (state, _root) = build_state(&fixture);
 
     let tenant_b = DataTenantId::new_v7();
     seed_tenant(fixture.platform_admin_pool(), tenant_b, "tenant-b").await;
@@ -642,7 +655,7 @@ async fn cross_tenant_judge_ref_denied_no_provider_call() {
     )
     .expect("prompt spec");
     insert_card(
-        &state.pool,
+        state.postgres.app_pool(),
         tenant_b,
         prompt_uid,
         CardKind::Prompt,
@@ -658,7 +671,13 @@ async fn cross_tenant_judge_ref_denied_no_provider_call() {
     // The judge path (whenever server-side scoring wires) resolves through the
     // same tenant-bound resolver. Under tenant A the tenant-B judge is invisible;
     // no provider is ever constructed, so no provider call is possible.
-    let denied = resolve_card_for_tenant(&state.pool, tenant_a, CardKind::Prompt, &judge_ref).await;
+    let denied = resolve_card_for_tenant(
+        state.postgres.app_pool(),
+        tenant_a,
+        CardKind::Prompt,
+        &judge_ref,
+    )
+    .await;
     assert!(
         denied.is_err(),
         "tenant A must not resolve tenant B's judge"
@@ -666,8 +685,13 @@ async fn cross_tenant_judge_ref_denied_no_provider_call() {
     assert_eq!(denied.unwrap_err().status(), 404);
 
     // Sanity: the same ref resolves under its own tenant.
-    let allowed =
-        resolve_card_for_tenant(&state.pool, tenant_b, CardKind::Prompt, &judge_ref).await;
+    let allowed = resolve_card_for_tenant(
+        state.postgres.app_pool(),
+        tenant_b,
+        CardKind::Prompt,
+        &judge_ref,
+    )
+    .await;
     assert!(allowed.is_ok(), "tenant B owns the judge card");
 }
 
@@ -682,7 +706,7 @@ async fn foreign_run_id_returns_404_not_403() {
         .expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     seed_roles(fixture.app_pool(), tenant).await;
-    let (state, _root) = build_state(fixture.app_pool().clone());
+    let (state, _root) = build_state(&fixture);
     let eval_ref = seed_eval(&state, tenant, "prod", "rubric").await;
 
     // Two distinct principals in the same tenant, minted before the router
@@ -749,14 +773,14 @@ async fn internal_failure_scrubs_5xx_body() {
         .expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     seed_roles(fixture.app_pool(), tenant).await;
-    let (state, _root) = build_state(fixture.app_pool().clone());
+    let (state, _root) = build_state(&fixture);
 
     // Eval + Data cards exist, but no scenario object was uploaded, so the
     // object fetch fails after the (successful) RLS hops.
     let data_uid = CardUid::new(uuid::Uuid::now_v7()).expect("uid");
     let data_ref = card_ref(CardKind::Data, "prod", "rubric-data");
     insert_card(
-        &state.pool,
+        state.postgres.app_pool(),
         tenant,
         data_uid,
         CardKind::Data,
@@ -768,7 +792,7 @@ async fn internal_failure_scrubs_5xx_body() {
     .await;
     let eval_uid = CardUid::new(uuid::Uuid::now_v7()).expect("uid");
     insert_card(
-        &state.pool,
+        state.postgres.app_pool(),
         tenant,
         eval_uid,
         CardKind::Eval,
@@ -808,7 +832,7 @@ async fn open_requires_eval_run_permission() {
         .expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     seed_roles(fixture.app_pool(), tenant).await;
-    let (state, _root) = build_state(fixture.app_pool().clone());
+    let (state, _root) = build_state(&fixture);
     let eval_ref = seed_eval(&state, tenant, "prod", "rubric").await;
 
     // In-tenant custom role holding cards:write but NOT evals:run. It would have
@@ -867,7 +891,7 @@ async fn lease_failures_on_owned_run_are_rejected() {
         .expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     seed_roles(fixture.app_pool(), tenant).await;
-    let (state, _root) = build_state(fixture.app_pool().clone());
+    let (state, _root) = build_state(&fixture);
     let eval_ref = seed_eval(&state, tenant, "prod", "rubric").await;
 
     let jwt = mint_jwt(&state, tenant, &["writer"]);

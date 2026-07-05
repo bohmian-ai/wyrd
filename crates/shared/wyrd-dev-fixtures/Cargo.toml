@@ -21,6 +21,7 @@ pg = [
     "dep:vala-sql",
     "vala-sql/testing",
     "dep:wyrd-sql",
+    "wyrd-sql/testing",
     "dep:wyrd-spec",
 ]
 

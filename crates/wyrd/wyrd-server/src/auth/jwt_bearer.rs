@@ -52,7 +52,9 @@ impl JwtBearer {
             let verified =
                 verify_workload_assertion(state, tenant_id, assertion.expose_secret()).await?;
             let card_ref = resolve_workload_binding(state, tenant_id, &verified).await?;
-            let mut conn = TenantConn::acquire(&state.pool, tenant_id)
+            let mut conn = state
+                .postgres
+                .tenant_conn(tenant_id)
                 .await
                 .map_err(sql_error)?;
             let (row, roles) = load_service_account_subject(&mut conn, &card_ref).await?;
@@ -81,6 +83,7 @@ async fn verify_workload_assertion(
     assertion: &str,
 ) -> Result<VerifiedExternalIdentity, WyrdErrorResponse> {
     let verifier = state
+        .auth
         .token_verifier
         .as_ref()
         .ok_or_else(auth_not_configured)?;
@@ -102,6 +105,7 @@ async fn resolve_workload_binding(
     verified: &VerifiedExternalIdentity,
 ) -> Result<CardRef, WyrdErrorResponse> {
     let binding_resolver = state
+        .auth
         .workload_binding_resolver
         .as_ref()
         .ok_or_else(auth_not_configured)?;
@@ -156,7 +160,11 @@ async fn issue_and_audit(
     roles: Vec<RoleRef>,
     request_id: &str,
 ) -> Result<ExchangedToken, WyrdErrorResponse> {
-    let issuing_key = state.issuing_key.as_ref().ok_or_else(auth_not_configured)?;
+    let issuing_key = state
+        .auth
+        .issuing_key
+        .as_ref()
+        .ok_or_else(auth_not_configured)?;
     let exchanged = issue_for_subject(
         conn,
         issuing_key,
@@ -225,7 +233,7 @@ async fn audit_workload_failure(
     request_id: &str,
     error: &WyrdErrorResponse,
 ) {
-    let mut conn = match TenantConn::acquire(&state.pool, tenant_id).await {
+    let mut conn = match state.postgres.tenant_conn(tenant_id).await {
         Ok(conn) => conn,
         Err(audit_error) => {
             tracing::warn!(
@@ -282,7 +290,7 @@ async fn resolve_workload_tenant(
     tenant: Option<TenantSlug>,
 ) -> Result<DataTenantId, WyrdErrorResponse> {
     if let Some(host_tenant) = tenant_slug_from_host(headers) {
-        return resolve_tenant_slug(&state.pool, &host_tenant)
+        return resolve_tenant_slug(state.postgres.app_pool(), &host_tenant)
             .await?
             .ok_or_else(|| invalid_token("request host tenant could not be resolved"));
     }
@@ -292,7 +300,7 @@ async fn resolve_workload_tenant(
             "tenant could not be resolved for workload token",
         ));
     };
-    resolve_tenant_slug(&state.pool, &fallback)
+    resolve_tenant_slug(state.postgres.app_pool(), &fallback)
         .await?
         .ok_or_else(|| invalid_token("requested tenant could not be resolved"))
 }
@@ -814,7 +822,11 @@ mod tests {
             .await
             .expect("tenant conn opens");
         let exchanged = crate::auth::exchange_api_key::ExchangeApiKey {
-            issuing_key: state.issuing_key.clone().expect("issuing key configured"),
+            issuing_key: state
+                .auth
+                .issuing_key
+                .clone()
+                .expect("issuing key configured"),
             settings: Default::default(),
         }
         .execute(&mut conn, SecretString::from(token), "req-api-key")
@@ -830,13 +842,16 @@ mod tests {
     }
 
     async fn test_state(fixture: &PgFixture) -> AppState {
+        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
+            fixture.wyrd_postgres().clone(),
+            fixture.vala_postgres().clone(),
+        ));
         let dir = tempfile::tempdir().expect("jwt-bearer storage tempdir");
         let storage_root = dir.keep().join("jwt-bearer-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
         AppState::new(
-            fixture.app_pool().clone(),
-            None,
+            postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
         )
     }
@@ -912,9 +927,13 @@ mod tests {
         );
         test_state(fixture)
             .await
-            .with_auth_handles(issuing_key, Arc::new(verifier))
-            .with_trusted_issuer_resolver(issuer_resolver)
-            .with_workload_binding_resolver(binding_resolver)
+            .with_auth(crate::auth::ServerAuth {
+                issuing_key: Some(issuing_key),
+                token_verifier: Some(Arc::new(verifier)),
+                trusted_issuer_resolver: Some(issuer_resolver),
+                workload_binding_resolver: Some(binding_resolver),
+                ..crate::auth::ServerAuth::default()
+            })
     }
 
     async fn bootstrap_principal(
@@ -1106,6 +1125,7 @@ mod tests {
         token: &str,
     ) -> Result<wyrd_auth_verify::VerifiedToken, wyrd_auth_verify::AuthError> {
         state
+            .auth
             .token_verifier
             .as_ref()
             .expect("token verifier configured")

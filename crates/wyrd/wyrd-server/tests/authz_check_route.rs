@@ -13,6 +13,8 @@ use wyrd_auth_verify::{
 };
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_semver::VersionBlock;
+use wyrd_server::auth::ServerAuth;
+use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::envelope::CardKind;
@@ -105,7 +107,7 @@ async fn authz_deny_hook_returns_403_with_reason() {
         .await
         .expect("fixture starts");
     let mut state = test_state(fixture.app_pool().clone());
-    state.policy_hook = Arc::new(DenyAllPolicyHook {
+    state.authz.policy_hook = Arc::new(DenyAllPolicyHook {
         reason: "test-deny".to_owned(),
     });
     let token = mint_delegated_service_jwt(&state, fixture.data_tenant_id());
@@ -238,6 +240,7 @@ fn authz_body(target: &CardRef) -> serde_json::Value {
 }
 
 fn test_state(pool: sqlx::PgPool) -> AppState {
+    let postgres = Arc::new(ServerPostgres::lazy_for_tests(pool.clone()));
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
     let issuing_key = Arc::new(
@@ -257,23 +260,25 @@ fn test_state(pool: sqlx::PgPool) -> AppState {
         keys,
         "wyrd",
         Arc::new(
-            wyrd_server::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(
-                pool.clone(),
-            )),
+            wyrd_server::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(pool)),
         ),
         WyrdAuthVerifySettings::default(),
     ));
 
     AppState::new(
-        pool,
-        None,
+        postgres,
         Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
     )
-    .with_auth_handles(issuing_key, verifier)
+    .with_auth(ServerAuth {
+        issuing_key: Some(issuing_key),
+        token_verifier: Some(verifier),
+        ..ServerAuth::default()
+    })
 }
 
 fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
     state
+        .auth
         .issuing_key
         .as_ref()
         .expect("issuing key exists")
@@ -293,6 +298,7 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
 
 fn mint_service_jwt(state: &AppState, tenant: DataTenantId, name: &str) -> String {
     state
+        .auth
         .issuing_key
         .as_ref()
         .expect("issuing key exists")
@@ -326,6 +332,7 @@ fn mint_delegated_service_jwt(state: &AppState, tenant: DataTenantId) -> String 
     };
 
     state
+        .auth
         .issuing_key
         .as_ref()
         .expect("issuing key exists")

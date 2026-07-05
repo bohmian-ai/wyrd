@@ -82,7 +82,9 @@ pub async fn upload_init(
     })?;
     let wire_protocol = derive_wire_protocol(backend, planned);
 
-    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     if let Some(key) = idempotency_key.as_ref()
@@ -178,7 +180,9 @@ pub async fn upload_init(
         }
     };
 
-    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     persist_s3_upload_id_and_audit(
@@ -223,7 +227,9 @@ pub async fn upload_part_url(
     authorize_card_write(&caller)?;
     let upload_uuid = upload_id_uuid(&upload_id)?;
 
-    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     let row = load_upload(&mut conn, upload_uuid).await?;
@@ -288,7 +294,9 @@ pub async fn upload_complete(
     authorize_card_write(&caller)?;
     let upload_uuid = upload_id_uuid(&upload_id)?;
 
-    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     let row = load_pending_upload(&mut conn, upload_uuid).await?;
@@ -360,7 +368,9 @@ pub async fn upload_complete(
     };
     verify_object_head(state, &caller, upload_uuid, &validated, &row, &head).await?;
 
-    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     wyrd_sql::queries::storage::artifact_metadata::insert(
@@ -420,7 +430,9 @@ pub async fn upload_abort(
     authorize_card_write(&caller)?;
     let upload_uuid = upload_id_uuid(&upload_id)?;
 
-    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     let row = load_upload(&mut conn, upload_uuid).await?;
@@ -445,7 +457,9 @@ pub async fn upload_abort(
         tracing::warn!(error = %error, upload_id = %upload_id, "best-effort backend abort failed");
     }
 
-    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     let aborted =
@@ -502,7 +516,9 @@ pub async fn download_init(
     authorize_card_read(&caller)?;
     let validated = validated_download_path(&caller, &body)?;
 
-    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     let metadata = load_artifact_metadata(&mut conn, &validated).await?;
@@ -516,7 +532,9 @@ pub async fn download_init(
         request_ttl_secs
     };
 
-    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(map_sql_error)?;
     audit::write(
@@ -1121,7 +1139,7 @@ async fn mark_failed_best_effort(
     backend: StorageBackendKind,
     ctx: FailureContext<'_>,
 ) {
-    let Ok(mut conn) = TenantConn::acquire(&state.pool, caller.data_tenant_id).await else {
+    let Ok(mut conn) = state.postgres.tenant_conn(caller.data_tenant_id).await else {
         tracing::warn!(upload_id = %upload_uuid, "failed to acquire tenant connection for failure mark");
         return;
     };
@@ -1251,6 +1269,7 @@ fn internal_error(message: impl Into<String>, details: serde_json::Value) -> Wyr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::postgres::ServerPostgres;
     use axum::body::to_bytes;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use std::sync::Arc;
@@ -1348,11 +1367,10 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let state = AppState::new(
+        let postgres = Arc::new(ServerPostgres::lazy_for_tests(
             PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
-            None,
-            Arc::clone(&storage),
-        );
+        ));
+        let state = AppState::new(postgres, Arc::clone(&storage));
         let tenant = DataTenantId::new_v7();
         let validated = ValidatedPath {
             full: format!("{tenant}/cards/018f0000-0000-7000-8000-000000000000/model.bin"),
@@ -1410,11 +1428,10 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let state = AppState::new(
+        let postgres = Arc::new(ServerPostgres::lazy_for_tests(
             PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
-            None,
-            Arc::clone(&storage),
-        );
+        ));
+        let state = AppState::new(postgres, Arc::clone(&storage));
         let tenant = DataTenantId::new_v7();
         let validated = ValidatedPath {
             full: format!("{tenant}/cards/018f0000-0000-7000-8000-000000000000/model.bin"),
@@ -1449,11 +1466,10 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let state = AppState::new(
+        let postgres = Arc::new(ServerPostgres::lazy_for_tests(
             PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
-            None,
-            Arc::clone(&storage),
-        );
+        ));
+        let state = AppState::new(postgres, Arc::clone(&storage));
         let caller = read_caller();
         let path = tenant_path::build(
             caller.data_tenant_id,
@@ -1501,11 +1517,10 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let state = AppState::new(
+        let postgres = Arc::new(ServerPostgres::lazy_for_tests(
             PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
-            None,
-            Arc::clone(&storage),
-        );
+        ));
+        let state = AppState::new(postgres, Arc::clone(&storage));
         let caller = caller_with_permissions([]);
         let path = tenant_path::build(
             caller.data_tenant_id,
@@ -1535,11 +1550,10 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let state = AppState::new(
+        let postgres = Arc::new(ServerPostgres::lazy_for_tests(
             PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
-            None,
-            Arc::clone(&storage),
-        );
+        ));
+        let state = AppState::new(postgres, Arc::clone(&storage));
         let caller = caller_with_permissions([]);
         let path = tenant_path::build(
             caller.data_tenant_id,

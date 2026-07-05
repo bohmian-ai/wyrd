@@ -2,9 +2,10 @@
 
 use sqlx::PgPool;
 use vala_sql::ValaPostgres;
+use wyrd_spec::DataTenantId;
 use wyrd_sql::dsn::ResolvedDsns;
 use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
-use wyrd_sql::{SqlError, WyrdPostgres};
+use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
 /// Errors raised while making server Postgres handles ready.
 #[derive(Debug, thiserror::Error)]
@@ -42,7 +43,32 @@ impl ServerPostgres {
     pub async fn connect_from_dsns(dsns: &ResolvedDsns) -> Result<Self, ServerPostgresError> {
         let wyrd = WyrdPostgres::connect_from_dsns(dsns).await?;
         let vala = ValaPostgres::connect_after_wyrd(dsns).await?;
-        Ok(Self { wyrd, vala })
+        Ok(Self::from_parts(wyrd, vala))
+    }
+
+    /// Compose already-built Wyrd and Vala handles.
+    ///
+    /// Both sub-handles must already be migration-ready. Production
+    /// `connect_from_dsns` builds them the production way and calls this; tests
+    /// build them via the test harness and call this. This assembles real
+    /// handles — it is not a fake or pool shim.
+    #[must_use]
+    pub fn from_parts(wyrd: WyrdPostgres, vala: ValaPostgres) -> Self {
+        Self { wyrd, vala }
+    }
+
+    /// Open a tenant-scoped transaction on the Wyrd app pool.
+    ///
+    /// Route-facing acquisition path. Delegates to `WyrdPostgres::tenant_conn`,
+    /// preserving the RLS tenant-bind hop (`app.current_tenant` GUC).
+    ///
+    /// # Errors
+    /// Returns [`wyrd_sql::SqlError`] when acquiring or binding the transaction fails.
+    pub async fn tenant_conn(
+        &self,
+        data_tenant_id: DataTenantId,
+    ) -> Result<TenantConn<'_>, SqlError> {
+        self.wyrd.tenant_conn(data_tenant_id).await
     }
 
     /// Borrow the Wyrd control-plane handle.
@@ -73,5 +99,18 @@ impl ServerPostgres {
     #[must_use]
     pub fn vala_pool(&self) -> &PgPool {
         self.vala.pool()
+    }
+
+    /// Build a lazy `ServerPostgres` from a single pool for offline unit tests.
+    ///
+    /// Both `WyrdPostgres` and `ValaPostgres` share the same lazy pool, which
+    /// will never actually connect unless a test exercises a DB path. Use this in
+    /// unit tests that need an `AppState` but make no DB calls.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn lazy_for_tests(app_pool: PgPool) -> Self {
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        Self::from_parts(wyrd, vala)
     }
 }

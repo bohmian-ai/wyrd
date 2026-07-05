@@ -107,7 +107,13 @@ pub async fn login(
     Query(query): Query<LoginQuery>,
 ) -> Result<Response, WyrdErrorResponse> {
     let tenant_id = resolve_login_tenant(&state, &headers).await?;
-    let trusted = crate::auth::trusted_issuer(&state, tenant_id, &query.issuer).await?;
+    let trusted = wyrd_auth::issuer::trusted_issuer(
+        state.auth.trusted_issuer_resolver.as_deref(),
+        tenant_id,
+        &query.issuer,
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)?;
     let provider = discover_provider(&trusted).await?;
     let redirect_uri = callback_redirect_uri(&headers)?;
     let state_key = auth_state_key();

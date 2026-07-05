@@ -219,7 +219,11 @@ async fn create_trusted_issuer(
     caller: AuthenticatedPrincipal,
     Json(request): Json<CreateTrustedIssuerRequest>,
 ) -> Result<Json<TrustedIssuerView>, WyrdErrorResponse> {
-    crate::auth::require_service_accounts_write(&caller.principal, "manage trusted issuers")?;
+    wyrd_auth::service_accounts::require_service_accounts_write(
+        &caller.principal,
+        "manage trusted issuers",
+    )
+    .map_err(WyrdErrorResponse::from)?;
 
     // The only network call on any admin path, and only at create: discovery
     // resolves jwks_uri. A runtime read must never re-discover.
@@ -262,7 +266,11 @@ async fn list_trusted_issuers(
     State(state): State<AppState>,
     caller: AuthenticatedPrincipal,
 ) -> Result<Json<Vec<TrustedIssuerView>>, WyrdErrorResponse> {
-    crate::auth::require_service_accounts_write(&caller.principal, "read trusted issuers")?;
+    wyrd_auth::service_accounts::require_service_accounts_write(
+        &caller.principal,
+        "read trusted issuers",
+    )
+    .map_err(WyrdErrorResponse::from)?;
 
     let mut conn = acquire_conn(&state, &caller).await?;
     let rows = trusted_issuers_for_tenant(&mut conn)
@@ -285,7 +293,11 @@ async fn delete_trusted_issuer_route(
     caller: AuthenticatedPrincipal,
     Query(query): Query<DeleteIssuerQuery>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
-    crate::auth::require_service_accounts_write(&caller.principal, "delete trusted issuers")?;
+    wyrd_auth::service_accounts::require_service_accounts_write(
+        &caller.principal,
+        "delete trusted issuers",
+    )
+    .map_err(WyrdErrorResponse::from)?;
 
     let issuer = normalize_issuer(&query.issuer);
     let mut conn = acquire_conn(&state, &caller).await?;
@@ -325,7 +337,11 @@ async fn create_workload_binding(
     caller: AuthenticatedPrincipal,
     Json(request): Json<CreateWorkloadBindingRequest>,
 ) -> Result<Json<WorkloadBindingView>, WyrdErrorResponse> {
-    crate::auth::require_service_accounts_write(&caller.principal, "manage workload bindings")?;
+    wyrd_auth::service_accounts::require_service_accounts_write(
+        &caller.principal,
+        "manage workload bindings",
+    )
+    .map_err(WyrdErrorResponse::from)?;
 
     let binding = WorkloadBinding {
         tenant_id: caller.principal.tenant_id,
@@ -354,7 +370,11 @@ async fn list_workload_bindings(
     caller: AuthenticatedPrincipal,
     Query(filter): Query<BindingFilter>,
 ) -> Result<Json<Vec<WorkloadBindingView>>, WyrdErrorResponse> {
-    crate::auth::require_service_accounts_write(&caller.principal, "read workload bindings")?;
+    wyrd_auth::service_accounts::require_service_accounts_write(
+        &caller.principal,
+        "read workload bindings",
+    )
+    .map_err(WyrdErrorResponse::from)?;
 
     // Normalize the issuer filter to the stored form so a trailing slash does
     // not silently miss; the subject is matched verbatim.
@@ -381,7 +401,11 @@ async fn delete_workload_binding_route(
     caller: AuthenticatedPrincipal,
     Query(query): Query<BindingQuery>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
-    crate::auth::require_service_accounts_write(&caller.principal, "delete workload bindings")?;
+    wyrd_auth::service_accounts::require_service_accounts_write(
+        &caller.principal,
+        "delete workload bindings",
+    )
+    .map_err(WyrdErrorResponse::from)?;
 
     let issuer = normalize_issuer(&query.issuer);
     let mut conn = acquire_conn(&state, &caller).await?;

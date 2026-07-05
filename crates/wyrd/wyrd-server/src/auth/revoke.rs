@@ -6,7 +6,6 @@ use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 
-use crate::auth::require_service_accounts_write;
 use crate::auth::revocation_listener::notify_principal_revoked;
 use crate::components::auth::AuthenticatedPrincipal;
 use crate::http::error::WyrdErrorResponse;
@@ -21,7 +20,11 @@ pub async fn revoke_principal(
 ) -> Result<(), WyrdErrorResponse> {
     let tenant = caller.principal.tenant_id;
 
-    require_service_accounts_write(&caller.principal, "revoke principals")?;
+    wyrd_auth::service_accounts::require_service_accounts_write(
+        &caller.principal,
+        "revoke principals",
+    )
+    .map_err(WyrdErrorResponse::from)?;
 
     let mut conn = acquire_conn(&state, tenant).await?;
     let kind = revoke_principal_in_conn(&mut conn, target_id, tenant)

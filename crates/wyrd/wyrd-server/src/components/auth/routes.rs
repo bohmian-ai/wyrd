@@ -263,7 +263,11 @@ async fn issue_key(
     request_id: Option<Extension<RequestId>>,
     Json(request): Json<IssueKeyRequest>,
 ) -> Result<Json<wyrd_spec::auth::IssueKeyResponse>, WyrdErrorResponse> {
-    crate::auth::require_service_accounts_write(&caller.principal, "issue API keys")?;
+    wyrd_auth::service_accounts::require_service_accounts_write(
+        &caller.principal,
+        "issue API keys",
+    )
+    .map_err(WyrdErrorResponse::from)?;
 
     let request_id_str: String;
     let req_id = match request_id.as_ref() {

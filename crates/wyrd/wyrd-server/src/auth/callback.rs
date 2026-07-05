@@ -77,7 +77,13 @@ pub async fn exchange_authorization_code(
         };
         let issuer = wyrd_spec::auth::IssuerUrl::new(login_state.issuer.clone())
             .map_err(|_| invalid_token("stored issuer URL is invalid"))?;
-        let trusted = crate::auth::trusted_issuer(state, tenant_id, &issuer).await?;
+        let trusted = wyrd_auth::issuer::trusted_issuer(
+            state.auth.trusted_issuer_resolver.as_deref(),
+            tenant_id,
+            &issuer,
+        )
+        .await
+        .map_err(WyrdErrorResponse::from)?;
         let provider = discover_provider(&trusted).await?;
         let id_token = exchange_code_for_id_token(&provider, &trusted, &login_state, code).await?;
         finish_authorization_code_exchange(

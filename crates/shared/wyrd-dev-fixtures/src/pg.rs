@@ -139,13 +139,13 @@ impl PgFixture {
         tenant_slug: String,
     ) -> Result<Self, FixtureError> {
         let test_db = TestDatabase::create().await?;
-        let shared = test_db.connect_handles().await?;
-        seed_tenant(&shared.db.platform_admin, data_tenant_id, &tenant_slug).await?;
+        let handles = test_db.connect_handles().await?;
+        seed_tenant(&handles.platform_admin, data_tenant_id, &tenant_slug).await?;
 
         Ok(Self {
-            platform_admin_pool: shared.db.platform_admin.clone(),
-            wyrd: shared.db.wyrd.clone(),
-            vala: shared.vala,
+            platform_admin_pool: handles.platform_admin,
+            wyrd: handles.wyrd,
+            vala: handles.vala,
             data_tenant_id,
             tenant_slug,
             _test_db: test_db,
@@ -159,8 +159,9 @@ struct TestDatabase {
 }
 
 struct TestDbHandles {
-    db: wyrd_sql::testing::SharedDb,
+    wyrd: WyrdPostgres,
     vala: ValaPostgres,
+    platform_admin: PgPool,
 }
 
 impl TestDatabase {
@@ -195,29 +196,13 @@ impl TestDatabase {
         let dsns = self.resolved_dsns()?;
         let wyrd = WyrdPostgres::connect_from_dsns(&dsns).await?;
         let vala = ValaPostgres::connect_after_wyrd(&dsns).await?;
-        let migrator_dsn = database_dsn(&resolved_external_test_dsns()?.migrator, &self.name)?;
-        let migrator = build_pool(
-            migrator_dsn.expose_secret(),
-            PoolConfig::migrator_defaults(),
-        )
-        .await
-        .map_err(SqlError::Connect)?;
-        let app = wyrd.app_pool().clone();
         let platform_admin = wyrd
             .platform_admin_pool()
             .cloned()
             .ok_or_else(|| SqlError::InvariantViolation {
                 detail: "test DB env unset (WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD); platform-admin pool is required for tenant seeding".to_owned(),
             })?;
-        Ok(TestDbHandles {
-            db: wyrd_sql::testing::SharedDb {
-                migrator,
-                app,
-                platform_admin,
-                wyrd,
-            },
-            vala,
-        })
+        Ok(TestDbHandles { wyrd, vala, platform_admin })
     }
 
     async fn migrate(&self, base: &ResolvedDsns) -> Result<(), SqlError> {

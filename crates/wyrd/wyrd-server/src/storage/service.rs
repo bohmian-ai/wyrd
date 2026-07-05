@@ -1367,10 +1367,9 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
-        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
-        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
-        let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
+        let postgres = Arc::new(ServerPostgres::lazy_for_tests(
+            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
+        ));
         let state = AppState::new(postgres, Arc::clone(&storage));
         let tenant = DataTenantId::new_v7();
         let validated = ValidatedPath {
@@ -1429,10 +1428,9 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
-        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
-        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
-        let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
+        let postgres = Arc::new(ServerPostgres::lazy_for_tests(
+            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
+        ));
         let state = AppState::new(postgres, Arc::clone(&storage));
         let tenant = DataTenantId::new_v7();
         let validated = ValidatedPath {
@@ -1468,10 +1466,9 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
-        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
-        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
-        let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
+        let postgres = Arc::new(ServerPostgres::lazy_for_tests(
+            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
+        ));
         let state = AppState::new(postgres, Arc::clone(&storage));
         let caller = read_caller();
         let path = tenant_path::build(
@@ -1520,10 +1517,9 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
-        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
-        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
-        let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
+        let postgres = Arc::new(ServerPostgres::lazy_for_tests(
+            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
+        ));
         let state = AppState::new(postgres, Arc::clone(&storage));
         let caller = caller_with_permissions([]);
         let path = tenant_path::build(
@@ -1554,10 +1550,9 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
-        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
-        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
-        let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
+        let postgres = Arc::new(ServerPostgres::lazy_for_tests(
+            PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
+        ));
         let state = AppState::new(postgres, Arc::clone(&storage));
         let caller = caller_with_permissions([]);
         let path = tenant_path::build(

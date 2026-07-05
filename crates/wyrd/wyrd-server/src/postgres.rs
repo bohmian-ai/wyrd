@@ -100,4 +100,17 @@ impl ServerPostgres {
     pub fn vala_pool(&self) -> &PgPool {
         self.vala.pool()
     }
+
+    /// Build a lazy `ServerPostgres` from a single pool for offline unit tests.
+    ///
+    /// Both `WyrdPostgres` and `ValaPostgres` share the same lazy pool, which
+    /// will never actually connect unless a test exercises a DB path. Use this in
+    /// unit tests that need an `AppState` but make no DB calls.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn lazy_for_tests(app_pool: PgPool) -> Self {
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        Self::from_parts(wyrd, vala)
+    }
 }

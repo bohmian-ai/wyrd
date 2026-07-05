@@ -240,9 +240,7 @@ fn authz_body(target: &CardRef) -> serde_json::Value {
 }
 
 fn test_state(pool: sqlx::PgPool) -> AppState {
-    let wyrd = wyrd_sql::WyrdPostgres::from_pools(pool.clone(), None);
-    let vala = vala_sql::ValaPostgres::from_pools(pool.clone(), None);
-    let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
+    let postgres = Arc::new(ServerPostgres::lazy_for_tests(pool.clone()));
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
     let issuing_key = Arc::new(

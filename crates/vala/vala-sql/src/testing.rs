@@ -29,12 +29,7 @@ fn resolved_test_dsns() -> Result<wyrd_sql::dsn::ResolvedDsns, SqlError> {
 /// Returns [`SqlError`] when the shared Wyrd DB cannot be prepared or Vala
 /// migrations fail.
 pub async fn shared() -> Result<wyrd_sql::testing::SharedDb, SqlError> {
-    let db = wyrd_sql::testing::shared().await?;
-    // resolve again because SharedDb does not expose its ResolvedDsns
-    let dsns = resolved_test_dsns()?;
-    let vala = crate::ValaPostgres::connect_after_wyrd(&dsns).await?;
-    drop(vala);
-    Ok(db)
+    Ok(shared_handles().await?.db)
 }
 
 /// Shared handles with Wyrd and Vala migrations guaranteed applied once.

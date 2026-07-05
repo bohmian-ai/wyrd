@@ -7,6 +7,7 @@ use wyrd_storage::sweeper::{SWEEPER_LEADER_LOCK_KEY, Sweeper, SweeperConfig};
 use wyrd_storage::{StorageHandle, tenant_path};
 
 #[tokio::test]
+#[ignore = "requires Postgres (PgFixture); run via mise test:sql"]
 async fn tick_sweeps_expired_uploads_and_reaps_idempotency_rows() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let admin_pool = fixture.platform_admin_pool().clone();
@@ -84,6 +85,7 @@ async fn tick_sweeps_expired_uploads_and_reaps_idempotency_rows() {
 }
 
 #[tokio::test]
+#[ignore = "requires Postgres (PgFixture); run via mise test:sql"]
 async fn sweeper_skips_audit_when_upload_already_completed() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let admin_pool = fixture.platform_admin_pool().clone();

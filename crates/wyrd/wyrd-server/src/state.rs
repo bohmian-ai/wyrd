@@ -197,12 +197,12 @@ impl AppState {
 pub enum ProductionValidationError {
     /// Stub allow policy hook is mounted in a production build.
     #[error(
-        "AppState.policy_hook is StubAllowPolicyHook in a production build; install a real PolicyHook"
+        "authz.policy_hook is StubAllowPolicyHook in a production build; install a real PolicyHook"
     )]
     StubPolicyHook,
     /// Noop audit writer is mounted in a production build.
     #[error(
-        "AppState.audit_writer is NoopAuthzAuditWriter in a production build; install a real AuthzAuditWriter"
+        "authz.audit_writer is NoopAuthzAuditWriter in a production build; install a real AuthzAuditWriter"
     )]
     NoopAuditWriter,
     /// Request-id propagation is enabled with no trusted upstream CIDRs.
@@ -210,12 +210,12 @@ pub enum ProductionValidationError {
     UntrustedRequestIdEdge,
     /// Token verifier is absent in a production build.
     #[error(
-        "AppState.token_verifier is None in a production build; auth-plan boot must install it"
+        "auth.token_verifier is None in a production build; auth-plan boot must install it"
     )]
     MissingTokenVerifier,
     /// Preview auth is still enabled in a production build.
     #[error(
-        "AppState.allow_preview_auth is true in a production build; clear WYRD_AUTH_ALLOW_PREVIEW"
+        "auth.allow_preview is true in a production build; clear WYRD_AUTH_ALLOW_PREVIEW"
     )]
     PreviewAuthEnabled,
 }

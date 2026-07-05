@@ -16,7 +16,7 @@ use http_body_util::{BodyExt, LengthLimitError, Limited};
 use tower::{Layer, Service};
 use wyrd_spec::error::WyrdError;
 
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 
 /// Tower layer that wraps a service with the Wyrd-owned body size limiter.
 #[derive(Clone)]

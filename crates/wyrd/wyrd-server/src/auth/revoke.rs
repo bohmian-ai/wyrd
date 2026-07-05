@@ -9,7 +9,7 @@ use wyrd_spec::error::WyrdError;
 use crate::auth::AuthenticatedPrincipal;
 use crate::auth::require_service_accounts_write;
 use crate::auth::revocation_listener::notify_principal_revoked;
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{

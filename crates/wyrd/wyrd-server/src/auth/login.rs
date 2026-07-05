@@ -20,7 +20,7 @@ use wyrd_spec::ids::TenantSlug;
 use wyrd_sql::queries::auth::{insert_login_state, take_login_state};
 use wyrd_sql::{SqlError, TenantConn};
 
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Short-lived state row stored server-side during the OIDC login flow.

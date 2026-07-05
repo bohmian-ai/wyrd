@@ -24,7 +24,7 @@ use wyrd_sql::{SqlError, TenantConn};
 
 use crate::auth::exchange_api_key::{ExchangedToken, role_refs, token_hash};
 use crate::auth::login::{LoginStateEntry, PgLoginStateStore};
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 const ACCESS_TTL: ChronoDuration = ChronoDuration::seconds(15 * 60);
@@ -564,7 +564,7 @@ mod tests {
     use crate::auth::login::{LoginStateEntry, PgLoginStateStore};
     use crate::auth::permission_resolver::SqlPermissionResolver;
     use crate::auth::pg_resolvers::{PgIssuerResolver, issuer_write_from_trusted};
-    use crate::error::WyrdErrorResponse;
+    use crate::http::error::WyrdErrorResponse;
     use crate::state::AppState;
 
     use super::{

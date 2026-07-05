@@ -14,7 +14,7 @@ use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::auth::pg_resolvers::PgIssuerResolver;
 use crate::auth::state::{ServerAuth, ServerAuthz};
 use crate::config::DeploymentProfile;
-use crate::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter, new_run_map};
+use crate::components::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter, new_run_map};
 use crate::health::ReadinessSnapshot;
 use crate::postgres::ServerPostgres;
 

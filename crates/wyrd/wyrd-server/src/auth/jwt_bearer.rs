@@ -25,7 +25,7 @@ use crate::auth::exchange_api_key::{
     issue_for_subject, role_refs,
 };
 use crate::auth::issue_api_key::principal_kind_for_card;
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Workload OIDC `jwt-bearer` exchange service.

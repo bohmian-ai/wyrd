@@ -44,15 +44,15 @@ use wyrd_sql::{SqlError, TenantConn};
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Default JWKS key-cache TTL when a create request omits `jwks_ttl_secs`.
 const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(3600);
 
-/// Mount the tenant-admin CRUD routes into an existing `/v1` router.
-pub fn mount(router: Router<AppState>) -> Router<AppState> {
-    router
+/// Build the tenant-admin CRUD routes for the `/v1` group.
+pub fn admin_router() -> Router<AppState> {
+    Router::new()
         .route(
             "/admin/trusted-issuers",
             post(create_trusted_issuer)

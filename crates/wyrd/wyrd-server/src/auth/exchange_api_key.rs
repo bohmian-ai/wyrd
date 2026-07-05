@@ -625,7 +625,7 @@ pub async fn map_exchange_error_to_wyrd(
 impl From<DelegateError> for WyrdError {
     fn from(error: DelegateError) -> Self {
         match error {
-            DelegateError::InvalidSubjectToken(error) => crate::error::auth_error_to_wyrd(error),
+            DelegateError::InvalidSubjectToken(error) => crate::http::error::auth_error_to_wyrd(error),
             DelegateError::SubjectNotFound => WyrdError::PrincipalNotFound {
                 message: "requested principal not found in tenant".to_owned(),
                 details: json!({}),

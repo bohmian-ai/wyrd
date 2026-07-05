@@ -11,8 +11,23 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::error::WyrdError;
 
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
+
+use axum::Router;
+use axum::routing::get;
+
+/// Build unprotected health routes.
+pub fn health_router() -> Router<AppState> {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+}
+
+/// Basic liveness endpoint.
+pub async fn healthz() -> &'static str {
+    "ok"
+}
 
 /// Stable reason codes surfaced in the `/readyz` body.
 ///

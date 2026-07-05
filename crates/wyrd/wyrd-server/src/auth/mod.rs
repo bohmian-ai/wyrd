@@ -1,9 +1,6 @@
 //! Authentication extractors for Wyrd HTTP handlers.
 
-pub mod admin;
-pub mod audit_writer;
 pub mod callback;
-pub mod caller_extractor;
 pub(crate) mod card_scope;
 pub mod exchange_api_key;
 pub mod issue_api_key;
@@ -11,24 +8,16 @@ pub mod jwt_bearer;
 pub mod login;
 pub mod permission_resolver;
 pub mod pg_resolvers;
-pub mod policy_hook;
-pub mod principal_extractor;
 pub mod refresh;
 pub mod repo;
 pub mod revocation_listener;
 pub mod revocation_resolver;
 pub mod revoke;
 pub mod roles;
-pub mod routes;
 pub mod seed;
-pub mod state;
-pub(crate) mod token_extract;
 
-pub use caller_extractor::Caller;
-pub use principal_extractor::AuthenticatedPrincipal;
-pub use state::{ServerAuth, ServerAuthz};
-
-use crate::error::WyrdErrorResponse;
+use crate::components::auth::AuthenticatedPrincipal;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use wyrd_auth_oidc::{IssuerConfigResolver, TrustedIssuer};
 use wyrd_runtime::{Permission, Principal};

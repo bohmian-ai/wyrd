@@ -96,7 +96,7 @@ pub fn wyrd_error_response_from_parts(
             {
                 response.headers_mut().insert(
                     axum::http::header::HeaderName::from_static(
-                        crate::middleware::request_id::REQUEST_ID_HEADER,
+                        crate::http::middleware::request_id::REQUEST_ID_HEADER,
                     ),
                     val,
                 );

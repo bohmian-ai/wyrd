@@ -9,7 +9,7 @@ use wyrd_auth_verify::AccessTokenClaims;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 
 pub(crate) const WYRD_ACCESS_TOKEN_HEADER: HeaderName =
     HeaderName::from_static("x-wyrd-access-token");

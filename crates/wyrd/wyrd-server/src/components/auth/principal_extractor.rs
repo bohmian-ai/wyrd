@@ -3,7 +3,7 @@ use axum::http::request::Parts;
 use wyrd_runtime::Principal;
 
 use crate::auth::token_extract::verify_authenticated_principal;
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Server-owned extractor wrapper for an authenticated Wyrd principal.
@@ -55,7 +55,7 @@ mod tests {
     use wyrd_spec::DataTenantId;
 
     use crate::auth::permission_resolver::SqlPermissionResolver;
-    use crate::error::WyrdErrorResponse;
+    use crate::http::error::WyrdErrorResponse;
 
     use super::AuthenticatedPrincipal;
 

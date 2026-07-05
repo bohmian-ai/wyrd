@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -38,12 +38,12 @@ use super::error::{
 use super::resolver;
 use super::state::{MAX_CONCURRENT_RUNS, RunEntry, sweep_and_count_tenant};
 
-/// Mount the four eval pull-protocol routes into an existing `/v1` router.
+/// Build the four eval pull-protocol routes for the `/v1` group.
 ///
 /// Mirrors `crate::storage::routes::mount`. Every route resolves the principal
 /// per-handler; there is no group-level auth layer to rely on.
-pub fn mount(router: Router<AppState>, _state: &AppState) -> Router<AppState> {
-    router
+pub fn eval_router() -> Router<AppState> {
+    Router::new()
         .route("/eval/runs", post(open))
         .route("/eval/runs/{run_id}/next", post(next))
         .route("/eval/runs/{run_id}/agent-turn", post(agent_turn))

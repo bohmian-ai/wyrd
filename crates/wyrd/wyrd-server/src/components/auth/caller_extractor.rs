@@ -6,7 +6,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
 use crate::auth::AuthenticatedPrincipal;
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Authenticated caller context used by tenant-scoped service code.

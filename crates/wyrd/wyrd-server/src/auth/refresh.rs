@@ -28,7 +28,7 @@ use crate::auth::exchange_api_key::{
     ExchangedToken, IssueOrSqlError, TokenExchangeSettings, principal_kind_wire, role_refs,
     token_hash,
 };
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 
 /// Refresh-token rotation service.
 pub struct RefreshTokens {

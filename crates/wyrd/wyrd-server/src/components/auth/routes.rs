@@ -3,6 +3,8 @@
 use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
 use axum::{Json, Router};
+use std::sync::Arc;
+
 use base64::Engine;
 use secrecy::SecretString;
 use uuid::Uuid;
@@ -10,6 +12,8 @@ use wyrd_auth_verify::AccessTokenClaims;
 use wyrd_spec::auth::{CallbackQuery, IssueKeyRequest, TokenRequest, TokenResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
+use tower_governor::GovernorLayer;
+use tower_governor::governor::GovernorConfigBuilder;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::auth::callback::exchange_authorization_code;
@@ -22,16 +26,25 @@ use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
 use crate::auth::jwt_bearer::JwtBearer;
 use crate::auth::login::login as login_handler;
 use crate::auth::refresh::{RefreshTokens, tenant_from_refresh_jwt};
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Build auth routes.
-pub fn router() -> Router<AppState> {
+pub fn auth_router() -> Router<AppState> {
+    let auth_governor = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(10)
+            .burst_size(20)
+            .finish()
+            .expect("static auth governor config is valid"),
+    );
+
     Router::new()
         .route("/auth/login", axum::routing::get(login_handler))
         .route("/auth/callback", axum::routing::get(callback))
         .route("/auth/token", axum::routing::post(token))
         .route("/auth/issue-key", axum::routing::post(issue_key))
+        .layer(GovernorLayer::new(auth_governor))
 }
 
 async fn token(

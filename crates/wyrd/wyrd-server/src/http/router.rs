@@ -1,45 +1,35 @@
 //! Axum router namespace for Wyrd server surfaces.
 
-use std::sync::Arc;
-
 use axum::Router;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::Request;
 use axum::middleware;
-use axum::routing::get;
 use tower::ServiceBuilder;
 use tower::limit::ConcurrencyLimitLayer;
 use tower::load_shed::LoadShedLayer;
 use tower::timeout::TimeoutLayer;
-use tower_governor::GovernorLayer;
-use tower_governor::governor::GovernorConfigBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use wyrd_spec::error::WyrdError;
 
-use crate::error::WyrdErrorResponse;
+use crate::components::admin::admin_router;
+use crate::components::auth::auth_router;
+use crate::components::authz::authz_router;
+use crate::components::eval::eval_router;
+use crate::components::health::health_router;
+use crate::components::storage::storage_router;
+use crate::http::error::WyrdErrorResponse;
+use crate::http::middleware::authenticate::require_authenticated;
 use crate::state::AppState;
 
 /// Build the HTTP router with shared server state.
 pub fn build_router(state: AppState) -> Router {
     // Unprotected: /healthz and /readyz skip the fallible middleware stack so
     // they can respond even when inner layers are under pressure or broken.
-    let unprotected = Router::new()
-        .route("/healthz", get(crate::healthz))
-        .route("/readyz", get(crate::health::readyz))
-        .layer(CatchPanicLayer::custom(crate::error::wyrd_panic_response));
+    let unprotected = health_router()
+        .layer(CatchPanicLayer::custom(crate::http::error::wyrd_panic_response));
 
-    // Per-peer rate limit applied only to auth endpoints (token exchange,
-    // API keys). Keyed by ConnectInfo<SocketAddr> via tower_governor's default
-    // PeerIpKeyExtractor: 10 req/s sustained per peer, burst 20.
-    let auth_governor = Arc::new(
-        GovernorConfigBuilder::default()
-            .per_second(10)
-            .burst_size(20)
-            .finish()
-            .expect("static auth governor config is valid"),
-    );
-    let auth_routes = crate::auth::routes::router().layer(GovernorLayer::new(auth_governor));
+    let auth_routes = auth_router();
 
     // Default-deny: authentication is a property of the whole /v1 nest, not any
     // single handler. Attaching require_authenticated to v1_group *after* its
@@ -47,15 +37,16 @@ pub fn build_router(state: AppState) -> Router {
     // are rejected with 401 before v1_not_found runs (no route-existence oracle).
     // attach_request_id remains outermost on `protected`, so the RequestId
     // extension is already present when this layer runs.
-    let v1_group = crate::auth::admin::mount(crate::routes::authz::routes::mount(
-        crate::eval::routes::mount(crate::storage::routes::mount(Router::new(), &state), &state),
-        &state,
-    ))
-    .fallback(v1_not_found)
-    .layer(middleware::from_fn_with_state(
-        state.clone(),
-        crate::middleware::authenticate::require_authenticated,
-    ));
+    let v1_group = Router::new()
+        .merge(storage_router(&state))
+        .merge(eval_router())
+        .merge(authz_router())
+        .merge(admin_router())
+        .fallback(v1_not_found)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated,
+        ));
 
     // ServiceBuilder builds the inner error-handling middleware stack as a
     // single layer. Each layer in the builder wraps the one below it; the
@@ -75,11 +66,11 @@ pub fn build_router(state: AppState) -> Router {
     //   7. WyrdBodyLimit — enforces max body size
     //   8. handler
     let inner_stack = ServiceBuilder::new()
-        .layer(HandleErrorLayer::new(crate::error::map_tower_error_to_wyrd))
+        .layer(HandleErrorLayer::new(crate::http::error::map_tower_error_to_wyrd))
         .layer(LoadShedLayer::new())
         .layer(ConcurrencyLimitLayer::new(state.limits.concurrency))
         .layer(TimeoutLayer::new(state.limits.timeout))
-        .layer(crate::middleware::body_limit::wyrd_body_limit(
+        .layer(crate::http::middleware::body_limit::wyrd_body_limit(
             state.limits.body_bytes,
         ));
 
@@ -87,10 +78,10 @@ pub fn build_router(state: AppState) -> Router {
         .merge(auth_routes)
         .nest("/v1", v1_group)
         .layer(inner_stack)
-        .layer(CatchPanicLayer::custom(crate::error::wyrd_panic_response))
+        .layer(CatchPanicLayer::custom(crate::http::error::wyrd_panic_response))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            crate::middleware::request_id::attach_request_id,
+            crate::http::middleware::request_id::attach_request_id,
         ));
 
     Router::new()

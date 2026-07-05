@@ -18,7 +18,7 @@ use wyrd_spec::request_id::RequestId;
 use crate::auth::token_extract::{
     auth_not_configured, extract_wyrd_access_token, tenant_from_unverified_access_token,
 };
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Check a delegated Service/Agent invoke request.

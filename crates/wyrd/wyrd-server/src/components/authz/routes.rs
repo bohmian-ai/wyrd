@@ -5,9 +5,9 @@ use axum::routing::post;
 
 use crate::state::AppState;
 
-/// Mount authz-check and principal management routes into an existing `/v1` router.
-pub fn mount(router: Router<AppState>, _: &AppState) -> Router<AppState> {
-    router
+/// Build authz-check and principal management routes for the `/v1` group.
+pub fn authz_router() -> Router<AppState> {
+    Router::new()
         .route("/authz/check", post(super::check::check_authz))
         .route(
             "/principals/{id}/revoke",

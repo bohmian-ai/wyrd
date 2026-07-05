@@ -16,13 +16,13 @@ use wyrd_spec::storage::{
 use wyrd_storage::BackendConfig;
 
 use crate::auth::Caller;
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use crate::storage::service;
 
-/// Mount storage routes into an existing `/v1` router.
-pub fn mount(router: Router<AppState>, state: &AppState) -> Router<AppState> {
-    let router = router
+/// Build storage routes for the `/v1` group.
+pub fn storage_router(state: &AppState) -> Router<AppState> {
+    let router = Router::new()
         .route("/cards/upload/init", post(init))
         .route("/cards/upload/{id}/part-url", post(part_url))
         .route("/cards/upload/{id}/complete", post(complete))

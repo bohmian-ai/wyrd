@@ -1,7 +1,8 @@
 //! Storage HTTP e2e integration tests.
 //!
 //! Drives the full request chain an SDK client would walk: upload-init →
-//! byte PUT → complete → download-init → byte GET → compare. Env-gated:
+//! byte PUT → complete → download-init → byte GET → compare. The local backend
+//! round trip runs in the normal server gate; emulator/cloud cases are env-gated:
 //!
 //! ```
 //! WYRD_STORAGE_E2E=1 \
@@ -76,9 +77,6 @@ async fn bootstrap_service_jwt(srv: &WyrdTestServer, name: &str, roles: &[&str])
 
 #[tokio::test(flavor = "current_thread")]
 async fn local_backend_upload_download_round_trip() {
-    if skip_unless_e2e() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process().await.expect("start env");
     let token = bootstrap_service_jwt(&srv, "storage-writer", &["writer"]).await;
 

@@ -245,3 +245,115 @@ fn storage_caller(caller: &Caller) -> StorageCaller {
         request_id: caller.request_id.clone(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wyrd_runtime::{PermissionSet, Principal, PrincipalId};
+    use wyrd_semver::VersionBlock;
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::reference::{CardRef, CardRefScope};
+    use wyrd_spec::request_id::RequestId;
+
+    #[test]
+    fn idempotency_key_rejects_non_utf8_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static("idempotency-key"),
+            axum::http::HeaderValue::from_bytes(&[0xFF, 0xFE]).expect("raw bytes header"),
+        );
+
+        let err = extract_idempotency_key(&headers).expect_err("non-UTF-8 key must fail");
+
+        assert_eq!(err.0.status(), 400);
+    }
+
+    #[test]
+    fn idempotency_key_rejects_invalid_key_format() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static("idempotency-key"),
+            axum::http::HeaderValue::from_static("bad"),
+        );
+
+        let err = extract_idempotency_key(&headers).expect_err("invalid key must fail");
+
+        assert_eq!(err.0.status(), 400);
+    }
+
+    #[test]
+    fn local_blob_helpers_require_route_permissions() {
+        let caller = caller_with_permissions(PrincipalKind::User, []);
+
+        let read = authorize_card_read(&caller).expect_err("missing read permission must fail");
+        let write = authorize_card_write(&caller).expect_err("missing write permission must fail");
+
+        assert_eq!(read.0.status(), 403);
+        assert_eq!(write.0.status(), 403);
+    }
+
+    #[test]
+    fn storage_caller_maps_runtime_identity_without_string_prefixing() {
+        let user = caller_with_permissions(PrincipalKind::User, [Permission::card_read()]);
+        let service_ref = card_ref(CardKind::Service, "artifact-writer");
+        let service = caller_with_permissions(
+            PrincipalKind::Service {
+                card_ref: service_ref.clone(),
+                card_ref_scope: CardRefScope::own(&service_ref),
+            },
+            [Permission::card_write()],
+        );
+        let agent_ref = card_ref(CardKind::Agent, "artifact-agent");
+        let agent = caller_with_permissions(
+            PrincipalKind::Agent {
+                card_ref: agent_ref.clone(),
+                card_ref_scope: CardRefScope::own(&agent_ref),
+            },
+            [Permission::card_write()],
+        );
+
+        let user_storage = storage_caller(&user);
+        let service_storage = storage_caller(&service);
+        let agent_storage = storage_caller(&agent);
+
+        assert_eq!(user_storage.subject.kind, StoragePrincipalKind::User);
+        assert_eq!(service_storage.subject.kind, StoragePrincipalKind::Service);
+        assert_eq!(agent_storage.subject.kind, StoragePrincipalKind::Agent);
+        assert_eq!(
+            user_storage.subject.principal_id,
+            user.principal.id.as_uuid()
+        );
+        assert_eq!(user_storage.request_id, user.request_id);
+    }
+
+    fn caller_with_permissions(
+        kind: PrincipalKind,
+        permissions: impl IntoIterator<Item = Permission>,
+    ) -> Caller {
+        let tenant = DataTenantId::new_v7();
+        Caller {
+            data_tenant_id: tenant,
+            principal: Principal::new(
+                PrincipalId::new(uuid::Uuid::now_v7()),
+                kind,
+                tenant,
+                vec![],
+                PermissionSet::from_iter(permissions),
+            ),
+            request_id: RequestId::parse(&uuid::Uuid::now_v7().to_string())
+                .expect("request id parses"),
+        }
+    }
+
+    fn card_ref(kind: CardKind, name: &str) -> CardRef {
+        CardRef {
+            kind,
+            name: CardName::new(name).expect("name"),
+            version: VersionBlock::parse("1.0.0").expect("version"),
+            space: SpaceName::new("prod").expect("space"),
+            uid: None,
+        }
+    }
+}

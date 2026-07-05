@@ -30,7 +30,7 @@ use wyrd_storage::signer::{CompletePayload, HeadInfo, MultipartInit, UploadPlanR
 use wyrd_storage::tenant_path::{self, TenantPathError, ValidatedPath};
 
 use crate::AppState;
-use crate::auth::Caller;
+use crate::components::auth::Caller;
 use crate::storage::audit::{self, UploadAuditOperation};
 
 const INIT_TTL_SECS: u64 = 24 * 60 * 60;

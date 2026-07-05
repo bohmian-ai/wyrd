@@ -15,7 +15,7 @@ use wyrd_spec::storage::{
 };
 use wyrd_storage::BackendConfig;
 
-use crate::auth::Caller;
+use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use crate::storage::service;

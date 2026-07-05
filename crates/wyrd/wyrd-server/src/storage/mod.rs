@@ -1,5 +1,4 @@
-//! Server-owned storage service and route adapters.
+//! Server-owned storage service.
 
 pub mod audit;
-pub mod routes;
 pub mod service;

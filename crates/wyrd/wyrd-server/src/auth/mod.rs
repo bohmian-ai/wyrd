@@ -16,7 +16,6 @@ pub mod revoke;
 pub mod roles;
 pub mod seed;
 
-use crate::components::auth::AuthenticatedPrincipal;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use wyrd_auth_oidc::{IssuerConfigResolver, TrustedIssuer};

@@ -3,7 +3,7 @@ use axum::response::IntoResponse;
 use std::borrow::Cow;
 use wyrd_auth_verify::AuthError;
 use wyrd_runtime::{Permission, PermissionDenyReason, PrincipalId};
-use wyrd_server::error::{
+use wyrd_server::http::error::{
     WyrdErrorResponse, auth_error_to_wyrd, permission_deny_reason_to_wyrd, sqlx_error_to_wyrd,
 };
 use wyrd_spec::error::WyrdError;

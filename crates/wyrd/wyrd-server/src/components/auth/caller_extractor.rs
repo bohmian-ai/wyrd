@@ -5,7 +5,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
-use crate::auth::AuthenticatedPrincipal;
+use crate::components::auth::AuthenticatedPrincipal;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -67,8 +67,8 @@ mod tests {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::request_id::RequestId;
 
-    use crate::auth::Caller;
     use crate::auth::permission_resolver::SqlPermissionResolver;
+    use crate::components::auth::Caller;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -134,10 +134,10 @@ mod tests {
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
         )
-        .with_auth(crate::auth::ServerAuth {
+        .with_auth(crate::components::auth::ServerAuth {
             issuing_key: Some(issuing_key),
             token_verifier: Some(verifier),
-            ..crate::auth::ServerAuth::default()
+            ..crate::components::auth::ServerAuth::default()
         })
     }
 

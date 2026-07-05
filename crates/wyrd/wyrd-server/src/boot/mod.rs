@@ -1,5 +1,9 @@
 //! Server boot sequence for SQL-backed Wyrd runtime state.
 
+pub mod auth;
+pub mod bootstrap;
+pub mod issuer;
+
 use std::sync::Arc;
 
 use base64::Engine;
@@ -17,10 +21,10 @@ use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
-use crate::auth::state::ServerAuth;
+use crate::components::auth::ServerAuth;
 use crate::config::WorkloadBindingEntry;
 use crate::postgres::ServerPostgres;
-use crate::state::AppState;
+use crate::state::{AppState, ProductionValidationError};
 
 /// Errors raised while assembling server state.
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +92,9 @@ pub enum ServerBootError {
     /// proceeding with an unusable sealing key.
     #[error("WYRD_SEALING_KEY is invalid: {0}")]
     SealingKey(String),
+    /// Production-profile state validation failed.
+    #[error(transparent)]
+    ProductionValidation(#[from] ProductionValidationError),
 }
 
 /// Resolve database configuration, run migrations, and assemble runtime state.
@@ -204,7 +211,7 @@ pub async fn build_app_state_from_config(
     // an ephemeral key so auth works on a fresh local run. The verifier's
     // external path is wired to the Postgres issuer resolver built above.
     let (issuing_key, verifier) = match config.auth.signing_key.as_ref() {
-        Some(signing_key) => crate::auth_boot::build_auth_handles(
+        Some(signing_key) => crate::boot::auth::build_auth_handles(
             signing_key,
             state.postgres.app_pool(),
             Arc::clone(&issuer_resolver),
@@ -224,7 +231,7 @@ pub async fn build_app_state_from_config(
                  key must never be used in staging or production. Set WYRD_SIGNING_KEY_FILE to \
                  provision a stable key."
             );
-            crate::auth_boot::build_auth_handles(
+            crate::boot::auth::build_auth_handles(
                 &ephemeral,
                 state.postgres.app_pool(),
                 Arc::clone(&issuer_resolver),
@@ -255,9 +262,9 @@ pub async fn build_app_state_from_config(
             }
         })?;
         let tenant_id =
-            crate::issuer_boot::resolve_implicit_tenant(state.postgres.app_pool(), slug).await?;
+            crate::boot::issuer::resolve_implicit_tenant(state.postgres.app_pool(), slug).await?;
 
-        crate::issuer_boot::seed_trusted_issuers(
+        crate::boot::issuer::seed_trusted_issuers(
             state.postgres.app_pool(),
             tenant_id,
             &config.trusted_issuers,
@@ -266,8 +273,12 @@ pub async fn build_app_state_from_config(
         .await?;
 
         let bindings = build_workload_bindings(&config.workload_bindings, tenant_id)?;
-        crate::issuer_boot::seed_workload_bindings(state.postgres.app_pool(), tenant_id, &bindings)
-            .await?;
+        crate::boot::issuer::seed_workload_bindings(
+            state.postgres.app_pool(),
+            tenant_id,
+            &bindings,
+        )
+        .await?;
     }
 
     Ok(state)

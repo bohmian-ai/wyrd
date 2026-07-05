@@ -1106,12 +1106,12 @@ mod tests {
             )),
             Arc::clone(&issuer_resolver),
         );
-        test_state(fixture).with_auth(crate::auth::ServerAuth {
+        test_state(fixture).with_auth(crate::components::auth::ServerAuth {
             issuing_key: Some(issuing_key),
             token_verifier: Some(Arc::new(verifier)),
             trusted_issuer_resolver: Some(issuer_resolver),
             sealing_key: Some(sealing_key),
-            ..crate::auth::ServerAuth::default()
+            ..crate::components::auth::ServerAuth::default()
         })
     }
 

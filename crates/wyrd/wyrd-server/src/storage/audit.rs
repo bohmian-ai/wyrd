@@ -1,6 +1,6 @@
 //! Storage access ledger helpers for request-scoped service code.
 
-use crate::auth::Caller;
+use crate::components::auth::Caller;
 use sqlx::types::Uuid;
 use wyrd_runtime::PrincipalKind;
 use wyrd_spec::error::WyrdError;

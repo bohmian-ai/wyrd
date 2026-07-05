@@ -9,7 +9,7 @@ authors = { workspace = true }
 
 [features]
 enterprise = ["dep:wyrd-enterprise"]
-testing = []
+testing = ["wyrd-sql/testing", "vala-sql/testing"]
 
 [[bin]]
 name = "wyrd-server"

@@ -927,12 +927,12 @@ mod tests {
         );
         test_state(fixture)
             .await
-            .with_auth(crate::auth::ServerAuth {
+            .with_auth(crate::components::auth::ServerAuth {
                 issuing_key: Some(issuing_key),
                 token_verifier: Some(Arc::new(verifier)),
                 trusted_issuer_resolver: Some(issuer_resolver),
                 workload_binding_resolver: Some(binding_resolver),
-                ..crate::auth::ServerAuth::default()
+                ..crate::components::auth::ServerAuth::default()
             })
     }
 

@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::auth::AuthenticatedPrincipal;
+use crate::components::auth::AuthenticatedPrincipal;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use axum::extract::{Path, State};

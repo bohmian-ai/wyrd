@@ -12,10 +12,10 @@ use wyrd_tonic::tonic_health::server::HealthReporter;
 
 use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::auth::pg_resolvers::PgIssuerResolver;
-use crate::auth::state::{ServerAuth, ServerAuthz};
-use crate::config::DeploymentProfile;
+use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter, new_run_map};
-use crate::health::ReadinessSnapshot;
+use crate::components::health::ReadinessSnapshot;
+use crate::config::DeploymentProfile;
 use crate::postgres::ServerPostgres;
 
 /// Production [`TokenVerifier`] specialization: SQL-backed permission resolution
@@ -209,14 +209,10 @@ pub enum ProductionValidationError {
     #[error("AppState.trusted_request_id_propagation=true requires non-empty trusted_upstreams")]
     UntrustedRequestIdEdge,
     /// Token verifier is absent in a production build.
-    #[error(
-        "auth.token_verifier is None in a production build; auth-plan boot must install it"
-    )]
+    #[error("auth.token_verifier is None in a production build; auth-plan boot must install it")]
     MissingTokenVerifier,
     /// Preview auth is still enabled in a production build.
-    #[error(
-        "auth.allow_preview is true in a production build; clear WYRD_AUTH_ALLOW_PREVIEW"
-    )]
+    #[error("auth.allow_preview is true in a production build; clear WYRD_AUTH_ALLOW_PREVIEW")]
     PreviewAuthEnabled,
 }
 

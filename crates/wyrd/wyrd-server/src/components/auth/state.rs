@@ -5,9 +5,9 @@ use wyrd_auth_issue::IssuingKey;
 use wyrd_crypt::SecretKey;
 use wyrd_runtime::{PermissionCheck, RbacCheck};
 
-use crate::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
 use crate::auth::exchange_api_key::TokenExchangeSettings;
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
+use crate::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
 use crate::state::WyrdTokenVerifier;
 
 /// Authentication handles: token issuance + verification + issuer/binding resolution.

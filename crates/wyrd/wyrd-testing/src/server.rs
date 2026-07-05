@@ -27,7 +27,7 @@ use wyrd_crypt::SecretKey;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::{PrincipalId, RbacCheck, RoleRef};
 use wyrd_semver::VersionBlock;
-use wyrd_server::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
+use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
 use wyrd_server::auth::exchange_api_key::TokenExchangeSettings;
 use wyrd_server::auth::issue_api_key::WyrdApiKey;
 use wyrd_server::auth::permission_resolver::SqlPermissionResolver;
@@ -35,8 +35,8 @@ use wyrd_server::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolve
 use wyrd_server::auth::revocation_resolver::SqlRevocationCheck;
 use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::boot::build_workload_bindings;
+use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::config::{IssuerEntry, WorkloadBindingEntry};
-use wyrd_server::issuer_boot::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
@@ -1106,7 +1106,7 @@ impl WyrdTestServerBuilder {
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
         ));
-        let mut state = AppState::new(postgres, storage).with_auth(wyrd_server::auth::ServerAuth {
+        let mut state = AppState::new(postgres, storage).with_auth(wyrd_server::components::auth::ServerAuth {
             allow_preview: self.allow_preview_auth,
             issuing_key: Some(Arc::clone(&issuing_key)),
             token_verifier: Some(Arc::clone(&verifier)),

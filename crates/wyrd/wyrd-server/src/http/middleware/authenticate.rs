@@ -6,7 +6,7 @@ use axum::http::Request;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use crate::auth::token_extract::verify_authenticated_principal;
+use crate::components::auth::token_extract::verify_authenticated_principal;
 use crate::state::AppState;
 
 /// Reject unauthenticated requests before they reach protected handlers.
@@ -55,8 +55,8 @@ mod tests {
     use wyrd_spec::DataTenantId;
 
     use super::require_authenticated;
-    use crate::auth::AuthenticatedPrincipal;
     use crate::auth::permission_resolver::SqlPermissionResolver;
+    use crate::components::auth::AuthenticatedPrincipal;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -167,10 +167,10 @@ mod tests {
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
         )
-        .with_auth(crate::auth::ServerAuth {
+        .with_auth(crate::components::auth::ServerAuth {
             issuing_key: Some(issuing_key),
             token_verifier: Some(verifier),
-            ..crate::auth::ServerAuth::default()
+            ..crate::components::auth::ServerAuth::default()
         })
     }
 

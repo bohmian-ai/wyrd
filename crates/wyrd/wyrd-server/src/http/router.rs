@@ -26,8 +26,9 @@ use crate::state::AppState;
 pub fn build_router(state: AppState) -> Router {
     // Unprotected: /healthz and /readyz skip the fallible middleware stack so
     // they can respond even when inner layers are under pressure or broken.
-    let unprotected = health_router()
-        .layer(CatchPanicLayer::custom(crate::http::error::wyrd_panic_response));
+    let unprotected = health_router().layer(CatchPanicLayer::custom(
+        crate::http::error::wyrd_panic_response,
+    ));
 
     let auth_routes = auth_router();
 
@@ -66,7 +67,9 @@ pub fn build_router(state: AppState) -> Router {
     //   7. WyrdBodyLimit — enforces max body size
     //   8. handler
     let inner_stack = ServiceBuilder::new()
-        .layer(HandleErrorLayer::new(crate::http::error::map_tower_error_to_wyrd))
+        .layer(HandleErrorLayer::new(
+            crate::http::error::map_tower_error_to_wyrd,
+        ))
         .layer(LoadShedLayer::new())
         .layer(ConcurrencyLimitLayer::new(state.limits.concurrency))
         .layer(TimeoutLayer::new(state.limits.timeout))
@@ -78,7 +81,9 @@ pub fn build_router(state: AppState) -> Router {
         .merge(auth_routes)
         .nest("/v1", v1_group)
         .layer(inner_stack)
-        .layer(CatchPanicLayer::custom(crate::http::error::wyrd_panic_response))
+        .layer(CatchPanicLayer::custom(
+            crate::http::error::wyrd_panic_response,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::http::middleware::request_id::attach_request_id,

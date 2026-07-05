@@ -15,7 +15,7 @@ use wyrd_spec::card::policy::PolicyDecision;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
-use crate::auth::token_extract::{
+use crate::components::auth::token_extract::{
     auth_not_configured, extract_wyrd_access_token, tenant_from_unverified_access_token,
 };
 use crate::http::error::WyrdErrorResponse;

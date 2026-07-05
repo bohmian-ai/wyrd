@@ -7,15 +7,14 @@ use std::sync::Arc;
 
 use base64::Engine;
 use secrecy::SecretString;
+use tower_governor::GovernorLayer;
+use tower_governor::governor::GovernorConfigBuilder;
 use uuid::Uuid;
 use wyrd_auth_verify::AccessTokenClaims;
 use wyrd_spec::auth::{CallbackQuery, IssueKeyRequest, TokenRequest, TokenResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
-use tower_governor::GovernorLayer;
-use tower_governor::governor::GovernorConfigBuilder;
 
-use crate::auth::AuthenticatedPrincipal;
 use crate::auth::callback::exchange_authorization_code;
 use crate::auth::card_scope::{
     MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_DELEGATION, MINT_KIND_REFRESH,
@@ -26,6 +25,7 @@ use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
 use crate::auth::jwt_bearer::JwtBearer;
 use crate::auth::login::login as login_handler;
 use crate::auth::refresh::{RefreshTokens, tenant_from_refresh_jwt};
+use crate::components::auth::AuthenticatedPrincipal;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -359,18 +359,18 @@ mod tests {
     use wyrd_spec::reference::CardRef;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
-    use crate::auth::AuthenticatedPrincipal;
+    use crate::components::auth::AuthenticatedPrincipal;
     use crate::state::AppState;
     use axum::Extension;
     use sqlx::Row;
     use wyrd_spec::request_id::RequestId;
     use wyrd_sql::TenantConn;
 
-    use super::{issue_key, router, tenant_from_unverified_access_token};
+    use super::{auth_router, issue_key, tenant_from_unverified_access_token};
 
     #[test]
     fn mounts_token_and_issue_key_routes() {
-        let _router = router();
+        let _router = auth_router();
     }
 
     #[test]

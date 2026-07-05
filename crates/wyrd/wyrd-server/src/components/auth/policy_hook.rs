@@ -44,7 +44,7 @@ mod tests {
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use super::BuildError;
-    use crate::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
+    use crate::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
     use crate::state::AppState;
 
     #[tokio::test]

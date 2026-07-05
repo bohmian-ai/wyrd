@@ -2,7 +2,7 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use wyrd_runtime::Principal;
 
-use crate::auth::token_extract::verify_authenticated_principal;
+use crate::components::auth::token_extract::verify_authenticated_principal;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -166,10 +166,10 @@ mod tests {
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
         )
-        .with_auth(crate::auth::ServerAuth {
+        .with_auth(crate::components::auth::ServerAuth {
             issuing_key: Some(issuing_key),
             token_verifier: Some(verifier),
-            ..crate::auth::ServerAuth::default()
+            ..crate::components::auth::ServerAuth::default()
         })
     }
 

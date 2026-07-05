@@ -12,8 +12,8 @@ use wyrd_auth_verify::{
     public_key_from_pem,
 };
 use wyrd_runtime::PrincipalId;
-use wyrd_server::auth::ServerAuth;
-use wyrd_server::health::{ProbeOutcome, ProbeReason, ReadinessSnapshot};
+use wyrd_server::components::auth::ServerAuth;
+use wyrd_server::components::health::{ProbeOutcome, ProbeReason, ReadinessSnapshot};
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;

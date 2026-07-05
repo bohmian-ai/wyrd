@@ -1124,10 +1124,10 @@ if [ "$count" != "1" ]; then
 fi
 
 case "$matches" in
-  crates/wyrd/wyrd-server/src/error.rs:*'impl IntoResponse for WyrdErrorResponse'*)
+  crates/wyrd/wyrd-server/src/http/error.rs:*'impl IntoResponse for WyrdErrorResponse'*)
     ;;
   *)
-    echo "Wyrd error IntoResponse mapper must stay in wyrd-server/src/error.rs"
+    echo "Wyrd error IntoResponse mapper must stay in wyrd-server/src/http/error.rs"
     printf '%s\n' "$matches"
     exit 1
     ;;
@@ -1142,7 +1142,7 @@ set -e
 
 # 1. Route prefix lock: /api/v1 may only appear in the router mount points, not scattered handlers
 ! rg -n --no-heading -e '/api/v1' crates/wyrd/wyrd-server/src/ \
-    --glob '!router.rs'
+    --glob '!http/router.rs'
 
 # 2. Identity vocabulary (server source only)
 ! rg -n --no-heading -e '\\bActor\\b' crates/wyrd/wyrd-server/src/
@@ -1172,7 +1172,10 @@ test "$COUNT" -eq 1
 
 # 9. Authorization header not consumed by auth/route handlers
 ! rg -n --no-heading -e 'header::AUTHORIZATION' \
-    crates/wyrd/wyrd-server/src/auth/ crates/wyrd/wyrd-server/src/routes/
+    crates/wyrd/wyrd-server/src/auth/ \
+    crates/wyrd/wyrd-server/src/components/auth/ \
+    crates/wyrd/wyrd-server/src/components/admin/ \
+    crates/wyrd/wyrd-server/src/components/authz/
 
 # 10. Wyrd-Caller-Identity not consumed
 ! rg -n --no-heading -e 'Wyrd-Caller-Identity' crates/wyrd/wyrd-server/src/ \
@@ -1187,7 +1190,7 @@ test "$COUNT" -eq 1
 #     Scoped to middleware only — domain error functions in error.rs log raw
 #     sqlx/storage errors deliberately and are excluded from this gate.
 ! rg -n --no-heading -e 'error\\s*=\\s*%error\\b' \
-    crates/wyrd/wyrd-server/src/middleware/
+    crates/wyrd/wyrd-server/src/http/middleware/
 """
 
 
@@ -1254,19 +1257,19 @@ run = """
 set -e
 # from_pools may only be called from the 14 sites below.
 # 2 definition files: wyrd-sql/src/postgres.rs, vala-sql/src/postgres.rs
-# 9 production wiring files: wyrd-server/src/{state,boot,middleware/authenticate,auth/{principal_extractor,caller_extractor,policy_hook,routes},health,postgres}.rs
+# 9 production wiring files: wyrd-server/src/{state,boot/mod,http/middleware/authenticate,components/{auth/{principal_extractor,caller_extractor,policy_hook,routes},health},postgres}.rs
 # 3 test files: wyrd-server/tests/{authz_check_route,grpc_smoke,router_smoke}.rs
 ! rg -n --no-heading -e '\\.from_pools\\(|::from_pools\\(' \
     --glob '!crates/wyrd/wyrd-sql/src/postgres.rs' \
     --glob '!crates/vala/vala-sql/src/postgres.rs' \
     --glob '!crates/wyrd/wyrd-server/src/state.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/boot.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/middleware/authenticate.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/auth/principal_extractor.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/auth/caller_extractor.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/auth/policy_hook.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/auth/routes.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/health.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/boot/mod.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/http/middleware/authenticate.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/components/auth/principal_extractor.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/components/auth/caller_extractor.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/components/auth/policy_hook.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/components/auth/routes.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/components/health/mod.rs' \
     --glob '!crates/wyrd/wyrd-server/src/postgres.rs' \
     --glob '!crates/wyrd/wyrd-server/tests/authz_check_route.rs' \
     --glob '!crates/wyrd/wyrd-server/tests/grpc_smoke.rs' \

@@ -42,8 +42,8 @@ use wyrd_sql::queries::auth::{
 use wyrd_sql::row_types::auth::{TrustedIssuerRow, WorkloadBindingRow};
 use wyrd_sql::{SqlError, TenantConn};
 
-use crate::auth::AuthenticatedPrincipal;
 use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
+use crate::components::auth::AuthenticatedPrincipal;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -601,9 +601,9 @@ mod tests {
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
         )
-        .with_auth(crate::auth::ServerAuth {
+        .with_auth(crate::components::auth::ServerAuth {
             sealing_key: Some(Arc::new(sealing_key())),
-            ..crate::auth::ServerAuth::default()
+            ..crate::components::auth::ServerAuth::default()
         })
     }
 

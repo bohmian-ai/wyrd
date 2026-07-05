@@ -121,9 +121,11 @@ pub struct ServiceComponent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<ComponentSource>,
     /// Component config.
+    /// TODO: does this earn its place?
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub config: BTreeMap<String, NonSecretValue>,
     /// Component credential references.
+    /// TODO: does this earn its place?
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credential_refs: Vec<CredentialRef>,
 }

@@ -202,7 +202,11 @@ impl TestDatabase {
             .ok_or_else(|| SqlError::InvariantViolation {
                 detail: "test DB env unset (WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD); platform-admin pool is required for tenant seeding".to_owned(),
             })?;
-        Ok(TestDbHandles { wyrd, vala, platform_admin })
+        Ok(TestDbHandles {
+            wyrd,
+            vala,
+            platform_admin,
+        })
     }
 
     async fn migrate(&self, base: &ResolvedDsns) -> Result<(), SqlError> {

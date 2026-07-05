@@ -9,8 +9,6 @@ pub mod card;
 pub mod card_ref;
 /// DataCard implementation module.
 pub mod data;
-/// Typed envelope holder modules.
-pub mod envelope;
 mod identity;
 /// ModelCard implementation module.
 pub mod model;

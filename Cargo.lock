@@ -10379,6 +10379,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-auth"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "jsonwebtoken 9.3.1",
+ "moka",
+ "rand 0.9.4",
+ "reqwest 0.12.28",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx 0.9.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+ "wyrd-auth-issue",
+ "wyrd-auth-oidc",
+ "wyrd-auth-verify",
+ "wyrd-crypt",
+ "wyrd-dev-fixtures",
+ "wyrd-runtime",
+ "wyrd-semver",
+ "wyrd-spec",
+ "wyrd-sql",
+]
+
+[[package]]
 name = "wyrd-auth-check"
 version = "0.0.1"
 dependencies = [
@@ -10727,6 +10759,7 @@ dependencies = [
  "vala-eval",
  "vala-sql",
  "wiremock",
+ "wyrd-auth",
  "wyrd-auth-check",
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
@@ -10887,6 +10920,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "wyrd-auth",
  "wyrd-auth-check",
  "wyrd-auth-issue",
  "wyrd-auth-oidc",

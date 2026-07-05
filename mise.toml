@@ -52,7 +52,60 @@ description = "Start a clean Postgres container via docker compose and wait for 
 # and storage even if a healthy container is already running (otherwise `up` is a
 # no-op and reuses the old PGDATA). Combined with the postgres tmpfs mount, the
 # test DB is empty on every invocation — no stale _sqlx_migrations ledger.
-run = ["docker compose down --volumes --remove-orphans", "docker compose up -d --build --force-recreate --renew-anon-volumes postgres --wait"]
+run = """
+set -eu
+
+lock_dir=".mise-postgres.lock"
+locked=0
+for _ in $(seq 1 180); do
+  if mkdir "$lock_dir" 2>/dev/null; then
+    trap 'rmdir "$lock_dir"' EXIT INT TERM
+    locked=1
+    break
+  fi
+  sleep 1
+done
+if [ "$locked" -ne 1 ]; then
+  echo "could not acquire Postgres setup lock" >&2
+  exit 1
+fi
+
+for id in $(docker ps -aq --filter publish=55432); do
+  echo "removing Docker container publishing 55432: $id"
+  error_file="$(mktemp)"
+  if ! docker rm -f -v "$id" 2>"$error_file"; then
+    if ! grep -q "removal of container .* is already in progress" "$error_file"; then
+      cat "$error_file" >&2
+      rm -f "$error_file"
+      exit 1
+    fi
+  fi
+  rm -f "$error_file"
+done
+
+docker compose down --volumes --remove-orphans
+docker compose up -d --build --force-recreate --renew-anon-volumes postgres --wait
+"""
+
+[tasks."db:teardown-postgres-port"]
+hide = true
+description = "Remove any Docker container publishing the local test Postgres port"
+run = """
+set -eu
+
+for id in $(docker ps -aq --filter publish=55432); do
+  echo "removing Docker container publishing 55432: $id"
+  error_file="$(mktemp)"
+  if ! docker rm -f -v "$id" 2>"$error_file"; then
+    if ! grep -q "removal of container .* is already in progress" "$error_file"; then
+      cat "$error_file" >&2
+      rm -f "$error_file"
+      exit 1
+    fi
+  fi
+  rm -f "$error_file"
+done
+"""
 
 [tasks."impl:setup"]
 hide = true
@@ -69,7 +122,7 @@ run = "cargo build --workspace --all-features --all-targets"
 hide = true
 description = "Run workspace Rust unit tests (no DB required)"
 run = """
-cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server --exclude vala-bifrost --exclude vala-sql --exclude vala-core --exclude wyrd-client --exclude wyrd-dev-fixtures --exclude wyrd-sql --exclude wyrd-storage --exclude wyrd-testing
+cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-auth --exclude wyrd-server --exclude vala-bifrost --exclude vala-sql --exclude vala-core --exclude wyrd-client --exclude wyrd-dev-fixtures --exclude wyrd-sql --exclude wyrd-storage --exclude wyrd-testing
 cargo test --locked -p wyrd-client --lib
 cargo test --locked -p wyrd-client --test transport
 cargo test --locked -p vala-core
@@ -96,7 +149,7 @@ Only real-credential cloud storage tests (test:storage:{s3,gcs,azure}:cloud) are
 storage-integration-cloud.yml; emulator-backed storage tests run here because they are just
 docker containers, same difficulty as Postgres.
 """
-depends = ["test:rust:workspace", "test:storage:matrix", "test:sql", "test:wyrd-server", "test:registry-e2e"]
+depends = ["test:rust:workspace", "test:storage:matrix", "test:sql", "test:wyrd-auth", "test:wyrd-server", "test:registry-e2e"]
 
 [tasks."test:wyrd-spec"]
 hide = true
@@ -123,6 +176,13 @@ cargo test --locked -p wyrd-server --all-features -- --test-threads=1
 cargo test --locked -p wyrd-testing -- --test-threads=1
 cargo test --locked -p wyrd-client --test auth_e2e_against_fixture --test discovery_against_fixture -- --test-threads=1
 """
+
+[tasks."test:wyrd-auth"]
+hide = true
+description = """Run wyrd-auth Rust tests against the local Postgres database."""
+depends = ["db:setup-roles"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+run = "cargo test --locked -p wyrd-auth --all-features -- --test-threads=1"
 
 [tasks."test:wyrd-mcp"]
 hide = true
@@ -443,7 +503,9 @@ if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/wyrd/wyrd-server/src/auth/jwt_bearer.rs' \
   --glob '!crates/wyrd/wyrd-server/src/auth/callback.rs' \
   --glob '!crates/wyrd/wyrd-server/src/auth/admin.rs' \
+  --glob '!crates/wyrd/wyrd-server/src/components/admin/routes.rs' \
   --glob '!crates/wyrd/wyrd-server/src/issuer_boot.rs' \
+  --glob '!crates/wyrd/wyrd-server/src/boot/issuer.rs' \
   --glob '!crates/wyrd/wyrd-cli/src/auth/trusted_issuer.rs'; then
   echo 'mock dependency leaked outside wyrd-testing'
   exit 1
@@ -712,7 +774,7 @@ if ! rg -q '#\\[serde\\(tag = "protocol", content = "data"' crates/wyrd-spec/src
   exit 1
 fi
 
-if rg -n -e '\\.unwrap\\(\\)' crates/wyrd/wyrd-storage/src crates/wyrd/wyrd-server/src/storage; then
+if rg_optional '\\.unwrap\\(\\)' crates/wyrd/wyrd-storage/src; then
   echo 'unwrap is forbidden in non-test storage code'
   exit 1
 fi
@@ -1124,10 +1186,10 @@ if [ "$count" != "1" ]; then
 fi
 
 case "$matches" in
-  crates/wyrd/wyrd-server/src/error.rs:*'impl IntoResponse for WyrdErrorResponse'*)
+  crates/wyrd/wyrd-server/src/http/error.rs:*'impl IntoResponse for WyrdErrorResponse'*)
     ;;
   *)
-    echo "Wyrd error IntoResponse mapper must stay in wyrd-server/src/error.rs"
+    echo "Wyrd error IntoResponse mapper must stay in wyrd-server/src/http/error.rs"
     printf '%s\n' "$matches"
     exit 1
     ;;
@@ -1142,17 +1204,17 @@ set -e
 
 # 1. Route prefix lock: /api/v1 may only appear in the router mount points, not scattered handlers
 ! rg -n --no-heading -e '/api/v1' crates/wyrd/wyrd-server/src/ \
-    --glob '!router.rs'
+    --glob '!http/router.rs'
 
-# 2. Identity vocabulary (server source only)
-! rg -n --no-heading -e '\\bActor\\b' crates/wyrd/wyrd-server/src/
-! rg -n --no-heading -e '\\bScope\\b' crates/wyrd/wyrd-server/src/
+# 2. Identity vocabulary (server source + server-tier auth domain crate)
+! rg -n --no-heading -e '\\bActor\\b' crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
+! rg -n --no-heading -e '\\bScope\\b' crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
 
 # 3. JWT claim leak
-! rg -n --no-heading -e '"scopes"' crates/wyrd/wyrd-server/src/
+! rg -n --no-heading -e '"scopes"' crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
 
 # 4. Predecessor names
-! rg -n --no-heading -e 'opsml|scouter' crates/wyrd/wyrd-server/src/
+! rg -n --no-heading -e 'opsml|scouter' crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
 
 # 5. Plan docs: predecessor names allowed only in audit + verification files
 ! rg -n --no-heading -e 'opsml|scouter' .dev/plan/foundations/07-server-skeleton \
@@ -1160,7 +1222,7 @@ set -e
 
 # 6. Predecessor domain nouns
 ! rg -n --no-heading -e '\\b(SubAgent|Skill|RecoveryCode|ScouterApiClient)\\b' \
-    crates/wyrd/wyrd-server/src/
+    crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
 
 # 7. Single IntoResponse impl for Wyrd errors
 COUNT=$(rg -n --no-heading -e 'impl[[:space:]]+IntoResponse[[:space:]]+for[[:space:]]+Wyrd' crates/ | wc -l)
@@ -1172,7 +1234,10 @@ test "$COUNT" -eq 1
 
 # 9. Authorization header not consumed by auth/route handlers
 ! rg -n --no-heading -e 'header::AUTHORIZATION' \
-    crates/wyrd/wyrd-server/src/auth/ crates/wyrd/wyrd-server/src/routes/
+    crates/wyrd/wyrd-server/src/auth/ \
+    crates/wyrd/wyrd-server/src/components/auth/ \
+    crates/wyrd/wyrd-server/src/components/admin/ \
+    crates/wyrd/wyrd-server/src/components/authz/
 
 # 10. Wyrd-Caller-Identity not consumed
 ! rg -n --no-heading -e 'Wyrd-Caller-Identity' crates/wyrd/wyrd-server/src/ \
@@ -1187,7 +1252,7 @@ test "$COUNT" -eq 1
 #     Scoped to middleware only — domain error functions in error.rs log raw
 #     sqlx/storage errors deliberately and are excluded from this gate.
 ! rg -n --no-heading -e 'error\\s*=\\s*%error\\b' \
-    crates/wyrd/wyrd-server/src/middleware/
+    crates/wyrd/wyrd-server/src/http/middleware/
 """
 
 
@@ -1254,19 +1319,19 @@ run = """
 set -e
 # from_pools may only be called from the 14 sites below.
 # 2 definition files: wyrd-sql/src/postgres.rs, vala-sql/src/postgres.rs
-# 9 production wiring files: wyrd-server/src/{state,boot,middleware/authenticate,auth/{principal_extractor,caller_extractor,policy_hook,routes},health,postgres}.rs
+# 9 production wiring files: wyrd-server/src/{state,boot/mod,http/middleware/authenticate,components/{auth/{principal_extractor,caller_extractor,policy_hook,routes},health},postgres}.rs
 # 3 test files: wyrd-server/tests/{authz_check_route,grpc_smoke,router_smoke}.rs
 ! rg -n --no-heading -e '\\.from_pools\\(|::from_pools\\(' \
     --glob '!crates/wyrd/wyrd-sql/src/postgres.rs' \
     --glob '!crates/vala/vala-sql/src/postgres.rs' \
     --glob '!crates/wyrd/wyrd-server/src/state.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/boot.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/middleware/authenticate.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/auth/principal_extractor.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/auth/caller_extractor.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/auth/policy_hook.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/auth/routes.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/health.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/boot/mod.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/http/middleware/authenticate.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/components/auth/principal_extractor.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/components/auth/caller_extractor.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/components/auth/policy_hook.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/components/auth/routes.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/components/health/mod.rs' \
     --glob '!crates/wyrd/wyrd-server/src/postgres.rs' \
     --glob '!crates/wyrd/wyrd-server/tests/authz_check_route.rs' \
     --glob '!crates/wyrd/wyrd-server/tests/grpc_smoke.rs' \

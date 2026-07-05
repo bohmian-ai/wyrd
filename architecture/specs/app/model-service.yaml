@@ -1,0 +1,38 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: churn-prediction-svc
+  version: "1.4.2"
+  space: prod
+  labels:
+    team: churn-ml
+spec:
+  description: HTTP prediction service for churn probability.
+  service_type: api
+  components:
+    # service defines a single model that has already been registered
+    - alias: model
+      ref:
+        kind: Model,
+        name: churn-classifier
+        space: ml-team
+        version: "1.4.2"
+        # we need to be able to search for card_ref by label as well
+        # this is important if one server is shared across environments, etc
+        labels:
+          environment: production
+
+    # service defines an prompt defined in prompt yaml
+    - alias: prompt
+      ref: { kind: Service, name: ddog-sink, version: "1.0.0", space: prod }
+
+  entry_point: acme.churn.service:app
+  deployment:
+    image: { type: str, value: registry.acme.com/churn-svc:1.4.2 }
+    replicas: { type: number, value: 3 }
+  runtime:
+    kind: api
+    mode: in_process
+    strict: true
+    policy:
+      runtime_hooks: true

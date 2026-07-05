@@ -13,7 +13,7 @@ use wyrd_auth_verify::{
 };
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_semver::VersionBlock;
-use wyrd_server::auth::ServerAuth;
+use wyrd_server::components::auth::ServerAuth;
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;

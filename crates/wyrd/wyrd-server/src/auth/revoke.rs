@@ -6,15 +6,12 @@ use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 
-use crate::auth::AuthenticatedPrincipal;
-use crate::auth::require_service_accounts_write;
 use crate::auth::revocation_listener::notify_principal_revoked;
-use crate::error::WyrdErrorResponse;
+use crate::components::auth::AuthenticatedPrincipal;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
+use wyrd_auth::revoke::revoke_principal_in_conn;
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::auth::{
-    revoke_service_account_principal, revoke_user_principal, service_account_by_id, user_by_id,
-};
 
 pub async fn revoke_principal(
     State(state): State<AppState>,
@@ -23,10 +20,16 @@ pub async fn revoke_principal(
 ) -> Result<(), WyrdErrorResponse> {
     let tenant = caller.principal.tenant_id;
 
-    require_service_accounts_write(&caller.principal, "revoke principals")?;
+    wyrd_auth::service_accounts::require_service_accounts_write(
+        &caller.principal,
+        "revoke principals",
+    )
+    .map_err(WyrdErrorResponse::from)?;
 
     let mut conn = acquire_conn(&state, tenant).await?;
-    let kind = revoke_in_conn(&mut conn, target_id, tenant).await?;
+    let kind = revoke_principal_in_conn(&mut conn, target_id, tenant)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
     commit_conn(conn).await?;
 
     fan_out_notify(&state, tenant, kind, target_id).await;
@@ -43,41 +46,6 @@ async fn acquire_conn(
         .tenant_conn(tenant)
         .await
         .map_err(internal_error)
-}
-
-/// Look up `target_id`, write the revocation timestamp, and return the principal kind.
-///
-/// Returns `PrincipalNotFound` when `target_id` does not exist in the tenant.
-async fn revoke_in_conn(
-    conn: &mut TenantConn<'_>,
-    target_id: PrincipalId,
-    tenant: DataTenantId,
-) -> Result<PrincipalKindWire, WyrdErrorResponse> {
-    let id_uuid = target_id.as_uuid();
-
-    if user_by_id(conn, id_uuid).await.ok().flatten().is_some() {
-        revoke_user_principal(conn, id_uuid)
-            .await
-            .map_err(internal_error)?;
-        return Ok(PrincipalKindWire::User);
-    }
-
-    if let Some(row) = service_account_by_id(conn, id_uuid).await.ok().flatten() {
-        revoke_service_account_principal(conn, id_uuid)
-            .await
-            .map_err(internal_error)?;
-        let kind = if row.principal_kind == "agent" {
-            PrincipalKindWire::Agent
-        } else {
-            PrincipalKindWire::Service
-        };
-        return Ok(kind);
-    }
-
-    Err(WyrdErrorResponse::from(WyrdError::PrincipalNotFound {
-        message: format!("principal {target_id} not found in tenant {tenant}"),
-        details: serde_json::json!({ "id": target_id.to_string() }),
-    }))
 }
 
 async fn commit_conn(conn: TenantConn<'_>) -> Result<(), WyrdErrorResponse> {

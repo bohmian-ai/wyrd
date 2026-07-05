@@ -1,0 +1,45 @@
+[package]
+name = "wyrd-auth"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+description = "Server-tier auth domain logic for Wyrd."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+base64 = { workspace = true }
+chrono = { workspace = true }
+jsonwebtoken = { workspace = true }
+moka = { version = "0.12", features = ["future"] }
+rand = { workspace = true }
+reqwest = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true, features = ["std", "v4"] }
+wyrd-auth-issue = { workspace = true }
+wyrd-auth-oidc = { workspace = true }
+wyrd-auth-verify = { workspace = true }
+wyrd-crypt = { path = "../../shared/wyrd-crypt", version = "0.0.1" }
+wyrd-runtime = { workspace = true }
+wyrd-semver = { workspace = true }
+wyrd-spec = { workspace = true }
+wyrd-sql = { workspace = true }
+
+[dev-dependencies]
+wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
+
+[lints]
+workspace = true

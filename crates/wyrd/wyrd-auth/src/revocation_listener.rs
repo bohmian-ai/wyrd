@@ -29,7 +29,7 @@ const CHANNEL: &str = "wyrd_principal_revoked";
 /// the transaction commits.
 ///
 /// # Errors
-/// Returns a SQLx error on database failure.
+/// Returns a `SQLx` error on database failure.
 pub async fn notify_principal_revoked(
     pool: &PgPool,
     tenant: DataTenantId,
@@ -41,7 +41,7 @@ pub async fn notify_principal_revoked(
         PrincipalKindWire::Service => "service",
         PrincipalKindWire::Agent => "agent",
     };
-    let payload = format!("{}/{}/{}", tenant, kind_str, id);
+    let payload = format!("{tenant}/{kind_str}/{id}");
     sqlx::query("SELECT pg_notify($1, $2)")
         .bind(CHANNEL)
         .bind(&payload)
@@ -84,7 +84,7 @@ impl RevocationListener {
     async fn run(self) {
         loop {
             tokio::select! {
-                _ = self.shutdown.cancelled() => {
+                () = self.shutdown.cancelled() => {
                     tracing::info!("revocation listener shutting down");
                     return;
                 }
@@ -106,7 +106,7 @@ impl RevocationListener {
         listener.listen(CHANNEL).await?;
         loop {
             tokio::select! {
-                _ = self.shutdown.cancelled() => return Ok(()),
+                () = self.shutdown.cancelled() => return Ok(()),
                 notification = listener.recv() => {
                     let n = notification?;
                     self.handle_notification(n.payload());
@@ -124,12 +124,9 @@ impl RevocationListener {
             return;
         };
 
-        let tenant = match tenant_str.parse::<DataTenantId>() {
-            Ok(t) => t,
-            Err(_) => {
-                tracing::warn!(%payload, "unparseable tenant in revocation notification");
-                return;
-            }
+        let Ok(tenant) = tenant_str.parse::<DataTenantId>() else {
+            tracing::warn!(%payload, "unparseable tenant in revocation notification");
+            return;
         };
         let kind = match kind_str {
             "user" => PrincipalKindWire::User,
@@ -140,12 +137,9 @@ impl RevocationListener {
                 return;
             }
         };
-        let id = match id_str.parse::<PrincipalId>() {
-            Ok(i) => i,
-            Err(_) => {
-                tracing::warn!(%payload, "unparseable principal id in revocation notification");
-                return;
-            }
+        let Ok(id) = id_str.parse::<PrincipalId>() else {
+            tracing::warn!(%payload, "unparseable principal id in revocation notification");
+            return;
         };
 
         let check = Arc::clone(&self.check);

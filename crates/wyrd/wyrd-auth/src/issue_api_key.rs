@@ -50,7 +50,7 @@ pub struct IssuedApiKey {
 /// API-key issuance failure.
 #[derive(Debug, thiserror::Error)]
 pub enum IssueKeyError {
-    /// No active principal row exists for the CardRef.
+    /// No active principal row exists for the `CardRef`.
     #[error("no principal bound to card_ref {0}")]
     ServiceAccountNotFound(String),
     /// Card kind cannot back a non-human principal.
@@ -215,7 +215,7 @@ impl WyrdApiKey {
 #[error("invalid Wyrd API key")]
 pub struct WyrdApiKeyParseError;
 
-/// Return the non-human principal kind for a CardRef.
+/// Return the non-human principal kind for a `CardRef`.
 pub fn principal_kind_for_card(card_ref: &CardRef) -> Result<&'static str, IssueKeyError> {
     match card_ref.kind {
         CardKind::Service => Ok("service"),

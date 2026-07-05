@@ -8,7 +8,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wyrd_auth_issue::{DelegationCaller, IssueError, IssuingKey};
-use wyrd_auth_verify::{ActClaim, AuthError, PrincipalKindWire, TokenPrincipalRef, TokenVerifier};
+use wyrd_auth_verify::{
+    ActClaim, AuthError, MAX_DELEGATION_DEPTH, PrincipalKindWire, TokenPrincipalRef, TokenVerifier,
+};
 use wyrd_runtime::{Permission, PermissionCheck, PrincipalId, PrincipalKind, RoleRef};
 use wyrd_spec::auth::{RequestedSubject, SecretBearer, TokenResponse, TokenType};
 use wyrd_spec::envelope::CardKind;
@@ -21,13 +23,13 @@ use wyrd_sql::queries::auth::{
     touch_api_key_last_used,
 };
 
-use crate::auth::card_scope::{
+use crate::card_scope::{
     IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_DELEGATION, issue_scope_error,
     resolve_card_ref_scope, write_scope_mint_success_audit,
 };
-use crate::auth::issue_api_key::{WyrdApiKey, principal_kind_for_card};
-use crate::auth::permission_resolver::SqlPermissionResolver;
-use crate::auth::pg_resolvers::PgIssuerResolver;
+use crate::issue_api_key::{WyrdApiKey, principal_kind_for_card};
+use crate::permission_resolver::SqlPermissionResolver;
+use crate::pg_resolvers::PgIssuerResolver;
 
 /// Token exchange settings.
 #[derive(Debug, Clone)]
@@ -124,7 +126,7 @@ impl ExchangedToken {
 /// they can re-present their durable credential, so issuing a long-lived
 /// refresh secret only widens the leak surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RefreshPolicy {
+pub enum RefreshPolicy {
     /// Issue and persist a refresh token (API-key exchange, human login).
     Mint,
     /// Access token only; no refresh token is issued or stored.
@@ -132,7 +134,7 @@ pub(super) enum RefreshPolicy {
 }
 
 /// The service/agent principal a token is being issued for.
-pub(super) struct IssueSubject {
+pub struct IssueSubject {
     /// Stable principal id.
     pub principal_id: Uuid,
     /// Principal kind: `"service"` or `"agent"`.
@@ -287,11 +289,10 @@ impl DelegateToken {
         let roles = role_refs(list_service_account_roles(conn, row.id).await?)
             .map_err(|_| DelegateError::InvalidRole)?;
         let caller = DelegationCaller {
-            sub: verified
-                .delegation_chain
-                .first()
-                .map(|step| step.principal.id.to_string())
-                .unwrap_or_else(|| verified.principal.id.to_string()),
+            sub: verified.delegation_chain.first().map_or_else(
+                || verified.principal.id.to_string(),
+                |step| step.principal.id.to_string(),
+            ),
             principal: TokenPrincipalRef::from(&verified.principal),
             act: act_from_chain(&verified.delegation_chain, conn.data_tenant_id()),
         };
@@ -345,7 +346,7 @@ impl DelegateToken {
     }
 }
 
-pub(super) async fn issue_for_subject(
+pub async fn issue_for_subject(
     conn: &mut TenantConn<'_>,
     issuing_key: &IssuingKey,
     settings: &TokenExchangeSettings,
@@ -442,7 +443,7 @@ fn delegate_issue_error(error: IssueError, root: &CardRef) -> DelegateError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum IssueOrSqlError {
+pub enum IssueOrSqlError {
     #[error("issue")]
     Issue(#[from] IssueError),
     #[error("db")]
@@ -479,11 +480,11 @@ async fn resolve_requested_subject(
     }
 }
 
-pub(crate) fn role_refs(names: Vec<String>) -> Result<Vec<RoleRef>, wyrd_runtime::InvalidRoleName> {
+pub fn role_refs(names: Vec<String>) -> Result<Vec<RoleRef>, wyrd_runtime::InvalidRoleName> {
     names.into_iter().map(|name| RoleRef::new(&name)).collect()
 }
 
-pub(super) fn principal_kind_wire(value: &str) -> Option<PrincipalKindWire> {
+pub fn principal_kind_wire(value: &str) -> Option<PrincipalKindWire> {
     match value {
         "service" => Some(PrincipalKindWire::Service),
         "agent" => Some(PrincipalKindWire::Agent),
@@ -540,7 +541,7 @@ fn act_from_chain(
     })
 }
 
-pub(crate) fn token_hash(token: &str) -> String {
+pub fn token_hash(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
@@ -625,9 +626,7 @@ pub async fn map_exchange_error_to_wyrd(
 impl From<DelegateError> for WyrdError {
     fn from(error: DelegateError) -> Self {
         match error {
-            DelegateError::InvalidSubjectToken(error) => {
-                crate::http::error::auth_error_to_wyrd(error)
-            }
+            DelegateError::InvalidSubjectToken(error) => auth_error_to_wyrd(error),
             DelegateError::SubjectNotFound => WyrdError::PrincipalNotFound {
                 message: "requested principal not found in tenant".to_owned(),
                 details: json!({}),
@@ -652,6 +651,82 @@ impl From<DelegateError> for WyrdError {
                 details: json!({ "retry_after_seconds": 1 }),
             },
         }
+    }
+}
+
+fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
+    match error {
+        AuthError::Jwt(error) => jwt_error_to_wyrd(&error),
+        AuthError::InvalidToken => invalid_token("token rejected"),
+        AuthError::TokenExpired => WyrdError::TokenExpired {
+            message: "token expired".to_owned(),
+            details: json!({}),
+        },
+        AuthError::InvalidCardRef => WyrdError::InvalidCardRef {
+            message: "non-user token card_ref claim is absent or malformed".to_owned(),
+            details: json!({}),
+        },
+        AuthError::CardScopeMissingRoot => WyrdError::InvalidCardRef {
+            message: "card-bound token scope is missing its root card_ref".to_owned(),
+            details: json!({ "field": "card_ref_scope" }),
+        },
+        AuthError::DelegationDepthExceeded => WyrdError::DelegationDepthExceededVerify {
+            message: format!(
+                "delegation chain exceeds MAX_DELEGATION_DEPTH={MAX_DELEGATION_DEPTH}"
+            ),
+            details: json!({ "max": MAX_DELEGATION_DEPTH }),
+        },
+        AuthError::Revoked => WyrdError::CredentialRevoked {
+            message: "credential revoked".to_owned(),
+            details: json!({}),
+        },
+        AuthError::BadTokenFormat => WyrdError::BadTokenFormat {
+            message: "authorization header malformed".to_owned(),
+            details: json!({}),
+        },
+        AuthError::VerifyUnavailable => WyrdError::AuthVerifyUnavailable {
+            message: "auth verify backend unavailable".to_owned(),
+            details: json!({ "retry_after_seconds": 1 }),
+        },
+        AuthError::PermissionsCorrupt => WyrdError::RoleCorrupt {
+            message: "stored role permissions failed to decode".to_owned(),
+            details: json!({}),
+        },
+    }
+}
+
+fn jwt_error_to_wyrd(error: &jsonwebtoken::errors::Error) -> WyrdError {
+    use jsonwebtoken::errors::ErrorKind;
+
+    tracing::debug!(jwt_error = ?error.kind(), "JWT validation failed");
+
+    match error.kind() {
+        ErrorKind::ExpiredSignature => WyrdError::TokenExpired {
+            message: "token expired".to_owned(),
+            details: json!({}),
+        },
+        ErrorKind::Base64(_) | ErrorKind::Json(_) | ErrorKind::Utf8(_) => {
+            WyrdError::BadTokenFormat {
+                message: "token payload is malformed".to_owned(),
+                details: json!({}),
+            }
+        }
+        ErrorKind::InvalidSignature
+        | ErrorKind::InvalidIssuer
+        | ErrorKind::InvalidSubject
+        | ErrorKind::InvalidAudience
+        | ErrorKind::InvalidAlgorithm
+        | ErrorKind::InvalidAlgorithmName => {
+            invalid_token("bearer token signature, issuer, subject, audience, or algorithm invalid")
+        }
+        _ => invalid_token("bearer token rejected"),
+    }
+}
+
+fn invalid_token(message: &str) -> WyrdError {
+    WyrdError::InvalidToken {
+        message: message.to_owned(),
+        details: json!({}),
     }
 }
 
@@ -683,9 +758,9 @@ mod tests {
     use super::{
         DelegateError, DelegateToken, ExchangeApiKey, ExchangeError, TokenExchangeSettings,
     };
-    use crate::auth::issue_api_key::WyrdApiKey;
-    use crate::auth::permission_resolver::SqlPermissionResolver;
-    use crate::auth::seed::seed_builtin_roles_for_tenant;
+    use crate::issue_api_key::WyrdApiKey;
+    use crate::permission_resolver::SqlPermissionResolver;
+    use crate::seed::seed_builtin_roles_for_tenant;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -726,7 +801,7 @@ mod tests {
         )
         .bind(user_id)
         .bind(tenant_id.as_uuid())
-        .bind(format!("test-{}@example.com", user_id))
+        .bind(format!("test-{user_id}@example.com"))
         .execute(&mut **conn.transaction())
         .await
         .expect("test user inserts");
@@ -751,7 +826,7 @@ mod tests {
         .bind(Uuid::now_v7())
         .bind(Json(card_ref.clone()))
         .bind(card_ref.space.as_str())
-        .bind(format!("svc-{}", sa_id))
+        .bind(format!("svc-{sa_id}"))
         .bind(card_ref.version.as_str())
         .bind(created_by)
         .execute(&mut **conn.transaction())

@@ -80,7 +80,7 @@ mod tests {
     use wyrd_runtime::{Permission, RoleRef};
     use wyrd_sql::queries::auth::RoleRow;
 
-    use crate::auth::seed::seed_builtin_roles_for_tenant;
+    use crate::seed::seed_builtin_roles_for_tenant;
 
     use super::SqlPermissionResolver;
     use super::permission_set_from_rows;

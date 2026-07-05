@@ -179,7 +179,7 @@ async fn download_local_blob(
 
 fn parse_upload_id(value: &str) -> Result<UploadId, WyrdErrorResponse> {
     UploadId::from_str(value)
-        .map_err(service::invalid_upload_id)
+        .map_err(|error| service::invalid_upload_id(&error))
         .map_err(WyrdErrorResponse::from)
 }
 

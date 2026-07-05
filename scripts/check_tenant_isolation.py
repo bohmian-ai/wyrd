@@ -49,6 +49,7 @@ RAW_QUERY_ALLOWLIST_MARKERS = [
 ]
 
 SERVER_POOL_ALLOWLIST_PREFIXES = (
+    "crates/wyrd/wyrd-server/src/boot/",
     "crates/wyrd/wyrd-server/src/boot.rs",
     "crates/wyrd/wyrd-server/src/main.rs",
     "crates/wyrd/wyrd-server/src/postgres.rs",

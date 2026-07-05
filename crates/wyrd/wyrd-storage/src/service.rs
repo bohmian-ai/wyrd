@@ -30,6 +30,7 @@ use crate::signer::{CompletePayload, HeadInfo, MultipartInit, UploadPlanReplayIn
 use crate::tenant_path::{self, TenantPathError, ValidatedPath};
 
 const INIT_TTL_SECS: u64 = 24 * 60 * 60;
+const INIT_TTL_SECS_I64: i64 = 24 * 60 * 60;
 
 /// Storage-local principal-kind discriminant for audit identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,28 +118,13 @@ pub async fn upload_init(
         .postgres
         .tenant_conn(caller.data_tenant_id)
         .await
-        .map_err(map_sql_error)?;
+        .map_err(|error| map_sql_error(&error))?;
     if let Some(key) = idempotency_key.as_ref()
         && let Some(response) =
             try_replay_idempotent_init(caller, &mut conn, key, &body_sha).await?
     {
-        conn.commit().await.map_err(map_sql_error)?;
-        let plan = state
-            .storage
-            .signer()
-            .remint_plan(
-                &response.validated,
-                &response.replay_input,
-                state.storage.presign_ttl(),
-            )
-            .await
-            .map_err(map_storage_error)?;
-        return Ok(UploadInitResponse {
-            upload_id: response.upload_id,
-            backend: response.backend,
-            plan,
-            storage_path: response.storage_path,
-        });
+        conn.commit().await.map_err(|error| map_sql_error(&error))?;
+        return remint_replayed_upload_init(&state, response).await;
     }
 
     let prior_abort = find_and_mark_prior_pending(&mut conn, &body).await?;
@@ -146,76 +132,37 @@ pub async fn upload_init(
     let upload_id = UploadId::new();
     let upload_uuid = upload_id_uuid(&upload_id)?;
     let counts = upload_row_counts(planned, body.expected_size_bytes, wire_protocol);
-    multipart_uploads::insert_initiating(
+    insert_initiating_upload(
         &mut conn,
-        multipart_uploads::NewMultipartUpload {
-            id: upload_uuid,
-            card_uid: body.card_uid.as_str(),
-            relative_path: &body.relative_path,
-            storage_path: &validated.full,
-            backend,
-            wire_protocol,
-            expected_sha256: &body.expected_sha256,
-            expected_size_bytes: i64::try_from(body.expected_size_bytes).map_err(|_| {
-                validation_error(
-                    "expected_size_bytes exceeds signed storage metadata range",
-                    serde_json::json!({ "expected_size_bytes": body.expected_size_bytes }),
-                )
-            })?,
-            content_type: body.content_type.as_deref(),
-            part_count_planned: i32::try_from(counts.part_count).map_err(|_| {
-                internal_error(
-                    "planned part count exceeds storage metadata range",
-                    serde_json::json!({ "part_count": counts.part_count }),
-                )
-            })?,
-            part_size_bytes: i64::try_from(counts.part_size_bytes).map_err(|_| {
-                internal_error(
-                    "planned part size exceeds storage metadata range",
-                    serde_json::json!({ "part_size_bytes": counts.part_size_bytes }),
-                )
-            })?,
-            block_count_planned: counts.block_count_planned,
-            ttl_secs: INIT_TTL_SECS as i64,
-        },
+        upload_uuid,
+        &validated,
+        &body,
+        backend,
+        wire_protocol,
+        counts,
     )
-    .await
-    .map_err(map_sql_error)?;
-    conn.commit().await.map_err(map_sql_error)?;
+    .await?;
+    conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     if let Some(prior) = prior_abort {
         abort_prior_best_effort(&state, caller, prior).await;
     }
 
-    let init = match drive_backend_init(&state, &validated, planned, body.expected_size_bytes).await
-    {
-        Ok(init) => init,
-        Err(error) => {
-            let error_code = error.code().to_owned();
-            let status_code = i32::from(error.status());
-            mark_failed_best_effort(
-                &state,
-                caller,
-                upload_uuid,
-                &validated,
-                backend,
-                FailureContext {
-                    operation: UploadAuditOperation::UploadInit,
-                    reason: "backend init failed",
-                    status_code,
-                    error_code: Some(&error_code),
-                },
-            )
-            .await;
-            return Err(error);
-        }
-    };
+    let init = drive_backend_init_or_mark_failed(
+        &state,
+        caller,
+        upload_uuid,
+        &validated,
+        planned,
+        body.expected_size_bytes,
+    )
+    .await?;
 
     let mut conn = state
         .postgres
         .tenant_conn(caller.data_tenant_id)
         .await
-        .map_err(map_sql_error)?;
+        .map_err(|error| map_sql_error(&error))?;
     persist_s3_upload_id_and_audit(
         &mut conn,
         caller,
@@ -237,7 +184,7 @@ pub async fn upload_init(
         )
         .await?;
     }
-    conn.commit().await.map_err(map_sql_error)?;
+    conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     Ok(UploadInitResponse {
         upload_id,
@@ -263,7 +210,7 @@ pub async fn upload_part_url(
         .postgres
         .tenant_conn(caller.data_tenant_id)
         .await
-        .map_err(map_sql_error)?;
+        .map_err(|error| map_sql_error(&error))?;
     let row = load_upload(&mut conn, upload_uuid).await?;
     if row.status != UploadStatus::Pending {
         return Err(conflict_error(
@@ -295,7 +242,7 @@ pub async fn upload_part_url(
             serde_json::json!({ "upload_id": upload_id.to_string() }),
         )
     })?;
-    conn.commit().await.map_err(map_sql_error)?;
+    conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     let url = state
         .storage
@@ -331,7 +278,7 @@ pub async fn upload_complete(
         .postgres
         .tenant_conn(caller.data_tenant_id)
         .await
-        .map_err(map_sql_error)?;
+        .map_err(|error| map_sql_error(&error))?;
     let row = load_pending_upload(&mut conn, upload_uuid).await?;
     let validated =
         tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
@@ -342,104 +289,19 @@ pub async fn upload_complete(
         row.block_count_planned,
         &row.expected_sha256,
     )?;
-    conn.commit().await.map_err(map_sql_error)?;
+    conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
-    if let Some(payload) = payload
-        && let Err(error) = state
-            .storage
-            .signer()
-            .complete_server_side(&validated, row.backend_upload_id.as_deref(), payload)
-            .await
-    {
-        let error = map_storage_error(error);
-        let error_code = error.code().to_owned();
-        let status_code = i32::from(error.status());
-        mark_failed_best_effort(
-            &state,
-            caller,
-            upload_uuid,
-            &validated,
-            row.backend,
-            FailureContext {
-                operation: UploadAuditOperation::UploadComplete,
-                reason: "backend_complete_failed",
-                status_code,
-                error_code: Some(&error_code),
-            },
-        )
-        .await;
-        return Err(error);
-    }
-
-    let head = match state
-        .storage
-        .signer()
-        .head_for_verification(&validated)
-        .await
-    {
-        Ok(head) => head,
-        Err(error) => {
-            let error = map_storage_error(error);
-            let error_code = error.code().to_owned();
-            let status_code = i32::from(error.status());
-            mark_failed_best_effort(
-                &state,
-                caller,
-                upload_uuid,
-                &validated,
-                row.backend,
-                FailureContext {
-                    operation: UploadAuditOperation::UploadComplete,
-                    reason: "head_for_verification_failed",
-                    status_code,
-                    error_code: Some(&error_code),
-                },
-            )
-            .await;
-            return Err(error);
-        }
-    };
+    complete_backend_upload(&state, caller, upload_uuid, &validated, &row, payload).await?;
+    let head = verified_object_head(&state, caller, upload_uuid, &validated, &row).await?;
     verify_object_head(&state, caller, upload_uuid, &validated, &row, &head).await?;
 
     let mut conn = state
         .postgres
         .tenant_conn(caller.data_tenant_id)
         .await
-        .map_err(map_sql_error)?;
-    wyrd_sql::queries::storage::artifact_metadata::insert(
-        &mut conn,
-        wyrd_sql::queries::storage::artifact_metadata::NewArtifactMetadata {
-            storage_path: &validated.full,
-            card_uid: &validated.card_uid,
-            size_bytes: i64::try_from(head.size_bytes).map_err(|_| {
-                internal_error(
-                    "verified object size exceeds storage metadata range",
-                    serde_json::json!({ "size_bytes": head.size_bytes }),
-                )
-            })?,
-            sha256: &row.expected_sha256,
-            content_type: head.content_type.as_deref().or(row.content_type.as_deref()),
-            sse_marker: head.sse_marker.as_deref(),
-            backend: row.backend,
-        },
-    )
-    .await
-    .map_err(map_sql_error)?;
-    multipart_uploads::mark_completed(&mut conn, upload_uuid)
-        .await
-        .map_err(map_sql_error)?;
-    audit::write(
-        &mut conn,
-        caller,
-        UploadAuditOperation::UploadComplete,
-        Some(upload_uuid),
-        &validated.full,
-        row.backend,
-        200,
-        None,
-    )
-    .await?;
-    conn.commit().await.map_err(map_sql_error)?;
+        .map_err(|error| map_sql_error(&error))?;
+    persist_completed_upload(&mut conn, caller, upload_uuid, &validated, &row, &head).await?;
+    conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     Ok(UploadCompleteResponse {
         stored: StoredObjectRef {
@@ -468,18 +330,18 @@ pub async fn upload_abort(
         .postgres
         .tenant_conn(caller.data_tenant_id)
         .await
-        .map_err(map_sql_error)?;
+        .map_err(|error| map_sql_error(&error))?;
     let row = load_upload(&mut conn, upload_uuid).await?;
     if matches!(
         row.status,
         UploadStatus::Aborted | UploadStatus::Completed | UploadStatus::Failed
     ) {
-        conn.commit().await.map_err(map_sql_error)?;
+        conn.commit().await.map_err(|error| map_sql_error(&error))?;
         return Ok(AbortResponse { aborted: false });
     }
     let validated =
         tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
-    conn.commit().await.map_err(map_sql_error)?;
+    conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     if let Some(backend_upload_id) = row.backend_upload_id.as_deref()
         && let Err(error) = state
@@ -495,12 +357,12 @@ pub async fn upload_abort(
         .postgres
         .tenant_conn(caller.data_tenant_id)
         .await
-        .map_err(map_sql_error)?;
+        .map_err(|error| map_sql_error(&error))?;
     let aborted =
         match multipart_uploads::mark_aborted(&mut conn, upload_uuid, Some("client-abort")).await {
             Ok(()) => true,
             Err(wyrd_sql::SqlError::Conflict { .. }) => false,
-            Err(error) => return Err(map_sql_error(error)),
+            Err(error) => return Err(map_sql_error(&error)),
         };
     audit::write(
         &mut conn,
@@ -513,7 +375,7 @@ pub async fn upload_abort(
         None,
     )
     .await?;
-    conn.commit().await.map_err(map_sql_error)?;
+    conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     Ok(AbortResponse { aborted })
 }
@@ -534,7 +396,7 @@ pub async fn upload_local_blob(
         ));
     };
     local
-        .write_atomically(Path::new(&validated.full), &body)
+        .write_atomically(Path::new(&validated.full), body)
         .await
         .map_err(map_storage_error)
 }
@@ -554,9 +416,9 @@ pub async fn download_init(
         .postgres
         .tenant_conn(caller.data_tenant_id)
         .await
-        .map_err(map_sql_error)?;
+        .map_err(|error| map_sql_error(&error))?;
     let metadata = load_artifact_metadata(&mut conn, &validated).await?;
-    conn.commit().await.map_err(map_sql_error)?;
+    conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     let request_ttl_secs = compute_download_ttl(&body, state.storage.presign_ttl_secs());
     let get_url = download_url(&state, &validated, request_ttl_secs).await?;
@@ -570,7 +432,7 @@ pub async fn download_init(
         .postgres
         .tenant_conn(caller.data_tenant_id)
         .await
-        .map_err(map_sql_error)?;
+        .map_err(|error| map_sql_error(&error))?;
     audit::write(
         &mut conn,
         caller,
@@ -582,7 +444,7 @@ pub async fn download_init(
         None,
     )
     .await?;
-    conn.commit().await.map_err(map_sql_error)?;
+    conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     Ok(DownloadInitResponse {
         plan: DownloadPlan { get_url, ttl_secs },
@@ -624,12 +486,16 @@ async fn try_replay_idempotent_init(
 ) -> Result<Option<InitReplay>, WyrdError> {
     let Some(cached) = wyrd_sql::queries::storage::idempotency::get(conn, key.as_str(), body_sha)
         .await
-        .map_err(map_sql_error)?
+        .map_err(|error| map_sql_error(&error))?
     else {
         return Ok(None);
     };
 
-    let upload_id: UploadId = cached.seed.upload_id.parse().map_err(invalid_upload_id)?;
+    let upload_id: UploadId = cached
+        .seed
+        .upload_id
+        .parse()
+        .map_err(|error| invalid_upload_id(&error))?;
     let row = load_upload(conn, upload_id_uuid(&upload_id)?).await?;
     let validated = tenant_path::validate(&cached.seed.storage_path, caller.data_tenant_id)
         .map_err(map_tenant_path)?;
@@ -662,7 +528,7 @@ async fn find_and_mark_prior_pending(
         &body.expected_sha256,
     )
     .await
-    .map_err(map_sql_error)?;
+    .map_err(|error| map_sql_error(&error))?;
 
     if let Some(prior) = prior {
         let abort = PriorAbort {
@@ -671,7 +537,7 @@ async fn find_and_mark_prior_pending(
         };
         multipart_uploads::mark_aborted(conn, prior.id, Some("re-init"))
             .await
-            .map_err(map_sql_error)?;
+            .map_err(|error| map_sql_error(&error))?;
         return Ok(Some(abort));
     }
 
@@ -698,6 +564,28 @@ async fn abort_prior_best_effort(
     {
         tracing::warn!(error = %error, "best-effort re-init backend abort failed");
     }
+}
+
+async fn remint_replayed_upload_init(
+    state: &StorageServiceState<'_>,
+    response: InitReplay,
+) -> Result<UploadInitResponse, WyrdError> {
+    let plan = state
+        .storage
+        .signer()
+        .remint_plan(
+            &response.validated,
+            &response.replay_input,
+            state.storage.presign_ttl(),
+        )
+        .await
+        .map_err(map_storage_error)?;
+    Ok(UploadInitResponse {
+        upload_id: response.upload_id,
+        backend: response.backend,
+        plan,
+        storage_path: response.storage_path,
+    })
 }
 
 fn validated_tenant_path(
@@ -731,7 +619,7 @@ async fn load_artifact_metadata(
 ) -> Result<ArtifactMetadataRow, WyrdError> {
     wyrd_sql::queries::storage::artifact_metadata::get(conn, &validated.full)
         .await
-        .map_err(map_sql_error)?
+        .map_err(|error| map_sql_error(&error))?
         .ok_or_else(|| {
             map_storage_error(StorageError::ObjectNotFound {
                 storage_path: validated.full.clone(),
@@ -864,6 +752,52 @@ fn upload_row_counts(
     }
 }
 
+async fn insert_initiating_upload(
+    conn: &mut TenantConn<'_>,
+    upload_uuid: Uuid,
+    validated: &ValidatedPath,
+    body: &UploadInitRequest,
+    backend: StorageBackendKind,
+    wire_protocol: WireProtocol,
+    counts: UploadRowCounts,
+) -> Result<(), WyrdError> {
+    multipart_uploads::insert_initiating(
+        conn,
+        multipart_uploads::NewMultipartUpload {
+            id: upload_uuid,
+            card_uid: body.card_uid.as_str(),
+            relative_path: &body.relative_path,
+            storage_path: &validated.full,
+            backend,
+            wire_protocol,
+            expected_sha256: &body.expected_sha256,
+            expected_size_bytes: i64::try_from(body.expected_size_bytes).map_err(|_| {
+                validation_error(
+                    "expected_size_bytes exceeds signed storage metadata range",
+                    serde_json::json!({ "expected_size_bytes": body.expected_size_bytes }),
+                )
+            })?,
+            content_type: body.content_type.as_deref(),
+            part_count_planned: i32::try_from(counts.part_count).map_err(|_| {
+                internal_error(
+                    "planned part count exceeds storage metadata range",
+                    serde_json::json!({ "part_count": counts.part_count }),
+                )
+            })?,
+            part_size_bytes: i64::try_from(counts.part_size_bytes).map_err(|_| {
+                internal_error(
+                    "planned part size exceeds storage metadata range",
+                    serde_json::json!({ "part_size_bytes": counts.part_size_bytes }),
+                )
+            })?,
+            block_count_planned: counts.block_count_planned,
+            ttl_secs: INIT_TTL_SECS_I64,
+        },
+    )
+    .await
+    .map_err(|error| map_sql_error(&error))
+}
+
 async fn drive_backend_init(
     state: &StorageServiceState<'_>,
     validated: &ValidatedPath,
@@ -904,6 +838,38 @@ async fn drive_backend_init(
     }
 }
 
+async fn drive_backend_init_or_mark_failed(
+    state: &StorageServiceState<'_>,
+    caller: &StorageCaller,
+    upload_uuid: Uuid,
+    validated: &ValidatedPath,
+    planned: PlannedUpload,
+    expected_size_bytes: u64,
+) -> Result<MultipartInit, WyrdError> {
+    match drive_backend_init(state, validated, planned, expected_size_bytes).await {
+        Ok(init) => Ok(init),
+        Err(error) => {
+            let error_code = error.code().to_owned();
+            let status_code = i32::from(error.status());
+            mark_failed_best_effort(
+                state,
+                caller,
+                upload_uuid,
+                validated,
+                state.storage.backend(),
+                FailureContext {
+                    operation: UploadAuditOperation::UploadInit,
+                    reason: "backend init failed",
+                    status_code,
+                    error_code: Some(&error_code),
+                },
+            )
+            .await;
+            Err(error)
+        }
+    }
+}
+
 fn local_single_put_plan(
     storage: &StorageHandle,
     validated: &ValidatedPath,
@@ -932,7 +898,7 @@ async fn persist_s3_upload_id_and_audit(
     let persisted_backend_id = (backend == StorageBackendKind::S3).then_some(backend_upload_id);
     multipart_uploads::mark_pending(conn, upload_uuid, persisted_backend_id)
         .await
-        .map_err(map_sql_error)?;
+        .map_err(|error| map_sql_error(&error))?;
     audit::write(
         conn,
         caller,
@@ -970,7 +936,7 @@ async fn cache_init_seed(
         Duration::from_secs(INIT_TTL_SECS),
     )
     .await
-    .map_err(map_sql_error)
+    .map_err(|error| map_sql_error(&error))
 }
 
 async fn load_upload(
@@ -979,7 +945,7 @@ async fn load_upload(
 ) -> Result<MultipartUploadRow, WyrdError> {
     multipart_uploads::find_by_id(conn, upload_uuid)
         .await
-        .map_err(map_sql_error)?
+        .map_err(|error| map_sql_error(&error))?
         .ok_or_else(|| WyrdStorageError::UploadNotFound.into())
 }
 
@@ -1007,7 +973,8 @@ fn build_complete_payload(
             WireProtocol::LocalFsV1,
             StorageBackendKind::Local,
         ) => Ok(Some(CompletePayload::Local)),
-        (UploadCompleteRequest::SinglePut(_), WireProtocol::SinglePutV1, _) => Ok(None),
+        (UploadCompleteRequest::SinglePut(_), WireProtocol::SinglePutV1, _)
+        | (UploadCompleteRequest::GcsResumable(_), WireProtocol::GcsResumableV1, _) => Ok(None),
         (
             UploadCompleteRequest::S3Multipart(S3MultipartComplete { parts }),
             WireProtocol::S3MultipartV1,
@@ -1016,7 +983,6 @@ fn build_complete_payload(
             parts: parts.clone(),
             expected_sha256: expected_sha256.to_owned(),
         })),
-        (UploadCompleteRequest::GcsResumable(_), WireProtocol::GcsResumableV1, _) => Ok(None),
         (
             UploadCompleteRequest::AzureBlockBlob(AzureBlockBlobComplete { block_count }),
             WireProtocol::AzureBlockBlobV1,
@@ -1049,6 +1015,125 @@ fn build_complete_payload(
             serde_json::json!({ "wire_protocol": stored }),
         )),
     }
+}
+
+async fn complete_backend_upload(
+    state: &StorageServiceState<'_>,
+    caller: &StorageCaller,
+    upload_uuid: Uuid,
+    validated: &ValidatedPath,
+    row: &MultipartUploadRow,
+    payload: Option<CompletePayload>,
+) -> Result<(), WyrdError> {
+    let Some(payload) = payload else {
+        return Ok(());
+    };
+    if let Err(error) = state
+        .storage
+        .signer()
+        .complete_server_side(validated, row.backend_upload_id.as_deref(), payload)
+        .await
+    {
+        let error = map_storage_error(error);
+        let error_code = error.code().to_owned();
+        let status_code = i32::from(error.status());
+        mark_failed_best_effort(
+            state,
+            caller,
+            upload_uuid,
+            validated,
+            row.backend,
+            FailureContext {
+                operation: UploadAuditOperation::UploadComplete,
+                reason: "backend_complete_failed",
+                status_code,
+                error_code: Some(&error_code),
+            },
+        )
+        .await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn verified_object_head(
+    state: &StorageServiceState<'_>,
+    caller: &StorageCaller,
+    upload_uuid: Uuid,
+    validated: &ValidatedPath,
+    row: &MultipartUploadRow,
+) -> Result<HeadInfo, WyrdError> {
+    match state
+        .storage
+        .signer()
+        .head_for_verification(validated)
+        .await
+    {
+        Ok(head) => Ok(head),
+        Err(error) => {
+            let error = map_storage_error(error);
+            let error_code = error.code().to_owned();
+            let status_code = i32::from(error.status());
+            mark_failed_best_effort(
+                state,
+                caller,
+                upload_uuid,
+                validated,
+                row.backend,
+                FailureContext {
+                    operation: UploadAuditOperation::UploadComplete,
+                    reason: "head_for_verification_failed",
+                    status_code,
+                    error_code: Some(&error_code),
+                },
+            )
+            .await;
+            Err(error)
+        }
+    }
+}
+
+async fn persist_completed_upload(
+    conn: &mut TenantConn<'_>,
+    caller: &StorageCaller,
+    upload_uuid: Uuid,
+    validated: &ValidatedPath,
+    row: &MultipartUploadRow,
+    head: &HeadInfo,
+) -> Result<(), WyrdError> {
+    wyrd_sql::queries::storage::artifact_metadata::insert(
+        conn,
+        wyrd_sql::queries::storage::artifact_metadata::NewArtifactMetadata {
+            storage_path: &validated.full,
+            card_uid: &validated.card_uid,
+            size_bytes: i64::try_from(head.size_bytes).map_err(|_| {
+                internal_error(
+                    "verified object size exceeds storage metadata range",
+                    serde_json::json!({ "size_bytes": head.size_bytes }),
+                )
+            })?,
+            sha256: &row.expected_sha256,
+            content_type: head.content_type.as_deref().or(row.content_type.as_deref()),
+            sse_marker: head.sse_marker.as_deref(),
+            backend: row.backend,
+        },
+    )
+    .await
+    .map_err(|error| map_sql_error(&error))?;
+    multipart_uploads::mark_completed(conn, upload_uuid)
+        .await
+        .map_err(|error| map_sql_error(&error))?;
+    audit::write(
+        conn,
+        caller,
+        UploadAuditOperation::UploadComplete,
+        Some(upload_uuid),
+        &validated.full,
+        row.backend,
+        200,
+        None,
+    )
+    .await
 }
 
 async fn verify_object_head(
@@ -1146,11 +1231,13 @@ async fn mark_failed_best_effort(
 }
 
 fn upload_id_uuid(upload_id: &UploadId) -> Result<Uuid, WyrdError> {
-    upload_id.as_uuid().map_err(invalid_upload_id)
+    upload_id
+        .as_uuid()
+        .map_err(|error| invalid_upload_id(&error))
 }
 
 /// Map an upload id parse error into the public storage error catalog.
-pub fn invalid_upload_id(error: UploadIdParseError) -> WyrdError {
+pub fn invalid_upload_id(error: &UploadIdParseError) -> WyrdError {
     WyrdStorageError::InvalidUploadId {
         reason: error.to_string(),
     }
@@ -1180,7 +1267,7 @@ fn map_tenant_path(error: TenantPathError) -> WyrdError {
 }
 
 /// Map a SQL-layer error into the current public error catalog.
-pub fn map_sql_error(error: wyrd_sql::SqlError) -> WyrdError {
+pub fn map_sql_error(error: &wyrd_sql::SqlError) -> WyrdError {
     let code = error.code();
     let message = error.to_string();
     let details = serde_json::json!({ "source_code": code });
@@ -1335,7 +1422,7 @@ mod tests {
                 root: root.path().to_path_buf(),
             },
             require_encryption: false,
-            presign_ttl: Duration::from_secs(600),
+            presign_ttl: Duration::from_mins(10),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test/".to_owned()),
@@ -1392,7 +1479,7 @@ mod tests {
                 root: root.path().to_path_buf(),
             },
             require_encryption: false,
-            presign_ttl: Duration::from_secs(900),
+            presign_ttl: Duration::from_mins(15),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test/".to_owned()),
@@ -1426,7 +1513,7 @@ mod tests {
                 root: root.path().to_path_buf(),
             },
             require_encryption: false,
-            presign_ttl: Duration::from_secs(900),
+            presign_ttl: Duration::from_mins(15),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test".to_owned()),
@@ -1466,7 +1553,7 @@ mod tests {
                 root: root.path().to_path_buf(),
             },
             require_encryption: false,
-            presign_ttl: Duration::from_secs(900),
+            presign_ttl: Duration::from_mins(15),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test".to_owned()),

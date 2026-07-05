@@ -50,6 +50,7 @@ wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-auth-check = { workspace = true }
+wyrd-auth = { workspace = true }
 wyrd-crypt = { path = "../../shared/wyrd-crypt", version = "0.0.1" }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1", features = ["embedded-postgres"] }
 tower = { workspace = true, features = ["util", "timeout", "limit", "load-shed"] }

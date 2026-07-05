@@ -345,7 +345,7 @@ fn client_auth_from_row(
 /// `tenant` is the bound tenant the row was read under: RLS guarantees
 /// `row.data_tenant_id == tenant.as_uuid()`, so we carry the already-validated
 /// [`DataTenantId`] through rather than re-parsing the column (which would
-/// re-impose UUIDv7 validation the boundary already passed).
+/// re-impose `UUIDv7` validation the boundary already passed).
 fn trusted_issuer_from_row(
     tenant: DataTenantId,
     row: TrustedIssuerRow,
@@ -491,7 +491,7 @@ mod tests {
             group_role_map,
             default_roles: vec!["viewer".to_owned()],
             principal_kind: PrincipalKindPolicy::Human,
-            jwks_ttl: Duration::from_secs(1800),
+            jwks_ttl: Duration::from_mins(30),
         }
     }
 
@@ -662,7 +662,7 @@ mod tests {
         let resolver = PgWorkloadBindingResolver::new(Arc::new(fixture.app_pool().clone()));
 
         // A NULL-audience binding answers an audience-qualified lookup (fallback).
-        let resolved = resolver
+        let resolved_binding = resolver
             .binding(
                 &tenant,
                 &issuer.issuer,
@@ -672,7 +672,7 @@ mod tests {
             .await
             .expect("lookup ok")
             .expect("subject resolves via fallback");
-        assert_eq!(resolved.name.to_string(), "my-model");
+        assert_eq!(resolved_binding.name.to_string(), "my-model");
 
         // An unbound subject resolves to None.
         let unbound = resolver

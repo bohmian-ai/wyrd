@@ -18,7 +18,7 @@ use wyrd_sql::queries::auth::{service_account_revocation_epoch, user_revocation_
 const EPOCH_CACHE_TTL: Duration = Duration::from_secs(5);
 const EPOCH_CACHE_MAX: u64 = 50_000;
 
-/// Cache key: (tenant_id, principal_kind, principal_id).
+/// Cache key: (`tenant_id`, `principal_kind`, `principal_id`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct EpochKey {
     tenant: DataTenantId,

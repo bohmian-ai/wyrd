@@ -63,7 +63,15 @@ set -eu
 
 for id in $(docker ps -aq --filter publish=55432); do
   echo "removing Docker container publishing 55432: $id"
-  docker rm -f -v "$id"
+  error_file="$(mktemp)"
+  if ! docker rm -f -v "$id" 2>"$error_file"; then
+    if ! grep -q "removal of container .* is already in progress" "$error_file"; then
+      cat "$error_file" >&2
+      rm -f "$error_file"
+      exit 1
+    fi
+  fi
+  rm -f "$error_file"
 done
 """
 
@@ -82,7 +90,7 @@ run = "cargo build --workspace --all-features --all-targets"
 hide = true
 description = "Run workspace Rust unit tests (no DB required)"
 run = """
-cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-server --exclude vala-bifrost --exclude vala-sql --exclude vala-core --exclude wyrd-client --exclude wyrd-dev-fixtures --exclude wyrd-sql --exclude wyrd-storage --exclude wyrd-testing
+cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-auth --exclude wyrd-server --exclude vala-bifrost --exclude vala-sql --exclude vala-core --exclude wyrd-client --exclude wyrd-dev-fixtures --exclude wyrd-sql --exclude wyrd-storage --exclude wyrd-testing
 cargo test --locked -p wyrd-client --lib
 cargo test --locked -p wyrd-client --test transport
 cargo test --locked -p vala-core
@@ -109,7 +117,7 @@ Only real-credential cloud storage tests (test:storage:{s3,gcs,azure}:cloud) are
 storage-integration-cloud.yml; emulator-backed storage tests run here because they are just
 docker containers, same difficulty as Postgres.
 """
-depends = ["test:rust:workspace", "test:storage:matrix", "test:sql", "test:wyrd-server", "test:registry-e2e"]
+depends = ["test:rust:workspace", "test:storage:matrix", "test:sql", "test:wyrd-auth", "test:wyrd-server", "test:registry-e2e"]
 
 [tasks."test:wyrd-spec"]
 hide = true
@@ -136,6 +144,13 @@ cargo test --locked -p wyrd-server --all-features -- --test-threads=1
 cargo test --locked -p wyrd-testing -- --test-threads=1
 cargo test --locked -p wyrd-client --test auth_e2e_against_fixture --test discovery_against_fixture -- --test-threads=1
 """
+
+[tasks."test:wyrd-auth"]
+hide = true
+description = """Run wyrd-auth Rust tests against the local Postgres database."""
+depends = ["db:setup-roles"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+run = "cargo test --locked -p wyrd-auth --all-features -- --test-threads=1"
 
 [tasks."test:wyrd-mcp"]
 hide = true
@@ -456,7 +471,9 @@ if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/wyrd/wyrd-server/src/auth/jwt_bearer.rs' \
   --glob '!crates/wyrd/wyrd-server/src/auth/callback.rs' \
   --glob '!crates/wyrd/wyrd-server/src/auth/admin.rs' \
+  --glob '!crates/wyrd/wyrd-server/src/components/admin/routes.rs' \
   --glob '!crates/wyrd/wyrd-server/src/issuer_boot.rs' \
+  --glob '!crates/wyrd/wyrd-server/src/boot/issuer.rs' \
   --glob '!crates/wyrd/wyrd-cli/src/auth/trusted_issuer.rs'; then
   echo 'mock dependency leaked outside wyrd-testing'
   exit 1
@@ -1157,15 +1174,15 @@ set -e
 ! rg -n --no-heading -e '/api/v1' crates/wyrd/wyrd-server/src/ \
     --glob '!http/router.rs'
 
-# 2. Identity vocabulary (server source only)
-! rg -n --no-heading -e '\\bActor\\b' crates/wyrd/wyrd-server/src/
-! rg -n --no-heading -e '\\bScope\\b' crates/wyrd/wyrd-server/src/
+# 2. Identity vocabulary (server source + server-tier auth domain crate)
+! rg -n --no-heading -e '\\bActor\\b' crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
+! rg -n --no-heading -e '\\bScope\\b' crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
 
 # 3. JWT claim leak
-! rg -n --no-heading -e '"scopes"' crates/wyrd/wyrd-server/src/
+! rg -n --no-heading -e '"scopes"' crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
 
 # 4. Predecessor names
-! rg -n --no-heading -e 'opsml|scouter' crates/wyrd/wyrd-server/src/
+! rg -n --no-heading -e 'opsml|scouter' crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
 
 # 5. Plan docs: predecessor names allowed only in audit + verification files
 ! rg -n --no-heading -e 'opsml|scouter' .dev/plan/foundations/07-server-skeleton \
@@ -1173,7 +1190,7 @@ set -e
 
 # 6. Predecessor domain nouns
 ! rg -n --no-heading -e '\\b(SubAgent|Skill|RecoveryCode|ScouterApiClient)\\b' \
-    crates/wyrd/wyrd-server/src/
+    crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
 
 # 7. Single IntoResponse impl for Wyrd errors
 COUNT=$(rg -n --no-heading -e 'impl[[:space:]]+IntoResponse[[:space:]]+for[[:space:]]+Wyrd' crates/ | wc -l)

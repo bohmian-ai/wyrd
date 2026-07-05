@@ -29,12 +29,12 @@ pub async fn seed_builtin_roles_for_tenant(
         let permissions_json: Value = serde_json::to_value(role.permissions)?;
         let id = builtin_role_uuid(data_tenant_id, role.name);
         sqlx::query(
-            r#"
+            r"
             INSERT INTO wyrd.auth_roles
                 (id, data_tenant_id, name, permissions, builtin)
             VALUES ($1, $2, $3, $4, TRUE)
             ON CONFLICT (data_tenant_id, name) DO NOTHING
-            "#,
+            ",
         )
         .bind(id)
         .bind(data_tenant_id.as_uuid())
@@ -106,7 +106,10 @@ mod tests {
             .await
             .expect("count query succeeds");
 
-        assert_eq!(count, BUILTIN_ROLES.len() as i64);
+        assert_eq!(
+            usize::try_from(count).expect("role count is nonnegative"),
+            BUILTIN_ROLES.len()
+        );
     }
 
     #[tokio::test]

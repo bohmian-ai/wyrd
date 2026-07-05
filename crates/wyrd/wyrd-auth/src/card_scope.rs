@@ -15,19 +15,19 @@ use wyrd_sql::queries::auth::insert_audit_card_scope_mint;
 use wyrd_sql::queries::cards::get_card_by_ref;
 
 const MAX_SCOPE_DEPTH: usize = 16;
-pub(crate) const MAX_SCOPE_CARDS: usize = 32;
+pub const MAX_SCOPE_CARDS: usize = 32;
 const SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT: usize = 16;
 
-pub(crate) const MINT_KIND_API_KEY_EXCHANGE: &str = "api_key_exchange";
-pub(crate) const MINT_KIND_REFRESH: &str = "refresh";
-pub(crate) const MINT_KIND_DELEGATION: &str = "delegation";
-pub(crate) const MINT_KIND_JWT_BEARER: &str = "jwt_bearer";
+pub const MINT_KIND_API_KEY_EXCHANGE: &str = "api_key_exchange";
+pub const MINT_KIND_REFRESH: &str = "refresh";
+pub const MINT_KIND_DELEGATION: &str = "delegation";
+pub const MINT_KIND_JWT_BEARER: &str = "jwt_bearer";
 
 /// Resolve the observation-target scope for a card-bound principal.
 ///
 /// The walk is tenant-scoped, fail-closed, cycle-guarded, and capped. Only
 /// observation-target kinds are included and expanded.
-pub(crate) async fn resolve_card_ref_scope(
+pub async fn resolve_card_ref_scope(
     conn: &mut TenantConn<'_>,
     root: &CardRef,
 ) -> Result<CardRefScope, WyrdError> {
@@ -81,7 +81,7 @@ fn too_large(limit_kind: &'static str, limit: usize, root: &CardRef) -> WyrdErro
 }
 
 /// Convert issuer scope-size failures into root-aware Wyrd errors.
-pub(crate) fn issue_scope_error(error: IssueError, root: &CardRef) -> IssueErrorOrWyrd {
+pub fn issue_scope_error(error: IssueError, root: &CardRef) -> IssueErrorOrWyrd {
     match error {
         IssueError::CardScopeTooLarge { encoded_len, limit } => {
             IssueErrorOrWyrd::Wyrd(WyrdError::CardScopeTooLarge {
@@ -101,13 +101,13 @@ pub(crate) fn issue_scope_error(error: IssueError, root: &CardRef) -> IssueError
 }
 
 /// Result of mapping an issuer error at a card-bound mint site.
-pub(crate) enum IssueErrorOrWyrd {
+pub enum IssueErrorOrWyrd {
     Issue(IssueError),
     Wyrd(WyrdError),
 }
 
 /// Write the successful card-ref scope mint audit row on the mint transaction.
-pub(crate) async fn write_scope_mint_success_audit(
+pub async fn write_scope_mint_success_audit(
     conn: &mut TenantConn<'_>,
     principal_id: Uuid,
     root: &CardRef,
@@ -125,10 +125,7 @@ pub(crate) async fn write_scope_mint_success_audit(
         root,
         request_id,
         "success",
-        Some(
-            i32::try_from(scope.len())
-                .expect("MAX_SCOPE_CARDS invariant: scope count fits into i32"),
-        ),
+        Some(i32::try_from(scope.len()).unwrap_or(i32::MAX)),
         Some(&scope_hash),
         scope_member_summary(&members),
         None,
@@ -138,7 +135,7 @@ pub(crate) async fn write_scope_mint_success_audit(
 }
 
 /// Best-effort write of a failed card-ref scope mint audit row on a fresh transaction.
-pub(crate) async fn audit_scope_mint_failure_best_effort(
+pub async fn audit_scope_mint_failure_best_effort(
     pool: &PgPool,
     tenant_id: DataTenantId,
     request_id: &str,
@@ -233,10 +230,10 @@ fn merge_scope_details(details: Value, root: &CardRef, unresolved: &CardRef) -> 
 
 /// Extract the root card ref from a scope-mint failure error.
 fn scope_failure_root(error: &WyrdError) -> Option<CardRef> {
-    let details = match error {
-        WyrdError::CardScopeTooLarge { details, .. }
-        | WyrdError::RegistryCardNotFound { details, .. } => details,
-        _ => return None,
+    let (WyrdError::CardScopeTooLarge { details, .. }
+    | WyrdError::RegistryCardNotFound { details, .. }) = error
+    else {
+        return None;
     };
     details
         .get("scope_mint_root")
@@ -346,7 +343,9 @@ mod tests {
             Some(root.to_string().as_str())
         );
         assert_eq!(
-            details.get("encoded_len").and_then(|v| v.as_u64()),
+            details
+                .get("encoded_len")
+                .and_then(serde_json::Value::as_u64),
             Some(9000)
         );
     }
@@ -495,7 +494,7 @@ mod tests {
         };
         assert!(message.contains("cards"), "message names the limit kind");
         assert_eq!(
-            details.get("limit").and_then(|v| v.as_u64()),
+            details.get("limit").and_then(serde_json::Value::as_u64),
             Some(MAX_SCOPE_CARDS as u64)
         );
         assert_eq!(
@@ -513,7 +512,7 @@ mod tests {
         };
         assert!(message.contains("depth"), "message names the limit kind");
         assert_eq!(
-            details.get("limit").and_then(|v| v.as_u64()),
+            details.get("limit").and_then(serde_json::Value::as_u64),
             Some(MAX_SCOPE_DEPTH as u64)
         );
     }

@@ -59,7 +59,7 @@ pub(crate) async fn write(
         },
     )
     .await
-    .map_err(crate::service::map_sql_error)
+    .map_err(|error| crate::service::map_sql_error(&error))
 }
 
 fn subject_id(caller: &StorageCaller) -> String {

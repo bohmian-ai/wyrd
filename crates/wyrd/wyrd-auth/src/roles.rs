@@ -43,7 +43,7 @@ mod tests {
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::builtin_roles::builtin_role_uuid;
 
-    use crate::auth::seed::seed_builtin_roles_for_tenant;
+    use crate::seed::seed_builtin_roles_for_tenant;
 
     use super::{RoleAdminError, delete_role};
 

@@ -20,15 +20,14 @@ use wyrd_sql::queries::auth::{
     list_service_account_roles, refresh_by_hash, revoke_refresh_family, service_account_by_id,
 };
 
-use crate::auth::card_scope::{
+use crate::card_scope::{
     IssueErrorOrWyrd, MINT_KIND_REFRESH, issue_scope_error, resolve_card_ref_scope,
     write_scope_mint_success_audit,
 };
-use crate::auth::exchange_api_key::{
+use crate::exchange_api_key::{
     ExchangedToken, IssueOrSqlError, TokenExchangeSettings, principal_kind_wire, role_refs,
     token_hash,
 };
-use crate::http::error::WyrdErrorResponse;
 
 /// Refresh-token rotation service.
 pub struct RefreshTokens {
@@ -92,12 +91,6 @@ impl From<RefreshError> for WyrdError {
     }
 }
 
-impl From<RefreshError> for WyrdErrorResponse {
-    fn from(error: RefreshError) -> Self {
-        Self::from(WyrdError::from(error))
-    }
-}
-
 impl RefreshTokens {
     /// Execute the refresh-token grant.
     ///
@@ -112,7 +105,7 @@ impl RefreshTokens {
     ///    - Win → mint successor pair, insert with `rotated_from`, audit, return OK.
     ///    - Loss → `refresh_by_hash`:
     ///      - Stale row found → reuse detected; family revoked, audit, return Reused.
-    ///      - No row → return NotFound.
+    ///      - No row → return `NotFound`.
     #[tracing::instrument(level = "debug", skip(self, conn, presented), err)]
     pub async fn execute(
         &self,
@@ -177,43 +170,40 @@ impl RefreshTokens {
             None => {
                 // consume_active_refresh returned no row. Check whether the token
                 // ever existed (reuse of a rotated token) or is unknown.
-                match refresh_by_hash(conn, &hash).await? {
-                    Some(stale) => {
-                        // Reuse detected: this token was already rotated or revoked.
-                        // Revoke the entire principal's token family as a theft response.
-                        let revoked = revoke_refresh_family(
-                            conn,
-                            &stale.principal_kind,
-                            stale.principal_id,
-                            "reuse_detected",
-                        )
-                        .await?;
+                if let Some(stale) = refresh_by_hash(conn, &hash).await? {
+                    // Reuse detected: this token was already rotated or revoked.
+                    // Revoke the entire principal's token family as a theft response.
+                    let revoked = revoke_refresh_family(
+                        conn,
+                        &stale.principal_kind,
+                        stale.principal_id,
+                        "reuse_detected",
+                    )
+                    .await?;
 
-                        // Audit the family revocation (F08).
-                        insert_audit_token_exchange(
-                            conn,
-                            Uuid::new_v4(),
-                            stale.principal_id,
-                            stale.principal_id,
-                            json!([]),
-                            request_id,
-                            Utc::now(),
-                        )
-                        .await?;
+                    // Audit the family revocation (F08).
+                    insert_audit_token_exchange(
+                        conn,
+                        Uuid::new_v4(),
+                        stale.principal_id,
+                        stale.principal_id,
+                        json!([]),
+                        request_id,
+                        Utc::now(),
+                    )
+                    .await?;
 
-                        tracing::warn!(
-                            principal_id = %stale.principal_id,
-                            principal_kind = %stale.principal_kind,
-                            revoked_family_rows = revoked,
-                            "refresh token reuse detected; family revoked"
-                        );
+                    tracing::warn!(
+                        principal_id = %stale.principal_id,
+                        principal_kind = %stale.principal_kind,
+                        revoked_family_rows = revoked,
+                        "refresh token reuse detected; family revoked"
+                    );
 
-                        Err(RefreshError::Reused)
-                    }
-                    None => {
-                        tracing::debug!("refresh token not found for presented hash");
-                        Err(RefreshError::NotFound)
-                    }
+                    Err(RefreshError::Reused)
+                } else {
+                    tracing::debug!("refresh token not found for presented hash");
+                    Err(RefreshError::NotFound)
                 }
             }
         }
@@ -344,7 +334,7 @@ fn map_refresh_issue_error(error: IssueError, root: &CardRef) -> RefreshError {
 /// real security authorities; this decode only routes the request to the right
 /// tenant. A forged or malformed token that cannot be decoded is rejected
 /// immediately as `RefreshRevoked`.
-pub fn claims_from_refresh_jwt(token: &str) -> Result<RefreshTokenClaims, WyrdErrorResponse> {
+pub fn claims_from_refresh_jwt(token: &str) -> Result<RefreshTokenClaims, WyrdError> {
     let payload = token
         .split('.')
         .nth(1)
@@ -356,15 +346,15 @@ pub fn claims_from_refresh_jwt(token: &str) -> Result<RefreshTokenClaims, WyrdEr
 }
 
 /// Extract the tenant id from an unverified refresh JWT.
-pub fn tenant_from_refresh_jwt(token: &str) -> Result<DataTenantId, WyrdErrorResponse> {
+pub fn tenant_from_refresh_jwt(token: &str) -> Result<DataTenantId, WyrdError> {
     claims_from_refresh_jwt(token).map(|c| c.tenant_id)
 }
 
-fn bad_refresh_token_format() -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::RefreshRevoked {
+fn bad_refresh_token_format() -> WyrdError {
+    WyrdError::RefreshRevoked {
         message: "refresh token is not a valid Wyrd JWT".to_owned(),
         details: json!({}),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -390,7 +380,7 @@ mod tests {
     use wyrd_dev_fixtures::cards::seed_backing_card;
 
     use super::{RefreshError, RefreshTokens};
-    use crate::auth::exchange_api_key::TokenExchangeSettings;
+    use crate::exchange_api_key::TokenExchangeSettings;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
@@ -451,7 +441,7 @@ mod tests {
         )
         .bind(user_id)
         .bind(tenant_id.as_uuid())
-        .bind(format!("test-{}@example.com", user_id))
+        .bind(format!("test-{user_id}@example.com"))
         .execute(&mut **conn.transaction())
         .await
         .expect("test user inserts");
@@ -551,12 +541,12 @@ mod tests {
 
         // Insert the token as already-revoked (simulates a previously rotated token).
         sqlx::query(
-            r#"
+            r"
             INSERT INTO wyrd.auth_refresh_tokens
                 (id, data_tenant_id, principal_kind, principal_id, token_hash,
                  expires_at, revoked_at, revoked_reason)
             VALUES ($1, $2, 'service', $3, $4, now() + interval '30 days', now(), 'rotated')
-            "#,
+            ",
         )
         .bind(Uuid::new_v4())
         .bind(tenant.as_uuid())
@@ -686,11 +676,11 @@ mod tests {
         // consume_active_refresh filters on expires_at > now(), so this row is not consumed.
         // refresh_by_hash has no lifecycle filter, so it finds this row and returns Reused.
         sqlx::query(
-            r#"
+            r"
             INSERT INTO wyrd.auth_refresh_tokens
                 (id, data_tenant_id, principal_kind, principal_id, token_hash, expires_at)
             VALUES ($1, $2, 'service', $3, $4, now() - interval '1 hour')
-            "#,
+            ",
         )
         .bind(Uuid::new_v4())
         .bind(tenant.as_uuid())

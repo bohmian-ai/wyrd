@@ -9,9 +9,7 @@ use serde_json::Value;
 use uuid::Uuid;
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_oidc::{ClientAuth, OidcProvider, TrustedIssuer};
-use wyrd_auth_verify::{
-    PrincipalKindWire, TokenPrincipalRef, TokenVerifier, VerifiedExternalIdentity,
-};
+use wyrd_auth_verify::{PrincipalKindWire, TokenPrincipalRef, TokenVerifier};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{IssuerUrl, TokenResponse, TokenType};
@@ -22,13 +20,28 @@ use wyrd_sql::queries::auth::{
 };
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
-use crate::exchange_api_key::{ExchangedToken, role_refs, token_hash};
+use crate::exchange_api_key::{ExchangedToken, auth_error_to_wyrd, role_refs, token_hash};
 use crate::login::{LoginStateEntry, PgLoginStateStore};
 use crate::permission_resolver::SqlPermissionResolver;
 use crate::pg_resolvers::PgIssuerResolver;
 
 const ACCESS_TTL: ChronoDuration = ChronoDuration::minutes(15);
 const REFRESH_TTL: ChronoDuration = ChronoDuration::days(30);
+
+#[derive(Debug, Deserialize)]
+struct TokenEndpointResponse {
+    id_token: String,
+}
+
+struct FinishAuthorizationCodeInput<'a> {
+    postgres: &'a WyrdPostgres,
+    tenant_id: DataTenantId,
+    trusted: &'a TrustedIssuer,
+    login_state: &'a LoginStateEntry,
+    id_token: &'a str,
+    request_id: &'a str,
+    audit_principal_id: &'a mut Uuid,
+}
 
 /// Human OIDC authorization-code exchange service.
 #[derive(Clone)]
@@ -76,17 +89,18 @@ impl AuthorizationCodeExchange {
             )
             .await?;
             let provider = discover_provider(&trusted).await?;
-            let id_token = exchange_code_for_id_token(&provider, &trusted, &login_state, code).await?;
+            let id_token =
+                exchange_code_for_id_token(&provider, &trusted, &login_state, code).await?;
             let token = self
-                .finish_authorization_code_exchange(
+                .finish_authorization_code_exchange(FinishAuthorizationCodeInput {
                     postgres,
                     tenant_id,
-                    &trusted,
-                    &login_state,
-                    &id_token,
+                    trusted: &trusted,
+                    login_state: &login_state,
+                    id_token: &id_token,
                     request_id,
-                    &mut audit_principal_id,
-                )
+                    audit_principal_id: &mut audit_principal_id,
+                })
                 .await?;
             Ok(token)
         }
@@ -108,7 +122,8 @@ impl AuthorizationCodeExchange {
         }
     }
 
-    async fn finish_authorization_code_exchange(
+    /// Complete a human OIDC login after the provider has returned an ID token.
+    pub async fn finish_id_token_exchange(
         &self,
         postgres: &WyrdPostgres,
         tenant_id: DataTenantId,
@@ -116,13 +131,40 @@ impl AuthorizationCodeExchange {
         login_state: &LoginStateEntry,
         id_token: &str,
         request_id: &str,
-        audit_principal_id: &mut Uuid,
+    ) -> Result<(TokenResponse, Uuid), WyrdError> {
+        let mut audit_principal_id = Uuid::nil();
+        let token = self
+            .finish_authorization_code_exchange(FinishAuthorizationCodeInput {
+                postgres,
+                tenant_id,
+                trusted,
+                login_state,
+                id_token,
+                request_id,
+                audit_principal_id: &mut audit_principal_id,
+            })
+            .await?;
+        Ok((token, audit_principal_id))
+    }
+
+    async fn finish_authorization_code_exchange(
+        &self,
+        input: FinishAuthorizationCodeInput<'_>,
     ) -> Result<TokenResponse, WyrdError> {
+        let FinishAuthorizationCodeInput {
+            postgres,
+            tenant_id,
+            trusted,
+            login_state,
+            id_token,
+            request_id,
+            audit_principal_id,
+        } = input;
         let verified = self
             .verifier
             .verify_external(&tenant_id, id_token)
             .await
-            .map_err(WyrdError::from)?;
+            .map_err(auth_error_to_wyrd)?;
         verify_nonce(login_state, &verified.raw_claims)?;
 
         let mut conn = postgres.tenant_conn(tenant_id).await.map_err(sql_error)?;
@@ -231,11 +273,6 @@ async fn exchange_code_for_id_token(
         };
     }
 
-    #[derive(Debug, Deserialize)]
-    struct TokenEndpointResponse {
-        id_token: String,
-    }
-
     response
         .json::<TokenEndpointResponse>()
         .await
@@ -286,8 +323,12 @@ async fn issue_and_record_user_session(
         PermissionSet::default(),
     );
     let access_token = issuing_key
-        .issue_user_access_token(TokenPrincipalRef::from(&principal), roles.clone(), ACCESS_TTL)
-        .map_err(issue_error)?;
+        .issue_user_access_token(
+            TokenPrincipalRef::from(&principal),
+            roles.clone(),
+            ACCESS_TTL,
+        )
+        .map_err(|error| issue_error(&error))?;
     let refresh_token = issuing_key
         .issue_refresh_token(
             PrincipalKindWire::User,
@@ -295,7 +336,7 @@ async fn issue_and_record_user_session(
             tenant_id,
             REFRESH_TTL,
         )
-        .map_err(issue_error)?;
+        .map_err(|error| issue_error(&error))?;
     let now = Utc::now();
     let expires_at = now + ACCESS_TTL;
     insert_refresh_token(
@@ -328,7 +369,8 @@ async fn issue_and_record_user_session(
     })
 }
 
-async fn audit_authorization_code_failure(
+/// Best-effort audit write for a failed human authorization-code exchange.
+pub async fn audit_authorization_code_failure(
     postgres: &WyrdPostgres,
     tenant_id: DataTenantId,
     principal_id: Uuid,
@@ -373,6 +415,8 @@ async fn audit_authorization_code_failure(
     }
 }
 
+/// Return the stable audit tag used for authorization-code exchange failures.
+#[must_use]
 pub fn audit_error_tag(error: &WyrdError) -> &'static str {
     match error {
         WyrdError::InvalidState { .. } => "InvalidState",
@@ -449,7 +493,7 @@ fn sql_error(error: impl Into<SqlError>) -> WyrdError {
     }
 }
 
-fn issue_error(error: wyrd_auth_issue::IssueError) -> WyrdError {
+fn issue_error(error: &wyrd_auth_issue::IssueError) -> WyrdError {
     tracing::warn!(error = %error, "OIDC token issue failed");
     WyrdError::Internal {
         message: "token issue failed".to_owned(),

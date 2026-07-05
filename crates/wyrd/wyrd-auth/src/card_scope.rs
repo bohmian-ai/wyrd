@@ -15,12 +15,17 @@ use wyrd_sql::queries::auth::insert_audit_card_scope_mint;
 use wyrd_sql::queries::cards::get_card_by_ref;
 
 const MAX_SCOPE_DEPTH: usize = 16;
+/// Maximum number of cards that may appear in a minted card-ref scope.
 pub const MAX_SCOPE_CARDS: usize = 32;
 const SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT: usize = 16;
 
+/// Audit mint kind for API-key token exchange scope minting.
 pub const MINT_KIND_API_KEY_EXCHANGE: &str = "api_key_exchange";
+/// Audit mint kind for refresh-token scope minting.
 pub const MINT_KIND_REFRESH: &str = "refresh";
+/// Audit mint kind for delegated-token scope minting.
 pub const MINT_KIND_DELEGATION: &str = "delegation";
+/// Audit mint kind for JWT bearer workload scope minting.
 pub const MINT_KIND_JWT_BEARER: &str = "jwt_bearer";
 
 /// Resolve the observation-target scope for a card-bound principal.
@@ -102,7 +107,9 @@ pub fn issue_scope_error(error: IssueError, root: &CardRef) -> IssueErrorOrWyrd 
 
 /// Result of mapping an issuer error at a card-bound mint site.
 pub enum IssueErrorOrWyrd {
+    /// Token issuer rejected the mint operation.
     Issue(IssueError),
+    /// Card-ref traversal produced a public Wyrd error.
     Wyrd(WyrdError),
 }
 

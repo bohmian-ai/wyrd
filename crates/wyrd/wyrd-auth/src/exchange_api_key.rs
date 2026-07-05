@@ -346,6 +346,7 @@ impl DelegateToken {
     }
 }
 
+/// Issue an access token, optional refresh token, and scope-mint audit for a principal.
 pub async fn issue_for_subject(
     conn: &mut TenantConn<'_>,
     issuing_key: &IssuingKey,
@@ -442,12 +443,16 @@ fn delegate_issue_error(error: IssueError, root: &CardRef) -> DelegateError {
     }
 }
 
+/// Error channel for token issue and database work during subject token minting.
 #[derive(Debug, thiserror::Error)]
 pub enum IssueOrSqlError {
+    /// Token issuer rejected the mint operation.
     #[error("issue")]
     Issue(#[from] IssueError),
+    /// Database operation failed.
     #[error("db")]
     Database(#[from] sqlx::Error),
+    /// Public Wyrd contract error.
     #[error("wyrd")]
     Wyrd(#[from] WyrdError),
 }
@@ -480,10 +485,12 @@ async fn resolve_requested_subject(
     }
 }
 
+/// Convert stored role names into runtime role references.
 pub fn role_refs(names: Vec<String>) -> Result<Vec<RoleRef>, wyrd_runtime::InvalidRoleName> {
     names.into_iter().map(|name| RoleRef::new(&name)).collect()
 }
 
+/// Convert a stored principal kind string into the token wire enum.
 pub fn principal_kind_wire(value: &str) -> Option<PrincipalKindWire> {
     match value {
         "service" => Some(PrincipalKindWire::Service),
@@ -541,6 +548,8 @@ fn act_from_chain(
     })
 }
 
+/// Hash a bearer secret for storage lookup and comparison.
+#[must_use]
 pub fn token_hash(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
@@ -654,7 +663,7 @@ impl From<DelegateError> for WyrdError {
     }
 }
 
-fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
+pub(crate) fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
     match error {
         AuthError::Jwt(error) => jwt_error_to_wyrd(&error),
         AuthError::InvalidToken => invalid_token("token rejected"),

@@ -23,7 +23,7 @@ use wyrd_sql::{TenantConn, WyrdPostgres};
 use crate::card_scope::MINT_KIND_JWT_BEARER;
 use crate::exchange_api_key::{
     ExchangeError, ExchangedToken, IssueSubject, RefreshPolicy, TokenExchangeSettings,
-    issue_for_subject, role_refs,
+    auth_error_to_wyrd, issue_for_subject, role_refs,
 };
 use crate::issue_api_key::principal_kind_for_card;
 use crate::permission_resolver::SqlPermissionResolver;
@@ -102,7 +102,7 @@ impl JwtBearer {
             .verifier
             .verify_external(&tenant_id, assertion)
             .await
-            .map_err(WyrdError::from)?;
+            .map_err(auth_error_to_wyrd)?;
         if verified.principal_kind != PrincipalKindPolicy::Workload {
             return Err(invalid_token(
                 "issuer is not configured for workload identity",
@@ -150,8 +150,12 @@ async fn load_service_account_subject(
         .await
         .map_err(sql_error)?
         .ok_or_else(|| principal_not_found_for_card_ref(card_ref))?;
-    let roles = role_refs(list_service_account_roles(conn, row.id).await.map_err(sql_error)?)
-        .map_err(|_| internal_error("failed to issue workload token"))?;
+    let roles = role_refs(
+        list_service_account_roles(conn, row.id)
+            .await
+            .map_err(sql_error)?,
+    )
+    .map_err(|_| internal_error("failed to issue workload token"))?;
     Ok((row, roles))
 }
 

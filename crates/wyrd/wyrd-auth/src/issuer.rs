@@ -22,17 +22,20 @@ where
         message: "trusted issuer resolver is not configured".to_owned(),
         details: serde_json::json!({}),
     })?;
-    let issuers = resolver.trusted_issuers(&tenant_id).await.map_err(|error| {
-        tracing::warn!(
-            error = %error,
-            tenant_id = %tenant_id,
-            "trusted issuer resolution failed"
-        );
-        WyrdError::AuthVerifyUnavailable {
-            message: "trusted issuer resolution unavailable".to_owned(),
-            details: serde_json::json!({ "retry_after_seconds": 1 }),
-        }
-    })?;
+    let issuers = resolver
+        .trusted_issuers(&tenant_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                error = %error,
+                tenant_id = %tenant_id,
+                "trusted issuer resolution failed"
+            );
+            WyrdError::AuthVerifyUnavailable {
+                message: "trusted issuer resolution unavailable".to_owned(),
+                details: serde_json::json!({ "retry_after_seconds": 1 }),
+            }
+        })?;
     issuers
         .into_iter()
         .find(|candidate| candidate.issuer == *issuer)

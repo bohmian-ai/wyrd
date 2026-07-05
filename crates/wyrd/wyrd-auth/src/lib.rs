@@ -4,10 +4,12 @@
 //! HTTP extractors, handlers, middleware, and response mapping stay in
 //! `wyrd-server`.
 
+pub mod callback;
 pub mod card_scope;
 pub mod exchange_api_key;
-pub mod issuer;
 pub mod issue_api_key;
+pub mod issuer;
+pub mod login;
 pub mod permission_resolver;
 pub mod pg_resolvers;
 pub mod refresh;

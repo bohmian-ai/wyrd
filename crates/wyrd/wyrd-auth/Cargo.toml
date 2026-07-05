@@ -16,6 +16,8 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 jsonwebtoken = { workspace = true }
 moka = { version = "0.12", features = ["future"] }
+rand = { workspace = true }
+reqwest = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

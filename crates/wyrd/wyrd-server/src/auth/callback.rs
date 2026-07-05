@@ -6,7 +6,6 @@ use axum::http::{HeaderMap, header};
 use chrono::{Duration as ChronoDuration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use serde_json::Value;
 use uuid::Uuid;
 use wyrd_auth_oidc::{ClientAuth, OidcProvider, TrustedIssuer};
 use wyrd_auth_verify::PrincipalKindWire;
@@ -22,10 +21,10 @@ use wyrd_sql::queries::auth::{
 };
 use wyrd_sql::{SqlError, TenantConn};
 
-use crate::auth::exchange_api_key::{ExchangedToken, role_refs, token_hash};
-use crate::auth::login::{LoginStateEntry, PgLoginStateStore};
+use crate::auth::exchange_api_key::{ExchangedToken, token_hash};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
+use wyrd_auth::login::{LoginStateEntry, PgLoginStateStore};
 
 const ACCESS_TTL: ChronoDuration = ChronoDuration::seconds(15 * 60);
 const REFRESH_TTL: ChronoDuration = ChronoDuration::seconds(30 * 24 * 60 * 60);
@@ -144,7 +143,8 @@ async fn finish_authorization_code_exchange(
         .verify_external(&tenant_id, id_token)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    verify_nonce(login_state, &verified.raw_claims)?;
+    wyrd_auth::callback::verify_nonce(login_state, &verified.raw_claims)
+        .map_err(WyrdErrorResponse::from)?;
 
     let mut conn = state
         .postgres
@@ -160,7 +160,8 @@ async fn finish_authorization_code_exchange(
     .await
     .map_err(sql_error)?;
     *audit_principal_id = principal_id;
-    let roles = role_names_to_refs(trusted, &verified.groups)?;
+    let roles = wyrd_auth::callback::role_names_to_refs(trusted, &verified.groups)
+        .map_err(WyrdErrorResponse::from)?;
     let issuing_key = state
         .auth
         .issuing_key
@@ -467,45 +468,8 @@ async fn ensure_user_identity(
     Ok(canonical)
 }
 
-fn verify_nonce(state: &LoginStateEntry, claims: &Value) -> Result<(), WyrdErrorResponse> {
-    let Some(nonce) = claims.get("nonce").and_then(Value::as_str) else {
-        return Err(invalid_nonce("id token nonce is missing"));
-    };
-    if nonce != state.nonce {
-        return Err(invalid_nonce("id token nonce mismatch"));
-    }
-    Ok(())
-}
-
-fn role_names_to_refs(
-    trusted: &TrustedIssuer,
-    groups: &[String],
-) -> Result<Vec<RoleRef>, WyrdErrorResponse> {
-    let mut names = trusted.default_roles.clone();
-    for group in groups {
-        if let Some(mapped) = trusted.group_role_map.get(group) {
-            names.extend(mapped.iter().cloned());
-        }
-    }
-    names.sort_unstable();
-    names.dedup();
-    role_refs(names).map_err(|_| {
-        WyrdErrorResponse::from(WyrdError::Internal {
-            message: "trusted issuer role mapping is invalid".to_owned(),
-            details: serde_json::json!({}),
-        })
-    })
-}
-
 fn invalid_state(message: &str) -> WyrdErrorResponse {
     WyrdErrorResponse::from(WyrdError::InvalidState {
-        message: message.to_owned(),
-        details: serde_json::json!({}),
-    })
-}
-
-fn invalid_nonce(message: &str) -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::InvalidNonce {
         message: message.to_owned(),
         details: serde_json::json!({}),
     })
@@ -567,17 +531,17 @@ mod tests {
     use wyrd_sql::queries::auth::upsert_trusted_issuer;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
-    use crate::auth::login::{LoginStateEntry, PgLoginStateStore};
     use crate::auth::permission_resolver::SqlPermissionResolver;
     use crate::auth::pg_resolvers::{PgIssuerResolver, issuer_write_from_trusted};
     use crate::http::error::WyrdErrorResponse;
     use crate::state::AppState;
+    use wyrd_auth::login::{LoginStateEntry, PgLoginStateStore};
 
     use super::{
         audit_authorization_code_failure, audit_error_tag, ensure_user_identity,
-        exchange_authorization_code, finish_authorization_code_exchange, role_names_to_refs,
-        tenant_slug_from_host, verify_nonce,
+        exchange_authorization_code, finish_authorization_code_exchange, tenant_slug_from_host,
     };
+    use wyrd_auth::callback::{role_names_to_refs, verify_nonce};
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -657,7 +621,7 @@ mod tests {
         let error = verify_nonce(&state, &serde_json::json!({ "nonce": "nonce-b" }))
             .expect_err("nonce mismatch rejects");
 
-        assert_eq!(error.0.code(), "WYRD_AUTH_400_INVALID_NONCE");
+        assert_eq!(error.code(), "WYRD_AUTH_400_INVALID_NONCE");
     }
 
     #[test]

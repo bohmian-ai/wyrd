@@ -21,11 +21,11 @@ use wyrd_auth_verify::{
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::{PrincipalId, RbacCheck, RoleRef};
 use wyrd_semver::VersionBlock;
-use wyrd_server::components::auth::audit_writer::NoopAuthzAuditWriter;
 use wyrd_server::auth::issue_api_key::WyrdApiKey;
 use wyrd_server::auth::permission_resolver::SqlPermissionResolver;
 use wyrd_server::auth::pg_resolvers::PgIssuerResolver;
 use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
+use wyrd_server::components::auth::audit_writer::NoopAuthzAuditWriter;
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
@@ -205,12 +205,13 @@ impl WyrdTestEnv {
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
         ));
-        let mut state = AppState::new(postgres, storage).with_auth(wyrd_server::components::auth::ServerAuth {
-            allow_preview: true,
-            issuing_key: Some(Arc::clone(&issuing_key)),
-            token_verifier: Some(Arc::clone(&verifier)),
-            ..wyrd_server::components::auth::ServerAuth::default()
-        });
+        let mut state =
+            AppState::new(postgres, storage).with_auth(wyrd_server::components::auth::ServerAuth {
+                allow_preview: true,
+                issuing_key: Some(Arc::clone(&issuing_key)),
+                token_verifier: Some(Arc::clone(&verifier)),
+                ..wyrd_server::components::auth::ServerAuth::default()
+            });
         state.authz.permission_check = Arc::new(RbacCheck);
         state.authz.audit_writer = Arc::new(NoopAuthzAuditWriter);
         let router = build_router(state.clone());

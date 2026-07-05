@@ -9,7 +9,6 @@ pub mod grpc;
 pub mod http;
 pub mod postgres;
 pub mod state;
-pub mod storage;
 
 pub use app::{build_app, run, serve};
 pub use boot::{

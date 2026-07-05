@@ -725,7 +725,7 @@ if ! rg -q '#\\[serde\\(tag = "protocol", content = "data"' crates/wyrd-spec/src
   exit 1
 fi
 
-if rg -n -e '\\.unwrap\\(\\)' crates/wyrd/wyrd-storage/src crates/wyrd/wyrd-server/src/storage; then
+if rg_optional '\\.unwrap\\(\\)' crates/wyrd/wyrd-storage/src; then
   echo 'unwrap is forbidden in non-test storage code'
   exit 1
 fi

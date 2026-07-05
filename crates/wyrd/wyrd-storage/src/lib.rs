@@ -32,7 +32,7 @@ pub use error::{AzureError, ConfigParseError, GcsError, LocalError, S3Error, Sto
 pub use handle::{StorageHandle, StorageHealthError};
 pub use local::LocalSigner;
 pub use plan::{PlanError, PlannedUpload, plan_upload};
-pub use settings::{BackendConfig, StorageSettings};
 pub use service::{StorageCaller, StoragePrincipalKind, StorageSubject};
+pub use settings::{BackendConfig, StorageSettings};
 pub use signer::{BackendSigner, CompletePayload, HeadInfo, MultipartInit, UploadPlanReplayInput};
 pub use tenant_path::{TenantPathError, ValidatedPath};

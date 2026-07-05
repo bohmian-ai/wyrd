@@ -22,12 +22,12 @@ use wyrd_sql::queries::storage::artifact_metadata::ArtifactMetadataRow;
 use wyrd_sql::queries::storage::multipart_uploads::{self, MultipartUploadRow, UploadStatus};
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
+use crate::StorageHandle;
 use crate::audit::{self, UploadAuditOperation};
 use crate::error::StorageError;
 use crate::plan::{MAX_OBJECT_SIZE_BYTES, PlannedUpload, plan_upload};
 use crate::signer::{CompletePayload, HeadInfo, MultipartInit, UploadPlanReplayInput};
 use crate::tenant_path::{self, TenantPathError, ValidatedPath};
-use crate::StorageHandle;
 
 const INIT_TTL_SECS: u64 = 24 * 60 * 60;
 
@@ -187,7 +187,7 @@ pub async fn upload_init(
         abort_prior_best_effort(&state, caller, prior).await;
     }
 
-    let init = match drive_backend_init(state, &validated, planned, body.expected_size_bytes).await
+    let init = match drive_backend_init(&state, &validated, planned, body.expected_size_bytes).await
     {
         Ok(init) => init,
         Err(error) => {
@@ -559,7 +559,7 @@ pub async fn download_init(
     conn.commit().await.map_err(map_sql_error)?;
 
     let request_ttl_secs = compute_download_ttl(&body, state.storage.presign_ttl_secs());
-    let get_url = download_url(state, &validated, request_ttl_secs).await?;
+    let get_url = download_url(&state, &validated, request_ttl_secs).await?;
     let ttl_secs = if state.storage.backend() == StorageBackendKind::Local {
         0
     } else {
@@ -678,7 +678,11 @@ async fn find_and_mark_prior_pending(
     Ok(None)
 }
 
-async fn abort_prior_best_effort(state: &StorageServiceState<'_>, caller: &StorageCaller, prior: PriorAbort) {
+async fn abort_prior_best_effort(
+    state: &StorageServiceState<'_>,
+    caller: &StorageCaller,
+    prior: PriorAbort,
+) {
     let Some(backend_upload_id) = prior.backend_upload_id else {
         return;
     };
@@ -756,7 +760,10 @@ async fn download_url(
         .map_err(map_storage_error)
 }
 
-fn local_download_url(storage: &StorageHandle, validated: &ValidatedPath) -> Result<String, WyrdError> {
+fn local_download_url(
+    storage: &StorageHandle,
+    validated: &ValidatedPath,
+) -> Result<String, WyrdError> {
     let base = storage.public_base_url().ok_or_else(|| {
         internal_error(
             "local storage requires WYRD_PUBLIC_BASE_URL to mint download URLs",
@@ -1467,11 +1474,7 @@ mod tests {
         .await
         .expect("local storage handle");
         let tenant = DataTenantId::new_v7();
-        let path = tenant_path::build(
-            tenant,
-            "018f0000-0000-7000-8000-000000000000",
-            "model.bin",
-        );
+        let path = tenant_path::build(tenant, "018f0000-0000-7000-8000-000000000000", "model.bin");
 
         upload_local_blob(&storage, tenant, path.clone(), b"data")
             .await
@@ -1521,5 +1524,4 @@ mod tests {
             WireProtocol::AzureBlockBlobV1,
         );
     }
-
 }

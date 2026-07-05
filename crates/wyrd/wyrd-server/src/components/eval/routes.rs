@@ -1,7 +1,7 @@
 //! Native `/v1/eval/*` pull-protocol handlers.
 //!
 //! Mounted inside the authenticated `/v1` group beside
-//! `crate::storage::routes::mount`. The `/v1` group has **no structural auth
+//! `crate::components::storage::storage_router`. The `/v1` group has **no structural auth
 //! layer** — every handler here takes the [`AuthenticatedPrincipal`] extractor,
 //! so a route omitting it would be silently unauthenticated.
 //!
@@ -40,7 +40,7 @@ use super::state::{MAX_CONCURRENT_RUNS, RunEntry, sweep_and_count_tenant};
 
 /// Build the four eval pull-protocol routes for the `/v1` group.
 ///
-/// Mirrors `crate::storage::routes::mount`. Every route resolves the principal
+/// Mirrors `crate::components::storage::storage_router`. Every route resolves the principal
 /// per-handler; there is no group-level auth layer to rely on.
 pub fn eval_router() -> Router<AppState> {
     Router::new()

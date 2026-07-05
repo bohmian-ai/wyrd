@@ -9,6 +9,7 @@ pub mod card_scope;
 pub mod exchange_api_key;
 pub mod issue_api_key;
 pub mod issuer;
+pub mod jwt_bearer;
 pub mod login;
 pub mod permission_resolver;
 pub mod pg_resolvers;

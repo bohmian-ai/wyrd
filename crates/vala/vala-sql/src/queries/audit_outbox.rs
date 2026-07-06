@@ -74,7 +74,7 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
     .bind(event.resource.as_str())
     .bind(card_ref.as_deref())
     .bind(event.principal_id.as_uuid())
-    .bind(event.principal_kind.tag().as_str())
+    .bind(event.principal_kind.as_str())
     .bind(auth_method_str(event.auth_method))
     .bind(event.permission.as_str())
     .bind(decision_str(event.decision))
@@ -169,7 +169,7 @@ fn entry_hash(prev_hash: &[u8], seq: i64, event: &AuditEvent, card_ref: Option<&
     push_str(&mut buf, &event.resource);
     push_opt(&mut buf, card_ref);
     buf.extend_from_slice(event.principal_id.as_uuid().as_bytes());
-    push_str(&mut buf, event.principal_kind.tag().as_str());
+    push_str(&mut buf, event.principal_kind.as_str());
     push_str(&mut buf, auth_method_str(event.auth_method));
     push_str(&mut buf, &event.permission);
     push_str(&mut buf, decision_str(event.decision));

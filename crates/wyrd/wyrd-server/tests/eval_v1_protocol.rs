@@ -27,7 +27,7 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::{
-    Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
+    Kid, PrincipalKindTag, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
     public_key_from_pem,
 };
 use wyrd_dev_fixtures::pg::PgFixture;
@@ -115,7 +115,7 @@ fn mint_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> String {
         .issue_user_access_token(
             TokenPrincipalRef {
                 id: PrincipalId::new(uuid::Uuid::now_v7()),
-                kind: PrincipalKindWire::User,
+                kind: PrincipalKindTag::User,
                 tenant_id: tenant,
                 card_ref: None,
                 card_ref_scope: Default::default(),

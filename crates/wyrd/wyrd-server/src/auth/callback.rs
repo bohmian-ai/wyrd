@@ -119,7 +119,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_oidc::{
-        ClaimMapping, ClaimPath, ClientAuth, JwksCache, PrincipalKindPolicy, TrustedIssuer,
+        ClaimMapping, ClaimPath, ClientAuth, JwksCache, IssuerTokenPolicy, TrustedIssuer,
     };
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
     use wyrd_crypt::SecretKey;
@@ -486,7 +486,7 @@ mod tests {
             },
             group_role_map,
             default_roles,
-            principal_kind: PrincipalKindPolicy::Human,
+            principal_kind: IssuerTokenPolicy::Human,
             jwks_ttl: StdDuration::from_secs(300),
         }
     }
@@ -511,7 +511,7 @@ mod tests {
             },
             group_role_map,
             default_roles,
-            principal_kind: PrincipalKindPolicy::Human,
+            principal_kind: IssuerTokenPolicy::Human,
             jwks_ttl: StdDuration::from_secs(300),
         }
     }

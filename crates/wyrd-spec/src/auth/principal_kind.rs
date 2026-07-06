@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 /// Serializes as a bare snake_case string (`"user"`, `"service"`, `"agent"`);
 /// this is a stable wire contract for the revoke request body, token claims, and
 /// the revocation NOTIFY channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PrincipalKindTag {

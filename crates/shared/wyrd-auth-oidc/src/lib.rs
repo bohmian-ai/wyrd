@@ -26,6 +26,6 @@ pub use error::OidcError;
 pub use jwks::{JwksCache, OidcKid};
 pub use provider::{OidcProvider, ProviderMetadata};
 pub use registry::{
-    ClaimMapping, ClaimPath, ClientAuth, PrincipalKindPolicy, TrustedIssuer, TrustedIssuerRegistry,
-    WorkloadBinding, WorkloadBindingResolver,
+    ClaimMapping, ClaimPath, ClientAuth, TrustedIssuer, TrustedIssuerRegistry, WorkloadBinding,
+    WorkloadBindingResolver,
 };

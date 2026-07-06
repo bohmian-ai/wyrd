@@ -8,7 +8,7 @@ use tower::ServiceExt;
 use wyrd_auth_check::DenyAllPolicyHook;
 use wyrd_auth_issue::{DelegationCaller, IssuingKey};
 use wyrd_auth_verify::{
-    ActClaim, Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
+    ActClaim, Kid, PrincipalKindTag, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
     public_key_from_pem,
 };
 use wyrd_runtime::{PrincipalId, RoleRef};
@@ -285,7 +285,7 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
         .issue_user_access_token(
             TokenPrincipalRef {
                 id: PrincipalId::new(uuid::Uuid::now_v7()),
-                kind: PrincipalKindWire::User,
+                kind: PrincipalKindTag::User,
                 tenant_id: tenant,
                 card_ref: None,
                 card_ref_scope: Default::default(),
@@ -317,7 +317,7 @@ fn mint_delegated_service_jwt(state: &AppState, tenant: DataTenantId) -> String 
     let caller_ref = card_ref(CardKind::Service, "caller");
     let caller = TokenPrincipalRef {
         id: PrincipalId::new(uuid::Uuid::now_v7()),
-        kind: PrincipalKindWire::Service,
+        kind: PrincipalKindTag::Service,
         tenant_id: tenant,
         card_ref: Some(caller_ref.clone()),
         card_ref_scope: wyrd_spec::reference::CardRefScope::own(&caller_ref),
@@ -325,7 +325,7 @@ fn mint_delegated_service_jwt(state: &AppState, tenant: DataTenantId) -> String 
     let requested_ref = card_ref(CardKind::Service, "callee");
     let requested = TokenPrincipalRef {
         id: PrincipalId::new(uuid::Uuid::now_v7()),
-        kind: PrincipalKindWire::Service,
+        kind: PrincipalKindTag::Service,
         tenant_id: tenant,
         card_ref: Some(requested_ref.clone()),
         card_ref_scope: wyrd_spec::reference::CardRefScope::own(&requested_ref),

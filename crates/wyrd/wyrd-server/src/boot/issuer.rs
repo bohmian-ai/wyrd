@@ -26,7 +26,7 @@ use std::time::Duration;
 use sqlx::PgPool;
 use url::Url;
 use wyrd_auth_oidc::{
-    ClaimMapping, ClaimPath, ClientAuth, OidcProvider, PrincipalKindPolicy, ProviderMetadata,
+    ClaimMapping, ClaimPath, ClientAuth, OidcProvider, IssuerTokenPolicy, ProviderMetadata,
     TrustedIssuer, WorkloadBinding,
 };
 use wyrd_crypt::SecretKey;
@@ -39,7 +39,7 @@ use wyrd_sql::queries::auth::{
 
 use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
 use crate::boot::ServerBootError;
-use crate::config::{ClaimMappingEntry, ClientAuthEntry, IssuerEntry, PrincipalKindEntry};
+use crate::config::{ClaimMappingEntry, ClientAuthEntry, IssuerEntry, IssuerTokenPolicy};
 
 /// Default JWKS key-cache TTL applied when an entry omits `jwks_ttl_secs`.
 const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(3600);
@@ -283,11 +283,11 @@ fn map_claim_mapping(entry: &ClaimMappingEntry) -> ClaimMapping {
     }
 }
 
-/// Map the config principal-kind DTO to the domain [`PrincipalKindPolicy`].
-fn map_principal_kind(entry: PrincipalKindEntry) -> PrincipalKindPolicy {
+/// Map the config principal-kind DTO to the domain [`IssuerTokenPolicy`].
+fn map_principal_kind(entry: IssuerTokenPolicy) -> IssuerTokenPolicy {
     match entry {
-        PrincipalKindEntry::Human => PrincipalKindPolicy::Human,
-        PrincipalKindEntry::Workload => PrincipalKindPolicy::Workload,
+        IssuerTokenPolicy::Human => IssuerTokenPolicy::Human,
+        IssuerTokenPolicy::Workload => IssuerTokenPolicy::Workload,
     }
 }
 
@@ -347,7 +347,7 @@ mod tests {
             },
             group_role_map: std::collections::HashMap::new(),
             default_roles: vec!["viewer".to_owned()],
-            principal_kind: PrincipalKindEntry::Workload,
+            principal_kind: IssuerTokenPolicy::Workload,
             jwks_ttl_secs: None,
         }
     }
@@ -437,7 +437,7 @@ mod tests {
         assert_eq!(trusted.jwks_uri.as_str(), format!("{issuer}/jwks"));
         assert_eq!(trusted.expected_audience, "wyrd-aud");
         assert_eq!(trusted.client_id, "wyrd-client");
-        assert_eq!(trusted.principal_kind, PrincipalKindPolicy::Workload);
+        assert_eq!(trusted.principal_kind, IssuerTokenPolicy::Workload);
         assert_eq!(trusted.default_roles, vec!["viewer".to_owned()]);
         assert_eq!(trusted.jwks_ttl, DEFAULT_JWKS_TTL);
         assert_eq!(trusted.claim_mapping.subject.as_str(), "sub");

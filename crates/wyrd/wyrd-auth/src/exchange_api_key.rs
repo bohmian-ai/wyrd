@@ -8,7 +8,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wyrd_auth_issue::{DelegationCaller, IssueError, IssuingKey};
-use wyrd_auth_verify::{ActClaim, AuthError, PrincipalKindWire, TokenPrincipalRef, TokenVerifier};
+use wyrd_auth_verify::{ActClaim, AuthError, PrincipalKindTag, TokenPrincipalRef, TokenVerifier};
 use wyrd_runtime::{Permission, PermissionCheck, PrincipalId, PrincipalKind, RoleRef};
 use wyrd_spec::auth::{RequestedSubject, SecretBearer, TokenResponse, TokenType};
 use wyrd_spec::envelope::CardKind;
@@ -490,10 +490,10 @@ pub(crate) fn role_refs(names: Vec<String>) -> Result<Vec<RoleRef>, wyrd_runtime
 }
 
 /// Convert a stored principal kind string into the token wire enum.
-pub(crate) fn principal_kind_wire(value: &str) -> Option<PrincipalKindWire> {
+pub(crate) fn principal_kind_wire(value: &str) -> Option<PrincipalKindTag> {
     match value {
-        "service" => Some(PrincipalKindWire::Service),
-        "agent" => Some(PrincipalKindWire::Agent),
+        "service" => Some(PrincipalKindTag::Service),
+        "agent" => Some(PrincipalKindTag::Agent),
         _ => None,
     }
 }

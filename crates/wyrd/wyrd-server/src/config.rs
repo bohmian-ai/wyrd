@@ -11,6 +11,7 @@ use std::time::Duration;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use wyrd_spec::TenantSlug;
+use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_telemetry::TelemetryConfig;
 
 /// Errors raised during configuration loading or validation.
@@ -322,19 +323,6 @@ pub enum ClientAuthEntry {
     Public,
 }
 
-/// Whether tokens from an issuer represent human users or machine workloads.
-///
-/// Maps 1:1 to `wyrd_auth_oidc::PrincipalKindPolicy`.
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PrincipalKindEntry {
-    /// Token represents a human user.
-    #[default]
-    Human,
-    /// Token represents a machine workload.
-    Workload,
-}
-
 /// Dotted claim paths for extracting normalized claims from verified tokens.
 ///
 /// `subject` defaults to `"sub"`. No path-format validation is performed here;
@@ -394,7 +382,7 @@ pub struct IssuerEntry {
     pub default_roles: Vec<String>,
     /// Whether tokens from this issuer represent human users or machine workloads.
     #[serde(default)]
-    pub principal_kind: PrincipalKindEntry,
+    pub principal_kind: IssuerTokenPolicy,
     /// JWKS key-cache TTL in seconds. `None` means boot applies its default.
     pub jwks_ttl_secs: Option<u64>,
 }
@@ -1509,7 +1497,7 @@ mod tests {
         }
     }
 
-    // ── 23. PrincipalKindEntry variants parse correctly ───────────────────────
+    // ── 23. IssuerTokenPolicy variants parse correctly ───────────────────────
 
     #[test]
     fn principal_kind_variants_parse() {

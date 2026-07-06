@@ -7,7 +7,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use uuid::Uuid;
 use wyrd_auth_issue::IssuingKey;
-use wyrd_auth_oidc::{PrincipalKindPolicy, WorkloadBindingResolver};
+use wyrd_auth_oidc::{IssuerTokenPolicy, WorkloadBindingResolver};
 use wyrd_auth_verify::{TokenVerifier, VerifiedExternalIdentity};
 use wyrd_runtime::RoleRef;
 use wyrd_spec::DataTenantId;
@@ -111,7 +111,7 @@ impl JwtBearer {
             .verify_external(&tenant_id, assertion)
             .await
             .map_err(auth_error_to_wyrd)?;
-        if verified.principal_kind != PrincipalKindPolicy::Workload {
+        if verified.principal_kind != IssuerTokenPolicy::Workload {
             return Err(invalid_token(
                 "issuer is not configured for workload identity",
             ));

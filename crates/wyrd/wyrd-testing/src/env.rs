@@ -20,7 +20,7 @@ use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_auth_check::{AuthzCheckRequest, AuthzCheckResponse, PolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::{
-    Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
+    Kid, PrincipalKindTag, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
     public_key_from_pem,
 };
 use wyrd_dev_fixtures::pg::PgFixture;
@@ -276,7 +276,7 @@ impl WyrdTestEnv {
 
         let principal = TokenPrincipalRef {
             id: PrincipalId::new(user_id),
-            kind: PrincipalKindWire::User,
+            kind: PrincipalKindTag::User,
             tenant_id: self.data_tenant_id(),
             card_ref: None,
             card_ref_scope: Default::default(),

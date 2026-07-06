@@ -351,7 +351,7 @@ mod tests {
     use base64::Engine;
     use sqlx::types::Json as SqlxJson;
     use uuid::Uuid;
-    use wyrd_auth_verify::{AccessTokenClaims, PrincipalKindWire, TokenPrincipalRef};
+    use wyrd_auth_verify::{AccessTokenClaims, PrincipalKindTag, TokenPrincipalRef};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind};
     use wyrd_semver::VersionBlock;
@@ -389,7 +389,7 @@ mod tests {
             sub: principal_id.to_string(),
             principal: TokenPrincipalRef {
                 id: principal_id,
-                kind: PrincipalKindWire::User,
+                kind: PrincipalKindTag::User,
                 tenant_id,
                 card_ref: None,
                 card_ref_scope: Default::default(),

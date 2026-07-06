@@ -46,7 +46,7 @@ pub fn audit_event(
         resource: resource.to_owned(),
         card_ref: caller.principal.card_ref().cloned(),
         principal_id: caller.principal.id,
-        principal_kind: caller.principal.kind.clone(),
+        principal_kind: caller.principal.kind.tag(),
         auth_method: AuthMethod::Jwt,
         permission: permission.to_owned(),
         decision,

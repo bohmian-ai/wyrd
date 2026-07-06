@@ -6,7 +6,7 @@ use clap::{Args, Subcommand};
 use url::Url;
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, IssuerUrl,
-    PrincipalKindPayload, TrustedIssuerView,
+    IssuerTokenPolicy, TrustedIssuerView,
 };
 
 use crate::error::WyrdCliError;
@@ -248,10 +248,10 @@ fn parse_client_auth(value: &str) -> Result<ClientAuthKind, WyrdCliError> {
     }
 }
 
-fn parse_principal_kind(value: &str) -> Result<PrincipalKindPayload, WyrdCliError> {
+fn parse_principal_kind(value: &str) -> Result<IssuerTokenPolicy, WyrdCliError> {
     match value {
-        "Human" => Ok(PrincipalKindPayload::Human),
-        "Workload" => Ok(PrincipalKindPayload::Workload),
+        "Human" => Ok(IssuerTokenPolicy::Human),
+        "Workload" => Ok(IssuerTokenPolicy::Workload),
         other => Err(WyrdCliError::AdminFailed {
             status: 400,
             detail: format!("unknown --principal-kind {other:?}; expected Human or Workload"),

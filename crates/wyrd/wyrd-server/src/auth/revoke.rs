@@ -1,7 +1,7 @@
 //! `POST /v1/principals/{id}/revoke` — bump `tokens_not_before` to now().
 
 use axum::extract::{Path, State};
-use wyrd_auth_verify::PrincipalKindWire;
+use wyrd_auth_verify::PrincipalKindTag;
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
@@ -56,7 +56,7 @@ async fn commit_conn(conn: TenantConn<'_>) -> Result<(), WyrdErrorResponse> {
 async fn fan_out_notify(
     state: &AppState,
     tenant: DataTenantId,
-    kind: PrincipalKindWire,
+    kind: PrincipalKindTag,
     id: PrincipalId,
 ) {
     if let Err(e) = notify_principal_revoked(state.postgres.app_pool(), tenant, kind, id).await {

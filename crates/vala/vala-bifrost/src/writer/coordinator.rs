@@ -6,7 +6,7 @@ use iceberg::table::Table;
 use iceberg_catalog_sql::SqlCatalog;
 use sqlx::PgPool;
 use tokio::sync::mpsc;
-use wyrd_spec::auth::{PrincipalId, PrincipalKind};
+use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
@@ -35,13 +35,9 @@ pub(crate) const AUDIT_RELAY_ORIGIN: &str = "audit-relay";
 /// is `Success` because this event is only appended on the finalized commit.
 fn ingest_audit_event(ctx: &BifrostWriteContext, resource: &str) -> AuditEvent {
     let principal_kind = match ctx.card_ref.as_ref() {
-        Some(card) if card.kind == CardKind::Agent => PrincipalKind::Agent {
-            card_ref: card.clone(),
-        },
-        Some(card) => PrincipalKind::Service {
-            card_ref: card.clone(),
-        },
-        None => PrincipalKind::User,
+        Some(card) if card.kind == CardKind::Agent => PrincipalKindTag::Agent,
+        Some(_) => PrincipalKindTag::Service,
+        None => PrincipalKindTag::User,
     };
     let principal_id = ctx
         .actor

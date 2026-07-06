@@ -1,6 +1,6 @@
 //! Principal revocation domain operations.
 
-use wyrd_auth_verify::PrincipalKindWire;
+use wyrd_auth_verify::PrincipalKindTag;
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
@@ -20,14 +20,14 @@ pub async fn revoke_principal_in_conn(
     conn: &mut TenantConn<'_>,
     target_id: PrincipalId,
     tenant: DataTenantId,
-) -> Result<PrincipalKindWire, WyrdError> {
+) -> Result<PrincipalKindTag, WyrdError> {
     let id_uuid = target_id.as_uuid();
 
     if user_by_id(conn, id_uuid).await.ok().flatten().is_some() {
         revoke_user_principal(conn, id_uuid)
             .await
             .map_err(internal_error)?;
-        return Ok(PrincipalKindWire::User);
+        return Ok(PrincipalKindTag::User);
     }
 
     if let Some(row) = service_account_by_id(conn, id_uuid).await.ok().flatten() {
@@ -35,9 +35,9 @@ pub async fn revoke_principal_in_conn(
             .await
             .map_err(internal_error)?;
         let kind = if row.principal_kind == "agent" {
-            PrincipalKindWire::Agent
+            PrincipalKindTag::Agent
         } else {
-            PrincipalKindWire::Service
+            PrincipalKindTag::Service
         };
         return Ok(kind);
     }
@@ -58,7 +58,7 @@ fn internal_error(error: impl std::fmt::Display) -> WyrdError {
 #[cfg(test)]
 mod tests {
     use uuid::Uuid;
-    use wyrd_auth_verify::PrincipalKindWire;
+    use wyrd_auth_verify::PrincipalKindTag;
     use wyrd_dev_fixtures::cards::seed_backing_card;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::PrincipalId;
@@ -96,7 +96,7 @@ mod tests {
             .await
             .expect("revocation succeeds");
 
-        assert_eq!(kind, PrincipalKindWire::User);
+        assert_eq!(kind, PrincipalKindTag::User);
     }
 
     #[tokio::test]
@@ -125,7 +125,7 @@ mod tests {
             .await
             .expect("revocation succeeds");
 
-        assert_eq!(kind, PrincipalKindWire::Service);
+        assert_eq!(kind, PrincipalKindTag::Service);
     }
 
     #[tokio::test]
@@ -160,7 +160,7 @@ mod tests {
             .await
             .expect("revocation succeeds");
 
-        assert_eq!(kind, PrincipalKindWire::Agent);
+        assert_eq!(kind, PrincipalKindTag::Agent);
     }
 
     #[tokio::test]

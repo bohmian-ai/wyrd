@@ -22,7 +22,7 @@ use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_semver::VersionBlock;
 use wyrd_server::config::{
-    ClaimMappingEntry, ClientAuthEntry, IssuerEntry, PrincipalKindEntry, WorkloadBindingEntry,
+    ClaimMappingEntry, ClientAuthEntry, IssuerEntry, IssuerTokenPolicy, WorkloadBindingEntry,
 };
 use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse, IssuerUrl};
 use wyrd_spec::envelope::CardKind;
@@ -53,7 +53,7 @@ const FIXTURE_TENANT_SLUG: &str = "test-tenant-1";
 
 /// Build a `[[trusted_issuers]]` config DTO. The config carries no tenant; the
 /// harness seam binds it to `fixture.data_tenant_id()` at boot.
-fn issuer_entry(issuer: &str, audience: &str, principal_kind: PrincipalKindEntry) -> IssuerEntry {
+fn issuer_entry(issuer: &str, audience: &str, principal_kind: IssuerTokenPolicy) -> IssuerEntry {
     IssuerEntry {
         issuer: issuer.to_owned(),
         client_id: audience.to_owned(),
@@ -72,7 +72,7 @@ fn keycloak_workload_issuer() -> IssuerEntry {
     issuer_entry(
         &keycloak_issuer(),
         "wyrd-workload",
-        PrincipalKindEntry::Workload,
+        IssuerTokenPolicy::Workload,
     )
 }
 
@@ -246,7 +246,7 @@ async fn assert_config_driven_trust_layer(issuer: &str, audience: &str) {
         .with_trusted_issuer_configs(vec![issuer_entry(
             issuer,
             audience,
-            PrincipalKindEntry::Workload,
+            IssuerTokenPolicy::Workload,
         )])
         .start_in_process()
         .await
@@ -787,7 +787,7 @@ async fn human_oidc_login_journey() {
             groups: Some("realm_access.roles".to_owned()),
         },
         default_roles: vec!["runtime_admin".to_owned()],
-        ..issuer_entry(&keycloak_issuer(), "wyrd-human", PrincipalKindEntry::Human)
+        ..issuer_entry(&keycloak_issuer(), "wyrd-human", IssuerTokenPolicy::Human)
     };
     human_issuer.client_id = "wyrd-human".to_owned();
 

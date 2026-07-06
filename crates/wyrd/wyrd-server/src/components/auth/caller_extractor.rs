@@ -60,7 +60,7 @@ mod tests {
     use std::time::Duration as StdDuration;
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{
-        Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
+        Kid, PrincipalKindTag, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
         public_key_from_pem,
     };
     use wyrd_runtime::PrincipalId;
@@ -144,7 +144,7 @@ mod tests {
     fn mint_test_user_jwt(state: &crate::state::AppState, tenant: DataTenantId) -> String {
         let principal = TokenPrincipalRef {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: PrincipalKindWire::User,
+            kind: PrincipalKindTag::User,
             tenant_id: tenant,
             card_ref: None,
             card_ref_scope: Default::default(),

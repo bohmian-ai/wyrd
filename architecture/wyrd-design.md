@@ -22,7 +22,7 @@ Downstream artifacts are brought up to this version in a sync pass.
   - [Service](#service) · [Policy](#policy) · [Audit](#audit)
   - [Drift](#drift) · [Eval](#eval) · [Source](#source) · [Bifrost](#bifrost--wyrds-olap-warehouse)
   - [Trigger](#trigger) · [Operator](#operator)
-- [Spec-file authoring](#spec-file-authoring) — `ref` / `path` / `inline`, pre-registration matrix
+- [Spec-file authoring](#spec-file-authoring) — `ref` / `select` / `path` / `inline`, pre-registration matrix
 - [Workspace config](#workspace-config-wyrdtoml) — `wyrd.toml` defaults and merge rules
 - [Reference-direction quick reference](#reference-direction-quick-reference) — who refs whom
 - [Worked directory layout](#worked-directory-layout) — example deployment tree
@@ -150,19 +150,38 @@ Downstream artifacts are brought up to this version in a sync pass.
     and `X-Original-*` to `/v1/authz/check`; the body is empty. Both caller
     and callee identities are server-verified from one signed delegated
     JWT — no enforcement-point JWT, no SPIFFE/mTLS callee derivation.
-19. **Light-card reference slots accept `ref | path | inline`.** Wherever a
-    card spec references a light card (Prompt, Agent, Workflow, Mcp, Policy,
-    Eval, Trigger, Operator, Source, Audit, Service), the slot is a
-    three-variant tagged-by-key union, mutually exclusive:
-    - `ref:`    — `CardRef` to a registered card. Stable identity.
-    - `path:`   — client-side authoring sugar. Loader splices the file's
-                  spec body inline before send. Never on the wire. Never
-                  auto-registered.
-    - `inline:` — spec body embedded in the parent, prefixed with `kind:`.
-                  No card identity; not addressable from outside the parent.
+19. **Reference slots accept `ref | select | path | inline`.** Wherever a
+    card spec references another card — light or heavy (Prompt, Agent,
+    Workflow, Mcp, Policy, Eval, Trigger, Operator, Source, Audit, Service,
+    Model, Data, Experiment, Artifact) — the slot is a tagged-by-key union,
+    mutually exclusive. The key IS the discriminator:
+    - `ref:`    — a `CardRef` with exact identity: `kind`, `name`, `version`,
+                  optional `space`, optional `uid`. The only durable form that
+                  crosses the wire. `CardRef` never carries `labels` or
+                  `annotations`.
+    - `select:` — client-side authoring sugar. A `CardSelector` that matches on
+                  target-card **metadata** (`kind`, optional `name`, `version`,
+                  `space`, `labels`, `annotations`, `latest`). `wyrd plan` /
+                  `wyrd apply` resolves it to exactly one `uid`-bearing
+                  `CardRef` before registration, relationship derivation,
+                  hydration, or any runtime observation. Zero matches →
+                  `CARD_SELECTOR_NOT_FOUND`; more than one →
+                  `CARD_SELECTOR_AMBIGUOUS`. Never on the wire.
+    - `path:`   — client-side authoring sugar. Targets a **full card envelope**
+                  on disk (`apiVersion` + `kind` + `metadata` + `spec`). The
+                  loader registers it as an independent card and rewrites the
+                  parent slot to `ref: CardRef`. Never on the wire.
+    - `inline:` — spec body embedded in the parent, prefixed with `kind:`. No
+                  card identity; not addressable from outside the parent. Light
+                  cards only.
 
-    Heavy cards (Model, Data, Experiment) accept `ref:` only — identity is
-    required for lineage. See §"Light-card reference forms" for loader rules.
+    `select` and `path` resolve to `ref` before send; only `ref` and `inline`
+    cross the wire. Heavy cards (Model, Data, Experiment, Artifact) accept
+    `ref` or `select` only — `inline` is rejected because identity anchors
+    lineage. Environment/stage is target-card metadata (`labels` /
+    `annotations`), never `space`; `space` is team/workspace scope only, and
+    one server may hold development, staging, and production cards side by side.
+    See §"Light-card reference forms" for loader rules and the slot inventory.
 20. **User journeys are the primary test contract.** A capability is not done
     until a real user/agent path proves it end-to-end — client → server →
     client, against a real server (`WyrdTestServer` + embedded Postgres), not a
@@ -302,7 +321,7 @@ directory, not Service components.
 ```yaml
 spec:
   description?: string
-  components: [ServiceComponent] # { alias, ref | path | inline }
+  components: [ServiceComponent] # { alias, ref | select | path | inline }
   entry_point?: string           # SDK AppState bootstrap module (e.g. `acme.copilot.app:app`).
                                  # Importing it materializes the service's locked card snapshot
                                  # at runtime. Wyrd doesn't import this; the deploy image does.
@@ -1212,8 +1231,10 @@ Exact field schema for each context lives in OpenAPI.
 ## Spec-file authoring
 
 Two complementary mechanisms — `wyrd apply -f file.yaml` reads + registers in
-one move, and a `PromptRef` may be inlined where its own identity isn't
-needed.
+one move, and reference slots accept `ref | select | path | inline` so a card
+can be pinned by identity, matched by metadata, split into its own file, or
+inlined where its own identity isn't needed. `select` and `path` are authoring
+sugar the loader resolves to `ref` before send.
 
 ### Pre-registration matrix (Rule 16)
 
@@ -1232,21 +1253,33 @@ apply -f eval-suite.yaml` registers all of them in dependency order. The Agent
 under test, the Source it reads from, and the Eval that judges it can all
 ship in one file.
 
-### Light-card reference forms
+### Reference forms
 
-A light-card reference slot accepts exactly one of three keys: `ref`, `path`,
+A reference slot accepts exactly one of four keys: `ref`, `select`, `path`,
 or `inline`. The key IS the discriminator; there is no separate `kind:` tag
-for the variant. The three forms in isolation:
+for the variant. Two of the four are durable wire forms (`ref`, `inline`);
+the other two (`select`, `path`) are client-side authoring sugar that the
+loader resolves to `ref` before anything leaves the client. The four forms in
+isolation:
 
 ```yaml
-# 1. ref — points at a registered card.
+# 1. ref — points at a registered card by exact identity.
+#    kind, name, version, space, optional uid. No labels/annotations here.
 ref: { kind: Policy, name: pii-redaction, version: "1.0.0", space: prod }
 
-# 2. path — authoring sugar. Loader splices the file's spec body inline.
-#    File begins with `kind:` then spec fields; no `apiVersion` or `metadata`.
+# 2. select — authoring sugar. Match a registered card by metadata; the loader
+#    resolves it to exactly one uid-bearing ref before send.
+select:
+  kind: Model
+  name: churn-classifier
+  labels: { environment: production, stage: champion }
+
+# 3. path — authoring sugar. Targets a FULL card envelope on disk
+#    (apiVersion + kind + metadata + spec). The loader registers it as an
+#    independent card and rewrites this slot to `ref: CardRef`.
 path: ./policies/pii-redaction.yaml
 
-# 3. inline — full spec body embedded in the parent. No card identity.
+# 4. inline — full spec body embedded in the parent. No card identity.
 inline:
   kind: Policy
   rules:
@@ -1256,19 +1289,24 @@ inline:
   scope: service_local
 ```
 
-The wire `CardRef` requires `space`. Omitting `space` in authored YAML is a
-loader-time convenience: the YAML loader splices the enclosing card's
+The wire `CardRef` requires `space`. Omitting `space` in an authored `ref:` is
+a loader-time convenience: the YAML loader splices the enclosing card's
 `metadata.space` into each child `ref:` before deserialization. A `CardRef`
-that has crossed an API boundary always carries `space` verbatim.
+that has crossed an API boundary always carries `space` verbatim. `CardRef` is
+exact identity only — it never carries `labels` or `annotations`. Metadata
+matching is the job of `select`, not `ref`.
 
-In context — `Service.components[]` mixing all three plus a heavy-card ref:
+In context — `Service.components[]` mixing all four forms plus a heavy-card ref:
 
 ```yaml
 components:
   - alias: agent
     ref:  { kind: Agent, name: support-triage,   version: "1.0.0", space: prod }
   - alias: model
-    ref:  { kind: Model, name: churn-classifier, version: "1.4.2", space: prod }  # heavy — ref only
+    select:                       # heavy card resolved by metadata, then pinned
+      kind: Model
+      name: churn-classifier
+      labels: { environment: production, stage: champion }
   - alias: prompt
     path: ./prompts/triage-system.yaml
   - alias: pii-policy
@@ -1281,14 +1319,50 @@ components:
       scope: service_local
 ```
 
-Same three-key shape applies anywhere a light card is referenced —
-`Service.components[].ref`, `Trigger.target`, `Workflow.steps[].target`,
-`Agent.prompt`, `EvalTask::LlmJudge.judge_ref`, etc.
+### Reference-slot inventory
+
+The four-key shape applies at **every** reference slot, light or heavy — not a
+per-surface subset. There is one canonical slot inventory, and the loader,
+`$service.*` sugar rewrite, diagnostics, and relationship tests all project
+from it (they do not maintain parallel hand-written lists):
+
+- `Service.components[]` (light and heavy targets)
+- `Agent.prompt`
+- `Trigger.target`
+- `Workflow.steps[].target`
+- `Eval` task refs, including `EvalTask::LlmJudge.judge_ref`
+- `Drift.subject_ref`, `Drift.signal.eval_ref`, `Drift.signal.source_ref`
+- Heavy anchors: `Model`/`Data`/`Experiment` `*_refs`, `Artifact` refs
+
+A new reference-bearing field is added to this inventory in one place; it then
+participates in path rewrite, select resolution, and relationship derivation
+without a second edit. This is the single-source rule for reference slots.
+
+### Selector resolution rules (loader contract)
+
+`select:` is **client-side authoring sugar**, not a wire variant. It matches a
+registered card by metadata and resolves to a concrete `ref`. Use it when the
+referrer and the target carry independent metadata — e.g. a `Service` that
+wants "the production champion Model" without hard-coding the Model's version.
+
+- `CardSelector { kind, name?, version?, space?, labels?, annotations?,
+  latest? }`. `kind` is required; every other field narrows the match.
+- `wyrd plan` / `wyrd apply` resolves `select` against target-card metadata to
+  exactly one `uid`-bearing `CardRef` **before** durable registration,
+  relationship derivation, hydration, or any runtime observation.
+- Zero matches is the stable error `CARD_SELECTOR_NOT_FOUND`; more than one is
+  `CARD_SELECTOR_AMBIGUOUS`. `latest: true` breaks a version tie by newest
+  registered version but never resolves a `labels`/`annotations` ambiguity.
+- Environment and stage are selected here, over `labels`/`annotations` — never
+  over `space`. `space` is team/workspace scope.
+- After resolution the durable payload carries only the pinned `ref`; the
+  registry, relationships, and `vala` never see a `select:` value.
 
 ### Path resolution rules (loader contract)
 
-`path:` is **client-side authoring sugar**, not a wire variant. The loader
-splices the referenced file's spec body into the parent at read time; the
+`path:` is **client-side authoring sugar**, not a wire variant. It targets a
+full card envelope on disk; the loader registers that envelope as an
+independent card and rewrites the referring slot to `ref: CardRef`. The
 payload that leaves the client contains only `ref` or `inline`. The server,
 registry, and `vala` never see a `path:` value.
 
@@ -1296,20 +1370,26 @@ registry, and `vala` never see a `path:` value.
   CWD, not apply-root.
 - Absolute paths are allowed but discouraged (breaks portability across
   machines and CI).
-- The referenced file is a **bare spec body** — `kind:` plus spec fields,
-  no `apiVersion` or `metadata` envelope. The `kind:` makes the file
-  self-describing and parses identically to an inline body.
-- Path imports are **never auto-registered as cards**. The result is inline.
-  If you want a registered, reusable card, write a full card document (with
-  `apiVersion` + `kind` + `metadata`) and apply it; then reference by `ref:`.
-- Transitive: a `path:`-loaded fragment may itself contain `path:` refs.
-  Loader resolves transitively with a hard depth limit (≤8) to catch cycles.
-- `ref`, `path`, and `inline` are mutually exclusive on any single slot.
-  Any combination is a validation error.
+- The referenced file is a **full card envelope** — `apiVersion` + `kind` +
+  `metadata` (`space`, `name`, `version`) + `spec`. Registration derives the
+  child's identity from that `metadata`, and the parent slot becomes a `ref:`
+  to it. This is what makes a `path:` target reusable and lineage-anchoring,
+  unlike `inline:`.
+- Path imports **are registered as independent cards**, in dependency order,
+  ahead of the parent that references them. A heavy-card envelope reached by
+  `path:` still follows the normal pre-registration + blob-upload flow before
+  the parent registers.
+- Transitive: a `path:`-loaded envelope may itself contain `ref`/`select`/
+  `path`/`inline` slots. The loader resolves transitively with a hard depth
+  limit (≤8) to catch cycles.
+- `ref`, `select`, `path`, and `inline` are mutually exclusive on any single
+  slot. Any combination is a validation error.
 
-This keeps the wire contract tight (two-variant `LightRef` post-loader),
-prevents filesystem-on-server, and gives authors the file-splitting
-ergonomic they expect from JSON-Schema `$ref` / OpenAPI external-file imports.
+This keeps the wire contract tight (two-variant `LightRef` post-loader:
+`ref | inline`), keeps `select`/`path` resolution client-side, prevents
+filesystem-on-server, and gives authors both the file-splitting ergonomic they
+expect from JSON-Schema `$ref` / OpenAPI external-file imports (`path`) and
+metadata-driven binding (`select`).
 
 ---
 

@@ -83,11 +83,14 @@ Locked cross-cutting decisions that any contributor must honor:
   owner crates. `python/py-wyrd` is the thin PyO3 module aggregator and Python
   package surface, not the place for duplicated business logic.
 - Current approved Python owner crates are `wyrd-interfaces`, `wyrd-cards`,
-  `wyrd-utils`, `wyrd-observe`, `vala-sdk`, `skald-prompt`,
+  `wyrd-utils`, `wyrd-observe`, `vala-sdk`, `wyrd-sdk`, `skald-prompt`,
   `skald-runtime`, `skald-agent`, `skald-tool`, `skald-workflow`, and
-  `wyrd-testing`. `wyrd-testing`'s `python` feature exposes the
-  `WyrdTestServer` harness only; it is a test-tier crate and is never
-  enabled on production Python wheels.
+  `wyrd-testing`. `wyrd-sdk` owns the `WyrdState` runtime handle (hydrated-tree
+  load, CardRef context, observation tying); its PyO3 surface lives behind an
+  optional `python` feature, and `python/py-wyrd` stays a thin aggregator that
+  registers the submodule without duplicating runtime logic.
+  `wyrd-testing`'s `python` feature exposes the `WyrdTestServer` harness only;
+  it is a test-tier crate and is never enabled on production Python wheels.
 - Client-tier crates do not depend on `sqlx`, cloud SDKs, `datafusion`, or
   `deltalake`.
 - Vala and Skald do not depend on each other directly.

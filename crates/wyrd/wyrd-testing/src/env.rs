@@ -12,6 +12,11 @@ use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use tower::ServiceExt;
 use uuid::Uuid;
+use vala_bifrost::catalog::WyrdCatalog;
+use wyrd_auth::issue_api_key::WyrdApiKey;
+use wyrd_auth::permission_resolver::SqlPermissionResolver;
+use wyrd_auth::pg_resolvers::PgIssuerResolver;
+use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_auth_check::{AuthzCheckRequest, AuthzCheckResponse, PolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::{
@@ -21,10 +26,6 @@ use wyrd_auth_verify::{
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::{PrincipalId, RbacCheck, RoleRef};
 use wyrd_semver::VersionBlock;
-use wyrd_auth::issue_api_key::WyrdApiKey;
-use wyrd_auth::permission_resolver::SqlPermissionResolver;
-use wyrd_auth::pg_resolvers::PgIssuerResolver;
-use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::components::auth::audit_writer::NoopAuthzAuditWriter;
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
@@ -174,6 +175,7 @@ impl WyrdTestEnv {
         })
         .await
         .map_err(|error| WyrdTestError::Start(error.to_string()))?;
+        let bifrost = test_catalog(&fixture, &storage).await?;
 
         let issuing_key = Arc::new(
             IssuingKey::from_ed_pem(
@@ -205,13 +207,14 @@ impl WyrdTestEnv {
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
         ));
-        let mut state =
-            AppState::new(postgres, storage).with_auth(wyrd_server::components::auth::ServerAuth {
+        let mut state = AppState::new(postgres, storage, bifrost).with_auth(
+            wyrd_server::components::auth::ServerAuth {
                 allow_preview: true,
                 issuing_key: Some(Arc::clone(&issuing_key)),
                 token_verifier: Some(Arc::clone(&verifier)),
                 ..wyrd_server::components::auth::ServerAuth::default()
-            });
+            },
+        );
         state.authz.permission_check = Arc::new(RbacCheck);
         state.authz.audit_writer = Arc::new(NoopAuthzAuditWriter);
         let router = build_router(state.clone());
@@ -852,6 +855,26 @@ where
 
 fn sql(error: impl std::fmt::Display) -> WyrdTestError {
     WyrdTestError::Sql(error.to_string())
+}
+
+async fn test_catalog(
+    fixture: &PgFixture,
+    storage: &Arc<StorageHandle>,
+) -> Result<Arc<WyrdCatalog>, WyrdTestError> {
+    let (factory, props) = storage
+        .iceberg_storage_factory()
+        .map_err(|error| WyrdTestError::Start(error.to_string()))?;
+    let catalog = WyrdCatalog::new(
+        fixture.catalog_dsn().expose_secret(),
+        storage.warehouse_uri(),
+        Arc::new(fixture.app_pool().clone()),
+        None,
+        factory,
+        props,
+    )
+    .await
+    .map_err(|error| WyrdTestError::Start(error.to_string()))?;
+    Ok(Arc::new(catalog))
 }
 
 fn is_unique_violation(error: &sqlx::Error) -> bool {

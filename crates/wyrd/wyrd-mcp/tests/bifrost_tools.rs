@@ -6,9 +6,7 @@
 use serde_json::json;
 use skald_tool::ToolRegistry;
 use wyrd_client::{WyrdClient, config::ClientConfig};
-use wyrd_mcp::bifrost::{
-    bifrost_error_catalog, bifrost_permissions, register_bifrost_tools,
-};
+use wyrd_mcp::bifrost::{bifrost_error_catalog, bifrost_permissions, register_bifrost_tools};
 
 fn dummy_client() -> WyrdClient {
     let mut config = ClientConfig::default();
@@ -47,21 +45,44 @@ fn bifrost_tools_duplicate_registration_returns_name_taken() {
 #[test]
 fn bifrost_tools_list_permissions_returns_five_entries() {
     let perms = bifrost_permissions();
-    assert_eq!(perms.len(), 5, "expected 5 Bifrost permissions, got {}", perms.len());
+    assert_eq!(
+        perms.len(),
+        5,
+        "expected 5 Bifrost permissions, got {}",
+        perms.len()
+    );
 }
 
 #[test]
 fn bifrost_tools_list_permissions_covers_all_expected() {
     let perms = bifrost_permissions();
     let names: Vec<&str> = perms.iter().map(|p| p.permission.as_str()).collect();
-    assert!(names.contains(&"bifrost_table:read"), "missing bifrost_table:read");
-    assert!(names.contains(&"bifrost_table:write"), "missing bifrost_table:write");
-    assert!(names.contains(&"bifrost_table:install"), "missing bifrost_table:install");
-    assert!(names.contains(&"bifrost_record:write"), "missing bifrost_record:write");
-    assert!(names.contains(&"bifrost_query:read"), "missing bifrost_query:read");
+    assert!(
+        names.contains(&"bifrost_table:read"),
+        "missing bifrost_table:read"
+    );
+    assert!(
+        names.contains(&"bifrost_table:write"),
+        "missing bifrost_table:write"
+    );
+    assert!(
+        names.contains(&"bifrost_table:install"),
+        "missing bifrost_table:install"
+    );
+    assert!(
+        names.contains(&"bifrost_record:write"),
+        "missing bifrost_record:write"
+    );
+    assert!(
+        names.contains(&"bifrost_query:read"),
+        "missing bifrost_query:read"
+    );
     // No bifrost_query:run — BifrostQuery only pairs with Read; nothing enforces
     // a `run` action, so projecting it would be a second source of truth.
-    assert!(!names.contains(&"bifrost_query:run"), "bifrost_query:run is not an enforced permission");
+    assert!(
+        !names.contains(&"bifrost_query:run"),
+        "bifrost_query:run is not an enforced permission"
+    );
 }
 
 #[test]
@@ -109,7 +130,10 @@ fn bifrost_tools_list_errors_all_entries_have_nonempty_fields() {
         assert!(!entry.code.is_empty(), "code must not be empty");
         assert!(entry.status > 0, "status must be nonzero");
         assert!(!entry.title.is_empty(), "title must not be empty");
-        assert!(!entry.remediation.is_empty(), "remediation must not be empty");
+        assert!(
+            !entry.remediation.is_empty(),
+            "remediation must not be empty"
+        );
     }
 }
 

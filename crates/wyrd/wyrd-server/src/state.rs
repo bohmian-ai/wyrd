@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use ipnetwork::IpNetwork;
 use tokio_util::sync::CancellationToken;
+use vala_bifrost::catalog::WyrdCatalog;
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
@@ -56,6 +57,8 @@ pub struct AppState {
     pub postgres: Arc<ServerPostgres>,
     /// Process-wide artifact storage handle.
     pub storage: Arc<StorageHandle>,
+    /// Process-wide Bifrost OLAP catalog.
+    pub bifrost: Arc<WyrdCatalog>,
     /// Authentication handles: token issuance + verification + issuer/binding resolution.
     pub auth: ServerAuth,
     /// Authorization handles: policy decision + RBAC evaluation + decision audit.
@@ -85,11 +88,16 @@ pub struct AppState {
 impl AppState {
     /// Build runtime state from production-ready Postgres handles.
     #[must_use]
-    pub fn new(postgres: Arc<ServerPostgres>, storage: Arc<StorageHandle>) -> Self {
+    pub fn new(
+        postgres: Arc<ServerPostgres>,
+        storage: Arc<StorageHandle>,
+        bifrost: Arc<WyrdCatalog>,
+    ) -> Self {
         let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
         Self {
             postgres,
             storage,
+            bifrost,
             auth: ServerAuth::default(),
             authz: ServerAuthz::default(),
             trusted_request_id_propagation: false,

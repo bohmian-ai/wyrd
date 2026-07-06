@@ -234,11 +234,7 @@ fn fieldspec_to_arrow_timestamp_all_time_units_round_trip() {
                 },
                 false,
             ),
-            make_field(
-                "ts_naive",
-                DataTypeSpec::Timestamp { unit, tz: None },
-                true,
-            ),
+            make_field("ts_naive", DataTypeSpec::Timestamp { unit, tz: None }, true),
         ];
         assert_eq!(round_trip(specs.clone()), specs, "unit={unit:?}");
     }
@@ -302,11 +298,7 @@ fn fieldspec_to_arrow_struct_round_trip() {
         make_field("x", DataTypeSpec::Float64, false),
         make_field("y", DataTypeSpec::Float64, true),
     ];
-    let specs = vec![make_field(
-        "point",
-        DataTypeSpec::Struct(inner),
-        true,
-    )];
+    let specs = vec![make_field("point", DataTypeSpec::Struct(inner), true)];
     assert_eq!(round_trip(specs.clone()), specs);
 }
 

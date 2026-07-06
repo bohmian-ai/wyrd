@@ -46,9 +46,7 @@ impl ClientScope {
     /// Returns [`WyrdError`] mapped from [`WyrdClientError`] when the credential
     /// chain yields nothing (`WYRD_CLIENT_401_NO_CREDENTIALS`).
     pub fn from_config(config: &ClientConfig) -> Result<Self, WyrdError> {
-        let credential = config
-            .resolve_credential()
-            .map_err(client_error_to_wyrd)?;
+        let credential = config.resolve_credential().map_err(client_error_to_wyrd)?;
         Ok(Self {
             server_url: config.http.base_url.clone(),
             credential_fingerprint: fingerprint_credential(&credential),

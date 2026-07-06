@@ -9,6 +9,7 @@ use std::sync::Arc;
 use base64::Engine;
 use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
+use vala_bifrost::catalog::WyrdCatalog;
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_crypt::SecretKey;
 use wyrd_semver::VersionBlock;
@@ -17,6 +18,7 @@ use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
+use wyrd_sql::pool::{PoolConfig, build_pool};
 use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
@@ -41,6 +43,12 @@ pub enum ServerBootError {
     /// Storage boot failed.
     #[error(transparent)]
     Storage(#[from] wyrd_storage::StorageError),
+    /// Runtime pool construction failed.
+    #[error("database pool construction failed")]
+    PoolConnect(#[source] sqlx::Error),
+    /// Bifrost catalog construction failed.
+    #[error(transparent)]
+    Bifrost(#[from] vala_bifrost::error::BifrostError),
     /// Wyrd's own signing key could not be loaded or its public key derived.
     /// Boot fails closed: without a usable signing key the server cannot mint or
     /// verify Wyrd JWTs.
@@ -116,6 +124,7 @@ pub async fn build_app_state() -> Result<AppState, ServerBootError> {
 /// Returns [`ServerBootError`] when DSN resolution, migrations, or runtime
 /// pool construction fails.
 pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, ServerBootError> {
+    let dsns = boot.dsns()?;
     let postgres = Arc::new(ServerPostgres::connect_from_boot(boot).await?);
     let storage_settings = load_storage_settings()?;
     tracing::info!(
@@ -127,8 +136,21 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
     );
     let storage = StorageHandle::from_settings(storage_settings).await?;
     tracing::info!(backend = %storage.backend(), "storage handle ready");
+    let recovery_pool = build_pool(dsns.recovery.expose_secret(), PoolConfig::default())
+        .await
+        .map_err(ServerBootError::PoolConnect)?;
+    let (storage_factory, storage_props) = storage.iceberg_storage_factory()?;
+    let bifrost = WyrdCatalog::new(
+        dsns.catalog_app.expose_secret(),
+        storage.warehouse_uri(),
+        Arc::new(postgres.app_pool().clone()),
+        Some(Arc::new(recovery_pool)),
+        storage_factory,
+        storage_props,
+    )
+    .await?;
 
-    Ok(AppState::new(postgres, storage))
+    Ok(AppState::new(postgres, storage, Arc::new(bifrost)))
 }
 
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.

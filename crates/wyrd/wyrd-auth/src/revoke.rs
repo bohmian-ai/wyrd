@@ -109,9 +109,17 @@ mod tests {
         let sa_id = Uuid::new_v4();
         let card_ref = make_service_card_ref("svc-revoke-service");
         seed_backing_card(&mut conn, &card_ref, creator).await;
-        insert_service_account(&mut conn, sa_id, "service", &card_ref, "svc-revoke-service", None, creator)
-            .await
-            .expect("service account inserts");
+        insert_service_account(
+            &mut conn,
+            sa_id,
+            "service",
+            &card_ref,
+            "svc-revoke-service",
+            None,
+            creator,
+        )
+        .await
+        .expect("service account inserts");
 
         let kind = revoke_principal_in_conn(&mut conn, PrincipalId::new(sa_id), tenant)
             .await
@@ -136,9 +144,17 @@ mod tests {
             uid: None,
         };
         seed_backing_card(&mut conn, &card_ref, creator).await;
-        insert_service_account(&mut conn, sa_id, "agent", &card_ref, "agent-revoke-test", None, creator)
-            .await
-            .expect("agent account inserts");
+        insert_service_account(
+            &mut conn,
+            sa_id,
+            "agent",
+            &card_ref,
+            "agent-revoke-test",
+            None,
+            creator,
+        )
+        .await
+        .expect("agent account inserts");
 
         let kind = revoke_principal_in_conn(&mut conn, PrincipalId::new(sa_id), tenant)
             .await

@@ -20,11 +20,13 @@ use sqlx::AssertSqlSafe;
 use crate::dsn::DsnError;
 use crate::pool::build_pool;
 use role_bootstrap::{
-    WYRD_APP_ROLE, WYRD_DATABASE, WYRD_MIGRATOR_ROLE, WYRD_PLATFORM_ADMIN_ROLE, role_bootstrap_sql,
+    VALA_RECOVERY_ROLE, WYRD_APP_ROLE, WYRD_CATALOG_APP_ROLE, WYRD_DATABASE, WYRD_MIGRATOR_ROLE,
+    WYRD_PLATFORM_ADMIN_ROLE, role_bootstrap_sql,
 };
 
 pub use crate::dsn::{
-    APP_DSN_ENV, MIGRATOR_PASSWORD_ENV, PLATFORM_ADMIN_PASSWORD_ENV, ResolvedDsns,
+    APP_DSN_ENV, CATALOG_APP_PASSWORD_ENV, MIGRATOR_PASSWORD_ENV, PLATFORM_ADMIN_PASSWORD_ENV,
+    RECOVERY_PASSWORD_ENV, ResolvedDsns, with_catalog_options,
 };
 pub use crate::pool::PoolConfig;
 
@@ -62,6 +64,10 @@ pub enum PostgresBoot {
         migrator_dsn: SecretString,
         /// Optional audited `wyrd_platform_admin` DSN.
         platform_admin_dsn: Option<SecretString>,
+        /// Bifrost catalog DSN (`wyrd_catalog_app` + role/search_path options).
+        catalog_app_dsn: SecretString,
+        /// Catalog recovery DSN (`vala_recovery`).
+        recovery_dsn: SecretString,
     },
     /// Embedded Postgres handle.
     Embedded(EmbeddedPgHandle),
@@ -80,6 +86,8 @@ impl fmt::Debug for PostgresBoot {
                     "platform_admin_dsn",
                     &platform_admin_dsn.as_ref().map(|_| "<redacted>"),
                 )
+                .field("catalog_app_dsn", &"<redacted>")
+                .field("recovery_dsn", &"<redacted>")
                 .finish(),
             Self::Embedded(handle) => f
                 .debug_tuple("PostgresBoot::Embedded")
@@ -109,6 +117,8 @@ impl PostgresBoot {
                 app_dsn: dsns.app,
                 migrator_dsn: dsns.migrator,
                 platform_admin_dsn: dsns.platform_admin,
+                catalog_app_dsn: dsns.catalog_app,
+                recovery_dsn: dsns.recovery,
             }),
             None => Self::embedded(EmbeddedConfig::default()).await,
         }
@@ -137,10 +147,14 @@ impl PostgresBoot {
                 app_dsn,
                 migrator_dsn,
                 platform_admin_dsn,
+                catalog_app_dsn,
+                recovery_dsn,
             } => Ok(ResolvedDsns {
                 app: app_dsn.clone(),
                 migrator: migrator_dsn.clone(),
                 platform_admin: platform_admin_dsn.clone(),
+                catalog_app: catalog_app_dsn.clone(),
+                recovery: recovery_dsn.clone(),
             }),
             Self::Embedded(handle) => handle.resolved_dsns(),
         }
@@ -151,12 +165,22 @@ impl PostgresBoot {
         app: Option<String>,
         migrator_password: Option<SecretString>,
         platform_admin_password: Option<SecretString>,
+        catalog_app_password: Option<SecretString>,
+        recovery_password: Option<SecretString>,
     ) -> Result<Self, BootError> {
-        match crate::dsn::resolve_external_dsns(app, migrator_password, platform_admin_password)? {
+        match crate::dsn::resolve_external_dsns(
+            app,
+            migrator_password,
+            platform_admin_password,
+            catalog_app_password,
+            recovery_password,
+        )? {
             Some(dsns) => Ok(Self::External {
                 app_dsn: dsns.app,
                 migrator_dsn: dsns.migrator,
                 platform_admin_dsn: dsns.platform_admin,
+                catalog_app_dsn: dsns.catalog_app,
+                recovery_dsn: dsns.recovery,
             }),
             None => Self::embedded(EmbeddedConfig::default()).await,
         }
@@ -248,11 +272,25 @@ impl EmbeddedPgHandle {
             self.port,
             WYRD_DATABASE,
         );
+        let catalog_app = with_catalog_options(&SecretString::from(embedded_dsn(
+            WYRD_CATALOG_APP_ROLE,
+            self.credentials.catalog_app.expose_secret(),
+            self.port,
+            WYRD_DATABASE,
+        )));
+        let recovery = embedded_dsn(
+            VALA_RECOVERY_ROLE,
+            self.credentials.recovery.expose_secret(),
+            self.port,
+            WYRD_DATABASE,
+        );
 
         Ok(ResolvedDsns {
             app: SecretString::from(app),
             migrator: SecretString::from(migrator),
             platform_admin: Some(SecretString::from(platform_admin)),
+            catalog_app,
+            recovery: SecretString::from(recovery),
         })
     }
 

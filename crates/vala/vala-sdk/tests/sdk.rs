@@ -149,7 +149,10 @@ fn insert_propagates_queue_full() {
             rejected += 1;
         }
     }
-    assert!(rejected > 0, "a saturated queue must reject on the write path");
+    assert!(
+        rejected > 0,
+        "a saturated queue must reject on the write path"
+    );
 }
 
 #[test]
@@ -161,12 +164,28 @@ fn observe_record_swallows_and_counts_overflow() {
 
     // Prime the stall, then flood the same saturated producer via the telemetry
     // path. `record` returns unit — the caller is never handed an error.
-    observe::record(&bifrost, SinkKind::Record, "ns.tbl", &schema, row(), card(), None);
+    observe::record(
+        &bifrost,
+        SinkKind::Record,
+        "ns.tbl",
+        &schema,
+        row(),
+        card(),
+        None,
+    );
     wait_until_started(&sink);
 
     for i in 0..40 {
         let payload = format!(r#"{{"id": {}}}"#, i + 1).into_bytes();
-        observe::record(&bifrost, SinkKind::Record, "ns.tbl", &schema, payload, card(), None);
+        observe::record(
+            &bifrost,
+            SinkKind::Record,
+            "ns.tbl",
+            &schema,
+            payload,
+            card(),
+            None,
+        );
     }
     assert!(
         bifrost.dropped() > 0,
@@ -212,7 +231,10 @@ fn ingest_sink_forwards_batch_id_unchanged() {
     let seen = transport.seen.lock().expect("poisoned");
     assert_eq!(seen.len(), 2);
     assert_eq!(seen[0], [7u8; 16]);
-    assert_eq!(seen[1], [7u8; 16], "retry preserves batch_id for server dedup");
+    assert_eq!(
+        seen[1], [7u8; 16],
+        "retry preserves batch_id for server dedup"
+    );
 }
 
 #[test]

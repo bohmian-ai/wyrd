@@ -14,11 +14,10 @@
 
 use std::sync::Arc;
 
+use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_auth_verify::{
-    IssuerConfigResolver, PermissionResolver, TokenVerifier, WYRD_ACCESS_TOKEN_HEADER,
-    tenant_from_unverified_access_token,
-};
+use wyrd_auth_oidc::IssuerConfigResolver;
+use wyrd_auth_verify::{AccessTokenClaims, PermissionResolver, TokenVerifier};
 use wyrd_runtime::Principal;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
@@ -29,6 +28,7 @@ use crate::error::IngestError;
 /// gRPC metadata key for the Wyrd request correlator (the gRPC spelling of the
 /// HTTP `Wyrd-Request-Id` header). Independent of `traceparent`.
 pub const WYRD_REQUEST_ID_METADATA: &str = "wyrd-request-id";
+const WYRD_ACCESS_TOKEN_METADATA: &str = "x-wyrd-access-token";
 
 /// Resolved identity for one ingest stream, produced by [`authenticate`] and
 /// handed to the service via request extensions.
@@ -50,13 +50,26 @@ pub struct AuthContext {
 /// valid ASCII.
 pub fn extract_bearer(metadata: &MetadataMap) -> Result<SecretString, IngestError> {
     let raw = metadata
-        .get(WYRD_ACCESS_TOKEN_HEADER.as_str())
+        .get(WYRD_ACCESS_TOKEN_METADATA)
         .ok_or_else(|| IngestError::Unauthenticated("missing x-wyrd-access-token".to_owned()))?;
     let value = raw
         .to_str()
         .map_err(|_| IngestError::Unauthenticated("x-wyrd-access-token is not ASCII".to_owned()))?;
     let token = value.strip_prefix("Bearer ").unwrap_or(value);
     Ok(SecretString::from(token.to_owned()))
+}
+
+fn tenant_from_unverified_access_token(token: &str) -> Result<DataTenantId, IngestError> {
+    let payload = token
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| IngestError::Unauthenticated("token does not name a tenant".to_owned()))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| IngestError::Unauthenticated("token does not name a tenant".to_owned()))?;
+    let claims: AccessTokenClaims = serde_json::from_slice(&bytes)
+        .map_err(|_| IngestError::Unauthenticated("token does not name a tenant".to_owned()))?;
+    Ok(claims.principal.tenant_id)
 }
 
 /// Read `wyrd-request-id` from the inbound metadata, or mint a UUIDv7 when it is
@@ -81,8 +94,7 @@ pub async fn authenticate<R: PermissionResolver + 'static, I: IssuerConfigResolv
     metadata: &MetadataMap,
 ) -> Result<AuthContext, IngestError> {
     let token = extract_bearer(metadata)?;
-    let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())
-        .map_err(|_| IngestError::Unauthenticated("token does not name a tenant".to_owned()))?;
+    let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
     let verified = verifier
         .verify(&token, &expected_tenant)
         .await

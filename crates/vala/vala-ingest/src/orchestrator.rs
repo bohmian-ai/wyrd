@@ -185,7 +185,7 @@ fn reconcile_header(
 }
 
 /// The anti-forgery gate: every per-row `card_ref` in the decoded batches must
-/// be a member of the principal's card scope (exact `CardRef` equality). A
+/// be a member of the principal's card-ref scope (exact `CardRef` equality). A
 /// missing column, a null cell, or an unparseable value rejects the whole
 /// stream — there is nothing valid to attribute.
 ///
@@ -196,7 +196,11 @@ pub fn validate_card_scope(
     batches: &[RecordBatch],
     principal: &Principal,
 ) -> Result<(), IngestError> {
-    let scope = principal.card_scope();
+    let Some(scope) = principal.card_ref_scope() else {
+        return Err(IngestError::CardScopeDenied {
+            card_ref: "<principal-without-card-scope>".to_owned(),
+        });
+    };
     for batch in batches {
         let column =
             batch
@@ -220,7 +224,7 @@ pub fn validate_card_scope(
             let card = CardRef::from_str(raw).map_err(|_| IngestError::CardScopeDenied {
                 card_ref: raw.to_owned(),
             })?;
-            if !scope.contains(&card) {
+            if !scope.authorizes(&card) {
                 return Err(IngestError::CardScopeDenied {
                     card_ref: raw.to_owned(),
                 });

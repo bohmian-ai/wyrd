@@ -16,6 +16,13 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use uuid::Uuid;
+use vala_bifrost::catalog::WyrdCatalog;
+use wyrd_auth::exchange_api_key::TokenExchangeSettings;
+use wyrd_auth::issue_api_key::WyrdApiKey;
+use wyrd_auth::permission_resolver::SqlPermissionResolver;
+use wyrd_auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
+use wyrd_auth::revocation_resolver::SqlRevocationCheck;
+use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_auth_check::{AuthzCheckRequest, AuthzCheckResponse, PolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_oidc::JwksCache;
@@ -27,12 +34,6 @@ use wyrd_crypt::SecretKey;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::{PrincipalId, RbacCheck, RoleRef};
 use wyrd_semver::VersionBlock;
-use wyrd_auth::exchange_api_key::TokenExchangeSettings;
-use wyrd_auth::issue_api_key::WyrdApiKey;
-use wyrd_auth::permission_resolver::SqlPermissionResolver;
-use wyrd_auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
-use wyrd_auth::revocation_resolver::SqlRevocationCheck;
-use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
@@ -1026,6 +1027,7 @@ impl WyrdTestServerBuilder {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             (Some(root), handle)
         };
+        let bifrost = test_catalog(&fixture, &storage).await?;
 
         let issuing_key = Arc::new(
             IssuingKey::from_ed_pem(
@@ -1106,8 +1108,8 @@ impl WyrdTestServerBuilder {
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
         ));
-        let mut state =
-            AppState::new(postgres, storage).with_auth(wyrd_server::components::auth::ServerAuth {
+        let mut state = AppState::new(postgres, storage, bifrost).with_auth(
+            wyrd_server::components::auth::ServerAuth {
                 allow_preview: self.allow_preview_auth,
                 issuing_key: Some(Arc::clone(&issuing_key)),
                 token_verifier: Some(Arc::clone(&verifier)),
@@ -1115,7 +1117,8 @@ impl WyrdTestServerBuilder {
                 trusted_issuer_resolver: Some(issuer_resolver),
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
-            });
+            },
+        );
         state.authz.permission_check = Arc::new(RbacCheck);
         state.authz.audit_writer = self
             .audit_writer
@@ -1433,6 +1436,26 @@ where
 
 fn sql(error: impl std::fmt::Display) -> WyrdTestServerError {
     WyrdTestServerError::Sql(error.to_string())
+}
+
+async fn test_catalog(
+    fixture: &PgFixture,
+    storage: &Arc<wyrd_storage::StorageHandle>,
+) -> Result<Arc<WyrdCatalog>, WyrdTestServerError> {
+    let (factory, props) = storage
+        .iceberg_storage_factory()
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+    let catalog = WyrdCatalog::new(
+        fixture.catalog_dsn().expose_secret(),
+        storage.warehouse_uri(),
+        Arc::new(fixture.app_pool().clone()),
+        None,
+        factory,
+        props,
+    )
+    .await
+    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+    Ok(Arc::new(catalog))
 }
 
 fn is_unique_violation(error: &sqlx::Error) -> bool {

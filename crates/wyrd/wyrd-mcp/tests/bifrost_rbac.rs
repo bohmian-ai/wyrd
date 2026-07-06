@@ -10,10 +10,7 @@ use wyrd_client::{WyrdClient, config::ClientConfig};
 use wyrd_mcp::bifrost::register_bifrost_tools;
 use wyrd_testing::WyrdTestServer;
 
-fn client_from_bootstrap(
-    base_url: &str,
-    api_key: secrecy::SecretString,
-) -> WyrdClient {
+fn client_from_bootstrap(base_url: &str, api_key: secrecy::SecretString) -> WyrdClient {
     let mut config = ClientConfig::default();
     config.http.base_url = base_url.to_owned();
     config.api_key = Some(api_key);
@@ -25,7 +22,10 @@ async fn bifrost_rbac_list_tables_without_permission_returns_permission_denied()
     let srv = WyrdTestServer::start_bound()
         .await
         .expect("test server starts");
-    let base_url = srv.base_url().expect("bound server has base url").to_owned();
+    let base_url = srv
+        .base_url()
+        .expect("bound server has base url")
+        .to_owned();
 
     let bootstrap = srv
         .bootstrap_agent("bifrost-rbac-list-tables", &[])
@@ -60,7 +60,10 @@ async fn bifrost_rbac_describe_table_without_permission_returns_permission_denie
     let srv = WyrdTestServer::start_bound()
         .await
         .expect("test server starts");
-    let base_url = srv.base_url().expect("bound server has base url").to_owned();
+    let base_url = srv
+        .base_url()
+        .expect("bound server has base url")
+        .to_owned();
 
     let bootstrap = srv
         .bootstrap_agent("bifrost-rbac-describe-table", &[])

@@ -13,7 +13,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgListener;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
-use wyrd_auth_verify::PrincipalKindTag;
+use wyrd_auth_verify::PrincipalKindWire;
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 
@@ -33,13 +33,13 @@ const CHANNEL: &str = "wyrd_principal_revoked";
 pub async fn notify_principal_revoked(
     pool: &PgPool,
     tenant: DataTenantId,
-    kind: PrincipalKindTag,
+    kind: PrincipalKindWire,
     id: PrincipalId,
 ) -> Result<(), sqlx::Error> {
     let kind_str = match kind {
-        PrincipalKindTag::User => "user",
-        PrincipalKindTag::Service => "service",
-        PrincipalKindTag::Agent => "agent",
+        PrincipalKindWire::User => "user",
+        PrincipalKindWire::Service => "service",
+        PrincipalKindWire::Agent => "agent",
     };
     let payload = format!("{tenant}/{kind_str}/{id}");
     sqlx::query("SELECT pg_notify($1, $2)")
@@ -129,9 +129,9 @@ impl RevocationListener {
             return;
         };
         let kind = match kind_str {
-            "user" => PrincipalKindTag::User,
-            "service" => PrincipalKindTag::Service,
-            "agent" => PrincipalKindTag::Agent,
+            "user" => PrincipalKindWire::User,
+            "service" => PrincipalKindWire::Service,
+            "agent" => PrincipalKindWire::Agent,
             _ => {
                 tracing::warn!(%payload, "unknown kind in revocation notification");
                 return;

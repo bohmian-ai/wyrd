@@ -35,6 +35,7 @@ where
     H: Health,
 {
     let verifier = state
+        .auth
         .token_verifier
         .clone()
         .ok_or(GrpcError::MissingTokenVerifier)?;

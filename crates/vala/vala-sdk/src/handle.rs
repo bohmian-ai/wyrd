@@ -65,10 +65,7 @@ impl Bifrost {
     /// Number of distinct producers currently pooled.
     #[must_use]
     pub fn producer_count(&self) -> usize {
-        self.producers
-            .lock()
-            .expect("producer pool poisoned")
-            .len()
+        self.producers.lock().expect("producer pool poisoned").len()
     }
 
     /// Rows dropped by the fire-and-forget observe path under backpressure.

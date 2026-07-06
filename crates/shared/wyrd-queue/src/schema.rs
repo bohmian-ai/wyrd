@@ -52,7 +52,13 @@ pub fn arrow_schema_to_fieldspec(schema: &Schema) -> Vec<FieldSpec> {
 pub fn fieldspec_to_arrow(fields: &[FieldSpec]) -> Result<Schema, WyrdQueueError> {
     let arrow_fields: Vec<Field> = fields
         .iter()
-        .map(|f| Field::new(f.name.as_str(), data_type_to_arrow(&f.data_type), f.nullable))
+        .map(|f| {
+            Field::new(
+                f.name.as_str(),
+                data_type_to_arrow(&f.data_type),
+                f.nullable,
+            )
+        })
         .collect();
     Ok(Schema::new(arrow_fields))
 }
@@ -279,10 +285,9 @@ fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
         DataTypeSpec::FixedSizeBinary { len } => DataType::FixedSizeBinary(*len),
         DataTypeSpec::Date32 => DataType::Date32,
         DataTypeSpec::Date64 => DataType::Date64,
-        DataTypeSpec::Timestamp { unit, tz } => DataType::Timestamp(
-            time_unit_to_arrow(*unit),
-            tz.as_deref().map(Into::into),
-        ),
+        DataTypeSpec::Timestamp { unit, tz } => {
+            DataType::Timestamp(time_unit_to_arrow(*unit), tz.as_deref().map(Into::into))
+        }
         DataTypeSpec::Time32 { unit } => DataType::Time32(time_unit_to_arrow(*unit)),
         DataTypeSpec::Time64 { unit } => DataType::Time64(time_unit_to_arrow(*unit)),
         DataTypeSpec::Decimal128 { precision, scale } => DataType::Decimal128(*precision, *scale),
@@ -294,7 +299,13 @@ fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
         DataTypeSpec::Struct(fields) => {
             let arrow_fields: Vec<Field> = fields
                 .iter()
-                .map(|f| Field::new(f.name.as_str(), data_type_to_arrow(&f.data_type), f.nullable))
+                .map(|f| {
+                    Field::new(
+                        f.name.as_str(),
+                        data_type_to_arrow(&f.data_type),
+                        f.nullable,
+                    )
+                })
                 .collect();
             DataType::Struct(Fields::from(arrow_fields))
         }

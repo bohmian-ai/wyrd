@@ -6,6 +6,24 @@ use wyrd_error_derive::WyrdError;
 /// Errors raised by the `wyrd` binary.
 #[derive(Debug, Error, WyrdError)]
 pub enum WyrdCliError {
+    /// `wyrd dev bootstrap` rejected because `WYRD_DATABASE_URL` points to a
+    /// non-loopback host and `--i-understand-this-is-not-production` was not set.
+    #[error(
+        "WYRD_DATABASE_URL points to a non-loopback host ({host}); \
+         wyrd dev bootstrap refuses to seed against non-local databases. \
+         Pass --i-understand-this-is-not-production to override."
+    )]
+    #[wyrd_error(
+        code = "WYRD_CLI_400_NON_LOOPBACK_DSN",
+        status = 400,
+        title = "Non-loopback database DSN rejected",
+        remediation = "Unset WYRD_DATABASE_URL to use embedded Postgres, or pass --i-understand-this-is-not-production to override."
+    )]
+    NonLoopbackDsn {
+        /// The host that was detected as non-loopback.
+        host: String,
+    },
+
     /// Client-delegated simulated-user mode was requested without a script.
     #[error("--simulated-user client requires --simulated-user-script <PATH>")]
     #[wyrd_error(

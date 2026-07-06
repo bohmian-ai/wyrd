@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use vala_bifrost::WyrdCatalog;
-use wyrd_auth_verify::{IssuerConfigResolver, PermissionResolver};
+use wyrd_auth_oidc::IssuerConfigResolver;
+use wyrd_auth_verify::PermissionResolver;
 use wyrd_tonic::tonic::{Request, Response, Status, Streaming};
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
     BifrostIngestService, BifrostIngestServiceServer,

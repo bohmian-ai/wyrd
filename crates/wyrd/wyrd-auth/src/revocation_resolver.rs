@@ -9,7 +9,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
 use sqlx::PgPool;
-use wyrd_auth_verify::{PrincipalKindTag, ResolveError, RevocationCheck};
+use wyrd_auth_verify::{PrincipalKindWire, ResolveError, RevocationCheck};
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::TenantConn;
@@ -33,11 +33,11 @@ enum PrincipalKindKind {
     ServiceOrAgent,
 }
 
-impl From<PrincipalKindTag> for PrincipalKindKind {
-    fn from(k: PrincipalKindTag) -> Self {
+impl From<PrincipalKindWire> for PrincipalKindKind {
+    fn from(k: PrincipalKindWire) -> Self {
         match k {
-            PrincipalKindTag::User => Self::User,
-            PrincipalKindTag::Service | PrincipalKindTag::Agent => Self::ServiceOrAgent,
+            PrincipalKindWire::User => Self::User,
+            PrincipalKindWire::Service | PrincipalKindWire::Agent => Self::ServiceOrAgent,
         }
     }
 }
@@ -88,7 +88,7 @@ impl SqlRevocationCheck {
     /// Called by `RevocationListener` when a `wyrd_principal_revoked` NOTIFY
     /// arrives so this replica reflects the revocation within the NOTIFY
     /// delivery window rather than waiting for TTL expiry.
-    pub async fn invalidate(&self, tenant: DataTenantId, id: PrincipalId, kind: PrincipalKindTag) {
+    pub async fn invalidate(&self, tenant: DataTenantId, id: PrincipalId, kind: PrincipalKindWire) {
         let key = EpochKey {
             tenant,
             kind: PrincipalKindKind::from(kind),
@@ -103,7 +103,7 @@ impl RevocationCheck for SqlRevocationCheck {
         &'a self,
         tenant: &'a DataTenantId,
         principal: PrincipalId,
-        kind: PrincipalKindTag,
+        kind: PrincipalKindWire,
     ) -> Pin<
         Box<
             dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>>

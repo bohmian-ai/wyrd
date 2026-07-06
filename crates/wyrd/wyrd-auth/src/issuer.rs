@@ -122,8 +122,7 @@ mod tests {
     #[tokio::test]
     async fn returns_invalid_token_when_issuer_not_in_list() {
         let tenant = DataTenantId::new_v7();
-        let issuer_url =
-            IssuerUrl::new("https://other.example.com".to_owned()).expect("valid url");
+        let issuer_url = IssuerUrl::new("https://other.example.com".to_owned()).expect("valid url");
         let resolver = StubResolver {
             issuers: vec![stub_issuer("https://idp.example.com")],
             fail: false,

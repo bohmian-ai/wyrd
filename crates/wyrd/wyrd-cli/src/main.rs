@@ -4,6 +4,7 @@
 
 mod auth;
 mod cli;
+mod dev;
 mod error;
 mod eval;
 mod principal;
@@ -36,6 +37,7 @@ async fn main() -> std::process::ExitCode {
 async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, WyrdCliError> {
     match cli.command {
         Command::Auth(command) => crate::auth::dispatch(command).await,
+        Command::Dev(command) => crate::dev::dispatch(command).await,
         Command::Eval(command) => crate::eval::run::dispatch(command).await,
         Command::Principal(command) => crate::principal::dispatch(command).await,
     }

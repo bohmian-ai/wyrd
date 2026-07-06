@@ -48,8 +48,8 @@ impl Bifrost {
             api_key: Some(api_key.into()),
             ..ClientConfig::default()
         };
-        let scope =
-            ClientScope::from_config(&config).map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let scope = ClientScope::from_config(&config)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         let handle = BifrostHandle::new(scope, Arc::new(MockSink::new()), QueueConfig::default());
         Ok(Self {
             inner: Arc::new(handle),
@@ -70,7 +70,14 @@ impl Bifrost {
         let card = parse_card_ref(card_ref)?;
         let run = run_id.map(RunId::from_string);
         self.inner
-            .insert(SinkKind::Record, table, &arrow_schema, row.as_bytes().to_vec(), card, run)
+            .insert(
+                SinkKind::Record,
+                table,
+                &arrow_schema,
+                row.as_bytes().to_vec(),
+                card,
+                run,
+            )
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
 

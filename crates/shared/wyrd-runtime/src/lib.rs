@@ -19,9 +19,10 @@ pub mod request_id;
 pub use permission::{Action, Permission, PermissionSet, Resource};
 pub use permission_check::{PermissionCheck, PermissionDenyReason, PermissionVerdict, RbacCheck};
 pub use principal::{
-    CardScope, InvalidRoleName, Principal, PrincipalId, PrincipalKind, PrincipalRef, RoleRef,
+    InvalidRoleName, Principal, PrincipalId, PrincipalKind, PrincipalRef, RoleRef,
 };
 pub use request_context::{DelegationStep, RequestContext, TraceParent};
+pub use wyrd_spec::reference::CardRefScope;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 

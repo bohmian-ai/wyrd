@@ -136,7 +136,6 @@ mod tests {
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
             roles: Vec::new(),
             effective_permissions: PermissionSet::new(),
-            card_scope: crate::CardScope::default(),
         }
     }
 

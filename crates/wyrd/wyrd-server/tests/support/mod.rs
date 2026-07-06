@@ -45,7 +45,7 @@ async fn shared() -> &'static SharedCatalog {
             let (factory, props) = storage
                 .iceberg_storage_factory()
                 .expect("iceberg storage factory");
-            let catalog_dsn = fixture.catalog_dsn().expect("catalog dsn resolves");
+            let catalog_dsn = fixture.catalog_dsn();
             let catalog = WyrdCatalog::new(
                 catalog_dsn.expose_secret(),
                 storage.warehouse_uri(),

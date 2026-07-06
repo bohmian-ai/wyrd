@@ -9,8 +9,10 @@ use wyrd_client::{WyrdClient, config::ClientConfig};
 use wyrd_mcp::bifrost::{bifrost_error_catalog, bifrost_permissions, register_bifrost_tools};
 
 fn dummy_client() -> WyrdClient {
-    let mut config = ClientConfig::default();
-    config.api_key = Some("test_key_placeholder".to_owned().into());
+    let config = ClientConfig {
+        api_key: Some("test_key_placeholder".to_owned().into()),
+        ..ClientConfig::default()
+    };
     WyrdClient::with_config(config).expect("test client builds")
 }
 

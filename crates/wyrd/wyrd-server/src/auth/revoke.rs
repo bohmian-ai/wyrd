@@ -1,9 +1,9 @@
 //! `POST /v1/principals/{id}/revoke` — bump `tokens_not_before` to now().
 
 use axum::extract::{Path, State};
-use wyrd_auth_verify::PrincipalKindTag;
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::error::WyrdError;
 
 use crate::auth::revocation_listener::notify_principal_revoked;

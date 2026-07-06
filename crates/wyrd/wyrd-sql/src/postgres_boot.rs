@@ -652,6 +652,8 @@ mod tests {
             Some(APP_URL.to_owned()),
             Some(SecretString::from(MIGRATOR_PW.to_owned())),
             None,
+            None,
+            None,
         )
         .await
         .expect("external boot resolves");
@@ -668,6 +670,8 @@ mod tests {
             Some(APP_URL.to_owned()),
             Some(SecretString::from(MIGRATOR_PW.to_owned())),
             Some(SecretString::from(ADMIN_PW.to_owned())),
+            None,
+            None,
         )
         .await
         .expect("external boot resolves");
@@ -698,6 +702,8 @@ mod tests {
                 app.map(str::to_owned),
                 migrator.map(|pw| SecretString::from(pw.to_owned())),
                 admin.map(|pw| SecretString::from(pw.to_owned())),
+                None,
+                None,
             )
             .await;
 
@@ -710,6 +716,8 @@ mod tests {
         let result = PostgresBoot::from_optional_dsns(
             Some("not-a-url".to_owned()),
             Some(SecretString::from(MIGRATOR_PW.to_owned())),
+            None,
+            None,
             None,
         )
         .await;
@@ -728,6 +736,8 @@ mod tests {
             ),
             Some(SecretString::from(MIGRATOR_PW.to_owned())),
             Some(SecretString::from(ADMIN_PW.to_owned())),
+            None,
+            None,
         )
         .await
         .expect("external boot resolves");
@@ -752,6 +762,8 @@ mod tests {
             app_dsn: APP_URL.to_owned().into(),
             migrator_dsn: EXPECTED_MIGRATOR_DSN.to_owned().into(),
             platform_admin_dsn: Some(EXPECTED_ADMIN_DSN.to_owned().into()),
+            catalog_app_dsn: APP_URL.to_owned().into(),
+            recovery_dsn: APP_URL.to_owned().into(),
         };
         let rendered = format!("{boot:?}");
 

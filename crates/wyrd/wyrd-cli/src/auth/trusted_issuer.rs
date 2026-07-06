@@ -5,8 +5,8 @@ use std::process::ExitCode;
 use clap::{Args, Subcommand};
 use url::Url;
 use wyrd_spec::auth::{
-    ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, IssuerUrl,
-    IssuerTokenPolicy, TrustedIssuerView,
+    ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, IssuerTokenPolicy, IssuerUrl,
+    TrustedIssuerView,
 };
 
 use crate::error::WyrdCliError;

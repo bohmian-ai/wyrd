@@ -131,7 +131,6 @@ mod tests {
             tenant_id: DataTenantId::new_v7(),
             roles: vec![RoleRef::new("service").expect("static role is valid")],
             effective_permissions: PermissionSet::new(),
-            card_scope: wyrd_runtime::CardScope::default(),
         }
     }
 

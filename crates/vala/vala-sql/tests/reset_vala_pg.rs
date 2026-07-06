@@ -31,7 +31,7 @@ async fn reset_clears_vala_tables_and_reseeds_sentinel() {
     )
     .await
     .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, &table_uid, &batch_id)
+    vala_sql::queries::olap_catalog::precommit(&mut conn, &table_uid, &batch_id, "test", "test")
         .await
         .unwrap();
     conn.commit().await.unwrap();

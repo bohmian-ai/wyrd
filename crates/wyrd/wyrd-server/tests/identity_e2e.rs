@@ -21,10 +21,8 @@ use wyrd_client::config::{ClientConfig, TokenCacheMode};
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_semver::VersionBlock;
-use wyrd_server::config::{
-    ClaimMappingEntry, ClientAuthEntry, IssuerEntry, IssuerTokenPolicy, WorkloadBindingEntry,
-};
-use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse, IssuerUrl};
+use wyrd_server::config::{ClaimMappingEntry, ClientAuthEntry, IssuerEntry, WorkloadBindingEntry};
+use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse, IssuerTokenPolicy, IssuerUrl};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;

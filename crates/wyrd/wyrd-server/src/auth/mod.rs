@@ -7,9 +7,10 @@ pub mod revoke;
 
 pub(crate) use wyrd_auth::card_scope;
 pub(crate) use wyrd_auth::{
-    exchange_api_key, issue_api_key, permission_resolver, pg_resolvers, refresh,
-    revocation_listener, revocation_resolver, roles, seed,
+    exchange_api_key, issue_api_key, pg_resolvers, refresh, revocation_listener,
+    revocation_resolver, roles,
 };
+pub use wyrd_auth::{permission_resolver, seed};
 
 // --------------------------------------------------------------------------
 // Shared host-header and error helpers used by multiple token-issuing paths.

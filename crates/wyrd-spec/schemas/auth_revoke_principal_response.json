@@ -19,7 +19,7 @@
       "description": "Revoked principal kind.",
       "allOf": [
         {
-          "$ref": "#/definitions/PrincipalKind"
+          "$ref": "#/definitions/PrincipalKindTag"
         }
       ]
     },
@@ -37,8 +37,8 @@
   },
   "additionalProperties": false,
   "definitions": {
-    "PrincipalKind": {
-      "description": "Principal-kind discriminator for auth administration requests.",
+    "PrincipalKindTag": {
+      "description": "Principal-kind discriminator without a bound card.\n\nSerializes as a bare snake_case string (`\"user\"`, `\"service\"`, `\"agent\"`); this is a stable wire contract for the revoke request body, token claims, and the revocation NOTIFY channel.",
       "oneOf": [
         {
           "description": "Human user principal.",

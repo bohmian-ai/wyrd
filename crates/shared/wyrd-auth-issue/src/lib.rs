@@ -13,11 +13,10 @@ use jsonwebtoken::{EncodingKey, Header};
 use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng};
 use secrecy::{ExposeSecret, SecretString};
 use ulid::Ulid;
-use wyrd_auth_verify::{
-    AccessTokenClaims, ActClaim, Kid, PrincipalKindTag, RefreshTokenClaims, TokenPrincipalRef,
-};
+use wyrd_auth_verify::{AccessTokenClaims, ActClaim, Kid, RefreshTokenClaims, TokenPrincipalRef};
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::reference::{CardRef, CardRefScope};
 
@@ -476,9 +475,7 @@ fn validate_principal_ref(principal: &TokenPrincipalRef) -> Result<(), IssueErro
         (PrincipalKindTag::User, Some(_)) => Err(IssueError::InvalidCardRef),
         (PrincipalKindTag::Service, Some(CardKind::Service)) => Ok(()),
         (PrincipalKindTag::Agent, Some(CardKind::Agent)) => Ok(()),
-        (PrincipalKindTag::Service | PrincipalKindTag::Agent, _) => {
-            Err(IssueError::InvalidCardRef)
-        }
+        (PrincipalKindTag::Service | PrincipalKindTag::Agent, _) => Err(IssueError::InvalidCardRef),
     }
 }
 
@@ -488,12 +485,13 @@ mod tests {
     use jsonwebtoken::{Algorithm, decode_header};
     use secrecy::{ExposeSecret, SecretString};
     use wyrd_auth_verify::{
-        AccessTokenClaims, ActClaim, PrincipalKindTag, RefreshTokenClaims, TokenPrincipalRef,
-        decode_kid, public_key_from_pem, verify_eddsa,
+        AccessTokenClaims, ActClaim, RefreshTokenClaims, TokenPrincipalRef, decode_kid,
+        public_key_from_pem, verify_eddsa,
     };
     use wyrd_runtime::{PrincipalId, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::{CardRef, CardRefScope};

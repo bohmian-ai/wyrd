@@ -7,7 +7,7 @@ pub mod scenarios;
 use sqlx::PgPool;
 
 use wyrd_runtime::permission::PermissionSet;
-use wyrd_runtime::principal::{CardScope, Principal, PrincipalId, PrincipalKind};
+use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
 use wyrd_semver::{VersionBlock, VersionSpec};
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::envelope::{Card, CardKind};
@@ -76,7 +76,6 @@ impl TestEnv {
             tenant,
             vec![],
             PermissionSet::new(),
-            CardScope::default(),
         )
     }
 }

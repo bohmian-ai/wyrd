@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 
 import pytest
-
 from wyrd.bifrost import Bifrost
 from wyrd.observe import record
 

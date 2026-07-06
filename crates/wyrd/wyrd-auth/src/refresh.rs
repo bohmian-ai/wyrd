@@ -366,11 +366,12 @@ mod tests {
     use sha2::{Digest, Sha256};
     use uuid::Uuid;
     use wyrd_auth_issue::IssuingKey;
-    use wyrd_auth_verify::{Kid, PrincipalKindTag};
+    use wyrd_auth_verify::Kid;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::PrincipalId;
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;

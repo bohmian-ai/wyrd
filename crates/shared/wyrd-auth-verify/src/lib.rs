@@ -685,7 +685,6 @@ pub struct TokenPrincipalRef {
     pub card_ref_scope: CardRefScope,
 }
 
-
 /// Refresh-token claims for any principal kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -819,9 +818,7 @@ fn wire_kind_into_principal_kind(
                 card_ref_scope: seed_scope(card_ref, card_ref_scope)?,
             })
         }
-        (PrincipalKindTag::Service | PrincipalKindTag::Agent, _) => {
-            Err(AuthError::InvalidCardRef)
-        }
+        (PrincipalKindTag::Service | PrincipalKindTag::Agent, _) => Err(AuthError::InvalidCardRef),
     }
 }
 
@@ -930,11 +927,11 @@ mod tests {
         ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, JwksCache, OidcError,
         TrustedIssuer,
     };
-    use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_runtime::{Permission, PermissionSet};
     use wyrd_runtime::{Principal, PrincipalId, PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::IssuerUrl;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};

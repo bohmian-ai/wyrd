@@ -64,7 +64,7 @@
       "description": "Kind of the acting principal (tag encoding; card payload is not the audit subject — `card_ref` is its own field).",
       "allOf": [
         {
-          "$ref": "#/definitions/PrincipalKind"
+          "$ref": "#/definitions/PrincipalKindTag"
         }
       ]
     },
@@ -240,74 +240,29 @@
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
-    "PrincipalKind": {
-      "description": "Kind of authenticated identity, carrying the bound card for card-backed kinds.",
+    "PrincipalKindTag": {
+      "description": "Principal-kind discriminator without a bound card.\n\nSerializes as a bare snake_case string (`\"user\"`, `\"service\"`, `\"agent\"`); this is a stable wire contract for the revoke request body, token claims, and the revocation NOTIFY channel.",
       "oneOf": [
         {
-          "description": "Human user identity.",
-          "type": "object",
-          "required": [
-            "kind"
-          ],
-          "properties": {
-            "kind": {
-              "type": "string",
-              "enum": [
-                "user"
-              ]
-            }
-          },
-          "additionalProperties": false
+          "description": "Human user principal.",
+          "type": "string",
+          "enum": [
+            "user"
+          ]
         },
         {
-          "description": "Card-bound service identity.",
-          "type": "object",
-          "required": [
-            "card_ref",
-            "kind"
-          ],
-          "properties": {
-            "card_ref": {
-              "description": "Bound Service card.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/CardRef"
-                }
-              ]
-            },
-            "kind": {
-              "type": "string",
-              "enum": [
-                "service"
-              ]
-            }
-          },
-          "additionalProperties": false
+          "description": "Service principal.",
+          "type": "string",
+          "enum": [
+            "service"
+          ]
         },
         {
-          "description": "Card-bound agent identity.",
-          "type": "object",
-          "required": [
-            "card_ref",
-            "kind"
-          ],
-          "properties": {
-            "card_ref": {
-              "description": "Bound Agent card.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/CardRef"
-                }
-              ]
-            },
-            "kind": {
-              "type": "string",
-              "enum": [
-                "agent"
-              ]
-            }
-          },
-          "additionalProperties": false
+          "description": "Agent principal.",
+          "type": "string",
+          "enum": [
+            "agent"
+          ]
         }
       ]
     },

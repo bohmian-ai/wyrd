@@ -25,11 +25,12 @@ use serde_json::Value;
 use sqlx::PgPool;
 use url::Url;
 use wyrd_auth_oidc::{
-    ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, OidcError, IssuerTokenPolicy,
-    TrustedIssuer, WorkloadBinding, WorkloadBindingResolver,
+    ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, OidcError, TrustedIssuer,
+    WorkloadBinding, WorkloadBindingResolver,
 };
 use wyrd_crypt::{CryptError, EncryptedPayload, SecretKey};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::reference::CardRef;
 use wyrd_sql::TenantConn;
@@ -447,13 +448,14 @@ mod tests {
 
     use secrecy::{ExposeSecret, SecretString};
     use wyrd_auth_oidc::{
-        ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, IssuerTokenPolicy,
-        TrustedIssuer, WorkloadBinding, WorkloadBindingResolver,
+        ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, TrustedIssuer, WorkloadBinding,
+        WorkloadBindingResolver,
     };
     use wyrd_crypt::SecretKey;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::IssuerUrl;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};

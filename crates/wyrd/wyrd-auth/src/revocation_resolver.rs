@@ -108,16 +108,17 @@ impl RevocationCheck for SqlRevocationCheck {
                         .await
                         .map_err(|e| ResolveError::Unavailable(e.to_string()))?;
                     let id_uuid = principal.as_uuid();
-                    let epoch = match kind {
-                        PrincipalKindTag::User => user_revocation_epoch(&mut conn, id_uuid)
-                            .await
-                            .map_err(|e| ResolveError::Unavailable(e.to_string()))?,
-                        PrincipalKindTag::Service | PrincipalKindTag::Agent => {
-                            service_account_revocation_epoch(&mut conn, id_uuid)
+                    let epoch =
+                        match kind {
+                            PrincipalKindTag::User => user_revocation_epoch(&mut conn, id_uuid)
                                 .await
-                                .map_err(|e| ResolveError::Unavailable(e.to_string()))?
-                        }
-                    };
+                                .map_err(|e| ResolveError::Unavailable(e.to_string()))?,
+                            PrincipalKindTag::Service | PrincipalKindTag::Agent => {
+                                service_account_revocation_epoch(&mut conn, id_uuid)
+                                    .await
+                                    .map_err(|e| ResolveError::Unavailable(e.to_string()))?
+                            }
+                        };
                     Ok(epoch)
                 })
                 .await

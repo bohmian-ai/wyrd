@@ -21,7 +21,7 @@ mod audit_relay {
     use vala_bifrost::catalog::namespaces::BifrostNamespace;
     use vala_bifrost::relay::{AUDIT_LOG_TABLE, AuditRelay};
     use vala_sql::TenantConn;
-    use wyrd_spec::auth::{PrincipalId, PrincipalKind};
+    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
@@ -77,7 +77,7 @@ mod audit_relay {
             resource: "vala.bifrost.thing".to_string(),
             card_ref: None,
             principal_id: PrincipalId::new(Uuid::now_v7()),
-            principal_kind: PrincipalKind::User,
+            principal_kind: PrincipalKindTag::User,
             auth_method: AuthMethod::Internal,
             permission: "bifrost.record_write".to_string(),
             decision: AuditDecision::Allow,

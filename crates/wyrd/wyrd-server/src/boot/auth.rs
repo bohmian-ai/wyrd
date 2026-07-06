@@ -92,11 +92,10 @@ mod tests {
     use super::*;
     use chrono::Duration as ChronoDuration;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-    use wyrd_auth_verify::{
-        AccessTokenClaims, PrincipalKindTag, TokenPrincipalRef, decode_kid, verify_eddsa,
-    };
+    use wyrd_auth_verify::{AccessTokenClaims, TokenPrincipalRef, decode_kid, verify_eddsa};
     use wyrd_runtime::{PrincipalId, RoleRef};
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::PrincipalKindTag;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 

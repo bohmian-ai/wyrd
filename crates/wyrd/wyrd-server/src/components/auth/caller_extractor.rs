@@ -60,11 +60,11 @@ mod tests {
     use std::time::Duration as StdDuration;
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{
-        Kid, PrincipalKindTag, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
-        public_key_from_pem,
+        Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
     };
     use wyrd_runtime::PrincipalId;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::request_id::RequestId;
 
     use crate::auth::permission_resolver::SqlPermissionResolver;
@@ -76,7 +76,7 @@ mod tests {
     #[tokio::test]
     async fn caller_data_tenant_id_sourced_from_principal() {
         let tenant = DataTenantId::new_v7();
-        let state = test_state();
+        let state = test_state().await;
         let token = mint_test_user_jwt(&state, tenant);
         let mut parts = Request::builder()
             .uri("/v1/cards/upload/init")
@@ -97,7 +97,7 @@ mod tests {
         assert_eq!(caller.principal.tenant_id, tenant);
     }
 
-    fn test_state() -> crate::state::AppState {
+    async fn test_state() -> crate::state::AppState {
         use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
         use std::collections::HashMap;
         use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -133,6 +133,7 @@ mod tests {
         crate::state::AppState::new(
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
         )
         .with_auth(crate::components::auth::ServerAuth {
             issuing_key: Some(issuing_key),

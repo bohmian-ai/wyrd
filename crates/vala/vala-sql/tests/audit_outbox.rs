@@ -9,7 +9,7 @@ mod audit_outbox {
     use sqlx::PgPool;
     use sqlx::types::Uuid;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{PrincipalId, PrincipalKind};
+    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
@@ -32,7 +32,7 @@ mod audit_outbox {
             resource: "ns.tbl".to_string(),
             card_ref: None,
             principal_id: PrincipalId::new(Uuid::now_v7()),
-            principal_kind: PrincipalKind::User,
+            principal_kind: PrincipalKindTag::User,
             auth_method: AuthMethod::Internal,
             permission: "bifrost.write".to_string(),
             decision: AuditDecision::Allow,

@@ -26,8 +26,8 @@ use std::time::Duration;
 use sqlx::PgPool;
 use url::Url;
 use wyrd_auth_oidc::{
-    ClaimMapping, ClaimPath, ClientAuth, OidcProvider, IssuerTokenPolicy, ProviderMetadata,
-    TrustedIssuer, WorkloadBinding,
+    ClaimMapping, ClaimPath, ClientAuth, OidcProvider, ProviderMetadata, TrustedIssuer,
+    WorkloadBinding,
 };
 use wyrd_crypt::SecretKey;
 use wyrd_spec::auth::IssuerUrl;
@@ -39,7 +39,9 @@ use wyrd_sql::queries::auth::{
 
 use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
 use crate::boot::ServerBootError;
-use crate::config::{ClaimMappingEntry, ClientAuthEntry, IssuerEntry, IssuerTokenPolicy};
+use wyrd_spec::auth::IssuerTokenPolicy;
+
+use crate::config::{ClaimMappingEntry, ClientAuthEntry, IssuerEntry};
 
 /// Default JWKS key-cache TTL applied when an entry omits `jwks_ttl_secs`.
 const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(3600);
@@ -283,12 +285,8 @@ fn map_claim_mapping(entry: &ClaimMappingEntry) -> ClaimMapping {
     }
 }
 
-/// Map the config principal-kind DTO to the domain [`IssuerTokenPolicy`].
 fn map_principal_kind(entry: IssuerTokenPolicy) -> IssuerTokenPolicy {
-    match entry {
-        IssuerTokenPolicy::Human => IssuerTokenPolicy::Human,
-        IssuerTokenPolicy::Workload => IssuerTokenPolicy::Workload,
-    }
+    entry
 }
 
 #[cfg(test)]

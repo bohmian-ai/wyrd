@@ -1,8 +1,8 @@
 //! Principal revocation domain operations.
 
-use wyrd_auth_verify::PrincipalKindTag;
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
@@ -58,11 +58,11 @@ fn internal_error(error: impl std::fmt::Display) -> WyrdError {
 #[cfg(test)]
 mod tests {
     use uuid::Uuid;
-    use wyrd_auth_verify::PrincipalKindTag;
     use wyrd_dev_fixtures::cards::seed_backing_card;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::PrincipalId;
     use wyrd_semver::VersionBlock;
+    use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, SpaceName};

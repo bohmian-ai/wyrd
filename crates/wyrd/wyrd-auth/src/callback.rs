@@ -9,9 +9,10 @@ use serde_json::Value;
 use uuid::Uuid;
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_oidc::{ClientAuth, OidcProvider, TrustedIssuer};
-use wyrd_auth_verify::{PrincipalKindTag, TokenPrincipalRef, TokenVerifier};
+use wyrd_auth_verify::{TokenPrincipalRef, TokenVerifier};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::auth::{IssuerUrl, TokenResponse, TokenType};
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::queries::auth::{

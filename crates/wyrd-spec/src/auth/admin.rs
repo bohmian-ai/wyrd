@@ -46,7 +46,7 @@ pub enum ClientAuthKind {
 
 /// Whether an issuer's tokens represent human users or machine workloads.
 ///
-/// This is the issuer token policy — distinct from [`PrincipalKindTag`], which
+/// This is the issuer token policy — distinct from [`super::PrincipalKindTag`], which
 /// discriminates the resulting principal identity. One canonical type backs the
 /// admin wire body, the OIDC domain registry, and the server config DTO.
 #[derive(

@@ -18,6 +18,7 @@ fn client_from_bootstrap(base_url: &str, api_key: secrecy::SecretString) -> Wyrd
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD"]
 async fn bifrost_rbac_list_tables_without_permission_returns_permission_denied() {
     let srv = WyrdTestServer::start_bound()
         .await
@@ -56,6 +57,7 @@ async fn bifrost_rbac_list_tables_without_permission_returns_permission_denied()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD"]
 async fn bifrost_rbac_describe_table_without_permission_returns_permission_denied() {
     let srv = WyrdTestServer::start_bound()
         .await

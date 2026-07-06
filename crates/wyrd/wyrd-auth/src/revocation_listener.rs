@@ -13,9 +13,9 @@ use sqlx::PgPool;
 use sqlx::postgres::PgListener;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
-use wyrd_auth_verify::PrincipalKindTag;
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PrincipalKindTag;
 
 use super::revocation_resolver::SqlRevocationCheck;
 

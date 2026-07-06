@@ -8,9 +8,9 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use vala_ingest::error::IngestError;
 use vala_ingest::orchestrator::validate_card_scope;
-use wyrd_runtime::{CardScope, Permission, PermissionSet, Principal, PrincipalId, PrincipalKind};
+use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, CardRefScope};
 
 const IN_SCOPE: &str = "prod/Service/billing@1.0.0";
 const OUT_OF_SCOPE: &str = "prod/Service/shipping@1.0.0";
@@ -20,16 +20,18 @@ fn card(canonical: &str) -> CardRef {
 }
 
 fn principal_with_scope(cards: &[&str]) -> Principal {
-    let scope = CardScope::new(cards.iter().map(|c| card(c)));
+    let card_ref = card(IN_SCOPE);
+    let card_ref_scope =
+        CardRefScope::from_root_and_members(&card_ref, cards.iter().map(|c| card(c)));
     Principal::new(
         PrincipalId::new(uuid::Uuid::now_v7()),
         PrincipalKind::Service {
-            card_ref: card(IN_SCOPE),
+            card_ref,
+            card_ref_scope,
         },
         DataTenantId::new_v7(),
         Vec::new(),
         PermissionSet::from_iter([Permission::bifrost_record_write()]),
-        scope,
     )
 }
 
@@ -104,7 +106,6 @@ fn card_scope_empty_user_principal_cannot_write() {
         DataTenantId::new_v7(),
         Vec::new(),
         PermissionSet::from_iter([Permission::bifrost_record_write()]),
-        CardScope::default(),
     );
     let batch = batch_with_card_refs(vec![Some(IN_SCOPE)]);
 

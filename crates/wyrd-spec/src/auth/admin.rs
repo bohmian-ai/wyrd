@@ -44,11 +44,19 @@ pub enum ClientAuthKind {
     Public,
 }
 
-/// Whether the issuer's tokens represent humans or machine workloads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// Whether an issuer's tokens represent human users or machine workloads.
+///
+/// This is the issuer token policy — distinct from [`PrincipalKindTag`], which
+/// discriminates the resulting principal identity. One canonical type backs the
+/// admin wire body, the OIDC domain registry, and the server config DTO.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub enum PrincipalKindPayload {
+#[serde(rename_all = "snake_case")]
+pub enum IssuerTokenPolicy {
     /// Tokens represent human users.
+    #[default]
     Human,
     /// Tokens represent machine workloads.
     Workload,
@@ -79,7 +87,7 @@ pub struct CreateTrustedIssuerRequest {
     #[serde(default)]
     pub default_roles: Vec<String>,
     /// Whether tokens represent humans or workloads.
-    pub principal_kind: PrincipalKindPayload,
+    pub principal_kind: IssuerTokenPolicy,
     /// Optional JWKS key-cache TTL override in seconds.
     #[serde(default)]
     pub jwks_ttl_secs: Option<u64>,

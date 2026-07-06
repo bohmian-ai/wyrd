@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{PrincipalId, PrincipalKind};
+use crate::auth::{PrincipalId, PrincipalKindTag};
 use crate::reference::CardRef;
 use crate::request_id::RequestId;
 
@@ -509,7 +509,7 @@ pub struct AuditEvent {
     pub principal_id: PrincipalId,
     /// Kind of the acting principal (tag encoding; card payload is not the audit
     /// subject — `card_ref` is its own field).
-    pub principal_kind: PrincipalKind,
+    pub principal_kind: PrincipalKindTag,
     /// How the principal authenticated.
     pub auth_method: AuthMethod,
     /// Effective RBAC permission checked for the op.

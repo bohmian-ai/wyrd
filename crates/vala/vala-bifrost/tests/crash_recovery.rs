@@ -228,7 +228,6 @@ async fn precommit_row_aborts_on_restart() {
 /// snapshot is real and carries `wyrd_batch_id`. Recovery finds it (`snapshot_found`)
 /// and rolls forward: finalizes 'committed'.
 #[tokio::test]
-#[ignore = "pre-existing: recovery roll-forward path not committing; tracked separately"]
 async fn snapshot_committed_but_not_finalized_rolls_forward() {
     let h = setup().await;
     let table = load_table(&h).await;

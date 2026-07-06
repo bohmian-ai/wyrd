@@ -35,6 +35,8 @@ uuid = { workspace = true, features = ["v4"] }
 base64 = { workspace = true }
 chrono = { workspace = true }
 jsonwebtoken = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 moka = { version = "0.12", features = ["future"] }
 rand = { workspace = true }
 secrecy = { workspace = true, features = ["serde"] }
@@ -72,11 +74,13 @@ reqwest = { workspace = true }
 wyrd-storage = { workspace = true, features = ["emulator"] }
 temp-env = { workspace = true }
 tempfile = { workspace = true }
+tokio-stream = "0.1"
 tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
 wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
 wyrd-testing = { path = "../wyrd-testing", version = "0.0.1" }
+wyrd-tonic = { workspace = true, features = ["client"] }
 wyrd-cli = { path = "../wyrd-cli", version = "0.0.1" }
 wyrd-client = { path = "../../shared/wyrd-client", version = "0.0.1" }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1", features = ["testing"] }

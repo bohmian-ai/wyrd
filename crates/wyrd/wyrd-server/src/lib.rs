@@ -13,11 +13,9 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use app::{build_app, run, serve};
-pub use boot::{
-    ServerBootError, build_app_state, build_app_state_from_config, spawn_storage_sweeper,
-};
-pub use config::WyrdServerConfig;
+pub use app::{BootExit, WyrdServer, run, serve};
+pub use boot::{ServerBootError, StateOverrides, build_state, spawn_storage_sweeper};
+pub use config::{ServeMode, WyrdServerConfig};
 pub use http::build_router;
 pub use postgres::{ServerPostgres, ServerPostgresError};
 pub use state::AppState;

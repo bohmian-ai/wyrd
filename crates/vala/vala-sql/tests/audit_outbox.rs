@@ -2,26 +2,28 @@
 //!
 //! Covers the per-tenant gapless hash chain, the append-only trigger, per-tenant
 //! isolation of chains and shipping, and the cross-tenant relay claim/ship cycle.
-//! Run against a live Postgres:
-//!   DATABASE_URL=... cargo test -p vala-sql --all-features audit_outbox -- --test-threads=1
+//! Run via `mise run test:sql`.
 
 mod audit_outbox {
     use sqlx::PgPool;
     use sqlx::types::Uuid;
+    use wyrd_sql::testing::SharedDb;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{PrincipalId, PrincipalKind};
+    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
     const ZERO_HASH: [u8; 32] = [0u8; 32];
 
-    async fn seed(pool: &PgPool) -> DataTenantId {
-        vala_sql::testing::migrate_for_test(pool).await.unwrap();
+    /// Shared DB with owned schemas reset and one seeded tenant.
+    async fn setup() -> (SharedDb, DataTenantId) {
+        let db = vala_sql::testing::shared().await.expect("shared db");
+        vala_sql::testing::reset_for_test(&db).await.expect("reset");
         let tenant = DataTenantId::new_v7();
-        vala_sql::testing::seed_tenant(pool, tenant.as_uuid())
+        vala_sql::testing::seed_tenant(&db.platform_admin, tenant.as_uuid())
             .await
             .unwrap();
-        tenant
+        (db, tenant)
     }
 
     fn event(operation: &str) -> AuditEvent {
@@ -32,7 +34,7 @@ mod audit_outbox {
             resource: "ns.tbl".to_string(),
             card_ref: None,
             principal_id: PrincipalId::new(Uuid::now_v7()),
-            principal_kind: PrincipalKind::User,
+            principal_kind: PrincipalKindTag::User,
             auth_method: AuthMethod::Internal,
             permission: "bifrost.write".to_string(),
             decision: AuditDecision::Allow,
@@ -50,20 +52,20 @@ mod audit_outbox {
         seq
     }
 
-    #[sqlx::test(migrations = false)]
-    async fn gapless_seq_and_hash_chain(pool: PgPool) {
-        let tenant = seed(&pool).await;
+    #[tokio::test]
+    async fn gapless_seq_and_hash_chain() {
+        let (db, tenant) = setup().await;
 
-        assert_eq!(append(&pool, tenant, "op.a").await, 1);
-        assert_eq!(append(&pool, tenant, "op.b").await, 2);
-        assert_eq!(append(&pool, tenant, "op.c").await, 3);
+        assert_eq!(append(&db.app, tenant, "op.a").await, 1);
+        assert_eq!(append(&db.app, tenant, "op.b").await, 2);
+        assert_eq!(append(&db.app, tenant, "op.c").await, 3);
 
         let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
             "SELECT seq, prev_hash, entry_hash FROM vala.audit_outbox
               WHERE data_tenant_id = $1 ORDER BY seq",
         )
         .bind(tenant.as_uuid())
-        .fetch_all(&pool)
+        .fetch_all(&db.migrator)
         .await
         .unwrap();
 
@@ -83,7 +85,7 @@ mod audit_outbox {
             "SELECT last_seq, head_hash FROM vala.audit_chain_head WHERE data_tenant_id = $1",
         )
         .bind(tenant.as_uuid())
-        .fetch_one(&pool)
+        .fetch_one(&db.migrator)
         .await
         .unwrap();
         assert_eq!(last_seq, 3);
@@ -93,15 +95,17 @@ mod audit_outbox {
         );
     }
 
-    #[sqlx::test(migrations = false)]
-    async fn append_only_trigger_rejects_delete_and_content_update(pool: PgPool) {
-        let tenant = seed(&pool).await;
-        append(&pool, tenant, "op.a").await;
+    #[tokio::test]
+    async fn append_only_trigger_rejects_delete_and_content_update() {
+        let (db, tenant) = setup().await;
+        append(&db.app, tenant, "op.a").await;
 
+        // Probe via the BYPASSRLS migrator pool so the statement reaches the row
+        // and the append-only trigger — not RLS — is what rejects it.
         let deleted =
             sqlx::query("DELETE FROM vala.audit_outbox WHERE data_tenant_id = $1 AND seq = 1")
                 .bind(tenant.as_uuid())
-                .execute(&pool)
+                .execute(&db.migrator)
                 .await;
         assert!(
             deleted.is_err(),
@@ -113,18 +117,18 @@ mod audit_outbox {
               WHERE data_tenant_id = $1 AND seq = 1",
         )
         .bind(tenant.as_uuid())
-        .execute(&pool)
+        .execute(&db.migrator)
         .await;
         assert!(tampered.is_err(), "content UPDATE must be rejected");
     }
 
-    #[sqlx::test(migrations = false)]
-    async fn shipped_row_is_immutable(pool: PgPool) {
-        let tenant = seed(&pool).await;
-        append(&pool, tenant, "op.a").await;
+    #[tokio::test]
+    async fn shipped_row_is_immutable() {
+        let (db, tenant) = setup().await;
+        append(&db.app, tenant, "op.a").await;
 
         let batch = [0xABu8; 16];
-        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await.unwrap();
+        let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant).await.unwrap();
         let shipped = vala_sql::queries::audit_outbox::mark_audit_shipped(&mut conn, 1, 1, &batch)
             .await
             .unwrap();
@@ -136,31 +140,27 @@ mod audit_outbox {
               WHERE data_tenant_id = $1 AND seq = 1",
         )
         .bind(tenant.as_uuid())
-        .execute(&pool)
+        .execute(&db.migrator)
         .await;
         assert!(reship.is_err(), "an already-shipped row must be immutable");
     }
 
-    #[sqlx::test(migrations = false)]
-    async fn per_tenant_chains_and_shipping_are_isolated(pool: PgPool) {
-        vala_sql::testing::migrate_for_test(&pool).await.unwrap();
-        let tenant_a = DataTenantId::new_v7();
+    #[tokio::test]
+    async fn per_tenant_chains_and_shipping_are_isolated() {
+        let (db, tenant_a) = setup().await;
         let tenant_b = DataTenantId::new_v7();
-        vala_sql::testing::seed_tenant(&pool, tenant_a.as_uuid())
-            .await
-            .unwrap();
-        vala_sql::testing::seed_tenant(&pool, tenant_b.as_uuid())
+        vala_sql::testing::seed_tenant(&db.platform_admin, tenant_b.as_uuid())
             .await
             .unwrap();
 
         // Each tenant's seq is independent and starts at 1.
-        assert_eq!(append(&pool, tenant_a, "a.1").await, 1);
-        assert_eq!(append(&pool, tenant_a, "a.2").await, 2);
-        assert_eq!(append(&pool, tenant_b, "b.1").await, 1);
+        assert_eq!(append(&db.app, tenant_a, "a.1").await, 1);
+        assert_eq!(append(&db.app, tenant_a, "a.2").await, 2);
+        assert_eq!(append(&db.app, tenant_b, "b.1").await, 1);
 
         // Marking tenant A shipped must not touch tenant B's rows.
         let batch_a = [0x0Au8; 16];
-        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_a)
+        let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant_a)
             .await
             .unwrap();
         let shipped_a =
@@ -175,30 +175,26 @@ mod audit_outbox {
               WHERE data_tenant_id = $1 AND NOT shipped",
         )
         .bind(tenant_b.as_uuid())
-        .fetch_one(&pool)
+        .fetch_one(&db.migrator)
         .await
         .unwrap();
         assert_eq!(b_unshipped, 1, "tenant B is untouched by tenant A shipping");
     }
 
-    #[sqlx::test(migrations = false)]
-    async fn relay_claims_across_tenants_then_marks_shipped(pool: PgPool) {
-        vala_sql::testing::migrate_for_test(&pool).await.unwrap();
-        let tenant_a = DataTenantId::new_v7();
+    #[tokio::test]
+    async fn relay_claims_across_tenants_then_marks_shipped() {
+        let (db, tenant_a) = setup().await;
         let tenant_b = DataTenantId::new_v7();
-        vala_sql::testing::seed_tenant(&pool, tenant_a.as_uuid())
-            .await
-            .unwrap();
-        vala_sql::testing::seed_tenant(&pool, tenant_b.as_uuid())
+        vala_sql::testing::seed_tenant(&db.platform_admin, tenant_b.as_uuid())
             .await
             .unwrap();
 
-        append(&pool, tenant_a, "a.1").await;
-        append(&pool, tenant_a, "a.2").await;
-        append(&pool, tenant_b, "b.1").await;
+        append(&db.app, tenant_a, "a.1").await;
+        append(&db.app, tenant_a, "a.2").await;
+        append(&db.app, tenant_b, "b.1").await;
 
         // Cross-tenant claim (SECURITY DEFINER) sees every unshipped row.
-        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_a)
+        let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant_a)
             .await
             .unwrap();
         let claimed = vala_sql::queries::audit_outbox::claim_unshipped_audit(&mut conn, 100)
@@ -208,7 +204,7 @@ mod audit_outbox {
         assert_eq!(claimed.len(), 3, "claim spans both tenants");
 
         // Ship per tenant under that tenant's bind.
-        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_a)
+        let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant_a)
             .await
             .unwrap();
         assert_eq!(
@@ -219,7 +215,7 @@ mod audit_outbox {
         );
         conn.commit().await.unwrap();
 
-        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_b)
+        let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant_b)
             .await
             .unwrap();
         assert_eq!(
@@ -231,7 +227,7 @@ mod audit_outbox {
         conn.commit().await.unwrap();
 
         // Nothing left to claim.
-        let mut conn = vala_sql::TenantConn::acquire(&pool, tenant_a)
+        let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant_a)
             .await
             .unwrap();
         let remaining = vala_sql::queries::audit_outbox::claim_unshipped_audit(&mut conn, 100)

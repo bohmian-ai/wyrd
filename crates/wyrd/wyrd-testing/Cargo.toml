@@ -28,8 +28,10 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
+tokio-stream = "0.1"
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
+wyrd-tonic = { workspace = true, features = ["server", "client"] }
 uuid = { workspace = true, features = ["v4", "v7"] }
 vala-bifrost = { workspace = true }
 wyrd-auth = { workspace = true }

@@ -459,7 +459,7 @@ mod tests {
         let root = tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
-        let state = AppState::new(postgres, storage);
+        let state = AppState::new(postgres, storage, crate::test_support::test_catalog().await);
 
         assert!(state.postgres.platform_admin_pool().is_some());
         assert_eq!(

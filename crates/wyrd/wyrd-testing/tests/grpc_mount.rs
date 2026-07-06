@@ -112,7 +112,7 @@ async fn grpc_mount_missing_verifier_hard_errors() {
     let srv = WyrdTestServer::start_bound().await.expect("bound server");
 
     let mut state = srv.state().clone();
-    state.token_verifier = None;
+    state.auth.token_verifier = None;
     let (_reporter, health_service) = health_reporter();
 
     let result = build_app_grpc(

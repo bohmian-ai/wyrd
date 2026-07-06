@@ -14,15 +14,13 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use wyrd_auth_oidc::{
-    IssuerConfigResolver, JwksCache, OidcError, OidcKid, PrincipalKindPolicy, map_claims,
-};
+use wyrd_auth_oidc::{IssuerConfigResolver, JwksCache, OidcError, OidcKid, map_claims};
 use wyrd_runtime::{
     DelegationStep, PermissionSet, Principal, PrincipalId, PrincipalKind,
     PrincipalRef as RuntimePrincipalRef, RoleRef,
 };
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::IssuerUrl;
+use wyrd_spec::auth::{IssuerTokenPolicy, IssuerUrl, PrincipalKindTag};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::reference::{CardRef, CardRefScope};
 
@@ -170,7 +168,7 @@ pub trait RevocationCheck: Send + Sync + fmt::Debug {
         &'a self,
         tenant: &'a DataTenantId,
         principal: PrincipalId,
-        kind: PrincipalKindWire,
+        kind: PrincipalKindTag,
     ) -> RevocationEpochFuture<'a>;
 }
 
@@ -183,7 +181,7 @@ impl RevocationCheck for NoRevocation {
         &'a self,
         _tenant: &'a DataTenantId,
         _principal: PrincipalId,
-        _kind: PrincipalKindWire,
+        _kind: PrincipalKindTag,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>>
@@ -279,7 +277,7 @@ pub struct VerifiedExternalIdentity {
     pub groups: Vec<String>,
     /// Whether the matched issuer represents human users or machine workloads.
     /// Carried out of the trust resolution so callers need not re-resolve it.
-    pub principal_kind: PrincipalKindPolicy,
+    pub principal_kind: IssuerTokenPolicy,
     /// The audience the matched issuer expects, used as the workload binding
     /// audience constraint without a second issuer resolution.
     pub expected_audience: String,
@@ -403,9 +401,9 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
             // A principal revoked after this token was cached must be rejected here.
             if let Some(ref rev) = self.revocation {
                 let kind = match &cached.principal.kind {
-                    PrincipalKind::User => PrincipalKindWire::User,
-                    PrincipalKind::Service { .. } => PrincipalKindWire::Service,
-                    PrincipalKind::Agent { .. } => PrincipalKindWire::Agent,
+                    PrincipalKind::User => PrincipalKindTag::User,
+                    PrincipalKind::Service { .. } => PrincipalKindTag::Service,
+                    PrincipalKind::Agent { .. } => PrincipalKindTag::Agent,
                 };
                 match rev
                     .epoch(&cached.principal.tenant_id, cached.principal.id, kind)
@@ -452,9 +450,9 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
         // Also check revocation for fresh (cache-miss) verifies.
         if let Some(ref rev) = self.revocation {
             let kind = match &result.principal.kind {
-                PrincipalKind::User => PrincipalKindWire::User,
-                PrincipalKind::Service { .. } => PrincipalKindWire::Service,
-                PrincipalKind::Agent { .. } => PrincipalKindWire::Agent,
+                PrincipalKind::User => PrincipalKindTag::User,
+                PrincipalKind::Service { .. } => PrincipalKindTag::Service,
+                PrincipalKind::Agent { .. } => PrincipalKindTag::Agent,
             };
             match rev
                 .epoch(&result.principal.tenant_id, result.principal.id, kind)
@@ -676,7 +674,7 @@ pub struct TokenPrincipalRef {
     /// Stable principal id.
     pub id: PrincipalId,
     /// Principal kind without inline runtime payloads.
-    pub kind: PrincipalKindWire,
+    pub kind: PrincipalKindTag,
     /// Tenant isolation key.
     pub tenant_id: DataTenantId,
     /// Bound card reference for Service and Agent principals.
@@ -687,18 +685,6 @@ pub struct TokenPrincipalRef {
     pub card_ref_scope: CardRefScope,
 }
 
-/// Principal kind discriminant used in token claims.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrincipalKindWire {
-    /// Human user identity.
-    User,
-    /// Card-bound service identity.
-    Service,
-    /// Card-bound agent identity.
-    Agent,
-}
-
 /// Refresh-token claims for any principal kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -706,7 +692,7 @@ pub struct RefreshTokenClaims {
     /// Subject id, equal to `principal_id`.
     pub sub: String,
     /// Principal kind.
-    pub principal_kind: PrincipalKindWire,
+    pub principal_kind: PrincipalKindTag,
     /// Stable principal id.
     pub principal_id: PrincipalId,
     /// Tenant isolation key.
@@ -726,9 +712,9 @@ impl From<(&RuntimePrincipalRef, DataTenantId)> for TokenPrincipalRef {
         Self {
             id: ref_.id,
             kind: match &ref_.kind {
-                PrincipalKind::User => PrincipalKindWire::User,
-                PrincipalKind::Service { .. } => PrincipalKindWire::Service,
-                PrincipalKind::Agent { .. } => PrincipalKindWire::Agent,
+                PrincipalKind::User => PrincipalKindTag::User,
+                PrincipalKind::Service { .. } => PrincipalKindTag::Service,
+                PrincipalKind::Agent { .. } => PrincipalKindTag::Agent,
             },
             tenant_id,
             card_ref: ref_.card_ref().cloned(),
@@ -740,12 +726,12 @@ impl From<(&RuntimePrincipalRef, DataTenantId)> for TokenPrincipalRef {
 impl From<&Principal> for TokenPrincipalRef {
     fn from(principal: &Principal) -> Self {
         let (kind, card_ref, card_ref_scope) = match &principal.kind {
-            PrincipalKind::User => (PrincipalKindWire::User, None, CardRefScope::default()),
+            PrincipalKind::User => (PrincipalKindTag::User, None, CardRefScope::default()),
             PrincipalKind::Service {
                 card_ref,
                 card_ref_scope,
             } => (
-                PrincipalKindWire::Service,
+                PrincipalKindTag::Service,
                 Some(card_ref.clone()),
                 card_ref_scope.clone(),
             ),
@@ -753,7 +739,7 @@ impl From<&Principal> for TokenPrincipalRef {
                 card_ref,
                 card_ref_scope,
             } => (
-                PrincipalKindWire::Agent,
+                PrincipalKindTag::Agent,
                 Some(card_ref.clone()),
                 card_ref_scope.clone(),
             ),
@@ -813,28 +799,26 @@ impl AccessTokenClaims {
 }
 
 fn wire_kind_into_principal_kind(
-    wire: PrincipalKindWire,
+    wire: PrincipalKindTag,
     card_ref: Option<&CardRef>,
     card_ref_scope: &CardRefScope,
 ) -> Result<PrincipalKind, AuthError> {
     match (wire, card_ref) {
-        (PrincipalKindWire::User, Some(_)) => Err(AuthError::InvalidCardRef),
-        (PrincipalKindWire::User, None) => Ok(PrincipalKind::User),
-        (PrincipalKindWire::Service, Some(card_ref)) if card_ref.kind == CardKind::Service => {
+        (PrincipalKindTag::User, Some(_)) => Err(AuthError::InvalidCardRef),
+        (PrincipalKindTag::User, None) => Ok(PrincipalKind::User),
+        (PrincipalKindTag::Service, Some(card_ref)) if card_ref.kind == CardKind::Service => {
             Ok(PrincipalKind::Service {
                 card_ref: card_ref.clone(),
                 card_ref_scope: seed_scope(card_ref, card_ref_scope)?,
             })
         }
-        (PrincipalKindWire::Agent, Some(card_ref)) if card_ref.kind == CardKind::Agent => {
+        (PrincipalKindTag::Agent, Some(card_ref)) if card_ref.kind == CardKind::Agent => {
             Ok(PrincipalKind::Agent {
                 card_ref: card_ref.clone(),
                 card_ref_scope: seed_scope(card_ref, card_ref_scope)?,
             })
         }
-        (PrincipalKindWire::Service | PrincipalKindWire::Agent, _) => {
-            Err(AuthError::InvalidCardRef)
-        }
+        (PrincipalKindTag::Service | PrincipalKindTag::Agent, _) => Err(AuthError::InvalidCardRef),
     }
 }
 
@@ -941,12 +925,13 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth_oidc::{
         ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, JwksCache, OidcError,
-        PrincipalKindPolicy, TrustedIssuer,
+        TrustedIssuer,
     };
     use wyrd_runtime::{Permission, PermissionSet};
     use wyrd_runtime::{Principal, PrincipalId, PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::IssuerUrl;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
@@ -954,7 +939,7 @@ mod tests {
 
     use super::{
         AccessTokenClaims, ActClaim, AuthError, Kid, MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH,
-        PermissionResolver, PrincipalKindWire, ResolveError, RevocationCheck, TokenPrincipalRef,
+        PermissionResolver, PrincipalKindTag, ResolveError, RevocationCheck, TokenPrincipalRef,
         TokenVerifier, WyrdAuthVerifySettings, decode_kid, public_key_from_pem, verify_eddsa,
         verify_eddsa_with,
     };
@@ -992,7 +977,7 @@ mod tests {
         let projected = TokenPrincipalRef::from(&principal);
 
         assert_eq!(projected.id, principal.id);
-        assert_eq!(projected.kind, PrincipalKindWire::Service);
+        assert_eq!(projected.kind, PrincipalKindTag::Service);
         assert_eq!(projected.tenant_id, principal.tenant_id);
         assert_eq!(projected.card_ref, Some(card_ref.clone()));
         assert_eq!(projected.card_ref_scope, CardRefScope::own(&card_ref));
@@ -1110,7 +1095,7 @@ mod tests {
     async fn into_verified_rejects_non_user_without_card_ref() {
         let claims = AccessTokenClaims {
             principal: TokenPrincipalRef {
-                kind: PrincipalKindWire::Service,
+                kind: PrincipalKindTag::Service,
                 card_ref: None,
                 ..user_ref()
             },
@@ -1126,7 +1111,7 @@ mod tests {
     async fn into_verified_rejects_card_ref_kind_mismatch() {
         let claims = AccessTokenClaims {
             principal: TokenPrincipalRef {
-                kind: PrincipalKindWire::Agent,
+                kind: PrincipalKindTag::Agent,
                 card_ref: Some(card_ref(CardKind::Service)),
                 ..user_ref()
             },
@@ -1143,7 +1128,7 @@ mod tests {
         let card_ref = card_ref(CardKind::Agent);
         let claims = AccessTokenClaims {
             principal: TokenPrincipalRef {
-                kind: PrincipalKindWire::Agent,
+                kind: PrincipalKindTag::Agent,
                 card_ref: Some(card_ref.clone()),
                 ..user_ref()
             },
@@ -1170,7 +1155,7 @@ mod tests {
         let other_card = named_card_ref(CardKind::Service, "other-service");
         let claims = AccessTokenClaims {
             principal: TokenPrincipalRef {
-                kind: PrincipalKindWire::Service,
+                kind: PrincipalKindTag::Service,
                 card_ref: Some(card_ref.clone()),
                 card_ref_scope: CardRefScope::own(&other_card),
                 ..user_ref()
@@ -1191,7 +1176,7 @@ mod tests {
         let card_ref = card_ref(CardKind::Service);
         let claims = AccessTokenClaims {
             principal: TokenPrincipalRef {
-                kind: PrincipalKindWire::Service,
+                kind: PrincipalKindTag::Service,
                 card_ref: Some(card_ref.clone()),
                 card_ref_scope: CardRefScope::own(&card_ref),
                 ..user_ref()
@@ -1390,7 +1375,7 @@ mod tests {
             &'a self,
             _tenant: &'a DataTenantId,
             _principal: PrincipalId,
-            _kind: PrincipalKindWire,
+            _kind: PrincipalKindTag,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>>
@@ -1501,7 +1486,7 @@ mod tests {
             sub: principal_id().to_string(),
             principal: TokenPrincipalRef {
                 id: principal_id(),
-                kind: PrincipalKindWire::User,
+                kind: PrincipalKindTag::User,
                 tenant_id: tenant_id(),
                 card_ref: None,
                 card_ref_scope: CardRefScope::default(),
@@ -1561,7 +1546,7 @@ mod tests {
     fn user_ref() -> TokenPrincipalRef {
         TokenPrincipalRef {
             id: principal_id(),
-            kind: PrincipalKindWire::User,
+            kind: PrincipalKindTag::User,
             tenant_id: tenant_id(),
             card_ref: None,
             card_ref_scope: CardRefScope::default(),
@@ -1572,7 +1557,7 @@ mod tests {
         let card_ref = named_card_ref(CardKind::Service, name);
         TokenPrincipalRef {
             id: principal_id(),
-            kind: PrincipalKindWire::Service,
+            kind: PrincipalKindTag::Service,
             tenant_id: tenant_id(),
             card_ref: Some(card_ref.clone()),
             card_ref_scope: CardRefScope::own(&card_ref),
@@ -1803,7 +1788,7 @@ mod tests {
             claim_mapping: make_claim_mapping(),
             group_role_map: std::collections::HashMap::new(),
             default_roles: Vec::new(),
-            principal_kind: PrincipalKindPolicy::Human,
+            principal_kind: IssuerTokenPolicy::Human,
             jwks_ttl: Duration::from_secs(3600),
         }
     }

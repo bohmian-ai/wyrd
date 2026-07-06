@@ -10948,6 +10948,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tower 0.5.3",
  "tracing",
@@ -10967,6 +10968,7 @@ dependencies = [
  "wyrd-spec",
  "wyrd-sql",
  "wyrd-storage",
+ "wyrd-tonic",
  "wyrd-utils",
 ]
 

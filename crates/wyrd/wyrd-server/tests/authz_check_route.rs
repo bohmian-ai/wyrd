@@ -1,3 +1,5 @@
+mod support;
+
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use chrono::Duration;
@@ -8,8 +10,7 @@ use tower::ServiceExt;
 use wyrd_auth_check::DenyAllPolicyHook;
 use wyrd_auth_issue::{DelegationCaller, IssuingKey};
 use wyrd_auth_verify::{
-    ActClaim, Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
-    public_key_from_pem,
+    ActClaim, Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
 };
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_semver::VersionBlock;
@@ -17,6 +18,7 @@ use wyrd_server::components::auth::ServerAuth;
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
@@ -33,7 +35,7 @@ async fn authz_user_jwt_returns_403_kind_not_eligible() {
     let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
         .await
         .expect("fixture starts");
-    let state = test_state(fixture.app_pool().clone());
+    let state = test_state(fixture.app_pool().clone()).await;
     let token = mint_user_jwt(&state, fixture.data_tenant_id());
 
     let problem = post_authz(state, &token, true).await;
@@ -48,7 +50,7 @@ async fn authz_direct_service_jwt_returns_403_chain_empty() {
     let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
         .await
         .expect("fixture starts");
-    let state = test_state(fixture.app_pool().clone());
+    let state = test_state(fixture.app_pool().clone()).await;
     let token = mint_service_jwt(&state, fixture.data_tenant_id(), "callee");
 
     let problem = post_authz(state, &token, true).await;
@@ -106,7 +108,7 @@ async fn authz_deny_hook_returns_403_with_reason() {
     let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
         .await
         .expect("fixture starts");
-    let mut state = test_state(fixture.app_pool().clone());
+    let mut state = test_state(fixture.app_pool().clone()).await;
     state.authz.policy_hook = Arc::new(DenyAllPolicyHook {
         reason: "test-deny".to_owned(),
     });
@@ -124,7 +126,7 @@ async fn authz_missing_x_original_method_still_uses_body_check() {
     let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
         .await
         .expect("fixture starts");
-    let state = test_state(fixture.app_pool().clone());
+    let state = test_state(fixture.app_pool().clone()).await;
     let token = mint_delegated_service_jwt(&state, fixture.data_tenant_id());
 
     let problem = post_authz(state, &token, false).await;
@@ -139,7 +141,7 @@ async fn authz_unknown_action_returns_validation_error() {
     let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
         .await
         .expect("fixture starts");
-    let state = test_state(fixture.app_pool().clone());
+    let state = test_state(fixture.app_pool().clone()).await;
     let token = mint_delegated_service_jwt(&state, fixture.data_tenant_id());
 
     let response = build_router(state)
@@ -239,7 +241,7 @@ fn authz_body(target: &CardRef) -> serde_json::Value {
     })
 }
 
-fn test_state(pool: sqlx::PgPool) -> AppState {
+async fn test_state(pool: sqlx::PgPool) -> AppState {
     let postgres = Arc::new(ServerPostgres::lazy_for_tests(pool.clone()));
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
@@ -268,6 +270,7 @@ fn test_state(pool: sqlx::PgPool) -> AppState {
     AppState::new(
         postgres,
         Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+        support::test_catalog().await,
     )
     .with_auth(ServerAuth {
         issuing_key: Some(issuing_key),
@@ -285,7 +288,7 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
         .issue_user_access_token(
             TokenPrincipalRef {
                 id: PrincipalId::new(uuid::Uuid::now_v7()),
-                kind: PrincipalKindWire::User,
+                kind: PrincipalKindTag::User,
                 tenant_id: tenant,
                 card_ref: None,
                 card_ref_scope: Default::default(),
@@ -317,7 +320,7 @@ fn mint_delegated_service_jwt(state: &AppState, tenant: DataTenantId) -> String 
     let caller_ref = card_ref(CardKind::Service, "caller");
     let caller = TokenPrincipalRef {
         id: PrincipalId::new(uuid::Uuid::now_v7()),
-        kind: PrincipalKindWire::Service,
+        kind: PrincipalKindTag::Service,
         tenant_id: tenant,
         card_ref: Some(caller_ref.clone()),
         card_ref_scope: wyrd_spec::reference::CardRefScope::own(&caller_ref),
@@ -325,7 +328,7 @@ fn mint_delegated_service_jwt(state: &AppState, tenant: DataTenantId) -> String 
     let requested_ref = card_ref(CardKind::Service, "callee");
     let requested = TokenPrincipalRef {
         id: PrincipalId::new(uuid::Uuid::now_v7()),
-        kind: PrincipalKindWire::Service,
+        kind: PrincipalKindTag::Service,
         tenant_id: tenant,
         card_ref: Some(requested_ref.clone()),
         card_ref_scope: wyrd_spec::reference::CardRefScope::own(&requested_ref),
@@ -360,6 +363,6 @@ fn card_ref(kind: CardKind, name: &str) -> CardRef {
 }
 
 #[allow(dead_code)]
-fn lazy_pool_state() -> AppState {
-    test_state(PgPoolOptions::new().connect_lazy_with(Default::default()))
+async fn lazy_pool_state() -> AppState {
+    test_state(PgPoolOptions::new().connect_lazy_with(Default::default())).await
 }

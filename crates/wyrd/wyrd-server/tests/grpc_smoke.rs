@@ -1,3 +1,5 @@
+mod support;
+
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -15,7 +17,7 @@ use wyrd_tonic::server::{
 use wyrd_tonic::tonic::server::NamedService;
 use wyrd_tonic::tonic_health::server::health_reporter;
 
-fn test_state() -> AppState {
+async fn test_state() -> AppState {
     let postgres = Arc::new(ServerPostgres::lazy_for_tests(
         PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
     ));
@@ -24,6 +26,7 @@ fn test_state() -> AppState {
     AppState::new(
         postgres,
         Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+        support::test_catalog().await,
     )
 }
 
@@ -72,7 +75,7 @@ async fn build_grpc_router_with_reflection_succeeds() {
 
 #[tokio::test]
 async fn publish_initial_health_not_serving_on_cold_boot() {
-    let _state = test_state();
+    let _state = test_state().await;
     let snapshot: Arc<ArcSwap<StubSnapshot>> =
         Arc::new(ArcSwap::new(Arc::new(StubSnapshot { ok: false })));
     let (mut reporter, _) = health_reporter();

@@ -1,4 +1,4 @@
-//! S3.C5 background audit relay.
+//! background audit relay.
 //!
 //! Ships hash-chained rows from the transactional `vala.audit_outbox` into the
 //! queryable `vala.system.audit_log` warehouse table. One tick claims unshipped

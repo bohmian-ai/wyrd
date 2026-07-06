@@ -53,10 +53,10 @@ mod tests {
 
     use wyrd_auth_oidc::error::OidcError;
     use wyrd_auth_oidc::{
-        ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, PrincipalKindPolicy,
-        TrustedIssuer,
+        ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, TrustedIssuer,
     };
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::IssuerUrl;
     use wyrd_spec::error::WyrdError;
 
@@ -101,8 +101,8 @@ mod tests {
             },
             group_role_map: HashMap::new(),
             default_roles: vec![],
-            principal_kind: PrincipalKindPolicy::Human,
-            jwks_ttl: Duration::from_secs(3600),
+            principal_kind: IssuerTokenPolicy::Human,
+            jwks_ttl: Duration::from_hours(1),
         }
     }
 

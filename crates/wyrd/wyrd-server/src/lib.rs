@@ -10,6 +10,9 @@ pub mod http;
 pub mod postgres;
 pub mod state;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use app::{build_app, run, serve};
 pub use boot::{
     ServerBootError, build_app_state, build_app_state_from_config, spawn_storage_sweeper,

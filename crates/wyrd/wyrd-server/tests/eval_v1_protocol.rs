@@ -14,6 +14,8 @@
 //! - RBAC gate: in-tenant principal lacking `evals:run` → denied at open;
 //!   principal holding `evals:run` opens successfully (tightened past card_write)
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -27,8 +29,7 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::{
-    Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
-    public_key_from_pem,
+    Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
 };
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::PrincipalId;
@@ -42,6 +43,7 @@ use wyrd_server::components::eval::{EvalAuditEvent, EvalAuditKind, EvalAuditWrit
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::card::data::{
     DataInterface, DataSchema, DataSpec, DataStats, PandasMeta, ParquetCompression,
 };
@@ -62,7 +64,7 @@ const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX
 // Harness
 // --------------------------------------------------------------------------
 
-fn build_state(fixture: &PgFixture) -> (AppState, TempDir) {
+async fn build_state(fixture: &PgFixture) -> (AppState, TempDir) {
     let postgres = Arc::new(ServerPostgres::from_parts(
         fixture.wyrd_postgres().clone(),
         fixture.vala_postgres().clone(),
@@ -93,6 +95,7 @@ fn build_state(fixture: &PgFixture) -> (AppState, TempDir) {
     let state = AppState::new(
         postgres,
         Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+        support::test_catalog().await,
     )
     .with_auth(ServerAuth {
         issuing_key: Some(issuing_key),
@@ -115,7 +118,7 @@ fn mint_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> String {
         .issue_user_access_token(
             TokenPrincipalRef {
                 id: PrincipalId::new(uuid::Uuid::now_v7()),
-                kind: PrincipalKindWire::User,
+                kind: PrincipalKindTag::User,
                 tenant_id: tenant,
                 card_ref: None,
                 card_ref_scope: Default::default(),
@@ -389,7 +392,7 @@ async fn unauthenticated_request_to_each_route_returns_401() {
     let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
         .await
         .expect("fixture starts");
-    let (state, _root) = build_state(&fixture);
+    let (state, _root) = build_state(&fixture).await;
     let app = build_router(state);
     let run = uuid::Uuid::now_v7();
 
@@ -432,7 +435,7 @@ async fn full_lifecycle_and_audit_under_one_jwt() {
         .expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     seed_roles(fixture.app_pool(), tenant).await;
-    let (state, _root) = build_state(&fixture);
+    let (state, _root) = build_state(&fixture).await;
     let audit = Arc::new(RecordingAudit::default());
     let state = state.with_eval_audit(audit.clone());
 
@@ -540,7 +543,7 @@ async fn cross_tenant_eval_ref_space_collision_returns_404() {
         .expect("fixture starts");
     let tenant_a = fixture.data_tenant_id();
     seed_roles(fixture.app_pool(), tenant_a).await;
-    let (state, _root) = build_state(&fixture);
+    let (state, _root) = build_state(&fixture).await;
 
     let tenant_b = DataTenantId::new_v7();
     seed_tenant(fixture.platform_admin_pool(), tenant_b, "tenant-b").await;
@@ -578,7 +581,7 @@ async fn cross_tenant_dataset_denied_before_bytes() {
         .expect("fixture starts");
     let tenant_a = fixture.data_tenant_id();
     seed_roles(fixture.app_pool(), tenant_a).await;
-    let (state, _root) = build_state(&fixture);
+    let (state, _root) = build_state(&fixture).await;
 
     let tenant_b = DataTenantId::new_v7();
     seed_tenant(fixture.platform_admin_pool(), tenant_b, "tenant-b").await;
@@ -643,7 +646,7 @@ async fn cross_tenant_judge_ref_denied_no_provider_call() {
         .await
         .expect("fixture starts");
     let tenant_a = fixture.data_tenant_id();
-    let (state, _root) = build_state(&fixture);
+    let (state, _root) = build_state(&fixture).await;
 
     let tenant_b = DataTenantId::new_v7();
     seed_tenant(fixture.platform_admin_pool(), tenant_b, "tenant-b").await;
@@ -706,7 +709,7 @@ async fn foreign_run_id_returns_404_not_403() {
         .expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     seed_roles(fixture.app_pool(), tenant).await;
-    let (state, _root) = build_state(&fixture);
+    let (state, _root) = build_state(&fixture).await;
     let eval_ref = seed_eval(&state, tenant, "prod", "rubric").await;
 
     // Two distinct principals in the same tenant, minted before the router
@@ -773,7 +776,7 @@ async fn internal_failure_scrubs_5xx_body() {
         .expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     seed_roles(fixture.app_pool(), tenant).await;
-    let (state, _root) = build_state(&fixture);
+    let (state, _root) = build_state(&fixture).await;
 
     // Eval + Data cards exist, but no scenario object was uploaded, so the
     // object fetch fails after the (successful) RLS hops.
@@ -832,7 +835,7 @@ async fn open_requires_eval_run_permission() {
         .expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     seed_roles(fixture.app_pool(), tenant).await;
-    let (state, _root) = build_state(&fixture);
+    let (state, _root) = build_state(&fixture).await;
     let eval_ref = seed_eval(&state, tenant, "prod", "rubric").await;
 
     // In-tenant custom role holding cards:write but NOT evals:run. It would have
@@ -891,7 +894,7 @@ async fn lease_failures_on_owned_run_are_rejected() {
         .expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     seed_roles(fixture.app_pool(), tenant).await;
-    let (state, _root) = build_state(&fixture);
+    let (state, _root) = build_state(&fixture).await;
     let eval_ref = seed_eval(&state, tenant, "prod", "rubric").await;
 
     let jwt = mint_jwt(&state, tenant, &["writer"]);

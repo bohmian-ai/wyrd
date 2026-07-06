@@ -1,0 +1,114 @@
+---
+title: Audit Relay
+description: How Vala's background relay pumps audit events from the transactional outbox into the queryable Iceberg warehouse, with crash-safe idempotency and tenant isolation.
+pillar: wyrd
+group: Concepts
+order: 11
+---
+
+# Audit Relay
+
+Wyrd records every auditable action into `vala.audit_outbox`, a Postgres table, as
+part of the request transaction — cheap, ACID, and never on the OLAP write path.
+The audit relay is a background tick job that drains that outbox into
+`vala.system.audit_log`, the queryable Iceberg warehouse table hosted by Bifrost.
+
+Separating the two tiers keeps the hot path free of OLAP latency while guaranteeing
+that every committed audit row eventually lands in the warehouse, even across crashes.
+
+## How a tick works
+
+Each call to `AuditRelay::tick(limit)` runs three operations:
+
+1. **Claim** — fetch up to `limit` unshipped rows across all tenants using
+   `FOR UPDATE SKIP LOCKED`. The claim commits immediately, releasing the row locks,
+   so a second relay worker never double-claims.
+
+2. **Group** — rows (ordered by `(data_tenant_id, seq)`) are grouped into
+   per-tenant `RelayShipment` values. Each shipment computes a deterministic
+   `batch_id = SHA-256(origin ‖ tenant ‖ seq_lo ‖ seq_hi)` before any write happens.
+
+3. **Ship and mark** — for each tenant shipment, the relay writes one Arrow
+   `RecordBatch` into `audit_log` via the Bifrost writer, then marks the shipped
+   `seq` range in `audit_outbox`.
+
+<WyrdSequenceDiagram
+  title="Audit relay tick"
+  participants={['AuditRelay', 'audit_outbox', 'Bifrost', 'audit_log']}
+  messages={[
+    { from: 'AuditRelay', to: 'audit_outbox', label: 'claim_unshipped(limit) · SKIP LOCKED' },
+    { from: 'audit_outbox', to: 'AuditRelay', label: 'AuditOutboxRow[] ordered by (tenant, seq)', dashed: true },
+    { from: 'AuditRelay', to: 'AuditRelay', label: 'group_by_tenant · derive batch_id' },
+    { from: 'AuditRelay', to: 'Bifrost', label: 'write(RecordBatch) · origin=audit-relay' },
+    { from: 'Bifrost', to: 'audit_log', label: 'Iceberg commit on batch_id' },
+    { from: 'Bifrost', to: 'AuditRelay', label: 'ok', dashed: true },
+    { from: 'AuditRelay', to: 'audit_outbox', label: 'mark_shipped(seq_lo, seq_hi)' },
+    { from: 'audit_outbox', to: 'AuditRelay', label: 'n rows marked', dashed: true }
+  ]}
+/>
+
+Steps 4–8 repeat once per tenant shipment within the same tick.
+
+## Crash safety
+
+If the process crashes between the Bifrost flush (step 5) and the mark (step 7), the
+next tick re-claims and re-ships the same rows. Because `batch_id` is a deterministic
+hash of `(origin, tenant, seq_lo, seq_hi)`, the Bifrost writer replays the prior
+`olap_commits` snapshot rather than writing a second copy. The mark query is also
+idempotent: it guards with `AND NOT shipped`, so repeated calls to
+`mark_shipped(seq_lo, seq_hi)` are safe.
+
+<Aside title="No duplicate warehouse rows" data-variant="wyrd">
+The `batch_id` is the idempotency key for the Bifrost commit. A re-ship after a
+crash produces the same `batch_id` and replays the same Iceberg snapshot — the
+warehouse row count does not change.
+</Aside>
+
+## Self-feed guard (M-11)
+
+The relay writes under `origin = "audit-relay"`. Bifrost checks the origin on every
+write and skips the audit-outbox append for relay-originated writes. Without this
+guard, each warehouse write would add a new audit row, which would be claimed and
+re-shipped, growing unboundedly.
+
+## Tenant isolation
+
+Rows are grouped into one `RecordBatch` per tenant before the Bifrost write. Each
+shipment acquires a tenant-scoped writer connection for the mark step. No row from
+tenant A is batched with rows from tenant B, and tenant B's writer connection is
+never used to mark tenant A's rows.
+
+## Table schema
+
+`vala.system.audit_log` is a system-shared Iceberg table in the `vala.system`
+namespace. It is provisioned at relay startup via `ensure_audit_log_table`.
+
+<DataTable
+  columns={[
+    { header: 'Column', role: 'name' },
+    { header: 'Type' },
+    { header: 'Notes' }
+  ]}
+  rows={[
+    ['seq', 'Int64', 'Outbox sequence number — monotonic per tenant'],
+    ['entry_hash', 'Utf8', 'SHA-256 of the row content (hex)'],
+    ['prev_hash', 'Utf8', 'SHA-256 of the previous row — forms the hash chain'],
+    ['request_id', 'Utf8', 'UUID of the originating request'],
+    ['trace_id', 'Utf8 (nullable)', 'OpenTelemetry trace ID if present'],
+    ['operation', 'Utf8', 'Action performed (e.g. cards:write)'],
+    ['resource', 'Utf8', 'Resource identifier targeted by the operation'],
+    ['audit_card_ref', 'Utf8 (nullable)', 'Card reference of the writer — distinct from the correlation card_ref'],
+    ['principal_id', 'Utf8', 'UUID of the acting principal'],
+    ['principal_kind', 'Utf8', 'User | Service | Agent'],
+    ['auth_method', 'Utf8', 'How the principal authenticated'],
+    ['permission', 'Utf8', 'Permission checked (resource:action)'],
+    ['decision', 'Utf8', 'allow | deny'],
+    ['result', 'Utf8', 'ok | error — outcome of the operation'],
+    ['payload_summary', 'Utf8', 'Redacted summary of the request payload'],
+    ['created_at_us', 'Int64', 'Event timestamp in microseconds since Unix epoch']
+  ]}
+/>
+
+System columns (`wyrd_*`, `data_tenant_id`) and correlation columns (`run_id`,
+`card_ref`) are stamped by the Bifrost writer at flush time. The relay passes both
+correlation columns as NULL — relay writes carry no card or run context.

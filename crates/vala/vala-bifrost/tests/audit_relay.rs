@@ -5,9 +5,8 @@
 //! shipped `seq` range — without self-feeding the outbox (M-11) and idempotently
 //! across a crash between flush and mark.
 //!
-//! Bare `#[sqlx::test]` + in-body `migrate_for_test` (the vala migrations are not
-//! self-contained — no `migrations=` arg). Run with a live Postgres:
-//! `DATABASE_URL=... cargo test -p vala-bifrost --all-features audit_relay`.
+//! Uses the shared-DB test helper (`vala_sql::testing::shared`); run via
+//! `mise run test:bifrost`.
 
 mod audit_relay {
     use std::sync::Arc;
@@ -21,7 +20,7 @@ mod audit_relay {
     use vala_bifrost::catalog::namespaces::BifrostNamespace;
     use vala_bifrost::relay::{AUDIT_LOG_TABLE, AuditRelay};
     use vala_sql::TenantConn;
-    use wyrd_spec::auth::{PrincipalId, PrincipalKind};
+    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
@@ -32,12 +31,16 @@ mod audit_relay {
     struct Fixture {
         _tmp: TempDir,
         catalog: Arc<WyrdCatalog>,
+        /// Runtime `wyrd_app` pool — WyrdCatalog writes and per-tenant appends.
         pool: Arc<PgPool>,
+        /// BYPASSRLS platform-admin pool — `platform.tenants` seeding only.
+        platform_admin: PgPool,
     }
 
-    async fn setup(pool: PgPool) -> Fixture {
-        let pool = Arc::new(pool);
-        vala_sql::testing::migrate_for_test(&pool).await.unwrap();
+    async fn setup() -> Fixture {
+        let db = vala_sql::testing::shared().await.expect("shared db");
+        vala_sql::testing::reset_for_test(&db).await.expect("reset");
+        let pool = Arc::new(db.app.clone());
 
         let tmp = tempfile::tempdir().unwrap();
         let warehouse = format!("file://{}", tmp.path().display());
@@ -45,7 +48,7 @@ mod audit_relay {
             root: tmp.path().to_path_buf(),
         };
         let (factory, props) = iceberg_storage_factory(&backend).unwrap();
-        let catalog_uri = vala_sql::testing::catalog_uri(&pool);
+        let catalog_uri = vala_sql::testing::catalog_uri(&db.migrator);
         let catalog =
             WyrdCatalog::new(&catalog_uri, &warehouse, pool.clone(), None, factory, props)
                 .await
@@ -61,6 +64,7 @@ mod audit_relay {
             _tmp: tmp,
             catalog,
             pool,
+            platform_admin: db.platform_admin,
         }
     }
 
@@ -77,7 +81,7 @@ mod audit_relay {
             resource: "vala.bifrost.thing".to_string(),
             card_ref: None,
             principal_id: PrincipalId::new(Uuid::now_v7()),
-            principal_kind: PrincipalKind::User,
+            principal_kind: PrincipalKindTag::User,
             auth_method: AuthMethod::Internal,
             permission: "bifrost.record_write".to_string(),
             decision: AuditDecision::Allow,
@@ -91,11 +95,11 @@ mod audit_relay {
     /// `vala.audit_chain_head.data_tenant_id` is FK'd to `platform.tenants`, so
     /// the tenant is registered first (the `SystemShared` warehouse write, by
     /// contrast, only stamps `data_tenant_id` and needs no FK row).
-    async fn seed_audit(pool: &PgPool, tenant: DataTenantId, n: usize) {
-        vala_sql::testing::seed_tenant(pool, tenant.as_uuid())
+    async fn seed_audit(fx: &Fixture, tenant: DataTenantId, n: usize) {
+        vala_sql::testing::seed_tenant(&fx.platform_admin, tenant.as_uuid())
             .await
             .unwrap();
-        let mut conn = TenantConn::acquire(pool, tenant).await.unwrap();
+        let mut conn = TenantConn::acquire(&fx.pool, tenant).await.unwrap();
         for i in 0..n {
             vala_sql::queries::audit_outbox::append_audit(
                 &mut conn,
@@ -134,13 +138,13 @@ mod audit_relay {
     /// A full tick ships every tenant's rows into the warehouse, isolated per
     /// tenant, and drains the outbox — proving the relay never self-feeds the
     /// spine (a self-appended audit row would resurface as unshipped work).
-    #[sqlx::test]
-    async fn ships_all_tenants_and_drains_outbox(pool: PgPool) {
-        let fx = setup(pool).await;
+    #[tokio::test]
+    async fn ships_all_tenants_and_drains_outbox() {
+        let fx = setup().await;
         let a = DataTenantId::new_v7();
         let b = DataTenantId::new_v7();
-        seed_audit(&fx.pool, a, 3).await;
-        seed_audit(&fx.pool, b, 2).await;
+        seed_audit(&fx, a, 3).await;
+        seed_audit(&fx, b, 2).await;
 
         let shipped = relay(&fx).tick(100).await.unwrap();
         assert_eq!(shipped, 5, "every seeded row must be marked shipped");
@@ -162,11 +166,11 @@ mod audit_relay {
     /// `batch_id`) replays the prior `vala.olap_commits` commit, so the warehouse
     /// gains no duplicate rows. Models it by shipping without marking, re-claiming
     /// the still-unshipped range, and shipping again.
-    #[sqlx::test]
-    async fn reship_after_crash_is_idempotent(pool: PgPool) {
-        let fx = setup(pool).await;
+    #[tokio::test]
+    async fn reship_after_crash_is_idempotent() {
+        let fx = setup().await;
         let t = DataTenantId::new_v7();
-        seed_audit(&fx.pool, t, 4).await;
+        seed_audit(&fx, t, 4).await;
 
         let relay = relay(&fx);
 

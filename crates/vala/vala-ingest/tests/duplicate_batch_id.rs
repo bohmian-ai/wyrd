@@ -20,9 +20,9 @@ use vala_ingest::InsertBatchRequest;
 use vala_ingest::auth::AuthContext;
 use vala_ingest::limits::IngestLimits;
 use vala_ingest::orchestrator::{FrameSource, run_ingest};
-use wyrd_runtime::{CardScope, Permission, PermissionSet, Principal, PrincipalId, PrincipalKind};
+use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_spec::request_id::RequestId;
 use wyrd_tonic::tonic::Status;
 
@@ -85,11 +85,11 @@ fn auth_ctx(tenant: DataTenantId) -> AuthContext {
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::Service {
                 card_ref: card.clone(),
+                card_ref_scope: CardRefScope::own(&card),
             },
             tenant,
             Vec::new(),
             PermissionSet::from_iter([Permission::bifrost_record_write()]),
-            CardScope::new([card]),
         ),
         tenant,
         request_id: RequestId::parse(&uuid::Uuid::now_v7().to_string()).expect("request id"),

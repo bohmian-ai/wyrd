@@ -118,13 +118,12 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth_issue::IssuingKey;
-    use wyrd_auth_oidc::{
-        ClaimMapping, ClaimPath, ClientAuth, JwksCache, PrincipalKindPolicy, TrustedIssuer,
-    };
+    use wyrd_auth_oidc::{ClaimMapping, ClaimPath, ClientAuth, JwksCache, TrustedIssuer};
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
     use wyrd_crypt::SecretKey;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::{IssuerUrl, TokenResponse, TokenType};
     use wyrd_sql::queries::auth::upsert_trusted_issuer;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -486,7 +485,7 @@ mod tests {
             },
             group_role_map,
             default_roles,
-            principal_kind: PrincipalKindPolicy::Human,
+            principal_kind: IssuerTokenPolicy::Human,
             jwks_ttl: StdDuration::from_secs(300),
         }
     }
@@ -511,7 +510,7 @@ mod tests {
             },
             group_role_map,
             default_roles,
-            principal_kind: PrincipalKindPolicy::Human,
+            principal_kind: IssuerTokenPolicy::Human,
             jwks_ttl: StdDuration::from_secs(300),
         }
     }
@@ -658,7 +657,7 @@ mod tests {
             .collect()
     }
 
-    fn test_state(fixture: &PgFixture) -> AppState {
+    async fn test_state(fixture: &PgFixture) -> AppState {
         let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
@@ -670,6 +669,7 @@ mod tests {
         AppState::new(
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
         )
     }
 
@@ -724,13 +724,15 @@ mod tests {
             )),
             Arc::clone(&issuer_resolver),
         );
-        test_state(fixture).with_auth(crate::components::auth::ServerAuth {
-            issuing_key: Some(issuing_key),
-            token_verifier: Some(Arc::new(verifier)),
-            trusted_issuer_resolver: Some(issuer_resolver),
-            sealing_key: Some(sealing_key),
-            ..crate::components::auth::ServerAuth::default()
-        })
+        test_state(fixture)
+            .await
+            .with_auth(crate::components::auth::ServerAuth {
+                issuing_key: Some(issuing_key),
+                token_verifier: Some(Arc::new(verifier)),
+                trusted_issuer_resolver: Some(issuer_resolver),
+                sealing_key: Some(sealing_key),
+                ..crate::components::auth::ServerAuth::default()
+            })
     }
 
     fn tenant_headers(slug: &str) -> HeaderMap {

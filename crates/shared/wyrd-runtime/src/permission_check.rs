@@ -86,7 +86,6 @@ mod tests {
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
             roles: vec![RoleRef::new("runtime_admin").expect("static role is valid")],
             effective_permissions: PermissionSet::from_iter(permissions),
-            card_scope: crate::CardScope::default(),
         }
     }
 

@@ -18,7 +18,7 @@ use wyrd_storage::settings::{BackendConfig, StorageSettings};
 /// Owns the embedded Postgres fixture and warehouse tempdir for the lifetime of
 /// the test process so the shared catalog's connections stay live.
 struct SharedCatalog {
-    fixture: PgFixture,
+    _fixture: PgFixture,
     _warehouse: TempDir,
     catalog: Arc<WyrdCatalog>,
 }
@@ -46,7 +46,7 @@ async fn build_shared() -> SharedCatalog {
     let (factory, props) = storage
         .iceberg_storage_factory()
         .expect("iceberg storage factory");
-    let catalog_dsn = fixture.catalog_dsn().expect("catalog dsn resolves");
+    let catalog_dsn = fixture.catalog_dsn();
     let catalog = WyrdCatalog::new(
         catalog_dsn.expose_secret(),
         storage.warehouse_uri(),
@@ -59,7 +59,7 @@ async fn build_shared() -> SharedCatalog {
     .expect("catalog builds against embedded postgres");
 
     SharedCatalog {
-        fixture,
+        _fixture: fixture,
         _warehouse: warehouse,
         catalog: Arc::new(catalog),
     }
@@ -86,7 +86,7 @@ fn shared() -> &'static SharedCatalog {
 }
 
 /// Return a live catalog handle for constructing `AppState` in unit tests.
-pub(crate) async fn test_catalog() -> Arc<WyrdCatalog> {
+pub async fn test_catalog() -> Arc<WyrdCatalog> {
     shared().catalog.clone()
 }
 
@@ -94,8 +94,9 @@ pub(crate) async fn test_catalog() -> Arc<WyrdCatalog> {
 /// RLS. Its connections take reactor affinity from the process-wide persistent
 /// runtime that initialized the fixture, so DB-acquiring tests must run on that
 /// runtime via `wyrd_runtime::runtime().block_on(..)`.
+#[allow(dead_code)]
 pub(crate) async fn test_pool() -> sqlx::PgPool {
-    shared().fixture.app_pool().clone()
+    shared()._fixture.app_pool().clone()
 }
 
 /// Return the fixture's seeded data tenant.
@@ -104,6 +105,7 @@ pub(crate) async fn test_pool() -> sqlx::PgPool {
 /// the embedded fixture seeds exactly this one tenant. Unit tests that register
 /// a `TenantOwned` table must bind this tenant: a freshly minted `DataTenantId`
 /// is absent from `platform.tenants`, so the register INSERT FK-violates.
+#[allow(dead_code)]
 pub(crate) async fn test_tenant() -> wyrd_spec::DataTenantId {
-    shared().fixture.data_tenant_id()
+    shared()._fixture.data_tenant_id()
 }

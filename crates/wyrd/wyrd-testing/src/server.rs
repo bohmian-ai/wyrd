@@ -27,8 +27,7 @@ use wyrd_auth_check::{AuthzCheckRequest, AuthzCheckResponse, PolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_oidc::JwksCache;
 use wyrd_auth_verify::{
-    Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
-    public_key_from_pem,
+    Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
 };
 use wyrd_crypt::SecretKey;
 use wyrd_dev_fixtures::pg::PgFixture;
@@ -41,6 +40,7 @@ use wyrd_server::config::{IssuerEntry, WorkloadBindingEntry};
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::auth::{
     RequestedSubject, SecretBearer, SubjectTokenType, TokenRequest, TokenResponse,
 };
@@ -349,7 +349,7 @@ impl WyrdTestServer {
 
         let principal = TokenPrincipalRef {
             id: PrincipalId::new(user_id),
-            kind: PrincipalKindWire::User,
+            kind: PrincipalKindTag::User,
             tenant_id: self.data_tenant_id(),
             card_ref: None,
             card_ref_scope: Default::default(),

@@ -170,13 +170,25 @@ async fn seeded() -> Seeded {
 }
 
 async fn write_rows(catalog: &WyrdCatalog, tenant: DataTenantId, payloads: &[&str]) {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "payload",
-        DataType::Utf8,
-        false,
-    )]));
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(payloads.to_vec()))]).unwrap();
+    // A client batch carries the user field plus the `run_id` / `card_ref`
+    // correlation columns; `with_system_columns` places them ahead of the
+    // server-stamped columns, so the batch fed to the writer must include them
+    // or the positional cast in `write_batches` misaligns.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("payload", DataType::Utf8, false),
+        Field::new("run_id", DataType::Utf8, true),
+        Field::new("card_ref", DataType::Utf8, true),
+    ]));
+    let nrows = payloads.len();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(payloads.to_vec())),
+            Arc::new(StringArray::from(vec![None::<&str>; nrows])),
+            Arc::new(StringArray::from(vec![None::<&str>; nrows])),
+        ],
+    )
+    .unwrap();
     let writer = catalog
         .writer(NS, TABLE, TableScope::SystemShared, tenant)
         .await

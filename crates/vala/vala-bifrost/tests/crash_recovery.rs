@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
+use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use iceberg::Catalog as _;
@@ -113,9 +113,28 @@ async fn setup() -> Harness {
 }
 
 fn make_batch(n: i64) -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
+    // A client batch carries the user field plus the `run_id` / `card_ref`
+    // correlation columns (`[user + run_id + card_ref]`), matching what the
+    // ingest path decodes and what `with_system_columns` places ahead of the
+    // server-stamped columns. Omitting them leaves the stamped batch two
+    // columns short of the table schema and the positional cast in
+    // `write_batches` misaligns.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("val", DataType::Int64, false),
+        Field::new("run_id", DataType::Utf8, true),
+        Field::new("card_ref", DataType::Utf8, true),
+    ]));
     let vals: Vec<i64> = (0..n).collect();
-    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vals))]).unwrap()
+    let nrows = vals.len();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vals)),
+            Arc::new(StringArray::from(vec![None::<&str>; nrows])),
+            Arc::new(StringArray::from(vec![None::<&str>; nrows])),
+        ],
+    )
+    .unwrap()
 }
 
 fn stamped_batch(n: i64, batch_id: [u8; 16]) -> RecordBatch {

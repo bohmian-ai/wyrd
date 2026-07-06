@@ -1443,6 +1443,8 @@ psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE vala_recovery LOGIN PASSWORD 'vala_rec
 psql "$WYRD_MIGRATOR_DSN" -c "GRANT wyrd_catalog TO wyrd_migrator;" || true
 psql "$WYRD_MIGRATOR_DSN" -c "GRANT wyrd_catalog TO wyrd_catalog_app;" || true
 psql "$WYRD_MIGRATOR_DSN" -c "GRANT vala_recovery_owner TO wyrd_migrator;" || true
+psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE vala_audit_relay NOLOGIN BYPASSRLS;" || true
+psql "$WYRD_MIGRATOR_DSN" -c "GRANT vala_audit_relay TO wyrd_migrator;" || true
 """
 
 [tasks."db:migrate"]

@@ -12,27 +12,27 @@ use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use tower::ServiceExt;
 use uuid::Uuid;
-use vala_bifrost::catalog::WyrdCatalog;
 use wyrd_auth_check::{AuthzCheckRequest, AuthzCheckResponse, PolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::{
-    Kid, PrincipalKind, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
+    Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
     public_key_from_pem,
 };
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::{PrincipalId, RbacCheck, RoleRef};
 use wyrd_semver::VersionBlock;
-use wyrd_server::auth::audit_writer::NoopAuthzAuditWriter;
-use wyrd_server::auth::issue_api_key::WyrdApiKey;
-use wyrd_server::auth::permission_resolver::SqlPermissionResolver;
-use wyrd_server::auth::pg_resolvers::PgIssuerResolver;
-use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
+use wyrd_auth::issue_api_key::WyrdApiKey;
+use wyrd_auth::permission_resolver::SqlPermissionResolver;
+use wyrd_auth::pg_resolvers::PgIssuerResolver;
+use wyrd_auth::seed::seed_builtin_roles_for_tenant;
+use wyrd_server::components::auth::audit_writer::NoopAuthzAuditWriter;
+use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     RequestedSubject, SecretBearer, SubjectTokenType, TokenRequest, TokenResponse,
 };
-use wyrd_spec::envelope::CardKind;
+use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
@@ -201,33 +201,19 @@ impl WyrdTestEnv {
             WyrdAuthVerifySettings::default(),
         ));
 
-        let (storage_factory, storage_props) = storage
-            .iceberg_storage_factory()
-            .map_err(|error| WyrdTestError::Start(error.to_string()))?;
-        let catalog_dsn = fixture
-            .catalog_dsn()
-            .map_err(|error| WyrdTestError::Start(error.to_string()))?;
-        let bifrost = WyrdCatalog::new(
-            catalog_dsn.expose_secret(),
-            storage.warehouse_uri(),
-            Arc::new(fixture.app_pool().clone()),
-            None,
-            storage_factory,
-            storage_props,
-        )
-        .await
-        .map_err(|error| WyrdTestError::Start(error.to_string()))?;
-
-        let mut state = AppState::new(
-            fixture.app_pool().clone(),
-            Some(fixture.platform_admin_pool().clone()),
-            storage,
-            Arc::new(bifrost),
-        )
-        .with_preview_auth(true)
-        .with_auth_handles(Arc::clone(&issuing_key), Arc::clone(&verifier));
-        state.permission_check = Arc::new(RbacCheck);
-        state.audit_writer = Arc::new(NoopAuthzAuditWriter);
+        let postgres = Arc::new(ServerPostgres::from_parts(
+            fixture.wyrd_postgres().clone(),
+            fixture.vala_postgres().clone(),
+        ));
+        let mut state =
+            AppState::new(postgres, storage).with_auth(wyrd_server::components::auth::ServerAuth {
+                allow_preview: true,
+                issuing_key: Some(Arc::clone(&issuing_key)),
+                token_verifier: Some(Arc::clone(&verifier)),
+                ..wyrd_server::components::auth::ServerAuth::default()
+            });
+        state.authz.permission_check = Arc::new(RbacCheck);
+        state.authz.audit_writer = Arc::new(NoopAuthzAuditWriter);
         let router = build_router(state.clone());
 
         Ok(Self {
@@ -255,7 +241,7 @@ impl WyrdTestEnv {
     /// Override the default allow policy hook.
     #[must_use]
     pub fn with_policy_hook(mut self, hook: Arc<dyn PolicyHook>) -> Self {
-        self.inner.state.policy_hook = hook;
+        self.inner.state.authz.policy_hook = hook;
         self.inner.router = build_router(self.inner.state.clone());
         self
     }
@@ -287,8 +273,10 @@ impl WyrdTestEnv {
 
         let principal = TokenPrincipalRef {
             id: PrincipalId::new(user_id),
-            kind: PrincipalKind::User,
+            kind: PrincipalKindWire::User,
             tenant_id: self.data_tenant_id(),
+            card_ref: None,
+            card_ref_scope: Default::default(),
         };
         let jwt = self
             .inner
@@ -553,6 +541,7 @@ impl WyrdTestEnv {
             .map_err(|error| WyrdTestError::Auth(error.to_string()))?;
 
         let mut conn = self.tenant_conn().await?;
+        seed_machine_card(&mut conn, &card_ref, creator_id).await?;
         insert_service_account(
             &mut conn,
             principal_id,
@@ -695,6 +684,148 @@ fn card_ref(kind: CardKind, name: &str) -> Result<CardRef, WyrdTestError> {
     })
 }
 
+/// Seed the backing Card row for a fixture-created Service or Agent principal.
+///
+/// # Errors
+/// Returns an error when the fixture spec cannot be encoded or Postgres rejects
+/// the insert.
+async fn seed_machine_card(
+    conn: &mut TenantConn<'_>,
+    machine_ref: &CardRef,
+    creator_id: Uuid,
+) -> Result<(), WyrdTestError> {
+    let spec = match &machine_ref.kind {
+        CardKind::Service => machine_card_spec(&machine_ref.kind)?,
+        CardKind::Agent => {
+            let prompt_ref = card_ref(CardKind::Prompt, &format!("{}-prompt", machine_ref.name))?;
+            seed_prompt_card(conn, &prompt_ref, creator_id).await?;
+            Spec::from_kind_and_value(
+                &CardKind::Agent,
+                serde_json::json!({
+                    "prompt": prompt_ref,
+                }),
+            )
+            .map_err(|error| WyrdTestError::Auth(error.to_string()))?
+        }
+        other => {
+            return Err(WyrdTestError::Auth(format!(
+                "machine fixture card must be Service or Agent, got {other:?}"
+            )));
+        }
+    };
+    insert_fixture_card(conn, machine_ref, &spec, creator_id).await
+}
+
+/// Seed a minimal Prompt Card for fixture-created Agent principals.
+///
+/// # Errors
+/// Returns an error when the prompt spec cannot be decoded or Postgres rejects
+/// the insert.
+async fn seed_prompt_card(
+    conn: &mut TenantConn<'_>,
+    card_ref: &CardRef,
+    creator_id: Uuid,
+) -> Result<(), WyrdTestError> {
+    let spec = Spec::from_kind_and_value(
+        &CardKind::Prompt,
+        serde_json::json!({
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "messages": "Fixture agent."
+        }),
+    )
+    .map_err(|error| WyrdTestError::Auth(error.to_string()))?;
+    insert_fixture_card(conn, card_ref, &spec, creator_id).await
+}
+
+/// Insert a fixture Card row inside the caller's tenant transaction.
+///
+/// # Errors
+/// Returns an error when canonical hashing, JSON encoding, or the SQL insert
+/// fails.
+async fn insert_fixture_card(
+    conn: &mut TenantConn<'_>,
+    card_ref: &CardRef,
+    spec: &Spec,
+    creator_id: Uuid,
+) -> Result<(), WyrdTestError> {
+    let (spec_hash, _) = spec
+        .canonical_hash_with_bytes()
+        .map_err(|error| WyrdTestError::Auth(error.to_string()))?;
+    let spec_json =
+        serde_json::to_value(spec).map_err(|error| WyrdTestError::Auth(error.to_string()))?;
+    let uid = card_ref
+        .uid
+        .as_ref()
+        .ok_or_else(|| WyrdTestError::Auth("machine CardRef must carry a uid".to_owned()))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO wyrd.cards (
+            card_uid,
+            data_tenant_id,
+            kind,
+            space,
+            name,
+            version,
+            spec,
+            spec_hash,
+            artifact_hash,
+            labels,
+            annotations,
+            status,
+            created_by
+        )
+        VALUES (
+            $1,
+            wyrd.current_tenant(),
+            $2,
+            $3,
+            $4,
+            $5,
+            $6,
+            $7,
+            NULL,
+            '{}'::jsonb,
+            '{}'::jsonb,
+            'active',
+            $8
+        )
+        "#,
+    )
+    .bind(uid.as_uuid())
+    .bind(card_ref.kind.wire_name())
+    .bind(card_ref.space.as_str())
+    .bind(card_ref.name.as_str())
+    .bind(card_ref.version.as_str())
+    .bind(spec_json)
+    .bind(spec_hash.as_str())
+    .bind(creator_id)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(sql)?;
+
+    Ok(())
+}
+
+/// Build the minimal fixture Card spec for a Service or Agent principal.
+///
+/// # Errors
+/// Returns an error when the requested kind is not machine-principal-backed or
+/// the inline fixture agent prompt cannot be decoded.
+fn machine_card_spec(kind: &CardKind) -> Result<Spec, WyrdTestError> {
+    let value = match kind {
+        CardKind::Service => serde_json::json!({}),
+        other => {
+            return Err(WyrdTestError::Auth(format!(
+                "machine fixture card must be Service or Agent, got {other:?}"
+            )));
+        }
+    };
+
+    Spec::from_kind_and_value(kind, value).map_err(|error| WyrdTestError::Auth(error.to_string()))
+}
+
 async fn parse_success<T>(response: Response<Body>) -> Result<T, WyrdTestError>
 where
     T: serde::de::DeserializeOwned,
@@ -791,6 +922,7 @@ mod tests {
             .expect("key exchanges");
         let verified = env
             .state()
+            .auth
             .token_verifier
             .as_ref()
             .expect("verifier exists")
@@ -828,6 +960,7 @@ mod tests {
             .expect("key re-exchanges after grant");
         let verified = env
             .state()
+            .auth
             .token_verifier
             .as_ref()
             .expect("verifier exists")
@@ -851,6 +984,7 @@ mod tests {
             .expect("key re-exchanges after revoke");
         let verified = env
             .state()
+            .auth
             .token_verifier
             .as_ref()
             .expect("verifier exists")

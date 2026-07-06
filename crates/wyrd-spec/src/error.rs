@@ -602,6 +602,20 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Card-bound principal graph produced a scope too large for one token.
+    #[error("[WYRD_AUTH_413_CARD_SCOPE_TOO_LARGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_413_CARD_SCOPE_TOO_LARGE",
+        status = 413,
+        title = "Card scope too large",
+        remediation = "Reduce or split the principal's declared card-ref graph so its transitive observation-target scope fits the token size limit, or issue a narrower card-bound principal."
+    )]
+    CardScopeTooLarge {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Presented token carries a delegation chain deeper than supported.
     #[error("[WYRD_AUTH_401_DELEGATION_DEPTH_EXCEEDED] {message}")]
     #[wyrd_error(
@@ -2232,6 +2246,7 @@ impl WyrdError {
             | Self::CredentialRevoked { message, details }
             | Self::ApiKeyInvalid { message, details }
             | Self::InvalidCardRef { message, details }
+            | Self::CardScopeTooLarge { message, details }
             | Self::DelegationDepthExceededVerify { message, details }
             | Self::PrincipalNotFound { message, details }
             | Self::AdminConflict { message, details }

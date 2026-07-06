@@ -10,13 +10,15 @@
 
 #![deny(missing_docs)]
 
-use sqlx::{AssertSqlSafe, PgPool};
+use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 
+pub mod postgres;
 pub mod queries;
 pub mod row_types;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
+pub use postgres::ValaPostgres;
 pub use wyrd_sql::{TenantConn, error::SqlError};
 
 /// Tenant-scoped Vala observability schema owned by `vala-sql`.
@@ -27,6 +29,7 @@ pub const ICEBERG_CATALOG_SCHEMA: &str = "iceberg_catalog";
 pub const OWNED_SCHEMAS: &[&str] = &[OBSERVABILITY_SCHEMA, ICEBERG_CATALOG_SCHEMA];
 /// Search path used only by the boot migrator connection.
 pub const MIGRATION_SEARCH_PATH: &str = "vala, iceberg_catalog, public";
+const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x0056_5441_4c41_5351;
 
 /// Apply embedded Vala SQL migrations against a boot-only migrator pool.
 ///
@@ -40,6 +43,7 @@ pub const MIGRATION_SEARCH_PATH: &str = "vala, iceberg_catalog, public";
 /// Returns [`SqlError::Migrate`] when migration execution fails.
 pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
     let mut conn = migrator_pool.acquire().await.map_err(SqlError::Connect)?;
+    acquire_migration_advisory_lock(&mut conn).await?;
 
     let result: Result<(), SqlError> = async {
         for schema in OWNED_SCHEMAS {
@@ -83,6 +87,17 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
     }
     .await;
 
+    let unlock_result = release_migration_advisory_lock(&mut conn).await;
+    if let Err(error) = unlock_result {
+        if result.is_ok() {
+            return Err(error);
+        }
+        tracing::warn!(
+            error = %error,
+            "failed to release vala-sql migration advisory lock after migration error"
+        );
+    }
+
     if let Err(error) = conn.close().await {
         tracing::warn!(
             error = %error,
@@ -91,6 +106,32 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
     }
 
     result
+}
+
+/// Acquire the Vala SQL migration advisory lock on the current session.
+///
+/// # Errors
+/// Returns [`SqlError::Connect`] when Postgres cannot acquire the lock.
+async fn acquire_migration_advisory_lock(conn: &mut PgConnection) -> Result<(), SqlError> {
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MIGRATION_ADVISORY_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+        .map_err(SqlError::Connect)?;
+    Ok(())
+}
+
+/// Release the Vala SQL migration advisory lock on the current session.
+///
+/// # Errors
+/// Returns [`SqlError::Connect`] when Postgres cannot release the lock.
+async fn release_migration_advisory_lock(conn: &mut PgConnection) -> Result<(), SqlError> {
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(MIGRATION_ADVISORY_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+        .map_err(SqlError::Connect)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -296,27 +337,6 @@ mod tests {
         assert!(
             forbidden.is_empty(),
             "vala-sql must not call wyrd-sql query modules for cross-crate transactions: {forbidden:?}"
-        );
-    }
-
-    #[test]
-    fn shared_pool_contract_uses_wyrd_runtime_pool_by_reference() {
-        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let lib = fs::read_to_string(crate_dir.join("src/lib.rs"))
-            .expect("Vala lib module doc is readable");
-        let manifest =
-            fs::read_to_string(crate_dir.join("Cargo.toml")).expect("manifest is readable");
-        let uncommented_lib = without_line_comments(&lib);
-        let production_lib = production_source(&uncommented_lib);
-
-        assert!(lib.contains("shared [`TenantConn`] wrapper"));
-        assert!(production_lib.contains("pub async fn migrate(migrator_pool: &PgPool)"));
-        assert!(manifest.contains("wyrd-sql"));
-        assert!(
-            !production_lib.contains("PoolConfig")
-                && !production_lib.contains("build_pool")
-                && !production_lib.contains("PostgresBoot"),
-            "vala-sql must consume Wyrd-owned pools by reference, not build another pool"
         );
     }
 

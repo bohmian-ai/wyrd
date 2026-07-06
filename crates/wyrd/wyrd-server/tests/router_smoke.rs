@@ -8,23 +8,23 @@ use std::sync::Arc;
 use tower::ServiceExt;
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::{
-    Kid, PrincipalKind, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
+    Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
     public_key_from_pem,
 };
 use wyrd_runtime::PrincipalId;
-use wyrd_server::health::{ProbeOutcome, ProbeReason, ReadinessSnapshot};
+use wyrd_server::components::auth::ServerAuth;
+use wyrd_server::components::health::{ProbeOutcome, ProbeReason, ReadinessSnapshot};
+use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
-
-mod support;
 
 const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
 
 #[tokio::test]
 async fn healthz_returns_ok_without_request_id() {
-    let response = build_router(test_state().await)
+    let response = build_router(test_state())
         .oneshot(
             Request::builder()
                 .uri("/healthz")
@@ -44,7 +44,7 @@ async fn healthz_returns_ok_without_request_id() {
 
 #[tokio::test]
 async fn unauthenticated_v1_request_returns_problem_json() {
-    let response = build_router(test_state().await)
+    let response = build_router(test_state())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -76,7 +76,7 @@ async fn unauthenticated_v1_request_returns_problem_json() {
 #[tokio::test]
 async fn request_with_real_jwt_passes_extractor() {
     let tenant = DataTenantId::new_v7();
-    let state = test_state().await;
+    let state = test_state();
     let token = mint_test_user_jwt(&state, tenant);
     let response = build_router(state)
         .oneshot(
@@ -104,7 +104,7 @@ async fn request_with_real_jwt_passes_extractor() {
 
 #[tokio::test]
 async fn request_with_missing_header_returns_401_unauthenticated() {
-    let response = build_router(test_state().await)
+    let response = build_router(test_state())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -128,7 +128,7 @@ async fn auth_routes_are_reachable_without_credential_and_carry_request_id() {
     // Guards two invariants: (1) /auth/token is NOT behind the default-deny layer
     // (a bootstrap deadlock would prevent any client from ever obtaining a token),
     // and (2) auth routes still carry wyrd-request-id from attach_request_id.
-    let response = build_router(test_state().await)
+    let response = build_router(test_state())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -158,9 +158,9 @@ async fn v1_request_without_verifier_configured_returns_503() {
     // 500. This locks the third arm of the 400/401/503 auth-error contract and the
     // retry_after_seconds hint that agents use for backoff.
     let tenant = DataTenantId::new_v7();
-    let token = mint_test_user_jwt(&test_state().await, tenant);
+    let token = mint_test_user_jwt(&test_state(), tenant);
 
-    let response = build_router(test_state_no_verifier().await)
+    let response = build_router(test_state_no_verifier())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -183,7 +183,7 @@ async fn v1_request_without_verifier_configured_returns_503() {
 
 #[tokio::test]
 async fn healthz_returns_ok_without_problem_json() {
-    let response = build_router(test_state().await)
+    let response = build_router(test_state())
         .oneshot(
             Request::builder()
                 .uri("/healthz")
@@ -209,7 +209,7 @@ async fn healthz_returns_ok_without_problem_json() {
 async fn readyz_returns_json_even_on_cold_boot() {
     // On cold boot ReadinessSnapshot::initial() is all-warmup, so /readyz returns 503.
     // The body must be application/problem+json with the correct code.
-    let response = build_router(test_state().await)
+    let response = build_router(test_state())
         .oneshot(
             Request::builder()
                 .uri("/readyz")
@@ -249,7 +249,7 @@ async fn readyz_returns_ok_when_all_probes_pass() {
         postgres: ok_probe.clone(),
         storage: ok_probe,
     }));
-    let state = test_state().await.with_readiness(snapshot);
+    let state = test_state().with_readiness(snapshot);
 
     let response = build_router(state)
         .oneshot(
@@ -274,7 +274,7 @@ async fn oversized_body_returns_413_problem_json() {
     use wyrd_server::state::LimitsConfig;
 
     // Build state with a 10-byte body limit.
-    let state = test_state().await.with_limits(LimitsConfig {
+    let state = test_state().with_limits(LimitsConfig {
         body_bytes: 10,
         timeout: std::time::Duration::from_secs(30),
         concurrency: 1024,
@@ -314,7 +314,7 @@ async fn unknown_v1_path_without_token_returns_401_via_layer() {
     // no token is rejected with 401 before v1_not_found runs — not 404. This is
     // the "no route-existence oracle" guarantee: unauthenticated callers cannot
     // distinguish a real route from a missing one.
-    let response = build_router(test_state().await)
+    let response = build_router(test_state())
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -330,12 +330,10 @@ async fn unknown_v1_path_without_token_returns_401_via_layer() {
 
 #[tokio::test]
 async fn representative_v1_routes_without_token_all_return_401() {
-    // Sweep one real route from every merged group — storage, authz, admin
-    // (identity) plus eval, bifrost, query (OLAP). With no token every one must be
-    // rejected by the layer with 401, proving auth is a property of the whole /v1
-    // nest rather than any single handler and that the flat `.merge()` chain keeps
-    // every group behind the default-deny layer. Assertions key on status 401 so
-    // they are robust to the exact error code family.
+    // Sweep one real route from each mounted group (storage, authz, admin). With
+    // no token every one must be rejected by the layer with 401, proving auth is
+    // a property of the whole /v1 nest rather than any single handler. Assertions
+    // key on status 401 so they are robust to the exact error code family.
     let routes = [
         ("POST", "/v1/cards/upload/init"),
         ("POST", "/v1/cards/download/init"),
@@ -346,13 +344,10 @@ async fn representative_v1_routes_without_token_all_return_401() {
         ),
         ("GET", "/v1/admin/trusted-issuers"),
         ("GET", "/v1/admin/workload-bindings"),
-        ("POST", "/v1/eval/runs"),
-        ("POST", "/v1/bifrost/tables"),
-        ("POST", "/v1/query"),
     ];
 
     for (method, path) in routes {
-        let response = build_router(test_state().await)
+        let response = build_router(test_state())
             .oneshot(
                 Request::builder()
                     .method(method)
@@ -376,7 +371,7 @@ async fn valid_token_is_not_rejected_by_default_deny_layer() {
     // A minted valid token on a real /v1 route must pass the layer. The handler
     // may still fail downstream (no live DB), but the layer itself must not 401.
     let tenant = DataTenantId::new_v7();
-    let state = test_state().await;
+    let state = test_state();
     let token = mint_test_user_jwt(&state, tenant);
 
     let response = build_router(state)
@@ -403,8 +398,9 @@ async fn valid_token_is_not_rejected_by_default_deny_layer() {
     assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
-async fn test_state() -> AppState {
+fn test_state() -> AppState {
     let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+    let postgres = Arc::new(ServerPostgres::lazy_for_tests(app_pool.clone()));
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
     let issuing_key = Arc::new(
@@ -424,31 +420,31 @@ async fn test_state() -> AppState {
         keys,
         "wyrd",
         Arc::new(
-            wyrd_server::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(
-                app_pool.clone(),
-            )),
+            wyrd_server::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(app_pool)),
         ),
         WyrdAuthVerifySettings::default(),
     ));
 
     AppState::new(
-        app_pool,
-        None,
+        postgres,
         Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-        support::test_catalog().await,
     )
-    .with_auth_handles(issuing_key, verifier)
+    .with_auth(ServerAuth {
+        issuing_key: Some(issuing_key),
+        token_verifier: Some(verifier),
+        ..ServerAuth::default()
+    })
 }
 
-async fn test_state_no_verifier() -> AppState {
-    let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+fn test_state_no_verifier() -> AppState {
+    let postgres = Arc::new(ServerPostgres::lazy_for_tests(
+        PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
+    ));
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
     AppState::new(
-        app_pool,
-        None,
+        postgres,
         Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-        support::test_catalog().await,
     )
     // no .with_auth_handles() → token_verifier is None → 503 on any /v1 request
 }
@@ -456,10 +452,13 @@ async fn test_state_no_verifier() -> AppState {
 fn mint_test_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
     let principal = TokenPrincipalRef {
         id: PrincipalId::new(uuid::Uuid::now_v7()),
-        kind: PrincipalKind::User,
+        kind: PrincipalKindWire::User,
         tenant_id: tenant,
+        card_ref: None,
+        card_ref_scope: Default::default(),
     };
     state
+        .auth
         .issuing_key
         .as_ref()
         .expect("test state has issuing key")

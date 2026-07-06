@@ -14,7 +14,7 @@ this repository. Reproduce useful patterns under Wyrd vocabulary and Wyrd paths.
 2. Read `architecture/wyrd-design.md`; it is the active design authority and
    wins over generated artifacts, older planning files, and implementation
    drift.
-3. Read `docs/src/content/docs/concepts/core-doctrine.mdx` before changing
+3. Read `architecture/wyrd-doctrine.mdx` before changing
    Wyrd contracts, public or internal APIs, SDK surfaces, CLI, MCP, UI, docs,
    generated schemas, or implementation behavior.
 4. Identify the owning crate or Python package (see §3 Ownership Boundaries).
@@ -300,10 +300,13 @@ Excludes real cloud storage integration tests (`test:storage:*:cloud`). Those ru
 ### Quick Iteration
 
 While working on a specific area:
+- all tests should be invoked with mise
 
 ```bash
 # Rust only
-cargo test -p <crate> <test_name> --all-features -- --nocapture --test-threads=1
+# Per-crate iteration (requires a running Postgres and WYRD_DATABASE_URL set; prefer mise tasks for crate-specific runs):
+cargo test --locked -p <crate> <test_name> --all-features -- --nocapture --test-threads=1
+mise run test:sql      # runs all SQL-backed integration tests across wyrd-sql, wyrd-dev-fixtures, and vala-sql
 mise run test:unit     # all Rust tests including SQL and storage emulators
 
 # Python only

@@ -108,7 +108,7 @@ mod tests {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
 
     use crate::context::{AuthzCheckContext, AuthzCheckContextError, is_delegated_token};
@@ -132,6 +132,24 @@ mod tests {
             roles: vec![RoleRef::new("service").expect("static role is valid")],
             effective_permissions: PermissionSet::new(),
             card_scope: wyrd_runtime::CardScope::default(),
+        }
+    }
+
+    /// Build a scoped service principal kind for tests.
+    fn service_kind(name: &str) -> PrincipalKind {
+        let card_ref = card_ref(CardKind::Service, name);
+        PrincipalKind::Service {
+            card_ref: card_ref.clone(),
+            card_ref_scope: CardRefScope::own(&card_ref),
+        }
+    }
+
+    /// Build a scoped agent principal kind for tests.
+    fn agent_kind(name: &str) -> PrincipalKind {
+        let card_ref = card_ref(CardKind::Agent, name);
+        PrincipalKind::Agent {
+            card_ref: card_ref.clone(),
+            card_ref_scope: CardRefScope::own(&card_ref),
         }
     }
 
@@ -164,15 +182,9 @@ mod tests {
 
     #[test]
     fn delegated_service_token_builds_initiator_first_context() {
-        let initiator = principal(PrincipalKind::Service {
-            card_ref: card_ref(CardKind::Service, "initiator"),
-        });
-        let immediate = principal(PrincipalKind::Service {
-            card_ref: card_ref(CardKind::Service, "caller"),
-        });
-        let callee = principal(PrincipalKind::Service {
-            card_ref: card_ref(CardKind::Service, "callee"),
-        });
+        let initiator = principal(service_kind("initiator"));
+        let immediate = principal(service_kind("caller"));
+        let callee = principal(service_kind("callee"));
         let verified = verified(callee.clone(), vec![initiator.clone(), immediate.clone()]);
 
         let ctx = AuthzCheckContext::from_verified(&verified, request(), None, request_id())
@@ -191,9 +203,7 @@ mod tests {
 
     #[test]
     fn direct_service_token_is_rejected_with_delegation_chain_error() {
-        let callee = principal(PrincipalKind::Service {
-            card_ref: card_ref(CardKind::Service, "callee"),
-        });
+        let callee = principal(service_kind("callee"));
         let verified = verified(callee, Vec::new());
 
         assert!(!is_delegated_token(&verified));
@@ -206,9 +216,7 @@ mod tests {
     #[test]
     fn delegated_user_token_is_rejected_with_kind_error() {
         let user = principal(PrincipalKind::User);
-        let initiator = principal(PrincipalKind::Service {
-            card_ref: card_ref(CardKind::Service, "initiator"),
-        });
+        let initiator = principal(service_kind("initiator"));
         let verified = verified(user, vec![initiator]);
 
         assert!(!is_delegated_token(&verified));
@@ -220,12 +228,8 @@ mod tests {
 
     #[test]
     fn delegated_agent_token_is_accepted() {
-        let initiator = principal(PrincipalKind::Service {
-            card_ref: card_ref(CardKind::Service, "initiator"),
-        });
-        let callee = principal(PrincipalKind::Agent {
-            card_ref: card_ref(CardKind::Agent, "agent"),
-        });
+        let initiator = principal(service_kind("initiator"));
+        let callee = principal(agent_kind("agent"));
         let verified = verified(callee, vec![initiator]);
 
         assert!(is_delegated_token(&verified));

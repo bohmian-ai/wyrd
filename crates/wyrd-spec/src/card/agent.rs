@@ -319,11 +319,17 @@ impl From<AgentCardError> for WyrdError {
     }
 }
 
+/// Return card refs declared by an agent for cascade and scope traversal.
 fn derive_cascade_children(spec: &AgentSpec) -> Vec<CardRef> {
     match &spec.prompt {
         PromptRef::Card(card_ref) => vec![card_ref.clone()],
         PromptRef::Inline(_) => Vec::new(),
     }
+}
+
+/// Return card refs declared by an agent for card-ref scope traversal.
+pub(crate) fn scope_child_card_refs(spec: &AgentSpec) -> Vec<CardRef> {
+    derive_cascade_children(spec)
 }
 
 fn card_name(field: &str, value: &str) -> Result<CardName, WyrdError> {

@@ -1,7 +1,7 @@
 //! Integration coverage for the `bootstrap-key` issuance chain.
 
 use wyrd_dev_fixtures::pg::PgFixture;
-use wyrd_server::bootstrap::{BootstrapError, bootstrap_admin_key};
+use wyrd_server::boot::bootstrap::{BootstrapError, bootstrap_admin_key};
 use wyrd_spec::TenantSlug;
 
 #[tokio::test]

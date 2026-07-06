@@ -4,6 +4,7 @@ use arc_swap::ArcSwap;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio_util::sync::CancellationToken;
 use wyrd_server::AppState;
+use wyrd_server::postgres::ServerPostgres;
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 use wyrd_tonic::health::HealthSnapshot;
 use wyrd_tonic::health::WyrdHealthSentinel;
@@ -14,17 +15,15 @@ use wyrd_tonic::server::{
 use wyrd_tonic::tonic::server::NamedService;
 use wyrd_tonic::tonic_health::server::health_reporter;
 
-mod support;
-
-async fn test_state() -> AppState {
-    let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+fn test_state() -> AppState {
+    let postgres = Arc::new(ServerPostgres::lazy_for_tests(
+        PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
+    ));
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
     AppState::new(
-        pool,
-        None,
+        postgres,
         Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-        support::test_catalog().await,
     )
 }
 
@@ -73,7 +72,7 @@ async fn build_grpc_router_with_reflection_succeeds() {
 
 #[tokio::test]
 async fn publish_initial_health_not_serving_on_cold_boot() {
-    let _state = test_state().await;
+    let _state = test_state();
     let snapshot: Arc<ArcSwap<StubSnapshot>> =
         Arc::new(ArcSwap::new(Arc::new(StubSnapshot { ok: false })));
     let (mut reporter, _) = health_reporter();

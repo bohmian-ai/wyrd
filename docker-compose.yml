@@ -16,7 +16,7 @@ services:
       - type: tmpfs
         target: /var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "55432:5432"
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "wyrd_migrator", "-d", "wyrd"]
       interval: 2s

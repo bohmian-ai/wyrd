@@ -329,14 +329,14 @@
           "type": "string"
         },
         "config": {
-          "description": "Component config.",
+          "description": "Component config. TODO: does this earn its place?",
           "type": "object",
           "additionalProperties": {
             "$ref": "#/definitions/NonSecretValue"
           }
         },
         "credential_refs": {
-          "description": "Component credential references.",
+          "description": "Component credential references. TODO: does this earn its place?",
           "type": "array",
           "items": {
             "$ref": "#/definitions/CredentialRef"

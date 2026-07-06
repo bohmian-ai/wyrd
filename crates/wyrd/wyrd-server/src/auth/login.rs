@@ -1,96 +1,16 @@
-//! Human OIDC login initiation and login-state storage.
-
-use std::time::Duration;
+//! Human OIDC login initiation HTTP adapter.
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Redirect, Response};
-use base64::Engine;
-use chrono::Utc;
-use rand::RngCore;
-use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use url::Url;
-use wyrd_auth_oidc::{OidcProvider, TrustedIssuer};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{AbsoluteUrl, IssuerUrl, LoginInitResponse};
+use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
-use wyrd_sql::queries::auth::{insert_login_state, take_login_state};
-use wyrd_sql::{SqlError, TenantConn};
 
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
-
-/// Short-lived state row stored server-side during the OIDC login flow.
-#[derive(Debug, Clone)]
-pub struct LoginStateEntry {
-    /// Server-generated PKCE verifier.
-    pub code_verifier: SecretString,
-    /// Server-generated nonce.
-    pub nonce: String,
-    /// Trusted issuer URL.
-    pub issuer: String,
-    /// Callback redirect URI.
-    pub redirect_uri: String,
-}
-
-/// Postgres-backed login-state store.
-#[derive(Debug, Clone)]
-pub struct PgLoginStateStore {
-    pool: sqlx::PgPool,
-}
-
-impl PgLoginStateStore {
-    /// Build a store from the runtime app pool.
-    #[must_use]
-    pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
-    }
-
-    /// Store one login-state row.
-    pub async fn put(
-        &self,
-        tenant: DataTenantId,
-        state: &str,
-        entry: LoginStateEntry,
-        ttl: Duration,
-    ) -> Result<(), SqlError> {
-        let mut conn = TenantConn::acquire(&self.pool, tenant).await?;
-        let expires_at = Utc::now()
-            + chrono::Duration::from_std(ttl)
-                .expect("login-state TTL is bounded and must fit chrono duration");
-        insert_login_state(
-            &mut conn,
-            state,
-            entry.code_verifier.expose_secret(),
-            &entry.nonce,
-            &entry.issuer,
-            &entry.redirect_uri,
-            expires_at,
-        )
-        .await?;
-        conn.commit().await
-    }
-
-    /// Consume a login-state row exactly once.
-    pub async fn take(
-        &self,
-        tenant: DataTenantId,
-        state: &str,
-    ) -> Result<Option<LoginStateEntry>, SqlError> {
-        let mut conn = TenantConn::acquire(&self.pool, tenant).await?;
-        let row = take_login_state(&mut conn, state).await?;
-        conn.commit().await?;
-        Ok(row.map(|row| LoginStateEntry {
-            code_verifier: SecretString::from(row.code_verifier),
-            nonce: row.nonce,
-            issuer: row.issuer,
-            redirect_uri: row.redirect_uri,
-        }))
-    }
-}
 
 /// Login initiation query parameters.
 #[derive(Debug, Clone, Deserialize)]
@@ -107,51 +27,30 @@ pub async fn login(
     Query(query): Query<LoginQuery>,
 ) -> Result<Response, WyrdErrorResponse> {
     let tenant_id = resolve_login_tenant(&state, &headers).await?;
-    let trusted = crate::auth::trusted_issuer(&state, tenant_id, &query.issuer).await?;
-    let provider = discover_provider(&trusted).await?;
+    let trusted = wyrd_auth::issuer::trusted_issuer(
+        state.auth.trusted_issuer_resolver.as_deref(),
+        tenant_id,
+        &query.issuer,
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)?;
     let redirect_uri = callback_redirect_uri(&headers)?;
-    let state_key = auth_state_key();
-    let code_verifier = pkce_verifier();
-    let nonce = auth_nonce();
-    let authz_url = build_authorization_url(
-        &provider,
+    let init = wyrd_auth::login::prepare_login(
+        state.postgres.app_pool(),
+        tenant_id,
         &trusted,
-        &redirect_uri,
-        &state_key,
-        code_verifier.expose_secret(),
-        &nonce,
-    )?;
-    let init = LoginInitResponse {
-        authorization_url: AbsoluteUrl::new(authz_url.as_str().to_owned())
-            .map_err(|_| invalid_token("authorization URL is invalid"))?,
-        state: state_key.clone(),
-    };
-    let store = PgLoginStateStore::new(state.pool.clone());
-    store
-        .put(
-            tenant_id,
-            &state_key,
-            LoginStateEntry {
-                code_verifier,
-                nonce,
-                issuer: query.issuer.to_string(),
-                redirect_uri,
-            },
-            LOGIN_STATE_TTL,
-        )
-        .await
-        .map_err(sql_error)?;
+        &query.issuer,
+        redirect_uri,
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)?;
 
     if wants_json(&headers) {
         Ok(axum::Json(init).into_response())
     } else {
-        Ok(Redirect::to(authz_url.as_str()).into_response())
+        Ok(Redirect::to(init.authorization_url.as_str()).into_response())
     }
 }
-
-/// Lifetime of a persisted login-state row: the browser must complete the IdP
-/// round-trip and hit `/auth/callback` within this window or the state is gone.
-const LOGIN_STATE_TTL: Duration = Duration::from_secs(300);
 
 /// Whether the client prefers a JSON response (`Accept: application/json`) over
 /// the default `302` redirect to the IdP.
@@ -160,39 +59,6 @@ fn wants_json(headers: &HeaderMap) -> bool {
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.contains("application/json"))
-}
-
-/// Generate the opaque CSRF `state` value that ties this login attempt to its
-/// callback (32 random bytes, base64url).
-fn auth_state_key() -> String {
-    random_b64url(32)
-}
-
-/// Generate the OIDC `nonce` bound into the authorization request and later
-/// verified against the returned ID token (32 random bytes, base64url).
-fn auth_nonce() -> String {
-    random_b64url(32)
-}
-
-/// Generate the PKCE code verifier (48 random bytes, base64url). Kept server-side
-/// in the login-state store and never sent to the browser.
-fn pkce_verifier() -> SecretString {
-    SecretString::from(random_b64url(48))
-}
-
-/// Derive the PKCE `S256` code challenge — base64url(SHA-256(verifier)) — sent to
-/// the IdP in the authorization request.
-fn pkce_challenge(verifier: &str) -> String {
-    let digest = Sha256::digest(verifier.as_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-}
-
-/// Draw `bytes` of CSPRNG randomness and encode as base64url (no padding). Shared
-/// by the state, nonce, and PKCE-verifier generators.
-fn random_b64url(bytes: usize) -> String {
-    let mut buf = vec![0_u8; bytes];
-    rand::rng().fill_bytes(&mut buf);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
 
 /// Build the `redirect_uri` the IdP sends the browser back to, derived from the
@@ -219,7 +85,7 @@ async fn resolve_login_tenant(
     headers: &HeaderMap,
 ) -> Result<DataTenantId, WyrdErrorResponse> {
     if let Some(slug) = tenant_slug_from_host(headers)
-        && let Some(tenant) = resolve_tenant_slug(&state.pool, &slug).await?
+        && let Some(tenant) = resolve_tenant_slug(state.postgres.app_pool(), &slug).await?
     {
         return Ok(tenant);
     }
@@ -255,53 +121,6 @@ async fn resolve_tenant_slug(
         .map_err(sql_error)
 }
 
-/// Resolve the trusted issuer's OIDC `authorization_endpoint` via discovery. A
-/// discovery failure is a `503` (`DiscoveryUnavailable`), never a silent skip.
-async fn discover_provider(trusted: &TrustedIssuer) -> Result<Url, WyrdErrorResponse> {
-    let issuer_url = Url::parse(trusted.issuer.as_str()).map_err(|_| {
-        WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
-            message: "trusted issuer URL could not be parsed".to_owned(),
-            details: serde_json::json!({}),
-        })
-    })?;
-    let provider = OidcProvider::discover(issuer_url, reqwest::Client::new())
-        .await
-        .map_err(|error| {
-            tracing::warn!(error = %error, "OIDC discovery failed");
-            WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
-                message: "OIDC discovery unavailable".to_owned(),
-                details: serde_json::json!({}),
-            })
-        })?;
-    Ok(provider.metadata.authorization_endpoint)
-}
-
-/// Assemble the IdP authorization URL: `response_type=code`, the client id,
-/// redirect URI, `openid profile email` scope, the PKCE `S256` challenge, and the
-/// CSRF `state` + `nonce`. This is the URL the browser is sent to.
-fn build_authorization_url(
-    authorization_endpoint: &Url,
-    trusted: &TrustedIssuer,
-    redirect_uri: &str,
-    state: &str,
-    code_verifier: &str,
-    nonce: &str,
-) -> Result<Url, WyrdErrorResponse> {
-    let mut url = authorization_endpoint.clone();
-    let challenge = pkce_challenge(code_verifier);
-    let mut query = url.query_pairs_mut();
-    query.append_pair("response_type", "code");
-    query.append_pair("client_id", &trusted.client_id);
-    query.append_pair("redirect_uri", redirect_uri);
-    query.append_pair("scope", "openid profile email");
-    query.append_pair("code_challenge", &challenge);
-    query.append_pair("code_challenge_method", "S256");
-    query.append_pair("state", state);
-    query.append_pair("nonce", nonce);
-    drop(query);
-    Ok(url)
-}
-
 /// Build a `401` [`WyrdError::InvalidToken`] for a login request that cannot be
 /// trusted (missing host, unresolvable tenant, untrusted issuer).
 fn invalid_token(message: &str) -> WyrdErrorResponse {
@@ -311,10 +130,7 @@ fn invalid_token(message: &str) -> WyrdErrorResponse {
     })
 }
 
-/// Map a login-path store error to a fail-closed `503` and log the cause; the
-/// raw SQL error never reaches the client.
-fn sql_error(error: impl Into<SqlError>) -> WyrdErrorResponse {
-    let error = error.into();
+fn sql_error(error: impl std::fmt::Display) -> WyrdErrorResponse {
     tracing::warn!(error = %error, "OIDC login SQL unavailable");
     WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
         message: "auth backend unavailable".to_owned(),
@@ -324,97 +140,28 @@ fn sql_error(error: impl Into<SqlError>) -> WyrdErrorResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{LoginStateEntry, PgLoginStateStore, resolve_login_tenant};
+    use super::resolve_login_tenant;
     use axum::http::{HeaderMap, HeaderValue, header};
-    use secrecy::{ExposeSecret, SecretString};
     use std::sync::Arc;
-    use std::time::Duration;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use crate::state::AppState;
-
-    #[tokio::test]
-    async fn login_state_store_consumes_single_use_rows_once() {
-        let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
-            .await
-            .expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let store_a = PgLoginStateStore::new(fixture.app_pool().clone());
-        let store_b = PgLoginStateStore::new(fixture.app_pool().clone());
-
-        store_a
-            .put(
-                tenant,
-                "state-1",
-                LoginStateEntry {
-                    code_verifier: SecretString::from("verifier-1".to_owned()),
-                    nonce: "nonce-1".to_owned(),
-                    issuer: "https://idp.example.com/realms/acme".to_owned(),
-                    redirect_uri: "https://app.example.com/auth/callback".to_owned(),
-                },
-                Duration::from_secs(300),
-            )
-            .await
-            .expect("state inserts");
-
-        let consumed = store_b.take(tenant, "state-1").await.expect("state takes");
-        let consumed = consumed.expect("state exists");
-        assert_eq!(consumed.nonce, "nonce-1");
-        assert_eq!(consumed.issuer, "https://idp.example.com/realms/acme");
-        assert_eq!(
-            consumed.redirect_uri,
-            "https://app.example.com/auth/callback"
-        );
-        assert_eq!(consumed.code_verifier.expose_secret(), "verifier-1");
-
-        let replay = store_a
-            .take(tenant, "state-1")
-            .await
-            .expect("state replay reads");
-        assert!(replay.is_none());
-    }
-
-    #[tokio::test]
-    async fn expired_login_state_returns_none() {
-        let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
-            .await
-            .expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let store = PgLoginStateStore::new(fixture.app_pool().clone());
-
-        store
-            .put(
-                tenant,
-                "state-expired",
-                LoginStateEntry {
-                    code_verifier: SecretString::from("verifier-expired".to_owned()),
-                    nonce: "nonce-expired".to_owned(),
-                    issuer: "https://idp.example.com/realms/acme".to_owned(),
-                    redirect_uri: "https://app.example.com/auth/callback".to_owned(),
-                },
-                Duration::from_secs(0),
-            )
-            .await
-            .expect("state inserts");
-
-        let consumed = store
-            .take(tenant, "state-expired")
-            .await
-            .expect("expired state read succeeds");
-        assert!(consumed.is_none());
-    }
 
     #[tokio::test]
     async fn login_tenant_resolution_rejects_non_tenant_host_even_with_query_fallback_context() {
         let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
             .await
             .expect("fixture starts");
-        let storage_root = fixture.tempdir_path().join("storage");
+        let tempdir = tempfile::tempdir().expect("login storage tempdir");
+        let storage_root = tempdir.path().join("storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
+        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
+            fixture.wyrd_postgres().clone(),
+            fixture.vala_postgres().clone(),
+        ));
         let state = AppState::new(
-            fixture.app_pool().clone(),
-            None,
+            postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
             crate::test_support::test_catalog().await,
         );

@@ -4,25 +4,19 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use ipnetwork::IpNetwork;
-use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
-use vala_bifrost::catalog::WyrdCatalog;
-use wyrd_auth_check::{PolicyHook, StubAllowPolicyHook};
-use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::TokenVerifier;
-use wyrd_crypt::SecretKey;
-use wyrd_runtime::{PermissionCheck, RbacCheck};
 use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
 use wyrd_tonic::tonic_health::server::HealthReporter;
 
-use crate::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
-use crate::auth::exchange_api_key::TokenExchangeSettings;
 use crate::auth::permission_resolver::SqlPermissionResolver;
-use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
+use crate::auth::pg_resolvers::PgIssuerResolver;
+use crate::components::auth::{ServerAuth, ServerAuthz};
+use crate::components::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter, new_run_map};
+use crate::components::health::ReadinessSnapshot;
 use crate::config::DeploymentProfile;
-use crate::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter, new_run_map};
-use crate::health::ReadinessSnapshot;
+use crate::postgres::ServerPostgres;
 
 /// Production [`TokenVerifier`] specialization: SQL-backed permission resolution
 /// (`SqlPermissionResolver`) plus Postgres-backed issuer resolution
@@ -58,36 +52,14 @@ impl Default for LimitsConfig {
 /// runtime database pools that already survive boot.
 #[derive(Clone)]
 pub struct AppState {
-    /// Runtime `wyrd_app` pool. Tenant-scoped traffic uses this pool and RLS
-    /// applies on tenant tables.
-    pub pool: PgPool,
-    /// Optional audited `wyrd_platform_admin` pool for cross-tenant platform
-    /// operations. Dedicated deployments may leave this unset.
-    pub platform_admin_pool: Option<PgPool>,
+    /// Composed production Postgres handle. Single DB access path for all routes.
+    pub postgres: Arc<ServerPostgres>,
     /// Process-wide artifact storage handle.
     pub storage: Arc<StorageHandle>,
-    /// Process-wide Bifrost OLAP catalog. Always present: every booted server and
-    /// test harness holds a live, tenant-capable `WyrdCatalog` connected as
-    /// `wyrd_catalog` over the `iceberg_catalog` schema.
-    pub bifrost: Arc<WyrdCatalog>,
-    /// Runtime preview gate for auth routes that depend on card-registry principal projection.
-    pub allow_preview_auth: bool,
-    /// RBAC checker for auth route permission gates.
-    pub permission_check: Arc<dyn PermissionCheck>,
-    /// JWT issuer for auth token routes.
-    pub issuing_key: Option<Arc<IssuingKey>>,
-    /// JWT verifier for token-exchange routes.
-    pub token_verifier: Option<Arc<WyrdTokenVerifier>>,
-    /// Postgres-backed trusted OIDC issuer resolver for human login + federation.
-    pub trusted_issuer_resolver: Option<Arc<PgIssuerResolver>>,
-    /// Postgres-backed workload binding resolver for jwt-bearer exchanges.
-    pub workload_binding_resolver: Option<Arc<PgWorkloadBindingResolver>>,
-    /// Process-wide sealing key for decrypting issuer client secrets on read.
-    pub sealing_key: Option<Arc<SecretKey>>,
-    /// Policy hook for authz-check evaluation.
-    pub policy_hook: Arc<dyn PolicyHook>,
-    /// Audit-fact writer for authz-check decisions.
-    pub audit_writer: Arc<dyn AuthzAuditWriter>,
+    /// Authentication handles: token issuance + verification + issuer/binding resolution.
+    pub auth: ServerAuth,
+    /// Authorization handles: policy decision + RBAC evaluation + decision audit.
+    pub authz: ServerAuthz,
     /// Trust gate for inbound Wyrd request ID propagation.
     pub trusted_request_id_propagation: bool,
     /// Deployment posture (Development / Production) locked at boot.
@@ -104,8 +76,6 @@ pub struct AppState {
     pub readiness: Arc<ArcSwap<ReadinessSnapshot>>,
     /// Parsed CIDR allowlist for the request-id trust gate.
     pub trusted_upstreams_parsed: Arc<[IpNetwork]>,
-    /// Access/refresh token TTL settings for all exchange paths.
-    pub token_exchange_settings: TokenExchangeSettings,
     /// Tenant-keyed in-memory eval run/lease/session map. Ephemeral, single-replica.
     pub eval_runs: EvalRuns,
     /// Audit sink for eval run open/complete events.
@@ -113,29 +83,15 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Build runtime state from the pools that survive boot.
+    /// Build runtime state from production-ready Postgres handles.
     #[must_use]
-    pub fn new(
-        pool: PgPool,
-        platform_admin_pool: Option<PgPool>,
-        storage: Arc<StorageHandle>,
-        bifrost: Arc<WyrdCatalog>,
-    ) -> Self {
+    pub fn new(postgres: Arc<ServerPostgres>, storage: Arc<StorageHandle>) -> Self {
         let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
         Self {
-            pool,
-            platform_admin_pool,
+            postgres,
             storage,
-            bifrost,
-            allow_preview_auth: false,
-            permission_check: Arc::new(RbacCheck),
-            issuing_key: None,
-            token_verifier: None,
-            trusted_issuer_resolver: None,
-            workload_binding_resolver: None,
-            sealing_key: None,
-            policy_hook: Arc::new(StubAllowPolicyHook),
-            audit_writer: Arc::new(NoopAuthzAuditWriter),
+            auth: ServerAuth::default(),
+            authz: ServerAuthz::default(),
             trusted_request_id_propagation: false,
             deployment_profile: DeploymentProfile::Development,
             shutdown_token: CancellationToken::new(),
@@ -146,7 +102,6 @@ impl AppState {
             grpc_health: reporter,
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
             trusted_upstreams_parsed: Arc::from(Vec::<IpNetwork>::new()),
-            token_exchange_settings: TokenExchangeSettings::default(),
             eval_runs: new_run_map(),
             eval_audit: Arc::new(TracingEvalAuditWriter),
         }
@@ -159,49 +114,17 @@ impl AppState {
         self
     }
 
-    /// Override the auth preview gate, primarily for tests and local config wiring.
+    /// Attach authentication handles (issuance, verification, resolvers).
     #[must_use]
-    pub fn with_preview_auth(mut self, allow_preview_auth: bool) -> Self {
-        self.allow_preview_auth = allow_preview_auth;
+    pub fn with_auth(mut self, auth: ServerAuth) -> Self {
+        self.auth = auth;
         self
     }
 
-    /// Attach auth signing and verification handles.
+    /// Attach authorization handles (policy, RBAC, audit).
     #[must_use]
-    pub fn with_auth_handles(
-        mut self,
-        issuing_key: Arc<IssuingKey>,
-        token_verifier: Arc<WyrdTokenVerifier>,
-    ) -> Self {
-        self.issuing_key = Some(issuing_key);
-        self.token_verifier = Some(token_verifier);
-        self
-    }
-
-    /// Attach the Postgres-backed trusted OIDC issuer resolver.
-    #[must_use]
-    pub fn with_trusted_issuer_resolver(
-        mut self,
-        trusted_issuer_resolver: Arc<PgIssuerResolver>,
-    ) -> Self {
-        self.trusted_issuer_resolver = Some(trusted_issuer_resolver);
-        self
-    }
-
-    /// Attach the Postgres-backed workload binding resolver.
-    #[must_use]
-    pub fn with_workload_binding_resolver(
-        mut self,
-        workload_binding_resolver: Arc<PgWorkloadBindingResolver>,
-    ) -> Self {
-        self.workload_binding_resolver = Some(workload_binding_resolver);
-        self
-    }
-
-    /// Attach the process-wide issuer-secret sealing key.
-    #[must_use]
-    pub fn with_sealing_key(mut self, sealing_key: Arc<SecretKey>) -> Self {
-        self.sealing_key = Some(sealing_key);
+    pub fn with_authz(mut self, authz: ServerAuthz) -> Self {
+        self.authz = authz;
         self
     }
 
@@ -267,27 +190,6 @@ impl AppState {
         self.storage = storage;
         self
     }
-
-    /// Replace the policy hook.
-    #[must_use]
-    pub fn with_policy_hook(mut self, policy_hook: Arc<dyn PolicyHook>) -> Self {
-        self.policy_hook = policy_hook;
-        self
-    }
-
-    /// Replace the authz audit writer.
-    #[must_use]
-    pub fn with_audit_writer(mut self, audit_writer: Arc<dyn AuthzAuditWriter>) -> Self {
-        self.audit_writer = audit_writer;
-        self
-    }
-
-    /// Override access/refresh token TTL settings for all exchange paths.
-    #[must_use]
-    pub fn with_token_exchange_settings(mut self, settings: TokenExchangeSettings) -> Self {
-        self.token_exchange_settings = settings;
-        self
-    }
 }
 
 /// Errors raised by [`AppState::production_validate`].
@@ -295,26 +197,22 @@ impl AppState {
 pub enum ProductionValidationError {
     /// Stub allow policy hook is mounted in a production build.
     #[error(
-        "AppState.policy_hook is StubAllowPolicyHook in a production build; install a real PolicyHook"
+        "authz.policy_hook is StubAllowPolicyHook in a production build; install a real PolicyHook"
     )]
     StubPolicyHook,
     /// Noop audit writer is mounted in a production build.
     #[error(
-        "AppState.audit_writer is NoopAuthzAuditWriter in a production build; install a real AuthzAuditWriter"
+        "authz.audit_writer is NoopAuthzAuditWriter in a production build; install a real AuthzAuditWriter"
     )]
     NoopAuditWriter,
     /// Request-id propagation is enabled with no trusted upstream CIDRs.
     #[error("AppState.trusted_request_id_propagation=true requires non-empty trusted_upstreams")]
     UntrustedRequestIdEdge,
     /// Token verifier is absent in a production build.
-    #[error(
-        "AppState.token_verifier is None in a production build; auth-plan boot must install it"
-    )]
+    #[error("auth.token_verifier is None in a production build; auth-plan boot must install it")]
     MissingTokenVerifier,
     /// Preview auth is still enabled in a production build.
-    #[error(
-        "AppState.allow_preview_auth is true in a production build; clear WYRD_AUTH_ALLOW_PREVIEW"
-    )]
+    #[error("auth.allow_preview is true in a production build; clear WYRD_AUTH_ALLOW_PREVIEW")]
     PreviewAuthEnabled,
 }
 
@@ -326,19 +224,19 @@ impl AppState {
         if !self.deployment_profile.is_production() {
             return Ok(());
         }
-        if self.policy_hook.is_stub_default() {
+        if self.authz.policy_hook.is_stub_default() {
             return Err(ProductionValidationError::StubPolicyHook);
         }
-        if self.audit_writer.is_stub_default() {
+        if self.authz.audit_writer.is_stub_default() {
             return Err(ProductionValidationError::NoopAuditWriter);
         }
         if self.trusted_request_id_propagation && self.trusted_upstreams_parsed.is_empty() {
             return Err(ProductionValidationError::UntrustedRequestIdEdge);
         }
-        if self.token_verifier.is_none() {
+        if self.auth.token_verifier.is_none() {
             return Err(ProductionValidationError::MissingTokenVerifier);
         }
-        if self.allow_preview_auth {
+        if self.auth.allow_preview {
             return Err(ProductionValidationError::PreviewAuthEnabled);
         }
         Ok(())
@@ -364,24 +262,26 @@ mod tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
+    use crate::postgres::ServerPostgres;
+
     use super::{AppState, LimitsConfig, ProductionValidationError};
 
     #[tokio::test]
     async fn defaults_for_test_safe() {
-        let state = test_state().await;
+        let state = test_state();
 
         assert!(!state.trusted_request_id_propagation);
         assert!(state.trusted_upstreams_parsed.is_empty());
         assert_eq!(
-            state.policy_hook.evaluate(&context()).await,
+            state.authz.policy_hook.evaluate(&context()).await,
             PolicyDecision::Allow
         );
-        assert!(state.audit_writer.is_stub_default());
+        assert!(state.authz.audit_writer.is_stub_default());
     }
 
     #[tokio::test]
     async fn new_state_has_fresh_cancellation_token() {
-        let state = test_state().await;
+        let state = test_state();
         assert!(!state.shutdown_token.is_cancelled());
         state.shutdown_token.cancel();
         assert!(state.shutdown_token.is_cancelled());
@@ -389,7 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_shutdown_token_replaces_field() {
-        let state = test_state().await;
+        let state = test_state();
         let token = tokio_util::sync::CancellationToken::new();
         let state = state.with_shutdown_token(token.clone());
         token.cancel();
@@ -398,22 +298,21 @@ mod tests {
 
     #[tokio::test]
     async fn production_validate_passes_development_profile() {
-        let state = test_state().await;
+        let state = test_state();
         assert!(state.production_validate().is_ok());
     }
 
     #[tokio::test]
     async fn production_validate_rejects_stub_on_production() {
-        let state = test_state()
-            .await
-            .with_deployment_profile(crate::config::DeploymentProfile::Production);
+        let state =
+            test_state().with_deployment_profile(crate::config::DeploymentProfile::Production);
         let err = state.production_validate().unwrap_err();
         assert!(matches!(err, ProductionValidationError::StubPolicyHook));
     }
 
     #[tokio::test]
     async fn with_limits_updates_all_fields() {
-        let state = test_state().await;
+        let state = test_state();
         let limits = LimitsConfig {
             body_bytes: 2048,
             timeout: std::time::Duration::from_millis(1000),
@@ -424,16 +323,16 @@ mod tests {
         assert_eq!(state.limits.concurrency, 10);
     }
 
-    async fn test_state() -> AppState {
+    fn test_state() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-
         AppState::new(
-            app_pool,
-            None,
+            postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-            crate::test_support::test_catalog().await,
         )
     }
 
@@ -452,11 +351,11 @@ mod tests {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKind::Service {
                 card_ref: card_ref(name),
+                card_ref_scope: wyrd_spec::reference::CardRefScope::own(&card_ref(name)),
             },
             tenant_id: DataTenantId::new_v7(),
             roles: Vec::new(),
             effective_permissions: PermissionSet::new(),
-            card_scope: wyrd_runtime::CardScope::default(),
         }
     }
 

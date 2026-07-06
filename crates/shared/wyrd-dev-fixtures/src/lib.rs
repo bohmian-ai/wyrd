@@ -5,3 +5,6 @@
 
 #[cfg(feature = "pg")]
 pub mod pg;
+
+#[cfg(feature = "pg")]
+pub mod cards;

@@ -2,33 +2,18 @@
 
 use axum::Json;
 use axum::extract::{Extension, Query, State};
-use axum::http::{HeaderMap, header};
-use chrono::{Duration as ChronoDuration, Utc};
-use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
-use serde_json::Value;
+use axum::http::HeaderMap;
+use secrecy::SecretString;
 use uuid::Uuid;
-use wyrd_auth_oidc::{ClientAuth, OidcProvider, TrustedIssuer};
-use wyrd_auth_verify::PrincipalKindTag;
-use wyrd_auth_verify::TokenPrincipalRef;
-use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{CallbackQuery, TokenResponse, TokenType};
+use wyrd_spec::auth::{CallbackQuery, TokenResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
-use wyrd_sql::queries::auth::{
-    delete_user, insert_audit_token_exchange, insert_refresh_token, insert_user,
-    upsert_user_identity, user_id_by_identity,
-};
-use wyrd_sql::{SqlError, TenantConn};
+use wyrd_sql::SqlError;
 
-use crate::auth::exchange_api_key::{ExchangedToken, role_refs, token_hash};
-use crate::auth::login::{LoginStateEntry, PgLoginStateStore};
-use crate::error::WyrdErrorResponse;
+use crate::auth::{auth_not_configured, invalid_token, tenant_slug_from_host};
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
-
-const ACCESS_TTL: ChronoDuration = ChronoDuration::seconds(15 * 60);
-const REFRESH_TTL: ChronoDuration = ChronoDuration::seconds(30 * 24 * 60 * 60);
 
 /// Handler for `GET /auth/callback`.
 #[tracing::instrument(level = "debug", skip(state, headers), fields(state = %query.state))]
@@ -54,11 +39,6 @@ pub async fn callback(
 }
 
 /// Execute the authorization-code grant for `POST /auth/token`.
-///
-/// This entrypoint owns the external OIDC round trip: tenant resolution,
-/// consumed login-state lookup, trusted-issuer lookup, discovery, and token
-/// endpoint exchange. Once an ID token is available, Wyrd-side verification and
-/// durable session writes are delegated to `finish_authorization_code_exchange`.
 pub async fn exchange_authorization_code(
     state: &AppState,
     headers: &HeaderMap,
@@ -67,174 +47,33 @@ pub async fn exchange_authorization_code(
     request_id: &str,
 ) -> Result<TokenResponse, WyrdErrorResponse> {
     let tenant_id = resolve_callback_tenant(state, headers).await?;
-    let store = PgLoginStateStore::new(state.pool.clone());
-    let mut audit_principal_id = Uuid::nil();
-    let result = async {
-        let Some(login_state) = store.take(tenant_id, state_key).await.map_err(sql_error)? else {
-            return Err(invalid_state(
-                "login state is missing, expired, or already consumed",
-            ));
-        };
-        let issuer = wyrd_spec::auth::IssuerUrl::new(login_state.issuer.clone())
-            .map_err(|_| invalid_token("stored issuer URL is invalid"))?;
-        let trusted = crate::auth::trusted_issuer(state, tenant_id, &issuer).await?;
-        let provider = discover_provider(&trusted).await?;
-        let id_token = exchange_code_for_id_token(&provider, &trusted, &login_state, code).await?;
-        finish_authorization_code_exchange(
-            state,
+    let service = wyrd_auth::callback::AuthorizationCodeExchange {
+        issuing_key: state
+            .auth
+            .issuing_key
+            .clone()
+            .ok_or_else(auth_not_configured)?,
+        verifier: state
+            .auth
+            .token_verifier
+            .clone()
+            .ok_or_else(auth_not_configured)?,
+        trusted_issuer_resolver: state
+            .auth
+            .trusted_issuer_resolver
+            .clone()
+            .ok_or_else(auth_not_configured)?,
+    };
+    service
+        .execute(
+            state.postgres.wyrd(),
             tenant_id,
-            &trusted,
-            &login_state,
-            &id_token,
+            code,
+            state_key,
             request_id,
-            &mut audit_principal_id,
         )
         .await
-    }
-    .await;
-
-    match result {
-        Ok(token) => Ok(token),
-        Err(error) => {
-            audit_authorization_code_failure(
-                state,
-                tenant_id,
-                audit_principal_id,
-                request_id,
-                &error,
-            )
-            .await;
-            Err(error)
-        }
-    }
-}
-
-/// Complete a verified human OIDC callback inside Wyrd.
-///
-/// The external authorization code has already been exchanged for an ID token
-/// by the caller. This function handles only Wyrd-owned durable behavior:
-/// verifying the external ID token against the tenant's trusted issuer,
-/// enforcing the stored nonce, resolving or creating the local user identity,
-/// mapping trusted groups to local roles, issuing Wyrd tokens, and recording
-/// refresh-token plus audit rows.
-///
-/// `audit_principal_id` is updated as soon as the user identity is known so the
-/// outer failure auditor can attribute later failures to the resolved user.
-async fn finish_authorization_code_exchange(
-    state: &AppState,
-    tenant_id: DataTenantId,
-    trusted: &TrustedIssuer,
-    login_state: &LoginStateEntry,
-    id_token: &str,
-    request_id: &str,
-    audit_principal_id: &mut Uuid,
-) -> Result<TokenResponse, WyrdErrorResponse> {
-    let verifier = state
-        .token_verifier
-        .as_ref()
-        .ok_or_else(auth_not_configured)?;
-    let verified = verifier
-        .verify_external(&tenant_id, id_token)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
-    verify_nonce(login_state, &verified.raw_claims)?;
-
-    let mut conn = TenantConn::acquire(&state.pool, tenant_id)
-        .await
-        .map_err(sql_error)?;
-    let principal_id = ensure_user_identity(
-        &mut conn,
-        trusted,
-        &verified.subject,
-        verified.email.as_deref(),
-    )
-    .await
-    .map_err(sql_error)?;
-    *audit_principal_id = principal_id;
-    let roles = role_names_to_refs(trusted, &verified.groups)?;
-    let issuing_key = state.issuing_key.as_ref().ok_or_else(auth_not_configured)?;
-    let exchanged = issue_and_record_user_session(
-        &mut conn,
-        issuing_key,
-        tenant_id,
-        principal_id,
-        roles,
-        request_id,
-    )
-    .await?;
-    conn.commit().await.map_err(sql_error)?;
-
-    Ok(exchanged.into_response())
-}
-
-/// Issue user access/refresh tokens and persist their tenant-scoped side effects.
-///
-/// The caller owns the tenant transaction. Keeping refresh-token insertion and
-/// success audit insertion on that transaction ensures Wyrd does not return a
-/// refresh token unless the corresponding server-side state and audit row commit
-/// together.
-async fn issue_and_record_user_session(
-    conn: &mut TenantConn<'_>,
-    issuing_key: &wyrd_auth_issue::IssuingKey,
-    tenant_id: DataTenantId,
-    principal_id: Uuid,
-    roles: Vec<RoleRef>,
-    request_id: &str,
-) -> Result<ExchangedToken, WyrdErrorResponse> {
-    let principal = Principal::new(
-        PrincipalId::new(principal_id),
-        PrincipalKind::User,
-        tenant_id,
-        roles.clone(),
-        PermissionSet::default(),
-        // User principals carry no bound card, so they cannot tag writes.
-        wyrd_runtime::CardScope::default(),
-    );
-    let access_token = issuing_key
-        .issue_user_access_token(
-            TokenPrincipalRef::from(&principal),
-            roles.clone(),
-            ACCESS_TTL,
-        )
-        .map_err(issue_error)?;
-    let refresh_token = issuing_key
-        .issue_refresh_token(
-            PrincipalKindTag::User,
-            PrincipalId::new(principal_id),
-            tenant_id,
-            REFRESH_TTL,
-        )
-        .map_err(issue_error)?;
-    let now = Utc::now();
-    let expires_at = now + ACCESS_TTL;
-    insert_refresh_token(
-        conn,
-        Uuid::new_v4(),
-        "user",
-        principal_id,
-        &token_hash(&refresh_token),
-        now + REFRESH_TTL,
-    )
-    .await
-    .map_err(sql_error)?;
-    insert_audit_token_exchange(
-        conn,
-        Uuid::new_v4(),
-        principal_id,
-        principal_id,
-        serde_json::json!([]),
-        request_id,
-        expires_at,
-    )
-    .await
-    .map_err(sql_error)?;
-
-    Ok(ExchangedToken {
-        access_token: SecretString::from(access_token),
-        refresh_token: Some(SecretString::from(refresh_token)),
-        token_type: TokenType::Bearer,
-        expires_at,
-    })
+        .map_err(WyrdErrorResponse::from)
 }
 
 async fn resolve_callback_tenant(
@@ -244,271 +83,16 @@ async fn resolve_callback_tenant(
     let Some(slug) = tenant_slug_from_host(headers) else {
         return Err(invalid_token("request host does not encode a tenant"));
     };
-    match wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app(&state.pool, &slug)
-        .await
-        .map_err(sql_error)?
+    match wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app(
+        state.postgres.app_pool(),
+        &slug,
+    )
+    .await
+    .map_err(sql_error)?
     {
         Some(tenant) => Ok(tenant),
         None => Err(invalid_token("request tenant could not be resolved")),
     }
-}
-
-/// Best-effort audit for authorization-code failures after tenant resolution.
-///
-/// Authentication failure must still return the original error if auditing
-/// fails, so audit write failures are logged and not surfaced to the caller.
-async fn audit_authorization_code_failure(
-    state: &AppState,
-    tenant_id: DataTenantId,
-    principal_id: Uuid,
-    request_id: &str,
-    error: &WyrdErrorResponse,
-) {
-    let mut conn = match TenantConn::acquire(&state.pool, tenant_id).await {
-        Ok(conn) => conn,
-        Err(audit_error) => {
-            tracing::warn!(
-                error = %audit_error,
-                original_error = %error.0,
-                "OIDC authorization-code failure audit could not acquire tenant connection"
-            );
-            return;
-        }
-    };
-    if let Err(audit_error) = insert_audit_token_exchange(
-        &mut conn,
-        Uuid::new_v4(),
-        principal_id,
-        principal_id,
-        serde_json::json!([{ "error": audit_error_tag(&error.0) }]),
-        request_id,
-        Utc::now() + ACCESS_TTL,
-    )
-    .await
-    {
-        tracing::warn!(
-            error = %audit_error,
-            original_error = %error.0,
-            "OIDC authorization-code failure audit insert failed"
-        );
-        return;
-    }
-    if let Err(audit_error) = conn.commit().await {
-        tracing::warn!(
-            error = %audit_error,
-            original_error = %error.0,
-            "OIDC authorization-code failure audit commit failed"
-        );
-    }
-}
-
-fn audit_error_tag(error: &WyrdError) -> &'static str {
-    match error {
-        WyrdError::InvalidState { .. } => "InvalidState",
-        WyrdError::InvalidToken { .. } => "InvalidToken",
-        WyrdError::DiscoveryUnavailable { .. } => "DiscoveryUnavailable",
-        WyrdError::AuthVerifyUnavailable { .. } => "AuthVerifyUnavailable",
-        WyrdError::InvalidNonce { .. } => "InvalidNonce",
-        WyrdError::Internal { .. } => "Internal",
-        WyrdError::TokenExpired { .. } => "TokenExpired",
-        WyrdError::BadTokenFormat { .. } => "BadTokenFormat",
-        WyrdError::CredentialRevoked { .. } => "CredentialRevoked",
-        WyrdError::RoleCorrupt { .. } => "RoleCorrupt",
-        _ => "WyrdError",
-    }
-}
-
-fn tenant_slug_from_host(headers: &HeaderMap) -> Option<wyrd_spec::ids::TenantSlug> {
-    let host = headers.get(header::HOST)?.to_str().ok()?;
-    let host = host.split(':').next().unwrap_or(host);
-    let mut segments = host.split('.').filter(|segment| !segment.is_empty());
-    let first = segments.next()?;
-    let second = segments.next()?;
-    if first == "localhost" || second == "localhost" {
-        return None;
-    }
-    wyrd_spec::ids::TenantSlug::new(first.to_owned()).ok()
-}
-
-async fn discover_provider(trusted: &TrustedIssuer) -> Result<OidcProvider, WyrdErrorResponse> {
-    let issuer_url = url::Url::parse(trusted.issuer.as_str()).map_err(|_| {
-        WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
-            message: "trusted issuer URL could not be parsed".to_owned(),
-            details: serde_json::json!({}),
-        })
-    })?;
-    OidcProvider::discover(issuer_url, reqwest::Client::new())
-        .await
-        .map_err(|error| {
-            tracing::warn!(error = %error, "OIDC discovery failed");
-            WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
-                message: "OIDC discovery unavailable".to_owned(),
-                details: serde_json::json!({}),
-            })
-        })
-}
-
-async fn exchange_code_for_id_token(
-    provider: &OidcProvider,
-    trusted: &TrustedIssuer,
-    state: &LoginStateEntry,
-    code: SecretString,
-) -> Result<String, WyrdErrorResponse> {
-    let Some(token_endpoint) = provider.metadata.token_endpoint.clone() else {
-        return Err(WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
-            message: "OIDC discovery document did not advertise a token endpoint".to_owned(),
-            details: serde_json::json!({}),
-        }));
-    };
-
-    let client = reqwest::Client::new();
-    let mut request = client.post(token_endpoint);
-    let mut form = vec![
-        ("grant_type", "authorization_code".to_owned()),
-        ("code", code.expose_secret().to_owned()),
-        ("client_id", trusted.client_id.clone()),
-        ("redirect_uri", state.redirect_uri.clone()),
-        (
-            "code_verifier",
-            state.code_verifier.expose_secret().to_owned(),
-        ),
-    ];
-
-    match &trusted.client_auth {
-        ClientAuth::SecretBasic(secret) => {
-            request = request.basic_auth(
-                trusted.client_id.clone(),
-                Some(secret.expose_secret().to_owned()),
-            );
-        }
-        ClientAuth::SecretPost(secret) => {
-            form.push(("client_secret", secret.expose_secret().to_owned()));
-        }
-        ClientAuth::PrivateKeyJwt => {
-            return Err(WyrdErrorResponse::from(WyrdError::Internal {
-                message: "private_key_jwt client authentication is not implemented".to_owned(),
-                details: serde_json::json!({ "client_auth": "private_key_jwt" }),
-            }));
-        }
-        ClientAuth::Public => {}
-    }
-
-    let response = request.form(&form).send().await.map_err(|error| {
-        tracing::warn!(error = %error, "OIDC token endpoint unavailable");
-        WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
-            message: "OIDC token endpoint unavailable".to_owned(),
-            details: serde_json::json!({ "retry_after_seconds": 1 }),
-        })
-    })?;
-    if !response.status().is_success() {
-        return if response.status().is_server_error() {
-            Err(WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
-                message: "OIDC token endpoint unavailable".to_owned(),
-                details: serde_json::json!({ "retry_after_seconds": 1 }),
-            }))
-        } else {
-            Err(invalid_token("authorization code exchange was rejected"))
-        };
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct TokenEndpointResponse {
-        id_token: String,
-    }
-
-    response
-        .json::<TokenEndpointResponse>()
-        .await
-        .map(|body| body.id_token)
-        .map_err(|error| {
-            tracing::warn!(error = %error, "OIDC token response decode failed");
-            WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
-                message: "OIDC token response decode failed".to_owned(),
-                details: serde_json::json!({ "retry_after_seconds": 1 }),
-            })
-        })
-}
-
-/// Resolve the local user for a trusted external identity or create it once.
-///
-/// The `(issuer, subject)` pair is the identity key. Email is optional profile
-/// data and is never used to decide identity ownership.
-async fn ensure_user_identity(
-    conn: &mut TenantConn<'_>,
-    trusted: &TrustedIssuer,
-    subject: &str,
-    email: Option<&str>,
-) -> Result<Uuid, SqlError> {
-    let issuer = trusted.issuer.as_str();
-    if let Some(user_id) = user_id_by_identity(conn, issuer, subject).await? {
-        return Ok(user_id);
-    }
-
-    let user_id = Uuid::new_v4();
-    insert_user(conn, user_id, email, "oidc", None).await?;
-    let canonical = upsert_user_identity(conn, issuer, subject, user_id).await?;
-    if canonical != user_id {
-        let _ = delete_user(conn, user_id).await?;
-    }
-    Ok(canonical)
-}
-
-fn verify_nonce(state: &LoginStateEntry, claims: &Value) -> Result<(), WyrdErrorResponse> {
-    let Some(nonce) = claims.get("nonce").and_then(Value::as_str) else {
-        return Err(invalid_nonce("id token nonce is missing"));
-    };
-    if nonce != state.nonce {
-        return Err(invalid_nonce("id token nonce mismatch"));
-    }
-    Ok(())
-}
-
-fn role_names_to_refs(
-    trusted: &TrustedIssuer,
-    groups: &[String],
-) -> Result<Vec<RoleRef>, WyrdErrorResponse> {
-    let mut names = trusted.default_roles.clone();
-    for group in groups {
-        if let Some(mapped) = trusted.group_role_map.get(group) {
-            names.extend(mapped.iter().cloned());
-        }
-    }
-    names.sort_unstable();
-    names.dedup();
-    role_refs(names).map_err(|_| {
-        WyrdErrorResponse::from(WyrdError::Internal {
-            message: "trusted issuer role mapping is invalid".to_owned(),
-            details: serde_json::json!({}),
-        })
-    })
-}
-
-fn invalid_state(message: &str) -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::InvalidState {
-        message: message.to_owned(),
-        details: serde_json::json!({}),
-    })
-}
-
-fn invalid_nonce(message: &str) -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::InvalidNonce {
-        message: message.to_owned(),
-        details: serde_json::json!({}),
-    })
-}
-
-fn invalid_token(message: &str) -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::InvalidToken {
-        message: message.to_owned(),
-        details: serde_json::json!({}),
-    })
-}
-
-fn auth_not_configured() -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::Internal {
-        message: "auth signing or verification handle is not configured".to_owned(),
-        details: serde_json::json!({}),
-    })
 }
 
 fn sql_error(error: impl Into<SqlError>) -> WyrdErrorResponse {
@@ -517,14 +101,6 @@ fn sql_error(error: impl Into<SqlError>) -> WyrdErrorResponse {
     WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
         message: "auth backend unavailable".to_owned(),
         details: serde_json::json!({ "retry_after_seconds": 1 }),
-    })
-}
-
-fn issue_error(error: wyrd_auth_issue::IssueError) -> WyrdErrorResponse {
-    tracing::warn!(error = %error, "OIDC token issue failed");
-    WyrdErrorResponse::from(WyrdError::Internal {
-        message: "token issue failed".to_owned(),
-        details: serde_json::json!({}),
     })
 }
 
@@ -553,17 +129,19 @@ mod tests {
     use wyrd_sql::queries::auth::upsert_trusted_issuer;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
-    use crate::auth::login::{LoginStateEntry, PgLoginStateStore};
     use crate::auth::permission_resolver::SqlPermissionResolver;
     use crate::auth::pg_resolvers::{PgIssuerResolver, issuer_write_from_trusted};
-    use crate::error::WyrdErrorResponse;
+    use crate::http::error::WyrdErrorResponse;
     use crate::state::AppState;
-
-    use super::{
-        audit_authorization_code_failure, audit_error_tag, ensure_user_identity,
-        exchange_authorization_code, finish_authorization_code_exchange, role_names_to_refs,
-        tenant_slug_from_host, verify_nonce,
+    use wyrd_auth::callback::{
+        AuthorizationCodeExchange, audit_authorization_code_failure, audit_error_tag,
+        ensure_user_identity, role_names_to_refs, verify_nonce,
     };
+    use wyrd_auth::login::{LoginStateEntry, PgLoginStateStore};
+
+    use crate::auth::tenant_slug_from_host;
+
+    use super::exchange_authorization_code;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -643,7 +221,7 @@ mod tests {
         let error = verify_nonce(&state, &serde_json::json!({ "nonce": "nonce-b" }))
             .expect_err("nonce mismatch rejects");
 
-        assert_eq!(error.0.code(), "WYRD_AUTH_400_INVALID_NONCE");
+        assert_eq!(error.code(), "WYRD_AUTH_400_INVALID_NONCE");
     }
 
     #[test]
@@ -670,7 +248,10 @@ mod tests {
     #[tokio::test]
     async fn missing_state_writes_failure_audit_with_nil_principal() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let state = test_state(&fixture).await;
+        let tenant = fixture.data_tenant_id();
+        let state =
+            test_state_with_external(&fixture, trusted_issuer(tenant, HashMap::new(), Vec::new()))
+                .await;
         let headers = tenant_headers(fixture.tenant_slug());
 
         let error = exchange_authorization_code(
@@ -695,7 +276,9 @@ mod tests {
     async fn stored_invalid_issuer_writes_failure_audit_with_nil_principal() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let state = test_state(&fixture).await;
+        let state =
+            test_state_with_external(&fixture, trusted_issuer(tenant, HashMap::new(), Vec::new()))
+                .await;
         let headers = tenant_headers(fixture.tenant_slug());
         PgLoginStateStore::new(fixture.app_pool().clone())
             .put(
@@ -753,16 +336,13 @@ mod tests {
             Some("ext@example.com"),
             &[],
         ));
-        let mut audit_principal_id = Uuid::nil();
-
-        let response = finish_authorization_code_exchange(
+        let (response, audit_principal_id) = finish_id_token_exchange(
             &state,
             tenant,
             &trusted,
             &login_state,
             &id_token,
             "req-success",
-            &mut audit_principal_id,
         )
         .await
         .expect("callback completion succeeds");
@@ -954,27 +534,73 @@ mod tests {
         request_id: &str,
     ) -> Result<TokenResponse, WyrdErrorResponse> {
         let mut audit_principal_id = Uuid::nil();
-        let result = finish_authorization_code_exchange(
-            state,
-            tenant_id,
-            trusted,
-            login_state,
-            id_token,
-            request_id,
-            &mut audit_principal_id,
-        )
-        .await;
+        let result = authorization_exchange_service(state)
+            .finish_id_token_exchange(
+                state.postgres.wyrd(),
+                tenant_id,
+                trusted,
+                login_state,
+                id_token,
+                request_id,
+            )
+            .await
+            .map(|(token, principal_id)| {
+                audit_principal_id = principal_id;
+                token
+            })
+            .map_err(WyrdErrorResponse::from);
         if let Err(error) = &result {
             audit_authorization_code_failure(
-                state,
+                state.postgres.wyrd(),
                 tenant_id,
                 audit_principal_id,
                 request_id,
-                error,
+                &error.0,
             )
             .await;
         }
         result
+    }
+
+    async fn finish_id_token_exchange(
+        state: &AppState,
+        tenant_id: DataTenantId,
+        trusted: &TrustedIssuer,
+        login_state: &LoginStateEntry,
+        id_token: &str,
+        request_id: &str,
+    ) -> Result<(TokenResponse, Uuid), WyrdErrorResponse> {
+        authorization_exchange_service(state)
+            .finish_id_token_exchange(
+                state.postgres.wyrd(),
+                tenant_id,
+                trusted,
+                login_state,
+                id_token,
+                request_id,
+            )
+            .await
+            .map_err(WyrdErrorResponse::from)
+    }
+
+    fn authorization_exchange_service(state: &AppState) -> AuthorizationCodeExchange {
+        AuthorizationCodeExchange {
+            issuing_key: state
+                .auth
+                .issuing_key
+                .clone()
+                .expect("test state has issuing key"),
+            verifier: state
+                .auth
+                .token_verifier
+                .clone()
+                .expect("test state has verifier"),
+            trusted_issuer_resolver: state
+                .auth
+                .trusted_issuer_resolver
+                .clone()
+                .expect("test state has issuer resolver"),
+        }
     }
 
     fn jwks_uri(server: &MockServer) -> url::Url {
@@ -1032,15 +658,18 @@ mod tests {
             .collect()
     }
 
-    async fn test_state(fixture: &PgFixture) -> AppState {
-        let storage_root = fixture.tempdir_path().join("callback-storage");
+    fn test_state(fixture: &PgFixture) -> AppState {
+        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
+            fixture.wyrd_postgres().clone(),
+            fixture.vala_postgres().clone(),
+        ));
+        let dir = tempfile::tempdir().expect("callback storage tempdir");
+        let storage_root = dir.keep().join("callback-storage");
         std::fs::create_dir_all(&storage_root).expect("storage root creates");
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
         AppState::new(
-            fixture.app_pool().clone(),
-            None,
+            postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-            crate::test_support::test_catalog().await,
         )
     }
 
@@ -1095,11 +724,13 @@ mod tests {
             )),
             Arc::clone(&issuer_resolver),
         );
-        test_state(fixture)
-            .await
-            .with_auth_handles(issuing_key, Arc::new(verifier))
-            .with_trusted_issuer_resolver(issuer_resolver)
-            .with_sealing_key(sealing_key)
+        test_state(fixture).with_auth(crate::components::auth::ServerAuth {
+            issuing_key: Some(issuing_key),
+            token_verifier: Some(Arc::new(verifier)),
+            trusted_issuer_resolver: Some(issuer_resolver),
+            sealing_key: Some(sealing_key),
+            ..crate::components::auth::ServerAuth::default()
+        })
     }
 
     fn tenant_headers(slug: &str) -> HeaderMap {

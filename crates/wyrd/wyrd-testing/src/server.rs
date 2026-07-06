@@ -16,35 +16,34 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use uuid::Uuid;
-use vala_bifrost::catalog::WyrdCatalog;
 use wyrd_auth_check::{AuthzCheckRequest, AuthzCheckResponse, PolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_oidc::JwksCache;
 use wyrd_auth_verify::{
-    Kid, PrincipalKind, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
+    Kid, PrincipalKindWire, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
     public_key_from_pem,
 };
 use wyrd_crypt::SecretKey;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::{PrincipalId, RbacCheck, RoleRef};
 use wyrd_semver::VersionBlock;
-use wyrd_server::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
-use wyrd_server::auth::exchange_api_key::TokenExchangeSettings;
-use wyrd_server::auth::issue_api_key::WyrdApiKey;
-use wyrd_server::auth::permission_resolver::SqlPermissionResolver;
-use wyrd_server::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
-use wyrd_server::auth::revocation_resolver::SqlRevocationCheck;
-use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
+use wyrd_auth::exchange_api_key::TokenExchangeSettings;
+use wyrd_auth::issue_api_key::WyrdApiKey;
+use wyrd_auth::permission_resolver::SqlPermissionResolver;
+use wyrd_auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
+use wyrd_auth::revocation_resolver::SqlRevocationCheck;
+use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::boot::build_workload_bindings;
+use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
+use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
 use wyrd_server::config::{IssuerEntry, WorkloadBindingEntry};
-use wyrd_server::grpc::{GrpcRouterConfig, build_app_grpc, serve_grpc};
-use wyrd_server::issuer_boot::{seed_trusted_issuers, seed_workload_bindings};
+use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     RequestedSubject, SecretBearer, SubjectTokenType, TokenRequest, TokenResponse,
 };
-use wyrd_spec::envelope::CardKind;
+use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
@@ -55,7 +54,6 @@ use wyrd_sql::queries::auth::{
     trusted_issuer_by_url, workload_binding_by_subject,
 };
 use wyrd_storage::{BackendConfig, StorageSettings};
-use wyrd_tonic::tonic_health::server::health_reporter;
 
 use crate::time::ClockHandle;
 
@@ -84,7 +82,6 @@ enum Mode {
     Bound {
         addr: std::net::SocketAddr,
         base_url: String,
-        grpc_addr: std::net::SocketAddr,
     },
 }
 
@@ -247,13 +244,13 @@ impl WyrdTestServer {
 
     /// Return the gRPC endpoint URL when bound to a real socket.
     ///
-    /// The harness binds a dedicated gRPC listener on its own port (distinct
-    /// from the HTTP `base_url`) through the same `build_app_grpc` path `main`
-    /// uses, so the ingest service is reachable off that address.
+    /// The harness binds a single TCP socket today; this derives the gRPC URL
+    /// from that same address so `WYRD_GRPC_URL` and `WYRD_SERVER_URL` point
+    /// to the same host:port until the harness grows a dedicated gRPC listener.
     #[must_use]
     pub fn grpc_url(&self) -> Option<String> {
         match &self.mode {
-            Mode::Bound { grpc_addr, .. } => Some(format!("http://{grpc_addr}")),
+            Mode::Bound { addr, .. } => Some(format!("http://{addr}")),
             Mode::InProcess => None,
         }
     }
@@ -351,8 +348,10 @@ impl WyrdTestServer {
 
         let principal = TokenPrincipalRef {
             id: PrincipalId::new(user_id),
-            kind: PrincipalKind::User,
+            kind: PrincipalKindWire::User,
             tenant_id: self.data_tenant_id(),
+            card_ref: None,
+            card_ref_scope: Default::default(),
         };
         let jwt = self
             .inner
@@ -758,6 +757,7 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
 
         let mut conn = self.tenant_conn_for(tenant_id).await?;
+        seed_machine_card(&mut conn, &card_ref, creator_id).await?;
         insert_service_account(
             &mut conn,
             principal_id,
@@ -1102,46 +1102,26 @@ impl WyrdTestServerBuilder {
             TokenExchangeSettings::default()
         };
 
-        // Provision the Bifrost catalog against the embedded Postgres: the fixture
-        // already ran `vala_sql::migrate` (so `iceberg_catalog` + the catalog roles
-        // exist) and surfaces the `wyrd_catalog_app` DSN. Warehouse is the storage
-        // backend's URI (a tempdir `file://` root by default). Recovery is disabled
-        // for the harness (`None`); harness servers do not exercise startup recovery.
-        let (storage_factory, storage_props) = storage
-            .iceberg_storage_factory()
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let catalog_dsn = fixture
-            .catalog_dsn()
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let bifrost = WyrdCatalog::new(
-            catalog_dsn.expose_secret(),
-            storage.warehouse_uri(),
-            Arc::new(fixture.app_pool().clone()),
-            None,
-            storage_factory,
-            storage_props,
-        )
-        .await
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-
-        let mut state = AppState::new(
-            fixture.app_pool().clone(),
-            Some(fixture.platform_admin_pool().clone()),
-            storage,
-            Arc::new(bifrost),
-        )
-        .with_preview_auth(self.allow_preview_auth)
-        .with_auth_handles(Arc::clone(&issuing_key), Arc::clone(&verifier))
-        .with_token_exchange_settings(exchange_settings)
-        .with_trusted_issuer_resolver(issuer_resolver)
-        .with_workload_binding_resolver(binding_resolver)
-        .with_sealing_key(sealing_key);
-        state.permission_check = Arc::new(RbacCheck);
-        state.audit_writer = self
+        let postgres = Arc::new(ServerPostgres::from_parts(
+            fixture.wyrd_postgres().clone(),
+            fixture.vala_postgres().clone(),
+        ));
+        let mut state =
+            AppState::new(postgres, storage).with_auth(wyrd_server::components::auth::ServerAuth {
+                allow_preview: self.allow_preview_auth,
+                issuing_key: Some(Arc::clone(&issuing_key)),
+                token_verifier: Some(Arc::clone(&verifier)),
+                token_exchange_settings: exchange_settings,
+                trusted_issuer_resolver: Some(issuer_resolver),
+                workload_binding_resolver: Some(binding_resolver),
+                sealing_key: Some(sealing_key),
+            });
+        state.authz.permission_check = Arc::new(RbacCheck);
+        state.authz.audit_writer = self
             .audit_writer
             .unwrap_or_else(|| Arc::new(NoopAuthzAuditWriter));
         if let Some(hook) = self.policy_hook {
-            state.policy_hook = hook;
+            state.authz.policy_hook = hook;
         }
         let router = build_router(state.clone());
 
@@ -1177,36 +1157,6 @@ impl WyrdTestServerBuilder {
         let base_url = format!("http://{addr}");
 
         let shutdown_token = CancellationToken::new();
-
-        // Reserve a second loopback port for the gRPC listener, then drop the
-        // reservation so serve_grpc can bind it. A brief race window is
-        // acceptable inside the test harness.
-        let grpc_probe = TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| WyrdTestServerError::Bind(e.to_string()))?;
-        let grpc_addr = grpc_probe
-            .local_addr()
-            .map_err(|e| WyrdTestServerError::Bind(e.to_string()))?;
-        drop(grpc_probe);
-
-        // Mount the ingest gRPC service through the SAME build_app_grpc path
-        // `main` uses. The health_service is a throwaway reporter/service pair;
-        // the harness does not drive gRPC readiness transitions.
-        let (_grpc_reporter, health_service) = health_reporter();
-        let grpc_router = build_app_grpc(
-            &srv.inner.state,
-            health_service,
-            GrpcRouterConfig {
-                reflection_enabled: false,
-            },
-        )
-        .map_err(|e| WyrdTestServerError::Start(e.to_string()))?;
-
-        let grpc_token = shutdown_token.clone();
-        wyrd_runtime::runtime().spawn(async move {
-            let _ = serve_grpc(grpc_router, grpc_addr, grpc_token).await;
-        });
-
         let token_clone = shutdown_token.clone();
         let router = srv.inner.router.clone();
 
@@ -1219,7 +1169,6 @@ impl WyrdTestServerBuilder {
         srv.mode = Mode::Bound {
             addr,
             base_url: base_url.clone(),
-            grpc_addr,
         };
 
         wait_for_ready(&base_url).await?;
@@ -1314,6 +1263,148 @@ fn card_ref(kind: CardKind, name: &str) -> Result<CardRef, WyrdTestServerError> 
             CardUid::new(Uuid::now_v7().to_string()).expect("generated UUIDv7 is a valid CardUid"),
         ),
     })
+}
+
+/// Seed the backing Card row for a fixture-created Service or Agent principal.
+///
+/// # Errors
+/// Returns an error when the fixture spec cannot be encoded or Postgres rejects
+/// the insert.
+async fn seed_machine_card(
+    conn: &mut TenantConn<'_>,
+    machine_ref: &CardRef,
+    creator_id: Uuid,
+) -> Result<(), WyrdTestServerError> {
+    let spec = match &machine_ref.kind {
+        CardKind::Service => machine_card_spec(&machine_ref.kind)?,
+        CardKind::Agent => {
+            let prompt_ref = card_ref(CardKind::Prompt, &format!("{}-prompt", machine_ref.name))?;
+            seed_prompt_card(conn, &prompt_ref, creator_id).await?;
+            Spec::from_kind_and_value(
+                &CardKind::Agent,
+                serde_json::json!({
+                    "prompt": prompt_ref,
+                }),
+            )
+            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
+        }
+        other => {
+            return Err(WyrdTestServerError::Auth(format!(
+                "machine fixture card must be Service or Agent, got {other:?}"
+            )));
+        }
+    };
+    insert_fixture_card(conn, machine_ref, &spec, creator_id).await
+}
+
+/// Seed a minimal Prompt Card for fixture-created Agent principals.
+///
+/// # Errors
+/// Returns an error when the prompt spec cannot be decoded or Postgres rejects
+/// the insert.
+async fn seed_prompt_card(
+    conn: &mut TenantConn<'_>,
+    card_ref: &CardRef,
+    creator_id: Uuid,
+) -> Result<(), WyrdTestServerError> {
+    let spec = Spec::from_kind_and_value(
+        &CardKind::Prompt,
+        serde_json::json!({
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "messages": "Fixture agent."
+        }),
+    )
+    .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+    insert_fixture_card(conn, card_ref, &spec, creator_id).await
+}
+
+/// Insert a fixture Card row inside the caller's tenant transaction.
+///
+/// # Errors
+/// Returns an error when canonical hashing, JSON encoding, or the SQL insert
+/// fails.
+async fn insert_fixture_card(
+    conn: &mut TenantConn<'_>,
+    card_ref: &CardRef,
+    spec: &Spec,
+    creator_id: Uuid,
+) -> Result<(), WyrdTestServerError> {
+    let (spec_hash, _) = spec
+        .canonical_hash_with_bytes()
+        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+    let spec_json =
+        serde_json::to_value(spec).map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+    let uid = card_ref
+        .uid
+        .as_ref()
+        .ok_or_else(|| WyrdTestServerError::Auth("machine CardRef must carry a uid".to_owned()))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO wyrd.cards (
+            card_uid,
+            data_tenant_id,
+            kind,
+            space,
+            name,
+            version,
+            spec,
+            spec_hash,
+            artifact_hash,
+            labels,
+            annotations,
+            status,
+            created_by
+        )
+        VALUES (
+            $1,
+            wyrd.current_tenant(),
+            $2,
+            $3,
+            $4,
+            $5,
+            $6,
+            $7,
+            NULL,
+            '{}'::jsonb,
+            '{}'::jsonb,
+            'active',
+            $8
+        )
+        "#,
+    )
+    .bind(uid.as_uuid())
+    .bind(card_ref.kind.wire_name())
+    .bind(card_ref.space.as_str())
+    .bind(card_ref.name.as_str())
+    .bind(card_ref.version.as_str())
+    .bind(spec_json)
+    .bind(spec_hash.as_str())
+    .bind(creator_id)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(sql)?;
+
+    Ok(())
+}
+
+/// Build the minimal fixture Card spec for a Service principal.
+///
+/// # Errors
+/// Returns an error when the requested kind is not service-principal-backed.
+fn machine_card_spec(kind: &CardKind) -> Result<Spec, WyrdTestServerError> {
+    let value = match kind {
+        CardKind::Service => serde_json::json!({}),
+        other => {
+            return Err(WyrdTestServerError::Auth(format!(
+                "machine fixture card must be Service, got {other:?}"
+            )));
+        }
+    };
+
+    Spec::from_kind_and_value(kind, value)
+        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))
 }
 
 async fn parse_success<T>(response: Response<Body>) -> Result<T, WyrdTestServerError>

@@ -255,6 +255,7 @@ async fn assert_config_driven_trust_layer(issuer: &str, audience: &str) {
     let tenant_id = srv.data_tenant_id();
     let resolver = srv
         .state()
+        .auth
         .trusted_issuer_resolver
         .as_ref()
         .expect("config seam populated the trusted-issuer resolver");

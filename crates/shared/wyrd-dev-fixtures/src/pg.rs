@@ -1,48 +1,47 @@
-//! Embedded Postgres fixtures for SQL integration tests.
+//! Shared Postgres fixtures for SQL integration tests.
 
-use std::path::Path;
+use std::collections::hash_map::DefaultHasher;
+use std::env;
+use std::hash::{Hash, Hasher};
+use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use secrecy::{ExposeSecret, SecretString};
-use sqlx::PgPool;
-use tempfile::TempDir;
+use sqlx::{AssertSqlSafe, PgPool};
+use url::Url;
+use vala_sql::ValaPostgres;
 use wyrd_spec::DataTenantId;
-use wyrd_sql::postgres_boot::{BootError, EmbeddedConfig, PostgresBoot};
-use wyrd_sql::{PoolConfig, SqlError, TenantConn};
+use wyrd_sql::dsn::ResolvedDsns;
+use wyrd_sql::pool::build_pool;
+use wyrd_sql::{PoolConfig, SqlError, TenantConn, WyrdPostgres};
 
-/// Per-test embedded Postgres fixture with Wyrd and Vala migrations applied.
+static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Per-test Postgres fixture backed by a fixture-owned database.
 pub struct PgFixture {
-    app_pool: PgPool,
+    wyrd: WyrdPostgres,
+    vala: ValaPostgres,
     platform_admin_pool: PgPool,
-    boot: PostgresBoot,
     data_tenant_id: DataTenantId,
     tenant_slug: String,
-    tempdir: TempDir,
+    _test_db: TestDatabase,
 }
 
-/// Errors returned while starting an embedded Postgres fixture.
+/// Errors returned while starting a shared Postgres fixture.
 #[derive(Debug, thiserror::Error)]
 pub enum FixtureError {
-    /// Temporary data directory creation failed.
-    #[error("tempdir create failed: {0}")]
-    TempDir(#[from] std::io::Error),
-    /// Embedded Postgres boot failed.
-    #[error("postgres boot failed: {0}")]
-    Boot(#[from] BootError),
-    /// Embedded boot did not return a platform-admin DSN.
-    #[error("embedded Postgres boot did not return a platform-admin DSN")]
-    MissingPlatformAdminDsn,
     /// SQL layer failed.
     #[error("sql layer failed: {0}")]
     Sql(#[from] SqlError),
 }
 
 impl PgFixture {
-    /// Start embedded Postgres, run Wyrd and Vala migrations, and seed one
-    /// deterministic test tenant row.
+    /// Create an isolated test database and seed one deterministic test tenant row.
     ///
     /// # Errors
-    /// Returns [`FixtureError`] when tempdir creation, embedded Postgres boot,
-    /// pool construction, migration, or seed insert fails.
+    /// Returns [`FixtureError`] when database creation, migration, or seed insert fails.
     pub async fn start() -> Result<Self, FixtureError> {
         let data_tenant_id = DataTenantId::new_v7();
         let tenant_slug = "test-tenant-1".to_owned();
@@ -77,33 +76,31 @@ impl PgFixture {
         &self,
         data_tenant_id: DataTenantId,
     ) -> Result<TenantConn<'_>, SqlError> {
-        TenantConn::acquire(&self.app_pool, data_tenant_id).await
+        self.wyrd.tenant_conn(data_tenant_id).await
+    }
+
+    /// Borrow the real control-plane handle.
+    #[must_use]
+    pub fn wyrd_postgres(&self) -> &WyrdPostgres {
+        &self.wyrd
+    }
+
+    /// Borrow the real Vala warehouse handle.
+    #[must_use]
+    pub fn vala_postgres(&self) -> &ValaPostgres {
+        &self.vala
     }
 
     /// Borrow the runtime `wyrd_app` pool.
     #[must_use]
     pub fn app_pool(&self) -> &PgPool {
-        &self.app_pool
+        self.wyrd.app_pool()
     }
 
     /// Borrow the audited `wyrd_platform_admin` pool.
     #[must_use]
     pub fn platform_admin_pool(&self) -> &PgPool {
         &self.platform_admin_pool
-    }
-
-    /// Resolve the Bifrost catalog DSN for this fixture's embedded Postgres.
-    ///
-    /// The DSN connects as `wyrd_catalog_app` with the `role=wyrd_catalog` +
-    /// `search_path=iceberg_catalog` options baked in — the prod catalog
-    /// identity — so a test can construct the same `WyrdCatalog` the server boot
-    /// path does. Only the embedded boot surfaces this; the roles it needs are
-    /// provisioned during `start_seeded`.
-    ///
-    /// # Errors
-    /// Returns [`FixtureError`] when DSN resolution fails.
-    pub fn catalog_dsn(&self) -> Result<SecretString, FixtureError> {
-        Ok(self.boot.dsns()?.catalog_app)
     }
 
     /// Return the fixture's tenant isolation key.
@@ -137,73 +134,198 @@ impl PgFixture {
         &self.tenant_slug
     }
 
-    /// Return the embedded Postgres port.
-    #[must_use]
-    pub fn port(&self) -> Option<u16> {
-        match &self.boot {
-            PostgresBoot::Embedded(handle) => Some(handle.port()),
-            PostgresBoot::External { .. } => None,
-        }
-    }
-
-    /// Return the root temporary directory that owns this fixture's data.
-    #[must_use]
-    pub fn tempdir_path(&self) -> &Path {
-        self.tempdir.path()
-    }
-
     async fn start_seeded(
         data_tenant_id: DataTenantId,
         tenant_slug: String,
     ) -> Result<Self, FixtureError> {
-        let tempdir = tempfile::tempdir()?;
-        let boot = PostgresBoot::embedded(EmbeddedConfig {
-            data_dir: tempdir.path().join("pg"),
-            port: 0,
-            ..EmbeddedConfig::default()
-        })
-        .await?;
-        let dsns = boot.dsns()?;
+        let test_db = TestDatabase::create().await?;
+        let handles = test_db.connect_handles().await?;
+        seed_tenant(&handles.platform_admin, data_tenant_id, &tenant_slug).await?;
 
-        let migrator_pool = wyrd_sql::pool::build_pool(
-            dsns.migrator.expose_secret(),
+        Ok(Self {
+            platform_admin_pool: handles.platform_admin,
+            wyrd: handles.wyrd,
+            vala: handles.vala,
+            data_tenant_id,
+            tenant_slug,
+            _test_db: test_db,
+        })
+    }
+}
+
+struct TestDatabase {
+    name: String,
+    maintenance_dsn: SecretString,
+}
+
+struct TestDbHandles {
+    wyrd: WyrdPostgres,
+    vala: ValaPostgres,
+    platform_admin: PgPool,
+}
+
+impl TestDatabase {
+    async fn create() -> Result<Self, SqlError> {
+        let base = resolved_external_test_dsns()?;
+        let maintenance_dsn = database_dsn(&base.migrator, "wyrd")?;
+        let name = unique_database_name();
+        let maintenance_pool = build_pool(
+            maintenance_dsn.expose_secret(),
             PoolConfig::migrator_defaults(),
         )
         .await
         .map_err(SqlError::Connect)?;
-        let migrate_result = async {
-            wyrd_sql::migrate(&migrator_pool).await?;
-            vala_sql::migrate(&migrator_pool).await
-        }
-        .await;
-        migrator_pool.close().await;
-        migrate_result?;
 
-        let app_pool =
-            wyrd_sql::pool::build_pool(dsns.app.expose_secret(), PoolConfig::app_defaults())
-                .await
-                .map_err(SqlError::Connect)?;
-        let platform_admin_dsn = dsns
-            .platform_admin
-            .ok_or(FixtureError::MissingPlatformAdminDsn)?;
-        let platform_admin_pool = wyrd_sql::pool::build_pool(
-            platform_admin_dsn.expose_secret(),
-            PoolConfig::platform_admin_defaults(),
+        sqlx::query(AssertSqlSafe(format!(
+            "CREATE DATABASE {name} OWNER wyrd_migrator"
+        )))
+        .execute(&maintenance_pool)
+        .await
+        .map_err(SqlError::from)?;
+        maintenance_pool.close().await;
+
+        let test_db = Self {
+            name,
+            maintenance_dsn,
+        };
+        test_db.migrate(&base).await?;
+        Ok(test_db)
+    }
+
+    async fn connect_handles(&self) -> Result<TestDbHandles, SqlError> {
+        let dsns = self.resolved_dsns()?;
+        let wyrd = WyrdPostgres::connect_from_dsns(&dsns).await?;
+        let vala = ValaPostgres::connect_after_wyrd(&dsns).await?;
+        let platform_admin = wyrd
+            .platform_admin_pool()
+            .cloned()
+            .ok_or_else(|| SqlError::InvariantViolation {
+                detail: "test DB env unset (WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD); platform-admin pool is required for tenant seeding".to_owned(),
+            })?;
+        Ok(TestDbHandles {
+            wyrd,
+            vala,
+            platform_admin,
+        })
+    }
+
+    async fn migrate(&self, base: &ResolvedDsns) -> Result<(), SqlError> {
+        let migrator_dsn = database_dsn(&base.migrator, &self.name)?;
+        let migrator = build_pool(
+            migrator_dsn.expose_secret(),
+            PoolConfig::migrator_defaults(),
         )
         .await
         .map_err(SqlError::Connect)?;
 
-        seed_tenant(&platform_admin_pool, data_tenant_id, &tenant_slug).await?;
+        let result = async {
+            wyrd_sql::migrate(&migrator).await?;
+            vala_sql::migrate(&migrator).await
+        }
+        .await;
+        migrator.close().await;
+        result
+    }
 
-        Ok(Self {
-            app_pool,
-            platform_admin_pool,
-            boot,
-            data_tenant_id,
-            tenant_slug,
-            tempdir,
+    fn resolved_dsns(&self) -> Result<ResolvedDsns, SqlError> {
+        let base = resolved_external_test_dsns()?;
+        Ok(ResolvedDsns {
+            app: database_dsn(&base.app, &self.name)?,
+            migrator: database_dsn(&base.migrator, &self.name)?,
+            platform_admin: base
+                .platform_admin
+                .as_ref()
+                .map(|dsn| database_dsn(dsn, &self.name))
+                .transpose()?,
         })
     }
+}
+
+impl Drop for TestDatabase {
+    fn drop(&mut self) {
+        let database_name = self.name.clone();
+        let maintenance_dsn = self.maintenance_dsn.clone();
+        let handle = thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("failed to build test database cleanup runtime: {error}");
+                    return;
+                }
+            };
+
+            runtime.block_on(async move {
+                let pool = match build_pool(
+                    maintenance_dsn.expose_secret(),
+                    PoolConfig::migrator_defaults(),
+                )
+                .await
+                {
+                    Ok(pool) => pool,
+                    Err(error) => {
+                        eprintln!("failed to connect for test database cleanup: {error}");
+                        return;
+                    }
+                };
+                let drop_result = sqlx::query(AssertSqlSafe(format!(
+                    "DROP DATABASE IF EXISTS {database_name} WITH (FORCE)"
+                )))
+                .execute(&pool)
+                .await;
+                pool.close().await;
+
+                if let Err(error) = drop_result {
+                    eprintln!("failed to drop test database {database_name}: {error}");
+                }
+            });
+        });
+
+        if handle.join().is_err() {
+            eprintln!("test database cleanup thread panicked");
+        }
+    }
+}
+
+fn resolved_external_test_dsns() -> Result<ResolvedDsns, SqlError> {
+    wyrd_sql::dsn::resolve_external_dsns_from_env()
+        .map_err(|error| SqlError::InvariantViolation {
+            detail: format!("test DB DSN config error: {error}"),
+        })?
+        .ok_or_else(|| SqlError::InvariantViolation {
+            detail: "test DB env unset (WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD); refusing to boot embedded in tests".to_owned(),
+        })
+}
+
+fn database_dsn(base: &SecretString, database: &str) -> Result<SecretString, SqlError> {
+    let mut url =
+        Url::parse(base.expose_secret()).map_err(|error| SqlError::InvariantViolation {
+            detail: format!("test DB DSN parse error: {error}"),
+        })?;
+    url.set_path(database);
+    Ok(SecretString::from(url.to_string()))
+}
+
+fn unique_database_name() -> String {
+    let cwd = env::current_dir()
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let mut hasher = DefaultHasher::new();
+    cwd.hash(&mut hasher);
+    let worktree_hash = hasher.finish();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let counter = TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let raw = format!(
+        "wyrd_test_{worktree_hash:016x}_{:x}_{counter:x}_{now:x}",
+        process::id()
+    );
+    raw.chars().take(63).collect()
 }
 
 async fn seed_tenant(
@@ -227,9 +349,6 @@ async fn seed_tenant(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::path::PathBuf;
-
     use super::PgFixture;
     use wyrd_spec::DataTenantId;
     use wyrd_sql::tenant_conn::CURRENT_TENANT_GUC;
@@ -254,58 +373,6 @@ mod tests {
 
         assert_eq!(fixture.tenant_slug(), "custom-tenant");
         assert_seeded_tenant(&fixture, "custom-tenant").await;
-    }
-
-    #[tokio::test]
-    async fn ten_concurrent_fixtures_are_isolated() {
-        let fixtures = futures_for_concurrent_start().await;
-
-        let ports = fixtures
-            .iter()
-            .map(|fixture| fixture.port().expect("embedded port is available"))
-            .collect::<HashSet<_>>();
-        let tenant_ids = fixtures
-            .iter()
-            .map(PgFixture::data_tenant_id)
-            .collect::<HashSet<_>>();
-        let tempdirs = fixtures
-            .iter()
-            .map(|fixture| fixture.tempdir_path().to_path_buf())
-            .collect::<HashSet<_>>();
-
-        assert_eq!(ports.len(), fixtures.len());
-        assert_eq!(tenant_ids.len(), fixtures.len());
-        assert_eq!(tempdirs.len(), fixtures.len());
-    }
-
-    #[tokio::test]
-    async fn data_dir_is_removed_after_drop() {
-        let tempdir_path = {
-            let fixture = PgFixture::start().await.expect("fixture starts");
-            fixture.tempdir_path().to_path_buf()
-        };
-
-        assert_path_removed(tempdir_path);
-    }
-
-    async fn futures_for_concurrent_start() -> Vec<PgFixture> {
-        let (a, b, c, d, e, f, g, h, i, j) = tokio::join!(
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-            PgFixture::start(),
-        );
-
-        [a, b, c, d, e, f, g, h, i, j]
-            .into_iter()
-            .map(|result| result.expect("concurrent fixture starts"))
-            .collect()
     }
 
     async fn assert_required_schemas(fixture: &PgFixture) {
@@ -392,13 +459,6 @@ mod tests {
             msg.contains("invalid input syntax for type uuid")
                 || msg.contains("unrecognized configuration parameter"),
             "expected loud RLS failure, got: {err}"
-        );
-    }
-
-    fn assert_path_removed(path: PathBuf) {
-        assert!(
-            !path.exists(),
-            "fixture temporary data directory should be removed after drop: {path:?}"
         );
     }
 }

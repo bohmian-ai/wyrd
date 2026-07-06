@@ -95,11 +95,21 @@ Downstream artifacts are brought up to this version in a sync pass.
     Auth-plane routes, authorized by the same JWT and a
     `Permission { resource, action }` like every other call. The legacy
     per-card **governance token is removed** — the JWT proves the principal and
-    bounds its emittable **card scope** (the principal's own card ∪ its
-    `Service.components`); the observation envelope carries the run's Target
-    `card_ref`, which the server authorizes against that scope, and `run_id`
-    carries which action emitted it. A separate emit credential was redundant —
-    see "Observation identity — Card → Run → Observation".
+    bounds its emittable **card scope**. For card-bound principals, the scope is
+    the principal's own `card_ref` plus the **observation-target** cards reachable
+    through the transitive card-ref graph declared in that card's spec. A card
+    enters the scope only if its kind is an observation target — a kind a client
+    (`wyrd.observer`, Bifrost, drift, eval) attributes records to: `Data`,
+    `Model`, `Experiment`, `Prompt`, `Agent`, `Workflow`, `Eval`, `Drift`,
+    `Service`, `Mcp`, `Artifact`, `Source`. Control-plane kinds (`Policy`,
+    `Audit`, `Operator`, `Trigger`) may be referenced for governance but never
+    enter the emit scope. Service principals start from their Service card and
+    therefore include declared `Service.components`; Agent principals start from
+    their Agent card and include its declared card refs. The observation envelope
+    carries the run's Target `card_ref`, which the server authorizes against that
+    scope, and `run_id` carries which action emitted it. A separate emit
+    credential was redundant — see "Observation identity — Card → Run →
+    Observation".
     - **Auth** gates Wyrd API calls: `Permission { resource, action }` on the
       handler, stateless pubkey verify of the access token. Answers "is this
       principal allowed to hit this Wyrd route?" This covers data-plane ingest
@@ -116,8 +126,9 @@ Downstream artifacts are brought up to this version in a sync pass.
     newtype; no string-prefix encoding (no `user:`, `sa:`, `agent:`) —
     discrimination lives on `PrincipalKind`. `PrincipalKind` is closed:
     `User`, `Service { card_ref }`, `Agent { card_ref }`. Service and Agent
-    are deployable, card-bound, non-human principals; User is the marker for
-    human identity. `wyrd apply -f service.yaml` (or an Agent card) creates
+    are deployable, card-bound, non-human principals; their JWT projection also
+    carries a `card_ref_scope` authorization set derived at mint time. User is
+    the marker for human identity. `wyrd apply -f service.yaml` (or an Agent card) creates
     or updates the principal row idempotently, keyed on
     `(tenant_id, card_kind, card_uid)`; re-apply preserves the same
     `principal_id`. No secret is returned. Credentials are issued out-of-band
@@ -347,9 +358,11 @@ Closed enums:
 
 Wyrd principals are UUID-backed runtime identities for `User`, `Service`,
 and `Agent` kinds. `Service` and `Agent` principals are card-bound: each
-carries a `card_ref` discriminated on `PrincipalKind`. `wyrd apply` for a
-Service or Agent card creates or updates the principal row idempotently
-(keyed on `(tenant_id, card_kind, card_uid)`); re-apply preserves the same
+carries a `card_ref` discriminated on `PrincipalKind`, and its JWT carries a
+mint-time `card_ref_scope` derived from the transitive card-ref graph rooted at
+that card. `wyrd apply` for a Service or Agent card creates or updates the
+principal row idempotently (keyed on `(tenant_id, card_kind, card_uid)`);
+re-apply preserves the same
 `principal_id`. No secret is returned. The declarative and credential
 operations are separated, matching the kubectl pattern (`apply` then
 `create token`):
@@ -465,15 +478,22 @@ Consequences, stated so they stop drifting:
   `wyrd_batch_id`) across the whole batch.
 
 - **`card_ref` is authorized, not trusted.** The server checks the asserted
-  `card_ref` against the principal's **card scope** — the principal's own card
-  plus the components its Service/Agent card declares (`Service.components`). A
-  `card_ref` outside that set is rejected: a principal may not attribute records
-  to a card it does not own. The scope can be resolved from the registry at
-  ingest or carried as a claim minted into the JWT at `/auth/token` — an
-  implementation choice deferred to the runtime stage.
+  `card_ref` against the principal's **card scope**. For Service and Agent
+  principals, the scope is the principal's own `card_ref` plus the
+  **observation-target** cards reachable through the transitive card-ref graph
+  declared in that card's spec. A card is in scope only if its kind is an
+  observation target (`Data`, `Model`, `Experiment`, `Prompt`, `Agent`,
+  `Workflow`, `Eval`, `Drift`, `Service`, `Mcp`, `Artifact`, `Source`);
+  control-plane kinds (`Policy`, `Audit`, `Operator`, `Trigger`) never enter the
+  emit scope. Service cards contribute `Service.components`; other reachable
+  specs contribute their declared card refs according to the shared card-ref
+  extraction rules. A `card_ref` outside that set is rejected: a principal may
+  not attribute records to a card outside its declared graph. The scope can be resolved from the
+  registry at ingest or carried as a claim minted into the JWT at `/auth/token`
+  — an implementation choice deferred to the runtime stage.
 - **This is not the governance token.** `card_ref` is one field in the
-  observation envelope, authorized by the existing JWT plus the Service's
-  declared component graph — not a separate per-card credential (doctrine #18).
+  observation envelope, authorized by the existing JWT plus the principal's
+  declared card-ref graph — not a separate per-card credential (doctrine #18).
   The token still proves the principal; it bounds a *set* of emittable cards,
   and the envelope selects one within it.
 - **There is no run registry.** Runs are a client-side execution record

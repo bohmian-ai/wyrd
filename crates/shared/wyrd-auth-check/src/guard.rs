@@ -59,7 +59,7 @@ mod tests {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::reference::{CardRef, CardRefScope};
 
     use super::{GuardOutcome, GuardReason, guard_reason};
 
@@ -74,12 +74,7 @@ mod tests {
     #[test]
     fn direct_service_token_reports_chain_empty() {
         assert_eq!(
-            guard_reason(
-                &principal(PrincipalKind::Service {
-                    card_ref: card_ref(CardKind::Service, "service")
-                }),
-                0
-            ),
+            guard_reason(&principal(service_kind("service")), 0),
             GuardOutcome::Reject(GuardReason::ChainEmpty)
         );
     }
@@ -87,12 +82,7 @@ mod tests {
     #[test]
     fn delegated_agent_token_is_allowed() {
         assert_eq!(
-            guard_reason(
-                &principal(PrincipalKind::Agent {
-                    card_ref: card_ref(CardKind::Agent, "agent")
-                }),
-                1
-            ),
+            guard_reason(&principal(agent_kind("agent")), 1),
             GuardOutcome::Allow
         );
     }
@@ -122,6 +112,24 @@ mod tests {
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
             space: SpaceName::new("prod").expect("static space is valid"),
             uid: None,
+        }
+    }
+
+    /// Build a scoped service principal kind for guard tests.
+    fn service_kind(name: &str) -> PrincipalKind {
+        let card_ref = card_ref(CardKind::Service, name);
+        PrincipalKind::Service {
+            card_ref: card_ref.clone(),
+            card_ref_scope: CardRefScope::own(&card_ref),
+        }
+    }
+
+    /// Build a scoped agent principal kind for guard tests.
+    fn agent_kind(name: &str) -> PrincipalKind {
+        let card_ref = card_ref(CardKind::Agent, name);
+        PrincipalKind::Agent {
+            card_ref: card_ref.clone(),
+            card_ref_scope: CardRefScope::own(&card_ref),
         }
     }
 }

@@ -157,6 +157,39 @@ impl WyrdTestServer {
             .clone()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started"))
     }
+
+    /// Bootstrap a service principal, returning its scoped API key string.
+    ///
+    /// Wraps [`crate::server::WyrdTestServer::bootstrap_service`]. `permissions`
+    /// maps to the Rust `roles` slice at the boundary; an empty list creates a
+    /// principal with no grants (useful for negative RBAC journeys). Must be
+    /// called inside the context manager.
+    #[pyo3(signature = (permissions, name = "svc"))]
+    fn bootstrap_service(&self, permissions: Vec<String>, name: &str) -> PyResult<String> {
+        let srv = self.server.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "WyrdTestServer not started (use as context manager)",
+            )
+        })?;
+        let roles: Vec<&str> = permissions.iter().map(String::as_str).collect();
+        let result: Result<crate::server::Bootstrap, wyrd_spec::error::WyrdError> =
+            wyrd_runtime::runtime().block_on(async {
+                srv.bootstrap_service(name, &roles)
+                    .await
+                    .map_err(wyrd_spec::error::WyrdError::from)
+            });
+        let bootstrap = result.map_err(wyrd_error_to_py_err)?;
+        match bootstrap {
+            crate::server::Bootstrap::Machine { api_key, .. } => {
+                Ok(api_key.expose_secret().to_owned())
+            }
+            crate::server::Bootstrap::User { .. } => {
+                Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "expected Machine bootstrap from bootstrap_service",
+                ))
+            }
+        }
+    }
 }
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -634,8 +634,8 @@ mod tests {
 
     use super::{
         APP_DSN_ENV, BootError, CATALOG_APP_PASSWORD_ENV, DsnError, EmbeddedConfig,
-        EmbeddedRoleCredentials, MIGRATOR_PASSWORD_ENV, PLATFORM_ADMIN_PASSWORD_ENV,
-        PostgresBoot, RECOVERY_PASSWORD_ENV, SecretString, write_embedded_postgres_config,
+        EmbeddedRoleCredentials, MIGRATOR_PASSWORD_ENV, PLATFORM_ADMIN_PASSWORD_ENV, PostgresBoot,
+        RECOVERY_PASSWORD_ENV, SecretString, write_embedded_postgres_config,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -646,11 +646,9 @@ mod tests {
     const CATALOG_PW: &str = "catalog-secret";
     const RECOVERY_PW: &str = "recovery-secret";
     const EXPECTED_MIGRATOR_DSN: &str = "postgres://wyrd_migrator:migrator-secret@localhost/wyrd";
-    const EXPECTED_ADMIN_DSN: &str =
-        "postgres://wyrd_platform_admin:admin-secret@localhost/wyrd";
+    const EXPECTED_ADMIN_DSN: &str = "postgres://wyrd_platform_admin:admin-secret@localhost/wyrd";
     const EXPECTED_CATALOG_DSN: &str = "postgres://wyrd_catalog_app:catalog-secret@localhost/wyrd?options=-c%20role%3Dwyrd_catalog%20-c%20search_path%3Diceberg_catalog";
-    const EXPECTED_RECOVERY_DSN: &str =
-        "postgres://vala_recovery:recovery-secret@localhost/wyrd";
+    const EXPECTED_RECOVERY_DSN: &str = "postgres://vala_recovery:recovery-secret@localhost/wyrd";
 
     #[tokio::test]
     async fn external_with_app_and_migrator_password_allows_dedicated_mode() {

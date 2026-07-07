@@ -9860,16 +9860,19 @@ version = "0.0.1"
 dependencies = [
  "arrow-schema",
  "async-trait",
+ "criterion",
  "hex",
  "pyo3",
  "secrecy",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
  "tracing",
  "wyrd-client",
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-spec",
+ "wyrd-testing",
 ]
 
 [[package]]

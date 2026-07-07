@@ -2,21 +2,7 @@
 
 from __future__ import annotations
 
-import json
-
 import pytest
-from wyrd.observe import record
-
-
-SCHEMA = json.dumps(
-    {
-        "type": "object",
-        "properties": {"id": {"type": "integer"}},
-        "required": ["id"],
-    }
-)
-CARD_REF = "prod/Service/alpha@1.0.0"
-ROW = json.dumps({"id": 1})
 
 
 def test_extension_submodules_import():

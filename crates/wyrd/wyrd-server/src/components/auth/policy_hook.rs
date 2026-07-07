@@ -75,6 +75,7 @@ mod tests {
         assert!(state.build_production().is_ok());
     }
 
+    // TODO: revisit - what is this even used for?
     #[derive(Debug)]
     struct ReadyAuditWriter;
 

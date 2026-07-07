@@ -1346,13 +1346,13 @@ git diff --exit-code -- crates/wyrd/wyrd-tonic/proto/wyrd.v1.bin \\
 
 [tasks."check:from-pools-allowlist"]
 hide = true
-description = "Fail if from_pools is called outside the 15 allowlisted sites (2 definition files, 9 production wiring files, 4 test files)"
+description = "Fail if from_pools is called outside the 16 allowlisted sites (2 definition files, 9 production wiring files, 5 test files)"
 run = """
 set -e
-# from_pools may only be called from the 15 sites below.
+# from_pools may only be called from the 16 sites below.
 # 2 definition files: wyrd-sql/src/postgres.rs, vala-sql/src/postgres.rs
 # 9 production wiring files: wyrd-server/src/{state,boot/mod,http/middleware/authenticate,components/{auth/{principal_extractor,caller_extractor,policy_hook,routes},health},postgres}.rs
-# 4 test files: wyrd-server/src/bifrost/service.rs (unit tests), wyrd-server/tests/{authz_check_route,grpc_smoke,router_smoke}.rs
+# 5 test files: wyrd-server/src/{bifrost,query}/service.rs (unit tests), wyrd-server/tests/{authz_check_route,grpc_smoke,router_smoke}.rs
 ! rg -n --no-heading -e '\\.from_pools\\(|::from_pools\\(' \
     --glob '!crates/wyrd/wyrd-sql/src/postgres.rs' \
     --glob '!crates/vala/vala-sql/src/postgres.rs' \
@@ -1366,6 +1366,7 @@ set -e
     --glob '!crates/wyrd/wyrd-server/src/components/health/mod.rs' \
     --glob '!crates/wyrd/wyrd-server/src/postgres.rs' \
     --glob '!crates/wyrd/wyrd-server/src/bifrost/service.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/query/service.rs' \
     --glob '!crates/wyrd/wyrd-server/tests/authz_check_route.rs' \
     --glob '!crates/wyrd/wyrd-server/tests/grpc_smoke.rs' \
     --glob '!crates/wyrd/wyrd-server/tests/router_smoke.rs' \

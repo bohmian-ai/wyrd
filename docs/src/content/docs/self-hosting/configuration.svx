@@ -1,0 +1,188 @@
+---
+title: Configuration
+description: Every environment variable, the config file resolution order, and the validation rules the server enforces at boot.
+pillar: wyrd
+group: Self-hosting
+order: 4
+---
+
+# Configuration
+
+The server reads configuration from three sources, highest priority first: environment variables, a TOML file, then compiled defaults. Every value has a safe default except the ones a real deployment must supply itself: the database connection, the storage backend, and (in production) the signing key.
+
+This page is the reference for the server itself. Database and storage each have their own page because their variables are read by separate crates: [Database](/self-hosting/database/) and [Storage](/self-hosting/storage/).
+
+## Resolution order
+
+1. Environment variables override everything.
+2. A TOML file, resolved in this order and used if present: `$WYRD_CONFIG_PATH`, then `/etc/wyrd/server.toml`, then `~/.config/wyrd/server.toml`. If `WYRD_CONFIG_PATH` is set, the file must exist or boot fails.
+3. Compiled defaults.
+
+Configuration is validated after loading. An out-of-range value or a contradiction (for example the same address bound for HTTP and gRPC) fails boot with exit code `78`.
+
+Field names and variable names refer to the same settings. Other pages name the config-file field (`shutdown.drain_ms`, `limits.timeout`); this page lists the environment variable that overrides it (`WYRD_SHUTDOWN_DRAIN_MS`, `WYRD_HTTP_REQUEST_TIMEOUT_MS`). Each table below pairs them.
+
+## Deployment profile
+
+`APP_ENV` selects the profile. `staging` and `production` both select the hardened profile; only `development` relaxes the gates. In the config file the same setting is the `deployment_profile` key, and `APP_ENV` overrides it.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `APP_ENV` | `development` | `development`, `staging`, or `production`. The hardened profile requires a signing key, a real policy hook and audit writer, gRPC reflection off, and preview auth off. |
+
+<Aside title="The hardened profile needs more than env vars">
+
+A production or staging profile requires a real authorization policy hook and audit writer. The open-source server ships development stubs for both, and `production_validate` rejects them at boot. There is no environment variable that swaps in real implementations: they are injected in code through the `StateOverrides` seam by a downstream build (see [Architecture](/self-hosting/architecture/#extension-seams)). Running the plain OSS server in a production profile fails validation until those are provided. Development profile has no such requirement.
+
+</Aside>
+
+## Bind and transport
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `WYRD_SERVER_BIND` | `0.0.0.0:8080` | HTTP listener address. |
+| `WYRD_GRPC_BIND` | `127.0.0.1:50051` | gRPC listener address. Must differ from the HTTP bind. |
+| `WYRD_GRPC_REFLECTION` | `false` | gRPC server reflection. Must be `false` in production. |
+| `WYRD_SERVE_MODE` | `both` | `both`, `http`, or `grpc`. Overridden by `--mode`. |
+| `WYRD_METRICS_ENABLED` | `true` | Serve the Prometheus `/metrics` endpoint. |
+| `WYRD_METRICS_BIND` | auto | Defaults to `127.0.0.1` on the HTTP port plus one, so `/metrics` is not public unless you set this. |
+
+## Authentication
+
+Every request carries a token the server signs itself, so a deployment supplies the material that makes those tokens work. There are three pieces here, and only the first is always required.
+
+The **signing key** is Wyrd's own Ed25519 private key. It signs every token the server issues and verifies every token that comes back, so it is the one secret a production server cannot boot without. Lose it and nothing validates. Generating, mounting, and rotating it is covered in [Authentication](/self-hosting/authentication/#signing-key).
+
+The **sealing key** encrypts IdP client secrets before they touch the database. "Sealing" is encryption at rest: when you register a trusted issuer that authenticates to its IdP with a shared `client_secret`, the server seals that secret with this key (AES-256-GCM) rather than storing it in plaintext. You need it only when an issuer carries a secret. Public PKCE clients and workload federation carry none, so most deployments never set it. Boot fails closed if an issuer needs a sealing key and none is configured. See [Authentication](/self-hosting/authentication/#sealing-key).
+
+The **tenant slug** names the tenant this deployment serves, and it matters only once you federate identity. See [The implicit tenant](#the-implicit-tenant) below.
+
+Signing and sealing keys are read from the environment only, never from the TOML file.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `WYRD_SIGNING_KEY_FILE` | none | Path to the Ed25519 signing key PEM. Required in production. |
+| `WYRD_SIGNING_KEY_PEM` | none | Inline PEM alternative, used only if `WYRD_SIGNING_KEY_FILE` is unset. |
+| `WYRD_SEALING_KEY_FILE` | none | Path to a file holding a base64 32-byte AES-256-GCM key. Required only if a seeded issuer carries a client secret. |
+| `WYRD_SEALING_KEY_BASE64` | none | Inline base64 alternative, used only if `WYRD_SEALING_KEY_FILE` is unset. |
+| `WYRD_SERVER_TENANT_SLUG` | none | Implicit tenant slug for this deployment. Required if any trusted issuer or workload binding is configured. |
+| `WYRD_AUTH_ALLOW_PREVIEW` | `false` | Allow preview-gated routes. Must be `false` in production. |
+
+### The implicit tenant
+
+Wyrd is multi-tenant by design. In the hosted product, each request names its tenant through the `Host` it arrives on, so one process serves many tenants. A self-hosted deployment has no such routing: it serves one tenant, and boot has no request to derive it from. `WYRD_SERVER_TENANT_SLUG` is how the operator names that tenant.
+
+You only need it when you federate identity. Trusted issuers and workload bindings are owned by a tenant, so the moment you declare either one (see [SSO and OIDC](/self-hosting/sso-and-oidc/)), the server has to know which tenant they attach to. Leave it unset if you configure no federation. If you do set it, the slug must resolve to an active tenant at boot; the server resolves it through the same lookup the request handlers use, so a bound issuer matches request-time identity. A slug that resolves to nothing fails boot rather than binding issuers to a tenant that does not exist.
+
+## Pools
+
+| Variable | Default | Range | Notes |
+| --- | --- | --- | --- |
+| `WYRD_PG_POOL_MAX` | `32` | `>= 2` | Max pooled connections across the app, catalog, and recovery pools. |
+| `WYRD_PG_POOL_ACQUIRE_MS` | `5000` | `100`–`60000` | Timeout to acquire a connection from the pool. |
+
+## Request limits
+
+| Variable | Default | Range | Notes |
+| --- | --- | --- | --- |
+| `WYRD_HTTP_BODY_LIMIT_BYTES` | `1048576` | `>= 1048576` | Max request body. Buffers up to this per request. |
+| `WYRD_HTTP_REQUEST_TIMEOUT_MS` | `30000` | `1000`–`600000` | Per-request processing timeout. |
+| `WYRD_HTTP_CONCURRENCY_LIMIT` | `1024` | `1`–`1048576` | Max in-flight concurrent requests. |
+| `WYRD_SHUTDOWN_DRAIN_MS` | `15000` | `1000`–`60000` | Drain budget for in-flight requests on shutdown. |
+
+## Readiness
+
+| Variable | Default | Range | Notes |
+| --- | --- | --- | --- |
+| `WYRD_READINESS_TICK_MS` | `5000` | `500`–`60000` | Interval between background readiness probes. |
+| `WYRD_READINESS_PROBE_TIMEOUT_MS` | `1500` | `100`–`10000` | Timeout per individual probe. |
+
+## Telemetry
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `WYRD_LOG` | `info` | Tracing filter. Priority: `WYRD_LOG`, then `RUST_LOG`, then the config field. |
+| `WYRD_OTLP_ENDPOINT` | none | OTLP collector endpoint. Setting it enables span export. Must be a valid `http`, `https`, or `grpc` URL with no userinfo, query, or fragment. |
+| `WYRD_SERVICE_NAME` | `wyrd` | Service name reported on exported spans. |
+| `WYRD_OTLP_PROTOCOL` | `grpc` | Only `grpc` is accepted via env. For HTTP OTLP, set `telemetry.protocol = "http"` in the config file. |
+| `WYRD_OTLP_SAMPLE_RATIO` | none | Sampling ratio in `[0.0, 1.0]`. Unset means always sample. |
+| `WYRD_OTLP_EXPORT_TIMEOUT_MS` | `30000` | OTLP exporter timeout. |
+
+## Database and storage
+
+These are documented in full on their own pages. In brief:
+
+- Database: set `WYRD_DATABASE_URL` plus the per-role passwords to run against external Postgres, or leave all of them unset to use embedded Postgres in development. See [Database](/self-hosting/database/).
+- Storage: set `WYRD_STORAGE_BACKEND` (`local`, `s3`, `gcs`, or `azure`) plus the backend-specific variables. See [Storage](/self-hosting/storage/).
+
+## Config file
+
+Anything set by env can also be set in the TOML file. Two things are env-only: the signing key and the sealing key. Trusted issuers and workload bindings are the reverse: they are declared as TOML arrays, not env vars, and are covered in [SSO and OIDC](/self-hosting/sso-and-oidc/).
+
+```toml
+# /etc/wyrd/server.toml
+deployment_profile = "production"
+
+[http]
+bind = "0.0.0.0:8080"
+
+[grpc]
+bind = "127.0.0.1:50051"
+reflection_enabled = false
+
+[limits]
+body_bytes = 1048576
+timeout_ms = 30000
+concurrency = 1024
+
+[telemetry]
+endpoint = "http://otel-collector:4317"
+service_name = "wyrd"
+
+[auth]
+tenant_slug = "acme"
+```
+
+## A complete production environment
+
+Each page above documents one slice. Here is the full set of variables a production deployment against external Postgres and an S3 bucket sets, in one place. Provision the five database roles and mount the signing key as a secret first.
+
+```bash
+# Profile
+export APP_ENV=production
+
+# Database (external). The five roles must already exist in the cluster.
+export WYRD_DATABASE_URL="postgresql://wyrd_app:app-pw@db.internal:5432/wyrd"
+export WYRD_DATABASE_MIGRATOR_PASSWORD="migrator-pw"
+export WYRD_DATABASE_CATALOG_APP_PASSWORD="catalog-pw"
+export WYRD_DATABASE_RECOVERY_PASSWORD="recovery-pw"
+
+# Storage (S3). AWS credentials resolve via the default SDK chain.
+export WYRD_STORAGE_BACKEND=s3
+export WYRD_STORAGE_S3_BUCKET=wyrd-artifacts
+export WYRD_STORAGE_S3_REGION=us-east-1
+
+# Signing key (required in production).
+export WYRD_SIGNING_KEY_FILE=/run/secrets/signing-key.pem
+
+# Observability (optional but recommended).
+export WYRD_OTLP_ENDPOINT=http://otel-collector:4317
+export WYRD_SERVICE_NAME=wyrd
+```
+
+This boots only if the deployment also provides a real policy hook and audit writer, per the note above. `WYRD_PUBLIC_BASE_URL` is not needed for S3; it is required only for the local storage backend.
+
+## Validation rules
+
+Boot rejects a configuration that breaks any of these:
+
+- HTTP and gRPC must bind different addresses, and the metrics bind must not collide with either.
+- Pool, limit, readiness, and shutdown values must fall in the ranges above.
+- A production profile requires a signing key, a real policy hook and audit writer, gRPC reflection off, and preview auth off.
+- Any trusted issuer or workload binding requires `WYRD_SERVER_TENANT_SLUG`.
+- `WYRD_OTLP_ENDPOINT`, if set, must be a valid URL with an `http`, `https`, or `grpc` scheme.
+
+## Related
+
+- [Running the server](/self-hosting/running-the-server/): how these values are read at boot.
+- [Database](/self-hosting/database/) and [Storage](/self-hosting/storage/): the connection and backend variables.

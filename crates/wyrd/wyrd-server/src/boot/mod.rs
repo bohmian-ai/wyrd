@@ -9,6 +9,7 @@ use std::sync::Arc;
 use base64::Engine;
 use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
+use vala_bifrost::catalog::WyrdCatalog;
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_crypt::SecretKey;
 use wyrd_semver::VersionBlock;
@@ -17,14 +18,30 @@ use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
+use wyrd_sql::pool::{PoolConfig, build_pool};
 use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
-use crate::components::auth::ServerAuth;
+use crate::components::auth::{ServerAuth, ServerAuthz};
+use crate::components::eval::EvalAuditWriter;
 use crate::config::WorkloadBindingEntry;
 use crate::postgres::ServerPostgres;
 use crate::state::{AppState, ProductionValidationError};
+
+/// Caller-supplied overrides applied to core `AppState` before
+/// `production_validate`. Enterprise uses this to inject a real ABAC policy
+/// hook + audit writer through the same seam production hardening enforces.
+///
+/// Defaults are all `None` — core (OSS) boot supplies its own defaults and
+/// applies no overrides.
+#[derive(Default)]
+pub struct StateOverrides {
+    /// Replace authorization handles (policy hook + RBAC + audit writer).
+    pub authz: Option<ServerAuthz>,
+    /// Replace the eval audit writer.
+    pub eval_audit: Option<Arc<dyn EvalAuditWriter>>,
+}
 
 /// Errors raised while assembling server state.
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +58,12 @@ pub enum ServerBootError {
     /// Storage boot failed.
     #[error(transparent)]
     Storage(#[from] wyrd_storage::StorageError),
+    /// Runtime pool construction failed.
+    #[error("database pool construction failed")]
+    PoolConnect(#[source] sqlx::Error),
+    /// Bifrost catalog construction failed.
+    #[error(transparent)]
+    Bifrost(#[from] vala_bifrost::error::BifrostError),
     /// Wyrd's own signing key could not be loaded or its public key derived.
     /// Boot fails closed: without a usable signing key the server cannot mint or
     /// verify Wyrd JWTs.
@@ -92,6 +115,9 @@ pub enum ServerBootError {
     /// proceeding with an unusable sealing key.
     #[error("WYRD_SEALING_KEY is invalid: {0}")]
     SealingKey(String),
+    /// gRPC router assembly failed (e.g. missing token verifier).
+    #[error(transparent)]
+    Grpc(#[from] wyrd_tonic::server::GrpcError),
     /// Production-profile state validation failed.
     #[error(transparent)]
     ProductionValidation(#[from] ProductionValidationError),
@@ -116,6 +142,7 @@ pub async fn build_app_state() -> Result<AppState, ServerBootError> {
 /// Returns [`ServerBootError`] when DSN resolution, migrations, or runtime
 /// pool construction fails.
 pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, ServerBootError> {
+    let dsns = boot.dsns()?;
     let postgres = Arc::new(ServerPostgres::connect_from_boot(boot).await?);
     let storage_settings = load_storage_settings()?;
     tracing::info!(
@@ -127,8 +154,21 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
     );
     let storage = StorageHandle::from_settings(storage_settings).await?;
     tracing::info!(backend = %storage.backend(), "storage handle ready");
+    let recovery_pool = build_pool(dsns.recovery.expose_secret(), PoolConfig::default())
+        .await
+        .map_err(ServerBootError::PoolConnect)?;
+    let (storage_factory, storage_props) = storage.iceberg_storage_factory()?;
+    let bifrost = WyrdCatalog::new(
+        dsns.catalog_app.expose_secret(),
+        storage.warehouse_uri(),
+        Arc::new(postgres.app_pool().clone()),
+        Some(Arc::new(recovery_pool)),
+        storage_factory,
+        storage_props,
+    )
+    .await?;
 
-    Ok(AppState::new(postgres, storage))
+    Ok(AppState::new(postgres, storage, Arc::new(bifrost)))
 }
 
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.
@@ -142,9 +182,6 @@ pub fn production_guards(config: &crate::config::WyrdServerConfig) {
     if config.deployment_profile.is_production() {
         return;
     }
-    if config.request_id.trust_upstream && config.request_id.trusted_upstreams.is_empty() {
-        tracing::warn!("request_id.trust_upstream=true with no trusted_upstreams configured");
-    }
     if config.grpc.reflection_enabled {
         tracing::warn!("grpc.reflection_enabled=true in development profile");
     }
@@ -153,44 +190,80 @@ pub fn production_guards(config: &crate::config::WyrdServerConfig) {
     }
 }
 
-/// Assemble runtime state from a resolved `WyrdServerConfig`.
+/// Assemble production `AppState` from config, applying `overrides` before
+/// production validation.
 ///
-/// This is the primary boot entry point from `main.rs` once the config is
-/// loaded. It runs the postgres boot, migrations, and pool phases, then chains
-/// the `with_*` builder calls to attach config-derived fields.
+/// Creates the shared shutdown `CancellationToken` internally and stores it in
+/// the returned state. The gRPC health reporter is left as the `AppState::new`
+/// default; `WyrdServer::new` replaces it with the reporter paired to the
+/// health service it mounts.
 ///
 /// # Errors
-/// Returns [`ServerBootError`] when database boot, migration, pool construction,
-/// or CIDR parsing fails.
-pub async fn build_app_state_from_config(
+/// Returns [`ServerBootError`] on database/storage/bifrost boot, auth handle
+/// construction, federation seeding, or production validation failure.
+pub async fn build_state(
+    config: &crate::config::WyrdServerConfig,
+    telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
+    overrides: StateOverrides,
+) -> Result<AppState, ServerBootError> {
+    let shutdown = CancellationToken::new();
+
+    let boot = PostgresBoot::from_env().await?;
+    let state = build_app_state_from_boot(&boot).await?;
+    let sealing_key = build_sealing_key(config)?;
+
+    let state = attach_config_fields(state, config, shutdown, telemetry)?;
+    let state = install_auth(state, config, sealing_key.clone()).await?;
+    seed_federation(&state, config, sealing_key.as_deref()).await?;
+
+    let state = apply_overrides(state, overrides);
+
+    state
+        .production_validate()
+        .map_err(ServerBootError::ProductionValidation)?;
+    Ok(state)
+}
+
+/// Apply caller overrides to a built state. Factored out for unit testing
+/// without a live DB boot.
+fn apply_overrides(state: AppState, overrides: StateOverrides) -> AppState {
+    let mut state = state;
+    if let Some(authz) = overrides.authz {
+        state = state.with_authz(authz);
+    }
+    if let Some(eval_audit) = overrides.eval_audit {
+        state = state.with_eval_audit(eval_audit);
+    }
+    state
+}
+
+/// Attach config-derived fields to core state: shutdown token, telemetry, and
+/// limits. Pure/sync (no I/O).
+fn attach_config_fields(
+    state: AppState,
     config: &crate::config::WyrdServerConfig,
     shutdown: CancellationToken,
     telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
-    reporter: wyrd_tonic::tonic_health::server::HealthReporter,
 ) -> Result<AppState, ServerBootError> {
-    let boot = PostgresBoot::from_env().await?;
-    let state = build_app_state_from_boot(&boot).await?;
-
-    let trusted_upstreams_parsed: Vec<ipnetwork::IpNetwork> = config
-        .request_id
-        .trusted_upstreams
-        .iter()
-        .filter_map(|cidr| cidr.parse::<ipnetwork::IpNetwork>().ok())
-        .collect();
-
-    // Decode the optional process-wide sealing key once. It is shared by the
-    // issuer resolver (decrypt on read) and boot-time seeding (encrypt on write).
-    let sealing_key = build_sealing_key(config)?;
-
-    let mut state = state
+    Ok(state
         .with_deployment_profile(config.deployment_profile)
         .with_shutdown_token(shutdown)
         .with_telemetry(telemetry)
-        .with_limits(config.limits.into_state())
-        .with_grpc_health(reporter)
-        .with_trusted_upstreams_parsed(Arc::from(trusted_upstreams_parsed))
-        .with_trusted_request_id_propagation(config.request_id.trust_upstream);
+        .with_limits(config.limits.into_state()))
+}
 
+/// Install Wyrd's own auth handles: build resolvers, construct issuing key +
+/// verifier (fails closed in production without a key), and attach via
+/// `with_auth`.
+///
+/// # Errors
+/// Returns [`ServerBootError::SigningKey`] when production profile lacks a
+/// signing key, or when key material is invalid.
+async fn install_auth(
+    state: AppState,
+    config: &crate::config::WyrdServerConfig,
+    sealing_key: Option<Arc<SecretKey>>,
+) -> Result<AppState, ServerBootError> {
     // Postgres is the single source of issuer/binding resolution. Both resolvers
     // are always attached; an empty config simply means the tenant federates no
     // issuers and binds no workloads, which they resolve as empty results. The
@@ -238,7 +311,8 @@ pub async fn build_app_state_from_config(
             )?
         }
     };
-    state = state.with_auth(ServerAuth {
+
+    Ok(state.with_auth(ServerAuth {
         allow_preview: config.auth.allow_preview,
         issuing_key: Some(issuing_key),
         token_verifier: Some(verifier),
@@ -246,13 +320,21 @@ pub async fn build_app_state_from_config(
         workload_binding_resolver: Some(binding_resolver),
         sealing_key: sealing_key.clone(),
         token_exchange_settings: crate::auth::exchange_api_key::TokenExchangeSettings::default(),
-    });
+    }))
+}
 
+/// Seed `[[trusted_issuers]]` and `[[workload_bindings]]` into Postgres under
+/// the implicit tenant. Issuers are seeded first because workload bindings
+/// reference them by FK.
+async fn seed_federation(
+    state: &AppState,
+    config: &crate::config::WyrdServerConfig,
+    sealing_key: Option<&SecretKey>,
+) -> Result<(), ServerBootError> {
     // Seed `[[trusted_issuers]]` and `[[workload_bindings]]` into Postgres under
     // the implicit tenant. Both resolve the slug through the same
     // `resolve_by_slug_for_app` path the request handlers use, so the bound
-    // tenant matches request-time lookups by construction. Issuers are seeded
-    // first because workload bindings reference them by FK. Each binding's card
+    // tenant matches request-time lookups by construction. Each binding's card
     // target is built into a server-owned `CardRef` (F04, never from token
     // claims); building the ref is not a card-existence check.
     if !config.trusted_issuers.is_empty() || !config.workload_bindings.is_empty() {
@@ -268,7 +350,7 @@ pub async fn build_app_state_from_config(
             state.postgres.app_pool(),
             tenant_id,
             &config.trusted_issuers,
-            sealing_key.as_deref(),
+            sealing_key,
         )
         .await?;
 
@@ -280,8 +362,7 @@ pub async fn build_app_state_from_config(
         )
         .await?;
     }
-
-    Ok(state)
+    Ok(())
 }
 
 /// Decode the optional base64 sealing key from config into an AES-256-GCM key.
@@ -427,6 +508,90 @@ mod tests {
 
     use crate::postgres::ServerPostgres;
 
+    async fn make_test_state() -> AppState {
+        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let admin_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), Some(admin_pool));
+        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
+        let root = tempdir().expect("temp dir");
+        let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
+        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
+        AppState::new(postgres, storage, crate::test_support::test_catalog().await)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_overrides_authz_applied() {
+        use wyrd_auth_check::DenyAllPolicyHook;
+
+        let state = make_test_state().await;
+        assert!(state.authz.policy_hook.is_stub_default(), "default is stub");
+
+        let non_stub_authz = ServerAuthz {
+            policy_hook: Arc::new(DenyAllPolicyHook {
+                reason: "test-override".to_owned(),
+            }),
+            ..ServerAuthz::default()
+        };
+        let overrides = StateOverrides {
+            authz: Some(non_stub_authz),
+            eval_audit: None,
+        };
+        let patched = apply_overrides(state, overrides);
+
+        assert!(
+            !patched.authz.policy_hook.is_stub_default(),
+            "override replaced stub policy hook"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_overrides_eval_audit_applied() {
+        use crate::components::eval::{EvalAuditEvent, EvalAuditWriter};
+
+        struct MarkerWriter;
+        impl EvalAuditWriter for MarkerWriter {
+            fn record(&self, _event: &EvalAuditEvent) {}
+        }
+
+        let state = make_test_state().await;
+        // Confirm default is the tracing-backed stub (Arc::ptr_eq won't work
+        // across two Arc<dyn Trait> directly, so we replace and check the new
+        // instance is reachable via the state field).
+        let marker: Arc<dyn EvalAuditWriter> = Arc::new(MarkerWriter);
+        let marker_ptr = Arc::as_ptr(&marker) as *const ();
+
+        let overrides = StateOverrides {
+            authz: None,
+            eval_audit: Some(marker),
+        };
+        let patched = apply_overrides(state, overrides);
+
+        assert_eq!(
+            Arc::as_ptr(&patched.eval_audit) as *const (),
+            marker_ptr,
+            "override replaced the default eval audit writer"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_overrides_default_is_noop() {
+        let state = make_test_state().await;
+        assert!(state.authz.policy_hook.is_stub_default());
+        assert!(state.authz.audit_writer.is_stub_default());
+
+        let patched = apply_overrides(state, StateOverrides::default());
+
+        assert!(
+            patched.authz.policy_hook.is_stub_default(),
+            "authz unchanged"
+        );
+        assert!(
+            patched.authz.audit_writer.is_stub_default(),
+            "audit unchanged"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn app_state_retains_only_runtime_pools() {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
@@ -437,7 +602,7 @@ mod tests {
         let root = tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
-        let state = AppState::new(postgres, storage);
+        let state = AppState::new(postgres, storage, crate::test_support::test_catalog().await);
 
         assert!(state.postgres.platform_admin_pool().is_some());
         assert_eq!(

@@ -104,6 +104,7 @@ async fn run(args: Args) {
             TableScope::TenantOwned,
             tenant,
             &[],
+            None,
         )
         .await
         .expect("create bench table");
@@ -130,7 +131,10 @@ async fn run(args: Args) {
         writer.write(batch).await.expect("write bench batch");
 
         let t0 = std::time::Instant::now();
-        writer.flush().await.expect("flush bench writer");
+        writer
+            .flush(vala_bifrost::writer::BifrostWriteContext::system())
+            .await
+            .expect("flush bench writer");
         durations_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
         commit_count += 1;
     }

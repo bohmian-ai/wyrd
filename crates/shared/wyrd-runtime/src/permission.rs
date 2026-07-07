@@ -43,6 +43,12 @@ pub enum Resource {
     Users,
     /// RFC 8693 token exchange and delegation.
     Delegation,
+    /// Bifrost table definitions (DDL: create/list/describe).
+    BifrostTable,
+    /// Bifrost record ingest (the streaming write surface).
+    BifrostRecord,
+    /// Bifrost table reads (SQL/scan).
+    BifrostQuery,
     /// One of several resources.
     AnyOf(Vec<Resource>),
     /// All resources.
@@ -102,6 +108,9 @@ impl Resource {
             Self::ServiceAccounts => "service_accounts",
             Self::Users => "users",
             Self::Delegation => "delegation",
+            Self::BifrostTable => "bifrost_table",
+            Self::BifrostRecord => "bifrost_record",
+            Self::BifrostQuery => "bifrost_query",
             Self::Wildcard => "wildcard",
             Self::AnyOf(_) => return None,
         })
@@ -268,6 +277,51 @@ impl Permission {
         }
     }
 
+    /// Write Bifrost records (the ingest surface).
+    #[must_use]
+    pub const fn bifrost_record_write() -> Self {
+        Self {
+            resource: Resource::BifrostRecord,
+            action: Action::Write,
+        }
+    }
+
+    /// Read Bifrost table definitions.
+    #[must_use]
+    pub const fn bifrost_table_read() -> Self {
+        Self {
+            resource: Resource::BifrostTable,
+            action: Action::Read,
+        }
+    }
+
+    /// Write Bifrost table definitions (DDL).
+    #[must_use]
+    pub const fn bifrost_table_write() -> Self {
+        Self {
+            resource: Resource::BifrostTable,
+            action: Action::Write,
+        }
+    }
+
+    /// Install a `SystemShared` Bifrost table (cross-tenant DDL).
+    #[must_use]
+    pub const fn bifrost_table_install() -> Self {
+        Self {
+            resource: Resource::BifrostTable,
+            action: Action::Install,
+        }
+    }
+
+    /// Read Bifrost tables (SQL/scan).
+    #[must_use]
+    pub const fn bifrost_query_read() -> Self {
+        Self {
+            resource: Resource::BifrostQuery,
+            action: Action::Read,
+        }
+    }
+
     /// All permissions.
     #[must_use]
     pub const fn wildcard() -> Self {
@@ -319,6 +373,9 @@ fn parse_resource(value: &str) -> Result<Resource, PermissionParseError> {
         "service_accounts" => Resource::ServiceAccounts,
         "users" => Resource::Users,
         "delegation" => Resource::Delegation,
+        "bifrost_table" => Resource::BifrostTable,
+        "bifrost_record" => Resource::BifrostRecord,
+        "bifrost_query" => Resource::BifrostQuery,
         "wildcard" => Resource::Wildcard,
         _ => return Err(PermissionParseError),
     })
@@ -441,6 +498,31 @@ mod tests {
             let round_trip: Action = serde_json::from_value(value).expect("action deserializes");
             assert_eq!(round_trip, action);
         }
+    }
+
+    #[test]
+    fn bifrost_permissions_round_trip_through_wire_strings() {
+        for (permission, wire) in [
+            (Permission::bifrost_record_write(), "bifrost_record:write"),
+            (Permission::bifrost_table_read(), "bifrost_table:read"),
+            (Permission::bifrost_table_write(), "bifrost_table:write"),
+            (Permission::bifrost_query_read(), "bifrost_query:read"),
+        ] {
+            assert_eq!(permission.to_string(), wire);
+            assert_eq!(wire.parse::<Permission>().expect("wire parses"), permission);
+            let json = serde_json::to_value(&permission).expect("serializes");
+            assert_eq!(
+                serde_json::from_value::<Permission>(json).expect("deserializes"),
+                permission
+            );
+        }
+    }
+
+    #[test]
+    fn bifrost_record_write_is_distinct_from_table_write() {
+        assert!(!Permission::bifrost_table_write().covers(&Permission::bifrost_record_write()));
+        assert!(!Permission::bifrost_record_write().covers(&Permission::bifrost_table_write()));
+        assert!(Permission::wildcard().covers(&Permission::bifrost_record_write()));
     }
 
     #[test]

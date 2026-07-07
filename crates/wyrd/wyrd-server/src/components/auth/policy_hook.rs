@@ -8,9 +8,6 @@ pub enum BuildError {
     /// Stub allow policy hook was mounted in production state.
     #[error("stub PolicyHook mounted in production build")]
     StubAllowInProduction,
-    /// Inbound request-id propagation was enabled without trusted upstreams.
-    #[error("trusted_request_id_propagation = true requires non-empty trusted_upstreams")]
-    RequestIdPropagationWithoutTrustedUpstreams,
     /// Noop authz-check audit writer was mounted in production state.
     #[error("stub AuthzAuditWriter mounted in production build")]
     NoopAuditWriterInProduction,
@@ -24,9 +21,6 @@ impl AppState {
     pub fn build_production(self) -> Result<Self, BuildError> {
         if self.authz.policy_hook.is_stub_default() {
             return Err(BuildError::StubAllowInProduction);
-        }
-        if self.trusted_request_id_propagation && self.trusted_upstreams_parsed.is_empty() {
-            return Err(BuildError::RequestIdPropagationWithoutTrustedUpstreams);
         }
         if self.authz.audit_writer.is_stub_default() {
             return Err(BuildError::NoopAuditWriterInProduction);
@@ -49,14 +43,14 @@ mod tests {
 
     #[tokio::test]
     async fn build_production_rejects_stub_policy_hook() {
-        let result = test_state().build_production();
+        let result = test_state().await.build_production();
 
         assert!(matches!(result, Err(BuildError::StubAllowInProduction)));
     }
 
     #[tokio::test]
     async fn build_production_rejects_stub_audit_writer() {
-        let mut state = test_state();
+        let mut state = test_state().await;
         state.authz.policy_hook = Arc::new(DenyAllPolicyHook {
             reason: "test-deny".to_owned(),
         });
@@ -71,22 +65,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_production_rejects_untrusted_request_id_configuration() {
-        let mut state = test_state();
+    async fn build_production_accepts_non_stub_hooks() {
+        let mut state = test_state().await;
         state.authz.policy_hook = Arc::new(DenyAllPolicyHook {
             reason: "test-deny".to_owned(),
         });
         state.authz.audit_writer = Arc::new(ReadyAuditWriter);
-        state.trusted_request_id_propagation = true;
 
-        let result = state.build_production();
-
-        assert!(matches!(
-            result,
-            Err(BuildError::RequestIdPropagationWithoutTrustedUpstreams)
-        ));
+        assert!(state.build_production().is_ok());
     }
 
+    // TODO: revisit - what is this even used for?
     #[derive(Debug)]
     struct ReadyAuditWriter;
 
@@ -102,7 +91,7 @@ mod tests {
         }
     }
 
-    fn test_state() -> AppState {
+    async fn test_state() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
         let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
@@ -112,6 +101,7 @@ mod tests {
         AppState::new(
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
         )
     }
 }

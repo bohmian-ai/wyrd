@@ -22,17 +22,25 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 reqwest = { workspace = true }
+secrecy = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+shellexpand = { workspace = true }
+sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+toml = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 vala-eval = { workspace = true, features = ["orchestrator"] }
+vala-sql = { workspace = true }
+wyrd-auth-issue = { workspace = true }
 wyrd-error-derive = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
+wyrd-sql = { workspace = true, features = ["embedded-postgres"] }
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -41,3 +49,4 @@ predicates = "3"
 tempfile = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }
+wyrd-dev-fixtures = { workspace = true, features = ["pg"] }

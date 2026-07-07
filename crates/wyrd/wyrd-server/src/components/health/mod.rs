@@ -360,7 +360,11 @@ mod tests {
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
-        let state = crate::state::AppState::new(postgres, storage);
+        let state = crate::state::AppState::new(
+            postgres,
+            storage,
+            crate::test_support::test_catalog().await,
+        );
 
         let shutdown = CancellationToken::new();
         let shutdown_clone = shutdown.clone();

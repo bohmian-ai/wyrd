@@ -22,6 +22,7 @@ pub use principal::{
     InvalidRoleName, Principal, PrincipalId, PrincipalKind, PrincipalRef, RoleRef,
 };
 pub use request_context::{DelegationStep, RequestContext, TraceParent};
+pub use wyrd_spec::reference::CardRefScope;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 

@@ -42,6 +42,7 @@ url        = { workspace = true }
 uuid       = { workspace = true, features = ["v7"] }
 serde      = { workspace = true, features = ["derive"] }
 sha2       = { workspace = true }
+hex        = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
 

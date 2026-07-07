@@ -1,13 +1,10 @@
 //! Request ID middleware.
 
-use std::net::{IpAddr, SocketAddr};
-
 use axum::body::Body;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::State;
 use axum::http::{HeaderValue, Request, header::HeaderName};
 use axum::middleware::Next;
 use axum::response::Response;
-use ipnetwork::IpNetwork;
 use wyrd_runtime::request_id::{inspect_header, mint};
 
 use crate::state::AppState;
@@ -17,39 +14,23 @@ pub const REQUEST_ID_HEADER: &str = "wyrd-request-id";
 
 /// Attach a Wyrd request ID extension to every inbound HTTP request.
 ///
-/// Trusts and propagates an inbound `wyrd-request-id` header only when
-/// `state.trusted_request_id_propagation` is enabled and the peer IP is in
-/// `state.trusted_upstreams_parsed`. All other requests mint a fresh ID.
+/// Propagates a valid inbound `wyrd-request-id` header from any caller;
+/// mints a fresh UUID v7 when the header is absent or unparseable.
 ///
 /// After the handler runs, the middleware:
 /// - Writes the request ID into the `wyrd-request-id` response header.
 /// - Injects an `instance` field into problem+json error responses that lack
 ///   one, linking the response back to the request ID.
 pub async fn attach_request_id(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    // Read ConnectInfo from extensions rather than using it as an extractor so
-    // the function signature stays a simple 3-tuple and avoids the axum
-    // OptionalFromRequestParts constraint on ConnectInfo's non-Infallible rejection.
-    let peer_trusted = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip())
-        .map(|ip| is_trusted(&ip, &state.trusted_upstreams_parsed))
-        .unwrap_or(false);
-
-    let propagation = if state.trusted_request_id_propagation && peer_trusted {
-        let inbound = request
-            .headers()
-            .get(REQUEST_ID_HEADER)
-            .and_then(|v| v.to_str().ok());
-        inspect_header(inbound)
-    } else {
-        inspect_header(None)
-    };
-
+    let inbound = request
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let propagation = inspect_header(inbound);
     let request_id = propagation.request_id.unwrap_or_else(mint);
     tracing::Span::current().record("request_id", request_id.as_str());
     request.extensions_mut().insert(request_id.clone());
@@ -67,10 +48,6 @@ pub async fn attach_request_id(
     }
 
     response
-}
-
-fn is_trusted(ip: &IpAddr, networks: &[IpNetwork]) -> bool {
-    networks.iter().any(|net| net.contains(*ip))
 }
 
 fn should_inject_instance(response: &Response) -> bool {
@@ -118,45 +95,23 @@ async fn inject_instance(
 }
 
 #[cfg(test)]
-fn inspect_inbound_request_id(
-    request: &Request<Body>,
-    trusted_request_id_propagation: bool,
-) -> wyrd_runtime::request_id::RequestIdPropagation {
-    if !trusted_request_id_propagation {
-        return inspect_header(None);
-    }
-    let inbound = request
-        .headers()
-        .get(REQUEST_ID_HEADER)
-        .and_then(|value| value.to_str().ok());
-    inspect_header(inbound)
-}
-
-#[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
-
     use axum::body::Body;
     use axum::http::Request;
+    use wyrd_runtime::request_id::inspect_header;
     use wyrd_spec::request_id::RequestId;
 
-    use super::{REQUEST_ID_HEADER, inspect_inbound_request_id, is_trusted};
+    use super::REQUEST_ID_HEADER;
 
     #[test]
-    fn untrusted_edge_mints_fresh_ulid() {
+    fn valid_inbound_request_id_is_propagated() {
         let inbound = uuid::Uuid::now_v7().to_string();
         let request = request_with_header(&inbound);
-        let propagation = inspect_inbound_request_id(&request, false);
-
-        assert!(propagation.should_generate);
-        assert_eq!(propagation.request_id, None);
-    }
-
-    #[test]
-    fn trusted_upstream_honors_parseable_inbound() {
-        let inbound = uuid::Uuid::now_v7().to_string();
-        let request = request_with_header(&inbound);
-        let propagation = inspect_inbound_request_id(&request, true);
+        let header_val = request
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok());
+        let propagation = inspect_header(header_val);
 
         assert!(!propagation.should_generate);
         assert_eq!(
@@ -166,21 +121,23 @@ mod tests {
     }
 
     #[test]
-    fn trusted_upstream_falls_back_to_fresh_when_unparseable() {
+    fn unparseable_inbound_request_id_mints_fresh() {
         let request = request_with_header("not-a-request-id");
-        let propagation = inspect_inbound_request_id(&request, true);
+        let header_val = request
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok());
+        let propagation = inspect_header(header_val);
 
         assert!(propagation.should_generate);
         assert_eq!(propagation.request_id, None);
     }
 
     #[test]
-    fn peer_outside_allowlist_mints_fresh() {
-        let trusted: Vec<ipnetwork::IpNetwork> = vec!["10.0.0.0/8".parse().expect("valid cidr")];
-        let outsider = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
-        assert!(!is_trusted(&outsider, &trusted));
-        let insider = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
-        assert!(is_trusted(&insider, &trusted));
+    fn absent_header_mints_fresh() {
+        let propagation = inspect_header(None);
+        assert!(propagation.should_generate);
+        assert_eq!(propagation.request_id, None);
     }
 
     fn request_with_header(value: &str) -> Request<Body> {

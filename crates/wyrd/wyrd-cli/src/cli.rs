@@ -3,6 +3,7 @@
 use clap::{Parser, Subcommand};
 
 use crate::auth::AuthCommand;
+use crate::dev::DevCommand;
 use crate::eval::run::EvalCommand;
 use crate::principal::PrincipalCommand;
 
@@ -21,6 +22,9 @@ pub enum Command {
     /// Authenticate with a Wyrd server (login, refresh, issue-key).
     #[command(subcommand)]
     Auth(AuthCommand),
+    /// Developer utilities (bootstrap local dev environment).
+    #[command(subcommand)]
+    Dev(DevCommand),
     /// Run, manage, and compare evaluations.
     #[command(subcommand)]
     Eval(EvalCommand),

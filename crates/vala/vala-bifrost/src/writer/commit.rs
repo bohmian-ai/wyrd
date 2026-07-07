@@ -16,6 +16,7 @@ use iceberg_catalog_sql::SqlCatalog;
 use sqlx::PgPool;
 use sqlx::types::Uuid;
 use wyrd_spec::ids::DataTenantId;
+use wyrd_spec::vala::api::AuditEvent;
 
 use crate::error::BifrostError;
 use crate::types::TableUid;
@@ -82,6 +83,13 @@ enum Phase1 {
 /// # Errors
 /// Returns [`BifrostError`] when the control-plane txn, Parquet write, or Iceberg
 /// append fails, or when the `batch_id` collides with a failed/in-flight anchor.
+///
+/// `audit` is the transactional audit-outbox event to append in the same tx as
+/// the successful finalize (S3.C5). It is `None` on paths that must NOT self-feed
+/// the audit spine — most importantly the relay flush (`origin == "audit-relay"`,
+/// review M-11) — and on the internal/system re-flush. On the idempotent replay
+/// path no new op occurred, so no audit row is appended.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_commit(
     pool: &PgPool,
     catalog: &SqlCatalog,
@@ -89,11 +97,17 @@ pub async fn run_commit(
     table_uid: &TableUid,
     batches: Vec<RecordBatch>,
     batch_id: [u8; 16],
+    origin: &str,
+    actor: &str,
     tenant: DataTenantId,
+    audit: Option<AuditEvent>,
 ) -> Result<(i64, Option<Table>), BifrostError> {
     let table_fqn = table.identifier().to_string();
 
-    let phase1 = claim_batch(pool, table_uid, &batch_id, tenant, &table_fqn).await?;
+    let phase1 = claim_batch(
+        pool, table_uid, &batch_id, origin, actor, tenant, &table_fqn,
+    )
+    .await?;
 
     match phase1 {
         Phase1::Replay { snapshot_id } => Ok((snapshot_id, None)),
@@ -111,6 +125,7 @@ pub async fn run_commit(
                 tenant,
                 owner,
                 fencing_token,
+                audit,
             )
             .await?;
             Ok((snapshot_id, Some(updated_table)))
@@ -163,6 +178,8 @@ async fn claim_batch(
     pool: &PgPool,
     table_uid: &TableUid,
     batch_id: &[u8; 16],
+    origin: &str,
+    actor: &str,
     tenant: DataTenantId,
     table_fqn: &str,
 ) -> Result<Phase1, BifrostError> {
@@ -201,9 +218,15 @@ async fn claim_batch(
             Err(BifrostError::CommitConflict(table_fqn.to_string()))
         }
         None => {
-            vala_sql::queries::olap_catalog::precommit(&mut conn, table_uid.as_bytes(), batch_id)
-                .await
-                .map_err(BifrostError::Sql)?;
+            vala_sql::queries::olap_catalog::precommit(
+                &mut conn,
+                table_uid.as_bytes(),
+                batch_id,
+                origin,
+                actor,
+            )
+            .await
+            .map_err(BifrostError::Sql)?;
 
             let owner = *WRITER_INSTANCE;
             let fencing_token =
@@ -254,6 +277,7 @@ async fn write_and_finalize(
     tenant: DataTenantId,
     owner: Uuid,
     fencing_token: i64,
+    audit: Option<AuditEvent>,
 ) -> Result<(i64, Table), BifrostError> {
     let files = match write_batches(table, batches).await {
         Err(e) => {
@@ -323,6 +347,20 @@ async fn write_and_finalize(
     )
     .await
     .map_err(BifrostError::Sql)?;
+
+    // Append the audit-outbox row in the SAME tx as the finalize (S3.C5): a
+    // rolled-back commit leaves no audit row, and an audit-append failure
+    // fails the op closed (WYRD_VALA_500_AUDIT_UNAVAILABLE). Only the fenced,
+    // truly-finalized commit is audited; a lost fence (finalized == false) is
+    // the recovery path's concern and appends nothing here.
+    if finalized && let Some(event) = audit.as_ref() {
+        vala_sql::queries::audit_outbox::append_audit(&mut conn, event)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "audit outbox append failed; refusing commit");
+                BifrostError::AuditUnavailable("audit outbox append failed".to_string())
+            })?;
+    }
 
     conn.commit().await.map_err(BifrostError::Sql)?;
 
@@ -474,7 +512,10 @@ pub async fn run_commit_with_fault(
     fault: FaultPoint,
 ) -> Result<(i64, Option<Table>), BifrostError> {
     let table_fqn = table.identifier().to_string();
-    let phase1 = claim_batch(pool, table_uid, &batch_id, tenant, &table_fqn).await?;
+    let phase1 = claim_batch(
+        pool, table_uid, &batch_id, "system", "system", tenant, &table_fqn,
+    )
+    .await?;
     let (owner, fencing_token) = match phase1 {
         Phase1::Replay { snapshot_id } => return Ok((snapshot_id, None)),
         Phase1::Fresh {

@@ -1,0 +1,61 @@
+---
+title: Self-hosting
+description: Run the Wyrd server yourself. Configuration, database, storage, auth, and the runtime architecture.
+pillar: wyrd
+group: Self-hosting
+order: 1
+---
+
+# Self-hosting
+
+Wyrd ships as a single server binary, and it is the control plane for your cards. It stores and validates them, derives their lineage, enforces auth and policy, records audit, and answers queries against them. This section is for the person running that binary.
+
+A **card** is the typed, versioned record Wyrd keeps for one piece of an AI system: a dataset, a model, a prompt, an agent. Authors register cards; the server is the authority on what exists and how it connects. New to the model? Read [Card](/concepts/card/) and [Architecture](/concepts/architecture/) in Concepts first. Everything in this section is operational: which env vars to set, what Postgres and object storage the server needs, and what happens between process start and the first accepted request.
+
+## What the server persists
+
+The server keeps three kinds of state, across two systems you provision plus a warehouse it layers on top.
+
+- **Postgres** is the registry itself: card metadata, the derived lineage graph, auth and policy state, and the tenancy boundary. Request traffic runs under Postgres row-level security, so a tenant sees only its own rows. See [Database](/self-hosting/database/).
+- **Object storage** holds the bytes a card points at, like a model file or a dataset. Postgres stores the metadata; the object store stores the file. See [Storage](/self-hosting/storage/).
+- **The Vala warehouse** records observations, the runs and traces your models and agents emit, into an OLAP store called Bifrost for analytical queries. You do not set it up separately, but its catalog and recovery database roles show up in [Database](/self-hosting/database/).
+
+That separation is why Database and Storage are their own pages. They are different systems with different jobs.
+
+## Tenancy
+
+Wyrd is multi-tenant. One server serves many tenants, isolated in the database, which is what makes the hosted product work. Self-hosted, you usually run a single tenant, but the isolation is always on. Once you connect an external identity provider for login (see [SSO and OIDC](/self-hosting/sso-and-oidc/)), you name that tenant with `WYRD_SERVER_TENANT_SLUG` so its issuers attach to it; the full explanation is [the implicit tenant](/self-hosting/configuration/#the-implicit-tenant).
+
+## Start here
+
+The fastest way to see the server run is local development. Leave the database variables unset and it provisions its own Postgres. Skip the signing key and it mints an ephemeral one. You only have to point it at a storage directory.
+
+```bash
+export WYRD_STORAGE_BACKEND=local
+export WYRD_STORAGE_LOCAL_ROOT="$PWD/.wyrd-dev/storage"
+export WYRD_PUBLIC_BASE_URL=http://localhost:8080
+mkdir -p "$WYRD_STORAGE_LOCAL_ROOT"
+
+cargo run -p wyrd-server
+```
+
+That configuration is development-only. It is not safe for staging or production, and the server refuses to boot a production profile without a real signing key. See [Local development](/self-hosting/local-development/) for the walkthrough, then [Configuration](/self-hosting/configuration/) for the full env var surface a real deployment needs.
+
+## Deployment targets
+
+| Target | Use it for | Status |
+| --- | --- | --- |
+| [Local development](/self-hosting/local-development/) | A working server on your laptop with zero external dependencies. | Documented |
+| [Docker](/self-hosting/docker/) | Running the OSS image against your own Postgres and bucket. | Placeholder |
+| [Binary](/self-hosting/binary/) | Deploying the compiled server to a host or VM. | Placeholder |
+| [Enterprise](/self-hosting/enterprise/) | Multi-tenant SaaS with custom policy, audit, and identity. | Placeholder |
+
+## Pages
+
+- [Architecture](/self-hosting/architecture/): what the server is made of and how a request flows through it.
+- [Running the server](/self-hosting/running-the-server/): the CLI, serve modes, boot sequence, and graceful shutdown.
+- [Configuration](/self-hosting/configuration/): every environment variable, the config file, and validation rules.
+- [Database](/self-hosting/database/): Postgres setup, the roles the server needs, and migrations.
+- [Storage](/self-hosting/storage/): local, S3, GCS, and Azure backends with the credentials each one needs.
+- [Authentication](/self-hosting/authentication/): principals, tokens, and setting up signing and sealing keys.
+- [SSO and OIDC](/self-hosting/sso-and-oidc/): wiring an identity provider for human login and machine workloads.

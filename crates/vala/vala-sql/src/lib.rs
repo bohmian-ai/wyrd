@@ -66,6 +66,9 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
                  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vala_recovery') THEN
                      GRANT USAGE ON SCHEMA vala TO vala_recovery;
                  END IF;
+                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vala_audit_relay') THEN
+                     GRANT USAGE, CREATE ON SCHEMA vala TO vala_audit_relay;
+                 END IF;
              END $$",
         )
         .execute(&mut *conn)

@@ -1,0 +1,80 @@
+---
+title: Authentication
+description: The principals, tokens, and grants the server uses, plus generating and mounting the signing and sealing keys.
+pillar: wyrd
+group: Self-hosting
+order: 7
+---
+
+# Authentication
+
+Wyrd authenticates every request with a signed token. There is no session cookie and no ambient identity: a caller presents a bearer token in the `X-Wyrd-Access-Token: Bearer <token>` header, and that token is the only credential the server trusts per request. This page is the operator view. For the deeper model behind it, read [Authentication](/concepts/authentication/) and [Authorization](/concepts/authorization/) in Concepts.
+
+## Principals
+
+Every token belongs to a principal: a **User** (a human who logged in through an IdP, identified by email), a **Service** (bound to a ServiceCard), or an **Agent** (bound to an AgentCard). Services and Agents authenticate the same way and differ only in the card kind they bind to. See [Authentication](/concepts/authentication/) in Concepts for the full principal and token model.
+
+## Tokens
+
+Wyrd mints EdDSA (Ed25519) JWTs signed with its own key, presented on every request. Access tokens are short-lived; refresh tokens are issued only for the grants that rotate (human login and API-key exchange). How a token is verified, and what each grant returns, is covered in [Authentication](/concepts/authentication/). What an operator supplies is the key material below.
+
+## Grants
+
+A **grant** is how a caller proves its identity at `POST /auth/token` to get a Wyrd access token. Which one you use depends on who is calling.
+
+| Caller | Grant | Set up in |
+| --- | --- | --- |
+| A person logging in through your IdP | `authorization_code` (with PKCE) | [SSO and OIDC](/self-hosting/sso-and-oidc/#human-single-sign-on) |
+| A machine workload (CI job, Kubernetes pod) | `jwt-bearer` | [SSO and OIDC](/self-hosting/sso-and-oidc/#workload-federation) |
+| A service or script holding an API key | API-key exchange | [Running the server](/self-hosting/running-the-server/#bootstrap-key) |
+| Any caller renewing an expiring token | `refresh_token` | Automatic once a refresh token is issued |
+
+Delegation (`token-exchange`) also exists, but it is preview-gated and not production-ready; see the [SSO and OIDC limitations](/self-hosting/sso-and-oidc/#limitations). Every grant returns a Wyrd token minted with the signing key below; how each one is verified is in the [grant reference](/concepts/authentication/#grant-types). The rest of this page is the key material every deployment provides.
+
+## Signing key
+
+The signing key is Wyrd's own Ed25519 private key. It signs and verifies every Wyrd-issued token, so it is the one secret a production server cannot boot without. Provide it as a PKCS#8 PEM.
+
+Generate one:
+
+```bash
+openssl genpkey -algorithm ed25519 -out signing-key.pem
+```
+
+Mount it by path (preferred) or inline:
+
+```bash
+export WYRD_SIGNING_KEY_FILE=/run/secrets/signing-key.pem
+# or, less preferred:
+export WYRD_SIGNING_KEY_PEM="$(cat signing-key.pem)"
+```
+
+In a production profile, boot fails closed if neither is set. In development the server mints an ephemeral key on each start and logs a warning, so local runs work with no secret. That key does not survive a restart, so tokens minted against it stop verifying when the process restarts. Never use an ephemeral key outside development.
+
+<Aside title="Rotation">
+
+Rotating the signing key invalidates every token signed with the old key. Plan a rotation for a window where callers can re-authenticate, or run the new and old keys in parallel if your deployment supports multiple verifying keys.
+
+</Aside>
+
+## Sealing key
+
+The sealing key encrypts IdP client secrets at rest with AES-256-GCM. You only need it if a trusted issuer you configure carries a client secret (`secret_basic` or `secret_post` client auth). A deployment that uses only public PKCE clients and workload federation does not need one.
+
+Generate a 32-byte key, base64-encoded, and put it in a file:
+
+```bash
+openssl rand -base64 32 > sealing-key.b64
+export WYRD_SEALING_KEY_FILE=/run/secrets/sealing-key.b64
+```
+
+The file holds base64 that must decode to exactly 32 bytes. Boot fails closed if it decodes to any other length, or if an issuer needs a sealing key and none is set.
+
+## First admin key
+
+A fresh deployment has no credentials. Mint the first admin API key with the `bootstrap-key` subcommand, then use it to call the rest of the API. See [Running the server](/self-hosting/running-the-server/#bootstrap-key).
+
+## Related
+
+- [SSO and OIDC](/self-hosting/sso-and-oidc/): wiring an identity provider for human and workload login.
+- [Authentication](/concepts/authentication/) and [Authorization](/concepts/authorization/): the model behind tokens and roles.

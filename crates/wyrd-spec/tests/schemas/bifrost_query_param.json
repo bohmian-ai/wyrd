@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "QueryParam",
+  "description": "A bound SQL parameter value for a parameterized query. Arrow-free scalar set.",
+  "oneOf": [
+    {
+      "description": "SQL `NULL`.",
+      "type": "string",
+      "enum": [
+        "Null"
+      ]
+    },
+    {
+      "description": "Boolean.",
+      "type": "object",
+      "required": [
+        "Bool"
+      ],
+      "properties": {
+        "Bool": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "64-bit signed integer.",
+      "type": "object",
+      "required": [
+        "Int"
+      ],
+      "properties": {
+        "Int": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "64-bit float.",
+      "type": "object",
+      "required": [
+        "Float"
+      ],
+      "properties": {
+        "Float": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "UTF-8 text.",
+      "type": "object",
+      "required": [
+        "Text"
+      ],
+      "properties": {
+        "Text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

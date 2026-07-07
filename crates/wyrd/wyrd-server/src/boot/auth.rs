@@ -92,11 +92,10 @@ mod tests {
     use super::*;
     use chrono::Duration as ChronoDuration;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-    use wyrd_auth_verify::{
-        AccessTokenClaims, PrincipalKindWire, TokenPrincipalRef, decode_kid, verify_eddsa,
-    };
+    use wyrd_auth_verify::{AccessTokenClaims, TokenPrincipalRef, decode_kid, verify_eddsa};
     use wyrd_runtime::{PrincipalId, RoleRef};
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::PrincipalKindTag;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
@@ -109,7 +108,7 @@ mod tests {
             id: "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00"
                 .parse::<PrincipalId>()
                 .expect("static principal id is valid"),
-            kind: PrincipalKindWire::User,
+            kind: PrincipalKindTag::User,
             tenant_id: "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
                 .parse::<DataTenantId>()
                 .expect("static tenant id is valid"),
@@ -151,7 +150,7 @@ mod tests {
         let claims = verify_eddsa::<AccessTokenClaims>(&token, &decoding, Some(WYRD_ISSUER))
             .expect("minted token verifies against the assembler's derived key and issuer");
 
-        assert_eq!(claims.principal.kind, PrincipalKindWire::User);
+        assert_eq!(claims.principal.kind, PrincipalKindTag::User);
         assert_eq!(claims.iss, WYRD_ISSUER);
     }
 

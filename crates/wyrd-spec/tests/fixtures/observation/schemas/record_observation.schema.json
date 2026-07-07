@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RecordObservation",
+  "description": "Metadata descriptor for a columnar record observation.\n\nThe columnar payload travels out-of-band as an Arrow batch on the C1 ingest wire; this struct identifies only the destination table.",
+  "type": "object",
+  "required": [
+    "table"
+  ],
+  "properties": {
+    "table": {
+      "description": "Destination Bifrost table for the record batch.",
+      "type": "string"
+    }
+  }
+}

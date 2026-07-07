@@ -12,6 +12,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use wyrd_spec::error::WyrdError;
 
+use crate::bifrost::routes::router as bifrost_router;
 use crate::components::admin::admin_router;
 use crate::components::auth::auth_router;
 use crate::components::authz::authz_router;
@@ -20,6 +21,7 @@ use crate::components::health::health_router;
 use crate::components::storage::storage_router;
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::authenticate::require_authenticated;
+use crate::query::routes::router as query_router;
 use crate::state::AppState;
 
 /// Build the HTTP router with shared server state.
@@ -43,29 +45,55 @@ pub fn build_router(state: AppState) -> Router {
         .merge(eval_router())
         .merge(authz_router())
         .merge(admin_router())
+        .merge(bifrost_router())
+        .merge(query_router())
         .fallback(v1_not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_authenticated,
         ));
 
-    // ServiceBuilder builds the inner error-handling middleware stack as a
-    // single layer. Each layer in the builder wraps the one below it; the
-    // first entry here is the outermost (runs first on each request).
-    //
-    // HandleErrorLayer must be outermost in the ServiceBuilder so the combined
-    // service exports Error = Infallible, satisfying axum 0.8's Router::layer
-    // constraint (`<L::Service as Service<Request>>::Error: Into<Infallible>`).
-    //
-    // Full request traversal (outermost → innermost):
-    //   1. attach_request_id — mints/propagates ID; injects instance into errors
-    //   2. CatchPanic — converts panics to 500 before they escape the stack
-    //   3. HandleErrorLayer — maps BoxError (Elapsed, Overloaded) → HTTP response
-    //   4. LoadShed — sheds requests when ConcurrencyLimit is not ready
-    //   5. ConcurrencyLimitLayer — caps in-flight requests
-    //   6. TimeoutLayer — enforces per-request deadline
-    //   7. WyrdBodyLimit — enforces max body size
-    //   8. handler
+    let protected = apply_protected_edge(
+        Router::new().merge(auth_routes).nest("/v1", v1_group),
+        &state,
+    );
+
+    Router::new()
+        .merge(unprotected)
+        .merge(protected)
+        .with_state(state)
+        .layer(axum::middleware::from_fn(
+            crate::http::middleware::metrics::track_metrics,
+        ))
+        .layer(TraceLayer::new_for_http())
+}
+
+/// Apply the core protective edge stack to `router`: request-id propagation,
+/// panic→`WyrdError` capture, tower error mapping, load-shed, concurrency,
+/// timeout, and body limit. This is exactly what wraps core `/v1`; it is reused
+/// by `WyrdServer::merge_http_protected` so enterprise write routes get an
+/// identical edge. Does NOT add authentication — callers layer
+/// `require_authenticated` themselves (core does it on `v1_group`;
+/// `merge_http_protected` does it before calling this).
+///
+/// Generic over `S` so it can be applied to both `Router<AppState>` (core) and
+/// `Router<()>` (finalized enterprise routers). The protective layers derive
+/// their configuration from `state: &AppState`; the router's state parameter
+/// `S` is independent and unchanged.
+///
+/// Full request traversal (outermost → innermost):
+///   1. attach_request_id — mints/propagates ID; injects instance into errors
+///   2. CatchPanic — converts panics to 500 before they escape the stack
+///   3. HandleErrorLayer — maps BoxError (Elapsed, Overloaded) → HTTP response
+///   4. LoadShed — sheds requests when ConcurrencyLimit is not ready
+///   5. ConcurrencyLimitLayer — caps in-flight requests
+///   6. TimeoutLayer — enforces per-request deadline
+///   7. WyrdBodyLimit — enforces max body size
+///   8. handler
+pub(crate) fn apply_protected_edge<S>(router: Router<S>, state: &AppState) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     let inner_stack = ServiceBuilder::new()
         .layer(HandleErrorLayer::new(
             crate::http::error::map_tower_error_to_wyrd,
@@ -76,10 +104,7 @@ pub fn build_router(state: AppState) -> Router {
         .layer(crate::http::middleware::body_limit::wyrd_body_limit(
             state.limits.body_bytes,
         ));
-
-    let protected = Router::new()
-        .merge(auth_routes)
-        .nest("/v1", v1_group)
+    router
         .layer(inner_stack)
         .layer(CatchPanicLayer::custom(
             crate::http::error::wyrd_panic_response,
@@ -87,13 +112,7 @@ pub fn build_router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::http::middleware::request_id::attach_request_id,
-        ));
-
-    Router::new()
-        .merge(unprotected)
-        .merge(protected)
-        .with_state(state)
-        .layer(TraceLayer::new_for_http())
+        ))
 }
 
 async fn v1_not_found(request: Request) -> Result<(), WyrdErrorResponse> {

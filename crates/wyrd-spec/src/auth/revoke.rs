@@ -5,20 +5,7 @@ use schemars::r#gen::SchemaGenerator;
 use schemars::schema::{InstanceType, Schema, SchemaObject, StringValidation};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::PrincipalId;
-
-/// Principal-kind discriminator for auth administration requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum PrincipalKind {
-    /// Human user principal.
-    User,
-    /// Service principal.
-    Service,
-    /// Agent principal.
-    Agent,
-}
+use crate::auth::{PrincipalId, PrincipalKindTag};
 
 /// `POST /v1/principals/{id}/revoke` body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -26,7 +13,7 @@ pub enum PrincipalKind {
 #[serde(deny_unknown_fields)]
 pub struct RevokePrincipalRequest {
     /// Required kind discriminator; principal ids are only unique with their table.
-    pub principal_kind: PrincipalKind,
+    pub principal_kind: PrincipalKindTag,
     /// Required audit reason for the revocation.
     #[schemars(schema_with = "reason_schema")]
     pub reason: String,
@@ -52,7 +39,7 @@ pub struct RevokePrincipalResponse {
     /// Revoked principal id.
     pub principal_id: PrincipalId,
     /// Revoked principal kind.
-    pub principal_kind: PrincipalKind,
+    pub principal_kind: PrincipalKindTag,
     /// New tokens-not-before epoch.
     pub revoked_at: DateTime<Utc>,
     /// Number of refresh-token family rows revoked.
@@ -61,14 +48,14 @@ pub struct RevokePrincipalResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrincipalKind, RevokePrincipalRequest, RevokePrincipalResponse};
-    use crate::auth::PrincipalId;
+    use super::{RevokePrincipalRequest, RevokePrincipalResponse};
+    use crate::auth::{PrincipalId, PrincipalKindTag};
     use chrono::Utc;
 
     #[test]
     fn revoke_principal_request_roundtrips() {
         let request = RevokePrincipalRequest {
-            principal_kind: PrincipalKind::Service,
+            principal_kind: PrincipalKindTag::Service,
             reason: "operator requested rotation".to_owned(),
         };
 
@@ -96,7 +83,7 @@ mod tests {
         let now = Utc::now();
         let resp = RevokePrincipalResponse {
             principal_id: id,
-            principal_kind: PrincipalKind::Agent,
+            principal_kind: PrincipalKindTag::Agent,
             revoked_at: now,
             refresh_tokens_revoked: 3,
         };

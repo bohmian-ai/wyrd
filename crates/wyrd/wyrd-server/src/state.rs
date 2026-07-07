@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use ipnetwork::IpNetwork;
 use tokio_util::sync::CancellationToken;
+use vala_bifrost::catalog::WyrdCatalog;
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
@@ -56,12 +56,12 @@ pub struct AppState {
     pub postgres: Arc<ServerPostgres>,
     /// Process-wide artifact storage handle.
     pub storage: Arc<StorageHandle>,
+    /// Process-wide Bifrost OLAP catalog.
+    pub bifrost: Arc<WyrdCatalog>,
     /// Authentication handles: token issuance + verification + issuer/binding resolution.
     pub auth: ServerAuth,
     /// Authorization handles: policy decision + RBAC evaluation + decision audit.
     pub authz: ServerAuthz,
-    /// Trust gate for inbound Wyrd request ID propagation.
-    pub trusted_request_id_propagation: bool,
     /// Deployment posture (Development / Production) locked at boot.
     pub deployment_profile: DeploymentProfile,
     /// Shared cancellation token for cooperative shutdown.
@@ -74,8 +74,6 @@ pub struct AppState {
     pub grpc_health: HealthReporter,
     /// Cached readiness snapshot from the background readiness_loop task.
     pub readiness: Arc<ArcSwap<ReadinessSnapshot>>,
-    /// Parsed CIDR allowlist for the request-id trust gate.
-    pub trusted_upstreams_parsed: Arc<[IpNetwork]>,
     /// Tenant-keyed in-memory eval run/lease/session map. Ephemeral, single-replica.
     pub eval_runs: EvalRuns,
     /// Audit sink for eval run open/complete events.
@@ -85,14 +83,18 @@ pub struct AppState {
 impl AppState {
     /// Build runtime state from production-ready Postgres handles.
     #[must_use]
-    pub fn new(postgres: Arc<ServerPostgres>, storage: Arc<StorageHandle>) -> Self {
+    pub fn new(
+        postgres: Arc<ServerPostgres>,
+        storage: Arc<StorageHandle>,
+        bifrost: Arc<WyrdCatalog>,
+    ) -> Self {
         let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
         Self {
             postgres,
             storage,
+            bifrost,
             auth: ServerAuth::default(),
             authz: ServerAuthz::default(),
-            trusted_request_id_propagation: false,
             deployment_profile: DeploymentProfile::Development,
             shutdown_token: CancellationToken::new(),
             telemetry: Arc::new(wyrd_telemetry::init_test_only_no_global(
@@ -101,7 +103,6 @@ impl AppState {
             limits: LimitsConfig::default(),
             grpc_health: reporter,
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
-            trusted_upstreams_parsed: Arc::from(Vec::<IpNetwork>::new()),
             eval_runs: new_run_map(),
             eval_audit: Arc::new(TracingEvalAuditWriter),
         }
@@ -170,20 +171,6 @@ impl AppState {
         self
     }
 
-    /// Attach the parsed CIDR allowlist for the request-id trust gate.
-    #[must_use]
-    pub fn with_trusted_upstreams_parsed(mut self, parsed: Arc<[IpNetwork]>) -> Self {
-        self.trusted_upstreams_parsed = parsed;
-        self
-    }
-
-    /// Toggle inbound Wyrd request-id propagation trust.
-    #[must_use]
-    pub fn with_trusted_request_id_propagation(mut self, trust: bool) -> Self {
-        self.trusted_request_id_propagation = trust;
-        self
-    }
-
     /// Replace the storage handle.
     #[must_use]
     pub fn with_storage(mut self, storage: Arc<StorageHandle>) -> Self {
@@ -205,9 +192,6 @@ pub enum ProductionValidationError {
         "authz.audit_writer is NoopAuthzAuditWriter in a production build; install a real AuthzAuditWriter"
     )]
     NoopAuditWriter,
-    /// Request-id propagation is enabled with no trusted upstream CIDRs.
-    #[error("AppState.trusted_request_id_propagation=true requires non-empty trusted_upstreams")]
-    UntrustedRequestIdEdge,
     /// Token verifier is absent in a production build.
     #[error("auth.token_verifier is None in a production build; auth-plan boot must install it")]
     MissingTokenVerifier,
@@ -229,9 +213,6 @@ impl AppState {
         }
         if self.authz.audit_writer.is_stub_default() {
             return Err(ProductionValidationError::NoopAuditWriter);
-        }
-        if self.trusted_request_id_propagation && self.trusted_upstreams_parsed.is_empty() {
-            return Err(ProductionValidationError::UntrustedRequestIdEdge);
         }
         if self.auth.token_verifier.is_none() {
             return Err(ProductionValidationError::MissingTokenVerifier);
@@ -268,10 +249,8 @@ mod tests {
 
     #[tokio::test]
     async fn defaults_for_test_safe() {
-        let state = test_state();
+        let state = test_state().await;
 
-        assert!(!state.trusted_request_id_propagation);
-        assert!(state.trusted_upstreams_parsed.is_empty());
         assert_eq!(
             state.authz.policy_hook.evaluate(&context()).await,
             PolicyDecision::Allow
@@ -281,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_state_has_fresh_cancellation_token() {
-        let state = test_state();
+        let state = test_state().await;
         assert!(!state.shutdown_token.is_cancelled());
         state.shutdown_token.cancel();
         assert!(state.shutdown_token.is_cancelled());
@@ -289,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_shutdown_token_replaces_field() {
-        let state = test_state();
+        let state = test_state().await;
         let token = tokio_util::sync::CancellationToken::new();
         let state = state.with_shutdown_token(token.clone());
         token.cancel();
@@ -298,21 +277,22 @@ mod tests {
 
     #[tokio::test]
     async fn production_validate_passes_development_profile() {
-        let state = test_state();
+        let state = test_state().await;
         assert!(state.production_validate().is_ok());
     }
 
     #[tokio::test]
     async fn production_validate_rejects_stub_on_production() {
-        let state =
-            test_state().with_deployment_profile(crate::config::DeploymentProfile::Production);
+        let state = test_state()
+            .await
+            .with_deployment_profile(crate::config::DeploymentProfile::Production);
         let err = state.production_validate().unwrap_err();
         assert!(matches!(err, ProductionValidationError::StubPolicyHook));
     }
 
     #[tokio::test]
     async fn with_limits_updates_all_fields() {
-        let state = test_state();
+        let state = test_state().await;
         let limits = LimitsConfig {
             body_bytes: 2048,
             timeout: std::time::Duration::from_millis(1000),
@@ -323,7 +303,7 @@ mod tests {
         assert_eq!(state.limits.concurrency, 10);
     }
 
-    fn test_state() -> AppState {
+    async fn test_state() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
         let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
@@ -333,6 +313,7 @@ mod tests {
         AppState::new(
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
         )
     }
 

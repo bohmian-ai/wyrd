@@ -111,8 +111,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_oidc::{
-        ClaimMapping, ClaimPath, ClientAuth, JwksCache, PrincipalKindPolicy, TrustedIssuer,
-        WorkloadBinding,
+        ClaimMapping, ClaimPath, ClientAuth, JwksCache, TrustedIssuer, WorkloadBinding,
     };
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
     use wyrd_dev_fixtures::cards::seed_card_with_spec;
@@ -120,6 +119,7 @@ mod tests {
     use wyrd_runtime::{PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::{IssuerUrl, TokenType};
     use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::error::WyrdError;
@@ -575,6 +575,7 @@ mod tests {
         AppState::new(
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
         )
     }
 
@@ -946,7 +947,7 @@ mod tests {
             },
             group_role_map: HashMap::new(),
             default_roles: Vec::new(),
-            principal_kind: PrincipalKindPolicy::Workload,
+            principal_kind: IssuerTokenPolicy::Workload,
             jwks_ttl: StdDuration::from_secs(300),
         }
     }

@@ -50,12 +50,17 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&providers)?;
     register_submodule(py, "wyrd._wyrd.providers", &providers)?;
 
-    let eval = PyModule::new(py, "eval")?;
-    vala_client::python::python_register(&eval)?;
-    m.add_submodule(&eval)?;
-    register_submodule(py, "wyrd._wyrd.eval", &eval)?;
-
     wyrd_observe::python::python_register(m)?;
+
+    let bifrost = PyModule::new(py, "bifrost")?;
+    vala_sdk::python::register_bifrost(&bifrost)?;
+    m.add_submodule(&bifrost)?;
+    register_submodule(py, "wyrd._wyrd.bifrost", &bifrost)?;
+
+    let observe = PyModule::new(py, "observe")?;
+    vala_sdk::python::register_observe(&observe)?;
+    m.add_submodule(&observe)?;
+    register_submodule(py, "wyrd._wyrd.observe", &observe)?;
 
     #[cfg(feature = "testing")]
     {

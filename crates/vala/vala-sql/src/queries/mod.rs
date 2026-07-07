@@ -9,9 +9,11 @@
 
 pub mod alerts;
 pub mod anchors;
+pub mod audit_outbox;
 #[cfg(feature = "diagnostics")]
 pub mod iceberg_catalog;
 pub mod monitor;
 pub mod olap_catalog;
+pub mod olap_query_jobs;
 pub mod profiles;
 pub mod queues;

@@ -6,7 +6,10 @@ use iceberg::table::Table;
 use iceberg_catalog_sql::SqlCatalog;
 use sqlx::PgPool;
 use tokio::sync::mpsc;
+use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::DataTenantId;
+use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 use wyrd_spec::vala::system_columns::is_reserved_system_column;
 
 use crate::batch_builder::stamp_system_columns;
@@ -15,7 +18,47 @@ use crate::registry::Registry;
 use crate::types::{TableScope, TableUid};
 use crate::writer::buffer::AppendBuffer;
 use crate::writer::commit::run_commit;
-use crate::writer::{TableWriterHandle, WriteCmd};
+use crate::writer::{BifrostWriteContext, TableWriterHandle, WriteCmd};
+
+/// The audit-outbox `origin` that marks the relay's own write into
+/// `vala.system.audit_log`. A commit under this origin MUST NOT append an audit
+/// row, or the relay would self-feed the spine (review M-11).
+pub(crate) const AUDIT_RELAY_ORIGIN: &str = "audit-relay";
+
+/// Build the C1 ingest-commit [`AuditEvent`] from the writer context.
+///
+/// The Principal is not reachable this deep in the write path (S3.C5 seam), so
+/// the attribution is reconstructed from the [`BifrostWriteContext`] the C1
+/// orchestrator set: `principal_id` parses `actor`, the writer-identity
+/// `card_ref` carries the principal kind (Service/Agent), and a card-less write
+/// is a `User`. An internal record write authenticates as `Internal`. `result`
+/// is `Success` because this event is only appended on the finalized commit.
+fn ingest_audit_event(ctx: &BifrostWriteContext, resource: &str) -> AuditEvent {
+    let principal_kind = match ctx.card_ref.as_ref() {
+        Some(card) if card.kind == CardKind::Agent => PrincipalKindTag::Agent,
+        Some(_) => PrincipalKindTag::Service,
+        None => PrincipalKindTag::User,
+    };
+    let principal_id = ctx
+        .actor
+        .parse::<PrincipalId>()
+        .unwrap_or_else(|_| PrincipalId::new(uuid::Uuid::nil()));
+
+    AuditEvent {
+        request_id: ctx.request_id.clone(),
+        trace_id: None,
+        operation: format!("bifrost.{}.commit", ctx.origin),
+        resource: resource.to_string(),
+        card_ref: ctx.card_ref.clone(),
+        principal_id,
+        principal_kind,
+        auth_method: AuthMethod::Internal,
+        permission: "bifrost.record_write".to_string(),
+        decision: AuditDecision::Allow,
+        result: AuditResult::Success,
+        payload_summary: "bifrost record commit".to_string(),
+    }
+}
 
 struct CommitActor {
     receiver: mpsc::Receiver<WriteCmd>,
@@ -56,8 +99,8 @@ impl CommitActor {
                 WriteCmd::Write(batch, reply) => {
                     let _ = reply.send(self.accept(batch));
                 }
-                WriteCmd::Flush(reply) => {
-                    let result = self.flush().await;
+                WriteCmd::Flush(ctx, reply) => {
+                    let result = self.flush(*ctx).await;
                     let _ = reply.send(result);
                 }
             }
@@ -83,15 +126,28 @@ impl CommitActor {
     /// Stamp every buffered batch with the system columns and commit them as one
     /// 2PC transaction. On any failure the drained batches are restored to the
     /// buffer so the caller can retry. An empty buffer is a no-op returning `0`.
-    async fn flush(&mut self) -> Result<i64, BifrostError> {
+    async fn flush(&mut self, ctx: BifrostWriteContext) -> Result<i64, BifrostError> {
         if self.buffer.is_empty() {
             return Ok(0);
         }
 
         let batches = self.buffer.drain();
-        let batch_id = *uuid::Uuid::now_v7().as_bytes();
+        let batch_id = ctx.batch_id;
         let ingested_at_us = now_micros();
         let stamp_tenant = self.scope.stamp_tenant(self.data_tenant);
+
+        // Audit attribution for the transactional outbox append (S3.C5). The
+        // relay's own write (`origin == "audit-relay"`) is skipped so it never
+        // self-feeds the spine (M-11); every other commit appends one row in the
+        // same tx as the finalize.
+        let audit = if ctx.origin == AUDIT_RELAY_ORIGIN {
+            None
+        } else {
+            Some(ingest_audit_event(
+                &ctx,
+                &self.table.identifier().to_string(),
+            ))
+        };
 
         let stamped: Vec<RecordBatch> = match batches
             .iter()
@@ -113,7 +169,10 @@ impl CommitActor {
             &self.table_uid,
             stamped,
             batch_id,
+            &ctx.origin,
+            &ctx.actor,
             self.scope.control_bind(self.data_tenant),
+            audit,
         )
         .await
         {

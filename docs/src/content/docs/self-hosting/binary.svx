@@ -1,0 +1,30 @@
+---
+title: Binary
+description: Deploy the compiled server to a host or VM.
+pillar: wyrd
+group: Self-hosting
+order: 11
+---
+
+# Binary
+
+<Aside title="Placeholder">
+
+This page is a stub. Build instructions, a systemd unit example, and release-artifact references are still being written.
+
+</Aside>
+
+The server is a single compiled binary with no runtime interpreter. Deploying it is a matter of getting the binary onto the host, giving it the environment it needs, and supervising the process.
+
+The shape of a binary deployment:
+
+- Build with `cargo build --release -p wyrd-server`, or use a published release artifact once available.
+- Provide the environment from [Configuration](/self-hosting/configuration/), including external Postgres, storage, and a signing key.
+- Run it under a supervisor (systemd, or your platform's equivalent) that sends `SIGTERM` on stop so the server drains gracefully. Set the stop timeout above `WYRD_SHUTDOWN_DRAIN_MS`.
+
+A systemd unit example and the release-artifact naming will land here.
+
+## Related
+
+- [Running the server](/self-hosting/running-the-server/): the CLI, serve modes, and graceful shutdown.
+- [Docker](/self-hosting/docker/): the same server in a container.

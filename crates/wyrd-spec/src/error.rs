@@ -1003,6 +1003,15 @@ pub enum WyrdError {
         #[serde(flatten)]
         error: WyrdStorageError,
     },
+    /// Vala/Bifrost OLAP error with a stable `WYRD_VALA_*` public code.
+    #[error(transparent)]
+    #[wyrd_error(delegate)]
+    Vala {
+        /// Stable wire Bifrost error catalog value.
+        #[from]
+        #[serde(flatten)]
+        error: crate::vala::error::BifrostError,
+    },
     /// DataCard validation failed.
     #[error("[WYRD_DATA_400_VALIDATION] {message}")]
     #[wyrd_error(
@@ -2352,6 +2361,10 @@ impl WyrdError {
                 (Cow::Borrowed(message.as_str()), details.clone())
             }
             Self::Storage { error } => (
+                Cow::Owned(error.to_string()),
+                serde_json::to_value(error).unwrap_or_else(|_| serde_json::json!({})),
+            ),
+            Self::Vala { error } => (
                 Cow::Owned(error.to_string()),
                 serde_json::to_value(error).unwrap_or_else(|_| serde_json::json!({})),
             ),

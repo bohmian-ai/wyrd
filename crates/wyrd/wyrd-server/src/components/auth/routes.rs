@@ -351,12 +351,13 @@ mod tests {
     use base64::Engine;
     use sqlx::types::Json as SqlxJson;
     use uuid::Uuid;
-    use wyrd_auth_verify::{AccessTokenClaims, PrincipalKindWire, TokenPrincipalRef};
+    use wyrd_auth_verify::{AccessTokenClaims, TokenPrincipalRef};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::IssueKeyRequest;
+    use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, SpaceName};
@@ -389,7 +390,7 @@ mod tests {
             sub: principal_id.to_string(),
             principal: TokenPrincipalRef {
                 id: principal_id,
-                kind: PrincipalKindWire::User,
+                kind: PrincipalKindTag::User,
                 tenant_id,
                 card_ref: None,
                 card_ref_scope: Default::default(),
@@ -459,7 +460,7 @@ mod tests {
         }
     }
 
-    fn lazy_state() -> AppState {
+    async fn lazy_state() -> AppState {
         use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
@@ -471,10 +472,11 @@ mod tests {
         AppState::new(
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
         )
     }
 
-    fn fixture_state(fixture: &PgFixture) -> AppState {
+    async fn fixture_state(fixture: &PgFixture) -> AppState {
         let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
@@ -486,6 +488,7 @@ mod tests {
         AppState::new(
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
         )
     }
 
@@ -533,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn issue_key_without_permission_is_rbac_denied() {
         let tenant = DataTenantId::new_v7();
-        let state = lazy_state();
+        let state = lazy_state().await;
         let caller = caller_with(Uuid::new_v4(), tenant, PermissionSet::new());
         let request = IssueKeyRequest {
             card_ref: service_card_ref(),
@@ -563,7 +566,7 @@ mod tests {
         let sa_id = insert_test_service_account(&mut conn, tenant, creator, &card_ref).await;
         conn.commit().await.expect("seed commits");
 
-        let state = fixture_state(&fixture);
+        let state = fixture_state(&fixture).await;
         let caller = caller_with(
             creator,
             tenant,

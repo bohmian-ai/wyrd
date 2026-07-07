@@ -1,0 +1,101 @@
+---
+title: Architecture
+description: The server's components, how a request flows through the protective edge, and how the process supervises and shuts down.
+pillar: wyrd
+group: Self-hosting
+order: 2
+---
+
+# Architecture
+
+The server is one process with three transports (HTTP, gRPC, and a Prometheus metrics endpoint), a shared handle registry called `AppState`, and a supervisor that owns the lifecycle of every task. Boot is a fixed, ordered sequence that fails closed. Once assembled, every transport and background worker runs under one supervisor that drains cooperatively on shutdown.
+
+That one process bundles two Wyrd subsystems. The control plane stores and validates cards, derives their lineage, and enforces auth and policy. The Vala data plane records observations, the runs and traces your models and agents emit, and answers analytical queries against them. Vala's warehouse is **Bifrost**, an Apache Iceberg catalog whose table metadata lives in Postgres and whose data files live in object storage. That is why the [Database](/self-hosting/database/) roles include a Bifrost catalog role and a Vala recovery role. For the product-level split between these planes, see [Architecture](/concepts/architecture/) in Concepts.
+
+## Component map
+
+<WyrdServerGraph />
+
+## AppState
+
+`AppState` is the process-wide handle registry. One instance is cloned into every request handler, so it holds `Arc` handles, not owned data. Foundation code attaches its handles here at boot.
+
+<DataTable
+  columns={[
+    { header: 'Field', role: 'name' },
+    { header: 'Subsystem' },
+    { header: 'What it holds' }
+  ]}
+  rows={[
+    ['postgres', 'Database', 'Composed Wyrd + Vala pools, RLS-enforced, single DB access path'],
+    ['storage', 'Storage', 'Artifact store handle (local, S3, GCS, or Azure)'],
+    ['bifrost', 'OLAP', 'Vala warehouse catalog for observations and analytical queries'],
+    ['auth', 'Auth', 'Issuing key, token verifier, issuer and workload-binding resolvers'],
+    ['authz', 'Authz', 'Policy hook, RBAC permission check, decision audit writer'],
+    ['telemetry', 'Telemetry', 'OTEL tracer provider guard, flushed on shutdown'],
+    ['limits', 'Config', 'Body size, request timeout, and concurrency ceiling'],
+    ['deployment_profile', 'Config', 'Development or Production, locked at boot'],
+    ['shutdown_token', 'Lifecycle', 'Shared CancellationToken for cooperative shutdown'],
+    ['grpc_health', 'gRPC', 'Health reporter shared with HTTP readiness'],
+    ['readiness', 'Liveness', 'Cached snapshot published by the readiness worker'],
+    ['eval_runs', 'Eval', 'Tenant-keyed in-memory run map, single replica'],
+    ['eval_audit', 'Eval', 'Sink for eval run open and complete events']
+  ]}
+/>
+
+## Request lifecycle
+
+Every authenticated route runs inside a fixed edge stack. The order matters: request-id attachment runs first so even a rejected request carries a `wyrd-request-id`, and the body limit runs last so oversized payloads are refused before a handler sees them.
+
+<WyrdSequenceDiagram
+  title="Protected request through the edge"
+  participants={['Client', 'Edge', 'Handler']}
+  messages={[
+    { from: 'Client', to: 'Edge', label: 'request' },
+    { from: 'Edge', to: 'Edge', label: 'attach wyrd-request-id (mint or propagate)' },
+    { from: 'Edge', to: 'Edge', label: 'catch-panic, timeout, concurrency, load-shed' },
+    { from: 'Edge', to: 'Edge', label: 'body limit (413 if oversized)' },
+    { from: 'Edge', to: 'Edge', label: 'require authenticated principal (401 if missing)' },
+    { from: 'Edge', to: 'Handler', label: 'verified principal in extensions' },
+    { from: 'Handler', to: 'Client', label: 'response + wyrd-request-id header', dashed: true }
+  ]}
+/>
+
+The edge layers, outermost to innermost:
+
+1. Request-id: propagate a valid inbound `wyrd-request-id`, or mint a fresh UUID v7. The id is written to the response header and injected into problem+json error bodies.
+2. Catch-panic: a panicking handler becomes a `500` problem+json response instead of a dropped connection.
+3. Timeout, concurrency limit, and load shed: enforce `limits.timeout` and `limits.concurrency`, shedding with `503` when saturated.
+4. Body limit: reject bodies over `limits.body_bytes` with `413`, using the `Content-Length` fast path before buffering.
+5. Authentication: `/v1` routes require a valid bearer token. Missing or invalid tokens get `401` before the handler runs.
+
+Health routes (`/healthz`, `/readyz`) sit outside the auth layer by design. They carry panic protection but no token requirement.
+
+## Supervision and shutdown
+
+All transports and workers run in one `JoinSet` under a single supervisor. The supervisor waits for the first task to exit, classifies it, then drives a bounded drain.
+
+<WyrdShutdownGraph />
+
+A `SIGINT` or `SIGTERM` is the normal path: the signal watcher exits first, the shutdown token is cancelled, and every transport stops accepting new work while in-flight requests finish within `shutdown.drain_ms`. If a task fails first instead (a listener dies, a worker panics), the same drain runs, but the process exits non-zero. Anything still running when the drain deadline passes is aborted.
+
+## Extension seams
+
+The server is built to be wrapped by a downstream crate (for example an enterprise distribution) without forking core boot. Three seams matter:
+
+- `StateOverrides` lets a caller inject a real `ServerAuthz` (policy hook plus audit writer) and eval audit sink before `production_validate` runs. This is how a production deployment replaces the development stubs that the open-source boot ships.
+- `spawn_worker(name, future)` registers a named background task that joins the supervised drain, so custom workers shut down cleanly with everything else.
+- `merge_http_protected(router)` mounts extra HTTP routes behind the exact same edge stack and auth requirement as core `/v1`. A companion `merge_http` mounts deliberately unprotected routes.
+
+```rust
+let server = WyrdServer::new(config, state)?
+    .spawn_worker("tenant-usage-rollup", async move { /* ... */ })
+    .merge_http_protected(enterprise_routes());
+
+server.bind().await?.supervise().await?;
+```
+
+## Related
+
+- [Running the server](/self-hosting/running-the-server/): the boot sequence step by step, plus health and readiness.
+- [Configuration](/self-hosting/configuration/): the limits and profile fields referenced above.

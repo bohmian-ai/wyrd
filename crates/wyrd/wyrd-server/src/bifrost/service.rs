@@ -1,0 +1,409 @@
+//! RBAC-gated Bifrost catalog service functions (register / list / describe).
+//!
+//! Each function authorizes the caller against the runtime RBAC model *before*
+//! touching the `WyrdCatalog`, mirroring `storage::service`. Engine errors cross
+//! the public boundary through `BifrostError::into_public().into()` and are
+//! rendered by the single `WyrdErrorResponse`.
+
+use arrow::datatypes::Field;
+use vala_bifrost::TableScope;
+use vala_bifrost::error::BifrostError as EngineBifrostError;
+use wyrd_runtime::Permission;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::vala::api::{
+    AuditDecision, AuditResult, BifrostTableDescription, BifrostTableEntry, RegisterOutcome,
+    RegisterTableRequest, RegisterTableResponse, TableScopeWire,
+};
+
+use crate::AppState;
+use crate::audit;
+use crate::bifrost::convert;
+use crate::components::auth::Caller;
+
+/// Map an engine Bifrost error to the public `WyrdError` via the single delegate.
+fn map_engine_error(error: EngineBifrostError) -> WyrdError {
+    error.into_public().into()
+}
+
+/// Authorize the caller against a required permission before execution.
+fn authorize(caller: &Caller, required: Permission) -> Result<(), WyrdError> {
+    if caller.principal.effective_permissions.contains(&required) {
+        return Ok(());
+    }
+    Err(WyrdError::PermissionDeniedRbac {
+        message: format!("caller lacks required permission {required}"),
+        details: serde_json::json!({ "required": required }),
+    })
+}
+
+/// Authorize, appending a `decision = deny` audit row (own tx) on refusal.
+async fn authorize_audited(
+    state: &AppState,
+    caller: &Caller,
+    required: &Permission,
+    operation: &str,
+    resource: &str,
+) -> Result<(), WyrdError> {
+    if caller.principal.effective_permissions.contains(required) {
+        return Ok(());
+    }
+    let event = audit::audit_event(
+        caller,
+        operation,
+        resource,
+        &required.to_string(),
+        AuditDecision::Deny,
+        AuditResult::Failure,
+        "rbac permission denied",
+    );
+    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &event).await?;
+    Err(WyrdError::PermissionDeniedRbac {
+        message: format!("caller lacks required permission {required}"),
+        details: serde_json::json!({ "required": required }),
+    })
+}
+
+/// Map the wire scope enum to the engine scope.
+fn engine_scope(scope: TableScopeWire) -> TableScope {
+    match scope {
+        TableScopeWire::TenantOwned => TableScope::TenantOwned,
+        TableScopeWire::SystemShared => TableScope::SystemShared,
+    }
+}
+
+/// Register (idempotently create) a Bifrost table.
+///
+/// `SystemShared` registration requires `bifrost_table:install`; `TenantOwned`
+/// requires `bifrost_table:write`. A matching-fingerprint re-register returns
+/// `AlreadyExists`; a conflicting schema is `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`.
+pub async fn register_table(
+    state: &AppState,
+    caller: Caller,
+    body: RegisterTableRequest,
+) -> Result<RegisterTableResponse, WyrdError> {
+    let scope = engine_scope(body.scope);
+    let required = match scope {
+        TableScope::SystemShared => Permission::bifrost_table_install(),
+        TableScope::TenantOwned => Permission::bifrost_table_write(),
+    };
+    let operation = match scope {
+        TableScope::SystemShared => "vala.bifrost.install",
+        TableScope::TenantOwned => "vala.bifrost.register",
+    };
+    let fqn_for_audit = format!("{}.{}", body.namespace, body.name);
+    authorize_audited(state, &caller, &required, operation, &fqn_for_audit).await?;
+
+    let ns = convert::namespace_from_wire(&body.namespace)?;
+    let user_fields: Vec<Field> = body.fields.iter().map(convert::field_to_arrow).collect();
+    let fingerprint = convert::fingerprint_hex(&user_fields);
+
+    let mut partition_columns = Vec::with_capacity(body.partition_columns.len());
+    for spec in &body.partition_columns {
+        partition_columns.push(convert::partition_column_to_engine(spec)?);
+    }
+
+    let fqn = format!("{}.{}", ns.as_str(), body.name);
+
+    match state
+        .bifrost
+        .describe_table(ns, &body.name, caller.data_tenant_id)
+        .await
+    {
+        Ok(existing) => {
+            if existing.entry.fingerprint == fingerprint {
+                Ok(RegisterTableResponse {
+                    outcome: RegisterOutcome::AlreadyExists,
+                    table_uid: existing.entry.table_uid,
+                    fingerprint,
+                })
+            } else {
+                Err(wyrd_spec::vala::BifrostError::FingerprintMismatch { table: fqn }.into())
+            }
+        }
+        Err(EngineBifrostError::TableNotFound(_)) => {
+            // Audit the successful registration in the SAME tx as the catalog row
+            // (append happens inside `create_table` before its commit).
+            let event = audit::audit_event(
+                &caller,
+                operation,
+                &fqn,
+                &required.to_string(),
+                AuditDecision::Allow,
+                AuditResult::Success,
+                "bifrost table registered",
+            );
+            let table_uid = state
+                .bifrost
+                .create_table(
+                    ns,
+                    &body.name,
+                    user_fields,
+                    scope,
+                    caller.data_tenant_id,
+                    &partition_columns,
+                    Some(event),
+                )
+                .await
+                .map_err(map_engine_error)?;
+            Ok(RegisterTableResponse {
+                outcome: RegisterOutcome::Created,
+                table_uid: convert::to_hex(table_uid.as_bytes()),
+                fingerprint,
+            })
+        }
+        Err(other) => Err(map_engine_error(other)),
+    }
+}
+
+/// List the tables visible to the caller's tenant (schema-free entries).
+pub async fn list_tables(
+    state: &AppState,
+    caller: Caller,
+) -> Result<Vec<BifrostTableEntry>, WyrdError> {
+    authorize(&caller, Permission::bifrost_table_read())?;
+    state
+        .bifrost
+        .list_tables(caller.data_tenant_id)
+        .await
+        .map_err(map_engine_error)
+}
+
+/// Describe a single table (entry plus its stored field list).
+pub async fn describe_table(
+    state: &AppState,
+    caller: Caller,
+    namespace: String,
+    name: String,
+) -> Result<BifrostTableDescription, WyrdError> {
+    authorize(&caller, Permission::bifrost_table_read())?;
+    let ns = convert::namespace_from_wire(&namespace)?;
+    state
+        .bifrost
+        .describe_table(ns, &name, caller.data_tenant_id)
+        .await
+        .map_err(map_engine_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
+    use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec};
+    use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
+
+    async fn test_state() -> AppState {
+        let root = tempfile::tempdir().expect("temp dir");
+        let storage = StorageHandle::from_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_secs(600),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+            public_base_url: Some("https://wyrd.test".to_owned()),
+        })
+        .await
+        .expect("local storage handle");
+        let pool = crate::test_support::test_pool().await;
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(pool.clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pools(pool, None);
+        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
+        AppState::new(
+            postgres,
+            Arc::clone(&storage),
+            crate::test_support::test_catalog().await,
+        )
+    }
+
+    async fn caller_with(permissions: impl IntoIterator<Item = Permission>) -> Caller {
+        let tenant = crate::test_support::test_tenant().await;
+        Caller {
+            data_tenant_id: tenant,
+            principal: Principal::new(
+                PrincipalId::new(uuid::Uuid::now_v7()),
+                PrincipalKind::User,
+                tenant,
+                vec![],
+                PermissionSet::from_iter(permissions),
+            ),
+            request_id: RequestId::parse(&uuid::Uuid::now_v7().to_string())
+                .expect("request id parses"),
+        }
+    }
+
+    fn unique_name() -> String {
+        format!("t_{}", uuid::Uuid::now_v7().simple())
+    }
+
+    fn field(name: &str, data_type: DataTypeSpec) -> FieldSpec {
+        FieldSpec {
+            name: name.to_owned(),
+            data_type,
+            nullable: true,
+            metadata: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn register_req(name: &str, fields: Vec<FieldSpec>) -> RegisterTableRequest {
+        RegisterTableRequest {
+            namespace: "vala.bifrost".to_owned(),
+            name: name.to_owned(),
+            fields,
+            partition_columns: vec![],
+            scope: TableScopeWire::TenantOwned,
+        }
+    }
+
+    // These tests drive the shared embedded-Postgres pool, whose connections
+    // take reactor affinity from the runtime that establishes them. They run on
+    // the process-wide persistent runtime (not a per-test `#[tokio::test]`
+    // runtime) so the shared pool is never poisoned by a runtime that dies at
+    // test end. See `crate::test_support::shared`.
+    #[test]
+    fn bifrost_tables_register_is_idempotent() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = caller_with([Permission::bifrost_table_write()]).await;
+            let name = unique_name();
+            let req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
+
+            let first = register_table(&state, caller.clone(), req.clone())
+                .await
+                .expect("first register creates");
+            assert_eq!(first.outcome, RegisterOutcome::Created);
+
+            let second = register_table(&state, caller.clone(), req)
+                .await
+                .expect("second register is idempotent");
+            assert_eq!(second.outcome, RegisterOutcome::AlreadyExists);
+            assert_eq!(first.table_uid, second.table_uid);
+            assert_eq!(first.fingerprint, second.fingerprint);
+        });
+    }
+
+    #[test]
+    fn bifrost_tables_register_conflicting_schema_returns_mismatch() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = caller_with([Permission::bifrost_table_write()]).await;
+            let name = unique_name();
+
+            register_table(
+                &state,
+                caller.clone(),
+                register_req(&name, vec![field("id", DataTypeSpec::Int64)]),
+            )
+            .await
+            .expect("first register creates");
+
+            let err = register_table(
+                &state,
+                caller.clone(),
+                register_req(&name, vec![field("id", DataTypeSpec::Utf8)]),
+            )
+            .await
+            .expect_err("conflicting schema is rejected");
+            assert_eq!(err.status(), 409);
+            assert_eq!(err.code(), "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH");
+        });
+    }
+
+    #[test]
+    fn bifrost_tables_register_requires_write_permission() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = caller_with([]).await;
+            let err = register_table(
+                &state,
+                caller,
+                register_req(&unique_name(), vec![field("id", DataTypeSpec::Int64)]),
+            )
+            .await
+            .expect_err("no permission is denied");
+            assert_eq!(err.status(), 403);
+        });
+    }
+
+    #[test]
+    fn bifrost_tables_register_system_shared_requires_install() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+
+            // A write-only caller may not install a SystemShared table.
+            let writer = caller_with([Permission::bifrost_table_write()]).await;
+            let mut denied = register_req(&unique_name(), vec![field("id", DataTypeSpec::Int64)]);
+            denied.scope = TableScopeWire::SystemShared;
+            let err = register_table(&state, writer, denied)
+                .await
+                .expect_err("write cannot install SystemShared");
+            assert_eq!(err.status(), 403);
+
+            // An install-capable caller can.
+            let installer = caller_with([Permission::bifrost_table_install()]).await;
+            let mut allowed = register_req(&unique_name(), vec![field("id", DataTypeSpec::Int64)]);
+            allowed.scope = TableScopeWire::SystemShared;
+            let created = register_table(&state, installer, allowed)
+                .await
+                .expect("install creates SystemShared");
+            assert_eq!(created.outcome, RegisterOutcome::Created);
+        });
+    }
+
+    #[test]
+    fn bifrost_tables_list_and_describe_reflect_registration() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = caller_with([
+                Permission::bifrost_table_write(),
+                Permission::bifrost_table_read(),
+            ])
+            .await;
+            let name = unique_name();
+
+            register_table(
+                &state,
+                caller.clone(),
+                register_req(&name, vec![field("value", DataTypeSpec::Int64)]),
+            )
+            .await
+            .expect("register creates");
+
+            let entries = list_tables(&state, caller.clone()).await.expect("list");
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.name == name && e.namespace == "vala.bifrost"),
+                "registered table is listed"
+            );
+
+            let described = describe_table(&state, caller, "vala.bifrost".to_owned(), name.clone())
+                .await
+                .expect("describe");
+            assert_eq!(described.entry.name, name);
+            assert!(
+                described
+                    .fields
+                    .iter()
+                    .any(|f| f.name == "value" && f.data_type == DataTypeSpec::Int64),
+                "describe surfaces the user field"
+            );
+        });
+    }
+
+    #[test]
+    fn bifrost_tables_list_requires_read_permission() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = caller_with([]).await;
+            let err = list_tables(&state, caller)
+                .await
+                .expect_err("no read permission is denied");
+            assert_eq!(err.status(), 403);
+        });
+    }
+}

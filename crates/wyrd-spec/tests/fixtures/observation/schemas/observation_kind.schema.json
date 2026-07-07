@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ObservationKind",
+  "description": "Closed observation-kind taxonomy for Stage 3.\n\nVariants map one-to-one to the `BatchSink`/gRPC-service pairs that ingest them (`Record` → `BifrostIngestSink` → `wyrd.v1.BifrostIngestService`). Drift and Eval variants arrive in later stages; this enum is intentionally **not** `#[non_exhaustive]` — new variants require an explicit versioned contract change (review M-01).",
+  "oneOf": [
+    {
+      "description": "Columnar record batch destined for a Bifrost table.",
+      "type": "object",
+      "required": [
+        "kind",
+        "table"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "record"
+          ]
+        },
+        "table": {
+          "description": "Destination Bifrost table for the record batch.",
+          "type": "string"
+        }
+      }
+    }
+  ]
+}

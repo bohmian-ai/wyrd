@@ -11,6 +11,15 @@ use serde::{Deserialize, Serialize};
 pub struct RequestId(String);
 
 impl RequestId {
+    /// Generate a fresh `RequestId` from a newly minted UUID v7.
+    ///
+    /// Infallible: the value is generated as a valid v7 UUID, so callers that
+    /// need a correlator for a server-internal operation avoid the parse dance.
+    #[must_use]
+    pub fn now_v7() -> Self {
+        Self(uuid::Uuid::now_v7().to_string())
+    }
+
     /// Parse a `RequestId` from a UUID v7 string.
     ///
     /// # Errors

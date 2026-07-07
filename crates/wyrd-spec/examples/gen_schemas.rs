@@ -5,7 +5,7 @@ use std::path::Path;
 
 use schemars::schema_for;
 use wyrd_spec::auth::{
-    AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, PrincipalKind,
+    AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, PrincipalKindTag,
     RevokePrincipalRequest, RevokePrincipalResponse, TokenRequest, TokenResponse,
 };
 use wyrd_spec::card::agent::AgentSpec;
@@ -45,12 +45,21 @@ use wyrd_spec::storage::{
     LocalBlobUploadResponse, PartUrlResponse, UploadCompleteRequest, UploadCompleteResponse,
     UploadInitRequest, UploadInitResponse, UploadPlan, VerificationGuarantee, WireProtocol,
 };
+use wyrd_spec::vala::api::{
+    AsyncJobState, AsyncQueryRequest, AsyncQueryResponse, AsyncQueryStatus, AuditDecision,
+    AuditEvent, AuditResult, AuthMethod, BifrostErrorDescriptor, BifrostPermissionDescriptor,
+    BifrostTableDescription, BifrostTableEntry, DataTypeSpec, ExecutorAvailability,
+    FieldSpec as BifrostFieldSpec, JobUid, PartitionColumnSpec, PartitionTransformWire, QueryParam,
+    RegisterOutcome, RegisterTableRequest, RegisterTableResponse, SyncQueryRequest, TableScopeWire,
+    TableStatus, TimeUnit,
+};
 use wyrd_spec::vala::eval::{
     AgentTurnSubmission, ComparisonOperator, ConversationTurn, DagError, EvalCondition,
     EvalPassGate, EvalRecordObservation, EvalRunOpenRequest, EvalRunOpenResponse, EvalSampling,
     EvalScenarioCollection, EvalSpec, EvalTask, ExecutionPlan, SimulatedUserMode,
     SimulatedUserTurn, TurnDirective, UserTurnSubmission,
 };
+use wyrd_spec::vala::observation::{ObservationEnvelope, ObservationKind, RecordObservation};
 use wyrd_spec::vala::trace::{
     AttributeValue, GenAiEvalResult, GenAiSpanRecord, InstrumentationScope, Resource, SpanEvent,
     SpanKind, SpanLink, SpanRecord, SpanStatus, TraceSummaryRecord,
@@ -140,13 +149,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<IssuerUrl>(out, golden, "auth_issuer_url")?;
     write::<LoginInitResponse>(out, golden, "auth_login_init_response")?;
     write::<CallbackQuery>(out, golden, "auth_callback_query")?;
-    write::<PrincipalKind>(out, golden, "auth_principal_kind")?;
+    write::<PrincipalKindTag>(out, golden, "auth_principal_kind")?;
     write::<RevokePrincipalRequest>(out, golden, "auth_revoke_principal_request")?;
     write::<RevokePrincipalResponse>(out, golden, "auth_revoke_principal_response")?;
 
     // Phase 4 section 16: shared security primitives.
     write::<SecretRef>(out, golden, "security_secret_ref")?;
     write::<TlsConfig>(out, golden, "security_tls_config")?;
+
+    // Stage 3 C2a: Bifrost wire contract (table management + query).
+    write::<BifrostTableEntry>(out, golden, "bifrost_table_entry")?;
+    write::<BifrostTableDescription>(out, golden, "bifrost_table_description")?;
+    write::<TableScopeWire>(out, golden, "bifrost_table_scope")?;
+    write::<TableStatus>(out, golden, "bifrost_table_status")?;
+    write::<DataTypeSpec>(out, golden, "bifrost_data_type_spec")?;
+    write::<BifrostFieldSpec>(out, golden, "bifrost_field_spec")?;
+    write::<TimeUnit>(out, golden, "bifrost_time_unit")?;
+    write::<PartitionTransformWire>(out, golden, "bifrost_partition_transform")?;
+    write::<PartitionColumnSpec>(out, golden, "bifrost_partition_column_spec")?;
+    write::<RegisterTableRequest>(out, golden, "bifrost_register_table_request")?;
+    write::<RegisterOutcome>(out, golden, "bifrost_register_outcome")?;
+    write::<RegisterTableResponse>(out, golden, "bifrost_register_table_response")?;
+    write::<QueryParam>(out, golden, "bifrost_query_param")?;
+    write::<JobUid>(out, golden, "bifrost_job_uid")?;
+    write::<AsyncJobState>(out, golden, "bifrost_async_job_state")?;
+    write::<ExecutorAvailability>(out, golden, "bifrost_executor_availability")?;
+    write::<SyncQueryRequest>(out, golden, "bifrost_sync_query_request")?;
+    write::<AsyncQueryRequest>(out, golden, "bifrost_async_query_request")?;
+    write::<AsyncQueryResponse>(out, golden, "bifrost_async_query_response")?;
+    write::<AsyncQueryStatus>(out, golden, "bifrost_async_query_status")?;
+    write::<AuditEvent>(out, golden, "bifrost_audit_event")?;
+    write::<AuthMethod>(out, golden, "bifrost_audit_auth_method")?;
+    write::<AuditDecision>(out, golden, "bifrost_audit_decision")?;
+    write::<AuditResult>(out, golden, "bifrost_audit_result")?;
+    // Stage 3 C7: Bifrost capability catalog — error descriptors + permission descriptors.
+    // One source (these types in vala::api), two consumers: gen_schemas (snapshot) +
+    // bifrost.list_errors / bifrost.list_permissions MCP tools. Schema drift detected here.
+    write::<BifrostErrorDescriptor>(out, golden, "bifrost_error_descriptor")?;
+    write::<BifrostPermissionDescriptor>(out, golden, "bifrost_permission_descriptor")?;
     let eval_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/eval/schemas");
     fs::create_dir_all(eval_fixtures)?;
     write_fixture::<EvalSpec>(eval_fixtures, "eval_spec")?;
@@ -181,6 +221,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_fixture::<GenAiSpanRecord>(trace_fixtures, "gen_ai_span_record")?;
     write_fixture::<GenAiEvalResult>(trace_fixtures, "gen_ai_eval_result")?;
     write_fixture::<AttributeValue>(trace_fixtures, "attribute_value")?;
+
+    let obs_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/observation/schemas");
+    fs::create_dir_all(obs_fixtures)?;
+    write_fixture::<ObservationEnvelope>(obs_fixtures, "observation_envelope")?;
+    write_fixture::<ObservationKind>(obs_fixtures, "observation_kind")?;
+    write_fixture::<RecordObservation>(obs_fixtures, "record_observation")?;
     Ok(())
 }
 

@@ -1,0 +1,396 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FieldSpec",
+  "description": "Arrow-free field declaration. Follows the `card::field::FieldSpec` precedent but carries a typed [`DataTypeSpec`] instead of a loose dtype string.",
+  "type": "object",
+  "required": [
+    "data_type",
+    "name"
+  ],
+  "properties": {
+    "data_type": {
+      "description": "Logical column type.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/DataTypeSpec"
+        }
+      ]
+    },
+    "metadata": {
+      "description": "String metadata. Bifrost describe uses the `wyrd:column_class` key to flag `correlation` columns distinctly from user columns.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "name": {
+      "description": "Column name.",
+      "type": "string"
+    },
+    "nullable": {
+      "description": "Whether the column is nullable. Defaults to `true`.",
+      "default": true,
+      "type": "boolean"
+    }
+  },
+  "definitions": {
+    "DataTypeSpec": {
+      "description": "Arrow-free logical column type. The exhaustive set Bifrost accepts on the register path; the `DataTypeSpec ↔ arrow::DataType` conversion lives in the server/engine, never in `wyrd-spec`.",
+      "oneOf": [
+        {
+          "description": "Boolean.",
+          "type": "string",
+          "enum": [
+            "Bool"
+          ]
+        },
+        {
+          "description": "Signed 8-bit integer.",
+          "type": "string",
+          "enum": [
+            "Int8"
+          ]
+        },
+        {
+          "description": "Signed 16-bit integer.",
+          "type": "string",
+          "enum": [
+            "Int16"
+          ]
+        },
+        {
+          "description": "Signed 32-bit integer.",
+          "type": "string",
+          "enum": [
+            "Int32"
+          ]
+        },
+        {
+          "description": "Signed 64-bit integer.",
+          "type": "string",
+          "enum": [
+            "Int64"
+          ]
+        },
+        {
+          "description": "Unsigned 8-bit integer.",
+          "type": "string",
+          "enum": [
+            "UInt8"
+          ]
+        },
+        {
+          "description": "Unsigned 16-bit integer.",
+          "type": "string",
+          "enum": [
+            "UInt16"
+          ]
+        },
+        {
+          "description": "Unsigned 32-bit integer.",
+          "type": "string",
+          "enum": [
+            "UInt32"
+          ]
+        },
+        {
+          "description": "Unsigned 64-bit integer.",
+          "type": "string",
+          "enum": [
+            "UInt64"
+          ]
+        },
+        {
+          "description": "32-bit float.",
+          "type": "string",
+          "enum": [
+            "Float32"
+          ]
+        },
+        {
+          "description": "64-bit float.",
+          "type": "string",
+          "enum": [
+            "Float64"
+          ]
+        },
+        {
+          "description": "UTF-8 string.",
+          "type": "string",
+          "enum": [
+            "Utf8"
+          ]
+        },
+        {
+          "description": "Large UTF-8 string.",
+          "type": "string",
+          "enum": [
+            "LargeUtf8"
+          ]
+        },
+        {
+          "description": "Variable-length binary.",
+          "type": "string",
+          "enum": [
+            "Binary"
+          ]
+        },
+        {
+          "description": "Large variable-length binary.",
+          "type": "string",
+          "enum": [
+            "LargeBinary"
+          ]
+        },
+        {
+          "description": "Fixed-width binary.",
+          "type": "object",
+          "required": [
+            "FixedSizeBinary"
+          ],
+          "properties": {
+            "FixedSizeBinary": {
+              "type": "object",
+              "required": [
+                "len"
+              ],
+              "properties": {
+                "len": {
+                  "description": "Byte width.",
+                  "type": "integer",
+                  "format": "int32"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "32-bit date (days since epoch).",
+          "type": "string",
+          "enum": [
+            "Date32"
+          ]
+        },
+        {
+          "description": "64-bit date (milliseconds since epoch).",
+          "type": "string",
+          "enum": [
+            "Date64"
+          ]
+        },
+        {
+          "description": "Timestamp with explicit precision and optional timezone.",
+          "type": "object",
+          "required": [
+            "Timestamp"
+          ],
+          "properties": {
+            "Timestamp": {
+              "type": "object",
+              "required": [
+                "unit"
+              ],
+              "properties": {
+                "tz": {
+                  "description": "IANA timezone string, or `None` for timezone-naive.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "unit": {
+                  "description": "Precision.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/TimeUnit"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Time-of-day at second/millisecond precision.",
+          "type": "object",
+          "required": [
+            "Time32"
+          ],
+          "properties": {
+            "Time32": {
+              "type": "object",
+              "required": [
+                "unit"
+              ],
+              "properties": {
+                "unit": {
+                  "description": "Precision.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/TimeUnit"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Time-of-day at microsecond/nanosecond precision.",
+          "type": "object",
+          "required": [
+            "Time64"
+          ],
+          "properties": {
+            "Time64": {
+              "type": "object",
+              "required": [
+                "unit"
+              ],
+              "properties": {
+                "unit": {
+                  "description": "Precision.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/TimeUnit"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "128-bit fixed-point decimal.",
+          "type": "object",
+          "required": [
+            "Decimal128"
+          ],
+          "properties": {
+            "Decimal128": {
+              "type": "object",
+              "required": [
+                "precision",
+                "scale"
+              ],
+              "properties": {
+                "precision": {
+                  "description": "Total number of digits.",
+                  "type": "integer",
+                  "format": "uint8",
+                  "minimum": 0.0
+                },
+                "scale": {
+                  "description": "Number of fractional digits.",
+                  "type": "integer",
+                  "format": "int8"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Variable-length list of a single element type.",
+          "type": "object",
+          "required": [
+            "List"
+          ],
+          "properties": {
+            "List": {
+              "$ref": "#/definitions/DataTypeSpec"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Nested struct of named fields.",
+          "type": "object",
+          "required": [
+            "Struct"
+          ],
+          "properties": {
+            "Struct": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/FieldSpec"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "FieldSpec": {
+      "description": "Arrow-free field declaration. Follows the `card::field::FieldSpec` precedent but carries a typed [`DataTypeSpec`] instead of a loose dtype string.",
+      "type": "object",
+      "required": [
+        "data_type",
+        "name"
+      ],
+      "properties": {
+        "data_type": {
+          "description": "Logical column type.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/DataTypeSpec"
+            }
+          ]
+        },
+        "metadata": {
+          "description": "String metadata. Bifrost describe uses the `wyrd:column_class` key to flag `correlation` columns distinctly from user columns.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "description": "Column name.",
+          "type": "string"
+        },
+        "nullable": {
+          "description": "Whether the column is nullable. Defaults to `true`.",
+          "default": true,
+          "type": "boolean"
+        }
+      }
+    },
+    "TimeUnit": {
+      "description": "Timestamp / time precision. Arrow-free mirror of `arrow::datatypes::TimeUnit`.",
+      "oneOf": [
+        {
+          "description": "Seconds.",
+          "type": "string",
+          "enum": [
+            "Second"
+          ]
+        },
+        {
+          "description": "Milliseconds.",
+          "type": "string",
+          "enum": [
+            "Millisecond"
+          ]
+        },
+        {
+          "description": "Microseconds — the canonical Bifrost physical timestamp precision.",
+          "type": "string",
+          "enum": [
+            "Microsecond"
+          ]
+        },
+        {
+          "description": "Nanoseconds — a caller may name it, but Bifrost coerces to microseconds.",
+          "type": "string",
+          "enum": [
+            "Nanosecond"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -44,6 +44,9 @@ pub enum BifrostError {
     #[error("writer unavailable for table: {0}")]
     WriterUnavailable(String),
 
+    #[error("audit outbox unavailable: {0}")]
+    AuditUnavailable(String),
+
     #[error("internal bifrost failure: {0}")]
     Internal(String),
 }
@@ -89,6 +92,7 @@ impl BifrostError {
                     detail: "internal query error".to_string(),
                 }
             }
+            Self::AuditUnavailable(detail) => Pub::AuditUnavailable { detail },
             Self::Internal(detail) => Pub::Internal { detail },
         }
     }

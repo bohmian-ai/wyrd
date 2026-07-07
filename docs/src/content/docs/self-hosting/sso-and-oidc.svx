@@ -1,0 +1,94 @@
+---
+title: SSO and OIDC
+description: Wire an identity provider for human single sign-on and for machine workload federation.
+pillar: wyrd
+group: Self-hosting
+order: 8
+---
+
+# SSO and OIDC
+
+Wyrd federates two kinds of identity from external OIDC providers: humans who log in through single sign-on, and machine workloads that present a platform-issued JWT. Both are declared the same way, as a trusted issuer, and distinguished by one field: `principal_kind`. Human issuers back the login flow. Workload issuers back the `jwt-bearer` grant.
+
+Trusted issuers and workload bindings are configured as TOML arrays in the same `server.toml` the rest of [Configuration](/self-hosting/configuration/) uses (`$WYRD_CONFIG_PATH`, `/etc/wyrd/server.toml`, or `~/.config/wyrd/server.toml`). They have no environment-variable form. Any deployment that declares either one must also set `WYRD_SERVER_TENANT_SLUG` so the server knows which tenant they belong to (see [the implicit tenant](/self-hosting/configuration/#the-implicit-tenant)).
+
+## Human single sign-on
+
+A person logs in through your IdP with the OIDC authorization-code flow, secured by PKCE. Wyrd stores the login state server-side for at most five minutes and verifies the returned ID token before issuing its own tokens. The [login flow](/concepts/authentication/#human-oidc-login-flow) in Concepts has the full sequence. To set it up:
+
+1. Register Wyrd as an OIDC client at your IdP. Set the redirect URI to `https://<your-server>/auth/callback`.
+2. Add a trusted issuer with `principal_kind = "human"`, the client id, and how Wyrd authenticates back to the IdP token endpoint.
+3. Map the IdP's groups to Wyrd roles so users land with the right permissions.
+
+```toml
+[[trusted_issuers]]
+issuer            = "https://idp.example.com/realms/acme"
+client_id         = "wyrd"
+expected_audience = "wyrd"
+client_auth       = "public"
+principal_kind    = "human"
+default_roles     = ["reader"]
+
+[trusted_issuers.claim_mapping]
+subject = "sub"
+email   = "email"
+groups  = "realm_access.roles"
+
+[trusted_issuers.group_role_map]
+"wyrd-admins" = ["admin"]
+"wyrd-writers" = ["writer"]
+```
+
+`client_auth` selects how Wyrd authenticates to the IdP token endpoint: `"public"` for a PKCE-only client with no secret, `{ secret_basic = "…" }` or `{ secret_post = "…" }` for a shared client secret. If you use a client secret, the server needs a [sealing key](/self-hosting/authentication/#sealing-key) to encrypt it at rest.
+
+## Workload federation
+
+Machine workloads (Kubernetes service accounts, GitHub Actions jobs, GCP Workload Identity, SPIFFE) present a JWT their platform issued. Wyrd verifies the assertion against the issuer's JWKS, then looks up a server-owned binding that names which Service or Agent card the workload represents. The token never names its own card; the binding does.
+
+Two declarations are needed: a trusted issuer with `principal_kind = "workload"`, and a workload binding keyed by `(issuer, subject, audience)`.
+
+```toml
+[[trusted_issuers]]
+issuer            = "https://token.actions.githubusercontent.com"
+client_id         = "wyrd"
+expected_audience = "wyrd"
+client_auth       = "public"
+principal_kind    = "workload"
+
+[[workload_bindings]]
+issuer   = "https://token.actions.githubusercontent.com"
+subject  = "repo:acme/deploy:ref:refs/heads/main"
+audience = "wyrd"
+kind     = "service"
+name     = "deploy-svc"
+space    = "prod"
+version  = "1.0.0"
+```
+
+The binding's `kind` must be `service` or `agent`. Any other kind is rejected at boot because it can never resolve a principal. The `subject` is the verified external subject claim, for example a Kubernetes service account (`system:serviceaccount:default/deploy`) or a GitHub Actions repo-and-ref subject.
+
+The workload then exchanges its platform JWT for a Wyrd access token:
+
+```bash
+curl -X POST https://<your-server>/auth/token \
+  -H 'content-type: application/json' \
+  -d '{
+    "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    "assertion": "<platform-issued-jwt>",
+    "tenant": "acme"
+  }'
+```
+
+## Managing issuers at runtime
+
+Beyond boot-time TOML, trusted issuers and workload bindings have admin CRUD routes under `/v1/admin/trusted-issuers` and `/v1/admin/workload-bindings` (both require `service_accounts:write`). Use them to add or rotate federation without a server restart. See [Cloud identity](/concepts/cloud-identity/) for the full field reference and request shapes.
+
+## Limitations
+
+- `private_key_jwt` client authentication to the IdP token endpoint is not yet implemented. Use `public` (PKCE) or a client secret.
+- The delegation grant (`token-exchange`) is preview-gated and not production-ready. It is rejected under a production profile unless preview auth is explicitly enabled, which production hardening forbids.
+
+## Related
+
+- [Authentication](/self-hosting/authentication/): tokens, and the sealing key that encrypts client secrets.
+- [Cloud identity](/concepts/cloud-identity/): the full issuer and binding field reference.

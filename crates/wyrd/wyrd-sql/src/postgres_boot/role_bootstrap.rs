@@ -31,10 +31,14 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vala_recovery') THEN
         CREATE ROLE vala_recovery LOGIN PASSWORD '<recovery_pw>';
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vala_audit_relay') THEN
+        CREATE ROLE vala_audit_relay NOLOGIN BYPASSRLS;
+    END IF;
 END $$;
 GRANT wyrd_catalog TO wyrd_catalog_app;
 GRANT wyrd_catalog TO wyrd_migrator;
 GRANT vala_recovery_owner TO wyrd_migrator;
+GRANT vala_audit_relay TO wyrd_migrator;
 "#;
 
 pub(crate) const WYRD_CATALOG_APP_ROLE: &str = "wyrd_catalog_app";

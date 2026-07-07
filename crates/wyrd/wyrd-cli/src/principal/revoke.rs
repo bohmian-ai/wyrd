@@ -2,11 +2,11 @@ use std::process::ExitCode;
 
 use clap::Args;
 use url::Url;
-use wyrd_spec::auth::{PrincipalKind, RevokePrincipalRequest};
+use wyrd_spec::auth::{PrincipalKindTag, RevokePrincipalRequest};
 
 use crate::error::WyrdCliError;
 
-/// CLI mirror of [`PrincipalKind`].
+/// CLI mirror of [`PrincipalKindTag`].
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum PrincipalKindCli {
     User,
@@ -14,7 +14,7 @@ pub enum PrincipalKindCli {
     Agent,
 }
 
-impl From<PrincipalKindCli> for PrincipalKind {
+impl From<PrincipalKindCli> for PrincipalKindTag {
     fn from(value: PrincipalKindCli) -> Self {
         match value {
             PrincipalKindCli::User => Self::User,
@@ -49,7 +49,7 @@ pub async fn dispatch(args: RevokeArgs) -> Result<ExitCode, WyrdCliError> {
         .map_err(|source| WyrdCliError::UrlJoin { source })?;
 
     let body = serde_json::to_string(&RevokePrincipalRequest {
-        principal_kind: PrincipalKind::from(args.kind),
+        principal_kind: PrincipalKindTag::from(args.kind),
         reason: args.reason,
     })
     .expect("RevokePrincipalRequest serializes");

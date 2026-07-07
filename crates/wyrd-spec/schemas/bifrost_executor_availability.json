@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutorAvailability",
+  "description": "Machine-readable executor-availability signal (review M-06). In Stage 3 a queued job is accepted but its executor does not exist yet, so status carries [`ExecutorAvailability::PendingStage5`] rather than a false \"running\" claim.",
+  "oneOf": [
+    {
+      "description": "An executor is available (Stage 5+).",
+      "type": "string",
+      "enum": [
+        "Available"
+      ]
+    },
+    {
+      "description": "No executor exists yet — the job is accepted but will not run until Stage 5.",
+      "type": "string",
+      "enum": [
+        "PendingStage5"
+      ]
+    }
+  ]
+}

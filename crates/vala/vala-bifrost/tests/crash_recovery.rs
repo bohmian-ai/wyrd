@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
+use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use iceberg::Catalog as _;
@@ -86,7 +86,15 @@ async fn setup() -> Harness {
 
     let fields = vec![Field::new("val", DataType::Int64, false)];
     let table_uid = catalog
-        .create_table(NS, TABLE, fields, TableScope::TenantOwned, tenant, &[])
+        .create_table(
+            NS,
+            TABLE,
+            fields,
+            TableScope::TenantOwned,
+            tenant,
+            &[],
+            None,
+        )
         .await
         .unwrap();
 
@@ -105,9 +113,28 @@ async fn setup() -> Harness {
 }
 
 fn make_batch(n: i64) -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
+    // A client batch carries the user field plus the `run_id` / `card_ref`
+    // correlation columns (`[user + run_id + card_ref]`), matching what the
+    // ingest path decodes and what `with_system_columns` places ahead of the
+    // server-stamped columns. Omitting them leaves the stamped batch two
+    // columns short of the table schema and the positional cast in
+    // `write_batches` misaligns.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("val", DataType::Int64, false),
+        Field::new("run_id", DataType::Utf8, true),
+        Field::new("card_ref", DataType::Utf8, true),
+    ]));
     let vals: Vec<i64> = (0..n).collect();
-    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vals))]).unwrap()
+    let nrows = vals.len();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vals)),
+            Arc::new(StringArray::from(vec![None::<&str>; nrows])),
+            Arc::new(StringArray::from(vec![None::<&str>; nrows])),
+        ],
+    )
+    .unwrap()
 }
 
 fn stamped_batch(n: i64, batch_id: [u8; 16]) -> RecordBatch {
@@ -306,9 +333,15 @@ async fn recovery_skips_live_writer_lease() {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, table_uid.as_bytes(), &batch_id)
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut conn,
+        table_uid.as_bytes(),
+        &batch_id,
+        "system",
+        "system",
+    )
+    .await
+    .unwrap();
     // Stamp a future-expiring lease so claim_stale_precommits skips it.
     sqlx::query(
         "UPDATE vala.olap_commits \
@@ -376,9 +409,15 @@ async fn cold_start_maps_table_identity() {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id)
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut conn,
+        h.table_uid.as_bytes(),
+        &batch_id,
+        "system",
+        "system",
+    )
+    .await
+    .unwrap();
     // Leave writer_lease_expires_at NULL so claim_stale_precommits picks it up.
     conn.commit().await.unwrap();
 
@@ -416,6 +455,7 @@ async fn cold_start_maps_system_shared_table_identity() {
             TableScope::SystemShared,
             DataTenantId::SYSTEM_OWNER,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -426,9 +466,15 @@ async fn cold_start_maps_system_shared_table_identity() {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, DataTenantId::SYSTEM_OWNER)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, sys_uid.as_bytes(), &batch_id)
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut conn,
+        sys_uid.as_bytes(),
+        &batch_id,
+        "system",
+        "system",
+    )
+    .await
+    .unwrap();
     conn.commit().await.unwrap();
 
     // Cold-start rebuild — recovery must resolve the system-shared identity and abort.
@@ -461,9 +507,15 @@ async fn recovery_disabled_when_no_recovery_pool() {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id)
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut conn,
+        h.table_uid.as_bytes(),
+        &batch_id,
+        "system",
+        "system",
+    )
+    .await
+    .unwrap();
     conn.commit().await.unwrap();
 
     // Construct WITHOUT a recovery pool — recovery must be skipped.
@@ -524,9 +576,15 @@ async fn zombie_writer_fenced_after_recovery_claim() {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id)
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut conn,
+        h.table_uid.as_bytes(),
+        &batch_id,
+        "system",
+        "system",
+    )
+    .await
+    .unwrap();
     sqlx::query(
         "UPDATE vala.olap_commits \
          SET writer_owner = $1, writer_fencing_token = $2, \
@@ -599,9 +657,15 @@ async fn expired_writer_fenced_before_recovery_claim() {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id)
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut conn,
+        h.table_uid.as_bytes(),
+        &batch_id,
+        "system",
+        "system",
+    )
+    .await
+    .unwrap();
     sqlx::query(
         "UPDATE vala.olap_commits \
          SET writer_owner = $1, writer_fencing_token = $2, \
@@ -673,9 +737,15 @@ async fn recovery_skips_after_unexpired_renewal() {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id)
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut conn,
+        h.table_uid.as_bytes(),
+        &batch_id,
+        "system",
+        "system",
+    )
+    .await
+    .unwrap();
     sqlx::query(
         "UPDATE vala.olap_commits \
          SET writer_owner = $1, writer_fencing_token = $2, \
@@ -749,6 +819,7 @@ async fn recovery_skips_after_unexpired_renewal() {
 /// iceberg-rust version cannot roll back the orphaned snapshot). The bare audit
 /// INSERT contract is covered separately by `audit_row_roundtrips_with_byte_ids`
 /// in vala-sql/tests/olap_recovery.rs.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn fence_lost_after_append_is_detected_and_audited() {
     let h = setup().await;
@@ -762,9 +833,15 @@ async fn fence_lost_after_append_is_detected_and_audited() {
     let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, h.table_uid.as_bytes(), &batch_id)
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut conn,
+        h.table_uid.as_bytes(),
+        &batch_id,
+        "system",
+        "system",
+    )
+    .await
+    .unwrap();
     sqlx::query(
         "UPDATE vala.olap_commits \
          SET writer_owner = $1, writer_fencing_token = $2, \

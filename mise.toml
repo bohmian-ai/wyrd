@@ -115,7 +115,7 @@ run = "echo 'impl env ready: shared Postgres up; mise supplies DATABASE_URL / WY
 
 [tasks."impl:warm"]
 hide = true
-description = "Warm the shared sccache by compiling the workspace on the impl base before dispatching a wave. Per-worktree CARGO_TARGET_DIR means each executor is cold on disk; sccache turns those into warm object-cache hits. Requires sccache + RUSTC_WRAPPER=sccache in the environment."
+description = "Seed the shared cargo target dir by compiling the workspace before dispatching a wave. All executors share one CARGO_TARGET_DIR, so warming once builds the heavy deps (DataFusion/Arrow/Iceberg) a single time; each executor then reuses them instead of cold-building in parallel and racing on cargo's build lock."
 run = "cargo build --workspace --all-features --all-targets"
 
 [tasks."test:rust:workspace"]
@@ -138,7 +138,7 @@ description = """Run vala-bifrost integration tests against local Postgres.
 Runs serially because each test resets shared database state at test start.
 """
 depends = ["db:setup-roles"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
+env = { DATABASE_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = "cargo test --locked -p vala-bifrost -- --test-threads=1"
 
 [tasks."test:unit"]
@@ -170,7 +170,7 @@ run = "cargo test -p wyrd-error-derive --all-features"
 hide = true
 description = """Run wyrd-server Rust tests against the local Postgres database."""
 depends = ["db:setup-roles"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = """
 cargo test --locked -p wyrd-server --all-features -- --test-threads=1
 cargo test --locked -p wyrd-testing -- --test-threads=1
@@ -181,7 +181,7 @@ cargo test --locked -p wyrd-client --test auth_e2e_against_fixture --test discov
 hide = true
 description = """Run wyrd-auth Rust tests against the local Postgres database."""
 depends = ["db:setup-roles"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = "cargo test --locked -p wyrd-auth --all-features -- --test-threads=1"
 
 [tasks."test:wyrd-mcp"]
@@ -354,6 +354,16 @@ forbidden_wyrd_client=$(cargo tree -p wyrd-client --all-features -e normal | \
 if [ -n "$forbidden_wyrd_client" ]; then
   echo "FAIL: wyrd-client pulls forbidden client-tier deps:"
   echo "$forbidden_wyrd_client"
+  exit 1
+fi
+
+# S3.C7: wyrd-mcp must stay engine-free (no vala-bifrost, no sqlx, no datafusion, no axum).
+# Mirror of the wyrd-client guard above. Dev-deps are excluded (-e normal).
+forbidden_wyrd_mcp=$(cargo tree -p wyrd-mcp --all-features -e normal | \
+  rg '(^|[ ─└├])(sqlx|datafusion|vala-|axum)' || true)
+if [ -n "$forbidden_wyrd_mcp" ]; then
+  echo "FAIL: wyrd-mcp pulls forbidden engine deps (sqlx|datafusion|vala-|axum):"
+  echo "$forbidden_wyrd_mcp"
   exit 1
 fi
 
@@ -579,14 +589,14 @@ run = "cargo test -p wyrd-storage --all-features --test integration_azurite -- -
 hide = true
 description = "Run server-level storage HTTP e2e tests (local single-put + S3/GCS/Azure multipart) against the docker emulators + Postgres"
 depends = ["storage:up", "build:postgres", "db:setup-roles", "db:migrate"]
-env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_INTEGRATION_S3 = "1", WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_GCS_EMULATOR_HOST = "http://localhost:4443", WYRD_AZURE_EMULATOR_ENDPOINT = "http://127.0.0.1:10000", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_INTEGRATION_S3 = "1", WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_GCS_EMULATOR_HOST = "http://localhost:4443", WYRD_AZURE_EMULATOR_ENDPOINT = "http://127.0.0.1:10000", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = "cargo test -p wyrd-server --all-features --test storage_e2e -- --nocapture --test-threads=1"
 
 [tasks."test:registry-e2e"]
 hide = true
 description = "Cards registration end-to-end against a real Postgres"
 depends = ["build:postgres", "db:setup-roles", "db:migrate"]
-env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = "cargo test --locked -p wyrd-sql --features test-e2e --test cards_e2e -- --include-ignored --test-threads=1"
 
 [tasks."test:storage:s3:cloud"]
@@ -933,6 +943,14 @@ description = "Run the wyrd.testing harness pytest suite"
 dir = "python/py-wyrd"
 depends = ["py:setup:testing"]
 run = "uv run pytest -q tests/test_test_server.py"
+
+[tasks."py:test:integration"]
+hide = true
+description = "Run wyrd.testing integration journeys against a live Postgres-backed server"
+dir = "python/py-wyrd"
+depends = ["py:setup:testing"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
+run = "uv run pytest -q -m integration"
 
 [tasks."check:py-wheel-no-testing"]
 hide = true
@@ -1312,15 +1330,29 @@ else
 fi
 """
 
-[tasks."check:from-pools-allowlist"]
+[tasks."check:proto-drift"]
 hide = true
-description = "Fail if from_pools is called outside the 14 allowlisted sites (2 definition files, 9 production wiring files, 3 test files)"
+description = "Fail if the checked-in wyrd.v1 FileDescriptorSet drifts from the .proto"
 run = """
 set -e
-# from_pools may only be called from the 14 sites below.
+# Rebuilding wyrd-tonic reruns build.rs, which regenerates the descriptor
+# snapshot at crates/wyrd/wyrd-tonic/proto/wyrd.v1.bin from the .proto. Force a
+# fresh compile of the build script so a stale target cache cannot mask drift.
+touch crates/wyrd/wyrd-tonic/build.rs
+cargo build --locked -p wyrd-tonic --all-features
+git diff --exit-code -- crates/wyrd/wyrd-tonic/proto/wyrd.v1.bin \\
+  || { echo 'wyrd.v1 descriptor drift detected - rebuild wyrd-tonic and commit crates/wyrd/wyrd-tonic/proto/wyrd.v1.bin'; exit 1; }
+"""
+
+[tasks."check:from-pools-allowlist"]
+hide = true
+description = "Fail if from_pools is called outside the 16 allowlisted sites (2 definition files, 9 production wiring files, 5 test files)"
+run = """
+set -e
+# from_pools may only be called from the 16 sites below.
 # 2 definition files: wyrd-sql/src/postgres.rs, vala-sql/src/postgres.rs
 # 9 production wiring files: wyrd-server/src/{state,boot/mod,http/middleware/authenticate,components/{auth/{principal_extractor,caller_extractor,policy_hook,routes},health},postgres}.rs
-# 3 test files: wyrd-server/tests/{authz_check_route,grpc_smoke,router_smoke}.rs
+# 5 test files: wyrd-server/src/{bifrost,query}/service.rs (unit tests), wyrd-server/tests/{authz_check_route,grpc_smoke,router_smoke}.rs
 ! rg -n --no-heading -e '\\.from_pools\\(|::from_pools\\(' \
     --glob '!crates/wyrd/wyrd-sql/src/postgres.rs' \
     --glob '!crates/vala/vala-sql/src/postgres.rs' \
@@ -1333,6 +1365,8 @@ set -e
     --glob '!crates/wyrd/wyrd-server/src/components/auth/routes.rs' \
     --glob '!crates/wyrd/wyrd-server/src/components/health/mod.rs' \
     --glob '!crates/wyrd/wyrd-server/src/postgres.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/bifrost/service.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/query/service.rs' \
     --glob '!crates/wyrd/wyrd-server/tests/authz_check_route.rs' \
     --glob '!crates/wyrd/wyrd-server/tests/grpc_smoke.rs' \
     --glob '!crates/wyrd/wyrd-server/tests/router_smoke.rs' \
@@ -1412,10 +1446,14 @@ psql "$WYRD_MIGRATOR_DSN" -c "ALTER ROLE wyrd_migrator BYPASSRLS;" || true
 psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE wyrd_app LOGIN PASSWORD 'wyrd_app_pw';" || true
 psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE wyrd_platform_admin LOGIN PASSWORD 'wyrd_platform_admin_pw' BYPASSRLS;" || true
 psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE wyrd_catalog NOLOGIN;" || true
+psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE wyrd_catalog_app LOGIN PASSWORD 'wyrd_catalog_app_pw';" || true
 psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE vala_recovery_owner NOLOGIN BYPASSRLS;" || true
 psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE vala_recovery LOGIN PASSWORD 'vala_recovery_pw';" || true
 psql "$WYRD_MIGRATOR_DSN" -c "GRANT wyrd_catalog TO wyrd_migrator;" || true
+psql "$WYRD_MIGRATOR_DSN" -c "GRANT wyrd_catalog TO wyrd_catalog_app;" || true
 psql "$WYRD_MIGRATOR_DSN" -c "GRANT vala_recovery_owner TO wyrd_migrator;" || true
+psql "$WYRD_MIGRATOR_DSN" -c "CREATE ROLE vala_audit_relay NOLOGIN BYPASSRLS;" || true
+psql "$WYRD_MIGRATOR_DSN" -c "GRANT vala_audit_relay TO wyrd_migrator;" || true
 """
 
 [tasks."db:migrate"]
@@ -1425,7 +1463,7 @@ roles (wyrd_migrator BYPASSRLS, wyrd_app no-BYPASSRLS, wyrd_platform_admin
 BYPASSRLS) are present before applying DDL.
 """
 depends = ["db:setup-roles"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw" }
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = "cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture"
 
 [tasks."test:sql"]
@@ -1434,7 +1472,7 @@ description = """Run live Postgres SQL integration tests against docker-compose 
 Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, and Vala SQL suites.
 """
 depends = ["dev:pg:nuke", "db:setup-roles"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = """
 cargo test --locked -p wyrd-sql --all-features -- --nocapture --test-threads=1
 cargo test --locked -p wyrd-dev-fixtures --all-features -- --test-threads=1
@@ -1446,7 +1484,7 @@ cargo test --locked -p wyrd-storage --all-features --test sweeper -- --include-i
 hide = true
 description = "Manual Wyrd + Vala migration smoke test against local docker-compose Postgres."
 depends = ["db:setup-roles"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = """
 cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture
 cargo test --locked -p vala-sql --all-features --test migration_pg -- vala_migrations_apply_and_are_idempotent --nocapture

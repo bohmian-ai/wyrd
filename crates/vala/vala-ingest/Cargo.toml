@@ -1,0 +1,39 @@
+[package]
+name = "vala-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+vala-bifrost = { workspace = true }
+# tonic / prost / tonic-types are consumed ONLY through wyrd-tonic re-exports
+# (check:no-tonic-outside-wyrd-tonic forbids direct deps here).
+wyrd-tonic = { workspace = true, features = ["server"] }
+wyrd-spec = { workspace = true }
+wyrd-runtime = { workspace = true }
+wyrd-auth-oidc = { workspace = true }
+wyrd-auth-verify = { workspace = true }
+arrow = { workspace = true, features = ["ipc"] }
+tokio = { workspace = true, features = ["full"] }
+secrecy = { workspace = true }
+base64 = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+
+[dev-dependencies]
+wyrd-tonic = { workspace = true, features = ["server"] }
+vala-bifrost = { workspace = true }
+vala-sql = { workspace = true, features = ["testing"] }
+wyrd-storage = { workspace = true }
+arrow = { workspace = true, features = ["ipc"] }
+wyrd-runtime = { workspace = true }
+wyrd-spec = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+uuid = { workspace = true, features = ["v7"] }
+tempfile = { workspace = true }
+sqlx = { workspace = true }

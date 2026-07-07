@@ -709,7 +709,7 @@
 .mk .shell {
   display: grid;
   grid-template-columns: 250px minmax(0, 1fr) 212px;
-  max-width: 1400px;
+  max-width: 1440px;
   margin: 0 auto;
 }
 .mk .side {
@@ -835,7 +835,7 @@
 
 /* prose */
 .mk .prose {
-  max-width: 74ch;
+  max-width: 88ch;
 }
 .mk .prose h1 {
   font-family: var(--font-display);

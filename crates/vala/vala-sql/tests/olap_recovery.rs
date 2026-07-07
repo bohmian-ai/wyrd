@@ -45,9 +45,11 @@ async fn aborted_state_accepted() {
     let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, &table_uid, &batch_id)
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut conn, &table_uid, &batch_id, "system", "system",
+    )
+    .await
+    .unwrap();
     vala_sql::queries::olap_catalog::finalize_aborted(&mut conn, &table_uid, &batch_id)
         .await
         .unwrap();
@@ -76,9 +78,11 @@ async fn audit_row_roundtrips_with_byte_ids() {
     let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, &table_uid, &batch_id)
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut conn, &table_uid, &batch_id, "system", "system",
+    )
+    .await
+    .unwrap();
     conn.commit().await.unwrap();
 
     let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
@@ -122,9 +126,11 @@ async fn claim_skips_live_lease() {
     let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, &table_uid, &batch_id)
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut conn, &table_uid, &batch_id, "system", "system",
+    )
+    .await
+    .unwrap();
     vala_sql::queries::olap_catalog::record_writer_lease(
         &mut conn, &table_uid, &batch_id, owner, token, 3600,
     )
@@ -155,9 +161,11 @@ async fn claim_takes_expired_lease() {
     let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, &table_uid, &batch_id)
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut conn, &table_uid, &batch_id, "system", "system",
+    )
+    .await
+    .unwrap();
     conn.commit().await.unwrap();
 
     sqlx::query(
@@ -204,9 +212,11 @@ async fn renew_fence_returns_false_after_claim() {
     let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, &table_uid, &batch_id)
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut conn, &table_uid, &batch_id, "system", "system",
+    )
+    .await
+    .unwrap();
     conn.commit().await.unwrap();
 
     sqlx::query(
@@ -265,9 +275,11 @@ async fn scan_failed_leaves_precommit_and_allows_retry() {
     let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
         .await
         .unwrap();
-    vala_sql::queries::olap_catalog::precommit(&mut conn, &table_uid, &batch_id)
-        .await
-        .unwrap();
+    vala_sql::queries::olap_catalog::precommit(
+        &mut conn, &table_uid, &batch_id, "system", "system",
+    )
+    .await
+    .unwrap();
     conn.commit().await.unwrap();
 
     let recovery_owner = Uuid::from_bytes([0x08u8; 16]);

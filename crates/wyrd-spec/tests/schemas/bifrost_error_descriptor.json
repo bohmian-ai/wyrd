@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BifrostErrorDescriptor",
+  "description": "Descriptor for one entry in the Bifrost error catalog.\n\nEmitted by `gen_schemas` (Stage 3 C7) and returned by the `bifrost.list_errors` MCP tool.",
+  "type": "object",
+  "required": [
+    "code",
+    "remediation",
+    "status",
+    "title"
+  ],
+  "properties": {
+    "code": {
+      "description": "Stable machine-readable error code (e.g. `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND`).",
+      "type": "string"
+    },
+    "remediation": {
+      "description": "Actionable remediation guidance.",
+      "type": "string"
+    },
+    "status": {
+      "description": "HTTP status code associated with this error.",
+      "type": "integer",
+      "format": "uint16",
+      "minimum": 0.0
+    },
+    "title": {
+      "description": "Short human-readable title.",
+      "type": "string"
+    }
+  }
+}

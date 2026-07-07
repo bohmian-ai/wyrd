@@ -182,6 +182,19 @@ Downstream artifacts are brought up to this version in a sync pass.
     `annotations`), never `space`; `space` is team/workspace scope only, and
     one server may hold development, staging, and production cards side by side.
     See §"Light-card reference forms" for loader rules and the slot inventory.
+20. **User journeys are the primary test contract.** A capability is not done
+    until a real user/agent path proves it end-to-end — client → server →
+    client, against a real server (`WyrdTestServer` + embedded Postgres), not a
+    mock. The journey is the unit of correctness: for a data surface,
+    instantiate → write → shutdown/flush → read; for an agent/MCP surface,
+    discover → act → observe. Unit and integration tests support journeys by
+    isolating a seam or a branch that is awkward to drive end-to-end; they never
+    substitute for the journey. Each journey covers the happy path **and** the
+    edge/negative flows a real caller actually hits — re-register with a
+    conflicting schema, an under-privileged token, a rejected query, a replayed
+    batch. A bug that only appears when state crosses a module boundary is
+    exactly what a journey catches and an isolated test misses. See AGENTS.md
+    §11 for the tier definitions and gates.
 
 ---
 

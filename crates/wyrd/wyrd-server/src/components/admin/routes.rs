@@ -26,12 +26,11 @@ use axum::routing::post;
 use secrecy::SecretString;
 use serde::Deserialize;
 use wyrd_auth_oidc::{
-    ClaimMapping, ClaimPath, ClientAuth, OidcProvider, PrincipalKindPolicy, TrustedIssuer,
-    WorkloadBinding,
+    ClaimMapping, ClaimPath, ClientAuth, OidcProvider, TrustedIssuer, WorkloadBinding,
 };
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
-    IssuerUrl, PrincipalKindPayload, TrustedIssuerView, WorkloadBindingView,
+    IssuerTokenPolicy, IssuerUrl, TrustedIssuerView, WorkloadBindingView,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::queries::auth::{
@@ -86,12 +85,8 @@ fn claim_mapping_into_domain(payload: ClaimMappingPayload) -> ClaimMapping {
     }
 }
 
-/// Map the authored principal kind to the domain policy.
-fn principal_kind_policy(payload: PrincipalKindPayload) -> PrincipalKindPolicy {
-    match payload {
-        PrincipalKindPayload::Human => PrincipalKindPolicy::Human,
-        PrincipalKindPayload::Workload => PrincipalKindPolicy::Workload,
-    }
+fn principal_kind_policy(payload: IssuerTokenPolicy) -> IssuerTokenPolicy {
+    payload
 }
 
 /// Build the domain [`ClientAuth`], requiring a secret for the secret-bearing
@@ -587,14 +582,14 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth_oidc::{
-        ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, PrincipalKindPolicy,
-        TrustedIssuer,
+        ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, TrustedIssuer,
     };
     use wyrd_crypt::SecretKey;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::IssuerUrl;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
@@ -626,6 +621,7 @@ mod tests {
         AppState::new(
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
         )
         .with_auth(crate::components::auth::ServerAuth {
             sealing_key: Some(Arc::new(sealing_key())),
@@ -692,7 +688,7 @@ mod tests {
             },
             group_role_map: HashMap::new(),
             default_roles: vec!["viewer".to_owned()],
-            principal_kind: PrincipalKindPayload::Human,
+            principal_kind: IssuerTokenPolicy::Human,
             jwks_ttl_secs: None,
         }
     }
@@ -724,7 +720,7 @@ mod tests {
             },
             group_role_map: HashMap::new(),
             default_roles: Vec::new(),
-            principal_kind: PrincipalKindPolicy::Workload,
+            principal_kind: IssuerTokenPolicy::Workload,
             jwks_ttl: Duration::from_secs(3600),
         };
         let write = issuer_write_from_trusted(&trusted, None).expect("issuer encodes");
@@ -1043,7 +1039,7 @@ mod tests {
                 },
                 group_role_map: HashMap::new(),
                 default_roles: Vec::new(),
-                principal_kind: PrincipalKindPolicy::Workload,
+                principal_kind: IssuerTokenPolicy::Workload,
                 jwks_ttl: Duration::from_secs(3600),
             };
             let write = issuer_write_from_trusted(&trusted, None).expect("issuer encodes");

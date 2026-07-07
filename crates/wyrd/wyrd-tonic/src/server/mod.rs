@@ -7,9 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::server::Router as TonicRouter;
+use tonic::transport::server::{Router as TonicRouter, TcpIncoming};
 use tonic::transport::Server;
 use tonic_health::pb::health_server::{Health, HealthServer};
 use tonic_health::server::HealthReporter;
@@ -43,6 +44,13 @@ pub enum GrpcError {
     /// Reflection builder failed to assemble. Only emitted when reflection is enabled.
     #[error("gRPC reflection assembly failed: {0}")]
     Reflection(String),
+    /// Building the incoming stream from a pre-bound listener failed.
+    #[error("gRPC incoming listener setup failed: {0}")]
+    IncomingSetup(String),
+    /// Ingest mount was requested but no token verifier is configured. Ingest is
+    /// never mounted unauthenticated, so a missing verifier is a hard boot error.
+    #[error("gRPC ingest requires a token verifier but none is configured")]
+    MissingTokenVerifier,
 }
 
 /// Inputs to [`build_grpc_router`].
@@ -115,6 +123,26 @@ pub async fn serve_grpc(
 ) -> Result<(), GrpcError> {
     router
         .serve_with_shutdown(bind, async move { shutdown.cancelled().await })
+        .await
+        .map_err(GrpcError::Transport)
+}
+
+/// Drive the tonic server on a **pre-bound** listener to completion.
+///
+/// The caller binds the [`TcpListener`] (e.g. on an OS-assigned `:0` port) and
+/// reads its `local_addr` before serving, so the served address is known with
+/// no bind-then-rebind race — the same listener the address was read from is
+/// the one served. Returns once `shutdown.cancelled()` resolves.
+#[tracing::instrument(skip(router, listener, shutdown))]
+pub async fn serve_grpc_with_listener(
+    router: TonicRouter,
+    listener: TcpListener,
+    shutdown: CancellationToken,
+) -> Result<(), GrpcError> {
+    let incoming = TcpIncoming::from_listener(listener, true, None)
+        .map_err(|e| GrpcError::IncomingSetup(e.to_string()))?;
+    router
+        .serve_with_incoming_shutdown(incoming, async move { shutdown.cancelled().await })
         .await
         .map_err(GrpcError::Transport)
 }

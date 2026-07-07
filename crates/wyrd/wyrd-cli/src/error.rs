@@ -6,6 +6,24 @@ use wyrd_error_derive::WyrdError;
 /// Errors raised by the `wyrd` binary.
 #[derive(Debug, Error, WyrdError)]
 pub enum WyrdCliError {
+    /// `wyrd dev bootstrap` rejected because `WYRD_DATABASE_URL` points to a
+    /// non-loopback host and `--i-understand-this-is-not-production` was not set.
+    #[error(
+        "WYRD_DATABASE_URL points to a non-loopback host ({host}); \
+         wyrd dev bootstrap refuses to seed against non-local databases. \
+         Pass --i-understand-this-is-not-production to override."
+    )]
+    #[wyrd_error(
+        code = "WYRD_CLI_400_NON_LOOPBACK_DSN",
+        status = 400,
+        title = "Non-loopback database DSN rejected",
+        remediation = "Unset WYRD_DATABASE_URL to use embedded Postgres, or pass --i-understand-this-is-not-production to override."
+    )]
+    NonLoopbackDsn {
+        /// The host that was detected as non-loopback.
+        host: String,
+    },
+
     /// Client-delegated simulated-user mode was requested without a script.
     #[error("--simulated-user client requires --simulated-user-script <PATH>")]
     #[wyrd_error(
@@ -146,6 +164,55 @@ pub enum WyrdCliError {
     )]
     EvalSpecInvalid {
         /// Validation detail.
+        detail: String,
+    },
+
+    /// Database pool, connection, or query failed.
+    #[error("database error: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_500_DATABASE",
+        status = 500,
+        title = "Database error",
+        remediation = "Check WYRD_DATABASE_URL, database connectivity, and credentials."
+    )]
+    Database {
+        /// Error detail.
+        detail: String,
+    },
+
+    /// Database migration failed.
+    #[error("migration failed: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_500_MIGRATION",
+        status = 500,
+        title = "Database migration failed",
+        remediation = "Inspect the migration error and ensure the migrator DSN has the required privileges."
+    )]
+    Migration {
+        /// Error detail.
+        detail: String,
+    },
+
+    /// Embedded Postgres did not return a platform-admin DSN.
+    #[error("embedded postgres did not return a platform-admin DSN")]
+    #[wyrd_error(
+        code = "WYRD_CLI_500_MISSING_ADMIN_DSN",
+        status = 500,
+        title = "Missing platform-admin DSN",
+        remediation = "Ensure embedded Postgres is configured to emit a platform-admin DSN, or supply WYRD_PLATFORM_ADMIN_DSN."
+    )]
+    MissingAdminDsn,
+
+    /// API key hashing failed.
+    #[error("api key hashing failed: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_500_HASHING",
+        status = 500,
+        title = "API key hashing failed",
+        remediation = "This is an internal error; retry or check the wyrd-auth-issue configuration."
+    )]
+    Hashing {
+        /// Error detail.
         detail: String,
     },
 

@@ -75,7 +75,10 @@ fn bench_registry(c: &mut Criterion) {
             .write(batch)
             .await
             .expect("write invalidation batch");
-        writer_handle.flush().await.expect("flush to bump epoch");
+        writer_handle
+            .flush(vala_bifrost::writer::BifrostWriteContext::system())
+            .await
+            .expect("flush to bump epoch");
     });
 
     group.bench_function("miss_iceberg_reload", |b| {

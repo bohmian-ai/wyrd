@@ -24,6 +24,7 @@ pub struct PgFixture {
     wyrd: WyrdPostgres,
     vala: ValaPostgres,
     platform_admin_pool: PgPool,
+    catalog_dsn: SecretString,
     data_tenant_id: DataTenantId,
     tenant_slug: String,
     _test_db: TestDatabase,
@@ -103,6 +104,12 @@ impl PgFixture {
         &self.platform_admin_pool
     }
 
+    /// Borrow the fixture database's Bifrost catalog DSN.
+    #[must_use]
+    pub fn catalog_dsn(&self) -> &SecretString {
+        &self.catalog_dsn
+    }
+
     /// Return the fixture's tenant isolation key.
     #[must_use]
     pub fn data_tenant_id(&self) -> DataTenantId {
@@ -140,12 +147,14 @@ impl PgFixture {
     ) -> Result<Self, FixtureError> {
         let test_db = TestDatabase::create().await?;
         let handles = test_db.connect_handles().await?;
+        let catalog_dsn = test_db.resolved_dsns()?.catalog_app;
         seed_tenant(&handles.platform_admin, data_tenant_id, &tenant_slug).await?;
 
         Ok(Self {
             platform_admin_pool: handles.platform_admin,
             wyrd: handles.wyrd,
             vala: handles.vala,
+            catalog_dsn,
             data_tenant_id,
             tenant_slug,
             _test_db: test_db,
@@ -237,6 +246,8 @@ impl TestDatabase {
                 .as_ref()
                 .map(|dsn| database_dsn(dsn, &self.name))
                 .transpose()?,
+            catalog_app: database_dsn(&base.catalog_app, &self.name)?,
+            recovery: database_dsn(&base.recovery, &self.name)?,
         })
     }
 }

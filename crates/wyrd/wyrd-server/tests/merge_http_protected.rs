@@ -31,26 +31,23 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
-const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
-const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
-
 async fn test_state() -> AppState {
     let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
     let postgres = Arc::new(ServerPostgres::lazy_for_tests(app_pool.clone()));
     let root = tempfile::tempdir().expect("temp dir");
     let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-    let issuing_key = Arc::new(
-        IssuingKey::from_ed_pem(
-            secrecy::SecretString::from(PRIVATE_KEY_PEM),
-            Kid::new("k1").expect("kid is valid"),
-            "wyrd",
-        )
-        .expect("test issuing key loads"),
-    );
+    let kid = Kid::new("k1").expect("kid is valid");
+    let pem = IssuingKey::generate_ephemeral_pem().expect("ephemeral key generates");
+    let raw_issuing_key = IssuingKey::from_ed_pem(pem, kid.clone(), "wyrd")
+        .expect("ephemeral issuing key loads");
+    let pub_pem = raw_issuing_key
+        .verifying_key_pem()
+        .expect("public key derives from ephemeral key");
+    let issuing_key = Arc::new(raw_issuing_key);
     let mut keys = HashMap::new();
     keys.insert(
-        Kid::new("k1").expect("kid is valid"),
-        Arc::new(public_key_from_pem(PUBLIC_KEY_PEM).expect("public key loads")),
+        kid,
+        Arc::new(public_key_from_pem(pub_pem.as_bytes()).expect("public key loads")),
     );
     let verifier = Arc::new(TokenVerifier::new(
         keys,

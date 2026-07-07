@@ -185,22 +185,27 @@ impl MetricsConfig {
     /// **loopback** (`127.0.0.1`) on `http_bind`'s port + 1 — NOT `http_bind`'s
     /// IP, which may be `0.0.0.0`. Unauthenticated `/metrics` must not be
     /// public by default.
+    ///
+    /// Returns `None` when the auto-computed port would overflow (HTTP on port
+    /// 65535 has no room for `+ 1`).
     #[must_use]
-    pub fn resolved_bind(&self, http_bind: SocketAddr) -> SocketAddr {
-        self.bind.unwrap_or_else(|| {
-            SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                http_bind.port().saturating_add(1),
-            )
-        })
+    pub fn resolved_bind(&self, http_bind: SocketAddr) -> Option<SocketAddr> {
+        if let Some(bind) = self.bind {
+            return Some(bind);
+        }
+        let port = http_bind.port().checked_add(1)?;
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
     }
 
     /// True when the resolved bind is exposed beyond loopback (public IP or the
     /// unspecified `0.0.0.0`/`::` address). Used to warn in production.
+    ///
+    /// Returns `false` when the bind address cannot be resolved (port overflow).
     #[must_use]
     pub fn is_public_bind(&self, http_bind: SocketAddr) -> bool {
-        let ip = self.resolved_bind(http_bind).ip();
-        !ip.is_loopback()
+        self.resolved_bind(http_bind)
+            .map(|addr| !addr.ip().is_loopback())
+            .unwrap_or(false)
     }
 }
 
@@ -913,7 +918,13 @@ impl WyrdServerConfig {
 
         // 1b. Metrics bind must not collide with HTTP or gRPC when enabled.
         if self.metrics.enabled {
-            let metrics_bind = self.metrics.resolved_bind(self.http.bind);
+            let metrics_bind = self.metrics.resolved_bind(self.http.bind).ok_or_else(|| {
+                ConfigError::Invalid {
+                    message: "metrics port arithmetic overflow: HTTP is on port 65535, leaving \
+                              no room for the auto-computed metrics port (http_port + 1)"
+                        .to_owned(),
+                }
+            })?;
             if metrics_bind == self.http.bind || metrics_bind == self.grpc.bind {
                 return Err(ConfigError::BindCollision { bind: metrics_bind });
             }
@@ -1129,11 +1140,13 @@ impl WyrdServerConfig {
             && self.deployment_profile.is_production()
             && self.metrics.is_public_bind(self.http.bind)
         {
-            tracing::warn!(
-                bind = %self.metrics.resolved_bind(self.http.bind),
-                "unauthenticated /metrics is bound to a non-loopback address in \
-                 production; ensure a network policy restricts scrape access"
-            );
+            if let Some(bind) = self.metrics.resolved_bind(self.http.bind) {
+                tracing::warn!(
+                    %bind,
+                    "unauthenticated /metrics is bound to a non-loopback address in \
+                     production; ensure a network policy restricts scrape access"
+                );
+            }
         }
 
         Ok(())
@@ -1947,11 +1960,21 @@ mod tests {
     fn metrics_bind_defaults_to_loopback_port_plus_one() {
         let cfg = MetricsConfig::default();
         let http_bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
-        let resolved = cfg.resolved_bind(http_bind);
+        let resolved = cfg.resolved_bind(http_bind).expect("port 8080 + 1 must not overflow");
         assert_eq!(
             resolved,
             "127.0.0.1:8081".parse::<SocketAddr>().unwrap(),
             "default metrics bind must be loopback:http_port+1"
+        );
+    }
+
+    #[test]
+    fn metrics_bind_overflow_at_port_65535_returns_none() {
+        let cfg = MetricsConfig::default();
+        let http_bind: SocketAddr = "0.0.0.0:65535".parse().unwrap();
+        assert!(
+            cfg.resolved_bind(http_bind).is_none(),
+            "port 65535 + 1 overflows u16 and must return None"
         );
     }
 

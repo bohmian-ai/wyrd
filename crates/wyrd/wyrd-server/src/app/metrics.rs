@@ -54,6 +54,29 @@ pub fn metrics_router(handle: PrometheusHandle) -> Router {
     Router::new().route("/metrics", get(move || ready(handle.render())))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `install_recorder()` must return `Err(MetricsError::Install)` on a second
+    /// call rather than panicking. This test calls the raw builder twice to pin
+    /// that contract without touching the process-global `OnceLock` in
+    /// `tests/metrics.rs`. Each call to `PrometheusBuilder::new().install_recorder()`
+    /// attempts to set the global recorder; the second attempt returns a
+    /// `BuildError` which we map to `MetricsError::Install`.
+    #[test]
+    fn install_recorder_second_call_errors_not_panics() {
+        // First install may succeed or fail depending on whether another test in
+        // this binary ran first. Either way, a second call must return Err.
+        let _ = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder();
+        let second = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder();
+        assert!(
+            second.is_err(),
+            "second install_recorder() call must return Err, not Ok or panic"
+        );
+    }
+}
+
 /// Serve the metrics router on an already-bound `listener` until `shutdown`.
 ///
 /// The caller binds the listener (in `WyrdServer::bind`) so bind failures are

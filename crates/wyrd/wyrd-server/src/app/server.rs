@@ -34,7 +34,7 @@ pub struct WyrdServer {
     http_router: Router,
     grpc_router: TonicRouter,
     reporter: HealthReporter,
-    extra_workers: Vec<BoxWorker>,
+    extra_workers: Vec<(&'static str, BoxWorker)>,
 }
 
 impl WyrdServer {
@@ -121,14 +121,18 @@ impl WyrdServer {
         self
     }
 
-    /// Register an additional background worker. It shares the server shutdown
-    /// token via `self.state.shutdown_token`; the worker must observe it.
+    /// Register an additional background worker with a diagnostic `name`.
+    ///
+    /// The name is used in supervisor logs and terminal-error messages so
+    /// multiple workers can be distinguished from one another.
+    /// The worker shares the server shutdown token via `self.state.shutdown_token`
+    /// and must observe it to participate in cooperative shutdown.
     #[must_use]
-    pub fn spawn_worker<F>(mut self, worker: F) -> Self
+    pub fn spawn_worker<F>(mut self, name: &'static str, worker: F) -> Self
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.extra_workers.push(Box::pin(worker));
+        self.extra_workers.push((name, Box::pin(worker)));
         self
     }
 
@@ -179,9 +183,10 @@ impl WyrdServer {
     /// Returns [`BootExit::Other`] on listener bind failure.
     pub async fn bind(self, mode: ServeMode) -> Result<BoundServer, BootExit> {
         let (http_listener, http_addr) = if mode.serves_http() {
-            let listener = TcpListener::bind(self.config.http.bind)
-                .await
-                .map_err(|e| BootExit::Other(Box::new(e)))?;
+            let bind = self.config.http.bind;
+            let listener = TcpListener::bind(bind).await.map_err(|e| {
+                BootExit::Other(format!("HTTP listener failed to bind {bind}: {e}").into())
+            })?;
             let addr = listener
                 .local_addr()
                 .map_err(|e| BootExit::Other(Box::new(e)))?;
@@ -190,9 +195,10 @@ impl WyrdServer {
             (None, None)
         };
         let (grpc_listener, grpc_addr) = if mode.serves_grpc() {
-            let listener = TcpListener::bind(self.config.grpc.bind)
-                .await
-                .map_err(|e| BootExit::Other(Box::new(e)))?;
+            let bind = self.config.grpc.bind;
+            let listener = TcpListener::bind(bind).await.map_err(|e| {
+                BootExit::Other(format!("gRPC listener failed to bind {bind}: {e}").into())
+            })?;
             let addr = listener
                 .local_addr()
                 .map_err(|e| BootExit::Other(Box::new(e)))?;
@@ -205,10 +211,16 @@ impl WyrdServer {
         // present so a `:0` HTTP bind yields `bound_port + 1`, not `config + 1`.
         let (metrics_listener, metrics_addr) = if self.config.metrics.enabled {
             let base = http_addr.unwrap_or(self.config.http.bind);
-            let bind = self.config.metrics.resolved_bind(base);
-            let listener = TcpListener::bind(bind)
-                .await
-                .map_err(|e| BootExit::Other(Box::new(e)))?;
+            let bind = self.config.metrics.resolved_bind(base).ok_or_else(|| {
+                BootExit::Other(
+                    "metrics port arithmetic overflow: HTTP port 65535 leaves no room for the \
+                     metrics listener (would wrap to 65535)"
+                        .into(),
+                )
+            })?;
+            let listener = TcpListener::bind(bind).await.map_err(|e| {
+                BootExit::Other(format!("metrics listener failed to bind {bind}: {e}").into())
+            })?;
             let addr = listener
                 .local_addr()
                 .map_err(|e| BootExit::Other(Box::new(e)))?;
@@ -246,7 +258,7 @@ pub struct BoundServer {
     http_router: Router,
     grpc_router: TonicRouter,
     reporter: HealthReporter,
-    extra_workers: Vec<BoxWorker>,
+    extra_workers: Vec<(&'static str, BoxWorker)>,
     http_listener: Option<TcpListener>,
     grpc_listener: Option<TcpListener>,
     metrics_listener: Option<TcpListener>,
@@ -324,8 +336,8 @@ impl BoundServer {
         }
 
         // Enterprise workers.
-        for worker in self.extra_workers.drain(..) {
-            set.spawn(worker_task(TaskId::Worker("custom"), worker));
+        for (name, worker) in self.extra_workers.drain(..) {
+            set.spawn(worker_task(TaskId::Worker(name), worker));
         }
 
         // Transports — drive the listeners bound in `WyrdServer::bind`.
@@ -392,26 +404,23 @@ mod tests {
     use crate::config::WyrdServerConfig;
     use crate::postgres::ServerPostgres;
 
-    const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
-    const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
-
     async fn test_state_with_auth() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let postgres = Arc::new(ServerPostgres::lazy_for_tests(app_pool.clone()));
         let root = tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-        let issuing_key = Arc::new(
-            IssuingKey::from_ed_pem(
-                secrecy::SecretString::from(PRIVATE_KEY_PEM),
-                Kid::new("k1").expect("kid is valid"),
-                "wyrd",
-            )
-            .expect("test issuing key loads"),
-        );
+        let kid = Kid::new("k1").expect("kid is valid");
+        let pem = IssuingKey::generate_ephemeral_pem().expect("ephemeral key generates");
+        let raw_issuing_key = IssuingKey::from_ed_pem(pem, kid.clone(), "wyrd")
+            .expect("ephemeral issuing key loads");
+        let pub_pem = raw_issuing_key
+            .verifying_key_pem()
+            .expect("public key derives from ephemeral key");
+        let issuing_key = Arc::new(raw_issuing_key);
         let mut keys = HashMap::new();
         keys.insert(
-            Kid::new("k1").expect("kid is valid"),
-            Arc::new(public_key_from_pem(PUBLIC_KEY_PEM).expect("public key loads")),
+            kid,
+            Arc::new(public_key_from_pem(pub_pem.as_bytes()).expect("public key loads")),
         );
         let verifier = Arc::new(TokenVerifier::new(
             keys,

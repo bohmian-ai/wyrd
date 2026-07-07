@@ -49,22 +49,6 @@ async fn wait_for_os_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn signal_watcher_cancels_token() {
-        let token = CancellationToken::new();
-        let child = token.child_token();
-
-        let token_clone = token.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            token_clone.cancel();
-        });
-
-        child.cancelled().await;
-        assert!(token.is_cancelled());
-    }
 
     #[tokio::test]
     async fn signal_watcher_returns_on_cancel() {

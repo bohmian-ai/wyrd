@@ -15,6 +15,8 @@ path = "src/lib.rs"
 [features]
 default = []
 python = ["dep:pyo3"]
+testing = []
+bench-bin = []
 
 [dependencies]
 wyrd-queue = { workspace = true }
@@ -32,9 +34,19 @@ tracing = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
 wyrd-queue = { workspace = true }
 wyrd-runtime = { workspace = true }
+wyrd-testing = { workspace = true }
+wyrd-client = { workspace = true }
 arrow-schema = { workspace = true }
 async-trait = { workspace = true }
 secrecy = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[bench]]
+name = "bifrost_throughput"
+path = "benches/bifrost_throughput.rs"
+harness = false
+required-features = ["bench-bin"]

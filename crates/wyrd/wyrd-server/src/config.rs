@@ -247,9 +247,6 @@ pub struct WyrdServerConfig {
     /// Readiness probe configuration.
     #[serde(default)]
     pub readiness: ReadinessConfig,
-    /// Request ID propagation trust configuration.
-    #[serde(default)]
-    pub request_id: RequestIdConfig,
     /// Authentication gate configuration.
     #[serde(default)]
     pub auth: AuthConfig,
@@ -343,18 +340,6 @@ pub struct ReadinessConfig {
     /// Per-probe timeout in milliseconds.
     #[serde(default = "default_readiness_probe_timeout_ms")]
     pub probe_timeout_ms: u64,
-}
-
-/// Request ID propagation trust configuration.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RequestIdConfig {
-    /// When true, inbound `X-Request-Id` headers are forwarded from trusted upstreams.
-    #[serde(default)]
-    pub trust_upstream: bool,
-    /// CIDR-formatted allowlist of upstreams whose request IDs are trusted.
-    #[serde(default)]
-    pub trusted_upstreams: Vec<String>,
 }
 
 /// Authentication gate configuration.
@@ -862,21 +847,6 @@ impl WyrdServerConfig {
                 })?;
         }
 
-        // request_id.trust_upstream
-        if let Some(val) = env_opt("WYRD_TRUSTED_REQUEST_ID_PROPAGATION")? {
-            self.request_id.trust_upstream =
-                parse_flag(&val, "WYRD_TRUSTED_REQUEST_ID_PROPAGATION")?;
-        }
-
-        // request_id.trusted_upstreams (comma-separated CIDRs)
-        if let Some(val) = env_opt("WYRD_TRUSTED_UPSTREAMS")? {
-            self.request_id.trusted_upstreams = val
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-        }
-
         // auth.allow_preview
         if let Some(val) = env_opt("WYRD_AUTH_ALLOW_PREVIEW")? {
             self.auth.allow_preview = parse_flag(&val, "WYRD_AUTH_ALLOW_PREVIEW")?;
@@ -1012,23 +982,7 @@ impl WyrdServerConfig {
             });
         }
 
-        // 10. All trusted_upstreams must parse as valid CIDRs.
-        for cidr in &self.request_id.trusted_upstreams {
-            cidr.parse::<ipnetwork::IpNetwork>()
-                .map_err(|e| ConfigError::Invalid {
-                    message: format!("trusted upstream {cidr:?} is not a valid CIDR: {e}"),
-                })?;
-        }
-
-        // 11. trust_upstream requires at least one trusted_upstream entry.
-        if self.request_id.trust_upstream && self.request_id.trusted_upstreams.is_empty() {
-            return Err(ConfigError::Invalid {
-                message: "request_id.trust_upstream is true but trusted_upstreams is empty"
-                    .to_string(),
-            });
-        }
-
-        // 12. Production profile hardening.
+        // 10. Production profile hardening.
         if self.deployment_profile.is_production() {
             if self.grpc.reflection_enabled {
                 return Err(ConfigError::Invalid {
@@ -1383,41 +1337,7 @@ mod tests {
         );
     }
 
-    // ── 7. trust_upstream without trusted_upstreams → Invalid ────────────────
-
-    #[test]
-    fn trust_upstream_without_entries_invalid() {
-        let toml = r#"
-            [request_id]
-            trust_upstream = true
-            trusted_upstreams = []
-        "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
-        let err = cfg.validate().expect_err("must fail");
-        assert!(
-            matches!(err, ConfigError::Invalid { .. }),
-            "expected Invalid, got {err:?}"
-        );
-    }
-
-    // ── 8. Invalid CIDR in trusted_upstreams → Invalid ───────────────────────
-
-    #[test]
-    fn invalid_cidr_invalid() {
-        let toml = r#"
-            [request_id]
-            trust_upstream = true
-            trusted_upstreams = ["not-a-cidr"]
-        "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
-        let err = cfg.validate().expect_err("must fail");
-        assert!(
-            matches!(err, ConfigError::Invalid { .. }),
-            "expected Invalid, got {err:?}"
-        );
-    }
-
-    // ── 9. shutdown.drain_ms over 60k cap → Invalid ───────────────────────────
+    // ── 7. shutdown.drain_ms over 60k cap → Invalid ───────────────────────────
 
     #[test]
     fn shutdown_drain_ms_over_cap_invalid() {
@@ -1433,7 +1353,7 @@ mod tests {
         );
     }
 
-    // ── 10. Empty env var → EmptyEnvVar ───────────────────────────────────────
+    // ── 8. Empty env var → EmptyEnvVar ────────────────────────────────────────
 
     #[test]
     fn empty_env_var_produces_error() {
@@ -1447,7 +1367,7 @@ mod tests {
         });
     }
 
-    // ── 11. tick_ms too low → Invalid ────────────────────────────────────────
+    // ── 9. tick_ms too low → Invalid ─────────────────────────────────────────
 
     #[test]
     fn tick_ms_too_low_invalid() {
@@ -1463,7 +1383,7 @@ mod tests {
         );
     }
 
-    // ── 12. Bad APP_ENV value → BadEnvVar ────────────────────────────────────
+    // ── 10. Bad APP_ENV value → BadEnvVar ────────────────────────────────────
 
     #[test]
     fn bad_app_env_value() {

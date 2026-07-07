@@ -16,8 +16,18 @@ pub async fn seed_backing_card(conn: &mut TenantConn<'_>, card_ref: &CardRef, cr
     let spec = match &card_ref.kind {
         CardKind::Service => Spec::from_kind_and_value(&CardKind::Service, serde_json::json!({}))
             .expect("service fixture spec decodes"),
-        CardKind::Agent => Spec::from_kind_and_value(&CardKind::Agent, serde_json::json!({}))
-            .expect("agent fixture spec decodes"),
+        CardKind::Agent => Spec::from_kind_and_value(
+            &CardKind::Agent,
+            serde_json::json!({
+                "prompt": {
+                    "kind": "Prompt",
+                    "space": "prod",
+                    "name": "fixture-prompt",
+                    "version": "1.0.0"
+                }
+            }),
+        )
+        .expect("agent fixture spec decodes"),
         other => panic!("seed_backing_card: unsupported card kind {other:?}"),
     };
     seed_card_with_spec(conn, card_ref, &spec, created_by).await;

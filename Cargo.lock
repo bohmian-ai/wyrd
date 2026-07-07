@@ -4708,15 +4708,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
-name = "ipnetwork"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf466541e9d546596ee94f9f69590f89473455f88372423e0008fc1a7daf100e"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "is-terminal"
 version = "0.4.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9860,16 +9851,19 @@ version = "0.0.1"
 dependencies = [
  "arrow-schema",
  "async-trait",
+ "criterion",
  "hex",
  "pyo3",
  "secrecy",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
  "tracing",
  "wyrd-client",
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-spec",
+ "wyrd-testing",
 ]
 
 [[package]]
@@ -10827,7 +10821,6 @@ dependencies = [
  "datafusion",
  "http-body-util",
  "insta",
- "ipnetwork",
  "jsonwebtoken 9.3.1",
  "metrics",
  "metrics-exporter-prometheus",

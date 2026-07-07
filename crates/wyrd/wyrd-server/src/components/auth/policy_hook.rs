@@ -8,9 +8,6 @@ pub enum BuildError {
     /// Stub allow policy hook was mounted in production state.
     #[error("stub PolicyHook mounted in production build")]
     StubAllowInProduction,
-    /// Inbound request-id propagation was enabled without trusted upstreams.
-    #[error("trusted_request_id_propagation = true requires non-empty trusted_upstreams")]
-    RequestIdPropagationWithoutTrustedUpstreams,
     /// Noop authz-check audit writer was mounted in production state.
     #[error("stub AuthzAuditWriter mounted in production build")]
     NoopAuditWriterInProduction,
@@ -24,9 +21,6 @@ impl AppState {
     pub fn build_production(self) -> Result<Self, BuildError> {
         if self.authz.policy_hook.is_stub_default() {
             return Err(BuildError::StubAllowInProduction);
-        }
-        if self.trusted_request_id_propagation && self.trusted_upstreams_parsed.is_empty() {
-            return Err(BuildError::RequestIdPropagationWithoutTrustedUpstreams);
         }
         if self.authz.audit_writer.is_stub_default() {
             return Err(BuildError::NoopAuditWriterInProduction);
@@ -67,23 +61,6 @@ mod tests {
         assert!(matches!(
             result,
             Err(BuildError::NoopAuditWriterInProduction)
-        ));
-    }
-
-    #[tokio::test]
-    async fn build_production_rejects_untrusted_request_id_configuration() {
-        let mut state = test_state().await;
-        state.authz.policy_hook = Arc::new(DenyAllPolicyHook {
-            reason: "test-deny".to_owned(),
-        });
-        state.authz.audit_writer = Arc::new(ReadyAuditWriter);
-        state.trusted_request_id_propagation = true;
-
-        let result = state.build_production();
-
-        assert!(matches!(
-            result,
-            Err(BuildError::RequestIdPropagationWithoutTrustedUpstreams)
         ));
     }
 

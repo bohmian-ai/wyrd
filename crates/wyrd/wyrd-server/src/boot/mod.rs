@@ -115,9 +115,6 @@ pub enum ServerBootError {
     /// proceeding with an unusable sealing key.
     #[error("WYRD_SEALING_KEY is invalid: {0}")]
     SealingKey(String),
-    /// A config field is invalid (e.g. an unparseable CIDR in trusted_upstreams).
-    #[error("invalid configuration: {0}")]
-    InvalidConfig(String),
     /// gRPC router assembly failed (e.g. missing token verifier).
     #[error(transparent)]
     Grpc(#[from] wyrd_tonic::server::GrpcError),
@@ -185,9 +182,6 @@ pub fn production_guards(config: &crate::config::WyrdServerConfig) {
     if config.deployment_profile.is_production() {
         return;
     }
-    if config.request_id.trust_upstream && config.request_id.trusted_upstreams.is_empty() {
-        tracing::warn!("request_id.trust_upstream=true with no trusted_upstreams configured");
-    }
     if config.grpc.reflection_enabled {
         tracing::warn!("grpc.reflection_enabled=true in development profile");
     }
@@ -243,35 +237,19 @@ fn apply_overrides(state: AppState, overrides: StateOverrides) -> AppState {
     state
 }
 
-/// Attach config-derived fields to core state: CIDR parse, shutdown token,
-/// telemetry, limits, trusted upstreams, and request-id trust. Pure/sync
-/// (no I/O after the CIDR parse).
+/// Attach config-derived fields to core state: shutdown token, telemetry, and
+/// limits. Pure/sync (no I/O).
 fn attach_config_fields(
     state: AppState,
     config: &crate::config::WyrdServerConfig,
     shutdown: CancellationToken,
     telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
 ) -> Result<AppState, ServerBootError> {
-    let trusted_upstreams_parsed: Vec<ipnetwork::IpNetwork> = config
-        .request_id
-        .trusted_upstreams
-        .iter()
-        .map(|cidr| {
-            cidr.parse::<ipnetwork::IpNetwork>().map_err(|e| {
-                ServerBootError::InvalidConfig(format!(
-                    "invalid trusted upstream CIDR {cidr:?}: {e}"
-                ))
-            })
-        })
-        .collect::<Result<_, _>>()?;
-
     Ok(state
         .with_deployment_profile(config.deployment_profile)
         .with_shutdown_token(shutdown)
         .with_telemetry(telemetry)
-        .with_limits(config.limits.into_state())
-        .with_trusted_upstreams_parsed(Arc::from(trusted_upstreams_parsed))
-        .with_trusted_request_id_propagation(config.request_id.trust_upstream))
+        .with_limits(config.limits.into_state()))
 }
 
 /// Install Wyrd's own auth handles: build resolvers, construct issuing key +

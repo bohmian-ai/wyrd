@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use ipnetwork::IpNetwork;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use wyrd_auth_verify::TokenVerifier;
@@ -63,8 +62,6 @@ pub struct AppState {
     pub auth: ServerAuth,
     /// Authorization handles: policy decision + RBAC evaluation + decision audit.
     pub authz: ServerAuthz,
-    /// Trust gate for inbound Wyrd request ID propagation.
-    pub trusted_request_id_propagation: bool,
     /// Deployment posture (Development / Production) locked at boot.
     pub deployment_profile: DeploymentProfile,
     /// Shared cancellation token for cooperative shutdown.
@@ -77,8 +74,6 @@ pub struct AppState {
     pub grpc_health: HealthReporter,
     /// Cached readiness snapshot from the background readiness_loop task.
     pub readiness: Arc<ArcSwap<ReadinessSnapshot>>,
-    /// Parsed CIDR allowlist for the request-id trust gate.
-    pub trusted_upstreams_parsed: Arc<[IpNetwork]>,
     /// Tenant-keyed in-memory eval run/lease/session map. Ephemeral, single-replica.
     pub eval_runs: EvalRuns,
     /// Audit sink for eval run open/complete events.
@@ -100,7 +95,6 @@ impl AppState {
             bifrost,
             auth: ServerAuth::default(),
             authz: ServerAuthz::default(),
-            trusted_request_id_propagation: false,
             deployment_profile: DeploymentProfile::Development,
             shutdown_token: CancellationToken::new(),
             telemetry: Arc::new(wyrd_telemetry::init_test_only_no_global(
@@ -109,7 +103,6 @@ impl AppState {
             limits: LimitsConfig::default(),
             grpc_health: reporter,
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
-            trusted_upstreams_parsed: Arc::from(Vec::<IpNetwork>::new()),
             eval_runs: new_run_map(),
             eval_audit: Arc::new(TracingEvalAuditWriter),
         }
@@ -178,20 +171,6 @@ impl AppState {
         self
     }
 
-    /// Attach the parsed CIDR allowlist for the request-id trust gate.
-    #[must_use]
-    pub fn with_trusted_upstreams_parsed(mut self, parsed: Arc<[IpNetwork]>) -> Self {
-        self.trusted_upstreams_parsed = parsed;
-        self
-    }
-
-    /// Toggle inbound Wyrd request-id propagation trust.
-    #[must_use]
-    pub fn with_trusted_request_id_propagation(mut self, trust: bool) -> Self {
-        self.trusted_request_id_propagation = trust;
-        self
-    }
-
     /// Replace the storage handle.
     #[must_use]
     pub fn with_storage(mut self, storage: Arc<StorageHandle>) -> Self {
@@ -213,9 +192,6 @@ pub enum ProductionValidationError {
         "authz.audit_writer is NoopAuthzAuditWriter in a production build; install a real AuthzAuditWriter"
     )]
     NoopAuditWriter,
-    /// Request-id propagation is enabled with no trusted upstream CIDRs.
-    #[error("AppState.trusted_request_id_propagation=true requires non-empty trusted_upstreams")]
-    UntrustedRequestIdEdge,
     /// Token verifier is absent in a production build.
     #[error("auth.token_verifier is None in a production build; auth-plan boot must install it")]
     MissingTokenVerifier,
@@ -237,9 +213,6 @@ impl AppState {
         }
         if self.authz.audit_writer.is_stub_default() {
             return Err(ProductionValidationError::NoopAuditWriter);
-        }
-        if self.trusted_request_id_propagation && self.trusted_upstreams_parsed.is_empty() {
-            return Err(ProductionValidationError::UntrustedRequestIdEdge);
         }
         if self.auth.token_verifier.is_none() {
             return Err(ProductionValidationError::MissingTokenVerifier);
@@ -278,8 +251,6 @@ mod tests {
     async fn defaults_for_test_safe() {
         let state = test_state().await;
 
-        assert!(!state.trusted_request_id_propagation);
-        assert!(state.trusted_upstreams_parsed.is_empty());
         assert_eq!(
             state.authz.policy_hook.evaluate(&context()).await,
             PolicyDecision::Allow

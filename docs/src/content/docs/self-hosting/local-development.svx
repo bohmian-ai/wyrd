@@ -1,0 +1,68 @@
+---
+title: Local development
+description: Run the server on your machine with embedded Postgres, local storage, and a development signing key.
+pillar: wyrd
+group: Self-hosting
+order: 9
+---
+
+# Local development
+
+A local run needs no external Postgres and no secrets. Leave the database variables unset and the server provisions and manages an embedded Postgres for you. Skip the signing key and it mints an ephemeral one on boot. The only thing you must configure is where artifacts go, so point storage at a local directory.
+
+## Run it
+
+```bash
+export WYRD_STORAGE_BACKEND=local
+export WYRD_STORAGE_LOCAL_ROOT="$PWD/.wyrd-dev/storage"
+export WYRD_PUBLIC_BASE_URL=http://localhost:8080
+mkdir -p "$WYRD_STORAGE_LOCAL_ROOT"
+
+cargo run -p wyrd-server
+```
+
+The server comes up on `http://localhost:8080`. Check it:
+
+```bash
+curl -s http://localhost:8080/healthz   # -> ok
+curl -s http://localhost:8080/readyz     # -> readiness snapshot
+```
+
+## Get an admin key
+
+A fresh database has no credentials. Mint the first admin API key, then use it as a bearer token:
+
+```bash
+cargo run -p wyrd-server -- bootstrap-key --tenant acme
+# wyrd_sk_acme_… (shown once)
+```
+
+Wyrd does not use the standard `Authorization` header. Exchange the key for an access token, then send it as `X-Wyrd-Access-Token`:
+
+```bash
+curl -H "X-Wyrd-Access-Token: Bearer <access-token>" \
+  http://localhost:8080/v1/...
+```
+
+See [Authentication](/self-hosting/authentication/) for the token exchange.
+
+## What is development-only here
+
+The convenience that makes local runs painless is exactly what makes this configuration unsafe to ship:
+
+- The embedded Postgres is managed by the process, not a real cluster.
+- The signing key is ephemeral. It is regenerated on each restart, so tokens stop verifying when you restart the server.
+- Local disk storage is not shared across replicas.
+
+When you move to a real environment, set `APP_ENV=production`, provide external Postgres, a real signing key, and a cloud storage backend. The production profile fails boot if any of those are missing. See [Configuration](/self-hosting/configuration/).
+
+<Aside title="More to come">
+
+A fuller local-development guide (seeding sample cards, running the UI, and wiring a local IdP for SSO testing) is planned. For now, the steps above give you a running server.
+
+</Aside>
+
+## Related
+
+- [Running the server](/self-hosting/running-the-server/): the CLI and boot sequence.
+- [Configuration](/self-hosting/configuration/): everything a non-local deployment needs to set.

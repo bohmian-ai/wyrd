@@ -1,0 +1,29 @@
+---
+title: Enterprise
+description: Multi-tenant SaaS deployment with custom policy, audit, and identity.
+pillar: wyrd
+group: Self-hosting
+order: 12
+---
+
+# Enterprise
+
+<Aside title="Placeholder">
+
+This page is a stub. The enterprise distribution and its deployment guide are still being written.
+
+</Aside>
+
+The open-source server is built to be wrapped by a downstream distribution without forking core boot. An enterprise deployment uses the extension seams described in [Architecture](/self-hosting/architecture/#extension-seams) to add what a multi-tenant SaaS needs:
+
+- A real policy engine and audit writer injected through `StateOverrides` before production validation runs, replacing the development stubs.
+- Custom background workers registered with `spawn_worker` so they join the supervised drain.
+- Additional protected routes mounted with `merge_http_protected`, behind the same edge and auth stack as core `/v1`.
+- Full tenant separation across identity, registry, storage, policy, audit, observability, and evaluation.
+
+The enterprise distribution, its licensing, and a deployment guide will land here.
+
+## Related
+
+- [Architecture](/self-hosting/architecture/#extension-seams): the seams an enterprise build extends.
+- [SSO and OIDC](/self-hosting/sso-and-oidc/): federated identity, which enterprise deployments lean on heavily.

@@ -14,15 +14,18 @@ Everything here is operational. If you want the model behind identity, tokens, a
 
 ## Start here
 
-The fastest way to see the server run is local development, where it provisions its own Postgres and mints an ephemeral signing key on boot. No external services, no secrets to generate.
+The fastest way to see the server run is local development. Leave the database variables unset and it provisions its own Postgres. Skip the signing key and it mints an ephemeral one. You only have to point it at a storage directory.
 
 ```bash
-# From the repo root. Builds and runs wyrd-server on :8080 with
-# embedded Postgres, local storage, and a dev signing key.
-mise run dev:backend
+export WYRD_STORAGE_BACKEND=local
+export WYRD_STORAGE_LOCAL_ROOT="$PWD/.wyrd-dev/storage"
+export WYRD_PUBLIC_BASE_URL=http://localhost:8080
+mkdir -p "$WYRD_STORAGE_LOCAL_ROOT"
+
+cargo run -p wyrd-server
 ```
 
-That configuration is development-only. It is not safe for staging or production, and the server refuses to boot a production profile without a real signing key. See [Local development](/self-hosting/local-development/) for the details, then [Configuration](/self-hosting/configuration/) for the full env var surface a real deployment needs.
+That configuration is development-only. It is not safe for staging or production, and the server refuses to boot a production profile without a real signing key. See [Local development](/self-hosting/local-development/) for the walkthrough, then [Configuration](/self-hosting/configuration/) for the full env var surface a real deployment needs.
 
 ## Deployment targets
 

@@ -20,13 +20,21 @@ This page is the reference for the server itself. Database and storage each have
 
 Configuration is validated after loading. An out-of-range value or a contradiction (for example the same address bound for HTTP and gRPC) fails boot with exit code `78`.
 
+Field names and variable names refer to the same settings. Other pages name the config-file field (`shutdown.drain_ms`, `limits.timeout`); this page lists the environment variable that overrides it (`WYRD_SHUTDOWN_DRAIN_MS`, `WYRD_HTTP_REQUEST_TIMEOUT_MS`). Each table below pairs them.
+
 ## Deployment profile
 
-`APP_ENV` selects the profile. `staging` and `production` both select the hardened profile; only `development` relaxes the gates.
+`APP_ENV` selects the profile. `staging` and `production` both select the hardened profile; only `development` relaxes the gates. In the config file the same setting is the `deployment_profile` key, and `APP_ENV` overrides it.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `APP_ENV` | `development` | `development`, `staging`, or `production`. The hardened profile requires a signing key, a real policy hook and audit writer, gRPC reflection off, and preview auth off. |
+
+<Aside title="The hardened profile needs more than env vars">
+
+A production or staging profile requires a real authorization policy hook and audit writer. The open-source server ships development stubs for both, and `production_validate` rejects them at boot. There is no environment variable that swaps in real implementations: they are injected in code through the `StateOverrides` seam by a downstream build (see [Architecture](/self-hosting/architecture/#extension-seams)). Running the plain OSS server in a production profile fails validation until those are provided. Development profile has no such requirement.
+
+</Aside>
 
 ## Bind and transport
 
@@ -119,6 +127,35 @@ service_name = "wyrd"
 [auth]
 tenant_slug = "acme"
 ```
+
+## A complete production environment
+
+Each page above documents one slice. Here is the full set of variables a production deployment against external Postgres and an S3 bucket sets, in one place. Provision the five database roles and mount the signing key as a secret first.
+
+```bash
+# Profile
+export APP_ENV=production
+
+# Database (external). The five roles must already exist in the cluster.
+export WYRD_DATABASE_URL="postgresql://wyrd_app:app-pw@db.internal:5432/wyrd"
+export WYRD_DATABASE_MIGRATOR_PASSWORD="migrator-pw"
+export WYRD_DATABASE_CATALOG_APP_PASSWORD="catalog-pw"
+export WYRD_DATABASE_RECOVERY_PASSWORD="recovery-pw"
+
+# Storage (S3). AWS credentials resolve via the default SDK chain.
+export WYRD_STORAGE_BACKEND=s3
+export WYRD_STORAGE_S3_BUCKET=wyrd-artifacts
+export WYRD_STORAGE_S3_REGION=us-east-1
+
+# Signing key (required in production).
+export WYRD_SIGNING_KEY_FILE=/run/secrets/signing-key.pem
+
+# Observability (optional but recommended).
+export WYRD_OTLP_ENDPOINT=http://otel-collector:4317
+export WYRD_SERVICE_NAME=wyrd
+```
+
+This boots only if the deployment also provides a real policy hook and audit writer, per the note above. `WYRD_PUBLIC_BASE_URL` is not needed for S3; it is required only for the local storage backend.
 
 ## Validation rules
 

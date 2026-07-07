@@ -52,7 +52,7 @@ The server splits privileges across five roles so that runtime request handling 
 | `vala_recovery` | not applicable | Vala warehouse startup recovery. |
 | `wyrd_platform_admin` | bypasses RLS | Optional audited cross-tenant administration. |
 
-These roles must exist in your cluster with the passwords you supply. Provision them before the server boots.
+These roles must exist in your cluster, with the privileges in the table above and the passwords you supply, before the server boots. The row-level security policies themselves are created by the migrations that run at boot, so you provision the roles and the server sets up the policies. In embedded mode the server provisions the roles for you; external mode expects them to already exist.
 
 ### Pool tuning
 

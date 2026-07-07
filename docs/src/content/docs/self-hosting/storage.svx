@@ -12,6 +12,8 @@ The server keeps artifacts (uploaded model files, datasets, and other card paylo
 
 Credentials for the cloud backends come from each provider's standard SDK credential chain, not from Wyrd-specific secrets. You configure the bucket and region through Wyrd, and let the cloud SDK resolve the identity the way it does everywhere else (environment, instance role, workload identity).
 
+`WYRD_PUBLIC_BASE_URL` is required only for the local backend. The cloud backends serve artifacts through presigned URLs and do not need it.
+
 ## Shared settings
 
 These apply to every backend.

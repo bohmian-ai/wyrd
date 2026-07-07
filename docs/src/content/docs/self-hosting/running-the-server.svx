@@ -39,6 +39,8 @@ wyrd-server bootstrap-key --tenant acme
 
 The key is shown exactly once and stored only as an Argon2 hash. If you lose it, mint another.
 
+`bootstrap-key` needs the database environment set (it connects as `wyrd_app`), but not a signing key or storage backend. You can run it against a fresh production database before the full serving environment is in place.
+
 ## Serve modes
 
 | Mode | HTTP | gRPC | Use it for |

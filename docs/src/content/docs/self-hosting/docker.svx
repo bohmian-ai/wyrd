@@ -1,0 +1,31 @@
+---
+title: Docker
+description: Run the open-source server image against your own Postgres and object storage.
+pillar: wyrd
+group: Self-hosting
+order: 10
+---
+
+# Docker
+
+<Aside title="Placeholder">
+
+This page is a stub. The published image reference, a compose example, and the recommended way to pass secrets are still being written.
+
+</Aside>
+
+Running the server in Docker is mostly a matter of passing the same environment the binary reads. The container is stateless: it holds no database and no artifacts, so both must be external.
+
+At minimum you will set:
+
+- `APP_ENV=production` (or `staging`).
+- The database variables from [Database](/self-hosting/database/), pointing at a Postgres you run.
+- The storage variables from [Storage](/self-hosting/storage/), pointing at a bucket.
+- `WYRD_SIGNING_KEY_FILE` mounted as a secret, per [Authentication](/self-hosting/authentication/).
+
+Full image name, tags, and a worked compose file will land here.
+
+## Related
+
+- [Configuration](/self-hosting/configuration/): the environment the container reads.
+- [Binary](/self-hosting/binary/): running the same server without a container.

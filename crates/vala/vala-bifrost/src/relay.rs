@@ -7,10 +7,15 @@
 //! path under `origin = "audit-relay"` (so the relay's own write never
 //! self-feeds the spine, M-11), then marks the shipped `seq` range.
 //!
-//! Re-ship after a crash between flush and mark is safe: the deterministic
-//! `batch_id = derive(tenant, seq_lo, seq_hi)` replays the prior `vala.olap_commits`
-//! commit (no duplicate warehouse rows), and `mark_audit_shipped` is idempotent
-//! via its `AND NOT shipped` guard.
+//! ## Crash-safety idempotency
+//!
+//! `ship_batch_id` is stamped on claimed rows **inside the claim transaction**
+//! before commit. On a crash between `ship` and `mark_shipped`, the next `claim`
+//! returns those rows with `ship_batch_id` already set; the relay reuses that
+//! stored key instead of re-deriving from the live seq range. Because new rows
+//! may have been appended for the same tenant in the interim (shifting the range),
+//! re-deriving would mint a different batch_id and re-ship already-committed rows
+//! into the append-only `vala.system.audit_log`. The persisted key prevents that.
 
 use std::sync::Arc;
 
@@ -30,6 +35,7 @@ use crate::writer::BifrostWriteContext;
 use crate::writer::coordinator::AUDIT_RELAY_ORIGIN;
 
 use vala_sql::TenantConn;
+use vala_sql::queries::audit_outbox::stamp_audit_ship_batch_id;
 use vala_sql::row_types::audit_outbox::AuditOutboxRow;
 
 /// Bifrost table name of the audit warehouse (`vala.system.audit_log`).
@@ -77,14 +83,14 @@ impl AuditRelay {
             .await
     }
 
-    /// Claim up to `limit` unshipped rows and group them into per-tenant
-    /// shipments. Rows are claimed under a short transaction that commits
-    /// immediately (releasing the `FOR UPDATE` locks); idempotency across a
-    /// crash is provided by the deterministic `batch_id` and the `NOT shipped`
-    /// mark guard, not by holding the lock across the flush.
+    /// Claim up to `limit` unshipped rows, stamp their `ship_batch_id` inside the
+    /// same transaction, then commit. The stamp makes crash recovery idempotent: if
+    /// the process crashes between `ship` and `mark_shipped`, the next `claim`
+    /// returns the same rows with `ship_batch_id` already set and `group_by_tenant`
+    /// reuses that key — no re-derivation from the (now-shifted) live seq range.
     ///
     /// # Errors
-    /// Returns [`BifrostError`] when the claim query fails.
+    /// Returns [`BifrostError`] when the claim query or batch-id stamp fails.
     pub async fn claim(&self, limit: i32) -> Result<Vec<RelayShipment>, BifrostError> {
         let mut conn = TenantConn::acquire(&self.pool, DataTenantId::SYSTEM_OWNER)
             .await
@@ -92,9 +98,20 @@ impl AuditRelay {
         let rows = vala_sql::queries::audit_outbox::claim_unshipped_audit(&mut conn, limit)
             .await
             .map_err(BifrostError::Sql)?;
+        let shipments = group_by_tenant(rows)?;
+        for shipment in &shipments {
+            stamp_audit_ship_batch_id(
+                &mut conn,
+                shipment.tenant.as_uuid(),
+                shipment.seq_lo,
+                shipment.seq_hi,
+                &shipment.batch_id,
+            )
+            .await
+            .map_err(BifrostError::Sql)?;
+        }
         conn.commit().await.map_err(BifrostError::Sql)?;
-
-        group_by_tenant(rows)
+        Ok(shipments)
     }
 
     /// Flush one tenant's shipment into `vala.system.audit_log` under
@@ -164,7 +181,12 @@ impl AuditRelay {
 }
 
 /// Group claim rows (ordered by `(data_tenant_id, seq)`) into contiguous
-/// per-tenant shipments with a deterministic `batch_id`.
+/// per-tenant shipments.
+///
+/// If the first row of a group already has `ship_batch_id` set (crash-recovery
+/// path), that persisted key is used as-is. Otherwise a fresh deterministic key
+/// is derived from the tenant + seq range; the caller stamps it back to the DB
+/// inside the claim transaction before commit.
 fn group_by_tenant(rows: Vec<AuditOutboxRow>) -> Result<Vec<RelayShipment>, BifrostError> {
     let mut groups: Vec<Vec<AuditOutboxRow>> = Vec::new();
     for row in rows {
@@ -186,7 +208,14 @@ fn group_by_tenant(rows: Vec<AuditOutboxRow>) -> Result<Vec<RelayShipment>, Bifr
             };
             let seq_lo = rows.first().expect("group is non-empty").seq;
             let seq_hi = rows.last().expect("group is non-empty").seq;
-            let batch_id = derive_batch_id(tenant, seq_lo, seq_hi);
+            let batch_id = match rows[0].ship_batch_id.as_deref() {
+                Some(existing) => existing
+                    .try_into()
+                    .map_err(|_| BifrostError::Internal(format!(
+                        "relay: persisted ship_batch_id for tenant {tenant} has wrong length"
+                    )))?,
+                None => derive_batch_id(tenant, seq_lo, seq_hi),
+            };
             Ok(RelayShipment {
                 tenant,
                 seq_lo,
@@ -198,10 +227,11 @@ fn group_by_tenant(rows: Vec<AuditOutboxRow>) -> Result<Vec<RelayShipment>, Bifr
         .collect()
 }
 
-/// Deterministic 16-byte idempotency key for a tenant's shipped `seq` range.
+/// Derive a 16-byte idempotency key for a fresh (not yet stamped) shipment.
 ///
-/// Stable across crash/retry so a re-ship replays the prior `vala.olap_commits`
-/// commit rather than writing duplicate warehouse rows.
+/// Used only when the claimed rows carry no `ship_batch_id` yet. The derived key
+/// is immediately stamped back to the DB inside the claim transaction so it is
+/// durable before the relay begins shipping.
 fn derive_batch_id(tenant: DataTenantId, seq_lo: i64, seq_hi: i64) -> [u8; 16] {
     let mut hasher = Sha256::new();
     hasher.update(AUDIT_RELAY_ORIGIN.as_bytes());

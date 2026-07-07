@@ -154,6 +154,35 @@ pub async fn claim_unshipped_audit(
         .map_err(SqlError::from)
 }
 
+/// Stamp `ship_batch_id` on the claimed `[seq_lo, seq_hi]` range for one tenant.
+///
+/// Called inside the claim transaction so the batch boundary is durable before the
+/// relay even begins shipping. `WHERE ship_batch_id IS NULL` makes repeated calls
+/// idempotent — rows already stamped from a prior (crashed) attempt are untouched,
+/// preserving their existing batch_id for the recovery path.
+///
+/// # Errors
+/// Returns [`SqlError`] when the update fails.
+pub async fn stamp_audit_ship_batch_id(
+    conn: &mut TenantConn<'_>,
+    tenant_id: uuid::Uuid,
+    seq_lo: i64,
+    seq_hi: i64,
+    batch_id: &[u8; 16],
+) -> Result<u64, SqlError> {
+    let result = sqlx::query(
+        "SELECT vala.stamp_audit_ship_batch_id($1, $2, $3, $4)",
+    )
+    .bind(tenant_id)
+    .bind(seq_lo)
+    .bind(seq_hi)
+    .bind(batch_id.as_slice())
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+    Ok(result.rows_affected())
+}
+
 /// Compute `entry_hash = SHA256(canonical(prev_hash, seq, event))`.
 ///
 /// The canonical encoding is a length-prefixed concatenation owned here, so the

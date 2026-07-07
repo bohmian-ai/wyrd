@@ -17,8 +17,8 @@ use wyrd_spec::vala::api::{
     AsyncQueryRequest, AsyncQueryResponse, AsyncQueryStatus, JobUid, SyncQueryRequest,
 };
 
-use crate::auth::Caller;
-use crate::error::WyrdErrorResponse;
+use crate::components::auth::Caller;
+use crate::http::error::WyrdErrorResponse;
 use crate::query::service;
 use crate::state::AppState;
 

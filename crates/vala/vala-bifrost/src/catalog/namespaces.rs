@@ -9,6 +9,10 @@ pub enum BifrostNamespace {
 }
 
 impl BifrostNamespace {
+    /// All known namespaces. Adding a variant here causes a compile error at every
+    /// `match` that is missing a branch — the exhaustiveness guard.
+    pub const ALL: [Self; 4] = [Self::System, Self::Bifrost, Self::Traces, Self::Eval];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::System => "vala.system",
@@ -16,6 +20,33 @@ impl BifrostNamespace {
             Self::Traces => "vala.traces",
             Self::Eval => "vala.eval",
         }
+    }
+
+    /// Parse a wire namespace string (e.g. `"vala.bifrost"`) into the enum.
+    /// Returns `None` for unknown namespaces.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|ns| ns.as_str() == s)
+    }
+
+    /// Split a fully-qualified `"namespace.table"` FQN into `(Self, table_name)`.
+    ///
+    /// Returns `None` for names that are not a known Bifrost namespace prefix followed
+    /// by a single-segment table (CTEs, aliases, three-part names, unknown namespaces).
+    pub fn split_fqn(fqn: &str) -> Option<(Self, String)> {
+        for ns in Self::ALL {
+            let ns_str = ns.as_str();
+            let prefix_len = ns_str.len();
+            if fqn.len() > prefix_len + 1
+                && fqn.starts_with(ns_str)
+                && fqn.as_bytes()[prefix_len] == b'.'
+            {
+                let name = &fqn[prefix_len + 1..];
+                if !name.is_empty() && !name.contains('.') {
+                    return Some((ns, name.to_owned()));
+                }
+            }
+        }
+        None
     }
 
     /// # Panics

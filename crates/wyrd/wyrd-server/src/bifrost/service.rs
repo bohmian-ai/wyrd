@@ -17,7 +17,7 @@ use wyrd_spec::vala::api::{
 
 use crate::AppState;
 use crate::audit;
-use crate::auth::Caller;
+use crate::components::auth::Caller;
 use crate::bifrost::convert;
 
 /// Map an engine Bifrost error to the public `WyrdError` via the single delegate.
@@ -56,7 +56,7 @@ async fn authorize_audited(
         AuditResult::Failure,
         "rbac permission denied",
     );
-    audit::record_audit(&state.pool, caller.data_tenant_id, &event).await?;
+    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &event).await?;
     Err(WyrdError::PermissionDeniedRbac {
         message: format!("caller lacks required permission {required}"),
         details: serde_json::json!({ "required": required }),

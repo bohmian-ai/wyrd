@@ -43,4 +43,8 @@ pub struct AuditOutboxRow {
     pub payload_summary: String,
     /// Wall-clock append time.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Relay batch idempotency key stamped at claim time; `None` for rows not yet
+    /// claimed by the relay. On crash recovery the relay reuses this value instead
+    /// of recomputing from the live seq range.
+    pub ship_batch_id: Option<Vec<u8>>,
 }

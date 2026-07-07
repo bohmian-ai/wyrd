@@ -22,7 +22,7 @@ use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::BifrostError as ValaError;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
-use crate::auth::Caller;
+use crate::components::auth::Caller;
 
 /// Build a data-plane [`AuditEvent`] attributed to the HTTP caller.
 ///

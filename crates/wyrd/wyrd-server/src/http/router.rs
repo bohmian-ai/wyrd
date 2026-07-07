@@ -12,6 +12,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use wyrd_spec::error::WyrdError;
 
+use crate::bifrost::routes::router as bifrost_router;
 use crate::components::admin::admin_router;
 use crate::components::auth::auth_router;
 use crate::components::authz::authz_router;
@@ -20,6 +21,7 @@ use crate::components::health::health_router;
 use crate::components::storage::storage_router;
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::authenticate::require_authenticated;
+use crate::query::routes::router as query_router;
 use crate::state::AppState;
 
 /// Build the HTTP router with shared server state.
@@ -43,6 +45,8 @@ pub fn build_router(state: AppState) -> Router {
         .merge(eval_router())
         .merge(authz_router())
         .merge(admin_router())
+        .merge(bifrost_router())
+        .merge(query_router())
         .fallback(v1_not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),

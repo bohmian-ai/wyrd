@@ -1,13 +1,16 @@
 //! Wyrd server boot and routing primitives.
 
 pub mod app;
+pub mod audit;
 pub mod auth;
+pub mod bifrost;
 pub mod boot;
 pub mod components;
 pub mod config;
 pub mod grpc;
 pub mod http;
 pub mod postgres;
+pub mod query;
 pub mod state;
 
 #[cfg(test)]

@@ -4,10 +4,13 @@
 //! `crossbeam_queue::ArrayQueue`. It owns the sink, the resolved schema, and the
 //! config; `seal_and_send` drains the buffer, builds one user-only Arrow IPC
 //! batch per `flush_max_rows` chunk, mints a stable `batch_id` per sealed batch,
-//! and ships it — re-buffering the rows on any sink failure (no silent drop).
+//! and ships it. On sink failure or flush-deadline timeout, the affected chunk is
+//! placed into a per-queue retry buffer (with its original `batch_id` intact) so
+//! the next `seal_and_send` re-sends it under the same id — preserving the
+//! server-side `olap_commits` dedup guarantee across retries.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -69,6 +72,9 @@ pub struct RecordQueue {
     table: String,
     schema: SchemaRef,
     staging: Arc<ArrayQueue<Row>>,
+    /// Failed chunks (with their original `batch_id`) waiting for the next retry.
+    /// Drained first by `seal_and_send` so retries reuse the same batch_id.
+    retry: Mutex<VecDeque<([u8; 16], Vec<Row>)>>,
     sink: Arc<dyn BatchSink>,
     config: QueueConfig,
     counters: Arc<Counters>,
@@ -87,6 +93,7 @@ impl RecordQueue {
         Self {
             table,
             schema,
+            retry: Mutex::new(VecDeque::new()),
             staging,
             sink,
             config,
@@ -156,7 +163,9 @@ impl RecordQueue {
 
     /// Drain staging, seal each `flush_max_rows` chunk into one IPC batch under a
     /// stable `batch_id`, and ship it. On sink failure or flush-deadline timeout,
-    /// the affected rows are re-buffered.
+    /// the affected chunk is pushed (with its original `batch_id`) into `self.retry`
+    /// so the next call resends it under the same id — preserving the server-side
+    /// `olap_commits` dedup guarantee across retries.
     ///
     /// # Errors
     /// - [`WyrdQueueError::Sink`] if the sink rejects a batch.
@@ -165,34 +174,45 @@ impl RecordQueue {
     /// - [`WyrdQueueError::SchemaParse`] / [`WyrdQueueError::ReservedColumn`] if a
     ///   row cannot be built.
     pub async fn seal_and_send(&self) -> Result<FlushOutcome, WyrdQueueError> {
-        let mut rows = self.drain();
-        if rows.is_empty() {
-            return Ok(FlushOutcome::default());
-        }
-
         let chunk_size = self.config.flush_max_rows.max(1);
-        let mut pending: VecDeque<Vec<Row>> = VecDeque::new();
+
+        // Drain the retry buffer first (chunks carry their original batch_ids),
+        // then drain staging and mint new batch_ids for the new chunks.
+        let mut pending: VecDeque<([u8; 16], Vec<Row>)> = {
+            let mut retry = self.retry.lock().expect("retry lock is not poisoned");
+            std::mem::take(&mut *retry)
+        };
+
+        let mut rows = self.drain();
         while !rows.is_empty() {
             let rest = if rows.len() > chunk_size {
                 rows.split_off(chunk_size)
             } else {
                 Vec::new()
             };
-            pending.push_back(std::mem::replace(&mut rows, rest));
+            let batch_id = Uuid::now_v7().into_bytes();
+            pending.push_back((batch_id, std::mem::replace(&mut rows, rest)));
+        }
+
+        if pending.is_empty() {
+            return Ok(FlushOutcome::default());
         }
 
         let mut outcome = FlushOutcome::default();
         let timeout = Duration::from_millis(self.config.flush_timeout_ms.max(1));
-        while let Some(mut chunk) = pending.pop_front() {
+        while let Some((batch_id, mut chunk)) = pending.pop_front() {
             let frames = match self.build_frames(&chunk) {
                 Ok(frames) => frames,
                 Err(err) => {
-                    // Poison chunk: cannot build. Drop it (counted) and re-buffer the
-                    // rest so no downstream row is lost.
+                    // Poison chunk: cannot build. Drop it (counted); remaining
+                    // pending chunks go back to retry with their batch_ids intact.
                     self.counters
                         .dropped
                         .fetch_add(chunk.len() as u64, Ordering::SeqCst);
-                    self.rebuffer(pending.into_iter().flatten());
+                    let mut retry = self.retry.lock().expect("retry lock is not poisoned");
+                    for item in pending {
+                        retry.push_back(item);
+                    }
                     return Err(err);
                 }
             };
@@ -202,17 +222,20 @@ impl RecordQueue {
                     self.counters
                         .dropped
                         .fetch_add(chunk.len() as u64, Ordering::SeqCst);
-                    self.rebuffer(pending.into_iter().flatten());
+                    let mut retry = self.retry.lock().expect("retry lock is not poisoned");
+                    for item in pending {
+                        retry.push_back(item);
+                    }
                     return Err(WyrdQueueError::PayloadTooLarge);
                 }
                 let mid = chunk.len() / 2;
                 let right = chunk.split_off(mid);
-                pending.push_front(right);
-                pending.push_front(chunk);
+                // Right half gets a fresh batch_id (different content); left keeps original.
+                pending.push_front((Uuid::now_v7().into_bytes(), right));
+                pending.push_front((batch_id, chunk));
                 continue;
             }
 
-            let batch_id = Uuid::now_v7().into_bytes();
             let rows_in = chunk.len();
             let sealed = SealedBatch {
                 table: self.table.clone(),
@@ -226,11 +249,19 @@ impl RecordQueue {
                     outcome.rows_flushed += rows_in;
                 }
                 Ok(Err(err)) => {
-                    self.rebuffer(chunk.into_iter().chain(pending.into_iter().flatten()));
+                    let mut retry = self.retry.lock().expect("retry lock is not poisoned");
+                    retry.push_front((batch_id, chunk));
+                    for item in pending {
+                        retry.push_back(item);
+                    }
                     return Err(WyrdQueueError::Sink(err));
                 }
                 Err(_elapsed) => {
-                    self.rebuffer(chunk.into_iter().chain(pending.into_iter().flatten()));
+                    let mut retry = self.retry.lock().expect("retry lock is not poisoned");
+                    retry.push_front((batch_id, chunk));
+                    for item in pending {
+                        retry.push_back(item);
+                    }
                     return Err(WyrdQueueError::FlushTimeout);
                 }
             }

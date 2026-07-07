@@ -7,9 +7,9 @@ use wyrd_spec::vala::api::{
     BifrostTableDescription, BifrostTableEntry, RegisterTableRequest, RegisterTableResponse,
 };
 
-use crate::auth::Caller;
+use crate::components::auth::Caller;
 use crate::bifrost::service;
-use crate::error::WyrdErrorResponse;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Standalone Bifrost catalog router for the `/v1` group.

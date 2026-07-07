@@ -34,7 +34,7 @@ use wyrd_spec::vala::api::{
 
 use crate::AppState;
 use crate::audit;
-use crate::auth::Caller;
+use crate::components::auth::Caller;
 use crate::bifrost::convert;
 use crate::query::floor;
 
@@ -74,7 +74,7 @@ async fn authorize_audited(
         AuditResult::Failure,
         "rbac permission denied",
     );
-    audit::record_audit(&state.pool, caller.data_tenant_id, &event).await?;
+    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &event).await?;
     Err(WyrdError::PermissionDeniedRbac {
         message: format!("caller lacks required permission {required}"),
         details: json!({ "required": required }),
@@ -122,28 +122,6 @@ fn ipc_error(error: arrow::error::ArrowError) -> WyrdError {
     }
 }
 
-/// Split a fully-qualified table name (`vala.bifrost.events`) into its Bifrost
-/// namespace and bare table name. Returns `None` for names that are not a known
-/// Bifrost namespace followed by a single-segment table (CTEs, aliases,
-/// `information_schema`, `catalog.schema.table`); the caller skips those and lets
-/// DataFusion planning surface a genuine unknown-table error.
-fn split_fqn(fqn: &str) -> Option<(BifrostNamespace, String)> {
-    for ns in [
-        BifrostNamespace::System,
-        BifrostNamespace::Bifrost,
-        BifrostNamespace::Traces,
-        BifrostNamespace::Eval,
-    ] {
-        let prefix = format!("{}.", ns.as_str());
-        if let Some(rest) = fqn.strip_prefix(&prefix)
-            && !rest.is_empty()
-            && !rest.contains('.')
-        {
-            return Some((ns, rest.to_owned()));
-        }
-    }
-    None
-}
 
 /// Build a tenant-scoped `SessionContext` and register only the Bifrost tables the
 /// query references. The context carries the tenant analyzer rule and each
@@ -156,7 +134,7 @@ async fn build_tenant_session(
 ) -> Result<SessionContext, WyrdError> {
     let ctx = wyrd_session_context(caller.data_tenant_id);
     for fqn in floor::referenced_tables(sql) {
-        let Some((ns, name)) = split_fqn(&fqn) else {
+        let Some((ns, name)) = BifrostNamespace::split_fqn(&fqn) else {
             continue;
         };
         match state
@@ -246,7 +224,7 @@ pub async fn run_sync_query(
         AuditResult::Success,
         "sync select executed",
     );
-    audit::record_audit(&state.pool, caller.data_tenant_id, &event).await?;
+    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &event).await?;
 
     Ok(SyncQueryResult {
         body: body_bytes,
@@ -311,7 +289,7 @@ pub async fn submit_async_query(
     let params_redacted = redact_params(&body.params);
     let key = idempotency_key(&sql_normalized, &params_redacted);
 
-    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+    let mut conn = TenantConn::acquire(state.postgres.vala_pool(), caller.data_tenant_id)
         .await
         .map_err(storage_error)?;
     let job_uid = enqueue_query_job(
@@ -361,7 +339,7 @@ pub async fn get_async_query_status(
     )
     .await?;
 
-    let mut conn = TenantConn::acquire(&state.pool, caller.data_tenant_id)
+    let mut conn = TenantConn::acquire(state.postgres.vala_pool(), caller.data_tenant_id)
         .await
         .map_err(storage_error)?;
     let status = query_job_status(&mut conn, job_uid)
@@ -605,7 +583,7 @@ mod tests {
                 .expect("valid submission enqueues");
 
             assert!(
-                has_audit(&state.pool, tenant, &request_id, "allow").await,
+                has_audit(state.postgres.vala_pool(), tenant, &request_id, "allow").await,
                 "a successful async submit appends one allow audit row"
             );
         });
@@ -632,7 +610,7 @@ mod tests {
             assert_eq!(err.status(), 403);
 
             assert!(
-                has_audit(&state.pool, tenant, &request_id, "deny").await,
+                has_audit(state.postgres.vala_pool(), tenant, &request_id, "deny").await,
                 "an RBAC denial appends one deny audit row in its own tx"
             );
         });

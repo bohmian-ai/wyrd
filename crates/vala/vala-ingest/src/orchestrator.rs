@@ -240,23 +240,9 @@ pub fn validate_card_scope(
 /// Returns [`IngestError::StreamProtocolViolation`] when the fqn does not name a
 /// known Bifrost namespace or is not a single `namespace.name` pair.
 pub fn resolve_fqn(fqn: &str) -> Result<(BifrostNamespace, String), IngestError> {
-    for ns in [
-        BifrostNamespace::System,
-        BifrostNamespace::Bifrost,
-        BifrostNamespace::Traces,
-        BifrostNamespace::Eval,
-    ] {
-        let prefix = format!("{}.", ns.as_str());
-        if let Some(name) = fqn.strip_prefix(&prefix) {
-            if name.is_empty() || name.contains('.') {
-                continue;
-            }
-            return Ok((ns, name.to_owned()));
-        }
-    }
-    Err(IngestError::StreamProtocolViolation(format!(
-        "unrecognized table fqn: {fqn}"
-    )))
+    BifrostNamespace::split_fqn(fqn).ok_or_else(|| {
+        IngestError::StreamProtocolViolation(format!("unrecognized table fqn: {fqn}"))
+    })
 }
 
 /// Drive one ingest stream end-to-end: RBAC gate → collect → system-table gate

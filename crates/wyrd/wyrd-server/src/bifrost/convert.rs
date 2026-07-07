@@ -20,19 +20,10 @@ use wyrd_spec::vala::api::{
 ///
 /// Unknown namespaces are a client error rather than a silent default.
 pub fn namespace_from_wire(namespace: &str) -> Result<BifrostNamespace, WyrdError> {
-    let ns = match namespace {
-        "vala.system" => BifrostNamespace::System,
-        "vala.bifrost" => BifrostNamespace::Bifrost,
-        "vala.traces" => BifrostNamespace::Traces,
-        "vala.eval" => BifrostNamespace::Eval,
-        other => {
-            return Err(WyrdError::Validation {
-                message: format!("unknown Bifrost namespace: {other}"),
-                details: serde_json::json!({ "namespace": other }),
-            });
-        }
-    };
-    Ok(ns)
+    BifrostNamespace::from_wire(namespace).ok_or_else(|| WyrdError::Validation {
+        message: format!("unknown Bifrost namespace: {namespace}"),
+        details: serde_json::json!({ "namespace": namespace }),
+    })
 }
 
 /// Map a wire time precision to its Arrow form.

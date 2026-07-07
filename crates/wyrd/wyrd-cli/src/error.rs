@@ -167,6 +167,55 @@ pub enum WyrdCliError {
         detail: String,
     },
 
+    /// Database pool, connection, or query failed.
+    #[error("database error: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_500_DATABASE",
+        status = 500,
+        title = "Database error",
+        remediation = "Check WYRD_DATABASE_URL, database connectivity, and credentials."
+    )]
+    Database {
+        /// Error detail.
+        detail: String,
+    },
+
+    /// Database migration failed.
+    #[error("migration failed: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_500_MIGRATION",
+        status = 500,
+        title = "Database migration failed",
+        remediation = "Inspect the migration error and ensure the migrator DSN has the required privileges."
+    )]
+    Migration {
+        /// Error detail.
+        detail: String,
+    },
+
+    /// Embedded Postgres did not return a platform-admin DSN.
+    #[error("embedded postgres did not return a platform-admin DSN")]
+    #[wyrd_error(
+        code = "WYRD_CLI_500_MISSING_ADMIN_DSN",
+        status = 500,
+        title = "Missing platform-admin DSN",
+        remediation = "Ensure embedded Postgres is configured to emit a platform-admin DSN, or supply WYRD_PLATFORM_ADMIN_DSN."
+    )]
+    MissingAdminDsn,
+
+    /// API key hashing failed.
+    #[error("api key hashing failed: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_500_HASHING",
+        status = 500,
+        title = "API key hashing failed",
+        remediation = "This is an internal error; retry or check the wyrd-auth-issue configuration."
+    )]
+    Hashing {
+        /// Error detail.
+        detail: String,
+    },
+
     /// Filesystem IO failed.
     #[error("io failed: {source}")]
     #[wyrd_error(

@@ -49,12 +49,12 @@ pub async fn dispatch(args: BootstrapArgs) -> Result<ExitCode, WyrdCliError> {
 
     let boot = PostgresBoot::from_env()
         .await
-        .map_err(|e| WyrdCliError::Io {
-            source: std::io::Error::other(e.to_string()),
+        .map_err(|e| WyrdCliError::Database {
+            detail: e.to_string(),
         })?;
 
-    let dsns = boot.dsns().map_err(|e| WyrdCliError::Io {
-        source: std::io::Error::other(e.to_string()),
+    let dsns = boot.dsns().map_err(|e| WyrdCliError::Database {
+        detail: e.to_string(),
     })?;
 
     let migrator_pool = wyrd_sql::pool::build_pool(
@@ -62,8 +62,8 @@ pub async fn dispatch(args: BootstrapArgs) -> Result<ExitCode, WyrdCliError> {
         PoolConfig::migrator_defaults(),
     )
     .await
-    .map_err(|e| WyrdCliError::Io {
-        source: std::io::Error::other(e.to_string()),
+    .map_err(|e| WyrdCliError::Database {
+        detail: e.to_string(),
     })?;
 
     let migrate_result = async {
@@ -72,26 +72,24 @@ pub async fn dispatch(args: BootstrapArgs) -> Result<ExitCode, WyrdCliError> {
     }
     .await;
     migrator_pool.close().await;
-    migrate_result.map_err(|e| WyrdCliError::Io {
-        source: std::io::Error::other(e.to_string()),
+    migrate_result.map_err(|e| WyrdCliError::Migration {
+        detail: e.to_string(),
     })?;
 
     let app_pool = wyrd_sql::pool::build_pool(dsns.app.expose_secret(), PoolConfig::app_defaults())
         .await
-        .map_err(|e| WyrdCliError::Io {
-            source: std::io::Error::other(e.to_string()),
+        .map_err(|e| WyrdCliError::Database {
+            detail: e.to_string(),
         })?;
 
-    let platform_admin_dsn = dsns.platform_admin.ok_or_else(|| WyrdCliError::Io {
-        source: std::io::Error::other("embedded postgres did not return a platform-admin DSN"),
-    })?;
+    let platform_admin_dsn = dsns.platform_admin.ok_or(WyrdCliError::MissingAdminDsn)?;
     let platform_admin_pool = wyrd_sql::pool::build_pool(
         platform_admin_dsn.expose_secret(),
         PoolConfig::platform_admin_defaults(),
     )
     .await
-    .map_err(|e| WyrdCliError::Io {
-        source: std::io::Error::other(e.to_string()),
+    .map_err(|e| WyrdCliError::Database {
+        detail: e.to_string(),
     })?;
 
     let data_tenant_id = provision_dev_tenant(&platform_admin_pool, &app_pool).await?;
@@ -121,14 +119,14 @@ async fn provision_dev_tenant(
     platform_admin_pool: &PgPool,
     app_pool: &PgPool,
 ) -> Result<DataTenantId, WyrdCliError> {
-    let slug = wyrd_spec::TenantSlug::new(DEV_TENANT_SLUG).map_err(|e| WyrdCliError::Io {
-        source: std::io::Error::other(e.to_string()),
+    let slug = wyrd_spec::TenantSlug::new(DEV_TENANT_SLUG).map_err(|e| WyrdCliError::Database {
+        detail: e.to_string(),
     })?;
 
     if let Some(id) = resolve_by_slug_for_app(app_pool, &slug)
         .await
-        .map_err(|e| WyrdCliError::Io {
-            source: std::io::Error::other(e.to_string()),
+        .map_err(|e| WyrdCliError::Database {
+            detail: e.to_string(),
         })?
     {
         return Ok(id);
@@ -145,17 +143,17 @@ async fn provision_dev_tenant(
     .bind(DEV_TENANT_DISPLAY_NAME)
     .execute(platform_admin_pool)
     .await
-    .map_err(|e| WyrdCliError::Io {
-        source: std::io::Error::other(e.to_string()),
+    .map_err(|e| WyrdCliError::Database {
+        detail: e.to_string(),
     })?;
 
     resolve_by_slug_for_app(app_pool, &slug)
         .await
-        .map_err(|e| WyrdCliError::Io {
-            source: std::io::Error::other(e.to_string()),
+        .map_err(|e| WyrdCliError::Database {
+            detail: e.to_string(),
         })?
-        .ok_or_else(|| WyrdCliError::Io {
-            source: std::io::Error::other("dev tenant could not be resolved after insert"),
+        .ok_or_else(|| WyrdCliError::Database {
+            detail: "dev tenant could not be resolved after insert".to_owned(),
         })
 }
 
@@ -166,8 +164,8 @@ async fn seed_dev_principal(
 ) -> Result<(SecretString, String), WyrdCliError> {
     let mut conn = TenantConn::acquire(app_pool, data_tenant_id)
         .await
-        .map_err(|e| WyrdCliError::Io {
-            source: std::io::Error::other(e.to_string()),
+        .map_err(|e| WyrdCliError::Database {
+            detail: e.to_string(),
         })?;
 
     let sa_id = Uuid::new_v4();
@@ -181,8 +179,8 @@ async fn seed_dev_principal(
         DEV_SYSTEM_ACTOR_ID,
     )
     .await
-    .map_err(|e| WyrdCliError::Io {
-        source: std::io::Error::other(e.to_string()),
+    .map_err(|e| WyrdCliError::Database {
+        detail: e.to_string(),
     })?;
 
     let api_key_id = Uuid::new_v4();
@@ -191,11 +189,11 @@ async fn seed_dev_principal(
     let raw_clone = raw_key.clone();
     let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw_clone))
         .await
-        .map_err(|e| WyrdCliError::Io {
-            source: std::io::Error::other(e.to_string()),
+        .map_err(|e| WyrdCliError::Database {
+            detail: format!("spawn_blocking join failed: {e}"),
         })?
-        .map_err(|e| WyrdCliError::Io {
-            source: std::io::Error::other(e.to_string()),
+        .map_err(|e| WyrdCliError::Hashing {
+            detail: e.to_string(),
         })?;
 
     let expires_at = Utc::now() + chrono::Duration::days(3650);
@@ -209,8 +207,8 @@ async fn seed_dev_principal(
         expires_at,
     )
     .await
-    .map_err(|e| WyrdCliError::Io {
-        source: std::io::Error::other(e.to_string()),
+    .map_err(|e| WyrdCliError::Database {
+        detail: e.to_string(),
     })?;
 
     insert_audit_credential_issuance(
@@ -223,12 +221,12 @@ async fn seed_dev_principal(
         expires_at,
     )
     .await
-    .map_err(|e| WyrdCliError::Io {
-        source: std::io::Error::other(e.to_string()),
+    .map_err(|e| WyrdCliError::Database {
+        detail: e.to_string(),
     })?;
 
-    conn.commit().await.map_err(|e| WyrdCliError::Io {
-        source: std::io::Error::other(e.to_string()),
+    conn.commit().await.map_err(|e| WyrdCliError::Database {
+        detail: e.to_string(),
     })?;
 
     let card_ref_string = card_ref.to_string();

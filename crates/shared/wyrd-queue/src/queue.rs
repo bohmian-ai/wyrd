@@ -148,19 +148,6 @@ impl RecordQueue {
         builder.finish_ipc()
     }
 
-    fn rebuffer<I: IntoIterator<Item = Row>>(&self, rows: I) {
-        let mut overflow = 0_u64;
-        for row in rows {
-            if self.staging.push(row).is_err() {
-                overflow += 1;
-            }
-        }
-        if overflow > 0 {
-            self.counters.dropped.fetch_add(overflow, Ordering::SeqCst);
-            tracing::warn!(overflow, "staging overflow on re-buffer; rows dropped");
-        }
-    }
-
     /// Drain staging, seal each `flush_max_rows` chunk into one IPC batch under a
     /// stable `batch_id`, and ship it. On sink failure or flush-deadline timeout,
     /// the affected chunk is pushed (with its original `batch_id`) into `self.retry`

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -116,6 +116,99 @@ impl DeploymentProfile {
     }
 }
 
+/// Which network transports the server binds and serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
+pub enum ServeMode {
+    /// Serve HTTP and gRPC (default).
+    #[default]
+    Both,
+    /// Serve HTTP only.
+    Http,
+    /// Serve gRPC only.
+    Grpc,
+}
+
+impl ServeMode {
+    /// True when this mode binds the HTTP listener.
+    #[must_use]
+    pub fn serves_http(self) -> bool {
+        matches!(self, Self::Both | Self::Http)
+    }
+
+    /// True when this mode binds the gRPC listener.
+    #[must_use]
+    pub fn serves_grpc(self) -> bool {
+        matches!(self, Self::Both | Self::Grpc)
+    }
+}
+
+/// Transport-selection configuration.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServeConfig {
+    /// Transports to bind. Defaults to `Both`.
+    #[serde(default)]
+    pub mode: ServeMode,
+}
+
+/// Prometheus metrics server configuration.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Whether to bind the metrics listener. Defaults to true.
+    #[serde(default = "default_metrics_enabled")]
+    pub enabled: bool,
+    /// Explicit bind address. When `None`, resolves to loopback on the HTTP
+    /// port + 1. The endpoint is unauthenticated, so the default deliberately
+    /// stays on loopback rather than inheriting the (possibly public) HTTP IP.
+    #[serde(default)]
+    pub bind: Option<SocketAddr>,
+}
+
+fn default_metrics_enabled() -> bool {
+    true
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_metrics_enabled(),
+            bind: None,
+        }
+    }
+}
+
+impl MetricsConfig {
+    /// Resolve the concrete metrics bind. When `bind` is unset, use
+    /// **loopback** (`127.0.0.1`) on `http_bind`'s port + 1 — NOT `http_bind`'s
+    /// IP, which may be `0.0.0.0`. Unauthenticated `/metrics` must not be
+    /// public by default.
+    ///
+    /// Returns `None` when the auto-computed port would overflow (HTTP on port
+    /// 65535 has no room for `+ 1`).
+    #[must_use]
+    pub fn resolved_bind(&self, http_bind: SocketAddr) -> Option<SocketAddr> {
+        if let Some(bind) = self.bind {
+            return Some(bind);
+        }
+        let port = http_bind.port().checked_add(1)?;
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+    }
+
+    /// True when the resolved bind is exposed beyond loopback (public IP or the
+    /// unspecified `0.0.0.0`/`::` address). Used to warn in production.
+    ///
+    /// Returns `false` when the bind address cannot be resolved (port overflow).
+    #[must_use]
+    pub fn is_public_bind(&self, http_bind: SocketAddr) -> bool {
+        self.resolved_bind(http_bind)
+            .map(|addr| !addr.ip().is_loopback())
+            .unwrap_or(false)
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Config structs
 // ──────────────────────────────────────────────────────────────────────────────
@@ -145,6 +238,12 @@ pub struct WyrdServerConfig {
     /// Graceful shutdown configuration.
     #[serde(default)]
     pub shutdown: ShutdownConfig,
+    /// Transport-selection configuration.
+    #[serde(default)]
+    pub serve: ServeConfig,
+    /// Prometheus metrics server configuration.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
     /// Readiness probe configuration.
     #[serde(default)]
     pub readiness: ReadinessConfig,
@@ -714,6 +813,38 @@ impl WyrdServerConfig {
             })?;
         }
 
+        // serve.mode
+        if let Some(val) = env_opt("WYRD_SERVE_MODE")? {
+            self.serve.mode = match val.as_str() {
+                "both" => ServeMode::Both,
+                "http" => ServeMode::Http,
+                "grpc" => ServeMode::Grpc,
+                _ => {
+                    return Err(ConfigError::BadEnvVar {
+                        key: "WYRD_SERVE_MODE".to_string(),
+                        message: format!("expected 'both', 'http', or 'grpc', got {val:?}"),
+                    });
+                }
+            };
+        }
+
+        // metrics.enabled
+        if let Some(val) = env_opt("WYRD_METRICS_ENABLED")? {
+            self.metrics.enabled = parse_flag(&val, "WYRD_METRICS_ENABLED")?;
+        }
+
+        // metrics.bind
+        if let Some(val) = env_opt("WYRD_METRICS_BIND")? {
+            self.metrics.bind =
+                Some(
+                    val.parse::<SocketAddr>()
+                        .map_err(|e| ConfigError::BadEnvVar {
+                            key: "WYRD_METRICS_BIND".to_string(),
+                            message: e.to_string(),
+                        })?,
+                );
+        }
+
         // readiness.tick_ms
         if let Some(val) = env_opt("WYRD_READINESS_TICK_MS")? {
             self.readiness.tick_ms = val.parse::<u64>().map_err(|e| ConfigError::BadEnvVar {
@@ -783,6 +914,22 @@ impl WyrdServerConfig {
             return Err(ConfigError::BindCollision {
                 bind: self.http.bind,
             });
+        }
+
+        // 1b. Metrics bind must not collide with HTTP or gRPC when enabled.
+        if self.metrics.enabled {
+            let metrics_bind =
+                self.metrics
+                    .resolved_bind(self.http.bind)
+                    .ok_or_else(|| ConfigError::Invalid {
+                        message:
+                            "metrics port arithmetic overflow: HTTP is on port 65535, leaving \
+                              no room for the auto-computed metrics port (http_port + 1)"
+                                .to_owned(),
+                    })?;
+            if metrics_bind == self.http.bind || metrics_bind == self.grpc.bind {
+                return Err(ConfigError::BindCollision { bind: metrics_bind });
+            }
         }
 
         // 2. pools.max_connections >= 2
@@ -986,6 +1133,22 @@ impl WyrdServerConfig {
                           workload_bindings are configured"
                     .to_string(),
             });
+        }
+
+        // Metrics endpoint is unauthenticated; warn if it is exposed beyond
+        // loopback in production. Not an error — routable scrape is a valid,
+        // network-policy-protected choice — but it must be deliberate.
+        if self.metrics.enabled
+            && self.deployment_profile.is_production()
+            && self.metrics.is_public_bind(self.http.bind)
+        {
+            if let Some(bind) = self.metrics.resolved_bind(self.http.bind) {
+                tracing::warn!(
+                    %bind,
+                    "unauthenticated /metrics is bound to a non-loopback address in \
+                     production; ensure a network policy restricts scrape access"
+                );
+            }
         }
 
         Ok(())
@@ -1753,5 +1916,120 @@ mod tests {
                 Some("from-env")
             );
         });
+    }
+
+    // ── 36. ServeMode defaults to Both ───────────────────────────────────────
+
+    #[test]
+    fn serve_mode_defaults_to_both() {
+        let cfg = WyrdServerConfig::default();
+        assert_eq!(cfg.serve.mode, ServeMode::Both);
+    }
+
+    // ── 37. WYRD_SERVE_MODE env override ────────────────────────────────────
+
+    #[test]
+    fn env_serve_mode_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_vars([("WYRD_SERVE_MODE", Some("grpc"))], || {
+            let mut cfg = WyrdServerConfig::default();
+            cfg.apply_env_overrides().expect("apply succeeds");
+            assert_eq!(cfg.serve.mode, ServeMode::Grpc);
+        });
+        temp_env::with_vars([("WYRD_SERVE_MODE", Some("http"))], || {
+            let mut cfg = WyrdServerConfig::default();
+            cfg.apply_env_overrides().expect("apply succeeds");
+            assert_eq!(cfg.serve.mode, ServeMode::Http);
+        });
+        temp_env::with_vars([("WYRD_SERVE_MODE", Some("both"))], || {
+            let mut cfg = WyrdServerConfig::default();
+            cfg.apply_env_overrides().expect("apply succeeds");
+            assert_eq!(cfg.serve.mode, ServeMode::Both);
+        });
+        temp_env::with_vars([("WYRD_SERVE_MODE", Some("invalid"))], || {
+            let mut cfg = WyrdServerConfig::default();
+            let err = cfg.apply_env_overrides().expect_err("bad value must error");
+            assert!(
+                matches!(err, ConfigError::BadEnvVar { ref key, .. } if key == "WYRD_SERVE_MODE"),
+                "expected BadEnvVar(WYRD_SERVE_MODE), got {err:?}"
+            );
+        });
+    }
+
+    // ── 38. MetricsConfig resolved_bind uses loopback + http_port+1 ──────────
+
+    #[test]
+    fn metrics_bind_defaults_to_loopback_port_plus_one() {
+        let cfg = MetricsConfig::default();
+        let http_bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let resolved = cfg
+            .resolved_bind(http_bind)
+            .expect("port 8080 + 1 must not overflow");
+        assert_eq!(
+            resolved,
+            "127.0.0.1:8081".parse::<SocketAddr>().unwrap(),
+            "default metrics bind must be loopback:http_port+1"
+        );
+    }
+
+    #[test]
+    fn metrics_bind_overflow_at_port_65535_returns_none() {
+        let cfg = MetricsConfig::default();
+        let http_bind: SocketAddr = "0.0.0.0:65535".parse().unwrap();
+        assert!(
+            cfg.resolved_bind(http_bind).is_none(),
+            "port 65535 + 1 overflows u16 and must return None"
+        );
+    }
+
+    // ── 39. MetricsConfig.is_public_bind correctness ─────────────────────────
+
+    #[test]
+    fn metrics_default_bind_is_not_public() {
+        let http_bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        assert!(
+            !MetricsConfig::default().is_public_bind(http_bind),
+            "default metrics bind must not be public"
+        );
+        let explicit_public = MetricsConfig {
+            enabled: true,
+            bind: Some("0.0.0.0:9000".parse().unwrap()),
+        };
+        assert!(
+            explicit_public.is_public_bind(http_bind),
+            "explicit 0.0.0.0 metrics bind must be public"
+        );
+    }
+
+    // ── 40. Metrics bind collision with HTTP → BindCollision ─────────────────
+
+    #[test]
+    fn metrics_bind_collision_with_http_invalid() {
+        // The default HTTP bind is 0.0.0.0:8080, gRPC is 127.0.0.1:50051.
+        // Set metrics.bind to the HTTP port explicitly to trigger a collision.
+        let toml = r#"
+            [metrics]
+            bind = "0.0.0.0:8080"
+        "#;
+        let cfg = from_toml_str(toml).expect("parses ok");
+        let err = cfg
+            .validate()
+            .expect_err("metrics-HTTP collision must fail");
+        assert!(
+            matches!(err, ConfigError::BindCollision { .. }),
+            "expected BindCollision, got {err:?}"
+        );
+    }
+
+    // ── 41. ServeMode truth table ─────────────────────────────────────────────
+
+    #[test]
+    fn serve_mode_truth_table() {
+        assert!(ServeMode::Both.serves_http());
+        assert!(ServeMode::Both.serves_grpc());
+        assert!(ServeMode::Http.serves_http());
+        assert!(!ServeMode::Http.serves_grpc());
+        assert!(!ServeMode::Grpc.serves_http());
+        assert!(ServeMode::Grpc.serves_grpc());
     }
 }

@@ -115,7 +115,7 @@ run = "echo 'impl env ready: shared Postgres up; mise supplies DATABASE_URL / WY
 
 [tasks."impl:warm"]
 hide = true
-description = "Warm the shared sccache by compiling the workspace on the impl base before dispatching a wave. Per-worktree CARGO_TARGET_DIR means each executor is cold on disk; sccache turns those into warm object-cache hits. Requires sccache + RUSTC_WRAPPER=sccache in the environment."
+description = "Seed the shared cargo target dir by compiling the workspace before dispatching a wave. All executors share one CARGO_TARGET_DIR, so warming once builds the heavy deps (DataFusion/Arrow/Iceberg) a single time; each executor then reuses them instead of cold-building in parallel and racing on cargo's build lock."
 run = "cargo build --workspace --all-features --all-targets"
 
 [tasks."test:rust:workspace"]

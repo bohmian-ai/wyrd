@@ -96,6 +96,8 @@ sha2 = "0.10"
 uuid = { version = "1", default-features = false, features = ["serde"] }
 semver = { version = "1", features = ["serde"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
+metrics = { version = "0.24", default-features = false }
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 mini-moka = { version = "0.10", features = ["sync"] }
 proptest = "1"
 serial_test = "3"

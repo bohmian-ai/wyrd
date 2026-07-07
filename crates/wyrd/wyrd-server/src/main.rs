@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use wyrd_server::WyrdServerConfig;
 use wyrd_server::app::{BootExit, run};
 use wyrd_server::boot::bootstrap::bootstrap_admin_key;
+use wyrd_server::config::ServeMode;
 use wyrd_spec::TenantSlug;
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::postgres_boot::PostgresBoot;
@@ -16,6 +17,9 @@ const EX_SOFTWARE: i32 = 70;
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// Transport to serve (overrides config `serve.mode` when set).
+    #[arg(long, value_enum, global = true)]
+    mode: Option<ServeMode>,
 }
 
 /// Operator subcommands. The absent arm runs the server.
@@ -35,7 +39,7 @@ async fn main() {
     // `None` arm stays byte-for-byte today's `run()`.
     let cli = Cli::parse();
     let result = match cli.command {
-        None => run().await,
+        None => run(cli.mode).await,
         Some(Command::BootstrapKey { tenant }) => bootstrap_key(&tenant).await,
     };
 

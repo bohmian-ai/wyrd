@@ -11,7 +11,6 @@ use chrono::Duration as ChronoDuration;
 use ed25519_dalek::VerifyingKey;
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
-use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
@@ -36,9 +35,10 @@ use wyrd_semver::VersionBlock;
 use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
+use wyrd_server::config::ServeMode;
 use wyrd_server::config::{IssuerEntry, WorkloadBindingEntry};
 use wyrd_server::postgres::ServerPostgres;
-use wyrd_server::{AppState, build_router};
+use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::auth::{
@@ -83,6 +83,7 @@ enum Mode {
     Bound {
         addr: std::net::SocketAddr,
         base_url: String,
+        grpc_addr: std::net::SocketAddr,
     },
 }
 
@@ -244,14 +245,10 @@ impl WyrdTestServer {
     }
 
     /// Return the gRPC endpoint URL when bound to a real socket.
-    ///
-    /// The harness binds a single TCP socket today; this derives the gRPC URL
-    /// from that same address so `WYRD_GRPC_URL` and `WYRD_SERVER_URL` point
-    /// to the same host:port until the harness grows a dedicated gRPC listener.
     #[must_use]
     pub fn grpc_url(&self) -> Option<String> {
         match &self.mode {
-            Mode::Bound { addr, .. } => Some(format!("http://{addr}")),
+            Mode::Bound { grpc_addr, .. } => Some(format!("http://{grpc_addr}")),
             Mode::InProcess => None,
         }
     }
@@ -1144,34 +1141,68 @@ impl WyrdTestServerBuilder {
         })
     }
 
-    /// Build, start, and bind the server to an OS-assigned TCP socket.
+    /// Build, start, and bind the server to OS-assigned TCP sockets (HTTP + gRPC).
+    ///
+    /// Boots the **exact production server** — `WyrdServer::new(...).bind(...)`
+    /// then `BoundServer::run()` — so bound-mode tests exercise the real
+    /// composition (protected edge stack, gRPC ingest mount, readiness-driven
+    /// health, supervisor) rather than a hand-rolled facsimile. Only the state
+    /// origin differs from production: it is built from the per-test
+    /// [`PgFixture`] instead of loaded config.
+    ///
+    /// Improves on the "find a free port, drop it, rebind" pattern: `bind`
+    /// binds the OS-assigned `:0` listeners once and reports the concrete
+    /// addresses, so there is no bind-then-rebind race.
     ///
     /// # Errors
     /// Returns an error when startup or socket binding fails.
     pub async fn start_bound(self) -> Result<WyrdTestServer, WyrdTestServerError> {
         let mut srv = self.start_in_process().await?;
 
-        let listener = TcpListener::bind("127.0.0.1:0")
+        // Inject a known shutdown token so the harness can stop the real server;
+        // `BoundServer::run` observes `state.shutdown_token`.
+        let shutdown_token = CancellationToken::new();
+        let state = srv
+            .inner
+            .state
+            .clone()
+            .with_shutdown_token(shutdown_token.clone());
+
+        // Ephemeral ports, metrics off (the recorder is a process-global
+        // singleton that must not be installed per-test), reflection off.
+        let loopback = "127.0.0.1:0"
+            .parse()
+            .expect("static loopback socket addr is valid");
+        let mut config = WyrdServerConfig::default();
+        config.http.bind = loopback;
+        config.grpc.bind = loopback;
+        config.metrics.enabled = false;
+        config.serve.mode = ServeMode::Both;
+
+        let bound = WyrdServer::new(config, state)
+            .map_err(|e| WyrdTestServerError::Start(e.to_string()))?
+            .bind(ServeMode::Both)
             .await
-            .map_err(|e| WyrdTestServerError::Bind(e.to_string()))?;
-        let addr = listener
-            .local_addr()
-            .map_err(|e| WyrdTestServerError::Bind(e.to_string()))?;
+            .map_err(|e| WyrdTestServerError::Bind(format!("{e:?}")))?;
+
+        let addr = bound
+            .http_addr()
+            .ok_or_else(|| WyrdTestServerError::Bind("no HTTP address bound".to_owned()))?;
+        let grpc_addr = bound
+            .grpc_addr()
+            .ok_or_else(|| WyrdTestServerError::Bind("no gRPC address bound".to_owned()))?;
         let base_url = format!("http://{addr}");
 
-        let shutdown_token = CancellationToken::new();
-        let token_clone = shutdown_token.clone();
-        let router = srv.inner.router.clone();
-
-        let handle = wyrd_runtime::runtime().spawn(async move {
-            let _ = wyrd_server::serve(router, listener, token_clone).await;
+        let serve_handle = wyrd_runtime::runtime().spawn(async move {
+            let _ = bound.run().await;
         });
 
         srv.shutdown_token = Some(shutdown_token);
-        srv.serve_handle = Some(handle);
+        srv.serve_handle = Some(serve_handle);
         srv.mode = Mode::Bound {
             addr,
             base_url: base_url.clone(),
+            grpc_addr,
         };
 
         wait_for_ready(&base_url).await?;

@@ -31,7 +31,7 @@ mod audit_relay {
     struct Fixture {
         _tmp: TempDir,
         catalog: Arc<WyrdCatalog>,
-        /// Runtime `wyrd_app` pool — WyrdCatalog writes and per-tenant appends.
+        /// Runtime `wyrd_app` pool — `WyrdCatalog` writes and per-tenant appends.
         pool: Arc<PgPool>,
         /// BYPASSRLS platform-admin pool — `platform.tenants` seeding only.
         platform_admin: PgPool,

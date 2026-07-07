@@ -53,12 +53,20 @@ pub enum IngestError {
         /// Fully-qualified table name whose schema does not match.
         table: String,
     },
-    /// The stream exceeded an aggregate byte/row bound.
-    #[error("ingest stream too large ({bytes} > {limit})")]
+    /// The stream exceeded the aggregate byte bound.
+    #[error("ingest stream too large ({bytes} > {limit} bytes)")]
     BatchTooLarge {
-        /// Observed running total when the bound tripped.
+        /// Observed running byte total when the bound tripped.
         bytes: u64,
-        /// The configured limit.
+        /// The configured byte limit.
+        limit: u64,
+    },
+    /// The stream exceeded the aggregate row bound.
+    #[error("ingest stream too many rows ({rows} > {limit})")]
+    TooManyRows {
+        /// Observed running row total when the bound tripped.
+        rows: u64,
+        /// The configured row limit.
         limit: u64,
     },
     /// An idle-frame gap or total-stream deadline elapsed.
@@ -90,7 +98,9 @@ impl IngestError {
             Self::RbacDenied { .. } => "WYRD_PERMISSION_403_DENIED_RBAC",
             Self::TableNotFound { .. } => "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
             Self::SchemaMismatch { .. } => "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
-            Self::BatchTooLarge { .. } => "WYRD_VALA_413_INGEST_OVERSIZED",
+            Self::BatchTooLarge { .. } | Self::TooManyRows { .. } => {
+                "WYRD_VALA_413_INGEST_OVERSIZED"
+            }
             Self::StreamIdle => "WYRD_VALA_408_INGEST_IDLE_TIMEOUT",
             Self::TooManyStreams => "WYRD_VALA_429_INGEST_TOO_MANY_STREAMS",
             Self::WriterClosed => "WYRD_VALA_409_INGEST_WRITER_CLOSED",
@@ -109,7 +119,9 @@ impl IngestError {
             | Self::RbacDenied { .. } => Code::PermissionDenied,
             Self::TableNotFound { .. } => Code::NotFound,
             Self::SchemaMismatch { .. } => Code::FailedPrecondition,
-            Self::BatchTooLarge { .. } | Self::TooManyStreams => Code::ResourceExhausted,
+            Self::BatchTooLarge { .. } | Self::TooManyRows { .. } | Self::TooManyStreams => {
+                Code::ResourceExhausted
+            }
             Self::StreamIdle => Code::DeadlineExceeded,
             Self::WriterClosed => Code::Aborted,
             Self::Internal(_) => Code::Internal,

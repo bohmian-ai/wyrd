@@ -17,8 +17,8 @@ use wyrd_spec::vala::api::{
 
 use crate::AppState;
 use crate::audit;
-use crate::components::auth::Caller;
 use crate::bifrost::convert;
+use crate::components::auth::Caller;
 
 /// Map an engine Bifrost error to the public `WyrdError` via the single delegate.
 fn map_engine_error(error: EngineBifrostError) -> WyrdError {
@@ -213,7 +213,11 @@ mod tests {
         let wyrd = wyrd_sql::WyrdPostgres::from_pools(pool.clone(), None);
         let vala = vala_sql::ValaPostgres::from_pools(pool, None);
         let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
-        AppState::new(postgres, Arc::clone(&storage), crate::test_support::test_catalog().await)
+        AppState::new(
+            postgres,
+            Arc::clone(&storage),
+            crate::test_support::test_catalog().await,
+        )
     }
 
     async fn caller_with(permissions: impl IntoIterator<Item = Permission>) -> Caller {
@@ -226,7 +230,6 @@ mod tests {
                 tenant,
                 vec![],
                 PermissionSet::from_iter(permissions),
-                wyrd_runtime::CardScope::default(),
             ),
             request_id: RequestId::parse(&uuid::Uuid::now_v7().to_string())
                 .expect("request id parses"),

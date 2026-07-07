@@ -34,8 +34,8 @@ use wyrd_spec::vala::api::{
 
 use crate::AppState;
 use crate::audit;
-use crate::components::auth::Caller;
 use crate::bifrost::convert;
+use crate::components::auth::Caller;
 use crate::query::floor;
 
 /// Materialized sync-query result: the Arrow IPC stream plus the header metadata
@@ -121,7 +121,6 @@ fn ipc_error(error: arrow::error::ArrowError) -> WyrdError {
         details: json!({ "detail": error.to_string() }),
     }
 }
-
 
 /// Build a tenant-scoped `SessionContext` and register only the Bifrost tables the
 /// query references. The context carries the tenant analyzer rule and each
@@ -413,9 +412,12 @@ mod tests {
         })
         .await
         .expect("local storage handle");
+        let pool = crate::test_support::test_pool().await;
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(pool.clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pools(pool, None);
+        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
         AppState::new(
-            crate::test_support::test_pool().await,
-            None,
+            postgres,
             Arc::clone(&storage),
             crate::test_support::test_catalog().await,
         )
@@ -431,7 +433,6 @@ mod tests {
                 tenant,
                 vec![],
                 PermissionSet::from_iter(permissions),
-                wyrd_runtime::CardScope::default(),
             ),
             request_id: RequestId::parse(&uuid::Uuid::now_v7().to_string())
                 .expect("request id parses"),

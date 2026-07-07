@@ -64,6 +64,17 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn build_production_accepts_non_stub_hooks() {
+        let mut state = test_state().await;
+        state.authz.policy_hook = Arc::new(DenyAllPolicyHook {
+            reason: "test-deny".to_owned(),
+        });
+        state.authz.audit_writer = Arc::new(ReadyAuditWriter);
+
+        assert!(state.build_production().is_ok());
+    }
+
     #[derive(Debug)]
     struct ReadyAuditWriter;
 

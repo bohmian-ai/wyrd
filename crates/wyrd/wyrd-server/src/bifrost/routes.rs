@@ -7,8 +7,8 @@ use wyrd_spec::vala::api::{
     BifrostTableDescription, BifrostTableEntry, RegisterTableRequest, RegisterTableResponse,
 };
 
-use crate::components::auth::Caller;
 use crate::bifrost::service;
+use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 

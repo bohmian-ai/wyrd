@@ -115,8 +115,8 @@ pub async fn collect_frames<S: FrameSource>(
         for decoded in decode_ipc(&frame.arrow_ipc)? {
             total_rows += decoded.num_rows() as u64;
             if total_rows > limits.max_stream_rows {
-                return Err(IngestError::BatchTooLarge {
-                    bytes: total_rows,
+                return Err(IngestError::TooManyRows {
+                    rows: total_rows,
                     limit: limits.max_stream_rows,
                 });
             }

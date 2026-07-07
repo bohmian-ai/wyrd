@@ -1095,14 +1095,13 @@ impl WyrdServerConfig {
         if self.metrics.enabled
             && self.deployment_profile.is_production()
             && self.metrics.is_public_bind(self.http.bind)
+            && let Some(bind) = self.metrics.resolved_bind(self.http.bind)
         {
-            if let Some(bind) = self.metrics.resolved_bind(self.http.bind) {
-                tracing::warn!(
-                    %bind,
-                    "unauthenticated /metrics is bound to a non-loopback address in \
-                     production; ensure a network policy restricts scrape access"
-                );
-            }
+            tracing::warn!(
+                %bind,
+                "unauthenticated /metrics is bound to a non-loopback address in \
+                 production; ensure a network policy restricts scrape access"
+            );
         }
 
         Ok(())

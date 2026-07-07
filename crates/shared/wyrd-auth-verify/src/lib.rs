@@ -413,7 +413,12 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
                         self.cache.invalidate(&hash).await;
                         return Err(AuthError::Revoked);
                     }
-                    Err(_) => {} // resolver unavailable: fail open, let the token through
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "revocation resolver unavailable; failing open (token may be revoked)"
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -462,7 +467,12 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
                     self.cache.invalidate(&hash).await;
                     return Err(AuthError::Revoked);
                 }
-                Err(_) => {} // resolver unavailable: fail open
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "revocation resolver unavailable; failing open (token may be revoked)"
+                    );
+                }
                 _ => {}
             }
         }

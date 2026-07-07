@@ -170,16 +170,14 @@ pub async fn stamp_audit_ship_batch_id(
     seq_hi: i64,
     batch_id: &[u8; 16],
 ) -> Result<u64, SqlError> {
-    let result = sqlx::query(
-        "SELECT vala.stamp_audit_ship_batch_id($1, $2, $3, $4)",
-    )
-    .bind(tenant_id)
-    .bind(seq_lo)
-    .bind(seq_hi)
-    .bind(batch_id.as_slice())
-    .execute(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)?;
+    let result = sqlx::query("SELECT vala.stamp_audit_ship_batch_id($1, $2, $3, $4)")
+        .bind(tenant_id)
+        .bind(seq_lo)
+        .bind(seq_hi)
+        .bind(batch_id.as_slice())
+        .execute(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)?;
     Ok(result.rows_affected())
 }
 

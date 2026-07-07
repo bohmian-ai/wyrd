@@ -14,7 +14,7 @@
 //! returns those rows with `ship_batch_id` already set; the relay reuses that
 //! stored key instead of re-deriving from the live seq range. Because new rows
 //! may have been appended for the same tenant in the interim (shifting the range),
-//! re-deriving would mint a different batch_id and re-ship already-committed rows
+//! re-deriving would mint a different `batch_id` and re-ship already-committed rows
 //! into the append-only `vala.system.audit_log`. The persisted key prevents that.
 
 use std::sync::Arc;
@@ -209,11 +209,11 @@ fn group_by_tenant(rows: Vec<AuditOutboxRow>) -> Result<Vec<RelayShipment>, Bifr
             let seq_lo = rows.first().expect("group is non-empty").seq;
             let seq_hi = rows.last().expect("group is non-empty").seq;
             let batch_id = match rows[0].ship_batch_id.as_deref() {
-                Some(existing) => existing
-                    .try_into()
-                    .map_err(|_| BifrostError::Internal(format!(
+                Some(existing) => existing.try_into().map_err(|_| {
+                    BifrostError::Internal(format!(
                         "relay: persisted ship_batch_id for tenant {tenant} has wrong length"
-                    )))?,
+                    ))
+                })?,
                 None => derive_batch_id(tenant, seq_lo, seq_hi),
             };
             Ok(RelayShipment {
@@ -354,10 +354,5 @@ fn build_audit_log_batch(rows: &[AuditOutboxRow]) -> Result<RecordBatch, Bifrost
 
 /// Lowercase hex-encode a byte slice (used for the chain-hash columns).
 fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    ::hex::encode(bytes)
 }

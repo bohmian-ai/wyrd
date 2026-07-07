@@ -1,17 +1,17 @@
-//! Bifrost read/discovery MCP tools (Stage 3 C7).
+//! Bifrost read/discovery MCP tools.
 //!
 //! Registers four read-only tools into the Skald tool registry:
 //!
-//! - `bifrost.list_tables` — lists the caller's tenant Bifrost tables via the
-//!   C2 route; requires `bifrost_table:read` (enforced server-side).
-//! - `bifrost.describe_table` — describes a single table's schema via the C2
-//!   route; requires `bifrost_table:read` (enforced server-side).
+//! - `bifrost.list_tables` — lists the caller's tenant Bifrost tables;
+//!   requires `bifrost_table:read` (enforced server-side).
+//! - `bifrost.describe_table` — describes a single table's schema;
+//!   requires `bifrost_table:read` (enforced server-side).
 //! - `bifrost.list_permissions` — static catalog of the five Bifrost RBAC
 //!   permissions; no bearer required.
 //! - `bifrost.list_errors` — static catalog of every `WYRD_VALA_*_BIFROST_*`
 //!   error code; no bearer required.
 //!
-//! WRITE tools are deferred to Stage 4+. This module never imports
+//! Write tools are not available in this module. This module never imports
 //! `vala-bifrost`, `sqlx`, or `datafusion` — no engine in the MCP process.
 
 use std::sync::Arc;
@@ -175,7 +175,7 @@ impl AgentTool for ListErrorsTool {
 
     fn description(&self) -> &str {
         "List all Bifrost error codes with their HTTP status, title, and remediation guidance. \
-         Covers C1+C2+C5 error codes including WYRD_VALA_500_AUDIT_UNAVAILABLE. \
+         Includes WYRD_VALA_500_AUDIT_UNAVAILABLE. \
          No authentication required."
     }
 
@@ -198,7 +198,7 @@ impl AgentTool for ListErrorsTool {
 /// Register the four Bifrost read/discovery tools into `registry`.
 ///
 /// The two client-backed tools (`list_tables`, `describe_table`) use the
-/// provided [`WyrdClient`] to call the C2 routes under the caller's bearer.
+/// provided [`WyrdClient`] to call the Bifrost routes under the caller's bearer.
 /// The two static tools (`list_permissions`, `list_errors`) need no bearer.
 ///
 /// # Errors
@@ -248,8 +248,7 @@ pub fn bifrost_permissions() -> Vec<BifrostPermissionDescriptor> {
         .collect()
 }
 
-/// The full Bifrost error catalog — read by `bifrost.list_errors`. Spans
-/// C1+C2+C5 codes.
+/// The full Bifrost error catalog — read by `bifrost.list_errors`.
 ///
 /// Every descriptor is **projected** from [`BifrostError`] via the `WyrdError`
 /// derive accessors (`code`/`status`/`title`/`remediation`); the metadata is

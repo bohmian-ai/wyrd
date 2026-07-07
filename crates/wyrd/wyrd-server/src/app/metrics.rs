@@ -54,10 +54,25 @@ pub fn metrics_router(handle: PrometheusHandle) -> Router {
     Router::new().route("/metrics", get(move || ready(handle.render())))
 }
 
+/// Serve the metrics router on an already-bound `listener` until `shutdown`.
+///
+/// The caller binds the listener (in `WyrdServer::bind`) so bind failures are
+/// boot errors, not task errors — symmetric with `app/serve.rs::serve`.
+///
+/// # Errors
+/// Returns the serve I/O error.
+pub async fn serve_metrics(
+    router: Router,
+    listener: TcpListener,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// `install_recorder()` must return `Err(MetricsError::Install)` on a second
     /// call rather than panicking. This test calls the raw builder twice to pin
     /// that contract without touching the process-global `OnceLock` in
@@ -75,21 +90,4 @@ mod tests {
             "second install_recorder() call must return Err, not Ok or panic"
         );
     }
-}
-
-/// Serve the metrics router on an already-bound `listener` until `shutdown`.
-///
-/// The caller binds the listener (in `WyrdServer::bind`) so bind failures are
-/// boot errors, not task errors — symmetric with `app/serve.rs::serve`.
-///
-/// # Errors
-/// Returns the serve I/O error.
-pub async fn serve_metrics(
-    router: Router,
-    listener: TcpListener,
-    shutdown: CancellationToken,
-) -> std::io::Result<()> {
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await
 }

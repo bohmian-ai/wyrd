@@ -10,8 +10,8 @@
 //! server-side `olap_commits` dedup guarantee across retries.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow_schema::SchemaRef;

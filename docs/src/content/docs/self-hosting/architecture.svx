@@ -10,37 +10,11 @@ order: 2
 
 The server is one process with three transports (HTTP, gRPC, and a Prometheus metrics endpoint), a shared handle registry called `AppState`, and a supervisor that owns the lifecycle of every task. Boot is a fixed, ordered sequence that fails closed. Once assembled, every transport and background worker runs under one supervisor that drains cooperatively on shutdown.
 
+That one process bundles two Wyrd subsystems. The control plane stores and validates cards, derives their lineage, and enforces auth and policy. The Vala data plane records observations, the runs and traces your models and agents emit, and answers analytical queries against them. Vala's warehouse is **Bifrost**, an Apache Iceberg catalog whose table metadata lives in Postgres and whose data files live in object storage. That is why the [Database](/self-hosting/database/) roles include a Bifrost catalog role and a Vala recovery role. For the product-level split between these planes, see [Architecture](/concepts/architecture/) in Concepts.
+
 ## Component map
 
-<Mermaid
-  title="wyrd-server components"
-  chart={`graph TB
-  subgraph Boot["Boot (ordered, fail-closed)"]
-    CFG["load config"] --> DB["PostgresBoot + migrations"]
-    DB --> ASM["assemble pools, storage, OLAP catalog"]
-    ASM --> AUTH["install auth: signing key, verifier, resolvers"]
-    AUTH --> SEED["seed federation: issuers, workload bindings"]
-    SEED --> VAL["production_validate"]
-  end
-  VAL --> STATE
-  subgraph STATE["AppState (shared handle registry)"]
-    PG["postgres"]
-    ST["storage"]
-    BF["bifrost OLAP"]
-    AU["auth + authz"]
-    TL["telemetry + limits"]
-  end
-  STATE --> RUN
-  subgraph RUN["Runtime (supervised tasks)"]
-    HTTP["HTTP transport"]
-    GRPC["gRPC transport"]
-    MET["metrics transport"]
-    WORK["workers: readiness, health, sweeper"]
-    SIG["signal watcher"]
-  end
-  RUN --> SUP["supervisor: drain then abort"]
-`}
-/>
+<WyrdServerGraph />
 
 ## AppState
 
@@ -101,18 +75,7 @@ Health routes (`/healthz`, `/readyz`) sit outside the auth layer by design. They
 
 All transports and workers run in one `JoinSet` under a single supervisor. The supervisor waits for the first task to exit, classifies it, then drives a bounded drain.
 
-<Mermaid
-  title="supervision and shutdown"
-  chart={`graph LR
-  W["wait for first exit"] --> C{"classify"}
-  C -->|"signal (SIGINT/SIGTERM)"| G["graceful"]
-  C -->|"transport or worker error"| T["terminal error"]
-  G --> X["cancel shutdown token"]
-  T --> X
-  X --> D["drain remaining within drain_ms"]
-  D --> A["abort whatever is still running"]
-`}
-/>
+<WyrdShutdownGraph />
 
 A `SIGINT` or `SIGTERM` is the normal path: the signal watcher exits first, the shutdown token is cancelled, and every transport stops accepting new work while in-flight requests finish within `shutdown.drain_ms`. If a task fails first instead (a listener dies, a worker panics), the same drain runs, but the process exits non-zero. Anything still running when the drain deadline passes is aborted.
 

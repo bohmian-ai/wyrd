@@ -42,7 +42,7 @@ export WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD="admin-pw"
 
 ### Roles
 
-The server splits privileges across five roles so that runtime request handling never holds more power than it needs. Row-level security is enforced for `wyrd_app`, which is the only role that serves request traffic.
+The server splits privileges across five roles so that runtime request handling never holds more power than it needs. Row-level security is enforced for `wyrd_app`, which is the only role that serves request traffic. Two of the five belong to Vala, Wyrd's observability warehouse: `wyrd_catalog_app` connects its Bifrost Iceberg catalog, and `vala_recovery` runs its startup recovery. [Architecture](/self-hosting/architecture/) explains how those pieces fit.
 
 | Role | Row-level security | What it does |
 | --- | --- | --- |

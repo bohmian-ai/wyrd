@@ -20,4 +20,5 @@ export { default as Tab } from '$lib/components/Tab.svelte';
 export { default as Steps } from '$lib/components/Steps.svelte';
 export { default as WyrdFlowDiagram } from '$lib/components/WyrdFlowDiagram.svelte';
 export { default as WyrdSequenceDiagram } from '$lib/components/WyrdSequenceDiagram.svelte';
-export { default as Mermaid } from '$lib/components/Mermaid.svelte';
+export { default as WyrdServerGraph } from '$lib/components/WyrdServerGraph.svelte';
+export { default as WyrdShutdownGraph } from '$lib/components/WyrdShutdownGraph.svelte';

@@ -12,7 +12,7 @@ The server keeps artifacts (uploaded model files, datasets, and other card paylo
 
 Credentials for the cloud backends come from each provider's standard SDK credential chain, not from Wyrd-specific secrets. You configure the bucket and region through Wyrd, and let the cloud SDK resolve the identity the way it does everywhere else (environment, instance role, workload identity).
 
-`WYRD_PUBLIC_BASE_URL` is required only for the local backend. The cloud backends serve artifacts through presigned URLs and do not need it.
+Clients move artifact bytes directly against the cloud store through short-lived presigned URLs. The server signs a URL and hands it back; it never proxies the bytes itself. Keeping large transfers off the server process is why the presign lifetime and multipart settings below exist. The local backend has no bucket to sign against, so it serves artifacts through the server, which is why `WYRD_PUBLIC_BASE_URL` is required for `local` and ignored by the cloud backends.
 
 ## Shared settings
 
@@ -25,6 +25,8 @@ These apply to every backend.
 | `WYRD_STORAGE_PRESIGN_TTL_SECS` | `600` | Presigned URL lifetime. Clamped to `60`–`3600`. |
 | `WYRD_STORAGE_PART_SIZE_BYTES` | `16777216` (16 MiB) | Multipart part size. Must be MiB-aligned. Clamped to 5 MiB–5 GiB. |
 | `WYRD_STORAGE_MULTIPART_THRESHOLD_BYTES` | `104857600` (100 MiB) | Object size at or above which cloud backends switch to multipart upload. |
+
+`WYRD_STORAGE_REQUIRE_ENCRYPTION` refuses to finalize an upload that does not report an encryption marker, so a misconfigured bucket fails loudly instead of silently storing plaintext objects. Leave it off unless your environment requires encryption at rest; turn it on to enforce it.
 
 ## Local
 

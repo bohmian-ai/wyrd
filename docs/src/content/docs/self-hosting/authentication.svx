@@ -12,40 +12,24 @@ Wyrd authenticates every request with a signed token. There is no session cookie
 
 ## Principals
 
-Every token belongs to a principal, the identity that obtained it. Three kinds exist.
-
-<DataTable
-  columns={[
-    { header: 'Kind', role: 'name' },
-    { header: 'How it authenticates' },
-    { header: 'Bound to' }
-  ]}
-  rows={[
-    ['User', 'Human OIDC login through an external IdP', 'An email, no card'],
-    ['Service', 'API key, or workload JWT (jwt-bearer)', 'A ServiceCard'],
-    ['Agent', 'API key, or workload JWT (jwt-bearer)', 'An AgentCard']
-  ]}
-/>
-
-Services and Agents authenticate the same way. The difference is the kind of card they are bound to.
+Every token belongs to a principal: a **User** (a human who logged in through an IdP, identified by email), a **Service** (bound to a ServiceCard), or an **Agent** (bound to an AgentCard). Services and Agents authenticate the same way and differ only in the card kind they bind to. See [Authentication](/concepts/authentication/) in Concepts for the full principal and token model.
 
 ## Tokens
 
-Wyrd mints EdDSA (Ed25519) JWTs signed with its own key. Access tokens are short-lived and required on every authenticated request. Refresh tokens are issued alongside for the grants that support rotation (human login and API-key exchange); they are single-use and rotate on each exchange. Workload grants issue an access token only, because a workload can always re-assert its identity through its platform.
-
-Verification runs five checks on every request: the EdDSA signature against the named key, the `iss` claim, expiry within the configured skew, the tenant binding, and the principal's revocation epoch. Any failure is a `401`.
+Wyrd mints EdDSA (Ed25519) JWTs signed with its own key, presented on every request. Access tokens are short-lived; refresh tokens are issued only for the grants that rotate (human login and API-key exchange). How a token is verified, and what each grant returns, is covered in [Authentication](/concepts/authentication/). What an operator supplies is the key material below.
 
 ## Grants
 
-| Grant | Route | Issues refresh? |
-| --- | --- | --- |
-| `wyrd_api_key` | `POST /auth/token` | Yes |
-| `jwt-bearer` (workload) | `POST /auth/token` | No |
-| `authorization_code` (OIDC) | `POST /auth/token` | Yes |
-| `token-exchange` (delegation) | `POST /auth/token` | No |
-| `refresh_token` | `POST /auth/token` | Yes (rotated) |
+A **grant** is how a caller proves its identity at `POST /auth/token` to get a Wyrd access token. Which one you use depends on who is calling.
 
-Human login and machine workload federation are set up in [SSO and OIDC](/self-hosting/sso-and-oidc/). The rest of this page is the key material an operator provides.
+| Caller | Grant | Set up in |
+| --- | --- | --- |
+| A person logging in through your IdP | `authorization_code` (with PKCE) | [SSO and OIDC](/self-hosting/sso-and-oidc/#human-single-sign-on) |
+| A machine workload (CI job, Kubernetes pod) | `jwt-bearer` | [SSO and OIDC](/self-hosting/sso-and-oidc/#workload-federation) |
+| A service or script holding an API key | API-key exchange | [Running the server](/self-hosting/running-the-server/#bootstrap-key) |
+| Any caller renewing an expiring token | `refresh_token` | Automatic once a refresh token is issued |
+
+Delegation (`token-exchange`) also exists, but it is preview-gated and not production-ready; see the [SSO and OIDC limitations](/self-hosting/sso-and-oidc/#limitations). Every grant returns a Wyrd token minted with the signing key below; how each one is verified is in the [grant reference](/concepts/authentication/#grant-types). The rest of this page is the key material every deployment provides.
 
 ## Signing key
 

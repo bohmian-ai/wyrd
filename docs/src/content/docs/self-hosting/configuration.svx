@@ -49,15 +49,30 @@ A production or staging profile requires a real authorization policy hook and au
 
 ## Authentication
 
-Signing and sealing keys are provided by env only, never in the TOML file. See [Authentication](/self-hosting/authentication/) for how to generate and rotate them.
+Every request carries a token the server signs itself, so a deployment supplies the material that makes those tokens work. There are three pieces here, and only the first is always required.
+
+The **signing key** is Wyrd's own Ed25519 private key. It signs every token the server issues and verifies every token that comes back, so it is the one secret a production server cannot boot without. Lose it and nothing validates. Generating, mounting, and rotating it is covered in [Authentication](/self-hosting/authentication/#signing-key).
+
+The **sealing key** encrypts IdP client secrets before they touch the database. "Sealing" is encryption at rest: when you register a trusted issuer that authenticates to its IdP with a shared `client_secret`, the server seals that secret with this key (AES-256-GCM) rather than storing it in plaintext. You need it only when an issuer carries a secret. Public PKCE clients and workload federation carry none, so most deployments never set it. Boot fails closed if an issuer needs a sealing key and none is configured. See [Authentication](/self-hosting/authentication/#sealing-key).
+
+The **tenant slug** names the tenant this deployment serves, and it matters only once you federate identity. See [The implicit tenant](#the-implicit-tenant) below.
+
+Signing and sealing keys are read from the environment only, never from the TOML file.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `WYRD_SIGNING_KEY_FILE` | none | Path to the Ed25519 signing key PEM. Required in production. |
 | `WYRD_SIGNING_KEY_PEM` | none | Inline PEM alternative, used only if `WYRD_SIGNING_KEY_FILE` is unset. |
 | `WYRD_SEALING_KEY_FILE` | none | Path to a file holding a base64 32-byte AES-256-GCM key. Required only if a seeded issuer carries a client secret. |
+| `WYRD_SEALING_KEY_BASE64` | none | Inline base64 alternative, used only if `WYRD_SEALING_KEY_FILE` is unset. |
 | `WYRD_SERVER_TENANT_SLUG` | none | Implicit tenant slug for this deployment. Required if any trusted issuer or workload binding is configured. |
 | `WYRD_AUTH_ALLOW_PREVIEW` | `false` | Allow preview-gated routes. Must be `false` in production. |
+
+### The implicit tenant
+
+Wyrd is multi-tenant by design. In the hosted product, each request names its tenant through the `Host` it arrives on, so one process serves many tenants. A self-hosted deployment has no such routing: it serves one tenant, and boot has no request to derive it from. `WYRD_SERVER_TENANT_SLUG` is how the operator names that tenant.
+
+You only need it when you federate identity. Trusted issuers and workload bindings are owned by a tenant, so the moment you declare either one (see [SSO and OIDC](/self-hosting/sso-and-oidc/)), the server has to know which tenant they attach to. Leave it unset if you configure no federation. If you do set it, the slug must resolve to an active tenant at boot; the server resolves it through the same lookup the request handlers use, so a bound issuer matches request-time identity. A slug that resolves to nothing fails boot rather than binding issuers to a tenant that does not exist.
 
 ## Pools
 

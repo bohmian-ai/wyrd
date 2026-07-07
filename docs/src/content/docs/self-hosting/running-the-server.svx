@@ -43,13 +43,15 @@ The key is shown exactly once and stored only as an Argon2 hash. If you lose it,
 
 ## Serve modes
 
+The server speaks two protocols. HTTP serves the REST/JSON API that your clients, the SDK, the CLI, and the UI call: card registration, queries, admin. gRPC is the ingest transport that machine workers use. They are independent, which is the reason `--mode` exists.
+
 | Mode | HTTP | gRPC | Use it for |
 | --- | --- | --- | --- |
 | `both` | yes | yes | The default. Full server. |
 | `http` | yes | no | REST/JSON only, no ingest transport. |
 | `grpc` | no | yes | Ingest-only workers. |
 
-gRPC assembly needs a token verifier. In `http` mode the gRPC router is never built, so an HTTP-only deployment does not require the gRPC ingest service.
+Most deployments run `both`. Split them when you want the two transports to scale or deploy separately: an API fleet on `http` and an ingest fleet on `grpc`. Running `http` alone also keeps the ingest path off a public listener. gRPC assembly needs a token verifier, so in `http` mode the gRPC router is never built and an HTTP-only deployment does not require it.
 
 ## Boot sequence
 

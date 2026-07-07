@@ -10,28 +10,11 @@ order: 8
 
 Wyrd federates two kinds of identity from external OIDC providers: humans who log in through single sign-on, and machine workloads that present a platform-issued JWT. Both are declared the same way, as a trusted issuer, and distinguished by one field: `principal_kind`. Human issuers back the login flow. Workload issuers back the `jwt-bearer` grant.
 
-Trusted issuers and workload bindings are configured as TOML arrays in the same `server.toml` the rest of [Configuration](/self-hosting/configuration/) uses (`$WYRD_CONFIG_PATH`, `/etc/wyrd/server.toml`, or `~/.config/wyrd/server.toml`). They have no environment-variable form. Any deployment that declares either one must also set `WYRD_SERVER_TENANT_SLUG` so the server knows which tenant they belong to.
+Trusted issuers and workload bindings are configured as TOML arrays in the same `server.toml` the rest of [Configuration](/self-hosting/configuration/) uses (`$WYRD_CONFIG_PATH`, `/etc/wyrd/server.toml`, or `~/.config/wyrd/server.toml`). They have no environment-variable form. Any deployment that declares either one must also set `WYRD_SERVER_TENANT_SLUG` so the server knows which tenant they belong to (see [the implicit tenant](/self-hosting/configuration/#the-implicit-tenant)).
 
 ## Human single sign-on
 
-A person logs in through your IdP with the OIDC authorization-code flow, secured by PKCE. Wyrd stores the login state server-side for at most five minutes and verifies the returned ID token before issuing its own tokens.
-
-<WyrdSequenceDiagram
-  title="Human SSO login"
-  participants={['Browser', 'Wyrd', 'IdP']}
-  messages={[
-    { from: 'Browser', to: 'Wyrd', label: 'GET /auth/login?issuer=…' },
-    { from: 'Wyrd', to: 'IdP', label: 'OIDC discovery' },
-    { from: 'Wyrd', to: 'Browser', label: '302 to IdP · PKCE challenge', dashed: true },
-    { from: 'Browser', to: 'IdP', label: 'authenticate' },
-    { from: 'IdP', to: 'Browser', label: 'redirect ?code&state', dashed: true },
-    { from: 'Browser', to: 'Wyrd', label: 'GET /auth/callback?code&state' },
-    { from: 'Wyrd', to: 'IdP', label: 'exchange code, verify id_token' },
-    { from: 'Wyrd', to: 'Browser', label: 'access + refresh', dashed: true }
-  ]}
-/>
-
-To set it up:
+A person logs in through your IdP with the OIDC authorization-code flow, secured by PKCE. Wyrd stores the login state server-side for at most five minutes and verifies the returned ID token before issuing its own tokens. The [login flow](/concepts/authentication/#human-oidc-login-flow) in Concepts has the full sequence. To set it up:
 
 1. Register Wyrd as an OIDC client at your IdP. Set the redirect URI to `https://<your-server>/auth/callback`.
 2. Add a trusted issuer with `principal_kind = "human"`, the client id, and how Wyrd authenticates back to the IdP token endpoint.

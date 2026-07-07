@@ -8,9 +8,23 @@ order: 1
 
 # Self-hosting
 
-Wyrd ships as a single server binary. It owns the durable behavior: registry writes, storage orchestration, auth, policy, audit, and the OLAP warehouse. This section is for the person running that binary.
+Wyrd ships as a single server binary, and it is the control plane for your cards. It stores and validates them, derives their lineage, enforces auth and policy, records audit, and answers queries against them. This section is for the person running that binary.
 
-Everything here is operational. If you want the model behind identity, tokens, and roles, read [Concepts](/concepts/). This section tells you which env vars to set, what Postgres and object storage the server needs, and what happens between process start and a server accepting requests.
+A **card** is the typed, versioned record Wyrd keeps for one piece of an AI system: a dataset, a model, a prompt, an agent. Authors register cards; the server is the authority on what exists and how it connects. New to the model? Read [Card](/concepts/card/) and [Architecture](/concepts/architecture/) in Concepts first. Everything in this section is operational: which env vars to set, what Postgres and object storage the server needs, and what happens between process start and the first accepted request.
+
+## What the server persists
+
+The server keeps three kinds of state, across two systems you provision plus a warehouse it layers on top.
+
+- **Postgres** is the registry itself: card metadata, the derived lineage graph, auth and policy state, and the tenancy boundary. Request traffic runs under Postgres row-level security, so a tenant sees only its own rows. See [Database](/self-hosting/database/).
+- **Object storage** holds the bytes a card points at, like a model file or a dataset. Postgres stores the metadata; the object store stores the file. See [Storage](/self-hosting/storage/).
+- **The Vala warehouse** records observations, the runs and traces your models and agents emit, into an OLAP store called Bifrost for analytical queries. You do not set it up separately, but its catalog and recovery database roles show up in [Database](/self-hosting/database/).
+
+That separation is why Database and Storage are their own pages. They are different systems with different jobs.
+
+## Tenancy
+
+Wyrd is multi-tenant. One server serves many tenants, isolated in the database, which is what makes the hosted product work. Self-hosted, you usually run a single tenant, but the isolation is always on. Once you connect an external identity provider for login (see [SSO and OIDC](/self-hosting/sso-and-oidc/)), you name that tenant with `WYRD_SERVER_TENANT_SLUG` so its issuers attach to it; the full explanation is [the implicit tenant](/self-hosting/configuration/#the-implicit-tenant).
 
 ## Start here
 

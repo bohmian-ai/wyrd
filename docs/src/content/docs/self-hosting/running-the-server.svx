@@ -1,0 +1,101 @@
+---
+title: Running the server
+description: The CLI, serve modes, the boot sequence, graceful shutdown, and the health and readiness probes.
+pillar: wyrd
+group: Self-hosting
+order: 3
+---
+
+# Running the server
+
+The server is a single binary, `wyrd-server`. Run it with no subcommand and it serves. One operator subcommand exists, `bootstrap-key`, for minting the first admin key on a fresh deployment.
+
+## Command line
+
+```bash
+# Serve (the default when no subcommand is given).
+wyrd-server
+
+# Serve only one transport.
+wyrd-server --mode http
+wyrd-server --mode grpc
+
+# Mint the first admin API key for a tenant, then exit.
+wyrd-server bootstrap-key --tenant acme
+```
+
+`--mode` overrides the `serve.mode` config field (`WYRD_SERVE_MODE`). Accepted values are `both`, `http`, and `grpc`. The default is `both`.
+
+The process uses two non-zero exit codes: `78` for a configuration error (bad env var, invalid config file, failed validation) and `70` for any other fatal error during boot or serving. A clean shutdown exits `0`.
+
+### bootstrap-key
+
+A fresh deployment has no credentials. `bootstrap-key` mints the first admin API key so you can call the rest of the API. It builds only the runtime database pool, runs the issuance in one transaction, and prints the plaintext key once to stdout. It never starts listeners, telemetry, or storage.
+
+```bash
+wyrd-server bootstrap-key --tenant acme
+# wyrd_sk_acme_… (shown once, store it now)
+```
+
+The key is shown exactly once and stored only as an Argon2 hash. If you lose it, mint another.
+
+## Serve modes
+
+| Mode | HTTP | gRPC | Use it for |
+| --- | --- | --- | --- |
+| `both` | yes | yes | The default. Full server. |
+| `http` | yes | no | REST/JSON only, no ingest transport. |
+| `grpc` | no | yes | Ingest-only workers. |
+
+gRPC assembly needs a token verifier. In `http` mode the gRPC router is never built, so an HTTP-only deployment does not require the gRPC ingest service.
+
+## Boot sequence
+
+Boot is ordered and fails closed. A failure at any step stops the process with a non-zero exit and a logged reason. Nothing half-starts.
+
+<WyrdFlowDiagram
+  title="Boot sequence"
+  steps={[
+    { label: 'Load config', sub: 'env > TOML > defaults, then validate' },
+    { label: 'Init telemetry', sub: 'tracer provider, log filter' },
+    { label: 'Boot Postgres', sub: 'resolve DSNs, run migrations' },
+    { label: 'Assemble state', sub: 'pools, storage, OLAP catalog' },
+    { label: 'Install auth', sub: 'signing key, verifier, resolvers' },
+    { label: 'Seed federation', sub: 'trusted issuers, workload bindings' },
+    { label: 'Validate', sub: 'production_validate, fail closed' },
+    { label: 'Bind and supervise', sub: 'listeners up, tasks spawned' }
+  ]}
+/>
+
+Two steps are the most common boot failures:
+
+- Install auth fails closed in a production profile with no signing key. Set `WYRD_SIGNING_KEY_FILE` (or `WYRD_SIGNING_KEY_PEM`). In development the server mints an ephemeral key and logs a warning, so local runs work with no secret.
+- Seed federation fails if a never-seeded trusted issuer is unreachable, or if `WYRD_SERVER_TENANT_SLUG` names a tenant that does not exist. On a restart, an already-seeded issuer that is temporarily unreachable is a warning, not a boot failure.
+
+See [Configuration](/self-hosting/configuration/) for every field these steps read.
+
+## Graceful shutdown
+
+Send `SIGINT` or `SIGTERM`. The server stops accepting new connections, lets in-flight requests finish within `shutdown.drain_ms` (default 15s), flushes telemetry, and exits `0`. Requests still running when the drain deadline passes are aborted.
+
+In Kubernetes, set `terminationGracePeriodSeconds` above `shutdown.drain_ms` so the drain completes before the pod is killed.
+
+## Health and readiness
+
+Two unauthenticated endpoints back liveness and readiness probes:
+
+| Endpoint | Answers | Backed by |
+| --- | --- | --- |
+| `GET /healthz` | Is the process alive? | Always `200 ok` once serving. |
+| `GET /readyz` | Can it serve traffic? | Cached Postgres and storage probe results. |
+
+`/readyz` reports a snapshot refreshed every `readiness.tick_ms` (default 5s) by a background worker, so a probe never blocks on a live database query. A failing dependency flips the snapshot to not-ready with a reason. The same snapshot drives the gRPC health service.
+
+## Metrics
+
+When `metrics.enabled` is true (the default), the server serves Prometheus metrics on a dedicated listener. By default that listener binds loopback (`127.0.0.1`) on the HTTP port plus one, so `/metrics` is not exposed publicly unless you set `WYRD_METRICS_BIND` yourself. It records `wyrd_http_requests_total` and `wyrd_http_request_duration_seconds` per route, method, and status.
+
+## Related
+
+- [Configuration](/self-hosting/configuration/): the full env var and config file reference.
+- [Architecture](/self-hosting/architecture/): what supervises these tasks and how shutdown drains.

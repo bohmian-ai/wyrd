@@ -1,0 +1,74 @@
+---
+title: Database
+description: Postgres setup for the server. External and embedded modes, the roles the server needs, and migrations.
+pillar: wyrd
+group: Self-hosting
+order: 5
+---
+
+# Database
+
+The server runs on PostgreSQL. It uses several roles with different privileges, not one superuser connection, because tenant isolation is enforced at the database layer with row-level security. There are two ways to provide Postgres: point the server at an external cluster, or let it run an embedded one for local development.
+
+## Two modes
+
+The mode is chosen by presence. Set the database variables and you get external mode. Leave all of them unset and you get embedded mode. Mixing the two (some set, some unset) is a configuration error, not a fallback.
+
+| Mode | When | Use it for |
+| --- | --- | --- |
+| External | `WYRD_DATABASE_URL` and the role passwords are set | Staging and production. Any real deployment. |
+| Embedded | all database variables unset | Local development only. The server provisions and manages its own Postgres. |
+
+## External Postgres
+
+`WYRD_DATABASE_URL` is the canonical connection string, and it carries the `wyrd_app` user. The server synthesizes the other role DSNs by swapping the userinfo in that URL with each role's password. So you supply one URL plus a password per role.
+
+| Variable | Role | Required | Purpose |
+| --- | --- | --- | --- |
+| `WYRD_DATABASE_URL` | `wyrd_app` | yes | Canonical DSN. Runtime traffic runs as `wyrd_app` under RLS. |
+| `WYRD_DATABASE_MIGRATOR_PASSWORD` | `wyrd_migrator` | yes | Runs migrations at boot. The pool is closed once migrations finish. |
+| `WYRD_DATABASE_CATALOG_APP_PASSWORD` | `wyrd_catalog_app` | yes | The Bifrost Iceberg catalog connects with this role. |
+| `WYRD_DATABASE_RECOVERY_PASSWORD` | `vala_recovery` | yes | Vala startup recovery connects with this role. |
+| `WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD` | `wyrd_platform_admin` | no | Audited cross-tenant admin. Set it only if you use that capability. |
+
+```bash
+export WYRD_DATABASE_URL="postgresql://wyrd_app:app-pw@db.internal:5432/wyrd"
+export WYRD_DATABASE_MIGRATOR_PASSWORD="migrator-pw"
+export WYRD_DATABASE_CATALOG_APP_PASSWORD="catalog-pw"
+export WYRD_DATABASE_RECOVERY_PASSWORD="recovery-pw"
+# Optional:
+export WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD="admin-pw"
+```
+
+### Roles
+
+The server splits privileges across five roles so that runtime request handling never holds more power than it needs. Row-level security is enforced for `wyrd_app`, which is the only role that serves request traffic.
+
+| Role | Row-level security | What it does |
+| --- | --- | --- |
+| `wyrd_app` | enforced | All runtime request traffic. Sees only its tenant's rows. |
+| `wyrd_migrator` | not applicable | Applies migrations at boot. Boot-only, closed afterward. |
+| `wyrd_catalog_app` | not applicable | Bifrost Iceberg catalog access with a catalog search path. |
+| `vala_recovery` | not applicable | Vala warehouse startup recovery. |
+| `wyrd_platform_admin` | bypasses RLS | Optional audited cross-tenant administration. |
+
+These roles must exist in your cluster with the passwords you supply. Provision them before the server boots.
+
+### Pool tuning
+
+Both modes share the same pool settings, covered in [Configuration](/self-hosting/configuration/): `WYRD_PG_POOL_MAX` (default 32) and `WYRD_PG_POOL_ACQUIRE_MS` (default 5000). The ceiling applies across the app, catalog, and recovery pools, so size your cluster's `max_connections` above the sum you expect across replicas.
+
+## Embedded Postgres
+
+Leave every database variable unset and the server provisions its own PostgreSQL for you: it creates the cluster, bootstraps the five roles with generated passwords, persists those credentials under your local data directory, and runs migrations. This is the zero-setup path behind `mise run dev:backend`.
+
+Embedded mode is for development. It is not a supported production deployment. When you move to staging or production, switch to external Postgres by setting the variables above.
+
+## Migrations
+
+Migrations run automatically at boot, driven by the `wyrd_migrator` role. The migrator pool is opened, migrations are applied, and the pool is closed before the runtime pools start serving, so the elevated migrator connection never survives into request handling. You do not run a separate migration command.
+
+## Related
+
+- [Configuration](/self-hosting/configuration/): pool settings and the full variable list.
+- [Storage](/self-hosting/storage/): the object store that holds artifacts, separate from Postgres.

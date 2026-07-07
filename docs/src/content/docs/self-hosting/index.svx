@@ -1,0 +1,44 @@
+---
+title: Self-hosting
+description: Run the Wyrd server yourself. Configuration, database, storage, auth, and the runtime architecture.
+pillar: wyrd
+group: Self-hosting
+order: 1
+---
+
+# Self-hosting
+
+Wyrd ships as a single server binary. It owns the durable behavior: registry writes, storage orchestration, auth, policy, audit, and the OLAP warehouse. This section is for the person running that binary.
+
+Everything here is operational. If you want the model behind identity, tokens, and roles, read [Concepts](/concepts/). This section tells you which env vars to set, what Postgres and object storage the server needs, and what happens between process start and a server accepting requests.
+
+## Start here
+
+The fastest way to see the server run is local development, where it provisions its own Postgres and mints an ephemeral signing key on boot. No external services, no secrets to generate.
+
+```bash
+# From the repo root. Builds and runs wyrd-server on :8080 with
+# embedded Postgres, local storage, and a dev signing key.
+mise run dev:backend
+```
+
+That configuration is development-only. It is not safe for staging or production, and the server refuses to boot a production profile without a real signing key. See [Local development](/self-hosting/local-development/) for the details, then [Configuration](/self-hosting/configuration/) for the full env var surface a real deployment needs.
+
+## Deployment targets
+
+| Target | Use it for | Status |
+| --- | --- | --- |
+| [Local development](/self-hosting/local-development/) | A working server on your laptop with zero external dependencies. | Documented |
+| [Docker](/self-hosting/docker/) | Running the OSS image against your own Postgres and bucket. | Placeholder |
+| [Binary](/self-hosting/binary/) | Deploying the compiled server to a host or VM. | Placeholder |
+| [Enterprise](/self-hosting/enterprise/) | Multi-tenant SaaS with custom policy, audit, and identity. | Placeholder |
+
+## Pages
+
+- [Architecture](/self-hosting/architecture/): what the server is made of and how a request flows through it.
+- [Running the server](/self-hosting/running-the-server/): the CLI, serve modes, boot sequence, and graceful shutdown.
+- [Configuration](/self-hosting/configuration/): every environment variable, the config file, and validation rules.
+- [Database](/self-hosting/database/): Postgres setup, the roles the server needs, and migrations.
+- [Storage](/self-hosting/storage/): local, S3, GCS, and Azure backends with the credentials each one needs.
+- [Authentication](/self-hosting/authentication/): principals, tokens, and setting up signing and sealing keys.
+- [SSO and OIDC](/self-hosting/sso-and-oidc/): wiring an identity provider for human login and machine workloads.

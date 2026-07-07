@@ -27,6 +27,7 @@ export const GROUP_ORDER: readonly string[] = [
   'Tutorials',
   'How-to',
   'Concepts',
+  'Self-hosting',
   'Reference',
   'For Agents',
 ];

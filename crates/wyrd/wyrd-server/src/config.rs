@@ -918,13 +918,15 @@ impl WyrdServerConfig {
 
         // 1b. Metrics bind must not collide with HTTP or gRPC when enabled.
         if self.metrics.enabled {
-            let metrics_bind = self.metrics.resolved_bind(self.http.bind).ok_or_else(|| {
-                ConfigError::Invalid {
-                    message: "metrics port arithmetic overflow: HTTP is on port 65535, leaving \
+            let metrics_bind =
+                self.metrics
+                    .resolved_bind(self.http.bind)
+                    .ok_or_else(|| ConfigError::Invalid {
+                        message:
+                            "metrics port arithmetic overflow: HTTP is on port 65535, leaving \
                               no room for the auto-computed metrics port (http_port + 1)"
-                        .to_owned(),
-                }
-            })?;
+                                .to_owned(),
+                    })?;
             if metrics_bind == self.http.bind || metrics_bind == self.grpc.bind {
                 return Err(ConfigError::BindCollision { bind: metrics_bind });
             }
@@ -1960,7 +1962,9 @@ mod tests {
     fn metrics_bind_defaults_to_loopback_port_plus_one() {
         let cfg = MetricsConfig::default();
         let http_bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
-        let resolved = cfg.resolved_bind(http_bind).expect("port 8080 + 1 must not overflow");
+        let resolved = cfg
+            .resolved_bind(http_bind)
+            .expect("port 8080 + 1 must not overflow");
         assert_eq!(
             resolved,
             "127.0.0.1:8081".parse::<SocketAddr>().unwrap(),

@@ -115,6 +115,9 @@ pub enum ServerBootError {
     /// proceeding with an unusable sealing key.
     #[error("WYRD_SEALING_KEY is invalid: {0}")]
     SealingKey(String),
+    /// A config field is invalid (e.g. an unparseable CIDR in trusted_upstreams).
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
     /// gRPC router assembly failed (e.g. missing token verifier).
     #[error(transparent)]
     Grpc(#[from] wyrd_tonic::server::GrpcError),
@@ -253,8 +256,14 @@ fn attach_config_fields(
         .request_id
         .trusted_upstreams
         .iter()
-        .filter_map(|cidr| cidr.parse::<ipnetwork::IpNetwork>().ok())
-        .collect();
+        .map(|cidr| {
+            cidr.parse::<ipnetwork::IpNetwork>().map_err(|e| {
+                ServerBootError::InvalidConfig(format!(
+                    "invalid trusted upstream CIDR {cidr:?}: {e}"
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
 
     Ok(state
         .with_deployment_profile(config.deployment_profile)
@@ -376,33 +385,6 @@ async fn seed_federation(
         .await?;
     }
     Ok(())
-}
-
-/// Assemble runtime state from a resolved `WyrdServerConfig`.
-///
-/// This is the primary boot entry point from `main.rs` once the config is
-/// loaded. It runs the postgres boot, migrations, and pool phases, then chains
-/// the `with_*` builder calls to attach config-derived fields.
-///
-/// # Errors
-/// Returns [`ServerBootError`] when database boot, migration, pool construction,
-/// or CIDR parsing fails.
-pub async fn build_app_state_from_config(
-    config: &crate::config::WyrdServerConfig,
-    shutdown: CancellationToken,
-    telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
-    reporter: wyrd_tonic::tonic_health::server::HealthReporter,
-) -> Result<AppState, ServerBootError> {
-    let boot = PostgresBoot::from_env().await?;
-    let state = build_app_state_from_boot(&boot).await?;
-    let sealing_key = build_sealing_key(config)?;
-
-    let state = attach_config_fields(state, config, shutdown, telemetry)?;
-    let state = state.with_grpc_health(reporter);
-    let state = install_auth(state, config, sealing_key.clone()).await?;
-    seed_federation(&state, config, sealing_key.as_deref()).await?;
-
-    Ok(state)
 }
 
 /// Decode the optional base64 sealing key from config into an AES-256-GCM key.
@@ -582,6 +564,35 @@ mod tests {
         assert!(
             !patched.authz.policy_hook.is_stub_default(),
             "override replaced stub policy hook"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_overrides_eval_audit_applied() {
+        use crate::components::eval::{EvalAuditEvent, EvalAuditWriter};
+
+        struct MarkerWriter;
+        impl EvalAuditWriter for MarkerWriter {
+            fn record(&self, _event: &EvalAuditEvent) {}
+        }
+
+        let state = make_test_state().await;
+        // Confirm default is the tracing-backed stub (Arc::ptr_eq won't work
+        // across two Arc<dyn Trait> directly, so we replace and check the new
+        // instance is reachable via the state field).
+        let marker: Arc<dyn EvalAuditWriter> = Arc::new(MarkerWriter);
+        let marker_ptr = Arc::as_ptr(&marker) as *const ();
+
+        let overrides = StateOverrides {
+            authz: None,
+            eval_audit: Some(marker),
+        };
+        let patched = apply_overrides(state, overrides);
+
+        assert_eq!(
+            Arc::as_ptr(&patched.eval_audit) as *const (),
+            marker_ptr,
+            "override replaced the default eval audit writer"
         );
     }
 

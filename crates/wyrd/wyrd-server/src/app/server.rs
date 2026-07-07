@@ -411,8 +411,8 @@ mod tests {
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         let kid = Kid::new("k1").expect("kid is valid");
         let pem = IssuingKey::generate_ephemeral_pem().expect("ephemeral key generates");
-        let raw_issuing_key = IssuingKey::from_ed_pem(pem, kid.clone(), "wyrd")
-            .expect("ephemeral issuing key loads");
+        let raw_issuing_key =
+            IssuingKey::from_ed_pem(pem, kid.clone(), "wyrd").expect("ephemeral issuing key loads");
         let pub_pem = raw_issuing_key
             .verifying_key_pem()
             .expect("public key derives from ephemeral key");

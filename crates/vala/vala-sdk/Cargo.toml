@@ -16,7 +16,7 @@ path = "src/lib.rs"
 default = []
 python = ["dep:pyo3"]
 testing = []
-bench-bin = ["dep:criterion"]
+bench-bin = []
 
 [dependencies]
 wyrd-queue = { workspace = true }
@@ -32,9 +32,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
-criterion = { version = "0.5", features = ["async_tokio"], optional = true }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
 wyrd-queue = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-testing = { workspace = true }

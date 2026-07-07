@@ -59,8 +59,8 @@ fn bench_enqueue_throughput(c: &mut Criterion) {
             BenchmarkId::from_parameter(batch_size),
             &batch_size,
             |b, &size| {
+                let bifrost = make_bifrost();
                 b.iter(|| {
-                    let bifrost = make_bifrost();
                     for i in 0..size {
                         bifrost
                             .insert(

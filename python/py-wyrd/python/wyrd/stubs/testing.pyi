@@ -4,6 +4,15 @@ class WyrdTestServer:
     Starts a real Wyrd server bound to a loopback TCP socket backed by an
     embedded Postgres fixture. Use as a context manager; ``bootstrap_service``
     is only valid inside the ``with`` block.
+
+    When ``mutate_env=True`` (default), the context manager sets
+    ``WYRD_SERVER_URL``, ``WYRD_GRPC_URL``, and ``WYRD_API_KEY`` in the process
+    environment for the duration of the block and restores original values (or
+    removes them) on exit. Use ``mutate_env=False`` when running parallel test
+    suites that manage these vars externally.
+
+    ``cleanup`` is reserved for a future teardown-skip feature; currently ignored
+    (the server and embedded Postgres are always cleaned up on exit).
     """
 
     def __init__(self, cleanup: bool = True, mutate_env: bool = True) -> None: ...
@@ -24,10 +33,10 @@ class WyrdTestServer:
         """Fixture tenant UUID string."""
         ...
 
-    def bootstrap_service(self, permissions: list[str], name: str = "svc") -> str:
-        """Mint a service principal with ``permissions`` roles and return its API key.
+    def bootstrap_service(self, roles: list[str], name: str = "svc") -> str:
+        """Mint a service principal with ``roles`` and return its API key.
 
-        ``permissions`` maps to Wyrd built-in role names (e.g. ``"bifrost_write"``).
+        ``roles``: Wyrd built-in role names (e.g. ``"bifrost_write"``).
         An empty list creates a principal with no grants (useful for negative RBAC
         journeys). Must be called inside the context manager.
         """

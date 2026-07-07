@@ -115,9 +115,7 @@ def test_observe_record_swallows_and_counts(wyrd_server: WyrdTestServer) -> None
         record(
             bifrost, table="genai.observe_overflow", schema=SCHEMA, row=_row(i), card_ref=CARD_REF
         )
-    # Fire-and-forget never raises; accepted + dropped == attempted.
-    # With MockSink all rows are accepted, so dropped == 0 is expected here.
-    assert bifrost.dropped + (attempted - bifrost.dropped) == attempted
+    assert bifrost.dropped == 0, "MockSink drains immediately; no spurious drops expected"
 
 
 # ---------------------------------------------------------------------------

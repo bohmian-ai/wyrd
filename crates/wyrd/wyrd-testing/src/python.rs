@@ -48,7 +48,6 @@ impl EnvSnapshot {
 #[pyclass(module = "wyrd._wyrd.testing")]
 pub struct WyrdTestServer {
     // Retained from the Python constructor signature; teardown wiring is not yet read here.
-    #[allow(dead_code)]
     cleanup: bool,
     mutate_env: bool,
     base_url: Option<String>,
@@ -127,6 +126,12 @@ impl WyrdTestServer {
             let _guard = env_mutex().lock().unwrap_or_else(|p| p.into_inner());
             snapshot.restore();
         }
+        if !self.cleanup {
+            tracing::warn!(
+                "WyrdTestServer: cleanup=false is not yet implemented; \
+                 the server and embedded Postgres will still be cleaned up"
+            );
+        }
         if let Some(srv) = self.server.take() {
             wyrd_runtime::runtime().block_on(async {
                 let _ = srv.shutdown().await;
@@ -146,32 +151,36 @@ impl WyrdTestServer {
 
     #[getter]
     fn api_key(&self) -> PyResult<String> {
-        self.api_key
-            .clone()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started"))
+        self.api_key.clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "WyrdTestServer not started (use as context manager)",
+            )
+        })
     }
 
     #[getter]
     fn tenant_id(&self) -> PyResult<String> {
-        self.tenant_id
-            .clone()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started"))
+        self.tenant_id.clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "WyrdTestServer not started (use as context manager)",
+            )
+        })
     }
 
     /// Bootstrap a service principal, returning its scoped API key string.
     ///
-    /// Wraps [`crate::server::WyrdTestServer::bootstrap_service`]. `permissions`
-    /// maps to the Rust `roles` slice at the boundary; an empty list creates a
-    /// principal with no grants (useful for negative RBAC journeys). Must be
-    /// called inside the context manager.
-    #[pyo3(signature = (permissions, name = "svc"))]
-    fn bootstrap_service(&self, permissions: Vec<String>, name: &str) -> PyResult<String> {
+    /// Wraps [`crate::server::WyrdTestServer::bootstrap_service`]. `roles` is a
+    /// list of Wyrd built-in role names; an empty list creates a principal with no
+    /// grants (useful for negative RBAC journeys). Must be called inside the context
+    /// manager.
+    #[pyo3(signature = (roles, name = "svc"))]
+    fn bootstrap_service(&self, roles: Vec<String>, name: &str) -> PyResult<String> {
         let srv = self.server.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "WyrdTestServer not started (use as context manager)",
             )
         })?;
-        let roles: Vec<&str> = permissions.iter().map(String::as_str).collect();
+        let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
         let result: Result<crate::server::Bootstrap, wyrd_spec::error::WyrdError> =
             wyrd_runtime::runtime().block_on(async {
                 srv.bootstrap_service(name, &roles)

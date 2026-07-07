@@ -19,6 +19,12 @@ def test_construct_no_env_mutation():
     assert srv is not None
 
 
+def test_bootstrap_service_raises_without_context_manager():
+    srv = WyrdTestServer()
+    with pytest.raises(RuntimeError, match="not started"):
+        srv.bootstrap_service([])
+
+
 def test_enter_fails_without_db():
     """__enter__ must raise WyrdError when no Postgres is available.
 

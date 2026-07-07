@@ -830,12 +830,14 @@ impl WyrdServerConfig {
 
         // metrics.bind
         if let Some(val) = env_opt("WYRD_METRICS_BIND")? {
-            self.metrics.bind = Some(val.parse::<SocketAddr>().map_err(|e| {
-                ConfigError::BadEnvVar {
-                    key: "WYRD_METRICS_BIND".to_string(),
-                    message: e.to_string(),
-                }
-            })?);
+            self.metrics.bind =
+                Some(
+                    val.parse::<SocketAddr>()
+                        .map_err(|e| ConfigError::BadEnvVar {
+                            key: "WYRD_METRICS_BIND".to_string(),
+                            message: e.to_string(),
+                        })?,
+                );
         }
 
         // readiness.tick_ms
@@ -1931,9 +1933,7 @@ mod tests {
         });
         temp_env::with_vars([("WYRD_SERVE_MODE", Some("invalid"))], || {
             let mut cfg = WyrdServerConfig::default();
-            let err = cfg
-                .apply_env_overrides()
-                .expect_err("bad value must error");
+            let err = cfg.apply_env_overrides().expect_err("bad value must error");
             assert!(
                 matches!(err, ConfigError::BadEnvVar { ref key, .. } if key == "WYRD_SERVE_MODE"),
                 "expected BadEnvVar(WYRD_SERVE_MODE), got {err:?}"
@@ -1985,7 +1985,9 @@ mod tests {
             bind = "0.0.0.0:8080"
         "#;
         let cfg = from_toml_str(toml).expect("parses ok");
-        let err = cfg.validate().expect_err("metrics-HTTP collision must fail");
+        let err = cfg
+            .validate()
+            .expect_err("metrics-HTTP collision must fail");
         assert!(
             matches!(err, ConfigError::BindCollision { .. }),
             "expected BindCollision, got {err:?}"

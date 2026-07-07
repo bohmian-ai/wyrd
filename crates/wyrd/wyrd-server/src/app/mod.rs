@@ -15,7 +15,7 @@ pub mod shutdown;
 pub mod supervise;
 
 pub use serve::serve;
-pub use server::WyrdServer;
+pub use server::{BoundServer, WyrdServer};
 
 /// Error wrapper used by the server binary's top-level CLI dispatcher.
 #[derive(Debug)]
@@ -40,7 +40,11 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
         init_telemetry(config.telemetry.clone()).map_err(|e| BootExit::Other(Box::new(e)))?,
     );
     info!(
-        service.name = config.telemetry.service_name.as_deref().unwrap_or("wyrd-server"),
+        service.name = config
+            .telemetry
+            .service_name
+            .as_deref()
+            .unwrap_or("wyrd-server"),
         "wyrd-server starting"
     );
 

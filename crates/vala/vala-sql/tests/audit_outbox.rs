@@ -7,11 +7,11 @@
 mod audit_outbox {
     use sqlx::PgPool;
     use sqlx::types::Uuid;
-    use wyrd_sql::testing::SharedDb;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+    use wyrd_sql::testing::SharedDb;
 
     const ZERO_HASH: [u8; 32] = [0u8; 32];
 
@@ -128,7 +128,9 @@ mod audit_outbox {
         append(&db.app, tenant, "op.a").await;
 
         let batch = [0xABu8; 16];
-        let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant).await.unwrap();
+        let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+            .await
+            .unwrap();
         let shipped = vala_sql::queries::audit_outbox::mark_audit_shipped(&mut conn, 1, 1, &batch)
             .await
             .unwrap();

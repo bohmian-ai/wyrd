@@ -1,6 +1,7 @@
 //! `WyrdServer` — composable supervised server lifecycle.
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -10,15 +11,16 @@ use tokio::task::JoinSet;
 use wyrd_tonic::tonic::transport::server::Router as TonicRouter;
 use wyrd_tonic::tonic_health::server::HealthReporter;
 
+use crate::app::BootExit;
 use crate::app::metrics::{install_recorder, metrics_router, serve_metrics};
 use crate::app::serve::serve;
 use crate::app::supervise::{TaskExit, TaskId, fallible_task, supervise, worker_task};
-use crate::app::BootExit;
 use crate::boot::{ServerBootError, spawn_storage_sweeper};
 use crate::components::health::readiness_loop;
 use crate::config::{ServeMode, WyrdServerConfig};
 use crate::grpc::{
-    GrpcRouterConfig, build_app_grpc, drive_health_status, publish_initial_health, serve_grpc,
+    GrpcRouterConfig, build_app_grpc, drive_health_status, publish_initial_health,
+    serve_grpc_with_listener,
 };
 use crate::state::AppState;
 
@@ -59,11 +61,20 @@ impl WyrdServer {
         let grpc_router = build_app_grpc(
             &state,
             health_service,
-            GrpcRouterConfig { reflection_enabled: config.grpc.reflection_enabled },
+            GrpcRouterConfig {
+                reflection_enabled: config.grpc.reflection_enabled,
+            },
         )?;
         let http_router = crate::http::build_router(state.clone());
 
-        Ok(Self { config, state, http_router, grpc_router, reporter, extra_workers: Vec::new() })
+        Ok(Self {
+            config,
+            state,
+            http_router,
+            grpc_router,
+            reporter,
+            extra_workers: Vec::new(),
+        })
     }
 
     /// Merge extension routes that **carry their own edge stack** onto core.
@@ -98,8 +109,7 @@ impl WyrdServer {
             self.state.clone(),
             crate::http::middleware::authenticate::require_authenticated,
         ));
-        let protected =
-            crate::http::router::apply_protected_edge(with_auth, &self.state);
+        let protected = crate::http::router::apply_protected_edge(with_auth, &self.state);
         self.http_router = self.http_router.merge(protected);
         self
     }
@@ -134,7 +144,6 @@ impl WyrdServer {
     /// Useful for integration tests that drive the router via
     /// `tower::ServiceExt::oneshot` without binding a listener. Not intended
     /// for production use — call [`serve`] for the full supervised lifecycle.
-    #[must_use]
     pub fn into_http_router(self) -> Router {
         self.http_router
     }
@@ -142,10 +151,142 @@ impl WyrdServer {
     /// Bind listeners for `mode`, spawn all tasks, and drive the supervised
     /// lifecycle to completion.
     ///
+    /// This is the production entry point: it is exactly [`bind`](Self::bind)
+    /// followed by [`BoundServer::run`]. Callers that need the bound addresses
+    /// before the server runs to completion (e.g. a test harness binding on an
+    /// OS-assigned `:0` port) should call [`bind`](Self::bind) directly, read
+    /// the addresses off the returned [`BoundServer`], then spawn
+    /// [`BoundServer::run`].
+    ///
     /// # Errors
     /// Returns [`BootExit::Other`] on listener bind failure or a terminal task
     /// error.
-    pub async fn serve(mut self, mode: ServeMode) -> Result<(), BootExit> {
+    pub async fn serve(self, mode: ServeMode) -> Result<(), BootExit> {
+        self.bind(mode).await?.run().await
+    }
+
+    /// Bind every listener the `mode` requires **now**, returning a
+    /// [`BoundServer`] that exposes the concrete bound addresses.
+    ///
+    /// Binding up front means bind failures surface here as boot errors (not
+    /// task errors), and — critically for `:0` binds — the resolved port is
+    /// readable from the [`BoundServer`] before serving begins, with no
+    /// bind-then-rebind race. The process-global metrics recorder is **not**
+    /// installed here; that is deferred to [`BoundServer::run`] so a bound but
+    /// never-run server never touches the global recorder.
+    ///
+    /// # Errors
+    /// Returns [`BootExit::Other`] on listener bind failure.
+    pub async fn bind(self, mode: ServeMode) -> Result<BoundServer, BootExit> {
+        let (http_listener, http_addr) = if mode.serves_http() {
+            let listener = TcpListener::bind(self.config.http.bind)
+                .await
+                .map_err(|e| BootExit::Other(Box::new(e)))?;
+            let addr = listener
+                .local_addr()
+                .map_err(|e| BootExit::Other(Box::new(e)))?;
+            (Some(listener), Some(addr))
+        } else {
+            (None, None)
+        };
+        let (grpc_listener, grpc_addr) = if mode.serves_grpc() {
+            let listener = TcpListener::bind(self.config.grpc.bind)
+                .await
+                .map_err(|e| BootExit::Other(Box::new(e)))?;
+            let addr = listener
+                .local_addr()
+                .map_err(|e| BootExit::Other(Box::new(e)))?;
+            (Some(listener), Some(addr))
+        } else {
+            (None, None)
+        };
+        // Metrics is orthogonal to `mode`: its own listener, enabled whenever
+        // `metrics.enabled`. Resolve against the *actually bound* HTTP addr when
+        // present so a `:0` HTTP bind yields `bound_port + 1`, not `config + 1`.
+        let (metrics_listener, metrics_addr) = if self.config.metrics.enabled {
+            let base = http_addr.unwrap_or(self.config.http.bind);
+            let bind = self.config.metrics.resolved_bind(base);
+            let listener = TcpListener::bind(bind)
+                .await
+                .map_err(|e| BootExit::Other(Box::new(e)))?;
+            let addr = listener
+                .local_addr()
+                .map_err(|e| BootExit::Other(Box::new(e)))?;
+            (Some(listener), Some(addr))
+        } else {
+            (None, None)
+        };
+
+        Ok(BoundServer {
+            config: self.config,
+            state: self.state,
+            http_router: self.http_router,
+            grpc_router: self.grpc_router,
+            reporter: self.reporter,
+            extra_workers: self.extra_workers,
+            http_listener,
+            grpc_listener,
+            metrics_listener,
+            http_addr,
+            grpc_addr,
+            metrics_addr,
+        })
+    }
+}
+
+/// A [`WyrdServer`] whose listeners are already bound.
+///
+/// Produced by [`WyrdServer::bind`]. The bound addresses are readable before
+/// the supervised lifecycle starts, so a caller can learn an OS-assigned `:0`
+/// port and hand it to clients, then drive the exact production supervision via
+/// [`run`](Self::run).
+pub struct BoundServer {
+    config: WyrdServerConfig,
+    state: AppState,
+    http_router: Router,
+    grpc_router: TonicRouter,
+    reporter: HealthReporter,
+    extra_workers: Vec<BoxWorker>,
+    http_listener: Option<TcpListener>,
+    grpc_listener: Option<TcpListener>,
+    metrics_listener: Option<TcpListener>,
+    http_addr: Option<SocketAddr>,
+    grpc_addr: Option<SocketAddr>,
+    metrics_addr: Option<SocketAddr>,
+}
+
+impl BoundServer {
+    /// The bound HTTP address, or `None` when the mode does not serve HTTP.
+    #[must_use]
+    pub fn http_addr(&self) -> Option<SocketAddr> {
+        self.http_addr
+    }
+
+    /// The bound gRPC address, or `None` when the mode does not serve gRPC.
+    #[must_use]
+    pub fn grpc_addr(&self) -> Option<SocketAddr> {
+        self.grpc_addr
+    }
+
+    /// The bound `/metrics` address, or `None` when metrics are disabled.
+    #[must_use]
+    pub fn metrics_addr(&self) -> Option<SocketAddr> {
+        self.metrics_addr
+    }
+
+    /// Read-only access to core state.
+    #[must_use]
+    pub fn state(&self) -> &AppState {
+        &self.state
+    }
+
+    /// Spawn all tasks on the pre-bound listeners and drive the supervised
+    /// lifecycle to completion.
+    ///
+    /// # Errors
+    /// Returns [`BootExit::Other`] on a terminal task error or if the process-
+    /// global metrics recorder fails to install.
+    pub async fn run(mut self) -> Result<(), BootExit> {
         let shutdown = self.state.shutdown_token.clone();
         let mut set: JoinSet<TaskExit> = JoinSet::new();
 
@@ -174,10 +315,10 @@ impl WyrdServer {
             .map_err(|e| BootExit::Other(Box::new(e)))?
         {
             set.spawn(worker_task(TaskId::Worker("storage_sweeper"), async move {
-                if let Err(join_error) = handle.await {
-                    if join_error.is_panic() {
-                        std::panic::resume_unwind(join_error.into_panic());
-                    }
+                if let Err(join_error) = handle.await
+                    && join_error.is_panic()
+                {
+                    std::panic::resume_unwind(join_error.into_panic());
                 }
             }));
         }
@@ -187,36 +328,28 @@ impl WyrdServer {
             set.spawn(worker_task(TaskId::Worker("custom"), worker));
         }
 
-        // Transports (bind up front so bind errors are boot errors, not task errors).
-        if mode.serves_http() {
-            let listener = TcpListener::bind(self.config.http.bind)
-                .await
-                .map_err(|e| BootExit::Other(Box::new(e)))?;
-            tracing::info!(bind = %self.config.http.bind, "HTTP server listening");
+        // Transports — drive the listeners bound in `WyrdServer::bind`.
+        if let Some(listener) = self.http_listener.take() {
+            tracing::info!(addr = ?self.http_addr, "HTTP server listening");
             set.spawn(fallible_task(
                 TaskId::Http,
                 serve(self.http_router, listener, shutdown.clone()),
             ));
         }
-        if mode.serves_grpc() {
-            let bind = self.config.grpc.bind;
+        if let Some(listener) = self.grpc_listener.take() {
+            tracing::info!(addr = ?self.grpc_addr, "gRPC server listening");
             let router = self.grpc_router;
             let token = shutdown.clone();
-            set.spawn(fallible_task(
-                TaskId::Grpc,
-                async move { serve_grpc(router, bind, token).await },
-            ));
+            set.spawn(fallible_task(TaskId::Grpc, async move {
+                serve_grpc_with_listener(router, listener, token).await
+            }));
         }
-        // Metrics is orthogonal to `mode`: it has its own listener and runs
-        // whenever `metrics.enabled`, including in `ServeMode::Grpc` (HTTP-off).
         // The recorder is a process-global singleton installed here (once, at
-        // serve, only when enabled) rather than in `new` — a constructed but
-        // never-served server never touches the global recorder.
-        if self.config.metrics.enabled {
+        // run, only when the metrics listener was bound) rather than in `new` or
+        // `bind` — a constructed or bound but never-run server never touches the
+        // global recorder.
+        if let Some(listener) = self.metrics_listener.take() {
             let handle = install_recorder().map_err(|e| BootExit::Other(Box::new(e)))?;
-            let bind = self.config.metrics.resolved_bind(self.config.http.bind);
-            let listener =
-                TcpListener::bind(bind).await.map_err(|e| BootExit::Other(Box::new(e)))?;
             let router = metrics_router(handle);
             set.spawn(fallible_task(
                 TaskId::Metrics,
@@ -235,7 +368,9 @@ impl WyrdServer {
 
         tracing::info!("wyrd-server shutdown complete");
         match terminal {
-            Some(msg) => Err(BootExit::Other(Box::<dyn std::error::Error + Send + Sync>::from(msg))),
+            Some(msg) => Err(BootExit::Other(
+                Box::<dyn std::error::Error + Send + Sync>::from(msg),
+            )),
             None => Ok(()),
         }
     }
@@ -281,9 +416,9 @@ mod tests {
         let verifier = Arc::new(TokenVerifier::new(
             keys,
             "wyrd",
-            Arc::new(crate::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(
-                app_pool,
-            ))),
+            Arc::new(
+                crate::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(app_pool)),
+            ),
             WyrdAuthVerifySettings::default(),
         ));
         AppState::new(
@@ -304,8 +439,8 @@ mod tests {
         config.metrics.enabled = false;
 
         let state1 = test_state_with_auth().await;
-        let server1 =
-            WyrdServer::new(config.clone(), state1).expect("first WyrdServer construction succeeds");
+        let server1 = WyrdServer::new(config.clone(), state1)
+            .expect("first WyrdServer construction succeeds");
 
         let state2 = test_state_with_auth().await;
         let server2 =

@@ -41,11 +41,20 @@ async fn metrics_router_serves_metrics() {
     let router = metrics_router(handle.clone());
 
     let response = router
-        .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .expect("metrics router responds");
 
-    assert_eq!(response.status(), StatusCode::OK, "GET /metrics must return 200");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "GET /metrics must return 200"
+    );
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body collects");
@@ -65,7 +74,12 @@ async fn track_metrics_records_request() {
         .layer(from_fn(track_metrics));
 
     router
-        .oneshot(Request::builder().uri("/probe").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/probe")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .expect("probe request completes");
 
@@ -90,7 +104,12 @@ async fn track_metrics_unmatched_route_uses_bounded_label() {
 
     let raw_path = "/scanner-bait/../../etc/passwd";
     router
-        .oneshot(Request::builder().uri(raw_path).body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri(raw_path)
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .expect("request to unmatched route completes");
 

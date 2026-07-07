@@ -10,10 +10,10 @@ mod support;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use axum::routing::{get, post};
-use axum::Router;
 use chrono::Duration;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tower::ServiceExt;
@@ -170,9 +170,10 @@ async fn extension_panic_maps_to_500() {
 
 #[tokio::test]
 async fn extension_oversized_body_rejected() {
-    let state = test_state()
-        .await
-        .with_limits(LimitsConfig { body_bytes: 1024, ..LimitsConfig::default() });
+    let state = test_state().await.with_limits(LimitsConfig {
+        body_bytes: 1024,
+        ..LimitsConfig::default()
+    });
     let router = build_protected_server(state)
         .await
         .merge_http_protected(probe_router())
@@ -199,8 +200,7 @@ async fn extension_oversized_body_rejected() {
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body collects");
-    let problem: serde_json::Value =
-        serde_json::from_slice(&body).expect("413 body must be JSON");
+    let problem: serde_json::Value = serde_json::from_slice(&body).expect("413 body must be JSON");
     assert_eq!(
         problem["code"], "WYRD_SPEC_413_PAYLOAD_TOO_LARGE",
         "error code must be WYRD_SPEC_413_PAYLOAD_TOO_LARGE; got {problem}"
@@ -233,8 +233,7 @@ async fn extension_requires_auth() {
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body collects");
-    let problem: serde_json::Value =
-        serde_json::from_slice(&body).expect("401 body must be JSON");
+    let problem: serde_json::Value = serde_json::from_slice(&body).expect("401 body must be JSON");
     assert_eq!(
         problem["code"], "WYRD_AUTH_401_UNAUTHENTICATED",
         "error code must be WYRD_AUTH_401_UNAUTHENTICATED; got {problem}"

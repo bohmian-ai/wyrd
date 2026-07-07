@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::Duration as ChronoDuration;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio_util::sync::CancellationToken;
 use wyrd_auth_issue::IssuingKey;
@@ -31,7 +32,6 @@ use wyrd_tonic::tonic::{Code, Request};
 use wyrd_tonic::tonic_health::server::health_reporter;
 use wyrd_tonic::wyrd::v1::InsertBatchRequest;
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_client::BifrostIngestServiceClient;
-use chrono::Duration as ChronoDuration;
 
 const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -132,7 +132,9 @@ async fn ingest_unauthenticated_is_rejected() {
     let router = build_app_grpc(
         &state,
         health_service,
-        GrpcRouterConfig { reflection_enabled: false },
+        GrpcRouterConfig {
+            reflection_enabled: false,
+        },
     )
     .expect("gRPC router builds with token verifier");
 
@@ -166,7 +168,9 @@ async fn ingest_valid_token_is_not_rejected_as_unauthenticated() {
     let router = build_app_grpc(
         &state,
         health_service,
-        GrpcRouterConfig { reflection_enabled: false },
+        GrpcRouterConfig {
+            reflection_enabled: false,
+        },
     )
     .expect("gRPC router builds with token verifier");
 

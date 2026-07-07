@@ -5,9 +5,9 @@
 
 use sqlx::types::JsonValue;
 use vala_sql::queries::olap_query_jobs::{NewQueryJob, enqueue_query_job, query_job_status};
-use wyrd_sql::testing::SharedDb;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AsyncJobState, ExecutorAvailability};
+use wyrd_sql::testing::SharedDb;
 
 async fn setup() -> (SharedDb, DataTenantId) {
     let db = vala_sql::testing::shared().await.expect("shared db");
@@ -24,7 +24,9 @@ async fn olap_query_jobs_enqueue_is_idempotent() {
     let (db, tenant) = setup().await;
     let params = JsonValue::Array(Vec::new());
 
-    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     let first = enqueue_query_job(
         &mut conn,
         NewQueryJob {
@@ -37,7 +39,9 @@ async fn olap_query_jobs_enqueue_is_idempotent() {
     .unwrap();
     conn.commit().await.unwrap();
 
-    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     let second = enqueue_query_job(
         &mut conn,
         NewQueryJob {
@@ -69,7 +73,9 @@ async fn olap_query_jobs_status_reports_pending_stage5() {
     let (db, tenant) = setup().await;
     let params = JsonValue::Array(Vec::new());
 
-    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     let job_uid = enqueue_query_job(
         &mut conn,
         NewQueryJob {
@@ -82,7 +88,9 @@ async fn olap_query_jobs_status_reports_pending_stage5() {
     .unwrap();
     conn.commit().await.unwrap();
 
-    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant).await.unwrap();
+    let mut conn = vala_sql::TenantConn::acquire(&db.app, tenant)
+        .await
+        .unwrap();
     let status = query_job_status(&mut conn, job_uid)
         .await
         .unwrap()

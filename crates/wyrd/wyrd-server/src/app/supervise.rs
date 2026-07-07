@@ -29,26 +29,25 @@ pub struct TaskExit {
 }
 
 /// Wrap a `()`-producing future (worker/signal) into a `TaskExit`.
-pub fn worker_task<F>(id: TaskId, fut: F) -> impl std::future::Future<Output = TaskExit>
+pub async fn worker_task<F>(id: TaskId, fut: F) -> TaskExit
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    async move {
-        fut.await;
-        TaskExit { id, outcome: Ok(()) }
+    fut.await;
+    TaskExit {
+        id,
+        outcome: Ok(()),
     }
 }
 
 /// Wrap a `Result<(), E: Display>`-producing future (transport) into a `TaskExit`.
-pub fn fallible_task<F, E>(id: TaskId, fut: F) -> impl std::future::Future<Output = TaskExit>
+pub async fn fallible_task<F, E>(id: TaskId, fut: F) -> TaskExit
 where
     F: std::future::Future<Output = Result<(), E>> + Send + 'static,
     E: std::fmt::Display,
 {
-    async move {
-        let outcome = fut.await.map_err(|e| e.to_string());
-        TaskExit { id, outcome }
-    }
+    let outcome = fut.await.map_err(|e| e.to_string());
+    TaskExit { id, outcome }
 }
 
 /// Drive the supervised set to completion. Returns the terminal error message,
@@ -90,20 +89,28 @@ pub async fn supervise(
     terminal
 }
 
-fn classify_first(
-    joined: Result<TaskExit, tokio::task::JoinError>,
-    terminal: &mut Option<String>,
-) {
+fn classify_first(joined: Result<TaskExit, tokio::task::JoinError>, terminal: &mut Option<String>) {
     match joined {
-        Ok(TaskExit { id: TaskId::Signal, .. }) => {
+        Ok(TaskExit {
+            id: TaskId::Signal, ..
+        }) => {
             tracing::info!("shutdown signal received; initiating shutdown");
         }
-        Ok(TaskExit { id, outcome: Err(msg) }) => {
+        Ok(TaskExit {
+            id,
+            outcome: Err(msg),
+        }) => {
             tracing::warn!(?id, error = %msg, "task failed; initiating shutdown");
             *terminal = Some(format!("{id:?} failed: {msg}"));
         }
-        Ok(TaskExit { id, outcome: Ok(()) }) => {
-            tracing::warn!(?id, "task exited before shutdown signal; initiating shutdown");
+        Ok(TaskExit {
+            id,
+            outcome: Ok(()),
+        }) => {
+            tracing::warn!(
+                ?id,
+                "task exited before shutdown signal; initiating shutdown"
+            );
             *terminal = Some(format!("{id:?} exited before shutdown signal"));
         }
         Err(join_error) => {
@@ -115,8 +122,14 @@ fn classify_first(
 
 fn log_drain(joined: Result<TaskExit, tokio::task::JoinError>) {
     match joined {
-        Ok(TaskExit { id, outcome: Ok(()) }) => tracing::debug!(?id, "task drained"),
-        Ok(TaskExit { id, outcome: Err(msg) }) => {
+        Ok(TaskExit {
+            id,
+            outcome: Ok(()),
+        }) => tracing::debug!(?id, "task drained"),
+        Ok(TaskExit {
+            id,
+            outcome: Err(msg),
+        }) => {
             tracing::warn!(?id, error = %msg, "task errored during drain")
         }
         Err(e) if e.is_cancelled() => {}
@@ -146,8 +159,14 @@ mod tests {
         }));
 
         let result = supervise(set, shutdown.clone(), Duration::from_millis(500)).await;
-        assert!(result.is_none(), "signal completion must be graceful; got: {result:?}");
-        assert!(shutdown.is_cancelled(), "token must be cancelled after supervise");
+        assert!(
+            result.is_none(),
+            "signal completion must be graceful; got: {result:?}"
+        );
+        assert!(
+            shutdown.is_cancelled(),
+            "token must be cancelled after supervise"
+        );
     }
 
     #[tokio::test]
@@ -166,8 +185,14 @@ mod tests {
 
         let result = supervise(set, shutdown.clone(), Duration::from_millis(500)).await;
         let msg = result.expect("Http transport error must be terminal");
-        assert!(msg.contains("Http"), "terminal error must name the task: {msg}");
-        assert!(msg.contains("bind failed"), "terminal error must include error text: {msg}");
+        assert!(
+            msg.contains("Http"),
+            "terminal error must name the task: {msg}"
+        );
+        assert!(
+            msg.contains("bind failed"),
+            "terminal error must include error text: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -200,7 +225,10 @@ mod tests {
         let result = supervise(set, shutdown.clone(), drain).await;
         let elapsed = start.elapsed();
 
-        assert!(result.is_none(), "signal completion must be graceful even with stuck worker: {result:?}");
+        assert!(
+            result.is_none(),
+            "signal completion must be graceful even with stuck worker: {result:?}"
+        );
         assert!(
             elapsed < Duration::from_millis(500),
             "supervise must complete within 500ms with 50ms drain; took {elapsed:?}"

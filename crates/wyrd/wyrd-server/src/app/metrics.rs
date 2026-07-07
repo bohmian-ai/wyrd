@@ -12,8 +12,9 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 /// Histogram buckets (seconds) for request-duration metrics.
-const REQUEST_DURATION_BUCKETS: &[f64] =
-    &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+const REQUEST_DURATION_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 
 /// Wyrd metric names. Keep these stable — dashboards depend on them.
 pub const HTTP_REQUESTS_TOTAL: &str = "wyrd_http_requests_total";
@@ -49,14 +50,13 @@ pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
 }
 
 /// Build the metrics router: `GET /metrics` renders the Prometheus snapshot.
-#[must_use]
 pub fn metrics_router(handle: PrometheusHandle) -> Router {
     Router::new().route("/metrics", get(move || ready(handle.render())))
 }
 
 /// Serve the metrics router on an already-bound `listener` until `shutdown`.
 ///
-/// The caller binds the listener (in `WyrdServer::serve`) so bind failures are
+/// The caller binds the listener (in `WyrdServer::bind`) so bind failures are
 /// boot errors, not task errors — symmetric with `app/serve.rs::serve`.
 ///
 /// # Errors

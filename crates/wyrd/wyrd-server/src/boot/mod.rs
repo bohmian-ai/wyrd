@@ -593,8 +593,14 @@ mod tests {
 
         let patched = apply_overrides(state, StateOverrides::default());
 
-        assert!(patched.authz.policy_hook.is_stub_default(), "authz unchanged");
-        assert!(patched.authz.audit_writer.is_stub_default(), "audit unchanged");
+        assert!(
+            patched.authz.policy_hook.is_stub_default(),
+            "authz unchanged"
+        );
+        assert!(
+            patched.authz.audit_writer.is_stub_default(),
+            "audit unchanged"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

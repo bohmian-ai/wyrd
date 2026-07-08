@@ -704,19 +704,18 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn real_authz_audit_writer_is_not_stub() {
-        use crate::components::auth::audit_writer::RealAuthzAuditWriter;
-
-        let state = make_test_state().await;
-        let state = state.with_authz(ServerAuthz {
-            audit_writer: Arc::new(RealAuthzAuditWriter),
-            ..ServerAuthz::default()
-        });
-        let patched = apply_overrides(state, StateOverrides::default());
+    #[test]
+    fn real_authz_audit_writer_is_not_stub() {
+        use crate::components::auth::audit_writer::{
+            AuthzAuditWriter, NoopAuthzAuditWriter, RealAuthzAuditWriter,
+        };
 
         assert!(
-            !patched.authz.audit_writer.is_stub_default(),
+            NoopAuthzAuditWriter.is_stub_default(),
+            "noop writer must be a stub"
+        );
+        assert!(
+            !RealAuthzAuditWriter.is_stub_default(),
             "RealAuthzAuditWriter must not be a stub"
         );
     }

@@ -658,7 +658,8 @@ mod tests {
 
     use super::*;
     use crate::auth::pg_resolvers::{PgIssuerResolver, issuer_write_from_trusted};
-    use crate::components::auth::AuthenticatedPrincipal;
+    use crate::components::auth::Caller;
+    use wyrd_spec::request_id::RequestId;
 
     const SECRET: &str = "super-secret";
     const SEEDED_ISSUER: &str = "https://idp.example.com/realms/wyrd";
@@ -687,8 +688,9 @@ mod tests {
         })
     }
 
-    fn principal_with(tenant: DataTenantId, perms: PermissionSet) -> AuthenticatedPrincipal {
-        AuthenticatedPrincipal {
+    fn principal_with(tenant: DataTenantId, perms: PermissionSet) -> Caller {
+        Caller {
+            data_tenant_id: tenant,
             principal: Principal::new(
                 PrincipalId::new(uuid::Uuid::nil()),
                 PrincipalKind::User,
@@ -696,17 +698,19 @@ mod tests {
                 Vec::<RoleRef>::new(),
                 perms,
             ),
+            request_id: RequestId::parse(&uuid::Uuid::nil().to_string())
+                .expect("nil UUID is a valid request id"),
         }
     }
 
-    fn writer(tenant: DataTenantId) -> AuthenticatedPrincipal {
+    fn writer(tenant: DataTenantId) -> Caller {
         principal_with(
             tenant,
             PermissionSet::from_iter([Permission::service_accounts_write()]),
         )
     }
 
-    fn reader(tenant: DataTenantId) -> AuthenticatedPrincipal {
+    fn reader(tenant: DataTenantId) -> Caller {
         principal_with(tenant, PermissionSet::new())
     }
 

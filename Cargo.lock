@@ -9737,6 +9737,7 @@ version = "0.0.1"
 dependencies = [
  "arrow",
  "async-trait",
+ "chrono",
  "clap",
  "criterion",
  "dashmap 6.2.1",

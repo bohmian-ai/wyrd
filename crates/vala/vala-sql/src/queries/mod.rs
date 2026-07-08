@@ -8,6 +8,7 @@
 //! are propagated after commit through the future outbox path.
 
 pub mod alerts;
+pub mod drift_alerts;
 pub mod anchors;
 pub mod audit_outbox;
 #[cfg(feature = "diagnostics")]

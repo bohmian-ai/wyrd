@@ -386,6 +386,7 @@ impl WyrdCatalog {
             Arc::clone(&self.registry),
             PayloadClass::Standard,
             &[],
+            None,
         );
 
         Ok(handle)
@@ -393,9 +394,9 @@ impl WyrdCatalog {
 
     /// Open a write handle for a pre-declared domain table `T`.
     ///
-    /// Carries the table's `PayloadClass` and `SENSITIVE_PAYLOAD_COLUMNS` into
-    /// the coordinator so the M-03 redaction pass fires automatically for
-    /// `Sensitive` tables before each commit.
+    /// Carries the table's `PayloadClass`, `SENSITIVE_PAYLOAD_COLUMNS`, and
+    /// `entity_bounds_mapping` into the coordinator so redaction and best-effort
+    /// entity-time-bounds upserts fire automatically on each commit.
     pub async fn typed_writer<T: DomainTable>(
         &self,
         scope: TableScope,
@@ -429,6 +430,7 @@ impl WyrdCatalog {
             Arc::clone(&self.registry),
             T::PAYLOAD_CLASS,
             T::SENSITIVE_PAYLOAD_COLUMNS,
+            T::entity_bounds_mapping(),
         );
 
         Ok(handle)

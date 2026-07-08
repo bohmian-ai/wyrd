@@ -75,7 +75,10 @@ struct CommitActor {
     /// This is per-handle today: one coordinator is spawned per `writer()` call,
     /// so a handle (and its actor) serves a single data tenant. When the shared
     /// per-physical-table coordinator (M5/D3/M16) lands, the data tenant must move
-    /// onto `WriteCmd::Write` so one actor can stamp many tenants' writes.
+    /// onto `WriteCmd::Write` so one actor can stamp many tenants' writes. Design
+    /// (queue, backpressure, flush timing, compaction, single/multi-tenant) is not
+    /// yet locked — see
+    /// `.dev/plan/foundations/12-olap-warehouse/stage5/07-write-path-group-commit.md`.
     data_tenant: DataTenantId,
     buffer: AppendBuffer,
     registry: Arc<Registry>,

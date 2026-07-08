@@ -39,7 +39,7 @@ Load these before judging alignment:
 7. Feature artifacts: `spec.md`, `plan.md`, `tasks.yaml`, and `tasks/`
 8. Review artifacts: `summary.md`, `validation.md`, and `implementation-plan.md`
 
-If `docs/src/content/docs/concepts/core-doctrine.mdx` exists, read it too. If it
+If `docs/src/content/docs/concepts/doctrine.svxx` exists, read it too. If it
 does not exist, treat the `.claude/references/doctrine/*` files as the doctrine
 slice for this gate.
 

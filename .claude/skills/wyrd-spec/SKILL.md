@@ -30,7 +30,7 @@ Ground in the Wyrd repo before asking anything. Do not ask what the repo answers
 
 1. `AGENTS.md`
 2. `architecture/wyrd-design.md` — active design authority.
-3. `docs/src/content/docs/concepts/core-doctrine.mdx` — doctrine vocabulary and
+3. `docs/src/content/docs/concepts/doctrine.svxx` — doctrine vocabulary and
    the Card/Spec/Run/Observation ontology.
 4. The nearest existing architecture file, spec, or implementation for the
    surface being specced.

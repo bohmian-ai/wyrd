@@ -12,7 +12,7 @@ Primary repository:
 |---|---|
 | `AGENTS.md` | Repository rules, source-of-truth ordering, Wyrd-native vocabulary, ownership boundaries, verification, and completion standard. |
 | `architecture/wyrd-design.md` | Active design authority and first design filter for nouns, card kinds, foundations, services, and public surfaces. Wins over generated artifacts, older planning files, and implementation drift. |
-| `docs/src/content/docs/concepts/core-doctrine.mdx` | Public doctrine summary for contracts, APIs, SDK surfaces, CLI, MCP, UI, docs, generated schemas, and implementation behavior. |
+| `docs/src/content/docs/concepts/doctrine.svxx` | Public doctrine summary for contracts, APIs, SDK surfaces, CLI, MCP, UI, docs, generated schemas, and implementation behavior. |
 | `.dev/plan/` | Current implementation phase plans and handoffs in this repository. |
 | `.dev/review/` | Current review artifacts and consensus ledgers in this repository. |
 | `PLAN.md` | Pointer to older planning history when historical context is needed. |

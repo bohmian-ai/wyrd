@@ -35,7 +35,7 @@ Before reviewing, read:
 1. `AGENTS.md`
 2. `architecture/wyrd-design.md`; it is the active design authority and wins
    over generated artifacts, older planning files, and implementation drift.
-3. `docs/src/content/docs/concepts/core-doctrine.mdx` before reviewing Wyrd
+3. `docs/src/content/docs/concepts/doctrine.svxx` before reviewing Wyrd
    contracts, public or internal APIs, SDK surfaces, CLI, MCP, UI, docs,
    generated schemas, or implementation behavior.
 4. The nearest architecture file, phase plan, review note, source map, or

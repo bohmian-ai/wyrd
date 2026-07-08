@@ -25,7 +25,7 @@
 specification under the public documentation site once stabilized.
 **Companion artifacts:**
 - Worked YAML examples: `architecture/specs/*.yaml`
-- Design filter: `docs/src/content/docs/concepts/core-doctrine.mdx`
+- Design filter: `docs/src/content/docs/concepts/doctrine.svxx`
 - Rust reference implementation: `crates/wyrd-spec/`
 
 > When this document and an implementation disagree, **this document is the

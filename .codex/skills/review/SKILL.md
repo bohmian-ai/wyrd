@@ -11,7 +11,7 @@ with the core doctrine.
 ## First Pass
 
 1. Read `AGENTS.md`.
-2. Read `docs/src/content/docs/concepts/core-doctrine.mdx`.
+2. Read `docs/src/content/docs/concepts/doctrine.svxx`.
 3. If available, compare against the canonical planning source:
    `/Users/stevenforrester/Documents/GitHub/wyrd-plan/architecture/v1/00-foundations/core-doctrine.md`.
 4. Read the changed files and nearest contracts, tests, schemas, docs, or

@@ -1,9 +1,11 @@
 //! Authz-check audit writer seam.
 
 use async_trait::async_trait;
+use vala_sql::queries::audit_outbox::append_audit;
 use wyrd_auth_check::AuthzCheckContext;
 use wyrd_spec::card::policy::PolicyDecision;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 use wyrd_sql::TenantConn;
 
 /// Audit writer used by the authz-check route.
@@ -20,6 +22,44 @@ pub trait AuthzAuditWriter: Send + Sync {
     /// Whether this writer is a placeholder default unsuitable for production.
     fn is_stub_default(&self) -> bool {
         false
+    }
+}
+
+/// Production authz-check audit writer that appends to `vala.audit_outbox`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RealAuthzAuditWriter;
+
+#[async_trait]
+impl AuthzAuditWriter for RealAuthzAuditWriter {
+    async fn write_authz_check(
+        &self,
+        conn: &mut TenantConn<'_>,
+        ctx: &AuthzCheckContext,
+        decision: &PolicyDecision,
+    ) -> Result<(), WyrdError> {
+        let (audit_decision, audit_result) = match decision {
+            PolicyDecision::Allow => (AuditDecision::Allow, AuditResult::Success),
+            PolicyDecision::Deny { .. } => (AuditDecision::Deny, AuditResult::Failure),
+            &_ => (AuditDecision::Deny, AuditResult::Failure),
+        };
+        let event = AuditEvent {
+            request_id: ctx.request_id.clone(),
+            trace_id: None,
+            operation: "authz.check".to_owned(),
+            resource: ctx.request.target.to_string(),
+            card_ref: ctx.caller.card_ref().cloned(),
+            principal_id: ctx.caller.id,
+            principal_kind: ctx.caller.kind.tag(),
+            auth_method: AuthMethod::Jwt,
+            permission: ctx.request.action.clone(),
+            decision: audit_decision,
+            result: audit_result,
+            payload_summary: format!("authz check; action={}", ctx.request.action),
+        };
+        append_audit(conn, &event)
+            .await
+            .map(|_| ())
+            .map_err(crate::audit::audit_unavailable)
     }
 }
 

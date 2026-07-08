@@ -11,6 +11,19 @@ use wyrd_spec::vala::system_columns::{
 
 pub mod system_columns;
 
+pub(crate) mod generated {
+    include!(concat!(env!("OUT_DIR"), "/domain_schemas.rs"));
+}
+
+pub mod system;
+pub mod traces;
+pub mod genai;
+pub mod metrics;
+pub mod logs;
+pub mod eval;
+pub mod drift;
+pub mod dev;
+
 /// Which universal correlation columns a pre-declared domain table carries (C-01).
 ///
 /// A single universal policy is wrong — the pre-declared set spans three shapes.
@@ -152,11 +165,31 @@ pub fn reject_reserved_domain_fields(
 
 /// Register all pre-declared domain tables at boot. Called from `WyrdCatalog::new`.
 ///
-/// Extend this list when each table task (04–11) adds a `DomainTable` impl.
+/// Append-only — do not reorder or remove entries.
 pub async fn register_all(catalog: &Arc<WyrdCatalog>) -> Result<(), BifrostError> {
-    // Tables registered as they land in tasks 04–11.
-    // This function is intentionally append-only; do not reorder or remove rows.
-    let _ = catalog; // placeholder until tables land
+    // traces
+    register::<traces::SpansTable>(catalog).await?;
+    register::<traces::EventsTable>(catalog).await?;
+    register::<traces::LinksTable>(catalog).await?;
+    // genai
+    register::<genai::MessagesTable>(catalog).await?;
+    register::<genai::EmbeddingsTable>(catalog).await?;
+    register::<genai::ToolCallsTable>(catalog).await?;
+    // metrics
+    register::<metrics::PointsTable>(catalog).await?;
+    // logs
+    register::<logs::RecordsTable>(catalog).await?;
+    // eval
+    register::<eval::RunsTable>(catalog).await?;
+    register::<eval::AssertionsTable>(catalog).await?;
+    // drift
+    register::<drift::FeaturesTable>(catalog).await?;
+    register::<drift::PredictionsTable>(catalog).await?;
+    register::<drift::MonitorsTable>(catalog).await?;
+    // dev
+    register::<dev::AgentTracesTable>(catalog).await?;
+    // system
+    register::<system::AuditLogTable>(catalog).await?;
     Ok(())
 }
 

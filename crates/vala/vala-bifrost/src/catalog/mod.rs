@@ -15,7 +15,7 @@ use crate::error::BifrostError;
 use crate::provider::WyrdTableProvider;
 use crate::registry::{CachedMeta, Registry, RegistryKey};
 use crate::schema::system_columns::with_system_columns;
-use crate::tables::{DeclaredIndex, DomainTable};
+use crate::tables::{DeclaredIndex, DomainTable, PayloadClass};
 use crate::types::{PartitionTransform, SchemaFingerprint, TableScope, TableUid};
 use crate::writer::TableWriterHandle;
 use crate::writer::coordinator::spawn_commit_coordinator;
@@ -384,6 +384,50 @@ impl WyrdCatalog {
             scope,
             tenant,
             Arc::clone(&self.registry),
+            PayloadClass::Standard,
+            &[],
+        );
+
+        Ok(handle)
+    }
+
+    /// Open a write handle for a pre-declared domain table `T`.
+    ///
+    /// Carries the table's `PayloadClass` and `SENSITIVE_PAYLOAD_COLUMNS` into
+    /// the coordinator so the M-03 redaction pass fires automatically for
+    /// `Sensitive` tables before each commit.
+    pub async fn typed_writer<T: DomainTable>(
+        &self,
+        scope: TableScope,
+        tenant: wyrd_spec::ids::DataTenantId,
+    ) -> Result<TableWriterHandle, BifrostError> {
+        let ns = BifrostNamespace::from_domain_namespace(T::NAMESPACE)
+            .ok_or_else(|| BifrostError::Internal(format!("unknown namespace: {}", T::NAMESPACE)))?;
+        let table_ident = iceberg::TableIdent::new(ns.to_namespace_ident(), T::NAME.to_string());
+        let table = self.catalog.load_table(&table_ident).await?;
+        let fqn = format!("{}.{}", ns.as_str(), T::NAME);
+
+        let row = self
+            .lookup_table_row(&fqn, scope.control_bind(tenant))
+            .await?
+            .ok_or_else(|| BifrostError::TableNotFound(fqn.clone()))?;
+        let table_uid = TableUid(
+            row.table_uid
+                .try_into()
+                .map_err(|_| BifrostError::Internal("table_uid length mismatch".to_string()))?,
+        );
+
+        let handle = spawn_commit_coordinator(
+            table,
+            self.catalog.clone(),
+            self.pool.clone(),
+            table_uid,
+            fqn,
+            scope,
+            tenant,
+            Arc::clone(&self.registry),
+            T::PAYLOAD_CLASS,
+            T::SENSITIVE_PAYLOAD_COLUMNS,
         );
 
         Ok(handle)

@@ -17,8 +17,10 @@
 use sqlx::PgPool;
 use vala_sql::TenantConn;
 use vala_sql::queries::audit_outbox::append_audit;
+use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::DataTenantId;
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError as ValaError;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
@@ -48,6 +50,39 @@ pub fn audit_event(
         principal_id: caller.principal.id,
         principal_kind: caller.principal.kind.tag(),
         auth_method: AuthMethod::Jwt,
+        permission: permission.to_owned(),
+        decision,
+        result,
+        payload_summary: payload_summary.to_owned(),
+    }
+}
+
+/// Build an [`AuditEvent`] for a pre-authentication attempt, attributed to
+/// [`PLATFORM_AUDIT_PRINCIPAL`] (a reserved well-known service actor). Used
+/// when no `Caller` is available — e.g. `GET /auth/login` before OIDC resolve.
+///
+/// `auth_method` is `Internal` (the platform actor is internal; the *claimed*
+/// OIDC method is a fact about the attempt, not the actor). `payload_summary`
+/// should include the attempted issuer, tenant slug, and outcome.
+#[must_use]
+pub fn audit_event_unauthenticated(
+    request_id: RequestId,
+    operation: &str,
+    resource: &str,
+    permission: &str,
+    decision: AuditDecision,
+    result: AuditResult,
+    payload_summary: &str,
+) -> AuditEvent {
+    AuditEvent {
+        request_id,
+        trace_id: None,
+        operation: operation.to_owned(),
+        resource: resource.to_owned(),
+        card_ref: None,
+        principal_id: PLATFORM_AUDIT_PRINCIPAL,
+        principal_kind: PrincipalKindTag::Service,
+        auth_method: AuthMethod::Internal,
         permission: permission.to_owned(),
         decision,
         result,

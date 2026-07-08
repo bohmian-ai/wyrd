@@ -42,7 +42,8 @@ use wyrd_sql::row_types::auth::{TrustedIssuerRow, WorkloadBindingRow};
 use wyrd_sql::{SqlError, TenantConn};
 
 use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
-use crate::components::auth::AuthenticatedPrincipal;
+use crate::audit;
+use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -211,7 +212,7 @@ struct BindingFilter {
 /// (never the secret).
 async fn create_trusted_issuer(
     State(state): State<AppState>,
-    caller: AuthenticatedPrincipal,
+    caller: Caller,
     Json(request): Json<CreateTrustedIssuerRequest>,
 ) -> Result<Json<TrustedIssuerView>, WyrdErrorResponse> {
     wyrd_auth::service_accounts::require_service_accounts_write(
@@ -249,6 +250,20 @@ async fn create_trusted_issuer(
     insert_trusted_issuer(&mut conn, &write)
         .await
         .map_err(map_write_error)?;
+    audit::append_on(
+        &mut conn,
+        &audit::audit_event(
+            &caller,
+            "admin.trusted_issuer.create",
+            &format!("trusted_issuer:{}", trusted.issuer),
+            "service_accounts:write",
+            wyrd_spec::vala::api::AuditDecision::Allow,
+            wyrd_spec::vala::api::AuditResult::Success,
+            "trusted issuer registered",
+        ),
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(Json(trusted_issuer_view_from_write(&write)))
@@ -259,7 +274,7 @@ async fn create_trusted_issuer(
 /// discovery or secret ever leaves the store.
 async fn list_trusted_issuers(
     State(state): State<AppState>,
-    caller: AuthenticatedPrincipal,
+    caller: Caller,
 ) -> Result<Json<Vec<TrustedIssuerView>>, WyrdErrorResponse> {
     wyrd_auth::service_accounts::require_service_accounts_write(
         &caller.principal,
@@ -285,7 +300,7 @@ async fn list_trusted_issuers(
 /// (`409`). A missing issuer is a `404`. Returns `204 No Content`.
 async fn delete_trusted_issuer_route(
     State(state): State<AppState>,
-    caller: AuthenticatedPrincipal,
+    caller: Caller,
     Query(query): Query<DeleteIssuerQuery>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
     wyrd_auth::service_accounts::require_service_accounts_write(
@@ -312,6 +327,20 @@ async fn delete_trusted_issuer_route(
     if removed == 0 {
         return Err(issuer_not_found(&issuer));
     }
+    audit::append_on(
+        &mut conn,
+        &audit::audit_event(
+            &caller,
+            "admin.trusted_issuer.delete",
+            &format!("trusted_issuer:{issuer}"),
+            "service_accounts:write",
+            wyrd_spec::vala::api::AuditDecision::Allow,
+            wyrd_spec::vala::api::AuditResult::Success,
+            "trusted issuer deleted",
+        ),
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -329,7 +358,7 @@ async fn delete_trusted_issuer_route(
 /// first), a duplicate binding to a `409`. Writes through the RLS `TenantConn`.
 async fn create_workload_binding(
     State(state): State<AppState>,
-    caller: AuthenticatedPrincipal,
+    caller: Caller,
     Json(request): Json<CreateWorkloadBindingRequest>,
 ) -> Result<Json<WorkloadBindingView>, WyrdErrorResponse> {
     wyrd_auth::service_accounts::require_service_accounts_write(
@@ -351,6 +380,20 @@ async fn create_workload_binding(
     insert_workload_binding(&mut conn, &write)
         .await
         .map_err(|error| map_binding_write_error(error, &binding.issuer))?;
+    audit::append_on(
+        &mut conn,
+        &audit::audit_event(
+            &caller,
+            "admin.workload_binding.create",
+            &format!("workload_binding:{}:{}", binding.issuer, binding.subject),
+            "service_accounts:write",
+            wyrd_spec::vala::api::AuditDecision::Allow,
+            wyrd_spec::vala::api::AuditResult::Success,
+            "workload binding registered",
+        ),
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(Json(workload_binding_view_from_write(&write)))
@@ -362,7 +405,7 @@ async fn create_workload_binding(
 /// form so a trailing slash does not silently miss.
 async fn list_workload_bindings(
     State(state): State<AppState>,
-    caller: AuthenticatedPrincipal,
+    caller: Caller,
     Query(filter): Query<BindingFilter>,
 ) -> Result<Json<Vec<WorkloadBindingView>>, WyrdErrorResponse> {
     wyrd_auth::service_accounts::require_service_accounts_write(
@@ -393,7 +436,7 @@ async fn list_workload_bindings(
 /// binding is a `404`. Returns `204 No Content`.
 async fn delete_workload_binding_route(
     State(state): State<AppState>,
-    caller: AuthenticatedPrincipal,
+    caller: Caller,
     Query(query): Query<BindingQuery>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
     wyrd_auth::service_accounts::require_service_accounts_write(
@@ -410,6 +453,20 @@ async fn delete_workload_binding_route(
     if removed == 0 {
         return Err(binding_not_found(&issuer, &query.subject));
     }
+    audit::append_on(
+        &mut conn,
+        &audit::audit_event(
+            &caller,
+            "admin.workload_binding.delete",
+            &format!("workload_binding:{issuer}:{}", query.subject),
+            "service_accounts:write",
+            wyrd_spec::vala::api::AuditDecision::Allow,
+            wyrd_spec::vala::api::AuditResult::Success,
+            "workload binding deleted",
+        ),
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -424,7 +481,7 @@ async fn delete_workload_binding_route(
 /// so Postgres row-level security is the load-bearing tenant boundary.
 async fn acquire_conn<'a>(
     state: &'a AppState,
-    caller: &AuthenticatedPrincipal,
+    caller: &Caller,
 ) -> Result<TenantConn<'a>, WyrdErrorResponse> {
     state
         .postgres
@@ -601,6 +658,7 @@ mod tests {
 
     use super::*;
     use crate::auth::pg_resolvers::{PgIssuerResolver, issuer_write_from_trusted};
+    use crate::components::auth::AuthenticatedPrincipal;
 
     const SECRET: &str = "super-secret";
     const SEEDED_ISSUER: &str = "https://idp.example.com/realms/wyrd";

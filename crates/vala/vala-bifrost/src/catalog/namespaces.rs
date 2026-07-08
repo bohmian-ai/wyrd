@@ -48,6 +48,23 @@ impl BifrostNamespace {
         Self::ALL.iter().copied().find(|ns| ns.as_str() == s)
     }
 
+    /// Map a [`DomainTable::NAMESPACE`] short segment (e.g. `"traces"`) to the enum.
+    /// Returns `None` for unknown segments.
+    pub fn from_domain_namespace(segment: &str) -> Option<Self> {
+        match segment {
+            "system" => Some(Self::System),
+            "bifrost" => Some(Self::Bifrost),
+            "traces" => Some(Self::Traces),
+            "metrics" => Some(Self::Metrics),
+            "logs" => Some(Self::Logs),
+            "genai" => Some(Self::GenAi),
+            "eval" => Some(Self::Eval),
+            "drift" => Some(Self::Drift),
+            "dev" => Some(Self::Dev),
+            _ => None,
+        }
+    }
+
     /// Split a fully-qualified `"namespace.table"` FQN into `(Self, table_name)`.
     ///
     /// Returns `None` for names that are not a known Bifrost namespace prefix followed

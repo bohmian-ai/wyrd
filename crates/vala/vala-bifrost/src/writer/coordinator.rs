@@ -15,9 +15,11 @@ use wyrd_spec::vala::system_columns::is_reserved_system_column;
 use crate::batch_builder::stamp_system_columns;
 use crate::error::BifrostError;
 use crate::registry::Registry;
+use crate::tables::PayloadClass;
 use crate::types::{TableScope, TableUid};
 use crate::writer::buffer::AppendBuffer;
 use crate::writer::commit::run_commit;
+use crate::writer::redaction::{BuiltinRedactionPass, RedactionClassifier};
 use crate::writer::{BifrostWriteContext, TableWriterHandle, WriteCmd};
 
 /// The audit-outbox `origin` that marks the relay's own write into
@@ -82,6 +84,8 @@ struct CommitActor {
     data_tenant: DataTenantId,
     buffer: AppendBuffer,
     registry: Arc<Registry>,
+    payload_class: PayloadClass,
+    sensitive_columns: &'static [&'static str],
 }
 
 /// Microseconds since the Unix epoch, used for the server-stamped
@@ -165,6 +169,28 @@ impl CommitActor {
             }
         };
 
+        // M-03: for Sensitive tables run the built-in redaction pass over
+        // SENSITIVE_PAYLOAD_COLUMNS before committing. A classifier error
+        // refuses the commit (WYRD_VALA_500_REDACTION_FAILED).
+        let stamped = if self.payload_class == PayloadClass::Sensitive
+            && !self.sensitive_columns.is_empty()
+        {
+            let pass = BuiltinRedactionPass;
+            match stamped
+                .iter()
+                .map(|b| pass.scrub(b, self.sensitive_columns))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(redacted) => redacted,
+                Err(e) => {
+                    self.buffer = AppendBuffer::from_vec(batches);
+                    return Err(e);
+                }
+            }
+        } else {
+            stamped
+        };
+
         match run_commit(
             &self.pool,
             &self.catalog,
@@ -224,6 +250,8 @@ pub(crate) fn spawn_commit_coordinator(
     scope: TableScope,
     data_tenant: DataTenantId,
     registry: Arc<Registry>,
+    payload_class: PayloadClass,
+    sensitive_columns: &'static [&'static str],
 ) -> TableWriterHandle {
     let (sender, receiver) = mpsc::channel(64);
 
@@ -237,6 +265,8 @@ pub(crate) fn spawn_commit_coordinator(
         data_tenant,
         buffer: AppendBuffer::new(),
         registry,
+        payload_class,
+        sensitive_columns,
     };
 
     tokio::spawn(actor.run());

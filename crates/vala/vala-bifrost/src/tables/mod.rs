@@ -15,14 +15,14 @@ pub(crate) mod generated {
     include!(concat!(env!("OUT_DIR"), "/domain_schemas.rs"));
 }
 
+pub mod dev;
+pub mod drift;
+pub mod eval;
+pub mod genai;
+pub mod logs;
+pub mod metrics;
 pub mod system;
 pub mod traces;
-pub mod genai;
-pub mod metrics;
-pub mod logs;
-pub mod eval;
-pub mod drift;
-pub mod dev;
 
 /// Which universal correlation columns a pre-declared domain table carries (C-01).
 ///
@@ -151,7 +151,12 @@ pub fn reject_reserved_domain_fields(
     policy: CorrelationPolicy,
 ) -> Result<(), BifrostError> {
     let appended = policy.appended_correlation_columns();
-    let always_reserved = [WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_BATCH_ID, DATA_TENANT_ID];
+    let always_reserved = [
+        WYRD_EVENT_TIME,
+        WYRD_INGESTED_AT,
+        WYRD_BATCH_ID,
+        DATA_TENANT_ID,
+    ];
     for name in user_field_names {
         if always_reserved.contains(name) || is_reserved_system_column(name) {
             return Err(BifrostError::ReservedColumn((*name).to_string()));
@@ -199,9 +204,7 @@ pub async fn register<T: DomainTable>(catalog: &Arc<WyrdCatalog>) -> Result<(), 
     let control = catalog
         .domain_table_fingerprint(T::NAMESPACE, T::NAME)
         .await?;
-    let iceberg = catalog
-        .iceberg_table_exists(T::NAMESPACE, T::NAME)
-        .await?;
+    let iceberg = catalog.iceberg_table_exists(T::NAMESPACE, T::NAME).await?;
 
     match (control, iceberg) {
         // STEADY STATE — only healthy path (M-01).
@@ -239,7 +242,9 @@ pub async fn register<T: DomainTable>(catalog: &Arc<WyrdCatalog>) -> Result<(), 
                     .register_domain_control_row::<T>(T::SCHEMA_FINGERPRINT)
                     .await?;
                 for idx in T::declared_indexes() {
-                    catalog.declare_domain_index(T::NAMESPACE, T::NAME, &idx).await?;
+                    catalog
+                        .declare_domain_index(T::NAMESPACE, T::NAME, &idx)
+                        .await?;
                 }
                 Ok(())
             }
@@ -291,7 +296,10 @@ mod tests {
     #[test]
     fn code_axis_policy_omits_run_id() {
         let cols = CorrelationPolicy::CodeAxis.appended_correlation_columns();
-        assert!(!cols.contains(&RUN_ID), "CodeAxis must not append universal run_id");
+        assert!(
+            !cols.contains(&RUN_ID),
+            "CodeAxis must not append universal run_id"
+        );
         assert!(cols.contains(&CARD_UID));
         assert!(cols.contains(&PRINCIPAL_ID));
     }
@@ -316,21 +324,37 @@ mod tests {
     #[test]
     fn none_table_permits_principal_id_and_run_id_as_content() {
         // audit_log has CorrelationPolicy::None and declares principal_id as a content column.
-        let result = reject_reserved_domain_fields(&["principal_id", "run_id"], CorrelationPolicy::None);
-        assert!(result.is_ok(), "None policy must permit content columns named principal_id/run_id");
+        let result =
+            reject_reserved_domain_fields(&["principal_id", "run_id"], CorrelationPolicy::None);
+        assert!(
+            result.is_ok(),
+            "None policy must permit content columns named principal_id/run_id"
+        );
     }
 
     #[test]
     fn code_axis_table_permits_run_id_content_column() {
         // agent_traces has CorrelationPolicy::CodeAxis and declares run_id as its own code-axis column.
         let result = reject_reserved_domain_fields(&["run_id"], CorrelationPolicy::CodeAxis);
-        assert!(result.is_ok(), "CodeAxis policy must permit run_id as a content column");
+        assert!(
+            result.is_ok(),
+            "CodeAxis policy must permit run_id as a content column"
+        );
     }
 
     #[test]
     fn system_column_always_rejected_regardless_of_policy() {
-        for policy in [CorrelationPolicy::Observation, CorrelationPolicy::CodeAxis, CorrelationPolicy::None] {
-            for sys in ["data_tenant_id", "wyrd_event_time", "wyrd_ingested_at", "wyrd_batch_id"] {
+        for policy in [
+            CorrelationPolicy::Observation,
+            CorrelationPolicy::CodeAxis,
+            CorrelationPolicy::None,
+        ] {
+            for sys in [
+                "data_tenant_id",
+                "wyrd_event_time",
+                "wyrd_ingested_at",
+                "wyrd_batch_id",
+            ] {
                 assert!(
                     reject_reserved_domain_fields(&[sys], policy).is_err(),
                     "system column '{sys}' must be rejected by all policies"

@@ -69,10 +69,12 @@ impl LogRecord {
     /// - Serialized `body` exceeds `MAX_LOG_BODY_BYTES`.
     /// - Serialized `attributes` exceeds `MAX_LOG_ATTRIBUTES_BYTES`.
     pub fn validate(&self) -> Result<(), WyrdError> {
-        let err = |msg: &str| Err(WyrdError::Validation {
-            message: msg.to_string(),
-            details: serde_json::Value::Null,
-        });
+        let err = |msg: &str| {
+            Err(WyrdError::Validation {
+                message: msg.to_string(),
+                details: serde_json::Value::Null,
+            })
+        };
         if let Some(sev) = self.severity_number {
             if sev > 24 {
                 return err("severity_number must be in [0, 24]");

@@ -4,7 +4,7 @@ use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, EntityBoundsMapping, IndexKind, PayloadClass,
     SortKey, generated,
 };
-use wyrd_spec::vala::system_columns::{WYRD_EVENT_TIME, DATA_TENANT_ID};
+use wyrd_spec::vala::system_columns::{DATA_TENANT_ID, WYRD_EVENT_TIME};
 
 /// `vala.system.audit_log` — 16 audit content columns + 4 Bifrost system
 /// columns, `CorrelationPolicy::None` (C-01). No universal correlation columns.
@@ -23,9 +23,21 @@ impl DomainTable for AuditLogTable {
 
     fn sort_keys() -> Vec<SortKey> {
         vec![
-            SortKey { column: WYRD_EVENT_TIME.into(), ascending: false, nulls_first: false },
-            SortKey { column: DATA_TENANT_ID.into(), ascending: true, nulls_first: false },
-            SortKey { column: "seq".into(), ascending: true, nulls_first: false },
+            SortKey {
+                column: WYRD_EVENT_TIME.into(),
+                ascending: false,
+                nulls_first: false,
+            },
+            SortKey {
+                column: DATA_TENANT_ID.into(),
+                ascending: true,
+                nulls_first: false,
+            },
+            SortKey {
+                column: "seq".into(),
+                ascending: true,
+                nulls_first: false,
+            },
         ]
     }
 

@@ -17,7 +17,7 @@ pub use admin::{
 pub use card_scope::CardScope;
 pub use issue_key::{IssueKeyRequest, IssueKeyResponse};
 pub use oidc::{AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, UrlParseError};
-pub use principal_id::{PrincipalId, PLATFORM_AUDIT_PRINCIPAL};
+pub use principal_id::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 pub use principal_kind::PrincipalKindTag;
 pub use revoke::{RevokePrincipalRequest, RevokePrincipalResponse};
 pub use secret_bearer::SecretBearer;

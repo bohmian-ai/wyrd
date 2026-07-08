@@ -23,8 +23,16 @@ impl DomainTable for MessagesTable {
 
     fn sort_keys() -> Vec<SortKey> {
         vec![
-            SortKey { column: WYRD_EVENT_TIME.into(), ascending: false, nulls_first: false },
-            SortKey { column: "conversation_id".into(), ascending: true, nulls_first: true },
+            SortKey {
+                column: WYRD_EVENT_TIME.into(),
+                ascending: false,
+                nulls_first: false,
+            },
+            SortKey {
+                column: "conversation_id".into(),
+                ascending: true,
+                nulls_first: true,
+            },
         ]
     }
 
@@ -64,19 +72,25 @@ impl DomainTable for EmbeddingsTable {
 
     fn sort_keys() -> Vec<SortKey> {
         vec![
-            SortKey { column: WYRD_EVENT_TIME.into(), ascending: false, nulls_first: false },
-            SortKey { column: "data_source_id".into(), ascending: true, nulls_first: true },
+            SortKey {
+                column: WYRD_EVENT_TIME.into(),
+                ascending: false,
+                nulls_first: false,
+            },
+            SortKey {
+                column: "data_source_id".into(),
+                ascending: true,
+                nulls_first: true,
+            },
         ]
     }
 
     fn declared_indexes() -> Vec<DeclaredIndex> {
-        vec![
-            DeclaredIndex {
-                name: "embeddings_data_source_bloom".into(),
-                columns: vec!["data_source_id".into()],
-                kind: IndexKind::BloomFilter,
-            },
-        ]
+        vec![DeclaredIndex {
+            name: "embeddings_data_source_bloom".into(),
+            columns: vec!["data_source_id".into()],
+            kind: IndexKind::BloomFilter,
+        }]
     }
 }
 
@@ -97,8 +111,16 @@ impl DomainTable for ToolCallsTable {
 
     fn sort_keys() -> Vec<SortKey> {
         vec![
-            SortKey { column: WYRD_EVENT_TIME.into(), ascending: false, nulls_first: false },
-            SortKey { column: "conversation_id".into(), ascending: true, nulls_first: true },
+            SortKey {
+                column: WYRD_EVENT_TIME.into(),
+                ascending: false,
+                nulls_first: false,
+            },
+            SortKey {
+                column: "conversation_id".into(),
+                ascending: true,
+                nulls_first: true,
+            },
         ]
     }
 

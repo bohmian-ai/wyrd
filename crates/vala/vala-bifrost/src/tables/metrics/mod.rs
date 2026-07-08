@@ -21,20 +21,30 @@ impl DomainTable for PointsTable {
 
     fn sort_keys() -> Vec<SortKey> {
         vec![
-            SortKey { column: WYRD_EVENT_TIME.into(), ascending: false, nulls_first: false },
-            SortKey { column: "metric_name".into(), ascending: true, nulls_first: false },
-            SortKey { column: "service_name".into(), ascending: true, nulls_first: false },
+            SortKey {
+                column: WYRD_EVENT_TIME.into(),
+                ascending: false,
+                nulls_first: false,
+            },
+            SortKey {
+                column: "metric_name".into(),
+                ascending: true,
+                nulls_first: false,
+            },
+            SortKey {
+                column: "service_name".into(),
+                ascending: true,
+                nulls_first: false,
+            },
         ]
     }
 
     fn declared_indexes() -> Vec<DeclaredIndex> {
-        vec![
-            DeclaredIndex {
-                name: "metrics_name_bloom".into(),
-                columns: vec!["metric_name".into()],
-                kind: IndexKind::BloomFilter,
-            },
-        ]
+        vec![DeclaredIndex {
+            name: "metrics_name_bloom".into(),
+            columns: vec!["metric_name".into()],
+            kind: IndexKind::BloomFilter,
+        }]
     }
 
     fn entity_bounds_mapping() -> Option<EntityBoundsMapping> {

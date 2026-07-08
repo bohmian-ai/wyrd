@@ -545,7 +545,11 @@ impl RelayConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(500i32);
-        Self { enabled, tick_ms, claim_limit }
+        Self {
+            enabled,
+            tick_ms,
+            claim_limit,
+        }
     }
 }
 

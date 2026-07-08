@@ -21,9 +21,21 @@ impl DomainTable for RunsTable {
 
     fn sort_keys() -> Vec<SortKey> {
         vec![
-            SortKey { column: WYRD_EVENT_TIME.into(), ascending: false, nulls_first: false },
-            SortKey { column: "eval_ref".into(), ascending: true, nulls_first: true },
-            SortKey { column: "run_id".into(), ascending: true, nulls_first: true },
+            SortKey {
+                column: WYRD_EVENT_TIME.into(),
+                ascending: false,
+                nulls_first: false,
+            },
+            SortKey {
+                column: "eval_ref".into(),
+                ascending: true,
+                nulls_first: true,
+            },
+            SortKey {
+                column: "run_id".into(),
+                ascending: true,
+                nulls_first: true,
+            },
         ]
     }
 
@@ -62,19 +74,29 @@ impl DomainTable for AssertionsTable {
 
     fn sort_keys() -> Vec<SortKey> {
         vec![
-            SortKey { column: WYRD_EVENT_TIME.into(), ascending: false, nulls_first: false },
-            SortKey { column: "run_id".into(), ascending: true, nulls_first: true },
-            SortKey { column: "assertion_name".into(), ascending: true, nulls_first: false },
+            SortKey {
+                column: WYRD_EVENT_TIME.into(),
+                ascending: false,
+                nulls_first: false,
+            },
+            SortKey {
+                column: "run_id".into(),
+                ascending: true,
+                nulls_first: true,
+            },
+            SortKey {
+                column: "assertion_name".into(),
+                ascending: true,
+                nulls_first: false,
+            },
         ]
     }
 
     fn declared_indexes() -> Vec<DeclaredIndex> {
-        vec![
-            DeclaredIndex {
-                name: "assertions_run_id_lookup".into(),
-                columns: vec!["run_id".into()],
-                kind: IndexKind::BloomFilter,
-            },
-        ]
+        vec![DeclaredIndex {
+            name: "assertions_run_id_lookup".into(),
+            columns: vec!["run_id".into()],
+            kind: IndexKind::BloomFilter,
+        }]
     }
 }

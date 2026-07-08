@@ -22,16 +22,36 @@ impl DomainTable for SpansTable {
 
     fn sort_keys() -> Vec<SortKey> {
         vec![
-            SortKey { column: WYRD_EVENT_TIME.into(), ascending: false, nulls_first: false },
-            SortKey { column: "data_tenant_id".into(), ascending: true, nulls_first: false },
-            SortKey { column: "trace_id".into(), ascending: true, nulls_first: false },
+            SortKey {
+                column: WYRD_EVENT_TIME.into(),
+                ascending: false,
+                nulls_first: false,
+            },
+            SortKey {
+                column: "data_tenant_id".into(),
+                ascending: true,
+                nulls_first: false,
+            },
+            SortKey {
+                column: "trace_id".into(),
+                ascending: true,
+                nulls_first: false,
+            },
         ]
     }
 
     fn declared_indexes() -> Vec<DeclaredIndex> {
         vec![
-            DeclaredIndex { name: "spans_trace_id_lookup".into(), columns: vec!["trace_id".into()], kind: IndexKind::BloomFilter },
-            DeclaredIndex { name: "spans_service_bloom".into(), columns: vec!["service_name".into()], kind: IndexKind::BloomFilter },
+            DeclaredIndex {
+                name: "spans_trace_id_lookup".into(),
+                columns: vec!["trace_id".into()],
+                kind: IndexKind::BloomFilter,
+            },
+            DeclaredIndex {
+                name: "spans_service_bloom".into(),
+                columns: vec!["service_name".into()],
+                kind: IndexKind::BloomFilter,
+            },
         ]
     }
 
@@ -59,16 +79,30 @@ impl DomainTable for EventsTable {
 
     fn sort_keys() -> Vec<SortKey> {
         vec![
-            SortKey { column: WYRD_EVENT_TIME.into(), ascending: false, nulls_first: false },
-            SortKey { column: "trace_id".into(), ascending: true, nulls_first: false },
-            SortKey { column: "span_id".into(), ascending: true, nulls_first: false },
+            SortKey {
+                column: WYRD_EVENT_TIME.into(),
+                ascending: false,
+                nulls_first: false,
+            },
+            SortKey {
+                column: "trace_id".into(),
+                ascending: true,
+                nulls_first: false,
+            },
+            SortKey {
+                column: "span_id".into(),
+                ascending: true,
+                nulls_first: false,
+            },
         ]
     }
 
     fn declared_indexes() -> Vec<DeclaredIndex> {
-        vec![
-            DeclaredIndex { name: "events_trace_id_lookup".into(), columns: vec!["trace_id".into()], kind: IndexKind::BloomFilter },
-        ]
+        vec![DeclaredIndex {
+            name: "events_trace_id_lookup".into(),
+            columns: vec!["trace_id".into()],
+            kind: IndexKind::BloomFilter,
+        }]
     }
 }
 
@@ -88,15 +122,31 @@ impl DomainTable for LinksTable {
 
     fn sort_keys() -> Vec<SortKey> {
         vec![
-            SortKey { column: WYRD_EVENT_TIME.into(), ascending: false, nulls_first: false },
-            SortKey { column: "trace_id".into(), ascending: true, nulls_first: false },
+            SortKey {
+                column: WYRD_EVENT_TIME.into(),
+                ascending: false,
+                nulls_first: false,
+            },
+            SortKey {
+                column: "trace_id".into(),
+                ascending: true,
+                nulls_first: false,
+            },
         ]
     }
 
     fn declared_indexes() -> Vec<DeclaredIndex> {
         vec![
-            DeclaredIndex { name: "links_trace_id_lookup".into(), columns: vec!["trace_id".into()], kind: IndexKind::BloomFilter },
-            DeclaredIndex { name: "links_linked_trace_id_lookup".into(), columns: vec!["linked_trace_id".into()], kind: IndexKind::BloomFilter },
+            DeclaredIndex {
+                name: "links_trace_id_lookup".into(),
+                columns: vec!["trace_id".into()],
+                kind: IndexKind::BloomFilter,
+            },
+            DeclaredIndex {
+                name: "links_linked_trace_id_lookup".into(),
+                columns: vec!["linked_trace_id".into()],
+                kind: IndexKind::BloomFilter,
+            },
         ]
     }
 }

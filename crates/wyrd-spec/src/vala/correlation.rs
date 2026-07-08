@@ -83,11 +83,8 @@ impl CorrelationColumns {
     ];
 
     /// Column names the server stamps at ingest (identity axis).
-    pub const SERVER_STAMPED: &'static [&'static str] = &[
-        Self::CARD_UID,
-        Self::PRINCIPAL_ID,
-        Self::EXPERIMENT_ID,
-    ];
+    pub const SERVER_STAMPED: &'static [&'static str] =
+        &[Self::CARD_UID, Self::PRINCIPAL_ID, Self::EXPERIMENT_ID];
 }
 
 #[cfg(test)]

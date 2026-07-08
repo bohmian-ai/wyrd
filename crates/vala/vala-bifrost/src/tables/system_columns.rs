@@ -70,7 +70,15 @@ mod tests {
         let names = field_names(&fields);
         assert_eq!(
             names,
-            vec![RUN_ID, CARD_UID, PRINCIPAL_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_BATCH_ID, DATA_TENANT_ID]
+            vec![
+                RUN_ID,
+                CARD_UID,
+                PRINCIPAL_ID,
+                WYRD_EVENT_TIME,
+                WYRD_INGESTED_AT,
+                WYRD_BATCH_ID,
+                DATA_TENANT_ID
+            ]
         );
     }
 
@@ -78,7 +86,10 @@ mod tests {
     fn code_axis_policy_omits_run_id() {
         let fields = ensure_system_cols(vec![], CorrelationPolicy::CodeAxis);
         let names = field_names(&fields);
-        assert!(!names.contains(&RUN_ID), "CodeAxis must not append universal run_id");
+        assert!(
+            !names.contains(&RUN_ID),
+            "CodeAxis must not append universal run_id"
+        );
         assert!(names.contains(&CARD_UID));
         assert!(names.contains(&PRINCIPAL_ID));
     }

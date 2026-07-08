@@ -725,7 +725,11 @@ pub async fn record_entity_bounds(
     conn: &mut TenantConn<'_>,
     table_uid: &[u8; 16],
     entity_kind: &str,
-    bounds: &[(&str, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)],
+    bounds: &[(
+        &str,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    )],
 ) -> Result<(), SqlError> {
     for (entity_id, min_t, max_t) in bounds {
         sqlx::query(

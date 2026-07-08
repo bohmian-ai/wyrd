@@ -58,10 +58,12 @@ impl AgentTraceRecord {
     /// `Validation` when the serialized `messages` + `tool_io` exceed
     /// `MAX_AGENT_TRACE_PAYLOAD_BYTES`, or `ended_at < started_at`.
     pub fn validate(&self) -> Result<(), WyrdError> {
-        let err = |msg: &str| Err(WyrdError::Validation {
-            message: msg.to_string(),
-            details: serde_json::Value::Null,
-        });
+        let err = |msg: &str| {
+            Err(WyrdError::Validation {
+                message: msg.to_string(),
+                details: serde_json::Value::Null,
+            })
+        };
         if self.ended_at < self.started_at {
             return err("ended_at must be >= started_at");
         }

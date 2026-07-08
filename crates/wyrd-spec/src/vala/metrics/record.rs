@@ -183,10 +183,12 @@ impl MetricRecord {
     ///   histogram bucket fields absent.
     /// - An exemplar with a `span_id` also carries a `trace_id`.
     pub fn validate(&self) -> Result<(), WyrdError> {
-        let err = |msg: &str| Err(WyrdError::Validation {
-            message: msg.to_string(),
-            details: serde_json::Value::Null,
-        });
+        let err = |msg: &str| {
+            Err(WyrdError::Validation {
+                message: msg.to_string(),
+                details: serde_json::Value::Null,
+            })
+        };
 
         for ex in &self.exemplars {
             if ex.span_id.is_some() && ex.trace_id.is_none() {
@@ -206,10 +208,15 @@ impl MetricRecord {
                 }
                 if let (Some(bc), Some(eb)) = (&self.bucket_counts, &self.explicit_bounds) {
                     if bc.len() != eb.len() + 1 {
-                        return err("Histogram: bucket_counts.len() must equal explicit_bounds.len() + 1");
+                        return err(
+                            "Histogram: bucket_counts.len() must equal explicit_bounds.len() + 1",
+                        );
                     }
                 }
-                if self.scale.is_some() || self.positive_buckets.is_some() || self.negative_buckets.is_some() {
+                if self.scale.is_some()
+                    || self.positive_buckets.is_some()
+                    || self.negative_buckets.is_some()
+                {
                     return err("Histogram must not carry exponential-histogram fields");
                 }
                 if self.quantile_values.is_some() {
@@ -224,7 +231,9 @@ impl MetricRecord {
                     return err("ExponentialHistogram requires scale");
                 }
                 if self.bucket_counts.is_some() || self.explicit_bounds.is_some() {
-                    return err("ExponentialHistogram must not carry explicit-boundary histogram fields");
+                    return err(
+                        "ExponentialHistogram must not carry explicit-boundary histogram fields",
+                    );
                 }
                 if self.quantile_values.is_some() {
                     return err("ExponentialHistogram must not carry quantile_values");

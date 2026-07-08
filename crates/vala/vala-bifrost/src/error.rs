@@ -3,7 +3,6 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum BifrostError {
     // --- DomainTable registration errors (task 02) ---
-
     #[error("schema fingerprint drift on domain table {namespace}.{name}")]
     SchemaDrift {
         namespace: &'static str,
@@ -12,7 +11,9 @@ pub enum BifrostError {
         actual: [u8; 32],
     },
 
-    #[error("physical schema drift on domain table {namespace}.{name}: control says clean but Iceberg schema differs")]
+    #[error(
+        "physical schema drift on domain table {namespace}.{name}: control says clean but Iceberg schema differs"
+    )]
     PhysicalDrift {
         namespace: &'static str,
         name: &'static str,
@@ -36,7 +37,6 @@ pub enum BifrostError {
     RedactionFailed { detail: String },
 
     // --- original variants ---
-
     #[error("iceberg error: {0}")]
     Iceberg(#[from] iceberg::Error),
 
@@ -100,10 +100,14 @@ impl BifrostError {
             Self::DuplicateFailedBatch(batch_id) => Pub::DuplicateFailedBatch { batch_id },
             Self::MetadataMismatch(detail) => Pub::MetadataMismatch { detail },
             Self::WriterUnavailable(table) => Pub::WriterUnavailable { table },
-            Self::SchemaDrift { namespace, name, .. } => Pub::MetadataMismatch {
+            Self::SchemaDrift {
+                namespace, name, ..
+            } => Pub::MetadataMismatch {
                 detail: format!("schema fingerprint drift on domain table {namespace}.{name}"),
             },
-            Self::PhysicalDrift { namespace, name, .. } => Pub::MetadataMismatch {
+            Self::PhysicalDrift {
+                namespace, name, ..
+            } => Pub::MetadataMismatch {
                 detail: format!("physical schema drift on domain table {namespace}.{name}"),
             },
             Self::IcebergMissing { namespace, name } => Pub::MetadataMismatch {

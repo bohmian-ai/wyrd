@@ -330,7 +330,10 @@ fn gen_ai_span_record_json_field_names_match_wire_spec() {
 
     assert!(obj.contains_key("trace_id"), "missing trace_id");
     assert!(obj.contains_key("span_id"), "missing span_id");
-    assert!(!obj.contains_key("data_tenant_id"), "data_tenant_id must not be a GenAiSpanRecord field (C-02)");
+    assert!(
+        !obj.contains_key("data_tenant_id"),
+        "data_tenant_id must not be a GenAiSpanRecord field (C-02)"
+    );
     assert!(obj.contains_key("provider_name"), "missing provider_name");
     assert!(obj.contains_key("operation_name"), "missing operation_name");
     assert!(obj.contains_key("request_model"), "missing request_model");

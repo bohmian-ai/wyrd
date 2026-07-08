@@ -14,11 +14,7 @@ pub trait RedactionClassifier: Send + Sync {
     /// Scrub matched secret/PII spans inside `columns` of `batch`, in place.
     /// Returns a new batch with the same schema and row count with matched spans
     /// replaced by `⟪redacted⟫`. `Err` causes the commit to be refused.
-    fn scrub(
-        &self,
-        batch: &RecordBatch,
-        columns: &[&str],
-    ) -> Result<RecordBatch, BifrostError>;
+    fn scrub(&self, batch: &RecordBatch, columns: &[&str]) -> Result<RecordBatch, BifrostError>;
 }
 
 /// Regex patterns for known secret formats.
@@ -47,13 +43,8 @@ fn secret_patterns() -> &'static [Regex] {
 }
 
 /// Sensitive attribute key names whose values should be masked.
-const SENSITIVE_ATTR_KEYS: &[&str] = &[
-    "authorization",
-    "cookie",
-    "x-api-key",
-    "password",
-    "secret",
-];
+const SENSITIVE_ATTR_KEYS: &[&str] =
+    &["authorization", "cookie", "x-api-key", "password", "secret"];
 
 const REDACTED: &str = "⟪redacted⟫";
 
@@ -71,7 +62,9 @@ fn luhn_check(digits: &str) -> bool {
     let mut sum = 0u32;
     let mut double = false;
     for c in digits.chars().rev() {
-        let Some(d) = c.to_digit(10) else { return false };
+        let Some(d) = c.to_digit(10) else {
+            return false;
+        };
         let val = if double {
             let v = d * 2;
             if v > 9 { v - 9 } else { v }
@@ -166,7 +159,11 @@ mod tests {
     use arrow::datatypes::{Field, Schema};
 
     fn make_batch(values: Vec<Option<&str>>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new("payload", DataType::Utf8, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            true,
+        )]));
         let array: ArrayRef = Arc::new(StringArray::from(values));
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }

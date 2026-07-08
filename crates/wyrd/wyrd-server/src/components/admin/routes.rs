@@ -41,8 +41,8 @@ use wyrd_sql::queries::auth::{
 use wyrd_sql::row_types::auth::{TrustedIssuerRow, WorkloadBindingRow};
 use wyrd_sql::{SqlError, TenantConn};
 
-use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
 use crate::audit;
+use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;

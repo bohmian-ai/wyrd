@@ -21,8 +21,16 @@ impl DomainTable for AgentTracesTable {
 
     fn sort_keys() -> Vec<SortKey> {
         vec![
-            SortKey { column: "started_at".into(), ascending: false, nulls_first: false },
-            SortKey { column: "dev_session_id".into(), ascending: true, nulls_first: false },
+            SortKey {
+                column: "started_at".into(),
+                ascending: false,
+                nulls_first: false,
+            },
+            SortKey {
+                column: "dev_session_id".into(),
+                ascending: true,
+                nulls_first: false,
+            },
         ]
     }
 

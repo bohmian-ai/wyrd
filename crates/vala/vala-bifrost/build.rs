@@ -35,56 +35,82 @@ fn main() {
     );
 
     emit_table::<arrow_projection::SpansTable>(
-        &mut code, "TRACES_SPANS_FINGERPRINT", "traces_spans_schema",
+        &mut code,
+        "TRACES_SPANS_FINGERPRINT",
+        "traces_spans_schema",
         BuildPolicy::Observation,
     );
     emit_table::<arrow_projection::EventsTable>(
-        &mut code, "TRACES_EVENTS_FINGERPRINT", "traces_events_schema",
+        &mut code,
+        "TRACES_EVENTS_FINGERPRINT",
+        "traces_events_schema",
         BuildPolicy::Observation,
     );
     emit_table::<arrow_projection::LinksTable>(
-        &mut code, "TRACES_LINKS_FINGERPRINT", "traces_links_schema",
+        &mut code,
+        "TRACES_LINKS_FINGERPRINT",
+        "traces_links_schema",
         BuildPolicy::Observation,
     );
     emit_table::<arrow_projection::MessagesTable>(
-        &mut code, "GENAI_MESSAGES_FINGERPRINT", "genai_messages_schema",
+        &mut code,
+        "GENAI_MESSAGES_FINGERPRINT",
+        "genai_messages_schema",
         BuildPolicy::Observation,
     );
     emit_table::<arrow_projection::EmbeddingsTable>(
-        &mut code, "GENAI_EMBEDDINGS_FINGERPRINT", "genai_embeddings_schema",
+        &mut code,
+        "GENAI_EMBEDDINGS_FINGERPRINT",
+        "genai_embeddings_schema",
         BuildPolicy::Observation,
     );
     emit_table::<arrow_projection::ToolCallsTable>(
-        &mut code, "GENAI_TOOL_CALLS_FINGERPRINT", "genai_tool_calls_schema",
+        &mut code,
+        "GENAI_TOOL_CALLS_FINGERPRINT",
+        "genai_tool_calls_schema",
         BuildPolicy::Observation,
     );
     emit_table::<arrow_projection::PointsTable>(
-        &mut code, "METRICS_POINTS_FINGERPRINT", "metrics_points_schema",
+        &mut code,
+        "METRICS_POINTS_FINGERPRINT",
+        "metrics_points_schema",
         BuildPolicy::Observation,
     );
     emit_table::<arrow_projection::LogsRecordsTable>(
-        &mut code, "LOGS_RECORDS_FINGERPRINT", "logs_records_schema",
+        &mut code,
+        "LOGS_RECORDS_FINGERPRINT",
+        "logs_records_schema",
         BuildPolicy::Observation,
     );
     emit_table::<arrow_projection::EvalRunsTable>(
-        &mut code, "EVAL_RUNS_FINGERPRINT", "eval_runs_schema",
+        &mut code,
+        "EVAL_RUNS_FINGERPRINT",
+        "eval_runs_schema",
         BuildPolicy::Observation,
     );
     emit_table::<arrow_projection::EvalAssertionsTable>(
-        &mut code, "EVAL_ASSERTIONS_FINGERPRINT", "eval_assertions_schema",
+        &mut code,
+        "EVAL_ASSERTIONS_FINGERPRINT",
+        "eval_assertions_schema",
         BuildPolicy::Observation,
     );
     emit_table::<arrow_projection::DriftObservationsTable>(
-        &mut code, "DRIFT_OBSERVATIONS_FINGERPRINT", "drift_observations_schema",
+        &mut code,
+        "DRIFT_OBSERVATIONS_FINGERPRINT",
+        "drift_observations_schema",
         BuildPolicy::Observation,
     );
     emit_table::<arrow_projection::AgentTracesTable>(
-        &mut code, "DEV_AGENT_TRACES_FINGERPRINT", "dev_agent_traces_schema",
+        &mut code,
+        "DEV_AGENT_TRACES_FINGERPRINT",
+        "dev_agent_traces_schema",
         BuildPolicy::CodeAxis,
     );
     // system — CorrelationPolicy::None: no universal correlation columns
     emit_table::<arrow_projection::AuditLogTable>(
-        &mut code, "SYSTEM_AUDIT_LOG_FINGERPRINT", "system_audit_log_schema",
+        &mut code,
+        "SYSTEM_AUDIT_LOG_FINGERPRINT",
+        "system_audit_log_schema",
         BuildPolicy::None,
     );
 

@@ -22,8 +22,16 @@ impl DomainTable for RecordsTable {
 
     fn sort_keys() -> Vec<SortKey> {
         vec![
-            SortKey { column: WYRD_EVENT_TIME.into(), ascending: false, nulls_first: false },
-            SortKey { column: "service_name".into(), ascending: true, nulls_first: true },
+            SortKey {
+                column: WYRD_EVENT_TIME.into(),
+                ascending: false,
+                nulls_first: false,
+            },
+            SortKey {
+                column: "service_name".into(),
+                ascending: true,
+                nulls_first: true,
+            },
         ]
     }
 

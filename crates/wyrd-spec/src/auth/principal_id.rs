@@ -14,11 +14,9 @@ pub struct PrincipalId(uuid::Uuid);
 /// Reserved platform principal attributed to unauthenticated audit events
 /// (pre-auth login attempts, platform-internal operations without a caller).
 /// This UUID is a stable well-known sentinel — never a real user principal.
-pub const PLATFORM_AUDIT_PRINCIPAL: PrincipalId =
-    PrincipalId::new(uuid::Uuid::from_bytes([
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x77, 0x79, 0x72, 0x64, 0x01,
-    ]));
+pub const PLATFORM_AUDIT_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::from_bytes([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77, 0x79, 0x72, 0x64, 0x01,
+]));
 
 impl PrincipalId {
     /// Build from a UUID.

@@ -6,8 +6,8 @@ use iceberg::Catalog as _;
 use iceberg::TableCreation;
 use iceberg::spec::FormatVersion;
 use iceberg_catalog_sql::SqlCatalog;
-use sqlx::PgPool;
 use sha2::{Digest, Sha256};
+use sqlx::PgPool;
 
 use crate::catalog::namespaces::BifrostNamespace;
 use crate::catalog::partition_spec::build_partition_spec;
@@ -401,8 +401,9 @@ impl WyrdCatalog {
         scope: TableScope,
         tenant: wyrd_spec::ids::DataTenantId,
     ) -> Result<TableWriterHandle, BifrostError> {
-        let ns = BifrostNamespace::from_domain_namespace(T::NAMESPACE)
-            .ok_or_else(|| BifrostError::Internal(format!("unknown namespace: {}", T::NAMESPACE)))?;
+        let ns = BifrostNamespace::from_domain_namespace(T::NAMESPACE).ok_or_else(|| {
+            BifrostError::Internal(format!("unknown namespace: {}", T::NAMESPACE))
+        })?;
         let table_ident = iceberg::TableIdent::new(ns.to_namespace_ident(), T::NAME.to_string());
         let table = self.catalog.load_table(&table_ident).await?;
         let fqn = format!("{}.{}", ns.as_str(), T::NAME);
@@ -524,12 +525,10 @@ impl WyrdCatalog {
         name: &str,
     ) -> Result<Option<[u8; 32]>, BifrostError> {
         let fqn = format!("{namespace}.{name}");
-        let mut conn = vala_sql::TenantConn::acquire(
-            &self.pool,
-            wyrd_spec::ids::DataTenantId::SYSTEM_OWNER,
-        )
-        .await
-        .map_err(BifrostError::Sql)?;
+        let mut conn =
+            vala_sql::TenantConn::acquire(&self.pool, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
+                .await
+                .map_err(BifrostError::Sql)?;
         let row = vala_sql::queries::olap_catalog::get_by_fqn(&mut conn, &fqn)
             .await
             .map_err(BifrostError::Sql)?;
@@ -568,8 +567,8 @@ impl WyrdCatalog {
         let ident = iceberg::TableIdent::new(ns.to_namespace_ident(), name.to_string());
         let table = self.catalog.load_table(&ident).await?;
         let iceberg_schema = table.metadata().current_schema();
-        let arrow_schema =
-            iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(BifrostError::Iceberg)?;
+        let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+            .map_err(BifrostError::Iceberg)?;
         Ok(Arc::new(arrow_schema))
     }
 
@@ -655,12 +654,10 @@ impl WyrdCatalog {
     ) -> Result<(), BifrostError> {
         let fqn = format!("{}.{}", T::NAMESPACE, T::NAME);
         let table_uid = TableUid::new_v7();
-        let mut conn = vala_sql::TenantConn::acquire(
-            &self.pool,
-            wyrd_spec::ids::DataTenantId::SYSTEM_OWNER,
-        )
-        .await
-        .map_err(BifrostError::Sql)?;
+        let mut conn =
+            vala_sql::TenantConn::acquire(&self.pool, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
+                .await
+                .map_err(BifrostError::Sql)?;
         vala_sql::queries::olap_catalog::upsert_table(
             &mut conn,
             table_uid.as_bytes(),
@@ -691,7 +688,8 @@ impl WyrdCatalog {
     /// Ensure all declared indexes for `T` exist idempotently.
     pub async fn ensure_domain_indexes<T: DomainTable>(&self) -> Result<(), BifrostError> {
         for idx in T::declared_indexes() {
-            self.declare_domain_index(T::NAMESPACE, T::NAME, &idx).await?;
+            self.declare_domain_index(T::NAMESPACE, T::NAME, &idx)
+                .await?;
         }
         Ok(())
     }

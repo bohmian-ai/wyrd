@@ -53,6 +53,12 @@ rand       = { workspace = true, optional = true }
 tempfile   = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
+[build-dependencies]
+# Used by build.rs to generate domain_schemas.rs (ArrowProjection, fingerprints).
+# wyrd-spec is pure — no Arrow feature — so wyrd-spec gains no Arrow dependency (C-01).
+arrow      = { workspace = true }
+sha2       = { workspace = true }
+
 [dev-dependencies]
 # Self-reference activates `testing` feature for integration tests in `tests/`
 # (cfg(test) does not apply to the lib when building integration test binaries).

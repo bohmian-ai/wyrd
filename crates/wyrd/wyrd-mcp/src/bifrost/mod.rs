@@ -327,6 +327,18 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
         BifrostError::AuditUnavailable {
             detail: String::new(),
         },
+        BifrostError::SchemaDrift {
+            detail: String::new(),
+        },
+        BifrostError::PhysicalDrift {
+            detail: String::new(),
+        },
+        BifrostError::IcebergMissing {
+            detail: String::new(),
+        },
+        BifrostError::RedactionFailed {
+            detail: String::new(),
+        },
     ];
 
     if let Some(sentinel) = variants.first() {
@@ -348,7 +360,11 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
             | BifrostError::QueryTimeout
             | BifrostError::QueryResultTooLarge
             | BifrostError::Internal { .. }
-            | BifrostError::AuditUnavailable { .. } => {}
+            | BifrostError::AuditUnavailable { .. }
+            | BifrostError::SchemaDrift { .. }
+            | BifrostError::PhysicalDrift { .. }
+            | BifrostError::IcebergMissing { .. }
+            | BifrostError::RedactionFailed { .. } => {}
         }
     }
 

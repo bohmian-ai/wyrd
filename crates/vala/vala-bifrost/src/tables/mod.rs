@@ -4,7 +4,7 @@ use arrow::datatypes::SchemaRef;
 
 use crate::catalog::WyrdCatalog;
 use crate::error::BifrostError;
-use crate::types::{PartitionTransform, TableUid};
+use crate::types::PartitionTransform;
 use wyrd_spec::vala::system_columns::{
     DATA_TENANT_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, is_reserved_system_column,
 };

@@ -5,20 +5,40 @@ pub enum BifrostNamespace {
     System,
     Bifrost,
     Traces,
+    Metrics,
+    Logs,
+    GenAi,
     Eval,
+    Drift,
+    Dev,
 }
 
 impl BifrostNamespace {
     /// All known namespaces. Adding a variant here causes a compile error at every
     /// `match` that is missing a branch — the exhaustiveness guard.
-    pub const ALL: [Self; 4] = [Self::System, Self::Bifrost, Self::Traces, Self::Eval];
+    pub const ALL: [Self; 9] = [
+        Self::System,
+        Self::Bifrost,
+        Self::Traces,
+        Self::Metrics,
+        Self::Logs,
+        Self::GenAi,
+        Self::Eval,
+        Self::Drift,
+        Self::Dev,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::System => "vala.system",
             Self::Bifrost => "vala.bifrost",
             Self::Traces => "vala.traces",
+            Self::Metrics => "vala.metrics",
+            Self::Logs => "vala.logs",
+            Self::GenAi => "vala.genai",
             Self::Eval => "vala.eval",
+            Self::Drift => "vala.drift",
+            Self::Dev => "vala.dev",
         }
     }
 

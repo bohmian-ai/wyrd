@@ -206,12 +206,12 @@ impl MetricRecord {
                 if self.count.is_none() {
                     return err("Histogram requires count");
                 }
-                if let (Some(bc), Some(eb)) = (&self.bucket_counts, &self.explicit_bounds) {
-                    if bc.len() != eb.len() + 1 {
-                        return err(
-                            "Histogram: bucket_counts.len() must equal explicit_bounds.len() + 1",
-                        );
-                    }
+                if let (Some(bc), Some(eb)) = (&self.bucket_counts, &self.explicit_bounds)
+                    && bc.len() != eb.len() + 1
+                {
+                    return err(
+                        "Histogram: bucket_counts.len() must equal explicit_bounds.len() + 1",
+                    );
                 }
                 if self.scale.is_some()
                     || self.positive_buckets.is_some()

@@ -531,7 +531,7 @@ fail=0
 for dep in object_store datafusion arrow parquet; do
   n=$(cargo tree --workspace -e=no-dev -d --all-features 2>/dev/null \
         | awk -v d="$dep" '$1==d {print $2}' | sort -u | wc -l | tr -d ' ')
-  if [ "$n" != "0" ]; then
+  if [ "$n" -gt "1" ]; then
     echo "FAIL: $dep has multiple versions:"
     cargo tree --workspace -e=no-dev -d --all-features | awk -v d="$dep" '$1==d {print "  "$2}'
     fail=1

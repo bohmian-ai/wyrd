@@ -75,10 +75,10 @@ impl LogRecord {
                 details: serde_json::Value::Null,
             })
         };
-        if let Some(sev) = self.severity_number {
-            if sev > 24 {
-                return err("severity_number must be in [0, 24]");
-            }
+        if let Some(sev) = self.severity_number
+            && sev > 24
+        {
+            return err("severity_number must be in [0, 24]");
         }
         if self.span_id.is_some() && self.trace_id.is_none() {
             return err("span_id requires trace_id");

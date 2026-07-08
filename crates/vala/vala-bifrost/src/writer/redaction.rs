@@ -23,21 +23,21 @@ fn secret_patterns() -> &'static [Regex] {
     PATTERNS.get_or_init(|| {
         vec![
             // GitHub PATs
-            Regex::new(r"ghp_[A-Za-z0-9]{36,}").unwrap(),
+            Regex::new(r"ghp_[A-Za-z0-9]{36,}").expect("valid static regex"),
             // OpenAI-style sk- keys
-            Regex::new(r"sk-[A-Za-z0-9]{32,}").unwrap(),
+            Regex::new(r"sk-[A-Za-z0-9]{32,}").expect("valid static regex"),
             // AWS access key IDs
-            Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
+            Regex::new(r"AKIA[A-Z0-9]{16}").expect("valid static regex"),
             // JWT tokens eyJ…
-            Regex::new(r"eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+").unwrap(),
+            Regex::new(r"eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+").expect("valid static regex"),
             // PEM private keys
-            Regex::new(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[^-]+-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----").unwrap(),
+            Regex::new(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[^-]+-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----").expect("valid static regex"),
             // Postgres DSNs with credentials
-            Regex::new(r"postgres(?:ql)?://[^:]+:[^@]+@[^\s]+").unwrap(),
+            Regex::new(r"postgres(?:ql)?://[^:]+:[^@]+@[^\s]+").expect("valid static regex"),
             // Email addresses
-            Regex::new(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b").unwrap(),
+            Regex::new(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b").expect("valid static regex"),
             // US SSN
-            Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap(),
+            Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").expect("valid static regex"),
         ]
     })
 }
@@ -51,7 +51,7 @@ const REDACTED: &str = "⟪redacted⟫";
 /// Returns `true` if the string contains a Luhn-valid credit card number.
 fn contains_luhn_card(s: &str) -> bool {
     // Extract contiguous digit sequences of length 13-19
-    let digits_only: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+    let digits_only: String = s.chars().filter(char::is_ascii_digit).collect();
     if digits_only.len() < 13 || digits_only.len() > 19 {
         return false;
     }
@@ -74,7 +74,7 @@ fn luhn_check(digits: &str) -> bool {
         sum += val;
         double = !double;
     }
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 /// Redact a single string value in place.
@@ -140,9 +140,8 @@ impl RedactionClassifier for BuiltinRedactionPass {
             }
         }
 
-        RecordBatch::try_new(schema, all_columns).map_err(|e| BifrostError::RedactionFailed {
-            detail: e.to_string(),
-        })
+        RecordBatch::try_new(schema, all_columns)
+            .map_err(|e| BifrostError::RedactionFailed(e.to_string()))
     }
 }
 

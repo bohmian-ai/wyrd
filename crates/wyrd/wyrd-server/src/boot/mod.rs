@@ -23,6 +23,8 @@ use wyrd_sql::pool::{PoolConfig, build_pool};
 use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
+use metrics::{counter, gauge};
+use vala_bifrost::reconcile::reconcile_audit;
 use vala_bifrost::relay::AuditRelay;
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
@@ -135,6 +137,17 @@ pub enum ServerBootError {
     )]
     AuditRelayRequired {
         /// Detail about why the relay could not be started.
+        detail: String,
+    },
+    /// `WYRD_VALA_500_AUDIT_RECONCILER_REQUIRED`: the audit reconciler is disabled or
+    /// its dependencies are unavailable in a production deployment. A production server
+    /// cannot accept mutating writes without the durability proof running.
+    #[error(
+        "WYRD_VALA_500_AUDIT_RECONCILER_REQUIRED: audit reconciler is required in \
+         production but is disabled or unavailable: {detail}"
+    )]
+    AuditReconcilerRequired {
+        /// Detail about why the reconciler could not be started.
         detail: String,
     },
 }
@@ -607,6 +620,195 @@ pub async fn spawn_audit_relay(
             }
             if let Err(e) = relay.tick(claim_limit).await {
                 tracing::error!(error = %e, "audit relay tick failed");
+            }
+        }
+    });
+
+    Ok(Some(handle))
+}
+
+/// Configuration for the background audit reconciler worker.
+pub struct ReconcileConfig {
+    /// Whether the reconciler is enabled (`WYRD_AUDIT_RECONCILER_ENABLED`, default `true`).
+    pub enabled: bool,
+    /// How often to run reconciliation in milliseconds
+    /// (`WYRD_AUDIT_RECONCILER_TICK_MS`, default `300000` = 5 minutes).
+    pub tick_ms: u64,
+}
+
+impl ReconcileConfig {
+    /// Read reconciler configuration from the process environment.
+    pub fn from_env() -> Self {
+        let enabled = std::env::var("WYRD_AUDIT_RECONCILER_ENABLED")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+        let tick_ms = std::env::var("WYRD_AUDIT_RECONCILER_TICK_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300_000u64);
+        Self { enabled, tick_ms }
+    }
+}
+
+/// Spawn the background audit reconciler that verifies durability of
+/// `vala.audit_outbox` against `vala.system.audit_log`. Mirrors
+/// `spawn_audit_relay`.
+///
+/// **Fail-closed in production (M-12).** If the reconciler is disabled or the
+/// platform admin pool is unavailable in a production deployment, boot fails
+/// with `WYRD_VALA_500_AUDIT_RECONCILER_REQUIRED`. In development/staging, a
+/// disabled reconciler logs a warning and returns `None`.
+///
+/// # Errors
+/// Returns [`ServerBootError::AuditReconcilerRequired`] when the reconciler
+/// cannot start in production; returns `Ok(None)` when cleanly skipped.
+pub async fn spawn_audit_reconciler(
+    state: &AppState,
+    shutdown: CancellationToken,
+) -> Result<Option<tokio::task::JoinHandle<()>>, ServerBootError> {
+    let cfg = ReconcileConfig::from_env();
+    let is_production = state.deployment_profile == DeploymentProfile::Production;
+
+    if !cfg.enabled {
+        if is_production {
+            return Err(ServerBootError::AuditReconcilerRequired {
+                detail: "WYRD_AUDIT_RECONCILER_ENABLED=false is not permitted in production"
+                    .to_owned(),
+            });
+        }
+        tracing::warn!(
+            "audit reconciler disabled via WYRD_AUDIT_RECONCILER_ENABLED=false (dev/test only)"
+        );
+        return Ok(None);
+    }
+
+    let Some(admin_pool) = state.postgres.platform_admin_pool().cloned() else {
+        if is_production {
+            return Err(ServerBootError::AuditReconcilerRequired {
+                detail: "platform admin pool is unavailable".to_owned(),
+            });
+        }
+        tracing::warn!("audit reconciler skipped: platform admin pool unavailable (dev/test only)");
+        return Ok(None);
+    };
+
+    let app_pool = state.postgres.vala_pool().clone();
+    let catalog = Arc::clone(&state.bifrost);
+    let tick_interval = Duration::from_millis(cfg.tick_ms);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(tick_interval) => {}
+            }
+            if shutdown.is_cancelled() {
+                break;
+            }
+
+            let tenant_ids =
+                match vala_sql::queries::relay::list_audit_tenant_ids(&admin_pool).await {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        tracing::error!(error = %e, "audit reconciler: tenant enumeration failed");
+                        continue;
+                    }
+                };
+
+            let mut all_clean = true;
+            for raw_id in tenant_ids {
+                let tenant_id = match DataTenantId::try_from(raw_id) {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                let result = match reconcile_audit(&app_pool, &catalog, tenant_id).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!(
+                            tenant_id = %tenant_id,
+                            error = %e,
+                            "audit reconciler: reconciliation failed"
+                        );
+                        all_clean = false;
+                        continue;
+                    }
+                };
+
+                let tenant_str = tenant_id.to_string();
+                for gap in &result.seq_gaps {
+                    counter!(
+                        "vala_audit_reconcile_violations_total",
+                        "tenant" => tenant_str.clone(),
+                        "kind" => "seq_gap"
+                    )
+                    .increment(1);
+                    tracing::error!(
+                        tenant_id = %tenant_id,
+                        gap_from = gap.gap_from,
+                        gap_to = gap.gap_to,
+                        "AUDIT INTEGRITY: seq gap detected"
+                    );
+                    all_clean = false;
+                }
+                for brk in &result.chain_breaks {
+                    counter!(
+                        "vala_audit_reconcile_violations_total",
+                        "tenant" => tenant_str.clone(),
+                        "kind" => "chain_break"
+                    )
+                    .increment(1);
+                    tracing::error!(
+                        tenant_id = %tenant_id,
+                        seq = brk.seq,
+                        "AUDIT INTEGRITY: hash-chain break detected"
+                    );
+                    all_clean = false;
+                }
+                for seq in &result.parity_misses {
+                    counter!(
+                        "vala_audit_reconcile_violations_total",
+                        "tenant" => tenant_str.clone(),
+                        "kind" => "parity_miss"
+                    )
+                    .increment(1);
+                    tracing::error!(
+                        tenant_id = %tenant_id,
+                        seq,
+                        "AUDIT INTEGRITY: shipped outbox row missing from warehouse"
+                    );
+                    all_clean = false;
+                }
+                for seq in &result.orphan_warehouse_seqs {
+                    counter!(
+                        "vala_audit_reconcile_violations_total",
+                        "tenant" => tenant_str.clone(),
+                        "kind" => "parity_miss"
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        seq,
+                        "AUDIT INTEGRITY: warehouse row has no matching shipped outbox entry"
+                    );
+                    all_clean = false;
+                }
+
+                if result.is_clean() {
+                    gauge!(
+                        "vala_audit_reconcile_last_success_timestamp",
+                        "tenant" => tenant_str
+                    )
+                    .set(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs_f64(),
+                    );
+                }
+            }
+
+            if all_clean {
+                tracing::debug!("audit reconciler: all tenants clean");
             }
         }
     });

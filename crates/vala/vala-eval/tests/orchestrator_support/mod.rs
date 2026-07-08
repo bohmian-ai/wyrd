@@ -130,6 +130,7 @@ pub fn record(run_id: &RunId, ok: bool) -> EvalRecordObservation {
         trace_id: None,
         span_id: None,
         created_at: Utc::now(),
+        media: None,
     }
 }
 

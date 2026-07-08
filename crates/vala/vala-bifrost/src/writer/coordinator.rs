@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow::array::{Array, FixedSizeBinaryArray, StringArray, TimestampMicrosecondArray};
 use arrow::array::RecordBatch;
+use arrow::array::{Array, FixedSizeBinaryArray, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::DataType;
 use chrono::{DateTime, Utc};
 use iceberg::table::Table;
@@ -242,55 +242,17 @@ impl CommitActor {
                     }
                 }
 
-                // Best-effort entity_time_bounds upsert (M-06). Runs in a separate
-                // transaction so a failure never rolls back the committed Iceberg data.
-                if !entity_bounds.is_empty() {
-                    if let Some(mapping) = &self.entity_bounds_mapping {
-                        let pool = Arc::clone(&self.pool);
-                        let data_tenant = self.data_tenant;
-                        let table_uid_arr = self.table_uid.0;
-                        let entity_kind = mapping.entity_kind.clone();
-                        tokio::spawn(async move {
-                            match vala_sql::TenantConn::acquire(&pool, data_tenant).await {
-                                Ok(mut conn) => {
-                                    let refs: Vec<(&str, DateTime<Utc>, DateTime<Utc>)> =
-                                        entity_bounds
-                                            .iter()
-                                            .map(|(id, min_t, max_t)| {
-                                                (id.as_str(), *min_t, *max_t)
-                                            })
-                                            .collect();
-                                    if let Err(e) =
-                                        vala_sql::queries::olap_catalog::record_entity_bounds(
-                                            &mut conn,
-                                            &table_uid_arr,
-                                            &entity_kind,
-                                            &refs,
-                                        )
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "entity_time_bounds upsert failed (best-effort)"
-                                        );
-                                        return;
-                                    }
-                                    if let Err(e) = conn.commit().await {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "entity_time_bounds commit failed (best-effort)"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "entity_time_bounds connection failed (best-effort)"
-                                    );
-                                }
-                            }
-                        });
-                    }
+                // Best-effort entity_time_bounds upsert (M-06).
+                if !entity_bounds.is_empty()
+                    && let Some(mapping) = &self.entity_bounds_mapping
+                {
+                    spawn_entity_bounds_upsert(
+                        Arc::clone(&self.pool),
+                        self.data_tenant,
+                        self.table_uid.0,
+                        mapping.entity_kind.clone(),
+                        entity_bounds,
+                    );
                 }
 
                 Ok(snapshot_id)
@@ -301,6 +263,42 @@ impl CommitActor {
             }
         }
     }
+}
+
+fn spawn_entity_bounds_upsert(
+    pool: Arc<PgPool>,
+    data_tenant: DataTenantId,
+    table_uid_arr: [u8; 16],
+    entity_kind: String,
+    entity_bounds: Vec<(String, DateTime<Utc>, DateTime<Utc>)>,
+) {
+    tokio::spawn(async move {
+        match vala_sql::TenantConn::acquire(&pool, data_tenant).await {
+            Ok(mut conn) => {
+                let refs: Vec<(&str, DateTime<Utc>, DateTime<Utc>)> = entity_bounds
+                    .iter()
+                    .map(|(id, min_t, max_t)| (id.as_str(), *min_t, *max_t))
+                    .collect();
+                if let Err(e) = vala_sql::queries::olap_catalog::record_entity_bounds(
+                    &mut conn,
+                    &table_uid_arr,
+                    &entity_kind,
+                    &refs,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "entity_time_bounds upsert failed (best-effort)");
+                    return;
+                }
+                if let Err(e) = conn.commit().await {
+                    tracing::warn!(error = %e, "entity_time_bounds commit failed (best-effort)");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "entity_time_bounds connection failed (best-effort)");
+            }
+        }
+    });
 }
 
 /// Extract per-entity (min, max) `wyrd_event_time` bounds from a slice of committed
@@ -350,7 +348,10 @@ fn extract_entity_bounds(
         }
     }
 
-    bounds.into_iter().map(|(id, (min, max))| (id, min, max)).collect()
+    bounds
+        .into_iter()
+        .map(|(id, (min, max))| (id, min, max))
+        .collect()
 }
 
 fn entity_id_str(col: &dyn Array, row: usize) -> Option<String> {

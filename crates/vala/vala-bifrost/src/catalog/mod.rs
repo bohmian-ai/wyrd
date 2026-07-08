@@ -675,7 +675,7 @@ impl WyrdCatalog {
     }
 
     /// Declare one index for a pre-declared domain table in `vala.olap_indexes`.
-    pub async fn declare_domain_index(
+    pub fn declare_domain_index(
         &self,
         namespace: &str,
         name: &str,
@@ -688,10 +688,9 @@ impl WyrdCatalog {
     }
 
     /// Ensure all declared indexes for `T` exist idempotently.
-    pub async fn ensure_domain_indexes<T: DomainTable>(&self) -> Result<(), BifrostError> {
+    pub fn ensure_domain_indexes<T: DomainTable>(&self) -> Result<(), BifrostError> {
         for idx in T::declared_indexes() {
-            self.declare_domain_index(T::NAMESPACE, T::NAME, &idx)
-                .await?;
+            self.declare_domain_index(T::NAMESPACE, T::NAME, &idx)?;
         }
         Ok(())
     }

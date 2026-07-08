@@ -336,9 +336,7 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
         BifrostError::IcebergMissing {
             detail: String::new(),
         },
-        BifrostError::RedactionFailed {
-            detail: String::new(),
-        },
+        BifrostError::RedactionFailed(String::new()),
     ];
 
     if let Some(sentinel) = variants.first() {
@@ -364,7 +362,7 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
             | BifrostError::SchemaDrift { .. }
             | BifrostError::PhysicalDrift { .. }
             | BifrostError::IcebergMissing { .. }
-            | BifrostError::RedactionFailed { .. } => {}
+            | BifrostError::RedactionFailed(..) => {}
         }
     }
 

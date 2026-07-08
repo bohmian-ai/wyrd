@@ -124,7 +124,11 @@ impl EvalReport {
             }
             duration_ms += i64::try_from(result.duration_ms).unwrap_or(i64::MAX);
         }
-        let pass_rate = if total > 0 { f64::from(passed) / f64::from(total) } else { 0.0 };
+        let pass_rate = if total > 0 {
+            f64::from(passed) / f64::from(total)
+        } else {
+            0.0
+        };
         EvalWorkflowSummary {
             total_tasks: total,
             passed_tasks: passed,

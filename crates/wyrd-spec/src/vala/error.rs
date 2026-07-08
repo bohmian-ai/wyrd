@@ -281,15 +281,12 @@ pub enum BifrostError {
 
     /// The write-path redaction pass failed on a sensitive-payload table.
     /// The commit was refused; no raw secrets were written.
-    #[error("write-path redaction failed: {detail}")]
+    #[error("write-path redaction failed: {0}")]
     #[wyrd_error(
         code = "WYRD_VALA_500_REDACTION_FAILED",
         status = 500,
         title = "Write-path redaction failed",
         remediation = "The redaction classifier failed on this batch. Retry; if it persists, check the classifier installation."
     )]
-    RedactionFailed {
-        /// Human-readable detail about the redaction failure.
-        detail: String,
-    },
+    RedactionFailed(String),
 }

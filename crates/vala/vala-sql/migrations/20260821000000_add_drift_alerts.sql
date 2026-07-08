@@ -20,8 +20,10 @@ CREATE TABLE vala.drift_alerts (
 );
 
 ALTER TABLE vala.drift_alerts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vala.drift_alerts FORCE ROW LEVEL SECURITY;
 
-CREATE POLICY drift_alerts_tenant ON vala.drift_alerts
-    USING (data_tenant_id = current_setting('app.current_tenant')::UUID);
+CREATE POLICY tenant_isolation ON vala.drift_alerts
+    USING (data_tenant_id = wyrd.current_tenant())
+    WITH CHECK (data_tenant_id = wyrd.current_tenant());
 
 GRANT SELECT, INSERT, UPDATE ON vala.drift_alerts TO vala_app;

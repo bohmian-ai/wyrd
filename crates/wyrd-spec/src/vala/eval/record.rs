@@ -19,6 +19,7 @@ use crate::error::WyrdError;
 use crate::reference::CardRef;
 
 use super::ids::{RecordId, RunId, SessionId, SpanId, TraceId};
+use super::media::MediaRef;
 
 /// The eval observation an instrumented agent emits at evaluation points.
 ///
@@ -88,6 +89,13 @@ pub struct EvalRecordObservation {
 
     /// Wall-clock emission time.
     pub created_at: DateTime<Utc>,
+
+    /// Reference descriptors for media associated with this eval record.
+    ///
+    /// URIs pointing to object storage — not inline blobs. Callers fetch content
+    /// separately. Null for records with no associated media.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<Vec<MediaRef>>,
 }
 
 impl EvalRecordObservation {

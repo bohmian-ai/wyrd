@@ -33,8 +33,8 @@ pub enum BifrostError {
         name: &'static str,
     },
 
-    #[error("redaction pass failed: {detail}")]
-    RedactionFailed { detail: String },
+    #[error("redaction pass failed: {0}")]
+    RedactionFailed(String),
 
     // --- original variants ---
     #[error("iceberg error: {0}")]
@@ -116,7 +116,6 @@ impl BifrostError {
             Self::IcebergAlreadyExists { namespace, name } => Pub::MetadataMismatch {
                 detail: format!("Iceberg table already exists: {namespace}.{name}"),
             },
-            Self::RedactionFailed { detail } => Pub::Internal { detail },
             // Sanitize underlying-engine detail before it crosses the public API.
             Self::Iceberg(e) => {
                 tracing::error!(error = %e, "iceberg catalog error");
@@ -143,7 +142,7 @@ impl BifrostError {
                 }
             }
             Self::AuditUnavailable(detail) => Pub::AuditUnavailable { detail },
-            Self::Internal(detail) => Pub::Internal { detail },
+            Self::RedactionFailed(detail) | Self::Internal(detail) => Pub::Internal { detail },
         }
     }
 }

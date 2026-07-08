@@ -42,6 +42,15 @@ VALA_CATALOG_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/iceberg_catalog.rs",
 }
 
+# Vala query modules that perform cross-tenant relay or reconcile operations
+# using the platform admin pool (BYPASSRLS `wyrd_platform_admin`). These
+# intentionally enumerate across all tenant partitions and are never on the
+# tenant request path. Isolation is enforced at the DB-role boundary. May
+# reference tenant schemas and take PgPool by design.
+VALA_RELAY_ALLOWLIST = {
+    "crates/vala/vala-sql/src/queries/relay.rs",
+}
+
 RAW_QUERY_ALLOWLIST_MARKERS = [
     "Dynamic query is intentional",
     "raw-query grep allowlist",
@@ -55,6 +64,7 @@ SERVER_POOL_ALLOWLIST_PREFIXES = (
     "crates/wyrd/wyrd-server/src/postgres.rs",
     "crates/wyrd/wyrd-server/src/state.rs",
     "crates/wyrd/wyrd-server/src/routes/platform/",
+    "crates/wyrd/wyrd-server/src/components/admin/",
 )
 
 CLIENT_TIER_CRATES = [
@@ -216,6 +226,11 @@ def check_vala_query_modules(failures: list[str]) -> None:
                 failures.append(f"{relative}: catalog query module must not reference tenant schema")
             if has_public_async_fn(code) and not has_platform_executor(code):
                 failures.append(f"{relative}: catalog public async fn must take PgPool or Transaction")
+            continue
+
+        if relative in VALA_RELAY_ALLOWLIST:
+            if has_public_async_fn(code) and not has_platform_executor(code):
+                failures.append(f"{relative}: relay public async fn must take PgPool or Transaction")
             continue
 
         check_tenant_query_file(relative, body, code, failures)

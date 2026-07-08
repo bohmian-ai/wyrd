@@ -31,6 +31,7 @@ fn fixture() -> EvalRecordObservation {
         trace_id: None,
         span_id: None,
         created_at: chrono::Utc.with_ymd_and_hms(2026, 6, 10, 0, 0, 0).unwrap(),
+        media: None,
     }
 }
 

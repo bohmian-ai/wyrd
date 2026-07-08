@@ -152,6 +152,16 @@
             }
           ]
         },
+        "media": {
+          "description": "Reference descriptors for media associated with this eval record.\n\nURIs pointing to object storage — not inline blobs. Callers fetch content separately. Null for records with no associated media.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/MediaRef"
+          }
+        },
         "record_id": {
           "description": "Client-generated UUIDv7-compatible record identity.\n\nStable across retries; the server deduplicates on this value.",
           "type": "string",
@@ -193,6 +203,26 @@
         }
       },
       "additionalProperties": false
+    },
+    "MediaRef": {
+      "description": "A reference to a media artifact stored in object storage.\n\nCarries the URI and optional MIME type — no inline binary data. The server stores URIs; callers fetch content separately.",
+      "type": "object",
+      "required": [
+        "uri"
+      ],
+      "properties": {
+        "media_type": {
+          "description": "IANA media type (e.g. `\"image/png\"`, `\"video/mp4\"`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uri": {
+          "description": "Object-storage URI pointing to the media artifact.",
+          "type": "string"
+        }
+      }
     },
     "ScenarioId": {
       "type": "string",

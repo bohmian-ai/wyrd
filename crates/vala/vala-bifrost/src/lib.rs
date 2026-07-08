@@ -8,6 +8,7 @@ pub mod batch_builder;
 pub mod catalog;
 pub mod error;
 pub mod provider;
+pub mod reconcile;
 pub mod registry;
 pub mod relay;
 pub mod schema;

@@ -140,11 +140,12 @@ fn emit_table<T: ArrowProjection>(
     let full = full_schema(user_fields, policy);
 
     // fingerprint constant
-    writeln!(code, "pub const {fp_const}: [u8; 32] = {fp:?};").unwrap();
+    writeln!(code, "pub const {fp_const}: [u8; 32] = {fp:?};")
+        .expect("write to OUT_DIR schema file");
 
     // schema constructor
-    writeln!(code, "pub fn {schema_fn}() -> SchemaRef {{").unwrap();
-    writeln!(code, "    Arc::new(Schema::new(vec![").unwrap();
+    writeln!(code, "pub fn {schema_fn}() -> SchemaRef {{").expect("write to OUT_DIR schema file");
+    writeln!(code, "    Arc::new(Schema::new(vec![").expect("write to OUT_DIR schema file");
     for f in full.fields() {
         let dt = format_dtype(f.data_type());
         writeln!(
@@ -153,11 +154,11 @@ fn emit_table<T: ArrowProjection>(
             f.name(),
             f.is_nullable()
         )
-        .unwrap();
+        .expect("write to OUT_DIR schema file");
     }
-    writeln!(code, "    ]))").unwrap();
-    writeln!(code, "}}").unwrap();
-    writeln!(code).unwrap();
+    writeln!(code, "    ]))").expect("write to OUT_DIR schema file");
+    writeln!(code, "}}").expect("write to OUT_DIR schema file");
+    writeln!(code).expect("write to OUT_DIR schema file");
 }
 
 fn format_dtype(dt: &arrow::datatypes::DataType) -> String {

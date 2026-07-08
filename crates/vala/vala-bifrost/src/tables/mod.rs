@@ -242,9 +242,7 @@ pub async fn register<T: DomainTable>(catalog: &Arc<WyrdCatalog>) -> Result<(), 
                     .register_domain_control_row::<T>(T::SCHEMA_FINGERPRINT)
                     .await?;
                 for idx in T::declared_indexes() {
-                    catalog
-                        .declare_domain_index(T::NAMESPACE, T::NAME, &idx)
-                        .await?;
+                    catalog.declare_domain_index(T::NAMESPACE, T::NAME, &idx)?;
                 }
                 Ok(())
             }
@@ -268,7 +266,7 @@ async fn repair_control_from_physical<T: DomainTable>(
         catalog
             .register_domain_control_row::<T>(T::SCHEMA_FINGERPRINT)
             .await?;
-        catalog.ensure_domain_indexes::<T>().await?;
+        catalog.ensure_domain_indexes::<T>()?;
         Ok(())
     } else {
         Err(BifrostError::PhysicalDrift {

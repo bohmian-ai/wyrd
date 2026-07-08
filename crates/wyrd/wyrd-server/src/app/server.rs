@@ -15,7 +15,9 @@ use crate::app::BootExit;
 use crate::app::metrics::{install_recorder, metrics_router, serve_metrics};
 use crate::app::serve::serve;
 use crate::app::supervise::{TaskExit, TaskId, fallible_task, supervise, worker_task};
-use crate::boot::{ServerBootError, spawn_audit_relay, spawn_storage_sweeper};
+use crate::boot::{
+    ServerBootError, spawn_audit_reconciler, spawn_audit_relay, spawn_storage_sweeper,
+};
 use crate::components::health::readiness_loop;
 use crate::config::{ServeMode, WyrdServerConfig};
 use crate::grpc::{
@@ -345,6 +347,21 @@ impl BoundServer {
                     std::panic::resume_unwind(join_error.into_panic());
                 }
             }));
+        }
+        if let Some(handle) = spawn_audit_reconciler(&self.state, shutdown.clone())
+            .await
+            .map_err(|e| BootExit::Other(Box::new(e)))?
+        {
+            set.spawn(worker_task(
+                TaskId::Worker("audit_reconciler"),
+                async move {
+                    if let Err(join_error) = handle.await
+                        && join_error.is_panic()
+                    {
+                        std::panic::resume_unwind(join_error.into_panic());
+                    }
+                },
+            ));
         }
 
         // Enterprise workers.

@@ -26,7 +26,7 @@ pub const CARD_UID: &str = "card_uid";
 /// Arrow column name for the server-stamped principal id (from verified JWT).
 pub const PRINCIPAL_ID: &str = "principal_id";
 
-/// Universal correlation columns appended (nullable) per [`CorrelationPolicy`] to
+/// Universal correlation columns appended (nullable) per `CorrelationPolicy` to
 /// pre-declared domain tables. Unlike [`RESERVED_SYSTEM_COLUMNS`], these are not
 /// blindly appended to every table — each domain table declares its policy (see
 /// `DomainTable::CORRELATION_POLICY`).

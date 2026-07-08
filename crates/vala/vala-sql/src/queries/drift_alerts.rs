@@ -1,9 +1,10 @@
 //! Query functions for `vala.drift_alerts`.
 //!
 //! Tenant-scoped functions take `&mut TenantConn<'_>`.
+// raw-query grep allowlist: drift_alerts post-dates the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
-use wyrd_sql::TenantConn;
 use wyrd_spec::reference::CardRef;
+use wyrd_sql::TenantConn;
 
 use crate::SqlError;
 use crate::row_types::alerts::DriftAlertRow;

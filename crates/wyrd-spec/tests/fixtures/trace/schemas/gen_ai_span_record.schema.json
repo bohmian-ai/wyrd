@@ -4,7 +4,6 @@
   "description": "OTel GenAI semantic-convention span projection.",
   "type": "object",
   "required": [
-    "data_tenant_id",
     "duration_ms",
     "end_time",
     "operation_name",
@@ -58,11 +57,6 @@
         "string",
         "null"
       ]
-    },
-    "data_tenant_id": {
-      "description": "Tenant partition key.",
-      "type": "string",
-      "format": "uuid"
     },
     "duration_ms": {
       "description": "Query convenience field equal to `(end_time - start_time)` in milliseconds.",

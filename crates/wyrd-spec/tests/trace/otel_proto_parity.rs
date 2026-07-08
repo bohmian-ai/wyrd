@@ -117,8 +117,7 @@ fn span_record_round_trips_otlp_shaped_json() {
                 "telemetry.sdk.name": "wyrd-tracing",
                 "host.name": "worker-0"
             }
-        },
-        "data_tenant_id": "018f5c7b-4d0e-7a4d-b8e1-c3d2e1f0a5b9"
+        }
     }"#;
 
     let record: SpanRecord =
@@ -187,7 +186,6 @@ fn span_record_minimal_otel_compliant_form_validates() {
             service_instance_id: None,
             attributes: serde_json::Map::new(),
         },
-        data_tenant_id: DataTenantId::new_v7(),
     };
 
     record.validate().expect("minimal OTel span validates");
@@ -262,7 +260,6 @@ fn gen_ai_span_record_json_field_names_match_wire_spec() {
         trace_id: TraceId::from_hex("0123456789abcdef0123456789abcdef").expect("valid trace id"),
         span_id: SpanId::from_hex("0123456789abcdef").expect("valid span id"),
         parent_span_id: None,
-        data_tenant_id: DataTenantId::new_v7(),
         start_time: start,
         end_time: end,
         duration_ms: 1_000,
@@ -333,7 +330,7 @@ fn gen_ai_span_record_json_field_names_match_wire_spec() {
 
     assert!(obj.contains_key("trace_id"), "missing trace_id");
     assert!(obj.contains_key("span_id"), "missing span_id");
-    assert!(obj.contains_key("data_tenant_id"), "missing data_tenant_id");
+    assert!(!obj.contains_key("data_tenant_id"), "data_tenant_id must not be a GenAiSpanRecord field (C-02)");
     assert!(obj.contains_key("provider_name"), "missing provider_name");
     assert!(obj.contains_key("operation_name"), "missing operation_name");
     assert!(obj.contains_key("request_model"), "missing request_model");

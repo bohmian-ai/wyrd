@@ -129,7 +129,6 @@
       "required": [
         "context",
         "created_at",
-        "eval_ref",
         "record_id",
         "run_id"
       ],
@@ -143,10 +142,13 @@
           "format": "date-time"
         },
         "eval_ref": {
-          "description": "Reference to the Eval card this record feeds.\n\nPer the D8 presence rule, the registry rejects online observations targeting an Eval card whose `subject_ref` is unset, so this field is meaningful only against cards that declared a subject.",
-          "allOf": [
+          "description": "Reference to the Eval card this record feeds.\n\n`None` → the server fans the record to every Eval card whose `subject_ref` is the run's Target (the normal online-monitoring path, plan 04). `Some` → score against exactly this card (CLI/CI `--records` runs, targeted re-score). Per the D8 presence rule, an online (`None`) record is only scored against Eval cards that declared a `subject_ref`.",
+          "anyOf": [
             {
               "$ref": "#/definitions/CardRef"
+            },
+            {
+              "type": "null"
             }
           ]
         },

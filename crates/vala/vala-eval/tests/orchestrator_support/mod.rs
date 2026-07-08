@@ -125,7 +125,7 @@ pub fn record(run_id: &RunId, ok: bool) -> EvalRecordObservation {
         record_id: RecordId(Uuid::from_u128(record_id)),
         run_id: run_id.clone(),
         session_id: None,
-        eval_ref: eval_ref(),
+        eval_ref: Some(eval_ref()),
         context: json!({ "ok": ok }),
         trace_id: None,
         span_id: None,

@@ -4,7 +4,6 @@
   "description": "One OTel-compliant span.",
   "type": "object",
   "required": [
-    "data_tenant_id",
     "duration_ms",
     "end_time",
     "kind",
@@ -22,11 +21,6 @@
       "default": {},
       "type": "object",
       "additionalProperties": true
-    },
-    "data_tenant_id": {
-      "description": "Tenant partition key.",
-      "type": "string",
-      "format": "uuid"
     },
     "dropped_attributes_count": {
       "description": "Count of span-level attributes the SDK dropped before sending.",

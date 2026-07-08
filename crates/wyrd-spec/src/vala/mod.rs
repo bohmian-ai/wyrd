@@ -16,10 +16,18 @@ pub mod api;
 /// Observation correlation: the code axis carried on a run and the reserved
 /// correlation column names.
 pub mod correlation;
+/// Dev-capture records (`agent_traces`).
+pub mod dev;
+/// Drift observation records (traditional-ML drift measurements).
+pub mod drift;
 /// Public Bifrost error catalog for HTTP, MCP, and Python SDK boundaries.
 pub mod error;
 pub mod eval;
 pub mod ids;
+/// Log observation records (faithful OTel LogRecord).
+pub mod logs;
+/// Metric observation records (full OTLP fidelity).
+pub mod metrics;
 /// Observation forward contract — envelope, closed kind taxonomy, and record
 /// descriptor for the Vala ingest surface.
 pub mod observation;

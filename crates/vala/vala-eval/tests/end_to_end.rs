@@ -62,7 +62,6 @@ use vala_eval::{
     ResultsConfig, RunIdentity, ScenarioAggregationInput, SkipReason, SubjectKey, aggregate_run,
 };
 use wyrd_semver::VersionBlock;
-use wyrd_spec::DataTenantId;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
@@ -153,7 +152,6 @@ fn agent_span() -> SpanRecord {
             service_instance_id: None,
             attributes: serde_json::Map::new(),
         },
-        data_tenant_id: DataTenantId::new_v7(),
     }
 }
 

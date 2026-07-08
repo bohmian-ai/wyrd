@@ -74,16 +74,8 @@ fn main() {
         &mut code, "EVAL_ASSERTIONS_FINGERPRINT", "eval_assertions_schema",
         BuildPolicy::Observation,
     );
-    emit_table::<arrow_projection::DriftFeaturesTable>(
-        &mut code, "DRIFT_FEATURES_FINGERPRINT", "drift_features_schema",
-        BuildPolicy::Observation,
-    );
-    emit_table::<arrow_projection::DriftPredictionsTable>(
-        &mut code, "DRIFT_PREDICTIONS_FINGERPRINT", "drift_predictions_schema",
-        BuildPolicy::Observation,
-    );
-    emit_table::<arrow_projection::DriftMonitorsTable>(
-        &mut code, "DRIFT_MONITORS_FINGERPRINT", "drift_monitors_schema",
+    emit_table::<arrow_projection::DriftObservationsTable>(
+        &mut code, "DRIFT_OBSERVATIONS_FINGERPRINT", "drift_observations_schema",
         BuildPolicy::Observation,
     );
     emit_table::<arrow_projection::AgentTracesTable>(

@@ -183,9 +183,7 @@ pub async fn register_all(catalog: &Arc<WyrdCatalog>) -> Result<(), BifrostError
     register::<eval::RunsTable>(catalog).await?;
     register::<eval::AssertionsTable>(catalog).await?;
     // drift
-    register::<drift::FeaturesTable>(catalog).await?;
-    register::<drift::PredictionsTable>(catalog).await?;
-    register::<drift::MonitorsTable>(catalog).await?;
+    register::<drift::ObservationsTable>(catalog).await?;
     // dev
     register::<dev::AgentTracesTable>(catalog).await?;
     // system

@@ -10,9 +10,13 @@ use crate::row_types::alerts::DriftAlertRow;
 
 /// Insert parameters for a single drift alert.
 pub struct DriftAlertInsert<'a> {
+    /// Card reference identifying the alerting card.
     pub drift_ref: &'a CardRef,
+    /// Discriminator: `spc`, `psi`, `custom`, or `eval`.
     pub drift_type: &'a str,
+    /// Feature or metric that alerted; `None` = aggregate alert.
     pub series: Option<&'a str>,
+    /// Alert payload from the scoring layer.
     pub alert: &'a serde_json::Value,
 }
 

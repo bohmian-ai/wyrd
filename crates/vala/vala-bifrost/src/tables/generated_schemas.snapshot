@@ -259,7 +259,7 @@ pub fn logs_records_schema() -> SchemaRef {
     ]))
 }
 
-pub const EVAL_RUNS_FINGERPRINT: [u8; 32] = [179, 14, 202, 136, 146, 54, 81, 255, 210, 155, 127, 45, 40, 86, 132, 88, 62, 84, 119, 152, 222, 53, 203, 238, 167, 57, 231, 40, 211, 13, 101, 134];
+pub const EVAL_RUNS_FINGERPRINT: [u8; 32] = [137, 217, 173, 185, 44, 241, 230, 190, 239, 170, 25, 235, 211, 193, 88, 94, 108, 213, 233, 203, 37, 111, 127, 130, 212, 50, 112, 50, 215, 227, 178, 121];
 pub fn eval_runs_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("record_id", DataType::Utf8, false),
@@ -269,6 +269,13 @@ pub fn eval_runs_schema() -> SchemaRef {
         Field::new("trace_id", DataType::FixedSizeBinary(16), true),
         Field::new("span_id", DataType::FixedSizeBinary(8), true),
         Field::new("created_at", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+        Field::new("media", DataType::Utf8View, true),
+        Field::new("total_tasks", DataType::Int32, true),
+        Field::new("passed_tasks", DataType::Int32, true),
+        Field::new("failed_tasks", DataType::Int32, true),
+        Field::new("pass_rate", DataType::Float64, true),
+        Field::new("duration_ms", DataType::Int64, true),
+        Field::new("execution_plan", DataType::Utf8View, true),
         Field::new("run_id", DataType::Utf8, true),
         Field::new("card_uid", DataType::Utf8, true),
         Field::new("principal_id", DataType::Utf8, true),

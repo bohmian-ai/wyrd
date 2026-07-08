@@ -12,6 +12,7 @@ pub mod registry;
 pub mod relay;
 pub mod schema;
 pub mod session;
+pub mod tables;
 pub mod types;
 pub mod writer;
 

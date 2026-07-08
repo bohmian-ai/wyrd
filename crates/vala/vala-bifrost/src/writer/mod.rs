@@ -9,6 +9,7 @@ pub mod buffer;
 pub mod commit;
 pub mod coordinator;
 pub mod file_writer;
+pub mod redaction;
 
 /// Caller-supplied context for one 2PC commit.
 ///

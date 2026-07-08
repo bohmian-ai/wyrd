@@ -235,4 +235,61 @@ pub enum BifrostError {
         /// Human-readable detail about the audit-append failure.
         detail: String,
     },
+
+    /// A pre-declared domain table's schema fingerprint does not match the
+    /// registered fingerprint — schema evolution happened without a coordinated
+    /// migration. Operator action required.
+    #[error("domain table schema fingerprint drift: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_500_SCHEMA_DRIFT",
+        status = 500,
+        title = "Domain table schema fingerprint drift",
+        remediation = "A domain table schema changed without a coordinated migration. Restore the previous schema or run the migration runbook."
+    )]
+    SchemaDrift {
+        /// Human-readable detail naming the table and the drift.
+        detail: String,
+    },
+
+    /// A pre-declared domain table's physical Iceberg schema does not match the
+    /// declared schema despite the fingerprint saying clean.
+    #[error("domain table physical schema drift: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_500_PHYSICAL_DRIFT",
+        status = 500,
+        title = "Domain table physical schema drift",
+        remediation = "The Iceberg table physical schema drifted from the declared schema. Run the repair runbook."
+    )]
+    PhysicalDrift {
+        /// Human-readable detail naming the table and the drift.
+        detail: String,
+    },
+
+    /// A pre-declared domain table's control row is present but the Iceberg
+    /// table is missing — the table was dropped or is otherwise unreachable.
+    #[error("domain table Iceberg table missing: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_500_ICEBERG_MISSING",
+        status = 500,
+        title = "Domain table Iceberg table missing",
+        remediation = "The Iceberg table for a pre-declared domain table is missing. Run the restore runbook."
+    )]
+    IcebergMissing {
+        /// Human-readable detail naming the affected table.
+        detail: String,
+    },
+
+    /// The write-path redaction pass failed on a sensitive-payload table.
+    /// The commit was refused; no raw secrets were written.
+    #[error("write-path redaction failed: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_500_REDACTION_FAILED",
+        status = 500,
+        title = "Write-path redaction failed",
+        remediation = "The redaction classifier failed on this batch. Retry; if it persists, check the classifier installation."
+    )]
+    RedactionFailed {
+        /// Human-readable detail about the redaction failure.
+        detail: String,
+    },
 }

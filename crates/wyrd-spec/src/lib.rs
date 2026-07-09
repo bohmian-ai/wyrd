@@ -20,6 +20,7 @@ pub mod ids;
 pub mod intel;
 pub mod metadata;
 pub mod origin;
+pub mod query;
 pub mod redaction;
 pub mod reference;
 pub mod request_id;
@@ -55,6 +56,7 @@ pub use metadata::{
     MetadataError,
 };
 pub use origin::{CommitSha, Origin, OriginValidationError};
+pub use query::{FieldRef, MetadataQuery, Operator, Predicate, QueryFieldErrorDetail, Value};
 pub use reference::AgentRef;
 #[cfg(any(test, feature = "test-utils"))]
 pub use security::InlineSecret;

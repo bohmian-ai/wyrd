@@ -16,6 +16,7 @@ pub mod postgres;
 #[cfg(feature = "embedded-postgres")]
 pub mod postgres_boot;
 pub mod queries;
+pub mod query;
 pub mod row_types;
 pub mod tenant_conn;
 #[cfg(any(test, feature = "testing"))]

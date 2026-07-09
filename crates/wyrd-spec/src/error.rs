@@ -826,6 +826,48 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Metadata query string failed to parse.
+    #[error("[WYRD_QUERY_400_INVALID_SYNTAX] {message}")]
+    #[wyrd_error(
+        code = "WYRD_QUERY_400_INVALID_SYNTAX",
+        status = 400,
+        title = "Invalid query syntax",
+        remediation = "Fix the query string at the reported offset and retry. See the metadata query grammar."
+    )]
+    QueryInvalidSyntax {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Query referenced a field or applied an operator the target surface rejects.
+    #[error("[WYRD_QUERY_400_INVALID_FIELD] {message}")]
+    #[wyrd_error(
+        code = "WYRD_QUERY_400_INVALID_FIELD",
+        status = 400,
+        title = "Invalid query field or operator",
+        remediation = "Reference a supported field and use an operator valid for its type. Ordering operators require a numeric or timestamp field."
+    )]
+    QueryInvalidField {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Query exceeded the predicate-count or nesting-depth cap.
+    #[error("[WYRD_QUERY_400_TOO_COMPLEX] {message}")]
+    #[wyrd_error(
+        code = "WYRD_QUERY_400_TOO_COMPLEX",
+        status = 400,
+        title = "Query too complex",
+        remediation = "Reduce the number of predicates or the nesting depth and retry."
+    )]
+    QueryTooComplex {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Card spec failed type-driven deserialization.
     #[error("[WYRD_REG_400_INVALID_CARD_SPEC] {message}")]
     #[wyrd_error(
@@ -2262,6 +2304,9 @@ impl WyrdError {
             | Self::PermissionDeniedRbac { message, details }
             | Self::RoleCorrupt { message, details }
             | Self::BuiltinRoleImmutableName { message, details }
+            | Self::QueryInvalidSyntax { message, details }
+            | Self::QueryInvalidField { message, details }
+            | Self::QueryTooComplex { message, details }
             | Self::SourceValidation { message, details }
             | Self::OriginValidation { message, details }
             | Self::DataValidation { message, details }
@@ -2422,6 +2467,68 @@ impl WyrdError {
         Self::RegistryVersionRequired {
             message: message.into(),
             details: serde_json::json!({}),
+        }
+    }
+
+    /// Construct [`WyrdError::QueryInvalidSyntax`].
+    #[must_use]
+    pub fn query_invalid_syntax(
+        message: impl Into<String>,
+        offset: usize,
+        expected: impl Into<String>,
+        found: impl Into<String>,
+    ) -> Self {
+        Self::QueryInvalidSyntax {
+            message: message.into(),
+            details: serde_json::json!({
+                "offset": offset,
+                "expected": expected.into(),
+                "found": found.into(),
+            }),
+        }
+    }
+
+    /// Construct a bare [`WyrdError::QueryInvalidField`].
+    #[must_use]
+    pub fn query_invalid_field(message: impl Into<String>) -> Self {
+        Self::QueryInvalidField {
+            message: message.into(),
+            details: serde_json::json!({ "reason": "invalid_field" }),
+        }
+    }
+
+    /// Construct [`WyrdError::QueryInvalidField`] with the empty-group reason.
+    #[must_use]
+    pub fn query_empty_group() -> Self {
+        Self::QueryInvalidField {
+            message: "empty boolean group (and/or with no children)".into(),
+            details: serde_json::json!({ "reason": "empty_group" }),
+        }
+    }
+
+    /// Construct [`WyrdError::QueryInvalidField`] with full type/field context.
+    #[must_use]
+    pub fn query_invalid_field_detail(
+        message: impl Into<String>,
+        detail: crate::query::QueryFieldErrorDetail<'_>,
+    ) -> Self {
+        Self::QueryInvalidField {
+            message: message.into(),
+            details: detail.to_json(),
+        }
+    }
+
+    /// Construct [`WyrdError::QueryTooComplex`].
+    #[must_use]
+    pub fn query_too_complex(
+        message: impl Into<String>,
+        cap: &'static str,
+        actual: usize,
+        limit: usize,
+    ) -> Self {
+        Self::QueryTooComplex {
+            message: message.into(),
+            details: serde_json::json!({ "cap": cap, "actual": actual, "limit": limit }),
         }
     }
 

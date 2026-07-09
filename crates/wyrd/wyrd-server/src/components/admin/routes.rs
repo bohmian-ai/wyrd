@@ -26,7 +26,6 @@ use axum::routing::{get, post};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use vala_bifrost::reconcile::{AuditReconcileResult, reconcile_audit};
-use vala_sql::queries::relay::list_audit_tenant_ids;
 use wyrd_auth_oidc::{
     ClaimMapping, ClaimPath, ClientAuth, OidcProvider, TrustedIssuer, WorkloadBinding,
 };
@@ -126,38 +125,25 @@ async fn audit_integrity(
         }));
     }
 
-    let Some(admin_pool) = state.postgres.platform_admin_pool() else {
-        return Err(WyrdErrorResponse::from(WyrdError::Internal {
-            message: "platform admin pool unavailable".to_owned(),
-            details: serde_json::Value::Null,
-        }));
-    };
-
-    let tenant_ids = list_audit_tenant_ids(admin_pool).await.map_err(|e| {
+    let result = reconcile_audit(
+        state.postgres.vala_pool(),
+        &state.bifrost,
+        caller.principal.tenant_id,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            error = %e,
+            tenant_id = %caller.principal.tenant_id,
+            "audit reconcile failed"
+        );
         WyrdErrorResponse::from(WyrdError::Internal {
-            message: format!("failed to enumerate audit tenants: {e}"),
+            message: "audit reconciliation failed; check server logs".to_owned(),
             details: serde_json::Value::Null,
         })
     })?;
 
-    let mut reports = Vec::with_capacity(tenant_ids.len());
-    for raw_id in tenant_ids {
-        let tenant_id = match DataTenantId::try_from(raw_id) {
-            Ok(id) => id,
-            Err(_) => continue,
-        };
-        let result = reconcile_audit(state.postgres.vala_pool(), &state.bifrost, tenant_id)
-            .await
-            .map_err(|e| {
-                WyrdErrorResponse::from(WyrdError::Internal {
-                    message: format!("reconcile failed for tenant {tenant_id}: {e}"),
-                    details: serde_json::Value::Null,
-                })
-            })?;
-        reports.push(TenantIntegrityReport::from(result));
-    }
-
-    Ok(Json(reports))
+    Ok(Json(vec![TenantIntegrityReport::from(result)]))
 }
 
 // --------------------------------------------------------------------------
@@ -583,6 +569,26 @@ async fn acquire_conn<'a>(
         .map_err(sql_unavailable)
 }
 
+/// Build a reqwest client with SSRF mitigations: 10 s timeout, no redirect-following.
+fn discovery_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("discovery client config is valid")
+}
+
+/// Return `true` when the URL host is a private, loopback, or link-local address.
+fn is_ssrf_blocked_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(addr)) => {
+            addr.is_loopback() || addr.is_private() || addr.is_link_local()
+        }
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback() || addr.is_multicast(),
+        _ => false,
+    }
+}
+
 /// Resolve the issuer's `jwks_uri` via OIDC discovery. The issuer URL is already
 /// validated by [`IssuerUrl`]; a discovery failure is a `503`.
 async fn discover_jwks_uri(issuer: &IssuerUrl) -> Result<url::Url, WyrdErrorResponse> {
@@ -592,7 +598,15 @@ async fn discover_jwks_uri(issuer: &IssuerUrl) -> Result<url::Url, WyrdErrorResp
             details: serde_json::json!({ "field": "issuer" }),
         })
     })?;
-    let provider = OidcProvider::discover(url, reqwest::Client::new())
+
+    if is_ssrf_blocked_host(&url) {
+        return Err(WyrdErrorResponse::from(WyrdError::MissingRequiredField {
+            message: "issuer resolves to a blocked address range".to_owned(),
+            details: serde_json::json!({ "field": "issuer" }),
+        }));
+    }
+
+    let provider = OidcProvider::discover(url, discovery_client())
         .await
         .map_err(|error| {
             tracing::warn!(

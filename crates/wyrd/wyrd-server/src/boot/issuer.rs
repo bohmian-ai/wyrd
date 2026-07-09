@@ -107,7 +107,11 @@ pub async fn seed_trusted_issuers(
     if entries.is_empty() {
         return Ok(());
     }
-    let http = reqwest::Client::new();
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("discovery client config is valid");
     let mut conn = TenantConn::acquire(pool, tenant_id).await?;
     for entry in entries {
         seed_one_trusted_issuer(&mut conn, tenant_id, entry, sealing_key, &http).await?;

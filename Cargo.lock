@@ -9882,6 +9882,7 @@ dependencies = [
  "tracing",
  "uuid",
  "vala-sql",
+ "wyrd-semver",
  "wyrd-spec",
  "wyrd-sql",
 ]

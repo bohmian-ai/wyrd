@@ -45,10 +45,13 @@ fn ingest_audit_event(ctx: &BifrostWriteContext, resource: &str) -> AuditEvent {
         Some(_) => PrincipalKindTag::Service,
         None => PrincipalKindTag::User,
     };
-    let principal_id = ctx
-        .actor
-        .parse::<PrincipalId>()
-        .unwrap_or_else(|_| PrincipalId::new(uuid::Uuid::nil()));
+    let principal_id = ctx.actor.parse::<PrincipalId>().unwrap_or_else(|_| {
+        tracing::warn!(
+            actor = %ctx.actor,
+            "failed to parse actor as PrincipalId; audit row will be attributed to nil UUID"
+        );
+        PrincipalId::new(uuid::Uuid::nil())
+    });
 
     AuditEvent {
         request_id: ctx.request_id.clone(),

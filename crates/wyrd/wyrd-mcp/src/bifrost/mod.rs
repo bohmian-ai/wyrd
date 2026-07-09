@@ -41,7 +41,7 @@ impl AgentTool for ListTablesTool {
 
     fn description(&self) -> &str {
         "List all Bifrost tables visible to the caller's tenant. \
-         Returns BifrostTableEntry objects including the universal card_ref correlation column. \
+         Returns BifrostTableEntry objects including the universal card_uid correlation column. \
          Requires bifrost_table:read permission (server-enforced)."
     }
 
@@ -84,7 +84,7 @@ impl AgentTool for DescribeTableTool {
 
     fn description(&self) -> &str {
         "Describe a single Bifrost table's schema. Returns BifrostTableDescription \
-         including user columns and the universal card_ref/run_id correlation columns. \
+         including user columns and the universal card_uid/run_id/principal_id correlation columns. \
          System columns (wyrd_*, data_tenant_id) are excluded. \
          Requires bifrost_table:read permission (server-enforced)."
     }

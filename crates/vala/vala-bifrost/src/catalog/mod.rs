@@ -6,7 +6,6 @@ use iceberg::Catalog as _;
 use iceberg::TableCreation;
 use iceberg::spec::FormatVersion;
 use iceberg_catalog_sql::SqlCatalog;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use crate::catalog::namespaces::BifrostNamespace;
@@ -14,6 +13,7 @@ use crate::catalog::partition_spec::build_partition_spec;
 use crate::error::BifrostError;
 use crate::provider::WyrdTableProvider;
 use crate::registry::{CachedMeta, Registry, RegistryKey};
+use crate::schema::fingerprint::fingerprint_user_fields;
 use crate::schema::system_columns::with_system_columns;
 use crate::tables::{DeclaredIndex, DomainTable, PayloadClass};
 use crate::types::{PartitionTransform, SchemaFingerprint, TableScope, TableUid};
@@ -36,24 +36,11 @@ pub struct WyrdCatalog {
     registry: Arc<Registry>,
 }
 
-/// RAII guard that releases a Postgres advisory lock when dropped.
+/// RAII guard that holds a Postgres transaction containing a transaction-scoped
+/// advisory lock. The lock is released automatically when this guard drops and
+/// sqlx rolls back the open transaction.
 pub struct AdvisoryLockGuard {
-    pool: Arc<PgPool>,
-    fqn: String,
-}
-
-impl Drop for AdvisoryLockGuard {
-    fn drop(&mut self) {
-        let pool = Arc::clone(&self.pool);
-        let fqn = self.fqn.clone();
-        // Best-effort release; spawn a task so Drop doesn't require a runtime.
-        tokio::spawn(async move {
-            let _ = sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
-                .bind(&fqn)
-                .execute(&*pool)
-                .await;
-        });
-    }
+    _tx: sqlx::Transaction<'static, sqlx::Postgres>,
 }
 
 impl WyrdCatalog {
@@ -157,14 +144,14 @@ impl WyrdCatalog {
         audit: Option<wyrd_spec::vala::api::AuditEvent>,
     ) -> Result<TableUid, BifrostError> {
         // M6 reserved-name guard: a user field may not take a reserved system
-        // (`wyrd_*`/`data_tenant_id`) or correlation (`card_ref`/`run_id`) name —
+        // (`wyrd_*`/`data_tenant_id`) or correlation (`card_uid`/`run_id`/`principal_id`) name —
         // the server stamps the former and carries the latter as cell values.
         wire::reject_reserved_field_names(&user_fields)?;
 
         self.ensure_namespace(ns).await?;
 
         // The fingerprint is user-fields-only (06 §3): the correlation
-        // (`run_id`/`card_ref`) and system columns are stripped before hashing,
+        // (`run_id`/`card_uid`/`principal_id`) and system columns are stripped before hashing,
         // so their presence in the physical schema does not perturb the value the
         // client caches and the server compares.
         let fingerprint = SchemaFingerprint::from_arrow_schema(&arrow::datatypes::Schema::new(
@@ -324,10 +311,10 @@ impl WyrdCatalog {
     /// Describe a single table for `tenant` — the public wire entry plus its
     /// projected field list.
     ///
-    /// The `fields` surface user columns and the universal `card_ref`/`run_id`
+    /// The `fields` surface user columns and the universal `card_uid`/`run_id`/`principal_id`
     /// correlation columns (the latter flagged `wyrd:column_class = correlation`,
     /// Decision E), while the server-stamped `wyrd_*`/`data_tenant_id` system
-    /// columns are excluded — so `card_ref` is distinct from both user and system
+    /// columns are excluded — so `card_uid` is distinct from both user and system
     /// columns. Resolves the same two-step (`TenantOwned` then `SystemShared`) bind
     /// as `get`.
     pub async fn describe_table(
@@ -495,28 +482,26 @@ impl WyrdCatalog {
     // DomainTable registration support (task 02)
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Acquire a Postgres advisory lock keyed by the table FQN hash. Released
-    /// when the returned guard is dropped (connection returned to pool).
-    ///
-    /// Uses `pg_advisory_lock(hashtext(fqn))` which is session-scoped.
-    /// For registration this is sufficient — the lock prevents two pods from
-    /// racing to create the same domain table.
+    /// Acquire a transaction-scoped Postgres advisory lock keyed by the table FQN
+    /// hash. The lock is held for the duration of the guard's lifetime and released
+    /// automatically when the guard drops (transaction rolled back).
     pub async fn advisory_lock_for(
         &self,
         namespace: &str,
         name: &str,
     ) -> Result<AdvisoryLockGuard, BifrostError> {
         let fqn = format!("{namespace}.{name}");
-        // pg_advisory_lock acquires session-level advisory lock.
-        sqlx::query("SELECT pg_advisory_lock(hashtext($1))")
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| BifrostError::Internal(format!("advisory lock begin: {e}")))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
             .bind(&fqn)
-            .execute(&*self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| BifrostError::Internal(format!("advisory lock: {e}")))?;
-        Ok(AdvisoryLockGuard {
-            pool: Arc::clone(&self.pool),
-            fqn,
-        })
+        Ok(AdvisoryLockGuard { _tx: tx })
     }
 
     /// Look up the stored schema fingerprint for a pre-declared domain table.
@@ -586,22 +571,16 @@ impl WyrdCatalog {
                 .all(|(p, d)| p.name() == d.name() && p.data_type() == d.data_type())
     }
 
-    /// Compute the fingerprint of an arbitrary schema (user fields only).
-    /// Used to characterize a physical schema during repair.
-    pub fn fingerprint_of_schema(&self, schema: &SchemaRef) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        for field in schema.fields() {
-            hasher.update(field.name().as_bytes());
-            hasher.update(b"\x00");
-            hasher.update(format!("{:?}", field.data_type()).as_bytes());
-            hasher.update(b"\x00");
-        }
-        hasher.finalize().into()
+    /// Compute the fingerprint of a physical schema over user fields only.
+    /// Strips system and correlation columns before hashing so the result matches
+    /// the build-time `SCHEMA_FINGERPRINT` constants.
+    pub fn fingerprint_of_user_fields(&self, schema: &SchemaRef) -> [u8; 32] {
+        fingerprint_user_fields(schema)
     }
 
     /// Create the Iceberg table for a pre-declared domain table.
     pub async fn create_domain_table<T: DomainTable>(&self) -> Result<(), BifrostError> {
-        let ns = BifrostNamespace::from_wire(T::NAMESPACE).ok_or_else(|| {
+        let ns = BifrostNamespace::from_domain_namespace(T::NAMESPACE).ok_or_else(|| {
             BifrostError::MetadataMismatch(format!("unknown namespace: {}", T::NAMESPACE))
         })?;
         self.ensure_namespace(ns).await?;

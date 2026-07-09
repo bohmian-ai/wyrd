@@ -4,19 +4,19 @@
 -- This is NOT a DomainTable; alerts live in Postgres, not Iceberg.
 
 CREATE TABLE vala.drift_alerts (
-    data_tenant_id  UUID        NOT NULL,
+    data_tenant_id  UUID        NOT NULL REFERENCES platform.tenants(data_tenant_id),
     drift_ref_kind  TEXT        NOT NULL,
     drift_ref_name  TEXT        NOT NULL,
     drift_ref_ver   TEXT        NOT NULL,
     drift_ref_space TEXT        NOT NULL,
     drift_type      TEXT        NOT NULL,
-    series          TEXT,
+    series          TEXT        NOT NULL DEFAULT '',
     alert           JSONB       NOT NULL,
     active          BOOLEAN     NOT NULL DEFAULT TRUE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (data_tenant_id, drift_ref_kind, drift_ref_name, drift_ref_ver,
-                 drift_ref_space, drift_type, COALESCE(series, ''))
+                 drift_ref_space, drift_type, series)
 );
 
 ALTER TABLE vala.drift_alerts ENABLE ROW LEVEL SECURITY;
@@ -26,4 +26,4 @@ CREATE POLICY tenant_isolation ON vala.drift_alerts
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
 
-GRANT SELECT, INSERT, UPDATE ON vala.drift_alerts TO vala_app;
+GRANT SELECT, INSERT, UPDATE ON vala.drift_alerts TO wyrd_app;

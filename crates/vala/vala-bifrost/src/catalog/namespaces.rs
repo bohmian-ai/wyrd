@@ -92,3 +92,25 @@ impl BifrostNamespace {
         NamespaceIdent::from_strs([self.as_str()]).expect("namespace identifier is always valid")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_domain_namespace_round_trips_all_known() {
+        for ns in BifrostNamespace::ALL {
+            let segment = ns.as_str().split('.').last().expect("namespace has dot");
+            assert_eq!(
+                BifrostNamespace::from_domain_namespace(segment),
+                Some(ns),
+                "from_domain_namespace(\"{segment}\") must round-trip to {ns:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_domain_namespace_unknown_returns_none() {
+        assert!(BifrostNamespace::from_domain_namespace("unknown_namespace").is_none());
+    }
+}

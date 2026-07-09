@@ -83,4 +83,4 @@ CREATE INDEX entity_time_bounds_kind_entity_idx
 
 GRANT SELECT, INSERT, UPDATE, DELETE
     ON vala.olap_indexes, vala.entity_time_bounds
-    TO vala_app;
+    TO wyrd_app;

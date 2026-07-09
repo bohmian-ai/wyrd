@@ -219,7 +219,7 @@ pub async fn register<T: DomainTable>(catalog: &Arc<WyrdCatalog>) -> Result<(), 
                     namespace: T::NAMESPACE,
                     name: T::NAME,
                     expected: T::SCHEMA_FINGERPRINT,
-                    actual: catalog.fingerprint_of_schema(&physical),
+                    actual: catalog.fingerprint_of_user_fields(&physical),
                 })
             }
         }
@@ -273,7 +273,7 @@ async fn repair_control_from_physical<T: DomainTable>(
             namespace: T::NAMESPACE,
             name: T::NAME,
             expected: T::SCHEMA_FINGERPRINT,
-            actual: catalog.fingerprint_of_schema(&physical),
+            actual: catalog.fingerprint_of_user_fields(&physical),
         })
     }
 }

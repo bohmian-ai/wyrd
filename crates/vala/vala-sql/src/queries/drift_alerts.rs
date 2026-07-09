@@ -39,7 +39,7 @@ pub async fn upsert_drift_alert(
              drift_ref_space, drift_type, series, alert, active)
         VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5, $6, $7, TRUE)
         ON CONFLICT (data_tenant_id, drift_ref_kind, drift_ref_name, drift_ref_ver,
-                     drift_ref_space, drift_type, COALESCE(series, ''))
+                     drift_ref_space, drift_type, series)
         DO UPDATE SET
             alert      = EXCLUDED.alert,
             active     = TRUE,
@@ -51,7 +51,7 @@ pub async fn upsert_drift_alert(
     .bind(ins.drift_ref.version.to_string())
     .bind(ins.drift_ref.space.as_str())
     .bind(ins.drift_type)
-    .bind(ins.series)
+    .bind(ins.series.unwrap_or(""))
     .bind(ins.alert)
     .execute(&mut **conn.transaction())
     .await

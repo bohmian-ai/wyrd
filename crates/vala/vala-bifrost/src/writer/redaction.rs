@@ -224,4 +224,80 @@ mod tests {
             .unwrap();
         assert_eq!(col.value(0), REDACTED);
     }
+
+    #[test]
+    fn email_is_redacted() {
+        let batch = make_batch(vec![Some("contact me at user@example.com thanks")]);
+        let pass = BuiltinRedactionPass;
+        let result = pass.scrub(&batch, &["payload"]).unwrap();
+        let col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(col.value(0).contains(REDACTED), "email must be redacted");
+        assert!(!col.value(0).contains("user@example.com"));
+    }
+
+    #[test]
+    fn ssn_is_redacted() {
+        let batch = make_batch(vec![Some("ssn is 123-45-6789 on file")]);
+        let pass = BuiltinRedactionPass;
+        let result = pass.scrub(&batch, &["payload"]).unwrap();
+        let col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(col.value(0).contains(REDACTED));
+        assert!(!col.value(0).contains("123-45-6789"));
+    }
+
+    #[test]
+    fn aws_key_is_redacted() {
+        let batch = make_batch(vec![Some("AKIAIOSFODNN7EXAMPLE is the key")]);
+        let pass = BuiltinRedactionPass;
+        let result = pass.scrub(&batch, &["payload"]).unwrap();
+        let col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(col.value(0).contains(REDACTED));
+        assert!(!col.value(0).contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[test]
+    fn jwt_is_redacted() {
+        let token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let batch = make_batch(vec![Some(token)]);
+        let pass = BuiltinRedactionPass;
+        let result = pass.scrub(&batch, &["payload"]).unwrap();
+        let col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(col.value(0), REDACTED);
+    }
+
+    #[test]
+    fn multiple_secrets_in_one_value_both_redacted() {
+        let val = "token=ghp_abcdefghijklmnopqrstuvwxyz123456789012 email=user@example.com";
+        let batch = make_batch(vec![Some(val)]);
+        let pass = BuiltinRedactionPass;
+        let result = pass.scrub(&batch, &["payload"]).unwrap();
+        let col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let redacted = col.value(0);
+        assert!(!redacted.contains("ghp_"), "PAT must be redacted");
+        assert!(
+            !redacted.contains("user@example.com"),
+            "email must be redacted"
+        );
+        assert!(redacted.contains(REDACTED));
+    }
 }

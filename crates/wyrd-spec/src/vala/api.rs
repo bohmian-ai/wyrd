@@ -1004,7 +1004,10 @@ mod tests {
             trace_id: "b7f3c1e2a4d5".to_owned(),
         };
         let v = serde_json::to_value(&get_trace).unwrap();
-        assert_eq!(serde_json::from_value::<GetTraceRequest>(v).unwrap(), get_trace);
+        assert_eq!(
+            serde_json::from_value::<GetTraceRequest>(v).unwrap(),
+            get_trace
+        );
 
         let query_traces = QueryTracesRequest {
             window: window.clone(),
@@ -1014,7 +1017,10 @@ mod tests {
             name: Some("GET /checkout".to_owned()),
         };
         let v = serde_json::to_value(&query_traces).unwrap();
-        assert_eq!(serde_json::from_value::<QueryTracesRequest>(v).unwrap(), query_traces);
+        assert_eq!(
+            serde_json::from_value::<QueryTracesRequest>(v).unwrap(),
+            query_traces
+        );
 
         let query_recent = QueryRecentTracesRequest {
             window: window.clone(),
@@ -1023,7 +1029,10 @@ mod tests {
             min_duration_ms: Some(10),
         };
         let v = serde_json::to_value(&query_recent).unwrap();
-        assert_eq!(serde_json::from_value::<QueryRecentTracesRequest>(v).unwrap(), query_recent);
+        assert_eq!(
+            serde_json::from_value::<QueryRecentTracesRequest>(v).unwrap(),
+            query_recent
+        );
 
         let query_genai = QueryGenAiRequest {
             window: window.clone(),
@@ -1032,7 +1041,10 @@ mod tests {
             provider: Some("openai".to_owned()),
         };
         let v = serde_json::to_value(&query_genai).unwrap();
-        assert_eq!(serde_json::from_value::<QueryGenAiRequest>(v).unwrap(), query_genai);
+        assert_eq!(
+            serde_json::from_value::<QueryGenAiRequest>(v).unwrap(),
+            query_genai
+        );
 
         let query_eval = QueryEvalRequest {
             window: window.clone(),
@@ -1040,7 +1052,10 @@ mod tests {
             run_id: Some("run-1".to_owned()),
         };
         let v = serde_json::to_value(&query_eval).unwrap();
-        assert_eq!(serde_json::from_value::<QueryEvalRequest>(v).unwrap(), query_eval);
+        assert_eq!(
+            serde_json::from_value::<QueryEvalRequest>(v).unwrap(),
+            query_eval
+        );
 
         let query_drift = QueryDriftRequest {
             window: window.clone(),
@@ -1048,7 +1063,10 @@ mod tests {
             run_id: Some("run-2".to_owned()),
         };
         let v = serde_json::to_value(&query_drift).unwrap();
-        assert_eq!(serde_json::from_value::<QueryDriftRequest>(v).unwrap(), query_drift);
+        assert_eq!(
+            serde_json::from_value::<QueryDriftRequest>(v).unwrap(),
+            query_drift
+        );
 
         let query_metrics = QueryMetricsRequest {
             window: window.clone(),
@@ -1056,7 +1074,10 @@ mod tests {
             metric_type: Some("histogram".to_owned()),
         };
         let v = serde_json::to_value(&query_metrics).unwrap();
-        assert_eq!(serde_json::from_value::<QueryMetricsRequest>(v).unwrap(), query_metrics);
+        assert_eq!(
+            serde_json::from_value::<QueryMetricsRequest>(v).unwrap(),
+            query_metrics
+        );
 
         let query_logs = QueryLogsRequest {
             window: window.clone(),
@@ -1065,7 +1086,10 @@ mod tests {
             event_name: Some("exception".to_owned()),
         };
         let v = serde_json::to_value(&query_logs).unwrap();
-        assert_eq!(serde_json::from_value::<QueryLogsRequest>(v).unwrap(), query_logs);
+        assert_eq!(
+            serde_json::from_value::<QueryLogsRequest>(v).unwrap(),
+            query_logs
+        );
 
         let query_agent = QueryAgentTracesRequest {
             window: window.clone(),
@@ -1076,7 +1100,10 @@ mod tests {
             run_id: Some("run-3".to_owned()),
         };
         let v = serde_json::to_value(&query_agent).unwrap();
-        assert_eq!(serde_json::from_value::<QueryAgentTracesRequest>(v).unwrap(), query_agent);
+        assert_eq!(
+            serde_json::from_value::<QueryAgentTracesRequest>(v).unwrap(),
+            query_agent
+        );
 
         let now = Utc::now();
 
@@ -1097,7 +1124,10 @@ mod tests {
             links: vec![],
         };
         let v = serde_json::to_value(&waterfall).unwrap();
-        assert_eq!(serde_json::from_value::<TraceWaterfall>(v).unwrap(), waterfall);
+        assert_eq!(
+            serde_json::from_value::<TraceWaterfall>(v).unwrap(),
+            waterfall
+        );
 
         let summary = TraceSummaryRow {
             trace_id: "t1".to_owned(),
@@ -1113,11 +1143,20 @@ mod tests {
             next_page_token: Some("tok".to_owned()),
         };
         let v = serde_json::to_value(&traces_resp).unwrap();
-        assert_eq!(serde_json::from_value::<QueryTracesResponse>(v).unwrap(), traces_resp);
+        assert_eq!(
+            serde_json::from_value::<QueryTracesResponse>(v).unwrap(),
+            traces_resp
+        );
 
-        let recent_resp = QueryRecentTracesResponse { rows: vec![], next_page_token: None };
+        let recent_resp = QueryRecentTracesResponse {
+            rows: vec![],
+            next_page_token: None,
+        };
         let v = serde_json::to_value(&recent_resp).unwrap();
-        assert_eq!(serde_json::from_value::<QueryRecentTracesResponse>(v).unwrap(), recent_resp);
+        assert_eq!(
+            serde_json::from_value::<QueryRecentTracesResponse>(v).unwrap(),
+            recent_resp
+        );
 
         let genai_row = GenAiRow {
             conversation_id: "conv-1".to_owned(),
@@ -1130,9 +1169,15 @@ mod tests {
             prompt: None,
             completion: None,
         };
-        let genai_resp = QueryGenAiResponse { rows: vec![genai_row], next_page_token: None };
+        let genai_resp = QueryGenAiResponse {
+            rows: vec![genai_row],
+            next_page_token: None,
+        };
         let v = serde_json::to_value(&genai_resp).unwrap();
-        assert_eq!(serde_json::from_value::<QueryGenAiResponse>(v).unwrap(), genai_resp);
+        assert_eq!(
+            serde_json::from_value::<QueryGenAiResponse>(v).unwrap(),
+            genai_resp
+        );
 
         let eval_row = EvalRow {
             eval_id: "eval-abc".to_owned(),
@@ -1141,9 +1186,15 @@ mod tests {
             score: 0.95,
             started_at: now,
         };
-        let eval_resp = QueryEvalResponse { rows: vec![eval_row], next_page_token: None };
+        let eval_resp = QueryEvalResponse {
+            rows: vec![eval_row],
+            next_page_token: None,
+        };
         let v = serde_json::to_value(&eval_resp).unwrap();
-        assert_eq!(serde_json::from_value::<QueryEvalResponse>(v).unwrap(), eval_resp);
+        assert_eq!(
+            serde_json::from_value::<QueryEvalResponse>(v).unwrap(),
+            eval_resp
+        );
 
         let drift_row = DriftRow {
             feature: "amount".to_owned(),
@@ -1152,9 +1203,15 @@ mod tests {
             threshold: Some(0.1),
             computed_at: now,
         };
-        let drift_resp = QueryDriftResponse { rows: vec![drift_row], next_page_token: None };
+        let drift_resp = QueryDriftResponse {
+            rows: vec![drift_row],
+            next_page_token: None,
+        };
         let v = serde_json::to_value(&drift_resp).unwrap();
-        assert_eq!(serde_json::from_value::<QueryDriftResponse>(v).unwrap(), drift_resp);
+        assert_eq!(
+            serde_json::from_value::<QueryDriftResponse>(v).unwrap(),
+            drift_resp
+        );
 
         let metric_row = MetricRow {
             metric_name: "request_latency".to_owned(),
@@ -1163,9 +1220,15 @@ mod tests {
             timestamp: now,
             attributes: None,
         };
-        let metrics_resp = QueryMetricsResponse { rows: vec![metric_row], next_page_token: None };
+        let metrics_resp = QueryMetricsResponse {
+            rows: vec![metric_row],
+            next_page_token: None,
+        };
         let v = serde_json::to_value(&metrics_resp).unwrap();
-        assert_eq!(serde_json::from_value::<QueryMetricsResponse>(v).unwrap(), metrics_resp);
+        assert_eq!(
+            serde_json::from_value::<QueryMetricsResponse>(v).unwrap(),
+            metrics_resp
+        );
 
         let log_row = LogRow {
             timestamp: now,
@@ -1176,9 +1239,15 @@ mod tests {
             event_name: None,
             body: None,
         };
-        let logs_resp = QueryLogsResponse { rows: vec![log_row], next_page_token: None };
+        let logs_resp = QueryLogsResponse {
+            rows: vec![log_row],
+            next_page_token: None,
+        };
         let v = serde_json::to_value(&logs_resp).unwrap();
-        assert_eq!(serde_json::from_value::<QueryLogsResponse>(v).unwrap(), logs_resp);
+        assert_eq!(
+            serde_json::from_value::<QueryLogsResponse>(v).unwrap(),
+            logs_resp
+        );
 
         let agent_row = AgentTraceRow {
             dev_session_id: "sess-1".to_owned(),
@@ -1189,9 +1258,15 @@ mod tests {
             started_at: now,
             payload: None,
         };
-        let agent_resp = QueryAgentTracesResponse { rows: vec![agent_row], next_page_token: None };
+        let agent_resp = QueryAgentTracesResponse {
+            rows: vec![agent_row],
+            next_page_token: None,
+        };
         let v = serde_json::to_value(&agent_resp).unwrap();
-        assert_eq!(serde_json::from_value::<QueryAgentTracesResponse>(v).unwrap(), agent_resp);
+        assert_eq!(
+            serde_json::from_value::<QueryAgentTracesResponse>(v).unwrap(),
+            agent_resp
+        );
 
         let _ = schemars::schema_for!(QueryTracesRequest);
         let _ = schemars::schema_for!(QueryRecentTracesRequest);

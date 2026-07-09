@@ -1,0 +1,58 @@
+---
+title: Bifrost
+description: The Wyrd analytical warehouse — Apache Iceberg tables, DataFusion queries, and a typed read surface for all Vala observations.
+pillar: wyrd
+group: Bifrost
+order: 1
+---
+
+# Bifrost
+
+Bifrost is the Wyrd OLAP warehouse. It persists every Vala observation (traces, metrics, logs, GenAI generations, evaluations, drift, and agent traces) as Apache Iceberg tables and exposes them through a typed `ValaQueryService` read surface.
+
+## What it is
+
+Bifrost owns the durable, queryable side of the observation pipeline. Observations written through `vala-sdk` are committed as Arrow-native Iceberg partitions by the Bifrost ingest service. Reads are served by DataFusion against snapshot-consistent views of those partitions.
+
+Key properties:
+
+- **Typed tables.** Pre-declared `DomainTable` schemas define every column, type, and nullability at registration time. The schema fingerprint is stored and enforced — a write with a mismatched schema is rejected before any Iceberg commit.
+- **Tenant isolation.** Every row carries a server-stamped `data_tenant_id`. DataFusion's `TenantPredicateRule` analyzer injects a `data_tenant_id = $tenant` predicate into every `WyrdTableProvider` scan. This predicate is non-removable — it is re-injected at the analysis stage of every `execute_logical_plan` call.
+- **Payload governance.** Sensitive columns (span attributes, log body, GenAI messages, agent-trace payloads) are projected away at the plan stage unless the caller holds the matching `BifrostTracePayload / BifrostLogPayload / BifrostGenAiPayload / BifrostAgentTracePayload` read permission.
+- **Time-bounded scans.** Every typed query carries a `QueryWindow` with a default 7-day lookback when no bounds are supplied. Generic SQL queries over domain tables are also required to carry a time predicate.
+
+## Write / read path
+
+```
+[vala-sdk observe.record()]
+       │  (Arrow IPC stream)
+       ▼
+[BifrostIngestService gRPC]
+       │
+       ▼
+[vala-bifrost writer → Iceberg commit]
+       │
+       ▼
+[Iceberg table (S3/local/…)]
+       │  (DataFusion scan via WyrdTableProvider)
+       ▼
+[ValaQueryService gRPC / HTTP]
+       │
+       ▼
+[caller]
+```
+
+The ingest service and query service share no in-process state — both go through the Bifrost catalog that holds the registered `DomainTable` metadata and the `WyrdTableProvider` factory.
+
+## Where it fits vs. the generic observe surface
+
+The `POST /v1/observations/query` endpoint accepts raw SQL against the same Iceberg tables but runs through the same governance checks as typed routes (referenced-table permission, payload-column gate, tenant/time admission). The typed `ValaQueryService` methods are the preferred surface for agent and SDK clients — they produce structured row types with stable field names, enforce payload permissions column-by-column, and return signed page tokens for keyset pagination.
+
+## What's next
+
+- [Quickstart](./quickstart) — emit and query an observation end-to-end
+- [Architecture](./architecture) — `DomainTable`, system columns, audit relay, schema fingerprinting
+- [Schema](./schema) — the pre-declared tables and their physical schemas
+- [Writing data](./writing-data) — `vala-sdk` producer, batching, governance
+- [Reading data](./reading-data) — typed methods, pagination, permissions, generic SQL
+- [SLOs](./slos) — performance targets

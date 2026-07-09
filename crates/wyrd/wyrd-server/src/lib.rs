@@ -12,6 +12,7 @@ pub mod http;
 pub mod postgres;
 pub mod query;
 pub mod state;
+pub mod vala_query;
 
 #[cfg(test)]
 pub(crate) mod test_support;

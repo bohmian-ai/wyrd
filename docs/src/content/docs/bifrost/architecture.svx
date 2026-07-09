@@ -1,0 +1,65 @@
+---
+title: Architecture
+description: DomainTable registration, schema fingerprinting, system columns, audit relay, and write-path redaction.
+pillar: wyrd
+group: Bifrost
+order: 3
+---
+
+# Bifrost Architecture
+
+## DomainTable and boot registration
+
+Every queryable table in Bifrost is a `DomainTable` — a pre-declared, validated description of the physical schema a Vala domain owns. At server boot, `register_all` iterates the full `DomainTable` set and ensures each table exists in the Iceberg catalog under its fully-qualified name (`vala.<namespace>.<table>`). Tables that are absent are created; tables with a mismatched fingerprint are flagged and not silently migrated.
+
+A `DomainTable` carries:
+
+- **FQN** — `vala.traces.spans`, `vala.genai.messages`, etc.
+- **Schema** — Arrow field list with types, nullability, and metadata.
+- **Scope** — `SystemShared`: all tenants write to the same physical Iceberg table; the `data_tenant_id` column enforces tenant isolation in the scan path.
+- **Partition spec** — typically `[data_tenant_id, wyrd_event_time_day]`.
+- **Sensitive payload columns** — the columns projected away by the payload permission gate.
+- **Correlation policy** — which of `run_id`, `card_uid`, `principal_id` are stamped.
+
+## Schema fingerprinting and strict schema matching
+
+The `SchemaFingerprint` is a 16-byte BLAKE3 hash of the canonical Arrow schema (field names, types, nullability, metadata keys sorted). The fingerprint is stored alongside the `DomainTable` registration. Every Arrow batch arriving at `BifrostIngestService` is validated against the stored fingerprint before any Iceberg commit. A mismatch returns `400 WYRD_VALA_400_SCHEMA_FINGERPRINT_MISMATCH` and writes no data.
+
+This means the physical schema is frozen at registration — schema evolution requires an explicit migration (Stage 5 concern).
+
+## System columns
+
+Every domain table appends five system columns that are not part of the user-declared schema:
+
+| Column | Type | Stamped by |
+|---|---|---|
+| `data_tenant_id` | `Utf8` | Ingest service (from the authenticated principal) |
+| `wyrd_event_time` | `Timestamp(Microseconds, UTC)` | Ingest service (first observation timestamp in the batch) |
+| `wyrd_ingested_at` | `Timestamp(Microseconds, UTC)` | Ingest service (wall-clock flush time) |
+| `wyrd_batch_id` | `FixedSizeBinary(16)` | Ingest service (UUIDv7, unique per batch) |
+
+Three optional correlation columns from the `CorrelationPolicy`:
+
+| Column | Type | Present when |
+|---|---|---|
+| `run_id` | `Utf8` (nullable) | Policy includes `RunId` |
+| `card_uid` | `Utf8` (nullable) | Policy includes `CardUid` |
+| `principal_id` | `Utf8` (nullable) | Policy includes `PrincipalId` |
+
+Callers never write system columns — the ingest service stamps them. Any row that arrives with a system column set in the user payload is rejected.
+
+## Tenant isolation: TenantPredicateRule
+
+The `TenantPredicateRule` is a DataFusion `AnalyzerRule` registered on every `SessionContext` created by `wyrd_session_context(tenant_id)`. It walks every `TableScan` node in the plan, identifies any `WyrdTableProvider` source (all domain tables use this provider), and prepends a filter `data_tenant_id = $tenant` as a non-removable predicate. The rule runs at analysis time — before optimization and before execution — so a plan that reaches execution is guaranteed to carry the predicate.
+
+The predicate cannot be elided by a DataFusion optimizer pass because the rule is re-run after every optimization cycle.
+
+## Audit relay
+
+Every Bifrost write operation appends an audit row to the `vala.audit.log` domain table via the audit relay — a background worker that tails the `vala_outbox` table and ships rows to the OLAP store on a configurable schedule. The relay is a supervision-tree worker started at boot (`spawn_audit_relay`).
+
+The audit log captures: operation name, principal ID, tenant, timestamp, decision (allow/deny), result, and a detail field. Denials are written in a separate fail-closed transaction before the `403` is returned to the caller.
+
+## Write-path redaction (M-03)
+
+Certain domain tables carry a redaction policy. Columns in the `REDACTED_COLUMNS` set are zeroed (strings → empty, numerics → 0, binaries → zero bytes) before the Arrow batch is committed. This applies to fields that should never be stored at rest — for example, raw prompt text in GenAI tables when a tenant has redaction enabled. Redaction happens server-side, is transparent to the SDK, and is logged in the audit row.

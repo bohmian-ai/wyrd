@@ -41,6 +41,9 @@ where
         .ok_or(GrpcError::MissingTokenVerifier)?;
     let interceptor = ingest_auth_interceptor(verifier);
     let ingest = BifrostIngestGrpc::new(state.bifrost.clone(), interceptor);
+    let query = crate::vala_query::grpc::ValaQueryGrpc::new(state.clone());
     let router = build_grpc_router(health_service, NoopInterceptor, cfg)?;
-    Ok(router.add_service(ingest.into_server()))
+    Ok(router
+        .add_service(ingest.into_server())
+        .add_service(query.into_server()))
 }

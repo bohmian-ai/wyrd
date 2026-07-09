@@ -540,11 +540,22 @@ mod tests {
             (Resource::BifrostTracePayload, "bifrost_trace_payload"),
             (Resource::BifrostLogPayload, "bifrost_log_payload"),
             (Resource::BifrostGenAiPayload, "bifrost_genai_payload"),
-            (Resource::BifrostAgentTracePayload, "bifrost_agent_trace_payload"),
+            (
+                Resource::BifrostAgentTracePayload,
+                "bifrost_agent_trace_payload",
+            ),
         ] {
-            let permission = Permission { resource: resource.clone(), action: Action::Read };
+            let permission = Permission {
+                resource: resource.clone(),
+                action: Action::Read,
+            };
             assert_eq!(permission.to_string(), format!("{wire}:read"));
-            assert_eq!(format!("{wire}:read").parse::<Permission>().expect("parses"), permission);
+            assert_eq!(
+                format!("{wire}:read")
+                    .parse::<Permission>()
+                    .expect("parses"),
+                permission
+            );
         }
     }
 

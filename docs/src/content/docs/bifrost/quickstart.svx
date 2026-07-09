@@ -1,0 +1,101 @@
+---
+title: Quickstart
+description: Emit an observation via vala-sdk and query it back through a typed ValaQueryService method.
+pillar: wyrd
+group: Bifrost
+order: 2
+---
+
+# Bifrost Quickstart
+
+This walkthrough emits a trace observation using `vala-sdk` and reads it back through the `QueryRecentTraces` typed method.
+
+## Prerequisites
+
+- A running Wyrd server (see [self-hosting](/self-hosting))
+- Python `wyrd` package installed (`pip install wyrd`)
+- A valid Wyrd access token in the environment
+
+## 1. Emit a trace observation (Python)
+
+```python
+from wyrd import WyrdClient
+from vala_sdk import ValaHandle, ObservationContext
+
+client = WyrdClient(base_url="https://your-wyrd-server", token="…")
+vala = ValaHandle(client)
+
+ctx = ObservationContext(run_id="run-abc-123")
+with vala.observe.trace(ctx, name="inference", service="my-service") as span:
+    span.set_attribute("model", "gpt-4o")
+    result = run_inference()
+    span.set_attribute("tokens", result.usage.total_tokens)
+```
+
+The trace is buffered and flushed as an Arrow IPC batch to `BifrostIngestService`.
+
+## 2. Query it back (Python)
+
+```python
+from wyrd.vala.query import ValaQueryClient, QueryWindow
+from datetime import datetime, timedelta, timezone
+
+qclient = ValaQueryClient(client)
+
+window = QueryWindow(
+    since=datetime.now(timezone.utc) - timedelta(hours=1),
+    limit=50,
+)
+response = qclient.query_recent_traces(window=window, service="my-service")
+
+for row in response.rows:
+    print(f"{row.trace_id}  {row.root_name}  {row.duration_ms:.1f}ms  error={row.error}")
+```
+
+## 3. Query it back (HTTP)
+
+```bash
+curl -X POST https://your-wyrd-server/v1/traces/recent/query \
+  -H "x-wyrd-access-token: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "since": "2026-07-01T00:00:00Z",
+    "service": "my-service",
+    "limit": 50
+  }'
+```
+
+Response:
+
+```json
+{
+  "rows": [
+    {
+      "trace_id": "b7f3c1e2a4d5...",
+      "root_name": "inference",
+      "service": "my-service",
+      "started_at": "2026-07-08T12:00:00Z",
+      "duration_ms": 142.5,
+      "span_count": 3,
+      "error": false
+    }
+  ],
+  "next_page_token": null
+}
+```
+
+## 4. Fetch a full trace waterfall (HTTP)
+
+```bash
+curl https://your-wyrd-server/v1/traces/b7f3c1e2a4d5... \
+  -H "x-wyrd-access-token: Bearer $TOKEN"
+```
+
+Response includes `spans`, `events`, and `links` nested under `trace`.
+
+## What happens inside
+
+1. `vala-sdk` flushes the buffered spans as Arrow IPC to `BifrostIngestService`.
+2. The ingest service validates the schema fingerprint, stamps `data_tenant_id`, `wyrd_event_time`, and `wyrd_batch_id`, and commits the Arrow batch to the `vala.traces.spans` Iceberg table.
+3. `QueryRecentTraces` builds a DataFusion `LogicalPlan` against `vala.traces.spans`. The `TenantPredicateRule` injects `data_tenant_id = $tenant` before execution. The route handler performs an in-Rust GROUP-BY over the collected spans to derive `TraceSummaryRow` values.
+4. The response is paginated at `MAX_QUERY_PAGE_SIZE = 1000` rows. A `next_page_token` is returned when there are more rows; pass it in the next request's `page_token` field.

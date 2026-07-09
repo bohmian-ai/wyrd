@@ -52,10 +52,13 @@ pub struct SyncQueryResult {
 
 /// Authorize the caller against a required permission, auditing a denial.
 ///
+/// `pub(crate)` so typed-route modules can reuse this without duplicating the
+/// audit-deny logic.
+///
 /// On success no row is written here — the handler audits the executed op. On
 /// denial a `decision = deny` row is appended in its own transaction (M-06
 /// doctrine: every allow AND every deny is audited) before the `403` propagates.
-async fn authorize_audited(
+pub(crate) async fn authorize_audited(
     state: &AppState,
     caller: &Caller,
     required: Permission,
@@ -362,6 +365,101 @@ pub async fn get_async_query_status(
         message: "async query job not found".to_owned(),
         details: json!({ "job_uid": job_uid.0 }),
     })
+}
+
+/// Execute a pre-built `LogicalPlan` through the typed seam (M-07).
+///
+/// Gates (in order):
+///   1. `bifrost_query_read` — audited deny on failure.
+///   2. Execution under a wall-clock budget (`SYNC_QUERY_TIMEOUT`).
+///   3. Row ceiling (`limit + 1`): if more than `limit` rows are present the
+///      returned `has_more` flag is `true` and the batch set is truncated to
+///      `limit` rows.
+///
+/// Returns the collected batches (already within `limit`) plus the `has_more`
+/// signal used by the caller to issue a signed page token.
+pub async fn run_plan_query(
+    state: &AppState,
+    caller: &Caller,
+    plan: datafusion::logical_expr::LogicalPlan,
+    audit_op: &str,
+    limit: u32,
+) -> Result<(Vec<RecordBatch>, bool), WyrdError> {
+    authorize_audited(
+        state,
+        caller,
+        Permission::bifrost_query_read(),
+        audit_op,
+        "vala.query",
+    )
+    .await?;
+
+    // A fresh tenant-scoped context runs the TenantPredicateRule analyzer on the
+    // incoming plan; providers are embedded in the plan's TableScan sources.
+    let ctx = vala_bifrost::session::wyrd_session_context(caller.data_tenant_id);
+    let limit_plus_one = (limit as usize).saturating_add(1);
+
+    let (schema, batches) = tokio::time::timeout(floor::SYNC_QUERY_TIMEOUT, async {
+        let df = ctx.execute_logical_plan(plan).await?;
+        let df = df
+            .limit(0, Some(limit_plus_one))
+            .map_err(datafusion::error::DataFusionError::Plan)?;
+        let schema = df.schema().as_arrow().clone();
+        let batches = df.collect().await?;
+        Ok::<_, datafusion::error::DataFusionError>((schema, batches))
+    })
+    .await
+    .map_err(|_| floor::query_timeout())?
+    .map_err(map_datafusion_error)?;
+
+    // Count total rows across all batches.
+    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    let has_more = total_rows > limit as usize;
+
+    // Truncate to exactly `limit` rows if has_more.
+    let batches = if has_more {
+        truncate_batches(batches, limit as usize, &schema)
+    } else {
+        batches
+    };
+
+    // Audit the authorized, successful typed query.
+    let event = audit::audit_event(
+        caller,
+        audit_op,
+        "vala.query",
+        &Permission::bifrost_query_read().to_string(),
+        wyrd_spec::vala::api::AuditDecision::Allow,
+        wyrd_spec::vala::api::AuditResult::Success,
+        "typed plan query executed",
+    );
+    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &event).await?;
+
+    Ok((batches, has_more))
+}
+
+/// Truncate a batch list to at most `limit` rows, re-slicing the last batch
+/// if needed rather than collecting row-by-row.
+fn truncate_batches(
+    batches: Vec<RecordBatch>,
+    limit: usize,
+    _schema: &arrow::datatypes::Schema,
+) -> Vec<RecordBatch> {
+    let mut result = Vec::with_capacity(batches.len());
+    let mut remaining = limit;
+    for batch in batches {
+        if remaining == 0 {
+            break;
+        }
+        if batch.num_rows() <= remaining {
+            remaining -= batch.num_rows();
+            result.push(batch);
+        } else {
+            result.push(batch.slice(0, remaining));
+            break;
+        }
+    }
+    result
 }
 
 #[cfg(test)]

@@ -26,8 +26,8 @@ pub use error::SqlError;
 pub use pool::PoolConfig;
 pub use postgres::WyrdPostgres;
 pub use row_types::cards::{
-    AuditCardRegistrationRow, CardRegistrationOperation, CardRow, CardStatus,
-    NewAuditCardRegistrationRow, NewCardRow, ParsedCardRow,
+    AuditCardRegistrationRow, CardRegistrationOperation, CardRegistrationOutcome, CardRow,
+    CardStatus, NewAuditCardRegistrationRow, NewCardRow, ParsedCardRow,
 };
 pub use tenant_conn::TenantConn;
 

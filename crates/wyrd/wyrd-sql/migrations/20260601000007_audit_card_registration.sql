@@ -10,6 +10,7 @@ CREATE TABLE wyrd.audit_card_registration (
     card_uid              UUID        NOT NULL,
     kind                  TEXT        NOT NULL,
     operation             TEXT        NOT NULL,
+    outcome               TEXT,
     actor_principal_id    UUID        NOT NULL,
     actor_kind            TEXT        NOT NULL,
     before_spec_hash      TEXT,
@@ -19,6 +20,13 @@ CREATE TABLE wyrd.audit_card_registration (
 
     CONSTRAINT audit_card_registration_operation_check CHECK (
         operation IN ('register','update','delete')
+    ),
+    CONSTRAINT audit_card_registration_outcome_check CHECK (
+        outcome IS NULL OR outcome IN ('created','idempotent_noop','deduplicated')
+    ),
+    CONSTRAINT audit_card_registration_outcome_operation_check CHECK (
+        (operation = 'register' AND outcome IS NOT NULL)
+        OR (operation <> 'register' AND outcome IS NULL)
     ),
     CONSTRAINT audit_card_registration_actor_kind_check CHECK (
         actor_kind IN ('user','service','agent')

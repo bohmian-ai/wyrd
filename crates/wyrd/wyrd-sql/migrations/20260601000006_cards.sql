@@ -16,6 +16,20 @@ CREATE TABLE wyrd.cards (
     space                 TEXT        NOT NULL,
     name                  TEXT        NOT NULL,
     version               TEXT        NOT NULL,
+    -- Sortable, DB-generated semver components. GENERATED ALWAYS ... STORED so
+    -- they can never drift from `version`; there is no write path that sets them.
+    -- The numeric triple always precedes any '-'/'+' in valid semver, so the
+    -- extraction is exact. `version` is validated semver TEXT (wyrd-spec).
+    version_major         BIGINT      GENERATED ALWAYS AS
+        (split_part(split_part(split_part(version, '+', 1), '-', 1), '.', 1)::bigint) STORED,
+    version_minor         BIGINT      GENERATED ALWAYS AS
+        (split_part(split_part(split_part(version, '+', 1), '-', 1), '.', 2)::bigint) STORED,
+    version_patch         BIGINT      GENERATED ALWAYS AS
+        (split_part(split_part(split_part(version, '+', 1), '-', 1), '.', 3)::bigint) STORED,
+    -- Stable-release filter. TRUE iff a '-pre' region exists once build metadata
+    -- (which may itself contain '-') is stripped. Exact for hyphenated pre-releases.
+    version_is_prerelease BOOLEAN     GENERATED ALWAYS AS
+        (position('-' in split_part(version, '+', 1)) > 0) STORED,
     spec                  JSONB       NOT NULL,
     spec_hash             TEXT        NOT NULL,
     artifact_hash         TEXT,
@@ -65,6 +79,22 @@ CREATE INDEX idx_cards_annotations_gin
 CREATE INDEX idx_cards_created_by
     ON wyrd.cards (data_tenant_id, created_by);
 
+-- "Latest stable in line" pushdown (B3 resolve, B4 range/latest, C1 query).
+-- Partial (stable-only) matches the default query shape and stays small.
+-- DESC lets "ORDER BY version_major DESC, minor DESC, patch DESC LIMIT 1" read
+-- the first row. Reads must repeat the WHERE predicates to use it.
+CREATE INDEX idx_cards_version_latest
+    ON wyrd.cards (
+        data_tenant_id, kind, space, name,
+        version_major DESC, version_minor DESC, version_patch DESC
+    )
+    WHERE status <> 'deleted' AND NOT version_is_prerelease;
+
+-- Hash dedup probe (B3 latest-in-line hash compare, C1 find_card_by_spec_hash).
+CREATE INDEX idx_cards_spec_hash
+    ON wyrd.cards (data_tenant_id, kind, space, name, spec_hash)
+    WHERE status <> 'deleted';
+
 -- Row-level security ----------------------------------------------------
 -- Mirrors the storage-table pattern at
 -- crates/wyrd/wyrd-sql/migrations/20260601000002_storage.sql:53-65.
@@ -100,6 +130,12 @@ BEGIN
             MESSAGE = 'cards.spec_hash is immutable; create a new version',
             ERRCODE = 'P0001',
             CONSTRAINT = 'cards_spec_hash_immutable';
+    END IF;
+    IF OLD.version IS DISTINCT FROM NEW.version THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'cards.version is immutable; create a new version',
+            ERRCODE = 'P0001',
+            CONSTRAINT = 'cards_version_immutable';
     END IF;
     NEW.updated_at := now();
     RETURN NEW;

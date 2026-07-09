@@ -230,6 +230,8 @@ pub struct AuditCardRegistrationRow {
     pub kind: String,
     /// Operation literal (`"register"`, `"update"`, `"delete"`).
     pub operation: String,
+    /// Outcome literal for registration rows.
+    pub outcome: Option<String>,
     /// Acting principal UUID.
     pub actor_principal_id: Uuid,
     /// Principal kind discriminator (`"user"`, `"service"`, `"agent"`).
@@ -256,6 +258,8 @@ pub struct NewAuditCardRegistrationRow<'a> {
     pub kind: CardKind,
     /// Operation discriminator.
     pub operation: CardRegistrationOperation,
+    /// Outcome discriminator for registration rows.
+    pub outcome: Option<CardRegistrationOutcome>,
     /// Acting principal id.
     pub actor_principal_id: PrincipalId,
     /// Acting principal kind (User / Service / Agent).
@@ -288,6 +292,30 @@ impl CardRegistrationOperation {
             Self::Register => "register",
             Self::Update => "update",
             Self::Delete => "delete",
+        }
+    }
+}
+
+/// `wyrd.audit_card_registration.outcome` enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardRegistrationOutcome {
+    /// A new row was inserted.
+    Created,
+    /// Existing pinned row matched on spec hash; no card write occurred.
+    IdempotentNoop,
+    /// Auto/scope registration matched the latest-in-line spec hash.
+    Deduplicated,
+}
+
+impl CardRegistrationOutcome {
+    /// Return the DB CHECK literal for this outcome.
+    #[must_use]
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::IdempotentNoop => "idempotent_noop",
+            Self::Deduplicated => "deduplicated",
         }
     }
 }
@@ -326,5 +354,18 @@ mod tests {
         assert_eq!(CardRegistrationOperation::Register.as_db_str(), "register");
         assert_eq!(CardRegistrationOperation::Update.as_db_str(), "update");
         assert_eq!(CardRegistrationOperation::Delete.as_db_str(), "delete");
+    }
+
+    #[test]
+    fn outcome_db_literals_match_check_constraint() {
+        assert_eq!(CardRegistrationOutcome::Created.as_db_str(), "created");
+        assert_eq!(
+            CardRegistrationOutcome::IdempotentNoop.as_db_str(),
+            "idempotent_noop"
+        );
+        assert_eq!(
+            CardRegistrationOutcome::Deduplicated.as_db_str(),
+            "deduplicated"
+        );
     }
 }

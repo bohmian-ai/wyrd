@@ -265,6 +265,29 @@ pub enum Spec {
 }
 
 impl Spec {
+    /// The [`CardKind`] this spec variant corresponds to.
+    #[must_use]
+    pub const fn kind(&self) -> CardKind {
+        match self {
+            Self::Data(_) => CardKind::Data,
+            Self::Model(_) => CardKind::Model,
+            Self::Experiment(_) => CardKind::Experiment,
+            Self::Prompt(_) => CardKind::Prompt,
+            Self::Agent(_) => CardKind::Agent,
+            Self::Workflow(_) => CardKind::Workflow,
+            Self::Eval(_) => CardKind::Eval,
+            Self::Drift(_) => CardKind::Drift,
+            Self::Service(_) => CardKind::Service,
+            Self::Policy(_) => CardKind::Policy,
+            Self::Mcp(_) => CardKind::Mcp,
+            Self::Audit(_) => CardKind::Audit,
+            Self::Artifact(_) => CardKind::Artifact,
+            Self::Trigger(_) => CardKind::Trigger,
+            Self::Operator(_) => CardKind::Operator,
+            Self::Source(_) => CardKind::Source,
+        }
+    }
+
     /// Compute the canonical hash of this spec.
     ///
     /// Pipeline: serialize to JSON → RFC 8785 (JCS) canonicalize → BLAKE3-256 → lowercase hex.

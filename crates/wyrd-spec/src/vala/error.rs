@@ -289,4 +289,80 @@ pub enum BifrostError {
         remediation = "The redaction classifier failed on this batch. Retry; if it persists, check the classifier installation."
     )]
     RedactionFailed(String),
+
+    /// The requested trace id was not found within the queried window.
+    #[error("trace not found: {trace_id}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_404_TRACE_NOT_FOUND",
+        status = 404,
+        title = "Trace not found",
+        remediation = "Confirm the trace_id and that it falls within the queried time window."
+    )]
+    TraceNotFound {
+        /// Trace id that was not found.
+        trace_id: String,
+    },
+
+    /// A query was submitted without a time window.
+    #[error("query time window required")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_WINDOW_REQUIRED",
+        status = 400,
+        title = "Query time window required",
+        remediation = "Supply `since` and/or `until` on the query request."
+    )]
+    WindowRequired,
+
+    /// A query filter value was invalid.
+    #[error("query filter invalid: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_FILTER_INVALID",
+        status = 400,
+        title = "Query filter invalid",
+        remediation = "Correct the filter value; see the error detail for the offending field."
+    )]
+    FilterInvalid {
+        /// Description of the offending filter.
+        detail: String,
+    },
+
+    /// The supplied page token failed verification.
+    #[error("page token invalid")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_PAGE_TOKEN_INVALID",
+        status = 400,
+        title = "Page token invalid",
+        remediation = "Restart the query from page 1 without a page_token."
+    )]
+    PageTokenInvalid,
+
+    /// The Iceberg snapshot pinned by the page token has expired.
+    #[error("page snapshot expired")]
+    #[wyrd_error(
+        code = "WYRD_VALA_410_PAGE_SNAPSHOT_EXPIRED",
+        status = 410,
+        title = "Page snapshot expired",
+        remediation = "restart the query from page 1"
+    )]
+    PageSnapshotExpired,
+
+    /// The principal lacks query permission for the table.
+    #[error("query forbidden")]
+    #[wyrd_error(
+        code = "WYRD_VALA_403_QUERY_FORBIDDEN",
+        status = 403,
+        title = "Query forbidden",
+        remediation = "The principal lacks bifrost_query:read for this table."
+    )]
+    QueryForbidden,
+
+    /// The principal lacks the payload resource permission.
+    #[error("payload access forbidden")]
+    #[wyrd_error(
+        code = "WYRD_VALA_403_PAYLOAD_FORBIDDEN",
+        status = 403,
+        title = "Payload access forbidden",
+        remediation = "The principal lacks the payload resource permission; sensitive columns were omitted."
+    )]
+    PayloadForbidden,
 }

@@ -118,22 +118,6 @@ fn span_row_to_proto(r: wyrd_spec::vala::api::SpanRow) -> proto::SpanRow {
     }
 }
 
-fn span_event_to_proto(r: wyrd_spec::vala::api::SpanEventRow) -> proto::SpanEventRow {
-    proto::SpanEventRow {
-        name: r.name,
-        timestamp: r.timestamp.to_rfc3339(),
-        attributes_json: r.attributes.map(|v| v.to_string()).unwrap_or_default(),
-    }
-}
-
-fn span_link_to_proto(r: wyrd_spec::vala::api::SpanLinkRow) -> proto::SpanLinkRow {
-    proto::SpanLinkRow {
-        linked_trace_id: r.linked_trace_id,
-        linked_span_id: r.linked_span_id,
-        attributes_json: r.attributes.map(|v| v.to_string()).unwrap_or_default(),
-    }
-}
-
 fn trace_summary_to_proto(r: wyrd_spec::vala::api::TraceSummaryRow) -> proto::TraceSummaryRow {
     proto::TraceSummaryRow {
         trace_id: r.trace_id,

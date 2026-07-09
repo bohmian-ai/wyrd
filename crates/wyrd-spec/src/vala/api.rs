@@ -641,6 +641,14 @@ pub struct TraceWaterfall {
     pub links: Vec<SpanLinkRow>,
 }
 
+/// `GetTrace` response — wraps the full waterfall for one trace.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct GetTraceResponse {
+    /// The full trace waterfall.
+    pub trace: TraceWaterfall,
+}
+
 /// Derived one-row trace summary. Carries no attributes/payload columns.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]

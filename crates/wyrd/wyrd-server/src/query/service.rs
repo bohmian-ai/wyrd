@@ -401,9 +401,7 @@ pub async fn run_plan_query(
 
     let (schema, batches) = tokio::time::timeout(floor::SYNC_QUERY_TIMEOUT, async {
         let df = ctx.execute_logical_plan(plan).await?;
-        let df = df
-            .limit(0, Some(limit_plus_one))
-            .map_err(datafusion::error::DataFusionError::Plan)?;
+        let df = df.limit(0, Some(limit_plus_one))?;
         let schema = df.schema().as_arrow().clone();
         let batches = df.collect().await?;
         Ok::<_, datafusion::error::DataFusionError>((schema, batches))

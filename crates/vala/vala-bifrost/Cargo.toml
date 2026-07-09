@@ -13,7 +13,6 @@ path = "src/lib.rs"
 
 [features]
 default = []
-python = ["dep:pyo3", "arrow/pyarrow"]
 testing = ["vala-sql/testing"]
 bench-bin = ["dep:criterion", "dep:clap", "dep:rand", "dep:tempfile", "dep:serde_json", "vala-sql/testing"]
 
@@ -46,19 +45,11 @@ hex        = { workspace = true }
 chrono     = { workspace = true }
 regex      = { workspace = true }
 
-pyo3 = { workspace = true, optional = true }
-
 criterion  = { version = "0.5", features = ["async_tokio"], optional = true }
 clap       = { workspace = true, optional = true }
 rand       = { workspace = true, optional = true }
 tempfile   = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-
-[build-dependencies]
-# Used by build.rs to generate domain_schemas.rs (ArrowProjection, fingerprints).
-# wyrd-spec is pure — no Arrow feature — so wyrd-spec gains no Arrow dependency (C-01).
-arrow      = { workspace = true }
-sha2       = { workspace = true }
 
 [dev-dependencies]
 # Self-reference activates `testing` feature for integration tests in `tests/`

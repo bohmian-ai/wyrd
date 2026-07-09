@@ -17,13 +17,14 @@ fn schema_has_correct_field_count_tenant_owned() {
     let schema = bifrost_schema(user_fields, TableScope::TenantOwned);
     assert_eq!(
         schema.fields().len(),
-        7,
-        "2 user + 2 correlation (run_id, card_ref) + 3 system (no tenant_id)"
+        8,
+        "2 user + 3 correlation (run_id, card_uid, principal_id) + 3 system (no tenant_id)"
     );
     assert!(schema.field_with_name(WYRD_BATCH_ID).is_ok());
     assert!(schema.field_with_name(WYRD_INGESTED_AT).is_ok());
     assert!(schema.field_with_name("run_id").is_ok());
-    assert!(schema.field_with_name("card_ref").is_ok());
+    assert!(schema.field_with_name("card_uid").is_ok());
+    assert!(schema.field_with_name("principal_id").is_ok());
     assert!(schema.field_with_name(DATA_TENANT_ID).is_err());
 }
 
@@ -33,12 +34,13 @@ fn schema_has_correct_field_count_system_shared() {
     let schema = bifrost_schema(user_fields, TableScope::SystemShared);
     assert_eq!(
         schema.fields().len(),
-        7,
-        "1 user + 2 correlation (run_id, card_ref) + 4 system (with tenant_id)"
+        8,
+        "1 user + 3 correlation (run_id, card_uid, principal_id) + 4 system (with tenant_id)"
     );
     assert!(schema.field_with_name(DATA_TENANT_ID).is_ok());
     assert!(schema.field_with_name("run_id").is_ok());
-    assert!(schema.field_with_name("card_ref").is_ok());
+    assert!(schema.field_with_name("card_uid").is_ok());
+    assert!(schema.field_with_name("principal_id").is_ok());
 }
 
 #[test]

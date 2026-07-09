@@ -14,8 +14,8 @@ use wyrd_spec::vala::{
 /// domain tables, which are all `SystemShared`).
 ///
 /// This is the single source of truth for what gets appended per policy.
-/// The fingerprint in `build.rs` covers only the user fields; the appended
-/// columns here are excluded from the fingerprint (as documented in the overview).
+/// The appended columns here are excluded from `schema_fingerprint()`, which
+/// hashes `arrow_fields()` only.
 pub fn ensure_system_cols(mut user_fields: Vec<Field>, policy: CorrelationPolicy) -> Vec<Field> {
     // Universal correlation columns per policy (C-01).
     match policy {

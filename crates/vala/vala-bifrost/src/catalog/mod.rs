@@ -511,7 +511,10 @@ impl WyrdCatalog {
         namespace: &str,
         name: &str,
     ) -> Result<Option<[u8; 32]>, BifrostError> {
-        let fqn = format!("{namespace}.{name}");
+        let ns = BifrostNamespace::from_domain_namespace(namespace).ok_or_else(|| {
+            BifrostError::MetadataMismatch(format!("unknown namespace: {namespace}"))
+        })?;
+        let fqn = format!("{}.{name}", ns.as_str());
         let mut conn =
             vala_sql::TenantConn::acquire(&self.pool, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
                 .await
@@ -535,7 +538,7 @@ impl WyrdCatalog {
         namespace: &str,
         name: &str,
     ) -> Result<bool, BifrostError> {
-        let ns = BifrostNamespace::from_wire(namespace).ok_or_else(|| {
+        let ns = BifrostNamespace::from_domain_namespace(namespace).ok_or_else(|| {
             BifrostError::MetadataMismatch(format!("unknown namespace: {namespace}"))
         })?;
         let ident = iceberg::TableIdent::new(ns.to_namespace_ident(), name.to_string());
@@ -548,7 +551,7 @@ impl WyrdCatalog {
         namespace: &str,
         name: &str,
     ) -> Result<SchemaRef, BifrostError> {
-        let ns = BifrostNamespace::from_wire(namespace).ok_or_else(|| {
+        let ns = BifrostNamespace::from_domain_namespace(namespace).ok_or_else(|| {
             BifrostError::MetadataMismatch(format!("unknown namespace: {namespace}"))
         })?;
         let ident = iceberg::TableIdent::new(ns.to_namespace_ident(), name.to_string());
@@ -572,8 +575,12 @@ impl WyrdCatalog {
     }
 
     /// Compute the fingerprint of a physical schema over user fields only.
-    /// Strips system and correlation columns before hashing so the result matches
-    /// the build-time `SCHEMA_FINGERPRINT` constants.
+    /// Strips system and universal correlation columns (`wyrd_*`, `data_tenant_id`,
+    /// `run_id`, `card_uid`, `principal_id`) to approximate a table's declared user
+    /// fields from a *physical* schema, for the `actual:` field of a `PhysicalDrift`
+    /// diagnostic only. This is NOT equal to `T::schema_fingerprint()` for tables
+    /// whose policy declares `run_id`/`principal_id` as content columns
+    /// (`dev.agent_traces`, `system.audit_log`), and is never a gate.
     pub fn fingerprint_of_user_fields(&self, schema: &SchemaRef) -> [u8; 32] {
         fingerprint_user_fields(schema)
     }
@@ -633,7 +640,10 @@ impl WyrdCatalog {
         &self,
         fingerprint: [u8; 32],
     ) -> Result<(), BifrostError> {
-        let fqn = format!("{}.{}", T::NAMESPACE, T::NAME);
+        let ns = BifrostNamespace::from_domain_namespace(T::NAMESPACE).ok_or_else(|| {
+            BifrostError::Internal(format!("unknown namespace: {}", T::NAMESPACE))
+        })?;
+        let fqn = format!("{}.{}", ns.as_str(), T::NAME);
         let table_uid = TableUid::new_v7();
         let mut conn =
             vala_sql::TenantConn::acquire(&self.pool, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)

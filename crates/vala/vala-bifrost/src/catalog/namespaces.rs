@@ -100,7 +100,11 @@ mod tests {
     #[test]
     fn from_domain_namespace_round_trips_all_known() {
         for ns in BifrostNamespace::ALL {
-            let segment = ns.as_str().split('.').last().expect("namespace has dot");
+            let segment = ns
+                .as_str()
+                .split('.')
+                .next_back()
+                .expect("namespace has dot");
             assert_eq!(
                 BifrostNamespace::from_domain_namespace(segment),
                 Some(ns),

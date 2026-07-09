@@ -17,9 +17,6 @@ pub mod tables;
 pub mod types;
 pub mod writer;
 
-#[cfg(feature = "python")]
-mod python;
-
 pub use catalog::WyrdCatalog;
 pub use catalog::namespaces::BifrostNamespace;
 pub use error::BifrostError;

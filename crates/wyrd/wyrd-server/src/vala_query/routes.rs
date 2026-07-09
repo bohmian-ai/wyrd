@@ -28,7 +28,7 @@ use wyrd_spec::vala::api::{
     QueryDriftResponse, QueryEvalRequest, QueryEvalResponse, QueryGenAiRequest, QueryGenAiResponse,
     QueryLogsRequest, QueryLogsResponse, QueryMetricsRequest, QueryMetricsResponse,
     QueryRecentTracesRequest, QueryRecentTracesResponse, QueryTracesRequest, QueryTracesResponse,
-    SpanEventRow, SpanLinkRow, SpanRow, TraceSummaryRow, TraceWaterfall,
+    SpanRow, TraceSummaryRow, TraceWaterfall,
 };
 
 use crate::AppState;
@@ -83,43 +83,43 @@ fn ts_us_to_dt(us: i64) -> DateTime<Utc> {
 
 // ─── column accessors ─────────────────────────────────────────────────────────
 
-fn col_ts(batch: &RecordBatch, name: &str) -> Option<&TimestampMicrosecondArray> {
+fn col_ts<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a TimestampMicrosecondArray> {
     batch
         .column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<TimestampMicrosecondArray>())
 }
 
-fn col_str(batch: &RecordBatch, name: &str) -> Option<&StringArray> {
+fn col_str<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
     batch
         .column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
 }
 
-fn col_u32(batch: &RecordBatch, name: &str) -> Option<&UInt32Array> {
+fn col_u32<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a UInt32Array> {
     batch
         .column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<UInt32Array>())
 }
 
-fn col_u64(batch: &RecordBatch, name: &str) -> Option<&UInt64Array> {
+fn col_u64<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a UInt64Array> {
     batch
         .column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
 }
 
-fn col_f64(batch: &RecordBatch, name: &str) -> Option<&Float64Array> {
+fn col_f64<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Float64Array> {
     batch
         .column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
 }
 
-fn col_bin16(batch: &RecordBatch, name: &str) -> Option<&FixedSizeBinaryArray> {
+fn col_bin16<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a FixedSizeBinaryArray> {
     batch
         .column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
 }
 
-fn get_str<'a>(arr: Option<&'a StringArray>, i: usize) -> Option<&'a str> {
+fn get_str(arr: Option<&StringArray>, i: usize) -> Option<&str> {
     arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
 }
 
@@ -175,43 +175,6 @@ pub(crate) fn extract_span_rows(batches: &[RecordBatch]) -> Vec<SpanRow> {
                     .map(|a| a.value(i) as f64)
                     .unwrap_or(0.0),
                 status: get_str(status_col, i).unwrap_or("").to_owned(),
-                attributes: get_json_str(attr_col, i),
-            });
-        }
-    }
-    rows
-}
-
-pub(crate) fn extract_span_event_rows(batches: &[RecordBatch]) -> Vec<SpanEventRow> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        let name_col = col_str(batch, "name");
-        let ts_col = col_ts(batch, "timestamp");
-        let attr_col = col_str(batch, "attributes");
-        for i in 0..batch.num_rows() {
-            rows.push(SpanEventRow {
-                name: get_str(name_col, i).unwrap_or("").to_owned(),
-                timestamp: ts_col
-                    .filter(|a| !a.is_null(i))
-                    .map(|a| ts_us_to_dt(a.value(i)))
-                    .unwrap_or_default(),
-                attributes: get_json_str(attr_col, i),
-            });
-        }
-    }
-    rows
-}
-
-pub(crate) fn extract_span_link_rows(batches: &[RecordBatch]) -> Vec<SpanLinkRow> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        let lt_col = col_bin16(batch, "linked_trace_id");
-        let ls_col = col_bin16(batch, "linked_span_id");
-        let attr_col = col_str(batch, "attributes");
-        for i in 0..batch.num_rows() {
-            rows.push(SpanLinkRow {
-                linked_trace_id: get_hex(lt_col, i).unwrap_or_default(),
-                linked_span_id: get_hex(ls_col, i).unwrap_or_default(),
                 attributes: get_json_str(attr_col, i),
             });
         }
@@ -296,7 +259,7 @@ pub(crate) fn aggregate_spans_to_summaries(batches: &[RecordBatch]) -> Vec<Trace
         })
         .collect();
 
-    rows.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    rows.sort_by_key(|b| std::cmp::Reverse(b.started_at));
     rows
 }
 
@@ -537,7 +500,7 @@ async fn get_trace(
 
     let spans: Vec<SpanRow> = extract_span_rows(&batches)
         .into_iter()
-        .filter(|s| {
+        .filter(|_| {
             // Filter by trace_id in Rust (binary column can't be filtered in plan for Stage 4)
             // For Stage 4 we accept all spans in the window and post-filter here.
             // The plan's window predicate already scoped the scan.
@@ -626,7 +589,7 @@ async fn query_recent_traces(
     .map_err(WyrdErrorResponse::from)?;
 
     let mut rows = aggregate_spans_to_summaries(&batches);
-    rows.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    rows.sort_by_key(|b| std::cmp::Reverse(b.started_at));
     rows.truncate(limit as usize);
 
     let next_page_token =

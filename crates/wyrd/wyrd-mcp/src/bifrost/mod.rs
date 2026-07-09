@@ -337,6 +337,17 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
             detail: String::new(),
         },
         BifrostError::RedactionFailed(String::new()),
+        BifrostError::TraceNotFound {
+            trace_id: String::new(),
+        },
+        BifrostError::WindowRequired,
+        BifrostError::FilterInvalid {
+            detail: String::new(),
+        },
+        BifrostError::PageTokenInvalid,
+        BifrostError::PageSnapshotExpired,
+        BifrostError::QueryForbidden,
+        BifrostError::PayloadForbidden,
     ];
 
     if let Some(sentinel) = variants.first() {
@@ -362,7 +373,14 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
             | BifrostError::SchemaDrift { .. }
             | BifrostError::PhysicalDrift { .. }
             | BifrostError::IcebergMissing { .. }
-            | BifrostError::RedactionFailed(..) => {}
+            | BifrostError::RedactionFailed(..)
+            | BifrostError::TraceNotFound { .. }
+            | BifrostError::WindowRequired
+            | BifrostError::FilterInvalid { .. }
+            | BifrostError::PageTokenInvalid
+            | BifrostError::PageSnapshotExpired
+            | BifrostError::QueryForbidden
+            | BifrostError::PayloadForbidden => {}
         }
     }
 

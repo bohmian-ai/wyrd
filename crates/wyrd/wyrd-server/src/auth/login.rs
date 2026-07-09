@@ -1,6 +1,6 @@
 //! Human OIDC login initiation HTTP adapter.
 
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
@@ -8,7 +8,10 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
+use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::{AuditDecision, AuditResult};
 
+use crate::audit;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -20,13 +23,88 @@ pub struct LoginQuery {
 }
 
 /// Handler for `GET /auth/login`.
-#[tracing::instrument(level = "debug", skip(state, headers), fields(issuer = %query.issuer))]
+///
+/// Emits one unauthenticated audit row (attributed to `PLATFORM_AUDIT_PRINCIPAL`)
+/// for every attempt — success or deny — before returning. Fail-closed: if the
+/// audit append fails, the login is refused rather than proceeding silently.
+/// Resolved-tenant attempts write to that tenant's audit log; unresolved-tenant
+/// attempts (unknown/inactive tenant) write to the platform stream (system tenant).
+#[tracing::instrument(level = "debug", skip(state, headers, maybe_request_id), fields(issuer = %query.issuer))]
 pub async fn login(
     State(state): State<AppState>,
+    maybe_request_id: Option<Extension<RequestId>>,
     headers: HeaderMap,
     Query(query): Query<LoginQuery>,
 ) -> Result<Response, WyrdErrorResponse> {
-    let tenant_id = resolve_login_tenant(&state, &headers).await?;
+    let request_id = maybe_request_id
+        .map(|Extension(id)| id)
+        .unwrap_or_else(RequestId::now_v7);
+    // Attempt tenant resolution. Capture the result so we can emit audit
+    // regardless of outcome before returning.
+    let tenant_result = resolve_login_tenant(&state, &headers).await;
+    let tenant_id = match &tenant_result {
+        Ok(id) => Some(*id),
+        Err(_) => None,
+    };
+
+    // Attempt the actual login only if tenant resolved.
+    let login_result = if let Some(tid) = tenant_id {
+        let r = try_initiate_login(&state, &headers, &query, tid).await;
+        Some(r)
+    } else {
+        None
+    };
+
+    // Determine audit outcome and resource.
+    let (decision, result, payload_summary) = match (&tenant_result, &login_result) {
+        (Err(_), _) => (
+            AuditDecision::Deny,
+            AuditResult::Failure,
+            format!("tenant unresolved; issuer={}", query.issuer),
+        ),
+        (_, Some(Err(_))) => (
+            AuditDecision::Deny,
+            AuditResult::Failure,
+            format!("login initiation failed; issuer={}", query.issuer),
+        ),
+        _ => (
+            AuditDecision::Allow,
+            AuditResult::Success,
+            format!("login initiated; issuer={}", query.issuer),
+        ),
+    };
+
+    let audit_event = audit::audit_event_unauthenticated(
+        request_id,
+        "auth.login.initiate",
+        &format!("issuer:{}", query.issuer),
+        "auth:login",
+        decision,
+        result,
+        &payload_summary,
+    );
+
+    // Route audit to tenant log (resolved) or platform stream (unresolved).
+    let audit_tenant = tenant_id.unwrap_or(DataTenantId::SYSTEM_OWNER);
+    audit::record_audit(state.postgres.app_pool(), audit_tenant, &audit_event)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
+
+    // Now surface the original login result.
+    tenant_result?;
+    match login_result {
+        Some(Ok(response)) => Ok(response),
+        Some(Err(e)) => Err(e),
+        None => unreachable!("tenant_result was Ok above"),
+    }
+}
+
+async fn try_initiate_login(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &LoginQuery,
+    tenant_id: DataTenantId,
+) -> Result<Response, WyrdErrorResponse> {
     let trusted = wyrd_auth::issuer::trusted_issuer(
         state.auth.trusted_issuer_resolver.as_deref(),
         tenant_id,
@@ -34,7 +112,7 @@ pub async fn login(
     )
     .await
     .map_err(WyrdErrorResponse::from)?;
-    let redirect_uri = callback_redirect_uri(&headers)?;
+    let redirect_uri = callback_redirect_uri(headers)?;
     let init = wyrd_auth::login::prepare_login(
         state.postgres.app_pool(),
         tenant_id,
@@ -45,7 +123,7 @@ pub async fn login(
     .await
     .map_err(WyrdErrorResponse::from)?;
 
-    if wants_json(&headers) {
+    if wants_json(headers) {
         Ok(axum::Json(init).into_response())
     } else {
         Ok(Redirect::to(init.authorization_url.as_str()).into_response())

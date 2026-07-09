@@ -1,0 +1,78 @@
+---
+title: Writing Data
+description: vala-sdk producer, batching, backpressure, payload governance, and tenant stamping.
+pillar: wyrd
+group: Bifrost
+order: 5
+---
+
+# Writing Data
+
+Observations flow into Bifrost through `vala-sdk`'s `ValaHandle`. The SDK buffers records in memory, builds Arrow batches at a configurable flush boundary, and streams them to `BifrostIngestService` over gRPC.
+
+## vala-sdk producer
+
+```python
+from vala_sdk import ValaHandle, ObservationContext
+
+# ValaHandle is constructed from a WyrdClient; it holds a background flush worker.
+vala = ValaHandle(client)
+
+ctx = ObservationContext(run_id="run-abc")
+
+# Traces
+with vala.observe.trace(ctx, name="inference", service="my-service") as span:
+    span.set_attribute("model", "gpt-4o")
+    # ... do work ...
+
+# Metrics
+vala.observe.metric(ctx, name="request_latency", metric_type="histogram", value=142.5)
+
+# Logs
+vala.observe.log(ctx, severity_number=17, body="inference complete")
+
+# vala.observe.flush() drains the buffer synchronously; not required for normal use
+```
+
+## Batching and backpressure
+
+Records accumulate in a bounded in-memory ring. The flush worker drains the ring into Arrow batches when:
+
+- The batch reaches the configured row count limit, OR
+- The flush interval elapses (default: 1 second).
+
+If the ring is full, new observations are dropped with a counter increment — **fire-and-forget semantics**. Use `vala.observe.flush()` before a process exit to drain the buffer.
+
+## Payload governance and redaction
+
+Sensitive fields (`input_messages`, `output_messages`, `body`, `attributes`, `messages`) are always written to the physical Iceberg table — they are not filtered at write time. Access control is enforced at read time by the payload permission gate.
+
+If a tenant has redaction enabled (server-side policy), the ingest service zeroes the sensitive columns before the Iceberg commit. The redaction is logged in the audit row. This is transparent to the SDK.
+
+## Tenant and correlation stamping
+
+The ingest service stamps:
+
+- `data_tenant_id` — from the authenticated principal's tenant claim.
+- `wyrd_event_time` — first observation timestamp in the batch (or `wyrd_ingested_at` if absent).
+- `wyrd_ingested_at` — server wall clock at flush time.
+- `wyrd_batch_id` — UUIDv7 unique per gRPC stream.
+- `run_id`, `card_uid`, `principal_id` — from the `ObservationContext` if present, per the table's `CorrelationPolicy`.
+
+Callers cannot override system columns. Any batch that contains rows with system column values set is rejected with `400 WYRD_VALA_400_SYSTEM_COLUMN_VIOLATION`.
+
+## Schema validation
+
+The batch is validated against the stored `SchemaFingerprint` before any Iceberg commit. A fingerprint mismatch returns `400 WYRD_VALA_400_SCHEMA_FINGERPRINT_MISMATCH`. The fingerprint is computed over the canonical Arrow schema (field names, types, nullability, sorted metadata keys).
+
+## Direct gRPC (Rust)
+
+```rust
+use vala_sdk::ingest::BifrostIngestClient;
+use arrow::record_batch::RecordBatch;
+
+let client = BifrostIngestClient::connect("https://your-wyrd-server")?;
+client.insert_batch(vec![batch]).await?;
+```
+
+The `insert_batch` call is idempotent at the batch level — a replayed `wyrd_batch_id` is detected and the prior row count is returned without a double-write.

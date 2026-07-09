@@ -23,3 +23,58 @@ message InsertBatchRequest {
 message InsertBatchResponse {
   uint64 rows_accepted = 1;   // total rows committed; a deduplicated replay returns the prior count
 }
+
+// Typed read surface for Vala observation tables. One unary rpc per query
+// method; mirrors the wyrd-spec::vala::api request/response contracts.
+service ValaQueryService {
+  rpc GetTrace(GetTraceRequest) returns (GetTraceResponse);
+  rpc QueryTraces(QueryTracesRequest) returns (QueryTracesResponse);
+  rpc QueryRecentTraces(QueryRecentTracesRequest) returns (QueryRecentTracesResponse);
+  rpc QueryGenAi(QueryGenAiRequest) returns (QueryGenAiResponse);
+  rpc QueryEval(QueryEvalRequest) returns (QueryEvalResponse);
+  rpc QueryDrift(QueryDriftRequest) returns (QueryDriftResponse);
+  rpc QueryMetrics(QueryMetricsRequest) returns (QueryMetricsResponse);
+  rpc QueryLogs(QueryLogsRequest) returns (QueryLogsResponse);
+  rpc QueryAgentTraces(QueryAgentTracesRequest) returns (QueryAgentTracesResponse);
+}
+
+// Shared time-window + pagination envelope. Timestamps are RFC3339 strings to
+// mirror the wyrd-spec DateTime<Utc> wire form; limit is capped server-side.
+message QueryWindow {
+  string since      = 1;   // RFC3339; empty = unbounded
+  string until      = 2;   // RFC3339; empty = unbounded
+  uint32 limit      = 3;   // 0 = server default; capped at MAX_QUERY_PAGE_SIZE
+  string page_token = 4;   // opaque continuation token
+}
+
+message GetTraceRequest        { QueryWindow window = 1; string trace_id = 2; }
+message QueryTracesRequest      { QueryWindow window = 1; string service = 2; uint32 min_duration_ms = 3; string status = 4; string name = 5; }
+message QueryRecentTracesRequest{ QueryWindow window = 1; string service = 2; string status = 3; uint32 min_duration_ms = 4; }
+message QueryGenAiRequest        { QueryWindow window = 1; string conversation_id = 2; string model = 3; string provider = 4; }
+message QueryEvalRequest         { QueryWindow window = 1; string eval_id = 2; string run_id = 3; }
+message QueryDriftRequest        { QueryWindow window = 1; string feature = 2; string run_id = 3; }
+message QueryMetricsRequest      { QueryWindow window = 1; string metric_name = 2; string metric_type = 3; }
+message QueryLogsRequest         { QueryWindow window = 1; int32 severity_number_min = 2; string trace_id = 3; string event_name = 4; }
+message QueryAgentTracesRequest  { QueryWindow window = 1; string dev_session_id = 2; string repo = 3; string commit_sha = 4; string branch = 5; string run_id = 6; }
+
+message SpanRow      { string span_id = 1; string parent_span_id = 2; string name = 3; string kind = 4; string started_at = 5; double duration_ms = 6; string status = 7; string attributes_json = 8; }
+message SpanEventRow { string name = 1; string timestamp = 2; string attributes_json = 3; }
+message SpanLinkRow  { string linked_trace_id = 1; string linked_span_id = 2; string attributes_json = 3; }
+message TraceWaterfall { string trace_id = 1; repeated SpanRow spans = 2; repeated SpanEventRow events = 3; repeated SpanLinkRow links = 4; }
+message TraceSummaryRow { string trace_id = 1; string root_name = 2; string service = 3; string started_at = 4; double duration_ms = 5; uint32 span_count = 6; bool error = 7; }
+message GenAiRow  { string conversation_id = 1; string model = 2; string provider = 3; string started_at = 4; int64 input_tokens = 5; int64 output_tokens = 6; double cost_usd = 7; string prompt = 8; string completion = 9; }
+message EvalRow   { string eval_id = 1; string run_id = 2; string metric = 3; double score = 4; string started_at = 5; }
+message DriftRow  { string feature = 1; string run_id = 2; double drift_score = 3; double threshold = 4; string computed_at = 5; }
+message MetricRow { string metric_name = 1; string metric_type = 2; double value = 3; string timestamp = 4; string attributes_json = 5; }
+message LogRow    { string timestamp = 1; int32 severity_number = 2; string severity_text = 3; string trace_id = 4; string span_id = 5; string event_name = 6; string body = 7; }
+message AgentTraceRow { string dev_session_id = 1; string repo = 2; string commit_sha = 3; string branch = 4; string run_id = 5; string started_at = 6; string payload_json = 7; }
+
+message GetTraceResponse         { TraceWaterfall trace = 1; }
+message QueryTracesResponse       { repeated TraceSummaryRow rows = 1; string next_page_token = 2; }
+message QueryRecentTracesResponse { repeated TraceSummaryRow rows = 1; string next_page_token = 2; }
+message QueryGenAiResponse        { repeated GenAiRow rows = 1; string next_page_token = 2; }
+message QueryEvalResponse         { repeated EvalRow rows = 1; string next_page_token = 2; }
+message QueryDriftResponse        { repeated DriftRow rows = 1; string next_page_token = 2; }
+message QueryMetricsResponse      { repeated MetricRow rows = 1; string next_page_token = 2; }
+message QueryLogsResponse         { repeated LogRow rows = 1; string next_page_token = 2; }
+message QueryAgentTracesResponse  { repeated AgentTraceRow rows = 1; string next_page_token = 2; }

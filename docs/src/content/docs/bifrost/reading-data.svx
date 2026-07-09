@@ -1,0 +1,120 @@
+---
+title: Reading Data
+description: ValaQueryService typed methods, signed page tokens, payload-read permissions, the governed generic SQL surface, and Arrow conversion.
+pillar: wyrd
+group: Bifrost
+order: 6
+---
+
+# Reading Data
+
+Bifrost exposes its domain tables through the `ValaQueryService` — nine typed methods, one per observation domain. A governed generic SQL surface (`POST /v1/observations/query`) is also available for ad-hoc analysis.
+
+## ValaQueryService methods
+
+| Method | Route | Returns |
+|---|---|---|
+| `GetTrace` | `GET /v1/traces/{trace_id}` | `TraceWaterfall` (spans, events, links) |
+| `QueryTraces` | `POST /v1/traces/query` | `Vec<TraceSummaryRow>` |
+| `QueryRecentTraces` | `POST /v1/traces/recent/query` | `Vec<TraceSummaryRow>` sorted by recency |
+| `QueryGenAi` | `POST /v1/genai/query` | `Vec<GenAiRow>` |
+| `QueryEval` | `POST /v1/eval/query` | `Vec<EvalRow>` |
+| `QueryDrift` | `POST /v1/drift/query` | `Vec<DriftRow>` |
+| `QueryMetrics` | `POST /v1/metrics/query` | `Vec<MetricRow>` |
+| `QueryLogs` | `POST /v1/logs/query` | `Vec<LogRow>` |
+| `QueryAgentTraces` | `POST /v1/agent-traces/query` | `Vec<AgentTraceRow>` |
+
+All methods accept a `QueryWindow` envelope:
+
+```json
+{
+  "since": "2026-07-01T00:00:00Z",
+  "until": "2026-07-08T00:00:00Z",
+  "limit": 100,
+  "page_token": null
+}
+```
+
+`since` defaults to `now - 7 days` when absent. `limit` is capped at `MAX_QUERY_PAGE_SIZE = 1000`.
+
+## Required permission
+
+All typed methods require `bifrost_query:read`. Callers without this permission receive `403 WYRD_VALA_403_QUERY_FORBIDDEN`.
+
+## Payload permissions
+
+Sensitive columns are projected away unless the caller holds the matching payload permission:
+
+| Permission | Unlocks columns |
+|---|---|
+| `bifrost_trace_payload:read` | `attributes` on spans, events, links |
+| `bifrost_log_payload:read` | `body`, `attributes` on logs |
+| `bifrost_genai_payload:read` | `input_messages`, `output_messages` on GenAI rows |
+| `bifrost_agent_trace_payload:read` | `messages`, `tool_io` on agent-trace rows |
+
+Without the payload permission the method still returns the metadata columns — it does not return an error. Only if the caller explicitly requests a gated column through the generic SQL surface does the server return `403 WYRD_VALA_403_PAYLOAD_FORBIDDEN`.
+
+## Column name mapping for `QueryEval`
+
+The `QueryEval` typed method accepts an `eval_id` filter parameter, which maps to the physical column `eval_ref` in the `vala.eval.assertions` table. If you write raw SQL against the generic SQL surface, use `eval_ref` — `eval_id` does not exist as a physical column and will return `column not found`.
+
+## Signed page tokens and pagination
+
+When a response carries `next_page_token`, pass it in the next request's `page_token` field to get the next page. Tokens are:
+
+- **Tenant-bound** — a token issued under tenant A is rejected under tenant B.
+- **Permission-bound** — a token encodes a hash of the caller's effective permissions; a token issued before a permission was revoked is rejected after revocation.
+- **Query-bound** — changing any filter field invalidates the token.
+- **TTL-bounded** — tokens expire after 300 seconds (default). An expired token returns `400 WYRD_VALA_400_PAGE_TOKEN_INVALID`. If the underlying Iceberg snapshot was pruned by the time the token is used, the server returns `410 WYRD_VALA_410_PAGE_SNAPSHOT_EXPIRED`, which is a signal to restart from page 1.
+
+## TraceSummaryRow derivation
+
+`QueryTraces` and `QueryRecentTraces` return `TraceSummaryRow` — a derived row that does not exist in the physical table. It is computed from the raw `vala.traces.spans` scan by grouping on `trace_id` and computing:
+
+- `root_name` — name of the span with `parent_span_id IS NULL`
+- `service` — `service_name` of the root span
+- `started_at` — min `start_time` across all spans
+- `duration_ms` — `(max(end_time) - min(start_time)) / 1000`
+- `span_count` — count of spans
+- `error` — any span has `status = "ERROR"`
+
+This GROUP-BY runs in Rust after collecting the scanned batches. In Stage 5 it will be pushed into the DataFusion plan.
+
+## Generic SQL surface
+
+`POST /v1/observations/query` accepts any SELECT statement:
+
+```bash
+curl -X POST /v1/observations/query \
+  -H "x-wyrd-access-token: Bearer $TOKEN" \
+  -d '{ "sql": "SELECT metric_name, AVG(value) AS avg FROM \"vala.metrics.points\" WHERE wyrd_event_time >= now() - interval '\''7 days'\'' GROUP BY metric_name" }'
+```
+
+The response body is a raw Arrow IPC stream (`application/vnd.apache.arrow.stream`).
+
+**Governance on the generic path:**
+
+- Requires `bifrost_query:read`.
+- Any reference to a domain table also requires its domain-level permission.
+- References to payload columns without the matching payload permission return `403 WYRD_VALA_403_PAYLOAD_FORBIDDEN`.
+- A domain-table scan without a `wyrd_event_time` time-window predicate is rejected with `400 WYRD_VALA_400_QUERY_INVALID_SQL`.
+- Non-SELECT statements are rejected.
+- Results are bounded at `MAX_SYNC_RESULT_ROWS` rows and `MAX_SYNC_RESULT_BYTES` bytes.
+
+## Arrow → Python conversion
+
+```python
+import pyarrow as pa
+import pyarrow.ipc as ipc
+import io
+
+response = requests.post(
+    "/v1/observations/query",
+    headers={"x-wyrd-access-token": f"Bearer {token}"},
+    json={"sql": "SELECT * FROM \"vala.metrics.points\" LIMIT 100"},
+    stream=True,
+)
+reader = ipc.open_stream(io.BytesIO(response.content))
+table = reader.read_all()
+df = table.to_pandas()
+```

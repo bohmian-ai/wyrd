@@ -68,7 +68,8 @@ pub use context::{
 };
 pub use error::{EvalError, EvalExecError, EvalPlanError};
 pub use executor::{
-    EvalReport, Executors, RunLedger, SkipReason, TaskExecutor, TaskRunOutcome, execute_plan,
+    EvalReport, EvalWorkflowSummary, Executors, RunLedger, SkipReason, TaskExecutor,
+    TaskRunOutcome, execute_plan,
 };
 pub use judge::{JudgeError, JudgeInvoker, MockJudgeInvoker};
 pub use operators::{OperatorVerdict, evaluate_operator};

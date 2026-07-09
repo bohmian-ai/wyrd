@@ -1137,6 +1137,47 @@ administrative install permission, and generic record writes must not write
 reserved or system-managed Bifrost tables. There is no `wyrd.warehouse` submodule
 and no `WarehouseCard`.
 
+**`ValaQueryService` — typed observability query surface (accepted, Stage 4).** `wyrd-server`
+exposes `wyrd.v1.ValaQueryService` (gRPC-first) with an axum HTTP projection as the
+**query-only** typed surface for the observability domain namespaces. There is no
+`vala-http` crate — `wyrd-server` is the only serving surface. The gRPC service and
+its HTTP projection are backed by `wyrd-spec::vala::api` request/response contracts with
+cursor pagination, mandatory time windows, and stable `WYRD_VALA_*` error codes.
+
+The accepted domain namespaces and tables:
+
+| Namespace | Tables | Notes |
+|---|---|---|
+| `vala.traces` | `spans`, `events`, `links` | Raw OTel spans — source of truth |
+| `vala.metrics` | `points` | OTel metric data points with exemplars |
+| `vala.logs` | `records` | OTel LogRecord signal |
+| `vala.genai` | `messages`, `embeddings`, `tool_calls` | Derived from `vala.traces` spans carrying `gen_ai.*` attributes |
+| `vala.eval` | `runs`, `assertions` | Agent/LLM evaluation records |
+| `vala.drift` | `*` | Traditional ML drift records |
+| `vala.dev` | `agent_traces` | High-fidelity coding-harness traces; carries the code axis |
+| `vala.system` | `audit_log` | Transactional audit log (relay-written) |
+
+All domain tables are `SystemShared` scope — server-stamped `data_tenant_id` isolation via
+provider `FilterExec` (primary) and scoped analyzer predicate (secondary). Typed query
+routes build bound DataFusion `LogicalPlan`s (never `ctx.sql`); a query-admission gate
+rejects plans missing the tenant predicate or a bounded time window before execution.
+
+**Elevated payload-read permissions.** Four payload-bearing table families are
+`PayloadClass::Sensitive` and gate their sensitive columns on an elevated read permission
+beyond the base `BifrostQuery:Read`:
+
+| Permission resource | Gates |
+|---|---|
+| `BifrostTracePayload` | `vala.traces.*` `attributes` column on `GetTrace` / `QueryTraces` |
+| `BifrostLogPayload` | `vala.logs.records` `body` / `attributes` on log-query methods |
+| `BifrostGenAiPayload` | `vala.genai.*` message and tool I/O columns |
+| `BifrostAgentTracePayload` | `vala.dev.agent_traces` message/tool payload columns |
+
+These four permissions extend the existing `Permission`/`Resource` model in
+`crates/shared/wyrd-runtime/src/permission.rs`. The generic-SQL analyzer enforces the
+same payload gate so `SELECT vala.traces.spans.attributes` without
+`BifrostTracePayload:Read` is denied through both the typed and the generic-SQL path.
+
 ### Trigger
 Fires an Operator. A Trigger declares when (`schedule`), what to evaluate
 (`source`, optional), and what to fire (`operator_ref`). On each schedule

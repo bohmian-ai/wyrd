@@ -12,7 +12,6 @@ use vala_eval::tasks::{
     AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, TraceTaskExecutor,
 };
 use vala_eval::{InMemoryTraceSource, MockJudgeInvoker, MockTraceSource, TraceUnavailable};
-use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::eval::{
     ComparisonOperator, EvalSpec, EvalTask, JsonPath, RecordId, RunId, TaskId, TraceAssertionTask,
 };
@@ -104,7 +103,6 @@ fn span(trace: TraceId, span: SpanId, name: &str, scenario: &str) -> SpanRecord 
             service_instance_id: None,
             attributes: serde_json::Map::new(),
         },
-        data_tenant_id: DataTenantId::new_v7(),
     }
 }
 

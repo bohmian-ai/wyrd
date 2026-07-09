@@ -35,6 +35,17 @@ pub enum IngestError {
         /// Canonical string form of the refused card reference.
         card_ref: String,
     },
+    /// A per-row `card_ref` was present but could not be resolved to a `card_uid`
+    /// by the server (unknown card, cross-tenant, or uid not available). Fail-closed
+    /// (M-11): an authenticated write with an unresolvable card_ref is always rejected.
+    #[error("card_ref {card_ref} cannot be resolved to card_uid (WYRD_VALA_403_CARD_UNRESOLVED)")]
+    CardUnresolved {
+        /// Canonical string form of the unresolvable card reference.
+        card_ref: String,
+    },
+    /// An authenticated write was missing a required `principal_id`.
+    #[error("principal_id cannot be stamped for authenticated write")]
+    PrincipalUnresolved,
     /// The principal lacks `bifrost_record:write`.
     #[error("principal lacks bifrost_record:write: {detail}")]
     RbacDenied {
@@ -95,6 +106,8 @@ impl IngestError {
             Self::StreamProtocolViolation(_) | Self::Decode(_) => "WYRD_VALA_400_INGEST_PROTO",
             Self::SystemTableWriteDenied { .. } => "WYRD_VALA_403_BIFROST_SYSTEM_TABLE_WRITE",
             Self::CardScopeDenied { .. } => "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+            Self::CardUnresolved { .. } => "WYRD_VALA_403_CARD_UNRESOLVED",
+            Self::PrincipalUnresolved => "WYRD_VALA_401_PRINCIPAL_UNRESOLVED",
             Self::RbacDenied { .. } => "WYRD_PERMISSION_403_DENIED_RBAC",
             Self::TableNotFound { .. } => "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
             Self::SchemaMismatch { .. } => "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
@@ -116,7 +129,9 @@ impl IngestError {
             Self::StreamProtocolViolation(_) | Self::Decode(_) => Code::InvalidArgument,
             Self::SystemTableWriteDenied { .. }
             | Self::CardScopeDenied { .. }
+            | Self::CardUnresolved { .. }
             | Self::RbacDenied { .. } => Code::PermissionDenied,
+            Self::PrincipalUnresolved => Code::Unauthenticated,
             Self::TableNotFound { .. } => Code::NotFound,
             Self::SchemaMismatch { .. } => Code::FailedPrecondition,
             Self::BatchTooLarge { .. } | Self::TooManyRows { .. } | Self::TooManyStreams => {

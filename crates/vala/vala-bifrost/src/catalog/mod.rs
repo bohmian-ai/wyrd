@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::datatypes::Field;
+use arrow::datatypes::{Field, SchemaRef};
 use iceberg::Catalog as _;
 use iceberg::TableCreation;
 use iceberg::spec::FormatVersion;
@@ -13,7 +13,9 @@ use crate::catalog::partition_spec::build_partition_spec;
 use crate::error::BifrostError;
 use crate::provider::WyrdTableProvider;
 use crate::registry::{CachedMeta, Registry, RegistryKey};
+use crate::schema::fingerprint::fingerprint_user_fields;
 use crate::schema::system_columns::with_system_columns;
+use crate::tables::{DeclaredIndex, DomainTable, PayloadClass};
 use crate::types::{PartitionTransform, SchemaFingerprint, TableScope, TableUid};
 use crate::writer::TableWriterHandle;
 use crate::writer::coordinator::spawn_commit_coordinator;
@@ -32,6 +34,13 @@ pub struct WyrdCatalog {
     storage_props: HashMap<String, String>,
     warehouse: String,
     registry: Arc<Registry>,
+}
+
+/// RAII guard that holds a Postgres transaction containing a transaction-scoped
+/// advisory lock. The lock is released automatically when this guard drops and
+/// sqlx rolls back the open transaction.
+pub struct AdvisoryLockGuard {
+    _tx: sqlx::Transaction<'static, sqlx::Postgres>,
 }
 
 impl WyrdCatalog {
@@ -135,14 +144,14 @@ impl WyrdCatalog {
         audit: Option<wyrd_spec::vala::api::AuditEvent>,
     ) -> Result<TableUid, BifrostError> {
         // M6 reserved-name guard: a user field may not take a reserved system
-        // (`wyrd_*`/`data_tenant_id`) or correlation (`card_ref`/`run_id`) name —
+        // (`wyrd_*`/`data_tenant_id`) or correlation (`card_uid`/`run_id`/`principal_id`) name —
         // the server stamps the former and carries the latter as cell values.
         wire::reject_reserved_field_names(&user_fields)?;
 
         self.ensure_namespace(ns).await?;
 
         // The fingerprint is user-fields-only (06 §3): the correlation
-        // (`run_id`/`card_ref`) and system columns are stripped before hashing,
+        // (`run_id`/`card_uid`/`principal_id`) and system columns are stripped before hashing,
         // so their presence in the physical schema does not perturb the value the
         // client caches and the server compares.
         let fingerprint = SchemaFingerprint::from_arrow_schema(&arrow::datatypes::Schema::new(
@@ -302,10 +311,10 @@ impl WyrdCatalog {
     /// Describe a single table for `tenant` — the public wire entry plus its
     /// projected field list.
     ///
-    /// The `fields` surface user columns and the universal `card_ref`/`run_id`
+    /// The `fields` surface user columns and the universal `card_uid`/`run_id`/`principal_id`
     /// correlation columns (the latter flagged `wyrd:column_class = correlation`,
     /// Decision E), while the server-stamped `wyrd_*`/`data_tenant_id` system
-    /// columns are excluded — so `card_ref` is distinct from both user and system
+    /// columns are excluded — so `card_uid` is distinct from both user and system
     /// columns. Resolves the same two-step (`TenantOwned` then `SystemShared`) bind
     /// as `get`.
     pub async fn describe_table(
@@ -362,6 +371,53 @@ impl WyrdCatalog {
             scope,
             tenant,
             Arc::clone(&self.registry),
+            PayloadClass::Standard,
+            &[],
+            None,
+        );
+
+        Ok(handle)
+    }
+
+    /// Open a write handle for a pre-declared domain table `T`.
+    ///
+    /// Carries the table's `PayloadClass`, `SENSITIVE_PAYLOAD_COLUMNS`, and
+    /// `entity_bounds_mapping` into the coordinator so redaction and best-effort
+    /// entity-time-bounds upserts fire automatically on each commit.
+    pub async fn typed_writer<T: DomainTable>(
+        &self,
+        scope: TableScope,
+        tenant: wyrd_spec::ids::DataTenantId,
+    ) -> Result<TableWriterHandle, BifrostError> {
+        let ns = BifrostNamespace::from_domain_namespace(T::NAMESPACE).ok_or_else(|| {
+            BifrostError::Internal(format!("unknown namespace: {}", T::NAMESPACE))
+        })?;
+        let table_ident = iceberg::TableIdent::new(ns.to_namespace_ident(), T::NAME.to_string());
+        let table = self.catalog.load_table(&table_ident).await?;
+        let fqn = format!("{}.{}", ns.as_str(), T::NAME);
+
+        let row = self
+            .lookup_table_row(&fqn, scope.control_bind(tenant))
+            .await?
+            .ok_or_else(|| BifrostError::TableNotFound(fqn.clone()))?;
+        let table_uid = TableUid(
+            row.table_uid
+                .try_into()
+                .map_err(|_| BifrostError::Internal("table_uid length mismatch".to_string()))?,
+        );
+
+        let handle = spawn_commit_coordinator(
+            table,
+            self.catalog.clone(),
+            self.pool.clone(),
+            table_uid,
+            fqn,
+            scope,
+            tenant,
+            Arc::clone(&self.registry),
+            T::PAYLOAD_CLASS,
+            T::SENSITIVE_PAYLOAD_COLUMNS,
+            T::entity_bounds_mapping(),
         );
 
         Ok(handle)
@@ -420,6 +476,212 @@ impl WyrdCatalog {
         WyrdTableProvider::try_new(table, scope, tenant)
             .await
             .map_err(BifrostError::DataFusion)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // DomainTable registration support (task 02)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Acquire a transaction-scoped Postgres advisory lock keyed by the table FQN
+    /// hash. The lock is held for the duration of the guard's lifetime and released
+    /// automatically when the guard drops (transaction rolled back).
+    pub async fn advisory_lock_for(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<AdvisoryLockGuard, BifrostError> {
+        let fqn = format!("{namespace}.{name}");
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| BifrostError::Internal(format!("advisory lock begin: {e}")))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(&fqn)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| BifrostError::Internal(format!("advisory lock: {e}")))?;
+        Ok(AdvisoryLockGuard { _tx: tx })
+    }
+
+    /// Look up the stored schema fingerprint for a pre-declared domain table.
+    /// Returns `None` when no control row exists (first-boot or split-brain).
+    pub async fn domain_table_fingerprint(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<[u8; 32]>, BifrostError> {
+        let ns = BifrostNamespace::from_domain_namespace(namespace).ok_or_else(|| {
+            BifrostError::MetadataMismatch(format!("unknown namespace: {namespace}"))
+        })?;
+        let fqn = format!("{}.{name}", ns.as_str());
+        let mut conn =
+            vala_sql::TenantConn::acquire(&self.pool, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
+                .await
+                .map_err(BifrostError::Sql)?;
+        let row = vala_sql::queries::olap_catalog::get_by_fqn(&mut conn, &fqn)
+            .await
+            .map_err(BifrostError::Sql)?;
+        conn.commit().await.map_err(BifrostError::Sql)?;
+        let Some(row) = row else { return Ok(None) };
+        let fp: [u8; 32] = row
+            .fingerprint
+            .as_slice()
+            .try_into()
+            .map_err(|_| BifrostError::Internal("fingerprint length mismatch".to_string()))?;
+        Ok(Some(fp))
+    }
+
+    /// Check whether the Iceberg table exists in the catalog.
+    pub async fn iceberg_table_exists(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<bool, BifrostError> {
+        let ns = BifrostNamespace::from_domain_namespace(namespace).ok_or_else(|| {
+            BifrostError::MetadataMismatch(format!("unknown namespace: {namespace}"))
+        })?;
+        let ident = iceberg::TableIdent::new(ns.to_namespace_ident(), name.to_string());
+        Ok(self.catalog.table_exists(&ident).await?)
+    }
+
+    /// Load the physical Arrow schema of an existing Iceberg table.
+    pub async fn iceberg_physical_schema(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<SchemaRef, BifrostError> {
+        let ns = BifrostNamespace::from_domain_namespace(namespace).ok_or_else(|| {
+            BifrostError::MetadataMismatch(format!("unknown namespace: {namespace}"))
+        })?;
+        let ident = iceberg::TableIdent::new(ns.to_namespace_ident(), name.to_string());
+        let table = self.catalog.load_table(&ident).await?;
+        let iceberg_schema = table.metadata().current_schema();
+        let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+            .map_err(BifrostError::Iceberg)?;
+        Ok(Arc::new(arrow_schema))
+    }
+
+    /// Check whether a loaded physical schema matches the declared schema for `T`.
+    pub fn physical_matches_declared<T: DomainTable>(&self, physical: &SchemaRef) -> bool {
+        let declared = T::schema();
+        // Compare field names and types (order-sensitive).
+        physical.fields().len() == declared.fields().len()
+            && physical
+                .fields()
+                .iter()
+                .zip(declared.fields().iter())
+                .all(|(p, d)| p.name() == d.name() && p.data_type() == d.data_type())
+    }
+
+    /// Compute the fingerprint of a physical schema over user fields only.
+    /// Strips system and universal correlation columns (`wyrd_*`, `data_tenant_id`,
+    /// `run_id`, `card_uid`, `principal_id`) to approximate a table's declared user
+    /// fields from a *physical* schema, for the `actual:` field of a `PhysicalDrift`
+    /// diagnostic only. This is NOT equal to `T::schema_fingerprint()` for tables
+    /// whose policy declares `run_id`/`principal_id` as content columns
+    /// (`dev.agent_traces`, `system.audit_log`), and is never a gate.
+    pub fn fingerprint_of_user_fields(&self, schema: &SchemaRef) -> [u8; 32] {
+        fingerprint_user_fields(schema)
+    }
+
+    /// Create the Iceberg table for a pre-declared domain table.
+    pub async fn create_domain_table<T: DomainTable>(&self) -> Result<(), BifrostError> {
+        let ns = BifrostNamespace::from_domain_namespace(T::NAMESPACE).ok_or_else(|| {
+            BifrostError::MetadataMismatch(format!("unknown namespace: {}", T::NAMESPACE))
+        })?;
+        self.ensure_namespace(ns).await?;
+
+        let schema = T::schema();
+        let iceberg_schema =
+            iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(schema.as_ref())
+                .map_err(BifrostError::Iceberg)?;
+
+        let partition_cols = T::partition_columns();
+        let partition_spec = if partition_cols.is_empty() {
+            None
+        } else {
+            Some(build_partition_spec(&iceberg_schema, &partition_cols)?)
+        };
+
+        let location = format!("{}/{}/{}", self.warehouse, T::NAMESPACE, T::NAME);
+
+        let creation = match partition_spec {
+            Some(spec) => TableCreation::builder()
+                .name(T::NAME.to_string())
+                .location(location)
+                .schema(iceberg_schema)
+                .format_version(FormatVersion::V2)
+                .partition_spec(spec)
+                .build(),
+            None => TableCreation::builder()
+                .name(T::NAME.to_string())
+                .location(location)
+                .schema(iceberg_schema)
+                .format_version(FormatVersion::V2)
+                .build(),
+        };
+
+        let ns_ident = ns.to_namespace_ident();
+        // Check first to give callers a clean IcebergAlreadyExists error.
+        let table_ident_check = iceberg::TableIdent::new(ns_ident.clone(), T::NAME.to_string());
+        if self.catalog.table_exists(&table_ident_check).await? {
+            return Err(BifrostError::IcebergAlreadyExists {
+                namespace: T::NAMESPACE,
+                name: T::NAME,
+            });
+        }
+        self.catalog.create_table(&ns_ident, creation).await?;
+        Ok(())
+    }
+
+    /// Register the SQL control row for a pre-declared domain table.
+    pub async fn register_domain_control_row<T: DomainTable>(
+        &self,
+        fingerprint: [u8; 32],
+    ) -> Result<(), BifrostError> {
+        let ns = BifrostNamespace::from_domain_namespace(T::NAMESPACE).ok_or_else(|| {
+            BifrostError::Internal(format!("unknown namespace: {}", T::NAMESPACE))
+        })?;
+        let fqn = format!("{}.{}", ns.as_str(), T::NAME);
+        let table_uid = TableUid::new_v7();
+        let mut conn =
+            vala_sql::TenantConn::acquire(&self.pool, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
+                .await
+                .map_err(BifrostError::Sql)?;
+        vala_sql::queries::olap_catalog::upsert_table(
+            &mut conn,
+            table_uid.as_bytes(),
+            &fqn,
+            &fingerprint,
+            TableScope::SystemShared.as_db_str(),
+            &[],
+        )
+        .await
+        .map_err(BifrostError::Sql)?;
+        conn.commit().await.map_err(BifrostError::Sql)?;
+        Ok(())
+    }
+
+    /// Declare one index for a pre-declared domain table in `vala.olap_indexes`.
+    pub fn declare_domain_index(
+        &self,
+        namespace: &str,
+        name: &str,
+        _idx: &DeclaredIndex,
+    ) -> Result<(), BifrostError> {
+        // Index registration uses vala.olap_indexes (task 03).
+        // Stubbed until olap_indexes migration and query functions land.
+        tracing::debug!(namespace, name, "declare_domain_index (stub)");
+        Ok(())
+    }
+
+    /// Ensure all declared indexes for `T` exist idempotently.
+    pub fn ensure_domain_indexes<T: DomainTable>(&self) -> Result<(), BifrostError> {
+        for idx in T::declared_indexes() {
+            self.declare_domain_index(T::NAMESPACE, T::NAME, &idx)?;
+        }
+        Ok(())
     }
 
     /// Best-effort startup recovery pass.
@@ -552,12 +814,7 @@ impl WyrdCatalog {
 /// dots (e.g. "vala.bifrost"). Match the known namespace prefix to extract the
 /// table name — avoids relying on the buggy `split_part('.', N)` in the SQL.
 fn fqn_to_table_ident(fqn: &str) -> Result<iceberg::TableIdent, BifrostError> {
-    let namespaces = [
-        BifrostNamespace::System,
-        BifrostNamespace::Bifrost,
-        BifrostNamespace::Traces,
-        BifrostNamespace::Eval,
-    ];
+    let namespaces = BifrostNamespace::ALL;
     for ns in namespaces {
         let prefix = format!("{}.", ns.as_str());
         if let Some(table_name) = fqn.strip_prefix(&prefix)

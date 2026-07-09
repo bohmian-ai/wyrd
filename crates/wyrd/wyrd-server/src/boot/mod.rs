@@ -5,6 +5,7 @@ pub mod bootstrap;
 pub mod issuer;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
 use secrecy::ExposeSecret;
@@ -22,10 +23,15 @@ use wyrd_sql::pool::{PoolConfig, build_pool};
 use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
+use metrics::{counter, gauge};
+use vala_bifrost::reconcile::reconcile_audit;
+use vala_bifrost::relay::AuditRelay;
+
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
+use crate::components::auth::audit_writer::RealAuthzAuditWriter;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::eval::EvalAuditWriter;
-use crate::config::WorkloadBindingEntry;
+use crate::config::{DeploymentProfile, WorkloadBindingEntry};
 use crate::postgres::ServerPostgres;
 use crate::state::{AppState, ProductionValidationError};
 
@@ -121,6 +127,29 @@ pub enum ServerBootError {
     /// Production-profile state validation failed.
     #[error(transparent)]
     ProductionValidation(#[from] ProductionValidationError),
+    /// `WYRD_VALA_500_AUDIT_RELAY_REQUIRED`: the audit relay is disabled or its
+    /// dependencies are unavailable in a production deployment. A server that
+    /// accepts auth/mutating writes while the audit outbox cannot drain to
+    /// `audit_log` must not boot (M-12 fail-closed).
+    #[error(
+        "WYRD_VALA_500_AUDIT_RELAY_REQUIRED: audit relay is required in production \
+         but is disabled or unavailable: {detail}"
+    )]
+    AuditRelayRequired {
+        /// Detail about why the relay could not be started.
+        detail: String,
+    },
+    /// `WYRD_VALA_500_AUDIT_RECONCILER_REQUIRED`: the audit reconciler is disabled or
+    /// its dependencies are unavailable in a production deployment. A production server
+    /// cannot accept mutating writes without the durability proof running.
+    #[error(
+        "WYRD_VALA_500_AUDIT_RECONCILER_REQUIRED: audit reconciler is required in \
+         production but is disabled or unavailable: {detail}"
+    )]
+    AuditReconcilerRequired {
+        /// Detail about why the reconciler could not be started.
+        detail: String,
+    },
 }
 
 /// Resolve database configuration, run migrations, and assemble runtime state.
@@ -216,6 +245,12 @@ pub async fn build_state(
     let state = install_auth(state, config, sealing_key.clone()).await?;
     seed_federation(&state, config, sealing_key.as_deref()).await?;
 
+    // Install the real authz audit writer as the OSS default. Callers can
+    // still replace the entire ServerAuthz (policy hook + writer) via overrides.
+    let state = state.with_authz(ServerAuthz {
+        audit_writer: Arc::new(RealAuthzAuditWriter),
+        ..ServerAuthz::default()
+    });
     let state = apply_overrides(state, overrides);
 
     state
@@ -498,6 +533,289 @@ pub fn spawn_storage_sweeper(
     Ok(Some(tokio::spawn(async move { sweeper.run().await })))
 }
 
+/// Configuration for the background audit relay worker.
+pub struct RelayConfig {
+    /// Whether the relay is enabled (`WYRD_AUDIT_RELAY_ENABLED`, default `true`).
+    pub enabled: bool,
+    /// How long to sleep between relay ticks in milliseconds
+    /// (`WYRD_AUDIT_RELAY_TICK_MS`, default `5000`).
+    pub tick_ms: u64,
+    /// Maximum rows to claim per tick (`WYRD_AUDIT_RELAY_CLAIM_LIMIT`, default `500`).
+    pub claim_limit: i32,
+}
+
+impl RelayConfig {
+    /// Read relay configuration from the process environment.
+    pub fn from_env() -> Self {
+        let enabled = std::env::var("WYRD_AUDIT_RELAY_ENABLED")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+        let tick_ms = std::env::var("WYRD_AUDIT_RELAY_TICK_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5_000u64);
+        let claim_limit = std::env::var("WYRD_AUDIT_RELAY_CLAIM_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500i32);
+        Self {
+            enabled,
+            tick_ms,
+            claim_limit,
+        }
+    }
+}
+
+/// Spawn the background audit relay that drains `vala.audit_outbox` into
+/// `vala.system.audit_log`. Mirrors `spawn_storage_sweeper`.
+///
+/// **Fail-closed in production (M-12).** If the relay is disabled or the
+/// platform admin pool is unavailable in a production deployment, boot fails
+/// with [`ServerBootError::AuditRelayRequired`]. In development/staging, a
+/// disabled relay logs a warning and returns `None`.
+///
+/// # Errors
+/// Returns [`ServerBootError::AuditRelayRequired`] when the relay cannot start
+/// in production; returns `Ok(None)` when cleanly skipped in non-production.
+pub async fn spawn_audit_relay(
+    state: &AppState,
+    shutdown: CancellationToken,
+) -> Result<Option<tokio::task::JoinHandle<()>>, ServerBootError> {
+    let cfg = RelayConfig::from_env();
+    let is_production = state.deployment_profile == DeploymentProfile::Production;
+
+    if !cfg.enabled {
+        if is_production {
+            return Err(ServerBootError::AuditRelayRequired {
+                detail: "WYRD_AUDIT_RELAY_ENABLED=false is not permitted in production".to_owned(),
+            });
+        }
+        tracing::warn!("audit relay disabled via WYRD_AUDIT_RELAY_ENABLED=false (dev/test only)");
+        return Ok(None);
+    }
+
+    let Some(admin_pool) = state.postgres.platform_admin_pool() else {
+        if is_production {
+            return Err(ServerBootError::AuditRelayRequired {
+                detail: "platform admin pool is unavailable".to_owned(),
+            });
+        }
+        tracing::warn!("audit relay skipped: platform admin pool unavailable (dev/test only)");
+        return Ok(None);
+    };
+
+    let relay = AuditRelay::new(Arc::clone(&state.bifrost), Arc::new(admin_pool.clone()));
+    relay.ensure_audit_log_table().await?;
+
+    let tick_interval = Duration::from_millis(cfg.tick_ms);
+    let claim_limit = cfg.claim_limit;
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(tick_interval) => {}
+            }
+            if shutdown.is_cancelled() {
+                break;
+            }
+            if let Err(e) = relay.tick(claim_limit).await {
+                tracing::error!(error = %e, "audit relay tick failed");
+            }
+        }
+    });
+
+    Ok(Some(handle))
+}
+
+/// Configuration for the background audit reconciler worker.
+pub struct ReconcileConfig {
+    /// Whether the reconciler is enabled (`WYRD_AUDIT_RECONCILER_ENABLED`, default `true`).
+    pub enabled: bool,
+    /// How often to run reconciliation in milliseconds
+    /// (`WYRD_AUDIT_RECONCILER_TICK_MS`, default `300000` = 5 minutes).
+    pub tick_ms: u64,
+}
+
+impl ReconcileConfig {
+    /// Read reconciler configuration from the process environment.
+    pub fn from_env() -> Self {
+        let enabled = std::env::var("WYRD_AUDIT_RECONCILER_ENABLED")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+        let tick_ms = std::env::var("WYRD_AUDIT_RECONCILER_TICK_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300_000u64);
+        Self { enabled, tick_ms }
+    }
+}
+
+/// Spawn the background audit reconciler that verifies durability of
+/// `vala.audit_outbox` against `vala.system.audit_log`. Mirrors
+/// `spawn_audit_relay`.
+///
+/// **Fail-closed in production (M-12).** If the reconciler is disabled or the
+/// platform admin pool is unavailable in a production deployment, boot fails
+/// with `WYRD_VALA_500_AUDIT_RECONCILER_REQUIRED`. In development/staging, a
+/// disabled reconciler logs a warning and returns `None`.
+///
+/// # Errors
+/// Returns [`ServerBootError::AuditReconcilerRequired`] when the reconciler
+/// cannot start in production; returns `Ok(None)` when cleanly skipped.
+pub async fn spawn_audit_reconciler(
+    state: &AppState,
+    shutdown: CancellationToken,
+) -> Result<Option<tokio::task::JoinHandle<()>>, ServerBootError> {
+    let cfg = ReconcileConfig::from_env();
+    let is_production = state.deployment_profile == DeploymentProfile::Production;
+
+    if !cfg.enabled {
+        if is_production {
+            return Err(ServerBootError::AuditReconcilerRequired {
+                detail: "WYRD_AUDIT_RECONCILER_ENABLED=false is not permitted in production"
+                    .to_owned(),
+            });
+        }
+        tracing::warn!(
+            "audit reconciler disabled via WYRD_AUDIT_RECONCILER_ENABLED=false (dev/test only)"
+        );
+        return Ok(None);
+    }
+
+    let Some(admin_pool) = state.postgres.platform_admin_pool().cloned() else {
+        if is_production {
+            return Err(ServerBootError::AuditReconcilerRequired {
+                detail: "platform admin pool is unavailable".to_owned(),
+            });
+        }
+        tracing::warn!("audit reconciler skipped: platform admin pool unavailable (dev/test only)");
+        return Ok(None);
+    };
+
+    let app_pool = state.postgres.vala_pool().clone();
+    let catalog = Arc::clone(&state.bifrost);
+    let tick_interval = Duration::from_millis(cfg.tick_ms);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(tick_interval) => {}
+            }
+            if shutdown.is_cancelled() {
+                break;
+            }
+
+            let tenant_ids =
+                match vala_sql::queries::relay::list_audit_tenant_ids(&admin_pool).await {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        tracing::error!(error = %e, "audit reconciler: tenant enumeration failed");
+                        continue;
+                    }
+                };
+
+            let mut all_clean = true;
+            for raw_id in tenant_ids {
+                let tenant_id = match DataTenantId::try_from(raw_id) {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                let result = match reconcile_audit(&app_pool, &catalog, tenant_id).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!(
+                            tenant_id = %tenant_id,
+                            error = %e,
+                            "audit reconciler: reconciliation failed"
+                        );
+                        all_clean = false;
+                        continue;
+                    }
+                };
+
+                let tenant_str = tenant_id.to_string();
+                for gap in &result.seq_gaps {
+                    counter!(
+                        "vala_audit_reconcile_violations_total",
+                        "tenant" => tenant_str.clone(),
+                        "kind" => "seq_gap"
+                    )
+                    .increment(1);
+                    tracing::error!(
+                        tenant_id = %tenant_id,
+                        gap_from = gap.gap_from,
+                        gap_to = gap.gap_to,
+                        "AUDIT INTEGRITY: seq gap detected"
+                    );
+                    all_clean = false;
+                }
+                for brk in &result.chain_breaks {
+                    counter!(
+                        "vala_audit_reconcile_violations_total",
+                        "tenant" => tenant_str.clone(),
+                        "kind" => "chain_break"
+                    )
+                    .increment(1);
+                    tracing::error!(
+                        tenant_id = %tenant_id,
+                        seq = brk.seq,
+                        "AUDIT INTEGRITY: hash-chain break detected"
+                    );
+                    all_clean = false;
+                }
+                for seq in &result.parity_misses {
+                    counter!(
+                        "vala_audit_reconcile_violations_total",
+                        "tenant" => tenant_str.clone(),
+                        "kind" => "parity_miss"
+                    )
+                    .increment(1);
+                    tracing::error!(
+                        tenant_id = %tenant_id,
+                        seq,
+                        "AUDIT INTEGRITY: shipped outbox row missing from warehouse"
+                    );
+                    all_clean = false;
+                }
+                for seq in &result.orphan_warehouse_seqs {
+                    counter!(
+                        "vala_audit_reconcile_violations_total",
+                        "tenant" => tenant_str.clone(),
+                        "kind" => "parity_miss"
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        seq,
+                        "AUDIT INTEGRITY: warehouse row has no matching shipped outbox entry"
+                    );
+                    all_clean = false;
+                }
+
+                if result.is_clean() {
+                    gauge!(
+                        "vala_audit_reconcile_last_success_timestamp",
+                        "tenant" => tenant_str
+                    )
+                    .set(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs_f64(),
+                    );
+                }
+            }
+
+            if all_clean {
+                tracing::debug!("audit reconciler: all tenants clean");
+            }
+        }
+    });
+
+    Ok(Some(handle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,6 +907,22 @@ mod tests {
         assert!(
             patched.authz.audit_writer.is_stub_default(),
             "audit unchanged"
+        );
+    }
+
+    #[test]
+    fn real_authz_audit_writer_is_not_stub() {
+        use crate::components::auth::audit_writer::{
+            AuthzAuditWriter, NoopAuthzAuditWriter, RealAuthzAuditWriter,
+        };
+
+        assert!(
+            NoopAuthzAuditWriter.is_stub_default(),
+            "noop writer must be a stub"
+        );
+        assert!(
+            !RealAuthzAuditWriter.is_stub_default(),
+            "RealAuthzAuditWriter must not be a stub"
         );
     }
 

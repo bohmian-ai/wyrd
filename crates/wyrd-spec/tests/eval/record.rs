@@ -26,11 +26,12 @@ fn fixture() -> EvalRecordObservation {
         record_id: RecordId(Uuid::nil()),
         run_id: RunId::from_string("r1".to_owned()),
         session_id: Some(SessionId(Uuid::nil())),
-        eval_ref: eval_ref("retriever-quality"),
+        eval_ref: Some(eval_ref("retriever-quality")),
         context: serde_json::json!({"response": "ok"}),
         trace_id: None,
         span_id: None,
         created_at: chrono::Utc.with_ymd_and_hms(2026, 6, 10, 0, 0, 0).unwrap(),
+        media: None,
     }
 }
 

@@ -240,3 +240,118 @@ fn result_str(result: AuditResult) -> &'static str {
         AuditResult::Failure => "failure",
     }
 }
+
+/// A gap detected between consecutive `seq` values for a tenant.
+#[derive(Debug, Clone)]
+pub struct SeqGap {
+    /// First missing `seq` in the gap.
+    pub gap_from: i64,
+    /// Last missing `seq` in the gap.
+    pub gap_to: i64,
+}
+
+/// A hash-chain break: the row at `seq` has a `prev_hash` that does not match
+/// the `entry_hash` of `seq - 1`.
+#[derive(Debug, Clone)]
+pub struct ChainBreak {
+    /// The `seq` whose `prev_hash` does not match its predecessor's `entry_hash`.
+    pub seq: i64,
+}
+
+/// A (seq, entry_hash) pair from a shipped outbox row, used for cross-store parity.
+#[derive(Debug, Clone)]
+pub struct ShippedOutboxRef {
+    /// The sequence number.
+    pub seq: i64,
+    /// The SHA256 entry hash of this row.
+    pub entry_hash: Vec<u8>,
+}
+
+/// Find gaps in the per-tenant `seq` sequence (check 1 of 3 — SQL-only).
+///
+/// Returns at most 100 gaps; a non-empty result indicates rows were lost or
+/// never inserted, which is an audit integrity incident.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
+pub async fn check_seq_gaps(conn: &mut TenantConn<'_>) -> Result<Vec<SeqGap>, SqlError> {
+    sqlx::query_as::<_, (i64, i64)>(
+        r#"
+        WITH ordered AS (
+            SELECT seq, lag(seq) OVER (ORDER BY seq) AS prev
+              FROM vala.audit_outbox
+             WHERE data_tenant_id = wyrd.current_tenant()
+        )
+        SELECT prev + 1 AS gap_from, seq - 1 AS gap_to
+          FROM ordered
+         WHERE seq - prev > 1
+         LIMIT 100
+        "#,
+    )
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+    .map(|rows| {
+        rows.into_iter()
+            .map(|(gap_from, gap_to)| SeqGap { gap_from, gap_to })
+            .collect()
+    })
+}
+
+/// Detect hash-chain breaks: rows whose `prev_hash` does not match the
+/// `entry_hash` of the preceding row (check 2 of 3 — SQL-only).
+///
+/// Returns at most 100 breaks; a non-empty result indicates tampering or
+/// data corruption.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
+pub async fn check_hash_chain(conn: &mut TenantConn<'_>) -> Result<Vec<ChainBreak>, SqlError> {
+    sqlx::query_as::<_, (i64,)>(
+        r#"
+        WITH chained AS (
+            SELECT seq, prev_hash,
+                   lag(entry_hash) OVER (ORDER BY seq) AS expected_prev
+              FROM vala.audit_outbox
+             WHERE data_tenant_id = wyrd.current_tenant()
+        )
+        SELECT seq
+          FROM chained
+         WHERE expected_prev IS NOT NULL
+           AND prev_hash != expected_prev
+         LIMIT 100
+        "#,
+    )
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+    .map(|rows| rows.into_iter().map(|(seq,)| ChainBreak { seq }).collect())
+}
+
+/// Return (seq, entry_hash) for all shipped outbox rows in seq order. Used by
+/// the Bifrost reconcile layer (check 3 of 3) to cross-reference against the
+/// Iceberg `audit_log` table.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
+pub async fn shipped_outbox_refs(
+    conn: &mut TenantConn<'_>,
+) -> Result<Vec<ShippedOutboxRef>, SqlError> {
+    sqlx::query_as::<_, (i64, Vec<u8>)>(
+        r#"
+        SELECT seq, entry_hash
+          FROM vala.audit_outbox
+         WHERE data_tenant_id = wyrd.current_tenant()
+           AND shipped = true
+         ORDER BY seq
+        "#,
+    )
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+    .map(|rows| {
+        rows.into_iter()
+            .map(|(seq, entry_hash)| ShippedOutboxRef { seq, entry_hash })
+            .collect()
+    })
+}

@@ -779,7 +779,7 @@ Use the full `review-and-plan` prompt files in the same skill root only as calib
 - `review-and-plan/review-frontend/review-frontend.md` when frontend files changed
 - `review-and-plan/review-wyrd-ui-contracts/review-wyrd-ui-contracts.md` when UI/API/SDK/schema/docs surfaces changed
 
-When Wyrd doctrine, contracts, APIs, SDKs, CLI, MCP, UI, docs, generated schemas, durable behavior, or public vocabulary are touched, apply `.codex/skills/review/SKILL.md` and read `docs/src/content/docs/concepts/core-doctrine.mdx` if needed.
+When Wyrd doctrine, contracts, APIs, SDKs, CLI, MCP, UI, docs, generated schemas, durable behavior, or public vocabulary are touched, apply `.codex/skills/review/SKILL.md` and read `docs/src/content/docs/concepts/doctrine.svxx` if needed.
 
 ## Review Lenses
 

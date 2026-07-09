@@ -5,9 +5,11 @@ use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::vala::api::{AuditDecision, AuditResult};
 
+use crate::audit;
 use crate::auth::revocation_listener::notify_principal_revoked;
-use crate::components::auth::AuthenticatedPrincipal;
+use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use wyrd_auth::revoke::revoke_principal_in_conn;
@@ -15,7 +17,7 @@ use wyrd_sql::TenantConn;
 
 pub async fn revoke_principal(
     State(state): State<AppState>,
-    caller: AuthenticatedPrincipal,
+    caller: Caller,
     Path(target_id): Path<PrincipalId>,
 ) -> Result<(), WyrdErrorResponse> {
     let tenant = caller.principal.tenant_id;
@@ -30,7 +32,21 @@ pub async fn revoke_principal(
     let kind = revoke_principal_in_conn(&mut conn, target_id, tenant)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    commit_conn(conn).await?;
+    audit::append_on(
+        &mut conn,
+        &audit::audit_event(
+            &caller,
+            "auth.principal.revoke",
+            &format!("principal:{target_id}"),
+            "service_accounts:write",
+            AuditDecision::Allow,
+            AuditResult::Success,
+            "principal revoked",
+        ),
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)?;
+    conn.commit().await.map_err(internal_error)?;
 
     fan_out_notify(&state, tenant, kind, target_id).await;
 
@@ -46,10 +62,6 @@ async fn acquire_conn(
         .tenant_conn(tenant)
         .await
         .map_err(internal_error)
-}
-
-async fn commit_conn(conn: TenantConn<'_>) -> Result<(), WyrdErrorResponse> {
-    conn.commit().await.map_err(internal_error)
 }
 
 /// Send the cross-pod revocation NOTIFY. Best-effort; failure does not undo the DB write.

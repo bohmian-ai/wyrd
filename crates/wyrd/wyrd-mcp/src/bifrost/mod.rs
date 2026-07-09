@@ -41,7 +41,7 @@ impl AgentTool for ListTablesTool {
 
     fn description(&self) -> &str {
         "List all Bifrost tables visible to the caller's tenant. \
-         Returns BifrostTableEntry objects including the universal card_ref correlation column. \
+         Returns BifrostTableEntry objects including the universal card_uid correlation column. \
          Requires bifrost_table:read permission (server-enforced)."
     }
 
@@ -84,7 +84,7 @@ impl AgentTool for DescribeTableTool {
 
     fn description(&self) -> &str {
         "Describe a single Bifrost table's schema. Returns BifrostTableDescription \
-         including user columns and the universal card_ref/run_id correlation columns. \
+         including user columns and the universal card_uid/run_id/principal_id correlation columns. \
          System columns (wyrd_*, data_tenant_id) are excluded. \
          Requires bifrost_table:read permission (server-enforced)."
     }
@@ -327,6 +327,27 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
         BifrostError::AuditUnavailable {
             detail: String::new(),
         },
+        BifrostError::SchemaDrift {
+            detail: String::new(),
+        },
+        BifrostError::PhysicalDrift {
+            detail: String::new(),
+        },
+        BifrostError::IcebergMissing {
+            detail: String::new(),
+        },
+        BifrostError::RedactionFailed(String::new()),
+        BifrostError::TraceNotFound {
+            trace_id: String::new(),
+        },
+        BifrostError::WindowRequired,
+        BifrostError::FilterInvalid {
+            detail: String::new(),
+        },
+        BifrostError::PageTokenInvalid,
+        BifrostError::PageSnapshotExpired,
+        BifrostError::QueryForbidden,
+        BifrostError::PayloadForbidden,
     ];
 
     if let Some(sentinel) = variants.first() {
@@ -348,7 +369,18 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
             | BifrostError::QueryTimeout
             | BifrostError::QueryResultTooLarge
             | BifrostError::Internal { .. }
-            | BifrostError::AuditUnavailable { .. } => {}
+            | BifrostError::AuditUnavailable { .. }
+            | BifrostError::SchemaDrift { .. }
+            | BifrostError::PhysicalDrift { .. }
+            | BifrostError::IcebergMissing { .. }
+            | BifrostError::RedactionFailed(..)
+            | BifrostError::TraceNotFound { .. }
+            | BifrostError::WindowRequired
+            | BifrostError::FilterInvalid { .. }
+            | BifrostError::PageTokenInvalid
+            | BifrostError::PageSnapshotExpired
+            | BifrostError::QueryForbidden
+            | BifrostError::PayloadForbidden => {}
         }
     }
 

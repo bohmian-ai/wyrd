@@ -8,15 +8,14 @@ pub mod batch_builder;
 pub mod catalog;
 pub mod error;
 pub mod provider;
+pub mod reconcile;
 pub mod registry;
 pub mod relay;
 pub mod schema;
 pub mod session;
+pub mod tables;
 pub mod types;
 pub mod writer;
-
-#[cfg(feature = "python")]
-mod python;
 
 pub use catalog::WyrdCatalog;
 pub use catalog::namespaces::BifrostNamespace;

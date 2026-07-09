@@ -155,11 +155,10 @@ fn field_to_field_spec(field: &Field) -> Result<FieldSpec, BifrostError> {
 
 /// Project a stored physical schema onto the describe field list.
 ///
-/// User fields are surfaced unflagged; the universal `card_ref`/`run_id`
-/// correlation columns are surfaced with a `wyrd:column_class = correlation`
-/// flag; the server-stamped `wyrd_*`/`data_tenant_id` system columns are
-/// excluded entirely — so `card_ref` is distinct from both user and system
-/// columns (Decision E).
+/// User fields are surfaced unflagged; the universal correlation columns
+/// (`run_id`, `card_uid`, `principal_id`) are surfaced with a
+/// `wyrd:column_class = correlation` flag; the server-stamped
+/// `wyrd_*`/`data_tenant_id` system columns are excluded entirely.
 pub fn fields_from_stored_schema(schema: &Schema) -> Result<Vec<FieldSpec>, BifrostError> {
     let mut fields = Vec::new();
     for field in schema.fields() {
@@ -182,9 +181,9 @@ pub fn fields_from_stored_schema(schema: &Schema) -> Result<Vec<FieldSpec>, Bifr
 /// M6 reserved-name guard for the `create_table` pre-build path.
 ///
 /// A *user* field may not take a reserved system column name (`wyrd_*`,
-/// `data_tenant_id`) or a reserved correlation name (`card_ref`, `run_id`) — the
-/// server stamps the former and carries the latter as client-supplied cell
-/// values. Rejected with `WYRD_VALA_400_BIFROST_RESERVED_COLUMN`.
+/// `data_tenant_id`) or a reserved universal correlation name (`run_id`,
+/// `card_uid`, `principal_id`). Rejected with `WYRD_VALA_400_BIFROST_RESERVED_COLUMN`.
+/// For domain tables use `reject_reserved_domain_fields` (policy-aware).
 pub fn reject_reserved_field_names(user_fields: &[Field]) -> Result<(), BifrostError> {
     for field in user_fields {
         let name = field.name();
@@ -246,12 +245,13 @@ mod tests {
     }
 
     #[test]
-    fn describe_table_fields_surface_card_ref_flagged() {
-        // A physical schema: one user field + correlation columns + system columns.
+    fn describe_table_fields_surface_correlation_flagged() {
+        // A physical schema: one user field + reconciled correlation columns + system columns.
         let schema = Schema::new(vec![
             Field::new("value", DataType::Int64, false),
             Field::new("run_id", DataType::Utf8, true),
-            Field::new("card_ref", DataType::Utf8, true),
+            Field::new("card_uid", DataType::Utf8, true),
+            Field::new("principal_id", DataType::Utf8, true),
             Field::new("wyrd_event_time", DataType::Utf8, false),
             Field::new("wyrd_ingested_at", DataType::Utf8, false),
             Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
@@ -262,11 +262,11 @@ mod tests {
         let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
 
         // User + correlation surfaced; system columns excluded.
-        assert_eq!(names, vec!["value", "run_id", "card_ref"]);
+        assert_eq!(names, vec!["value", "run_id", "card_uid", "principal_id"]);
 
-        let card_ref = fields.iter().find(|f| f.name == "card_ref").unwrap();
+        let card_uid = fields.iter().find(|f| f.name == "card_uid").unwrap();
         assert_eq!(
-            card_ref
+            card_uid
                 .metadata
                 .get("wyrd:column_class")
                 .map(String::as_str),
@@ -314,7 +314,13 @@ mod tests {
 
     #[test]
     fn create_table_reserved_name_guard_rejects_correlation_and_system() {
-        for reserved in ["card_ref", "run_id", "wyrd_event_time", "data_tenant_id"] {
+        for reserved in [
+            "run_id",
+            "card_uid",
+            "principal_id",
+            "wyrd_event_time",
+            "data_tenant_id",
+        ] {
             let fields = vec![Field::new(reserved, DataType::Int64, true)];
             let err = reject_reserved_field_names(&fields).unwrap_err();
             assert!(

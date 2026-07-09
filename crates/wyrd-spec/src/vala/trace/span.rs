@@ -12,7 +12,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::WyrdError;
-use crate::ids::DataTenantId;
 use crate::vala::ids::{SpanId, TraceId};
 
 use super::{InstrumentationScope, Resource, SpanEvent, SpanLink};
@@ -69,8 +68,6 @@ pub struct SpanRecord {
     pub scope: InstrumentationScope,
     /// Resource of the producer.
     pub resource: Resource,
-    /// Tenant partition key.
-    pub data_tenant_id: DataTenantId,
 }
 
 impl SpanRecord {

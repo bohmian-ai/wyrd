@@ -80,6 +80,49 @@ pub struct ClaimedPrecommitRow {
     pub scope: String,
 }
 
+/// Declared skip index row from `vala.olap_indexes`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DeclaredIndexRow {
+    /// Tenant isolation key.
+    pub data_tenant_id: Uuid,
+    /// Opaque 16-byte table identifier.
+    pub table_uid: Vec<u8>,
+    /// Column the index is declared over.
+    pub column_name: String,
+    /// Index kind: `bloom`, `zone_map`, `lookup_set`, or `none`.
+    pub index_kind: String,
+    /// Build state: `building`, `ready`, `failed`, or `deprecated`.
+    pub index_state: String,
+    /// Optional index parameters (e.g. bloom FPP).
+    pub params: Option<serde_json::Value>,
+    /// Wall-clock creation time.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Wall-clock last-update time.
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Per-entity min/max event-time bounds from `vala.entity_time_bounds`.
+///
+/// Best-effort acceleration for by-id lookups (M-06 / F-05). Present → set a
+/// tight time window. Absent → fall back to the caller's `?since=` window or a
+/// capped default. Never gate a read on presence; an absent bound is a miss, not
+/// "entity does not exist."
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct EntityTimeBoundsRow {
+    /// Tenant isolation key.
+    pub data_tenant_id: Uuid,
+    /// Opaque 16-byte table identifier.
+    pub table_uid: Vec<u8>,
+    /// Entity kind: `trace`, `agent_run`, or `session`.
+    pub entity_kind: String,
+    /// Opaque entity identifier (e.g. trace_id hex string, dev_session_id).
+    pub entity_id: String,
+    /// Earliest known `wyrd_event_time` for this entity (over-approximation).
+    pub min_event_time: chrono::DateTime<chrono::Utc>,
+    /// Latest known `wyrd_event_time` for this entity (over-approximation).
+    pub max_event_time: chrono::DateTime<chrono::Utc>,
+}
+
 /// Cache-invalidation watermark row from `vala.refresh_epochs`.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct RefreshEpochRow {

@@ -1,7 +1,6 @@
 use chrono::{Duration, TimeZone, Utc};
 use serde_json::json;
 
-use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::vala::trace::{GenAiEvalResult, GenAiSpanRecord, Resource, SpanStatus};
 
@@ -12,7 +11,6 @@ fn gen_ai() -> GenAiSpanRecord {
         trace_id: TraceId::from_hex("0123456789abcdef0123456789abcdef").unwrap(),
         span_id: SpanId::from_hex("0123456789abcdef").unwrap(),
         parent_span_id: None,
-        data_tenant_id: DataTenantId::new_v7(),
         start_time: start,
         end_time: end,
         duration_ms: 1_200,
@@ -95,7 +93,6 @@ fn gen_ai_span_record_round_trip_minimal_required_only() {
         trace_id: TraceId::from_hex("0123456789abcdef0123456789abcdef").unwrap(),
         span_id: SpanId::from_hex("0123456789abcdef").unwrap(),
         parent_span_id: None,
-        data_tenant_id: DataTenantId::new_v7(),
         start_time: start,
         end_time: end,
         duration_ms: 500,

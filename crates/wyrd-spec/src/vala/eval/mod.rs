@@ -13,11 +13,11 @@
 //! Module map:
 //! - `ids` — `TaskId`, `SessionId`, `RecordId`, `WorkflowUid`, `EntityUid`,
 //!   `TraceId`, `SpanId`, `JsonPath`.
+//! - `media` — `MediaRef` (URI-bearing descriptor; no inline blobs).
 //! - `operator` — `ComparisonOperator`, `JsonValueType`,
 //!   `DivergenceMetric`.
 //! - `status` — `EvalStatus` (mirrors `eval_inbox.status`).
 //! - `workflow` — `Workflow`, `WorkflowFieldType` (optional declared shape).
-//! - (`media` — deferred; lands with its first real consumer.)
 //! - `condition` — `EvalCondition` gate predicates shared by tasks.
 //! - `assertion` — `AssertionTask` programmatic assertions.
 //! - `llm_judge` — `LlmJudgeTask` prompt-backed judge task.
@@ -36,6 +36,8 @@ pub mod assertion;
 pub mod condition;
 pub mod ids;
 pub mod llm_judge;
+/// Media reference descriptors for eval records — object-storage URIs, no inline blobs.
+pub mod media;
 pub mod operator;
 pub mod plan;
 pub mod protocol;
@@ -61,6 +63,7 @@ pub use ids::{
     TraceId, WorkflowUid,
 };
 pub use llm_judge::LlmJudgeTask;
+pub use media::MediaRef;
 pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
 pub use plan::{DagError, ExecutionPlan, Stage, validate_dag};
 pub use protocol::{

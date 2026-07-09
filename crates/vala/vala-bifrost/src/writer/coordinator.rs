@@ -1,7 +1,11 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::RecordBatch;
+use arrow::array::{Array, FixedSizeBinaryArray, StringArray, TimestampMicrosecondArray};
+use arrow::datatypes::DataType;
+use chrono::{DateTime, Utc};
 use iceberg::table::Table;
 use iceberg_catalog_sql::SqlCatalog;
 use sqlx::PgPool;
@@ -10,14 +14,16 @@ use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
-use wyrd_spec::vala::system_columns::is_reserved_system_column;
+use wyrd_spec::vala::system_columns::{WYRD_EVENT_TIME, is_reserved_system_column};
 
 use crate::batch_builder::stamp_system_columns;
 use crate::error::BifrostError;
 use crate::registry::Registry;
+use crate::tables::{EntityBoundsMapping, PayloadClass};
 use crate::types::{TableScope, TableUid};
 use crate::writer::buffer::AppendBuffer;
 use crate::writer::commit::run_commit;
+use crate::writer::redaction::{BuiltinRedactionPass, RedactionClassifier};
 use crate::writer::{BifrostWriteContext, TableWriterHandle, WriteCmd};
 
 /// The audit-outbox `origin` that marks the relay's own write into
@@ -39,10 +45,13 @@ fn ingest_audit_event(ctx: &BifrostWriteContext, resource: &str) -> AuditEvent {
         Some(_) => PrincipalKindTag::Service,
         None => PrincipalKindTag::User,
     };
-    let principal_id = ctx
-        .actor
-        .parse::<PrincipalId>()
-        .unwrap_or_else(|_| PrincipalId::new(uuid::Uuid::nil()));
+    let principal_id = ctx.actor.parse::<PrincipalId>().unwrap_or_else(|_| {
+        tracing::warn!(
+            actor = %ctx.actor,
+            "failed to parse actor as PrincipalId; audit row will be attributed to nil UUID"
+        );
+        PrincipalId::new(uuid::Uuid::nil())
+    });
 
     AuditEvent {
         request_id: ctx.request_id.clone(),
@@ -75,10 +84,19 @@ struct CommitActor {
     /// This is per-handle today: one coordinator is spawned per `writer()` call,
     /// so a handle (and its actor) serves a single data tenant. When the shared
     /// per-physical-table coordinator (M5/D3/M16) lands, the data tenant must move
-    /// onto `WriteCmd::Write` so one actor can stamp many tenants' writes.
+    /// onto `WriteCmd::Write` so one actor can stamp many tenants' writes. Design
+    /// (queue, backpressure, flush timing, compaction, single/multi-tenant) is not
+    /// yet locked — see
+    /// `.dev/plan/foundations/12-olap-warehouse/stage5/07-write-path-group-commit.md`.
     data_tenant: DataTenantId,
     buffer: AppendBuffer,
     registry: Arc<Registry>,
+    payload_class: PayloadClass,
+    sensitive_columns: &'static [&'static str],
+    /// Optional entity → time bounds mapping for best-effort acceleration (M-06).
+    /// When `Some`, each successful flush upserts per-entity min/max event time
+    /// into `vala.entity_time_bounds` in a separate best-effort transaction.
+    entity_bounds_mapping: Option<EntityBoundsMapping>,
 }
 
 /// Microseconds since the Unix epoch, used for the server-stamped
@@ -162,6 +180,36 @@ impl CommitActor {
             }
         };
 
+        // M-03: for Sensitive tables run the built-in redaction pass over
+        // SENSITIVE_PAYLOAD_COLUMNS before committing. A classifier error
+        // refuses the commit (WYRD_VALA_500_REDACTION_FAILED).
+        let stamped = if self.payload_class == PayloadClass::Sensitive
+            && !self.sensitive_columns.is_empty()
+        {
+            let pass = BuiltinRedactionPass;
+            match stamped
+                .iter()
+                .map(|b| pass.scrub(b, self.sensitive_columns))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(redacted) => redacted,
+                Err(e) => {
+                    self.buffer = AppendBuffer::from_vec(batches);
+                    return Err(e);
+                }
+            }
+        } else {
+            stamped
+        };
+
+        // Extract entity bounds before run_commit consumes `stamped` (best-effort M-06).
+        let entity_bounds: Vec<(String, DateTime<Utc>, DateTime<Utc>)> =
+            if let Some(mapping) = &self.entity_bounds_mapping {
+                extract_entity_bounds(&stamped, &mapping.entity_id_column)
+            } else {
+                vec![]
+            };
+
         match run_commit(
             &self.pool,
             &self.catalog,
@@ -196,6 +244,20 @@ impl CommitActor {
                         );
                     }
                 }
+
+                // Best-effort entity_time_bounds upsert (M-06).
+                if !entity_bounds.is_empty()
+                    && let Some(mapping) = &self.entity_bounds_mapping
+                {
+                    spawn_entity_bounds_upsert(
+                        Arc::clone(&self.pool),
+                        self.data_tenant,
+                        self.table_uid.0,
+                        mapping.entity_kind.clone(),
+                        entity_bounds,
+                    );
+                }
+
                 Ok(snapshot_id)
             }
             Err(e) => {
@@ -203,6 +265,109 @@ impl CommitActor {
                 Err(e)
             }
         }
+    }
+}
+
+fn spawn_entity_bounds_upsert(
+    pool: Arc<PgPool>,
+    data_tenant: DataTenantId,
+    table_uid_arr: [u8; 16],
+    entity_kind: String,
+    entity_bounds: Vec<(String, DateTime<Utc>, DateTime<Utc>)>,
+) {
+    tokio::spawn(async move {
+        match vala_sql::TenantConn::acquire(&pool, data_tenant).await {
+            Ok(mut conn) => {
+                let refs: Vec<(&str, DateTime<Utc>, DateTime<Utc>)> = entity_bounds
+                    .iter()
+                    .map(|(id, min_t, max_t)| (id.as_str(), *min_t, *max_t))
+                    .collect();
+                if let Err(e) = vala_sql::queries::olap_catalog::record_entity_bounds(
+                    &mut conn,
+                    &table_uid_arr,
+                    &entity_kind,
+                    &refs,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "entity_time_bounds upsert failed (best-effort)");
+                    return;
+                }
+                if let Err(e) = conn.commit().await {
+                    tracing::warn!(error = %e, "entity_time_bounds commit failed (best-effort)");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "entity_time_bounds connection failed (best-effort)");
+            }
+        }
+    });
+}
+
+/// Extract per-entity (min, max) `wyrd_event_time` bounds from a slice of committed
+/// batches. Entities are identified by `entity_id_column` (Utf8 or FixedSizeBinary(16)).
+/// Binary values are hex-encoded. Rows where either the entity column or the timestamp
+/// is null are skipped. Returns an empty vec when the column is missing or the type is
+/// unsupported (caller treats a missing result as a bounds miss, not an error).
+fn extract_entity_bounds(
+    batches: &[RecordBatch],
+    entity_id_column: &str,
+) -> Vec<(String, DateTime<Utc>, DateTime<Utc>)> {
+    let mut bounds: HashMap<String, (DateTime<Utc>, DateTime<Utc>)> = HashMap::new();
+
+    for batch in batches {
+        let Some(id_idx) = batch.schema().index_of(entity_id_column).ok() else {
+            continue;
+        };
+        let Some(ts_idx) = batch.schema().index_of(WYRD_EVENT_TIME).ok() else {
+            continue;
+        };
+
+        let id_col = batch.column(id_idx);
+        let ts_col = batch.column(ts_idx);
+
+        let Some(ts_arr) = ts_col.as_any().downcast_ref::<TimestampMicrosecondArray>() else {
+            continue;
+        };
+
+        for row in 0..batch.num_rows() {
+            if ts_arr.is_null(row) || id_col.is_null(row) {
+                continue;
+            }
+            let Some(entity_id) = entity_id_str(id_col.as_ref(), row) else {
+                continue;
+            };
+            let ts_us = ts_arr.value(row);
+            let Some(ts) = DateTime::<Utc>::from_timestamp_micros(ts_us) else {
+                continue;
+            };
+            let entry = bounds.entry(entity_id).or_insert((ts, ts));
+            if ts < entry.0 {
+                entry.0 = ts;
+            }
+            if ts > entry.1 {
+                entry.1 = ts;
+            }
+        }
+    }
+
+    bounds
+        .into_iter()
+        .map(|(id, (min, max))| (id, min, max))
+        .collect()
+}
+
+fn entity_id_str(col: &dyn Array, row: usize) -> Option<String> {
+    match col.data_type() {
+        DataType::Utf8 => col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|a| a.value(row).to_string()),
+        DataType::FixedSizeBinary(_) => col
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .map(|a| hex::encode(a.value(row))),
+        _ => None,
     }
 }
 
@@ -221,6 +386,9 @@ pub(crate) fn spawn_commit_coordinator(
     scope: TableScope,
     data_tenant: DataTenantId,
     registry: Arc<Registry>,
+    payload_class: PayloadClass,
+    sensitive_columns: &'static [&'static str],
+    entity_bounds_mapping: Option<EntityBoundsMapping>,
 ) -> TableWriterHandle {
     let (sender, receiver) = mpsc::channel(64);
 
@@ -234,6 +402,9 @@ pub(crate) fn spawn_commit_coordinator(
         data_tenant,
         buffer: AppendBuffer::new(),
         registry,
+        payload_class,
+        sensitive_columns,
+        entity_bounds_mapping,
     };
 
     tokio::spawn(actor.run());

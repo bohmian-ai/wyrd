@@ -19,6 +19,7 @@ use crate::error::WyrdError;
 use crate::reference::CardRef;
 
 use super::ids::{RecordId, RunId, SessionId, SpanId, TraceId};
+use super::media::MediaRef;
 
 /// The eval observation an instrumented agent emits at evaluation points.
 ///
@@ -53,10 +54,13 @@ pub struct EvalRecordObservation {
 
     /// Reference to the Eval card this record feeds.
     ///
-    /// Per the D8 presence rule, the registry rejects online observations
-    /// targeting an Eval card whose `subject_ref` is unset, so this field is
-    /// meaningful only against cards that declared a subject.
-    pub eval_ref: CardRef,
+    /// `None` → the server fans the record to every Eval card whose `subject_ref`
+    /// is the run's Target (the normal online-monitoring path, plan 04). `Some` →
+    /// score against exactly this card (CLI/CI `--records` runs, targeted re-score).
+    /// Per the D8 presence rule, an online (`None`) record is only scored against
+    /// Eval cards that declared a `subject_ref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_ref: Option<CardRef>,
 
     /// JSON payload the eval tasks assert against.
     ///
@@ -85,6 +89,13 @@ pub struct EvalRecordObservation {
 
     /// Wall-clock emission time.
     pub created_at: DateTime<Utc>,
+
+    /// Reference descriptors for media associated with this eval record.
+    ///
+    /// URIs pointing to object storage — not inline blobs. Callers fetch content
+    /// separately. Null for records with no associated media.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<Vec<MediaRef>>,
 }
 
 impl EvalRecordObservation {

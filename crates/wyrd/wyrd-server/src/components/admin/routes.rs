@@ -22,12 +22,15 @@ use axum::Json;
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use secrecy::SecretString;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use vala_bifrost::reconcile::{AuditReconcileResult, reconcile_audit};
 use wyrd_auth_oidc::{
     ClaimMapping, ClaimPath, ClientAuth, OidcProvider, TrustedIssuer, WorkloadBinding,
 };
+use wyrd_runtime::Permission;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
     IssuerTokenPolicy, IssuerUrl, TrustedIssuerView, WorkloadBindingView,
@@ -41,8 +44,9 @@ use wyrd_sql::queries::auth::{
 use wyrd_sql::row_types::auth::{TrustedIssuerRow, WorkloadBindingRow};
 use wyrd_sql::{SqlError, TenantConn};
 
+use crate::audit;
 use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
-use crate::components::auth::AuthenticatedPrincipal;
+use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -64,6 +68,82 @@ pub fn admin_router() -> Router<AppState> {
                 .get(list_workload_bindings)
                 .delete(delete_workload_binding_route),
         )
+        .route("/admin/audit/integrity", get(audit_integrity))
+}
+
+/// Per-tenant integrity report returned by `GET /v1/admin/audit/integrity`.
+#[derive(Debug, Serialize)]
+pub struct TenantIntegrityReport {
+    /// Tenant the report covers.
+    pub tenant_id: DataTenantId,
+    /// Whether all three checks passed for this tenant.
+    pub clean: bool,
+    /// Seq-gap check: first/last missing seq in each gap.
+    pub seq_gaps: Vec<(i64, i64)>,
+    /// Hash-chain breaks: seq of each broken link.
+    pub chain_breaks: Vec<i64>,
+    /// Seqs present in shipped outbox but absent in the Iceberg warehouse.
+    pub parity_misses: Vec<i64>,
+    /// Seqs present in the warehouse but absent in the shipped outbox.
+    pub orphan_warehouse_seqs: Vec<i64>,
+}
+
+impl From<AuditReconcileResult> for TenantIntegrityReport {
+    fn from(r: AuditReconcileResult) -> Self {
+        let clean = r.is_clean();
+        Self {
+            tenant_id: r.tenant_id,
+            clean,
+            seq_gaps: r
+                .seq_gaps
+                .into_iter()
+                .map(|g| (g.gap_from, g.gap_to))
+                .collect(),
+            chain_breaks: r.chain_breaks.into_iter().map(|b| b.seq).collect(),
+            parity_misses: r.parity_misses,
+            orphan_warehouse_seqs: r.orphan_warehouse_seqs,
+        }
+    }
+}
+
+/// `GET /v1/admin/audit/integrity` — run all three audit durability checks for
+/// every tenant and return the report.
+///
+/// Gated on `audit:read`. Read-only: this endpoint never modifies any state.
+async fn audit_integrity(
+    State(state): State<AppState>,
+    caller: Caller,
+) -> Result<Json<Vec<TenantIntegrityReport>>, WyrdErrorResponse> {
+    if !caller
+        .principal
+        .effective_permissions
+        .contains(&Permission::audit_read())
+    {
+        return Err(WyrdErrorResponse::from(WyrdError::PermissionDeniedRbac {
+            message: "caller lacks audit:read".to_owned(),
+            details: serde_json::json!({ "required": "audit:read" }),
+        }));
+    }
+
+    let result = reconcile_audit(
+        state.postgres.vala_pool(),
+        &state.bifrost,
+        caller.principal.tenant_id,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            error = %e,
+            tenant_id = %caller.principal.tenant_id,
+            "audit reconcile failed"
+        );
+        WyrdErrorResponse::from(WyrdError::Internal {
+            message: "audit reconciliation failed; check server logs".to_owned(),
+            details: serde_json::Value::Null,
+        })
+    })?;
+
+    Ok(Json(vec![TenantIntegrityReport::from(result)]))
 }
 
 // --------------------------------------------------------------------------
@@ -211,7 +291,7 @@ struct BindingFilter {
 /// (never the secret).
 async fn create_trusted_issuer(
     State(state): State<AppState>,
-    caller: AuthenticatedPrincipal,
+    caller: Caller,
     Json(request): Json<CreateTrustedIssuerRequest>,
 ) -> Result<Json<TrustedIssuerView>, WyrdErrorResponse> {
     wyrd_auth::service_accounts::require_service_accounts_write(
@@ -249,6 +329,20 @@ async fn create_trusted_issuer(
     insert_trusted_issuer(&mut conn, &write)
         .await
         .map_err(map_write_error)?;
+    audit::append_on(
+        &mut conn,
+        &audit::audit_event(
+            &caller,
+            "admin.trusted_issuer.create",
+            &format!("trusted_issuer:{}", trusted.issuer),
+            "service_accounts:write",
+            wyrd_spec::vala::api::AuditDecision::Allow,
+            wyrd_spec::vala::api::AuditResult::Success,
+            "trusted issuer registered",
+        ),
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(Json(trusted_issuer_view_from_write(&write)))
@@ -259,7 +353,7 @@ async fn create_trusted_issuer(
 /// discovery or secret ever leaves the store.
 async fn list_trusted_issuers(
     State(state): State<AppState>,
-    caller: AuthenticatedPrincipal,
+    caller: Caller,
 ) -> Result<Json<Vec<TrustedIssuerView>>, WyrdErrorResponse> {
     wyrd_auth::service_accounts::require_service_accounts_write(
         &caller.principal,
@@ -285,7 +379,7 @@ async fn list_trusted_issuers(
 /// (`409`). A missing issuer is a `404`. Returns `204 No Content`.
 async fn delete_trusted_issuer_route(
     State(state): State<AppState>,
-    caller: AuthenticatedPrincipal,
+    caller: Caller,
     Query(query): Query<DeleteIssuerQuery>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
     wyrd_auth::service_accounts::require_service_accounts_write(
@@ -312,6 +406,20 @@ async fn delete_trusted_issuer_route(
     if removed == 0 {
         return Err(issuer_not_found(&issuer));
     }
+    audit::append_on(
+        &mut conn,
+        &audit::audit_event(
+            &caller,
+            "admin.trusted_issuer.delete",
+            &format!("trusted_issuer:{issuer}"),
+            "service_accounts:write",
+            wyrd_spec::vala::api::AuditDecision::Allow,
+            wyrd_spec::vala::api::AuditResult::Success,
+            "trusted issuer deleted",
+        ),
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -329,7 +437,7 @@ async fn delete_trusted_issuer_route(
 /// first), a duplicate binding to a `409`. Writes through the RLS `TenantConn`.
 async fn create_workload_binding(
     State(state): State<AppState>,
-    caller: AuthenticatedPrincipal,
+    caller: Caller,
     Json(request): Json<CreateWorkloadBindingRequest>,
 ) -> Result<Json<WorkloadBindingView>, WyrdErrorResponse> {
     wyrd_auth::service_accounts::require_service_accounts_write(
@@ -351,6 +459,20 @@ async fn create_workload_binding(
     insert_workload_binding(&mut conn, &write)
         .await
         .map_err(|error| map_binding_write_error(error, &binding.issuer))?;
+    audit::append_on(
+        &mut conn,
+        &audit::audit_event(
+            &caller,
+            "admin.workload_binding.create",
+            &format!("workload_binding:{}:{}", binding.issuer, binding.subject),
+            "service_accounts:write",
+            wyrd_spec::vala::api::AuditDecision::Allow,
+            wyrd_spec::vala::api::AuditResult::Success,
+            "workload binding registered",
+        ),
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(Json(workload_binding_view_from_write(&write)))
@@ -362,7 +484,7 @@ async fn create_workload_binding(
 /// form so a trailing slash does not silently miss.
 async fn list_workload_bindings(
     State(state): State<AppState>,
-    caller: AuthenticatedPrincipal,
+    caller: Caller,
     Query(filter): Query<BindingFilter>,
 ) -> Result<Json<Vec<WorkloadBindingView>>, WyrdErrorResponse> {
     wyrd_auth::service_accounts::require_service_accounts_write(
@@ -393,7 +515,7 @@ async fn list_workload_bindings(
 /// binding is a `404`. Returns `204 No Content`.
 async fn delete_workload_binding_route(
     State(state): State<AppState>,
-    caller: AuthenticatedPrincipal,
+    caller: Caller,
     Query(query): Query<BindingQuery>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
     wyrd_auth::service_accounts::require_service_accounts_write(
@@ -410,6 +532,20 @@ async fn delete_workload_binding_route(
     if removed == 0 {
         return Err(binding_not_found(&issuer, &query.subject));
     }
+    audit::append_on(
+        &mut conn,
+        &audit::audit_event(
+            &caller,
+            "admin.workload_binding.delete",
+            &format!("workload_binding:{issuer}:{}", query.subject),
+            "service_accounts:write",
+            wyrd_spec::vala::api::AuditDecision::Allow,
+            wyrd_spec::vala::api::AuditResult::Success,
+            "workload binding deleted",
+        ),
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -424,13 +560,33 @@ async fn delete_workload_binding_route(
 /// so Postgres row-level security is the load-bearing tenant boundary.
 async fn acquire_conn<'a>(
     state: &'a AppState,
-    caller: &AuthenticatedPrincipal,
+    caller: &Caller,
 ) -> Result<TenantConn<'a>, WyrdErrorResponse> {
     state
         .postgres
         .tenant_conn(caller.principal.tenant_id)
         .await
         .map_err(sql_unavailable)
+}
+
+/// Build a reqwest client with SSRF mitigations: 10 s timeout, no redirect-following.
+fn discovery_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("discovery client config is valid")
+}
+
+/// Return `true` when the URL host is a private, loopback, or link-local address.
+fn is_ssrf_blocked_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(addr)) => {
+            addr.is_loopback() || addr.is_private() || addr.is_link_local()
+        }
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback() || addr.is_multicast(),
+        _ => false,
+    }
 }
 
 /// Resolve the issuer's `jwks_uri` via OIDC discovery. The issuer URL is already
@@ -442,7 +598,15 @@ async fn discover_jwks_uri(issuer: &IssuerUrl) -> Result<url::Url, WyrdErrorResp
             details: serde_json::json!({ "field": "issuer" }),
         })
     })?;
-    let provider = OidcProvider::discover(url, reqwest::Client::new())
+
+    if is_ssrf_blocked_host(&url) {
+        return Err(WyrdErrorResponse::from(WyrdError::MissingRequiredField {
+            message: "issuer resolves to a blocked address range".to_owned(),
+            details: serde_json::json!({ "field": "issuer" }),
+        }));
+    }
+
+    let provider = OidcProvider::discover(url, discovery_client())
         .await
         .map_err(|error| {
             tracing::warn!(
@@ -601,6 +765,8 @@ mod tests {
 
     use super::*;
     use crate::auth::pg_resolvers::{PgIssuerResolver, issuer_write_from_trusted};
+    use crate::components::auth::Caller;
+    use wyrd_spec::request_id::RequestId;
 
     const SECRET: &str = "super-secret";
     const SEEDED_ISSUER: &str = "https://idp.example.com/realms/wyrd";
@@ -629,8 +795,9 @@ mod tests {
         })
     }
 
-    fn principal_with(tenant: DataTenantId, perms: PermissionSet) -> AuthenticatedPrincipal {
-        AuthenticatedPrincipal {
+    fn principal_with(tenant: DataTenantId, perms: PermissionSet) -> Caller {
+        Caller {
+            data_tenant_id: tenant,
             principal: Principal::new(
                 PrincipalId::new(uuid::Uuid::nil()),
                 PrincipalKind::User,
@@ -638,17 +805,19 @@ mod tests {
                 Vec::<RoleRef>::new(),
                 perms,
             ),
+            request_id: RequestId::parse(&uuid::Uuid::nil().to_string())
+                .expect("nil UUID is a valid request id"),
         }
     }
 
-    fn writer(tenant: DataTenantId) -> AuthenticatedPrincipal {
+    fn writer(tenant: DataTenantId) -> Caller {
         principal_with(
             tenant,
             PermissionSet::from_iter([Permission::service_accounts_write()]),
         )
     }
 
-    fn reader(tenant: DataTenantId) -> AuthenticatedPrincipal {
+    fn reader(tenant: DataTenantId) -> Caller {
         principal_with(tenant, PermissionSet::new())
     }
 

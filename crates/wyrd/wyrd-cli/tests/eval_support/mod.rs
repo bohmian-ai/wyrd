@@ -139,11 +139,12 @@ pub fn record(ok: bool) -> EvalRecordObservation {
         record_id: RecordId(Uuid::from_u128(if ok { 1 } else { 2 })),
         run_id: RunId::from_string("run-records".to_owned()),
         session_id: None,
-        eval_ref: eval_ref(),
+        eval_ref: Some(eval_ref()),
         context: json!({ "ok": ok }),
         trace_id: None,
         span_id: None,
         created_at: Utc::now(),
+        media: None,
     }
 }
 

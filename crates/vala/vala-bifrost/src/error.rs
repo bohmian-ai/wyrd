@@ -2,6 +2,41 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum BifrostError {
+    // --- DomainTable registration errors (task 02) ---
+    #[error("schema fingerprint drift on domain table {namespace}.{name}")]
+    SchemaDrift {
+        namespace: &'static str,
+        name: &'static str,
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+
+    #[error(
+        "physical schema drift on domain table {namespace}.{name}: control says clean but Iceberg schema differs"
+    )]
+    PhysicalDrift {
+        namespace: &'static str,
+        name: &'static str,
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+
+    #[error("domain table {namespace}.{name}: control row present but Iceberg table is missing")]
+    IcebergMissing {
+        namespace: &'static str,
+        name: &'static str,
+    },
+
+    #[error("domain table {namespace}.{name}: Iceberg table already exists")]
+    IcebergAlreadyExists {
+        namespace: &'static str,
+        name: &'static str,
+    },
+
+    #[error("redaction pass failed: {0}")]
+    RedactionFailed(String),
+
+    // --- original variants ---
     #[error("iceberg error: {0}")]
     Iceberg(#[from] iceberg::Error),
 
@@ -65,9 +100,23 @@ impl BifrostError {
             Self::DuplicateFailedBatch(batch_id) => Pub::DuplicateFailedBatch { batch_id },
             Self::MetadataMismatch(detail) => Pub::MetadataMismatch { detail },
             Self::WriterUnavailable(table) => Pub::WriterUnavailable { table },
-            // Sanitize underlying-engine detail before it crosses the public API:
-            // sqlx/Iceberg/DataFusion errors carry constraint names, column names,
-            // and storage path prefixes. Log the full error; expose a generic detail.
+            Self::SchemaDrift {
+                namespace, name, ..
+            } => Pub::MetadataMismatch {
+                detail: format!("schema fingerprint drift on domain table {namespace}.{name}"),
+            },
+            Self::PhysicalDrift {
+                namespace, name, ..
+            } => Pub::MetadataMismatch {
+                detail: format!("physical schema drift on domain table {namespace}.{name}"),
+            },
+            Self::IcebergMissing { namespace, name } => Pub::MetadataMismatch {
+                detail: format!("Iceberg table missing for domain table {namespace}.{name}"),
+            },
+            Self::IcebergAlreadyExists { namespace, name } => Pub::MetadataMismatch {
+                detail: format!("Iceberg table already exists: {namespace}.{name}"),
+            },
+            // Sanitize underlying-engine detail before it crosses the public API.
             Self::Iceberg(e) => {
                 tracing::error!(error = %e, "iceberg catalog error");
                 Pub::CatalogUnreachable {
@@ -93,7 +142,7 @@ impl BifrostError {
                 }
             }
             Self::AuditUnavailable(detail) => Pub::AuditUnavailable { detail },
-            Self::Internal(detail) => Pub::Internal { detail },
+            Self::RedactionFailed(detail) | Self::Internal(detail) => Pub::Internal { detail },
         }
     }
 }

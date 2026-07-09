@@ -1,0 +1,56 @@
+---
+title: SLOs
+description: Bifrost performance targets and methodology. All figures are TBD pending the bench:bifrost suite.
+pillar: wyrd
+group: Bifrost
+order: 7
+---
+
+# Bifrost SLOs
+
+Performance targets for the Bifrost OLAP warehouse. All numbers below are `TBD (pending bench:bifrost)`. They will be replaced with verified figures from the `bench:bifrost` criterion suite once that suite runs against a named, fixed hardware profile.
+
+> **No performance number ships in this doc unless a verified bench run produced it.** The benchmark suite backing these figures is authored in the consolidated bench pass (after Stage 4 + 4b + 5 are green). Do not replace these placeholders with estimates.
+
+## Write path
+
+| Metric | SLO | Status |
+|---|---|---|
+| `observe.record` / `insert()` enqueue latency (p50) | TBD (pending bench:bifrost) | Not benchmarked |
+| `observe.record` / `insert()` enqueue latency (p95) | TBD (pending bench:bifrost) | Not benchmarked |
+| Arrow batch build throughput (rows/s at flush boundary) | TBD (pending bench:bifrost) | Not benchmarked |
+| End-to-end append → queryable lag (p50) | TBD (pending bench:bifrost) | Not benchmarked |
+| End-to-end append → queryable lag (p95) | TBD (pending bench:bifrost) | Not benchmarked |
+
+## Read path (typed ValaQueryService)
+
+| Method | Metric | SLO | Status |
+|---|---|---|---|
+| `GetTrace` | Point-lookup latency (p50) | TBD (pending bench:bifrost) | Not benchmarked |
+| `GetTrace` | Point-lookup latency (p95) | TBD (pending bench:bifrost) | Not benchmarked |
+| `QueryRecentTraces` | Derived-list latency (p95) | TBD (pending bench:bifrost) | Not benchmarked |
+| Aggregation scan | Throughput over bounded partition window | TBD (pending bench:bifrost) | Not benchmarked |
+
+## Benchmark methodology
+
+When the `bench:bifrost` suite runs:
+
+1. A fixed hardware profile is recorded (CPU, RAM, storage IOPS) and pinned to this page.
+2. Each benchmark is run via `mise run bench:bifrost` which emits a machine-readable JSON summary.
+3. The p50/p95 figures from that summary replace the `TBD` placeholders here.
+4. The hardware profile + run timestamp are cited alongside each figure.
+
+The suite does not run in `pre-pr` — benchmarks are not a correctness gate. The SLO figures are refreshed deliberately when a performance-relevant change lands.
+
+## Benchmark suite (spec — not yet authored)
+
+The following benchmarks will be authored in `crates/vala/vala-bifrost/benches/` as part of the consolidated bench pass:
+
+| Benchmark | Measures |
+|---|---|
+| `write_insert` | `observe.record` / producer `insert()` call latency |
+| `batch_build` | Arrow batch build throughput at the flush boundary |
+| `ingest_lag` | End-to-end append → queryable lag |
+| `read_get_trace` | `GetTrace` point-lookup latency |
+| `read_recent_traces` | `QueryRecentTraces` derived-list latency (includes the in-Rust GROUP-BY) |
+| `scan_aggregate` | Aggregation scan throughput over a bounded partition window |

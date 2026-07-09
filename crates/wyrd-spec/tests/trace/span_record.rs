@@ -1,7 +1,6 @@
 use chrono::{Duration, TimeZone, Utc};
 use serde_json::json;
 
-use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::vala::trace::{
     InstrumentationScope, Resource, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus,
@@ -40,7 +39,6 @@ fn span() -> SpanRecord {
             service_instance_id: None,
             attributes: serde_json::Map::new(),
         },
-        data_tenant_id: DataTenantId::new_v7(),
     }
 }
 

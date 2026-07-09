@@ -1,0 +1,166 @@
+---
+title: Schema
+description: Pre-declared Bifrost domain tables, physical schemas, system columns, and type mapping.
+pillar: wyrd
+group: Bifrost
+order: 4
+---
+
+# Bifrost Schema
+
+All tables are pre-declared `DomainTable` instances registered at boot. The physical schemas below are what DataFusion sees at scan time — they include system columns. The Rust record types in `wyrd-spec` (`SpanRecord`, `GenAiSpanRecord`, etc.) are the canonical source; this page documents the derived physical layout.
+
+## Common system columns (all tables)
+
+| Column | Physical type | Description |
+|---|---|---|
+| `data_tenant_id` | `Utf8` | Tenant isolation key (server-stamped) |
+| `wyrd_event_time` | `Timestamp(µs, UTC)` | Canonical event time for partitioning and windowing |
+| `wyrd_ingested_at` | `Timestamp(µs, UTC)` | Server-side flush wall clock |
+| `wyrd_batch_id` | `FixedSizeBinary(16)` | Batch deduplication key |
+| `run_id` | `Utf8` (nullable) | Correlation: job/experiment run |
+| `card_uid` | `Utf8` (nullable) | Correlation: owning Card |
+| `principal_id` | `Utf8` (nullable) | Correlation: emitting principal |
+
+## vala.traces.spans
+
+Source type: `SpanRecord` (`wyrd-spec::vala::traces`).
+
+| Column | Physical type | Notes |
+|---|---|---|
+| `trace_id` | `FixedSizeBinary(16)` | 128-bit trace ID |
+| `span_id` | `FixedSizeBinary(8)` | 64-bit span ID |
+| `parent_span_id` | `FixedSizeBinary(8)` nullable | Absent for root span |
+| `flags` | `UInt32` | OpenTelemetry span flags |
+| `name` | `Utf8` | Span operation name |
+| `kind` | `Utf8` | `SERVER`, `CLIENT`, `INTERNAL`, etc. |
+| `start_time` | `Timestamp(µs, UTC)` | Span start |
+| `end_time` | `Timestamp(µs, UTC)` | Span end |
+| `duration_ms` | `UInt64` | `(end_time - start_time) / 1000` |
+| `status` | `Utf8` | `OK`, `ERROR`, `UNSET` |
+| `attributes` | `Utf8View` nullable | JSON-serialized span attributes — **payload-gated** |
+| `service_name` | `Utf8` | Emitting service |
+| + system columns | | |
+
+## vala.traces.events
+
+| Column | Physical type |
+|---|---|
+| `trace_id` | `FixedSizeBinary(16)` |
+| `span_id` | `FixedSizeBinary(8)` |
+| `timestamp` | `Timestamp(µs, UTC)` |
+| `name` | `Utf8` |
+| `attributes` | `Utf8View` nullable — **payload-gated** |
+| + system columns | |
+
+## vala.traces.links
+
+| Column | Physical type |
+|---|---|
+| `trace_id` | `FixedSizeBinary(16)` |
+| `span_id` | `FixedSizeBinary(8)` |
+| `linked_trace_id` | `FixedSizeBinary(16)` |
+| `linked_span_id` | `FixedSizeBinary(8)` |
+| `attributes` | `Utf8View` nullable — **payload-gated** |
+| + system columns | |
+
+## vala.genai.messages
+
+Source type: `GenAiSpanRecord`.
+
+| Column | Physical type | Notes |
+|---|---|---|
+| `trace_id` | `FixedSizeBinary(16)` | |
+| `span_id` | `FixedSizeBinary(8)` | |
+| `start_time` | `Timestamp(µs, UTC)` | |
+| `provider_name` | `Utf8` | e.g. `openai`, `anthropic` |
+| `request_model` | `Utf8` | Model name as requested |
+| `conversation_id` | `Utf8` nullable | |
+| `usage_input_tokens` | `UInt32` nullable | |
+| `usage_output_tokens` | `UInt32` nullable | |
+| `input_messages` | `Utf8View` nullable | **payload-gated** |
+| `output_messages` | `Utf8View` nullable | **payload-gated** |
+| + system columns | |
+
+## vala.metrics.points
+
+Source type: `MetricRecord`.
+
+| Column | Physical type |
+|---|---|
+| `metric_name` | `Utf8` |
+| `time` | `Timestamp(µs, UTC)` |
+| `metric_type` | `Utf8` |
+| `value` | `Float64` nullable |
+| `attributes` | `Utf8View` nullable |
+| + system columns | |
+
+## vala.logs.records
+
+Source type: `LogRecord`.
+
+| Column | Physical type |
+|---|---|
+| `time` | `Timestamp(µs, UTC)` nullable |
+| `observed_time` | `Timestamp(µs, UTC)` |
+| `severity_number` | `UInt32` nullable |
+| `severity_text` | `Utf8` nullable |
+| `event_name` | `Utf8` nullable — **payload-gated** |
+| `body` | `Utf8View` nullable — **payload-gated** |
+| `trace_id` | `FixedSizeBinary(16)` nullable |
+| `span_id` | `FixedSizeBinary(8)` nullable |
+| + system columns | |
+
+## vala.eval.assertions
+
+Source type: `EvalRecordObservation` (per-assertion rows).
+
+| Column | Physical type |
+|---|---|
+| `record_id` | `Utf8` |
+| `eval_ref` | `Utf8` nullable |
+| `assertion_name` | `Utf8` |
+| `score_value` | `Float64` nullable |
+| `created_at` | `Timestamp(µs, UTC)` |
+| + system columns | |
+
+## vala.drift.observations
+
+Source type: `DriftRecordObservation`.
+
+| Column | Physical type |
+|---|---|
+| `record_id` | `Utf8` |
+| `series` | `Utf8` |
+| `num_value` | `Float64` nullable |
+| `str_value` | `Utf8` nullable |
+| `created_at` | `Timestamp(µs, UTC)` |
+| + system columns | |
+
+## vala.dev.agent_traces
+
+Source type: `AgentTraceRecord`.
+
+| Column | Physical type |
+|---|---|
+| `dev_session_id` | `Utf8` |
+| `repo` | `Utf8` |
+| `commit_sha` | `Utf8` nullable |
+| `branch` | `Utf8` nullable |
+| `run_id` | `Utf8` |
+| `started_at` | `Timestamp(µs, UTC)` |
+| `ended_at` | `Timestamp(µs, UTC)` |
+| `messages` | `Utf8View` — **payload-gated** |
+| `tool_io` | `Utf8View` nullable — **payload-gated** |
+| + system columns | |
+
+## Type mapping
+
+| Arrow physical type | API wire type | Notes |
+|---|---|---|
+| `FixedSizeBinary(16)` | `String` (lowercase hex) | trace_id, batch_id |
+| `FixedSizeBinary(8)` | `String` (lowercase hex) | span_id |
+| `Timestamp(µs, UTC)` | `DateTime<Utc>` (RFC3339) | All timestamps |
+| `Utf8View` | `String` or `serde_json::Value` | Attributes are JSON-parsed |
+| `UInt32` nullable | `Option<i64>` | Token counts |
+| `Float64` nullable | `Option<f64>` | Scores, values |

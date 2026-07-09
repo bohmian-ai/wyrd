@@ -79,6 +79,22 @@ pub struct EvalReport {
     pub outcomes: Vec<TaskRunOutcome>,
 }
 
+/// Rollup summary of an [`EvalReport`] for populating `vala.eval.runs`
+/// workflow-summary columns (B6).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalWorkflowSummary {
+    /// Total tasks that ran (skipped tasks excluded).
+    pub total_tasks: i32,
+    /// Tasks that ran and passed.
+    pub passed_tasks: i32,
+    /// Tasks that ran and failed.
+    pub failed_tasks: i32,
+    /// `passed_tasks / total_tasks`; `0.0` when `total_tasks == 0`.
+    pub pass_rate: f64,
+    /// Sum of per-task `duration_ms` across all ran tasks.
+    pub duration_ms: i64,
+}
+
 impl EvalReport {
     /// Iterate over the assertion results of tasks that actually ran.
     pub fn ran(&self) -> impl Iterator<Item = &AssertionResult> + '_ {
@@ -94,6 +110,32 @@ impl EvalReport {
             TaskRunOutcome::Skipped { task_id, reason } => Some((task_id, reason)),
             TaskRunOutcome::Ran(_) => None,
         })
+    }
+
+    /// Compute the workflow-level summary for populating `vala.eval.runs` columns.
+    pub fn workflow_summary(&self) -> EvalWorkflowSummary {
+        let mut total = 0i32;
+        let mut passed = 0i32;
+        let mut duration_ms = 0i64;
+        for result in self.ran() {
+            total += 1;
+            if result.passed {
+                passed += 1;
+            }
+            duration_ms += i64::try_from(result.duration_ms).unwrap_or(i64::MAX);
+        }
+        let pass_rate = if total > 0 {
+            f64::from(passed) / f64::from(total)
+        } else {
+            0.0
+        };
+        EvalWorkflowSummary {
+            total_tasks: total,
+            passed_tasks: passed,
+            failed_tasks: total - passed,
+            pass_rate,
+            duration_ms,
+        }
     }
 }
 

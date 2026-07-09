@@ -23,6 +23,7 @@ use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::authenticate::require_authenticated;
 use crate::query::routes::router as query_router;
 use crate::state::AppState;
+use crate::vala_query::routes::router as vala_query_router;
 
 /// Build the HTTP router with shared server state.
 pub fn build_router(state: AppState) -> Router {
@@ -47,6 +48,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(admin_router())
         .merge(bifrost_router())
         .merge(query_router())
+        .merge(vala_query_router())
         .fallback(v1_not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),

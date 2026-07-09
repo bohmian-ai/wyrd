@@ -19,6 +19,8 @@ testing = ["dep:tokio", "wyrd-sql/testing"]
 [dependencies]
 sha2 = { workspace = true }
 secrecy = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true, optional = true, features = ["sync", "macros", "rt-multi-thread"] }
 tracing = { workspace = true }
@@ -28,6 +30,8 @@ wyrd-sql = { path = "../../wyrd/wyrd-sql", version = "0.0.1" }
 
 [dev-dependencies]
 secrecy = { workspace = true }
+serde_json = { workspace = true }
+wyrd-semver = { workspace = true }
 # Self-reference activates `testing` feature for integration tests in `tests/`
 # (cfg(test) does not apply to the lib when building integration test binaries).
 vala-sql = { path = ".", features = ["testing"] }

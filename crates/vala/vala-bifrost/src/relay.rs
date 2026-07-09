@@ -25,11 +25,11 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::system_columns::{CARD_REF, RUN_ID};
 
 use crate::catalog::WyrdCatalog;
 use crate::catalog::namespaces::BifrostNamespace;
 use crate::error::BifrostError;
+use crate::tables::{self, DomainTable};
 use crate::types::TableScope;
 use crate::writer::BifrostWriteContext;
 use crate::writer::coordinator::AUDIT_RELAY_ORIGIN;
@@ -39,7 +39,7 @@ use vala_sql::queries::audit_outbox::stamp_audit_ship_batch_id;
 use vala_sql::row_types::audit_outbox::AuditOutboxRow;
 
 /// Bifrost table name of the audit warehouse (`vala.system.audit_log`).
-pub const AUDIT_LOG_TABLE: &str = "audit_log";
+pub const AUDIT_LOG_TABLE: &str = tables::system::AuditLogTable::NAME;
 
 /// Background relay from `vala.audit_outbox` to `vala.system.audit_log`.
 pub struct AuditRelay {
@@ -67,20 +67,15 @@ impl AuditRelay {
         Self { catalog, pool }
     }
 
-    /// Idempotently ensure `vala.system.audit_log` exists. Call once at boot
-    /// before the first tick.
+    /// Idempotently ensure `vala.system.audit_log` exists and is registered with
+    /// fingerprint pinning. Delegates to the `DomainTable` registration path
+    /// (`register_all` equivalent) so the table goes through the same steady-state
+    /// and split-brain checks as all other pre-declared domain tables.
     ///
     /// # Errors
     /// Returns [`BifrostError`] when the catalog create/register fails.
     pub async fn ensure_audit_log_table(&self) -> Result<(), BifrostError> {
-        self.catalog
-            .ensure_system_table(
-                BifrostNamespace::System,
-                AUDIT_LOG_TABLE,
-                audit_log_fields(),
-                &[],
-            )
-            .await
+        tables::register::<tables::system::AuditLogTable>(&self.catalog).await
     }
 
     /// Claim up to `limit` unshipped rows, stamp their `ship_batch_id` inside the
@@ -269,12 +264,9 @@ fn audit_log_fields() -> Vec<Field> {
     ]
 }
 
-/// Build the Arrow batch of audit content columns for one tenant's shipment.
-///
-/// The batch carries the content fields plus the nullable `run_id`/`card_ref`
-/// correlation columns (both NULL for relay writes) so the stamped batch aligns
-/// with the stored physical schema; the server stamps the remaining system
-/// columns (`wyrd_*`, `data_tenant_id`) at flush.
+/// Build the Arrow batch of the 16 audit content columns for one tenant's
+/// shipment. `CorrelationPolicy::None` — no `run_id`/`card_ref` appended (C-01).
+/// The writer stamps the 4 Bifrost system columns at flush.
 fn build_audit_log_batch(rows: &[AuditOutboxRow]) -> Result<RecordBatch, BifrostError> {
     let seq = Int64Array::from(rows.iter().map(|r| r.seq).collect::<Vec<_>>());
     let entry_hash = StringArray::from(rows.iter().map(|r| hex(&r.entry_hash)).collect::<Vec<_>>());
@@ -321,12 +313,8 @@ fn build_audit_log_batch(rows: &[AuditOutboxRow]) -> Result<RecordBatch, Bifrost
             .map(|r| r.created_at.timestamp_micros())
             .collect::<Vec<_>>(),
     );
-    let null_corr = StringArray::from(vec![None::<String>; rows.len()]);
 
-    let mut fields = audit_log_fields();
-    fields.push(Field::new(RUN_ID, DataType::Utf8, true));
-    fields.push(Field::new(CARD_REF, DataType::Utf8, true));
-    let schema = Arc::new(Schema::new(fields));
+    let schema = Arc::new(Schema::new(audit_log_fields()));
 
     let columns: Vec<ArrayRef> = vec![
         Arc::new(seq),
@@ -345,8 +333,6 @@ fn build_audit_log_batch(rows: &[AuditOutboxRow]) -> Result<RecordBatch, Bifrost
         Arc::new(result),
         Arc::new(payload_summary),
         Arc::new(created_at_us),
-        Arc::new(null_corr.clone()),
-        Arc::new(null_corr),
     ];
 
     RecordBatch::try_new(schema, columns).map_err(BifrostError::Arrow)

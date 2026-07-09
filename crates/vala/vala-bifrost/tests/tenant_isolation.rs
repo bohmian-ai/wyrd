@@ -170,20 +170,24 @@ async fn seeded() -> Seeded {
 }
 
 async fn write_rows(catalog: &WyrdCatalog, tenant: DataTenantId, payloads: &[&str]) {
-    // A client batch carries the user field plus the `run_id` / `card_ref`
-    // correlation columns; `with_system_columns` places them ahead of the
-    // server-stamped columns, so the batch fed to the writer must include them
-    // or the positional cast in `write_batches` misaligns.
+    // Pre-stamp user+correlation columns for a SystemShared table.
+    // `with_system_columns` appends run_id, card_uid, principal_id before the
+    // server-stamped wyrd_* columns. The coordinator's flush() appends
+    // wyrd_event_time, wyrd_ingested_at, wyrd_batch_id, data_tenant_id.
+    // Positional cast in write_batches requires the batch column order and count
+    // to match the physical schema exactly.
     let schema = Arc::new(Schema::new(vec![
         Field::new("payload", DataType::Utf8, false),
         Field::new("run_id", DataType::Utf8, true),
-        Field::new("card_ref", DataType::Utf8, true),
+        Field::new("card_uid", DataType::Utf8, true),
+        Field::new("principal_id", DataType::Utf8, true),
     ]));
     let nrows = payloads.len();
     let batch = RecordBatch::try_new(
         schema,
         vec![
             Arc::new(StringArray::from(payloads.to_vec())),
+            Arc::new(StringArray::from(vec![None::<&str>; nrows])),
             Arc::new(StringArray::from(vec![None::<&str>; nrows])),
             Arc::new(StringArray::from(vec![None::<&str>; nrows])),
         ],

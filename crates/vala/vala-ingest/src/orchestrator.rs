@@ -6,16 +6,18 @@
 //! take in-memory inputs and never touch the catalog.
 
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use tokio::time::timeout;
 use vala_bifrost::writer::BifrostWriteContext;
 use vala_bifrost::{BifrostNamespace, TableScope, WyrdCatalog};
 use wyrd_runtime::{Permission, PermissionCheck, Principal, RbacCheck};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::vala::CARD_REF;
+use wyrd_spec::vala::{CARD_REF, CARD_UID, PRINCIPAL_ID};
 use wyrd_tonic::tonic::Status;
 use wyrd_tonic::wyrd::v1::InsertBatchRequest;
 
@@ -234,6 +236,117 @@ pub fn validate_card_scope(
     Ok(())
 }
 
+/// Stamp server-resolved `card_uid` and `principal_id` correlation columns onto
+/// every batch, removing the wire-only `card_ref` column (M-11 / Task 12).
+///
+/// Rules (fail-closed for authenticated writes):
+/// - If `card_ref` column is present: resolve each value to `card_uid` via the
+///   principal's bound card reference uid. If uid is unavailable (not yet
+///   resolved by the registry), rejects with `CardUnresolved`.
+/// - If `card_ref` column is absent or all-null: `card_uid` is stamped NULL
+///   (card-less observation, permitted for authenticated writes).
+/// - `principal_id` is always stamped from `principal.id` (never NULL for
+///   authenticated writes).
+///
+/// # Errors
+/// Returns [`IngestError::CardUnresolved`] when a `card_ref` is present but
+/// its uid cannot be resolved via the principal's bound card.
+pub fn stamp_correlation_columns(
+    batches: Vec<RecordBatch>,
+    principal: &Principal,
+) -> Result<Vec<RecordBatch>, IngestError> {
+    let principal_id_str = principal.id.to_string();
+    let bound_card_uid: Option<String> = principal
+        .card_ref()
+        .and_then(|cr| cr.uid.as_ref())
+        .map(|uid| uid.to_string());
+
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let nrows = batch.num_rows();
+        let card_ref_col_idx = batch.schema().index_of(CARD_REF).ok();
+
+        // Resolve card_uid per-row when card_ref column is present.
+        let card_uid_values: Vec<Option<String>> = if let Some(idx) = card_ref_col_idx {
+            let col = batch.column(idx);
+            let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                IngestError::CardScopeDenied {
+                    card_ref: "<non-utf8-card_ref>".to_owned(),
+                }
+            })?;
+            let mut uids = Vec::with_capacity(nrows);
+            for i in 0..nrows {
+                if arr.is_null(i) {
+                    uids.push(None);
+                } else {
+                    let raw = arr.value(i);
+                    let card =
+                        CardRef::from_str(raw).map_err(|_| IngestError::CardScopeDenied {
+                            card_ref: raw.to_owned(),
+                        })?;
+                    // Try resolving uid from principal's bound card (same identity).
+                    let uid = if let Some(bound) = principal.card_ref() {
+                        if bound.same_identity(&card) {
+                            bound_card_uid
+                                .clone()
+                                .ok_or_else(|| IngestError::CardUnresolved {
+                                    card_ref: raw.to_owned(),
+                                })?
+                        } else {
+                            // Card in scope but not the principal's bound card — no uid available.
+                            return Err(IngestError::CardUnresolved {
+                                card_ref: raw.to_owned(),
+                            });
+                        }
+                    } else {
+                        // User principal: card_ref present but no bound card → cannot resolve.
+                        return Err(IngestError::CardUnresolved {
+                            card_ref: raw.to_owned(),
+                        });
+                    };
+                    uids.push(Some(uid));
+                }
+            }
+            uids
+        } else {
+            vec![None; nrows]
+        };
+
+        // Build new schema: drop card_ref, add card_uid + principal_id.
+        let mut new_fields: Vec<Field> = batch
+            .schema()
+            .fields()
+            .iter()
+            .filter(|f| f.name() != CARD_REF)
+            .map(|f| f.as_ref().clone())
+            .collect();
+        new_fields.push(Field::new(CARD_UID, DataType::Utf8, true));
+        new_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, false));
+
+        let mut new_cols: Vec<Arc<dyn Array>> = batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.name() != CARD_REF)
+            .map(|(i, _)| Arc::clone(batch.column(i)))
+            .collect();
+
+        let card_uid_arr = Arc::new(StringArray::from(card_uid_values)) as Arc<dyn Array>;
+        let principal_id_arr =
+            Arc::new(StringArray::from(vec![principal_id_str.as_str(); nrows])) as Arc<dyn Array>;
+        new_cols.push(card_uid_arr);
+        new_cols.push(principal_id_arr);
+
+        let new_schema = Arc::new(Schema::new(new_fields));
+        out.push(
+            RecordBatch::try_new(new_schema, new_cols)
+                .map_err(|e| IngestError::Internal(e.to_string()))?,
+        );
+    }
+    Ok(out)
+}
+
 /// Resolve a `namespace.name` fqn into a [`BifrostNamespace`] + table name.
 ///
 /// # Errors
@@ -278,12 +391,15 @@ pub async fn run_ingest<S: FrameSource>(
     // Gate (c): attribution boundary — every per-row card must be in scope.
     validate_card_scope(&collected.batches, &auth.principal)?;
 
+    // Resolve card_ref → card_uid and stamp principal_id server-side (M-11).
+    let stamped = stamp_correlation_columns(collected.batches, &auth.principal)?;
+
     let writer = catalog
         .writer(namespace, &name, TableScope::TenantOwned, auth.tenant)
         .await
         .map_err(IngestError::from_engine)?;
 
-    for batch in collected.batches {
+    for batch in stamped {
         writer
             .write(batch)
             .await

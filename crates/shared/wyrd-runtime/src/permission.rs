@@ -49,6 +49,14 @@ pub enum Resource {
     BifrostRecord,
     /// Bifrost table reads (SQL/scan).
     BifrostQuery,
+    /// Trace-span payload/attribute columns (sensitive; gates waterfall payloads).
+    BifrostTracePayload,
+    /// Log-record body/attribute columns (sensitive).
+    BifrostLogPayload,
+    /// GenAI prompt/completion columns (sensitive).
+    BifrostGenAiPayload,
+    /// Agent-trace captured payload columns (sensitive).
+    BifrostAgentTracePayload,
     /// One of several resources.
     AnyOf(Vec<Resource>),
     /// All resources.
@@ -111,6 +119,10 @@ impl Resource {
             Self::BifrostTable => "bifrost_table",
             Self::BifrostRecord => "bifrost_record",
             Self::BifrostQuery => "bifrost_query",
+            Self::BifrostTracePayload => "bifrost_trace_payload",
+            Self::BifrostLogPayload => "bifrost_log_payload",
+            Self::BifrostGenAiPayload => "bifrost_genai_payload",
+            Self::BifrostAgentTracePayload => "bifrost_agent_trace_payload",
             Self::Wildcard => "wildcard",
             Self::AnyOf(_) => return None,
         })
@@ -376,6 +388,10 @@ fn parse_resource(value: &str) -> Result<Resource, PermissionParseError> {
         "bifrost_table" => Resource::BifrostTable,
         "bifrost_record" => Resource::BifrostRecord,
         "bifrost_query" => Resource::BifrostQuery,
+        "bifrost_trace_payload" => Resource::BifrostTracePayload,
+        "bifrost_log_payload" => Resource::BifrostLogPayload,
+        "bifrost_genai_payload" => Resource::BifrostGenAiPayload,
+        "bifrost_agent_trace_payload" => Resource::BifrostAgentTracePayload,
         "wildcard" => Resource::Wildcard,
         _ => return Err(PermissionParseError),
     })
@@ -513,6 +529,31 @@ mod tests {
             let json = serde_json::to_value(&permission).expect("serializes");
             assert_eq!(
                 serde_json::from_value::<Permission>(json).expect("deserializes"),
+                permission
+            );
+        }
+    }
+
+    #[test]
+    fn payload_resource_wire_strings() {
+        for (resource, wire) in [
+            (Resource::BifrostTracePayload, "bifrost_trace_payload"),
+            (Resource::BifrostLogPayload, "bifrost_log_payload"),
+            (Resource::BifrostGenAiPayload, "bifrost_genai_payload"),
+            (
+                Resource::BifrostAgentTracePayload,
+                "bifrost_agent_trace_payload",
+            ),
+        ] {
+            let permission = Permission {
+                resource: resource.clone(),
+                action: Action::Read,
+            };
+            assert_eq!(permission.to_string(), format!("{wire}:read"));
+            assert_eq!(
+                format!("{wire}:read")
+                    .parse::<Permission>()
+                    .expect("parses"),
                 permission
             );
         }

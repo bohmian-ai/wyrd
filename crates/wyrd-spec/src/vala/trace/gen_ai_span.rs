@@ -12,7 +12,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::WyrdError;
-use crate::ids::DataTenantId;
 use crate::vala::ids::{SpanId, TraceId};
 use crate::vala::trace::{GenAiEvalResult, Resource, SpanStatus};
 
@@ -27,8 +26,6 @@ pub struct GenAiSpanRecord {
     /// Parent span id. `None` for root spans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_span_id: Option<SpanId>,
-    /// Tenant partition key.
-    pub data_tenant_id: DataTenantId,
     /// Span start time. Same as `SpanRecord.start_time`.
     pub start_time: DateTime<Utc>,
     /// Span end time. Same as `SpanRecord.end_time`.

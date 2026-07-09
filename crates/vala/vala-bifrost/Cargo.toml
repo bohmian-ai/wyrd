@@ -13,7 +13,6 @@ path = "src/lib.rs"
 
 [features]
 default = []
-python = ["dep:pyo3", "arrow/pyarrow"]
 testing = ["vala-sql/testing"]
 bench-bin = ["dep:criterion", "dep:clap", "dep:rand", "dep:tempfile", "dep:serde_json", "vala-sql/testing"]
 
@@ -43,8 +42,8 @@ uuid       = { workspace = true, features = ["v7"] }
 serde      = { workspace = true, features = ["derive"] }
 sha2       = { workspace = true }
 hex        = { workspace = true }
-
-pyo3 = { workspace = true, optional = true }
+chrono     = { workspace = true }
+regex      = { workspace = true }
 
 criterion  = { version = "0.5", features = ["async_tokio"], optional = true }
 clap       = { workspace = true, optional = true }

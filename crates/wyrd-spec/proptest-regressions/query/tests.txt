@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a3e16f64f95baf9db3bf4b7562525c63e355bbaf78f3491ed62fb6ac9dea73b4 # shrinks to query = And([And([Predicate(Predicate { field: Label("a"), op: Eq(String("")) }), Or([Predicate(Predicate { field: Annotation("a.in._"), op: Eq(String("")) }), Predicate(Predicate { field: Label("a"), op: Eq(String("")) })])]), And([Predicate(Predicate { field: Label("a"), op: Eq(String("")) }), And([Predicate(Predicate { field: Label("a"), op: Eq(Int(-579)) }), Predicate(Predicate { field: Annotation("xhhk m"), op: Eq(Duration(231733)) })])])])

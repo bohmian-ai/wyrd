@@ -1,20 +1,35 @@
 //! String parser for metadata queries.
 
 use crate::error::WyrdError;
-use crate::query::{FieldRef, MetadataQuery, Operator, Predicate, Value};
+use crate::query::{FieldRef, MAX_DEPTH, MetadataQuery, Operator, Predicate, Value};
+
+/// Maximum accepted byte length for a raw query string.
+pub(crate) const MAX_QUERY_INPUT_LEN: usize = 4096;
 
 /// Parse a metadata query string into an AST.
 ///
 /// # Errors
+/// Returns `WYRD_QUERY_400_TOO_COMPLEX` when the input exceeds `MAX_QUERY_INPUT_LEN`.
 /// Returns `WYRD_QUERY_400_INVALID_SYNTAX` when lexing or parsing fails.
 pub(crate) fn parse_query(input: &str) -> Result<MetadataQuery, WyrdError> {
+    if input.len() > MAX_QUERY_INPUT_LEN {
+        return Err(WyrdError::query_too_complex(
+            format!(
+                "query string length {} exceeds max {MAX_QUERY_INPUT_LEN}",
+                input.len()
+            ),
+            "input_length",
+            input.len(),
+            MAX_QUERY_INPUT_LEN,
+        ));
+    }
     let tokens = lex(input)?;
     let mut parser = Parser {
         tokens,
         cursor: 0,
         input_len: input.len(),
     };
-    let query = parser.parse_or()?;
+    let query = parser.parse_or(0)?;
     parser.expect_eof()?;
     Ok(query)
 }
@@ -379,10 +394,18 @@ struct Parser {
 }
 
 impl Parser {
-    fn parse_or(&mut self) -> Result<MetadataQuery, WyrdError> {
-        let mut children = vec![self.parse_and()?];
+    fn parse_or(&mut self, depth: usize) -> Result<MetadataQuery, WyrdError> {
+        if depth > MAX_DEPTH {
+            return Err(WyrdError::query_too_complex(
+                format!("query nesting depth {depth} exceeds max {MAX_DEPTH}"),
+                "depth",
+                depth,
+                MAX_DEPTH,
+            ));
+        }
+        let mut children = vec![self.parse_and(depth)?];
         while self.matches(|tok| matches!(tok, Tok::Or)) {
-            children.push(self.parse_and()?);
+            children.push(self.parse_and(depth)?);
         }
         Ok(if children.len() == 1 {
             children.remove(0)
@@ -391,10 +414,10 @@ impl Parser {
         })
     }
 
-    fn parse_and(&mut self) -> Result<MetadataQuery, WyrdError> {
-        let mut children = vec![self.parse_unary()?];
+    fn parse_and(&mut self, depth: usize) -> Result<MetadataQuery, WyrdError> {
+        let mut children = vec![self.parse_unary(depth)?];
         while self.matches(|tok| matches!(tok, Tok::And)) {
-            children.push(self.parse_unary()?);
+            children.push(self.parse_unary(depth)?);
         }
         Ok(if children.len() == 1 {
             children.remove(0)
@@ -403,12 +426,12 @@ impl Parser {
         })
     }
 
-    fn parse_unary(&mut self) -> Result<MetadataQuery, WyrdError> {
+    fn parse_unary(&mut self, depth: usize) -> Result<MetadataQuery, WyrdError> {
         if self.matches(|tok| matches!(tok, Tok::Not)) {
-            return Ok(MetadataQuery::Not(Box::new(self.parse_unary()?)));
+            return Ok(MetadataQuery::Not(Box::new(self.parse_unary(depth + 1)?)));
         }
         if self.matches(|tok| matches!(tok, Tok::LParen)) {
-            let query = self.parse_or()?;
+            let query = self.parse_or(depth + 1)?;
             self.expect(|tok| matches!(tok, Tok::RParen), ")")?;
             return Ok(query);
         }
@@ -527,6 +550,15 @@ impl Parser {
         };
         match spanned.tok {
             Tok::Ident(value) | Tok::Str(value) => Ok(value),
+            // Keywords are lexically identical to identifiers in the dotted-key
+            // context (labels.in, annotations.not.exists, etc. are valid keys).
+            Tok::And => Ok("and".to_owned()),
+            Tok::Or => Ok("or".to_owned()),
+            Tok::Not => Ok("not".to_owned()),
+            Tok::In => Ok("in".to_owned()),
+            Tok::Exists => Ok("exists".to_owned()),
+            Tok::Bool(true) => Ok("true".to_owned()),
+            Tok::Bool(false) => Ok("false".to_owned()),
             other => Err(syntax(
                 "expected key segment after '.'",
                 spanned.offset,
@@ -715,7 +747,39 @@ pub(crate) fn escape_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::query::{FieldRef, MetadataQuery, Operator, Value};
+    use crate::query::{FieldRef, MAX_DEPTH, MetadataQuery, Operator, Value};
+
+    use super::MAX_QUERY_INPUT_LEN;
+
+    #[test]
+    fn rejects_input_exceeding_max_len() {
+        let long = format!("a = \"{}\"", "x".repeat(MAX_QUERY_INPUT_LEN));
+        let err = MetadataQuery::parse(&long).expect_err("over-length query is rejected");
+        assert_eq!(err.code(), "WYRD_QUERY_400_TOO_COMPLEX");
+        let details = err.as_problem_json()["details"].clone();
+        assert_eq!(details["cap"], "input_length");
+    }
+
+    #[test]
+    fn rejects_paren_nesting_beyond_max_depth() {
+        let open = "(".repeat(MAX_DEPTH + 1);
+        let close = ")".repeat(MAX_DEPTH + 1);
+        let input = format!("{open}a = \"x\"{close}");
+        let err = MetadataQuery::parse(&input).expect_err("over-deep paren nesting is rejected");
+        assert_eq!(err.code(), "WYRD_QUERY_400_TOO_COMPLEX");
+        let details = err.as_problem_json()["details"].clone();
+        assert_eq!(details["cap"], "depth");
+    }
+
+    #[test]
+    fn rejects_chained_not_beyond_max_depth() {
+        let nots = "not ".repeat(MAX_DEPTH + 1);
+        let input = format!("{nots}a = \"x\"");
+        let err = MetadataQuery::parse(&input).expect_err("over-deep not chain is rejected");
+        assert_eq!(err.code(), "WYRD_QUERY_400_TOO_COMPLEX");
+        let details = err.as_problem_json()["details"].clone();
+        assert_eq!(details["cap"], "depth");
+    }
 
     #[test]
     fn parses_label_equality() {

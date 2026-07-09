@@ -635,9 +635,9 @@ pub struct TraceWaterfall {
     pub trace_id: String,
     /// Spans in the trace.
     pub spans: Vec<SpanRow>,
-    /// Span events in the trace.
+    /// Span events in the trace. Stage 4 stub — always empty until traces.events extraction is implemented.
     pub events: Vec<SpanEventRow>,
-    /// Span links in the trace.
+    /// Span links in the trace. Stage 4 stub — always empty until traces.links extraction is implemented.
     pub links: Vec<SpanLinkRow>,
 }
 
@@ -688,7 +688,7 @@ pub struct GenAiRow {
     /// Output token count, if recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<i64>,
-    /// Cost in USD, if recorded.
+    /// Cost in USD. Always absent — planned for a future stage when the column is added to `genai.messages`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
     /// Payload-gated prompt text; omitted without `bifrost_genai_payload:read`.
@@ -721,8 +721,10 @@ pub struct EvalRow {
 pub struct DriftRow {
     /// Feature name.
     pub feature: String,
-    /// Run id.
-    pub run_id: String,
+    /// Run id, if correlated via `CorrelationPolicy::Observation`. Absent when no `run_id`
+    /// correlation column was stamped on this row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     /// Computed drift score.
     pub drift_score: f64,
     /// Configured alert threshold, if any.
@@ -783,10 +785,12 @@ pub struct AgentTraceRow {
     pub dev_session_id: String,
     /// Repository.
     pub repo: String,
-    /// Commit sha.
-    pub commit_sha: String,
-    /// Branch.
-    pub branch: String,
+    /// Commit sha; nullable in the physical schema — absent when not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    /// Branch; nullable in the physical schema — absent when not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Run id, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
@@ -1206,7 +1210,7 @@ mod tests {
 
         let drift_row = DriftRow {
             feature: "amount".to_owned(),
-            run_id: "run-2".to_owned(),
+            run_id: Some("run-2".to_owned()),
             drift_score: 0.12,
             threshold: Some(0.1),
             computed_at: now,
@@ -1260,8 +1264,8 @@ mod tests {
         let agent_row = AgentTraceRow {
             dev_session_id: "sess-1".to_owned(),
             repo: "wyrd".to_owned(),
-            commit_sha: "abc123".to_owned(),
-            branch: "main".to_owned(),
+            commit_sha: Some("abc123".to_owned()),
+            branch: Some("main".to_owned()),
             run_id: None,
             started_at: now,
             payload: None,

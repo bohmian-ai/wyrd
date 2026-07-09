@@ -29,7 +29,7 @@ use crate::query::service::run_plan_query;
 use crate::vala_query::page_token;
 use crate::vala_query::routes::{
     aggregate_spans_to_summaries, extract_agent_trace_rows, extract_drift_rows, extract_eval_rows,
-    extract_genai_rows, extract_log_rows, extract_metric_rows, extract_span_rows,
+    extract_genai_rows, extract_log_rows, extract_metric_rows, extract_span_rows_filtered,
 };
 use crate::vala_query::service::effective_limit;
 
@@ -157,7 +157,7 @@ fn eval_row_to_proto(r: wyrd_spec::vala::api::EvalRow) -> proto::EvalRow {
 fn drift_row_to_proto(r: wyrd_spec::vala::api::DriftRow) -> proto::DriftRow {
     proto::DriftRow {
         feature: r.feature,
-        run_id: r.run_id,
+        run_id: r.run_id.unwrap_or_default(),
         drift_score: r.drift_score,
         threshold: r.threshold.unwrap_or(0.0),
         computed_at: r.computed_at.to_rfc3339(),
@@ -190,8 +190,8 @@ fn agent_trace_to_proto(r: wyrd_spec::vala::api::AgentTraceRow) -> proto::AgentT
     proto::AgentTraceRow {
         dev_session_id: r.dev_session_id,
         repo: r.repo,
-        commit_sha: r.commit_sha,
-        branch: r.branch,
+        commit_sha: r.commit_sha.unwrap_or_default(),
+        branch: r.branch.unwrap_or_default(),
         run_id: r.run_id.unwrap_or_default(),
         started_at: r.started_at.to_rfc3339(),
         payload_json: r.payload.map(|v| v.to_string()).unwrap_or_default(),
@@ -210,12 +210,7 @@ fn grpc_next_page_token(
     if !has_more {
         return String::new();
     }
-    let Some(key) = state
-        .auth
-        .sealing_key
-        .as_deref()
-        .map(|k| k.expose().as_ref())
-    else {
+    let Some(key) = super::sealing_key(state) else {
         return String::new();
     };
     let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
@@ -277,7 +272,7 @@ impl ValaQueryService for ValaQueryGrpc {
         .await
         .map_err(status_from_wyrd)?;
 
-        let spans: Vec<proto::SpanRow> = extract_span_rows(&batches)
+        let spans: Vec<proto::SpanRow> = extract_span_rows_filtered(&batches, &api_req.trace_id)
             .into_iter()
             .map(span_row_to_proto)
             .collect();
@@ -313,6 +308,15 @@ impl ValaQueryService for ValaQueryGrpc {
             api_req.status.as_deref().unwrap_or(""),
             api_req.name.as_deref().unwrap_or(""),
         ]);
+        if let Some(token) = &api_req.window.page_token {
+            if let Some(key) = super::sealing_key(&self.state) {
+                let auth_hash =
+                    page_token::permissions_hash(&caller.principal.effective_permissions);
+                let tenant_id_str = caller.data_tenant_id.to_string();
+                page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_traces", qhash)
+                    .map_err(|e| status_from_wyrd(e.into()))?;
+            }
+        }
         let plan = build_query_traces_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
@@ -357,6 +361,22 @@ impl ValaQueryService for ValaQueryGrpc {
             api_req.service.as_deref().unwrap_or(""),
             api_req.status.as_deref().unwrap_or(""),
         ]);
+        if let Some(token) = &api_req.window.page_token {
+            if let Some(key) = super::sealing_key(&self.state) {
+                let auth_hash =
+                    page_token::permissions_hash(&caller.principal.effective_permissions);
+                let tenant_id_str = caller.data_tenant_id.to_string();
+                page_token::verify(
+                    token,
+                    key,
+                    &tenant_id_str,
+                    &auth_hash,
+                    "query_recent_traces",
+                    qhash,
+                )
+                .map_err(|e| status_from_wyrd(e.into()))?;
+            }
+        }
         let plan = build_query_recent_traces_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
@@ -403,6 +423,15 @@ impl ValaQueryService for ValaQueryGrpc {
             api_req.model.as_deref().unwrap_or(""),
             api_req.provider.as_deref().unwrap_or(""),
         ]);
+        if let Some(token) = &api_req.window.page_token {
+            if let Some(key) = super::sealing_key(&self.state) {
+                let auth_hash =
+                    page_token::permissions_hash(&caller.principal.effective_permissions);
+                let tenant_id_str = caller.data_tenant_id.to_string();
+                page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_genai", qhash)
+                    .map_err(|e| status_from_wyrd(e.into()))?;
+            }
+        }
         let plan = build_query_genai_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
@@ -446,6 +475,15 @@ impl ValaQueryService for ValaQueryGrpc {
             api_req.eval_id.as_deref().unwrap_or(""),
             api_req.run_id.as_deref().unwrap_or(""),
         ]);
+        if let Some(token) = &api_req.window.page_token {
+            if let Some(key) = super::sealing_key(&self.state) {
+                let auth_hash =
+                    page_token::permissions_hash(&caller.principal.effective_permissions);
+                let tenant_id_str = caller.data_tenant_id.to_string();
+                page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_eval", qhash)
+                    .map_err(|e| status_from_wyrd(e.into()))?;
+            }
+        }
         let plan = build_query_eval_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
@@ -489,6 +527,15 @@ impl ValaQueryService for ValaQueryGrpc {
             api_req.feature.as_deref().unwrap_or(""),
             api_req.run_id.as_deref().unwrap_or(""),
         ]);
+        if let Some(token) = &api_req.window.page_token {
+            if let Some(key) = super::sealing_key(&self.state) {
+                let auth_hash =
+                    page_token::permissions_hash(&caller.principal.effective_permissions);
+                let tenant_id_str = caller.data_tenant_id.to_string();
+                page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_drift", qhash)
+                    .map_err(|e| status_from_wyrd(e.into()))?;
+            }
+        }
         let plan = build_query_drift_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
@@ -532,6 +579,22 @@ impl ValaQueryService for ValaQueryGrpc {
             api_req.metric_name.as_deref().unwrap_or(""),
             api_req.metric_type.as_deref().unwrap_or(""),
         ]);
+        if let Some(token) = &api_req.window.page_token {
+            if let Some(key) = super::sealing_key(&self.state) {
+                let auth_hash =
+                    page_token::permissions_hash(&caller.principal.effective_permissions);
+                let tenant_id_str = caller.data_tenant_id.to_string();
+                page_token::verify(
+                    token,
+                    key,
+                    &tenant_id_str,
+                    &auth_hash,
+                    "query_metrics",
+                    qhash,
+                )
+                .map_err(|e| status_from_wyrd(e.into()))?;
+            }
+        }
         let plan = build_query_metrics_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
@@ -573,6 +636,15 @@ impl ValaQueryService for ValaQueryGrpc {
         };
         let limit = effective_limit(api_req.window.limit);
         let qhash = page_token::query_hash(&[api_req.trace_id.as_deref().unwrap_or("")]);
+        if let Some(token) = &api_req.window.page_token {
+            if let Some(key) = super::sealing_key(&self.state) {
+                let auth_hash =
+                    page_token::permissions_hash(&caller.principal.effective_permissions);
+                let tenant_id_str = caller.data_tenant_id.to_string();
+                page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_logs", qhash)
+                    .map_err(|e| status_from_wyrd(e.into()))?;
+            }
+        }
         let plan = build_query_logs_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
@@ -620,6 +692,22 @@ impl ValaQueryService for ValaQueryGrpc {
             api_req.repo.as_deref().unwrap_or(""),
             api_req.run_id.as_deref().unwrap_or(""),
         ]);
+        if let Some(token) = &api_req.window.page_token {
+            if let Some(key) = super::sealing_key(&self.state) {
+                let auth_hash =
+                    page_token::permissions_hash(&caller.principal.effective_permissions);
+                let tenant_id_str = caller.data_tenant_id.to_string();
+                page_token::verify(
+                    token,
+                    key,
+                    &tenant_id_str,
+                    &auth_hash,
+                    "query_agent_traces",
+                    qhash,
+                )
+                .map_err(|e| status_from_wyrd(e.into()))?;
+            }
+        }
         let plan = build_query_agent_traces_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;

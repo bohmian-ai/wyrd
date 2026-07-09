@@ -23,13 +23,15 @@ A `DomainTable` carries:
 
 ## Schema fingerprinting and strict schema matching
 
-The `SchemaFingerprint` is a 16-byte BLAKE3 hash of the canonical Arrow schema (field names, types, nullability, metadata keys sorted). The fingerprint is stored alongside the `DomainTable` registration. Every Arrow batch arriving at `BifrostIngestService` is validated against the stored fingerprint before any Iceberg commit. A mismatch returns `400 WYRD_VALA_400_SCHEMA_FINGERPRINT_MISMATCH` and writes no data.
+The `SchemaFingerprint` is a 32-byte SHA-256 hash of the Arrow IPC bytes of the table's declared user fields. The fingerprint is stored alongside the `DomainTable` registration. Every Arrow batch arriving at `BifrostIngestService` is validated against the stored fingerprint before any Iceberg commit. A mismatch returns `400 WYRD_VALA_400_SCHEMA_FINGERPRINT_MISMATCH` and writes no data.
 
 This means the physical schema is frozen at registration — schema evolution requires an explicit migration (Stage 5 concern).
 
 ## System columns
 
-Every domain table appends five system columns that are not part of the user-declared schema:
+Every domain table appends system columns that are not part of the user-declared schema. All system and correlation columns are server-stamped — callers never write them. Any row that arrives with a system column set in the user payload is rejected.
+
+**Bifrost system columns** (always present):
 
 | Column | Type | Stamped by |
 |---|---|---|
@@ -38,15 +40,15 @@ Every domain table appends five system columns that are not part of the user-dec
 | `wyrd_ingested_at` | `Timestamp(Microseconds, UTC)` | Ingest service (wall-clock flush time) |
 | `wyrd_batch_id` | `FixedSizeBinary(16)` | Ingest service (UUIDv7, unique per batch) |
 
-Three optional correlation columns from the `CorrelationPolicy`:
+**Correlation columns** (policy-conditional, server-stamped, non-writable by callers):
 
 | Column | Type | Present when |
 |---|---|---|
-| `run_id` | `Utf8` (nullable) | Policy includes `RunId` |
-| `card_uid` | `Utf8` (nullable) | Policy includes `CardUid` |
-| `principal_id` | `Utf8` (nullable) | Policy includes `PrincipalId` |
+| `run_id` | `Utf8` (nullable) | `CorrelationPolicy::Observation` (traces, metrics, logs, genai, eval, drift) |
+| `card_uid` | `Utf8` (nullable) | `CorrelationPolicy::Observation` or `CodeAxis` |
+| `principal_id` | `Utf8` (nullable) | `CorrelationPolicy::Observation` or `CodeAxis` |
 
-Callers never write system columns — the ingest service stamps them. Any row that arrives with a system column set in the user payload is rejected.
+`CorrelationPolicy::None` tables (e.g. `system.audit_log`) receive no correlation columns. `CorrelationPolicy::CodeAxis` tables (e.g. `dev.agent_traces`) own `run_id` as a content column and do not receive the universal correlation `run_id`. See `CorrelationPolicy` in `crates/vala/vala-bifrost/src/tables/mod.rs` for the authoritative mapping.
 
 ## Tenant isolation: TenantPredicateRule
 

@@ -29,3 +29,65 @@ pub fn build_partition_spec(
     }
     Ok(builder.build())
 }
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+
+    use super::*;
+
+    fn ts_schema() -> Schema {
+        let arrow = ArrowSchema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )]);
+        iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow)
+            .expect("test schema builds")
+    }
+
+    #[test]
+    fn partition_field_names_use_transform_suffix() {
+        let schema = ts_schema();
+        let spec =
+            build_partition_spec(&schema, &[("ts".to_owned(), PartitionTransform::Day)])
+                .expect("day partition spec builds");
+        assert_eq!(spec.fields()[0].name, "ts_day");
+    }
+
+    #[test]
+    fn identity_partition_keeps_column_name() {
+        let schema = ts_schema();
+        let spec =
+            build_partition_spec(&schema, &[("ts".to_owned(), PartitionTransform::Identity)])
+                .expect("identity partition spec builds");
+        assert_eq!(spec.fields()[0].name, "ts");
+    }
+
+    #[test]
+    fn month_partition_uses_month_suffix() {
+        let schema = ts_schema();
+        let spec =
+            build_partition_spec(&schema, &[("ts".to_owned(), PartitionTransform::Month)])
+                .expect("month partition spec builds");
+        assert_eq!(spec.fields()[0].name, "ts_month");
+    }
+
+    #[test]
+    fn truncate_partition_uses_trunc_suffix() {
+        let schema = ts_schema();
+        let spec =
+            build_partition_spec(&schema, &[("ts".to_owned(), PartitionTransform::Truncate(16))])
+                .expect("truncate partition spec builds");
+        assert_eq!(spec.fields()[0].name, "ts_trunc16");
+    }
+
+    #[test]
+    fn bucket_partition_uses_bucket_suffix() {
+        let schema = ts_schema();
+        let spec =
+            build_partition_spec(&schema, &[("ts".to_owned(), PartitionTransform::Bucket(8))])
+                .expect("bucket partition spec builds");
+        assert_eq!(spec.fields()[0].name, "ts_bucket8");
+    }
+}

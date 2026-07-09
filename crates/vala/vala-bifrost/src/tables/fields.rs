@@ -21,7 +21,7 @@ pub fn ts_us_utc(name: &str, nullable: bool) -> Field {
     )
 }
 
-pub fn bool_field(name: &str, nullable: bool) -> Field {
+pub fn boolean(name: &str, nullable: bool) -> Field {
     Field::new(name, DataType::Boolean, nullable)
 }
 

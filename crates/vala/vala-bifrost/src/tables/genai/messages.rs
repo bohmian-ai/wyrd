@@ -1,7 +1,7 @@
 use arrow::datatypes::Field;
 
 use crate::tables::fields::{
-    bool_field, fixed_binary, float64, int64, ts_us_utc, uint32, uint64, utf8, utf8_view,
+    boolean, fixed_binary, float64, int64, ts_us_utc, uint32, uint64, utf8, utf8_view,
 };
 use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
@@ -45,7 +45,7 @@ impl DomainTable for MessagesTable {
             int64("request_seed", true),
             uint32("request_choice_count", true),
             utf8_view("request_stop_sequences", true),
-            bool_field("request_stream", true),
+            boolean("request_stream", true),
             utf8_view("request_encoding_formats", true),
             uint32("usage_input_tokens", true),
             uint32("usage_output_tokens", true),

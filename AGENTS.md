@@ -383,7 +383,7 @@ Code in this repo lands one session at a time, via dialogue-locked decisions.
 
 ## 17. Agent and Subagent Rules
 
-- NEVER run shell commands to verify your own work. No `cargo build`, `cargo test`, `cargo clippy`, `cargo check`, `mise run`, `npm run`, `pytest`, or any test/lint/build command. Write the code the plan specifies and stop. Verification is the orchestrator's job, not the worker's.
+- Verify your work in-session. Do not create background shells for `cargo build`, `cargo test`, `cargo clippy`, `cargo check`, `mise run`, `npm run`, `pytest`, or any test/lint/build command. This will create delays and issues in rust-based projects. Run necessary commands within the active session.
 
 ## 18. CodeGraph
 

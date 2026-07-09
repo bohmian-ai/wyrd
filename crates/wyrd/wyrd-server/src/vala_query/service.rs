@@ -53,7 +53,7 @@ pub(crate) fn effective_limit(requested: Option<u32>) -> u32 {
 /// Register a domain table provider in `ctx`. A missing table (not yet materialized)
 /// is silently skipped — DataFusion planning will surface the error if the table is
 /// actually referenced.
-async fn register(
+async fn attach_table_provider(
     ctx: &SessionContext,
     state: &AppState,
     ns: BifrostNamespace,
@@ -160,7 +160,7 @@ pub async fn build_get_trace_plan(
     let tenant = caller.data_tenant_id;
     let ctx = wyrd_session_context(tenant);
 
-    register(
+    attach_table_provider(
         &ctx,
         state,
         BifrostNamespace::Traces,
@@ -196,7 +196,7 @@ pub async fn build_query_traces_plan(
     let tenant = caller.data_tenant_id;
     let ctx = wyrd_session_context(tenant);
 
-    register(
+    attach_table_provider(
         &ctx,
         state,
         BifrostNamespace::Traces,
@@ -230,7 +230,7 @@ pub async fn build_query_recent_traces_plan(
     let tenant = caller.data_tenant_id;
     let ctx = wyrd_session_context(tenant);
 
-    register(
+    attach_table_provider(
         &ctx,
         state,
         BifrostNamespace::Traces,
@@ -248,12 +248,6 @@ pub async fn build_query_recent_traces_plan(
     let df = opt_filter_str(df, "service_name", &req.service)?;
     let df = opt_filter_str(df, "status", &req.status)?;
     let df = opt_filter_u32(df, "duration_ms", req.min_duration_ms)?;
-    // Order by start_time DESC so the extractor can pick earliest/latest per trace
-    let df = df
-        .sort(vec![
-            datafusion::prelude::col("start_time").sort(false, true),
-        ])
-        .map_err(df_err)?;
 
     Ok(df.logical_plan().clone())
 }
@@ -269,7 +263,7 @@ pub async fn build_query_genai_plan(
     let tenant = caller.data_tenant_id;
     let ctx = wyrd_session_context(tenant);
 
-    register(
+    attach_table_provider(
         &ctx,
         state,
         BifrostNamespace::GenAi,
@@ -307,7 +301,7 @@ pub async fn build_query_eval_plan(
     let ctx = wyrd_session_context(tenant);
 
     // assertions table has assertion_name (metric), score_value (score), eval_ref (eval_id)
-    register(
+    attach_table_provider(
         &ctx,
         state,
         BifrostNamespace::Eval,
@@ -339,7 +333,7 @@ pub async fn build_query_drift_plan(
     let tenant = caller.data_tenant_id;
     let ctx = wyrd_session_context(tenant);
 
-    register(
+    attach_table_provider(
         &ctx,
         state,
         BifrostNamespace::Drift,
@@ -371,7 +365,7 @@ pub async fn build_query_metrics_plan(
     let tenant = caller.data_tenant_id;
     let ctx = wyrd_session_context(tenant);
 
-    register(
+    attach_table_provider(
         &ctx,
         state,
         BifrostNamespace::Metrics,
@@ -402,7 +396,7 @@ pub async fn build_query_logs_plan(
     let tenant = caller.data_tenant_id;
     let ctx = wyrd_session_context(tenant);
 
-    register(
+    attach_table_provider(
         &ctx,
         state,
         BifrostNamespace::Logs,
@@ -440,7 +434,7 @@ pub async fn build_query_agent_traces_plan(
     let tenant = caller.data_tenant_id;
     let ctx = wyrd_session_context(tenant);
 
-    register(
+    attach_table_provider(
         &ctx,
         state,
         BifrostNamespace::Dev,

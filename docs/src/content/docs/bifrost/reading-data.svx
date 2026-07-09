@@ -48,11 +48,15 @@ Sensitive columns are projected away unless the caller holds the matching payloa
 | Permission | Unlocks columns |
 |---|---|
 | `bifrost_trace_payload:read` | `attributes` on spans, events, links |
-| `bifrost_log_payload:read` | `body`, `event_name` on logs |
+| `bifrost_log_payload:read` | `body`, `attributes` on logs |
 | `bifrost_genai_payload:read` | `input_messages`, `output_messages` on GenAI rows |
 | `bifrost_agent_trace_payload:read` | `messages`, `tool_io` on agent-trace rows |
 
 Without the payload permission the method still returns the metadata columns — it does not return an error. Only if the caller explicitly requests a gated column through the generic SQL surface does the server return `403 WYRD_VALA_403_PAYLOAD_FORBIDDEN`.
+
+## Column name mapping for `QueryEval`
+
+The `QueryEval` typed method accepts an `eval_id` filter parameter, which maps to the physical column `eval_ref` in the `vala.eval.assertions` table. If you write raw SQL against the generic SQL surface, use `eval_ref` — `eval_id` does not exist as a physical column and will return `column not found`.
 
 ## Signed page tokens and pagination
 

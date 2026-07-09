@@ -102,6 +102,20 @@ pub struct EntityBoundsMapping {
 /// Implementors declare user fields, correlation policy, payload class, partition
 /// columns, sort keys, declared indexes, and (optionally) entity bounds mapping.
 /// The `register_all` boot path pins each table to its `schema_fingerprint()`.
+///
+/// # Implementing DomainTable
+///
+/// 1. **Field ordering is fingerprint-identity-significant.** Do not reorder fields
+///    in `arrow_fields()` — any reorder changes `schema_fingerprint()` and causes boot
+///    to treat the existing Iceberg table as drifted.
+/// 2. **`NAMESPACE` must round-trip through `BifrostNamespace::from_domain_namespace`.**
+///    If it does not, `register_all` panics when resolving the table's Iceberg path.
+/// 3. **`SENSITIVE_PAYLOAD_COLUMNS` must be non-empty if and only if
+///    `PAYLOAD_CLASS == PayloadClass::Sensitive`.** The redaction pass and read gate
+///    both depend on this invariant; mismatches cause silent data leakage or spurious
+///    column-drop on reads.
+/// 4. **`register_all` is append-only.** It never removes or modifies existing Iceberg
+///    entries. Adding a new table is safe; removing or reordering existing calls is not.
 pub trait DomainTable: Send + Sync + 'static {
     const NAMESPACE: &'static str;
     const NAME: &'static str;

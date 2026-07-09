@@ -14,8 +14,8 @@
 use std::collections::HashMap;
 
 use arrow::array::{
-    Array, FixedSizeBinaryArray, Float64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
-    UInt32Array, UInt64Array,
+    Array, FixedSizeBinaryArray, Float64Array, RecordBatch, StringArray, StringViewArray,
+    TimestampMicrosecondArray, UInt32Array, UInt64Array,
 };
 use axum::Json;
 use axum::Router;
@@ -50,16 +50,6 @@ pub fn router() -> Router<AppState> {
         .route("/metrics/query", post(query_metrics))
         .route("/logs/query", post(query_logs))
         .route("/agent-traces/query", post(query_agent_traces))
-}
-
-// ─── sealing key helper ───────────────────────────────────────────────────────
-
-fn sealing_key(state: &AppState) -> Option<&[u8]> {
-    state
-        .auth
-        .sealing_key
-        .as_deref()
-        .map(|k| k.expose().as_ref())
 }
 
 // ─── hex helper ───────────────────────────────────────────────────────────────
@@ -133,7 +123,17 @@ fn get_hex(arr: Option<&FixedSizeBinaryArray>, i: usize) -> Option<String> {
     })
 }
 
-fn get_json_str(arr: Option<&StringArray>, i: usize) -> Option<serde_json::Value> {
+fn col_str_view<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringViewArray> {
+    batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<StringViewArray>())
+}
+
+fn get_str_view<'a>(arr: Option<&'a StringViewArray>, i: usize) -> Option<&'a str> {
+    arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+}
+
+fn get_json_str_view(arr: Option<&StringViewArray>, i: usize) -> Option<serde_json::Value> {
     arr.and_then(|a| {
         if a.is_null(i) {
             None
@@ -148,9 +148,14 @@ fn get_json_str(arr: Option<&StringArray>, i: usize) -> Option<serde_json::Value
 
 // ─── row extractors ───────────────────────────────────────────────────────────
 
-pub(crate) fn extract_span_rows(batches: &[RecordBatch]) -> Vec<SpanRow> {
+pub(crate) fn extract_span_rows_filtered(batches: &[RecordBatch], trace_id: &str) -> Vec<SpanRow> {
+    extract_span_rows_impl(batches, Some(trace_id))
+}
+
+fn extract_span_rows_impl(batches: &[RecordBatch], trace_id_filter: Option<&str>) -> Vec<SpanRow> {
     let mut rows = Vec::new();
     for batch in batches {
+        let trace_id_col = col_bin16(batch, "trace_id");
         let span_id_col = col_bin16(batch, "span_id");
         let parent_span_id_col = col_bin16(batch, "parent_span_id");
         let name_col = col_str(batch, "name");
@@ -158,9 +163,15 @@ pub(crate) fn extract_span_rows(batches: &[RecordBatch]) -> Vec<SpanRow> {
         let start_col = col_ts(batch, "start_time");
         let dur_col = col_u64(batch, "duration_ms");
         let status_col = col_str(batch, "status");
-        let attr_col = col_str(batch, "attributes");
+        let attr_col = col_str_view(batch, "attributes");
 
         for i in 0..batch.num_rows() {
+            if let Some(filter) = trace_id_filter {
+                let row_trace_id = get_hex(trace_id_col, i);
+                if row_trace_id.as_deref() != Some(filter) {
+                    continue;
+                }
+            }
             rows.push(SpanRow {
                 span_id: get_hex(span_id_col, i).unwrap_or_default(),
                 parent_span_id: get_hex(parent_span_id_col, i),
@@ -175,7 +186,7 @@ pub(crate) fn extract_span_rows(batches: &[RecordBatch]) -> Vec<SpanRow> {
                     .map(|a| a.value(i) as f64)
                     .unwrap_or(0.0),
                 status: get_str(status_col, i).unwrap_or("").to_owned(),
-                attributes: get_json_str(attr_col, i),
+                attributes: get_json_str_view(attr_col, i),
             });
         }
     }
@@ -272,8 +283,8 @@ pub(crate) fn extract_genai_rows(batches: &[RecordBatch]) -> Vec<GenAiRow> {
         let start_col = col_ts(batch, "start_time");
         let in_tok_col = col_u32(batch, "usage_input_tokens");
         let out_tok_col = col_u32(batch, "usage_output_tokens");
-        let prompt_col = col_str(batch, "input_messages");
-        let completion_col = col_str(batch, "output_messages");
+        let prompt_col = col_str_view(batch, "input_messages");
+        let completion_col = col_str_view(batch, "output_messages");
 
         for i in 0..batch.num_rows() {
             rows.push(GenAiRow {
@@ -290,9 +301,9 @@ pub(crate) fn extract_genai_rows(batches: &[RecordBatch]) -> Vec<GenAiRow> {
                 output_tokens: out_tok_col
                     .filter(|a| !a.is_null(i))
                     .map(|a| a.value(i) as i64),
-                cost_usd: None,
-                prompt: get_str(prompt_col, i).map(|s| s.to_owned()),
-                completion: get_str(completion_col, i).map(|s| s.to_owned()),
+                cost_usd: None, // Stage N placeholder — no physical column in genai.messages yet
+                prompt: get_str_view(prompt_col, i).map(|s| s.to_owned()),
+                completion: get_str_view(completion_col, i).map(|s| s.to_owned()),
             });
         }
     }
@@ -338,7 +349,7 @@ pub(crate) fn extract_drift_rows(batches: &[RecordBatch]) -> Vec<DriftRow> {
         for i in 0..batch.num_rows() {
             rows.push(DriftRow {
                 feature: get_str(feat_col, i).unwrap_or("").to_owned(),
-                run_id: get_str(run_id_col, i).unwrap_or("").to_owned(),
+                run_id: get_str(run_id_col, i).map(|s| s.to_owned()),
                 drift_score: score_col
                     .filter(|a| !a.is_null(i))
                     .map(|a| a.value(i))
@@ -361,7 +372,7 @@ pub(crate) fn extract_metric_rows(batches: &[RecordBatch]) -> Vec<MetricRow> {
         let type_col = col_str(batch, "metric_type");
         let val_col = col_f64(batch, "value");
         let ts_col = col_ts(batch, "time");
-        let attr_col = col_str(batch, "attributes");
+        let attr_col = col_str_view(batch, "attributes");
 
         for i in 0..batch.num_rows() {
             rows.push(MetricRow {
@@ -375,7 +386,7 @@ pub(crate) fn extract_metric_rows(batches: &[RecordBatch]) -> Vec<MetricRow> {
                     .filter(|a| !a.is_null(i))
                     .map(|a| ts_us_to_dt(a.value(i)))
                     .unwrap_or_default(),
-                attributes: get_json_str(attr_col, i),
+                attributes: get_json_str_view(attr_col, i),
             });
         }
     }
@@ -393,7 +404,7 @@ pub(crate) fn extract_log_rows(batches: &[RecordBatch]) -> Vec<LogRow> {
             .column_by_name("span_id")
             .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
         let evt_col = col_str(batch, "event_name");
-        let body_col = col_str(batch, "body");
+        let body_col = col_str_view(batch, "body");
 
         for i in 0..batch.num_rows() {
             rows.push(LogRow {
@@ -409,7 +420,7 @@ pub(crate) fn extract_log_rows(batches: &[RecordBatch]) -> Vec<LogRow> {
                 trace_id: get_hex(trace_col, i),
                 span_id: get_hex(span_col, i),
                 event_name: get_str(evt_col, i).map(|s| s.to_owned()),
-                body: get_str(body_col, i).map(|s| s.to_owned()),
+                body: get_str_view(body_col, i).map(|s| s.to_owned()),
             });
         }
     }
@@ -425,20 +436,20 @@ pub(crate) fn extract_agent_trace_rows(batches: &[RecordBatch]) -> Vec<AgentTrac
         let branch_col = col_str(batch, "branch");
         let run_col = col_str(batch, "run_id");
         let start_col = col_ts(batch, "started_at");
-        let msgs_col = col_str(batch, "messages");
+        let msgs_col = col_str_view(batch, "messages");
 
         for i in 0..batch.num_rows() {
             rows.push(AgentTraceRow {
                 dev_session_id: get_str(sess_col, i).unwrap_or("").to_owned(),
                 repo: get_str(repo_col, i).unwrap_or("").to_owned(),
-                commit_sha: get_str(sha_col, i).unwrap_or("").to_owned(),
-                branch: get_str(branch_col, i).unwrap_or("").to_owned(),
+                commit_sha: get_str(sha_col, i).map(|s| s.to_owned()),
+                branch: get_str(branch_col, i).map(|s| s.to_owned()),
                 run_id: get_str(run_col, i).map(|s| s.to_owned()),
                 started_at: start_col
                     .filter(|a| !a.is_null(i))
                     .map(|a| ts_us_to_dt(a.value(i)))
                     .unwrap_or_default(),
-                payload: get_json_str(msgs_col, i),
+                payload: get_json_str_view(msgs_col, i),
             });
         }
     }
@@ -457,7 +468,7 @@ fn maybe_issue_token(
     if !has_more {
         return None;
     }
-    let key = sealing_key(state)?;
+    let key = super::sealing_key(state)?;
     let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
     let body = page_token::PageTokenBody::new(
         caller.data_tenant_id.to_string(),
@@ -486,6 +497,8 @@ async fn get_trace(
             since: None,
             until: None,
             limit: None,
+            // TODO(Stage 5): accept since/until as optional query parameters. Window is
+            // hardcoded to the default 7-day scan for Stage 4.
             page_token: None,
         },
         trace_id: trace_id.clone(),
@@ -498,15 +511,8 @@ async fn get_trace(
         .await
         .map_err(WyrdErrorResponse::from)?;
 
-    let spans: Vec<SpanRow> = extract_span_rows(&batches)
-        .into_iter()
-        .filter(|_| {
-            // Filter by trace_id in Rust (binary column can't be filtered in plan for Stage 4)
-            // For Stage 4 we accept all spans in the window and post-filter here.
-            // The plan's window predicate already scoped the scan.
-            true
-        })
-        .collect();
+    // trace_id binary pushdown deferred to Stage 5 — Rust post-filter applied.
+    let spans: Vec<SpanRow> = extract_span_rows_filtered(&batches, &trace_id);
 
     if spans.is_empty() {
         let err: wyrd_spec::error::WyrdError = wyrd_spec::vala::BifrostError::TraceNotFound {
@@ -539,6 +545,18 @@ async fn query_traces(
         req.status.as_deref().unwrap_or(""),
         req.name.as_deref().unwrap_or(""),
     ]);
+
+    if let Some(token) = &req.window.page_token {
+        if let Some(key) = super::sealing_key(&state) {
+            let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
+            let tenant_id_str = caller.data_tenant_id.to_string();
+            page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_traces", qhash)
+                .map_err(|e| {
+                    let err: wyrd_spec::error::WyrdError = e.into();
+                    WyrdErrorResponse::from(err)
+                })?;
+        }
+    }
 
     let plan = build_query_traces_plan(&state, &caller, &req)
         .await
@@ -575,6 +593,18 @@ async fn query_recent_traces(
         req.status.as_deref().unwrap_or(""),
     ]);
 
+    if let Some(token) = &req.window.page_token {
+        if let Some(key) = super::sealing_key(&state) {
+            let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
+            let tenant_id_str = caller.data_tenant_id.to_string();
+            page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_recent_traces", qhash)
+                .map_err(|e| {
+                    let err: wyrd_spec::error::WyrdError = e.into();
+                    WyrdErrorResponse::from(err)
+                })?;
+        }
+    }
+
     let plan = build_query_recent_traces_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
@@ -589,7 +619,6 @@ async fn query_recent_traces(
     .map_err(WyrdErrorResponse::from)?;
 
     let mut rows = aggregate_spans_to_summaries(&batches);
-    rows.sort_by_key(|b| std::cmp::Reverse(b.started_at));
     rows.truncate(limit as usize);
 
     let next_page_token =
@@ -613,6 +642,18 @@ async fn query_genai(
         req.model.as_deref().unwrap_or(""),
         req.provider.as_deref().unwrap_or(""),
     ]);
+
+    if let Some(token) = &req.window.page_token {
+        if let Some(key) = super::sealing_key(&state) {
+            let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
+            let tenant_id_str = caller.data_tenant_id.to_string();
+            page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_genai", qhash)
+                .map_err(|e| {
+                    let err: wyrd_spec::error::WyrdError = e.into();
+                    WyrdErrorResponse::from(err)
+                })?;
+        }
+    }
 
     let plan = build_query_genai_plan(&state, &caller, &req)
         .await
@@ -643,6 +684,18 @@ async fn query_eval(
         req.run_id.as_deref().unwrap_or(""),
     ]);
 
+    if let Some(token) = &req.window.page_token {
+        if let Some(key) = super::sealing_key(&state) {
+            let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
+            let tenant_id_str = caller.data_tenant_id.to_string();
+            page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_eval", qhash)
+                .map_err(|e| {
+                    let err: wyrd_spec::error::WyrdError = e.into();
+                    WyrdErrorResponse::from(err)
+                })?;
+        }
+    }
+
     let plan = build_query_eval_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
@@ -672,6 +725,18 @@ async fn query_drift(
         req.run_id.as_deref().unwrap_or(""),
     ]);
 
+    if let Some(token) = &req.window.page_token {
+        if let Some(key) = super::sealing_key(&state) {
+            let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
+            let tenant_id_str = caller.data_tenant_id.to_string();
+            page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_drift", qhash)
+                .map_err(|e| {
+                    let err: wyrd_spec::error::WyrdError = e.into();
+                    WyrdErrorResponse::from(err)
+                })?;
+        }
+    }
+
     let plan = build_query_drift_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
@@ -700,6 +765,18 @@ async fn query_metrics(
         req.metric_name.as_deref().unwrap_or(""),
         req.metric_type.as_deref().unwrap_or(""),
     ]);
+
+    if let Some(token) = &req.window.page_token {
+        if let Some(key) = super::sealing_key(&state) {
+            let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
+            let tenant_id_str = caller.data_tenant_id.to_string();
+            page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_metrics", qhash)
+                .map_err(|e| {
+                    let err: wyrd_spec::error::WyrdError = e.into();
+                    WyrdErrorResponse::from(err)
+                })?;
+        }
+    }
 
     let plan = build_query_metrics_plan(&state, &caller, &req)
         .await
@@ -732,6 +809,18 @@ async fn query_logs(
     let limit = effective_limit(req.window.limit);
     let qhash = page_token::query_hash(&[req.trace_id.as_deref().unwrap_or("")]);
 
+    if let Some(token) = &req.window.page_token {
+        if let Some(key) = super::sealing_key(&state) {
+            let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
+            let tenant_id_str = caller.data_tenant_id.to_string();
+            page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_logs", qhash)
+                .map_err(|e| {
+                    let err: wyrd_spec::error::WyrdError = e.into();
+                    WyrdErrorResponse::from(err)
+                })?;
+        }
+    }
+
     let plan = build_query_logs_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
@@ -761,6 +850,18 @@ async fn query_agent_traces(
         req.repo.as_deref().unwrap_or(""),
         req.run_id.as_deref().unwrap_or(""),
     ]);
+
+    if let Some(token) = &req.window.page_token {
+        if let Some(key) = super::sealing_key(&state) {
+            let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
+            let tenant_id_str = caller.data_tenant_id.to_string();
+            page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_agent_traces", qhash)
+                .map_err(|e| {
+                    let err: wyrd_spec::error::WyrdError = e.into();
+                    WyrdErrorResponse::from(err)
+                })?;
+        }
+    }
 
     let plan = build_query_agent_traces_plan(&state, &caller, &req)
         .await

@@ -2488,15 +2488,6 @@ impl WyrdError {
         }
     }
 
-    /// Construct a bare [`WyrdError::QueryInvalidField`].
-    #[must_use]
-    pub fn query_invalid_field(message: impl Into<String>) -> Self {
-        Self::QueryInvalidField {
-            message: message.into(),
-            details: serde_json::json!({ "reason": "invalid_field" }),
-        }
-    }
-
     /// Construct [`WyrdError::QueryInvalidField`] with the empty-group reason.
     #[must_use]
     pub fn query_empty_group() -> Self {

@@ -215,7 +215,13 @@ fn compile_typed_predicate(
             push_typed_comparison(column, "=", ty, value, predicate, resolver, qb)
         }
         Operator::Ne(value) => {
-            push_typed_comparison(column, "<>", ty, value, predicate, resolver, qb)
+            // NULL-inclusive: match absent/NULL rows the same way JSONB Ne does.
+            qb.push("(");
+            qb.push(column);
+            qb.push(" IS NULL OR ");
+            push_typed_comparison(column, "<>", ty, value, predicate, resolver, qb)?;
+            qb.push(")");
+            Ok(())
         }
         Operator::Gt(value) => {
             ensure_orderable(ty, predicate, resolver, ">")?;
@@ -248,16 +254,27 @@ fn compile_typed_predicate(
                 return Err(regex_on_non_string(predicate, resolver, "!~", ty));
             }
             admit_regex(regex, predicate, resolver, "!~")?;
+            // NULL-inclusive: match absent/NULL rows the same way JSONB NotMatches does.
+            qb.push("(");
+            qb.push(column);
+            qb.push(" IS NULL OR ");
             qb.push(column);
             qb.push(" !~ ");
             qb.push_bind(regex.clone());
+            qb.push(")");
             Ok(())
         }
         Operator::In(values) => {
             push_typed_array(column, " = ANY", ty, values, predicate, resolver, qb)
         }
         Operator::NotIn(values) => {
-            push_typed_array(column, " <> ALL", ty, values, predicate, resolver, qb)
+            // NULL-inclusive: match absent/NULL rows the same way JSONB NotIn does.
+            qb.push("(");
+            qb.push(column);
+            qb.push(" IS NULL OR ");
+            push_typed_array(column, " <> ALL", ty, values, predicate, resolver, qb)?;
+            qb.push(")");
+            Ok(())
         }
         Operator::Exists => {
             qb.push(column);
@@ -309,14 +326,37 @@ fn push_typed_array(
     qb.push(column);
     qb.push(op);
     qb.push("(");
+    let operator = op.trim();
     match ty {
-        ValueType::Str => qb.push_bind(collect_strings(values, predicate, resolver, op.trim())?),
-        ValueType::Int => qb.push_bind(collect_ints(values, predicate, resolver, op.trim())?),
-        ValueType::Float => qb.push_bind(collect_floats(values, predicate, resolver, op.trim())?),
-        ValueType::Bool => qb.push_bind(collect_bools(values, predicate, resolver, op.trim())?),
-        ValueType::Duration => {
-            qb.push_bind(collect_durations(values, predicate, resolver, op.trim())?)
+        ValueType::Str => {
+            qb.push_bind(expect_string_values(values, predicate, resolver, operator)?)
         }
+        ValueType::Int => qb.push_bind(collect_typed(values, predicate, resolver, operator, "int", |v| {
+            if let Value::Int(n) = v { Some(*n) } else { None }
+        })?),
+        ValueType::Float => qb.push_bind(collect_typed(
+            values,
+            predicate,
+            resolver,
+            operator,
+            "float",
+            |v| {
+                if let Value::Float(f) = v { Some(*f) } else { None }
+            },
+        )?),
+        ValueType::Bool => qb.push_bind(collect_typed(values, predicate, resolver, operator, "bool", |v| {
+            if let Value::Bool(b) = v { Some(*b) } else { None }
+        })?),
+        ValueType::Duration => qb.push_bind(collect_typed(
+            values,
+            predicate,
+            resolver,
+            operator,
+            "duration",
+            |v| {
+                if let Value::Duration(d) = v { Some(*d) } else { None }
+            },
+        )?),
         ValueType::Timestamp => unreachable!("timestamp arrays rejected above"),
     };
     qb.push(")");
@@ -334,9 +374,7 @@ fn push_typed_value(
     match (ty, value) {
         (ValueType::Str, Value::String(value)) => qb.push_bind(value.clone()),
         (ValueType::Int, Value::Int(value)) => qb.push_bind(*value),
-        (ValueType::Int, Value::Float(value)) => qb.push_bind(*value),
         (ValueType::Float, Value::Float(value)) => qb.push_bind(*value),
-        (ValueType::Float, Value::Int(value)) => qb.push_bind(*value as f64),
         (ValueType::Bool, Value::Bool(value)) => qb.push_bind(*value),
         (ValueType::Duration, Value::Duration(value)) => qb.push_bind(*value),
         (ValueType::Timestamp, Value::Timestamp(value)) => qb.push_bind(*value),
@@ -355,6 +393,24 @@ fn push_typed_value(
         }
     };
     Ok(())
+}
+
+fn collect_typed<T>(
+    values: &[Value],
+    predicate: &Predicate,
+    resolver: &dyn FieldResolver,
+    operator: &'static str,
+    expected: &'static str,
+    extract: impl Fn(&Value) -> Option<T>,
+) -> Result<Vec<T>, WyrdError> {
+    values
+        .iter()
+        .map(|v| {
+            extract(v).ok_or_else(|| {
+                type_mismatch(predicate, resolver, operator, expected, v.value_type().as_str())
+            })
+        })
+        .collect()
 }
 
 fn push_jsonb_text(qb: &mut QueryBuilder<Postgres>, column: &'static str, key: &str) {
@@ -396,100 +452,6 @@ fn expect_string_values(
     values
         .iter()
         .map(|value| expect_string(value, predicate, resolver, operator).map(str::to_owned))
-        .collect()
-}
-
-fn collect_strings(
-    values: &[Value],
-    predicate: &Predicate,
-    resolver: &dyn FieldResolver,
-    operator: &'static str,
-) -> Result<Vec<String>, WyrdError> {
-    expect_string_values(values, predicate, resolver, operator)
-}
-
-fn collect_ints(
-    values: &[Value],
-    predicate: &Predicate,
-    resolver: &dyn FieldResolver,
-    operator: &'static str,
-) -> Result<Vec<i64>, WyrdError> {
-    values
-        .iter()
-        .map(|value| match value {
-            Value::Int(value) => Ok(*value),
-            other => Err(type_mismatch(
-                predicate,
-                resolver,
-                operator,
-                "int",
-                other.value_type().as_str(),
-            )),
-        })
-        .collect()
-}
-
-fn collect_floats(
-    values: &[Value],
-    predicate: &Predicate,
-    resolver: &dyn FieldResolver,
-    operator: &'static str,
-) -> Result<Vec<f64>, WyrdError> {
-    values
-        .iter()
-        .map(|value| match value {
-            Value::Float(value) => Ok(*value),
-            Value::Int(value) => Ok(*value as f64),
-            other => Err(type_mismatch(
-                predicate,
-                resolver,
-                operator,
-                "float",
-                other.value_type().as_str(),
-            )),
-        })
-        .collect()
-}
-
-fn collect_bools(
-    values: &[Value],
-    predicate: &Predicate,
-    resolver: &dyn FieldResolver,
-    operator: &'static str,
-) -> Result<Vec<bool>, WyrdError> {
-    values
-        .iter()
-        .map(|value| match value {
-            Value::Bool(value) => Ok(*value),
-            other => Err(type_mismatch(
-                predicate,
-                resolver,
-                operator,
-                "bool",
-                other.value_type().as_str(),
-            )),
-        })
-        .collect()
-}
-
-fn collect_durations(
-    values: &[Value],
-    predicate: &Predicate,
-    resolver: &dyn FieldResolver,
-    operator: &'static str,
-) -> Result<Vec<i64>, WyrdError> {
-    values
-        .iter()
-        .map(|value| match value {
-            Value::Duration(value) => Ok(*value),
-            other => Err(type_mismatch(
-                predicate,
-                resolver,
-                operator,
-                "duration",
-                other.value_type().as_str(),
-            )),
-        })
         .collect()
 }
 
@@ -631,7 +593,7 @@ mod tests {
         }
 
         fn valid_fields(&self) -> &'static [&'static str] {
-            &["created_at", "status"]
+            &["created_at", "status", "score"]
         }
 
         fn resolve(&self, field: &FieldRef) -> Result<FieldColumn, WyrdError> {
@@ -643,6 +605,10 @@ mod tests {
                 FieldRef::Reserved(column) if column == "status" => Ok(FieldColumn::Typed {
                     column: "status",
                     ty: ValueType::Str,
+                }),
+                FieldRef::Reserved(column) if column == "score" => Ok(FieldColumn::Typed {
+                    column: "score",
+                    ty: ValueType::Int,
                 }),
                 FieldRef::Reserved(column) => Err(WyrdError::query_invalid_field_detail(
                     format!("unknown field {column}"),
@@ -773,5 +739,35 @@ mod tests {
         let err = compile_ast(&MetadataQuery::And(vec![])).expect_err("empty group rejected");
         assert_eq!(err.code(), "WYRD_QUERY_400_INVALID_FIELD");
         assert_eq!(err.as_problem_json()["details"]["reason"], "empty_group");
+    }
+
+    #[test]
+    fn typed_negation_is_null_inclusive() {
+        let sql = compile("status != \"active\"").expect("query compiles");
+        assert!(
+            sql.contains("status IS NULL OR status <> $"),
+            "Ne must include NULL rows: {sql}"
+        );
+
+        let sql = compile("status !~ \"act.*\"").expect("query compiles");
+        assert!(
+            sql.contains("status IS NULL OR status !~ $"),
+            "NotMatches must include NULL rows: {sql}"
+        );
+
+        let sql = compile("status not in [\"a\",\"b\"]").expect("query compiles");
+        assert!(
+            sql.contains("status IS NULL OR status <> ALL($"),
+            "NotIn must include NULL rows: {sql}"
+        );
+    }
+
+    #[test]
+    fn typed_numeric_coercion_is_strict() {
+        let err = compile("score = 1.5").expect_err("float value rejected for int column");
+        assert_eq!(err.as_problem_json()["details"]["reason"], "operator_type_mismatch");
+
+        let err = compile("score in [1, 2.0]").expect_err("mixed list rejected for int column");
+        assert_eq!(err.as_problem_json()["details"]["reason"], "operator_type_mismatch");
     }
 }

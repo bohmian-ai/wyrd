@@ -14,6 +14,14 @@ use wyrd_spec::metadata::{Annotations, Labels};
 
 use crate::error::SqlError;
 
+/// Shared SELECT column list for `wyrd.cards` queries.
+///
+/// Must stay in lockstep with the positional `FromRow` decode order on [`CardRow`].
+pub const CARD_ROW_COLUMNS: &str =
+    "card_uid, data_tenant_id, kind, space, name, version, \
+     spec, spec_hash, artifact_hash, labels, annotations, \
+     status, created_by, created_at, updated_at";
+
 /// Live `wyrd.cards` row, decoded for handler return.
 ///
 /// `spec`, `labels`, and `annotations` decode lazily through [`serde_json::Value`]
@@ -62,38 +70,6 @@ impl CardRow {
     pub fn spec_value(&self) -> &serde_json::Value {
         &self.spec
     }
-}
-
-/// Borrowed insert payload for `register_card`.
-///
-/// All borrows live as long as the caller's owned `Card`; no allocation occurs
-/// in this struct's fields. The INSERT body serializes `spec` once via
-/// `serde_json::to_value`.
-pub struct NewCardRow<'a> {
-    /// Stable per-card UUID (caller pre-mints from `CardUid`).
-    pub card_uid: &'a CardUid,
-    /// Tenant isolation key (resolved from the request context).
-    pub data_tenant_id: Uuid,
-    /// Card kind discriminator.
-    pub kind: CardKind,
-    /// Space slug.
-    pub space: &'a SpaceName,
-    /// Card name slug.
-    pub name: &'a CardName,
-    /// Canonical version block (serializes via `Display`).
-    pub version: &'a VersionBlock,
-    /// Kind-specific spec payload.
-    pub spec: &'a Spec,
-    /// BLAKE3-256 of the canonical spec bytes.
-    pub spec_hash: &'a str,
-    /// BLAKE3-256 of the artifact blob, when present.
-    pub artifact_hash: Option<&'a str>,
-    /// Display labels reference.
-    pub labels: &'a Labels,
-    /// Free-form annotations reference.
-    pub annotations: &'a Annotations,
-    /// Creating principal, if the request is authenticated.
-    pub created_by: Option<PrincipalId>,
 }
 
 /// Owned, typed representation of a parsed `wyrd.cards` row.
@@ -230,6 +206,8 @@ pub struct AuditCardRegistrationRow {
     pub kind: String,
     /// Operation literal (`"register"`, `"update"`, `"delete"`).
     pub operation: String,
+    /// Outcome literal for registration rows.
+    pub outcome: Option<String>,
     /// Acting principal UUID.
     pub actor_principal_id: Uuid,
     /// Principal kind discriminator (`"user"`, `"service"`, `"agent"`).
@@ -256,6 +234,8 @@ pub struct NewAuditCardRegistrationRow<'a> {
     pub kind: CardKind,
     /// Operation discriminator.
     pub operation: CardRegistrationOperation,
+    /// Outcome discriminator for registration rows.
+    pub outcome: Option<CardRegistrationOutcome>,
     /// Acting principal id.
     pub actor_principal_id: PrincipalId,
     /// Acting principal kind (User / Service / Agent).
@@ -288,6 +268,30 @@ impl CardRegistrationOperation {
             Self::Register => "register",
             Self::Update => "update",
             Self::Delete => "delete",
+        }
+    }
+}
+
+/// `wyrd.audit_card_registration.outcome` enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardRegistrationOutcome {
+    /// A new row was inserted.
+    Created,
+    /// Existing pinned row matched on spec hash; no card write occurred.
+    IdempotentNoop,
+    /// Auto/scope registration matched the latest-in-line spec hash.
+    Deduplicated,
+}
+
+impl CardRegistrationOutcome {
+    /// Return the DB CHECK literal for this outcome.
+    #[must_use]
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::IdempotentNoop => "idempotent_noop",
+            Self::Deduplicated => "deduplicated",
         }
     }
 }
@@ -326,5 +330,18 @@ mod tests {
         assert_eq!(CardRegistrationOperation::Register.as_db_str(), "register");
         assert_eq!(CardRegistrationOperation::Update.as_db_str(), "update");
         assert_eq!(CardRegistrationOperation::Delete.as_db_str(), "delete");
+    }
+
+    #[test]
+    fn outcome_db_literals_match_check_constraint() {
+        assert_eq!(CardRegistrationOutcome::Created.as_db_str(), "created");
+        assert_eq!(
+            CardRegistrationOutcome::IdempotentNoop.as_db_str(),
+            "idempotent_noop"
+        );
+        assert_eq!(
+            CardRegistrationOutcome::Deduplicated.as_db_str(),
+            "deduplicated"
+        );
     }
 }

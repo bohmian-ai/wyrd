@@ -1,4 +1,5 @@
 //! Shared fixture helpers for `cards_e2e.rs`.
+#![allow(dead_code)]
 
 pub mod asserts;
 pub mod per_kind;
@@ -8,7 +9,7 @@ use sqlx::PgPool;
 
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
-use wyrd_semver::{VersionBlock, VersionSpec};
+use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{CardName, DataTenantId, SpaceName};
@@ -103,4 +104,43 @@ pub fn fixture_card(kind: CardKind, space: &str, name: &str, version: &str) -> C
         relationships: Default::default(),
         status: None,
     }
+}
+
+pub fn fixture_card_auto(kind: CardKind, space: &str, name: &str) -> Card {
+    let mut card = fixture_card(kind, space, name, "1.0.0");
+    card.metadata.version = None;
+    card.metadata.bump = None;
+    card
+}
+
+pub fn fixture_card_scoped(kind: CardKind, space: &str, name: &str, scope: &str) -> Card {
+    let mut card = fixture_card(kind, space, name, "1.0.0");
+    card.metadata.version = Some(VersionSpec::parse(scope).expect("fixture scope"));
+    card.metadata.bump = None;
+    card
+}
+
+pub fn with_bump(mut card: Card, bump: VersionBump) -> Card {
+    card.metadata.bump = Some(bump);
+    card
+}
+
+pub fn with_labels(mut card: Card, pairs: &[(&str, &str)]) -> Card {
+    for (key, value) in pairs {
+        card.metadata.labels.insert(
+            wyrd_spec::metadata::LabelKey::new(*key).expect("label key"),
+            wyrd_spec::metadata::LabelValue::new(*value).expect("label value"),
+        );
+    }
+    card
+}
+
+pub fn with_annotations(mut card: Card, pairs: &[(&str, &str)]) -> Card {
+    for (key, value) in pairs {
+        card.metadata.annotations.insert(
+            wyrd_spec::metadata::AnnotationKey::new(*key).expect("annotation key"),
+            wyrd_spec::metadata::AnnotationValue::new(*value).expect("annotation value"),
+        );
+    }
+    card
 }

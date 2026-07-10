@@ -16,6 +16,7 @@ pub mod postgres;
 #[cfg(feature = "embedded-postgres")]
 pub mod postgres_boot;
 pub mod queries;
+pub mod query;
 pub mod row_types;
 pub mod tenant_conn;
 #[cfg(any(test, feature = "testing"))]
@@ -25,8 +26,8 @@ pub use error::SqlError;
 pub use pool::PoolConfig;
 pub use postgres::WyrdPostgres;
 pub use row_types::cards::{
-    AuditCardRegistrationRow, CardRegistrationOperation, CardRow, CardStatus,
-    NewAuditCardRegistrationRow, NewCardRow, ParsedCardRow,
+    AuditCardRegistrationRow, CardRegistrationOperation, CardRegistrationOutcome, CardRow,
+    CardStatus, NewAuditCardRegistrationRow, ParsedCardRow,
 };
 pub use tenant_conn::TenantConn;
 

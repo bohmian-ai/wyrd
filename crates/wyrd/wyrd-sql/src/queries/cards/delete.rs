@@ -86,6 +86,7 @@ pub async fn soft_delete_card(
             card_uid: uid,
             kind: card_kind,
             operation: CardRegistrationOperation::Delete,
+            outcome: None,
             actor_principal_id: actor.id,
             actor_kind: actor.kind.clone(),
             before_spec_hash: Some(spec_hash.as_str()),

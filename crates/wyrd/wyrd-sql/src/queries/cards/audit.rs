@@ -15,8 +15,28 @@ use crate::tenant_conn::TenantConn;
 
 /// Insert one append-only audit row for a card registration event.
 ///
-/// MUST be called inside the same `TenantConn` tx as the corresponding
-/// `wyrd.cards` write.
+/// Callers supply a fully-populated [`NewAuditCardRegistrationRow`]. The hash
+/// fields and `outcome` must satisfy the per-operation invariant:
+///
+/// | `operation`  | `before_spec_hash` | `after_spec_hash` | `outcome`     |
+/// |---|---|---|---|
+/// | `Register`   | `None`             | `Some(_)`         | `Some(_)`     |
+/// | `Update`     | `Some(_)`          | `Some(_)`         | `None`        |
+/// | `Delete`     | `Some(_)`          | `None`            | `None`        |
+///
+/// This function enforces the invariant at the `debug_assert!` level in Rust
+/// and relies on `audit_card_registration_op_hash_consistency` and
+/// `audit_card_registration_outcome_operation_check` check constraints in the
+/// database as a second gate.
+///
+/// # Errors
+/// Returns `WYRD_INTERNAL` if the database rejects the row due to a
+/// constraint violation (indicates a caller bug, not a user error).
+/// Returns `WYRD_REG_503_REGISTRY_UNAVAILABLE` on transient database errors.
+///
+/// # Invariant
+/// MUST be called inside the same [`TenantConn`] tx as the corresponding
+/// `wyrd.cards` write. Fire-and-forget audit emission is forbidden.
 #[tracing::instrument(
     skip(conn, row),
     fields(
@@ -33,17 +53,24 @@ pub(crate) async fn record_card_registration_audit(
     debug_assert!(
         match row.operation {
             CardRegistrationOperation::Register =>
-                row.before_spec_hash.is_none() && row.after_spec_hash.is_some(),
+                row.before_spec_hash.is_none()
+                    && row.after_spec_hash.is_some()
+                    && row.outcome.is_some(),
             CardRegistrationOperation::Update =>
-                row.before_spec_hash.is_some() && row.after_spec_hash.is_some(),
+                row.before_spec_hash.is_some()
+                    && row.after_spec_hash.is_some()
+                    && row.outcome.is_none(),
             CardRegistrationOperation::Delete =>
-                row.before_spec_hash.is_some() && row.after_spec_hash.is_none(),
+                row.before_spec_hash.is_some()
+                    && row.after_spec_hash.is_none()
+                    && row.outcome.is_none(),
         },
         "audit row operation/hash invariant violated"
     );
 
     let kind_db = row.kind.wire_name();
     let operation_db = row.operation.as_db_str();
+    let outcome_db = row.outcome.map(|outcome| outcome.as_db_str());
     let actor_kind_db = actor_kind_db_str(&row.actor_kind);
 
     // Dynamic query is intentional: the audit table is append-only and the
@@ -58,6 +85,7 @@ pub(crate) async fn record_card_registration_audit(
             card_uid,
             kind,
             operation,
+            outcome,
             actor_principal_id,
             actor_kind,
             before_spec_hash,
@@ -65,13 +93,14 @@ pub(crate) async fn record_card_registration_audit(
             request_id,
             occurred_at
         )
-        VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
         "#,
     )
     .bind(row.audit_id)
     .bind(row.card_uid.as_uuid())
     .bind(kind_db)
     .bind(operation_db)
+    .bind(outcome_db)
     .bind(row.actor_principal_id.as_uuid())
     .bind(actor_kind_db)
     .bind(row.before_spec_hash)
@@ -96,6 +125,16 @@ pub(crate) async fn record_card_registration_audit(
                     tracing::error!("audit op/hash invariant violated; this is a bug");
                     Err(WyrdError::internal(
                         "audit_card_registration op/hash invariant violated",
+                    ))
+                }
+                // `outcome_operation_check` enforces that `outcome IS NOT NULL`
+                // only for `Register` rows and `IS NULL` for `Update`/`Delete`.
+                // A violation here means the Rust caller passed the wrong
+                // operation/outcome combination — it is always a caller bug.
+                (Some("23514"), Some("audit_card_registration_outcome_operation_check")) => {
+                    tracing::error!("audit outcome invariant violated; this is a bug");
+                    Err(WyrdError::internal(
+                        "audit_card_registration outcome invariant violated",
                     ))
                 }
                 (Some("23514"), Some("audit_card_registration_kind_check")) => {

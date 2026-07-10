@@ -10900,6 +10900,7 @@ dependencies = [
  "paste",
  "pg-embed",
  "rand 0.9.4",
+ "regex",
  "secrecy",
  "serde",
  "serde_json",

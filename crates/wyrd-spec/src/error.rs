@@ -882,13 +882,13 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Service and Agent cards require a Pin version, not a Requirement.
+    /// The version block is invalid for this operation.
     #[error("[WYRD_REG_400_INVALID_VERSION_BLOCK] {message}")]
     #[wyrd_error(
         code = "WYRD_REG_400_INVALID_VERSION_BLOCK",
         status = 400,
-        title = "Service and Agent cards require a Pin version, not a Requirement",
-        remediation = "Set `metadata.version` to an exact semver (e.g. `\"1.0.0\"`), not a range expression (e.g. `\"^1\"`)."
+        title = "The version block is invalid for this operation",
+        remediation = "Check the error message for the specific constraint: Service and Agent cards require an exact semver pin; version components must fit i64; a scoped bump must stay within the authored range."
     )]
     RegistryInvalidVersionBlock {
         /// Human-readable error message.
@@ -910,13 +910,13 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// `metadata.version` is required.
+    /// `metadata.version` was present but empty.
     #[error("[WYRD_REG_400_VERSION_REQUIRED] {message}")]
     #[wyrd_error(
         code = "WYRD_REG_400_VERSION_REQUIRED",
         status = 400,
-        title = "`metadata.version` is required",
-        remediation = "Add `metadata.version` to the card envelope. v1 does not auto-assign a next-patch version."
+        title = "`metadata.version` is present but empty",
+        remediation = "Provide a valid semver string (e.g. `\"1.0.0\"`) or omit `metadata.version` entirely to let the server auto-assign the next version."
     )]
     RegistryVersionRequired {
         /// Human-readable error message.

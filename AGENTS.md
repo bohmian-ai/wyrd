@@ -285,20 +285,47 @@ a user-observable behavior — especially a negative flow — down to a unit tes
 may stay unit-only when driving it end-to-end is materially harder and the
 behavior has no cross-boundary state (record the reason).
 
-### Pre-PR Gate (mirrors GitHub CI)
+### Verification Scope
 
-Run these before pushing. They are the same commands CI runs — no surprises on PR.
+Run verification for the code you changed. `mise run pre-pr` is the aggregate
+CI gate; it is intentionally broad and slow, so do not make it the default
+requirement for every plan, PR, or implementation slice.
 
 ```bash
-mise run pre-pr        # Rust + Python: all tests, format, lints, boundary checks, codegen
-mise run docs:check    # only if you changed docs/ (Starlight site)
+# Always run the relevant format and lint checks.
+mise run fmt           # Rust formatting
+mise run lints         # Rust clippy, workspace-wide
+mise run py:format     # if Python files changed
+mise run py:lints      # if Python files changed
 ```
 
-`mise run pre-pr` covers:
-- Rust: format, clippy, all tests (`test:unit` — unit + SQL + storage emulators), codegen drift, boundary gates
-- Python: format, lints, type check, unit tests, examples
+Then run the narrowest `mise` test/check tasks that cover the touched surface:
 
-Excludes real cloud storage integration tests (`test:storage:*:cloud`). Those run against live infrastructure separately.
+- Rust crate change: prefer the nearest crate-specific `mise run ...` task
+  (`test:wyrd-spec`, `test:wyrd-server`, `test:sql`, `test:storage:matrix`,
+  etc.). Whole-crate tests should use `mise` when a task exists because some
+  crates need external dependencies, migrations, generated artifacts, or
+  environment variables that the mise task sets up. Use raw `cargo test` only
+  when no relevant mise task exists or when narrowing to a single pure unit
+  test that does not need repository setup.
+- Python package change: run `mise run py:test:unit`; add
+  `mise run py:typecheck` when stubs, exports, or public Python typing changed.
+- Contract, schema, MCP, or stub generation change: run
+  `mise run codegen:check`.
+- Boundary-sensitive change: run the matching boundary check, such as
+  `mise run check:client-tier`, `mise run check:pyo3-scope`, or
+  `mise run check:unwrap-audit`.
+- Docs-site change under `docs/`: run `mise run docs:check`.
+- Example change: run the touched example task, or `mise run check:examples`
+  when the change affects shared example behavior.
+
+Run `mise run pre-pr` when the change is intentionally broad, crosses several
+ownership boundaries, changes shared CI/build/test infrastructure, prepares a
+release, or when the user explicitly asks for the full gate. It remains useful
+as a final confidence sweep; it is not the normal bar for every local PR.
+
+Real cloud storage integration tests (`test:storage:*:cloud`) run against live
+infrastructure separately.
 
 ### Quick Iteration
 
@@ -307,8 +334,9 @@ While working on a specific area:
 
 ```bash
 # Rust only
-# Per-crate iteration (requires a running Postgres and WYRD_DATABASE_URL set; prefer mise tasks for crate-specific runs):
-cargo test --locked -p <crate> <test_name> --all-features -- --nocapture --test-threads=1
+# Whole-crate tests should use a crate-specific mise task when one exists.
+# Raw cargo is acceptable for a narrow pure unit test that needs no repo setup.
+mise exec -- cargo test --locked -p <crate> <test_name> --all-features -- --nocapture --test-threads=1
 mise run test:sql      # runs all SQL-backed integration tests across wyrd-sql, wyrd-dev-fixtures, and vala-sql
 mise run test:unit     # all Rust tests including SQL and storage emulators
 
@@ -335,19 +363,15 @@ A change is not done until:
   not.
 - Public contracts regenerate cleanly when touched.
 - No legacy names, routes, package names, or compatibility aliases were added.
-- **`mise run pre-pr` passes green.** This is the final gate and it is
-  non-negotiable — a feature is not complete until it is green.
-  - It does not matter if the gate was already red on the base branch.
-    Inheriting a red gate does not excuse shipping red; make it green.
-  - Do not declare a gate "environment-blocked" without proof the environment
-    genuinely cannot run it. `pre-pr` needs only Docker plus the local toolchain,
-    and `PgFixture`/embedded-Postgres tests need neither an external database nor
-    Docker. Run it before claiming it cannot be run.
-  - Do not circumvent the gate to make it pass: never weaken or disable a check,
-    add `#[allow]`, delete or `#[ignore]` a failing test, or broaden a boundary
-    glob to hide a real violation. Fix the underlying cause. Only use a check's
-    own sanctioned mechanism (e.g. the documented per-file allowlist) when the
-    usage is legitimately test-only and matches an existing in-pattern precedent.
+- Format, lints, and the targeted tests/checks for the touched surface pass.
+  Prefer the smallest `mise` task set that proves the change. Do not require
+  `mise run pre-pr` unless the verification scope in §11 calls for the aggregate
+  gate.
+- Do not circumvent a gate to make it pass: never weaken or disable a check,
+  add `#[allow]`, delete or `#[ignore]` a failing test, or broaden a boundary
+  glob to hide a real violation. Fix the underlying cause. Only use a check's
+  own sanctioned mechanism (e.g. the documented per-file allowlist) when the
+  usage is legitimately test-only and matches an existing in-pattern precedent.
 
 ## 13. Git Identity Rules
 

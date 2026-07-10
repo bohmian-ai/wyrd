@@ -15,8 +15,28 @@ use crate::tenant_conn::TenantConn;
 
 /// Insert one append-only audit row for a card registration event.
 ///
-/// MUST be called inside the same `TenantConn` tx as the corresponding
-/// `wyrd.cards` write.
+/// Callers supply a fully-populated [`NewAuditCardRegistrationRow`]. The hash
+/// fields and `outcome` must satisfy the per-operation invariant:
+///
+/// | `operation`  | `before_spec_hash` | `after_spec_hash` | `outcome`     |
+/// |---|---|---|---|
+/// | `Register`   | `None`             | `Some(_)`         | `Some(_)`     |
+/// | `Update`     | `Some(_)`          | `Some(_)`         | `None`        |
+/// | `Delete`     | `Some(_)`          | `None`            | `None`        |
+///
+/// This function enforces the invariant at the `debug_assert!` level in Rust
+/// and relies on `audit_card_registration_op_hash_consistency` and
+/// `audit_card_registration_outcome_operation_check` check constraints in the
+/// database as a second gate.
+///
+/// # Errors
+/// Returns `WYRD_INTERNAL` if the database rejects the row due to a
+/// constraint violation (indicates a caller bug, not a user error).
+/// Returns `WYRD_REG_503_REGISTRY_UNAVAILABLE` on transient database errors.
+///
+/// # Invariant
+/// MUST be called inside the same [`TenantConn`] tx as the corresponding
+/// `wyrd.cards` write. Fire-and-forget audit emission is forbidden.
 #[tracing::instrument(
     skip(conn, row),
     fields(
@@ -107,6 +127,10 @@ pub(crate) async fn record_card_registration_audit(
                         "audit_card_registration op/hash invariant violated",
                     ))
                 }
+                // `outcome_operation_check` enforces that `outcome IS NOT NULL`
+                // only for `Register` rows and `IS NULL` for `Update`/`Delete`.
+                // A violation here means the Rust caller passed the wrong
+                // operation/outcome combination — it is always a caller bug.
                 (Some("23514"), Some("audit_card_registration_outcome_operation_check")) => {
                     tracing::error!("audit outcome invariant violated; this is a bug");
                     Err(WyrdError::internal(

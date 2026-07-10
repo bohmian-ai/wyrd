@@ -113,6 +113,8 @@ for_each_card_kind!(register, |kind| {
     }
 });
 
+// Verify that a card missing `metadata.space` is rejected at the boundary
+// before any database write, returning WYRD_REG_400_INVALID_CARD_SPEC.
 e2e_test!(register_missing_space_returns_400_invalid_card_spec, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
@@ -127,6 +129,10 @@ e2e_test!(register_missing_space_returns_400_invalid_card_spec, {
 
 // ─── PR2 Group V — Version resolution, dedup, range reads ─────────────────
 
+// Full auto-version registration journey: first submit seeds 0.1.0 (Created),
+// identical re-submit deduplicates (Deduplicated, same uid), content-changed
+// re-submit bumps to 0.1.1 (Created, new uid). Also verifies that version
+// columns, `list_versions` ordering, and audit rows record the right outcomes.
 e2e_test!(auto_register_resolves_deduplicates_and_audits_outcomes, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
@@ -184,6 +190,10 @@ e2e_test!(auto_register_resolves_deduplicates_and_audits_outcomes, {
     assert_registration_outcome(&audit[1], CardRegistrationOutcome::Deduplicated);
 });
 
+// Service and Agent cards require an explicit semver pin. Verify that
+// auto-version (None) and scope-version submissions are rejected with
+// WYRD_REG_400_INVALID_VERSION_BLOCK for both kinds, while a correctly
+// pinned submission succeeds and projects a service account.
 e2e_test!(service_and_agent_remain_pin_only, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
@@ -216,6 +226,10 @@ e2e_test!(service_and_agent_remain_pin_only, {
     }
 });
 
+// A scoped version (e.g. `~1.2`) with a Minor bump that would exit the
+// authored range (1.3.x is outside `~1.2`) must be rejected with
+// WYRD_REG_400_INVALID_VERSION_BLOCK rather than silently emitting an
+// out-of-range version.
 e2e_test!(scoped_bump_must_stay_inside_authored_range, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
@@ -234,6 +248,11 @@ e2e_test!(scoped_bump_must_stay_inside_authored_range, {
     assert_error_code(&err, "WYRD_REG_400_INVALID_VERSION_BLOCK");
 });
 
+// Seeds a range-card line with five stable versions (1.0.0, 1.2.0, 1.2.5,
+// 1.3.0, 2.0.0) and verifies that `get_latest_card_by_range` resolves the
+// correct latest-stable winner for each of the common semver range syntaxes
+// (^, ~, *, x.*, x.y.*, exact). Also checks that pre-release rows are
+// excluded from stable reads unless explicitly requested.
 e2e_test!(range_reads_and_prerelease_exclusion_work, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
@@ -356,6 +375,10 @@ for_each_card_kind!(reapply_drifted, |kind| {
 
 // ─── Group D — Delete ───────────────────────────────────────────────────────
 
+// A soft-deleted card stays in `wyrd.cards` with `status = 'deleted'` and
+// is excluded from all active reads. Verifies that `soft_delete_card`
+// succeeds for an existing card and that `uid_exists` still returns true
+// (the row is preserved, not removed).
 e2e_test!(soft_delete_active_card_flips_status, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
@@ -370,6 +393,8 @@ e2e_test!(soft_delete_active_card_flips_status, {
         .expect("soft delete must succeed");
 });
 
+// Soft-deleting a uid that does not exist in the tenant must return
+// WYRD_REG_404_CARD_NOT_FOUND rather than silently succeeding.
 e2e_test!(soft_delete_unknown_uid_returns_404, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
@@ -386,6 +411,13 @@ e2e_test!(soft_delete_unknown_uid_returns_404, {
 
 // ─── PR2 Group Q/P/H/S — Query, pagination, probes, invariants ────────────
 
+// `query_cards` integration: seeds cards across two spaces with labels,
+// annotations, and a deliberately malicious label value ("or-1-eq-1").
+// Verifies kind+space+filter composition, regex annotation matching, that
+// the malicious label value is safely bound (not interpreted as SQL),
+// `find_card_by_spec_hash`, `check_uid_exists`, `get_unique_spaces`,
+// and that soft-deleted rows are hidden from the default query but visible
+// when `status = Deleted` is explicitly requested.
 e2e_test!(query_cards_composes_metadata_filters_and_helpers, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
@@ -547,6 +579,10 @@ e2e_test!(query_cards_composes_metadata_filters_and_helpers, {
     assert_page_size(&deleted, 1);
 });
 
+// Inserts 250 cards and pages through them in pages of 100, asserting that
+// the page sizes are [100, 100, 50] and that no uid appears more than once
+// across pages. Validates that keyset pagination on `(created_at, card_uid)`
+// is stable and exhaustive.
 e2e_test!(query_cards_keyset_paginates_without_duplicates, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
@@ -592,6 +628,13 @@ e2e_test!(query_cards_keyset_paginates_without_duplicates, {
     assert_eq!(seen, expected);
 });
 
+// Verifies three schema-level invariants enforced by the migration:
+// 1. `version_major` is a GENERATED ALWAYS column — explicit UPDATE is
+//    rejected with PG error 428C9.
+// 2. `version` is immutable after INSERT — UPDATE is rejected by the
+//    `cards_version_immutable` trigger.
+// 3. A card whose `kind` field does not match its spec variant is rejected
+//    with WYRD_REG_400_INVALID_CARD_SPEC before the INSERT.
 e2e_test!(version_columns_and_kind_spec_mismatch_are_rejected, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
@@ -628,6 +671,10 @@ e2e_test!(version_columns_and_kind_spec_mismatch_are_rejected, {
 
 // ─── Group I — Invariants (tenant isolation) ────────────────────────────────
 
+// Two tenants registering the same (kind, space, name, version) identity
+// must produce independent rows with distinct uids. Verifies that the
+// unique index is scoped to `data_tenant_id` and that RLS prevents
+// cross-tenant reads.
 e2e_test!(
     two_tenants_can_register_identical_card_ref_without_conflict,
     {
@@ -651,6 +698,9 @@ e2e_test!(
     }
 );
 
+// Auto-registration dedup is strictly within-tenant. Both tenants submit the
+// same auto-version card; each gets a Created outcome with a distinct uid.
+// Also verifies that `query_cards` for tenant1 sees only its own rows.
 e2e_test!(
     two_tenants_auto_register_identical_card_without_cross_tenant_dedup,
     {
@@ -689,6 +739,10 @@ e2e_test!(
 
 // ─── Group R — Re-registration after soft-delete ────────────────────────────
 
+// A pinned card that has been soft-deleted can be re-registered at the same
+// version without a unique-constraint violation. The partial unique index
+// (`WHERE status <> 'deleted'`) allows the new row, and the re-registration
+// produces a Created outcome with a new uid distinct from the deleted row.
 e2e_test!(soft_deleted_pin_can_be_re_registered, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
@@ -726,6 +780,10 @@ e2e_test!(soft_deleted_pin_can_be_re_registered, {
 
 // ─── Group Q2 — CardQuery version_range and include_prerelease predicates ───
 
+// `CardQuery.version_range` filters rows by semver range (^1.2.0 returns
+// 1.2.0 and 1.3.0 only). `include_prerelease = true` adds the 1.3.0-rc.1
+// row (5 total); `include_prerelease = false` (default) excludes it (4
+// total). Verifies that both predicates compose correctly in `push_card_filters`.
 e2e_test!(query_cards_version_range_and_prerelease_predicates, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
@@ -805,6 +863,11 @@ e2e_test!(query_cards_version_range_and_prerelease_predicates, {
 
 // ─── Group L — Advisory lock under concurrent auto-registration ─────────────
 
+// Two concurrent auto-registrations for the same line run simultaneously via
+// `tokio::join!`. The advisory lock (`lock_version_line`) must serialize them
+// so the outcomes are either Created+Created (two distinct versions) or
+// Created+Deduplicated (same content, one version). A duplicate version in
+// the list indicates the lock did not protect the read-then-write sequence.
 e2e_test!(concurrent_auto_registration_produces_no_duplicate_versions, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;
@@ -854,6 +917,10 @@ e2e_test!(concurrent_auto_registration_produces_no_duplicate_versions, {
 
 // ─── Group N — No-stable-match error from get_latest_card_by_range ──────────
 
+// `get_latest_card_by_range` returns WYRD_REG_404_CARD_NOT_FOUND in two
+// cases: (1) the line contains only a pre-release row and the range matches
+// no stable version, and (2) the line does not exist at all. Both paths must
+// return 404 rather than 500.
 e2e_test!(get_latest_card_by_range_returns_404_when_no_stable_match, {
     let env = TestEnv::new().await;
     let tenant = env.fresh_tenant().await;

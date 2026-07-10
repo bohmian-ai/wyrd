@@ -142,6 +142,11 @@ pub async fn register_card(
     }
 }
 
+/// Reject cards that cannot be registered before touching the database.
+///
+/// Checks: supported `apiVersion`, presence of `metadata.space`, `kind` /
+/// `spec` consistency, non-empty `metadata.version`, and the Service/Agent
+/// pin-only rule. All failures map to `WYRD_REG_400_*` errors.
 fn validate_boundary(card: &Card) -> Result<(), WyrdError> {
     if card.api_version.as_str() != ApiVersion::V1 {
         return Err(WyrdError::registry_invalid_card_spec(
@@ -180,6 +185,13 @@ fn validate_boundary(card: &Card) -> Result<(), WyrdError> {
     Ok(())
 }
 
+/// Attempt to register a card at an exact pinned version.
+///
+/// Tries an INSERT with `ON CONFLICT … DO NOTHING`. If the row already exists
+/// (INSERT returned nothing), delegates to [`handle_conflict`] to determine
+/// whether the existing row is an idempotent re-apply or a spec-hash drift.
+/// For Service and Agent kinds, also projects the service account on first
+/// creation.
 async fn insert_pin(
     conn: &mut TenantConn<'_>,
     req: &RegisterCardRequest<'_>,
@@ -195,6 +207,8 @@ async fn insert_pin(
         None => return handle_conflict(conn, req.card, space, block, data.spec_hash, req).await,
     };
 
+    // Service and Agent cards project a durable service account on first
+    // registration so that their identity is immediately usable for auth.
     let principal_id = match &req.card.kind {
         CardKind::Service | CardKind::Agent => {
             let pid = upsert_service_account_from_card(conn, &uid_for_writes, req.card, req.actor)
@@ -220,6 +234,16 @@ async fn insert_pin(
     })
 }
 
+/// Register a card whose version is `None` (auto) or a `Scope` range.
+///
+/// Acquires a per-line advisory lock so concurrent callers cannot race to
+/// assign the same next version. After locking, calls [`resolve_version`] to
+/// determine whether the submitted spec hash matches the latest stable row in
+/// the line (content-identical dedup → `Deduplicated`) or to compute the next
+/// auto-incremented version (content-changed → `Created`).
+///
+/// Service and Agent cards are forbidden here — `validate_boundary` rejects
+/// them before this point.
 async fn register_auto(
     conn: &mut TenantConn<'_>,
     req: &RegisterCardRequest<'_>,
@@ -288,6 +312,16 @@ async fn register_auto(
     }
 }
 
+/// INSERT one row into `wyrd.cards`, returning the new uid on success.
+///
+/// Uses `ON CONFLICT … WHERE status <> 'deleted' DO NOTHING` so that a
+/// concurrent INSERT for the same active identity is silently skipped rather
+/// than erroring. Returns `None` when the conflict path fires; the caller is
+/// responsible for deciding what to do (idempotent re-apply check vs. advisory
+/// lock guarantee).
+///
+/// Validates that each semver component fits in `i64` before the INSERT, since
+/// the generated `version_major/minor/patch` columns are `BIGINT`.
 async fn insert_card_row(
     conn: &mut TenantConn<'_>,
     req: &RegisterCardRequest<'_>,
@@ -341,6 +375,14 @@ async fn insert_card_row(
         .transpose()
 }
 
+/// Fetch the uid of the active row that matches a resolved `(kind, space,
+/// name, version)` identity.
+///
+/// Called by `register_auto` after a `Deduplicated` resolution to convert the
+/// resolved version string back to a uid without re-doing the full content
+/// comparison. Returns `WYRD_REG_503_REGISTRY_UNAVAILABLE` if the row has
+/// disappeared between resolution and lookup (should not happen under the
+/// advisory lock, but guarded defensively).
 async fn lookup_uid_by_ref(
     conn: &mut TenantConn<'_>,
     kind: CardKind,
@@ -368,6 +410,19 @@ async fn lookup_uid_by_ref(
     CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error)
 }
 
+/// Resolve a pin conflict: either idempotent re-apply or spec-hash drift.
+///
+/// Called when `insert_card_row` returns `None` for a pin registration,
+/// meaning an active row with the same identity already exists. Reads the
+/// existing row's `spec_hash` and compares it against the submitted hash:
+///
+/// - Same hash → `IdempotentNoop` (caller re-submitted identical content).
+/// - Different hash → `WYRD_REG_409_SPEC_DRIFT` (caller is trying to change
+///   a pinned version in place, which is forbidden).
+///
+/// The `AND status <> 'deleted'` guard ensures that a previously soft-deleted
+/// pin at this identity (which the partial unique index now allows) does not
+/// produce a false conflict reading.
 async fn handle_conflict(
     conn: &mut TenantConn<'_>,
     card: &Card,
@@ -426,6 +481,12 @@ async fn handle_conflict(
     })
 }
 
+/// Build and write the audit row for a registration event.
+///
+/// Thin wrapper that assembles a [`NewAuditCardRegistrationRow`] from the
+/// parts available at the call site and delegates to
+/// [`record_card_registration_audit`]. Always writes a `Register` operation
+/// row; `Update` and `Delete` audit rows are written by other callers.
 async fn record_registration_audit(
     conn: &mut TenantConn<'_>,
     req: &RegisterCardRequest<'_>,

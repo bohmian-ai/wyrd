@@ -94,6 +94,10 @@ pub async fn query_cards(
 ) -> Result<ListPage<CardRow>, WyrdError> {
     validate_cursor(&cursor)?;
 
+    // The metadata filter can compile to a regex predicate (SIMILAR TO / ~).
+    // Postgres rejects trivially-invalid patterns but can run slowly on
+    // pathological inputs from callers. 5s caps any single list query and
+    // matches the server-level per-request deadline.
     sqlx::query("SET LOCAL statement_timeout = '5s'")
         .execute(&mut **conn.transaction())
         .await
@@ -102,44 +106,8 @@ pub async fn query_cards(
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
         "SELECT {CARD_ROW_COLUMNS} FROM wyrd.cards WHERE data_tenant_id = wyrd.current_tenant()"
     ));
-
-    match &query.status {
-        Some(status) => {
-            qb.push(" AND status = ").push_bind(status.as_db_str());
-        }
-        None => {
-            qb.push(" AND status <> 'deleted'");
-        }
-    }
-    if let Some(kind) = &query.kind {
-        qb.push(" AND kind = ").push_bind(kind.wire_name());
-    }
-    if let Some(space) = &query.space {
-        qb.push(" AND space = ").push_bind(space.as_str());
-    }
-    if let Some(name) = &query.name {
-        qb.push(" AND name = ").push_bind(name.as_str());
-    }
-    if !query.include_prerelease {
-        qb.push(" AND NOT version_is_prerelease");
-    }
-    if let Some(range) = &query.version_range {
-        let bounds = range
-            .to_bounds()
-            .map_err(|e| WyrdError::registry_invalid_version_block(e.to_string()))?;
-        push_bounds(&mut qb, &bounds)?;
-    }
-    if let Some(filter) = &query.filter {
-        qb.push(" AND ");
-        compile_query(filter, &CardFieldResolver, &mut qb)?;
-    }
-    if let (Some(after_ts), Some(after_uid)) =
-        (cursor.after_created_at.as_ref(), cursor.after_uid.as_ref())
-    {
-        qb.push(" AND (created_at, card_uid) > (");
-        qb.push_bind(after_ts.to_owned()).push(", ");
-        qb.push_bind(after_uid.as_uuid()).push(")");
-    }
+    push_card_filters(&mut qb, query)?;
+    push_keyset_cursor(&mut qb, &cursor);
     qb.push(" ORDER BY created_at ASC, card_uid ASC LIMIT ");
     qb.push_bind(cursor.limit as i64 + 1);
 
@@ -153,6 +121,11 @@ pub async fn query_cards(
 }
 
 /// Find an active card in a line whose spec hash matches.
+///
+/// Used during auto/scope registration to detect content-identical re-submits
+/// before deciding whether to insert a new version row. Only non-deleted rows
+/// are considered; the most recently registered version in the line is
+/// returned when multiple rows share the same hash.
 ///
 /// # Errors
 /// Returns `WYRD_REG_503_REGISTRY_UNAVAILABLE` on database errors.
@@ -214,6 +187,58 @@ pub async fn get_unique_spaces(conn: &mut TenantConn<'_>) -> Result<Vec<SpaceNam
             SpaceName::new(space).map_err(|e| WyrdError::registry_invalid_card_spec(e.to_string()))
         })
         .collect()
+}
+
+/// Append all `CardQuery` WHERE predicates to `qb`.
+///
+/// Does not touch ORDER BY, LIMIT, or the keyset cursor — those are the
+/// caller's responsibility. Returns an error only when a version range cannot
+/// be converted to SQL bounds.
+fn push_card_filters(qb: &mut QueryBuilder<Postgres>, query: &CardQuery) -> Result<(), WyrdError> {
+    match &query.status {
+        Some(status) => {
+            qb.push(" AND status = ").push_bind(status.as_db_str());
+        }
+        None => {
+            qb.push(" AND status <> 'deleted'");
+        }
+    }
+    if let Some(kind) = &query.kind {
+        qb.push(" AND kind = ").push_bind(kind.wire_name());
+    }
+    if let Some(space) = &query.space {
+        qb.push(" AND space = ").push_bind(space.as_str());
+    }
+    if let Some(name) = &query.name {
+        qb.push(" AND name = ").push_bind(name.as_str());
+    }
+    if !query.include_prerelease {
+        qb.push(" AND NOT version_is_prerelease");
+    }
+    if let Some(range) = &query.version_range {
+        let bounds = range
+            .to_bounds()
+            .map_err(|e| WyrdError::registry_invalid_version_block(e.to_string()))?;
+        push_bounds(qb, &bounds)?;
+    }
+    if let Some(filter) = &query.filter {
+        qb.push(" AND ");
+        compile_query(filter, &CardFieldResolver, qb)?;
+    }
+    Ok(())
+}
+
+/// Append the keyset continuation predicate for `(created_at, card_uid)` when
+/// the cursor carries a prior-page position. No-ops when the cursor has no
+/// prior position (first page).
+fn push_keyset_cursor(qb: &mut QueryBuilder<Postgres>, cursor: &ListCursor) {
+    if let (Some(after_ts), Some(after_uid)) =
+        (cursor.after_created_at.as_ref(), cursor.after_uid.as_ref())
+    {
+        qb.push(" AND (created_at, card_uid) > (");
+        qb.push_bind(after_ts.to_owned()).push(", ");
+        qb.push_bind(after_uid.as_uuid()).push(")");
+    }
 }
 
 fn map_query_db_error(e: sqlx::Error) -> WyrdError {

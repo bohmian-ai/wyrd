@@ -14,7 +14,8 @@ Downstream artifacts are brought up to this version in a sync pass.
 
 ## Table of contents
 
-- [Doctrine](#doctrine) — 18 design principles
+- [Doctrine](#doctrine) — 20 design principles
+- [Client model](#client-model) — language-agnostic protocol and first-class SDKs
 - [Kind catalog](#kind-catalog) — 16 native kinds + External
 - [Per-kind specs](#per-kind-specs) — field shapes per kind
   - [Data](#data) · [Model](#model) · [Artifact](#artifact) · [Experiment](#experiment)
@@ -195,6 +196,25 @@ Downstream artifacts are brought up to this version in a sync pass.
     batch. A bug that only appears when state crosses a module boundary is
     exactly what a journey catches and an isolated test misses. See AGENTS.md
     §11 for the tier definitions and gates.
+
+## Client model
+
+Wyrd is language-agnostic at the protocol boundary. The server owns durable
+behavior, and its typed wire contracts are the source of truth. Any language
+can implement a client by following those contracts; no SDK owns a separate
+registry, lifecycle, validation, or storage model.
+
+Rust, Python, and TypeScript are Wyrd's first-class client languages. Wyrd
+maintains idiomatic SDKs, generated types, examples, and client → server →
+client journeys for all three. Surface ergonomics may differ, but durable
+nouns, fields, errors, permissions, side effects, and lifecycle semantics do
+not. Go is planned. It becomes first-class only when its SDK and the same
+contract and journey gates ship.
+
+The public protocol remains open to every language. HTTP, MCP, generated
+schemas, stable errors, and machine-readable documentation are sufficient to
+implement a complete client without depending on Rust, Python, or TypeScript
+internals.
 
 ---
 

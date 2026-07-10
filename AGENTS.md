@@ -48,11 +48,13 @@ Locked cross-cutting decisions that any contributor must honor:
 - Core durable logic is Rust-only server logic. Contracts live on the API wire
   through typed schemas, HTTP/MCP payloads, generated docs, and stable error
   codes so any language can implement a Wyrd client.
-- Python and Rust are first-class client languages. They may receive richer
-  SDK ergonomics, local authoring helpers, OTEL integration, agent workflow
-  integration, and test tooling when useful, but those features must not move
-  server-owned durable behavior out of the server or make the product
-  language-exclusive.
+- Rust, Python, and TypeScript are first-class client languages. Wyrd ships
+  idiomatic SDKs, generated types, examples, and user-journey coverage for all
+  three. Go is a planned client language, but it is not first-class until its
+  SDK and the same contract and journey gates ship. These SDKs may add local
+  authoring helpers, OTEL integration, agent workflow integration, and test
+  tooling, but they must not move server-owned durable behavior out of the
+  server or create language-specific durable contracts.
 - Wyrd must work both self-hosted and as a cloud SaaS product. SaaS and
   enterprise deployments require full tenant separation for identity, authz,
   storage, registry, policy, audit, observability, evaluation, and generated
@@ -111,13 +113,17 @@ Locked cross-cutting decisions that any contributor must honor:
   OLAP, and background data-plane behavior. Python-visible Vala client
   behavior lives in `vala-sdk` behind its optional `python` feature.
 - `crates/wyrd/*`: server, CLI, MCP, application integration, UI host.
+- `crates/bindings/*`: thin native bindings and package roots for first-class
+  SDKs that need them, including the TypeScript/Node surface. Shared client
+  behavior stays in client-tier Rust crates; bindings do not reimplement HTTP,
+  validation, registry, storage, or lifecycle logic.
 - `python/py-wyrd`: PyO3 module root, Python package exports, generated stubs,
   Python-facing tests, and submodule aggregation.
 
 When behavior crosses boundaries, put the durable contract in `wyrd-spec`, keep
 durable server behavior in Rust-owned server/service crates, and expose the
-necessary API through language-agnostic wire contracts plus first-class Rust
-and Python client surfaces where appropriate.
+necessary API through language-agnostic wire contracts plus first-class Rust,
+Python, and TypeScript client surfaces where appropriate.
 
 ## 4. Rust Core Rules
 
@@ -222,9 +228,10 @@ then run codegen.
 - Server code owns durable behavior, side effects, tenancy checks, registry
   writes, storage orchestration, policy decisions, audit records, and generated
   relationship/status state.
-- Client code, including first-class Rust and Python SDKs, may own ergonomic
-  authoring helpers, local save/load, local validation messages, tracing hooks,
-  and runtime integrations, but it must not become the durable source of truth.
+- Client code, including first-class Rust, Python, and TypeScript SDKs, may own
+  ergonomic authoring helpers, local save/load, local validation messages,
+  tracing hooks, and runtime integrations, but it must not become the durable
+  source of truth.
 - Public request/response bodies are typed structs.
 - Wire types derive schema support where required by the feature gate.
 - Public handlers return structured Wyrd errors via the `WyrdError` derive.
@@ -266,10 +273,11 @@ missing higher one.
    the **negative** flows a real caller hits (under-privileged token →
    rejection, non-SELECT or oversized query → floor rejection, write to an
    unregistered table, replayed batch → no double-write). Cover every
-   user-facing surface the capability ships — Python and Rust SDK, and the
-   MCP/HTTP path when the capability is agent-facing. Journeys run in a gated
-   lane (`integration` pytest marker; Rust `e2e`/`#[ignore]`) so the fast lane
-   stays credential- and server-free.
+   user-facing surface the capability ships — Rust, Python, and TypeScript SDKs,
+   and the MCP/HTTP path when the capability is agent-facing. Journeys run in a
+   gated lane (`integration` pytest marker; Rust `e2e`/`#[ignore]`; the
+   repository TypeScript integration task) so the fast lane stays credential-
+   and server-free.
 2. **Integration tests — supporting.** Exercise one subsystem against its real
    dependency (a handler against Postgres, the ingest service against the
    writer) without standing up the full client→server journey. Use them to pin

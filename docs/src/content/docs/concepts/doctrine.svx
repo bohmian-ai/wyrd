@@ -28,7 +28,7 @@ operates on the one below it.
     ['Card kinds', 'Domain specializations of Card. The kind changes the spec, not the ontology.'],
     ['Foundations', 'The envelope, metadata, CardRef, relationship, status, and version.'],
     ['Services', 'Registry, storage, lineage, policy, install, audit, observability, evaluation, drift, runtime.'],
-    ['Surfaces', 'HTTP, SDK, CLI, UI, MCP, IDE integrations, and generated docs.']
+    ['Surfaces', 'HTTP, first-class Rust/Python/TypeScript SDKs, CLI, UI, MCP, IDE integrations, and generated docs.']
   ]}
 />
 
@@ -61,9 +61,17 @@ bypassed.
 
 The SDK, HTTP API, CLI, UI, generated schemas, and MCP tools all project the same
 card contract. A surface may add an ergonomic shortcut, but it does not invent new
-shapes, rename durable fields, or expose server-internal state. What you declare in
-Python is recognizable in the HTTP payload, the stored card, the generated schema,
-and the MCP tool input.
+shapes, rename durable fields, or expose server-internal state.
+
+Rust, Python, and TypeScript are first-class SDK languages. Each gets idiomatic
+client ergonomics, generated types, examples, and user-journey coverage over the
+same server contract. Go is planned; it becomes first-class when those SDK and
+verification surfaces ship.
+
+The protocol stays language-agnostic. Any language can implement a client from
+the HTTP and MCP contracts, generated schemas, machine-readable docs, and stable
+errors. What you declare in Rust, Python, or TypeScript is recognizable in the
+HTTP payload, the stored card, the generated schema, and the MCP tool input.
 
 ## The implementation rule
 

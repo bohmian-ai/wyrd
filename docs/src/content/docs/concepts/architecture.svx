@@ -11,8 +11,8 @@ order: 5
 Wyrd ships three products from one source tree. `wyrd-spec` is the shared Rust
 crate that defines every wire type; each product depends on it, and none owns it.
 That single shared crate is what keeps the contract identical across the HTTP API,
-SDK, CLI, MCP tools, and generated schemas — what you declare in Python is
-recognizable in every other surface.
+SDKs, CLI, MCP tools, and generated schemas. What you declare in Rust, Python, or
+TypeScript is recognizable in every other surface.
 
 ## The three products
 
@@ -57,6 +57,12 @@ The SDK, HTTP API, CLI, UI, generated schemas, and MCP tools all project the sam
 card contract. All contracts live on the API wire, which makes Wyrd
 language-agnostic: a surface can add an ergonomic shortcut, but it cannot rename a
 durable field, invent a new shape, or expose server-internal state.
+
+Rust, Python, and TypeScript are the first-class SDK languages. Wyrd maintains
+idiomatic clients, generated types, examples, and user-journey coverage for each
+one. Go is planned, but remains a protocol consumer until the same SDK and
+verification contract ships. Other languages can implement complete clients
+directly from the public wire contract without depending on SDK internals.
 
 ## Related
 

@@ -8,7 +8,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, SpaceName};
 
 use crate::queries::cards::version_sql::push_bounds;
-use crate::row_types::cards::{CardRow, ParsedCardRow};
+use crate::row_types::cards::{CARD_ROW_COLUMNS, CardRow, ParsedCardRow};
 use crate::tenant_conn::TenantConn;
 
 /// Return the latest stable card whose version falls within `range`.
@@ -26,18 +26,18 @@ pub async fn get_latest_card_by_range(
     name: &CardName,
     range: &VersionRange,
 ) -> Result<ParsedCardRow, WyrdError> {
+    // No statement_timeout: these reads hit idx_cards_version_latest (partial, bounded index)
+    // and carry no user-supplied regex, so unbounded scan is not a concern. Add one if
+    // these queries are ever exposed directly to user-supplied range inputs without a pre-check.
     let bounds = range
         .to_bounds()
         .map_err(|e| WyrdError::registry_invalid_version_block(e.to_string()))?;
 
-    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        "SELECT card_uid, data_tenant_id, kind, space, name, version, \
-                spec, spec_hash, artifact_hash, labels, annotations, \
-                status, created_by, created_at, updated_at \
-         FROM wyrd.cards \
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
+        "SELECT {CARD_ROW_COLUMNS} FROM wyrd.cards \
          WHERE data_tenant_id = wyrd.current_tenant() \
-           AND status <> 'deleted' AND NOT version_is_prerelease AND kind = ",
-    );
+           AND status <> 'deleted' AND NOT version_is_prerelease AND kind = "
+    ));
     qb.push_bind(kind.wire_name());
     qb.push(" AND space = ").push_bind(space.as_str());
     qb.push(" AND name = ").push_bind(name.as_str());

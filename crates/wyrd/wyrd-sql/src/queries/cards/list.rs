@@ -12,7 +12,7 @@ use wyrd_spec::query::{MetadataQuery, QueryFieldErrorDetail};
 use crate::queries::cards::field_resolver::CardFieldResolver;
 use crate::queries::cards::version_sql::push_bounds;
 use crate::query::compile_query;
-use crate::row_types::cards::{CardRow, CardStatus};
+use crate::row_types::cards::{CARD_ROW_COLUMNS, CardRow, CardStatus};
 use crate::tenant_conn::TenantConn;
 
 /// Maximum page size for list queries.
@@ -99,13 +99,9 @@ pub async fn query_cards(
         .await
         .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?;
 
-    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        "SELECT card_uid, data_tenant_id, kind, space, name, version, \
-                spec, spec_hash, artifact_hash, labels, annotations, \
-                status, created_by, created_at, updated_at \
-         FROM wyrd.cards \
-         WHERE data_tenant_id = wyrd.current_tenant()",
-    );
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
+        "SELECT {CARD_ROW_COLUMNS} FROM wyrd.cards WHERE data_tenant_id = wyrd.current_tenant()"
+    ));
 
     match &query.status {
         Some(status) => {
@@ -167,13 +163,10 @@ pub async fn find_card_by_spec_hash(
     name: &CardName,
     spec_hash: &str,
 ) -> Result<Option<CardRow>, WyrdError> {
-    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        "SELECT card_uid, data_tenant_id, kind, space, name, version, \
-                spec, spec_hash, artifact_hash, labels, annotations, \
-                status, created_by, created_at, updated_at \
-         FROM wyrd.cards \
-         WHERE data_tenant_id = wyrd.current_tenant() AND status <> 'deleted' AND kind = ",
-    );
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
+        "SELECT {CARD_ROW_COLUMNS} FROM wyrd.cards \
+         WHERE data_tenant_id = wyrd.current_tenant() AND status <> 'deleted' AND kind = "
+    ));
     qb.push_bind(kind.wire_name());
     qb.push(" AND space = ").push_bind(space.as_str());
     qb.push(" AND name = ").push_bind(name.as_str());
@@ -224,17 +217,17 @@ pub async fn get_unique_spaces(conn: &mut TenantConn<'_>) -> Result<Vec<SpaceNam
 }
 
 fn map_query_db_error(e: sqlx::Error) -> WyrdError {
-    if let Some(db) = e.as_database_error() {
-        if db.code().as_deref() == Some("2201B") {
-            return WyrdError::query_invalid_field_detail(
-                "regex rejected by the query engine",
-                QueryFieldErrorDetail {
-                    reason: "regex_rejected",
-                    surface: Some("cards"),
-                    ..Default::default()
-                },
-            );
-        }
+    if let Some(db) = e.as_database_error()
+        && db.code().as_deref() == Some("2201B")
+    {
+        return WyrdError::query_invalid_field_detail(
+            "regex rejected by the query engine",
+            QueryFieldErrorDetail {
+                reason: "regex_rejected",
+                surface: Some("cards"),
+                ..Default::default()
+            },
+        );
     }
     WyrdError::registry_unavailable(e.to_string())
 }
@@ -258,4 +251,43 @@ fn build_page(mut rows: Vec<CardRow>, cursor: ListCursor) -> ListPage<CardRow> {
         None
     };
     ListPage { items: rows, next }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_cursor_rejects_zero_limit() {
+        let cursor = ListCursor {
+            after_created_at: None,
+            after_uid: None,
+            limit: 0,
+        };
+        let err = validate_cursor(&cursor).expect_err("limit 0 must be rejected");
+        assert_eq!(err.code(), "WYRD_REG_400_LIST_LIMIT_OUT_OF_RANGE");
+    }
+
+    #[test]
+    fn validate_cursor_rejects_overlimit() {
+        let cursor = ListCursor {
+            after_created_at: None,
+            after_uid: None,
+            limit: MAX_LIST_LIMIT + 1,
+        };
+        let err = validate_cursor(&cursor).expect_err("limit > MAX must be rejected");
+        assert_eq!(err.code(), "WYRD_REG_400_LIST_LIMIT_OUT_OF_RANGE");
+    }
+
+    #[test]
+    fn validate_cursor_accepts_boundary_values() {
+        for limit in [1, MAX_LIST_LIMIT] {
+            let cursor = ListCursor {
+                after_created_at: None,
+                after_uid: None,
+                limit,
+            };
+            validate_cursor(&cursor).expect("boundary limit must be accepted");
+        }
+    }
 }

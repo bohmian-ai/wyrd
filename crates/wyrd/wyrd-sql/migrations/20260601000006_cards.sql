@@ -53,16 +53,17 @@ CREATE TABLE wyrd.cards (
     -- for the deprecation lifecycle and does not hide the row from list_*.
     CONSTRAINT cards_status_check CHECK (
         status IN ('active','deprecated','deleted')
-    ),
-
-    -- Durable identity. card_uid is a handle; this 5-tuple is the key.
-    -- register_card's ON CONFLICT clause targets this constraint by name.
-    CONSTRAINT cards_identity_unique UNIQUE (data_tenant_id, kind, space, name, version)
+    )
 );
 
 -- Indexes ---------------------------------------------------------------
--- The UNIQUE constraint above already provides the
--- (data_tenant_id, kind, space, name, version) btree; no second index.
+-- cards_identity_unique is partial (WHERE status <> 'deleted') so that
+-- soft-deleted pins do not block re-registration at the same identity.
+-- register_card's ON CONFLICT clause targets this index by column list + predicate.
+
+CREATE UNIQUE INDEX cards_identity_unique
+    ON wyrd.cards (data_tenant_id, kind, space, name, version)
+    WHERE status <> 'deleted';
 
 CREATE INDEX idx_cards_kind
     ON wyrd.cards (data_tenant_id, kind, status);

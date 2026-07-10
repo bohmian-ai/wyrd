@@ -17,7 +17,7 @@ use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::query::MetadataQuery;
 use wyrd_sql::CardRegistrationOutcome;
-use wyrd_sql::queries::cards::{CardQuery, ListCursor};
+use wyrd_sql::queries::cards::{CardQuery, ListCursor, RegisterCardOutcomeKind};
 
 mod fixtures;
 use fixtures::{
@@ -614,8 +614,7 @@ e2e_test!(version_columns_and_kind_spec_mismatch_are_rejected, {
     assert_eq!(
         version_err
             .as_database_error()
-            .and_then(|db| db.constraint())
-            .as_deref(),
+            .and_then(|db| db.constraint()),
         Some("cards_version_immutable")
     );
 
@@ -687,3 +686,207 @@ e2e_test!(
         assert_page_size(&tenant1_rows, 1);
     }
 );
+
+// ─── Group R — Re-registration after soft-delete ────────────────────────────
+
+e2e_test!(soft_deleted_pin_can_be_re_registered, {
+    let env = TestEnv::new().await;
+    let tenant = env.fresh_tenant().await;
+    let actor = env.fixture_user(tenant).await;
+    let card = fixture_card(CardKind::Prompt, "prod", "deletable-pin", "1.0.0");
+
+    let first = scenarios::register(&env, tenant, &actor, &card)
+        .await
+        .expect("first registration succeeds");
+    assert_created(&first);
+
+    scenarios::soft_delete(&env, tenant, &first.card_uid, &actor)
+        .await
+        .expect("soft delete succeeds");
+
+    let second = scenarios::register(&env, tenant, &actor, &card)
+        .await
+        .expect("re-registration after soft-delete must succeed");
+
+    assert_created(&second);
+    assert_distinct_uids(&first, &second);
+
+    let found = scenarios::get_by_ref(
+        &env,
+        tenant,
+        CardKind::Prompt,
+        &space("prod"),
+        &name("deletable-pin"),
+        &VersionBlock::parse("1.0.0").expect("version"),
+    )
+    .await
+    .expect("re-registered pin is visible");
+    assert_eq!(found.card_uid, second.card_uid);
+});
+
+// ─── Group Q2 — CardQuery version_range and include_prerelease predicates ───
+
+e2e_test!(query_cards_version_range_and_prerelease_predicates, {
+    let env = TestEnv::new().await;
+    let tenant = env.fresh_tenant().await;
+    let actor = env.fixture_user(tenant).await;
+
+    for version in ["1.0.0", "1.2.0", "1.3.0", "2.0.0", "1.3.0-rc.1"] {
+        let card = fixture_card(CardKind::Data, "ver", "range-query-card", version);
+        scenarios::register(&env, tenant, &actor, &card)
+            .await
+            .expect("seed registers");
+    }
+
+    let in_range = scenarios::query(
+        &env,
+        tenant,
+        &CardQuery {
+            kind: Some(CardKind::Data),
+            space: Some(space("ver")),
+            name: Some(name("range-query-card")),
+            version_range: Some(VersionRange::parse_loose("^1.2.0").expect("range")),
+            ..Default::default()
+        },
+        cursor(50),
+    )
+    .await
+    .expect("range query");
+    assert_page_size(&in_range, 2);
+    let in_range_versions: Vec<&str> = in_range
+        .items
+        .iter()
+        .map(|r| r.version.as_str())
+        .collect();
+    assert!(
+        in_range_versions.contains(&"1.2.0") && in_range_versions.contains(&"1.3.0"),
+        "expected 1.2.0 and 1.3.0 in range, got {in_range_versions:?}"
+    );
+
+    let with_pre = scenarios::query(
+        &env,
+        tenant,
+        &CardQuery {
+            kind: Some(CardKind::Data),
+            space: Some(space("ver")),
+            name: Some(name("range-query-card")),
+            include_prerelease: true,
+            ..Default::default()
+        },
+        cursor(50),
+    )
+    .await
+    .expect("include_prerelease=true query");
+    assert_page_size(&with_pre, 5);
+
+    let without_pre = scenarios::query(
+        &env,
+        tenant,
+        &CardQuery {
+            kind: Some(CardKind::Data),
+            space: Some(space("ver")),
+            name: Some(name("range-query-card")),
+            include_prerelease: false,
+            ..Default::default()
+        },
+        cursor(50),
+    )
+    .await
+    .expect("include_prerelease=false query");
+    assert_page_size(&without_pre, 4);
+    assert!(
+        without_pre
+            .items
+            .iter()
+            .all(|r| !r.version.as_str().contains('-')),
+        "pre-release row leaked into include_prerelease=false result"
+    );
+});
+
+// ─── Group L — Advisory lock under concurrent auto-registration ─────────────
+
+e2e_test!(concurrent_auto_registration_produces_no_duplicate_versions, {
+    let env = TestEnv::new().await;
+    let tenant = env.fresh_tenant().await;
+    let actor = env.fixture_user(tenant).await;
+    let card = fixture_card_auto(CardKind::Data, "prod", "concurrent-auto");
+
+    let (r1, r2) = tokio::join!(
+        scenarios::register(&env, tenant, &actor, &card),
+        scenarios::register(&env, tenant, &actor, &card),
+    );
+
+    let o1 = r1.expect("first concurrent auto register succeeds");
+    let o2 = r2.expect("second concurrent auto register succeeds");
+
+    let both_created = matches!(
+        (o1.kind, o2.kind),
+        (RegisterCardOutcomeKind::Created, RegisterCardOutcomeKind::Created)
+    );
+    let one_dedup = matches!(
+        (&o1.kind, &o2.kind),
+        (RegisterCardOutcomeKind::Created, RegisterCardOutcomeKind::Deduplicated)
+            | (RegisterCardOutcomeKind::Deduplicated, RegisterCardOutcomeKind::Created)
+    );
+    assert!(
+        both_created || one_dedup,
+        "expected Created+Created or Created+Deduplicated, got {:?} and {:?}",
+        o1.kind,
+        o2.kind
+    );
+
+    let versions = scenarios::versions(
+        &env,
+        tenant,
+        CardKind::Data,
+        &space("prod"),
+        &name("concurrent-auto"),
+        false,
+    )
+    .await
+    .expect("versions list");
+    assert!(
+        versions.len() <= 2,
+        "concurrent auto must not mint duplicate versions; got {:?}",
+        versions
+    );
+});
+
+// ─── Group N — No-stable-match error from get_latest_card_by_range ──────────
+
+e2e_test!(get_latest_card_by_range_returns_404_when_no_stable_match, {
+    let env = TestEnv::new().await;
+    let tenant = env.fresh_tenant().await;
+    let actor = env.fixture_user(tenant).await;
+
+    let pre_only = fixture_card(CardKind::Model, "prod", "pre-only-card", "1.0.0-rc.1");
+    scenarios::register(&env, tenant, &actor, &pre_only)
+        .await
+        .expect("pre-release seed registers");
+
+    let err = scenarios::latest_by_range(
+        &env,
+        tenant,
+        CardKind::Model,
+        &space("prod"),
+        &name("pre-only-card"),
+        &VersionRange::parse_loose("*").expect("range"),
+    )
+    .await
+    .expect_err("no stable match must return error");
+
+    assert_error_code(&err, "WYRD_REG_404_CARD_NOT_FOUND");
+
+    let no_card_err = scenarios::latest_by_range(
+        &env,
+        tenant,
+        CardKind::Model,
+        &space("prod"),
+        &name("nonexistent-card"),
+        &VersionRange::parse_loose("*").expect("range"),
+    )
+    .await
+    .expect_err("missing card must return 404");
+
+    assert_error_code(&no_card_err, "WYRD_REG_404_CARD_NOT_FOUND");
+});

@@ -26,6 +26,9 @@ struct LatestInLine {
     spec_hash: String,
 }
 
+// No statement_timeout on version-resolve reads: they hit idx_cards_version_latest
+// (partial, bounded index) and carry no user-supplied regex. Add one if these
+// queries are ever exposed to unconstrained inputs.
 async fn latest_stable_in_line(
     conn: &mut TenantConn<'_>,
     kind: CardKind,

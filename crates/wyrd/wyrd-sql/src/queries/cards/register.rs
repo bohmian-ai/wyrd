@@ -28,6 +28,13 @@ use crate::tenant_conn::TenantConn;
 /// Maximum canonical-JSON byte size for a single `Spec`.
 pub const MAX_SPEC_BYTES: usize = 256 * 1024;
 
+struct PreparedCardData<'a> {
+    spec_hash: &'a str,
+    spec_json: &'a JsonValue,
+    labels_json: &'a JsonValue,
+    annotations_json: &'a JsonValue,
+}
+
 /// Inputs to [`register_card`].
 pub struct RegisterCardRequest<'a> {
     /// Source card envelope.
@@ -111,22 +118,15 @@ pub async fn register_card(
         .as_ref()
         .expect("space presence verified in validate_boundary");
     let name = &req.card.metadata.name;
+    let data = PreparedCardData {
+        spec_hash: spec_hash.as_str(),
+        spec_json: &spec_json,
+        labels_json: &labels_json,
+        annotations_json: &annotations_json,
+    };
 
     match &req.card.metadata.version {
-        Some(VersionSpec::Pin(block)) => {
-            insert_pin(
-                conn,
-                &req,
-                space,
-                name,
-                block,
-                spec_hash.as_str(),
-                &spec_json,
-                &labels_json,
-                &annotations_json,
-            )
-            .await
-        }
+        Some(VersionSpec::Pin(block)) => insert_pin(conn, &req, space, name, block, &data).await,
         other => {
             register_auto(
                 conn,
@@ -135,10 +135,7 @@ pub async fn register_card(
                 name,
                 other.as_ref(),
                 req.card.metadata.bump.as_ref(),
-                spec_hash.as_str(),
-                &spec_json,
-                &labels_json,
-                &annotations_json,
+                &data,
             )
             .await
         }
@@ -167,20 +164,18 @@ fn validate_boundary(card: &Card) -> Result<(), WyrdError> {
                 "metadata.version must not be empty",
             ));
         }
-        Some(v) => {
-            if matches!(&card.kind, CardKind::Service | CardKind::Agent) && !v.is_pin() {
-                return Err(WyrdError::registry_invalid_version_block(
-                    "Service and Agent cards require a pinned version",
-                ));
-            }
-        }
-        None => {
-            if matches!(&card.kind, CardKind::Service | CardKind::Agent) {
-                return Err(WyrdError::registry_invalid_version_block(
-                    "Service and Agent cards require a pinned version",
-                ));
-            }
-        }
+        _ => {}
+    }
+    if matches!(&card.kind, CardKind::Service | CardKind::Agent)
+        && !card
+            .metadata
+            .version
+            .as_ref()
+            .is_some_and(|v| !v.as_str().is_empty() && v.is_pin())
+    {
+        return Err(WyrdError::registry_invalid_version_block(
+            "Service and Agent cards require a pinned version",
+        ));
     }
     Ok(())
 }
@@ -191,27 +186,13 @@ async fn insert_pin(
     space: &SpaceName,
     name: &CardName,
     block: &VersionBlock,
-    spec_hash: &str,
-    spec_json: &JsonValue,
-    labels_json: &JsonValue,
-    annotations_json: &JsonValue,
+    data: &PreparedCardData<'_>,
 ) -> Result<RegisterCardOutcome, WyrdError> {
-    let inserted = insert_card_row(
-        conn,
-        req,
-        space,
-        name,
-        block,
-        spec_hash,
-        spec_json,
-        labels_json,
-        annotations_json,
-    )
-    .await?;
+    let inserted = insert_card_row(conn, req, space, name, block, data).await?;
 
     let uid_for_writes = match inserted {
         Some(uid) => uid,
-        None => return handle_conflict(conn, req.card, space, block, spec_hash, req).await,
+        None => return handle_conflict(conn, req.card, space, block, data.spec_hash, req).await,
     };
 
     let principal_id = match &req.card.kind {
@@ -227,7 +208,7 @@ async fn insert_pin(
         conn,
         req,
         &uid_for_writes,
-        spec_hash,
+        data.spec_hash,
         CardRegistrationOutcome::Created,
     )
     .await?;
@@ -246,10 +227,7 @@ async fn register_auto(
     name: &CardName,
     version: Option<&VersionSpec>,
     bump: Option<&VersionBump>,
-    spec_hash: &str,
-    spec_json: &JsonValue,
-    labels_json: &JsonValue,
-    annotations_json: &JsonValue,
+    data: &PreparedCardData<'_>,
 ) -> Result<RegisterCardOutcome, WyrdError> {
     debug_assert!(
         !matches!(&req.card.kind, CardKind::Service | CardKind::Agent),
@@ -265,7 +243,7 @@ async fn register_auto(
         name,
         version,
         bump,
-        spec_hash,
+        data.spec_hash,
     )
     .await?
     {
@@ -275,7 +253,7 @@ async fn register_auto(
                 conn,
                 req,
                 &uid,
-                spec_hash,
+                data.spec_hash,
                 CardRegistrationOutcome::Deduplicated,
             )
             .await?;
@@ -286,25 +264,21 @@ async fn register_auto(
             })
         }
         Resolution::Fresh(next) => {
-            let uid = insert_card_row(
+            let uid = insert_card_row(conn, req, space, name, &next, data)
+                .await?
+                .ok_or_else(|| {
+                    WyrdError::registry_unavailable(
+                        "auto-version insert conflicted under advisory lock",
+                    )
+                })?;
+            record_registration_audit(
                 conn,
                 req,
-                space,
-                name,
-                &next,
-                spec_hash,
-                spec_json,
-                labels_json,
-                annotations_json,
+                &uid,
+                data.spec_hash,
+                CardRegistrationOutcome::Created,
             )
-            .await?
-            .ok_or_else(|| {
-                WyrdError::registry_unavailable(
-                    "auto-version insert conflicted under advisory lock",
-                )
-            })?;
-            record_registration_audit(conn, req, &uid, spec_hash, CardRegistrationOutcome::Created)
-                .await?;
+            .await?;
             Ok(RegisterCardOutcome {
                 card_uid: uid,
                 kind: RegisterCardOutcomeKind::Created,
@@ -320,11 +294,17 @@ async fn insert_card_row(
     space: &SpaceName,
     name: &CardName,
     version: &VersionBlock,
-    spec_hash: &str,
-    spec_json: &JsonValue,
-    labels_json: &JsonValue,
-    annotations_json: &JsonValue,
+    data: &PreparedCardData<'_>,
 ) -> Result<Option<CardUid>, WyrdError> {
+    let sv = version
+        .semver()
+        .map_err(|e| WyrdError::registry_invalid_version_block(e.to_string()))?;
+    for component in [sv.major, sv.minor, sv.patch] {
+        i64::try_from(component).map_err(|_| {
+            WyrdError::registry_invalid_version_block("version component exceeds i64::MAX")
+        })?;
+    }
+
     let card_uid = CardUid::from_uuid(Uuid::now_v7()).map_err(WyrdError::from_card_uid_error)?;
     let inserted = sqlx::query_as::<_, (Uuid,)>(
         r#"
@@ -337,7 +317,7 @@ async fn insert_card_row(
             $6, $7, $8, $9, $10,
             'active', $11
         )
-        ON CONFLICT (data_tenant_id, kind, space, name, version) DO NOTHING
+        ON CONFLICT (data_tenant_id, kind, space, name, version) WHERE status <> 'deleted' DO NOTHING
         RETURNING card_uid
         "#,
     )
@@ -346,11 +326,11 @@ async fn insert_card_row(
     .bind(space.as_str())
     .bind(name.as_str())
     .bind(version.as_str())
-    .bind(spec_json)
-    .bind(spec_hash)
+    .bind(data.spec_json)
+    .bind(data.spec_hash)
     .bind(req.card.metadata.artifact_hash.as_deref())
-    .bind(labels_json)
-    .bind(annotations_json)
+    .bind(data.labels_json)
+    .bind(data.annotations_json)
     .bind(req.actor.id.as_uuid())
     .fetch_optional(&mut **conn.transaction())
     .await
@@ -399,7 +379,8 @@ async fn handle_conflict(
     let existing = sqlx::query_as::<_, (Uuid, String)>(
         r#"SELECT card_uid, spec_hash FROM wyrd.cards
            WHERE kind = $1 AND space = $2 AND name = $3 AND version = $4
-             AND data_tenant_id = wyrd.current_tenant()"#,
+             AND data_tenant_id = wyrd.current_tenant()
+             AND status <> 'deleted'"#,
     )
     .bind(card.kind.wire_name())
     .bind(space.as_str())

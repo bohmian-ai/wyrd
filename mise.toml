@@ -303,88 +303,7 @@ run = "cargo test -p wyrd-spec --test cards kind:: --features server"
 [tasks."check:client-tier"]
 hide = true
 description = "Foundation invariants: wyrd-spec server-tier-free; shared shells pyo3+sqlx-free; Skald keeps only locked Wyrd foundation edges"
-run = """
-set -eu
-
-forbidden_spec=$(cargo tree -p wyrd-spec --no-default-features -e normal | \
-  rg '(^|[ ─└├])(utoipa|pyo3|sqlx|axum|opentelemetry|reqwest|tokio)' || true)
-if [ -n "$forbidden_spec" ]; then
-  echo "FAIL: wyrd-spec pulls forbidden deps at --no-default-features:"
-  echo "$forbidden_spec"
-  exit 1
-fi
-
-for crate in wyrd-auth-verify; do
-  forbidden_shared=$(cargo tree -p "$crate" --all-features -e normal | \
-    rg '(^|[ ─└├])(pyo3|sqlx)' || true)
-  if [ -n "$forbidden_shared" ]; then
-    echo "FAIL: $crate pulls forbidden deps:"
-    echo "$forbidden_shared"
-    exit 1
-  fi
-done
-
-# `tower-http` is intentionally absent: it is a non-optional transitive
-# dependency of `reqwest` (client-side follow-redirect), the sanctioned async
-# HTTP client for the auth exchange and HTTP transport. `axum` still flags the
-# server HTTP stack.
-forbidden_wyrd_client=$(cargo tree -p wyrd-client --all-features -e normal | \
-  rg '(^|[ ─└├])(sqlx|tokio-postgres|postgres|deltalake|datafusion|axum|kube|aws-sdk|azure_|google-cloud|opendal|rdkafka|lapin|redis|deadpool-|vala-)' || true)
-if [ -n "$forbidden_wyrd_client" ]; then
-  echo "FAIL: wyrd-client pulls forbidden client-tier deps:"
-  echo "$forbidden_wyrd_client"
-  exit 1
-fi
-
-# S3.C7: wyrd-mcp must stay engine-free (no vala-bifrost, no sqlx, no datafusion, no axum).
-# Mirror of the wyrd-client guard above. Dev-deps are excluded (-e normal).
-forbidden_wyrd_mcp=$(cargo tree -p wyrd-mcp --all-features -e normal | \
-  rg '(^|[ ─└├])(sqlx|datafusion|vala-|axum)' || true)
-if [ -n "$forbidden_wyrd_mcp" ]; then
-  echo "FAIL: wyrd-mcp pulls forbidden engine deps (sqlx|datafusion|vala-|axum):"
-  echo "$forbidden_wyrd_mcp"
-  exit 1
-fi
-
-forbidden_skald_prompt=$(cargo tree -p skald-prompt --all-features -e normal | \
-  rg '(^|[ ─└├])(reqwest|tokio|hyper|axum|sqlx|opentelemetry|skald-runtime|skald-providers|skald-cache|skald-tool)' || true)
-if [ -n "$forbidden_skald_prompt" ]; then
-  echo "FAIL: skald-prompt pulls forbidden client-unsafe deps:"
-  echo "$forbidden_skald_prompt"
-  exit 1
-fi
-
-for crate in skald-agent skald-workflow skald-tool skald-runtime; do
-  forbidden_skald_member=$(cargo tree -p "$crate" --all-features -e normal | \
-    rg '(^|[ ─└├])(wyrd-|vala-)' | \
-    rg -v '(^|[ ─└├])(wyrd-spec|wyrd-semver|wyrd-interfaces|wyrd-utils|wyrd-runtime|wyrd-error-derive|wyrd-observe)' || true)
-  if [ -n "$forbidden_skald_member" ]; then
-    echo "FAIL: $crate pulls forbidden Wyrd/Vala deps outside the locked foundation set:"
-    echo "$forbidden_skald_member"
-    exit 1
-  fi
-done
-
-if rg -n 'wyrd_spec|wyrd-' crates/skald \
-  --glob '!crates/skald/skald-prompt/**' \
-  --glob '!crates/skald/skald-agent/**' \
-  --glob '!crates/skald/skald-agent/Cargo.toml' \
-  --glob '!crates/skald/skald-tool/Cargo.toml' \
-  --glob '!crates/skald/skald-workflow/**'; then
-  echo 'Skald engine crates must remain free of Wyrd references outside locked boundary crates'
-  exit 1
-fi
-
-if rg -n 'wyrd_cards|wyrd-cards' crates/skald/skald-agent; then
-  echo 'skald-agent must not depend on wyrd-cards'
-  exit 1
-fi
-
-if ! rg -q 'wyrd-(spec|interfaces|utils)' crates/skald/skald-prompt/Cargo.toml; then
-  echo 'skald-prompt must remain the documented Skald/Wyrd boundary crate'
-  exit 1
-fi
-"""
+run = "bash scripts/checks/client-tier.sh"
 
 [tasks."check:registry-no-server-routes"]
 hide = true
@@ -396,131 +315,17 @@ rg -n 'use axum::|use hyper::|use tower::' crates/wyrd/wyrd-sql/src/ && exit 1 |
 [tasks."check:pyo3-scope"]
 hide = true
 description = "Assert PyO3 stays out of pure contracts and Python-free shared crates"
-run = """
-set -eu
-
-if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/wyrd-spec; then
-  echo 'PyO3 scope violation detected in wyrd-spec'
-  exit 1
-fi
-
-if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/shared \
-  --glob '!crates/shared/wyrd-utils/**' \
-  --glob '!crates/shared/wyrd-observe/**'; then
-  echo 'PyO3 scope violation detected in Python-free shared crates'
-  exit 1
-fi
-
-if rg -n 'pyo3|pymodule|pyclass|pymethods|Python|Bound<|Py<|PyErr' crates/skald \
-  --glob '!crates/skald/skald-prompt/**' \
-  --glob '!crates/skald/skald-runtime/Cargo.toml' \
-  --glob '!crates/skald/skald-runtime/src/lib.rs' \
-  --glob '!crates/skald/skald-runtime/src/python.rs' \
-  --glob '!crates/skald/skald-agent/Cargo.toml' \
-  --glob '!crates/skald/skald-agent/src/agent.rs' \
-  --glob '!crates/skald/skald-agent/src/lib.rs' \
-  --glob '!crates/skald/skald-agent/src/py_error.rs' \
-  --glob '!crates/skald/skald-agent/src/python.rs' \
-  --glob '!crates/skald/skald-agent/src/run.rs' \
-  --glob '!crates/skald/skald-agent/src/session.rs' \
-  --glob '!crates/skald/skald-tool/Cargo.toml' \
-  --glob '!crates/skald/skald-tool/src/lib.rs' \
-  --glob '!crates/skald/skald-tool/src/python.rs' \
-  --glob '!crates/skald/skald-workflow/Cargo.toml' \
-  --glob '!crates/skald/skald-workflow/src/lib.rs' \
-  --glob '!crates/skald/skald-workflow/src/python.rs' \
-  --glob '!crates/skald/skald-workflow/src/run.rs' \
-  --glob '!crates/skald/skald-workflow/src/task.rs' \
-  --glob '!crates/skald/skald-workflow/src/workflow_surface.rs'; then
-  echo 'PyO3 scope violation detected in Python-free Skald engine crates'
-  exit 1
-fi
-
-for crate in skald-prompt skald-runtime skald-agent skald-tool skald-workflow; do
-  manifest="crates/skald/$crate/Cargo.toml"
-  if ! rg -q 'python = \\[' "$manifest" || ! rg -q 'dep:pyo3' "$manifest"; then
-    echo "$crate must gate PyO3 behind its python feature"
-    exit 1
-  fi
-
-  if ! rg -q 'pyo3 = \\{ workspace = true, optional = true \\}' "$manifest"; then
-    echo "$crate PyO3 dependency must remain optional"
-    exit 1
-  fi
-done
-
-if ! rg -qF 'python = ["dep:pyo3"]' crates/shared/wyrd-utils/Cargo.toml; then
-  echo 'wyrd-utils must gate PyO3 behind its python feature'
-  exit 1
-fi
-
-if ! rg -q 'pyo3 = \\{ workspace = true, optional = true \\}' crates/shared/wyrd-utils/Cargo.toml; then
-  echo 'wyrd-utils PyO3 dependency must remain optional'
-  exit 1
-fi
-
-if ! rg -q '#\\[cfg\\(feature = "python"\\)\\]' crates/shared/wyrd-utils/src/lib.rs; then
-  echo 'wyrd-utils Python helpers must remain cfg-gated'
-  exit 1
-fi
-
-forbidden_utils_default=$(cargo tree -p wyrd-utils --no-default-features -e normal | \
-  rg '(^|[ ─└├])pyo3' || true)
-if [ -n "$forbidden_utils_default" ]; then
-  echo "FAIL: wyrd-utils pulls PyO3 without its python feature:"
-  echo "$forbidden_utils_default"
-  exit 1
-fi
-"""
+run = "bash scripts/checks/pyo3-scope.sh"
 
 [tasks."check:mocks-scope"]
 hide = true
 description = "Assert mock helpers stay out of production source"
-run = """
-if rg -n 'mockall|wiremock|mockito' crates \
-  --glob '!crates/shared/wyrd-testing/**' \
-  --glob '!crates/skald/skald-providers/Cargo.toml' \
-  --glob '!crates/skald/skald-providers/tests/**' \
-  --glob '!crates/wyrd/wyrd-cli/Cargo.toml' \
-  --glob '!crates/wyrd/wyrd-cli/tests/**' \
-  --glob '!crates/shared/wyrd-auth-oidc/Cargo.toml' \
-  --glob '!crates/shared/wyrd-auth-oidc/src/jwks.rs' \
-  --glob '!crates/shared/wyrd-auth-oidc/src/provider.rs' \
-  --glob '!crates/shared/wyrd-auth-verify/Cargo.toml' \
-  --glob '!crates/shared/wyrd-auth-verify/src/lib.rs' \
-  --glob '!crates/wyrd/wyrd-server/Cargo.toml' \
-  --glob '!crates/wyrd/wyrd-server/src/auth/jwt_bearer.rs' \
-  --glob '!crates/wyrd/wyrd-server/src/auth/callback.rs' \
-  --glob '!crates/wyrd/wyrd-server/src/auth/admin.rs' \
-  --glob '!crates/wyrd/wyrd-server/src/components/admin/routes.rs' \
-  --glob '!crates/wyrd/wyrd-server/src/issuer_boot.rs' \
-  --glob '!crates/wyrd/wyrd-server/src/boot/issuer.rs' \
-  --glob '!crates/wyrd/wyrd-cli/src/auth/trusted_issuer.rs'; then
-  echo 'mock dependency leaked outside wyrd-testing'
-  exit 1
-fi
-"""
+run = "bash scripts/checks/mocks-scope.sh"
 
 [tasks."check:object-store-pin"]
 hide = true
 description = "Assert single versions of object_store/datafusion/arrow/parquet across the iceberg cone (stage1+)"
-run = """
-set -e
-fail=0
-for dep in object_store datafusion arrow parquet; do
-  n=$(cargo tree --workspace -e=no-dev -d --all-features 2>/dev/null \
-        | awk -v d="$dep" '$1==d {print $2}' | sort -u | wc -l | tr -d ' ')
-  if [ "$n" -gt "1" ]; then
-    echo "FAIL: $dep has multiple versions:"
-    cargo tree --workspace -e=no-dev -d --all-features | awk -v d="$dep" '$1==d {print "  "$2}'
-    fail=1
-  fi
-done
-os=$(cargo tree --workspace -e=no-dev -i object_store --all-features 2>/dev/null | awk 'NR==1{print $2}')
-case "$os" in v0.13.*) : ;; *) echo "FAIL: object_store $os is not 0.13.*"; fail=1 ;; esac
-[ "$fail" = 0 ] && echo "OK: single object_store ($os) + single datafusion/arrow/parquet across the iceberg cone"
-exit $fail
-"""
+run = "bash scripts/checks/object-store-pin.sh"
 
 [tasks."storage:up"]
 description = """Start local storage emulators (RustFS, fake-gcs-server, Azurite) and
@@ -649,125 +454,7 @@ depends = ["test:storage:handle:s3-emu", "test:storage:handle:gcs-emu", "test:st
 [tasks."check:storage:drift"]
 hide = true
 description = "Assert storage foundation guardrails against paths that exist in this workspace"
-run = """
-set -eu
-
-rg_optional() {
-  pattern="$1"
-  shift
-  existing=""
-  for path in "$@"; do
-    if [ -e "$path" ]; then
-      existing="$existing $path"
-    else
-      echo "skip missing path: $path"
-    fi
-  done
-  if [ -n "$existing" ]; then
-    # shellcheck disable=SC2086
-    rg -n "$pattern" $existing
-  else
-    return 1
-  fi
-}
-
-rg_fixed_optional() {
-  pattern="$1"
-  shift
-  existing=""
-  for path in "$@"; do
-    if [ -e "$path" ]; then
-      existing="$existing $path"
-    else
-      echo "skip missing path: $path"
-    fi
-  done
-  if [ -n "$existing" ]; then
-    # shellcheck disable=SC2086
-    rg -nF "$pattern" $existing
-  else
-    return 1
-  fi
-}
-
-if rg_optional 'pyo3|pymodule|pyclass|pymethods' \
-  crates/wyrd/wyrd-storage \
-  crates/wyrd/wyrd-server/src/storage \
-  crates/wyrd-spec/src/storage; then
-  echo 'storage foundation must stay PyO3-free'
-  exit 1
-fi
-
-if rg_optional 'session_uri|session_url|sas|presigned_url' \
-  crates/wyrd/wyrd-sql/migrations \
-  crates/wyrd/wyrd-sql/src/queries/storage; then
-  echo 'bearer-equivalent upload tokens must not be persisted in migrations or storage queries'
-  exit 1
-fi
-
-if rg_fixed_optional 'partial.state' \
-  crates/wyrd/wyrd-client/src/artifacts \
-  crates/wyrd/wyrd-client/src/cards; then
-  echo 'upload sidecar state is forbidden'
-  exit 1
-fi
-
-if rg_fixed_optional 'storage_multipart_upload_parts' crates/wyrd/wyrd-sql/migrations; then
-  echo 'per-part multipart upload tables are forbidden'
-  exit 1
-fi
-
-if rg_optional 'presign_batch|next_parts|part_batch_size|batch_presign|presign.*batch|batch.*presign' \
-  crates/wyrd/wyrd-storage/src \
-  crates/wyrd-spec/src/storage \
-  crates/wyrd/wyrd-client/src; then
-  echo 'per-part presign batching is forbidden'
-  exit 1
-fi
-
-if rg_optional 'aws_sdk_s3|gcloud_storage|azure_storage|azure_core|object_store|sqlx' \
-  crates/wyrd/wyrd-client/src \
-  crates/wyrd/wyrd-client/Cargo.toml; then
-  echo 'client tier must stay free of cloud SDK, object_store, and sqlx dependencies'
-  exit 1
-fi
-
-if rg_optional '&PgPool' \
-  crates/wyrd/wyrd-sql/src/queries/storage/multipart_uploads.rs \
-  crates/wyrd/wyrd-sql/src/queries/storage/artifact_metadata.rs \
-  crates/wyrd/wyrd-sql/src/queries/storage/access_ledger.rs \
-  crates/wyrd/wyrd-sql/src/queries/storage/idempotency.rs; then
-  echo 'tenant-scoped storage queries must use TenantConn, not PgPool'
-  exit 1
-fi
-
-if rg_optional 'PendingMap|storage_pending' \
-  crates/wyrd/wyrd-server/src \
-  crates/wyrd-spec/src; then
-  echo 'storage uploads must not rely on in-memory cross-request state'
-  exit 1
-fi
-
-if rg -n --glob '*.rs' 'wire_protocol\\s*==\\s*"' crates; then
-  echo 'WireProtocol dispatch must not use string equality'
-  exit 1
-fi
-
-if rg -n --type rust 'ArtifactRef' crates/wyrd-spec/src/storage 2>/dev/null; then
-  echo 'storage must not introduce a second artifact identity surface'
-  exit 1
-fi
-
-if ! rg -q '#\\[serde\\(tag = "protocol", content = "data"' crates/wyrd-spec/src/storage/upload.rs; then
-  echo 'UploadPlan must remain a closed tagged union'
-  exit 1
-fi
-
-if rg_optional '\\.unwrap\\(\\)' crates/wyrd/wyrd-storage/src; then
-  echo 'unwrap is forbidden in non-test storage code'
-  exit 1
-fi
-"""
+run = "bash scripts/checks/storage-drift.sh"
 
 [tasks."check:registry-tx-coupling"]
 hide = true
@@ -795,30 +482,7 @@ if rg -n 'CREATE TABLE wyrd\\.cards_[a-z]' crates/wyrd/wyrd-sql/migrations/; the
 [tasks."check:design-sync"]
 hide = true
 description = "Assert ValaQueryService and all four payload-read permissions are accepted in wyrd-design.md before the vala_query seam exists in code"
-run = """
-set -eu
-DESIGN=architecture/wyrd-design.md
-fail=0
-for sym in ValaQueryService BifrostTracePayload BifrostLogPayload BifrostGenAiPayload BifrostAgentTracePayload; do
-  if ! rg -q "$sym" "$DESIGN"; then
-    echo "check:design-sync FAIL: '$sym' missing from $DESIGN"
-    fail=1
-  fi
-done
-# Only enforce the seam-exists check when the query seam is present in code
-if rg -qr 'vala_query|ValaQueryService' crates/wyrd/wyrd-server/src/ 2>/dev/null || \
-   rg -qr 'vala::api::Query' crates/wyrd-spec/src/vala/ 2>/dev/null; then
-  if [ "$fail" -ne 0 ]; then
-    echo "check:design-sync FAIL: vala_query seam exists in code but wyrd-design.md is missing required symbols"
-    exit 1
-  fi
-fi
-if [ "$fail" -ne 0 ]; then
-  echo "check:design-sync FAIL: wyrd-design.md is missing required symbols (add the acceptance entry from Stage 4 task 01)"
-  exit 1
-fi
-echo "check:design-sync OK"
-"""
+run = "bash scripts/checks/design-sync.sh"
 
 [tasks."check:unwrap-audit"]
 hide = true
@@ -833,43 +497,7 @@ run = "python scripts/tests/test_check_unwrap_audit.py"
 [tasks."check:error-coverage"]
 hide = true
 description = "Assert emitted Skald error codes are mapped and SQL errors have coverage"
-run = """
-set -eu
-
-emitted=$(mktemp)
-mapped=$(mktemp)
-sql_emitted=$(mktemp)
-sql_tested=$(mktemp)
-trap 'rm -f "$emitted" "$mapped" "$sql_emitted" "$sql_tested"' EXIT
-
-{
-  rg --no-filename -oN 'SKALD_AGENT_[0-9]{3}_[A-Z_]+' crates/skald/skald-agent/src || true
-  rg --no-filename -oN 'SKALD_SESSION_[0-9]{3}_[A-Z_]+' crates/skald/skald-agent/src || true
-  rg --no-filename -oN 'SKALD_WORKFLOW_[0-9]{3}_[A-Z_]+' crates/skald/skald-workflow/src || true
-} | sort -u > "$emitted"
-
-rg --no-filename -oN 'SKALD_(AGENT|SESSION|WORKFLOW)_[0-9]{3}_[A-Z_]+' \
-  crates/shared/wyrd-observe/src/error_map.rs \
-  | sort -u > "$mapped"
-
-if comm -23 "$emitted" "$mapped" | rg .; then
-  echo 'Observed Skald error map is missing emitted source codes'
-  exit 1
-fi
-
-rg --no-filename -oN 'WYRD_SQL_[0-9]{3}_[A-Z_]+' \
-  crates/wyrd/wyrd-sql/src/error.rs \
-  | sort -u > "$sql_emitted"
-
-sed -n '/#\\[cfg(test)\\]/,$p' crates/wyrd/wyrd-sql/src/error.rs \
-  | rg --no-filename -oN 'WYRD_SQL_[0-9]{3}_[A-Z_]+' \
-  | sort -u > "$sql_tested"
-
-if comm -23 "$sql_emitted" "$sql_tested" | rg .; then
-  echo 'SQL error coverage is missing stable WYRD_SQL_* codes'
-  exit 1
-fi
-"""
+run = "bash scripts/checks/error-coverage.sh"
 
 [tasks."check:tenant-isolation"]
 hide = true
@@ -1198,205 +826,33 @@ diff -u "$BEFORE" "$AFTER" \
 [tasks."check:single-into-response-impl"]
 hide = true
 description = "Assert Wyrd HTTP errors flow through one server IntoResponse mapper"
-run = """
-set -eu
-
-matches=$(rg -n 'impl IntoResponse for (WyrdErrorResponse|.*Wyrd.*Error)' crates --glob '*.rs' || true)
-count=$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')
-
-if [ "$count" != "1" ]; then
-  echo "expected exactly one Wyrd error IntoResponse mapper, found $count"
-  printf '%s\n' "$matches"
-  exit 1
-fi
-
-case "$matches" in
-  crates/wyrd/wyrd-server/src/http/error.rs:*'impl IntoResponse for WyrdErrorResponse'*)
-    ;;
-  *)
-    echo "Wyrd error IntoResponse mapper must stay in wyrd-server/src/http/error.rs"
-    printf '%s\n' "$matches"
-    exit 1
-    ;;
-esac
-"""
+run = "bash scripts/checks/single-into-response-impl.sh"
 
 [tasks."check:no-legacy-server-vocab"]
 hide = true
 description = "Reject legacy server vocabulary and orphan-rule violations"
-run = """
-set -e
-
-# 1. Route prefix lock: /api/v1 may only appear in the router mount points, not scattered handlers
-! rg -n --no-heading -e '/api/v1' crates/wyrd/wyrd-server/src/ \
-    --glob '!http/router.rs'
-
-# 2. Identity vocabulary (server source + server-tier auth domain crate)
-! rg -n --no-heading -e '\\bActor\\b' crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
-! rg -n --no-heading -e '\\bScope\\b' crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
-
-# 3. JWT claim leak
-! rg -n --no-heading -e '"scopes"' crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
-
-# 4. Predecessor names
-! rg -n --no-heading -e 'opsml|scouter' crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
-
-# 5. Plan docs: predecessor names allowed only in audit + verification files
-! rg -n --no-heading -e 'opsml|scouter' .dev/plan/foundations/07-server-skeleton \
-    --glob '!11-parity-audit.md' --glob '!10-verification.md'
-
-# 6. Predecessor domain nouns
-! rg -n --no-heading -e '\\b(SubAgent|Skill|RecoveryCode|ScouterApiClient)\\b' \
-    crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
-
-# 7. Single IntoResponse impl for Wyrd errors
-COUNT=$(rg -n --no-heading -e 'impl[[:space:]]+IntoResponse[[:space:]]+for[[:space:]]+Wyrd' crates/ | wc -l)
-test "$COUNT" -eq 1
-
-# 8. Orphan rule: no From<WyrdError> for tonic::Status (impl blocks only, not comments)
-! rg -n --no-heading -e 'impl[[:space:]]+From<WyrdError>[[:space:]]+for[[:space:]]+([a-zA-Z_:]+::)?Status\\b' crates/
-! rg -n --no-heading -e '^[[:space:]]*impl[^/]*From<WyrdError>[[:space:]]+for[[:space:]]+\\S*tonic\\S*::' crates/
-
-# 9. Authorization header not consumed by auth/route handlers
-! rg -n --no-heading -e 'header::AUTHORIZATION' \
-    crates/wyrd/wyrd-server/src/auth/ \
-    crates/wyrd/wyrd-server/src/components/auth/ \
-    crates/wyrd/wyrd-server/src/components/admin/ \
-    crates/wyrd/wyrd-server/src/components/authz/
-
-# 10. Wyrd-Caller-Identity not consumed
-! rg -n --no-heading -e 'Wyrd-Caller-Identity' crates/wyrd/wyrd-server/src/ \
-    | rg -n -e '\\.extract|\\.get'
-
-# 11. tower-http body-limit layer absent from server source (F-02 closeout).
-#     LengthLimitError from http_body_util is permitted in the custom body limiter.
-! rg -n --no-heading -e 'RequestBodyLimitLayer' \
-    crates/wyrd/wyrd-server/src/
-
-# 12. Tower middleware logs do not format raw inner errors (F-05 closeout).
-#     Scoped to middleware only — domain error functions in error.rs log raw
-#     sqlx/storage errors deliberately and are excluded from this gate.
-! rg -n --no-heading -e 'error\\s*=\\s*%error\\b' \
-    crates/wyrd/wyrd-server/src/http/middleware/
-"""
+run = "bash scripts/checks/no-legacy-server-vocab.sh"
 
 
 [tasks."check:no-tonic-outside-wyrd-tonic"]
 hide = true
 description = "Reject tonic-family dep declarations outside wyrd-tonic + workspace pins"
-run = """
-set -e
-
-# 1. Manifest declarations must only appear in wyrd-tonic and workspace root
-! rg -n --no-heading \
-    -e '^[[:space:]]*(tonic|tonic-health|tonic-reflection|prost)[[:space:]]*=' \
-    --glob '!crates/wyrd/wyrd-tonic/Cargo.toml' \
-    --glob '!Cargo.toml' \
-    crates/ python/
-
-# 1a. Renamed-dep evasion (package = "tonic")
-! rg -n --no-heading \
-    -e 'package[[:space:]]*=[[:space:]]*"(tonic|tonic-health|tonic-reflection|prost)"' \
-    --glob '!crates/wyrd/wyrd-tonic/Cargo.toml' \
-    --glob '!Cargo.toml' \
-    crates/ python/
-
-# 2. Source-code imports must not bypass wyrd-tonic re-exports
-! rg -n --no-heading \
-    -e '^[[:space:]]*(pub(\\([^)]+\\))?[[:space:]]+)?use[[:space:]]+(tonic|tonic_health|tonic_reflection|prost)::' \
-    --glob '!crates/wyrd/wyrd-tonic/src/**' \
-    crates/ python/
-
-# 2a. extern crate form
-! rg -n --no-heading \
-    -e '^[[:space:]]*extern[[:space:]]+crate[[:space:]]+(tonic|tonic_health|tonic_reflection|prost)\\b' \
-    --glob '!crates/wyrd/wyrd-tonic/src/**' \
-    crates/ python/
-
-# 3. Workspace pin sanity
-rg -q -e '^[[:space:]]*tonic[[:space:]]*=' Cargo.toml
-rg -q -e '^[[:space:]]*tonic-health[[:space:]]*=' Cargo.toml
-rg -q -e '^[[:space:]]*tonic-reflection[[:space:]]*=' Cargo.toml
-rg -q -e '^[[:space:]]*prost[[:space:]]*=' Cargo.toml
-
-# 4. wyrd-server consumes wyrd-tonic with features = ["server"]
-if command -v cargo >/dev/null && command -v jq >/dev/null; then
-    server_features=$(cargo metadata --format-version=1 --no-deps |
-        jq -r '.packages[] | select(.name=="wyrd-server")
-               | .dependencies[]
-               | select(.name=="wyrd-tonic")
-               | .features[]')
-    echo "$server_features" | rg -q '^server$'
-else
-    rg -q -U \
-        -e 'wyrd-tonic[[:space:]]*=.*features[^\n]*"server"' \
-        crates/wyrd/wyrd-server/Cargo.toml || \
-    rg -q -U \
-        -e '\\[dependencies\\.wyrd-tonic\\][^\\[]*features[^\n]*"server"' \
-        crates/wyrd/wyrd-server/Cargo.toml
-fi
-"""
+run = "bash scripts/checks/no-tonic-outside-wyrd-tonic.sh"
 
 [tasks."check:proto-drift"]
 hide = true
 description = "Fail if the checked-in wyrd.v1 FileDescriptorSet drifts from the .proto"
-run = """
-set -e
-# Rebuilding wyrd-tonic reruns build.rs, which regenerates the descriptor
-# snapshot at crates/wyrd/wyrd-tonic/proto/wyrd.v1.bin from the .proto. Force a
-# fresh compile of the build script so a stale target cache cannot mask drift.
-touch crates/wyrd/wyrd-tonic/build.rs
-cargo build --locked -p wyrd-tonic --all-features
-git diff --exit-code -- crates/wyrd/wyrd-tonic/proto/wyrd.v1.bin \\
-  || { echo 'wyrd.v1 descriptor drift detected - rebuild wyrd-tonic and commit crates/wyrd/wyrd-tonic/proto/wyrd.v1.bin'; exit 1; }
-"""
+run = "bash scripts/checks/proto-drift.sh"
 
 [tasks."check:from-pools-allowlist"]
 hide = true
 description = "Fail if from_pools is called outside the 16 allowlisted sites (2 definition files, 9 production wiring files, 5 test files)"
-run = """
-set -e
-# from_pools may only be called from the 16 sites below.
-# 2 definition files: wyrd-sql/src/postgres.rs, vala-sql/src/postgres.rs
-# 9 production wiring files: wyrd-server/src/{state,boot/mod,http/middleware/authenticate,components/{auth/{principal_extractor,caller_extractor,policy_hook,routes},health},postgres}.rs
-# 5 test files: wyrd-server/src/{bifrost,query}/service.rs (unit tests), wyrd-server/tests/{authz_check_route,grpc_smoke,router_smoke}.rs
-! rg -n --no-heading -e '\\.from_pools\\(|::from_pools\\(' \
-    --glob '!crates/wyrd/wyrd-sql/src/postgres.rs' \
-    --glob '!crates/vala/vala-sql/src/postgres.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/state.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/boot/mod.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/http/middleware/authenticate.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/components/auth/principal_extractor.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/components/auth/caller_extractor.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/components/auth/policy_hook.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/components/auth/routes.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/components/health/mod.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/postgres.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/bifrost/service.rs' \
-    --glob '!crates/wyrd/wyrd-server/src/query/service.rs' \
-    --glob '!crates/wyrd/wyrd-server/tests/authz_check_route.rs' \
-    --glob '!crates/wyrd/wyrd-server/tests/grpc_smoke.rs' \
-    --glob '!crates/wyrd/wyrd-server/tests/router_smoke.rs' \
-    crates/ python/
-"""
+run = "bash scripts/checks/from-pools-allowlist.sh"
 
 [tasks."check:fixtures-no-server"]
 hide = true
 description = "Fail if wyrd-dev-fixtures imports wyrd-server or ServerPostgres::from_parts appears outside wyrd-server/wyrd-testing"
-run = """
-set -e
-# 1. wyrd-dev-fixtures must never import wyrd-server.
-! rg -n --no-heading -e '\\buse\\s+wyrd_server\\b|\\bwyrd_server::' \
-    crates/shared/wyrd-dev-fixtures/
-# 2. ServerPostgres composition (from_parts) stays in server + test harness only.
-! rg -n --no-heading -e 'ServerPostgres::from_parts' \
-    --glob '!crates/wyrd/wyrd-server/**' \
-    --glob '!crates/wyrd/wyrd-testing/**' \
-    crates/ python/
-# 3. wyrd-dev-fixtures Cargo.toml must not declare wyrd-server as a dependency.
-! rg -n --no-heading -e '^[[:space:]]*wyrd-server[[:space:]]*=' \
-    crates/shared/wyrd-dev-fixtures/Cargo.toml
-"""
+run = "bash scripts/checks/fixtures-no-server.sh"
 
 [tasks."pre-pr"]
 description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"

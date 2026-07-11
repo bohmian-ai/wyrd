@@ -804,7 +804,7 @@ fn gcs_emu_handle() -> Arc<StorageHandle> {
     )
     .expect("gcs emulator signer");
     Arc::new(StorageHandle::from_signer(
-        BackendSigner::Cloud(CloudSigner::Gcs(signer)),
+        BackendSigner::Cloud(Box::new(CloudSigner::Gcs(signer))),
         LOW_THRESHOLD_BYTES,
     ))
 }
@@ -823,7 +823,7 @@ fn azure_emu_handle() -> Arc<StorageHandle> {
     )
     .expect("azure emulator signer");
     Arc::new(StorageHandle::from_signer(
-        BackendSigner::Cloud(CloudSigner::Azure(signer)),
+        BackendSigner::Cloud(Box::new(CloudSigner::Azure(signer))),
         LOW_THRESHOLD_BYTES,
     ))
 }

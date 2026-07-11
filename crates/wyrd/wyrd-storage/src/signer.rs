@@ -182,7 +182,7 @@ impl BackendSigner {
         match self {
             Self::Local(signer) => signer.head(path).await,
             #[cfg(feature = "cloud")]
-            Self::Cloud(cloud) => cloud.head(path).await,
+            Self::Cloud(cloud) => cloud.head_for_verification(path).await,
         }
     }
 
@@ -236,7 +236,7 @@ pub enum CompletePayload {
 }
 
 impl CompletePayload {
-    fn kind(&self) -> &'static str {
+    pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::SinglePut => "single_put",
             Self::S3 { .. } => "s3",

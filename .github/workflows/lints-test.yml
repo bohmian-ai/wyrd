@@ -76,39 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space
-        if: runner.os == 'Linux'
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - name: Set up mise
-        uses: jdx/mise-action@v3
-        with:
-          install: true
-          cache: true
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Use GNU BFD linker on Linux
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          command -v cc
-          command -v ld.bfd
-          rustflags="${RUSTFLAGS:-}"
-          rustflags="${rustflags:+$rustflags }-C linker-features=-lld -C link-arg=-fuse-ld=bfd"
-          {
-            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc"
-            echo "RUSTFLAGS=$rustflags"
-          } >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-rust-ci
 
       - name: Run Rust test gate
         run: mise run test:unit
@@ -122,39 +90,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+      - uses: ./.github/actions/setup-rust-ci
         with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - name: Set up mise
-        uses: jdx/mise-action@v3
-        with:
-          install: true
-          cache: true
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: bifrost
-
-      - name: Use GNU BFD linker on Linux
-        shell: bash
-        run: |
-          command -v cc
-          command -v ld.bfd
-          rustflags="${RUSTFLAGS:-}"
-          rustflags="${rustflags:+$rustflags }-C linker-features=-lld -C link-arg=-fuse-ld=bfd"
-          {
-            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc"
-            echo "RUSTFLAGS=$rustflags"
-          } >> "$GITHUB_ENV"
+          rust-cache-key: bifrost
 
       - name: Run bifrost tests
         run: mise run test:bifrost

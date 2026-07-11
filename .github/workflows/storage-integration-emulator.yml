@@ -7,8 +7,9 @@ name: storage-integration-emulator
 # the server HTTP multipart e2e — the same set of tests for local, S3, GCS, and
 # Azure.
 #
-# The credentialed real-cloud matrix lives in storage-integration-cloud.yml and
-# runs only on merge-to-main.
+# Gated by the `storage` path filter so docs/UI/python-only PRs skip the heavy
+# emulator bring-up. The credentialed real-cloud matrix lives in
+# storage-integration-cloud.yml and runs only on merge-to-main.
 
 on:
   pull_request:
@@ -22,44 +23,37 @@ env:
   MISE_LOCKED: "true"
 
 jobs:
+  changes:
+    name: detect changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      storage: ${{ steps.filter.outputs.storage }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed areas
+        id: filter
+        shell: bash
+        env:
+          WYRD_CHANGE_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          WYRD_CHANGE_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: .github/scripts/detect-changes.sh
+
   emulator-matrix:
     name: storage emulator matrix
+    needs: changes
+    if: needs.changes.outputs.storage == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main # v1.3.1
+      - uses: ./.github/actions/setup-rust-ci
         with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: false
-          swap-storage: true
-
-      - name: Set up mise
-        uses: jdx/mise-action@v3
-        with:
-          install: true
-          cache: true
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Use GNU BFD linker on Linux
-        shell: bash
-        run: |
-          command -v cc
-          command -v ld.bfd
-          rustflags="${RUSTFLAGS:-}"
-          rustflags="${rustflags:+$rustflags }-C linker-features=-lld -C link-arg=-fuse-ld=bfd"
-          {
-            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc"
-            echo "RUSTFLAGS=$rustflags"
-          } >> "$GITHUB_ENV"
+          docker-images: "false"
 
       - name: Start storage emulators
         run: mise run storage:up

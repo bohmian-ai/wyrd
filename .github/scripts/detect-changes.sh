@@ -33,6 +33,10 @@ set_output docs '^(mise\.toml|docs/|openapi\.yaml|crates/wyrd-spec/schemas/|exam
 # drift lock fires on a hand-edit to any of them, not just on brand/ source edits.
 set_output ui '^(mise\.toml|crates/wyrd/wyrd-server/wyrd-ui/|docs/src/styles/wyrd-tokens\.css|\.claude/skills/wyrd-ui/references/wyrd-theme\.css|\.codex/skills/wyrd-ui/references/wyrd-theme\.css)'
 set_output generated '^(mise\.toml|Cargo\.toml|Cargo\.lock|crates/wyrd-spec/|crates/wyrd/wyrd-cards/|crates/wyrd/wyrd-interfaces/|python/py-wyrd/)'
+# storage/identity gate their own heavy emulator + OIDC e2e workflows. Both boot
+# the server, so a wyrd-server change re-runs both; docs/UI/python-only PRs skip.
+set_output storage '^(mise\.toml|Cargo\.lock|crates/wyrd/wyrd-storage/|crates/wyrd/wyrd-server/|crates/wyrd/wyrd-sql/|crates/wyrd/wyrd-client/src/artifacts/|crates/wyrd-spec/src/storage/|\.github/workflows/storage-integration|\.github/scripts/detect-changes\.sh)'
+set_output identity '^(mise\.toml|Cargo\.lock|crates/shared/wyrd-auth|crates/wyrd/wyrd-auth/|crates/wyrd/wyrd-server/|crates/wyrd-spec/src/security|\.github/workflows/identity-e2e\.yml|\.github/scripts/detect-changes\.sh)'
 set_output workflow '^(\.github/workflows/|\.github/scripts/)'
 
 if [[ -s "$changed_files" ]]; then

@@ -20,7 +20,6 @@ python = ["dep:pyo3"]
 skald-spec = { workspace = true }
 skald-providers = { workspace = true }
 skald-cache = { workspace = true }
-skald-tool = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 async-trait = { workspace = true }
 thiserror = { workspace = true }

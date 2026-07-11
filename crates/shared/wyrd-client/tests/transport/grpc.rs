@@ -89,7 +89,6 @@ fn assert_config_error(err: WyrdClientError, expected_field: &str, expected_reas
     assert_eq!(reason, expected_reason);
 }
 
-#[cfg(feature = "transport-grpc")]
 mod grpc_connection {
     use std::sync::Arc;
 

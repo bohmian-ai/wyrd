@@ -11,6 +11,7 @@
 use std::time::Duration;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::{StorageBackendKind, UploadPlan, WireProtocol};
+use wyrd_storage::cloud::CloudSigner;
 use wyrd_storage::error::{GcsError, StorageError};
 use wyrd_storage::factory::gcs::build_emulator_signer;
 use wyrd_storage::gcs::GcsSigner;
@@ -118,7 +119,7 @@ async fn gcs_abort_returns_capability_mismatch() {
     if skip_unless_enabled() {
         return;
     }
-    let backend = BackendSigner::Gcs(build_signer());
+    let backend = BackendSigner::Cloud(CloudSigner::Gcs(build_signer()));
     let path = fresh_path("abort/object.bin");
 
     let result = backend.abort_multipart(&path, "ignored").await;
@@ -189,7 +190,7 @@ async fn gcs_capability_mismatch_is_typed_for_presign_part() {
     if skip_unless_enabled() {
         return;
     }
-    let backend = BackendSigner::Gcs(build_signer());
+    let backend = BackendSigner::Cloud(CloudSigner::Gcs(build_signer()));
     let path = fresh_path("capability/object.bin");
 
     let result = backend

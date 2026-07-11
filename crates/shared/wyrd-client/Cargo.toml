@@ -12,11 +12,6 @@ description = "External Wyrd client transport runtime."
 [lib]
 path = "src/lib.rs"
 
-[features]
-default = ["transport-grpc", "transport-http"]
-transport-grpc = ["dep:wyrd-tonic"]
-transport-http = []
-
 [dependencies]
 chrono = { workspace = true }
 reqwest = { workspace = true }
@@ -31,7 +26,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 wyrd-spec = { workspace = true }
-wyrd-tonic = { workspace = true, optional = true }
+wyrd-tonic = { workspace = true }
 
 [dev-dependencies]
 secrecy = { workspace = true }

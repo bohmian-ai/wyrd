@@ -26,6 +26,7 @@ use wyrd_spec::storage::{
     GcsResumableComplete, PartUrlResponse, S3MultipartComplete, SinglePutComplete,
     UploadCompleteRequest, UploadInitRequest, UploadInitResponse, UploadPlan,
 };
+use wyrd_storage::cloud::CloudSigner;
 use wyrd_storage::settings::{AzureConfig, GcsConfig, S3Config};
 use wyrd_storage::{BackendConfig, BackendSigner, StorageHandle, StorageSettings};
 use wyrd_testing::{MultipartClient, WyrdTestServer};
@@ -803,7 +804,7 @@ fn gcs_emu_handle() -> Arc<StorageHandle> {
     )
     .expect("gcs emulator signer");
     Arc::new(StorageHandle::from_signer(
-        BackendSigner::Gcs(signer),
+        BackendSigner::Cloud(CloudSigner::Gcs(signer)),
         LOW_THRESHOLD_BYTES,
     ))
 }
@@ -822,7 +823,7 @@ fn azure_emu_handle() -> Arc<StorageHandle> {
     )
     .expect("azure emulator signer");
     Arc::new(StorageHandle::from_signer(
-        BackendSigner::Azure(signer),
+        BackendSigner::Cloud(CloudSigner::Azure(signer)),
         LOW_THRESHOLD_BYTES,
     ))
 }

@@ -214,7 +214,7 @@ impl MultipartClient {
     ///
     /// Each block is PUT with `comp=block&blockid={base64}` where the block id
     /// is the same zero-padded 6-digit ASCII form as
-    /// [`wyrd_storage::azure::azure_block_id`] (kept in lockstep to avoid commit
+    /// `wyrd_storage::azure::azure_block_id` (kept in lockstep to avoid commit
     /// drift; the signer's `complete_blocklist_server` regenerates the same ids
     /// from the block count).
     ///

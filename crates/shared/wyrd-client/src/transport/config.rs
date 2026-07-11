@@ -291,21 +291,14 @@ impl Default for MockConfig {
 /// Redis) are intentionally absent in this phase.
 ///
 /// Wire shape: `{"transport": "grpc", "params": { ... }}`.
-///
-/// # Feature gating
-///
-/// `is_enabled()` is feature-aware natively. `Grpc` is gated on
-/// `cfg!(feature = "transport-grpc")`, `Http` on
-/// `cfg!(feature = "transport-http")`, and `Mock` is always available.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "transport", content = "params", rename_all = "snake_case")]
 pub enum TransportConfig {
-    /// gRPC transport (tonic). The default transport. Gated on `transport-grpc`.
+    /// gRPC transport (tonic). The default transport.
     Grpc(GrpcConfig),
     /// HTTP transport (reqwest). Secondary path for gRPC-restricted environments.
-    /// Gated on `transport-http`.
     Http(HttpConfig),
-    /// In-memory loopback transport for tests. Always available; no feature gate.
+    /// In-memory loopback transport for tests. Always available.
     Mock(MockConfig),
 }
 
@@ -326,28 +319,6 @@ impl TransportConfig {
             Self::Grpc(_) => "grpc",
             Self::Http(_) => "http",
             Self::Mock(_) => "mock",
-        }
-    }
-
-    /// Returns the Cargo feature name that gates this variant, or `None` if
-    /// the variant is always available.
-    pub fn required_feature(&self) -> Option<&'static str> {
-        match self {
-            Self::Grpc(_) => Some("transport-grpc"),
-            Self::Http(_) => Some("transport-http"),
-            Self::Mock(_) => None,
-        }
-    }
-
-    /// Returns `true` if the variant is compiled into the current build.
-    ///
-    /// `Mock` is always enabled. `Grpc` is enabled when the `transport-grpc`
-    /// Cargo feature is on; `Http` requires `transport-http`.
-    pub fn is_enabled(&self) -> bool {
-        match self {
-            Self::Grpc(_) => cfg!(feature = "transport-grpc"),
-            Self::Http(_) => cfg!(feature = "transport-http"),
-            Self::Mock(_) => true,
         }
     }
 

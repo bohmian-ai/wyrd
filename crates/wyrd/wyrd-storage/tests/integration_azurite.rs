@@ -8,6 +8,7 @@ use std::time::Duration;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::{StorageBackendKind, UploadPlan, WireProtocol};
 use wyrd_storage::azure::AzureSigner;
+use wyrd_storage::cloud::CloudSigner;
 use wyrd_storage::error::{AzureError, StorageError};
 use wyrd_storage::factory::azure::build_emulator_signer;
 use wyrd_storage::{BackendSigner, UploadPlanReplayInput, ValidatedPath};
@@ -257,7 +258,7 @@ async fn azure_capability_mismatch_is_typed_for_presign_part() {
     if skip_unless_enabled() {
         return;
     }
-    let backend = BackendSigner::Azure(build_signer());
+    let backend = BackendSigner::Cloud(CloudSigner::Azure(build_signer()));
     let path = fresh_path("capability/object.bin");
 
     let result = backend

@@ -31,8 +31,6 @@ pub enum BootExit {
 /// `mode` is `None` to use the configured default (`config.serve.mode`), or
 /// `Some(_)` to override it (the binary passes the `--mode` flag through here).
 pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
-    enterprise_on_start();
-
     let config = WyrdServerConfig::load().map_err(|e| BootExit::Config(Box::new(e)))?;
     production_guards(&config);
 
@@ -62,11 +60,3 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
     drop(telemetry); // flush OTLP exporters after serving stops
     result
 }
-
-#[cfg(feature = "enterprise")]
-fn enterprise_on_start() {
-    wyrd_enterprise::on_server_start();
-}
-
-#[cfg(not(feature = "enterprise"))]
-fn enterprise_on_start() {}

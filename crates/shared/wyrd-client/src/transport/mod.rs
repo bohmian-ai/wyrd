@@ -17,7 +17,6 @@ pub mod mock;
 ///
 /// Shared by the HTTP retry loop and the gRPC connect-retry loop so both paths
 /// back off on the same schedule: attempt 0 → 100 ms, 1 → 1 s, ≥2 → 5 s (cap).
-#[cfg(any(feature = "transport-http", feature = "transport-grpc"))]
 pub(crate) fn backoff_ms(attempt: u32) -> u64 {
     const DELAYS: &[u64] = &[100, 1_000];
     DELAYS.get(attempt as usize).copied().unwrap_or(5_000)
@@ -25,8 +24,6 @@ pub(crate) fn backoff_ms(attempt: u32) -> u64 {
 
 pub use config::{GrpcConfig, HttpConfig, MockConfig, TransportConfig};
 pub use credential::{CredentialChain, CredentialSource, ResolvedCredential};
-#[cfg(feature = "transport-grpc")]
 pub use grpc::GrpcConnection;
-#[cfg(feature = "transport-http")]
 pub use http::{ArrowResponse, HttpTransport};
 pub use mock::{MockRecord, MockTransport};

@@ -279,10 +279,6 @@ mod tests {
             .into_iter()
             .filter_map(|path| {
                 let body = fs::read_to_string(&path).expect("Vala query file is readable");
-                // diagnostics-gated modules are explicitly tenant-free by design.
-                if body.contains("#![cfg(feature = \"diagnostics\")]") {
-                    return None;
-                }
                 let checked = without_line_comments(&body);
                 (checked.contains("&PgPool")
                     || checked.contains("PgPool,")

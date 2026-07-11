@@ -137,7 +137,6 @@ fn assert_config_error(err: WyrdClientError, expected_field: &str, expected_reas
 
 // ── HttpTransport behavioral tests ────────────────────────────────────────────
 
-#[cfg(feature = "transport-http")]
 mod transport_behavior {
     use std::collections::VecDeque;
     use std::sync::Arc;

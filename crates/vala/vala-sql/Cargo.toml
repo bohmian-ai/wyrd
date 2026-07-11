@@ -13,7 +13,6 @@ description = "Server-tier SQL migrations for Vala observability storage."
 path = "src/lib.rs"
 
 [features]
-diagnostics = []
 testing = ["dep:tokio", "wyrd-sql/testing"]
 
 [dependencies]

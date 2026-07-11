@@ -389,6 +389,7 @@ pub async fn upload_local_blob(
     body: &[u8],
 ) -> Result<(), WyrdError> {
     let validated = tenant_path::validate(&path, data_tenant_id).map_err(map_tenant_path)?;
+    #[cfg_attr(not(feature = "cloud"), allow(irrefutable_let_patterns))]
     let crate::BackendSigner::Local(local) = storage.signer() else {
         return Err(internal_error(
             "local blob route mounted for non-local backend",
@@ -469,6 +470,7 @@ pub async fn download_local_blob(
     path: String,
 ) -> Result<(tokio::fs::File, u64), WyrdError> {
     let validated = tenant_path::validate(&path, data_tenant_id).map_err(map_tenant_path)?;
+    #[cfg_attr(not(feature = "cloud"), allow(irrefutable_let_patterns))]
     let crate::BackendSigner::Local(local) = storage.signer() else {
         return Err(internal_error(
             "local download route mounted for non-local backend",

@@ -102,41 +102,6 @@ fn transport_config_all_variants_round_trip() {
 }
 
 #[test]
-fn transport_config_is_enabled_mock_always_true() {
-    let m = TransportConfig::Mock(MockConfig {
-        label: "m".to_string(),
-        fail_on_drain: None,
-    });
-    assert!(m.is_enabled());
-    assert!(m.required_feature().is_none());
-}
-
-#[cfg(feature = "transport-grpc")]
-#[test]
-fn transport_config_is_enabled_grpc_with_feature() {
-    assert!(TransportConfig::Grpc(GrpcConfig::default()).is_enabled());
-}
-
-#[cfg(feature = "transport-http")]
-#[test]
-fn transport_config_is_enabled_http_with_feature() {
-    let h = HttpConfig::default();
-    assert!(TransportConfig::Http(h).is_enabled());
-}
-
-#[test]
-fn transport_config_required_feature_matches_variant() {
-    assert_eq!(
-        TransportConfig::Grpc(GrpcConfig::default()).required_feature(),
-        Some("transport-grpc"),
-    );
-    assert_eq!(
-        TransportConfig::Http(HttpConfig::default()).required_feature(),
-        Some("transport-http"),
-    );
-}
-
-#[test]
 fn transport_config_validate_grpc_empty_endpoint_returns_err() {
     let c = TransportConfig::Grpc(GrpcConfig {
         endpoint: String::new(),

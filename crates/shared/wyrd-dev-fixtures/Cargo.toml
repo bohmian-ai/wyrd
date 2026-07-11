@@ -9,7 +9,6 @@ authors = { workspace = true }
 
 [features]
 default = []
-dev = []
 pg = [
     "dep:secrecy",
     "dep:serde_json",

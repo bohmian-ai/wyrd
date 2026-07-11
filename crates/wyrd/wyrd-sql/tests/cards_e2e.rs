@@ -7,7 +7,7 @@
 //! appears inline — assertions go through named helpers so the test reads as
 //! prose. Per-kind matrices are emitted via `for_each_card_kind!`.
 
-#![cfg(feature = "test-e2e")]
+#![cfg(feature = "testing")]
 #![cfg_attr(test, allow(missing_docs))]
 
 use std::env;

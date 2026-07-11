@@ -17,7 +17,6 @@ default = []
 
 [dependencies]
 arrow = { workspace = true }
-arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 statrs = { workspace = true }

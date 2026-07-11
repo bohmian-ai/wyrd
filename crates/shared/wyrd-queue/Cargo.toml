@@ -21,7 +21,6 @@ crossbeam-queue = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
-serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

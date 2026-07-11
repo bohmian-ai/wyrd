@@ -1,11 +1,14 @@
 //! Backend SDK and opendal operator construction.
 
+#[cfg(feature = "cloud")]
 pub mod azure;
+#[cfg(feature = "cloud")]
 pub mod gcs;
 /// Iceberg `StorageFactory` builder wired to the active backend configuration.
 #[cfg(feature = "iceberg")]
 pub mod iceberg_factory;
 pub mod local;
+#[cfg(feature = "cloud")]
 pub mod s3;
 
 use crate::error::StorageError;
@@ -13,6 +16,21 @@ use crate::settings::BackendConfig;
 use crate::signer::BackendSigner;
 use opendal::Operator;
 use wyrd_spec::storage::StorageBackendKind;
+
+#[cfg(not(feature = "cloud"))]
+fn cloud_disabled(backend: &BackendConfig) -> StorageError {
+    let backend_kind = match backend {
+        BackendConfig::Local { .. } => StorageBackendKind::Local,
+        BackendConfig::S3(_) => StorageBackendKind::S3,
+        BackendConfig::Gcs(_) => StorageBackendKind::Gcs,
+        BackendConfig::Azure(_) => StorageBackendKind::Azure,
+    };
+    StorageError::Backend {
+        backend: backend_kind,
+        op: "build_signer",
+        message: "cloud storage backends are not compiled in this build; rebuild with the `cloud` feature".to_owned(),
+    }
+}
 
 /// Build the active backend signer.
 ///
@@ -23,11 +41,18 @@ pub async fn build_signer(backend: &BackendConfig) -> Result<BackendSigner, Stor
         BackendConfig::Local { root } => {
             Ok(BackendSigner::Local(local::build_signer(root.clone())?))
         }
-        BackendConfig::S3(config) => Ok(BackendSigner::S3(s3::build_signer(config).await?)),
-        BackendConfig::Gcs(config) => Ok(BackendSigner::Gcs(gcs::build_signer(config).await?)),
-        BackendConfig::Azure(config) => {
-            Ok(BackendSigner::Azure(azure::build_signer(config).await?))
-        }
+        #[cfg(feature = "cloud")]
+        BackendConfig::S3(config) => Ok(BackendSigner::Cloud(crate::cloud::CloudSigner::S3(s3::build_signer(config).await?))),
+        #[cfg(feature = "cloud")]
+        BackendConfig::Gcs(config) => Ok(BackendSigner::Cloud(crate::cloud::CloudSigner::Gcs(gcs::build_signer(config).await?))),
+        #[cfg(feature = "cloud")]
+        BackendConfig::Azure(config) => Ok(BackendSigner::Cloud(crate::cloud::CloudSigner::Azure(azure::build_signer(config).await?))),
+        #[cfg(not(feature = "cloud"))]
+        BackendConfig::S3(_) => Err(cloud_disabled(backend)),
+        #[cfg(not(feature = "cloud"))]
+        BackendConfig::Gcs(_) => Err(cloud_disabled(backend)),
+        #[cfg(not(feature = "cloud"))]
+        BackendConfig::Azure(_) => Err(cloud_disabled(backend)),
     }
 }
 

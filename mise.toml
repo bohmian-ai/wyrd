@@ -271,25 +271,15 @@ cargo test -p wyrd-server --all-features --test identity_e2e -- --nocapture --te
 docker compose stop keycloak dex
 """
 
-[tasks."build:server:oss"]
+[tasks."build:server"]
 hide = true
-description = "Build the OSS wyrd-server release binary"
-run = "cargo build --release --locked -p wyrd-server"
+description = "Build the wyrd-server release binary"
+run = "cargo build --release --locked -p wyrd-server --features cloud"
 
-[tasks."build:server:enterprise"]
+[tasks."docker:build"]
 hide = true
-description = "Build the enterprise wyrd-server release binary"
-run = "cargo build --release --locked -p wyrd-server --features enterprise"
-
-[tasks."docker:build:oss"]
-hide = true
-description = "Build the OSS wyrd-server Docker image"
-run = "docker build -f docker/Dockerfile --build-arg WYRD_FLAVOR=oss -t wyrd-server:oss ."
-
-[tasks."docker:build:enterprise"]
-hide = true
-description = "Build the enterprise wyrd-server Docker image"
-run = "docker build -f docker/Dockerfile --build-arg WYRD_FLAVOR=enterprise -t wyrd-server:enterprise ."
+description = "Build the wyrd-server Docker image"
+run = "docker build -f docker/Dockerfile -t wyrd-server ."
 
 [tasks."check:docs"]
 hide = true
@@ -586,7 +576,7 @@ hide = true
 description = "Cards registration end-to-end against a real Postgres"
 depends = ["setup:postgres", "db:migrate"]
 env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
-run = "cargo test --locked -p wyrd-sql --features test-e2e --test cards_e2e -- --include-ignored --test-threads=1"
+run = "cargo test --locked -p wyrd-sql --features testing --test cards_e2e -- --include-ignored --test-threads=1"
 
 [tasks."test:storage:s3:cloud"]
 hide = true

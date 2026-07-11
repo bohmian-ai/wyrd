@@ -77,21 +77,8 @@ impl StorageHandle {
             BackendSigner::Local(local) => BackendConfig::Local {
                 root: local.root().to_path_buf(),
             },
-            BackendSigner::S3(s3) => BackendConfig::S3(crate::settings::S3Config {
-                bucket: s3.bucket().to_owned(),
-                region: None,
-                endpoint_url: None,
-                force_path_style: false,
-            }),
-            BackendSigner::Gcs(gcs) => BackendConfig::Gcs(crate::settings::GcsConfig {
-                bucket: gcs.bucket().to_owned(),
-                endpoint_url: None,
-            }),
-            BackendSigner::Azure(azure) => BackendConfig::Azure(crate::settings::AzureConfig {
-                account: azure.account().to_owned(),
-                container: azure.container().to_owned(),
-                endpoint_url: None,
-            }),
+            #[cfg(feature = "cloud")]
+            BackendSigner::Cloud(cloud) => cloud.backend_config(),
         };
         let operator = crate::factory::build_operator(&backend_config)
             .expect("operator construction is infallible for the test/local-harness constructor");
@@ -384,6 +371,7 @@ mod tests {
         StorageHandle::new(signer)
     }
 
+    #[cfg(feature = "emulator")]
     #[test]
     fn from_signer_builds_cloud_handles_without_probing() {
         let gcs = crate::factory::gcs::build_emulator_signer(
@@ -391,7 +379,7 @@ mod tests {
             "http://localhost:4443",
         )
         .expect("gcs emulator signer");
-        let handle = StorageHandle::from_signer(BackendSigner::Gcs(gcs), 8 * 1024 * 1024);
+        let handle = StorageHandle::from_signer(BackendSigner::Cloud(crate::cloud::CloudSigner::Gcs(gcs)), 8 * 1024 * 1024);
         assert_eq!(handle.backend(), StorageBackendKind::Gcs);
         assert_eq!(handle.multipart_threshold_bytes(), 8 * 1024 * 1024);
 
@@ -400,7 +388,7 @@ mod tests {
             "http://127.0.0.1:10000",
         )
         .expect("azure emulator signer");
-        let handle = StorageHandle::from_signer(BackendSigner::Azure(azure), 8 * 1024 * 1024);
+        let handle = StorageHandle::from_signer(BackendSigner::Cloud(crate::cloud::CloudSigner::Azure(azure)), 8 * 1024 * 1024);
         assert_eq!(handle.backend(), StorageBackendKind::Azure);
         assert_eq!(handle.multipart_threshold_bytes(), 8 * 1024 * 1024);
     }

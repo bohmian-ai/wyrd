@@ -4,6 +4,7 @@ async fn azure_abort_is_not_silent_success_when_no_blob_exists() {
     use azure_storage_blobs::prelude::BlobServiceClient;
     use wyrd_spec::DataTenantId;
     use wyrd_storage::azure::{AzureSasMode, AzureSigner};
+    use wyrd_storage::cloud::CloudSigner;
     use wyrd_storage::signer::BackendSigner;
     use wyrd_storage::tenant_path::ValidatedPath;
 
@@ -15,11 +16,11 @@ async fn azure_abort_is_not_silent_success_when_no_blob_exists() {
         ),
     );
     let tenant = DataTenantId::new_v7();
-    let signer = BackendSigner::Azure(AzureSigner::new(
+    let signer = BackendSigner::Cloud(CloudSigner::Azure(AzureSigner::new(
         service_client,
         "test-container".to_owned(),
         AzureSasMode::AccountKey,
-    ));
+    )));
     let path = ValidatedPath {
         full: format!("{tenant}/cards/card/model.bin"),
         data_tenant_id: tenant,

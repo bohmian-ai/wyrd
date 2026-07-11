@@ -3,9 +3,9 @@
 //! Validates that compiled SQL + binds execute correctly against Postgres and
 //! that the chosen NULL semantics hold for typed-column negation operators.
 //! Requires a live database. Opt in via `WYRD_REG_E2E=1 cargo test --features
-//! test-e2e -- --include-ignored`.
+//! testing -- --include-ignored`.
 
-#![cfg(feature = "test-e2e")]
+#![cfg(feature = "testing")]
 #![cfg_attr(test, allow(missing_docs))]
 
 use std::env;

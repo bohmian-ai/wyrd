@@ -129,7 +129,7 @@ fn col_str_view<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringView
         .and_then(|c| c.as_any().downcast_ref::<StringViewArray>())
 }
 
-fn get_str_view<'a>(arr: Option<&'a StringViewArray>, i: usize) -> Option<&'a str> {
+fn get_str_view(arr: Option<&StringViewArray>, i: usize) -> Option<&str> {
     arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
 }
 

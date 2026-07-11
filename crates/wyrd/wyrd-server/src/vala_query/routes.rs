@@ -550,11 +550,18 @@ async fn query_traces(
         if let Some(key) = super::sealing_key(&state) {
             let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
             let tenant_id_str = caller.data_tenant_id.to_string();
-            page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_traces", qhash)
-                .map_err(|e| {
-                    let err: wyrd_spec::error::WyrdError = e.into();
-                    WyrdErrorResponse::from(err)
-                })?;
+            page_token::verify(
+                token,
+                key,
+                &tenant_id_str,
+                &auth_hash,
+                "query_traces",
+                qhash,
+            )
+            .map_err(|e| {
+                let err: wyrd_spec::error::WyrdError = e.into();
+                WyrdErrorResponse::from(err)
+            })?;
         }
     }
 
@@ -597,11 +604,18 @@ async fn query_recent_traces(
         if let Some(key) = super::sealing_key(&state) {
             let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
             let tenant_id_str = caller.data_tenant_id.to_string();
-            page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_recent_traces", qhash)
-                .map_err(|e| {
-                    let err: wyrd_spec::error::WyrdError = e.into();
-                    WyrdErrorResponse::from(err)
-                })?;
+            page_token::verify(
+                token,
+                key,
+                &tenant_id_str,
+                &auth_hash,
+                "query_recent_traces",
+                qhash,
+            )
+            .map_err(|e| {
+                let err: wyrd_spec::error::WyrdError = e.into();
+                WyrdErrorResponse::from(err)
+            })?;
         }
     }
 
@@ -770,11 +784,18 @@ async fn query_metrics(
         if let Some(key) = super::sealing_key(&state) {
             let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
             let tenant_id_str = caller.data_tenant_id.to_string();
-            page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_metrics", qhash)
-                .map_err(|e| {
-                    let err: wyrd_spec::error::WyrdError = e.into();
-                    WyrdErrorResponse::from(err)
-                })?;
+            page_token::verify(
+                token,
+                key,
+                &tenant_id_str,
+                &auth_hash,
+                "query_metrics",
+                qhash,
+            )
+            .map_err(|e| {
+                let err: wyrd_spec::error::WyrdError = e.into();
+                WyrdErrorResponse::from(err)
+            })?;
         }
     }
 
@@ -855,11 +876,18 @@ async fn query_agent_traces(
         if let Some(key) = super::sealing_key(&state) {
             let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
             let tenant_id_str = caller.data_tenant_id.to_string();
-            page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_agent_traces", qhash)
-                .map_err(|e| {
-                    let err: wyrd_spec::error::WyrdError = e.into();
-                    WyrdErrorResponse::from(err)
-                })?;
+            page_token::verify(
+                token,
+                key,
+                &tenant_id_str,
+                &auth_hash,
+                "query_agent_traces",
+                qhash,
+            )
+            .map_err(|e| {
+                let err: wyrd_spec::error::WyrdError = e.into();
+                WyrdErrorResponse::from(err)
+            })?;
         }
     }
 

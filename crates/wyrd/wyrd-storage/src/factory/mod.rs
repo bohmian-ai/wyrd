@@ -42,11 +42,17 @@ pub async fn build_signer(backend: &BackendConfig) -> Result<BackendSigner, Stor
             Ok(BackendSigner::Local(local::build_signer(root.clone())?))
         }
         #[cfg(feature = "cloud")]
-        BackendConfig::S3(config) => Ok(BackendSigner::Cloud(crate::cloud::CloudSigner::S3(s3::build_signer(config).await?))),
+        BackendConfig::S3(config) => Ok(BackendSigner::Cloud(crate::cloud::CloudSigner::S3(
+            s3::build_signer(config).await?,
+        ))),
         #[cfg(feature = "cloud")]
-        BackendConfig::Gcs(config) => Ok(BackendSigner::Cloud(crate::cloud::CloudSigner::Gcs(gcs::build_signer(config).await?))),
+        BackendConfig::Gcs(config) => Ok(BackendSigner::Cloud(crate::cloud::CloudSigner::Gcs(
+            gcs::build_signer(config).await?,
+        ))),
         #[cfg(feature = "cloud")]
-        BackendConfig::Azure(config) => Ok(BackendSigner::Cloud(crate::cloud::CloudSigner::Azure(azure::build_signer(config).await?))),
+        BackendConfig::Azure(config) => Ok(BackendSigner::Cloud(crate::cloud::CloudSigner::Azure(
+            azure::build_signer(config).await?,
+        ))),
         #[cfg(not(feature = "cloud"))]
         BackendConfig::S3(_) => Err(cloud_disabled(backend)),
         #[cfg(not(feature = "cloud"))]

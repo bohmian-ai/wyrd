@@ -140,7 +140,11 @@ e2e_test!(jsonb_key_absent_ne_includes_absent_rows, {
     setup(&db.app).await;
 
     let ids = query_ids(&db.app, "labels.env != \"prod\"").await;
-    assert_eq!(ids, vec![2, 3], "absent-key row must be included by JSONB Ne");
+    assert_eq!(
+        ids,
+        vec![2, 3],
+        "absent-key row must be included by JSONB Ne"
+    );
 });
 
 // Typed Ne: NULL rows must be included (matches JSONB behavior after fix).
@@ -158,7 +162,11 @@ e2e_test!(typed_not_in_is_null_inclusive, {
     setup(&db.app).await;
 
     let ids = query_ids(&db.app, "score not in [10]").await;
-    assert_eq!(ids, vec![2, 3, 4], "NULL typed column must be included by NotIn");
+    assert_eq!(
+        ids,
+        vec![2, 3, 4],
+        "NULL typed column must be included by NotIn"
+    );
 });
 
 // Typed In array-bind: only matching non-NULL rows.

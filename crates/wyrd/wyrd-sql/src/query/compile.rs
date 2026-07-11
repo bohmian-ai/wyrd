@@ -331,9 +331,20 @@ fn push_typed_array(
         ValueType::Str => {
             qb.push_bind(expect_string_values(values, predicate, resolver, operator)?)
         }
-        ValueType::Int => qb.push_bind(collect_typed(values, predicate, resolver, operator, "int", |v| {
-            if let Value::Int(n) = v { Some(*n) } else { None }
-        })?),
+        ValueType::Int => qb.push_bind(collect_typed(
+            values,
+            predicate,
+            resolver,
+            operator,
+            "int",
+            |v| {
+                if let Value::Int(n) = v {
+                    Some(*n)
+                } else {
+                    None
+                }
+            },
+        )?),
         ValueType::Float => qb.push_bind(collect_typed(
             values,
             predicate,
@@ -341,12 +352,27 @@ fn push_typed_array(
             operator,
             "float",
             |v| {
-                if let Value::Float(f) = v { Some(*f) } else { None }
+                if let Value::Float(f) = v {
+                    Some(*f)
+                } else {
+                    None
+                }
             },
         )?),
-        ValueType::Bool => qb.push_bind(collect_typed(values, predicate, resolver, operator, "bool", |v| {
-            if let Value::Bool(b) = v { Some(*b) } else { None }
-        })?),
+        ValueType::Bool => qb.push_bind(collect_typed(
+            values,
+            predicate,
+            resolver,
+            operator,
+            "bool",
+            |v| {
+                if let Value::Bool(b) = v {
+                    Some(*b)
+                } else {
+                    None
+                }
+            },
+        )?),
         ValueType::Duration => qb.push_bind(collect_typed(
             values,
             predicate,
@@ -354,7 +380,11 @@ fn push_typed_array(
             operator,
             "duration",
             |v| {
-                if let Value::Duration(d) = v { Some(*d) } else { None }
+                if let Value::Duration(d) = v {
+                    Some(*d)
+                } else {
+                    None
+                }
             },
         )?),
         ValueType::Timestamp => unreachable!("timestamp arrays rejected above"),
@@ -407,7 +437,13 @@ fn collect_typed<T>(
         .iter()
         .map(|v| {
             extract(v).ok_or_else(|| {
-                type_mismatch(predicate, resolver, operator, expected, v.value_type().as_str())
+                type_mismatch(
+                    predicate,
+                    resolver,
+                    operator,
+                    expected,
+                    v.value_type().as_str(),
+                )
             })
         })
         .collect()
@@ -765,9 +801,15 @@ mod tests {
     #[test]
     fn typed_numeric_coercion_is_strict() {
         let err = compile("score = 1.5").expect_err("float value rejected for int column");
-        assert_eq!(err.as_problem_json()["details"]["reason"], "operator_type_mismatch");
+        assert_eq!(
+            err.as_problem_json()["details"]["reason"],
+            "operator_type_mismatch"
+        );
 
         let err = compile("score in [1, 2.0]").expect_err("mixed list rejected for int column");
-        assert_eq!(err.as_problem_json()["details"]["reason"], "operator_type_mismatch");
+        assert_eq!(
+            err.as_problem_json()["details"]["reason"],
+            "operator_type_mismatch"
+        );
     }
 }

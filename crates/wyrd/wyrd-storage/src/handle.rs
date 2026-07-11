@@ -379,7 +379,10 @@ mod tests {
             "http://localhost:4443",
         )
         .expect("gcs emulator signer");
-        let handle = StorageHandle::from_signer(BackendSigner::Cloud(crate::cloud::CloudSigner::Gcs(gcs)), 8 * 1024 * 1024);
+        let handle = StorageHandle::from_signer(
+            BackendSigner::Cloud(crate::cloud::CloudSigner::Gcs(gcs)),
+            8 * 1024 * 1024,
+        );
         assert_eq!(handle.backend(), StorageBackendKind::Gcs);
         assert_eq!(handle.multipart_threshold_bytes(), 8 * 1024 * 1024);
 
@@ -388,7 +391,10 @@ mod tests {
             "http://127.0.0.1:10000",
         )
         .expect("azure emulator signer");
-        let handle = StorageHandle::from_signer(BackendSigner::Cloud(crate::cloud::CloudSigner::Azure(azure)), 8 * 1024 * 1024);
+        let handle = StorageHandle::from_signer(
+            BackendSigner::Cloud(crate::cloud::CloudSigner::Azure(azure)),
+            8 * 1024 * 1024,
+        );
         assert_eq!(handle.backend(), StorageBackendKind::Azure);
         assert_eq!(handle.multipart_threshold_bytes(), 8 * 1024 * 1024);
     }

@@ -313,8 +313,15 @@ impl ValaQueryService for ValaQueryGrpc {
                 let auth_hash =
                     page_token::permissions_hash(&caller.principal.effective_permissions);
                 let tenant_id_str = caller.data_tenant_id.to_string();
-                page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_traces", qhash)
-                    .map_err(|e| status_from_wyrd(e.into()))?;
+                page_token::verify(
+                    token,
+                    key,
+                    &tenant_id_str,
+                    &auth_hash,
+                    "query_traces",
+                    qhash,
+                )
+                .map_err(|e| status_from_wyrd(e.into()))?;
             }
         }
         let plan = build_query_traces_plan(&self.state, &caller, &api_req)

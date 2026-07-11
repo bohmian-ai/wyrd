@@ -811,11 +811,7 @@ e2e_test!(query_cards_version_range_and_prerelease_predicates, {
     .await
     .expect("range query");
     assert_page_size(&in_range, 2);
-    let in_range_versions: Vec<&str> = in_range
-        .items
-        .iter()
-        .map(|r| r.version.as_str())
-        .collect();
+    let in_range_versions: Vec<&str> = in_range.items.iter().map(|r| r.version.as_str()).collect();
     assert!(
         in_range_versions.contains(&"1.2.0") && in_range_versions.contains(&"1.3.0"),
         "expected 1.2.0 and 1.3.0 in range, got {in_range_versions:?}"
@@ -868,52 +864,63 @@ e2e_test!(query_cards_version_range_and_prerelease_predicates, {
 // so the outcomes are either Created+Created (two distinct versions) or
 // Created+Deduplicated (same content, one version). A duplicate version in
 // the list indicates the lock did not protect the read-then-write sequence.
-e2e_test!(concurrent_auto_registration_produces_no_duplicate_versions, {
-    let env = TestEnv::new().await;
-    let tenant = env.fresh_tenant().await;
-    let actor = env.fixture_user(tenant).await;
-    let card = fixture_card_auto(CardKind::Data, "prod", "concurrent-auto");
+e2e_test!(
+    concurrent_auto_registration_produces_no_duplicate_versions,
+    {
+        let env = TestEnv::new().await;
+        let tenant = env.fresh_tenant().await;
+        let actor = env.fixture_user(tenant).await;
+        let card = fixture_card_auto(CardKind::Data, "prod", "concurrent-auto");
 
-    let (r1, r2) = tokio::join!(
-        scenarios::register(&env, tenant, &actor, &card),
-        scenarios::register(&env, tenant, &actor, &card),
-    );
+        let (r1, r2) = tokio::join!(
+            scenarios::register(&env, tenant, &actor, &card),
+            scenarios::register(&env, tenant, &actor, &card),
+        );
 
-    let o1 = r1.expect("first concurrent auto register succeeds");
-    let o2 = r2.expect("second concurrent auto register succeeds");
+        let o1 = r1.expect("first concurrent auto register succeeds");
+        let o2 = r2.expect("second concurrent auto register succeeds");
 
-    let both_created = matches!(
-        (o1.kind, o2.kind),
-        (RegisterCardOutcomeKind::Created, RegisterCardOutcomeKind::Created)
-    );
-    let one_dedup = matches!(
-        (&o1.kind, &o2.kind),
-        (RegisterCardOutcomeKind::Created, RegisterCardOutcomeKind::Deduplicated)
-            | (RegisterCardOutcomeKind::Deduplicated, RegisterCardOutcomeKind::Created)
-    );
-    assert!(
-        both_created || one_dedup,
-        "expected Created+Created or Created+Deduplicated, got {:?} and {:?}",
-        o1.kind,
-        o2.kind
-    );
+        let both_created = matches!(
+            (o1.kind, o2.kind),
+            (
+                RegisterCardOutcomeKind::Created,
+                RegisterCardOutcomeKind::Created
+            )
+        );
+        let one_dedup = matches!(
+            (&o1.kind, &o2.kind),
+            (
+                RegisterCardOutcomeKind::Created,
+                RegisterCardOutcomeKind::Deduplicated
+            ) | (
+                RegisterCardOutcomeKind::Deduplicated,
+                RegisterCardOutcomeKind::Created
+            )
+        );
+        assert!(
+            both_created || one_dedup,
+            "expected Created+Created or Created+Deduplicated, got {:?} and {:?}",
+            o1.kind,
+            o2.kind
+        );
 
-    let versions = scenarios::versions(
-        &env,
-        tenant,
-        CardKind::Data,
-        &space("prod"),
-        &name("concurrent-auto"),
-        false,
-    )
-    .await
-    .expect("versions list");
-    assert!(
-        versions.len() <= 2,
-        "concurrent auto must not mint duplicate versions; got {:?}",
-        versions
-    );
-});
+        let versions = scenarios::versions(
+            &env,
+            tenant,
+            CardKind::Data,
+            &space("prod"),
+            &name("concurrent-auto"),
+            false,
+        )
+        .await
+        .expect("versions list");
+        assert!(
+            versions.len() <= 2,
+            "concurrent auto must not mint duplicate versions; got {:?}",
+            versions
+        );
+    }
+);
 
 // ─── Group N — No-stable-match error from get_latest_card_by_range ──────────
 

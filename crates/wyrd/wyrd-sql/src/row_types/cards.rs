@@ -17,8 +17,7 @@ use crate::error::SqlError;
 /// Shared SELECT column list for `wyrd.cards` queries.
 ///
 /// Must stay in lockstep with the positional `FromRow` decode order on [`CardRow`].
-pub const CARD_ROW_COLUMNS: &str =
-    "card_uid, data_tenant_id, kind, space, name, version, \
+pub const CARD_ROW_COLUMNS: &str = "card_uid, data_tenant_id, kind, space, name, version, \
      spec, spec_hash, artifact_hash, labels, annotations, \
      status, created_by, created_at, updated_at";
 

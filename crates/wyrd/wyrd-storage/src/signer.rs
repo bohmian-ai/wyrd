@@ -68,7 +68,11 @@ impl BackendSigner {
                     .await
             }
             #[cfg(feature = "cloud")]
-            Self::Cloud(cloud) => cloud.init_multipart(path, part_count, part_size_bytes, ttl).await,
+            Self::Cloud(cloud) => {
+                cloud
+                    .init_multipart(path, part_count, part_size_bytes, ttl)
+                    .await
+            }
         }
     }
 
@@ -86,13 +90,15 @@ impl BackendSigner {
     ) -> Result<String, StorageError> {
         match self {
             #[cfg(feature = "cloud")]
-            Self::Cloud(cloud) => cloud.presign_part(path, backend_upload_id, part_number, ttl).await,
-            Self::Local(_) => {
-                Err(StorageError::BackendCapabilityMismatch {
-                    signer: self.kind(),
-                    op: "presign_part",
-                })
+            Self::Cloud(cloud) => {
+                cloud
+                    .presign_part(path, backend_upload_id, part_number, ttl)
+                    .await
             }
+            Self::Local(_) => Err(StorageError::BackendCapabilityMismatch {
+                signer: self.kind(),
+                op: "presign_part",
+            }),
         }
     }
 
@@ -112,7 +118,11 @@ impl BackendSigner {
                 signer.finalize_temp_object(path).await
             }
             #[cfg(feature = "cloud")]
-            (Self::Cloud(cloud), payload) => cloud.complete_server_side(path, backend_upload_id, payload).await,
+            (Self::Cloud(cloud), payload) => {
+                cloud
+                    .complete_server_side(path, backend_upload_id, payload)
+                    .await
+            }
             (signer, payload) => {
                 tracing::error!(
                     backend = %signer.kind(),

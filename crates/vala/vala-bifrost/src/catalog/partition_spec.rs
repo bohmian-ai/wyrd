@@ -42,16 +42,14 @@ mod tests {
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
         )]);
-        iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow)
-            .expect("test schema builds")
+        iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow).expect("test schema builds")
     }
 
     #[test]
     fn partition_field_names_use_transform_suffix() {
         let schema = ts_schema();
-        let spec =
-            build_partition_spec(&schema, &[("ts".to_owned(), PartitionTransform::Day)])
-                .expect("day partition spec builds");
+        let spec = build_partition_spec(&schema, &[("ts".to_owned(), PartitionTransform::Day)])
+            .expect("day partition spec builds");
         assert_eq!(spec.fields()[0].name, "ts_day");
     }
 
@@ -67,18 +65,19 @@ mod tests {
     #[test]
     fn month_partition_uses_month_suffix() {
         let schema = ts_schema();
-        let spec =
-            build_partition_spec(&schema, &[("ts".to_owned(), PartitionTransform::Month)])
-                .expect("month partition spec builds");
+        let spec = build_partition_spec(&schema, &[("ts".to_owned(), PartitionTransform::Month)])
+            .expect("month partition spec builds");
         assert_eq!(spec.fields()[0].name, "ts_month");
     }
 
     #[test]
     fn truncate_partition_uses_trunc_suffix() {
         let schema = ts_schema();
-        let spec =
-            build_partition_spec(&schema, &[("ts".to_owned(), PartitionTransform::Truncate(16))])
-                .expect("truncate partition spec builds");
+        let spec = build_partition_spec(
+            &schema,
+            &[("ts".to_owned(), PartitionTransform::Truncate(16))],
+        )
+        .expect("truncate partition spec builds");
         assert_eq!(spec.fields()[0].name, "ts_trunc16");
     }
 

@@ -16,11 +16,11 @@ async fn azure_abort_is_not_silent_success_when_no_blob_exists() {
         ),
     );
     let tenant = DataTenantId::new_v7();
-    let signer = BackendSigner::Cloud(CloudSigner::Azure(AzureSigner::new(
+    let signer = BackendSigner::Cloud(Box::new(CloudSigner::Azure(AzureSigner::new(
         service_client,
         "test-container".to_owned(),
         AzureSasMode::AccountKey,
-    )));
+    ))));
     let path = ValidatedPath {
         full: format!("{tenant}/cards/card/model.bin"),
         data_tenant_id: tenant,

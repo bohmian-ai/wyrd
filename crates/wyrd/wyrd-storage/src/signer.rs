@@ -17,7 +17,7 @@ pub enum BackendSigner {
     Local(LocalSigner),
     /// Cloud backend signer (S3, GCS, or Azure).
     #[cfg(feature = "cloud")]
-    Cloud(crate::cloud::CloudSigner),
+    Cloud(Box<crate::cloud::CloudSigner>),
 }
 
 impl BackendSigner {

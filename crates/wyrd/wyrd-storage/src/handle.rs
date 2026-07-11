@@ -380,7 +380,7 @@ mod tests {
         )
         .expect("gcs emulator signer");
         let handle = StorageHandle::from_signer(
-            BackendSigner::Cloud(crate::cloud::CloudSigner::Gcs(gcs)),
+            BackendSigner::Cloud(Box::new(crate::cloud::CloudSigner::Gcs(gcs))),
             8 * 1024 * 1024,
         );
         assert_eq!(handle.backend(), StorageBackendKind::Gcs);
@@ -392,7 +392,7 @@ mod tests {
         )
         .expect("azure emulator signer");
         let handle = StorageHandle::from_signer(
-            BackendSigner::Cloud(crate::cloud::CloudSigner::Azure(azure)),
+            BackendSigner::Cloud(Box::new(crate::cloud::CloudSigner::Azure(azure))),
             8 * 1024 * 1024,
         );
         assert_eq!(handle.backend(), StorageBackendKind::Azure);

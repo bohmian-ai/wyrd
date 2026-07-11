@@ -258,7 +258,7 @@ async fn azure_capability_mismatch_is_typed_for_presign_part() {
     if skip_unless_enabled() {
         return;
     }
-    let backend = BackendSigner::Cloud(CloudSigner::Azure(build_signer()));
+    let backend = BackendSigner::Cloud(Box::new(CloudSigner::Azure(build_signer())));
     let path = fresh_path("capability/object.bin");
 
     let result = backend

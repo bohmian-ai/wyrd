@@ -546,8 +546,8 @@ async fn query_traces(
         req.name.as_deref().unwrap_or(""),
     ]);
 
-    if let Some(token) = &req.window.page_token {
-        if let Some(key) = super::sealing_key(&state) {
+    if let Some(token) = &req.window.page_token
+        && let Some(key) = super::sealing_key(&state) {
             let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
             let tenant_id_str = caller.data_tenant_id.to_string();
             page_token::verify(
@@ -563,7 +563,6 @@ async fn query_traces(
                 WyrdErrorResponse::from(err)
             })?;
         }
-    }
 
     let plan = build_query_traces_plan(&state, &caller, &req)
         .await
@@ -600,8 +599,8 @@ async fn query_recent_traces(
         req.status.as_deref().unwrap_or(""),
     ]);
 
-    if let Some(token) = &req.window.page_token {
-        if let Some(key) = super::sealing_key(&state) {
+    if let Some(token) = &req.window.page_token
+        && let Some(key) = super::sealing_key(&state) {
             let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
             let tenant_id_str = caller.data_tenant_id.to_string();
             page_token::verify(
@@ -617,7 +616,6 @@ async fn query_recent_traces(
                 WyrdErrorResponse::from(err)
             })?;
         }
-    }
 
     let plan = build_query_recent_traces_plan(&state, &caller, &req)
         .await
@@ -657,8 +655,8 @@ async fn query_genai(
         req.provider.as_deref().unwrap_or(""),
     ]);
 
-    if let Some(token) = &req.window.page_token {
-        if let Some(key) = super::sealing_key(&state) {
+    if let Some(token) = &req.window.page_token
+        && let Some(key) = super::sealing_key(&state) {
             let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
             let tenant_id_str = caller.data_tenant_id.to_string();
             page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_genai", qhash)
@@ -667,7 +665,6 @@ async fn query_genai(
                     WyrdErrorResponse::from(err)
                 })?;
         }
-    }
 
     let plan = build_query_genai_plan(&state, &caller, &req)
         .await
@@ -698,8 +695,8 @@ async fn query_eval(
         req.run_id.as_deref().unwrap_or(""),
     ]);
 
-    if let Some(token) = &req.window.page_token {
-        if let Some(key) = super::sealing_key(&state) {
+    if let Some(token) = &req.window.page_token
+        && let Some(key) = super::sealing_key(&state) {
             let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
             let tenant_id_str = caller.data_tenant_id.to_string();
             page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_eval", qhash)
@@ -708,7 +705,6 @@ async fn query_eval(
                     WyrdErrorResponse::from(err)
                 })?;
         }
-    }
 
     let plan = build_query_eval_plan(&state, &caller, &req)
         .await
@@ -739,8 +735,8 @@ async fn query_drift(
         req.run_id.as_deref().unwrap_or(""),
     ]);
 
-    if let Some(token) = &req.window.page_token {
-        if let Some(key) = super::sealing_key(&state) {
+    if let Some(token) = &req.window.page_token
+        && let Some(key) = super::sealing_key(&state) {
             let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
             let tenant_id_str = caller.data_tenant_id.to_string();
             page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_drift", qhash)
@@ -749,7 +745,6 @@ async fn query_drift(
                     WyrdErrorResponse::from(err)
                 })?;
         }
-    }
 
     let plan = build_query_drift_plan(&state, &caller, &req)
         .await
@@ -780,8 +775,8 @@ async fn query_metrics(
         req.metric_type.as_deref().unwrap_or(""),
     ]);
 
-    if let Some(token) = &req.window.page_token {
-        if let Some(key) = super::sealing_key(&state) {
+    if let Some(token) = &req.window.page_token
+        && let Some(key) = super::sealing_key(&state) {
             let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
             let tenant_id_str = caller.data_tenant_id.to_string();
             page_token::verify(
@@ -797,7 +792,6 @@ async fn query_metrics(
                 WyrdErrorResponse::from(err)
             })?;
         }
-    }
 
     let plan = build_query_metrics_plan(&state, &caller, &req)
         .await
@@ -830,8 +824,8 @@ async fn query_logs(
     let limit = effective_limit(req.window.limit);
     let qhash = page_token::query_hash(&[req.trace_id.as_deref().unwrap_or("")]);
 
-    if let Some(token) = &req.window.page_token {
-        if let Some(key) = super::sealing_key(&state) {
+    if let Some(token) = &req.window.page_token
+        && let Some(key) = super::sealing_key(&state) {
             let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
             let tenant_id_str = caller.data_tenant_id.to_string();
             page_token::verify(token, key, &tenant_id_str, &auth_hash, "query_logs", qhash)
@@ -840,7 +834,6 @@ async fn query_logs(
                     WyrdErrorResponse::from(err)
                 })?;
         }
-    }
 
     let plan = build_query_logs_plan(&state, &caller, &req)
         .await
@@ -872,8 +865,8 @@ async fn query_agent_traces(
         req.run_id.as_deref().unwrap_or(""),
     ]);
 
-    if let Some(token) = &req.window.page_token {
-        if let Some(key) = super::sealing_key(&state) {
+    if let Some(token) = &req.window.page_token
+        && let Some(key) = super::sealing_key(&state) {
             let auth_hash = page_token::permissions_hash(&caller.principal.effective_permissions);
             let tenant_id_str = caller.data_tenant_id.to_string();
             page_token::verify(
@@ -889,7 +882,6 @@ async fn query_agent_traces(
                 WyrdErrorResponse::from(err)
             })?;
         }
-    }
 
     let plan = build_query_agent_traces_plan(&state, &caller, &req)
         .await
